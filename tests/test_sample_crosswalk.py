@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.dosage_store import HalfSamples
+from sv_pgs.sample_ids import ResearchId, SequencingId
 from sv_pgs.sample_crosswalk import (
     ABSENT_COLUMN,
     SampleCrosswalk,
@@ -69,7 +70,7 @@ def test_crosswalk_reads_a_delimited_table(tmp_path: Path) -> None:
 def test_store_research_ids_map_a_half_and_refuse_gaps_and_repeats() -> None:
     crosswalk = SampleCrosswalk(research_ids=("R1", "R2", "R3"), sequencing_ids=("D1", "D2", "D3"))
 
-    assert store_research_ids(HalfSamples("dragen_sample", ("D3", "D1")), crosswalk) == ("R3", "R1")
+    assert store_research_ids(HalfSamples("dragen_sample", ("D3", "D1")), crosswalk) == (ResearchId("R3"), ResearchId("R1"))
     with pytest.raises(ValueError, match="no crosswalk row"):
         store_research_ids(HalfSamples("dragen_sample", ("D1", "D9")), crosswalk)
     with pytest.raises(ValueError, match="more than once"):
@@ -86,3 +87,10 @@ def test_a_half_named_by_research_id_is_never_looked_up_among_sequencing_names()
         store_research_ids(long_read_half, crosswalk)
     with pytest.raises(ValueError, match="never compared across namespaces"):
         source_columns_for_store_samples(long_read_half, ["R1", "R2"], crosswalk)
+
+
+def test_a_half_types_its_names_by_namespace() -> None:
+    assert HalfSamples("dragen_sample", ("1001", "D2")).sample_ids() == (SequencingId("1001"), SequencingId("D2"))
+    assert HalfSamples("research_id", ("1001",)).sample_ids() == (ResearchId("1001"),)
+    with pytest.raises(TypeError):
+        _ = HalfSamples("dragen_sample", ("1001",)).sample_ids()[0] == HalfSamples("research_id", ("1001",)).sample_ids()[0]

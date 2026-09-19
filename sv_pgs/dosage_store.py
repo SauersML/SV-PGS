@@ -48,6 +48,7 @@ import zstandard
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
+from sv_pgs.sample_ids import ResearchId, SequencingId
 
 
 class _PinnedBufferPool:
@@ -792,6 +793,12 @@ class HalfSamples:
             raise ValueError(f"sample namespace must be one of {SAMPLE_NAMESPACES}; got {self.namespace!r}.")
         if len(set(self.names)) != len(self.names) or not all(self.names):
             raise ValueError("a half lists a sample more than once or a blank sample name.")
+
+    def sample_ids(self) -> tuple[SequencingId, ...] | tuple[ResearchId, ...]:
+        """The names typed by their namespace, so they can never be compared across namespaces."""
+        if self.namespace == "dragen_sample":
+            return tuple(SequencingId(name) for name in self.names)
+        return tuple(ResearchId(name) for name in self.names)
 
 
 def write_half_samples(root: Path, half_index: int, samples: HalfSamples) -> None:

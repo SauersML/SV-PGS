@@ -17,6 +17,7 @@ from sv_pgs.cohort import (
     kinship_folds,
     resolve_cohort_rows,
 )
+from sv_pgs.dosage_store import HalfSamples
 from sv_pgs.sample_crosswalk import SampleCrosswalk
 from sv_pgs.sample_ids import ResearchId, SequencingId
 
@@ -209,6 +210,7 @@ def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
 
 
 
+
 def _crosswalk(pairs: dict[str, str]) -> SampleCrosswalk:
     """Sequencing name -> research ID."""
     return SampleCrosswalk(research_ids=tuple(pairs.values()), sequencing_ids=tuple(pairs))
@@ -218,20 +220,24 @@ def _research(*values: str) -> list[ResearchId]:
     return [ResearchId(value) for value in values]
 
 
-def _sequencing(*values: str) -> list[SequencingId]:
-    return [SequencingId(value) for value in values]
+def _imputed(*names: str) -> HalfSamples:
+    return HalfSamples("dragen_sample", names)
+
+
+def _long_read(*names: str) -> HalfSamples:
+    return HalfSamples("research_id", names)
 
 
 def test_a_participant_in_both_halves_keeps_only_the_truth_row() -> None:
     rows = resolve_cohort_rows(
-        truth_research_ids=_research("R1", "R2"),
-        imputed_sequencing_ids=_sequencing("D1", "D3"),
+        [_imputed("D1", "D3"), _long_read("R1", "R2")],
         crosswalk=_crosswalk({"D1": "R1", "D3": "R3"}),
         kinship_pairs=[],
     )
 
-    assert rows.research_ids == tuple(_research("R1", "R2", "R3"))
-    assert rows.genotype_source == ("long_read", "long_read", "imputed")
+    assert rows.research_ids == tuple(_research("R3", "R1", "R2"))
+    assert rows.genotype_source == ("imputed", "long_read", "long_read")
+    assert (rows.store_half, rows.store_column) == ((0, 1, 1), (1, 0, 1))
     assert rows.imputed_rows_sharing_a_research_id == 1
 
 
@@ -239,13 +245,12 @@ def test_names_that_collide_across_the_halves_are_different_people() -> None:
     # The DRAGEN name "1001" is spelled like the truth participant 1001, but the crosswalk
     # maps it to participant 2002, and the KING pair links 2002 (not 1001) to 3003.
     rows = resolve_cohort_rows(
-        truth_research_ids=_research("1001", "3003"),
-        imputed_sequencing_ids=_sequencing("1001"),
+        [_imputed("1001"), _long_read("1001", "3003")],
         crosswalk=_crosswalk({"1001": "2002"}),
         kinship_pairs=[(SequencingId("1001"), ResearchId("3003"), 0.25)],
     )
 
-    assert rows.research_ids == tuple(_research("1001", "3003", "2002"))
+    assert rows.research_ids == tuple(_research("2002", "1001", "3003"))
     assert rows.imputed_rows_sharing_a_research_id == 0
     assert rows.kinship_pairs == ((ResearchId("2002"), ResearchId("3003"), 0.25),)
 
@@ -260,23 +265,18 @@ def test_ids_of_different_namespaces_never_compare() -> None:
     assert ResearchId("1001") == ResearchId("1001") and ResearchId("1001") != ResearchId("1002")
 
 
-def test_the_halves_must_arrive_typed_by_namespace() -> None:
-    with pytest.raises(TypeError, match="truth half is named by ResearchId"):
-        resolve_cohort_rows(["R1"], _sequencing("D1"), _crosswalk({"D1": "R2"}), [])
-    with pytest.raises(TypeError, match="imputed half is named by SequencingId"):
-        resolve_cohort_rows(_research("R1"), _research("D1"), _crosswalk({"D1": "R2"}), [])
+def test_kinship_pairs_must_name_typed_samples() -> None:
     with pytest.raises(TypeError, match="not a typed sample ID"):
-        resolve_cohort_rows(_research("R1"), _sequencing("D1"), _crosswalk({"D1": "R2"}), [("R1", "D1", 0.25)])
+        resolve_cohort_rows([_imputed("D1"), _long_read("R1")], _crosswalk({"D1": "R2"}), [("R1", "D1", 0.25)])
 
 
 def test_a_duplicate_genome_across_halves_keeps_the_truth_row_but_twins_within_a_half_stay() -> None:
     duplicate = DUPLICATE_KINSHIP * 1.4
     rows = resolve_cohort_rows(
-        truth_research_ids=_research("R1", "R2"),
-        imputed_sequencing_ids=_sequencing("D4", "D5", "D6", "D7"),
+        [_imputed("D4", "D5"), _imputed("D6", "D7"), _long_read("R1", "R2")],
         crosswalk=_crosswalk({"D4": "R4", "D5": "R5", "D6": "R6", "D7": "R7"}),
-        # D4 is R1's genome under another research ID; D5/D6 and R1/R2 are twins within one
-        # half; D7 is R2's first-degree relative.
+        # D4 is R1's genome under another research ID; D5/D6 (across the two imputed
+        # halves) and R1/R2 are twins in one namespace; D7 is R2's first-degree relative.
         kinship_pairs=[
             (SequencingId("D4"), ResearchId("R1"), duplicate),
             (SequencingId("D5"), SequencingId("D6"), duplicate),
@@ -285,32 +285,31 @@ def test_a_duplicate_genome_across_halves_keeps_the_truth_row_but_twins_within_a
         ],
     )
 
-    assert rows.research_ids == tuple(_research("R1", "R2", "R5", "R6", "R7"))
+    assert rows.research_ids == tuple(_research("R5", "R6", "R7", "R1", "R2"))
+    assert rows.store_half == (0, 1, 1, 2, 2)
     assert rows.imputed_rows_duplicating_a_truth_genome == 1
     assert rows.imputed_rows_sharing_a_research_id == 0
 
 
 @pytest.mark.parametrize(
-    ("truth", "imputed", "crosswalk", "pairs", "message"),
+    ("halves", "crosswalk", "pairs", "message"),
     [
-        (["R1", "R1"], ["D2"], {"D2": "R2"}, [], "truth half repeats a research ID"),
-        (["R1"], ["D2", "D2"], {"D2": "R2"}, [], "imputed half repeats a sequencing ID"),
-        (["R1"], ["D2", "D3"], {"D2": "R2"}, [], "1 imputed samples have no crosswalk row"),
-        (["R1"], ["D2"], {"D2": "R2"}, [("D9", "R1")], "kinship pair names an imputed sample with no crosswalk row"),
+        ([_long_read("R1"), _long_read("R1")], {}, [], "truth halves list a research ID more than once"),
+        ([_imputed("D2"), _imputed("D2")], {"D2": "R2"}, [], "two imputed halves list the same sequencing sample"),
+        ([_imputed("D2", "D3")], {"D2": "R2"}, [], "1 store samples have no crosswalk row"),
+        ([_imputed("D2"), _long_read("R1")], {"D2": "R2", "D9": "R9"}, [("D9", "R1")], "no store half lists"),
     ],
 )
-def test_repeats_within_a_half_and_unmapped_samples_are_errors(truth, imputed, crosswalk, pairs, message) -> None:
+def test_repeats_and_unmapped_samples_are_errors(halves, crosswalk, pairs, message) -> None:
     typed_pairs = [(SequencingId(first), ResearchId(second), 0.25) for first, second in pairs]
     with pytest.raises(ValueError, match=message):
-        resolve_cohort_rows(_research(*truth), _sequencing(*imputed), _crosswalk(crosswalk), typed_pairs)
+        resolve_cohort_rows(halves, _crosswalk(crosswalk), typed_pairs)
 
 
 def test_replaced_row_counts_of_one_to_twenty_are_suppressed_in_the_log(caplog: pytest.LogCaptureFixture) -> None:
     def resolve(overlap: int) -> None:
         crosswalk = _crosswalk({f"D{index}": f"R{index}" for index in range(overlap)})
-        resolve_cohort_rows(
-            _research(*crosswalk.research_ids), _sequencing(*crosswalk.sequencing_ids), crosswalk, []
-        )
+        resolve_cohort_rows([_imputed(*crosswalk.sequencing_ids), _long_read(*crosswalk.research_ids)], crosswalk, [])
 
     with caplog.at_level("INFO", logger="sv_pgs.cohort"):
         resolve(3)
@@ -327,8 +326,7 @@ def test_relatives_across_the_two_halves_share_a_fold() -> None:
     # The truth participants and the imputed samples use the same strings on purpose:
     # the crosswalk maps each imputed name to another participant.
     rows = resolve_cohort_rows(
-        _research(*names),
-        _sequencing(*names),
+        [_long_read(*names), _imputed(*names)],
         _crosswalk({name: f"P{name}" for name in names}),
         [(ResearchId(names[index]), SequencingId(names[index + 1]), 0.25) for index in range(0, 148, 2)],
     )
@@ -347,7 +345,6 @@ def test_relatives_across_the_two_halves_share_a_fold() -> None:
 
     assert len(rows.research_ids) == 300
     assert all(folds[first] == folds[second] for first, second, _coefficient in rows.kinship_pairs)
-
 
 def test_build_cohort_rejects_a_participant_listed_twice_or_an_untyped_id() -> None:
     rng = np.random.default_rng(4)

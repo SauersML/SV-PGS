@@ -21,7 +21,8 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.all_of_us import MINIMUM_REPORTED_PARTICIPANTS
-from sv_pgs.sample_crosswalk import SampleCrosswalk
+from sv_pgs.dosage_store import HalfSamples
+from sv_pgs.sample_crosswalk import SampleCrosswalk, store_research_ids
 from sv_pgs.sample_ids import ResearchId, SequencingId
 
 LOGGER = logging.getLogger(__name__)
@@ -40,50 +41,60 @@ IMPUTED_SOURCE = "imputed"
 
 @dataclass(frozen=True, slots=True)
 class CohortRows:
-    """One genotype row per person over the union of the long-read truth half and the imputed half.
+    """One genotype row per person over the union of the store's halves.
 
     A person with a truth row and an imputed row (the crosswalk maps the imputed
     sample to a truth research ID, or a KING pair across the halves is at
     duplicate/MZ level) keeps the truth row: the imputed row is a leave-in imputation
-    of a panel genome. Everyone else keeps the one row they have. ``kinship_pairs``
-    are the input pairs with every sample in the research-ID namespace, for
-    kinship_components.
+    of a panel genome. Everyone else keeps the one row they have. Rows follow store
+    order; ``store_half`` is each row's position in the halves given and
+    ``store_column`` its column within that half. ``kinship_pairs`` are the input
+    pairs with every sample in the research-ID namespace, for kinship_components.
     """
 
     research_ids: tuple[ResearchId, ...]
     genotype_source: tuple[str, ...]
+    store_half: tuple[int, ...]
+    store_column: tuple[int, ...]
     kinship_pairs: tuple[tuple[ResearchId, ResearchId, float], ...]
     imputed_rows_sharing_a_research_id: int
     imputed_rows_duplicating_a_truth_genome: int
 
 
 def resolve_cohort_rows(
-    truth_research_ids: Sequence[ResearchId],
-    imputed_sequencing_ids: Sequence[SequencingId],
+    halves: Sequence[HalfSamples],
     crosswalk: SampleCrosswalk,
     kinship_pairs: Sequence[tuple[ResearchId | SequencingId, ResearchId | SequencingId, float]],
 ) -> CohortRows:
-    """Resolve the two halves into one row per person.
+    """Resolve the store's halves (DosageStore.half_samples) into one row per person.
 
-    The truth half is named by research ID and the imputed half by sequencing ID;
-    the two are matched only through the crosswalk, never by name.
-    ``kinship_pairs`` are KING pairs over the union of both halves, each sample
-    typed by the half that named it. A repeat within either half, or an imputed
-    sample (in the half or in a pair) without a crosswalk row, is an error. The
-    number of imputed rows given up is logged, with counts of 1 to 20 suppressed.
+    Halves named by research ID are long-read truth rows; halves named by DRAGEN
+    sample are imputed rows, mapped to research IDs through the crosswalk only
+    (sample_crosswalk.store_research_ids), never by name. ``kinship_pairs`` are KING
+    pairs over the union of the halves, each sample typed by the half that named it.
+    A person listed twice in the truth halves, a sequencing name listed in two
+    imputed halves, or a pair naming a sample in no half, is an error (the crosswalk
+    is one-to-one, so distinct sequencing names map to distinct research IDs). The number of imputed rows given up
+    is logged, with counts of 1 to 20 suppressed.
     """
-    if not all(isinstance(research_id, ResearchId) for research_id in truth_research_ids):
-        raise TypeError("the long-read truth half is named by ResearchId.")
-    if not all(isinstance(sequencing_id, SequencingId) for sequencing_id in imputed_sequencing_ids):
-        raise TypeError("the imputed half is named by SequencingId.")
+    truth_rows: list[tuple[int, int, ResearchId]] = []
+    imputed_rows: list[tuple[int, int, ResearchId]] = []
+    research_of_sequencing: dict[SequencingId, ResearchId] = {}
+    for half_position, half in enumerate(halves):
+        if half.namespace == "research_id":
+            truth_rows.extend((half_position, column, ResearchId(name)) for column, name in enumerate(half.names))
+            continue
+        research_ids = store_research_ids(half, crosswalk)
+        for name, research_id in zip(half.names, research_ids, strict=True):
+            if SequencingId(name) in research_of_sequencing:
+                raise ValueError("two imputed halves list the same sequencing sample.")
+            research_of_sequencing[SequencingId(name)] = research_id
+        imputed_rows.extend((half_position, column, research_id) for column, research_id in enumerate(research_ids))
+    truth_research_ids = [research_id for _half, _column, research_id in truth_rows]
+    imputed_research_ids = [research_id for _half, _column, research_id in imputed_rows]
     if len(set(truth_research_ids)) != len(truth_research_ids):
-        raise ValueError("the long-read truth half repeats a research ID.")
-    if len(set(imputed_sequencing_ids)) != len(imputed_sequencing_ids):
-        raise ValueError("the imputed half repeats a sequencing ID.")
-    research_of_sequencing = {
-        SequencingId(sequencing_id): ResearchId(research_id)
-        for sequencing_id, research_id in zip(crosswalk.sequencing_ids, crosswalk.research_ids, strict=True)
-    }
+        raise ValueError("the long-read truth halves list a research ID more than once.")
+    truth = set(truth_research_ids)
 
     def as_research_id(sample: ResearchId | SequencingId) -> ResearchId:
         if isinstance(sample, ResearchId):
@@ -91,14 +102,9 @@ def resolve_cohort_rows(
         if not isinstance(sample, SequencingId):
             raise TypeError(f"a kinship pair names a {type(sample).__name__}, not a typed sample ID.")
         if sample not in research_of_sequencing:
-            raise ValueError("a kinship pair names an imputed sample with no crosswalk row.")
+            raise ValueError("a kinship pair names an imputed sample that no store half lists.")
         return research_of_sequencing[sample]
 
-    unmapped = [sequencing_id for sequencing_id in imputed_sequencing_ids if sequencing_id not in research_of_sequencing]
-    if unmapped:
-        raise ValueError(f"{len(unmapped)} imputed samples have no crosswalk row.")
-    imputed_research_ids = [research_of_sequencing[sequencing_id] for sequencing_id in imputed_sequencing_ids]
-    truth = set(truth_research_ids)
     shared_research_ids = truth & set(imputed_research_ids)
     imputed_only = set(imputed_research_ids) - truth
     research_pairs = tuple(
@@ -112,15 +118,25 @@ def resolve_cohort_rows(
         for truth_side, imputed_side in ((first, second), (second, first))
         if truth_side in truth and imputed_side in imputed_only
     }
-    kept_imputed = [research_id for research_id in imputed_research_ids if research_id in imputed_only - duplicated_genomes]
+    kept = sorted(
+        [(half, column, research_id, LONG_READ_SOURCE) for half, column, research_id in truth_rows]
+        + [
+            (half, column, research_id, IMPUTED_SOURCE)
+            for half, column, research_id in imputed_rows
+            if research_id in imputed_only - duplicated_genomes
+        ],
+        key=lambda row: (row[0], row[1]),
+    )
     LOGGER.info(
         "cohort rows: imputed rows replaced by a truth row: %s sharing a research ID, %s duplicating a truth genome",
         _reportable_count(len(shared_research_ids)),
         _reportable_count(len(duplicated_genomes)),
     )
     return CohortRows(
-        research_ids=(*truth_research_ids, *kept_imputed),
-        genotype_source=(LONG_READ_SOURCE,) * len(truth_research_ids) + (IMPUTED_SOURCE,) * len(kept_imputed),
+        research_ids=tuple(research_id for _half, _column, research_id, _source in kept),
+        genotype_source=tuple(source for _half, _column, _research_id, source in kept),
+        store_half=tuple(half for half, _column, _research_id, _source in kept),
+        store_column=tuple(column for _half, column, _research_id, _source in kept),
         kinship_pairs=research_pairs,
         imputed_rows_sharing_a_research_id=len(shared_research_ids),
         imputed_rows_duplicating_a_truth_genome=len(duplicated_genomes),

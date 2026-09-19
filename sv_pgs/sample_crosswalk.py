@@ -19,6 +19,7 @@ import numpy as np
 
 from sv_pgs._typing import I64Array
 from sv_pgs.dosage_store import HalfSamples
+from sv_pgs.sample_ids import ResearchId
 
 ABSENT_COLUMN = -1
 
@@ -87,7 +88,7 @@ def source_columns_for_store_samples(
     return columns
 
 
-def store_research_ids(store_half: HalfSamples, crosswalk: SampleCrosswalk) -> tuple[str, ...]:
+def store_research_ids(store_half: HalfSamples, crosswalk: SampleCrosswalk) -> tuple[ResearchId, ...]:
     """The research ID of each sample of an imputed store half, in store column order.
 
     Fails on a sample the crosswalk has no row for. A half named by research ID (the long-read
@@ -99,4 +100,4 @@ def store_research_ids(store_half: HalfSamples, crosswalk: SampleCrosswalk) -> t
     unmapped = [sequencing_id for sequencing_id in half_sequencing_ids if sequencing_id not in research_of_sequencing]
     if unmapped:
         raise ValueError(f"{len(unmapped)} store samples have no crosswalk row.")
-    return tuple(research_of_sequencing[sequencing_id] for sequencing_id in half_sequencing_ids)
+    return tuple(ResearchId(research_of_sequencing[sequencing_id]) for sequencing_id in half_sequencing_ids)
