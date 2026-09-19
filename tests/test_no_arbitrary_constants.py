@@ -89,6 +89,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('fast_scoring.py', '_FLOAT64_BYTES'): ('definitional', frozenset({8}), 'float64 itemsize'),
     ('fast_scoring.py', 'predictive_intercept_shift.xtol'): ('derived', frozenset({4.0}), "rtol = 4 eps is scipy's minimum; xtol = 4 eps min(p, 1 - p) since the logistic slope is at most 1/4"),
     ('fast_scoring.py', 'predictive_intercept_shift.rtol'): ('derived', frozenset({4.0}), "rtol = 4 eps is scipy's minimum; xtol = 4 eps min(p, 1 - p) since the logistic slope is at most 1/4"),
+    ('logistic_ep.py', '_LOG_SIGMOID_CURVATURE_BOUND'): ('math', frozenset({0.25}), 'max of sigmoid(w) sigmoid(-w), the curvature of -log sigmoid, attained at w = 0'),
     ('genotype_buffers.py', 'SIGNED_CODE_OFFSET'): ('spec', frozenset({127}), '8-bit store code offset (STORE.md)'),
     ('genotype_buffers.py', 'build_sample_layout'): ('definitional', frozenset({3}), 'a sample correlation needs at least three samples to be non-degenerate'),
     ('genotype_buffers.py', 'host_buffer_bytes'): ('derived', frozenset({4, 16, 3, 8}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
