@@ -181,11 +181,27 @@ $S_{\rm eff}(H)$:
 - **Frequency changes shape, not only scale.** The ceiling truncates the upper tail, and the reweighting by $(1+\kappa Hs)^{-n/2}$ moves mass between components. A scale-only smooth $f(\log H)$ is therefore misspecified in the saturation regime. The derived term replaces it.
 
 **Parameters, all learned, none hand-set:**
-- $\kappa_c\ge0$, the selection strength per unit effect². $\kappa=2N/V_s$ depends on the trait's $V_s$ in trait-SD units, so it is pooled hierarchically across traits: $\log\kappa_{c,t}\sim N(\overline{\log\kappa}_c,\omega^2_\kappa)$. lit-pool reports that SBayesS's $S$ is nearly common across traits (79% of 155 traits in [−0.7, −0.5]), so expect small $\omega^2_\kappa$.
+- $\kappa_c\ge0$, the selection strength per unit effect², learned through λ = nκ/2 (see the ridge below). $\kappa=2N/V_s$ depends on the trait's $V_s$ in trait-SD units, so it is pooled hierarchically across traits: $\log\kappa_{c,t}\sim N(\overline{\log\kappa}_c,\omega^2_\kappa)$. lit-pool reports that SBayesS's $S$ is nearly common across traits (79% of 155 traits in [−0.7, −0.5]), so expect small $\omega^2_\kappa$.
 - $n_c>0$, the effective number of trait axes under selection, per class. It differs by annotation: coding −0.74 vs TSS −0.36 in SBayesS, via lit-pool.
   - For SVs, gene disruption means larger $n$ and a heavier $g$. A rare SV is 841× more likely than a rare SNV to be strongly deleterious (Abel 2020, via lit-pgs), which predicts a more negative $S$.
   - Length dependence enters as $n_c(\log\mathrm{len})$ and $g_c$ deviations, both smooth with learned smoothness.
 - $w$, the ancestry mixing of $H^{\rm sel}$.
+
+**κ and n sit on a ridge; parametrize by (log λ, log n) with λ = nκ/2.** The bulk of the density ($\kappa Hs\ll1$) sees only $(1+\kappa Hs)^{-n/2}\approx e^{-\lambda Hs}$. κ alone is informed only by the saturated tail.
+- **Check with g known** (`check_kappa_n.py`: true κ = 200, n = 6, 6 replicates, 2-D type-II ML):
+
+| M | κ̂ | n̂ | λ̂ (true 600) | corr(log κ̂, log n̂) |
+|---|---|---|---|---|
+| 30k | 145–247 | 4.35–9.22 | 537–666 | −0.99 |
+| 120k | 181–224 | 5.07–6.64 | 568–617 | −0.98 |
+
+  So even with g known the ridge is present. It narrows with M, and λ is identified far more sharply than either κ or n.
+- **With a nonparametric g**, novel-evoprior reports that κ̂ and n̂ spread up to 2× along the ridge with no narrowing from 30k to 120k, while λ̂ stays within ±10% (their prototype; not re-run here).
+- **Practical rule:**
+  - learn log λ (well identified) and log n (a weak direction), in that parametrization;
+  - pool log n across classes and traits;
+  - report n and κ only with their ridge uncertainty.
+- The κ̂ recovery in check (ii) held n = 1 and g fixed, so it overstates how well κ alone is identified.
 
 **Confounded direction and its pin.** $(s,\kappa,\ell)\to(cs,\kappa/c,\ell-\log c)$ leaves the prior unchanged; the weights are invariant too. The mean-variance pin $\mathbb E_g[s]=1$ of §9 removes it. novel-evoprior derived the same direction independently (THEORY.md, Theorem 5).
 
