@@ -253,8 +253,10 @@ def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
     baselines.baselines(shared, scenario, tmp_path / "results", "beagle")
 
     residual, scale = baselines.residualized(phenotype[train], shared["covariates"][train])
+    design = np.column_stack([np.ones(train.size), shared["covariates"][train]])
+    projector = np.eye(train.size) - design @ np.linalg.solve(design.T @ design, design.T)
     for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
-        train_kernel = matrix[np.ix_(train, train)]
+        train_kernel = projector @ matrix[np.ix_(train, train)] @ projector
         off_diagonal = ~np.eye(train.size, dtype=bool)
         cross_products = np.outer(residual, residual)[off_diagonal]
         heritability = float(np.clip((train_kernel[off_diagonal] @ cross_products) / (train_kernel[off_diagonal] @ train_kernel[off_diagonal]), 0.0, 1.0))
@@ -269,7 +271,7 @@ def test_ridge_inf_baseline_matches_a_direct_solve(tmp_path) -> None:
             continue
         ridge = (1 - heritability) / heritability
         system = train_kernel + ridge * np.eye(train.size)
-        expected = scale * matrix[np.ix_(test, train)] @ np.linalg.solve(system, residual)
+        expected = scale * matrix[np.ix_(test, train)] @ projector @ np.linalg.solve(system, residual)
         # A relative perturbation delta of the kernel moves the solve by at most cond(system) * delta.
         assert np.max(np.abs(prediction - expected)) <= float32_tolerance * np.linalg.cond(system) * np.max(np.abs(expected))
 
@@ -285,3 +287,21 @@ def test_measured_records_follow_the_panel_allele_count_rule(tmp_path) -> None:
     measured = measurement.measured_records(tmp_path)
     assert measured.tolist() == [False, False, True, False, True, True]
     assert np.array_equal(np.load(tmp_path / "measured.npy"), measured)
+
+
+def test_projection_matches_the_explicit_projector() -> None:
+    rng = np.random.default_rng(13)
+    size, test_size = 700, 90
+    factor = rng.standard_normal((size, 40))
+    kernel = factor @ factor.T / 40
+    cross = rng.standard_normal((test_size, size))
+    design = np.column_stack([np.ones(size), rng.standard_normal((size, 4))])
+    projector = np.eye(size) - design @ np.linalg.solve(design.T @ design, design.T)
+    expected_kernel, expected_cross = projector @ kernel @ projector, cross @ projector
+    kernel_scale, cross_scale = np.max(np.abs(kernel)), np.max(np.abs(cross))
+    baselines.project_out_covariates(kernel, cross, design)
+    # P K P has four terms (K, QQ'K, KQQ', QQ'KQQ'), each an entry-wise sum of at most size^2 products of
+    # orthonormal-basis entries (|q| <= 1) with kernel entries: rounding at most size * eps * max|K| per term,
+    # in both this computation and the explicit one.
+    assert np.max(np.abs(kernel - expected_kernel)) <= 2 * 4 * size * EPSILON * kernel_scale * size
+    assert np.max(np.abs(cross - expected_cross)) <= 2 * 2 * size * EPSILON * cross_scale * size

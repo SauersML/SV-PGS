@@ -29,6 +29,25 @@ def residualized(outcome: np.ndarray, covariates: np.ndarray) -> tuple[np.ndarra
     return residual / residual.std(), float(residual.std())
 
 
+PROJECTION_BLOCK_ROWS = 2048
+
+
+def project_out_covariates(train_kernel: np.ndarray, cross_kernel: np.ndarray, design: np.ndarray) -> None:
+    """In place: K <- P K P and C <- C P with P = I - Q Q' (Q an orthonormal basis of the training design).
+
+    The covariates and PCs are fixed effects, so the kernel must be projected the same way the phenotype is
+    residualized; an unprojected kernel keeps the ancestry structure the PCs removed from y, inflates tr(K^2),
+    and drives the Haseman-Elston h2 toward zero.
+    """
+    basis, _ = np.linalg.qr(design)
+    kernel_basis = train_kernel @ basis
+    middle = basis.T @ kernel_basis
+    for first in range(0, train_kernel.shape[0], PROJECTION_BLOCK_ROWS):
+        rows = slice(first, first + PROJECTION_BLOCK_ROWS)
+        train_kernel[rows] -= basis[rows] @ kernel_basis.T + kernel_basis[rows] @ basis.T - (basis[rows] @ middle) @ basis.T
+    cross_kernel -= (cross_kernel @ basis) @ basis.T
+
+
 def load_shared(cohort: Path, arm: str) -> dict:
     """Scenario-independent inputs, read once: split, covariates, and the training and test-train kernel blocks."""
     samples = np.load(cohort / "samples.npz")
@@ -43,6 +62,9 @@ def load_shared(cohort: Path, arm: str) -> dict:
         rows = np.asarray(kernel[train])
         blocks[name] = (rows[:, train].astype(np.float64), np.asarray(kernel[test])[:, train].astype(np.float64))
         del rows
+    design = np.column_stack([np.ones(train.size), covariates[train]])
+    for name in ("simple", "structural"):
+        project_out_covariates(blocks[name][0], blocks[name][1], design)
     train_kernels = {"simple": blocks["simple"][0],
                      "all": (1 - weight_structural) * blocks["simple"][0] + weight_structural * blocks["structural"][0]}
     return {
