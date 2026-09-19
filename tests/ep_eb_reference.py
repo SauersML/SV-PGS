@@ -36,8 +36,10 @@ Inference.
   condition in its Fellner–Schall form,
   λ_i ← λ_i (tr(S_λ⁺S_i) − tr(H⁻¹S_i)) / (x̂ᵀS_ix̂), with S_λ = Σ_i λ_iS_i the
   block's total penalty and H the negative Hessian of the penalized objective.
-  A weight at the top of its numerical range (e^25) means the term has shrunk
-  out, which is the marginal-likelihood optimum when the data do not support it.
+  A weight at the top of its numerical range (e^15) means the term has shrunk
+  into the penalty's null space, which is the marginal-likelihood optimum when
+  the data do not support it; the range stops where the trace difference in the
+  update is still resolved in double precision.
 
 The fixed point is where the sites, (φ, θ) and λ all stop moving. It does not
 depend on damping or update order, which is what lets a stage be compared with it.
@@ -57,7 +59,7 @@ from scipy.special import logsumexp
 GRID_LOG_SPACING = 0.5 * np.log(2.0)
 GRID_LOWER_FACTOR = 1e-2
 GRID_UPPER_FACTOR = 4.0
-LOG_PENALTY_RANGE = 25.0
+LOG_PENALTY_RANGE = 15.0
 # Search box for the coefficient maximizer, only to keep trial steps finite:
 # e^20 on the prior variance per unit of an annotation, and log-weight contrasts
 # of e^100, lie far outside any optimum.
@@ -205,13 +207,23 @@ def tilted_terms(
     responsibility = np.exp(log_component - log_normalizer[:, None])
     tilted_mean = cavity_shift * np.sum(responsibility * conditional_variance, axis=1)
     tilted_second_moment = np.sum(responsibility * (conditional_variance + shift_square * np.square(conditional_variance)), axis=1)
-    component_scale_derivative = variance * (-0.5 * precision / relative + 0.5 * shift_square / np.square(relative))
+    # With q = vP and r = 1/(1 + q): ∂ log component/∂η = g = ½ r (h² v r − q) and
+    # ∂g/∂η = ½ h² v r³ (1 − q) − ½ q r²   (η = log u_j).
+    retained = 1.0 / relative
+    ratio = variance * precision
+    component_scale_derivative = 0.5 * retained * (shift_square * variance * retained - ratio)
+    component_scale_curvature = 0.5 * shift_square * variance * retained**3 * (1.0 - ratio) - 0.5 * ratio * retained**2
+    scale_derivative = np.sum(responsibility * component_scale_derivative, axis=1)
     return {
         "log_normalizer": log_normalizer,
         "responsibility": responsibility,
         "tilted_mean": tilted_mean,
         "tilted_variance": tilted_second_moment - np.square(tilted_mean),
-        "scale_derivative": np.sum(responsibility * component_scale_derivative, axis=1),
+        "scale_derivative": scale_derivative,
+        "component_scale_derivative": component_scale_derivative,
+        "scale_curvature": np.sum(
+            responsibility * (np.square(component_scale_derivative - scale_derivative[:, None]) + component_scale_curvature), axis=1
+        ),
     }
 
 
@@ -256,6 +268,45 @@ def penalized_objective(
     return value, np.concatenate([mixing_gradient.ravel(), annotation_gradient])
 
 
+def penalized_hessian(prior, hyperparameters, vector, cavity_precision, cavity_shift) -> np.ndarray:
+    """The exact Hessian of penalized_objective in (ψ, θ).
+
+    For variant j of class c, with responsibilities w_j, component derivatives
+    g_jk and their mean ḡ_j: ∂²/∂φ² = diag(w_j) − w_jw_jᵀ − (diag π_c − π_cπ_cᵀ),
+    ∂²/∂η∂φ_k = w_jk (g_jk − ḡ_j), and ∂²/∂η² = Var_w(g_j) + E_w[∂g_j/∂η].
+    """
+    mixing_coordinates, annotation_coefficients = _unpack(prior, vector)
+    terms = tilted_terms(prior, mixing_coordinates, annotation_coefficients, cavity_precision, cavity_shift)
+    density = mixing_density(prior, mixing_coordinates)
+    basis = sum_to_zero_basis(prior.grid_size)
+    penalty_matrices = _mixing_penalty_matrices(prior)
+    block = prior.grid_size - 1
+    mixing_size = prior.class_count * block
+    dimension = mixing_size + prior.feature_count
+    hessian = np.zeros((dimension, dimension))
+    responsibility = terms["responsibility"]
+    covariance_weight = responsibility * (terms["component_scale_derivative"] - terms["scale_derivative"][:, None])
+    design = prior.centred_design
+    for class_position in range(prior.class_count):
+        members = prior.class_index == class_position
+        member_weights = responsibility[members]
+        data_part = np.diag(member_weights.sum(axis=0)) - member_weights.T @ member_weights
+        prior_part = members.sum() * (np.diag(density[class_position]) - np.outer(density[class_position], density[class_position]))
+        total_penalty = sum(
+            weight * matrix for weight, matrix in zip(hyperparameters.mixing_penalty[class_position], penalty_matrices)
+        )
+        span = slice(class_position * block, (class_position + 1) * block)
+        hessian[span, span] = basis.T @ (data_part - prior_part) @ basis - total_penalty
+        cross = basis.T @ covariance_weight[members].T @ design[members]
+        hessian[span, mixing_size:] = cross
+        hessian[mixing_size:, span] = cross.T
+    annotation_block = design.T @ (terms["scale_curvature"][:, None] * design)
+    for group_position, group in enumerate(prior.annotation_groups):
+        annotation_block[np.ix_(group.columns, group.columns)] -= hyperparameters.annotation_penalty[group_position] * group.penalty
+    hessian[mixing_size:, mixing_size:] = annotation_block
+    return hessian
+
+
 def _numerical_hessian(function, vector: np.ndarray) -> np.ndarray:
     step = 1e-5
     hessian = np.empty((vector.shape[0], vector.shape[0]))
@@ -287,7 +338,9 @@ def maximize_coefficients(prior, hyperparameters, start, cavity_precision, cavit
     vector = np.asarray(result.x, dtype=np.float64)
     value, gradient = objective(vector)
     for _newton_step in range(12):
-        step = np.linalg.solve(-_numerical_hessian(objective, vector), gradient)
+        step = np.linalg.solve(
+            -penalized_hessian(prior, hyperparameters, vector, cavity_precision, cavity_shift), gradient
+        )
         candidate = vector + step
         candidate_value, candidate_gradient = objective(candidate)
         if not candidate_value >= value:
@@ -312,7 +365,8 @@ def _fellner_schall(weights, matrices, coefficients, inverse_block) -> np.ndarra
         # effective degrees of freedom below 1e-4) and the step still raises λ,
         # the marginal-likelihood optimum is λ = ∞ (the term shrinks into the
         # penalty's null space); Fellner–Schall only creeps towards it, so go there.
-        if proposal > weight and numerator < 1e-4 * prior_dimension:
+        at_ceiling = np.log(weight) >= LOG_PENALTY_RANGE - 1e-9
+        if proposal > weight and (at_ceiling or numerator < 1e-4 * prior_dimension):
             proposal = np.exp(LOG_PENALTY_RANGE)
         updated[position] = np.exp(np.clip(np.log(max(proposal, 1e-300)), -LOG_PENALTY_RANGE, LOG_PENALTY_RANGE))
     return updated
@@ -321,10 +375,7 @@ def _fellner_schall(weights, matrices, coefficients, inverse_block) -> np.ndarra
 def update_penalties(prior, hyperparameters, vector, cavity_precision, cavity_shift) -> ReferenceHyperparameters:
     """One Fellner–Schall step for every penalty weight at the current optimum."""
 
-    def objective(candidate):
-        return penalized_objective(prior, hyperparameters, candidate, cavity_precision, cavity_shift)
-
-    inverse = np.linalg.inv(-_numerical_hessian(objective, vector))
+    inverse = np.linalg.inv(-penalized_hessian(prior, hyperparameters, vector, cavity_precision, cavity_shift))
     mixing_coordinates, annotation_coefficients = _unpack(prior, vector)
     penalty_matrices = _mixing_penalty_matrices(prior)
     block = prior.grid_size - 1
@@ -363,11 +414,9 @@ def newton_decrement(prior, hyperparameters, cavity_precision, cavity_shift) -> 
     """1/2 gᵀ(-H)⁻¹g of the penalized objective in (ψ, θ): what a Newton step would still gain."""
     vector = _pack(prior, hyperparameters.mixing_coordinates, hyperparameters.annotation_coefficients)
 
-    def objective(candidate):
-        return penalized_objective(prior, hyperparameters, candidate, cavity_precision, cavity_shift)
-
-    _value, gradient = objective(vector)
-    return float(0.5 * gradient @ np.linalg.solve(-_numerical_hessian(objective, vector), gradient))
+    _value, gradient = penalized_objective(prior, hyperparameters, vector, cavity_precision, cavity_shift)
+    hessian = penalized_hessian(prior, hyperparameters, vector, cavity_precision, cavity_shift)
+    return float(0.5 * gradient @ np.linalg.solve(-hessian, gradient))
 
 
 def site_targets(log_scale, log_density, log_variance_grid, cavity_precision, cavity_shift):

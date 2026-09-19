@@ -173,6 +173,22 @@ def test_penalized_objective_gradient_matches_finite_differences() -> None:
         np.testing.assert_allclose(gradient[coordinate], difference, rtol=1e-6, atol=1e-6)
 
 
+def test_penalized_hessian_matches_finite_differences_of_the_gradient() -> None:
+    rng = np.random.default_rng(7)
+    likelihood_precision, linear_term, _effects = _ld_problem(seed=7, sample_count=200, variant_count=30)
+    prior = _prior(rng, likelihood_precision, linear_term)
+    hyperparameters = _random_hyperparameters(rng, prior)
+    vector = reference._pack(prior, hyperparameters.mixing_coordinates, hyperparameters.annotation_coefficients)
+    cavity_precision = rng.uniform(0.0, 300.0, size=linear_term.shape[0])
+    cavity_shift = rng.normal(0.0, 8.0, size=linear_term.shape[0])
+    analytic = reference.penalized_hessian(prior, hyperparameters, vector, cavity_precision, cavity_shift)
+    numerical = reference._numerical_hessian(
+        lambda candidate: reference.penalized_objective(prior, hyperparameters, candidate, cavity_precision, cavity_shift),
+        vector,
+    )
+    np.testing.assert_allclose(analytic, numerical, rtol=1e-5, atol=1e-5)
+
+
 def test_fit_is_a_joint_fixed_point_and_deterministic() -> None:
     rng = np.random.default_rng(5)
     likelihood_precision, linear_term, effects = _ld_problem(seed=5, sample_count=400, variant_count=60, causal_count=6)
