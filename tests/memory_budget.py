@@ -13,35 +13,46 @@ their processes have no meaningful address-space budget.
 
 The child runs single-threaded with one glibc arena and a fixed mmap threshold, so that its address space
 is the computation's own: no per-thread BLAS buffers, thread stacks or malloc arenas, and no heap growth
-from glibc raising its mmap threshold after a large free.
+from glibc raising its mmap threshold after a large free. Its first GEMM runs before the baseline is taken,
+large enough to leave OpenBLAS's small-matrix path, so BLAS's working buffer is part of the baseline.
+
+The limit also allows the allocators' own granularity, which a small allocation can cost in address space
+even when the computation's plan is exact: one CPython object arena, one glibc heap top pad and one page.
 """
 from __future__ import annotations
 
 import os
 import pickle
+import resource
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-# glibc's documented default M_MMAP_THRESHOLD (mallopt(3)). Setting it explicitly turns off the dynamic
-# threshold, so large blocks keep coming from mmap and return to the system when freed.
+# glibc's documented defaults for M_MMAP_THRESHOLD and M_TOP_PAD (mallopt(3)). Setting the threshold explicitly
+# turns off its dynamic adjustment, so large blocks keep coming from mmap and return to the system when freed.
 _GLIBC_MMAP_THRESHOLD = 128 * 1024
+_GLIBC_TOP_PAD = 128 * 1024
+# CPython's object-allocator arena on 64-bit builds: ARENA_BITS = 20 with USE_LARGE_ARENAS (Objects/obmalloc.c).
+_PYMALLOC_ARENA_BYTES = 1 << 20
+# OpenBLAS takes its small-matrix path while M N K <= 100^3 (the kernels' gemm_small_kernel_permit); one side
+# past 100 leaves it.
+_BLAS_WARMUP_SIDE = 101
 
 _CHILD = r"""
 import pickle, resource, sys, traceback
 payload_path, result_path = sys.argv[1], sys.argv[2]
 with open(payload_path, "rb") as handle:
-    search_path, module_name, qualified_name, args, kwargs, working_bytes = pickle.load(handle)
+    search_path, module_name, qualified_name, args, kwargs, working_bytes, warmup_side = pickle.load(handle)
 sys.path[:0] = search_path
 import importlib
 import numpy as np
 function = importlib.import_module(module_name)
 for part in qualified_name.split("."):
     function = getattr(function, part)
-# BLAS allocates its buffers on first use; do that before the baseline so they are not charged to the plan.
-np.ones((2, 2)) @ np.ones((2, 2))
+# BLAS allocates its working buffer on its first blocked GEMM; do one before the baseline.
+np.ones((warmup_side, warmup_side)) @ np.ones((warmup_side, warmup_side))
 with open("/proc/self/status", encoding="ascii") as status:
     baseline = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
 soft, hard = resource.getrlimit(resource.RLIMIT_AS)
@@ -62,7 +73,8 @@ with open(result_path, "wb") as handle:
 
 
 def run_within_budget(function: Callable[..., Any], *args: Any, working_bytes: int, **kwargs: Any) -> Any:
-    """``function(*args, **kwargs)`` in a child whose address space may grow by at most ``working_bytes``.
+    """``function(*args, **kwargs)`` in a child whose address space may grow by at most ``working_bytes`` (plus
+    the allocators' granularity).
 
     ``function`` must be importable by module and qualified name, and its arguments and result picklable.
     Arguments are loaded before the limit is set, so they are not charged to the budget. An exception other
@@ -78,13 +90,15 @@ def run_within_budget(function: Callable[..., Any], *args: Any, working_bytes: i
         MKL_NUM_THREADS="1",
         MALLOC_ARENA_MAX="1",
         MALLOC_MMAP_THRESHOLD_=str(_GLIBC_MMAP_THRESHOLD),
+        MALLOC_TOP_PAD_=str(_GLIBC_TOP_PAD),
     )
+    allowed = int(working_bytes) + _PYMALLOC_ARENA_BYTES + _GLIBC_TOP_PAD + resource.getpagesize()
     with tempfile.TemporaryDirectory() as directory:
         payload_path = Path(directory) / "payload.pickle"
         result_path = Path(directory) / "result.pickle"
         with payload_path.open("wb") as handle:
             pickle.dump(
-                (list(sys.path), function.__module__, function.__qualname__, args, kwargs, int(working_bytes)), handle
+                (list(sys.path), function.__module__, function.__qualname__, args, kwargs, allowed, _BLAS_WARMUP_SIDE), handle
             )
         completed = subprocess.run(
             [sys.executable, "-c", _CHILD, str(payload_path), str(result_path)],
