@@ -8,6 +8,8 @@ to bound. Every number here is a math check [sim-only].
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from scipy.integrate import quad
@@ -801,9 +803,20 @@ def test_the_infinity_edge_is_the_limit_of_the_evidence(seed, block):
     assert abs(near - edge.laplace_value) <= abs(near - far) + rounding, (values, edge.laplace_value)
 
 
+def _dropped_block_view(prior, block: int):
+    """The model with block ``block`` absent and its directions profiled: what a lambda = 0 edge evaluates."""
+    blocks = tuple(smoothing for position, smoothing in enumerate(prior.smoothing_blocks) if position != block)
+    total = np.zeros((prior.coefficient_size, prior.coefficient_size))
+    for smoothing in blocks:
+        total[np.ix_(smoothing.coordinates, smoothing.coordinates)] += smoothing.matrix
+    eigenvalues, eigenvectors = np.linalg.eigh(total)
+    null_basis = eigenvectors[:, eigenvalues <= _EPSILON * prior.coefficient_size * float(eigenvalues[-1])]
+    return replace(prior, smoothing_blocks=blocks, null_basis=null_basis)
+
+
 @pytest.mark.parametrize("seed", _SEEDS)
 def test_every_interior_evidence_is_below_the_zero_edge(seed):
-    """At lambda_i = 0 block i is dropped and its directions profiled (``_restricted_prior``): V_0 is the profile,
+    """At lambda_i = 0 block i is dropped and its directions profiled (``_dropped_block_view``): V_0 is the profile,
     and every proper-prior V(rho) is at most it. For the Laplace forms: V(rho) - V_0 = [max of the penalized
     objective - max of the unpenalized] + 1/2 log|lambda S (B~ + lambda S)^-1| over the block's directions, both
     terms <= 0 (B~ the profiled data curvature there). So V falls without bound toward rho = -infinity (slope
@@ -815,8 +828,7 @@ def test_every_interior_evidence_is_below_the_zero_edge(seed):
     lower, upper = _smoothing_bounds(prior, _data_objective(prior, base.coefficients, cavity, _WORKING_BYTES))[1]
     rhos = np.linspace(lower, upper, 9)
     values, roundings, _point = _laplace_path(prior, cavity, 1, rhos, base.coefficients)
-    view, allowed = _restricted_prior(prior, frozenset(), frozenset({1}))
-    zero_edge = _evidence(view, np.zeros(1), allowed.T @ base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+    zero_edge = _evidence(_dropped_block_view(prior, 1), np.zeros(1), base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     assert zero_edge is not None
     assert np.all(values <= zero_edge.laplace_value + roundings), (values, zero_edge.laplace_value)
 
