@@ -47,6 +47,25 @@ def _aligned(count: int) -> int:
     return -(-count // INT8_GEMM_ALIGNMENT) * INT8_GEMM_ALIGNMENT
 
 
+def reduced_block_layout(
+    statistics: GenotypeSufficientStatistics,
+) -> tuple[list[NDArray[np.int64]], list[NDArray[np.int64]], list[NDArray[np.float64]], list[NDArray[np.float64]]]:
+    """Per LD block of one Stage 0 pass: its store rows, its reduced columns, and their means and
+    scales. Each reduced column is its tie group's representative, whose store row, mean and scale
+    Stage 0 recorded."""
+    kept = np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)
+    boundaries = statistics.ld.block_boundaries
+    block_rows, block_indices, means, scales = [], [], [], []
+    for block_index in range(statistics.ld.block_count):
+        reduced = np.arange(int(boundaries[block_index]), int(boundaries[block_index + 1]), dtype=np.int64)
+        representatives = kept[reduced]
+        block_rows.append(statistics.active_rows[representatives])
+        block_indices.append(reduced)
+        means.append(statistics.means[representatives])
+        scales.append(statistics.scales[representatives])
+    return block_rows, block_indices, means, scales
+
+
 class StoreGenotypeBlockSource:
     """A dosage store's LD blocks as Stage 2 tiles, streamed once per read.
 
@@ -110,15 +129,8 @@ class StoreGenotypeBlockSource:
     ) -> StoreGenotypeBlockSource:
         """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
         group's representative, whose store row, mean and scale Stage 0 recorded."""
-        kept = np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)
-        boundaries = statistics.ld.block_boundaries
-        block_rows, block_indices = [], []
-        for block_index in range(statistics.ld.block_count):
-            reduced = np.arange(int(boundaries[block_index]), int(boundaries[block_index + 1]), dtype=np.int64)
-            block_rows.append(statistics.active_rows[kept[reduced]])
-            block_indices.append(reduced)
-        order = np.concatenate([kept[indices] for indices in block_indices])
-        return cls(store, block_rows, block_indices, statistics.means[order], statistics.scales[order], budget, workspace_bytes)
+        block_rows, block_indices, means, scales = reduced_block_layout(statistics)
+        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes)
 
     @property
     def sample_count(self) -> int:
