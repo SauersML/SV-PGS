@@ -297,22 +297,11 @@ def test_a_column_budget_keeps_the_largest_spikes() -> None:
     spikes = np.column_stack([
         variances[:, model] * np.sum(_dense(genotypes, covariates, weights, variances, model)[1] ** 2, axis=0) for model in range(MODEL_COUNT)
     ])
-    kept = np.concatenate([spikes[np.flatnonzero(np.isin(np.arange(spikes.shape[0]), _kept_indices(source, models, deflation, model))), model] for model in range(MODEL_COUNT)])
+    kept = np.concatenate([spikes[deflation.indices[model], model] for model in range(MODEL_COUNT)])
     right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
     result = _exact_solve(source, models, right, dual_solve.PassCount(), deflation)
     assert np.all(result.residual_norm <= _solve_bound(right))
     assert kept.min() >= np.sort(spikes[spikes > 1.0].ravel())[::-1][budget - 1] * (1.0 - genotypes.shape[0] * EPS)
-
-
-def _kept_indices(source, models, deflation, model):
-    """The variants a model's deflation basis holds, recovered from its columns."""
-    if model not in deflation.bases:
-        return np.zeros(0, dtype=np.int64)
-    full = np.concatenate([tile.columns(np.arange(stop - start)) for start, stop, tile in source.blocks()], axis=1)
-    design = models.design_to_sample(full, np.full(full.shape[1], model))
-    basis = deflation.bases[model]
-    matches = [int(np.argmin(np.linalg.norm(design - basis[:, [column]], axis=0))) for column in range(basis.shape[1])]
-    return np.asarray(matches, dtype=np.int64)
 
 
 def test_the_split_eliminates_negative_sites_exactly_in_mean_and_draws() -> None:

@@ -221,7 +221,7 @@ def _cholesky_solve(array_module: Any, factor: Any, right: Any) -> Any:
 
 @dataclass
 class Deflation:
-    """Per model, a basis W (n x k) of its spike directions, S W, and the factor of W'SW.
+    """Per model, a basis W (n x k) of its spike directions, S W, the factor of W'SW, and the variants W holds.
 
     Deflated CG (Saad, Yeung, Erhel & Guyomarc'h 2000) keeps every residual orthogonal to W and
     every direction S-orthogonal to it: the spikes W spans are solved exactly in the k x k system
@@ -231,6 +231,7 @@ class Deflation:
     bases: dict
     images: dict
     factors: dict
+    indices: dict
 
     def project_start(self, array_module: Any, model: int, solution: Any, residual: Any) -> tuple[Any, Any]:
         coefficients = _cholesky_solve(array_module, self.factors[model], self.bases[model].T @ residual)
@@ -307,7 +308,7 @@ def spike_deflation(
             offset += width
             gram = bases[model].T @ images[model]
             factors[model] = array_module.linalg.cholesky(0.5 * (gram + gram.T))
-    return Deflation(bases, images, factors), {model: int(indices.size) for model, indices in resolved.items()}
+    return Deflation(bases, images, factors, resolved), {model: int(indices.size) for model, indices in resolved.items()}
 
 
 @dataclass
