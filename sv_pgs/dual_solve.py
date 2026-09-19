@@ -1328,6 +1328,55 @@ class DualGaussian:
         self.count.note(columns, 0.0, "information-products")
         return back_products, coupling, error / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
 
+    def resolved_block(self, model: int) -> "ResolvedBlock | None":
+        """The last iterate's resolved block of `model` (Xt_L, Z_hat, R_L, core_hat and its factor), or None."""
+        return self._state["blocks"].get(model)
+
+    def block_products(self, model: int, columns: np.ndarray, coefficients: Any, rows: np.ndarray, residual_tolerance: float) -> tuple[Any, Any, Any, Any]:
+        """Xt_rows' w for directions u = Xt_columns C of a few bulk columns, at the last iterate's sites.
+
+        `columns` are sorted bulk variants, `coefficients` C is (|columns|, r) and `rows` are sorted variants.
+        With w = K_S^-1 u - Z_L core^-1 Z_L'u (Q u, every resolved site eliminated), the K_S solve runs to the
+        relative residual `residual_tolerance` of each u. Returns (Xt_rows' w (|rows|, r), t = Z_L'u (|L|, r),
+        the exact relative residuals (r,), ||u|| (r,)). Unlike information_solve it holds no p x r array: the
+        image reads only the columns' tiles and the back product keeps only the rows' tiles. One read for the
+        image, the CG passes, one read for the back product.
+        """
+        array_module = self.array_module
+        state = self._state
+        models = state["models"]
+        columns = np.asarray(columns, dtype=np.int64)
+        rows = np.asarray(rows, dtype=np.int64)
+        values = array_module.asarray(coefficients, dtype=array_module.float64)
+        width = int(values.shape[1])
+        column_models = array_module.full(width, model)
+        image = array_module.zeros((self.source.sample_count, width))
+        for start, stop, tile in self.source.blocks():
+            inside = np.flatnonzero((columns >= start) & (columns < stop))
+            if inside.size:
+                image += tile.columns(columns[inside] - start) @ values[array_module.asarray(inside)]
+        self.count.note(width, 0.0, "block-image")
+        image = models.design_to_sample(image, column_models)
+        image_norms = array_module.linalg.norm(image, axis=0)
+        tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (width,))
+        bound = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
+        spike_free = Deflation({}, {}, {}, self._resolved)
+        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="block-products")
+        duals = result.solution
+        block = state["blocks"].get(model)
+        coupling = array_module.zeros((0, width))
+        if block is not None:
+            coupling = block.duals.T @ image
+            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling)
+        left = models.sample_to_design(duals, column_models)
+        products = array_module.zeros((rows.size, width))
+        for start, stop, tile in self.source.blocks():
+            inside = np.flatnonzero((rows >= start) & (rows < stop))
+            if inside.size:
+                products[array_module.asarray(inside)] = tile.rmatmat(left)[array_module.asarray(rows[inside] - start)]
+        self.count.note(width, 0.0, "block-products")
+        return products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny), image_norms
+
     def posterior_solve(self, right: Any, model: int, error_bound: Any) -> Any:
         """A_m^-1 right (p x r) at the last iterate's sites, each column certified to ||x_hat - x||_A <= error_bound.
 
