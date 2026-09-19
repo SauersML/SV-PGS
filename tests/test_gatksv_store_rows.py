@@ -38,7 +38,7 @@ def _codes(values: np.ndarray, codes_per_unit: int) -> np.ndarray:
 
 def _posterior_variance(imputed: ImputedSvRecords, record: int) -> np.ndarray:
     dosage = imputed.codes[record] / CODES_PER_ALLELE
-    return dosage + 2 * imputed.gp2_codes[record] / GP2_CODES_PER_UNIT - dosage**2
+    return dosage + 2.0 * imputed.gp2_codes[record] / GP2_CODES_PER_UNIT - dosage**2
 
 
 def _scenario() -> tuple[GatksvBlock, ImputedSvRecords, dict[str, np.ndarray]]:
@@ -146,4 +146,5 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     copy_number_mean = gatksv.values[3][observed[3]].mean()
     assert set(rows.codes[2][gatksv.no_call[3]].tolist()) == {int(np.floor(copy_number_mean + 0.5))}
     predicted = prediction[gatksv.no_call[2]]
-    assert rows.clipped_counts.tolist() == [0, int(np.count_nonzero((predicted < 0) | (predicted > 2))), 0]
+    half_code = 0.5 / 127
+    assert rows.clipped_counts.tolist() == [0, int(np.count_nonzero((predicted < -half_code) | (predicted >= 2 + half_code))), 0]

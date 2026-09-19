@@ -25,8 +25,8 @@ genotypes only, never a phenotype, and SPEC trains on all samples, so they are
 the training statistics. ``observed_fractions`` keeps the share of each row
 that was called. Codes follow the store encoding: a dosage or ALT count x is
 round(127 x) and a copy number is stored as itself. A fused dosage or a
-predicted call outside the stored range is clipped to it, and every clipped
-entry is counted.
+predicted call outside the stored range is clipped to it, and every entry
+whose code the clip changed is counted.
 """
 
 from __future__ import annotations
@@ -123,9 +123,11 @@ def gatksv_sites(block: GatksvBlock) -> SvSites:
 
 
 def _clipped_codes(values: F64Array, maximum_value: float, codes_per_unit: int) -> tuple[U8Array, int]:
-    clipped = np.clip(values, 0.0, maximum_value)
-    codes = np.floor(clipped * codes_per_unit + 0.5).astype(np.uint8)
-    return codes, int(np.count_nonzero(clipped != values))
+    """Codes of ``values`` clipped to [0, maximum_value], and how many entries the clip changed."""
+    codes = np.floor(np.clip(values, 0.0, maximum_value) * codes_per_unit + 0.5).astype(np.uint8)
+    # Only a value past half a code outside the range stores a different code.
+    half_code = 0.5 / codes_per_unit
+    return codes, int(np.count_nonzero((values < -half_code) | (values >= maximum_value + half_code)))
 
 
 def _dosage_codes(values: F64Array) -> tuple[U8Array, int]:
