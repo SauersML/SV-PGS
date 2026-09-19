@@ -280,13 +280,27 @@ def _plan_blocks(blocks: Iterable[tuple[int, int, int, U8Array]]) -> Iterator[tu
         yield plan_start, plan_start + store_stop - store_start, codes
 
 
+def _read_ahead_buffers(block_rows: int, sample_count: int, budget: ComputeBudget) -> list[U8Array]:
+    """The read-ahead ring; page-locked on CUDA so uploads run at full bus speed."""
+    shape = (block_rows, sample_count)
+    if budget.device_kind != "cuda":
+        return [np.empty(shape, dtype=np.uint8) for _ in range(_READ_AHEAD_BUFFERS)]
+    cupy: Any = _try_import_cupy()
+    if cupy is None:
+        raise RuntimeError("the compute budget selected CUDA but CuPy is unavailable.")
+    element_count = block_rows * sample_count
+    return [
+        np.frombuffer(cupy.cuda.alloc_pinned_memory(element_count), dtype=np.uint8, count=element_count).reshape(shape)
+        for _ in range(_READ_AHEAD_BUFFERS)
+    ]
+
+
 def _read_plan_blocks(
     source: CodeBlockSource,
     ranges: Sequence[tuple[int, int, int]],
-    block_rows: int,
+    buffers: Sequence[U8Array],
     sample_indices: I64Array | None,
 ) -> Iterator[tuple[int, int, int, U8Array]]:
-    buffers = [np.empty((block_rows, source.sample_count), dtype=np.uint8) for _ in range(_READ_AHEAD_BUFFERS)]
     plan_starts = {(store_start, store_stop): plan_start for store_start, store_stop, plan_start in ranges}
     variant_ranges = [(store_start, store_stop) for store_start, store_stop, _ in ranges]
     for store_start, store_stop, codes in source.iter_code_blocks(variant_ranges, buffers):
@@ -325,7 +339,7 @@ def score_genetic(
         + f"on {budget.describe()}"
     )
     accumulator = np.zeros((plan.model_count, sample_count), dtype=np.float64)
-    blocks = _read_plan_blocks(source, ranges, block_rows, selected)
+    blocks = _read_plan_blocks(source, ranges, _read_ahead_buffers(block_rows, source.sample_count, budget), selected)
     if budget.device_kind == "cuda":
         _score_cuda(blocks, plan.weights, accumulator, budget)
     else:
