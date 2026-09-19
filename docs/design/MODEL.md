@@ -98,7 +98,10 @@ Untagged numbers are derivations, definitions or targets.
   - **Until Stage 1 lands, Stage 2 starts from the prior itself:** moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, a zero mean, the start density, and the covariate-only residual variance as the noise.
 - **Stage 2: full-data certification** (`exact_polish.py`).
   - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40 [sim-only: synthetic store].
-  - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate.
+  - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate. These are being replaced by `marginal_variances.py`, the leave-block-out marginals:
+    - Block-Jacobi inverses are variances conditional on the other blocks' effects, which biases the EP fixed point.
+    - The replacement is exact elimination of the resolved sites plus a neighbour-window Woodbury, with a deterministic equivalent only for the far field. Every block carries a probe certificate.
+    - Measured against the dense inverse, with LD across cuts: max per-variant relative error 0.5–3.5%, below the equivalent's scale ‖K_S⁻¹‖_F/tr K_S⁻¹. Block-Jacobi was off by 16–58% [machinery: dense inverse].
   - Posterior draws.
   - This stage carries the real weight: a block-diagonal Stage 1 alone was 2.7× off at p/n = 20 [semi-real: design-credit].
 - **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [sim-only: synthetic store; timing].
