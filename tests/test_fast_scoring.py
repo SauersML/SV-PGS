@@ -287,6 +287,31 @@ def test_a_host_budget_below_one_block_row_is_refused_and_panels_balance():
     assert _cpu_panels(3, 8) == [(0, 1), (1, 2), (2, 3)]
 
 
+def test_a_one_draw_binary_model_carries_its_variance_into_the_damped_predictive():
+    random_generator = np.random.default_rng(11)
+    codes = random_codes(random_generator, variant_count=80, sample_count=50)
+    models = [replace(model, trait_type=TraitType.BINARY) for model in two_fold_models(codes, random_generator, draw_count=1)]
+    plan = ScoringPlan.from_models(models)
+    scores = score_genetic(InMemoryCodes(codes), plan, cpu_budget(plan, sample_count=50, block_rows=16, threads=2))
+    linear_predictor = score_linear_predictor(scores.means, np.zeros((50, 2)), models)
+
+    for model_index, model in enumerate(models):
+        _mean, _mean_bound, variance, variance_bound = dense_reference(codes, model)
+        assert np.all(np.isfinite(scores.variances[:, model_index])) and np.all(scores.variances[:, model_index] >= 0.0)
+        assert_within(scores.variances[:, model_index], variance, variance_bound)
+        eta = linear_predictor[:, model_index]
+        probability = posterior_predictive_probability(eta, scores.variances[:, model_index], 0.0)
+        # E[sigmoid(eta + sqrt(v) Z)] lies strictly between 1/2 and sigmoid(eta) whenever eta != 0 and v > 0
+        damped = (scores.variances[:, model_index] > 0.0) & (eta != 0.0)
+        assert np.all(np.abs(probability[damped] - 0.5) < np.abs(expit(eta[damped]) - 0.5))
+
+    # a model without draws has no variance, and the predictive refuses it rather than dropping the damping
+    no_draws = score_genetic(InMemoryCodes(codes), ScoringPlan.from_models(two_fold_models(codes, random_generator)),
+                             cpu_budget(plan, sample_count=50, block_rows=16, threads=1))
+    with pytest.raises(ValueError, match="finite"):
+        posterior_predictive_probability(no_draws.means[:, 0], no_draws.variances[:, 0], 0.0)
+
+
 def test_the_predictive_is_the_logistic_normal_integral():
     linear_predictor = np.array([-4.0, -1.3, 0.0, 0.7, 3.2, -2.5])
     variance = np.array([0.0, 0.01, 0.5, 1.7, 4.0, 2.9])
