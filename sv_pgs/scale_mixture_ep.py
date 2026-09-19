@@ -508,15 +508,21 @@ class _Components:
 
 def _kernel_terms(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
-) -> tuple[F64Array, F64Array, F64Array, F64Array]:
-    """(variance v, q = vP, r = 1/(1+q), log pi_k + log Z_jk) at every node; v = 0 below ``floor``."""
+) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
+    """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node; v = 0 below
+    ``floor``. Written so that an overflowing v (a node far past every effect's scale) gives its limits
+    v r = 1/P, r = 0, qr = 1 and a component of weight zero, not inf * 0."""
     variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
-    ratio = variance * precision[:, None]
+    column_precision = precision[:, None]
+    ratio = variance * column_precision
     if np.any(ratio <= -1.0):
         raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
     retained = 1.0 / (1.0 + ratio)
-    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * np.square(shift)[:, None] * variance * retained
-    return variance, ratio, retained, log_component
+    ratio_retained = np.where(np.isfinite(ratio), ratio * retained, 1.0)
+    conditional = np.where(np.isfinite(variance), variance * retained, 1.0 / column_precision)
+    signal = np.square(shift)[:, None] * conditional
+    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * signal
+    return conditional, retained, ratio_retained, log_component, signal
 
 
 def _log_normalizers(
@@ -533,16 +539,14 @@ def _components(
     B_(n+1) = -r(1 - r) B_n', giving A_2 = r^2 - r/2, B_2 = r(1 - r)/2, A_3 = 3r^3 - 3r^2 + r/2,
     B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
     Nodes below ``floor`` have a flat kernel: v = 0 there."""
-    variance, ratio, retained, log_component = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
-    signal = np.square(shift)[:, None] * variance * retained
+    conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
     log_normalizer = logsumexp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
-    ratio_retained = ratio * retained
     return _Components(
         log_normalizer=log_normalizer,
         responsibility=responsibility,
-        conditional_variance=variance * retained,
-        first=0.5 * retained * (signal - ratio),
+        conditional_variance=conditional,
+        first=0.5 * (retained * signal - ratio_retained),
         second=0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained,
         third=0.5 * signal * retained * (6.0 * retained * retained - 6.0 * retained + 1.0)
         - 0.5 * ratio_retained * retained * (2.0 * retained - 1.0),
