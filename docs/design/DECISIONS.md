@@ -60,7 +60,7 @@ Each entry gives the ruling and the measurement or identity behind it. Simulatio
 - **The headline is one pre-registered panel test with non-negative power weights.** Per-trait power is weak at 50k.
 
 ## Engineering
-- **The new path replaces the old one, and superseded code is deleted.** About 81% of sv_pgs is slated for removal, in ordered commits C0–C8.
+- **The new path replaces the old one, and superseded code is deleted.** About 74% of sv_pgs (48,616 of 65,304 lines at `c2a9443`) is slated for removal, in ordered commits C0–C8 ([CUTOVER.md](CUTOVER.md)).
 - **Continuous integration:** every validated increment lands on main through full-suite CI, sharded three ways.
 - **Compute:** development runs on MSI with public or synthetic data. Training runs in the dedicated AoU workspace through its in-perimeter launch path.
 - **All agents run on one model; helper subagents on other models are not used.**
