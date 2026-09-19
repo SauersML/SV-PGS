@@ -6,9 +6,13 @@ kappa in float64 carries relative error <= dimension * kappa * eps.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
+import pytest
 
 from sv_pgs import dual_solve
+from tests.memory_budget import run_within_budget
 
 EPS = np.finfo(np.float64).eps
 MODEL_COUNT = 4
@@ -161,6 +165,45 @@ def test_a_fold_mask_is_the_posterior_of_its_training_rows() -> None:
     exact = np.linalg.solve(precision, design.T @ (projector @ (root * response[rows, 1])) + prior_mean[:, 1] / variances[:, 1])
     error = mean[:, 1] - exact
     assert np.sqrt(float(error @ precision @ error)) <= float(result.residual_norm[1]) * (1.0 + np.linalg.cond(precision) * EPS * genotypes.shape[1])
+
+
+def budgeted_solve(genotypes, bounds, weights, variances, covariates, right, column_models, bound):
+    """A certified solve with the relaxed operand error, built and run inside the budget."""
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    spike_free = dual_solve.Deflation({}, {}, {}, {})
+    result = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), column_models, bound, dual_solve.PassCount(), deflation=spike_free)
+    return result.residual_norm, result.iterations
+
+
+def reserve(rows: int, columns: int) -> int:
+    """Reserve, without writing, the float64 block a p-side Krylov state would hold."""
+    return int(np.empty((rows, columns)).shape[0])
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the budget reads /proc/self/status")
+def test_the_certified_solve_holds_only_sample_side_state() -> None:
+    """The solve keeps O(n C) sample-side state and O(p_b C) per block, never a p x C array.
+
+    The budget is a tenth of one p x C float64 block (the primal plan's Krylov state), which the
+    problem makes 400 times its n x C one, so the solve fits only if nothing p-side is allocated;
+    the same budget refuses a p x C reservation.
+    """
+    genotypes, bounds, covariates, weights, variances, _prior_mean, _response = _problem(71, sample_count=100, variant_count=40000, block=100)
+    columns_per_model = 16
+    column_models = np.repeat(np.arange(MODEL_COUNT), columns_per_model)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    right = models.complement(np.random.default_rng(72).standard_normal((genotypes.shape[0], column_models.size)), column_models)
+    bound = _solve_bound(right)
+    primal_block = genotypes.shape[1] * column_models.size * np.dtype(np.float64).itemsize
+    budget = primal_block // 10
+    residual_norm, iterations = run_within_budget(
+        budgeted_solve, genotypes, bounds, weights, variances, covariates, right, column_models, bound, working_bytes=budget
+    )
+    assert np.all(residual_norm <= bound)
+    assert iterations > 0
+    with pytest.raises(AssertionError, match="past its working_bytes budget"):
+        run_within_budget(reserve, genotypes.shape[1], column_models.size, working_bytes=budget)
 
 
 def test_matheron_draws_have_the_posterior_covariance_exactly() -> None:
