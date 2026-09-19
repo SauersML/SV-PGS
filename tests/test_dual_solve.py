@@ -189,10 +189,11 @@ def test_relaxed_operand_error_keeps_the_exact_certificate() -> None:
     assert np.all(result.residual_norm <= bound)
     assert result.relative_errors[0] == 0.0
     assert any(relative_error > 0.0 for relative_error in result.relative_errors[1:])
-    exact = right - np.column_stack([
-        _dense(genotypes, covariates, weights, variances, model)[3] @ result.solution[:, model] for model in range(MODEL_COUNT)
-    ])
-    np.testing.assert_allclose(np.linalg.norm(exact, axis=0), result.residual_norm, rtol=np.sqrt(EPS), atol=0.0)
+    operators = [_dense(genotypes, covariates, weights, variances, model)[3] for model in range(MODEL_COUNT)]
+    exact = right - np.column_stack([operators[model] @ result.solution[:, model] for model in range(MODEL_COUNT)])
+    # Two float64 evaluations of b - S z differ by the rounding of S z: n eps ||S|| ||z|| per column.
+    rounding = np.array([genotypes.shape[0] * EPS * np.linalg.norm(operators[model], 2) * np.linalg.norm(result.solution[:, model]) for model in range(MODEL_COUNT)])
+    assert np.all(np.abs(np.linalg.norm(exact, axis=0) - result.residual_norm) <= rounding)
 
 
 def test_rounded_operand_meets_its_normwise_bound_and_keeps_zeros() -> None:
