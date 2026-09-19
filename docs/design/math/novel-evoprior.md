@@ -85,7 +85,7 @@ This is again a Gaussian scale mixture, i.e. within the SPEC family, but both it
 
 ## 5. Theorem 5: identifiability
 
-- **Claim:** given the laws of v at a continuum of H, (f, κ, n, g_mut) are identified up to the one-parameter group (c, κ, g) → (λc, λκ, g(·λ)λ). A single location pin breaks that group; it is the same direction as the current design's level-vs-g-location confounding.
+- **Claim:** given the laws of v at a continuum of H, (f, κ, n, g_mut) are identified up to the one-parameter group (c, κ, g) → (λc, λκ, g(·λ)λ). A single location pin breaks that group; it is the same direction as the current design's level-vs-g-location confounding. Use E_g[s] = 1, or no free level; ∫ log s g = 0 is ill-conditioned at finite data because g's sub-noise part is unidentified (math-scale).
 - **Proof sketch:**
   1. The essential supremum of v_H gives c(H)/κ.
   2. In W = κHs the tilt cancels in density ratios across H, so ℓ(u) = log g(e^u/κ) is identified up to a linear term.
@@ -111,6 +111,7 @@ This is again a Gaussian scale mixture, i.e. within the SPEC family, but both it
 | Theorem 2 in a forward pleiotropic WF population | E[a₁² \| s, m] by decile of predicted variance | every decile within 15% |
 | §4.1, S = α − 1 | quadrature | slope within 0.05 of α |
 | §4.5, class SFS = generalized Stieltjes transform | forward WF, SNV class with a mixture DFE | within 4/√E + 5% in every populated bin |
+| §4.3, Wright tilt (exact case: parent-independent recurrent mutation) | forward WF, 40k loci, 4Nμ = 0.5, S = 0 and 20 | within 4√E + 3% in every bin |
 | Class-assembled Hessian = full Hessian | JAX | exact to 1e-8 |
 | Estimator recovery | data from M2′, p = 30k and 120k, 3 seeds each | λ within ±10%; κ, n spread up to 2× along the λ ridge, not shrinking with p |
 
