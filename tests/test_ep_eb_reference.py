@@ -71,7 +71,7 @@ def _quadrature_moments(components, precision: float, shift: float):
                 )
                 return effect**power * np.exp(log_value) * scale
 
-            moments[power] += mass * integrate.quad(integrand, -40.0, 40.0, limit=200, epsabs=0.0, epsrel=1e-12)[0]
+            moments[power] += mass * integrate.quad(integrand, -40.0, 40.0, limit=200, epsabs=0.0, epsrel=1e-10)[0]
     normalizer = moments[0]
     mean = moments[1] / normalizer
     return normalizer, mean, moments[2] / normalizer - mean**2
