@@ -898,8 +898,8 @@ class _Model:
 
     def fit(self, start: _State) -> tuple[_State, _Expectation, float]:
         """The penalty weight maximizing the evidence (``bracketed_maximum`` over its resolvable range, each EM
-        warm-started from the nearest weight fitted), moved to 0 or infinity exactly when the maximum sits at an
-        end of that range (the engine's edge rule)."""
+        warm-started from the nearest weight fitted), moved to 0 or infinity exactly when the ascent reaches an
+        end of that range (the engine's edge rule, ``scale_mixture_ep._maximize_evidence``)."""
         if len(start.prior.smoothing_blocks) != 1:
             raise ValueError("the occasion noise density has one class and one roughness penalty")
         fits: dict[float, tuple[_State, _Expectation, float]] = {}
@@ -915,57 +915,57 @@ class _Model:
         initial = float(start.hyperparameters.log_smoothing[0])
         at(initial)
         lower, upper = self.smoothing_range(*fits[initial][:2])
-        best = bracketed_maximum(at, float(np.clip(initial, lower, upper)), lower, upper)
+        best = bracketed_maximum(at, initial, lower, upper)
         if best in (lower, upper):
-            edge = np.inf if best == upper else -np.inf
-            at(edge)
-            if fits[edge][2] >= fits[best][2]:
-                best = edge
+            # The ascent reached an end of the resolvable range: the weight moves to that edge exactly.
+            best = np.inf if best == upper else -np.inf
+            at(best)
         return fits[best]
 
 
 def bracketed_maximum(function: Callable[[float], float], start: float, lower: float, upper: float) -> float:
-    """A maximizer of ``function`` over [lower, upper]: a bracket grown from ``start`` by golden-ratio steps,
-    starting one unit out (the step sets only the search's cost), then golden-section search until the bracket's
-    values span less than EVIDENCE_TOLERANCE, or it is half of double precision wide. An end of the range is
-    returned when the function still rises there. Values of -inf (uncertified maxima) count as the lowest."""
+    """A maximizer of ``function`` over [lower, upper], for a function unimodal there.
+
+    From ``start`` (clipped into the range) the ascent steps outward, one unit first and growing by the golden
+    ratio (the steps set only the search's cost), until the function falls, which brackets the maximum, or the
+    range ends while it still rises, which returns that end. The bracket then narrows by golden-section search
+    until its values span less than EVIDENCE_TOLERANCE or it is half of double precision wide. Values of -inf
+    (uncertified maxima) count as the lowest.
+    """
     growth = 1.0 / _GOLDEN - 1.0
-    forward, backward = float(min(start + 1.0, upper)), float(max(start - 1.0, lower))
-    centre = function(start)
-    if forward > start and function(forward) >= centre:
-        previous, middle = start, forward
-    elif backward < start and function(backward) > centre:
-        previous, middle = start, backward
+    origin = float(np.clip(start, lower, upper))
+    right, left = min(origin + 1.0, upper), max(origin - 1.0, lower)
+    if right > origin and function(right) > function(origin):
+        previous, current = origin, right
+    elif left < origin and function(left) > function(origin):
+        previous, current = origin, left
     else:
-        previous = middle = None
-        low, high = backward, forward
-    if middle is not None:
+        previous = current = origin
+    if current != origin:
         while True:
-            beyond = float(np.clip(middle + growth * (middle - previous), lower, upper))
-            if beyond == middle:
-                return middle
-            if function(beyond) < function(middle):
-                low, high = min(previous, beyond), max(previous, beyond)
+            beyond = float(np.clip(current + growth * (current - previous), lower, upper))
+            if beyond == current:
+                return current
+            if function(beyond) <= function(current):
                 break
-            previous, middle = middle, beyond
+            previous, current = current, beyond
+        low, high = min(previous, beyond), max(previous, beyond)
     else:
-        middle = start
+        low, high = left, right
+    # Golden-section search on [low, high], keeping two interior points.
+    inner_low, inner_high = high - (1.0 - _GOLDEN) * (high - low), low + (1.0 - _GOLDEN) * (high - low)
     while high - low > _HALF_PRECISION * (1.0 + abs(high) + abs(low)):
-        if max(function(low), function(middle), function(high)) - min(function(low), function(high)) < EVIDENCE_TOLERANCE:
+        values = [function(point) for point in (low, inner_low, inner_high, high)]
+        if max(values) - min(values) < EVIDENCE_TOLERANCE:
             break
-        if high - middle > middle - low:
-            trial = middle + _GOLDEN * (high - middle)
-            if function(trial) > function(middle):
-                low, middle = middle, trial
-            else:
-                high = trial
+        if values[1] >= values[2]:
+            high, inner_high = inner_high, inner_low
+            inner_low = high - (1.0 - _GOLDEN) * (high - low)
         else:
-            trial = middle - _GOLDEN * (middle - low)
-            if function(trial) > function(middle):
-                high, middle = middle, trial
-            else:
-                low = trial
-    return middle
+            low, inner_low = inner_low, inner_high
+            inner_high = low + (1.0 - _GOLDEN) * (high - low)
+    candidates = (low, inner_low, inner_high, high)
+    return max(candidates, key=function)
 
 
 def _result(model: _Model, state: _State, expectation: _Expectation, evidence: float) -> OccasionModelFit:
