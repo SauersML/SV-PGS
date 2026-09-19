@@ -130,7 +130,8 @@ class FitCertificate:
     - ``negative_sites``: sites with negative precision (allowed; EP is unclipped);
     - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
     - ``outer_iterations``, ``halvings`` and ``unresolved``: accepted outer steps, refused trials, and those refused for
-      having no EP fixed point, whose reasons ``refusals`` keeps;
+      having no EP fixed point, whose reasons ``refusals`` keeps; ``outer_history``: each model's decrement plus remaining
+      gain at every outer evaluation (the outer rate);
     - ``prediction_move``: the certifying Newton step's move of q's mean in q's posterior metric, against
       ``prediction_tolerance`` = p_eff / K (MODEL.md: the certificate includes the prediction change);
       ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
@@ -155,6 +156,7 @@ class FitCertificate:
     prediction_tolerance: F64Array
     unresolved: I64Array
     refusals: tuple[str, ...]
+    outer_history: tuple[tuple[float, ...], ...]
     refreshes: int
     passes: int
 
@@ -491,6 +493,7 @@ def fit_full_data(
             prediction_tolerance=np.array([fit.prediction_tolerance for fit in fits]),
             unresolved=np.array([fit.unresolved for fit in fits], dtype=np.int64),
             refusals=tuple(fixed_points.refusals),
+            outer_history=tuple(fit.history for fit in fits),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
         ),

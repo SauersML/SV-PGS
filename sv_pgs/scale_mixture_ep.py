@@ -1934,6 +1934,8 @@ class OuterFit:
     iterations: int
     halvings: int
     unresolved: int
+    # The decrement plus the weights' remaining gain at every outer evaluation, in order: the outer rate.
+    history: tuple[float, ...]
 
 
 @dataclass(frozen=True)
@@ -2050,6 +2052,7 @@ def fit_hyperparameters(
     radii: list[float | None] = [None] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
+    histories: list[list[float]] = [[] for _model in range(count)]
     while True:
         for model in range(count):
             if fits[model] is not None or pending[model] is not None:
@@ -2064,6 +2067,7 @@ def fit_hyperparameters(
             log_smoothing = hyperparameters[model].log_smoothing if step is None else step.hyperparameters.log_smoothing
             newton = _newton_b(prior, log_smoothing, hyperparameters[model].coefficients, point, correction, working_bytes)
             remaining = newton.decrement + (np.inf if step is None else step.evidence_gain)
+            histories[model].append(float(remaining))
             certifying = step is not None and remaining <= tolerance
             if certifying:
                 steps_taken[model] = (step, remaining)
@@ -2095,7 +2099,7 @@ def fit_hyperparameters(
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
                         prediction_move=move, prediction_tolerance=allowed_move, iterations=iterations[model], halvings=halvings[model],
-                        unresolved=unresolved[model],
+                        unresolved=unresolved[model], history=tuple(histories[model]),
                     )
                     pending[model] = None
                     continue
