@@ -19,6 +19,9 @@ from sv_pgs.scale_mixture_ep import (
     _data_objective,
     _evidence,
     _curvature_trace_gradient,
+    _data_value,
+    _log_normal_start,
+    _maximize_coefficients,
     _penalized,
     _penalty_matrix,
     _restricted_prior,
@@ -469,3 +472,47 @@ def test_relattice_extends_the_log_tails_linearly_and_keeps_the_density_inside()
     outside = np.flatnonzero(wider > nodes[-1] + 0.2)
     np.testing.assert_allclose(np.diff(new_log_density[:, outside], n=2, axis=1), 0.0, atol=1e-8)
     assert moved.kernel_floor == -9.0 and moved.kernel_top == 4.0
+
+
+def _log_normal_problem(seed: int):
+    """One class, no annotations, effects whose variances are log-normal: the null model is the truth."""
+    generator = np.random.default_rng(seed)
+    variant_count = 400
+    log_variance = generator.normal(np.log(0.02), 1.2, variant_count)
+    precision = generator.uniform(100.0, 800.0, variant_count)
+    effect = generator.standard_normal(variant_count) * np.exp(0.5 * log_variance)
+    shift = precision * (effect + generator.standard_normal(variant_count) / np.sqrt(precision))
+    offset = np.zeros(variant_count)
+    nodes, floor, top = derived_lattice(precision, shift, offset, 1e-3)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variant_count, dtype=np.int64), log_variance_offset=offset, annotation_design=np.zeros((variant_count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    return prior, Cavity(precision=precision, shift=shift)
+
+
+def test_the_global_log_normal_start_reaches_the_null_models_maximum():
+    prior, cavity = _log_normal_problem(31)
+    view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
+    start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
+    coefficients, objective = _maximize_coefficients(view, np.zeros(0), allowed.T @ start, cavity, _WORKING_BYTES, 0.0)
+    nodes = prior.log_variance_grid
+    basis = prior.coefficient_map[: prior.grid_size, : prior.pooled_size]
+    brute = -np.inf
+    for centre in np.linspace(prior.kernel_floor, prior.kernel_top, 60):
+        for width in np.exp(np.linspace(np.log(nodes[1] - nodes[0]), np.log(prior.kernel_top - prior.kernel_floor), 40)):
+            log_density = -0.5 * np.square((nodes - centre) / width)
+            candidate = np.zeros(prior.coefficient_size)
+            candidate[: prior.pooled_size] = basis.T @ (log_density - log_density.mean())
+            brute = max(brute, _data_value(prior, candidate, cavity, _WORKING_BYTES))
+    assert objective.value >= brute - 1e-6
+
+
+def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
+    prior, cavity = _log_normal_problem(33)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    view, allowed = _restricted_prior(prior, frozenset({0}), frozenset())
+    start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
+    edge = _evidence(view, np.zeros(0), allowed.T @ start, cavity, _WORKING_BYTES, 0.0)
+    assert edge is not None
+    assert step.evidence >= edge.value - 1e-6
