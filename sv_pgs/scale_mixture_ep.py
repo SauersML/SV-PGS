@@ -1159,6 +1159,9 @@ def _laplace_corrections(
     moved = response @ complement
     schur = moved.T @ negative @ moved
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
+    # -H passed its Cholesky test, so the Schur complement is positive definite; an eigenvalue below eps times the
+    # largest is rounding, raised to that floor as in ``_ascent_direction``.
+    eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
     directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
     third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
     terms = fourth / 8.0 + 5.0 * third**2 / 24.0
@@ -1247,6 +1250,7 @@ def _evidence(
     # sqrt(c'(-H)^-1 c) sqrt(2 d) / 2, c their x-gradient. The inner tolerance tightens until that is below ``tolerance``.
     inner_tolerance = tolerance
     coefficients = np.array(start, dtype=np.float64, copy=True)
+    previous = None
     while True:
         coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
         value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
@@ -1262,6 +1266,10 @@ def _evidence(
         rounding = _EPSILON * (objective.magnitude + abs(value))
         if 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
+        if previous is not None and np.array_equal(coefficients, previous):
+            # The maximizer resolves x no further (its own rounding stop): V is as accurate as double precision gives.
+            break
+        previous = coefficients
         inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     # A relative error e in B moves log|B + S| by at most D e for well-scaled B + S: the linear response is solved to
@@ -1602,8 +1610,12 @@ def _stationarity_check(
     Per eigen-direction of its block, V depends on rho_i through terms log(1 + e^(rho + a)) / 2 and
     b sigma(rho + a) / 2; the first derivatives are sigma / 2 and b sigma' / 2, and every higher derivative of the
     logistic is bounded by sigma itself. So s_i = (edf_i + lambda_i ||R_i x||^2) / 2 bounds |V''| and |V'''| in rho_i.
-    With V known to eps_V = eps |V|, the central difference errs by at most h^2 s / 6 + eps_V / h, least at
-    h = (3 eps_V / s)^(1/3); a step halves only while one of its sides has no certified maximum.
+
+    With each side's V certified to e (``_evidence``'s tolerance, never below V's rounding), the central difference
+    errs by at most E = h^2 s / 6 + e / h, least at h = (3 e / s)^(1/3), where E = (3^(2/3) / 2) s^(1/3) e^(2/3). The
+    caller certifies the gain's upper bound 1/2 sum (|c| + E)^2 / s against ``tolerance``; e is set so that the error
+    alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
+    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4). A step halves only while one of its sides has no certified maximum.
     """
     gradient = np.zeros(weights.shape[0])
     rounding = _EPSILON * evidence.magnitude
@@ -1611,20 +1623,22 @@ def _stationarity_check(
     steps = np.zeros(weights.shape[0])
     errors = np.zeros(weights.shape[0])
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights))))
+    count = max(int(np.count_nonzero(interior)), 1)
     for position in np.flatnonzero(interior):
         unit = np.zeros(weights.shape[0])
         unit[position] = 1.0
-        step = (3.0 * rounding / scale[position]) ** (1.0 / 3.0)
+        accuracy = max((2.0 * tolerance / (count * 3.0 ** (4.0 / 3.0))) ** 0.75 * scale[position] ** 0.25, rounding)
+        step = (3.0 * accuracy / scale[position]) ** (1.0 / 3.0)
         while True:
             if step <= limit:
                 raise FloatingPointError("the B-evidence has no certified maximum on both sides of a fitted penalty weight")
-            both = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, tolerance) for side in (-1.0, 1.0)]
+            both = [_evidence(view, weights + side * step * unit, evidence.coefficients, cavity, posterior_at, working_bytes, accuracy) for side in (-1.0, 1.0)]
             if all(side is not None for side in both):
                 break
             step *= 0.5
         gradient[position] = (both[1].value - both[0].value) / (2.0 * step)
         steps[position] = step
-        errors[position] = step * step * scale[position] / 6.0 + rounding / step
+        errors[position] = step * step * scale[position] / 6.0 + accuracy / step
     return gradient, scale, steps, errors
 
 
@@ -1666,7 +1680,7 @@ def hyper_step(
         check, curvature, check_steps, check_errors = _stationarity_check(
             final_view, weights, evidence, interior, cavity, posterior_at, working_bytes, tolerance
         )
-        if 0.5 * float(np.sum(check * check / curvature)) <= tolerance:
+        if 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature)) <= tolerance:
             break
         direction = check / curvature
         step_length, moved = 1.0, None
@@ -1679,7 +1693,22 @@ def hyper_step(
             step_length *= 0.5
         if moved is None:
             break
+        # The search resumes from the moved point, edges and structural starts included. It keeps the move when the
+        # resumed search ends lower (a basin chosen by its corrected V), so V rises at every pass and the loop ends.
         weights, evidence = moved
+        resumed_smoothing = log_smoothing.copy()
+        resumed_smoothing[finite_final] = weights
+        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, posterior_at, working_bytes, bounds, tolerance)
+        if resumed[2].value > evidence.value:
+            log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
+            final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+            final_zero = frozenset(int(position) for position in np.flatnonzero(log_smoothing == -np.inf))
+            final_view, final_allowed = _restricted_prior(prior, final_infinite, final_zero)
+            finite_final = np.isfinite(log_smoothing)
+            weights = log_smoothing[finite_final]
+            lower = np.array([bound[0] for bound in bounds])[finite_final]
+            upper = np.array([bound[1] for bound in bounds])[finite_final]
+            evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
     return HyperStep(
