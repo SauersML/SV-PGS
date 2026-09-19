@@ -31,6 +31,8 @@ PL_CAP = 999
 HOMREF_HOM_ALT_CAP = 30
 GQ_CAP = 99
 ERR_IMP = "1e-3"
+# Records simulated and written per vectorized step.
+ROW_BLOCK = 256
 
 
 def encode_milli(milli: np.ndarray) -> np.ndarray:
@@ -69,15 +71,17 @@ def finish(sink, process, path: Path) -> None:
     run(["tabix", "-f", "-p", "vcf", str(path)])
 
 
-def simulated_pl(genotype: np.ndarray, error: float, rng: np.random.Generator) -> np.ndarray:
-    """PL triplets from a gamma-Poisson read-depth model, with the gVCF hom-ref block rule."""
+def simulated_pl(genotype: np.ndarray, error, rng: np.random.Generator) -> np.ndarray:
+    """PL triplets from a gamma-Poisson read-depth model, with the gVCF hom-ref block rule.
+
+    error is the per-read base error, a scalar or an array broadcastable to genotype (one per record).
+    """
     depth = rng.poisson(rng.gamma(DEPTH_SHAPE, MEAN_DEPTH / DEPTH_SHAPE, size=genotype.shape))
-    fraction = np.array([error, 0.5, 1.0 - error])[genotype]
-    alt_reads = rng.binomial(depth, fraction)
+    per_read = np.broadcast_to(np.asarray(error, dtype=np.float64), genotype.shape)
+    fractions = np.stack([per_read, np.full(genotype.shape, 0.5), 1.0 - per_read], axis=-1)
+    alt_reads = rng.binomial(depth, np.take_along_axis(fractions, genotype[..., None], axis=-1)[..., 0])
     ref_reads = depth - alt_reads
-    log_fraction = np.log10(np.array([error, 0.5, 1.0 - error]))
-    log_complement = np.log10(1.0 - np.array([error, 0.5, 1.0 - error]))
-    log_likelihood = alt_reads[..., None] * log_fraction + ref_reads[..., None] * log_complement
+    log_likelihood = alt_reads[..., None] * np.log10(fractions) + ref_reads[..., None] * np.log10(1.0 - fractions)
     pl = -10.0 * (log_likelihood - log_likelihood.max(axis=-1, keepdims=True))
     pl = np.minimum(np.rint(pl), PL_CAP).astype(np.int64)
     ordered = np.sort(pl, axis=-1)
@@ -182,11 +186,15 @@ def main() -> None:
         target = work / f"gl{batch_index}{suffix}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "PL"))
-        for row in simple_rows:
-            genotype = truth[row, first:last].astype(np.intp)
-            body = pl_text(simulated_pl(genotype, BASE_ERROR[int(cls[row])], rng)).reshape(-1).copy()
-            body[-1] = ord("\n")
-            process.stdin.write(prefix[row] + b"PL\t" + body.tobytes())
+        errors = np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]])
+        for block_start in range(0, simple_rows.size, ROW_BLOCK):
+            rows = simple_rows[block_start:block_start + ROW_BLOCK]
+            genotype = truth[rows, first:last].astype(np.intp)
+            pl = simulated_pl(genotype, errors[block_start:block_start + ROW_BLOCK, None], rng)
+            text = pl_text(pl.reshape(-1, 3)).reshape(rows.size, -1)
+            text[:, -1] = ord("\n")
+            for row, body in zip(rows, text):
+                process.stdin.write(prefix[row] + b"PL\t" + body.tobytes())
         finish(sink, process, target)
         outputs = []
         for index, (chunk, binary) in enumerate(zip(chunks, binaries)):

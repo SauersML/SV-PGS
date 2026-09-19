@@ -32,6 +32,7 @@ from benchmarks.bench_sim.measurement import (
 
 UNPHASED = np.frombuffer(b"0/0\t0/1\t1/1\t", dtype=np.uint8).reshape(3, 4)
 STREAM_ROWS = 20_000
+ROW_BLOCK = 256
 
 
 def batch_block(truth: np.ndarray, rows: np.ndarray, first: int, last: int) -> np.ndarray:
@@ -97,13 +98,16 @@ def main() -> None:
         target = work / f"target{batch_index}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "GT"))
-        for offset, row in enumerate(simple_rows):
-            pl = simulated_pl(truth_block[offset].astype(np.intp), BASE_ERROR[int(cls[row])], rng)
+        errors = np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]])
+        for block_start in range(0, simple_rows.size, ROW_BLOCK):
+            stop = block_start + ROW_BLOCK
+            pl = simulated_pl(truth_block[block_start:stop].astype(np.intp), errors[block_start:stop, None], rng)
             called = np.argmin(pl, axis=-1)
-            calls[offset] = called
-            body = UNPHASED[called].reshape(-1).copy()
-            body[-1] = ord("\n")
-            process.stdin.write(sites[row].encode() + body.tobytes())
+            calls[block_start:stop] = called
+            text = UNPHASED[called].reshape(called.shape[0], -1)
+            text[:, -1] = ord("\n")
+            for row, body in zip(simple_rows[block_start:stop], text):
+                process.stdin.write(sites[row].encode() + body.tobytes())
         finish(sink, process, target)
         out_prefix = work / f"imputed{batch_index}"
         run(["java", f"-Xmx{args.memory_gb}g", "-jar", args.beagle, f"ref={reference}", f"gt={target}",
