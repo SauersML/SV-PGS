@@ -58,6 +58,11 @@ GRID_LOG_SPACING = 0.5 * np.log(2.0)
 GRID_LOWER_FACTOR = 1e-2
 GRID_UPPER_FACTOR = 4.0
 LOG_PENALTY_RANGE = 25.0
+# Search box for the coefficient maximizer, only to keep trial steps finite:
+# e^20 on the prior variance per unit of an annotation, and log-weight contrasts
+# of e^100, lie far outside any optimum.
+ANNOTATION_COEFFICIENT_RANGE = 20.0
+MIXING_COORDINATE_RANGE = 100.0
 
 
 def data_driven_variance_grid(likelihood_precision: np.ndarray, linear_term: np.ndarray, log_variance_offset: np.ndarray):
@@ -157,9 +162,13 @@ class ReferenceFit:
     outer_iterations: int
 
 
-def mixing_density(prior: ReferencePrior, mixing_coordinates: np.ndarray) -> np.ndarray:
+def log_mixing_density(prior: ReferencePrior, mixing_coordinates: np.ndarray) -> np.ndarray:
     log_weights = mixing_coordinates @ sum_to_zero_basis(prior.grid_size).T
-    return np.exp(log_weights - logsumexp(log_weights, axis=1, keepdims=True))
+    return log_weights - logsumexp(log_weights, axis=1, keepdims=True)
+
+
+def mixing_density(prior: ReferencePrior, mixing_coordinates: np.ndarray) -> np.ndarray:
+    return np.exp(log_mixing_density(prior, mixing_coordinates))
 
 
 def _pack(prior: ReferencePrior, mixing_coordinates: np.ndarray, annotation_coefficients: np.ndarray) -> np.ndarray:
@@ -190,7 +199,7 @@ def tilted_terms(
     shift_square = np.square(cavity_shift)[:, None]
     relative = 1.0 + variance * precision
     conditional_variance = variance / relative
-    log_density = np.log(mixing_density(prior, mixing_coordinates))[prior.class_index]
+    log_density = log_mixing_density(prior, mixing_coordinates)[prior.class_index]
     log_component = log_density - 0.5 * np.log(relative) + 0.5 * shift_square * conditional_variance
     log_normalizer = logsumexp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
@@ -263,18 +272,27 @@ def maximize_coefficients(prior, hyperparameters, start, cavity_precision, cavit
     def objective(vector):
         return penalized_objective(prior, hyperparameters, vector, cavity_precision, cavity_shift)
 
+    mixing_size = prior.class_count * (prior.grid_size - 1)
+    bounds = [(-MIXING_COORDINATE_RANGE, MIXING_COORDINATE_RANGE)] * mixing_size + [
+        (-ANNOTATION_COEFFICIENT_RANGE, ANNOTATION_COEFFICIENT_RANGE)
+    ] * prior.feature_count
     result = minimize(
         lambda vector: tuple(-part for part in objective(vector)),
-        start,
+        np.clip(start, [bound[0] for bound in bounds], [bound[1] for bound in bounds]),
         jac=True,
         method="L-BFGS-B",
+        bounds=bounds,
         options={"maxiter": 20_000, "ftol": 1e-16, "gtol": 1e-12},
     )
     vector = np.asarray(result.x, dtype=np.float64)
+    value, gradient = objective(vector)
     for _newton_step in range(12):
-        _value, gradient = objective(vector)
         step = np.linalg.solve(-_numerical_hessian(objective, vector), gradient)
-        vector = vector + step
+        candidate = vector + step
+        candidate_value, candidate_gradient = objective(candidate)
+        if not candidate_value >= value:
+            break
+        vector, value, gradient = candidate, candidate_value, candidate_gradient
         if float(np.max(np.abs(step))) < 1e-12:
             break
     return vector
@@ -378,7 +396,7 @@ def run_sites(prior, hyperparameters, likelihood_precision, linear_term, site_pr
     site_precision = np.array(site_precision, dtype=np.float64, copy=True)
     site_shift = np.array(site_shift, dtype=np.float64, copy=True)
     log_scale = prior.log_variance_offset + prior.centred_design @ hyperparameters.annotation_coefficients
-    log_density = np.log(mixing_density(prior, hyperparameters.mixing_coordinates))[prior.class_index]
+    log_density = log_mixing_density(prior, hyperparameters.mixing_coordinates)[prior.class_index]
     for _sweep in range(maximum_sweeps):
         covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
         covariance = 0.5 * (covariance + covariance.T)
