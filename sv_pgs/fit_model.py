@@ -31,7 +31,9 @@ from sv_pgs.artifact import (
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
-from sv_pgs.full_data_fit import FitCertificate, fit_models
+from sv_pgs.full_data_fit import FitCertificate
+# RUN-ONLY (run/svpgs-bench-1): e2e's full_data_fit.fit_models replaces this wiring.
+from sv_pgs.stage2_wiring import fit_models
 
 # MODEL.md section 4: the scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
 DRAW_COUNT = 64
