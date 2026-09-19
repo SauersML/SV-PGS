@@ -22,6 +22,7 @@ from sv_pgs.all_of_us import (
     DiseaseDefinition,
     MeasurementDefinition,
     prepare_all_of_us_disease_sample_table,
+    phenotype_fingerprint,
     prepare_all_of_us_measurement_sample_table,
     resolve_all_of_us_phenotype,
 )
@@ -839,12 +840,6 @@ def merge_pcs_into_sample_table(
 
     log(f"  extracted {len(pc_cols)} PCs: {pc_cols}")
 
-    # Add age^2
-    if "age_at_observation_start" in samples.columns:
-        samples["age_at_observation_start"] = pd.to_numeric(samples["age_at_observation_start"], errors="coerce")
-        samples["age_squared"] = samples["age_at_observation_start"] ** 2
-        log("  added age_squared covariate")
-
     # Check ID overlap before merging (aggregate counts only, no individual IDs)
     ancestry_ids = set(ancestry[id_col].dropna().astype(str))
     sample_id_sets = {
@@ -910,6 +905,7 @@ def _validate_aou_chromosomes(chromosomes: list[int]) -> list[int]:
 def _build_aou_run_metadata(
     *,
     phenotype: str,
+    phenotype_fingerprint: str,
     chromosomes: list[int],
     n_pcs: int,
     pc_cols: list[str],
@@ -931,6 +927,8 @@ def _build_aou_run_metadata(
         # the key predates quantitative traits and is kept so existing fits
         # still match their metadata.
         "disease": phenotype,
+        # A new phenotype definition (or CDR) means a new target: refit.
+        "phenotype_fingerprint": phenotype_fingerprint,
         "chromosomes": chromosomes,
         "requested_n_pcs": n_pcs,
         "effective_pc_columns": pc_cols,
@@ -1067,36 +1065,13 @@ def _split_merged_sample_table(
     )
     return train_path, test_path
 
-DEFAULT_COVARIATES = [
-    "age_at_observation_start",
-    "age_squared",
-    "gender_concept_id",
-    "race_concept_id",
-    "ethnicity_concept_id",
-]
-# Quantitative traits: mean age and mean squared age over the person's
-# measurement occasions (all_of_us.build_all_of_us_measurement_targets) and
-# sex at birth instead of gender identity.
-MEASUREMENT_COVARIATES = [
-    "age_at_measurement",
-    "age_at_measurement_squared",
-    "sex_at_birth_concept_id",
-    "race_concept_id",
-    "ethnicity_concept_id",
-]
-
 # Categorical OMOP fields that are one-hot expanded during phenotype
 # preparation (see all_of_us._add_one_hot_omop_categorical_covariates).
 # The raw column is popped from the sample table and replaced by one
 # `<name>_<concept_id>` column per observed level. The covariate list
 # must match the actual on-disk columns, so we expand each raw name back
 # into the set of one-hot columns by reading the sample table header.
-_OMOP_ONE_HOT_PREFIXES = (
-    "gender_concept_id",
-    "sex_at_birth_concept_id",
-    "race_concept_id",
-    "ethnicity_concept_id",
-)
+_OMOP_ONE_HOT_PREFIXES = ("sex_at_birth_concept_id",)
 
 
 def _expand_one_hot_covariates(
@@ -1627,6 +1602,24 @@ def _describe_phenotype_source(phenotype_definition: DiseaseDefinition | Measure
     return f"condition SNOMED root {phenotype_definition.snomed_code} ({phenotype_definition.snomed_concept_name})"
 
 
+def _sample_metadata_path(sample_table_path: Path) -> Path:
+    return sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json")
+
+
+def _phenotype_table_is_current(
+    phenotype_definition: DiseaseDefinition | MeasurementDefinition,
+    sample_table_path: Path,
+) -> bool:
+    """The preparer writes the TSV first and the metadata sidecar last, so a
+    table is complete when its sidecar exists, and current when the sidecar's
+    fingerprint matches the phenotype definition (and CDR) in use now."""
+    metadata_path = _sample_metadata_path(sample_table_path)
+    if not (sample_table_path.exists() and metadata_path.exists()):
+        return False
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    return metadata.get("phenotype_fingerprint") == phenotype_fingerprint(phenotype_definition)
+
+
 def _prepare_phenotype_sample_table(
     phenotype_definition: DiseaseDefinition | MeasurementDefinition,
     sample_table_path: Path,
@@ -1832,11 +1825,8 @@ def run_all_of_us(
         log(f"  auto-tune banner unavailable: {_autotune_banner_error}")
     sample_table_path = work_dir / f"{phenotype_definition.canonical_name}.samples.tsv"
     merged_path = work_dir / f"{phenotype_definition.canonical_name}.samples.with_pcs.tsv"
-    _sample_metadata_path = sample_table_path.with_suffix(sample_table_path.suffix + ".metadata.json")
-    log(
-        "  phenotype table: "
-        + ("DONE" if (sample_table_path.exists() and _sample_metadata_path.exists()) else "NEEDED")
-    )
+    phenotype_table_current = _phenotype_table_is_current(phenotype_definition, sample_table_path)
+    log(f"  phenotype table: {'DONE' if phenotype_table_current else 'NEEDED'}")
     log(f"  PC-merged table: {'DONE' if merged_path.exists() else 'NEEDED'}")
     ancestry_local = local_ancestry_predictions_path(work_dir)
     resolved_variant_metadata_path = Path(variant_metadata_path) if variant_metadata_path is not None else None
@@ -1948,27 +1938,12 @@ def run_all_of_us(
 
     # Step 1: Prepare phenotype
     log("=== STEP 1: Prepare phenotype ===")
-    sample_table_path = work_dir / f"{phenotype_definition.canonical_name}.samples.tsv"
-    # The writer in prepare_all_of_us_disease_sample_table emits the TSV
-    # first and the .sql / .metadata.json sidecars second. An interrupted
-    # run therefore leaves a partial TSV without sidecars on disk. Treat
-    # the metadata sidecar (written last) as the completion marker so
-    # truncated TSVs are rewritten instead of silently reused.
-    sample_metadata_path = sample_table_path.with_suffix(
-        sample_table_path.suffix + ".metadata.json"
-    )
-    if not sample_table_path.exists() or not sample_metadata_path.exists():
-        if sample_table_path.exists() and not sample_metadata_path.exists():
-            log(
-                f"  existing sample table missing metadata sidecar; rewriting: {sample_table_path}"
-            )
-            try:
-                sample_table_path.unlink()
-            except OSError:
-                pass
-        _prepare_phenotype_sample_table(phenotype_definition, sample_table_path)
+    if phenotype_table_current:
+        log(f"  sample table is current: {sample_table_path}")
     else:
-        log(f"  sample table already exists: {sample_table_path}")
+        log(f"  preparing sample table (missing, partial or from another definition): {sample_table_path}")
+        _prepare_phenotype_sample_table(phenotype_definition, sample_table_path)
+    sample_metadata = json.loads(_sample_metadata_path(sample_table_path).read_text(encoding="utf-8"))
 
     # Step 2: Download and merge PCs
     log("=== STEP 2: Merge genomic PCs ===")
@@ -1981,20 +1956,17 @@ def run_all_of_us(
         n_pcs=n_pcs,
     )
 
-    # Build covariate list. The phenotype preparation step one-hot encodes
-    # gender/race/ethnicity concept_ids into `<name>_<id>` columns and drops
-    # the raw column, so expand those entries against the merged table's
-    # header before passing the list to the loader.
-    base_covariates = (
-        MEASUREMENT_COVARIATES if isinstance(phenotype_definition, MeasurementDefinition) else DEFAULT_COVARIATES
-    )
-    covariates = _expand_one_hot_covariates(base_covariates + pc_cols, merged_path)
+    # The phenotype's covariates come from its metadata sidecar. Preparation
+    # one-hot encodes sex_at_birth_concept_id into `<name>_<id>` columns and
+    # drops the raw column, so expand it against the merged table's header.
+    covariates = _expand_one_hot_covariates(list(sample_metadata["covariate_columns"]) + pc_cols, merged_path)
     log(f"  covariates ({len(covariates)}): {covariates}")
 
     summary_path = work_dir / "summary.json.gz"
     run_metadata_path = _aou_run_metadata_path(work_dir)
     run_metadata = _build_aou_run_metadata(
         phenotype=phenotype_definition.canonical_name,
+        phenotype_fingerprint=sample_metadata["phenotype_fingerprint"],
         chromosomes=chromosomes,
         n_pcs=n_pcs,
         pc_cols=pc_cols,
