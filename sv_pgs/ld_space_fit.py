@@ -88,8 +88,9 @@ from threadpoolctl import threadpool_limits
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.anderson import AndersonState, anderson_step
 from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.config import ModelConfig
 from sv_pgs.genotype import _try_import_cupy
-from sv_pgs.mixture_inference import _gig_moment
+from sv_pgs.mixture_inference import PriorDesign, _gig_moment, _scale_model_penalty
 from sv_pgs.progress import log
 
 # EP damping of the site parameters, as in theory-inference's clipped EP.
@@ -347,6 +348,37 @@ class LDPriorHypermodel:
             log_variance_level + self.log_variance_offset[variants] + self.annotation_design[variants] @ coefficients,
             dtype=np.float64,
         )
+
+
+def hypermodel_from_prior_design(
+    prior_design: PriorDesign,
+    config: ModelConfig,
+    log_variance_offset: F64Array,
+    shape_a: float,
+) -> LDPriorHypermodel:
+    """The Stage 1 hypermodel on today's prior design (class offsets, factor levels, splines).
+
+    The design's coefficients act on the log prior SD with ridge precisions from
+    ``config``; on the log variance they are doubled, so their precisions are
+    quartered. Each variant needs exactly one prior class.
+    """
+    membership = np.asarray(prior_design.class_membership_matrix, dtype=np.float64)
+    if not (np.all((membership == 0.0) | (membership == 1.0)) and np.all(membership.sum(axis=1) == 1.0)):
+        raise ValueError("Stage 1 needs one prior class per variant; soft class membership is not supported.")
+    classes = [prior_design.inverse_class_lookup[class_position] for class_position in range(membership.shape[1])]
+    default_shape_b = config.class_tpb_shape_b()
+    feature_count = prior_design.design_matrix.shape[1]
+    return LDPriorHypermodel(
+        annotation_design=np.asarray(prior_design.design_matrix, dtype=np.float64),
+        annotation_prior_mean=np.zeros(feature_count),
+        annotation_prior_precision=_scale_model_penalty(prior_design.feature_names, config) / 4.0,
+        log_variance_offset=np.asarray(log_variance_offset, dtype=np.float64),
+        variant_class_index=np.argmax(membership, axis=1).astype(np.int64),
+        class_names=tuple(variant_class.value for variant_class in classes),
+        shape_a=shape_a,
+        initial_shape_b=np.array([default_shape_b[variant_class] for variant_class in classes], dtype=np.float64),
+        shape_b_pooling_variance=config.tpb_hierarchical_prior_variance,
+    )
 
 
 @dataclass(slots=True)

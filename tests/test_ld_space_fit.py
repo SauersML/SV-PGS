@@ -22,6 +22,8 @@ from scipy.special import betaln, digamma, expit
 
 from sv_pgs import ld_space_fit
 from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.config import ModelConfig, VariantClass
+from sv_pgs.mixture_inference import _build_prior_design
 from sv_pgs.ld_space_fit import (
     ExpectationPropagationSites,
     InMemoryLDBlocks,
@@ -30,8 +32,10 @@ from sv_pgs.ld_space_fit import (
     binary_statistics_at,
     fit_ld_space,
     gig_expected_log,
+    hypermodel_from_prior_design,
     inverse_digamma,
 )
+from tests.conftest import make_variant_records
 
 SCHEMES = ("expectation_propagation", "coherent_vb", "plug_in")
 CPU_BUDGET = ComputeBudget(
@@ -75,6 +79,20 @@ def test_anderson_extrapolation_is_capped_on_the_log_scale() -> None:
     capped = ld_space_fit._accelerated_hyperparameters(acceleration, np.array([1.0]), np.array([1.999]))
     np.testing.assert_array_equal(capped, [1.999])
     assert not acceleration.residuals
+
+
+def test_hypermodel_from_prior_design_maps_classes_and_precisions() -> None:
+    records = make_variant_records(30) + make_variant_records(10, VariantClass.DELETION_SHORT)
+    prior_design = _build_prior_design(records)
+    config = ModelConfig()
+    offset = np.log(np.linspace(0.4, 1.0, 40))
+    hypermodel = hypermodel_from_prior_design(prior_design, config, offset, shape_a=0.5)
+    assert hypermodel.class_names == ("deletion_short", "snv")
+    np.testing.assert_array_equal(hypermodel.variant_class_index, np.r_[np.ones(30), np.zeros(10)])
+    np.testing.assert_array_equal(hypermodel.initial_shape_b, [config.class_tpb_shape_b()[VariantClass.DELETION_SHORT], 0.5])
+    # The one type-offset column carries the type-offset penalty, quartered on the log-variance scale.
+    np.testing.assert_array_equal(hypermodel.annotation_prior_precision, [config.type_offset_penalty / 4.0])
+    np.testing.assert_array_equal(hypermodel.log_variance_offset, offset)
 
 
 def test_host_worker_count_is_bounded_by_threads_and_memory() -> None:
