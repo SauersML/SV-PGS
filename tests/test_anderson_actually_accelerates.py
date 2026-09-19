@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 import sv_pgs.mixture_inference as mixture_inference
 from sv_pgs.preprocessing import build_tie_map
 

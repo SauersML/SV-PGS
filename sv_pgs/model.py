@@ -43,7 +43,8 @@ from sv_pgs.genotype import (
     auto_batch_size,
 )
 from sv_pgs.plink import PLINK_MISSING_INT8
-from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult, fit_variational_em
+from sv_pgs.inference import VariationalFitResult
+from sv_pgs.mixture_inference import VariationalFitCheckpoint, fit_variational_em
 from sv_pgs.numeric import logistic_normal_probit_scale, stable_sigmoid
 from sv_pgs.preprocessing import (
     Preprocessor,

@@ -13,7 +13,7 @@ import pytest
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
 from sv_pgs.elbo import compute_elbo
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.preprocessing import build_tie_map
 
 

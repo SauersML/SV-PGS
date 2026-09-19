@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     VariationalFitCheckpoint,
     _gig_moment,

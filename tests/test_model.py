@@ -25,7 +25,8 @@ from sv_pgs import (
 )
 from sv_pgs.data import TieGroup, TieMap, VariantStatistics
 from sv_pgs.genotype import RawGenotypeBatch, RawGenotypeMatrix, as_raw_genotype_matrix
-from sv_pgs.inference import VariationalFitCheckpoint, VariationalFitResult
+from sv_pgs.inference import VariationalFitResult
+from sv_pgs.mixture_inference import VariationalFitCheckpoint
 from sv_pgs.model import (
     _FitStageCachePaths,
     _active_indices_cover_original,

@@ -11,7 +11,7 @@ import numpy as np
 
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     VariationalFitCheckpoint,
     _build_prior_design,

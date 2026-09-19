@@ -10,7 +10,7 @@ from scipy.special import kve
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import TieGroup, TieMap, VariantRecord
 from sv_pgs.genotype import StandardizedGenotypeMatrix, as_raw_genotype_matrix
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.mixture_inference import (
     _binary_newton_solver_controls,
     _build_restricted_projector_jax,

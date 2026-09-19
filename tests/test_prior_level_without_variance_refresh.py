@@ -15,7 +15,7 @@ from sklearn.metrics import roc_auc_score
 from sv_pgs import mixture_inference
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.inference import fit_variational_em
+from sv_pgs.mixture_inference import fit_variational_em
 from sv_pgs.preprocessing import build_tie_map
 
 from tests.test_prediction_accuracy import _covariate_only_holdout_probability
