@@ -12,6 +12,7 @@ These documents describe SV-PGS: the one model, its dosage store, its phenotypes
 | [COMPUTE.md](COMPUTE.md) | Cost model, cloud launch path, MSI notes |
 | [CUTOVER.md](CUTOVER.md) | The ordered deletion of the old path (C2–C8): files, tests, blockers, verification |
 | [DECISIONS.md](DECISIONS.md) | Dated log of the design rulings and the measurements behind them |
+| [math/scale_model.md](math/scale_model.md) | Derivation of the prior scale: the r² offset, joint leakage and the A-map, stacking, the frequency term from stabilizing selection, shape vs scale, the TR column, the SV-context kernel, the pooling pin |
 
 **Standing rules** (also in SPEC.md):
 - one model and one path;
