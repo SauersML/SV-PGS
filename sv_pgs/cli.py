@@ -14,6 +14,8 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_measurement_census,
     prepare_all_of_us_measurement_sample_table,
 )
+from sv_pgs.artifact import write_predictions
+from sv_pgs.compute_budget import detect_compute_budget
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -65,6 +67,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     census_parser.add_argument("--output", required=True, help="Output TSV path for the census.")
 
+    score_parser = subparsers.add_parser(
+        "score",
+        help="Score store samples with a fitted model and write their genetic scores and posterior predictive.",
+    )
+    score_parser.add_argument("model", help="Fitted model directory.")
+    score_parser.add_argument("store", help="Dosage store directory with the model's variant layout.")
+    score_parser.add_argument(
+        "people",
+        help="NPZ with sample_indices [n] (store columns) and covariates [n, k] in the model's covariate order, without the intercept.",
+    )
+    score_parser.add_argument("output", help="Output NPZ of model_names and the prediction arrays [n, models]; never overwritten.")
+
     subparsers.add_parser(
         "version",
         help="Print sv-pgs package version and git commit sha.",
@@ -103,6 +117,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if args.command == "version":
         pkg_ver, git_sha = _resolve_version_info()
         print(f"sv-pgs {pkg_ver} commit {git_sha}")
+        return 0
+
+    if args.command == "score":
+        write_predictions(args.model, args.store, args.people, args.output, detect_compute_budget())
+        print("predictions\t" + str(args.output))
         return 0
 
     if args.command == "list-all-of-us-diseases":

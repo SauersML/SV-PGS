@@ -1,361 +1,323 @@
+"""A fitted SV-PGS model on disk: every (trait, fold) scoring model, the fit's certificate, its prior hyperparameters and
+its provenance. A model loads and scores without the fit that made it.
+
+Layout of a model directory::
+
+    model.json   format, model names and trait types, covariate names, provenance, and the name of every array
+    arrays.npz   every array, by name
+
+``save_model`` writes a sibling temporary directory, flushes both files, and renames the directory into place, so
+a reader finds either no model or a complete one. An existing model is never overwritten. ``load_model`` refuses
+any model whose format, names, shapes or values are not exactly what ``save_model`` writes.
+"""
+
 from __future__ import annotations
 
+import hashlib
 import json
-import logging
 import os
-import uuid
-import zipfile
-from dataclasses import asdict, dataclass
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from sv_pgs._typing import F32Array
-from sv_pgs.config import ModelConfig, TraitType, VariantClass
-from sv_pgs.data import TieGroup, TieMap, VariantRecord, normalize_variant_records
-
-# A truncated/half-written arrays.npz raises zipfile.BadZipFile, which is NOT an
-# OSError/ValueError subclass; without it a corrupt artifact crashes the reuse
-# check instead of degrading to a clean refit. (json.JSONDecodeError IS a
-# ValueError subclass, so a corrupt metadata.json is already covered.)
-_ARTIFACT_CORRUPTION_ERRORS: tuple[type[BaseException], ...] = (
-    OSError,
-    ValueError,
-    KeyError,
-    zipfile.BadZipFile,
+from sv_pgs._typing import F64Array
+from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.config import TraitType
+from sv_pgs.dosage_store import MANIFEST_FILE, DosageStore, read_manifest
+from sv_pgs.fast_scoring import (
+    GeneticScores,
+    ScoringModel,
+    ScoringPlan,
+    posterior_predictive_probability,
+    score_genetic,
+    score_linear_predictor,
 )
+from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+MODEL_FORMAT = "svpgs-model v1"
+_METADATA = "model.json"
+_ARRAYS = "arrays.npz"
+_SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha")
 
 
-def _fsync_parent_dir(path: Path) -> None:
-    """Best-effort fsync of `path.parent` so an atomic rename survives a crash.
+@dataclass(frozen=True)
+class Provenance:
+    """What produced a model: the exact code, the exact store, its variant layout and the exact training cohort.
 
-    Atomic rename guarantees the file's new name is visible OR the old one
-    is, but durability of the directory entry update itself requires fsync
-    on the parent directory FD. Silent no-op on platforms that don't
-    support directory fsync (e.g. Windows).
+    ``code_digest`` is the SHA-256 of the ``sv_pgs`` sources, ``store_digest`` that of the training store's
+    ``MANIFEST.json``, ``sites_digest`` that of its chromosomes, record counts and site digests (the layout the
+    scoring models' store rows index; any store scored with the model must have the same one), and
+    ``cohort_digest`` that of the training research IDs. Digests only, no identifiers.
     """
-    try:
-        dir_fd = os.open(str(path.parent), os.O_RDONLY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        try:
-            os.close(dir_fd)
-        except OSError:
-            pass
 
-_LEGACY_DIAGNOSTICS_LOGGED = False
-_logger = logging.getLogger(__name__)
+    code_digest: str
+    store_digest: str
+    sites_digest: str
+    cohort_digest: str
 
 
-@dataclass(slots=True)
-class ModelArtifact:
-    config: ModelConfig
-    records: list[VariantRecord]
-    means: F32Array
-    scales: F32Array
-    alpha: F32Array
-    beta_reduced: F32Array
-    beta_full: F32Array
-    beta_variance: F32Array
-    tie_map: TieMap
-    sigma_e2: float
-    prior_scales: F32Array
-    global_scale: float
-    class_tpb_shape_a: dict[VariantClass, float]
-    class_tpb_shape_b: dict[VariantClass, float]
-    scale_model_coefficients: F32Array
-    scale_model_feature_names: list[str]
-    objective_history: list[float]
-    validation_history: list[float]
-    # SHA-256 of (genotype shape, variant records, covariates, targets, config)
-    # captured at fit time. Empty string means "unknown / legacy artifact" —
-    # auto-reuse paths must treat that as a miss. Populated via
-    # ``BayesianPGS.export(..., fit_fingerprint=...)``.
-    fit_fingerprint: str = ""
-    # Convergence diagnostics persisted from the variational fit. Older
-    # artifacts predate these fields; load_artifact() back-fills them with
-    # defaults (converged=False, others None) and emits a one-shot warning.
-    converged: bool = False
-    selected_iteration_count: int = 0
-    final_parameter_change: float | None = None
-    final_predictor_change: float | None = None
-    final_objective_change: float | None = None
-    final_hyperparameter_change: float | None = None
-    # Intercept shift of the damped posterior predictive (predict_proba). Artifacts
-    # written before it existed load with 0.0, their earlier predict_proba.
-    predictive_intercept_shift: float = 0.0
+def code_digest() -> str:
+    """SHA-256 over every ``sv_pgs`` source file, in path order, each prefixed by its path."""
+    package = Path(__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(path.relative_to(package).as_posix().encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def store_digest(store_root: str | Path) -> str:
+    """SHA-256 of the store's manifest file."""
+    return hashlib.sha256((Path(store_root) / MANIFEST_FILE).read_bytes()).hexdigest()
+
+
+def sites_digest(store_root: str | Path) -> str:
+    """SHA-256 of the store's variant layout: its chromosomes in order, their record counts and site digests."""
+    manifest = read_manifest(Path(store_root))
+    layout = {
+        "chromosomes": manifest["chromosomes"],
+        "record_counts": manifest["record_counts"],
+        "sites_md5": [manifest["sites_md5"][chromosome] for chromosome in manifest["chromosomes"]],
+    }
+    return hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()
+
+
+def cohort_digest(research_ids: Sequence[str]) -> str:
+    """SHA-256 over the training research IDs, sorted and newline-joined."""
+    values = sorted(str(value) for value in research_ids)
+    if len(set(values)) != len(values):
+        raise ValueError("research_ids repeats a participant.")
+    return hashlib.sha256("\n".join(values).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class FittedModel:
+    """One fitted model per (trait, fold) training set, in ``model_names`` order.
+
+    ``certificate`` holds every term of the fit's certificate as an array with one entry per model;
+    ``noise_variance`` is each quantitative model's residual variance, used in its predictive variance.
+    """
+
+    model_names: tuple[str, ...]
+    covariate_names: tuple[str, ...]
+    scoring: tuple[ScoringModel, ...]
+    noise_variance: F64Array
+    hyperparameters: tuple[MixtureHyperparameters, ...]
+    certificate: Mapping[str, F64Array]
+    provenance: Provenance
 
     def __post_init__(self) -> None:
-        self.records = normalize_variant_records(self.records)
-        variant_count = len(self.records)
-        if self.means.shape != (variant_count,):
-            raise ValueError("Artifact means must align with records.")
-        if self.scales.shape != (variant_count,):
-            raise ValueError("Artifact scales must align with records.")
-        if self.beta_full.shape != (variant_count,):
-            raise ValueError("Artifact beta_full must align with records.")
-        if self.tie_map.original_to_reduced.shape != (variant_count,):
-            raise ValueError("Artifact tie_map must align with records.")
+        model_count = len(self.model_names)
+        if model_count == 0 or len(set(self.model_names)) != model_count:
+            raise ValueError("a model needs distinct model names.")
+        if len(self.scoring) != model_count or len(self.hyperparameters) != model_count:
+            raise ValueError("scoring and hyperparameters need one entry per model.")
+        noise = np.asarray(self.noise_variance)
+        if noise.shape != (model_count,) or noise.dtype != np.float64 or not np.all(np.isfinite(noise)) or np.any(noise <= 0.0):
+            raise ValueError("noise_variance must be positive float64 with one entry per model.")
+        for model in self.scoring:
+            if model.alpha.shape[0] != len(self.covariate_names) + 1:
+                raise ValueError("each model's alpha must hold the intercept and one entry per covariate.")
+        for name, values in self.certificate.items():
+            if np.asarray(values).shape[:1] != (model_count,):
+                raise ValueError(f"certificate term {name!r} needs one entry per model.")
+
+    @property
+    def trait_types(self) -> tuple[TraitType, ...]:
+        return tuple(model.trait_type for model in self.scoring)
 
 
-def save_artifact(path: str | Path, artifact: ModelArtifact) -> None:
-    root = Path(path)
-    root.mkdir(parents=True, exist_ok=True)
-    arrays_final = root / "arrays.npz"
-    metadata_final = root / "metadata.json"
-    # Per-process unique temp names so two concurrent save_artifact() calls
-    # targeting the same output dir cannot clobber each other's staging
-    # files mid-write. The replace at the end is still atomic per file.
-    unique_tag = f"{os.getpid()}.{uuid.uuid4().hex}"
-    arrays_tmp = root / f"arrays.tmp.{unique_tag}.npz"
-    metadata_tmp = root / f"metadata.json.tmp.{unique_tag}"
-
-    # Write arrays to a staging file and fsync before publishing either output,
-    # so a crash between the two replaces cannot leave new arrays paired with
-    # old metadata (or vice versa).
-    try:
-        np.savez_compressed(
-            arrays_tmp,
-            means=artifact.means,
-            scales=artifact.scales,
-            alpha=artifact.alpha,
-            beta_reduced=artifact.beta_reduced,
-            beta_full=artifact.beta_full,
-            beta_variance=artifact.beta_variance,
-            tie_kept_indices=artifact.tie_map.kept_indices,
-            tie_original_to_reduced=artifact.tie_map.original_to_reduced,
-            prior_scales=artifact.prior_scales,
-            scale_model_coefficients=artifact.scale_model_coefficients,
-        )
-        # Reopen read-write so the fsync flushes dirty pages of THIS handle's
-        # cache (read-mode fsync on a fresh fd was a no-op in practice).
-        with open(arrays_tmp, "r+b") as arrays_handle:
-            os.fsync(arrays_handle.fileno())
-    except BaseException:
-        # Don't leak per-pid staging files when serialization fails.
-        try:
-            Path(arrays_tmp).unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-    payload = {
-        "config": _config_to_json(artifact.config),
-        "records": [
-            {
-                "variant_id": record.variant_id,
-                "variant_class": record.variant_class.value,
-                "chromosome": record.chromosome,
-                "position": record.position,
-                "length": record.length,
-                "allele_frequency": record.allele_frequency,
-                "quality": record.quality,
-                "training_support": record.training_support,
-                "is_repeat": record.is_repeat,
-                "is_copy_number": record.is_copy_number,
-                "prior_binary_features": dict(record.prior_binary_features),
-                "prior_continuous_features": dict(record.prior_continuous_features),
-                "prior_categorical_features": dict(record.prior_categorical_features),
-                "prior_membership_features": {
-                    feature_name: dict(feature_memberships)
-                    for feature_name, feature_memberships in record.prior_membership_features.items()
-                },
-                "prior_nested_features": {
-                    feature_name: list(feature_path)
-                    for feature_name, feature_path in record.prior_nested_features.items()
-                },
-                "prior_nested_membership_features": {
-                    feature_name: dict(feature_memberships)
-                    for feature_name, feature_memberships in record.prior_nested_membership_features.items()
-                },
-                "prior_class_members": [
-                    variant_class.value for variant_class in record.prior_class_members
-                ],
-                "prior_class_membership": list(record.prior_class_membership),
-            }
-            for record in artifact.records
-        ],
-        "tie_groups": [
-            {
-                "representative_index": group.representative_index,
-                "member_indices": group.member_indices.tolist(),
-                "signs": group.signs.tolist(),
-            }
-            for group in artifact.tie_map.reduced_to_group
-        ],
-        "sigma_e2": artifact.sigma_e2,
-        "global_scale": float(artifact.global_scale),
-        "class_tpb_shape_a": {
-            variant_class.value: float(value) for variant_class, value in artifact.class_tpb_shape_a.items()
+def save_model(path: str | Path, model: FittedModel) -> None:
+    """Write ``model`` to the new directory ``path``, atomically."""
+    target = Path(path)
+    if target.exists():
+        raise FileExistsError(f"{target} exists; a model is never overwritten.")
+    arrays: dict[str, np.ndarray] = {"noise_variance": model.noise_variance}
+    for index, scoring in enumerate(model.scoring):
+        for field_name in _SCORING_FIELDS:
+            arrays[f"scoring/{index}/{field_name}"] = getattr(scoring, field_name)
+    for index, hyperparameters in enumerate(model.hyperparameters):
+        arrays[f"hyperparameters/{index}/coefficients"] = hyperparameters.coefficients
+        arrays[f"hyperparameters/{index}/log_smoothing"] = hyperparameters.log_smoothing
+    for name, values in model.certificate.items():
+        arrays[f"certificate/{name}"] = np.asarray(values)
+    metadata = {
+        "format": MODEL_FORMAT,
+        "model_names": list(model.model_names),
+        "trait_types": [trait_type.value for trait_type in model.trait_types],
+        "covariate_names": list(model.covariate_names),
+        "predictive_intercept_shifts": [scoring.predictive_intercept_shift for scoring in model.scoring],
+        "certificate_terms": sorted(model.certificate),
+        "provenance": {
+            "code_digest": model.provenance.code_digest,
+            "store_digest": model.provenance.store_digest,
+            "sites_digest": model.provenance.sites_digest,
+            "cohort_digest": model.provenance.cohort_digest,
         },
-        "class_tpb_shape_b": {
-            variant_class.value: float(value) for variant_class, value in artifact.class_tpb_shape_b.items()
-        },
-        "scale_model_feature_names": artifact.scale_model_feature_names,
-        "objective_history": artifact.objective_history,
-        "validation_history": artifact.validation_history,
-        "fit_fingerprint": artifact.fit_fingerprint,
-        "converged": bool(artifact.converged),
-        "selected_iteration_count": int(artifact.selected_iteration_count),
-        "final_parameter_change": (
-            None if artifact.final_parameter_change is None else float(artifact.final_parameter_change)
-        ),
-        "final_predictor_change": (
-            None if artifact.final_predictor_change is None else float(artifact.final_predictor_change)
-        ),
-        "final_objective_change": (
-            None if artifact.final_objective_change is None else float(artifact.final_objective_change)
-        ),
-        "final_hyperparameter_change": (
-            None
-            if artifact.final_hyperparameter_change is None
-            else float(artifact.final_hyperparameter_change)
-        ),
-        "predictive_intercept_shift": float(artifact.predictive_intercept_shift),
+        "arrays": sorted(arrays),
     }
-    metadata_bytes = json.dumps(payload, indent=2).encode("utf-8")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.", dir=target.parent))
+    with open(staging / _ARRAYS, "wb") as handle:
+        np.savez(handle, **arrays)
+        handle.flush()
+        os.fsync(handle.fileno())
+    with open(staging / _METADATA, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=1, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.rename(staging, target)
+    directory = os.open(target.parent, os.O_RDONLY)
     try:
-        with open(metadata_tmp, "wb") as metadata_handle:
-            metadata_handle.write(metadata_bytes)
-            metadata_handle.flush()
-            os.fsync(metadata_handle.fileno())
-    except BaseException:
-        try:
-            Path(metadata_tmp).unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            Path(arrays_tmp).unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
-
-    # Both staging files are durable on disk; publish via atomic per-file
-    # replaces. A crash before the first replace leaves the prior pair intact.
-    # The window between the two replaces is two metadata operations — orders
-    # of magnitude smaller than the prior write window — and the metadata
-    # replace is treated as the commit point.
-    os.replace(arrays_tmp, arrays_final)
-    os.replace(metadata_tmp, metadata_final)
-    # fsync the directory so the rename itself is durable across a crash;
-    # without this the rename can be lost even though the files survive.
-    _fsync_parent_dir(arrays_final)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
-def load_artifact(path: str | Path) -> ModelArtifact:
-    root = Path(path)
-    # ``np.load`` on an .npz returns an NpzFile that keeps the underlying
-    # ZipFile open until ``close()``. Without an explicit close, the file
-    # descriptor lingers until GC — on long-running pipelines that load many
-    # artifacts (e.g. sweeping across diseases) this can exhaust the per-process
-    # fd limit. Use ``with`` so the zip handle is released deterministically
-    # even when key lookups or ``astype`` raise mid-construction.
-    with np.load(root / "arrays.npz", allow_pickle=False) as arrays:
-        payload = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+def _required(metadata: Mapping[str, Any], key: str, kind: type) -> Any:
+    if key not in metadata or not isinstance(metadata[key], kind):
+        raise ValueError(f"model.json has no valid {key!r}.")
+    return metadata[key]
 
-        tie_map = TieMap(
-            kept_indices=arrays["tie_kept_indices"].astype(np.int32),
-            original_to_reduced=arrays["tie_original_to_reduced"].astype(np.int32),
-            reduced_to_group=[
-                TieGroup(
-                    representative_index=int(group["representative_index"]),
-                    member_indices=np.asarray(group["member_indices"], dtype=np.int32),
-                    signs=np.asarray(group["signs"], dtype=np.float32),
-                )
-                for group in payload["tie_groups"]
-            ],
+
+def load_model(path: str | Path) -> FittedModel:
+    """Read a model written by ``save_model``; anything else raises ``ValueError``."""
+    directory = Path(path)
+    with open(directory / _METADATA, encoding="utf-8") as handle:
+        metadata = json.load(handle)
+    if not isinstance(metadata, dict) or metadata.get("format") != MODEL_FORMAT:
+        raise ValueError(f"{directory} is not a {MODEL_FORMAT!r} model.")
+    model_names = tuple(_required(metadata, "model_names", list))
+    trait_types = tuple(TraitType(value) for value in _required(metadata, "trait_types", list))
+    covariate_names = tuple(_required(metadata, "covariate_names", list))
+    shifts = _required(metadata, "predictive_intercept_shifts", list)
+    terms = _required(metadata, "certificate_terms", list)
+    provenance = _required(metadata, "provenance", dict)
+    names = _required(metadata, "arrays", list)
+    if not len(model_names) == len(trait_types) == len(shifts):
+        raise ValueError("model.json lists models, trait types and intercept shifts of different lengths.")
+    with np.load(directory / _ARRAYS, allow_pickle=False) as archive:
+        if sorted(archive.files) != sorted(names):
+            raise ValueError("arrays.npz does not hold exactly the arrays model.json lists.")
+        arrays = {name: np.array(archive[name]) for name in archive.files}
+    scoring = tuple(
+        ScoringModel(
+            **{field_name: arrays[f"scoring/{index}/{field_name}"] for field_name in _SCORING_FIELDS},
+            trait_type=trait_type,
+            predictive_intercept_shift=float(shift),
         )
-        return ModelArtifact(
-            config=_config_from_json(payload["config"]),
-            records=payload["records"],
-            means=arrays["means"].astype(np.float32),
-            scales=arrays["scales"].astype(np.float32),
-            alpha=arrays["alpha"].astype(np.float32),
-            beta_reduced=arrays["beta_reduced"].astype(np.float32),
-            beta_full=arrays["beta_full"].astype(np.float32),
-            beta_variance=arrays["beta_variance"].astype(np.float32),
-            tie_map=tie_map,
-            sigma_e2=float(payload["sigma_e2"]),
-            prior_scales=arrays["prior_scales"].astype(np.float32),
-            global_scale=float(payload["global_scale"]),
-            class_tpb_shape_a={
-                VariantClass(key): float(value)
-                for key, value in payload["class_tpb_shape_a"].items()
-            },
-            class_tpb_shape_b={
-                VariantClass(key): float(value)
-                for key, value in payload["class_tpb_shape_b"].items()
-            },
-            scale_model_coefficients=arrays["scale_model_coefficients"].astype(np.float32),
-            scale_model_feature_names=[str(feature_name) for feature_name in payload["scale_model_feature_names"]],
-            objective_history=[float(value) for value in payload["objective_history"]],
-            validation_history=[float(value) for value in payload["validation_history"]],
-            fit_fingerprint=str(payload.get("fit_fingerprint", "")),
-            predictive_intercept_shift=float(payload.get("predictive_intercept_shift", 0.0)),
-            **_load_diagnostics(payload),
+        for index, (trait_type, shift) in enumerate(zip(trait_types, shifts))
+    )
+    hyperparameters = tuple(
+        MixtureHyperparameters(
+            coefficients=arrays[f"hyperparameters/{index}/coefficients"],
+            log_smoothing=arrays[f"hyperparameters/{index}/log_smoothing"],
         )
+        for index in range(len(model_names))
+    )
+    return FittedModel(
+        model_names=model_names,
+        covariate_names=covariate_names,
+        scoring=scoring,
+        noise_variance=arrays["noise_variance"],
+        hyperparameters=hyperparameters,
+        certificate={name: arrays[f"certificate/{name}"] for name in terms},
+        provenance=Provenance(
+            code_digest=str(provenance["code_digest"]),
+            store_digest=str(provenance["store_digest"]),
+            sites_digest=str(provenance["sites_digest"]),
+            cohort_digest=str(provenance["cohort_digest"]),
+        ),
+    )
 
 
-def _load_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
-    global _LEGACY_DIAGNOSTICS_LOGGED
-    if "converged" not in payload and not _LEGACY_DIAGNOSTICS_LOGGED:
-        _logger.warning(
-            "Loading legacy artifact without convergence diagnostics; "
-            "defaulting converged=False and final_*_change=None."
-        )
-        _LEGACY_DIAGNOSTICS_LOGGED = True
+class StoreCodeBlocks:
+    """A ``DosageStore`` as ``fast_scoring.CodeBlockSource``: its own read-ahead ring, all samples."""
 
-    def _opt_float(key: str) -> float | None:
-        value = payload.get(key)
-        return None if value is None else float(value)
+    def __init__(self, store: DosageStore, budget: ComputeBudget) -> None:
+        self.store = store
+        self.budget = budget
 
-    return {
-        "converged": bool(payload.get("converged", False)),
-        "selected_iteration_count": int(payload.get("selected_iteration_count", 0)),
-        "final_parameter_change": _opt_float("final_parameter_change"),
-        "final_predictor_change": _opt_float("final_predictor_change"),
-        "final_objective_change": _opt_float("final_objective_change"),
-        "final_hyperparameter_change": _opt_float("final_hyperparameter_change"),
-    }
+    @property
+    def sample_count(self) -> int:
+        return int(self.store.n_samples)
+
+    def iter_code_blocks(self, variant_ranges, buffers):
+        yield from self.store.iter_codes(variant_ranges, None, self.budget)
 
 
-def try_load_artifact_if_fingerprint_matches(
-    path: str | Path,
-    expected_fingerprint: str,
-) -> ModelArtifact | None:
-    """Return the artifact at ``path`` iff its ``fit_fingerprint`` matches.
+@dataclass(frozen=True)
+class Prediction:
+    """Predictions [samples, models] for the scored samples.
 
-    Returns ``None`` when the artifact is absent, malformed, missing a
-    fingerprint, or the fingerprint differs. Callers use this to decide
-    whether to skip a refit and reuse a prior run's outputs.
+    ``genetic`` holds the posterior-mean genetic scores and their K-draw posterior variances;
+    ``linear_predictor`` adds the intercept and covariate effects. ``predictive_mean`` is the linear predictor for a
+    quantitative trait and P(y = 1) for a binary one; ``predictive_variance`` is the genetic variance plus the noise
+    variance for a quantitative trait and p(1 - p) for a binary one.
     """
-    root = Path(path)
-    if not (root / "arrays.npz").exists() or not (root / "metadata.json").exists():
-        return None
-    if not expected_fingerprint:
-        return None
-    try:
-        artifact = load_artifact(root)
-    except _ARTIFACT_CORRUPTION_ERRORS:
-        return None
-    if not artifact.fit_fingerprint or artifact.fit_fingerprint != expected_fingerprint:
-        return None
-    return artifact
+
+    genetic: GeneticScores
+    linear_predictor: F64Array
+    predictive_mean: F64Array
+    predictive_variance: F64Array
 
 
-def _config_to_json(config: ModelConfig) -> dict[str, Any]:
-    payload = asdict(config)
-    payload["trait_type"] = config.trait_type.value
-    return payload
+def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, covariates: F64Array, budget: ComputeBudget) -> Prediction:
+    """Score ``model`` on the store samples ``sample_indices``, whose covariates are ``covariates`` in the model's
+    ``covariate_names`` order without the intercept, from one read of the store."""
+    if sites_digest(store.root) != model.provenance.sites_digest:
+        raise ValueError(f"{store.root} has a different variant layout than the store the model was fitted on.")
+    samples = np.asarray(sample_indices, dtype=np.int64)
+    covariate_matrix = np.asarray(covariates, dtype=np.float64)
+    if covariate_matrix.shape != (samples.shape[0], len(model.covariate_names)):
+        raise ValueError("covariates must be [samples, the model's covariates].")
+    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(model.scoring), budget, samples)
+    linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, model.scoring)
+    predictive_mean = np.empty_like(linear_predictor)
+    predictive_variance = np.empty_like(linear_predictor)
+    for index, scoring in enumerate(model.scoring):
+        if scoring.trait_type == TraitType.BINARY:
+            probability = posterior_predictive_probability(
+                linear_predictor[:, index], genetic.variances[:, index], scoring.predictive_intercept_shift
+            )
+            predictive_mean[:, index] = probability
+            predictive_variance[:, index] = probability * (1.0 - probability)
+        else:
+            predictive_mean[:, index] = linear_predictor[:, index]
+            genetic_variance = genetic.variances[:, index]
+            if not np.all(np.isfinite(genetic_variance)):
+                raise ValueError(f"model {model.model_names[index]!r} has no posterior draws, so no predictive variance.")
+            predictive_variance[:, index] = genetic_variance + model.noise_variance[index]
+    return Prediction(genetic=genetic, linear_predictor=linear_predictor, predictive_mean=predictive_mean, predictive_variance=predictive_variance)
 
 
-def _config_from_json(payload: dict[str, Any]) -> ModelConfig:
-    restored_payload = dict(payload)
-    restored_payload["trait_type"] = TraitType(payload["trait_type"])
-    return ModelConfig(**restored_payload)
+def write_predictions(model_path: str | Path, store_path: str | Path, people_path: str | Path, output_path: str | Path, budget: ComputeBudget) -> None:
+    """Score the people in ``people_path`` (an NPZ holding ``sample_indices`` [n], their store columns, and
+    ``covariates`` [n, k] in the model's covariate order without the intercept) and write an NPZ of
+    ``model_names`` and the prediction's arrays [n, models]. An existing output is never overwritten."""
+    output = Path(output_path)
+    if output.exists():
+        raise FileExistsError(f"{output} exists; predictions are never overwritten.")
+    model = load_model(model_path)
+    with np.load(people_path, allow_pickle=False) as people:
+        if sorted(people.files) != ["covariates", "sample_indices"]:
+            raise ValueError("the people file must hold exactly sample_indices and covariates.")
+        sample_indices = np.array(people["sample_indices"])
+        covariates = np.array(people["covariates"])
+    prediction = predict(model, DosageStore.open(store_path), sample_indices, covariates, budget)
+    with open(output, "xb") as handle:
+        np.savez(
+            handle,
+            model_names=np.array(model.model_names),
+            genetic_mean=prediction.genetic.means,
+            genetic_variance=prediction.genetic.variances,
+            draw_counts=np.array(prediction.genetic.draw_counts, dtype=np.int64),
+            linear_predictor=prediction.linear_predictor,
+            predictive_mean=prediction.predictive_mean,
+            predictive_variance=prediction.predictive_variance,
+        )
+        handle.flush()
+        os.fsync(handle.fileno())
