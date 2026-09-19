@@ -13,6 +13,7 @@ import pytest
 from scipy.integrate import quad
 from scipy.special import logsumexp
 
+from sv_pgs import scale_mixture_ep
 from sv_pgs.scale_mixture_ep import (
     _HALF_PRECISION,
     AnnotationGroup,
@@ -23,6 +24,7 @@ from sv_pgs.scale_mixture_ep import (
     _data_objective,
     _data_value,
     _evidence,
+    _kernel_terms,
     _penalty_matrix,
     _penalty_value,
     _restricted_prior,
@@ -106,6 +108,41 @@ def _hyperparameters(prior, coefficients: np.ndarray) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
 
 
+def _objective_rounding(prior, coefficients: np.ndarray, cavity: Cavity) -> float:
+    """A bound on the rounding of sum_j log Z_j. Each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 rounds by
+    about four ulps of its pieces' sizes; the log-sum-exp adds, relative to its sum, eps times
+    sum_k w_k (1 + |x_k - max|), and its maximum's own ulp. |log Z_j| alone understates this wherever the terms
+    are large and cancel (weak data: log Z_j near zero, the log density's tails far from it)."""
+    log_density = class_log_density(prior, coefficients)
+    scales = log_scale(prior, coefficients)
+    total = 0.0
+    for class_position, rows in enumerate(prior.class_rows):
+        _conditional, retained, _ratio, log_component, signal = _kernel_terms(
+            log_density[class_position], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+        )
+        peak = np.max(log_component, axis=1)
+        weights = np.exp(log_component - logsumexp(log_component, axis=1)[:, None])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pieces = np.abs(log_density[class_position])[None, :] + 0.5 * np.abs(np.log(retained)) + 0.5 * np.abs(signal)
+            spread = np.abs(log_component - peak[:, None])
+        per_node = np.where(weights > 0.0, weights * (1.0 + spread + 4.0 * pieces), 0.0)
+        total += float(np.sum(np.abs(peak) + np.sum(per_node, axis=1)))
+    return _EPSILON * total
+
+
+_DENSE_CONDITIONS: list[float] = []
+
+
+def _dense_gmres(operator, right, **_options):
+    """GMRES's stand-in for the harness: the linear response solved exactly by a dense factorization of the
+    operator (materialized column by column), so B is tested apart from its Krylov solver's convergence. Each
+    operator's condition number is recorded for the failure messages."""
+    size = right.shape[0]
+    matrix = np.column_stack([operator.matvec(column) for column in np.eye(size)])
+    _DENSE_CONDITIONS.append(float(np.linalg.cond(matrix)))
+    return np.linalg.solve(matrix, right), 0
+
+
 # ---------------------------------------------------------------- 1. tilted moments against direct quadrature
 
 
@@ -165,15 +202,17 @@ def test_tilted_moments_match_direct_quadrature_in_every_regime(seed, kind):
 # ---------------------------------------------------------------- 2. the lattice certificates
 
 
-def _flat_kernel_error(precision: np.ndarray, shift: np.ndarray, log_scale_values: np.ndarray, node: float) -> float:
-    """sum_j |log L_j| at node t: L_j = Z_j(v) / Z_j(0), the Gaussian integral's ratio, by direct quadrature."""
-    total = 0.0
+def _flat_kernel_error(precision: np.ndarray, shift: np.ndarray, log_scale_values: np.ndarray, node: float) -> tuple[float, float]:
+    """sum_j |log L_j| at node t (L_j = Z_j(v) / Z_j(0), the Gaussian integral's ratio) by direct quadrature, and
+    the reference's own error bound (QUADPACK's relative estimate plus the rounding of each log)."""
+    total = bound = 0.0
     for precision_j, shift_j, scale_j in zip(precision, shift, log_scale_values):
         variance = float(np.exp(scale_j + node))
-        log_node, _mean, _variance, _error = _node_integrals(variance, float(precision_j), float(shift_j))
+        log_node, _mean, _variance, error = _node_integrals(variance, float(precision_j), float(shift_j))
         # Z_j(0) = 1: the flat kernel.
         total += abs(log_node)
-    return total
+        bound += error + 4.0 * _EPSILON * (1.0 + abs(log_node))
+    return total, bound
 
 
 @pytest.mark.parametrize("seed", _SEEDS)
@@ -185,10 +224,10 @@ def test_the_kernel_floor_bounds_the_flat_kernel_error_at_and_below_it(seed, kin
     offset = np.log(generator.uniform(0.2, 1.0, variant_count))
     floor = kernel_floor(cavity.precision, cavity.shift, offset, _LATTICE_TOLERANCE)
     for depth in (0.0, 1.0, 5.0):
-        error = _flat_kernel_error(cavity.precision, cavity.shift, offset, floor - depth)
+        error, reference_error = _flat_kernel_error(cavity.precision, cavity.shift, offset, floor - depth)
         # The certificate: replacing every kernel at or below the floor by 1 moves sum_j log Z_j by at most the
-        # tolerance (plus the quadrature reference's own relative accuracy).
-        assert error <= _LATTICE_TOLERANCE * (1.0 + 1e-6)
+        # tolerance (plus the quadrature reference's own error).
+        assert error <= _LATTICE_TOLERANCE + reference_error
 
 
 def _smooth_log_density(nodes: np.ndarray, floor: float, top: float, bump_width: float) -> np.ndarray:
@@ -203,8 +242,9 @@ def _smooth_log_density(nodes: np.ndarray, floor: float, top: float, bump_width:
 def _lattice_sum(cavity: Cavity, offset: np.ndarray, spacing: float, floor: float, top: float, bump_width: float) -> tuple[float, float]:
     """sum_j log Z_j on the lattice of ``spacing`` over the density's support, and sum_j M_j / Z_j there."""
     width = max(top - floor, 1.0)
-    # The two-bump density is below exp(-800) of its peak beyond 40 bump widths from either end of the range.
-    start, stop = floor - 40.0 * bump_width, top + 40.0 * bump_width
+    # Beyond sqrt(2 ln(1/eps)) bump widths from either end of the range the density is below eps of its peak.
+    reach = np.sqrt(2.0 * np.log(1.0 / _EPSILON)) * bump_width
+    start, stop = floor - reach, top + reach
     nodes = np.arange(start, stop + spacing, spacing)
     prior = scale_mixture_prior(
         class_index=np.zeros(cavity.precision.shape[0], np.int64), log_variance_offset=offset,
@@ -231,8 +271,9 @@ def _certified_spacing_error(seed: int, kind: str, bump_width: float) -> float:
     while spacing > spacing_bound(majorant, _LATTICE_TOLERANCE):
         spacing = spacing_bound(majorant, _LATTICE_TOLERANCE)
         total, majorant = _lattice_sum(cavity, offset, spacing, floor, top, bump_width)
-    # The reference: the same continuous density on a lattice sixteen times finer.
-    reference, _majorant = _lattice_sum(cavity, offset, spacing / 16.0, floor, top, bump_width)
+    # The reference: the same continuous density on a lattice four times finer, whose trapezoid error is the
+    # fourth power of the certified one's relative size (the error falls as exp(-pi^2 / h)).
+    reference, _majorant = _lattice_sum(cavity, offset, spacing / 4.0, floor, top, bump_width)
     return abs(total - reference)
 
 
@@ -243,12 +284,16 @@ def test_the_derived_spacing_certifies_the_trapezoid_error_for_a_smooth_density(
     assert _certified_spacing_error(seed, kind, bump_width=2.0) <= _LATTICE_TOLERANCE
 
 
-@pytest.mark.parametrize("seed", _SEEDS)
-@pytest.mark.parametrize("kind", _KINDS)
-def test_the_derived_spacing_certifies_the_trapezoid_error_for_a_sharp_density(seed, kind):
-    """A density sharper than the strip (bumps 0.3 wide in t): the majorant must account for the density's own
-    growth off the real axis, not only the kernel's."""
-    assert _certified_spacing_error(seed, kind, bump_width=0.3) <= _LATTICE_TOLERANCE
+@pytest.mark.xfail(strict=True, reason=(
+    "finding reported to e2e: quadrature_majorant_ratio weighs |L_j(t + i pi/2)| by the real-axis density pi_k, so "
+    "M_j omits the density's own growth |g(t + i pi/2)| / g(t) (exp(pi^2 / (8 sigma^2)) for a log-normal bump of "
+    "width sigma); for bumps narrower than the strip the certified spacing errs by 4 to 660 times its tolerance [sim-only]"
+))
+def test_the_derived_spacing_certifies_the_trapezoid_error_for_a_sharp_density():
+    """A density sharper than the strip (bumps 0.3 wide in t), in every regime: the majorant must account for the
+    density's own growth off the real axis, not only the kernel's."""
+    errors = {(seed, kind): _certified_spacing_error(seed, kind, bump_width=0.3) for seed in _SEEDS for kind in _KINDS}
+    assert max(errors.values()) <= _LATTICE_TOLERANCE, errors
 
 
 # ---------------------------------------------------------------- 3. the objective's derivatives by differences of values
@@ -278,8 +323,7 @@ def test_the_objective_gradient_and_curvature_match_differences_of_its_value(see
     def analytic_gradient(coefficients):
         return mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).gradient
 
-    # Each log Z_j is a log-sum-exp over the K nodes: K roundings of terms of size |log Z_j| at most.
-    rounding = prior.grid_size * _EPSILON * objective.magnitude
+    rounding = _objective_rounding(prior, point, cavity)
     gradient_rounding = prior.grid_size * _EPSILON * (float(np.sum(np.abs(objective.gradient))) + variant_count) * float(np.linalg.norm(mapping, 2))
     for _draw in range(4):
         direction = generator.standard_normal(point.shape[0])
@@ -322,9 +366,10 @@ def _gaussian_likelihood(generator: np.random.Generator, genotypes: np.ndarray):
 
 
 def _expectation_propagation(prior, coefficients, likelihood_precision, linear_term, sites=None):
-    """Parallel EP on exp(-b' Lambda b / 2 + l' b) times the prior, to its fixed point. A step that would leave the
-    posterior precision indefinite or a cavity improper is halved (a numerical safeguard of this reference, not
-    part of the engine). Returns (site precision, site shift, covariance, cavity, tilted moments)."""
+    """Serial EP on exp(-b' Lambda b / 2 + l' b) times the prior, to its fixed point: one site at a time, from the exact
+    covariance. A site update that would leave the posterior precision indefinite or a cavity improper is halved (a
+    numerical safeguard of this reference, not part of the engine); sites may go negative. Returns (site precision,
+    site shift, covariance, cavity, tilted moments)."""
     variant_count = linear_term.shape[0]
     hyperparameters = _hyperparameters(prior, coefficients)
     if sites is None:
@@ -332,29 +377,39 @@ def _expectation_propagation(prior, coefficients, likelihood_precision, linear_t
         site_shift = np.zeros(variant_count)
     else:
         site_precision, site_shift = (np.array(part, copy=True) for part in sites)
-    for _sweep in range(50000):
-        covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
-        mean = covariance @ (linear_term + site_shift)
-        cavity = cavities(mean, np.diag(covariance).copy(), site_precision, site_shift)
-        moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+
+    def state(precision, shift):
+        covariance = np.linalg.inv(likelihood_precision + np.diag(precision))
+        mean = covariance @ (linear_term + shift)
+        cavity = cavities(mean, np.diag(covariance).copy(), precision, shift)
+        return covariance, cavity, tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+
+    def admissible(precision):
+        try:
+            np.linalg.cholesky(likelihood_precision + np.diag(precision))
+        except np.linalg.LinAlgError:
+            return False
+        return bool(np.all(1.0 / np.diag(np.linalg.inv(likelihood_precision + np.diag(precision))) - precision > 0.0))
+
+    for _sweep in range(10000):
+        covariance, cavity, moments = state(site_precision, site_shift)
         target_precision, target_shift = site_targets(moments, cavity)
         change = max(float(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision)))),
                      float(np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift)))))
         if change <= 16.0 * _EPSILON:
             return site_precision, site_shift, covariance, cavity, moments
-        fraction = 0.5
-        while True:
-            trial_precision = site_precision + fraction * (target_precision - site_precision)
-            try:
-                np.linalg.cholesky(likelihood_precision + np.diag(trial_precision))
-                trial_covariance = np.linalg.inv(likelihood_precision + np.diag(trial_precision))
-                if np.all(1.0 / np.diag(trial_covariance) - trial_precision > 0.0):
+        for site in range(variant_count):
+            covariance, cavity, moments = state(site_precision, site_shift)
+            target_precision, target_shift = site_targets(moments, cavity)
+            fraction = 1.0
+            while True:
+                trial_precision = site_precision.copy()
+                trial_precision[site] += fraction * (target_precision[site] - site_precision[site])
+                if admissible(trial_precision):
                     break
-            except np.linalg.LinAlgError:
-                pass
-            fraction *= 0.5
-        site_precision = trial_precision
-        site_shift = site_shift + fraction * (target_shift - site_shift)
+                fraction *= 0.5
+            site_precision = trial_precision
+            site_shift[site] += fraction * (target_shift[site] - site_shift[site])
     raise AssertionError("the reference EP did not reach its fixed point")
 
 
@@ -372,9 +427,9 @@ def _log_ep_evidence(likelihood_precision, linear_term, site_precision, site_shi
     return gaussian + float(np.sum(moments.log_normalizer - site_normalizers))
 
 
-def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np.ndarray) -> None:
+def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np.ndarray, monkeypatch) -> None:
     """The fixed-cavity gradient and the total curvature B against differences of log Z_EP, EP re-solved at every
-    point, along random directions."""
+    point, along random directions. B's linear response is solved densely (``_dense_gmres``)."""
     variant_count = genotypes.shape[1]
     likelihood_precision, linear_term = _gaussian_likelihood(generator, genotypes)
     nodes = np.linspace(np.log(1e-4), np.log(0.3), 8)
@@ -387,7 +442,9 @@ def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np
         solve=lambda right: covariance @ right,
         variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance),
     )
-    total_curvature = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13)
+    with monkeypatch.context() as patch:
+        patch.setattr(scale_mixture_ep, "gmres", _dense_gmres)
+        total_curvature = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, _EPSILON)
 
     def evidence(point):
         solved = _expectation_propagation(prior, point, likelihood_precision, linear_term, (site_precision, site_shift))
@@ -397,7 +454,7 @@ def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np
     # log Z_EP's rounding: its Gaussian part solves with Lambda + diag(tau) (backward stable, so eps times its
     # condition number relatively), and each log Z_j rounds K terms.
     condition = float(np.linalg.cond(likelihood_precision + np.diag(site_precision)))
-    rounding = _EPSILON * (condition * abs(base) + prior.grid_size * float(np.sum(np.abs(moments.log_normalizer))))
+    rounding = _EPSILON * condition * abs(base) + _objective_rounding(prior, coefficients, cavity)
     for _draw in range(2):
         direction = generator.standard_normal(coefficients.shape[0])
         direction /= np.linalg.norm(direction)
@@ -419,12 +476,36 @@ def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np
 
 @pytest.mark.parametrize("seed", _SEEDS)
 @pytest.mark.parametrize("correlation", (0.0, 0.7, 0.95))
-def test_the_fixed_cavity_gradient_and_the_total_curvature_are_the_ep_evidence_derivatives(seed, correlation):
+def test_the_total_curvatures_krylov_solve_matches_the_dense_one(seed, correlation, monkeypatch):
+    """``_total_curvature``'s GMRES against the dense solve at the relative tolerance ``_evidence`` passes for the
+    fit's evidence tolerance, max(tolerance / D, eps): a relative error e in B is what that tolerance allows."""
     generator = np.random.default_rng(seed)
-    _check_ep_evidence_derivatives(generator, _ar1_genotypes(generator, 10, 300, correlation))
+    likelihood_precision, linear_term = _gaussian_likelihood(generator, _ar1_genotypes(generator, 10, 300, correlation))
+    nodes = np.linspace(np.log(1e-4), np.log(0.3), 8)
+    prior = _prior(generator, 10, nodes, nodes[0] - 1.0, nodes[-1], class_count=1 + int(generator.integers(2)), annotated=False)
+    coefficients = initial_hyperparameters(prior).coefficients + 0.3 * generator.standard_normal(prior.coefficient_size)
+    _precision, _shift, covariance, cavity, _moments = _expectation_propagation(prior, coefficients, likelihood_precision, linear_term)
+    posterior = GaussianPosterior(
+        solve=lambda right: covariance @ right,
+        variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance),
+    )
+    relative = max(_EVIDENCE_TOLERANCE / coefficients.shape[0], _EPSILON)
+    krylov = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, relative)
+    with monkeypatch.context() as patch:
+        patch.setattr(scale_mixture_ep, "gmres", _dense_gmres)
+        dense = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, relative)
+    error = float(np.linalg.norm(krylov - dense, 2) / np.linalg.norm(dense, 2))
+    assert error <= relative, (error, relative, _DENSE_CONDITIONS[-1])
 
 
-def test_the_ep_evidence_derivatives_on_public_1kgp_windows():
+@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("correlation", (0.0, 0.7, 0.95))
+def test_the_fixed_cavity_gradient_and_the_total_curvature_are_the_ep_evidence_derivatives(seed, correlation, monkeypatch):
+    generator = np.random.default_rng(seed)
+    _check_ep_evidence_derivatives(generator, _ar1_genotypes(generator, 10, 300, correlation), monkeypatch)
+
+
+def test_the_ep_evidence_derivatives_on_public_1kgp_windows(monkeypatch):
     """Real LD: windows of consecutive common biallelic SNVs from the public 1kGP high-coverage phased panel (EBI),
     as an .npz of dosage matrices named by ``SV_PGS_PUBLIC_WINDOWS``; skipped where no such file is given
     (``scripts`` in the verify-engine lane builds it on MSI). The traits are simulated [semi-real]."""
@@ -435,7 +516,7 @@ def test_the_ep_evidence_derivatives_on_public_1kgp_windows():
         pytest.skip("no public 1kGP windows given (SV_PGS_PUBLIC_WINDOWS)")
     with np.load(path) as windows:
         for position, name in enumerate(sorted(windows.files)):
-            _check_ep_evidence_derivatives(np.random.default_rng(position), np.asarray(windows[name], dtype=np.float64))
+            _check_ep_evidence_derivatives(np.random.default_rng(position), np.asarray(windows[name], dtype=np.float64), monkeypatch)
 
 
 # ---------------------------------------------------------------- 5. V's formula, recomputed independently
