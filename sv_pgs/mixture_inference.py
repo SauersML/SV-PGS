@@ -69,14 +69,15 @@ from sv_pgs._jax import gpu_compute_jax_dtype, gpu_compute_numpy_dtype
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.linalg import solve_triangular as jax_solve_triangular
-from jax.scipy.special import digamma as jax_digamma
 from jax.scipy.special import gammaln as jax_gammaln
 from scipy.linalg import cholesky as scipy_cholesky
 from scipy.linalg import solve_triangular
 from scipy.linalg.blas import dsyrk
 from scipy.linalg.lapack import dtrtri
-from scipy.optimize import minimize
+from scipy.special import digamma as scipy_digamma
+from scipy.special import gammaln as scipy_gammaln
 from scipy.special import kve as scipy_bessel_kve
+from scipy.special import polygamma as scipy_polygamma
 
 from sv_pgs.anderson import AndersonState, anderson_step
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
@@ -2847,7 +2848,10 @@ def fit_variational_em(
                         (1.0 - step_size) * reduced_second_moment[block_indices]
                         + step_size * block_second_moment
                     )
-                    updated_local_scale_block, updated_auxiliary_delta_block = _update_local_scales(
+                    # The rate stays at its epoch-start value until the epoch end, where
+                    # delta is refreshed for every variant; the epoch-end shape M-step
+                    # rebuilds each block's q(lambda) from it.
+                    updated_local_scale_block, _updated_auxiliary_delta_block = _update_local_scales(
                         coefficient_second_moment=reduced_second_moment[block_indices],
                         baseline_prior_variances=baseline_reduced_prior_variances[block_indices],
                         local_shape_a=local_shape_a[block_indices],
@@ -2858,10 +2862,6 @@ def fit_variational_em(
                     local_scale[block_indices] = (
                         (1.0 - step_size) * local_scale[block_indices]
                         + step_size * updated_local_scale_block
-                    )
-                    auxiliary_delta[block_indices] = (
-                        (1.0 - step_size) * auxiliary_delta[block_indices]
-                        + step_size * updated_auxiliary_delta_block
                     )
                     # Free GPU memory for this block before next iteration
                     block_genotypes._cupy_cache = None
@@ -2981,12 +2981,21 @@ def fit_variational_em(
                     current_scale_model_coefficients=scale_model_coefficients,
                     config=config,
                 )
+                expected_log_local_scale, expected_log_auxiliary_delta = _local_scale_log_expectations(
+                    coefficient_second_moment=reduced_second_moment,
+                    baseline_prior_variances=baseline_reduced_prior_variances,
+                    local_shape_a=local_shape_a,
+                    local_shape_b=local_shape_b,
+                    auxiliary_delta=auxiliary_delta,
+                    local_scale=local_scale,
+                    config=config,
+                )
                 tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
                     class_membership_matrix=prior_design.class_membership_matrix,
                     current_shape_a_vector=tpb_shape_a_vector,
                     current_shape_b_vector=tpb_shape_b_vector,
-                    local_scale=local_scale,
-                    auxiliary_delta=auxiliary_delta,
+                    expected_log_local_scale=expected_log_local_scale,
+                    expected_log_auxiliary_delta=expected_log_auxiliary_delta,
                     config=config,
                 )
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
@@ -3581,12 +3590,21 @@ def fit_variational_em(
                     current_scale_model_coefficients=scale_model_coefficients,
                     config=config,
                 )
+                expected_log_local_scale, expected_log_auxiliary_delta = _local_scale_log_expectations(
+                    coefficient_second_moment=reduced_second_moment,
+                    baseline_prior_variances=baseline_reduced_prior_variances,
+                    local_shape_a=local_shape_a,
+                    local_shape_b=local_shape_b,
+                    auxiliary_delta=auxiliary_delta,
+                    local_scale=updated_local_scale,
+                    config=config,
+                )
                 tpb_shape_a_vector, tpb_shape_b_vector = _update_tpb_shape_vectors(
                     class_membership_matrix=prior_design.class_membership_matrix,
                     current_shape_a_vector=tpb_shape_a_vector,
                     current_shape_b_vector=tpb_shape_b_vector,
-                    local_scale=updated_local_scale,
-                    auxiliary_delta=updated_auxiliary_delta,
+                    expected_log_local_scale=expected_log_local_scale,
+                    expected_log_auxiliary_delta=expected_log_auxiliary_delta,
                     config=config,
                 )
                 local_shape_a = prior_design.class_membership_matrix @ tpb_shape_a_vector
@@ -13617,110 +13635,172 @@ def _initialize_tpb_shape_b_vector(
 
 # Update the TPB shape parameters (a, b) for each variant class.
 #
-# These shapes control the "tail weight" of the shrinkage prior:
-#   - Smaller a,b = heavier tails = more tolerance for large effects
-#   - Larger a,b  = lighter tails = more shrinkage toward zero
+# The TPB prior is lambda | delta ~ Gamma(a, rate delta), delta ~ Gamma(b, 1),
+# so a controls the spike at zero and b the tail. The variational M-step for
+# the shapes maximizes the expected log prior under q(lambda) and q(delta),
 #
-# SVs (deletions, duplications) get smaller shapes than SNVs because they
-# tend to have larger individual effects.  We optimize (a, b) by gradient
-# ascent on the marginal likelihood of the local scales, with a
-# hierarchical penalty that keeps classes from diverging too much.
+#   sum_j [a_j E[log delta_j] - lgamma(a_j) + (a_j - 1) E[log lambda_j]]
+#     + sum_j [(b_j - 1) E[log delta_j] - lgamma(b_j)],
+#
+# plus the hierarchical Gaussian pull of the log shapes toward their mean.
+# The a and b problems separate and depend on the variants only through
+# per-membership-pattern counts and sums of E[log delta] (+ E[log lambda]),
+# so each is a small exact Newton solve. With pure class memberships and no
+# pull the optimum is the Gamma-shape MLE digamma(a_c) = mean(E[log delta] +
+# E[log lambda]), digamma(b_c) = mean(E[log delta]), which starts the Newton
+# iteration (Minka's inverse digamma).
 def _update_tpb_shape_vectors(
     class_membership_matrix: NDArray,
     current_shape_a_vector: NDArray,
     current_shape_b_vector: NDArray,
-    local_scale: NDArray,
-    auxiliary_delta: NDArray,
+    expected_log_local_scale: NDArray,
+    expected_log_auxiliary_delta: NDArray,
     config: ModelConfig,
 ) -> tuple[NDArray, NDArray]:
     class_count = current_shape_a_vector.shape[0]
     if class_count == 0:
         return current_shape_a_vector, current_shape_b_vector
-
-    log_local_scale = np.log(np.maximum(np.asarray(local_scale, dtype=np.float64), config.local_scale_floor))
-    log_auxiliary_delta = np.log(np.maximum(np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor))
-    lower_bound = np.log(config.minimum_tpb_shape)
-    upper_bound = np.log(config.maximum_tpb_shape)
-    initial_log_shape = np.concatenate(
-        [
-            np.log(np.clip(current_shape_a_vector, config.minimum_tpb_shape, config.maximum_tpb_shape)),
-            np.log(np.clip(current_shape_b_vector, config.minimum_tpb_shape, config.maximum_tpb_shape)),
-        ]
+    # Group variants by membership row. Sorting a generic projection of the
+    # rows is far cheaper than np.unique over rows (0.5 s vs 35 s at 3.4M x 8);
+    # the equality check makes the grouping exact.
+    membership = np.asarray(class_membership_matrix, dtype=np.float64)
+    row_keys = membership @ np.random.default_rng(0).standard_normal(class_count)
+    _unique_keys, first_index, pattern_index = np.unique(row_keys, return_index=True, return_inverse=True)
+    membership_patterns = membership[first_index]
+    pattern_index = np.asarray(pattern_index, dtype=np.int64).reshape(-1)
+    if not np.array_equal(membership_patterns[pattern_index], membership):
+        raise ValueError("Class-membership rows collided under the grouping projection.")
+    pattern_count = membership_patterns.shape[0]
+    pattern_sizes = np.bincount(pattern_index, minlength=pattern_count).astype(np.float64)
+    log_delta_sums = np.bincount(
+        pattern_index,
+        weights=np.asarray(expected_log_auxiliary_delta, dtype=np.float64),
+        minlength=pattern_count,
     )
-
-    def objective_and_gradient(log_shape_vector: NDArray) -> tuple[float, NDArray]:
-        log_shape_a = log_shape_vector[:class_count]
-        log_shape_b = log_shape_vector[class_count:]
-        shape_a_vector = np.exp(log_shape_a)
-        shape_b_vector = np.exp(log_shape_b)
-        local_shape_a = class_membership_matrix @ shape_a_vector
-        local_shape_b = class_membership_matrix @ shape_b_vector
-        centered_log_shape_a = log_shape_a - np.mean(log_shape_a)
-        centered_log_shape_b = log_shape_b - np.mean(log_shape_b)
-        hierarchical_penalty = -0.5 * (
-            np.sum(centered_log_shape_a * centered_log_shape_a)
-            + np.sum(centered_log_shape_b * centered_log_shape_b)
-        ) / config.tpb_hierarchical_prior_variance
-        # Batch all JAX special function calls into one GPU round-trip
-        a_jax = jnp.asarray(local_shape_a, dtype=jnp.float64)
-        b_jax = jnp.asarray(local_shape_b, dtype=jnp.float64)
-        gammaln_a = np.asarray(jax_gammaln(a_jax), dtype=np.float64)
-        gammaln_b = np.asarray(jax_gammaln(b_jax), dtype=np.float64)
-        digamma_a = np.asarray(jax_digamma(a_jax), dtype=np.float64)
-        digamma_b = np.asarray(jax_digamma(b_jax), dtype=np.float64)
-        objective_value = float(
-            np.sum(
-                local_shape_a * log_auxiliary_delta
-                - gammaln_a
-                + (local_shape_a - 1.0) * log_local_scale
-            )
-            + np.sum(
-                (local_shape_b - 1.0) * log_auxiliary_delta
-                - gammaln_b
-            )
-            + hierarchical_penalty
-        )
-        score_a = log_auxiliary_delta - digamma_a + log_local_scale
-        score_b = log_auxiliary_delta - digamma_b
-        gradient_a = shape_a_vector * (class_membership_matrix.T @ score_a)
-        gradient_b = shape_b_vector * (class_membership_matrix.T @ score_b)
-        gradient_a -= centered_log_shape_a / config.tpb_hierarchical_prior_variance
-        gradient_b -= centered_log_shape_b / config.tpb_hierarchical_prior_variance
-        gradient = np.concatenate([gradient_a, gradient_b]).astype(np.float64)
-        return objective_value, gradient
-
-    def neg_obj_and_grad(log_shape: NDArray) -> tuple[float, NDArray]:
-        val, grad = objective_and_gradient(np.asarray(log_shape, dtype=np.float64))
-        return -val, -grad
-
-    bounds = [(float(lower_bound), float(upper_bound))] * (2 * class_count)
-
-    result = minimize(
-        neg_obj_and_grad,
-        initial_log_shape.astype(np.float64),
-        method="L-BFGS-B",
-        jac=True,
-        bounds=bounds,
-        options={
-            "maxiter": max(int(config.maximum_tpb_shape_iterations), 200),
-            "gtol": float(config.convergence_tolerance),
-            "ftol": float(config.convergence_tolerance),
-        },
+    log_scale_sums = np.bincount(
+        pattern_index,
+        weights=np.asarray(expected_log_local_scale, dtype=np.float64),
+        minlength=pattern_count,
     )
-
-    # L-BFGS-B can ABNORMAL on tiny/ill-conditioned problems (degenerate first
-    # epoch with empty class membership). Fall back to the input shape rather
-    # than raising — the next outer EM iteration retries from updated state.
-    if not result.success or result.x is None or not np.all(np.isfinite(result.x)):
-        log(f"  TPB shape L-BFGS-B did not converge ({result.message}); keeping previous shape")
-        optimized_log_shape = initial_log_shape.copy()
-    else:
-        optimized_log_shape = np.asarray(result.x, dtype=np.float64)
-
     return (
-        np.exp(optimized_log_shape[:class_count]).astype(np.float64),
-        np.exp(optimized_log_shape[class_count:]).astype(np.float64),
+        _maximize_gamma_shape_objective(
+            membership_patterns=membership_patterns,
+            pattern_sizes=pattern_sizes,
+            pattern_log_sums=log_delta_sums + log_scale_sums,
+            current_shape_vector=current_shape_a_vector,
+            config=config,
+        ),
+        _maximize_gamma_shape_objective(
+            membership_patterns=membership_patterns,
+            pattern_sizes=pattern_sizes,
+            pattern_log_sums=log_delta_sums,
+            current_shape_vector=current_shape_b_vector,
+            config=config,
+        ),
     )
+
+
+def _inverse_digamma(values: NDArray) -> NDArray:
+    # Minka (2000): a piecewise initial guess, then Newton on digamma, which
+    # converges to machine precision in five steps from this start.
+    target = np.asarray(values, dtype=np.float64)
+    solution = np.where(
+        target >= -2.22,
+        np.exp(target) + 0.5,
+        -1.0 / (target - scipy_digamma(1.0)),
+    )
+    for _ in range(5):
+        solution = solution - (scipy_digamma(solution) - target) / scipy_polygamma(1, solution)
+    return solution
+
+
+# Maximize F(x) = sum_k [(m_k . s) T_k - n_k lgamma(m_k . s)] - |x - mean(x)|^2 / (2 v)
+# over the log shapes x = log s within the configured bounds, where pattern k
+# has membership row m_k, n_k variants and log-expectation sum T_k. Projected
+# Newton with the exact (trigamma) Hessian, shifted to negative definite when
+# needed, and a backtracking line search, so every accepted step increases F.
+def _maximize_gamma_shape_objective(
+    *,
+    membership_patterns: NDArray,
+    pattern_sizes: NDArray,
+    pattern_log_sums: NDArray,
+    current_shape_vector: NDArray,
+    config: ModelConfig,
+) -> NDArray:
+    class_count = membership_patterns.shape[1]
+    lower_bound = float(np.log(config.minimum_tpb_shape))
+    upper_bound = float(np.log(config.maximum_tpb_shape))
+    penalty_precision = 1.0 / float(config.tpb_hierarchical_prior_variance)
+    centering = np.eye(class_count) - np.full((class_count, class_count), 1.0 / class_count)
+
+    def objective(log_shape: NDArray) -> float:
+        pattern_shape = membership_patterns @ np.exp(log_shape)
+        centered = log_shape - np.mean(log_shape)
+        return float(
+            np.sum(pattern_shape * pattern_log_sums - pattern_sizes * scipy_gammaln(pattern_shape))
+            - 0.5 * penalty_precision * np.dot(centered, centered)
+        )
+
+    class_weight = membership_patterns.T @ pattern_sizes
+    class_mean = np.divide(
+        membership_patterns.T @ pattern_log_sums,
+        class_weight,
+        out=np.zeros(class_count),
+        where=class_weight > 0.0,
+    )
+    log_shape = np.clip(
+        np.where(
+            class_weight > 0.0,
+            np.log(_inverse_digamma(class_mean)),
+            np.log(np.asarray(current_shape_vector, dtype=np.float64)),
+        ),
+        lower_bound,
+        upper_bound,
+    )
+    gradient_tolerance = 1e-10 * max(float(np.sum(pattern_sizes)), 1.0)
+    current_value = objective(log_shape)
+    for _ in range(int(config.maximum_tpb_shape_iterations)):
+        shape = np.exp(log_shape)
+        pattern_shape = membership_patterns @ shape
+        likelihood_score = membership_patterns.T @ (pattern_log_sums - pattern_sizes * scipy_digamma(pattern_shape))
+        gradient = shape * likelihood_score - penalty_precision * (centering @ log_shape)
+        hessian = (
+            np.outer(shape, shape)
+            * (membership_patterns.T @ (membership_patterns * (-pattern_sizes * scipy_polygamma(1, pattern_shape))[:, None]))
+            + np.diag(shape * likelihood_score)
+            - penalty_precision * centering
+        )
+        free = ~(
+            ((log_shape <= lower_bound) & (gradient < 0.0))
+            | ((log_shape >= upper_bound) & (gradient > 0.0))
+        )
+        if not np.any(free) or float(np.max(np.abs(gradient[free]))) <= gradient_tolerance:
+            break
+        negative_hessian = -hessian[np.ix_(free, free)]
+        shift = 0.0
+        while True:
+            try:
+                factor = scipy_cholesky(
+                    negative_hessian + shift * np.eye(negative_hessian.shape[0]),
+                    lower=True,
+                )
+                break
+            except np.linalg.LinAlgError:
+                shift = max(2.0 * shift, 1e-8 * max(float(np.max(np.abs(np.diag(negative_hessian)))), 1.0))
+        direction = np.zeros(class_count)
+        direction[free] = _cholesky_solve(factor, gradient[free])
+        step_size = 1.0
+        while step_size >= 1e-12:
+            candidate = np.clip(log_shape + step_size * direction, lower_bound, upper_bound)
+            candidate_value = objective(candidate)
+            if candidate_value >= current_value:
+                break
+            step_size *= 0.5
+        if step_size < 1e-12 or float(np.max(np.abs(candidate - log_shape))) <= 1e-14:
+            break
+        log_shape = candidate
+        current_value = candidate_value
+    return np.exp(log_shape).astype(np.float64)
 
 
 def _metadata_baseline_scales_from_coefficients(
@@ -13925,13 +14005,13 @@ def _update_local_scales(
     auxiliary_delta: NDArray,
     config: ModelConfig,
 ) -> tuple[NDArray, NDArray]:
-    chi = np.maximum(
-        coefficient_second_moment / np.maximum(baseline_prior_variances, 1e-12),
-        1e-12,
+    p_parameter, chi, psi = _local_scale_gig_parameters(
+        coefficient_second_moment=coefficient_second_moment,
+        baseline_prior_variances=baseline_prior_variances,
+        local_shape_a=local_shape_a,
+        auxiliary_delta=auxiliary_delta,
+        config=config,
     )
-    p_parameter = np.asarray(local_shape_a, dtype=np.float64) - 0.5
-    current_auxiliary_delta = np.maximum(np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor)
-    psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
     updated_local_scale = np.maximum(
         _gig_moment(
             p_parameter=p_parameter,
@@ -13948,6 +14028,55 @@ def _update_local_scales(
     return updated_local_scale, updated_auxiliary_delta
 
 
+# q(lambda_j) = GIG(a_j - 1/2, chi_j, psi_j) with chi = E[beta^2] / baseline
+# variance and psi = 2 E[delta] at the rate it was formed with.
+def _local_scale_gig_parameters(
+    *,
+    coefficient_second_moment: NDArray,
+    baseline_prior_variances: NDArray,
+    local_shape_a: NDArray,
+    auxiliary_delta: NDArray,
+    config: ModelConfig,
+) -> tuple[NDArray, NDArray, NDArray]:
+    chi = np.maximum(
+        coefficient_second_moment / np.maximum(baseline_prior_variances, 1e-12),
+        1e-12,
+    )
+    p_parameter = np.asarray(local_shape_a, dtype=np.float64) - 0.5
+    current_auxiliary_delta = np.maximum(np.asarray(auxiliary_delta, dtype=np.float64), config.local_scale_floor)
+    psi = np.maximum(2.0 * current_auxiliary_delta, 1e-12)
+    return p_parameter, chi, psi
+
+
+# E_q[log lambda] and E_q[log delta] for the shape M-step. ``auxiliary_delta``
+# is the rate q(lambda) was formed with by _update_local_scales and
+# ``local_scale`` the E[lambda] it returned; q(delta) = Gamma(a + b, 1 + E[lambda])
+# gives E[log delta] = digamma(a + b) - log(1 + E[lambda]). The plug-in log E[.]
+# overstates both by Jensen's inequality, which drives the shapes to the bound.
+def _local_scale_log_expectations(
+    *,
+    coefficient_second_moment: NDArray,
+    baseline_prior_variances: NDArray,
+    local_shape_a: NDArray,
+    local_shape_b: NDArray,
+    auxiliary_delta: NDArray,
+    local_scale: NDArray,
+    config: ModelConfig,
+) -> tuple[NDArray, NDArray]:
+    p_parameter, chi, psi = _local_scale_gig_parameters(
+        coefficient_second_moment=coefficient_second_moment,
+        baseline_prior_variances=baseline_prior_variances,
+        local_shape_a=local_shape_a,
+        auxiliary_delta=auxiliary_delta,
+        config=config,
+    )
+    expected_log_local_scale = _gig_log_moment(p_parameter=p_parameter, chi=chi, psi=psi)
+    expected_log_auxiliary_delta = scipy_digamma(
+        np.asarray(local_shape_a, dtype=np.float64) + np.asarray(local_shape_b, dtype=np.float64)
+    ) - np.log1p(np.asarray(local_scale, dtype=np.float64))
+    return expected_log_local_scale, expected_log_auxiliary_delta
+
+
 # Compute the expected value of X^r where X ~ GIG(p, chi, psi).
 #
 # The Generalized Inverse Gaussian is the conjugate distribution that
@@ -13959,6 +14088,32 @@ def _update_local_scales(
 # In our context: p = shape_a - 0.5, chi = beta^2 / baseline_variance,
 # psi = 2 * delta.  The result E[lambda] tells us how much to shrink
 # each variant.
+# E[log X] for X ~ GIG(p, chi, psi): differentiating the normaliser in p gives
+# 0.5 log(chi / psi) + d/dnu log K_nu(z) at nu = p, z = sqrt(chi psi). K_nu is
+# smooth and even in nu; a central difference in the order with step 1e-5 is
+# accurate to about 1e-8 (checked against quadrature down to the caller's chi
+# and psi floors). The scaling of kve cancels in the difference.
+def _gig_log_moment(
+    *,
+    p_parameter: NDArray,
+    chi: NDArray,
+    psi: NDArray,
+) -> NDArray:
+    chi_array = np.asarray(chi, dtype=np.float64)
+    psi_array = np.asarray(psi, dtype=np.float64)
+    p_array = np.asarray(p_parameter, dtype=np.float64)
+    z_value = np.sqrt(chi_array) * np.sqrt(psi_array)
+    order_step = 1e-5
+    log_bessel_derivative = (
+        np.log(scipy_bessel_kve(p_array + order_step, z_value))
+        - np.log(scipy_bessel_kve(p_array - order_step, z_value))
+    ) / (2.0 * order_step)
+    log_moment = 0.5 * (np.log(chi_array) - np.log(psi_array)) + log_bessel_derivative
+    if not np.all(np.isfinite(log_moment)):
+        raise FloatingPointError("GIG log-moment is non-finite; chi and psi must be positive and finite.")
+    return np.asarray(log_moment, dtype=np.float64)
+
+
 def _gig_moment(
     p_parameter: NDArray,
     chi: NDArray,

@@ -141,14 +141,21 @@ def test_fit_reaches_one_fixed_point_on_every_route(sample_count: int, variant_c
     )
     # The iterative routes run float32 CG at a 1e-6 tolerance, so they agree
     # with the exact route to a few percent. A route-dependent prior moved the
-    # global scale by 2.5x on problems like this one.
+    # global scale by 2.5x on problems like this one. The iterative routes'
+    # probe diagonal of the posterior variance is not exact here (up to 8%
+    # relative on this problem even with 80 probes), and each local scale
+    # follows its own E[beta^2] = m^2 + Sigma_jj, so per-variant prior scales
+    # agree only to about 10%; the pooled hyperparameters agree to 2%.
     exact_beta = np.asarray(exact_fit.beta_reduced, dtype=np.float64)
     scale = float(np.max(np.abs(exact_beta)))
     for route_fit in (iterative_fit, working_set_fit):
         np.testing.assert_allclose(np.asarray(route_fit.beta_reduced, dtype=np.float64), exact_beta, rtol=0.0, atol=5e-2 * scale)
         assert route_fit.sigma_error2 == pytest.approx(exact_fit.sigma_error2, rel=2e-2)
         assert route_fit.global_scale == pytest.approx(exact_fit.global_scale, rel=2e-2)
-        np.testing.assert_allclose(route_fit.prior_scales, exact_fit.prior_scales, rtol=5e-2)
+        for variant_class, shape_a in exact_fit.class_tpb_shape_a.items():
+            assert route_fit.class_tpb_shape_a[variant_class] == pytest.approx(shape_a, rel=2e-2)
+            assert route_fit.class_tpb_shape_b[variant_class] == pytest.approx(exact_fit.class_tpb_shape_b[variant_class], rel=2e-2)
+        np.testing.assert_allclose(route_fit.prior_scales, exact_fit.prior_scales, rtol=1e-1)
 
 
 def test_final_posterior_is_the_gaussian_posterior_under_the_reported_prior(monkeypatch: pytest.MonkeyPatch) -> None:

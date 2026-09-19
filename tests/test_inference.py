@@ -6059,8 +6059,8 @@ def test_tpb_shape_vectors_are_learned_from_local_scale_state():
         class_membership_matrix=np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float64),
         current_shape_a_vector=np.array([1.0, 1.0], dtype=np.float64),
         current_shape_b_vector=np.array([0.5, 0.5], dtype=np.float64),
-        local_scale=np.array([0.1, 5.0], dtype=np.float64),
-        auxiliary_delta=np.array([2.0, 0.2], dtype=np.float64),
+        expected_log_local_scale=np.log(np.array([0.1, 5.0], dtype=np.float64)),
+        expected_log_auxiliary_delta=np.log(np.array([2.0, 0.2], dtype=np.float64)),
         config=ModelConfig(maximum_tpb_shape_iterations=6),
     )
     assert not np.allclose(updated_shape_a, [1.0, 1.0])
