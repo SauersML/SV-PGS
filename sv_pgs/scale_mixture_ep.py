@@ -952,10 +952,13 @@ def _total_curvature(
         shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
         variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
         response = variance_step / variance**2 + precision_step
-        return shift_step, response + posterior.variance_jvp(response) / variance**2
+        return shift_step, response + posterior.variance_jvp(response) / variance**2, response
 
     shape = mean_by_z.shape
-    _shift, offset = through(np.zeros(shape))
+    _shift, offset, start_response = through(np.zeros(shape))
+    # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times the
+    # terms that cancel, which is where GMRES's residual can stop.
+    rounding = _EPSILON * float(np.linalg.norm(start_response))
 
     def linear_part(vector: F64Array) -> F64Array:
         precision_step = vector.reshape(shape)
@@ -963,11 +966,11 @@ def _total_curvature(
 
     size = int(np.prod(shape))
     operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
-    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=0.0, restart=size, maxiter=size)
+    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=rounding, restart=size, maxiter=size)
     if information != 0:
         raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
     precision_step = solution.reshape(shape)
-    shift_step, _next = through(precision_step)
+    shift_step, _next, _response = through(precision_step)
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
