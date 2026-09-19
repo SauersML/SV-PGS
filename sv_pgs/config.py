@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal, Mapping
 
 
 class TraitType(str, Enum):
@@ -24,301 +23,27 @@ class VariantClass(str, Enum):
     INVERSION = "inversion"
 
 
-# Default log-scale for each variant class's prior effect size.
-# More negative = smaller expected effects.  SNVs (-4.5) are expected to
-# have the smallest individual effects; complex SVs (-3.1) the largest.
-# These are starting points — the model updates them during fitting.
-# Values are in log-space: exp(-4.5) ≈ 0.011, exp(-3.1) ≈ 0.045.
-DEFAULT_CLASS_LOG_BASELINE_SCALE = {
-    VariantClass.SNV: -4.5,
-    VariantClass.SMALL_INDEL: -4.2,
-    VariantClass.DELETION: -3.55,
-    VariantClass.DUPLICATION: -3.5,
-    VariantClass.INSERTION_MEI: -3.6,
-    VariantClass.INVERSION_BND_COMPLEX: -3.1,
-    VariantClass.STR_VNTR_REPEAT: -3.5,
-    VariantClass.OTHER_COMPLEX_SV: -3.3,
-    VariantClass.COPY_NUMBER: -3.3,
-    VariantClass.INVERSION: -3.1,
-}
-
-# TPB shapes of the local-scale prior lambda | delta ~ Gamma(shape_a, rate delta),
-# delta ~ Gamma(shape_b, rate 1) (_local_scale_prior_objective). Marginally
-# lambda ~ BetaPrime(shape_a, shape_b), density proportional to
-# lambda^(shape_a - 1) (1 + lambda)^-(shape_a + shape_b), so:
-#   - shape_a sets the mass near zero: smaller a puts more variants at a
-#     near-zero effect, and a <= 1/2 gives the marginal effect density a pole
-#     at zero (horseshoe: a = b = 1/2);
-#   - shape_b sets the tail: p(beta) ~ |beta|^(-2 b - 1), so smaller b
-#     tolerates more large effects.
-# SVs start with smaller a and b than SNVs: more of them are null, and the
-# ones that act can have large effects. The model updates both during fitting.
-DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
-    VariantClass.SNV: 1.0,
-    VariantClass.SMALL_INDEL: 0.9,
-    VariantClass.DELETION: 0.65,
-    VariantClass.DUPLICATION: 0.65,
-    VariantClass.INSERTION_MEI: 0.65,
-    VariantClass.INVERSION_BND_COMPLEX: 0.55,
-    VariantClass.STR_VNTR_REPEAT: 0.6,
-    VariantClass.OTHER_COMPLEX_SV: 0.6,
-    VariantClass.COPY_NUMBER: 0.6,
-    VariantClass.INVERSION: 0.55,
-}
-
-# Shape_b is the shape of the auxiliary rate delta and sets the tail of the
-# local-scale prior (see above): smaller values allow more large effects.
-DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
-    VariantClass.SNV: 0.5,
-    VariantClass.SMALL_INDEL: 0.5,
-    VariantClass.DELETION: 0.425,
-    VariantClass.DUPLICATION: 0.425,
-    VariantClass.INSERTION_MEI: 0.42,
-    VariantClass.INVERSION_BND_COMPLEX: 0.38,
-    VariantClass.STR_VNTR_REPEAT: 0.4,
-    VariantClass.OTHER_COMPLEX_SV: 0.4,
-    VariantClass.COPY_NUMBER: 0.4,
-    VariantClass.INVERSION: 0.38,
-}
-
-STRUCTURAL_VARIANT_CLASSES = (
-    VariantClass.DELETION,
-    VariantClass.DUPLICATION,
-    VariantClass.INSERTION_MEI,
-    VariantClass.INVERSION_BND_COMPLEX,
-    VariantClass.STR_VNTR_REPEAT,
-    VariantClass.OTHER_COMPLEX_SV,
-    VariantClass.COPY_NUMBER,
-    VariantClass.INVERSION,
-)
-
-
 @dataclass(slots=True)
 class ModelConfig:
-    """All tunable parameters for SV-PGS inference.
+    """The settings the kept stages read."""
 
-    Most users won't need to change these. Key groups:
-
-    Variational Bayes: prior scales, TPB shapes, linear algebra, working sets
-    """
-    trait_type: TraitType = TraitType.BINARY       # binary (case/control) or quantitative
-    max_outer_iterations: int = 20                 # EM iterations (CAVI usually converges in 10-20; large SVI runs are expensive)
-    convergence_tolerance: float = 1e-4            # stop when parameters change < this (realistic variational floor)
+    trait_type: TraitType = TraitType.BINARY
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
-    polya_gamma_minimum_weight: float = 1e-4       # floor on IRLS weights to prevent division by ~zero
-    sigma_error_floor: float = 1e-3                # noise variance can't go below this
+    minimum_minor_allele_frequency: float = 1e-2
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
-    global_scale_floor: float = 1e-4
-    global_scale_ceiling: float = 10.0
     local_scale_floor: float = 1e-8
     scale_model_ridge_penalty: float = 1.0
     type_offset_penalty: float = 2.0
-    maximum_scale_model_iterations: int = 8
-
-    tpb_hierarchical_prior_variance: float = 1.0
-    maximum_tpb_shape_iterations: int = 8
-    minimum_tpb_shape: float = 0.1
-    maximum_tpb_shape: float = 10.0
-
-    max_inner_newton_iterations: int = 20
-    # Shared gradient stopping tolerance for binary PG-IRLS and TR-Newton.
-    # Its default deliberately matches the outer variational tolerance: solving
-    # the binary subproblem more tightly than the state that consumes it wastes
-    # exact posterior factorizations below the fit's practical resolution.
-    binary_inner_tolerance: float = 1e-4
-
-    linear_solver_tolerance: float = 1e-6
-    maximum_linear_solver_iterations: int = 1024
-    logdet_probe_count: int = 12
-    logdet_lanczos_steps: int = 20
-    exact_solver_matrix_limit: int = 2048  # below this: direct solve; above: Woodbury or CG
-    posterior_variance_batch_size: int = 1024
-    posterior_variance_probe_count: int = 24
-    # Must be positive: skipping beta variance refreshes can hide unstable
-    # calibration and non-identifiability until the final posterior pass.
-    beta_variance_update_interval: int = 2
-    final_posterior_diagnostics: bool = True
-    # When the variational fit reports converged=False, the artifact is
-    # still written (a hard block broke legitimate small-N / short-iteration
-    # runs whose partial-but-coherent fit is still useful) but a clear
-    # WARNING is emitted with the four final_*_change deltas
-    # (parameter/predictor/objective/hyperparameter). Set True to suppress
-    # the warning's audit-trail "unacknowledged override" marker; callers
-    # that need strict gating should introspect ``fit_result.converged``
-    # directly rather than relying on export() to raise.
-    allow_nonconverged_export: bool = False
-    use_tr_newton_binary: bool = False
-    cg_progress_interval: int = 5
-    solver_wall_clock_budget_s: float = 600.0
-    minimum_minor_allele_frequency: float = 1e-2
-    # Marginal-univariate |z| pre-screen threshold. After the MAF filter,
-    # variants with |z_j| (residualized on covariates, normalized so null ~
-    # N(0,1)) below this value are dropped before joint fitting. 0.0 disables
-    # the screen (default — no behavior change for existing callers).
-    # When the experiment is supposed to test SV contribution, marginal
-    # screening is methodologically risky: rare SVs and correlated-region
-    # signals can have weak marginal z-scores but matter in the joint model.
-    # Recommended values:
-    #   1.5  — drops ~87% of pure-noise variants (Φ⁻¹(0.13)); a common PRS
-    #          marginal-then-joint-fit practice.
-    #   2.0  — drops ~95% of nulls (~p<0.05 per variant) — aggressive; risks
-    #          losing small-effect signal.
-    # Set on the runner / CLI when the joint matrix would otherwise exceed
-    # the GPU budget; below the budget the fast deterministic CAVI path runs.
-    marginal_screen_min_abs_z: float = 0.0
-    marginal_screen_protect_sv: bool = True
-
-    sample_space_preconditioner_rank: int = 256
-    validation_interval: int = 10
-    validate_first_iteration: bool = True
-    stochastic_variational_updates: bool = True
-    stochastic_min_variant_count: int = 4096
-    stochastic_variant_batch_size: int = 8192
-    posterior_working_set_min_variants: int = 65_536
-    posterior_working_set_initial_size: int = 8_192
-    posterior_working_set_growth: int = 8_192
-    posterior_working_set_max_passes: int = 6
-    posterior_working_set_coefficient_tolerance: float = 1e-4
-
-    random_seed: int = 0
-
-    # ------------------------------------------------------------------
-    # LD-block / N-GPU rewrite (Phase 4) wiring flags.
-    #
-    # ``use_ld_blocks`` is opt-in: when True the sample-space matvec is
-    # decomposed into per-LD-block matmuls and dispatched across all
-    # visible CUDA devices via :class:`sv_pgs.gpu_scheduler.GPUScheduler`.
-    # When False (default) the existing single-monolithic-matmul path
-    # remains in force for every entry point — only the AoU runner flips
-    # this to True until the new code path has been verified on every
-    # other entry point.
-    # ------------------------------------------------------------------
-    use_ld_blocks: bool = False
-    ld_block_population: str = "EUR"
-    ld_block_build: str = "hg38"
-    ld_block_singleton_chunk_size: int = 256
-    ld_block_pipeline_depth: int = 2
-
-    # ------------------------------------------------------------------
-    # Bitpacked GPU genotype pipeline (see BITPACKED_SPEC.md).
-    # ------------------------------------------------------------------
-    # Selects the genotype storage / kernel backend used during fitting.
-    # "bitpacked" (default, fast path) keeps PLINK 1.9 2-bits/sample packed
-    # bytes resident in GPU HBM and decodes via constant-memory LUTs inside
-    # custom CuPy RawKernels (forward/transpose GEMV, gram GEMM, screening).
-    # "int8" preserves the legacy host-int8 ``.npy`` cache + host-side LUT
-    # decode path for parity testing and CPU-only environments.
-    genotype_backend: Literal["bitpacked", "int8"] = "bitpacked"
-    # When True, sequential cold reads of PLINK BED trios are serviced via
-    # :class:`sv_pgs.mmap_reader.BedMmapReader` (mmap + ``MADV_SEQUENTIAL``
-    # / ``MADV_WILLNEED``) instead of the default ``preadv`` path. Opt-in
-    # because mmap on some filesystems (notably gcsfuse) can stall or raise
-    # SIGBUS; the reader falls back to ``preadv`` on error.
-    use_mmap_bed: bool = False
-    # When True, sv-pgs copies gcsfuse-mounted PLINK BED trios
-    # (``.bed`` / ``.bim`` / ``.fam``) to local NVMe before reading so that
-    # downstream readers (mmap, preadv, GPUDirect Storage) operate on a
-    # POSIX-real file. Set False to read directly from the gcsfuse mount
-    # (slower but avoids the local-disk copy and the extra space).
-    stage_gcsfuse_locally: bool = True
 
     def __post_init__(self) -> None:
-        if self.max_outer_iterations < 1:
-            raise ValueError("max_outer_iterations must be positive.")
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
-        if self.polya_gamma_minimum_weight <= 0.0:
-            raise ValueError("polya_gamma_minimum_weight must be positive.")
+        if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
+            raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
         if self.prior_scale_floor <= 0.0:
             raise ValueError("prior_scale_floor must be positive.")
         if self.prior_scale_ceiling <= self.prior_scale_floor:
             raise ValueError("prior_scale_ceiling must exceed prior_scale_floor.")
-        if self.global_scale_floor <= 0.0:
-            raise ValueError("global_scale_floor must be positive.")
-        if self.global_scale_ceiling <= self.global_scale_floor:
-            raise ValueError("global_scale_ceiling must exceed global_scale_floor.")
         if self.local_scale_floor <= 0.0:
             raise ValueError("local_scale_floor must be positive.")
-        if self.maximum_scale_model_iterations < 1:
-            raise ValueError("maximum_scale_model_iterations must be positive.")
-        if self.minimum_tpb_shape <= 0.0:
-            raise ValueError("minimum_tpb_shape must be positive.")
-        if self.maximum_tpb_shape <= self.minimum_tpb_shape:
-            raise ValueError("maximum_tpb_shape must exceed minimum_tpb_shape.")
-        if self.tpb_hierarchical_prior_variance <= 0.0:
-            raise ValueError("tpb_hierarchical_prior_variance must be positive.")
-        if self.maximum_tpb_shape_iterations < 1:
-            raise ValueError("maximum_tpb_shape_iterations must be positive.")
-        if self.max_inner_newton_iterations < 1:
-            raise ValueError("max_inner_newton_iterations must be positive.")
-        if self.binary_inner_tolerance <= 0.0:
-            raise ValueError("binary_inner_tolerance must be positive.")
-        if self.linear_solver_tolerance <= 0.0:
-            raise ValueError("linear_solver_tolerance must be positive.")
-        if self.maximum_linear_solver_iterations < 1:
-            raise ValueError("maximum_linear_solver_iterations must be positive.")
-        if self.logdet_probe_count < 1:
-            raise ValueError("logdet_probe_count must be positive.")
-        if self.logdet_lanczos_steps < 2:
-            raise ValueError("logdet_lanczos_steps must be at least 2.")
-        if self.exact_solver_matrix_limit < 1:
-            raise ValueError("exact_solver_matrix_limit must be positive.")
-        if self.posterior_variance_batch_size < 1:
-            raise ValueError("posterior_variance_batch_size must be positive.")
-        if self.posterior_variance_probe_count < 1:
-            raise ValueError("posterior_variance_probe_count must be positive.")
-        if self.beta_variance_update_interval < 1:
-            raise ValueError("beta_variance_update_interval must be positive.")
-        if self.cg_progress_interval < 1:
-            raise ValueError("cg_progress_interval must be positive.")
-        if self.solver_wall_clock_budget_s <= 0.0:
-            raise ValueError("solver_wall_clock_budget_s must be positive.")
-        if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
-            raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
-        if self.marginal_screen_min_abs_z < 0.0:
-            raise ValueError("marginal_screen_min_abs_z must be non-negative.")
-        if self.sample_space_preconditioner_rank < 0:
-            raise ValueError("sample_space_preconditioner_rank must be non-negative.")
-        if self.validation_interval < 1:
-            raise ValueError("validation_interval must be positive.")
-        if self.stochastic_min_variant_count < 0:
-            raise ValueError("stochastic_min_variant_count must be non-negative.")
-        if self.stochastic_variant_batch_size < 1:
-            raise ValueError("stochastic_variant_batch_size must be positive.")
-        if self.posterior_working_set_min_variants < 0:
-            raise ValueError("posterior_working_set_min_variants must be non-negative.")
-        if self.posterior_working_set_initial_size < 1:
-            raise ValueError("posterior_working_set_initial_size must be positive.")
-        if self.posterior_working_set_growth < 1:
-            raise ValueError("posterior_working_set_growth must be positive.")
-        if self.posterior_working_set_max_passes < 1:
-            raise ValueError("posterior_working_set_max_passes must be positive.")
-        if self.posterior_working_set_coefficient_tolerance < 0.0:
-            raise ValueError("posterior_working_set_coefficient_tolerance must be non-negative.")
-        if self.ld_block_population.upper() not in {"EUR", "AFR", "EAS", "AMR"}:
-            raise ValueError(
-                "ld_block_population must be one of 'EUR', 'AFR', 'EAS', 'AMR'; "
-                + f"got {self.ld_block_population!r}"
-            )
-        if self.ld_block_build.lower() not in {"hg19", "grch37", "hg38", "grch38"}:
-            raise ValueError(
-                "ld_block_build must be one of 'hg19', 'hg38' (or 'grch37'/'grch38'); "
-                + f"got {self.ld_block_build!r}"
-            )
-        if self.ld_block_singleton_chunk_size < 1:
-            raise ValueError("ld_block_singleton_chunk_size must be positive.")
-        if self.ld_block_pipeline_depth < 1:
-            raise ValueError("ld_block_pipeline_depth must be positive.")
-    def class_log_baseline_scales(self) -> Mapping[VariantClass, float]:
-        return dict(DEFAULT_CLASS_LOG_BASELINE_SCALE)
-
-    def class_tpb_shape_a(self) -> Mapping[VariantClass, float]:
-        return dict(DEFAULT_CLASS_TPB_SHAPE_A)
-
-    def class_tpb_shape_b(self) -> Mapping[VariantClass, float]:
-        return dict(DEFAULT_CLASS_TPB_SHAPE_B)
-
-    @staticmethod
-    def structural_variant_classes() -> tuple[VariantClass, ...]:
-        return STRUCTURAL_VARIANT_CLASSES

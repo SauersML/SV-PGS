@@ -20,7 +20,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
 | C5 | landed: `mixture_inference`, `linear_solvers`, `tr_newton`, `elbo`, `forcing_sequence`, `precision_policy`, `inference`, `gpu_scheduler`, and `numeric` (`stable_sigmoid` duplicated `scipy.special.expit`; the probit scale was superseded by the Gauss–Hermite predictive); `anderson.py` and `prior_design.py` stay for the engine |
 | C6 | landed: `genotype`, `io`, `preprocessing`, `screening_pipeline`, `plink`, `mmap_reader`, `gcsfuse_staging`, `gds`, `bitpacked/`, `bitpacked_loader`, `bitpacked_matrix`, `bitpacked_profile`, `ld_blocks`, `ld_block_partition`, `_data/`, `sample_table`, `path_policy`, `diagnostics`; `collapse_tie_groups` tests moved to `test_tie_group_collapse`. The config keys moved to C8; the dead symbols in other lanes' files (`data.VariantStatistics`/`PreparedArrays`, `tie_map._empty_tie_map`, `_typing.I8Array`/`I16Array`, two docstrings) went to their owners |
 | C7 | landed: `_jax.py` and its tests; `test_package_import` imports every module and checks no JAX and no `CUPY_TF32`; the jax/jaxlib dependency drop is deslop-hygiene's pyproject change |
-| C8 | pending |
+| C8 | landed: every `ModelConfig` key, method and class table without a kept reader; `test_tpb_prior` became `test_prior_design` (encoder tests only). The B7 keys stay until the engine's EB step replaces them. README, pyproject and the docs index are deslop-hygiene's; the SPEC JAX rule (L14–15) and rare-SV rule (L4) wait for the lead's ruling |
 
 ## Size
 - **`sv_pgs/`:** 65,304 lines.
@@ -264,7 +264,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
   - `README.md`: rewrite around the new path. The All of Us quickstart, generic usage, GPU check, bitpacked smoke/bench, data and troubleshooting sections all describe the old path.
   - `docs/design/README.md` and HANDOFF.md: drop "the old path is still present".
   - pyproject `description` and the `__init__` docstring: no longer "multi-GPU joint empirical-Bayes GLM".
-  - `.gitignore`: drop `.sv_pgs_cache/`, `diagnose_runs*.txt`, `falsify.txt`, `inspect_runs.txt`, `probe_*.txt` and `verify_fix.txt` once nothing writes them.
+  - `.gitignore` keeps its old patterns: the user's own checkout still holds those files (deslop-hygiene).
 - **SPEC.md (lead's ruling):**
   - L4 "Very rare SVs will be filtered" becomes the information-based inclusion rule;
   - L14–15, the JAX rule, becomes an array-module rule.

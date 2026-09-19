@@ -16,7 +16,7 @@
   - `cohort.py` (the shared covariates, multi-trait targets and kinship-grouped folds);
   - phenotypes in `all_of_us.py`, trimmed to the 21-trait panel.
 - **SPEC.md** carries the rulings: one model; CPU/GPU first-class; certification of approximate stages; EP-EB with a certificate; the r² prior; the TR length column; SV context in every prior; the learned mixing density; no hand-chosen priors.
-- **The old path is still present** and is scheduled for deletion (below). Cutover step C0 (dead code) and most of C1 (module moves) are done.
+- **The old path is deleted** (cutover C0–C8, CUTOVER.md); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## What remains, in order
 1. **Stage 1 (EP-EB LD-space warm start) is not on main.**
