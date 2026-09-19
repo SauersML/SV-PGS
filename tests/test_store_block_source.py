@@ -14,6 +14,7 @@ from sv_pgs.store_block_source import StoreGenotypeBlockSource
 from tests.test_dosage_store import _two_half_dosage, _write_store
 
 cupy = _try_import_cupy()
+FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
 WORKSPACE_BYTES = 1 << 30
 # ascending, gapped rows (inactive and tied rows skipped), one block ending a chromosome
 BLOCK_ROWS = [np.array([3, 5, 6, 10, 40]), np.array([41, 44, 47, 99, 298, 299]), np.array([300, 301, 449])]
@@ -95,9 +96,9 @@ def test_cuda_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, c
         expected = CodeBlockTile(
             cupy.asarray(signed[BLOCK_ROWS[block_index]]), cupy.asarray(means[columns]), cupy.asarray(scales[columns]), cupy, WORKSPACE_BYTES
         )
-        operand = tile.sample_operand(left) if operand is None else operand
+        operand = tile.sample_operand(left, FLOAT64_ROUNDING) if operand is None else operand
         right = cupy.asarray(rng.standard_normal((tile.variant_count, 2)))
         assert np.array_equal(_bits(tile.rmatmat(operand)), _bits(expected.rmatmat(left)))
-        tile.accumulate_matmat(right, image)
+        tile.accumulate_matmat(right, image, FLOAT64_ROUNDING)
         expected_image += expected.matmat(right)
     assert np.array_equal(_bits(image), _bits(expected_image))

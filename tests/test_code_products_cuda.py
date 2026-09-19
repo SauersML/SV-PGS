@@ -9,6 +9,7 @@ from sv_pgs.compute_budget import _try_import_cupy
 from tests.test_code_products import _signed_codes
 
 cupy = _try_import_cupy()
+FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
 pytestmark = pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
 
 
@@ -81,7 +82,7 @@ def test_cuda_sample_operand_gives_the_array_rmatmat_bit_for_bit(variants: int, 
     rng = np.random.default_rng(variants + columns)
     tiles = [_cuda_tile(rng, variants, samples, 1 << 33)[0] for _ in range(3)]
     left = cupy.asarray(rng.standard_normal((samples, columns)) * np.exp(rng.uniform(-30, 30, columns))[None, :])
-    operand = tiles[0].sample_operand(left)
+    operand = tiles[0].sample_operand(left, FLOAT64_ROUNDING)
     for tile in tiles:
         assert np.array_equal(_bits(tile.rmatmat(operand)), _bits(tile.rmatmat(left)))
 
@@ -95,7 +96,7 @@ def test_cuda_accumulate_matmat_adds_matmat_bit_for_bit(variants: int, samples: 
         tile, _codes = _cuda_tile(rng, variants, samples, workspace_bytes)
         right = cupy.asarray(rng.standard_normal((variants, columns)) * np.exp(rng.uniform(-30, 30, columns))[None, :])
         expected += tile.matmat(right)
-        tile.accumulate_matmat(right, fused)
+        tile.accumulate_matmat(right, fused, FLOAT64_ROUNDING)
     assert np.array_equal(_bits(fused), _bits(expected))
 
 
@@ -105,7 +106,7 @@ def test_cuda_operand_spanning_the_int32_exact_depth_matches_exact_integers() ->
     codes = _signed_codes(rng, 8, samples)
     tile = CodeBlockTile(cupy.asarray(codes), cupy.zeros(8), cupy.ones(8), cupy, 1 << 33)
     operand = rng.integers(-5000, 5000, size=(samples, 2)).astype(np.float64)
-    produced = cupy.asnumpy(tile.rmatmat(tile.sample_operand(cupy.asarray(operand))))
+    produced = cupy.asnumpy(tile.rmatmat(tile.sample_operand(cupy.asarray(operand), FLOAT64_ROUNDING)))
     np.testing.assert_array_equal(produced, (codes.astype(np.int64) @ operand.astype(np.int64)).astype(np.float64))
 
 
@@ -129,3 +130,31 @@ def test_cuda_weighted_column_squares_match_the_cpu_tile() -> None:
     quantization = 2.0 ** -(DIGIT_BITS * OPERAND_DIGITS - 2)
     bound = (quantization + 2 * (samples + 4) * unit_roundoff) * magnitude
     assert np.all(np.abs(produced - expected) <= bound)
+
+
+@pytest.mark.parametrize("relative_error", [1e-2, 1e-5])
+def test_cuda_budgeted_products_stay_within_their_bound(relative_error: float) -> None:
+    rng = np.random.default_rng(17)
+    variants, samples, columns = 96, 6007, 4
+    codes = _signed_codes(rng, variants, samples)
+    values = codes.astype(np.float64)
+    means, scales = values.mean(axis=1), values.std(axis=1)
+    standardized = (values - means[:, None]) / scales[:, None]
+    norm = float(np.linalg.norm(standardized, 2))
+    cuda_tile = CodeBlockTile(cupy.asarray(codes), cupy.asarray(means), cupy.asarray(scales), cupy, 1 << 33)
+    left = rng.standard_normal((samples, columns))
+    left[rng.random(samples) < 0.2] = 0.0
+    operand = cuda_tile.sample_operand(cupy.asarray(left), relative_error)
+    assert operand.digit_count < OPERAND_DIGITS
+    produced = cupy.asnumpy(cuda_tile.rmatmat(operand))
+    exact = standardized @ left
+    unit_roundoff = np.finfo(np.float64).eps / 2
+    # the budget moves the operand by relative_error ||L_k||; fp64 rounding adds a sum of n terms
+    rounding = 2 * (samples + 4) * unit_roundoff * (np.abs(standardized) @ np.abs(left))
+    assert np.all(np.linalg.norm(produced - exact, axis=0) <= relative_error * norm * np.linalg.norm(left, axis=0) + np.linalg.norm(rounding, axis=0))
+    right = rng.standard_normal((variants, columns))
+    image = cupy.zeros((samples, columns))
+    cuda_tile.accumulate_matmat(cupy.asarray(right), image, relative_error)
+    exact_image = standardized.T @ right
+    rounding = 2 * (variants + 4) * unit_roundoff * (np.abs(standardized).T @ np.abs(right))
+    assert np.all(np.linalg.norm(cupy.asnumpy(image) - exact_image, axis=0) <= relative_error * norm * np.linalg.norm(right, axis=0) + np.linalg.norm(rounding, axis=0))

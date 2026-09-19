@@ -12,19 +12,24 @@ product folds the centering into a rank-one correction, so ``X_b`` is never form
 
 Both devices return fp64-accurate products.
 
-* CUDA: the float operand of ``S`` is written as ``OPERAND_DIGITS`` balanced base-128 int8
-  digits per entry, with a power-of-two scale per column, laid side by side. One int8 x int8 ->
+* CUDA: the float operand of ``S`` is written as ``m`` balanced base-128 int8 digits per entry
+  (``OPERAND_DIGITS`` for fp64-equivalent products, fewer for a caller's error budget), with a
+  power-of-two scale per column, laid side by side. One int8 x int8 ->
   int32 cuBLAS GEMM per sample chunk (IMMA tensor cores on sm_75+, DP4A on sm_70) computes every
   digit product exactly (``INT32_EXACT_DIGIT_ROWS`` rows per chunk keep int32 exact), and
   recombining the digits in fp64 leaves only the operand's quantization: at most
-  ``2^-(7 OPERAND_DIGITS - 2)`` of its column maximum per entry.
+  ``2^-(7 m - 2)`` of its column maximum per entry.
 * CPU: the codes are converted to float64 per sample chunk (exact) and multiplied by DGEMM.
 
 One Stage 2 read multiplies every block by the same sample-side operand ``L``, so
-``CodeBlockTile.sample_operand(L)`` prepares it once (its digits on CUDA, its padded copy on the
-CPU, and its column sums) and every block's ``rmatmat`` reuses it. ``accumulate_matmat(R, image)``
-adds ``X_b R`` into the read's image in place, with the recombination, centering and sum fused
-on CUDA. Both give exactly the values of ``rmatmat(L)`` and ``image += matmat(R)``.
+``CodeBlockTile.sample_operand(L, relative_error)`` prepares it once (its digits on CUDA, its padded copy on the
+CPU, and its column sums) and every block's ``rmatmat`` reuses it.
+``accumulate_matmat(R, image, relative_error)`` adds ``X_b R`` into the read's image in place,
+with the recombination, centering and sum fused on CUDA. The error budget is normwise per
+column: the operand the GEMMs multiply is within ``relative_error * ||L_k||_2`` of ``L_k`` (so the
+product is within ``||X_b||_2`` times that), and the digit count is the least that guarantees it.
+At a budget of fp64 rounding both give exactly the values of ``rmatmat(L)`` and
+``image += matmat(R)``.
 
 Memory: the caller's plan hands each tile ``workspace_bytes`` for the transients of one product.
 Every product counts its fixed buffers (padded operand, output, integer products) and its
@@ -35,6 +40,7 @@ CuPy is passed in by the caller as the array module; this module never imports i
 
 from __future__ import annotations
 
+import math
 from types import ModuleType
 from typing import Any
 
@@ -52,8 +58,9 @@ DIGIT_BITS = 7
 """Each operand digit covers 7 bits: balanced digits lie in [-64, 63], safely inside int8."""
 
 OPERAND_DIGITS = 8
-"""Digits per operand entry: 7 * 8 - 2 = 54 bits hold the 53-bit fp64 mantissa of the column
-maximum, so quantization is at most 2^-54 of it and the products carry fp64 GEMM accuracy."""
+"""The most digits an operand entry takes: 7 * 8 - 2 = 54 bits hold the 53-bit fp64 mantissa of
+the column maximum, so quantization is at most 2^-54 of it and the products carry fp64 GEMM
+accuracy. A caller's error budget asks for fewer (``operand_digits_for``)."""
 
 _DIGIT_HALF = 1 << (DIGIT_BITS - 1)
 _DIGIT_MASK = (1 << DIGIT_BITS) - 1
@@ -63,16 +70,50 @@ INT32_EXACT_DIGIT_ROWS = (2**31 - 1) // (SIGNED_CODE_OFFSET * _DIGIT_HALF)
 
 _FLOAT64_BYTES = 8
 _INT32_BYTES = 4
-_DIGIT_WORKING_BYTES = OPERAND_DIGITS + 4 * _FLOAT64_BYTES
-"""Peak bytes ``operand_digits`` holds per operand entry: the int8 digits plus four live 8-byte
-temporaries while one digit is split off (the remaining integers, the digit, and two
-intermediate expressions)."""
 
 
-def operand_digits(dense: Any, array_module: ModuleType) -> tuple[Any, Any]:
-    """Split ``dense`` [rows, K] into balanced base-128 digits.
+def _digit_working_bytes(digit_count: int) -> int:
+    """Peak bytes ``operand_digits`` holds per operand entry: the int8 digits plus four live 8-byte
+    temporaries while one digit is split off (the remaining integers, the digit, and two
+    intermediate expressions)."""
+    return digit_count + 4 * _FLOAT64_BYTES
 
-    Returns ``(digits, scale)``: ``digits`` is int8 [rows, OPERAND_DIGITS * K] in column-major
+
+_FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
+"""A budget no digit count below ``OPERAND_DIGITS`` meets: products exact to fp64 rounding."""
+
+
+def _digits_for_ratio(ratio: float, relative_error: float) -> int:
+    """The least digit count m with ratio * 2^-(7m-2) <= relative_error, at most OPERAND_DIGITS."""
+    if not relative_error > 0:
+        raise ValueError("relative_error must be positive")
+    if ratio == 0:
+        return 1
+    return max(1, min(OPERAND_DIGITS, math.ceil((math.log2(ratio / relative_error) + 2) / DIGIT_BITS)))
+
+
+def operand_digits_for(dense: Any, relative_error: float, array_module: ModuleType) -> int:
+    """The fewest digits whose split of ``dense`` [rows, K] moves no column k by more than
+    ``relative_error * ||dense_k||_2`` (2-norm), at most ``OPERAND_DIGITS``.
+
+    The split rounds each entry to within 2^-(7m-2) of its column's largest magnitude and keeps
+    zeros exact, so column k moves by at most sqrt(nnz_k) 2^-(7m-2) max|dense_k|.
+    """
+    xp = array_module
+    values = xp.asarray(dense, dtype=xp.float64)
+    if values.size == 0:
+        return _digits_for_ratio(0.0, relative_error)
+    magnitude = xp.abs(values)
+    norm = xp.sqrt(xp.square(values).sum(axis=0))
+    live = norm > 0
+    ratio = xp.where(live, xp.sqrt((magnitude > 0).sum(axis=0)) * magnitude.max(axis=0) / xp.where(live, norm, 1.0), 0.0)
+    return _digits_for_ratio(float(ratio.max()), relative_error)
+
+
+def operand_digits(dense: Any, array_module: ModuleType, digit_count: int = OPERAND_DIGITS) -> tuple[Any, Any]:
+    """Split ``dense`` [rows, K] into ``digit_count`` balanced base-128 digits.
+
+    Returns ``(digits, scale)``: ``digits`` is int8 [rows, digit_count * K] in column-major
     order, digit ``d`` of column ``k`` in column ``d * K + k``, and
     ``sum_d digits[:, d * K + k] * 128^d == rint(dense[:, k] * scale[k])`` exactly. ``scale`` is a
     power of two per column that puts the column maximum in (2^(7m-3), 2^(7m-2)].
@@ -80,11 +121,11 @@ def operand_digits(dense: Any, array_module: ModuleType) -> tuple[Any, Any]:
     values = array_module.asarray(dense, dtype=array_module.float64)
     rows, columns = values.shape
     magnitude = array_module.max(array_module.abs(values), axis=0) if rows else array_module.zeros(columns)
-    exponent = (DIGIT_BITS * OPERAND_DIGITS - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0)))
+    exponent = (DIGIT_BITS * digit_count - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0)))
     scale = array_module.exp2(exponent)
     integers = array_module.rint(values * scale[None, :]).astype(array_module.int64)
-    digits = array_module.empty((rows, OPERAND_DIGITS * columns), dtype=array_module.int8, order="F")
-    for digit_index in range(OPERAND_DIGITS):
+    digits = array_module.empty((rows, digit_count * columns), dtype=array_module.int8, order="F")
+    for digit_index in range(digit_count):
         low = ((integers + _DIGIT_HALF) & _DIGIT_MASK) - _DIGIT_HALF
         digits[:, digit_index * columns : (digit_index + 1) * columns] = low.astype(array_module.int8)
         integers = (integers - low) >> DIGIT_BITS
@@ -92,10 +133,11 @@ def operand_digits(dense: Any, array_module: ModuleType) -> tuple[Any, Any]:
 
 
 def recombine_digit_products(products: Any, scale: Any, array_module: ModuleType) -> Any:
-    """Undo ``operand_digits`` on the right of an exact integer product [rows, OPERAND_DIGITS * K]."""
+    """Undo ``operand_digits`` on the right of an exact integer product [rows, m * K]."""
     columns = int(scale.shape[0])
-    total = products[:, (OPERAND_DIGITS - 1) * columns :].astype(array_module.float64)
-    for digit_index in range(OPERAND_DIGITS - 2, -1, -1):
+    digit_count = int(products.shape[1]) // columns
+    total = products[:, (digit_count - 1) * columns :].astype(array_module.float64)
+    for digit_index in range(digit_count - 2, -1, -1):
         total = total * float(1 << DIGIT_BITS) + products[:, digit_index * columns : (digit_index + 1) * columns]
     return total / scale[None, :]
 
@@ -214,8 +256,11 @@ class SampleOperand:
     the zero-padded ``L``; both hold the column sums ``1' L``. ``nbytes`` counts what it holds.
     """
 
-    def __init__(self, column_sums: Any, padded: Any, chunks: list[tuple[int, int, Any, Any]], padded_samples: int) -> None:
+    def __init__(
+        self, column_sums: Any, padded: Any, chunks: list[tuple[int, int, Any, Any]], padded_samples: int, digit_count: int
+    ) -> None:
         self.column_sums = column_sums
+        self.digit_count = digit_count
         self.columns = int(column_sums.shape[0])
         self.padded = padded
         self.chunks = chunks
@@ -241,30 +286,34 @@ class CodeBlockTile:
         variant_count, sample_count = (int(extent) for extent in codes.shape)
         aligned = array_module.zeros((_aligned(variant_count), _aligned(sample_count)), dtype=array_module.int8)
         aligned[:variant_count, :sample_count] = codes
-        self._hold(aligned, variant_count, sample_count, means, scales, array_module, workspace_bytes)
+        scale_values = array_module.asarray(scales, dtype=array_module.float64)
+        spread = float(scale_values.max() / scale_values.min()) if variant_count else 1.0
+        self._hold(aligned, variant_count, sample_count, means, scale_values, spread, array_module, workspace_bytes)
 
     @classmethod
     def from_aligned(
-        cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any,
+        cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
         array_module: ModuleType, workspace_bytes: int,
     ) -> CodeBlockTile:
         """A tile over codes the caller already holds in an ``INT8_GEMM_ALIGNMENT``-aligned buffer (a
         streamed block's device buffer, say), without copying them. The alignment padding, at most
-        three rows and three columns, is cleared in place."""
+        three rows and three columns, is cleared in place. ``scale_spread`` is max(scales) /
+        min(scales), which the caller knows on the host (so the tile never waits on the device)."""
         codes = array_module.asarray(aligned_codes)
         if codes.dtype != array_module.int8 or codes.shape != (_aligned(variant_count), _aligned(sample_count)):
             raise ValueError(f"aligned_codes must be int8 [{_aligned(variant_count)}, {_aligned(sample_count)}]")
         codes[variant_count:] = 0
         codes[:, sample_count:] = 0
         tile = cls.__new__(cls)
-        tile._hold(codes, int(variant_count), int(sample_count), means, scales, array_module, workspace_bytes)
+        tile._hold(codes, int(variant_count), int(sample_count), means, scales, float(scale_spread), array_module, workspace_bytes)
         return tile
 
     def _hold(
-        self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any,
+        self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
         array_module: ModuleType, workspace_bytes: int,
     ) -> None:
         self._array_module = array_module
+        self._scale_spread = scale_spread
         self._variant_count, self._sample_count = variant_count, sample_count
         self._codes = aligned_codes
         self._means = array_module.asarray(means, dtype=array_module.float64)
@@ -287,11 +336,15 @@ class CodeBlockTile:
         scaled = xp.asarray(right, dtype=xp.float64) / self._scales[:, None]
         return self._codes_transposed_times(scaled) - (self._means @ scaled)[None, :]
 
-    def accumulate_matmat(self, right: Any, image: Any) -> None:
-        """``image += self.matmat(right)`` in place, with exactly its values.
+    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
+        """``image += X_b R~`` in place for an R~ with ``||R~_k - right_k||_2 <= relative_error ||right_k||_2``.
 
         ``image`` is the read's C-contiguous float64 (n, K) sum. No (n, K) temporary is formed: on
         CUDA one kernel recombines each chunk's integer products, centers them and adds them in.
+        The CUDA split holds R / scale, whose rounding moves column k of R by at most
+        sqrt(p_b) (max scale / min scale) 2^-(7m-2) ||R_k||_2, which sets m. At a budget of fp64
+        rounding (m = OPERAND_DIGITS) the values equal ``image += self.matmat(right)`` exactly; the
+        CPU products are exact fp64 whatever the budget.
         """
         xp = self._array_module
         scaled = xp.asarray(right, dtype=xp.float64) / self._scales[:, None]
@@ -312,8 +365,13 @@ class CodeBlockTile:
             return
         if variants > INT32_EXACT_DIGIT_ROWS:
             raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
-        digits, scale = operand_digits(padded, xp)
-        digit_columns = OPERAND_DIGITS * columns
+        digit_count = _digits_for_ratio(math.sqrt(self._variant_count) * self._scale_spread, relative_error)
+        digits, scale = operand_digits(padded, xp, digit_count)
+        if digit_count < OPERAND_DIGITS:
+            # center with the operand the digits represent, so the image gets exactly X_b R~
+            represented = recombine_digit_products(digits.astype(xp.int32), scale, xp)[: self._variant_count]
+            offset = self._means @ represented
+        digit_columns = digit_count * columns
         # fixed: the operand and its digits; per sample: its variant-contiguous codes and integer products
         fixed = _FLOAT64_BYTES * variants * columns + digit_columns * variants
         chunk = self._sample_chunk(fixed, variants + _INT32_BYTES * digit_columns, samples)
@@ -332,16 +390,19 @@ class CodeBlockTile:
             grid, block = _launch_shape(xp, warp, rows, columns)
             kernel(
                 grid, block,
-                (products, np.int64(chunk), np.int32(OPERAND_DIGITS), np.int64(columns), scale, offset, image, np.int64(start), np.int64(rows)),
+                (products, np.int64(chunk), np.int32(digit_count), np.int64(columns), scale, offset, image, np.int64(start), np.int64(rows)),
             )
 
-    def sample_operand(self, left: Any) -> SampleOperand:
+    def sample_operand(self, left: Any, relative_error: float) -> SampleOperand:
         """``left`` [n, K] prepared once for the ``rmatmat`` of every block of a read.
 
-        Every tile of the read shares this tile's sample count. ``rmatmat(operand)`` equals
-        ``rmatmat(left)`` bit for bit whenever ``left``'s product fits one chunk of its own (a
-        workspace that holds it and n within the int32-exact depth); otherwise the two group the
-        fp64 sum over samples differently.
+        Every tile of the read shares this tile's sample count. ``rmatmat(operand)`` is X_b' L~ for
+        an L~ with ``||L~_k - left_k||_2 <= relative_error ||left_k||_2`` (``operand_digits_for``;
+        exact zeros, such as a fold's masked rows, stay zero); the CPU products are exact fp64
+        whatever the budget. At a budget of fp64 rounding it equals ``rmatmat(left)`` bit for bit
+        whenever ``left``'s product fits one chunk of its own (a workspace that holds it and n
+        within the int32-exact depth); otherwise the two group the fp64 sum over samples
+        differently.
         """
         xp = self._array_module
         values = xp.asarray(left, dtype=xp.float64)
@@ -351,10 +412,17 @@ class CodeBlockTile:
         padded = self._padded_rows(values, samples)
         column_sums = values.sum(axis=0)
         if xp is np:
-            return SampleOperand(column_sums, padded, [], samples)
+            return SampleOperand(column_sums, padded, [], samples, OPERAND_DIGITS)
+        digit_count = operand_digits_for(values, relative_error, xp)
         span = INT32_EXACT_DIGIT_ROWS // INT8_GEMM_ALIGNMENT * INT8_GEMM_ALIGNMENT
-        chunks = [(start, min(start + span, samples), *operand_digits(padded[start : start + span], xp)) for start in range(0, samples, span)]
-        return SampleOperand(column_sums, None, chunks, samples)
+        chunks = [
+            (start, min(start + span, samples), *operand_digits(padded[start : start + span], xp, digit_count))
+            for start in range(0, samples, span)
+        ]
+        if digit_count < OPERAND_DIGITS:
+            # center with the operand the digits represent, so rmatmat gives exactly X_b' L~
+            column_sums = sum(recombine_digit_products(digits.astype(xp.int32), scale, xp).sum(axis=0) for _, _, digits, scale in chunks)
+        return SampleOperand(column_sums, None, chunks, samples, digit_count)
 
     def rmatmat(self, left: Any) -> Any:
         """X_b.T @ left for left of shape (n, K), or for its read's ``SampleOperand``; returns (p_b, K)."""
@@ -374,12 +442,18 @@ class CodeBlockTile:
         for S2 = s * s. On CUDA, S2 = 128 A + B with A = S2 >> 7 and B = S2 & 127, both in [0, 127],
         so each digit GEMM stays within the int32-exact bound of the codes themselves.
         """
-        xp = self._array_module
-        operand = self.sample_operand(weights)
+        operand = self.sample_operand(weights, _FLOAT64_ROUNDING)
         linear = self._codes_times_operand(operand)
         squares = self._squared_codes_times_operand(operand)
         centered = squares - 2.0 * self._means[:, None] * linear + (self._means * self._means)[:, None] * operand.column_sums[None, :]
         return centered / (self._scales * self._scales)[:, None]
+
+    def columns(self, local: Any) -> Any:
+        """The standardized columns X_b[:, local] as a dense float64 (n, len(local)) array."""
+        xp = self._array_module
+        index = xp.asarray(local, dtype=xp.int64)
+        codes = self._codes[index, : self._sample_count].astype(xp.float64)
+        return ((codes - self._means[index][:, None]) / self._scales[index][:, None]).T
 
     def weighted_gram(self, weights: Any) -> Any:
         """X_b.T diag(weights) X_b; returns (p_b, p_b)."""
@@ -439,19 +513,19 @@ class CodeBlockTile:
         # fixed: the operand, the total, the integer products and two fp64 recombination terms;
         # per sample: the digit split of its operand row
         fixed = operand_bytes + variants * columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
-        chunk = self._sample_chunk(fixed, _DIGIT_WORKING_BYTES * columns, INT32_EXACT_DIGIT_ROWS)
+        chunk = self._sample_chunk(fixed, _digit_working_bytes(OPERAND_DIGITS) * columns, INT32_EXACT_DIGIT_ROWS)
         chunks = ((start, min(start + chunk, samples), *operand_digits(padded[start : start + chunk], xp)) for start in range(0, samples, chunk))
-        return self._digit_products(self._codes, chunks, columns)[: self._variant_count]
+        return self._digit_products(self._codes, chunks, columns, OPERAND_DIGITS)[: self._variant_count]
 
-    def _digit_products(self, left_codes: Any, chunks: Any, columns: int) -> Any:
+    def _digit_products(self, left_codes: Any, chunks: Any, columns: int, digit_count: int) -> Any:
         """sum over the operand's sample chunks of left_codes @ chunk, from its digits (CUDA); [p_b, K]."""
         xp = self._array_module
         variants, samples = (int(extent) for extent in left_codes.shape)
         total = xp.zeros((variants, columns), dtype=xp.float64)
-        products = xp.empty((variants, OPERAND_DIGITS * columns), dtype=xp.int32, order="F")
+        products = xp.empty((variants, digit_count * columns), dtype=xp.int32, order="F")
         for start, stop, digits, scale in chunks:
             _cuda_int8_gemm(
-                xp, rows=variants, columns=OPERAND_DIGITS * columns, depth=stop - start,
+                xp, rows=variants, columns=digit_count * columns, depth=stop - start,
                 left=left_codes, left_offset=start, left_lead=samples,
                 right=digits, right_lead=stop - start, output=products, output_lead=variants,
             )
@@ -485,8 +559,8 @@ class CodeBlockTile:
             return self._operand_codes_times(operand, lambda codes: codes.astype(np.float64))[: self._variant_count]
         variants = int(self._codes.shape[0])
         # fixed: the total, the integer products and two fp64 recombination terms
-        self._require_workspace(variants * operand.columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES))
-        return self._digit_products(self._codes, operand.chunks, operand.columns)[: self._variant_count]
+        self._require_workspace(variants * operand.columns * (3 * _FLOAT64_BYTES + operand.digit_count * _INT32_BYTES))
+        return self._digit_products(self._codes, operand.chunks, operand.columns, operand.digit_count)[: self._variant_count]
 
     def _squared_codes_times_operand(self, operand: SampleOperand) -> Any:
         """(S * S) @ L for the read's prepared L; returns [p_b, K] float64."""
@@ -498,15 +572,15 @@ class CodeBlockTile:
         # fixed: the int16 squares, their two int8 halves, the total, the integer products and two
         # fp64 recombination terms
         code_bytes = int(self._codes.size)
-        self._require_workspace(4 * code_bytes + variants * operand.columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES))
+        self._require_workspace(4 * code_bytes + variants * operand.columns * (3 * _FLOAT64_BYTES + operand.digit_count * _INT32_BYTES))
         squares = self._codes.astype(xp.int16)
         squares *= squares
         high = (squares >> DIGIT_BITS).astype(xp.int8)
         low = (squares & _DIGIT_MASK).astype(xp.int8)
         del squares
         return (
-            self._digit_products(high, operand.chunks, operand.columns) * float(1 << DIGIT_BITS)
-            + self._digit_products(low, operand.chunks, operand.columns)
+            self._digit_products(high, operand.chunks, operand.columns, operand.digit_count) * float(1 << DIGIT_BITS)
+            + self._digit_products(low, operand.chunks, operand.columns, operand.digit_count)
         )[: self._variant_count]
 
     def _codes_transposed_times(self, operand: Any) -> Any:
@@ -569,7 +643,7 @@ class CodeBlockTile:
         # fixed: the weights, the total, the integer products and two fp64 recombination terms;
         # per sample: its weighted fp64 codes and their digit split
         fixed = _FLOAT64_BYTES * samples + variants * variants * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
-        chunk = self._sample_chunk(fixed, (_FLOAT64_BYTES + _DIGIT_WORKING_BYTES) * variants, INT32_EXACT_DIGIT_ROWS)
+        chunk = self._sample_chunk(fixed, (_FLOAT64_BYTES + _digit_working_bytes(OPERAND_DIGITS)) * variants, INT32_EXACT_DIGIT_ROWS)
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
             weighted_codes = padded_weights[start:stop, None] * self._codes[:, start:stop].T.astype(xp.float64)

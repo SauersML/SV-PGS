@@ -9,8 +9,12 @@ from sv_pgs.code_products import (
     OPERAND_DIGITS,
     CodeBlockTile,
     operand_digits,
+    operand_digits_for,
     recombine_digit_products,
 )
+
+
+FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
 
 
 def _gamma(term_count: int) -> float:
@@ -114,7 +118,7 @@ def test_cpu_sample_operand_gives_the_array_rmatmat_bit_for_bit() -> None:
     codes, _standardized_codes, means, scales = _standard_tile_inputs(rng, 37, 1001)
     tiles = [CodeBlockTile(codes[rows], means[rows], scales[rows], np, 1 << 34) for rows in (slice(0, 20), slice(20, 37))]
     left = rng.standard_normal((1001, 5)) * np.exp(rng.uniform(-20, 20, 5))[None, :]
-    operand = tiles[0].sample_operand(left)
+    operand = tiles[0].sample_operand(left, FLOAT64_ROUNDING)
     for tile in tiles:
         np.testing.assert_array_equal(tile.rmatmat(operand).view(np.uint64), tile.rmatmat(left).view(np.uint64))
 
@@ -128,7 +132,7 @@ def test_cpu_accumulate_matmat_adds_matmat_bit_for_bit(workspace_bytes: int) -> 
     expected = rng.standard_normal((1001, 4))
     fused = expected.copy()
     expected += tile.matmat(right)
-    tile.accumulate_matmat(right, fused)
+    tile.accumulate_matmat(right, fused, FLOAT64_ROUNDING)
     np.testing.assert_array_equal(fused.view(np.uint64), expected.view(np.uint64))
 
 
@@ -154,14 +158,40 @@ def test_from_aligned_wraps_the_callers_codes_without_copying() -> None:
     codes, _standardized_codes, means, scales = _standard_tile_inputs(rng, 37, 1001)
     aligned = np.zeros((40, 1004), dtype=np.int8)
     aligned[:37, :1001] = codes
-    wrapped = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, np, 1 << 34)
+    wrapped = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, float(scales.max() / scales.min()), np, 1 << 34)
     copied = CodeBlockTile(codes, means, scales, np, 1 << 34)
     left = rng.standard_normal((1001, 3))
     assert np.shares_memory(wrapped._codes, aligned)
     np.testing.assert_array_equal(wrapped.rmatmat(left).view(np.uint64), copied.rmatmat(left).view(np.uint64))
     aligned[38, 5] = 1
     aligned[3, 1002] = -4
-    cleared = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, np, 1 << 34)
+    cleared = CodeBlockTile.from_aligned(aligned, 37, 1001, means, scales, float(scales.max() / scales.min()), np, 1 << 34)
     np.testing.assert_array_equal(cleared.rmatmat(left).view(np.uint64), copied.rmatmat(left).view(np.uint64))
     with pytest.raises(ValueError, match="aligned_codes"):
-        CodeBlockTile.from_aligned(aligned[:, :1002], 37, 1001, means, scales, np, 1 << 34)
+        CodeBlockTile.from_aligned(aligned[:, :1002], 37, 1001, means, scales, 1.0, np, 1 << 34)
+
+
+def test_operand_digits_for_is_the_least_count_meeting_the_budget() -> None:
+    rng = np.random.default_rng(15)
+    values = rng.standard_normal((2000, 5)) * np.exp(rng.uniform(-8, 8, 5))[None, :]
+    values[rng.random((2000, 5)) < 0.3] = 0.0
+    values[:, 4] = 0.0
+    for relative_error in (1e-1, 1e-4, 1e-9, FLOAT64_ROUNDING):
+        count = operand_digits_for(values, relative_error, np)
+        digits, scale = operand_digits(values, np, count)
+        represented = recombine_digit_products(digits.astype(np.int64), scale, np)
+        moved = np.linalg.norm(represented - values, axis=0)
+        assert np.all(moved <= relative_error * np.linalg.norm(values, axis=0))
+        live = np.linalg.norm(values, axis=0) > 0
+        ratio = np.sqrt((values[:, live] != 0).sum(axis=0)) * np.abs(values[:, live]).max(axis=0) / np.linalg.norm(values[:, live], axis=0)
+        # the guarantee one digit fewer would give is not enough for the worst column
+        assert count == OPERAND_DIGITS or count == 1 or ratio.max() * 2.0 ** -(DIGIT_BITS * (count - 1) - 2) > relative_error
+    assert operand_digits_for(values, FLOAT64_ROUNDING, np) == OPERAND_DIGITS
+
+
+def test_columns_are_the_standardized_block_columns() -> None:
+    rng = np.random.default_rng(16)
+    codes, standardized, means, scales = _standard_tile_inputs(rng, 37, 1001)
+    tile = CodeBlockTile(codes, means, scales, np, 1 << 34)
+    local = np.array([0, 5, 36])
+    np.testing.assert_allclose(tile.columns(local), standardized[local].T, rtol=4 * np.finfo(np.float64).eps, atol=0)

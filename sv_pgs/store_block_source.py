@@ -87,8 +87,12 @@ class StoreGenotypeBlockSource:
         widest_block = _aligned(max(rows.shape[0] for rows in self._block_rows))
         self._cupy = _try_import_cupy() if budget.device_kind == "cuda" else None
         xp = self._cupy if self._cupy is not None else np
+        host_scales = np.asarray(scales, dtype=np.float64)
+        self._scale_spreads = [
+            float(host_scales[start:stop].max() / host_scales[start:stop].min()) for start, stop in zip(self._offsets[:-1], self._offsets[1:])
+        ]
         self._means = xp.asarray(means, dtype=xp.float64)
-        self._scales = xp.asarray(scales, dtype=xp.float64)
+        self._scales = xp.asarray(host_scales)
         # Two slots, so that the next block's span and codes fill while the current block computes.
         self._signed = [xp.empty((widest_block, self._padded_samples), dtype=xp.int8) for _ in range(2)]
         self.resident_bytes = sum(int(slot.nbytes) for slot in self._signed) + int(self._means.nbytes) + int(self._scales.nbytes)
@@ -133,7 +137,7 @@ class StoreGenotypeBlockSource:
         offset = slice(int(self._offsets[block_index]), int(self._offsets[block_index + 1]))
         return CodeBlockTile.from_aligned(
             self._signed[slot][: _aligned(rows)], rows, self._samples, self._means[offset], self._scales[offset],
-            self.array_module, self._workspace_bytes,
+            self._scale_spreads[block_index], self.array_module, self._workspace_bytes,
         )
 
     def iter_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
