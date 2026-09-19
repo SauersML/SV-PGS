@@ -34,8 +34,11 @@ from sv_pgs.ld_space_fit import (
     gig_expected_log,
     hypermodel_from_prior_design,
     inverse_digamma,
+    quantitative_trait_statistics,
 )
+from sv_pgs.genotype_statistics import compute_genotype_statistics
 from tests.conftest import make_variant_records
+from tests.stage0_support import InMemoryTileSource, bubble_groups, mosaic_codes
 
 SCHEMES = ("expectation_propagation", "coherent_vb", "plug_in")
 CPU_BUDGET = ComputeBudget(
@@ -621,6 +624,55 @@ def test_subset_hyperparameters_then_fixed_pass_stays_close_to_the_full_fit(monk
     full_accuracy = np.corrcoef(genotypes @ full.posterior_mean, genetic)[0, 1] ** 2
     two_phase_accuracy = np.corrcoef(genotypes @ two_phase.posterior_mean, genetic)[0, 1] ** 2
     assert two_phase_accuracy > full_accuracy - 0.02, (two_phase_accuracy, full_accuracy)
+
+
+def test_stage1_on_stage0_output_matches_dense_sufficient_statistics(tmp_path) -> None:
+    rng = np.random.default_rng(12)
+    sample_count, variant_count = 900, 360
+    codes = mosaic_codes(rng, sample_count, variant_count)
+    source = InMemoryTileSource(codes={"chr1": codes}, groups={"chr1": bubble_groups(rng, variant_count)})
+    covariates = np.column_stack([np.ones(sample_count), rng.standard_normal((sample_count, 2))])
+    dosage = codes.T.astype(np.float64) / 127.0
+    phenotype = covariates @ np.array([1.0, 0.4, -0.2]) + rng.standard_normal(sample_count)
+    phenotype += 0.3 * (dosage[:, rng.choice(variant_count, 12, replace=False)] @ rng.standard_normal(12))
+    config = ModelConfig(minimum_minor_allele_frequency=0.01)
+    statistics = compute_genotype_statistics(
+        source, np.arange(sample_count), covariates, phenotype[:, None], config, CPU_BUDGET, 128, tmp_path / "ld"
+    )
+    ld = statistics.ld
+    trait = quantitative_trait_statistics(statistics, 0)
+
+    active = dosage[:, statistics.active_rows]
+    standardized = (active - active.mean(axis=0)) / active.std(axis=0)
+    reduced = standardized[:, statistics.tie_map.kept_indices]
+    projected = reduced - covariates @ np.linalg.lstsq(covariates, reduced, rcond=None)[0]
+    residual = phenotype - covariates @ np.linalg.lstsq(covariates, phenotype, rcond=None)[0]
+    dense = _ld_blocks(projected, np.asarray(ld.block_boundaries))
+    dense_trait = QuantitativeTraitStatistics(
+        sample_count=sample_count, covariate_count=3, score=projected.T @ residual, residual_sum_of_squares=float(residual @ residual)
+    )
+    np.testing.assert_allclose(trait.score, dense_trait.score, rtol=1e-8, atol=1e-6)
+    np.testing.assert_allclose(trait.residual_sum_of_squares, dense_trait.residual_sum_of_squares, rtol=1e-10)
+
+    reduced_count = projected.shape[1]
+    hypermodel = LDPriorHypermodel(
+        annotation_design=np.zeros((reduced_count, 0)),
+        annotation_prior_mean=np.zeros(0),
+        annotation_prior_precision=np.zeros(0),
+        log_variance_offset=np.zeros(reduced_count),
+        variant_class_index=np.zeros(reduced_count, dtype=np.int64),
+        class_names=("snv",),
+        shape_a=0.5,
+        initial_shape_b=np.array([0.5]),
+        shape_b_pooling_variance=0.25,
+    )
+    (from_stage0,) = fit_ld_space(ld, [trait], hypermodel, CPU_BUDGET)
+    (from_dense,) = fit_ld_space(dense, [dense_trait], hypermodel, CPU_BUDGET)
+    assert ld.block_count > 1 and from_stage0.converged and from_dense.converged
+    # Stage 0 stores the Grams in fp32.
+    np.testing.assert_allclose(from_stage0.log_variance_level, from_dense.log_variance_level, rtol=0.0, atol=1e-4)
+    scale = np.max(np.abs(from_dense.posterior_mean))
+    np.testing.assert_allclose(from_stage0.posterior_mean, from_dense.posterior_mean, rtol=0.0, atol=1e-4 * scale)
 
 
 def test_several_traits_share_one_pass_and_match_separate_fits() -> None:
