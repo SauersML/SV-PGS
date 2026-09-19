@@ -5,7 +5,7 @@ for a quantitative trait; the logistic curvature or EP likelihood-site precision
 the logistic likelihood is log-concave, for a binary one), Gaussian site variances D = 1/Pi (p,)
 >= 0, and the covariates C profiled out in its own weighted metric:
 
-    H  = W^1/2 C (C'WC)^-1 C' W^1/2,   Xt = (I - H) W^1/2 X,
+    H  = W^1/2 C (C'WC)^+ C' W^1/2,   Xt = (I - H) W^1/2 X,
     A  = Xt'Xt + diag(1/D)            (the posterior precision)
     S  = I + Xt D Xt'                 (n x n, every eigenvalue >= 1)
 
@@ -17,6 +17,8 @@ identity A^-1 Xt' = D Xt' S^-1. For any iterate with residual r = b - S z_hat,
 (e = -D Xt' S^-1 r and Xt (D A D) Xt' = G S with G = S - I), so a column's exact residual norm is
 its certificate against ep_eb.md's target ||e||_A^2 <= p_eff / K. Rows outside the training metric
 (held-out folds, target people) satisfy ||X_out e||^2 <= lambda_max(X_out D X_out') ||r||^2 / 4.
+H is the projector onto the column space of W^1/2 C, which can lose rank on a model's rows while C
+has full rank on the cohort (`covariate_whitener`).
 
 One pass reads each tile once and serves every column of every model:
 
@@ -211,8 +213,31 @@ def _host(values: Any) -> np.ndarray:
     return np.asarray(values.get() if hasattr(values, "get") else values)
 
 
+def covariate_whitener(array_module: Any, weighted_covariates: Any) -> Any:
+    """F (k x k) with F F' = (A'A)^+ on the numerical column space of A = W^1/2 C (n x k).
+
+    The covariates are shared by every trait, so a model's rows can take their rank away: a
+    sex-restricted disease (prostate cancer: men only) makes the sex indicator equal the intercept and
+    age x female zero, and a fold can hold no member of a rare level. Singular values of A at or below
+    the numerical-rank tolerance max(n, k) eps s_max (Golub and Van Loan 5.4.1) span no direction of
+    its column space; the others give F = V diag(1/s) from A's own SVD, zero columns for the rest, so
+    the Gram's squared condition number never enters. A F has orthonormal (or zero) columns, so
+    H = A F F' A' is the projector onto A's column space and F F' A'y the minimum-norm coefficients.
+    The SVD is taken of R in A = QR (Householder, backward stable), which has A's singular values and
+    right vectors without forming the n x k left ones.
+    """
+    triangle = array_module.linalg.qr(weighted_covariates, mode="r")
+    _, singular_values, right_vectors = array_module.linalg.svd(triangle, full_matrices=False)
+    kept = singular_values > max(weighted_covariates.shape) * np.finfo(np.float64).eps * singular_values[0]
+    inverse = array_module.where(kept, 1.0 / array_module.where(kept, singular_values, 1.0), 0.0)
+    return right_vectors.T * inverse[None, :]
+
+
 class DualModels:
-    """Weights (n, M), site variances (p, M) and shared covariates (n, k) of every model."""
+    """Weights (n, M), site variances (p, M) and shared covariates (n, k) of every model.
+
+    `covariate_factor` (M, k, k) holds each model's `covariate_whitener`: F_m F_m' = (C'W_m C)^+.
+    """
 
     def __init__(self, weights: Any, variances: Any, covariates: Any, array_module: Any = np) -> None:
         self.array_module = array_module
@@ -222,21 +247,24 @@ class DualModels:
         if bool(array_module.any(self.variances < 0.0)):
             raise ValueError("site variances must be non-negative; negative sites need the exact split.")
         self.root_weights = array_module.sqrt(self.weights)
-        normal = array_module.einsum("na,nm,nb->mab", self.covariates, self.weights, self.covariates)
-        self.covariate_factor = array_module.linalg.cholesky(normal)
+        self.covariate_factor = array_module.stack(
+            [covariate_whitener(array_module, self.root_weights[:, model : model + 1] * self.covariates) for model in range(self.model_count)]
+        )
 
     @property
     def model_count(self) -> int:
         return int(self.weights.shape[1])
 
+    def covariate_solve(self, right: Any, column_models: Any) -> Any:
+        """(C'W_m C)^+ r for each column r of `right` (k x columns), with m the column's model."""
+        factor = self.covariate_factor[column_models]
+        whitened = self.array_module.einsum("cab,ac->cb", factor, right)
+        return self.array_module.einsum("cab,cb->ac", factor, whitened)
+
     def complement(self, values: Any, column_models: Any) -> Any:
         """(I - H_m) v per column, with H_m the weighted covariate projector of the column's model."""
-        array_module = self.array_module
         root = self.root_weights[:, column_models]
-        projected = (self.covariates.T @ (root * values)).T[:, :, None]
-        factor = self.covariate_factor[column_models]
-        solved = array_module.linalg.solve(array_module.swapaxes(factor, 1, 2), array_module.linalg.solve(factor, projected))[:, :, 0].T
-        return values - root * (self.covariates @ solved)
+        return values - root * (self.covariates @ self.covariate_solve(self.covariates.T @ (root * values), column_models))
 
     def sample_to_design(self, values: Any, column_models: Any) -> Any:
         """The sample-side operand of X_b': Xt'v = X' [W^1/2 (I - H) v]."""
@@ -316,7 +344,7 @@ def _cholesky_solve(array_module: Any, factor: Any, right: Any) -> Any:
 
 
 def column_squares(source: DualTileSource, models: DualModels, count: PassCount) -> Any:
-    """||xt_k||^2 for every variant and model, one read: x_k'W x_k - (x_k'WC)(C'WC)^-1(C'Wx_k)."""
+    """||xt_k||^2 for every variant and model, one read: x_k'W x_k - ||F'(C'Wx_k)||^2, F F' = (C'WC)^+."""
     array_module = source.array_module
     squares = array_module.zeros((source.variant_count, models.model_count))
     covariate_count = int(models.covariates.shape[1])
@@ -325,9 +353,8 @@ def column_squares(source: DualTileSource, models: DualModels, count: PassCount)
     )
     for start, stop, tile in source.blocks():
         cross = tile.rmatmat(weighted_covariates).reshape(stop - start, models.model_count, covariate_count)
-        factor = array_module.broadcast_to(models.covariate_factor[None], (stop - start,) + tuple(models.covariate_factor.shape))
-        solved = array_module.linalg.solve(array_module.swapaxes(factor, 2, 3), array_module.linalg.solve(factor, cross[..., None]))[..., 0]
-        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
+        whitened = array_module.einsum("vma,mab->vmb", cross, models.covariate_factor)
+        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(whitened * whitened, axis=2)
     count.note(models.model_count * (1 + covariate_count), 0.0, "column-squares")
     return squares
 
@@ -343,9 +370,29 @@ def resolved_spikes(spikes: Any, sample_count: int, array_module: Any) -> np.nda
         chosen = updated
 
 
+def deflation_factor(array_module: Any, basis: Any, image: Any) -> Any:
+    """F with F F' = (W'SW)^+ on the numerical column space of a spike basis W (n x k), from S W = `image`.
+
+    Spikes tied on a model's rows (variants that differ only off them) give W equal columns, and
+    W'SW, whose null space is W's since S >= I, is singular: a Cholesky factorization fails, or passes
+    only on a pivot that rounding left positive. The computed Gram W'(SW) is within
+    gamma_n |W|'|SW| of the exact one (Higham 2002, 3.5; gamma_n = n u / (1 - n u) <= n eps for
+    u = eps / 2), so its error is below n eps ||W||_F ||SW||_F in norm and, by Weyl, an eigenvalue
+    at or below that spans no direction.
+    The others give F = V diag(lambda^-1/2): W F F' W' S is the S-orthogonal projector onto span(W),
+    so the deflated iteration is the one on the independent spike directions.
+    """
+    gram = basis.T @ image
+    eigenvalues, eigenvectors = array_module.linalg.eigh(0.5 * (gram + gram.T))
+    rounding = basis.shape[0] * np.finfo(np.float64).eps * array_module.linalg.norm(basis) * array_module.linalg.norm(image)
+    kept = eigenvalues > rounding
+    return eigenvectors * array_module.where(kept, 1.0 / array_module.sqrt(array_module.where(kept, eigenvalues, 1.0)), 0.0)[None, :]
+
+
 @dataclass
 class Deflation:
-    """Per model, a basis W (n x k) of its spike directions, S W, the factor of W'SW, and the variants W holds.
+    """Per model, a basis W (n x k) of its spike directions, S W, F with F F' = (W'SW)^+
+    (`deflation_factor`), and the variants W holds.
 
     Deflated CG (Saad, Yeung, Erhel & Guyomarc'h 2000) keeps every residual orthogonal to W and
     every direction S-orthogonal to it: the spikes W spans are solved exactly in the k x k system
@@ -358,11 +405,13 @@ class Deflation:
     indices: dict
 
     def project_start(self, array_module: Any, model: int, solution: Any, residual: Any) -> tuple[Any, Any]:
-        coefficients = _cholesky_solve(array_module, self.factors[model], self.bases[model].T @ residual)
+        factor = self.factors[model]
+        coefficients = factor @ (factor.T @ (self.bases[model].T @ residual))
         return solution + self.bases[model] @ coefficients, residual - self.images[model] @ coefficients
 
     def project_direction(self, array_module: Any, model: int, values: Any) -> Any:
-        return values - self.bases[model] @ _cholesky_solve(array_module, self.factors[model], self.images[model].T @ values)
+        factor = self.factors[model]
+        return values - self.bases[model] @ (factor @ (factor.T @ (self.images[model].T @ values)))
 
 
 def spike_deflation(
@@ -412,8 +461,7 @@ def spike_deflation(
             width = int(bases[model].shape[1])
             images[model] = image[:, offset : offset + width]
             offset += width
-            gram = bases[model].T @ images[model]
-            factors[model] = array_module.linalg.cholesky(0.5 * (gram + gram.T))
+            factors[model] = deflation_factor(array_module, bases[model], images[model])
     return Deflation(bases, images, factors, resolved), {model: int(indices.size) for model, indices in resolved.items()}
 
 
@@ -504,6 +552,8 @@ def certified_block_cg(
     There is no iteration cap. A bound below what float64 can attain for a column,
     (n + p) eps lambda_max ||z||, the rounding of one exact product S z, is refused up front, and a
     restart whose exact residual did not fall below the previous one fails loudly instead of looping.
+    So does a residual that is not finite: NaN compares false against every bound, so it would
+    otherwise pass as certified.
     """
     array_module = source.array_module
     host_models = _host(column_models)
@@ -522,6 +572,8 @@ def certified_block_cg(
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
         norms = array_module.linalg.norm(residual, axis=0)
+        if not bool(array_module.all(array_module.isfinite(norms))):
+            raise FloatingPointError("an exact residual is not finite: the right-hand side or the operator holds NaN or inf.")
         open_mask = _host(norms > bound)
         if not open_mask.any():
             return SolveResult(solution, residual, norms, iterations, restarts, relative_errors, operator_scale, model_scales)
@@ -928,7 +980,8 @@ class DualGaussian:
     quantities for the leave-block-out marginal variances, the covariates and posterior draws.
 
     A model is a quantitative trait on a training set: `training` (n, M) is 1 on its training rows,
-    `targets` and `offsets` are (n, M), and the covariates are profiled out in its metric
+    `targets` and `offsets` are (n, M) (a target off its model's rows is never read, so it may be
+    missing: NaN, as in cohort.Cohort.targets), and the covariates are profiled out in its metric
     W = training / sigma^2. The sites (tau, nu) of `iterate` give D = 1/tau and m = nu / tau on the
     bulk; the resolved set L of each model, its non-positive sites and its spikes (resolved_spikes),
     is eliminated exactly, and the bulk probes (Rademacher on the training rows) give
@@ -945,7 +998,11 @@ class DualGaussian:
         self.windows = _WindowLayout(grams, source)
         self.array_module = array_module
         self.training = array_module.asarray(training, dtype=array_module.float64)
-        self.targets = array_module.asarray(targets, dtype=array_module.float64)
+        targets = array_module.asarray(targets, dtype=array_module.float64)
+        if not bool(array_module.all(array_module.isfinite(targets) | (self.training == 0.0))):
+            raise ValueError("every target on a model's training rows must be finite.")
+        # Zero weight times a missing target is NaN, not zero: the rows off the mask take target 0.
+        self.targets = array_module.where(self.training == 0.0, 0.0, targets)
         self.offsets = array_module.asarray(offsets, dtype=array_module.float64)
         self.covariates = array_module.asarray(covariates, dtype=array_module.float64)
         self.model_count = int(self.training.shape[1])
@@ -1093,10 +1150,8 @@ class DualGaussian:
         self.count.note(int(duals.shape[1]), 0.0, "finish")
         self.mean = mean
         self.genetic_image = image
-        weights = models.weights
         remainder = self.targets - self.offsets - image
-        normal = array_module.einsum("na,nm,nb->mab", self.covariates, weights, self.covariates)
-        self.alpha = array_module.linalg.solve(normal, (self.covariates.T @ (weights * remainder)).T[:, :, None])[:, :, 0].T
+        self.alpha = models.covariate_solve(self.covariates.T @ (models.weights * remainder), array_module.arange(self.model_count))
         self.linear_predictor = self.offsets + image + self.covariates @ self.alpha
         probe_solutions = result.solution[:, int(state["offsets"][-2]) :]
         self.bulk_solves = []
