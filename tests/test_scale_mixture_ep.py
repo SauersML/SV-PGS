@@ -6,6 +6,8 @@ Gaussian-prior regression for the noise update.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 from scipy.integrate import quad
@@ -556,3 +558,38 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
     # Where the Tierney-Kadane term is tiny, the exact correction is of its size.
     tiny = np.abs(terms) < 1e-5
     assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
+
+
+def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
+    # x = T x' with T orthogonal within each coefficient block: every log-determinant moves by log|det T| = 0,
+    # so V and the tilted means must agree to rounding. A normalization or log-determinant error would not.
+    prior, cavity = _problem(variant_count=60, seed=41, node_count=12)
+    hyperparameters = _hyperparameters(prior, 42, log_smoothing=2.0)
+    generator = np.random.default_rng(43)
+    rotation = np.zeros((prior.coefficient_size, prior.coefficient_size))
+    covered = np.zeros(prior.coefficient_size, dtype=bool)
+    for block in prior.smoothing_blocks:
+        coordinates = block.coordinates[~covered[block.coordinates]]
+        if coordinates.size:
+            rotation[np.ix_(coordinates, coordinates)] = np.linalg.qr(generator.standard_normal((coordinates.size, coordinates.size)))[0]
+            covered[coordinates] = True
+    rotation[np.ix_(~covered, ~covered)] = np.eye(int((~covered).sum()))
+    rotated = replace(
+        prior,
+        coefficient_map=prior.coefficient_map @ rotation,
+        smoothing_blocks=tuple(
+            replace(block, factor=block.factor @ rotation[np.ix_(block.coordinates, block.coordinates)]) for block in prior.smoothing_blocks
+        ),
+        null_basis=rotation.T @ prior.null_basis,
+    )
+    original = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
+    transformed = _evidence(rotated, hyperparameters.log_smoothing, rotation.T @ hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
+    assert original is not None and transformed is not None
+    np.testing.assert_allclose(transformed.value, original.value, rtol=0.0, atol=1e-8)
+    np.testing.assert_allclose(transformed.gradient, original.gradient, rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(rotation @ transformed.coefficients, original.coefficients, rtol=0.0, atol=1e-6)
+    means = [
+        tilted_moments(model, MixtureHyperparameters(evidence.coefficients, hyperparameters.log_smoothing), cavity, _WORKING_BYTES).mean
+        for model, evidence in ((prior, original), (rotated, transformed))
+    ]
+    np.testing.assert_allclose(means[1], means[0], rtol=1e-8, atol=1e-12)
