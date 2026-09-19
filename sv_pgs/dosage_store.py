@@ -823,12 +823,14 @@ def read_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
-def write_identifier_columns(bytes_directory: Path, offsets_directory: Path, identifiers: Sequence[str]) -> None:
+def write_identifier_columns(
+    bytes_directory: Path, offsets_directory: Path, identifiers: Sequence[str], attributes: Mapping[str, Any] | None = None
+) -> None:
     """Identifiers as one uint8 byte column plus uint64 offsets (len + 1), with no per-id object."""
     encoded = [identifier.encode() for identifier in identifiers]
     offsets = np.zeros(len(encoded) + 1, dtype=np.uint64)
     offsets[1:] = np.cumsum([len(identifier) for identifier in encoded], dtype=np.uint64)
-    write_column(bytes_directory, np.frombuffer(b"".join(encoded), dtype=np.uint8))
+    write_column(bytes_directory, np.frombuffer(b"".join(encoded), dtype=np.uint8), attributes)
     write_column(offsets_directory, offsets)
 
 
@@ -838,16 +840,37 @@ def read_identifier_columns(bytes_directory: Path, offsets_directory: Path) -> t
     return tuple(buffer[int(offsets[row]) : int(offsets[row + 1])].decode() for row in range(offsets.shape[0] - 1))
 
 
-def write_half_samples(root: Path, half_index: int, sample_ids: Sequence[str]) -> None:
-    """A half's sample manifest: its samples' names in store column order, each once.
+# The ID systems a half's sample names can be in. The imputed halves name samples by DRAGEN
+# sequencing name, the long-read half by AoU research ID; strings of the two collide by chance
+# (distinct people), so names are never compared across namespaces, only mapped through the
+# CDR crosswalk (sample_crosswalk) or matched by genotype.
+SAMPLE_NAMESPACES = ("dragen_sample", "research_id")
 
-    The names are those of the source files (sequencing IDs in AoU), so the manifest stays in
-    the workspace with the store; the crosswalk maps them to research IDs.
+
+@dataclass(frozen=True, slots=True)
+class HalfSamples:
+    """One half's sample names in store column order, with the namespace they are written in."""
+
+    namespace: str
+    names: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.namespace not in SAMPLE_NAMESPACES:
+            raise ValueError(f"sample namespace must be one of {SAMPLE_NAMESPACES}; got {self.namespace!r}.")
+        if len(set(self.names)) != len(self.names) or not all(self.names):
+            raise ValueError("a half lists a sample more than once or a blank sample name.")
+
+
+def write_half_samples(root: Path, half_index: int, samples: HalfSamples) -> None:
+    """A half's sample manifest: its names in store column order and their namespace.
+
+    The names are those of the source files, so the manifest stays in the workspace with the
+    store.
     """
-    if len(set(sample_ids)) != len(sample_ids) or not all(sample_ids):
-        raise ValueError(f"half{half_index} lists a sample more than once or a blank sample name.")
     directory = sample_directory(root, half_index)
-    write_identifier_columns(directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN, sample_ids)
+    write_identifier_columns(
+        directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN, samples.names, {"namespace": samples.namespace}
+    )
 
 
 def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -> None:
@@ -1072,20 +1095,24 @@ class DosageStore:
     def n_variants(self) -> int:
         return int(self.chromosome_starts[-1])
 
-    @property
-    def sample_ids(self) -> tuple[str, ...]:
-        """The selected halves' sample names in store column order, from each half's manifest."""
-        names: list[str] = []
+    def half_samples(self) -> tuple[HalfSamples, ...]:
+        """Each selected half's sample manifest, in store column order.
+
+        Halves stay separate: their names can be in different namespaces, so there is no
+        concatenated list of names across halves.
+        """
+        manifests = []
         for position, half in enumerate(self.half_indices):
             directory = sample_directory(self.root, half)
             if not (directory / _ID_BYTES_COLUMN).exists():
                 raise ValueError(f"{self.root} has no sample manifest for half{half}; convert the store again.")
-            half_names = read_identifier_columns(directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN)
+            names = read_identifier_columns(directory / _ID_BYTES_COLUMN, directory / _ID_OFFSETS_COLUMN)
             expected = int(self.half_sample_starts[position + 1] - self.half_sample_starts[position])
-            if len(half_names) != expected:
-                raise ValueError(f"half{half}'s sample manifest lists {len(half_names)} samples, not {expected}.")
-            names.extend(half_names)
-        return tuple(names)
+            if len(names) != expected:
+                raise ValueError(f"half{half}'s sample manifest lists {len(names)} samples, not {expected}.")
+            namespace = open_column(directory / _ID_BYTES_COLUMN)[1]["namespace"]
+            manifests.append(HalfSamples(namespace=namespace, names=names))
+        return tuple(manifests)
 
     @property
     def n_samples(self) -> int:

@@ -348,7 +348,7 @@ def test_a_store_without_a_sample_manifest_says_so(two_half_store: tuple[Path, l
     root, _ = two_half_store
     with DosageStore.open(root) as store:
         with pytest.raises(ValueError, match="no sample manifest"):
-            store.sample_ids
+            store.half_samples()
 
 
 def test_a_forked_child_compresses_with_its_own_threads(tmp_path: Path) -> None:

@@ -46,6 +46,7 @@ from sv_pgs.dosage_store import (
     MAXIMUM_DOSAGE_MILLI,
     MISSING_CODE,
     Codec,
+    HalfSamples,
     encode_dosage_milli,
     statistic_column_directory,
     write_column,
@@ -705,23 +706,24 @@ def write_store_manifest(
     record_counts: Sequence[int],
     chromosome_sites_md5: Sequence[str],
     half_sample_counts: Sequence[int],
-    half_sample_ids: Sequence[Sequence[str]],
+    half_samples: Sequence[HalfSamples],
     half_measurements: Sequence[str],
     gates: dict[str, str],
     recalibrated: bool,
 ) -> None:
     """The store MANIFEST: halves with their measurement kind, gate results, whether D* was applied,
-    and each half's sample manifest (its batches' sample names in batch order, each once).
+    and each half's sample manifest (its batches' sample names in batch order, each once, with
+    the namespace they are written in).
 
     A long-read half shares the imputed halves' verified site list; the fit gives every half its
     own covariate.
     """
     if len(half_measurements) != len(half_sample_counts) or any(kind not in HALF_MEASUREMENTS for kind in half_measurements):
         raise ValueError(f"every half needs a measurement in {HALF_MEASUREMENTS}.")
-    if [len(names) for names in half_sample_ids] != [int(count) for count in half_sample_counts]:
+    if [len(samples.names) for samples in half_samples] != [int(count) for count in half_sample_counts]:
         raise ValueError("every half needs one sample name per sample.")
-    for half_index, names in enumerate(half_sample_ids):
-        write_half_samples(Path(root), half_index, list(names))
+    for half_index, samples in enumerate(half_samples):
+        write_half_samples(Path(root), half_index, samples)
     write_manifest(
         Path(root),
         chromosomes=chromosomes,

@@ -8,7 +8,8 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 - **Layout:** `dosage/half{h}/chrK` is a Zarr v3 uint8 array `[n_records, n_samples_h]`.
   - Rows are in popped-BCF file order, all records.
   - Columns are the half's batches side by side, each in header order.
-  - `samples/half{h}` is the half's sample manifest: the header names (sequencing IDs in AoU) in column order, each once. `DosageStore.sample_ids` reads it, and the crosswalk maps it to research IDs. A name repeated within a half fails conversion.
+  - `samples/half{h}` is the half's sample manifest: the header names in column order, each once, tagged with their namespace. The imputed halves use `dragen_sample` (DRAGEN sequencing names) and the long-read half `research_id` (AoU person IDs). `DosageStore.half_samples()` returns one `HalfSamples` per half, never a list merged across halves.
+  - Names of the two namespaces collide by chance (different people), so they are never compared across namespaces. Only a `dragen_sample` half goes through the CDR crosswalk (`sample_crosswalk` refuses any other), and cross-half identity comes only from that map or from genotype (KING). A name repeated within a half fails conversion.
 - **Code:** `(DS_milli·127 + 500) // 1000`, where DS_milli is the corrected dosage below. 255 is never written.
 - **Encoding:**
   - shards of 65,536 rows with 64-row inner chunks;

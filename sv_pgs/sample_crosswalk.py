@@ -18,6 +18,7 @@ from typing import Sequence
 import numpy as np
 
 from sv_pgs._typing import I64Array
+from sv_pgs.dosage_store import HalfSamples
 
 ABSENT_COLUMN = -1
 
@@ -53,16 +54,27 @@ class SampleCrosswalk:
         )
 
 
+def _sequencing_names(half: HalfSamples) -> tuple[str, ...]:
+    """The half's names, which the crosswalk can map only when they are sequencing names."""
+    if half.namespace != "dragen_sample":
+        raise ValueError(
+            f"the crosswalk maps DRAGEN sequencing names; this half is named by {half.namespace}, and names are "
+            "never compared across namespaces."
+        )
+    return half.names
+
+
 def source_columns_for_store_samples(
-    store_sequencing_ids: Sequence[str],
+    store_half: HalfSamples,
     source_research_ids: Sequence[str],
     crosswalk: SampleCrosswalk,
 ) -> I64Array:
-    """For each store sample, its column in a research-ID-keyed source, or ABSENT_COLUMN.
+    """For each sample of an imputed store half, its column in a research-ID-keyed source, or ABSENT_COLUMN.
 
-    A store sample is absent when the crosswalk has no row for it or the
-    source does not carry its participant.
+    A store sample is absent when the crosswalk has no row for it or the source does not carry
+    its participant.
     """
+    store_sequencing_ids = _sequencing_names(store_half)
     if len(set(source_research_ids)) != len(source_research_ids):
         raise ValueError("the genotype source repeats a research ID.")
     research_of_sequencing = dict(zip(crosswalk.sequencing_ids, crosswalk.research_ids))
@@ -75,15 +87,14 @@ def source_columns_for_store_samples(
     return columns
 
 
+def store_research_ids(store_half: HalfSamples, crosswalk: SampleCrosswalk) -> tuple[str, ...]:
+    """The research ID of each sample of an imputed store half, in store column order.
 
-def store_research_ids(half_sequencing_ids: Sequence[str], crosswalk: SampleCrosswalk) -> tuple[str, ...]:
-    """The research ID of each sample of one store half, in store column order.
-
-    Fails on a sample the crosswalk has no row for, and on a half that lists a person twice
-    (the crosswalk is one-to-one, so two columns with one research ID repeat a sequencing ID).
+    Fails on a sample the crosswalk has no row for. A half named by research ID (the long-read
+    half) is refused: its names are already research IDs, and looking them up among sequencing
+    names would join any that collide by chance to the wrong person.
     """
-    if len(set(half_sequencing_ids)) != len(half_sequencing_ids):
-        raise ValueError("the store half lists a sample more than once.")
+    half_sequencing_ids = _sequencing_names(store_half)
     research_of_sequencing = dict(zip(crosswalk.sequencing_ids, crosswalk.research_ids))
     unmapped = [sequencing_id for sequencing_id in half_sequencing_ids if sequencing_id not in research_of_sequencing]
     if unmapped:

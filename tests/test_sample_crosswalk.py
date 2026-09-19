@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from sv_pgs.dosage_store import HalfSamples
 from sv_pgs.sample_crosswalk import (
     ABSENT_COLUMN,
     SampleCrosswalk,
@@ -21,7 +22,7 @@ def test_join_follows_the_crosswalk_and_never_matches_equal_names() -> None:
     store_sequencing_ids = ["D1", "D2", "D3", "D4"]
     source_research_ids = ["R2", "R1", "D3"]
 
-    columns = source_columns_for_store_samples(store_sequencing_ids, source_research_ids, crosswalk)
+    columns = source_columns_for_store_samples(HalfSamples("dragen_sample", tuple(store_sequencing_ids)), source_research_ids, crosswalk)
 
     np.testing.assert_array_equal(columns, [1, 0, ABSENT_COLUMN, ABSENT_COLUMN])
 
@@ -30,7 +31,7 @@ def test_name_equal_ids_do_not_join_without_a_crosswalk_row() -> None:
     crosswalk = SampleCrosswalk(research_ids=("R9",), sequencing_ids=("D9",))
     shared_names = ["S1", "S2", "S3"]
 
-    columns = source_columns_for_store_samples(shared_names, shared_names, crosswalk)
+    columns = source_columns_for_store_samples(HalfSamples("dragen_sample", tuple(shared_names)), shared_names, crosswalk)
 
     assert (columns == ABSENT_COLUMN).all()
 
@@ -52,7 +53,7 @@ def test_crosswalk_must_be_one_to_one(research_ids: tuple[str, ...], sequencing_
 def test_source_with_repeated_research_ids_is_rejected() -> None:
     crosswalk = SampleCrosswalk(research_ids=("R1",), sequencing_ids=("D1",))
     with pytest.raises(ValueError, match="repeats a research ID"):
-        source_columns_for_store_samples(["D1"], ["R1", "R1"], crosswalk)
+        source_columns_for_store_samples(HalfSamples("dragen_sample", ("D1",)), ["R1", "R1"], crosswalk)
 
 
 def test_crosswalk_reads_a_delimited_table(tmp_path: Path) -> None:
@@ -68,8 +69,20 @@ def test_crosswalk_reads_a_delimited_table(tmp_path: Path) -> None:
 def test_store_research_ids_map_a_half_and_refuse_gaps_and_repeats() -> None:
     crosswalk = SampleCrosswalk(research_ids=("R1", "R2", "R3"), sequencing_ids=("D1", "D2", "D3"))
 
-    assert store_research_ids(["D3", "D1"], crosswalk) == ("R3", "R1")
+    assert store_research_ids(HalfSamples("dragen_sample", ("D3", "D1")), crosswalk) == ("R3", "R1")
     with pytest.raises(ValueError, match="no crosswalk row"):
-        store_research_ids(["D1", "D9"], crosswalk)
+        store_research_ids(HalfSamples("dragen_sample", ("D1", "D9")), crosswalk)
     with pytest.raises(ValueError, match="more than once"):
-        store_research_ids(["D2", "D2"], crosswalk)
+        HalfSamples("dragen_sample", ("D2", "D2"))
+
+
+def test_a_half_named_by_research_id_is_never_looked_up_among_sequencing_names() -> None:
+    # A long-read participant whose research ID is spelled like another person's DRAGEN name:
+    # a name lookup would join the wrong person, so the research-ID half is refused outright.
+    crosswalk = SampleCrosswalk(research_ids=("R1", "R2"), sequencing_ids=("1234567", "D2"))
+    long_read_half = HalfSamples("research_id", ("1234567",))
+
+    with pytest.raises(ValueError, match="never compared across namespaces"):
+        store_research_ids(long_read_half, crosswalk)
+    with pytest.raises(ValueError, match="never compared across namespaces"):
+        source_columns_for_store_samples(long_read_half, ["R1", "R2"], crosswalk)

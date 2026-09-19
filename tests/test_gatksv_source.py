@@ -7,6 +7,7 @@ import numpy as np
 
 from sv_pgs.config import VariantClass
 from sv_pgs.gatksv_source import GatksvSource
+from sv_pgs.dosage_store import HalfSamples
 from sv_pgs.sample_crosswalk import SampleCrosswalk, source_columns_for_store_samples
 
 _HEADER_START = (
@@ -126,7 +127,7 @@ def test_blocks_align_to_store_samples_through_the_crosswalk(tmp_path: Path) -> 
     source, blocks = _read_all(tmp_path, _KGP_LIKE_VCF, block_records=10)
     crosswalk = SampleCrosswalk(research_ids=("R1", "R2", "R4"), sequencing_ids=("D1", "D2", "D4"))
     # Store order D4, D3, D1, D2: D3 has no crosswalk row, R3 no store sample.
-    columns = source_columns_for_store_samples(["D4", "D3", "D1", "D2"], source.sample_ids, crosswalk)
+    columns = source_columns_for_store_samples(HalfSamples("dragen_sample", ("D4", "D3", "D1", "D2")), source.sample_ids, crosswalk)
 
     aligned = blocks[0].aligned_to_store_samples(columns)
 
