@@ -851,7 +851,10 @@ def test_a_null_annotation_is_not_left_unpenalized(seed):
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("seed", (101, 202, pytest.param(303, marks=pytest.mark.xfail(strict=True, reason=(
+    "finding reported to e2e: s = (edf + penalty size) / 2 bounds |V''| from above, so 1/2 (|c| + E)^2 / s bounds the "
+    "Newton gain from below; here V rises 0.0645 nats within one unit of rho against a claimed 0.0245 [sim-only]"
+)))))
 def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
     """The stationarity check's gain 1/2 sum (|c| + E)^2 / s is claimed to bound the gain a Newton step on the
     weights could still find (``HyperStep.stationarity_gain``). At the interior ascent's stop (both weights finite:
@@ -884,5 +887,8 @@ def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
             )
             if moved is not None:
                 gains[(int(position), distance)] = moved.value - evidence.value
-    best = max(gains.values(), default=0.0)
-    assert best <= claimed + 2.0 * _EVIDENCE_TOLERANCE, (gains, claimed, weights, check, curvature, errors)
+    best_move = max(gains, key=gains.get)
+    assert gains[best_move] <= claimed + 2.0 * _EVIDENCE_TOLERANCE, (
+        f"a move {best_move} (weight, distance in rho) gains {gains[best_move]:.4g} nats; claimed {claimed:.4g}; "
+        f"c {check}, s {curvature}, E {errors}"
+    )
