@@ -1,29 +1,32 @@
-"""Stage 2: the one model fitted on the full data by decoupled EP-EB, and its scoring models.
+"""Stage 2: each model fitted on the full data by EP-EB, and its scoring models.
 
 For every model (a quantitative trait on its training rows) q(beta) is ``dual_solve.DualGaussian``'s Gaussian:
 its mean is exact on the full-data operator and certified in the posterior metric, and non-positive sites are
-eliminated exactly, so EP is unclipped. The EP sites are matched against q's marginal variances from
-``marginal_variances`` (leave-block-out marginals), frozen between refreshes; block-Jacobi variances are block
-conditionals, which bias the fixed point by 1-3% however long the fit runs (novel-inference, [sim-only]). The
-variant side, from tilted moments to the prior's empirical Bayes, is ``scale_mixture_ep``.
+eliminated exactly, so EP is unclipped. Every cavity comes from q's certified marginal variances
+(``marginal_variances``, leave-block-out; lead ruling). Block-Jacobi variances are block conditionals: their
+cavity-precision errors reach p99 28-58% at production (speed-floor [semi-real]), and they appear nowhere here.
+The variant side, from tilted moments to the prior's empirical Bayes, is ``scale_mixture_ep``.
 
-The decoupled scheme alternates:
-1. Refresh: solve the mean at the current sites, freeze the marginal variances z and the cavity precisions
-   P = 1/z - tau. Negative sites are halved while the global precision is not positive definite or a cavity not
-   proper; non-negative sites always pass, so this ends, and only the path to the fixed point changes.
-2. Mean-only EP: with P frozen, each site moves toward the one making q's marginal the tilted law, and the mean
-   is re-solved. With frozen variances this is the stationarity of a convex function of the mean (math-epeb). A
-   pass that does not shrink the move estimates an eigenvalue of the site map at or past -1 (rho = sqrt of the
-   move ratio), and the damping 1/(1 + rho) sends it to zero. It stops when the undamped move in the posterior
-   metric, sum_j (delta mu_j)^2 / sigma_j^2, is below p_eff / K, the scorer's Monte Carlo resolution with K draws.
-3. The noise update sigma^2 = RSS / (n - k - gamma), gamma = p - sum_j tau_j sigma_j^2 (``noise_variance``).
-4. The hyper step at the converged EP fixed point, on the evidence with the total curvature B
-   (``scale_mixture_ep.hyper_step``); a step that stops reducing what the next one still finds is damped by the
-   same spectral rule.
-until the hyper step finds less than 1/(2K) nats (its start decrement plus its gain).
-
-Stage 1 fills ``WarmStart``. Until it lands, ``prior_start`` is the stand-in: q at the prior (moment-matched
-sites), which reaches the same fixed point, only later.
+The fit starts from the prior itself: moment-matched sites, the start density, and each model's covariate-only
+residual variance. ``scale_mixture_ep.fit_hyperparameters`` then alternates two steps.
+1. The EP fixed point at the current hyperparameters (``_FullDataFixedPoints``):
+   a. Refresh: solve the mean at the current sites and compute the certified marginal variances z and the
+      cavities (P = 1/z - tau). Negative sites are halved while the global precision is not positive definite or a
+      cavity is not proper. Non-negative sites always pass, so this ends; only the path to the fixed point changes.
+   b. Check, at the refresh. The undamped EP update from these cavities moves the mean by
+      Sigma (delta nu - delta tau o mu), exactly to first order in the site change. The fixed point is certified when
+      that move is at most p_eff / K in the posterior metric (the scorer's Monte Carlo resolution with K draws),
+      and when the noise update's evidence gain, n_eff (delta log sigma^2)^2 / 4, is at most 1/(2K).
+   c. Otherwise, mean-only EP with P frozen. Each site moves toward the one that makes q's marginal the tilted law,
+      and the mean is re-solved; with frozen variances this is the stationarity of a convex function of the mean
+      (math-epeb). A pass that does not shrink the move estimates an eigenvalue of the site map at or past -1
+      (rho = sqrt of the move ratio), and the damping 1/(1 + rho) sends it to zero. It runs until the frozen move
+      is below p_eff / K. Then comes the noise update sigma^2 = RSS / (n - k - gamma), with
+      gamma = p - sum_j tau_j z_j (``noise_variance``), and the loop returns to (a).
+2. The outer step at that fixed point: the weights by the B-evidence (``hyper_step``), and x by Newton on the
+   total curvature B + S, accepted by the natural monotonicity test. It is never the plain EP-EM step, which
+   diverges where (A + S)^-1 (B + S) exceeds 2; speed-floor measured up to 5.4 at production [semi-real].
+The fit ends when every model's Newton-B decrement plus its weights' remaining gain is at most 1/(2K).
 """
 
 from __future__ import annotations
@@ -34,18 +37,19 @@ from typing import Sequence
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.config import TraitType
 from sv_pgs.dual_solve import DualGaussian
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.marginal_variances import BlockGrams, BulkSolve, certificate_tolerance, marginal_variances, variance_jvp
-from sv_pgs.config import TraitType
+from sv_pgs.marginal_variances import BlockGrams, certificate_tolerance, marginal_variances, variance_jvp
 from sv_pgs.scale_mixture_ep import (
     Cavity,
+    FixedPoint,
     GaussianPosterior,
     MixtureHyperparameters,
     ScaleMixturePrior,
     derived_lattice,
-    hyper_step,
+    fit_hyperparameters,
     initial_hyperparameters,
     moment_matched_prior_sites,
     noise_variance,
@@ -82,17 +86,6 @@ def block_grams(statistics: GenotypeSufficientStatistics, noise: float) -> Block
     return BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross))
 
 
-@dataclass(frozen=True)
-class WarmStart:
-    """What Stage 2 takes from Stage 1 for each of the M models: the sites (p, M) over Stage 0's reduced columns, each
-    model's prior hyperparameters, and the noise variances (M,)."""
-
-    site_precision: F64Array
-    site_shift: F64Array
-    hyperparameters: tuple[MixtureHyperparameters, ...]
-    noise_variance: F64Array
-
-
 def covariate_residual_variance(targets: F64Array, training: F64Array, covariates: F64Array) -> F64Array:
     """(M,): each model's residual variance after the covariates alone, over n - k degrees of freedom."""
     noise = np.empty(int(targets.shape[1]))
@@ -104,42 +97,38 @@ def covariate_residual_variance(targets: F64Array, training: F64Array, covariate
     return noise
 
 
-def prior_start(prior: ScaleMixturePrior, targets: F64Array, training: F64Array, covariates: F64Array) -> WarmStart:
-    """The stand-in for Stage 1: q at the prior (moment-matched sites) at the start density, and each model's noise at
-    its covariate-only residual variance (all variance attributed to noise)."""
-    hyperparameters = tuple(initial_hyperparameters(prior) for _model in range(int(targets.shape[1])))
-    columns = [moment_matched_prior_sites(prior, model_hyperparameters) for model_hyperparameters in hyperparameters]
-    return WarmStart(
-        site_precision=np.column_stack([column[0] for column in columns]),
-        site_shift=np.column_stack([column[1] for column in columns]),
-        hyperparameters=hyperparameters,
-        noise_variance=covariate_residual_variance(targets, training, covariates),
-    )
-
-
 @dataclass(frozen=True)
 class FitCertificate:
     """Why a fit is accepted, per model; recorded in the artifact.
 
-    - ``remaining_gain``: what the last hyper step still found, its start decrement plus its evidence gain, in nats
-      (below 1/(2K));
-    - ``newton_decrement``: 1/2 g'(B + S)^-1 g at the returned hyperparameters;
-    - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, by central differences;
-    - ``mean_move``: the last EP pass's undamped sum_j (delta mu_j)^2 / sigma_j^2, against ``draw_tolerance`` = p_eff / K;
+    - ``remaining_gain``: the last outer check's Newton-B decrement plus its weights' B-evidence gain, in nats
+      (at most 1/(2K)); ``newton_decrement`` is its first part, 1/2 g'|B + S|^-1 g;
+    - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, by central differences, with
+      each difference's step and error bound in ``stationarity_steps`` and ``stationarity_errors``;
+    - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
+      the final refresh, against ``draw_tolerance`` = p_eff / K; ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``negative_sites``: sites with negative precision (allowed; EP is unclipped);
-    - ``effective_effects``: p_eff = p - sum_j tau_j sigma_j^2.
+    - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
+    - ``outer_iterations`` and ``halvings``: accepted Newton-B steps and the trials the monotonicity test refused;
+      ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
     """
 
     remaining_gain: F64Array
     newton_decrement: F64Array
     smoothing_gradient: F64Array
+    stationarity_steps: tuple[F64Array, ...]
+    stationarity_errors: tuple[F64Array, ...]
     mean_move: F64Array
     draw_tolerance: F64Array
+    noise_gain: F64Array
     mean_error: F64Array
     negative_sites: I64Array
     effective_effects: F64Array
-    outer_iterations: int
+    outer_iterations: I64Array
+    halvings: I64Array
+    refreshes: int
+    passes: int
 
 
 @dataclass(frozen=True)
@@ -152,149 +141,212 @@ class FullDataFit:
     certificate: FitCertificate
 
 
-def _refresh(
-    gaussian: DualGaussian,
-    statistics: GenotypeSufficientStatistics,
-    site_precision: F64Array,
-    site_shift: F64Array,
-    noise: F64Array,
-    error_bound: F64Array,
-    probe_ratio: float,
-) -> tuple[F64Array, F64Array, list[BulkSolve], list[BlockGrams]]:
-    """Solve the mean and freeze the marginal variances; negative sites halve while A is not positive definite or a
-    cavity is not proper. Returns the sites, the frozen cavity precisions and each model's solve and Grams."""
-    precision = np.array(site_precision, dtype=np.float64, copy=True)
-    while True:
-        try:
-            gaussian.iterate(site_precision=precision, site_shift=site_shift, noise_variance=noise, error_bound=error_bound, probe_residual_ratio=probe_ratio)
-            grams = [block_grams(statistics, float(noise[model])) for model in range(noise.shape[0])]
-            variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
-            frozen = 1.0 / variances - precision
-            if np.all(frozen > 0.0):
-                return precision, frozen, list(gaussian.bulk_solves), grams
-        except np.linalg.LinAlgError:
-            pass
-        negative = precision < 0.0
-        if not np.any(negative):
-            raise FloatingPointError("the full-data precision is not positive definite with non-negative sites")
-        precision[negative] *= 0.5
+def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Array]:
+    """Bounds on ||x||_A from r'x_hat when ||x_hat - x||_A <= b, where A x = r.
+
+    r'x_hat = ||x||_A^2 + x'A(x_hat - x), and the last term is at most ||x||_A b in size, so ||x||_A lies between
+    the positive roots of t^2 - b t = r'x_hat and t^2 + b t = r'x_hat.
+    """
+    lower = 0.5 * (np.sqrt(np.maximum(bound * bound + 4.0 * products, 0.0)) - bound)
+    upper = 0.5 * (np.sqrt(np.maximum(bound * bound + 4.0 * products, 0.0)) + bound)
+    return lower, upper
 
 
-def _posterior(gaussian: DualGaussian, solve: BulkSolve, grams: BlockGrams, model: int, error_bound: float) -> GaussianPosterior:
-    """q's responses at the fixed point for the total curvature: Sigma R by the dual solver, -(Sigma o Sigma) W by the
-    leave-block-out map."""
-    return GaussianPosterior(
-        solve=lambda right: gaussian.posterior_solve(right, model, error_bound),
-        variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values,
-    )
+def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array) -> GaussianPosterior:
+    """q's responses at the current refresh for the total curvature: Sigma R by the dual solver, each column to a
+    relative error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map."""
+    solve = gaussian.bulk_solves[model]
+
+    def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
+        # A column is done when its certified error b is at most e times the lower bound on ||x||_A. The first b
+        # takes ||x||_A^2 ~ sum_j r_j^2 z_j, which is exact for independent effects.
+        values = np.asarray(right, dtype=np.float64)
+        solution = np.zeros_like(values)
+        live = np.flatnonzero(np.any(values != 0.0, axis=0))
+        bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
+        while live.size:
+            solved = np.asarray(gaussian.posterior_solve(values[:, live], model, bound), dtype=np.float64)
+            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), bound)
+            done = bound <= relative_tolerance * lower
+            solution[:, live[done]] = solved[:, done]
+            bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
+            live = live[~done]
+        return solution
+
+    return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values)
 
 
-def fit_full_data(
-    *,
-    gaussian: DualGaussian,
-    statistics: GenotypeSufficientStatistics,
-    prior: ScaleMixturePrior,
-    start: WarmStart,
-    draw_count: int,
-    working_bytes: int,
-) -> FullDataFit:
-    """Decoupled EP-EB on the full data for quantitative models (see the module docstring)."""
-    model_count = gaussian.model_count
-    site_precision = np.array(start.site_precision, dtype=np.float64, copy=True)
-    site_shift = np.array(start.site_shift, dtype=np.float64, copy=True)
-    hyperparameters = list(start.hyperparameters)
-    noise = np.array(start.noise_variance, dtype=np.float64, copy=True)
-    covariate_count = int(gaussian.covariates.shape[1])
-    tolerance = 0.5 / draw_count
-    effective = np.full(model_count, float(prior.variant_count))
-    probe_ratio = _HALF_PRECISION
-    previous_remaining, outer_damping, outer = np.full(model_count, np.inf), 1.0, 0
-    while True:
-        outer += 1
-        error_bound = np.sqrt(effective / draw_count)
-        site_precision, frozen, solves, grams = _refresh(gaussian, statistics, site_precision, site_shift, noise, error_bound, probe_ratio)
-        probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in solves)
+class _FullDataFixedPoints:
+    """``scale_mixture_ep.FixedPoints`` on the full data: each model's certified EP fixed point at its
+    hyperparameters, with its noise variance stationary, warm from the previous call (the module docstring's step 1)."""
+
+    def __init__(self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int) -> None:
+        self.gaussian = gaussian
+        self.statistics = statistics
+        self.prior = prior
+        self.draw_count = draw_count
+        self.working_bytes = working_bytes
+        model_count = gaussian.model_count
+        precision, shift = moment_matched_prior_sites(prior, initial_hyperparameters(prior))
+        self.site_precision = np.repeat(precision[:, None], model_count, axis=1)
+        self.site_shift = np.repeat(shift[:, None], model_count, axis=1)
+        self.noise = covariate_residual_variance(np.asarray(gaussian.targets), np.asarray(gaussian.training), np.asarray(gaussian.covariates))
+        self.effective = np.full(model_count, float(prior.variant_count))
+        self.probe_ratio = _HALF_PRECISION
+        self.mean_move = np.full(model_count, np.inf)
+        self.noise_gain = np.full(model_count, np.inf)
+        self.mean_error = np.full(model_count, np.inf)
+        self.refreshes = 0
+        self.passes = 0
+
+    def _iterate(self, site_precision: F64Array, site_shift: F64Array) -> None:
+        certificate = self.gaussian.iterate(
+            site_precision=site_precision, site_shift=site_shift, noise_variance=self.noise,
+            error_bound=np.sqrt(self.effective / self.draw_count), probe_residual_ratio=self.probe_ratio,
+        )
+        self.mean_error = np.asarray(certificate.error_bound, dtype=np.float64)
+        self.passes += 1
+
+    def _refresh(self) -> tuple[F64Array, list[BlockGrams]]:
+        """Solve the mean and compute the certified marginal variances (p, M) at the current sites; negative sites
+        halve while the precision is not positive definite or a cavity is not proper."""
+        gaussian = self.gaussian
+        while True:
+            try:
+                self._iterate(self.site_precision, self.site_shift)
+                grams = [block_grams(self.statistics, float(self.noise[model])) for model in range(gaussian.model_count)]
+                variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
+                if np.all(1.0 / variances - self.site_precision > 0.0):
+                    self.refreshes += 1
+                    self.probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in gaussian.bulk_solves)
+                    self.effective = self.prior.variant_count - np.sum(self.site_precision * variances, axis=0)
+                    return variances, grams
+            except np.linalg.LinAlgError:
+                pass
+            negative = self.site_precision < 0.0
+            if not np.any(negative):
+                raise FloatingPointError("the full-data precision is not positive definite with non-negative sites")
+            self.site_precision[negative] *= 0.5
+
+    def _noise(self, variances: F64Array) -> F64Array:
+        gaussian = self.gaussian
+        residual_sum_of_squares = gaussian.residual_sum_of_squares()
+        return np.array([
+            noise_variance(
+                residual_sum_of_squares=float(residual_sum_of_squares[model]),
+                sample_count=int(gaussian.training_counts[model]),
+                covariate_count=int(gaussian.covariates.shape[1]),
+                site_precision=self.site_precision[:, model],
+                posterior_variance=variances[:, model],
+            )
+            for model in range(gaussian.model_count)
+        ])
+
+    def _targets(self, hyperparameters: Sequence[MixtureHyperparameters], cavities: list[Cavity]) -> tuple[F64Array, F64Array]:
+        columns = [site_targets(tilted_moments(self.prior, model, cavity, self.working_bytes), cavity) for model, cavity in zip(hyperparameters, cavities)]
+        return np.column_stack([column[0] for column in columns]), np.column_stack([column[1] for column in columns])
+
+    def _move_bounds(self, model: int, right: F64Array, threshold: float) -> float:
+        """An upper bound on ||Sigma right||_A^2 that decides it against ``threshold``: the solve's bound halves until
+        the two-sided bounds from r'x_hat fall on one side."""
+        bound = np.array([0.5 * np.sqrt(threshold)])
+        while True:
+            solved = np.asarray(self.gaussian.posterior_solve(right[:, None], model, bound), dtype=np.float64)
+            lower, upper = _norm_bounds(np.array([float(right @ solved[:, 0])]), bound)
+            if upper[0] * upper[0] <= threshold or lower[0] * lower[0] > threshold:
+                return float(upper[0] * upper[0])
+            bound = 0.5 * bound
+
+    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint]:
+        gaussian = self.gaussian
+        model_count = gaussian.model_count
+        tolerance = 0.5 / self.draw_count
+        while True:
+            variances, grams = self._refresh()
+            frozen = 1.0 / variances - self.site_precision
+            mean = np.asarray(gaussian.mean, dtype=np.float64).copy()
+            cavities = [Cavity(precision=frozen[:, model], shift=mean[:, model] / variances[:, model] - self.site_shift[:, model]) for model in range(model_count)]
+            target_precision, target_shift = self._targets(hyperparameters, cavities)
+            # The undamped update moves the mean by Sigma (delta nu - delta tau o mu), to first order in the site change.
+            right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
+            draw_tolerance = self.effective / self.draw_count
+            self.mean_move = np.array([self._move_bounds(model, right[:, model], float(draw_tolerance[model])) for model in range(model_count)])
+            noise = self._noise(variances)
+            degrees = gaussian.training_counts - int(gaussian.covariates.shape[1]) - self.effective
+            self.noise_gain = 0.25 * degrees * np.square(np.log(noise / self.noise))
+            if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
+                return [
+                    FixedPoint(cavity=cavities[model], posterior=_posterior(gaussian, model, grams[model], variances[:, model]))
+                    for model in range(model_count)
+                ]
+            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
+            self.noise = self._noise(1.0 / (frozen + self.site_precision))
+
+    def _frozen_passes(self, hyperparameters: Sequence[MixtureHyperparameters], frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
+        """Mean-only EP with the cavity precisions frozen, from the check's targets, until the frozen move is below
+        p_eff / K (the module docstring's step 1c)."""
+        gaussian = self.gaussian
+        model_count = gaussian.model_count
         previous_move, damping = np.full(model_count, np.inf), 1.0
         while True:
-            marginal = 1.0 / (frozen + site_precision)
             mean = np.asarray(gaussian.mean, dtype=np.float64).copy()
-            target_precision, target_shift = site_precision.copy(), site_shift.copy()
-            for model in range(model_count):
-                cavity = Cavity(precision=frozen[:, model], shift=mean[:, model] / marginal[:, model] - site_shift[:, model])
-                target_precision[:, model], target_shift[:, model] = site_targets(tilted_moments(prior, hyperparameters[model], cavity, working_bytes), cavity)
             fraction = damping
             while True:
-                trial_precision = site_precision + fraction * (target_precision - site_precision)
-                trial_shift = site_shift + fraction * (target_shift - site_shift)
+                trial_precision = self.site_precision + fraction * (target_precision - self.site_precision)
+                trial_shift = self.site_shift + fraction * (target_shift - self.site_shift)
                 try:
-                    certificate = gaussian.iterate(
-                        site_precision=trial_precision, site_shift=trial_shift, noise_variance=noise, error_bound=error_bound, probe_residual_ratio=probe_ratio
-                    )
+                    self._iterate(trial_precision, trial_shift)
                     break
                 except np.linalg.LinAlgError:
                     fraction *= 0.5
-            site_precision, site_shift = trial_precision, trial_shift
-            marginal = 1.0 / (frozen + site_precision)
+            self.site_precision, self.site_shift = trial_precision, trial_shift
+            marginal = 1.0 / (frozen + self.site_precision)
             # A damped pass moves fraction^2 of the full step's squared size: converge on the full step.
             mean_move = np.sum(np.square(np.asarray(gaussian.mean) - mean) / marginal, axis=0) / (fraction * fraction)
-            effective = prior.variant_count - np.sum(site_precision * marginal, axis=0)
-            if np.all(mean_move <= effective / draw_count):
-                break
+            if np.all(mean_move <= self.effective / self.draw_count):
+                return
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
                 damping = min(damping, 1.0 / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
-        residual_sum_of_squares = gaussian.residual_sum_of_squares()
-        noise = np.array([
-            noise_variance(
-                residual_sum_of_squares=float(residual_sum_of_squares[model]),
-                sample_count=int(gaussian.training_counts[model]),
-                covariate_count=covariate_count,
-                site_precision=site_precision[:, model],
-                posterior_variance=marginal[:, model],
-            )
-            for model in range(model_count)
-        ])
-        steps = []
-        for model in range(model_count):
-            cavity = Cavity(precision=frozen[:, model], shift=np.asarray(gaussian.mean)[:, model] / marginal[:, model] - site_shift[:, model])
-            posterior = _posterior(gaussian, solves[model], grams[model], model, float(error_bound[model]))
-            steps.append(hyper_step(prior, hyperparameters[model], cavity, lambda _view, _coefficients, fixed=posterior: fixed, working_bytes, tolerance))
-        remaining = np.array([step.start_decrement + step.evidence_gain for step in steps])
-        if np.all(remaining <= tolerance):
-            return FullDataFit(
-                gaussian=gaussian,
-                site_precision=site_precision,
-                site_shift=site_shift,
-                hyperparameters=tuple(hyperparameters),
-                noise_variance=noise,
-                certificate=FitCertificate(
-                    remaining_gain=remaining,
-                    newton_decrement=np.array([step.newton_decrement for step in steps]),
-                    smoothing_gradient=np.array([step.smoothing_gradient for step in steps]),
-                    mean_move=mean_move,
-                    draw_tolerance=effective / draw_count,
-                    mean_error=np.asarray(certificate.error_bound, dtype=np.float64),
-                    negative_sites=np.sum(site_precision < 0.0, axis=0).astype(np.int64),
-                    effective_effects=effective,
-                    outer_iterations=outer,
-                ),
-            )
-        ratio = float(np.max(remaining / previous_remaining))
-        if ratio >= 1.0:
-            outer_damping = min(outer_damping, 1.0 / (1.0 + np.sqrt(ratio)))
-        previous_remaining = remaining
-        hyperparameters = [_blended(old, step.hyperparameters, outer_damping) for old, step in zip(hyperparameters, steps)]
+            new_mean = np.asarray(gaussian.mean, dtype=np.float64)
+            cavities = [
+                Cavity(precision=frozen[:, model], shift=new_mean[:, model] / marginal[:, model] - self.site_shift[:, model]) for model in range(model_count)
+            ]
+            target_precision, target_shift = self._targets(hyperparameters, cavities)
 
 
-def _blended(old: MixtureHyperparameters, new: MixtureHyperparameters, fraction: float) -> MixtureHyperparameters:
-    """``fraction`` of the way from ``old`` to ``new``; when a weight moved to or from an edge (0 or infinity), all of it."""
-    if not np.array_equal(np.isfinite(old.log_smoothing), np.isfinite(new.log_smoothing)):
-        return new
-    finite = np.isfinite(new.log_smoothing)
-    log_smoothing = new.log_smoothing.copy()
-    log_smoothing[finite] = old.log_smoothing[finite] + fraction * (new.log_smoothing[finite] - old.log_smoothing[finite])
-    return MixtureHyperparameters(coefficients=old.coefficients + fraction * (new.coefficients - old.coefficients), log_smoothing=log_smoothing)
+def fit_full_data(
+    *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int
+) -> FullDataFit:
+    """Stage 2 for quantitative models, from the prior (see the module docstring)."""
+    fixed_points = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes)
+    starts = [initial_hyperparameters(prior) for _model in range(gaussian.model_count)]
+    fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
+    return FullDataFit(
+        gaussian=gaussian,
+        site_precision=fixed_points.site_precision,
+        site_shift=fixed_points.site_shift,
+        hyperparameters=tuple(fit.hyperparameters for fit in fits),
+        noise_variance=fixed_points.noise,
+        certificate=FitCertificate(
+            remaining_gain=np.array([fit.remaining_gain for fit in fits]),
+            newton_decrement=np.array([fit.newton_decrement for fit in fits]),
+            smoothing_gradient=np.array([fit.step.smoothing_gradient for fit in fits]),
+            stationarity_steps=tuple(fit.step.stationarity_steps for fit in fits),
+            stationarity_errors=tuple(fit.step.stationarity_errors for fit in fits),
+            mean_move=fixed_points.mean_move,
+            draw_tolerance=fixed_points.effective / draw_count,
+            noise_gain=fixed_points.noise_gain,
+            mean_error=fixed_points.mean_error,
+            negative_sites=np.sum(fixed_points.site_precision < 0.0, axis=0).astype(np.int64),
+            effective_effects=fixed_points.effective,
+            outer_iterations=np.array([fit.iterations for fit in fits], dtype=np.int64),
+            halvings=np.array([fit.halvings for fit in fits], dtype=np.int64),
+            refreshes=fixed_points.refreshes,
+            passes=fixed_points.passes,
+        ),
+    )
 
 
 def scoring_models(

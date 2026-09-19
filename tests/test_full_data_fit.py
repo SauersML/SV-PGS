@@ -15,7 +15,7 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringPlan, score_genetic
-from sv_pgs.full_data_fit import covariate_residual_variance, fit_full_data, prior_start, scoring_models, stage0_lattice
+from sv_pgs.full_data_fit import covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
 from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
 from sv_pgs.scale_mixture_ep import scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -96,15 +96,15 @@ def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_
         class_index=classes, log_variance_offset=offsets, annotation_design=np.zeros((reduced_count, 0)), annotation_groups=(),
         nodes=nodes, floor=floor, top=top,
     )
-    start = prior_start(prior, targets[:, None], mask, store_covariates)
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
     gaussian = DualGaussian(
         source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates, probe_count=_DRAWS, seed=11
     )
-    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, start=start, draw_count=_DRAWS, working_bytes=1 << 22)
+    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22)
     certificate = fit.certificate
     assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
     assert certificate.mean_move[0] <= certificate.draw_tolerance[0]
+    assert certificate.noise_gain[0] <= 0.5 / _DRAWS
     scoring = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], _DRAWS, seed=12)
     scores = score_genetic(_StoreCodes(store), ScoringPlan.from_models(scoring), _budget())
     # The scorer's in-sample genetic score is the fitted model's own X mu, read back from the store.
