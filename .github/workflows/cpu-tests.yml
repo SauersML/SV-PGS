@@ -2,9 +2,13 @@ name: cpu-tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'lane/**']
   pull_request:
     branches: [main]
+
+concurrency:
+  group: cpu-tests-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   cpu-full-suite:
