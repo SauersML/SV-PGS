@@ -73,5 +73,17 @@
   - **Our trigger:** mass hold and cancel of about 1,000 pending array tasks, plus about 40 `scontrol update partition=` calls on pending arrays. The single over-removing call needs root-only slurmctld debug2 logs to identify.
   - **Reset:** only an administrator can do it. A slurmctld restart or reconfigure runs `_restore_job_accounting()` in read_config.c, which clears and recounts usage. The permanent fix is Slurm ≥ 25.11.3. A support request was filed; any follow-up is sent by the user, never by an agent.
   - Until the reset, the `interactive` and `interactive-gpu` partitions still accept jobs, at most one running job per user each, shared across all sessions of the account.
-- **Imports:** script runs must set PYTHONPATH to their worktree and log `sv_pgs.__file__` and the commit. The shared clone's editable install otherwise imports whatever commit that clone has checked out.
-- **Environment:** simulation studies need the uv `sim` dependency group (msprime).
+- **Task runner (runq), the workaround while the counter is wrapped:**
+  - one long `interactive-gpu` allocation (2×A40, 48 cores, 24 h, which submits its own successor) runs small tasks from file queues;
+  - tasks go to `/scratch.global/<user>/svpgs-team/runq/{gpu,cpu}/pending/` as `<lane>__<name>__c<cores>[__g<gpus>].sh`, at most 16 cores each and at most 2 queued per lane;
+  - the runner pins each task (`taskset`, `nice 10`), sets the thread counts, `CUDA_VISIBLE_DEVICES` and a private TMPDIR, and records each exit in `logs/records.jsonl`;
+  - `touch <queue>/STOP` drains it;
+  - the sources are `svpgs-team/runq_bin/` (runner.py and the two sbatch launchers);
+  - a watcher (`runq_bin/slurm_watch.sh`, one core, nice 19) writes `runq/SLURM_RESTORED` once the counter is reset;
+  - no task may call `sbatch` itself.
+- **Environments** (uv, Python 3.12, synced `--locked` from `svpgs-team/env-src`, a detached checkout of origin/main):
+  - `svpgs-team/venv-cpu`: the dev and sim groups (msprime included);
+  - `svpgs-team/venv-gpu`: the same plus the `gpu` extra (cupy-cuda12x, jax[cuda12]). Export `LD_LIBRARY_PATH` from `venv-gpu/lib/python3.12/site-packages/nvidia/*/lib` before importing cupy or jax.
+  - Both are built with `--no-install-project`, so `sv_pgs` is never installed in them. Every run uses its own worktree as cwd (`python -m pytest`) or sets `PYTHONPATH` to it, and logs `sv_pgs.__file__` and the commit. A run without either fails at import instead of silently using another commit.
+  - To refresh after a lock change: update `env-src` to origin/main, then rerun `uv sync --locked --no-install-project --group dev --group sim [--extra gpu]` with `UV_PROJECT_ENVIRONMENT` set to the venv.
+  - The older `main/.venv` belongs to the shared clone, which another session depends on. It predates zstandard and duckdb, so it cannot collect the store tests. Never sync or install into it.

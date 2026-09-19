@@ -80,6 +80,6 @@
 - **Scratch cleanup, about 345 GB freed:**
   - kept: the main clone and its `.venv`; the stores `s1M_100k` (94 GB) and `mini`; `build-lead/synth` (127 GB); `lit-review`; the Descent olean cache; public-data caches; result dirs;
   - deleted by an interrupted cleanup: the agent script and log dirs, `venv-cpu-fast`, `venv-fast`, the Descent clone and `runq_bin`;
-  - `venv-gpu` is broken.
-  - Rebuild the venvs with uv before running anything, and re-clone Descent from d86c2669 if it's needed.
+  - the venvs and the task runner were rebuilt on resume (`venv-cpu`, `venv-gpu`, `runq_bin`; see COMPUTE.md);
+  - re-clone Descent from d86c2669 if it's needed.
 - **Slurm:** the account's submit counter is still wrapped at −260 (see COMPUTE.md for the root cause). Check `scontrol show assoc_mgr users=<user> flags=assoc` before submitting. Until an admin reset, only the `interactive` partitions work.
