@@ -100,7 +100,7 @@ def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_
     gaussian = DualGaussian(
         source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates, probe_count=_DRAWS, seed=11
     )
-    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22)
+    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13)
     certificate = fit.certificate
     assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
     assert certificate.mean_move[0] <= certificate.draw_tolerance[0]

@@ -13,6 +13,10 @@ residual variance. ``scale_mixture_ep.fit_hyperparameters`` then alternates two 
    a. Refresh: solve the mean at the current sites and compute the certified marginal variances z and the
       cavities (P = 1/z - tau). Negative sites are halved while the global precision is not positive definite or a
       cavity is not proper. Non-negative sites always pass, so this ends; only the path to the fixed point changes.
+      The cavity is the information the data removed, D - z, which amplifies a variance error by about 1/(D q)
+      where each variant carries little data; so every refresh is certified on tr(D - z) per block
+      (``block_information_certificate``, from the dual solve's own products, with the solve accuracy it derives),
+      and a violated block refuses the fixed point (novel-inference: the equivalent failed there).
    b. Check, at the refresh. The undamped EP update from these cavities moves the mean by
       Sigma (delta nu - delta tau o mu), exactly to first order in the site change. The fixed point is certified when
       that move is at most p_eff / K in the posterior metric (the scorer's Monte Carlo resolution with K draws),
@@ -41,7 +45,16 @@ from sv_pgs.config import TraitType
 from sv_pgs.dual_solve import DualGaussian
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.marginal_variances import BlockGrams, certificate_tolerance, marginal_variances, variance_jvp
+from sv_pgs.marginal_variances import (
+    BlockCertificate,
+    BlockGrams,
+    block_information_certificate,
+    certificate_tolerance,
+    information_products,
+    information_solve_tolerance,
+    marginal_variances,
+    variance_jvp,
+)
 from sv_pgs.scale_mixture_ep import (
     Cavity,
     FixedPoint,
@@ -108,6 +121,8 @@ class FitCertificate:
     - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
       the final refresh, against ``draw_tolerance`` = p_eff / K; ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
+    - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
+      block's relative error in tr(D - Sigma), and the approximation scale it is tested against;
     - ``negative_sites``: sites with negative precision (allowed; EP is unclipped);
     - ``effective_effects``: p_eff = p - sum_j tau_j z_j;
     - ``outer_iterations`` and ``halvings``: accepted Newton-B steps and the trials the monotonicity test refused;
@@ -123,6 +138,8 @@ class FitCertificate:
     draw_tolerance: F64Array
     noise_gain: F64Array
     mean_error: F64Array
+    information_bound: F64Array
+    information_tolerance: F64Array
     negative_sites: I64Array
     effective_effects: F64Array
     outer_iterations: I64Array
@@ -180,8 +197,11 @@ class _FullDataFixedPoints:
     """``scale_mixture_ep.FixedPoints`` on the full data: each model's certified EP fixed point at its
     hyperparameters, with its noise variance stationary, warm from the previous call (the module docstring's step 1)."""
 
-    def __init__(self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int) -> None:
+    def __init__(
+        self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int
+    ) -> None:
         self.gaussian = gaussian
+        self.generator = np.random.default_rng(seed)
         self.statistics = statistics
         self.prior = prior
         self.draw_count = draw_count
@@ -196,6 +216,7 @@ class _FullDataFixedPoints:
         self.mean_move = np.full(model_count, np.inf)
         self.noise_gain = np.full(model_count, np.inf)
         self.mean_error = np.full(model_count, np.inf)
+        self.information: list[BlockCertificate] = []
         self.refreshes = 0
         self.passes = 0
 
@@ -218,6 +239,13 @@ class _FullDataFixedPoints:
                 variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
                 if np.all(1.0 / variances - self.site_precision > 0.0):
                     self.refreshes += 1
+                    self.information = [self._information(model, variances[:, model], grams[model]) for model in range(gaussian.model_count)]
+                    for model, certificate in enumerate(self.information):
+                        if np.any(certificate.violated):
+                            raise FloatingPointError(
+                                f"model {model}: the marginal variances fail the cavity information certificate in "
+                                f"{int(np.count_nonzero(certificate.violated))} of {certificate.violated.shape[0]} blocks"
+                            )
                     self.probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in gaussian.bulk_solves)
                     self.effective = self.prior.variant_count - np.sum(self.site_precision * variances, axis=0)
                     return variances, grams
@@ -227,6 +255,19 @@ class _FullDataFixedPoints:
             if not np.any(negative):
                 raise FloatingPointError("the full-data precision is not positive definite with non-negative sites")
             self.site_precision[negative] *= 0.5
+
+    def _information(self, model: int, variances: F64Array, grams: BlockGrams) -> BlockCertificate:
+        """Each block's tr(D - Sigma) tested against Rademacher probes of the removed information (D - Sigma) z,
+        formed by the dual solve itself (``information_products``) with its derived relative residual."""
+        gaussian = self.gaussian
+        solve = gaussian.bulk_solves[model]
+        tolerance = certificate_tolerance(solve, gaussian.probe_count)
+        column_square_norms = np.asarray(gaussian.unit_squares, dtype=np.float64)[:, model] / float(self.noise[model])
+        residual = information_solve_tolerance(solve, variances, grams.blocks, column_square_norms, tolerance)
+        probes = self.generator.choice(np.array([-1.0, 1.0]), size=(solve.site_precision.shape[0], gaussian.probe_count))
+        back_products, _coupling, _residual_norm = gaussian.information_solve(probes, model, residual)
+        removed = information_products(solve, np.asarray(back_products, dtype=np.float64))
+        return block_information_certificate(solve, variances, grams.blocks, probes, removed, tolerance)
 
     def _noise(self, variances: F64Array) -> F64Array:
         gaussian = self.gaussian
@@ -317,10 +358,11 @@ class _FullDataFixedPoints:
 
 
 def fit_full_data(
-    *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int
+    *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int
 ) -> FullDataFit:
-    """Stage 2 for quantitative models, from the prior (see the module docstring)."""
-    fixed_points = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes)
+    """Stage 2 for quantitative models, from the prior (see the module docstring); ``seed`` draws the certificate's
+    variant-side probes."""
+    fixed_points = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed)
     starts = [initial_hyperparameters(prior) for _model in range(gaussian.model_count)]
     fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
     return FullDataFit(
@@ -339,6 +381,8 @@ def fit_full_data(
             draw_tolerance=fixed_points.effective / draw_count,
             noise_gain=fixed_points.noise_gain,
             mean_error=fixed_points.mean_error,
+            information_bound=np.array([float(np.max(certificate.upper_bound)) for certificate in fixed_points.information]),
+            information_tolerance=np.array([certificate.tolerance for certificate in fixed_points.information]),
             negative_sites=np.sum(fixed_points.site_precision < 0.0, axis=0).astype(np.int64),
             effective_effects=fixed_points.effective,
             outer_iterations=np.array([fit.iterations for fit in fits], dtype=np.int64),
