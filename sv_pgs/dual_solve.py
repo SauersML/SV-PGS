@@ -88,6 +88,15 @@ class DualTileSource(Protocol):
         """(start, stop, tile) for every block, in variant order, covering 0..p-1."""
         ...
 
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        """sum over blocks of what work(start, stop, tile, shared, rows_b, image) adds into a zero image.
+
+        `shared` holds sample-side arrays every block reads (work may cache per-device state in it),
+        `rows` variant-side arrays of which each block gets its rows. A source over several devices
+        runs its blocks on all of them at once and sums the devices' images in a fixed order.
+        """
+        ...
+
 
 def rounded_operand(values: Any, relative_error: float, array_module: Any) -> Any:
     """The operand the int8 digit split multiplies: the fewest digits meeting the normwise bound.
@@ -150,6 +159,9 @@ class DenseDualSource:
         for start, stop in self.block_bounds:
             yield start, stop, DenseDualTile(self.genotypes[:, start:stop], self.array_module)
 
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        return sequential_map_reduce(self, work, shared, rows, image_shape)
+
 
 def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> list[tuple[int, int]]:
     bounds = [(int(start), int(stop)) for start, stop in block_bounds]
@@ -158,6 +170,15 @@ def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> 
     ):
         raise ValueError("blocks must cover every variant once, in order.")
     return bounds
+
+
+def sequential_map_reduce(source: DualTileSource, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+    """map_reduce on one device: every block in order into one image."""
+    image = source.array_module.zeros(image_shape)
+    device_shared = dict(shared)
+    for start, stop, tile in source.blocks():
+        work(start, stop, tile, device_shared, {name: values[start:stop] for name, values in rows.items()}, image)
+    return image
 
 
 class StreamedDualSource:
@@ -181,6 +202,9 @@ class StreamedDualSource:
         for block_index, tile in self.source.iter_tiles():
             start, stop = self.block_bounds[block_index]
             yield start, stop, tile
+
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        return sequential_map_reduce(self, work, shared, rows, image_shape)
 
 
 def _host(values: Any) -> np.ndarray:
@@ -237,15 +261,6 @@ class PassCount:
         self.records.append((label, columns, relative_error))
 
 
-def _read_products(tile: DualTile, operand: Any, left: Any, relative_error: float) -> tuple[Any, Any]:
-    """X_b' L for one block of a read, preparing the read's operand at its first block."""
-    if relative_error <= 0.0:
-        return tile.rmatmat(left), operand
-    if operand is None:
-        operand = tile.sample_operand(left, relative_error)
-    return tile.rmatmat(operand), operand
-
-
 def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -> None:
     if relative_error <= 0.0:
         image += tile.matmat(right)
@@ -253,15 +268,28 @@ def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -
         tile.accumulate_matmat(right, image, relative_error)
 
 
+def _operator_block(relative_error: float) -> Callable[..., None]:
+    """One block of S V's read: X_b' L, scaled by D_b per column, back through X_b into the image.
+
+    With a relaxed error the read's sample operand is prepared at a device's first block and reused
+    by its other blocks (code_products.CodeBlockTile.sample_operand)."""
+
+    def work(_start: int, _stop: int, tile: DualTile, shared: dict, rows: dict, image: Any) -> None:
+        if relative_error > 0.0 and "operand" not in shared:
+            shared["operand"] = tile.sample_operand(shared["left"], relative_error)
+        products = tile.rmatmat(shared["operand"] if relative_error > 0.0 else shared["left"])
+        scaled = rows["variances"][:, shared["column_models"]] * products
+        _accumulate(tile, scaled if scaled.flags.c_contiguous else scaled.copy(order="C"), image, relative_error)
+
+    return work
+
+
 def apply_operator(source: DualTileSource, models: DualModels, values: Any, column_models: Any, relative_error: float, count: PassCount, label: str) -> Any:
-    """S V for every column, one read; the sample operand is prepared once for the read."""
-    array_module = source.array_module
+    """S V for every column, one read over every device of the source."""
     left = models.sample_to_design(values, column_models)
-    image = array_module.zeros_like(values)
-    operand = None
-    for start, stop, tile in source.blocks():
-        products, operand = _read_products(tile, operand, left, relative_error)
-        _accumulate(tile, array_module.ascontiguousarray(models.variances[start:stop][:, column_models] * products), image, relative_error)
+    image = source.map_reduce(
+        _operator_block(relative_error), {"left": left, "column_models": column_models}, {"variances": models.variances}, tuple(values.shape)
+    )
     count.note(int(values.shape[1]), relative_error, label)
     return values + models.design_to_sample(image, column_models)
 
