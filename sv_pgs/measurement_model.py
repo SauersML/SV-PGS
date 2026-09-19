@@ -30,9 +30,7 @@ truth samples, and on public benchmarks from their truth.
    removes it. C_k is the Bayesian ridge fit of the calibrated residual
    T_k - D*_k on the block's standardized columns. One ridge ratio per block is
    chosen by marginal likelihood, and each target has its own noise variance.
-   A ratio of 0 means the data show no leakage and gives back D*. A block whose
-   ratio is not identified (the calibration pairs can interpolate every target)
-   returns no correction and says so.
+   A ratio of 0 means the data show no leakage and gives back D*.
 4. The engine's products for the mapped columns. Xtilde = X A with
    A = I + E, where E holds C in the target columns, so a block's centred Gram
    becomes A' G A and its cross-products A' X'y.
@@ -284,20 +282,14 @@ class LeakageMap:
 
     ``coefficients`` is [block columns, targets] in per-allele units, so the mapped
     column is Xtilde_k = D*_k + sum_j coefficients[j, k] (D*_j - column_means[j]).
+    ``ridge_ratio`` is the marginal-likelihood ratio: 0 when the pairs show no
+    leakage, infinite when they are fitted exactly (the minimum-norm interpolant).
     """
 
     targets: I64Array
     column_means: F64Array
     coefficients: F64Array
     ridge_ratio: float
-    identified: bool
-    log_evidence_gain: float
-
-
-def _unmapped(targets: I64Array, column_means: F64Array, identified: bool = True) -> LeakageMap:
-    """No correction: rho = 0 when the data show no leakage, infinite when rho is not identified."""
-    ratio = 0.0 if identified else np.inf
-    return LeakageMap(targets, column_means, np.zeros((column_means.shape[0], targets.shape[0])), ratio, identified, 0.0)
 
 
 def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
@@ -308,13 +300,12 @@ def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: N
     ``target_truth`` is [pairs, targets]: the truth of the columns being mapped,
     whose indices in the block are ``targets``. The ridge prior is exchangeable in
     standardized units, c ~ N(0, rho sigma_k^2 I). Its ratio rho is shared by the
-    block's targets and is the maximizer of the profile marginal likelihood, with
-    each target's sigma_k^2 profiled out in closed form. A column with no
-    calibration variation predicts nothing and gets coefficient 0, as does a target
-    whose calibrated column already equals its truth on every pair. When the block's
-    columns span all the pairs' centred directions they interpolate every residual,
-    the likelihood has no maximum in rho, and the block is returned unmapped and
-    flagged as not identified.
+    block's targets and maximizes the marginal likelihood of the centred residuals,
+    which live in the n - 1 directions orthogonal to the mean, with each target's
+    sigma_k^2 profiled out in closed form. When the likelihood still rises as rho
+    grows without bound, the map is its limit, the minimum-norm least-squares fit.
+    A column with no calibration variation predicts nothing and gets coefficient 0,
+    as does a target whose calibrated column already equals its truth on every pair.
     """
     block = np.asarray(calibrated_block, dtype=np.float64)
     truth = np.asarray(target_truth, dtype=np.float64)
@@ -325,51 +316,42 @@ def fit_leakage_map(calibrated_block: NDArray, target_truth: NDArray, targets: N
         raise ValueError("fit_leakage_map needs complete calibration pairs.")
     if np.any((target_index < 0) | (target_index >= block.shape[1])) or np.unique(target_index).size != target_index.size:
         raise ValueError("fit_leakage_map needs distinct target columns inside the block.")
-    pair_count = block.shape[0]
     column_means = block.mean(axis=0)
+    coefficients = np.zeros((block.shape[1], target_index.shape[0]))
     centred = block - column_means
     deviations = centred.std(axis=0)
     varying = deviations > 0.0
     residuals = (truth - truth.mean(axis=0)) - centred[:, target_index]
     leaking = np.any(residuals != 0.0, axis=0)
     if not (np.any(varying) and np.any(leaking)):
-        return _unmapped(target_index, column_means)
+        return LeakageMap(target_index, column_means, coefficients, 0.0)
     standardized = centred[:, varying] / deviations[varying]
     left, singular, right_transposed = np.linalg.svd(standardized, full_matrices=False)
     retained = singular > singular[0] * np.finfo(np.float64).eps * max(standardized.shape)
-    if retained.sum() >= pair_count - 1:
-        # The block's columns span every centred direction of the pairs, so every
-        # residual is interpolated and the likelihood grows without bound in rho.
-        return _unmapped(target_index, column_means, identified=False)
     left, singular, right_transposed = left[:, retained], singular[retained], right_transposed[retained]
     eigenvalues = singular**2
+    directions = block.shape[0] - 1
     target_count = int(leaking.sum())
     projected = left.T @ residuals[:, leaking]
     outside = np.sum((residuals[:, leaking] - left @ projected) ** 2, axis=0)
 
-    def residual_energy(ratio: float) -> F64Array:
-        return np.sum(projected**2 / (1.0 + ratio * eigenvalues)[:, None], axis=0) + outside
-
-    def profile(ratio: float) -> float:
-        return float(-(pair_count * np.sum(np.log(residual_energy(ratio))) + target_count * np.sum(np.log1p(ratio * eigenvalues))) / 2)
-
     def score(ratio: float) -> float:
         shrink = 1.0 + ratio * eigenvalues
+        energy = np.sum(projected**2 / shrink[:, None], axis=0) + outside
         energy_slope = -np.sum(projected**2 * (eigenvalues / shrink**2)[:, None], axis=0)
-        return float(-(pair_count * np.sum(energy_slope / residual_energy(ratio)) + target_count * np.sum(eigenvalues / shrink)) / 2)
+        return float(-(directions * np.sum(energy_slope / energy) + target_count * np.sum(eigenvalues / shrink)) / 2)
 
     if not score(0.0) > 0.0:
-        return _unmapped(target_index, column_means)
+        return LeakageMap(target_index, column_means, coefficients, 0.0)
     high = 1.0 / eigenvalues[0]
-    while score(high) > 0.0:
+    while np.isfinite(high) and score(high) > 0.0:
         high *= 2
-        if not np.isfinite(high):
-            return _unmapped(target_index, column_means, identified=False)
-    ratio = _bisect_to_exhaustion(score, 0.0, high)
-    standardized_coefficients = right_transposed.T @ ((ratio * singular / (1.0 + ratio * eigenvalues))[:, None] * projected)
-    coefficients = np.zeros((block.shape[1], target_index.shape[0]))
+    ratio = _bisect_to_exhaustion(score, 0.0, high) if np.isfinite(high) else np.inf
+    # rho s / (1 + rho s^2) written as s / (1 / rho + s^2), which is 1 / s at rho = infinity.
+    gains = singular / (1.0 / ratio + eigenvalues)
+    standardized_coefficients = right_transposed.T @ (gains[:, None] * projected)
     coefficients[np.ix_(varying, leaking)] = standardized_coefficients / deviations[varying][:, None]
-    return LeakageMap(target_index, column_means, coefficients, ratio, True, profile(ratio) - profile(0.0))
+    return LeakageMap(target_index, column_means, coefficients, ratio)
 
 
 def apply_leakage_map(calibrated_block: NDArray, leakage: LeakageMap) -> F64Array:
@@ -546,7 +528,7 @@ def fit_measurement_model(
             block_scales = scales[np.asarray(pairs.block.records, dtype=np.int64)]
             block_means = pairs.dosage.mean(axis=0)
             maps.append(fit_leakage_map(block_means + block_scales * (pairs.dosage - block_means), pairs.truth, pairs.block.targets))
-    unidentified = sum(not leakage.identified for leakage in maps)
+    ratios = np.array([leakage.ridge_ratio for leakage in maps])
     certificate: dict[str, object] = {
         "calibration_samples": 0 if calibration is None else len(calibration.sample_ids),
         "calibrated_records": int(calibrated.sum()),
@@ -556,7 +538,8 @@ def fit_measurement_model(
             f"not applied to {int(uncalibrated.sum())} records with fewer than 3 pairs"
         ),
         "leakage_correction": (
-            f"applied to {len(maps)} LD blocks; not identified (left unmapped) in {unidentified}"
+            f"applied to {len(maps)} LD blocks: no leakage found in {int(np.sum(ratios == 0.0))}, "
+            f"fitted exactly (minimum-norm interpolant) in {int(np.sum(np.isinf(ratios)))}"
             if maps
             else "not applied: no LD block has calibration pairs"
         ),

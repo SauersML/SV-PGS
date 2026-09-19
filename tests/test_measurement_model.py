@@ -145,7 +145,7 @@ def test_the_leakage_map_moves_an_sv_effect_back_off_its_tag_snp() -> None:
     scale = recalibration_scales(moments, np.zeros(1, dtype=int))[0]
     calibrated = moments.dosage_mean[0] + scale * (calibration_draw - moments.dosage_mean[0])
     leakage = fit_leakage_map(np.column_stack([calibrated, calibration_snp]), calibration_sv[:, None], np.array([0]))
-    assert leakage.identified and leakage.ridge_ratio > 0.0
+    assert leakage.ridge_ratio > 0.0
 
     cohort_sv, cohort_snp = _two_locus(rng, 40000, frequency, 0.9)
     cohort_draw = _draw_type_column(cohort_sv[None], np.array([frequency]), keep, rng)[0]
@@ -190,13 +190,25 @@ def test_the_mapped_gram_is_the_gram_of_the_mapped_columns() -> None:
     assert np.all(np.abs(mapped_gram(centred.T @ centred, leakage) - mapped_centred.T @ mapped_centred) <= gram_bound)
 
 
-def test_a_block_the_pairs_can_interpolate_is_left_unmapped_and_says_so() -> None:
+def test_noise_free_leakage_is_recovered_exactly() -> None:
+    rng = np.random.default_rng(31)
+    block = rng.normal(size=(400, 5))
+    leak = np.array([0.0, 0.4, -0.3, 0.2, 0.1])
+    centred = block - block.mean(axis=0)
+    truth = block[:, [0]] + (centred @ leak)[:, None]
+    leakage = fit_leakage_map(block, truth, np.array([0]))
+    # The residual lies in the columns' span, so the fit is the least-squares solution
+    # up to rounding, amplified at most by the block's condition number.
+    bound = rounding_gamma(block.size) * np.linalg.cond(centred / centred.std(axis=0)) * np.abs(leak).max()
+    assert np.all(np.abs(leakage.coefficients[:, 0] - leak) <= bound)
+
+
+def test_a_block_wider_than_its_pairs_still_gets_a_finite_map() -> None:
     rng = np.random.default_rng(13)
     block = rng.normal(size=(20, 40))
-    truth = rng.normal(size=(20, 1))
-    leakage = fit_leakage_map(block, truth, np.array([3]))
-    assert not leakage.identified
-    assert np.all(leakage.coefficients == 0.0)
+    leakage = fit_leakage_map(block, block[:, [3]] + rng.normal(size=(20, 1)), np.array([3]))
+    assert leakage.ridge_ratio >= 0.0
+    assert np.all(np.isfinite(leakage.coefficients))
 
 
 def test_without_truth_the_model_degrades_loudly_and_records_it() -> None:
