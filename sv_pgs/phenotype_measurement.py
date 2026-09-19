@@ -202,28 +202,51 @@ def _log_occasion_density(residuals: F64Array, points: F64Array, log_masses: F64
 
 # The level integrals certified: of F, |T| F and T^2 F (L_i and the two moments' absolute integrals).
 def _log_prior_tail_moments(distance: F64Array, level_variance: float) -> F64Array:
-    """log of the integral of |T|^m N(T; 0, tau^2) over |T| > distance, one side, for m = 0, 1, 2 (persons x 3):
-    Phi(-a), tau phi(a) and tau^2 (a phi(a) + Phi(-a)) with a = distance / tau >= 0."""
+    """log of the integral of |T|^m N(T; 0, tau^2) over T > distance, for m = 0, 1, 2 (persons x 3). For
+    a = distance / tau >= 0 these are Phi(-a), tau phi(a) and tau^2 (a phi(a) + Phi(-a)); below 0 they are the
+    whole moments 1, tau sqrt(2 / pi) and tau^2 less the tails beyond -distance."""
     scale = np.sqrt(level_variance)
-    standardized = distance / scale
+    standardized = np.abs(distance) / scale
     log_survival = log_ndtr(-standardized)
     log_density = -0.5 * (_LOG_TWO_PI + np.square(standardized))
-    second = np.logaddexp(np.log(standardized) + log_density, log_survival)
-    return np.stack([log_survival, np.log(scale) + log_density, 2.0 * np.log(scale) + second], axis=1)
+    with np.errstate(divide="ignore"):  # a = 0: the first term of the second moment's tail is 0
+        second = np.logaddexp(np.log(standardized) + log_density, log_survival)
+    beyond = np.stack([log_survival, np.log(scale) + log_density, 2.0 * np.log(scale) + second], axis=1)
+    whole = np.array([0.0, np.log(scale) + 0.5 * (np.log(2.0) - np.log(np.pi)), 2.0 * np.log(scale)])
+    within = whole + np.log(-np.expm1(beyond - whole))
+    return np.where((distance >= 0.0)[:, None], beyond, within)
 
 
-def _log_tail(residuals: F64Array, edge: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, upper: bool) -> F64Array:
-    """log of a bound on the integral of |T|^m F(T) beyond ``edge`` (above it when ``upper``), m = 0, 1, 2.
+def _log_prior_sum_bound(distance: F64Array, level_variance: float, steps: F64Array) -> F64Array:
+    """log of a bound on h sum over the nodes beyond ``distance`` of |T|^m N(T; 0, tau^2), m = 0, 1, 2.
 
-    The edge lies on the far side of 0 from the bulk, so past it each f(r_j - T) is at most f(r_j - edge) when
-    r_j lies on the edge's inner side (it decreases away from r_j) and at most f(0) otherwise, and the rest is
-    the prior's tail moment (``_log_prior_tail_moments``). The trapezoid terms past the edge sum to no more.
+    On each interval where a function is monotone, its trapezoid terms sum to at most its integral plus h times
+    its largest value there. |T|^m N(T; 0, tau^2) has two monotone pieces for m = 0 and four for m > 0 (modes
+    at +-sqrt(m) tau), and its largest value past ``distance`` is at max(distance, sqrt(m) tau).
+    """
+    powers = np.arange(3.0)
+    pieces = np.where(powers > 0.0, 4.0, 2.0)
+    peak = np.maximum(distance[:, None], np.sqrt(powers * level_variance)[None, :])
+    with np.errstate(divide="ignore"):  # the m = 0 peak at T = 0 has |T|^0 = 1
+        log_peak = np.where(powers > 0.0, powers * np.log(np.abs(peak)), 0.0) - 0.5 * (_LOG_TWO_PI + np.log(level_variance) + np.square(peak) / level_variance)
+    return np.logaddexp(_log_prior_tail_moments(distance, level_variance), np.log(pieces * steps[:, None]) + log_peak)
+
+
+def _log_tail(
+    residuals: F64Array, edge: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array,
+    upper: bool,
+) -> F64Array:
+    """log of a bound on h sum over the nodes beyond ``edge`` (above it when ``upper``) of |T|^m F(T), m = 0, 1, 2.
+
+    Past the edge each f(r_j - T) is at most f(r_j - edge) when r_j lies on the edge's inner side (it decreases
+    away from r_j) and at most f(0) otherwise, and the prior's terms are bounded by ``_log_prior_sum_bound``
+    (the prior is symmetric, so the lower tail is the upper one beyond -edge).
     """
     inner = residuals <= edge[:, None] if upper else residuals >= edge[:, None]
     at_edge = _log_occasion_density(residuals, edge, log_masses, variances)
     at_peak = float(logsumexp(log_masses - 0.5 * (_LOG_TWO_PI + np.log(variances))))
     occasions = np.sum(np.where(inner, at_edge, at_peak), axis=1)
-    return occasions[:, None] + _log_prior_tail_moments(np.abs(edge), level_variance)
+    return occasions[:, None] + _log_prior_sum_bound(edge if upper else -edge, level_variance, steps)
 
 
 def _log_modulus_bound(
@@ -281,24 +304,23 @@ def _log_moment_sums(log_integrand: F64Array, levels: F64Array, steps: F64Array,
 
 
 def _level_grid(
-    residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array, relative_tolerance: float,
-    working_bytes: int,
+    residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array,
+    centres: F64Array, reach: F64Array, relative_tolerance: float, working_bytes: int,
 ) -> tuple[F64Array, np.ndarray, F64Array, F64Array]:
-    """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask), the log components at
-    them (``_log_components``) and the log integrals of |T|^m F, m = 0, 1, 2 (persons x 3).
+    """Trapezoid nodes on each person's grid c_p + n h_p (persons x nodes, a validity mask), the log components
+    at them (``_log_components``) and the log integrals of |T|^m F, m = 0, 1, 2 (persons x 3).
 
-    Each side starts sqrt(2) tau past 0, the mode of T^2 N(T; 0, tau^2), so that every |T|^m N(T; 0, tau^2)
-    decreases past either edge and the trapezoid terms beyond it sum to at most its tail integral; it doubles
-    until every one of its tail bounds (``_log_tail``) is at most a quarter of relative_tolerance times its
-    integral so far.
+    Each side starts ``reach`` past the centre and doubles until every one of its tail bounds (``_log_tail``,
+    which bounds the omitted nodes' terms) is at most a quarter of relative_tolerance times its integral so far.
+    The centre and reach set only the cost.
     """
-    reach = np.ceil(np.sqrt(2.0 * level_variance) / steps)
-    lower, upper = -reach, reach.copy()
+    upper = np.maximum(np.ceil(reach / steps), 1.0)
+    lower = -upper
     while True:
         counts = (upper - lower).astype(np.int64) + 1
         offsets = np.arange(int(counts.max()))[None, :]
         valid = offsets < counts[:, None]
-        levels = (lower[:, None] + np.minimum(offsets, counts[:, None] - 1)) * steps[:, None]
+        levels = centres[:, None] + (lower[:, None] + np.minimum(offsets, counts[:, None] - 1)) * steps[:, None]
         if levels.size * residuals.shape[1] * variances.shape[0] * _ENTRY_BYTES > working_bytes:
             raise PieceTooLarge(f"{levels.shape[0]} persons need {levels.shape[1]} level nodes each")
         log_components = _log_components(residuals, levels, log_masses, variances)
@@ -308,8 +330,9 @@ def _level_grid(
         if not np.all(np.isfinite(log_totals[:, 0])):
             raise FloatingPointError("a person's level integral is not finite")
         bound = np.log(0.25 * relative_tolerance) + log_totals
-        grow_lower = np.any(_log_tail(residuals, lower * steps, level_variance, log_masses, variances, upper=False) > bound, axis=1)
-        grow_upper = np.any(_log_tail(residuals, upper * steps, level_variance, log_masses, variances, upper=True) > bound, axis=1)
+        low_edge, high_edge = centres + lower * steps, centres + upper * steps
+        grow_lower = np.any(_log_tail(residuals, low_edge, level_variance, log_masses, variances, steps, upper=False) > bound, axis=1)
+        grow_upper = np.any(_log_tail(residuals, high_edge, level_variance, log_masses, variances, steps, upper=True) > bound, axis=1)
         if not (np.any(grow_lower) or np.any(grow_upper)):
             return levels, valid, log_components, log_totals
         lower = np.where(grow_lower, 2.0 * lower, lower)
@@ -318,7 +341,7 @@ def _level_grid(
 
 def level_posterior(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, relative_tolerance: float,
-    steps: F64Array | None, louis: bool, working_bytes: int,
+    steps: F64Array | None, centres: F64Array | None, louis: bool, working_bytes: int,
 ) -> LevelPosterior:
     """The exact E-step for persons with J occasions each (``residuals`` is persons x J).
 
@@ -332,7 +355,8 @@ def level_posterior(
     Every b is valid, so b only sets the cost. It is searched on a ladder of halvings between the strips that are
     optimal for Gaussian occasions of the largest and of the smallest variance (``strip_half_width``). ``steps``
     (None or NaN: ``gaussian_step`` at the density's harmonic-mean variance) shrink to the certified step until
-    every person's is.
+    every person's is. The grid is centred at ``centres`` (None or NaN: the Gaussian posterior mean at that
+    variance) and starts one Gaussian posterior standard deviation to either side; both set only the cost.
     """
     persons, occasion_count = residuals.shape
     trapezoid_share = 0.5 * relative_tolerance
@@ -341,11 +365,15 @@ def level_posterior(
     harmonic = 1.0 / float(np.exp(logsumexp(log_masses - np.log(variances))))
     start = gaussian_step(level_variance, occasion_count, harmonic, trapezoid_share)
     steps = np.full(persons, start) if steps is None else np.where(np.isnan(steps), start, steps)
+    precision = 1.0 / level_variance + occasion_count / harmonic
+    gaussian_mean = residuals.sum(axis=1) / harmonic / precision
+    centres = gaussian_mean if centres is None else np.where(np.isnan(centres), gaussian_mean, centres)
+    reach = np.full(persons, 1.0 / np.sqrt(precision))
     ladder = np.maximum(widest * np.exp2(-np.arange(int(np.ceil(np.log2(widest / narrowest))) + 1)), narrowest)
     log_moduli = [_log_modulus_bound(residuals, level_variance, log_masses, variances, np.full(persons, width)) for width in ladder]
     while True:
         levels, valid, log_components, log_totals = _level_grid(
-            residuals, level_variance, log_masses, variances, steps, relative_tolerance, working_bytes
+            residuals, level_variance, log_masses, variances, steps, centres, reach, relative_tolerance, working_bytes
         )
         log_lower = log_totals - np.log1p(relative_tolerance)
         admissible = np.max([
@@ -523,8 +551,9 @@ class _Model:
         sorted_persons = occasions.person_index[order]
         self.groups = [order[counts[sorted_persons] == count].reshape(-1, count) for count in np.unique(counts)]
         self.relative_tolerance = person_tolerance(occasions.person_count)
-        # Each person's last admissible trapezoid step, the start of their next E-step (NaN: none yet).
+        # Each person's last admissible trapezoid step and level mean, the start of their next E-step (NaN: none yet).
         self.steps = np.full(occasions.person_count, np.nan)
+        self.centres = np.full(occasions.person_count, np.nan)
 
     def start(self) -> _State:
         """Least-squares fixed effects, the moment level variance, and the engine's start density on the lattice
@@ -569,7 +598,7 @@ class _Model:
             try:
                 posterior = level_posterior(
                     residuals[piece], state.level_variance, log_masses, variances, self.relative_tolerance,
-                    self.steps[persons], louis, self.working_bytes,
+                    self.steps[persons], self.centres[persons], louis, self.working_bytes,
                 )
             except PieceTooLarge:
                 if piece.shape[0] == 1:
@@ -584,6 +613,7 @@ class _Model:
             counts += posterior.counts
             missing += posterior.missing_information
             self.steps[persons] = posterior.admissible_step
+            self.centres[persons] = posterior.level_mean
         return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing)
 
     def maximization(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> _State:
