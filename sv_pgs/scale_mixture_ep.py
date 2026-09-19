@@ -2009,7 +2009,7 @@ def fit_hyperparameters(
       Newton Methods for Nonlinear Problems, 2004, Section 3.1.4): at the trial's fixed point g'(B + S)^-1 g, taken
       with the step's own B + S, must fall, and otherwise the step halves. It needs no evidence value, which a
       full-data fixed point does not give, and it is invariant to x's coordinates.
-    - Where B + S is indefinite (real LD can make it so: bug-recent, 17q21.31 [semi-real]) the step maximizes the
+    - Where B + S is indefinite (as at the true prior on real LD: speed-floor [semi-real]) the step maximizes the
       model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
       value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
       a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
