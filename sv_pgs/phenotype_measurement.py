@@ -660,13 +660,12 @@ class _Model:
         fixed_effects = np.linalg.solve(design.T @ weighted, weighted.T @ self.transformed - design.T @ expectation.occasion_shift)
         return _State(fixed_effects, float(np.mean(expectation.level_second_moment)), state.prior, state.hyperparameters)
 
-    def density_step(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> tuple[_State, _Expectation]:
-        """The density's coefficients by a Newton step on the exact penalized marginal log-likelihood.
+    def newton_direction(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> F64Array | None:
+        """The Newton direction of the density's coefficients on the exact penalized marginal log-likelihood,
+        or None where its curvature is not negative definite.
 
-        Its gradient is M'(C - N pi) - S x (Fisher's identity, C the expected counts) and its curvature
-        M' I M + S, with I Louis' observed information (``expectation`` carries both). The step is halved until
-        the penalized log-likelihood rises. Where that curvature is not positive definite, or no halving rises,
-        the EM step (``maximize_count_density`` on the expected counts) is taken instead, which always rises.
+        Its gradient is M'(C - N pi) - S x (Fisher's identity, C the expected counts) and its negative curvature
+        M' I M + S, with I Louis' observed information (``expectation`` carries both).
         """
         prior = state.prior
         allowed = _allowed(prior, log_smoothing)
@@ -677,22 +676,27 @@ class _Model:
         total = float(expectation.counts.sum())
         gradient = mapping.T @ (expectation.counts - total * masses) - penalty @ reduced
         curvature = mapping.T @ (total * (np.diag(masses) - np.outer(masses, masses)) - expectation.missing_information) @ mapping + penalty
-        curvature = 0.5 * (curvature + curvature.T)
-        base = self.penalized(state, expectation)
         try:
-            step = scipy.linalg.cho_solve(scipy.linalg.cho_factor(curvature), gradient)
+            return allowed @ scipy.linalg.cho_solve(scipy.linalg.cho_factor(0.5 * (curvature + curvature.T)), gradient)
         except np.linalg.LinAlgError:
-            step = None
+            return None
+
+    def density_step(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> tuple[_State, _Expectation]:
+        """The density by the Newton step (``newton_direction``), halved until the penalized log-likelihood
+        rises; where there is no direction, or no halving rises, the EM step (``maximize_count_density`` on the
+        expected counts), which always rises."""
+        coefficients = state.hyperparameters.coefficients
+        direction = self.newton_direction(state, expectation, log_smoothing)
+        base = self.penalized(state, expectation)
         length = 1.0
-        while step is not None and length * float(np.linalg.norm(step)) > _HALF_PRECISION * (1.0 + float(np.linalg.norm(reduced))):
-            trial = self._with_density(state, allowed @ (reduced + length * step), log_smoothing)
-            trial_expectation = self.expectation(trial, louis=False)
+        while direction is not None and length * float(np.linalg.norm(direction)) > _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
+            trial = self._with_density(state, coefficients + length * direction, log_smoothing)
+            trial_expectation = self.expectation(trial, louis=True)
             if self.penalized(trial, trial_expectation) > base:
                 return trial, trial_expectation
             length *= 0.5
-        coefficients = maximize_count_density(prior, log_smoothing, expectation.counts, state.hyperparameters.coefficients)
-        trial = self._with_density(state, coefficients, log_smoothing)
-        return trial, self.expectation(trial, louis=False)
+        trial = self._with_density(state, maximize_count_density(state.prior, log_smoothing, expectation.counts, coefficients), log_smoothing)
+        return trial, self.expectation(trial, louis=True)
 
     @staticmethod
     def _with_density(state: _State, coefficients: F64Array, log_smoothing: F64Array) -> _State:
@@ -706,31 +710,42 @@ class _Model:
         """ECME (Liu and Rubin 1994) to the penalized maximum at one penalty weight; returns the state and its
         E-step with Louis' information.
 
-        Each iteration takes gamma and tau^2 by their EM step (``level_step``), then the density by a Newton step
-        on the exact marginal likelihood (``density_step``); both raise the penalized log-likelihood. Near the
-        maximum the ascent is linear at a rate r, so after an increment d the remaining gain is d r / (1 - r).
-        It stops when that bound, with r the ratio of the last two increments, and the increment itself are below
-        EVIDENCE_TOLERANCE, with the lattice's quadrature bound met, or when an increment is not positive.
+        Each iteration first tries, from one E-step, gamma and tau^2 by their EM step (``level_step``) together
+        with the density's Newton step (``newton_direction``; EM's density step where there is none). If that
+        does not raise the penalized log-likelihood, it takes them in turn: the level step, then the density
+        (``density_step``), each of which rises. Near the maximum the ascent is linear at a rate r, so after an
+        increment d the remaining gain is d r / (1 - r). It stops when that bound, with r the ratio of the last
+        two increments, and the increment itself are below EVIDENCE_TOLERANCE, with the lattice's quadrature
+        bound met, or when an increment is not positive.
         """
         allowed = _allowed(state.prior, log_smoothing)
         state = self._with_density(state, allowed @ (allowed.T @ state.hyperparameters.coefficients), log_smoothing)
-        expectation = self.expectation(state, louis=False)
+        expectation = self.expectation(state, louis=True)
         previous = np.inf
         while True:
             refined = self._refined(state, expectation)
             if refined.prior.grid_size != state.prior.grid_size:
-                state, expectation, previous = refined, self.expectation(refined, louis=False), np.inf
+                state, expectation, previous = refined, self.expectation(refined, louis=True), np.inf
+            base = self.penalized(state, expectation)
             levels = self.level_step(state, expectation)
-            candidate, candidate_expectation = self.density_step(levels, self.expectation(levels, louis=True), log_smoothing)
-            increment = self.penalized(candidate, candidate_expectation) - self.penalized(state, expectation)
+            direction = self.newton_direction(state, expectation, log_smoothing)
+            coefficients = (
+                maximize_count_density(state.prior, log_smoothing, expectation.counts, state.hyperparameters.coefficients)
+                if direction is None else state.hyperparameters.coefficients + direction
+            )
+            candidate = self._with_density(levels, coefficients, log_smoothing)
+            candidate_expectation = self.expectation(candidate, louis=True)
+            if not self.penalized(candidate, candidate_expectation) > base:
+                candidate, candidate_expectation = self.density_step(levels, self.expectation(levels, louis=True), log_smoothing)
+            increment = self.penalized(candidate, candidate_expectation) - base
             state, expectation = candidate, candidate_expectation
             if increment <= 0.0:
                 # Every step rises in exact arithmetic, so the quadrature no longer resolves the gain.
-                return state, self.expectation(state, louis=True)
+                return state, expectation
             if previous < np.inf:
                 rate = increment / previous
                 if increment < EVIDENCE_TOLERANCE and 0.0 <= rate < 1.0 and increment * rate / (1.0 - rate) < EVIDENCE_TOLERANCE:
-                    return state, self.expectation(state, louis=True)
+                    return state, expectation
             previous = increment
 
     def _refined(self, state: _State, expectation: _Expectation) -> _State:
