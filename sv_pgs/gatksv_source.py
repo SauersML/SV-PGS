@@ -22,9 +22,8 @@ whose maximum is 652. Every drop is counted by reason.
 
 No-calls are kept as a mask, never filled here. AoU's genotype filter turns
 uncertain carriers into no-calls, so missingness depends on the genotype; the
-store rows fill them from the imputed DS where it has the same SV
-(``gatksv_store_rows``). The per-sample no-call counts over the kept records
-become a covariate.
+store rows fill them inside the measurement model, from the imputed DS where
+it has the same SV (``gatksv_store_rows``).
 Samples keep this call set's own IDs (research IDs in AoU); joining them to
 the store's samples is the crosswalk's job, never a join by name.
 """
@@ -130,9 +129,9 @@ def _copy_number_values(record: Any, field: str) -> tuple[NDArray, BoolArray] | 
 class GatksvSource:
     """One GATK-SV VCF (optionally one region of it) read as store records.
 
-    ``skipped_records`` counts every dropped record by reason, and
-    ``sample_no_call_counts`` the no-calls of each sample over the kept
-    records; both are complete once ``blocks()`` is exhausted.
+    ``skipped_records`` counts every dropped record by reason and
+    ``kept_record_count`` the kept ones; both are complete once ``blocks()``
+    is exhausted.
     """
 
     def __init__(self, vcf_path: str | Path, region: str | None = None) -> None:
@@ -143,7 +142,6 @@ class GatksvSource:
         self._format_fields = tuple(field for field in ("CN", "RD_CN") if reader.contains(field))
         reader.close()
         self.skipped_records: Counter[str] = Counter()
-        self.sample_no_call_counts = np.zeros(len(self.sample_ids), dtype=np.int64)
         self.kept_record_count = 0
 
     @staticmethod
@@ -231,7 +229,6 @@ class GatksvSource:
                         no_call,
                     )
                 )
-                self.sample_no_call_counts += no_call
                 self.kept_record_count += 1
                 if len(pending) == block_records:
                     yield _block_from_records(pending)
@@ -241,11 +238,6 @@ class GatksvSource:
         finally:
             reader.close()
 
-    def sample_no_call_rates(self) -> F64Array:
-        """No-call fraction of each sample over the kept records."""
-        if self.kept_record_count == 0:
-            raise ValueError(f"{self.vcf_path} kept no records, so no-call rates are undefined.")
-        return self.sample_no_call_counts / float(self.kept_record_count)
 
 
 def _block_from_records(

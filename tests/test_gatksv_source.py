@@ -95,8 +95,7 @@ def test_aou_layout_filter_policy_classes_and_copy_number(tmp_path: Path) -> Non
         "FILTER HIGH_NCR;MULTIALLELIC": 1,
         "multi-allelic DEL": 1,
     }
-    np.testing.assert_array_equal(source.sample_no_call_counts, [0, 1, 2, 0])
-    np.testing.assert_allclose(source.sample_no_call_rates(), [0.0, 1 / 6, 2 / 6, 0.0])
+    assert source.kept_record_count == 6
 
 
 def test_kgp_layout_reads_copy_number_not_the_placeholder_genotype(tmp_path: Path) -> None:

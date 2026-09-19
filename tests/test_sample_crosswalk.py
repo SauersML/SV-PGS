@@ -10,7 +10,6 @@ from sv_pgs.sample_crosswalk import (
     ABSENT_COLUMN,
     SampleCrosswalk,
     source_columns_for_store_samples,
-    source_sample_covariates,
 )
 
 
@@ -63,12 +62,3 @@ def test_crosswalk_reads_a_delimited_table(tmp_path: Path) -> None:
 
     assert crosswalk == SampleCrosswalk(research_ids=("R1", "R2"), sequencing_ids=("D1", "D2"))
 
-
-def test_availability_and_no_call_rate_covariates() -> None:
-    columns = np.array([1, ABSENT_COLUMN, 0], dtype=np.int64)
-    source_rates = np.array([0.02, 0.1])
-
-    available, no_call_rate = source_sample_covariates(columns, source_rates)
-
-    assert available.tolist() == [True, False, True]
-    np.testing.assert_allclose(no_call_rate, [0.1, 0.0, 0.02])

@@ -17,7 +17,7 @@ from typing import Sequence
 
 import numpy as np
 
-from sv_pgs._typing import BoolArray, F64Array, I64Array
+from sv_pgs._typing import I64Array
 
 ABSENT_COLUMN = -1
 
@@ -74,18 +74,3 @@ def source_columns_for_store_samples(
             columns[store_index] = column_of_research.get(research_id, ABSENT_COLUMN)
     return columns
 
-
-def source_sample_covariates(
-    source_columns: I64Array,
-    source_no_call_rates: F64Array,
-) -> tuple[BoolArray, F64Array]:
-    """Per store sample: whether the source carries it, and its no-call rate there.
-
-    The no-call rate is 0 where the source is absent; the availability flag
-    carries the absence. Both enter the fit as covariates, because neither the
-    source's cohort membership nor its no-calls are random.
-    """
-    available = source_columns != ABSENT_COLUMN
-    no_call_rate = np.zeros(source_columns.shape[0], dtype=np.float64)
-    no_call_rate[available] = np.asarray(source_no_call_rates, dtype=np.float64)[source_columns[available]]
-    return available, no_call_rate
