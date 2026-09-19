@@ -260,6 +260,21 @@ def spacing_bound(majorant_ratio_sum: float, tolerance: float) -> float:
     return float(np.pi**2 / np.log1p(2.0 * majorant_ratio_sum / tolerance))
 
 
+def derived_lattice(single_precision: F64Array, single_shift: F64Array, log_scale_values: F64Array, tolerance: float) -> tuple[F64Array, float, float]:
+    """The start lattice (nodes, floor, top) from each effect's own likelihood exp(-P beta^2 / 2 + h beta).
+
+    The floor and top are ``kernel_floor`` and ``kernel_top`` at ``tolerance``; the spacing is
+    ``spacing_bound`` with every M_j / Z_j at its minimum of one (a fit refines it against the fitted
+    density by ``halved_lattice``); the lattice reaches past the kernel range by the range's own width on
+    each side, which the start density's tails (``initial_hyperparameters``) leave empty to double precision.
+    """
+    floor = kernel_floor(single_precision, single_shift, log_scale_values, tolerance)
+    top = kernel_top(single_precision, single_shift, log_scale_values, floor)
+    spacing = spacing_bound(float(np.asarray(single_precision).shape[0]), tolerance)
+    width = max(top - floor, spacing)
+    return np.arange(floor - width, top + width + spacing, spacing), floor, top
+
+
 def tail_mass(end_value: float, outward_slope: float, curvature: float) -> float:
     """The integral over tau >= 0 of exp(end_value + outward_slope tau + curvature tau^2 / 2); inf when improper."""
     if curvature < 0.0:

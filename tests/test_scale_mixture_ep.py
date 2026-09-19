@@ -24,6 +24,7 @@ from sv_pgs.scale_mixture_ep import (
     _restricted_prior,
     cavities,
     class_log_density,
+    derived_lattice,
     halved_lattice,
     hyper_step,
     initial_hyperparameters,
@@ -433,3 +434,12 @@ def test_the_derived_spacing_certifies_the_lattice_sum():
     coarse = tilted_moments(coarse_prior, log_normal(coarse_prior), cavity, _WORKING_BYTES).log_normalizer
     reference = tilted_moments(reference_prior, log_normal(reference_prior), cavity, _WORKING_BYTES).log_normalizer
     assert np.sum(np.abs(coarse - reference)) <= tolerance
+
+
+def test_the_derived_lattice_is_uniform_and_covers_the_kernel_range():
+    _class_index, offset, _design, _groups, cavity = _data(60, 27)
+    nodes, floor, top = derived_lattice(cavity.precision, cavity.shift, offset, 1e-3)
+    assert floor == kernel_floor(cavity.precision, cavity.shift, offset, 1e-3)
+    assert top == kernel_top(cavity.precision, cavity.shift, offset, floor)
+    np.testing.assert_allclose(np.diff(nodes), spacing_bound(60.0, 1e-3), rtol=1e-12)
+    assert nodes[0] <= floor - (top - floor) + 1e-12 and nodes[-1] >= top + (top - floor) - 1e-12
