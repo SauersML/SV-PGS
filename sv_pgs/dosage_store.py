@@ -700,7 +700,8 @@ def _column_metadata(dtype: np.dtype[Any], length: int, attributes: Mapping[str,
         "node_type": "array",
         "shape": [length],
         "data_type": _ZARR_DATA_TYPES[dtype],
-        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [length]}},
+        # Zarr chunk shapes are positive: an empty column has one unwritten chunk of one value.
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": [max(length, 1)]}},
         "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
         "fill_value": False if dtype == np.bool_ else 0,
         "codecs": [_LITTLE_ENDIAN_BYTES_CODEC],
@@ -726,6 +727,14 @@ def create_column(
 
 
 def write_column(directory: Path, values: NDArray, attributes: Mapping[str, Any] | None = None) -> None:
+    if values.shape[0] == 0:
+        # No chunk holds an empty column's values, and np.memmap cannot map zero bytes.
+        column_dtype = np.dtype(values.dtype)
+        if column_dtype not in _ZARR_DATA_TYPES:
+            raise ValueError(f"unsupported column dtype {column_dtype}.")
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / _ZARR_METADATA_FILE).write_text(json.dumps(_column_metadata(column_dtype, 0, attributes or {}), indent=1))
+        return
     column = create_column(directory, values.dtype, values.shape[0], attributes)
     column[:] = values
     column.flush()
@@ -737,8 +746,10 @@ def open_column(directory: Path, *, writable: bool = False) -> tuple[np.memmap[A
     _require(metadata.get("zarr_format") == 3 and len(metadata["shape"]) == 1, directory, "not a 1-D Zarr v3 column")
     _require(metadata["codecs"] == [_LITTLE_ENDIAN_BYTES_CODEC], directory, "column must be raw little-endian")
     length = int(metadata["shape"][0])
-    _require(metadata["chunk_grid"]["configuration"]["chunk_shape"] == [length], directory, "column must be one chunk")
+    _require(metadata["chunk_grid"]["configuration"]["chunk_shape"] == [max(length, 1)], directory, "column must be one chunk")
     dtype = _NUMPY_DATA_TYPES[metadata["data_type"]].newbyteorder("<")
+    if length == 0:
+        return np.zeros(0, dtype=dtype), dict(metadata.get("attributes", {}))
     values = np.memmap(directory / "c" / "0", dtype=dtype, mode="r+" if writable else "r", shape=(length,))
     return values, dict(metadata.get("attributes", {}))
 

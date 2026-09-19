@@ -329,6 +329,40 @@ def test_the_mean_anchor_removes_a_known_false_positive_intercept() -> None:
     assert corrected.variance > mean_anchor(first, second, observed, false_rate, 0.0).variance
 
 
+def test_the_mean_anchor_is_exact_on_a_population_with_false_positives() -> None:
+    # Exact population moments: g ~ HWE(1/4); a read equal to g with probability 3/4, else each
+    # other genotype with 1/8; A = E[g | read] (mean-calibrated); B calls a carrier haplotype with
+    # sensitivity 4/5 and a non-carrier one with false-positive rate f = 1/10, independently of A
+    # given g, so E[B | g] = 2 f + (s - f) g. Every cell probability is a multiple of 1/12800, so
+    # the rows below are the population itself and the anchor must recover r2_A exactly.
+    sensitivity, false_rate = 0.8, 0.1
+    prior = np.array([9, 6, 1]) / 16
+    reads = np.full((3, 3), 1 / 8) + np.eye(3) * (3 / 4 - 1 / 8)
+    posterior_mean = (prior[:, None] * reads * np.arange(3)[:, None]).sum(axis=0) / (prior[:, None] * reads).sum(axis=0)
+    carrier, non_carrier = np.array([1 - sensitivity, sensitivity]), np.array([1 - false_rate, false_rate])
+    genotypes, dosages, calls, weights = [], [], [], []
+    for genotype in range(3):
+        haplotypes = [carrier] * genotype + [non_carrier] * (2 - genotype)
+        call_distribution = np.convolve(haplotypes[0], haplotypes[1])
+        for read in range(3):
+            for call in range(3):
+                genotypes.append(genotype)
+                dosages.append(posterior_mean[read])
+                calls.append(call)
+                weights.append(prior[genotype] * reads[genotype, read] * call_distribution[call])
+    counts = np.rint(np.array(weights) * 12_800).astype(np.int64)
+    # Each weight is a product of four rounded factors, so it sits within 4 eps of its multiple.
+    np.testing.assert_allclose(counts, np.array(weights) * 12_800, rtol=4 * np.finfo(float).eps)
+    genotype = np.repeat(np.array(genotypes, dtype=np.float64), counts)
+    first = np.repeat(np.array(dosages), counts)
+    second = np.repeat(np.array(calls, dtype=np.float64), counts)
+
+    anchor = mean_anchor(first, second, np.ones(first.shape[0], dtype=bool), false_rate, 0.0)
+
+    # Algebraically exact: only floating-point summation over the rows separates the two.
+    np.testing.assert_allclose(np.exp(anchor.log_reliability), _squared_correlation(first, genotype), rtol=first.shape[0] * np.finfo(float).eps)
+
+
 def test_an_undefined_anchor_has_infinite_variance() -> None:
     first = np.array([0.0, 1.0, 0.0, 1.0, 2.0, 0.0])
     anticorrelated = 2.0 - first

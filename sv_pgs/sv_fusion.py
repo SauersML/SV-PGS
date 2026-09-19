@@ -417,7 +417,9 @@ def resolve_one_to_one(pairs: SvCandidatePairs, calibrations: Sequence[TwoSource
 #       rho_B g + e_B, rho_B = (m_B - alpha_B) / m_A, rho_A = C_AB / (rho_B V_G)
 #       and r2_A = rho_A^2 V_G / V_A, i.e.
 #         log r2_A = 2 log C + 2 log m_A - 2 log(m_B - alpha_B) - log V_G - log V_A,
-#       where alpha_B = 2 f (1 - p) from B's per-haplotype false-positive rate f;
+#       where alpha_B = 2 f from B's per-haplotype false-positive rate f: B calls a
+#       carrier haplotype with sensitivity s and a non-carrier one with rate f, so
+#       E[B | g] = s g + f (2 - g) = 2 f + (s - f) g;
 #   (c) the truth-calibrated reliability model's prediction mu (the store's
 #       r2_truth), unbiased but blind to per-locus spread.
 # The anchor's error is mostly systematic (a false-positive intercept that
@@ -475,8 +477,8 @@ def mean_anchor(
     """The per-locus mean anchor on the samples where both sources are called.
 
     ``false_positive_rate`` is the other source's per-haplotype false-positive
-    rate for this record's class, and ``false_positive_rate_variance`` its
-    uncertainty across the class's records.
+    rate for this record's class (the chance it calls a non-carrier haplotype),
+    and ``false_positive_rate_variance`` its uncertainty across the class's records.
     """
     observed = np.asarray(second_observed, dtype=bool)
     first = np.asarray(first_dosage, dtype=np.float64)[observed]
@@ -486,8 +488,8 @@ def mean_anchor(
         return undefined
     first_mean = float(first.mean())
     second_mean = float(second.mean())
-    frequency = first_mean / 2
-    intercept = 2.0 * false_positive_rate * (1.0 - frequency)
+    # The intercept of E[B | g] = 2 f + (s - f) g, so that signal = (s - f) m_A = rho_B m_A.
+    intercept = 2.0 * false_positive_rate
     signal = second_mean - intercept
     first_centred = first - first_mean
     second_centred = second - second_mean
@@ -510,7 +512,8 @@ def mean_anchor(
         - (1.0 - first_mean) * first_centred / genotype_variance
         - (first_centred**2 - first_variance) / first_variance
     )
-    intercept_variance = 4.0 * (4.0 * (1.0 - frequency) ** 2 * false_positive_rate_variance) / signal**2
+    # d log r2_A / d alpha_B = 2 / signal and Var(alpha_B) = 4 Var(f).
+    intercept_variance = 4.0 * (4.0 * false_positive_rate_variance) / signal**2
     return AnchorEstimate(
         log_reliability=float(log_reliability),
         variance=float(np.mean(influence**2) / first.shape[0]) + intercept_variance,

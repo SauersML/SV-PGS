@@ -314,8 +314,8 @@ def squared_z(effects: NDArray, standard_errors: NDArray) -> NDArray:
     """The payload value: z^2 = (beta / se)^2, free of the effect scale and the allele orientation."""
     beta = np.asarray(effects, dtype=np.float64)
     error = np.asarray(standard_errors, dtype=np.float64)
-    if beta.shape != error.shape or np.any(error <= 0.0) or not np.all(np.isfinite(beta)):
-        raise ValueError("squared_z needs finite effects and positive standard errors, one each.")
+    if beta.shape != error.shape or not np.all(np.isfinite(beta)) or not np.all(np.isfinite(error) & (error > 0.0)):
+        raise ValueError("squared_z needs finite effects and finite positive standard errors, one each.")
     return (beta / error) ** 2
 
 

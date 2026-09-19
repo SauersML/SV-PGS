@@ -136,6 +136,9 @@ def test_squared_z_is_scale_and_orientation_free() -> None:
     np.testing.assert_allclose(squared_z(np.array([0.2, -0.2]), np.array([0.1, 0.1])), [4.0, 4.0])
     with pytest.raises(ValueError, match="positive standard errors"):
         squared_z(np.array([0.1]), np.array([0.0]))
+    # A missing standard error is no evidence; it must not become a NaN payload marked present.
+    with pytest.raises(ValueError, match="positive standard errors"):
+        squared_z(np.array([0.1]), np.array([np.nan]))
 
 
 def test_maps_round_trip_through_the_store_and_key_the_payload_join(tmp_path) -> None:
@@ -161,3 +164,18 @@ def test_maps_round_trip_through_the_store_and_key_the_payload_join(tmp_path) ->
     annotation = annotate_records(keys, payload)
     assert annotation.present.tolist() == [False, True, False, True, False]
     np.testing.assert_allclose(annotation.log_squared_z[[1, 3]], np.log1p([4.0, 0.5]))
+
+
+def test_a_chromosome_without_matches_keeps_empty_maps(tmp_path) -> None:
+    records = RecordMatches(
+        store_rows=np.zeros(0, dtype=np.int64), external_identifiers=(), tiers=np.zeros(0, dtype=np.uint8), displaced_pairs=0
+    )
+    write_record_map(tmp_path, "bai2026_sv", "chr21", records)
+    write_locus_map(tmp_path, "bai2026_vntr", "chr21", LocusMatches(loci=np.zeros(0, dtype=np.int64), external_identifiers=()))
+
+    read = read_record_map(tmp_path, "bai2026_sv", "chr21")
+    assert read.store_rows.size == 0 and read.tiers.size == 0 and read.external_identifiers == ()
+    read_loci = read_locus_map(tmp_path, "bai2026_vntr", "chr21")
+    assert read_loci.loci.size == 0 and read_loci.external_identifiers == ()
+    payload = ExternalAssociations(keys=np.array(["chr21_SV_1"], dtype=object), squared_z=np.array([4.0]))
+    assert not annotate_records(mapped_keys(read.store_rows, read.external_identifiers, 3), payload).present.any()
