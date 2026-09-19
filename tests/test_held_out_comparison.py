@@ -157,6 +157,32 @@ def test_logistic_recalibration_returns_the_maximum_of_a_score_far_from_zero():
     assert _within_the_stopping_rule(centered, labels, intercept + slope * 1e6, slope)
 
 
+def test_logistic_recalibration_terminates_at_the_same_maximum_for_small_offset_samples():
+    # bug-recent's stall shape: n = 30, prevalence near 0.2, spread 0.1, far offsets. Each fit must
+    # return, and its log-likelihood in the centred score's coordinates must reach the centred fit's
+    # to within the rounding of evaluating it (gamma_{n+3} of the summed magnitudes).
+    unit_roundoff = np.finfo(np.float64).eps / 2.0
+    for seed in range(40):
+        rng = np.random.default_rng([30, seed])
+        centered = rng.standard_normal(30)
+        labels = (rng.random(30) < special.expit(-1.4 + 1.5 * centered)).astype(float)
+        positive = labels == 1.0
+        if not positive.any() or positive.all() or centered[positive].min() >= centered[~positive].max():
+            continue
+
+        def centred_log_likelihood(intercept: float, slope: float) -> tuple[float, float]:
+            linear = intercept + slope * centered
+            terms = labels * linear - np.logaddexp(0.0, linear)
+            return float(np.sum(terms)), float(np.sum(np.abs(terms)))
+
+        reference, magnitude = centred_log_likelihood(*logistic_recalibration_coefficients(centered, labels))
+        for offset in (1e3, -1e6):
+            intercept, slope = logistic_recalibration_coefficients(offset + 0.1 * centered, labels)
+            value, _ = centred_log_likelihood(intercept + slope * offset, 0.1 * slope)
+            count = 30 + 3
+            assert value >= reference - 2.0 * count * unit_roundoff / (1.0 - count * unit_roundoff) * magnitude
+
+
 def test_size_gate_is_the_exact_binomial_test_at_alpha():
     null_count = 200
     critical = stats.norm.isf(0.05)
