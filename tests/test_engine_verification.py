@@ -391,12 +391,16 @@ def _expectation_propagation(prior, coefficients, likelihood_precision, linear_t
             return False
         return bool(np.all(1.0 / np.diag(np.linalg.inv(likelihood_precision + np.diag(precision))) - precision > 0.0))
 
+    changes = []
     for _sweep in range(10000):
         covariance, cavity, moments = state(site_precision, site_shift)
         target_precision, target_shift = site_targets(moments, cavity)
         change = max(float(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision)))),
                      float(np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift)))))
-        if change <= 16.0 * _EPSILON:
+        changes.append(change)
+        # The sites' targets come through Sigma, computed to eps times the condition number of Lambda + diag(tau)
+        # relatively: the fixed point is resolved no further (16 ulps of it).
+        if change <= 16.0 * _EPSILON * float(np.linalg.cond(likelihood_precision + np.diag(site_precision))):
             return site_precision, site_shift, covariance, cavity, moments
         for site in range(variant_count):
             covariance, cavity, moments = state(site_precision, site_shift)
@@ -410,7 +414,10 @@ def _expectation_propagation(prior, coefficients, likelihood_precision, linear_t
                 fraction *= 0.5
             site_precision = trial_precision
             site_shift[site] += fraction * (target_shift[site] - site_shift[site])
-    raise AssertionError("the reference EP did not reach its fixed point")
+    raise AssertionError(
+        f"the reference EP did not reach its fixed point: last changes {changes[-4:]}, condition "
+        f"{np.linalg.cond(likelihood_precision + np.diag(site_precision)):.3g}"
+    )
 
 
 def _log_ep_evidence(likelihood_precision, linear_term, site_precision, site_shift, cavity, moments) -> float:
