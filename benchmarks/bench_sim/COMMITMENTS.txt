@@ -5,3 +5,4 @@ bench-sim commitments (published before any submission)
 e937142a730560774e559363861b9c76df9ee97a5b02f840847e7cf6682e558f  PREREG.md (v1, before amendments)
 2a7aa5f246410216c4a3d9b1550d460af6f2054f5c8c64a69c6972c5553f220a  truth.py (as first committed)
 5f44b85653ce7a263efece4f73dc4e3582cd5566676849f6bd7abc5407e9c912  PREREG.md (with amendments 1-3)
+2026-09-19T05:20Z  sha256(concatenated sealed/scenario_*/scenario.json, 64 test scenarios)  cca3c4e5c00af53d80ba3d8badbe69312758c12fc85cbcd0700454138d5bb94e

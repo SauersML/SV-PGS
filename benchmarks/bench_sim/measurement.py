@@ -178,7 +178,7 @@ def main() -> None:
         last = min(first + args.batch, size)
         names = [f"s{index}" for index in range(first, last)]
         rng = np.random.default_rng([20260919, batch_index, int(args.chrom.lstrip("chr"))])
-        target = work / f"gl{batch_index}.vcf.gz"
+        target = work / f"gl{batch_index}{suffix}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "PL"))
         for row in simple_rows:
@@ -189,13 +189,13 @@ def main() -> None:
         finish(sink, process, target)
         outputs = []
         for index, (chunk, binary) in enumerate(zip(chunks, binaries)):
-            output = work / f"imp{batch_index}_{index}.bcf"
+            output = work / f"imp{batch_index}{suffix}_{index}.bcf"
             run([str(tools / "GLIMPSE2_phase_static"), "--input-gl", str(target), "--reference", str(binary),
                  "--output", str(output), "--threads", str(args.threads), "--err-imp", ERR_IMP])
             outputs.append(output)
-        listing = work / f"ligate{batch_index}.txt"
+        listing = work / f"ligate{batch_index}{suffix}.txt"
         listing.write_text("\n".join(str(path) for path in outputs) + "\n")
-        ligated = work / f"imputed{batch_index}.bcf"
+        ligated = work / f"imputed{batch_index}{suffix}.bcf"
         run([str(tools / "GLIMPSE2_ligate_static"), "--input", str(listing), "--output", str(ligated), "--threads", str(args.threads)])
         batch_codes = np.zeros((n_var, last - first), dtype=np.uint8)
         seen = np.zeros(n_var, dtype=bool)
