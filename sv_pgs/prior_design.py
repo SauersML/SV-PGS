@@ -124,6 +124,14 @@ def _build_prior_design(records: Sequence[VariantRecord]) -> PriorDesign:
     )
 
 
+_UNIT_ROUNDOFF = float(np.finfo(np.float64).eps) / 2.0
+
+
+def _summation_error_bound(term_count: int) -> float:
+    """Higham's gamma_n = n u / (1 - n u): the relative error bound of an fp64 sum of n terms."""
+    return term_count * _UNIT_ROUNDOFF / (1.0 - term_count * _UNIT_ROUNDOFF)
+
+
 def _compile_prior_feature_specs(
     annotation_tables: _PriorAnnotationTables,
     class_membership_by_class: dict[VariantClass, NDArray],
@@ -132,11 +140,6 @@ def _compile_prior_feature_specs(
     orthonormal_columns: list[NDArray] = []
     main_effect_specs: list[ScaleModelFeatureSpec] = []
     interaction_specs: list[ScaleModelFeatureSpec] = []
-    class_totals = {
-        variant_class: float(np.sum(class_membership))
-        for variant_class, class_membership in class_membership_by_class.items()
-    }
-
     def append_if_independent(feature_spec: ScaleModelFeatureSpec) -> None:
         feature_column = _column_for_feature_spec(
             feature_spec=feature_spec,
@@ -146,7 +149,10 @@ def _compile_prior_feature_specs(
         center_value = float(np.mean(feature_column))
         centered_column = np.asarray(feature_column, dtype=np.float64) - center_value
         rms_scale = float(np.sqrt(np.mean(centered_column * centered_column)))
-        if not np.isfinite(rms_scale) or rms_scale < 1e-10:
+        # A constant column centres to the rounding of its mean, at most gamma_n of its magnitude.
+        if not np.isfinite(rms_scale) or rms_scale <= _summation_error_bound(centered_column.shape[0]) * float(
+            np.max(np.abs(feature_column))
+        ):
             return
         standardized_column = centered_column / rms_scale
         residual_column = standardized_column.copy()
@@ -158,7 +164,9 @@ def _compile_prior_feature_specs(
                 residual_column -= orthonormal_column * float(orthonormal_column @ residual_column)
         standardized_norm = float(np.linalg.norm(standardized_column))
         residual_norm = float(np.linalg.norm(residual_column))
-        if residual_norm <= 1e-8 * standardized_norm:
+        # The numerical-rank tolerance max(m, n) eps ||column|| (Golub and Van Loan, 5.4.1).
+        rank_tolerance = max(standardized_column.shape[0], len(orthonormal_columns) + 1) * float(np.finfo(np.float64).eps)
+        if residual_norm <= rank_tolerance * standardized_norm:
             return
         feature_specs.append(
             dataclass_replace(
@@ -195,9 +203,6 @@ def _compile_prior_feature_specs(
                 )
             )
             for variant_class in encoded_variant_classes:
-                class_membership = class_membership_by_class[variant_class]
-                if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
-                    continue
                 interaction_specs.append(
                     ScaleModelFeatureSpec(
                         kind="factor_interaction",
@@ -220,9 +225,6 @@ def _compile_prior_feature_specs(
                     )
                 )
                 for variant_class in encoded_variant_classes:
-                    class_membership = class_membership_by_class[variant_class]
-                    if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
-                        continue
                     interaction_specs.append(
                         ScaleModelFeatureSpec(
                             kind="nested_interaction",
@@ -238,9 +240,6 @@ def _compile_prior_feature_specs(
         for base_feature_spec in _continuous_spline_feature_specs(source_name, continuous_values):
             main_effect_specs.append(base_feature_spec)
             for variant_class in encoded_variant_classes:
-                class_membership = class_membership_by_class[variant_class]
-                if class_totals[variant_class] < 3.0 or np.max(class_membership) <= 0.0:
-                    continue
                 interaction_specs.append(
                     ScaleModelFeatureSpec(
                         kind="continuous_spline_interaction",
@@ -257,7 +256,8 @@ def _compile_prior_feature_specs(
     # Compile every main effect before any interaction. When annotations are
     # confounded on a particular dataset, the rank screen therefore preserves
     # the hierarchy instead of retaining an interaction at the expense of its
-    # marginal annotation effect.
+    # marginal annotation effect. The same screen drops the interactions of a
+    # class too small to identify them, so no member count is needed.
     for feature_spec in (*main_effect_specs, *interaction_specs):
         append_if_independent(feature_spec)
 
@@ -584,7 +584,11 @@ def _levels_to_encode(
     )
     implicit_reference = np.asarray(parent_weights, dtype=np.float64) - represented_weights
     centered_implicit_reference = implicit_reference - float(np.mean(implicit_reference))
-    if np.max(np.abs(centered_implicit_reference)) >= 1e-10:
+    # Levels that exhaust the parent leave only the rounding of the sum and the mean.
+    exhaustion_bound = _summation_error_bound(len(sorted_levels) + implicit_reference.shape[0]) * float(
+        np.max(np.abs(parent_weights))
+    )
+    if np.max(np.abs(centered_implicit_reference)) > exhaustion_bound:
         return sorted_levels
     reference_level = max(
         sorted_levels,
@@ -625,7 +629,7 @@ def _continuous_spline_feature_specs(
 ) -> tuple[ScaleModelFeatureSpec, ...]:
     mean_value = float(np.mean(raw_values))
     scale_value = float(np.std(raw_values))
-    if scale_value < 1e-8:
+    if scale_value <= _summation_error_bound(np.asarray(raw_values).shape[0]) * float(np.max(np.abs(raw_values))):
         return ()
     standardized_values = (np.asarray(raw_values, dtype=np.float64) - mean_value) / scale_value
     feature_specs = [
@@ -654,19 +658,16 @@ def _continuous_spline_feature_specs(
 
 
 def _continuous_spline_knots(standardized_values: NDArray) -> tuple[float, ...]:
-    if np.unique(np.round(standardized_values, 12)).shape[0] < 3:
-        return ()
+    """Distinct quartile knots strictly inside the data range; the rank screen drops any hinge a
+    nearby knot makes numerically dependent."""
     candidate_knots = np.quantile(standardized_values, [0.25, 0.5, 0.75])
     minimum_value = float(np.min(standardized_values))
     maximum_value = float(np.max(standardized_values))
     knot_values: list[float] = []
     for knot_value in candidate_knots:
         knot_float = float(knot_value)
-        if knot_float <= minimum_value + 1e-6 or knot_float >= maximum_value - 1e-6:
-            continue
-        if knot_values and abs(knot_values[-1] - knot_float) < 1e-6:
-            continue
-        knot_values.append(knot_float)
+        if minimum_value < knot_float < maximum_value and (not knot_values or knot_float != knot_values[-1]):
+            knot_values.append(knot_float)
     return tuple(knot_values)
 
 
