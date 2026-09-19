@@ -5,7 +5,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from sv_pgs._typing import F32Array, I32Array
+from sv_pgs._typing import F32Array, I32Array, NDArray
 from sv_pgs.config import VariantClass
 
 
@@ -316,26 +316,29 @@ class TieMap:
 
     def expand_coefficients(
         self,
-        reduced_beta: F32Array,
+        reduced_beta: NDArray,
         group_weights: Sequence[F32Array],
-    ) -> F32Array:
+    ) -> NDArray:
         """Distribute each group's single fitted effect back to all its members.
 
         Each member gets: beta_member = beta_group * weight_member * sign_member
         where weights are proportional to prior variance and signs handle negation.
+        The result keeps the precision of ``reduced_beta`` (float32 at the least), so an
+        fp64 posterior mean expands without rounding.
         """
-        reduced_beta_array = np.asarray(reduced_beta, dtype=np.float32)
+        coefficient_dtype = np.result_type(np.asarray(reduced_beta).dtype, np.float32)
+        reduced_beta_array = np.asarray(reduced_beta, dtype=coefficient_dtype)
         if not self.reduced_to_group:
-            expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
+            expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=coefficient_dtype)
             if self.kept_indices.shape[0] != reduced_beta_array.shape[0]:
                 raise ValueError("reduced_beta must align with compact tie-map representatives.")
             # self.kept_indices is already int32 (dataclass invariant via callers);
             # use it directly to avoid an unnecessary np.asarray copy.
             expanded_coefficients[self.kept_indices] = reduced_beta_array
             return expanded_coefficients
-        expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=np.float32)
+        expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=coefficient_dtype)
         for reduced_index, tie_group in enumerate(self.reduced_to_group):
-            group_weight_vector = np.asarray(group_weights[reduced_index], dtype=np.float32)
+            group_weight_vector = np.asarray(group_weights[reduced_index], dtype=coefficient_dtype)
             expanded_coefficients[tie_group.member_indices] = (
                 reduced_beta_array[reduced_index] * group_weight_vector * tie_group.signs
             )
