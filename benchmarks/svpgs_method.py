@@ -35,6 +35,7 @@ from sv_pgs.dosage_store import (
     MAXIMUM_CODE,
     DosageStore,
     VariantTable,
+    chromosome_number,
     write_dosage_store,
 )
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel, ScoringPlan, score_genetic
@@ -99,7 +100,7 @@ def write_store(
     identifiers = "".join(f"{chromosome}-{row}" for row in range(count)).encode()
     lengths = np.array([len(f"{chromosome}-{row}") for row in range(count)], dtype=np.int64)
     table = VariantTable(
-        chromosome=np.full(count, chromosome),
+        chromosome=np.full(count, chromosome_number(chromosome), dtype=np.int8),
         position=np.asarray(position, dtype=np.int64),
         genetic_position_cm=np.asarray(genetic_position_cm, dtype=np.float64),
         ref_length=np.asarray(reference_length, dtype=np.int32),
