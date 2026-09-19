@@ -336,7 +336,15 @@ def size_gate(null_z: NDArray, alpha: float = 0.05) -> bool:
     return float(stats.binom.sf(rejections - 1, null_z.shape[0], alpha)) > alpha
 
 
-def null_cost_gate(r2_without: NDArray, r2_with: NDArray, maximum_relative_loss: float = 0.005) -> bool:
-    """Gate G13c: adding columns with no effect costs at most this relative R^2 on average."""
-    relative_loss = (np.asarray(r2_without) - np.asarray(r2_with)) / np.asarray(r2_without)
-    return float(np.mean(relative_loss)) <= maximum_relative_loss
+def null_cost_gate(r2_without: NDArray, r2_with: NDArray, alpha: float = 0.05) -> bool:
+    """Gate G13c: adding columns with no effect does not make held-out R^2 significantly worse.
+
+    Paired over null replicates by the exact one-sided sign test at `alpha`: it fails only when the
+    replicates where R^2 drops are significantly more than half of the untied ones. The test needs
+    no distributional assumption beyond independent replicates, and its result is the same on the
+    absolute and the relative R^2 scale.
+    """
+    difference = np.asarray(r2_with, dtype=np.float64) - np.asarray(r2_without, dtype=np.float64)
+    losses = int(np.sum(difference < 0.0))
+    untied = int(np.sum(difference != 0.0))
+    return float(stats.binom.sf(losses - 1, untied, 0.5)) > alpha

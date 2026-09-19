@@ -216,5 +216,14 @@ def test_gates_accept_calibrated_nulls_and_reject_inflated_ones():
     rng = np.random.default_rng(9)
     assert size_gate(rng.standard_normal(2000))
     assert not size_gate(rng.standard_normal(2000) + 0.5)
-    assert null_cost_gate(np.full(10, 0.2), np.full(10, 0.1995))
-    assert not null_cost_gate(np.full(10, 0.2), np.full(10, 0.19))
+
+
+def test_null_cost_gate_is_the_exact_one_sided_sign_test_at_alpha():
+    baseline = np.full(10, 0.2)
+    # 8 of 10 replicates losing R^2 is not significant (P = 56/1024 = 0.055); 9 is (P = 11/1024 = 0.011)
+    for losses, passes in ((8, True), (9, False)):
+        with_columns = np.where(np.arange(10) < losses, 0.1999, 0.2001)
+        assert null_cost_gate(baseline, with_columns) is passes
+    # ties carry no evidence of a loss and leave the test to the untied replicates
+    assert null_cost_gate(baseline, baseline)
+    assert not null_cost_gate(np.full(12, 0.2), np.concatenate([np.full(9, 0.1999), np.full(3, 0.2)]))

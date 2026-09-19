@@ -70,7 +70,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
 ## Simulation gates (must pass before any real claim)
 - **G13:** over ≥ 200 null traits, the primary test's rejections at one-sided 0.05 are not significantly more than 5% of them, by the exact one-sided binomial test at the same 0.05 (for 200 traits: at most 15 rejections). That covers the SV null against both A and C-null, and the equal-accuracy twin null.
 - **G13b:** C-capacity against A passes the same size gate.
-- **G13c:** with SV effects switched off, C costs ≤ 0.5% relative R². Measured: −1e-4 to −2e-4 [sim-only: theory-evaluation].
+- **G13c:** with SV effects switched off, C's held-out R² is not significantly below A's: over the null replicates, the replicates where R² drops are not significantly more than half of the untied ones, by the exact one-sided sign test at 0.05 (for 10 replicates: at most 8 drops). Measured relative cost: −1e-4 to −2e-4 [sim-only: theory-evaluation].
 - **Red-team gates RT1–RT8:** each attack must keep the null rejection rate within 2 SE of the clean null, and the fake ΔR² within 2 SE of 0.
   - RT1: imputation-half-specific quality with a phenotype shift by half.
   - RT2: fine-structure environment with ancestry-differentiated SVs as a proxy.
