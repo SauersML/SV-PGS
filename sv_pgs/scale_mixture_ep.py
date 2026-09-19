@@ -90,6 +90,7 @@ from dataclasses import dataclass, replace
 from typing import Iterator, Sequence
 
 import numpy as np
+from scipy.integrate import quad
 from scipy.interpolate import CubicSpline
 from scipy.special import erfcx, logsumexp
 
@@ -502,6 +503,7 @@ class _Components:
     first: F64Array
     second: F64Array
     third: F64Array
+    fourth: F64Array
 
 
 def _kernel_terms(
@@ -526,8 +528,10 @@ def _log_normalizers(
 def _components(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
 ) -> _Components:
-    """With q = vP, r = 1/(1+q) and a = h^2 v r:  d log Z_k / d eta = (a - q) r / 2,
-    its eta-derivative a r (2r - 1)/2 - q r^2/2, and the next a r (6r^2 - 6r + 1)/2 - q r^2 (2r - 1)/2.
+    """With q = vP, r = 1/(1+q) and a = h^2 v r (so dr/deta = -r(1 - r) and da/deta = a r), each derivative of
+    log Z_k in eta = log u is a A_n(r) - B_n(r): d1 = (a - q) r / 2, then A_(n+1) = r A_n - r(1 - r) A_n' and
+    B_(n+1) = -r(1 - r) B_n', giving A_2 = r^2 - r/2, B_2 = r(1 - r)/2, A_3 = 3r^3 - 3r^2 + r/2,
+    B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
     Nodes below ``floor`` have a flat kernel: v = 0 there."""
     variance, ratio, retained, log_component = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
     signal = np.square(shift)[:, None] * variance * retained
@@ -542,6 +546,11 @@ def _components(
         second=0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained,
         third=0.5 * signal * retained * (6.0 * retained * retained - 6.0 * retained + 1.0)
         - 0.5 * ratio_retained * retained * (2.0 * retained - 1.0),
+        fourth=signal * (
+            retained * (3.0 * retained**3 - 3.0 * retained**2 + 0.5 * retained)
+            - retained * (1.0 - retained) * (9.0 * retained**2 - 6.0 * retained + 0.5)
+        )
+        + retained * (1.0 - retained) * (-3.0 * retained**2 + 3.0 * retained - 0.5),
     )
 
 
@@ -879,6 +888,114 @@ class _Evidence:
     magnitude: float
 
 
+def _directional_derivatives(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, directions: F64Array, working_bytes: int
+) -> tuple[F64Array, F64Array]:
+    """The third and fourth derivatives of sum_j log Z_j along each column of ``directions`` (in x), exactly.
+
+    Along x + s b, variant j's natural parameters are theta_k(s) = eta_ck + s b_ck + L_jk(e_j + s b_e) with
+    b_e = d_j' b_theta, and log Z_j = LSE(theta) - LSE(eta_c). With the node distribution w and
+    theta' = b_c + L' b_e, theta'' = L'' b_e^2, theta''' = L''' b_e^3, theta'''' = L'''' b_e^4, the derivatives of a
+    log-sum-exp are joint cumulants under w:
+        d3 = k3(theta') + 3 cov(theta', theta'') + E theta''',
+        d4 = k4(theta') + 6 k(theta', theta', theta'') + 3 var(theta'') + 4 cov(theta', theta''') + E theta''''.
+    The -LSE(eta_c) term subtracts k3 and k4 of b_c under pi_c, once per variant of the class.
+    """
+    mapping = prior.coefficient_map
+    directions_z = mapping @ directions
+    grid_size = prior.grid_size
+    scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
+    third = np.zeros(directions.shape[1])
+    fourth = np.zeros(directions.shape[1])
+    density = np.exp(class_log_density(prior, coefficients))
+    for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+        weights = terms.responsibility
+        design = prior.scale_design[rows]
+        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
+        for column in range(directions.shape[1]):
+            density_step = directions_z[span, column][None, :]
+            scale_step = (design @ directions_z[scale_span, column])[:, None]
+            first = density_step + terms.first * scale_step
+            second = terms.second * scale_step**2
+            third_term = terms.third * scale_step**3
+            fourth_term = terms.fourth * scale_step**4
+            centred = first - np.sum(weights * first, axis=1, keepdims=True)
+            centred_second = second - np.sum(weights * second, axis=1, keepdims=True)
+            centred_third = third_term - np.sum(weights * third_term, axis=1, keepdims=True)
+            variance = np.sum(weights * centred**2, axis=1)
+            third[column] += float(np.sum(
+                np.sum(weights * centred**3, axis=1) + 3.0 * np.sum(weights * centred * centred_second, axis=1) + np.sum(weights * third_term, axis=1)
+            ))
+            fourth[column] += float(np.sum(
+                np.sum(weights * centred**4, axis=1) - 3.0 * variance**2
+                + 6.0 * np.sum(weights * centred**2 * centred_second, axis=1)
+                + 3.0 * np.sum(weights * centred_second**2, axis=1)
+                + 4.0 * np.sum(weights * centred * centred_third, axis=1)
+                + np.sum(weights * fourth_term, axis=1)
+            ))
+    for class_position, class_rows in enumerate(prior.class_rows):
+        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
+        class_density = density[class_position]
+        for column in range(directions.shape[1]):
+            step = directions_z[span, column]
+            centred = step - float(class_density @ step)
+            variance = float(class_density @ centred**2)
+            third[column] -= class_rows.shape[0] * float(class_density @ centred**3)
+            fourth[column] -= class_rows.shape[0] * (float(class_density @ centred**4) - 3.0 * variance**2)
+    return third, fourth
+
+
+def _laplace_corrections(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, working_bytes: int, tolerance: float
+) -> tuple[F64Array, F64Array]:
+    """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, and
+    the Tierney-Kadane term that decided it.
+
+    The integrated directions are the eigenvectors of -H's Schur complement on the complement of the profiled null
+    space, each moved with the null coordinates' first-order response and scaled to unit curvature. Along a
+    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24; where its magnitude exceeds
+    ``tolerance`` the Laplace term is replaced by an exact quadrature of the integrand along that line, and the
+    correction is the log of their ratio (its limit covers a density collapsing to a point). Elsewhere it is 0.
+    """
+    penalty = _penalty_matrix(prior, log_smoothing)
+    objective = _data_objective(prior, evidence.coefficients, cavity, working_bytes)
+    value, _gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, evidence.coefficients)
+    negative = -hessian
+    null_basis = prior.null_basis
+    complement = np.linalg.svd(np.eye(negative.shape[0]) - null_basis @ null_basis.T)[0][:, : negative.shape[0] - null_basis.shape[1]]
+    response = np.eye(negative.shape[0])
+    if null_basis.shape[1]:
+        response = response - null_basis @ np.linalg.solve(null_basis.T @ negative @ null_basis, null_basis.T @ negative)
+    moved = response @ complement
+    schur = moved.T @ negative @ moved
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
+    directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
+    third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
+    terms = fourth / 8.0 + 5.0 * third**2 / 24.0
+    corrections = np.zeros(directions.shape[1])
+    for index in np.flatnonzero(np.abs(terms) > tolerance):
+        direction = directions[:, index]
+
+        def integrand(step: float) -> float:
+            point = evidence.coefficients + step * direction
+            return float(np.exp(
+                _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
+            ))
+
+        integral = quad(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=tolerance, limit=200)[0]
+        corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
+    return corrections, terms
+
+
+def _corrected_value(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, working_bytes: int, tolerance: float
+) -> float:
+    """V with its per-direction Laplace terms replaced by exact one-dimensional integrals where they fail: the value
+    basins and edges are compared by (lead ruling)."""
+    corrections, _terms = _laplace_corrections(prior, log_smoothing, evidence, cavity, working_bytes, tolerance)
+    return evidence.value + float(np.sum(corrections))
+
+
 def _range_projector(matrix: F64Array) -> tuple[F64Array, F64Array]:
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (matrix + matrix.T))
     kept = eigenvalues > _EPSILON * matrix.shape[0] * max(float(eigenvalues[-1]), np.finfo(np.float64).tiny)
@@ -1099,10 +1216,19 @@ def _certified_evidence(
 def _best_certified(
     prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
-    """The certified inner maximum with the highest V over the given starts."""
-    candidates = [_evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance) for start in starts]
-    certified = [candidate for candidate in candidates if candidate is not None]
-    return max(certified, key=lambda candidate: candidate.value) if certified else None
+    """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
+    by ``_corrected_value``, and a start that lands in an already-found basin adds nothing."""
+    certified: list[_Evidence] = []
+    for start in starts:
+        candidate = _evidence(prior, log_smoothing, start, cavity, working_bytes, tolerance)
+        if candidate is None:
+            continue
+        scale = 1.0 + float(np.max(np.abs(candidate.coefficients)))
+        if all(float(np.max(np.abs(candidate.coefficients - other.coefficients))) > _HALF_PRECISION * scale for other in certified):
+            certified.append(candidate)
+    if len(certified) <= 1:
+        return certified[0] if certified else None
+    return max(certified, key=lambda candidate: _corrected_value(prior, log_smoothing, candidate, cavity, working_bytes, tolerance))
 
 
 def _log_normal_start(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:

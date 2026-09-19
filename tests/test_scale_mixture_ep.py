@@ -20,6 +20,8 @@ from sv_pgs.scale_mixture_ep import (
     _evidence,
     _curvature_trace_gradient,
     _data_value,
+    _directional_derivatives,
+    _laplace_corrections,
     _log_normal_start,
     _maximize_coefficients,
     _penalized,
@@ -516,3 +518,28 @@ def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     edge = _evidence(view, np.zeros(0), allowed.T @ start, cavity, _WORKING_BYTES, 0.0)
     assert edge is not None
     assert step.evidence >= edge.value - 1e-6
+
+
+def test_directional_third_and_fourth_derivatives_match_finite_differences():
+    prior, cavity = _problem(variant_count=25, seed=35, node_count=10)
+    coefficients = _hyperparameters(prior, 36).coefficients
+    directions = np.random.default_rng(37).standard_normal((prior.coefficient_size, 3)) * 0.2
+    third, fourth = _directional_derivatives(prior, coefficients, cavity, directions, _WORKING_BYTES)
+    step = 2e-2
+    for column in range(3):
+        values = [_data_value(prior, coefficients + multiple * step * directions[:, column], cavity, _WORKING_BYTES) for multiple in (-2, -1, 0, 1, 2)]
+        numerical_third = (values[4] - 2.0 * values[3] + 2.0 * values[1] - values[0]) / (2.0 * step**3)
+        numerical_fourth = (values[4] - 4.0 * values[3] + 6.0 * values[2] - 4.0 * values[1] + values[0]) / step**4
+        np.testing.assert_allclose(third[column], numerical_third, rtol=2e-3, atol=1e-3)
+        np.testing.assert_allclose(fourth[column], numerical_fourth, rtol=2e-2, atol=1e-2)
+
+
+def test_quadrature_corrections_agree_with_the_tierney_kadane_term_where_it_is_small():
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
+    assert evidence is not None
+    corrections, terms = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, _WORKING_BYTES, 0.0)
+    small = np.abs(terms) < 1e-2
+    assert np.any(small)
+    np.testing.assert_allclose(corrections[small], terms[small], atol=float(np.max(np.abs(terms[small]))) ** 1.5 + 1e-7)
