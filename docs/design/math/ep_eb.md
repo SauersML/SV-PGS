@@ -183,11 +183,14 @@ Two cases follow:
 
   where N_b is the null space inside the penalized block. Compare it with interior stationary points.
 - **Caution: the flat null-space integral can diverge.**
-  - This V(∞) integrates the null-space coordinates under a flat prior (the −½ log|Ã_NN| term).
-  - With a D3 penalty the null space {1, t, t²} contains a ray along which log g concentrates on the lower grid end. There the likelihood tends to the null model's, a positive constant, so Ã_NN → 0 and V(∞) → +∞. The prior lane observed 3e302 on a weak 100-variant class.
-  - The D2 null space {1, t} has the same kind of ray, from its tilt.
-  - **Proposed fix, not yet checked numerically:** maximize over the null-space coordinates instead of integrating them, i.e. ML rather than REML for the unpenalized part. Then V(∞) = max_{x_N} [J_∞ + ½ log|(S_o)_{N_b}| − ½ log|Ã over the integrated directions only|], which stays finite along the ray.
-  - The ray's endpoint, all of a class's mass below resolution, is then a legitimate candidate. Its evidence is compared, not excluded.
+  - This V(∞) integrates the null directions that no other penalty covers under a flat prior (the −½ log|Ã_NN| term).
+  - With D3 alone, the null space {1, t, t²} contains a ray along which log g concentrates on the lower grid end. There the likelihood tends to the null model's, a positive constant, so Ã_NN → 0 and V(∞) → +∞. The prior lane observed 3e302 on a weak 100-variant class. D2 alone has the same ray, from its tilt.
+  - **Profiling the null space does not fix it.** The prior lane checked this numerically: exact normal means, D3, the null coordinates maximized and the log-det taken over the penalized subspace only. The profiled evidence then ran to λ → ∞ (the log-normal limit) on a BayesR truth, a 1k-variant class: ΔLPD −4.06 nats per 1k against −0.71 for integrated D3, and MSE +1.5% against −0.8%. The profiled null-space parameters, fitted freely, make switching off the penalized part look best.
+  - **What works is a penalty with no uncovered null space.** First plus second differences on the sum-to-zero coordinates, as in the reference: S₁ is positive definite there, since the constant is removed.
+    - At λ₂ = ∞ the tilt then keeps the proper Gaussian prior λ₁S₁, which is the ½ log|(S_o)_{N_bN_b}| term above, and V(∞) is finite. This is the case measured in the profile above.
+    - At λ₁ = ∞ the limit is the flat density on the compact range, also proper.
+    - Measured by the prior lane: D1+D2's learned λ is grid-invariant (log λ −1.04/3.08 → −1.01/3.15 across spacings 0.5 to 0.125), while D3's is not (3.33 / 1.35 / −18.4). D1+D2 also beat D3 on the snvtr TR class (ΔLPD −7.0 against −11.8).
+  - Penalty values must be computed as |Rx|², never xᵀSx, which went negative at large null-space x in the prior lane's runs.
 - **The same test applies at the other boundaries** (for hyperprior_pooling the per-trait model is quadratic in θ_t, so c = 0 and the q − d form is exact within that approximation):
   - the λ → 0 end, where FS's numerator is ≤ 0, which the likelihood's indefinite Hessian allows (lit-ep);
   - hyperprior_pooling's ω² → 0 (full pooling): a squared score ≤ information at ω² = 0 means the coordinate is shared exactly. That replaces the 1e-6 per-step shrink floor, and the FS ratio there shrinks ω² geometrically without ever reaching 0.
