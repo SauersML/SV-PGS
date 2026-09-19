@@ -87,6 +87,9 @@ dev = [
     # on synthetic OMOP tables: sqlglot transpiles it to DuckDB.
     "duckdb>=1.1",
     "sqlglot>=30",
+    # benchmarks/bench_real/baselines.py runs the mr.ash coordinate-ascent
+    # kernel under numba; its math tests import it.
+    "numba>=0.60",
 ]
 # Coalescent simulation for the team's accuracy and power studies on public data.
 # Never imported by sv_pgs; install with `uv sync --group sim`.
