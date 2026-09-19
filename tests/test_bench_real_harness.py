@@ -41,7 +41,8 @@ def test_sv_masking_removes_exactly_the_sv_part_of_a_linear_prediction():
     test = generator.binomial(2, 0.3, size=(20, 6)).astype(np.float64)
     is_sv = np.array([False, True, False, False, True, False])
     train = harness.TrainData(gene_id="g", chrom="chr1", tss=0, genotypes=genotypes, phenotype=generator.normal(size=50),
-                              variants=synthetic_variants(is_sv, ["panel"] * 6), superpopulation=np.array(["EUR"] * 50), population=np.array(["CEU"] * 50))
+                              variants=synthetic_variants(is_sv, ["panel"] * 6), superpopulation=np.array(["EUR"] * 50), population=np.array(["CEU"] * 50),
+                              gene_start=0, gene_end=0, strand="+", exons=np.zeros((0, 2), dtype=np.int64), coding_exons=np.zeros((0, 2), dtype=np.int64))
     coefficients = generator.normal(size=6)
     predictor = baselines.LinearPredictor(0.3, coefficients)
     sv_part = predictor.predict(test) - predictor.predict(harness._without_structural_variants(train, test))
@@ -69,3 +70,9 @@ def test_leave_one_superpopulation_out_partitions_the_samples():
     held_out = [fold["test"] for fold in splits.leave_one_superpopulation_out(samples)]
     assert sorted(sum(held_out, [])) == sorted(samples["sample"])
     assert all(len(set(samples.set_index("sample").loc[group, "Superpopulation"])) == 1 for group in held_out)
+
+
+def test_merged_intervals_are_the_disjoint_union():
+    from benchmarks.bench_real import build_dataset
+
+    assert build_dataset.merged([(10, 20), (5, 12), (22, 30), (21, 21), (40, 41)]) == [[5, 30], [40, 41]]

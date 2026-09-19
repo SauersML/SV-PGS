@@ -10,6 +10,8 @@ Outputs per chromosome, in <root>/dataset/:
 and once: samples.tsv, expression.npy (float64 [genes x samples], inverse-normal TMM), covariates.npy, genes.tsv.
 """
 import argparse
+import gzip
+import json
 import pathlib
 
 import cyvcf2
@@ -119,6 +121,49 @@ def build_chromosome(root: pathlib.Path, samples: list, out_dir: pathlib.Path, c
     return len(dosages), int(table["is_sv"].sum()), int((table["source"] == "pangenie").sum()), missing_records
 
 
+def merged(intervals):
+    """Union of closed 1-based intervals, as sorted disjoint [start, end] pairs."""
+    union = []
+    for start, end in sorted(intervals):
+        if union and start <= union[-1][1] + 1:
+            union[-1][1] = max(union[-1][1], end)
+        else:
+            union.append([start, end])
+    return union
+
+
+def write_gene_annotation(root: pathlib.Path, out_dir: pathlib.Path):
+    """Target-gene structure from GENCODE v38 (MAGE's annotation): gene body, strand, merged exons and CDS,
+    in the GTF's 1-based closed coordinates, the same convention as the variant POS/END columns."""
+    wanted = set(pd.read_csv(out_dir / "genes.tsv", sep="\t")["gene_id"])
+    annotation = {}
+    exons, coding = {}, {}
+    with gzip.open(root / "data/gencode/gencode.v38.annotation.gtf.gz", "rt") as gtf:
+        for line in gtf:
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t")
+            feature = fields[2]
+            if feature not in ("gene", "exon", "CDS"):
+                continue
+            gene_id = fields[8].split('gene_id "', 1)[1].split('"', 1)[0]
+            if gene_id not in wanted:
+                continue
+            interval = (int(fields[3]), int(fields[4]))
+            if feature == "gene":
+                annotation[gene_id] = {"start": interval[0], "end": interval[1], "strand": fields[6]}
+            else:
+                (exons if feature == "exon" else coding).setdefault(gene_id, []).append(interval)
+    for gene_id, record in annotation.items():
+        record["exons"] = merged(exons.get(gene_id, []))
+        record["coding_exons"] = merged(coding.get(gene_id, []))
+    missing = wanted - set(annotation)
+    temporary = out_dir / ".gene_annotation.json.tmp"
+    temporary.write_text(json.dumps(annotation))
+    temporary.rename(out_dir / "gene_annotation.json")
+    return len(annotation), len(missing)
+
+
 def write_shared(root: pathlib.Path, out_dir: pathlib.Path):
     expression, covariates, metadata = read_expression(root / "data/mage")
     if metadata["sample_kgpID"].duplicated().any():
@@ -145,11 +190,15 @@ def main():
     parser.add_argument("--root", required=True)
     parser.add_argument("--chromosomes", nargs="*", default=[])
     parser.add_argument("--shared", action="store_true", help="also write the chromosome-independent arrays (samples, expression, covariates, genes)")
+    parser.add_argument("--gene-annotation", action="store_true", help="write the GENCODE v38 target-gene structure")
     arguments = parser.parse_args()
     root = pathlib.Path(arguments.root)
     out_dir = root / "dataset"
     out_dir.mkdir(exist_ok=True)
     samples = write_shared(root, out_dir) if arguments.shared else pd.read_csv(out_dir / "samples.tsv", sep="\t")["sample"].tolist()
+    if arguments.gene_annotation:
+        found, missing = write_gene_annotation(root, out_dir)
+        print(f"gene annotation: {found} genes, {missing} expression genes absent from GENCODE v38", flush=True)
     for chrom in arguments.chromosomes:
         count, sv_count, pangenie_count, missing = build_chromosome(root, samples, out_dir, chrom)
         print(f"chr{chrom}: {count} dosage rows, {sv_count} SV rows ({pangenie_count} PanGenie), {missing} records with missing genotypes skipped", flush=True)

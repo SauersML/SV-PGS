@@ -7,6 +7,7 @@ passes only test genotypes to ``predict``. Test phenotypes are read only when sc
 
 Phenotype: MAGE inverse-normal TMM expression, residualized on the MAGE eQTL covariates (sex, 5 genotype PCs,
 60 PEER factors) by OLS fitted on the training samples only; test phenotypes are adjusted with the training fit.
+Target gene: GENCODE v38 gene body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 Genotypes: alternate-allele counts 0/1/2 from the 1kGP phased panel; variants monomorphic in the training samples
 are dropped. Window: the variant interval overlaps TSS +/- 1 Mb, the cis window of MAGE's own mapping and of
 GTEx (GTEx Consortium 2020, Science 369:1318).
@@ -48,6 +49,11 @@ class TrainData:
     variants: Variants
     superpopulation: np.ndarray
     population: np.ndarray
+    gene_start: int
+    gene_end: int
+    strand: str
+    exons: np.ndarray
+    coding_exons: np.ndarray
 
 
 class Dataset:
@@ -58,6 +64,7 @@ class Dataset:
         self.expression = np.load(self.directory / "expression.npy")
         self.covariates = np.load(self.directory / "covariates.npy")
         self.splits = {split["name"]: split for split in json.loads((self.directory / "splits.json").read_text())}
+        self.gene_annotation = json.loads((self.directory / "gene_annotation.json").read_text())
         self.sample_index = {sample: index for index, sample in enumerate(self.samples["sample"])}
         self._chromosomes = {}
 
@@ -131,8 +138,11 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
+    gene = dataset.gene_annotation[window.gene_id]
     train = TrainData(gene_id=window.gene_id, chrom=window.chrom, tss=window.tss, genotypes=train_genotypes, phenotype=train_phenotype, variants=variants,
-                      superpopulation=samples["Superpopulation"].to_numpy()[train_index], population=samples["Population"].to_numpy()[train_index])
+                      superpopulation=samples["Superpopulation"].to_numpy()[train_index], population=samples["Population"].to_numpy()[train_index],
+                      gene_start=gene["start"], gene_end=gene["end"], strand=gene["strand"],
+                      exons=np.array(gene["exons"], dtype=np.int64).reshape(-1, 2), coding_exons=np.array(gene["coding_exons"], dtype=np.int64).reshape(-1, 2))
     return train, test_genotypes, test_phenotype, test_index
 
 

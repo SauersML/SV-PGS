@@ -17,6 +17,11 @@ curl -s -o "$PANEL/20220804_manifest.txt" "$PANEL_URL/20220804_manifest.txt"
 curl -s -o "$ROOT/data/kgp/20130606_g1k_3202_samples_ped_population.txt" \
   http://ftp.1000genomes.ebi.ac.uk/vol1/ftp/data_collections/1000G_2504_high_coverage/20130606_g1k_3202_samples_ped_population.txt
 tail -n +2 "$ROOT/data/mage/sample_library_info/sample.metadata.MAGE.v1.0.txt" | cut -f4 | sort -u > "$ROOT/data/geno/mage_samples.txt"
+GENCODE_URL=http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38
+mkdir -p "$ROOT/data/gencode"
+curl -s -o "$ROOT/data/gencode/MD5SUMS" "$GENCODE_URL/MD5SUMS"
+curl -s --retry 5 -o "$ROOT/data/gencode/gencode.v38.annotation.gtf.gz" "$GENCODE_URL/gencode.v38.annotation.gtf.gz"
+[ "$(md5sum "$ROOT/data/gencode/gencode.v38.annotation.gtf.gz" | cut -d' ' -f1)" == "$(awk '$2=="gencode.v38.annotation.gtf.gz"{print $1}' "$ROOT/data/gencode/MD5SUMS")" ] || { echo "md5 mismatch gencode"; exit 1; }
 for file in "$(basename "$PANGENIE")" "$(basename "$PANGENIE").tbi"; do
   [ -s "$ROOT/data/hgsvc2/$file" ] || curl -s --retry 5 -o "$ROOT/data/hgsvc2/$file" "$PANGENIE_URL/$file"
 done

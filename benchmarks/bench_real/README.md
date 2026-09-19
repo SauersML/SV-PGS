@@ -7,6 +7,7 @@ The real-data benchmark that no method lane controls (scratchpad EVIDENCE_RULE).
 |---|---|---|
 | Expression, covariates, sample metadata | MAGE v1.0 (Taylor et al. 2024, Nature 631:610), Zenodo record 10535719, `MAGE.v1.0.data.zip`, CC-BY-4.0. 15 members are extracted by HTTP range reads, one request per member (`fetch_mage.py`). | zip md5 9b32d1e24aa883b3dc57359598420203; per-member CRC32 and sha256 in `data/mage/PROVENANCE.json` |
 | Genotypes | 1kGP 3,202-sample phased SNV/INDEL/SV panel, NYGC high coverage, `20220422_3202_phased_SNV_INDEL_SV` (Byrska-Bishop et al. 2022, Cell 185:3426), from the EBI FTP over http | every file md5-checked against `20220804_manifest.txt`; `public/kgp_phased_panel_20220422/md5_checked.txt` |
+| Target-gene structure | GENCODE v38 comprehensive annotation (MAGE's gene set), `gencode.v38.annotation.gtf.gz`, EBI FTP | md5 checked against the release MD5SUMS |
 | Pedigree, populations | `20130606_g1k_3202_samples_ped_population.txt`, from the same FTP directory | — |
 | Second SV source | HGSVC2 PanGenie genotypes of the 3,202 samples (Ebert et al. 2021), `20201217_pangenie_merged_bi_nosnvs.vcf.gz`: short-read genotyping of long-read-discovered SVs | — |
 
@@ -41,7 +42,7 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 
 ## Harness contract
 - **The method:** `fit(train: TrainData) -> predictor`, where `predictor.predict(test_genotypes) -> ndarray`.
-- **What TrainData holds:** training genotypes, the adjusted phenotype, variant annotations, and superpopulation and population labels.
+- **What TrainData holds:** training genotypes, the adjusted phenotype, variant annotations, superpopulation and population labels, and the target gene's GENCODE v38 body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 - **Sealing:** test phenotypes never reach method code; the harness reads them only to score.
 - **Feature sets:** `snv` (panel SNVs and indels under 50 bp), `snv_sv` (all panel rows), and `snv_pgsv` (panel SNVs/indels plus PanGenie SVs).
 - **Submitting:** a method lane sends a file and callable (`path.py:callable`), and bench-real runs it on the sealed splits. Lanes don't run the benchmark themselves.
@@ -99,7 +100,7 @@ The baselines need numba, which is in the repository's dev dependency group. bcf
 
     python benchmarks/bench_real/fetch_mage.py <root>/data/mage
     benchmarks/bench_real/fetch_genotypes.sh <root> <public-dir> <threads>
-    python benchmarks/bench_real/build_dataset.py --root <root> --shared
+    python benchmarks/bench_real/build_dataset.py --root <root> --shared --gene-annotation
     python benchmarks/bench_real/build_dataset.py --root <root> --chromosomes <c>   # one per autosome, in parallel
     python benchmarks/bench_real/splits.py <root>/dataset
     python benchmarks/bench_real/harness.py --dataset <root>/dataset --method benchmarks/bench_real/baselines.py:gblup_reml         --name gblup_reml --design loso --chromosomes chr22 --out <root>/results --workers <n>
