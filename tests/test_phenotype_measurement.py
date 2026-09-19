@@ -101,7 +101,7 @@ def test_the_certified_quadrature_matches_brute_force(residuals):
     variances = np.exp(prior.log_variance_grid)
     level_variance, tolerance = 4.0, person_tolerance(50_000)
     residual_array = np.array([residuals])
-    posterior = level_posterior(residual_array, level_variance, np.log(masses), variances, tolerance, None, True, WORKING_BYTES)
+    posterior = level_posterior(residual_array, level_variance, np.log(masses), variances, tolerance, None, None, True, WORKING_BYTES)
     log_likelihood, mean, second, brute_error = _brute(residual_array[0], level_variance, masses, variances)
     first_error, second_error, _variance_error = _moment_errors(tolerance, mean, second)
     # The certificate bounds L's relative error by the tolerance; the brute force adds its own error estimate.
@@ -146,7 +146,7 @@ def test_the_likelihood_is_a_density_over_the_reading_at_the_log_transform():
     level_variance, centre, tolerance = 0.25, float(np.log(80.0)), person_tolerance(1)
 
     def density(log_reading: float) -> float:
-        posterior = level_posterior(np.array([[log_reading - centre]]), level_variance, np.log(masses), variances, tolerance, None, False, WORKING_BYTES)
+        posterior = level_posterior(np.array([[log_reading - centre]]), level_variance, np.log(masses), variances, tolerance, None, None, False, WORKING_BYTES)
         return float(np.exp(posterior.log_likelihood[0]))  # the density of log y; its Jacobian dy = y d(log y) cancels
 
     total, error = integrate.quad(density, -np.inf, np.inf)
@@ -164,13 +164,14 @@ def test_louis_information_is_the_curvature_of_the_exact_log_likelihood():
 
     def log_likelihood(coefficients: np.ndarray) -> float:
         log_masses = class_log_density(prior, coefficients)[0]
-        return float(level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, False, WORKING_BYTES).log_likelihood.sum())
+        return float(level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, widths, False, WORKING_BYTES).log_likelihood.sum())
 
     log_masses = class_log_density(prior, base)[0]
     # Half the admissible steps stay certified at the nearby densities of the differences, so every likelihood
     # below is one trapezoid rule, a finite mixture over the nodes, for which Louis' identity is exact.
-    steps = 0.5 * level_posterior(residuals, 4.0, log_masses, variances, tolerance, None, False, WORKING_BYTES).admissible_step
-    posterior = level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, True, WORKING_BYTES)
+    first = level_posterior(residuals, 4.0, log_masses, variances, tolerance, None, None, False, WORKING_BYTES)
+    steps, widths = 0.5 * first.admissible_step, first.half_width
+    posterior = level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, widths, True, WORKING_BYTES)
     masses = np.exp(log_masses)
     louis = mapping.T @ (posterior.counts.sum() * (np.diag(masses) - np.outer(masses, masses)) - posterior.missing_information) @ mapping
 

@@ -192,7 +192,7 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # diagnostic criterion (Standards of Care in Diabetes, section 2). Only
         # people without a diabetes code or drug reach it, since the HbA1c trait
         # drops everyone else's values.
-        lab_criteria=(LabCriterion("hemoglobin_a1c", True, 6.5, 1, (3.0, 20.0)),),
+        lab_criteria=(LabCriterion("hemoglobin_a1c", True, 6.5, 1, plausible_range=(3.0, 20.0)),),
     ),
     DiseaseDefinition(
         canonical_name="atrial_fibrillation",
@@ -273,8 +273,8 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # mg/g, present for more than 3 months.
         lab_criteria=(
             # Serum creatinine in mg/dL for eGFR; the albumin/creatinine ratio in mg/g.
-            LabCriterion("egfr_ckd_epi_2021", False, 60.0, 90, (0.2, 20.0)),
-            LabCriterion("urine_albumin_creatinine_ratio", True, 30.0, 90, (0.1, 30000.0)),
+            LabCriterion("egfr_ckd_epi_2021", False, 60.0, 90, plausible_range=(0.2, 20.0)),
+            LabCriterion("urine_albumin_creatinine_ratio", True, 30.0, 90, plausible_range=(0.1, 30000.0)),
         ),
     ),
     DiseaseDefinition(
