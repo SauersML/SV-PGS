@@ -18,7 +18,7 @@ import numpy as np
 from cupyx.scipy.sparse.linalg import LinearOperator, eigsh
 
 from benchmarks.bench_sim.harness import ARMS
-from benchmarks.bench_sim.measurement import measured_records
+from benchmarks.bench_sim.records import measured_records
 
 CODES_PER_DOSAGE = 127
 PC_COUNT = 10

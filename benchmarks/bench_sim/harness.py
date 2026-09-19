@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import norm
 
-from benchmarks.bench_sim.measurement import measured_records
+from benchmarks.bench_sim.records import measured_records
 
 CODES_PER_DOSAGE = 127
 # Measurement arms: observed codes and their per-record quality, plus the label every result carries.

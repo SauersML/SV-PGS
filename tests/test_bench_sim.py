@@ -7,6 +7,7 @@ FALSE_FAILURE_PROBABILITY, so a correct implementation fails with at most that p
 from __future__ import annotations
 
 import gzip
+import subprocess
 import sys
 
 import numpy as np
@@ -14,7 +15,7 @@ from scipy.stats import norm
 
 import json
 
-from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, truth
+from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, records, truth
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -285,7 +286,7 @@ def test_measured_records_follow_the_panel_allele_count_rule(tmp_path) -> None:
     panel[4, :8] = 1
     panel[5, :5] = 1
     np.save(tmp_path / "panel_haps.npy", panel)
-    measured = measurement.measured_records(tmp_path)
+    measured = records.measured_records(tmp_path)
     assert measured.tolist() == [False, False, True, False, True, True]
     assert np.array_equal(np.load(tmp_path / "measured.npy"), measured)
 
@@ -333,3 +334,14 @@ def test_truth_half_takes_a_fixed_share_of_each_groups_training_samples(tmp_path
     expected = observed.copy()
     expected[np.ix_(measured, flags)] = truth_genotype[np.ix_(measured, flags)] * measurement.CODES_PER_DOSAGE
     assert np.array_equal(arm, expected)
+
+
+def test_harness_imports_without_cyvcf2() -> None:
+    """A submission's environment needs only numpy and scipy: the harness must not pull in the measurement arms."""
+    script = ("import sys, builtins; real = builtins.__import__\n"
+              "def guard(name, *args, **kwargs):\n"
+              "    if name.split('.')[0] == 'cyvcf2': raise ImportError('cyvcf2 blocked')\n"
+              "    return real(name, *args, **kwargs)\n"
+              "builtins.__import__ = guard\n"
+              "import benchmarks.bench_sim.harness, benchmarks.bench_sim.compare\n")
+    subprocess.run([sys.executable, "-c", script], check=True)

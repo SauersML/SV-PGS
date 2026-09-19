@@ -16,7 +16,8 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.bench_sim.measurement import CODES_PER_DOSAGE, STREAM_ROWS, measured_records
+from benchmarks.bench_sim.measurement import CODES_PER_DOSAGE
+from benchmarks.bench_sim.records import STREAM_ROWS, measured_records
 
 PUBLIC_SEED = 20260919
 # The truth half's share of each group's training samples: a benchmark design choice (PREREG amendment 8),
