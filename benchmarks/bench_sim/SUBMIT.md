@@ -17,6 +17,7 @@ class Model:
   - `train.codes(rows)`: uint8 observed codes, shape [len(rows), n_train_samples]; dosage = code / 127, the arm's observed value per record;
   - `train.variants`: a dict of public per-record arrays: pos, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV), len_change (signed), ref_len, alt_len, in_gene, in_exon, log_tss_distance, in_repeat, log_sv_length, and imputation_info (GLIMPSE2 INFO or Beagle DR2 for imputed records, per arm);
   - `train.covariates` [n_train, 13], with names in `train.covariate_names`: sex, age (standardized), batch, pc1–pc10;
+  - `train.truth_half` (a bool per training sample);
   - `train.phenotype`, `train.trait_type` ("quantitative" or "binary"), `train.prevalence` (binary only), and `train.cores`.
 - **`test`:** the same `codes(rows)`, `variants` and `covariates`, for test samples, with no phenotype.
 - **`structural`:** optional. It's the part of your prediction carried by TR+SV records, used for SV credit.
@@ -25,6 +26,7 @@ class Model:
 ## Measurement arms
 Every result carries its arm's label.
 - **`beagle`** (Beagle-imputed): all 50,000 samples; simple sites are read-model calls, and TR and SV records are Beagle DS. This is the arm submissions run on first.
+- **`beagle_truthhalf`** (Beagle-imputed with a true-genotype training half): the Beagle arm, but a flagged 20% of each group's training samples are observed at their true genotypes. `train.truth_half` flags them; it's all False in every other arm.
 - **`glimpse2`** (GLIMPSE2-imputed): every record is GLIMPSE2 DS, mirroring aou2. For now it covers only the 2,500-sample calibration subset; the full cohort comes later.
 
 ## Rules

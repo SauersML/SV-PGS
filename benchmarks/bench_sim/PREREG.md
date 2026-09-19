@@ -165,3 +165,9 @@ The cohort's group weights no longer come from any All of Us source. They are de
 - The group-weight table in section 1 is superseded.
 - The cohort, annotations, dev and sealed truths, Beagle arm and kernels are rebuilt under these weights in `bench-sim/v7/`, with new commitments in COMMITMENTS.txt. The sealed master seed is unchanged.
 - Results from the earlier cohort, including the GLIMPSE2 calibration tables, are labelled "built under withdrawn weights".
+
+## Amendment 8 (2026-09-19, before any submission): the true-genotype training half
+- **Arm "beagle_truthhalf"** (label: Beagle-imputed with a true-genotype training half) is the Beagle arm in which a flagged subset of the training samples is observed at its true genotypes (code = 127·G) on every measured record, as a long-read truth half would be.
+- **The subset:** 20% of each group's training samples, chosen with the public seed (measurement_truthhalf.truth_half). Test samples are never in it.
+- **The 20% is a benchmark design choice, fixed here;** it isn't taken from any production cohort. Methods see the flags as `train.truth_half`; every other arm reports them all False.
+- **Purpose:** it lets the ablation plan (benchmarks/ABLATION_PLAN.md, term t7) test measurement-model terms that learn from a truth subset.

@@ -7,13 +7,14 @@ FALSE_FAILURE_PROBABILITY, so a correct implementation fails with at most that p
 from __future__ import annotations
 
 import gzip
+import sys
 
 import numpy as np
 from scipy.stats import norm
 
 import json
 
-from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, truth
+from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, truth
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -305,3 +306,30 @@ def test_projection_matches_the_explicit_projector() -> None:
     # in both this computation and the explicit one.
     assert np.max(np.abs(kernel - expected_kernel)) <= 2 * 4 * size * EPSILON * kernel_scale * size
     assert np.max(np.abs(cross - expected_cross)) <= 2 * 2 * size * EPSILON * cross_scale * size
+
+
+def test_truth_half_takes_a_fixed_share_of_each_groups_training_samples(tmp_path, monkeypatch) -> None:
+    rng = np.random.default_rng(14)
+    size, n_var = 1_000, 30
+    group = rng.integers(0, 5, size=size)
+    is_test = rng.random(size) < 0.2
+    np.savez(tmp_path / "samples.npz", group=group, is_test=is_test)
+    flags = measurement_truthhalf.truth_half(np.load(tmp_path / "samples.npz"))
+    assert not (flags & is_test).any()
+    for index in range(5):
+        members = (group == index) & ~is_test
+        assert flags[members].sum() == int(round(measurement_truthhalf.TRUTH_FRACTION * members.sum()))
+    truth_genotype = rng.integers(0, 3, size=(n_var, size)).astype(np.uint8)
+    observed = rng.integers(0, 255, size=(n_var, size)).astype(np.uint8)
+    measured = rng.random(n_var) < 0.8
+    np.save(tmp_path / "truth_G.npy", truth_genotype)
+    np.save(tmp_path / "observed_beagle.npy", observed)
+    np.save(tmp_path / "measured.npy", measured)
+    monkeypatch.setattr(sys, "argv", ["measurement_truthhalf", "--dir", str(tmp_path)])
+    measurement_truthhalf.main()
+    arm = np.load(tmp_path / "observed_beagle_truth.npy")
+    saved_flags = np.load(tmp_path / "truth_half.npy")
+    assert np.array_equal(saved_flags, flags)
+    expected = observed.copy()
+    expected[np.ix_(measured, flags)] = truth_genotype[np.ix_(measured, flags)] * measurement.CODES_PER_DOSAGE
+    assert np.array_equal(arm, expected)

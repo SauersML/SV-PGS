@@ -36,7 +36,10 @@ ARMS = {
     # novel-measure's Rao-Blackwellised TR/SV columns built from the Beagle arm's phased simple-site input and
     # the panel only; SNV/INDEL rows are the Beagle arm's. Assembled by bench-sim after an input audit.
     "beagle_rb": ("observed_beagle_rb.npy", "imputation_beagle_rb.npz", "Beagle-imputed + RB structural columns (novel-measure)"),
+    # A flagged fifth of the training samples observed at their true genotypes (PREREG amendment 8).
+    "beagle_truthhalf": ("observed_beagle_truth.npy", "imputation_beagle.npz", "Beagle-imputed with a true-genotype training half"),
 }
+TRUTH_HALF_ARMS = {"beagle_truthhalf": "truth_half.npy"}
 VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
 ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")
 
@@ -51,6 +54,7 @@ class TrainData:
     trait_type: str
     prevalence: float | None
     cores: int
+    truth_half: np.ndarray
     _observed: np.ndarray = field(repr=False)
     _columns: np.ndarray = field(repr=False)
     _records: np.ndarray = field(repr=False)
@@ -130,6 +134,8 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
         variants=table, covariates=covariates[train_columns], covariate_names=names, phenotype=phenotype[train_columns].copy(),
         trait_type="binary" if params["binary"] else "quantitative",
         prevalence=params["prevalence"] if params["binary"] else None, cores=cores,
+        truth_half=(np.load(cohort / TRUTH_HALF_ARMS[arm])[train_columns] if arm in TRUTH_HALF_ARMS
+                    else np.zeros(train_columns.size, dtype=bool)),
         _observed=observed, _columns=train_columns, _records=records,
     )
     test = ScoreData(variants=table, covariates=covariates[test_columns], covariate_names=names,
