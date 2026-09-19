@@ -61,7 +61,9 @@ retained buffer, ``(LAG_BLOCKS + 2) * cap + tile_rows`` rows, and never depends 
 
 BLOCK_CAP_STEP = 256
 
-_HOST_TILES = 3
+_HOST_TILES = 2
+"""Host tiles in flight: while tile ``i`` computes, tile ``i + 1`` uploads and tile ``i + 2`` is
+read, which is all the overlap the pipeline has; a deeper ring only buffers read jitter."""
 
 
 class GenotypeTileSource(Protocol):
@@ -509,8 +511,12 @@ def run_cross_product_pass(
     return time.monotonic() - started
 
 
-TIE_CORRELATION_SCREEN = 1.0 - 1e-9
-"""Pairs with fp64 ``|r|`` above this are tested for an exact tie in integer arithmetic."""
+_UNIT_ROUNDOFF = float(np.finfo(np.float64).eps) / 2.0
+TIE_CORRELATION_SCREEN = 1.0 - 6.0 * _UNIT_ROUNDOFF / (1.0 - 6.0 * _UNIT_ROUNDOFF)
+"""An exact tie has ``|r| = 1``. ``N_jk`` is an exact integer in fp64, and the correlation rounds six
+times after it (a square root and a reciprocal per column, then two products), so a tie keeps
+``|r| >= 1 - gamma_6`` (Higham's ``gamma_n = n u / (1 - n u)``). Pairs at or above it are tested for
+an exact tie in integer arithmetic."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -531,8 +537,9 @@ class ProjectedLdBlock:
 
 
 _LD_INDEX = "ld_blocks.json"
-_PENDING_BLOCK_WRITES = 4
-"""Blocks the writer thread may hold while the disk catches up (bounds the host memory in flight)."""
+_PENDING_BLOCK_WRITES = 1
+"""One queued block lets the writer thread overlap the pass; in steady state a deeper queue holds more
+host memory without raising the throughput, max(compute, write) per block."""
 _LD_ARRAYS = {
     "gram": ("ld_grams.f32", np.float32),
     "score": ("ld_projected_scores.f64", np.float64),
@@ -792,7 +799,7 @@ def _project_block(
         panel *= inverse_root[start:stop, None]
         panel *= inverse_root[None, :]
         above = xp.arange(width)[None, :] > xp.arange(start, stop)[:, None]
-        hits = xp.argwhere(((panel > TIE_CORRELATION_SCREEN) | (panel < -TIE_CORRELATION_SCREEN)) & above)
+        hits = xp.argwhere((xp.abs(panel) >= TIE_CORRELATION_SCREEN) & above)
         screened.append(buffer.to_host(hits) + np.array([start, 0]))
 
     buffer.parallel_rows(correlate, width)

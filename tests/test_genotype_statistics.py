@@ -7,6 +7,7 @@ import pytest
 
 from sv_pgs.genotype_buffers import HostGenotypeBuffer, build_sample_layout
 from sv_pgs.genotype_statistics import (
+    TIE_CORRELATION_SCREEN,
     assign_chromosomes,
     plan_genotype_pass,
     run_cross_product_pass,
@@ -314,3 +315,22 @@ def test_the_dosage_store_source_streams_the_candidate_rows() -> None:
         store_rows = tile_source.store_rows(block.chromosome)[block.start : block.stop]
         values = signed[store_rows][:, members]
         np.testing.assert_array_equal(block.grams[0], values @ values.T)
+
+
+def test_the_tie_screen_keeps_every_exact_tie_under_fp64_rounding():
+    # The correlation is formed as in _project_block: exact integer N, then two inverse roots.
+    random_generator = np.random.default_rng(13)
+    count = 50_000
+    lowest = 1.0
+    for _ in range(2000):
+        base = random_generator.integers(-40, 41, size=count)
+        shift, slope = int(random_generator.integers(-40, 41)), int(random_generator.choice([-2, -1, 1, 2]))
+        tied = shift + slope * base
+        codes = np.stack([base, tied]).astype(np.int64)
+        sums = codes.sum(axis=1).astype(np.float64)
+        gram = (codes @ codes.T).astype(np.float64)
+        numerator = count * np.diag(gram) - sums * sums
+        inverse_root = 1.0 / np.sqrt(numerator)
+        correlation = (count * gram[0, 1] - sums[0] * sums[1]) * inverse_root[0] * inverse_root[1]
+        lowest = min(lowest, abs(float(correlation)))
+    assert lowest >= TIE_CORRELATION_SCREEN
