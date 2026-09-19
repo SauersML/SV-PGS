@@ -164,7 +164,7 @@ def _compute_auc_safe(labels: NDArray, preds: NDArray) -> float | None:
     # nested Python while-loop becomes one np.unique + scatter.
     order = np.argsort(preds, kind="mergesort")
     sorted_preds = preds[order]
-    n = sorted_preds.size
+    sample_count = sorted_preds.size
     _unique_vals, group_starts, group_counts = np.unique(
         sorted_preds, return_index=True, return_counts=True
     )
@@ -173,7 +173,7 @@ def _compute_auc_safe(labels: NDArray, preds: NDArray) -> float | None:
     # Broadcast the group rank back to every position in the sorted order.
     group_id_per_position = np.repeat(np.arange(group_starts.size), group_counts)
     ranks_sorted = group_avg_ranks[group_id_per_position]
-    ranks = np.empty(n, dtype=np.float64)
+    ranks = np.empty(sample_count, dtype=np.float64)
     ranks[order] = ranks_sorted
 
     positive_rank_sum = float(np.sum(ranks[labels == 1]))
@@ -194,7 +194,7 @@ def _select_score_column(
     evaluation_purpose: EvaluationPurpose,
     context: str,
 ) -> str:
-    score_col = next((c for c in _score_column_priority(evaluation_purpose) if c in columns), None)
+    score_col = next((column for column in _score_column_priority(evaluation_purpose) if column in columns), None)
     if score_col is None:
         raise ValueError(f"No score column found for {context}. Columns: {columns}")
     if evaluation_purpose == "genetic_only" and score_col in ("probability", "predicted_probability"):
@@ -311,7 +311,7 @@ def evaluate_all_of_us(
     if ancestry_path is not None:
         ancestry_labels = _load_ancestry_labels(ancestry_path)
         if ancestry_labels:
-            eur_count = sum(1 for v in ancestry_labels.values() if v.lower() in ("eur", "european"))
+            eur_count = sum(1 for ancestry in ancestry_labels.values() if ancestry.lower() in ("eur", "european"))
             log(f"  ancestry labels: {len(ancestry_labels):,} total, {eur_count:,} EUR")
 
     eur_ids = {sid for sid, anc in ancestry_labels.items() if anc.lower() in ("eur", "european")} if ancestry_labels else set()
@@ -329,8 +329,8 @@ def evaluate_all_of_us(
 
     zero_items = groups.get(0, [])
     one_items = groups.get(1, [])
-    zero_scores_arr = np.array([s for _, s in zero_items])
-    one_scores_arr = np.array([s for _, s in one_items])
+    zero_scores_arr = np.array([score for _, score in zero_items])
+    one_scores_arr = np.array([score for _, score in one_items])
 
     _run_auc_test(
         "ALL",
@@ -343,8 +343,8 @@ def evaluate_all_of_us(
     )
 
     if eur_ids:
-        zero_eur = np.array([s for sid, s in zero_items if sid in eur_ids])
-        one_eur = np.array([s for sid, s in one_items if sid in eur_ids])
+        zero_eur = np.array([score for sid, score in zero_items if sid in eur_ids])
+        one_eur = np.array([score for sid, score in one_items if sid in eur_ids])
         _run_auc_test(
             "EUR only",
             zero_eur,
@@ -403,9 +403,9 @@ def evaluate_all_of_us(
     log("=== DOSE-RESPONSE (score vs observation count) ===")
     for cnt in sorted(groups.keys()):
         items = groups[cnt]
-        g = np.array([s for _, s in items])
+        group_scores = np.array([score for _, score in items])
         if cnt <= 5 or cnt in (10, 20, 50, 100) or cnt == max(groups.keys()):
-            log(f"  {cnt:>3} codes: n={len(g):>6,}  mean_score={g.mean():.6f}")
+            log(f"  {cnt:>3} codes: n={len(group_scores):>6,}  mean_score={group_scores.mean():.6f}")
 
     # === TRUE 20% held-out test set ===
     # The fit pipeline holds out a deterministic 20% of samples (SHA-256 of
@@ -447,26 +447,26 @@ def evaluate_all_of_us(
                     test_rows.append((sid, target, score, quasi_score, genetic, covariate))
 
         if test_rows:
-            test_ids = np.array([r[0] for r in test_rows])
-            y = np.array([r[1] for r in test_rows], dtype=np.int8)
-            p = np.array([r[2] for r in test_rows], dtype=np.float64)
-            g = np.array([r[4] for r in test_rows], dtype=np.float64)
-            c = np.array([r[5] for r in test_rows], dtype=np.float64)
+            test_ids = np.array([row[0] for row in test_rows])
+            targets = np.array([row[1] for row in test_rows], dtype=np.int8)
+            target_scores = np.array([row[2] for row in test_rows], dtype=np.float64)
+            genetic_scores = np.array([row[4] for row in test_rows], dtype=np.float64)
+            covariate_scores = np.array([row[5] for row in test_rows], dtype=np.float64)
 
-            n_total = int(y.size)
-            n_pos = int((y == 1).sum())
-            n_neg = int((y == 0).sum())
+            n_total = int(targets.size)
+            n_pos = int((targets == 1).sum())
+            n_neg = int((targets == 0).sum())
             log(f"  test samples: {n_total:,}  cases={n_pos:,}  controls={n_neg:,}")
 
-            mean_pos = float(p[y == 1].mean()) if n_pos else float("nan")
-            mean_neg = float(p[y == 0].mean()) if n_neg else float("nan")
+            mean_pos = float(target_scores[targets == 1].mean()) if n_pos else float("nan")
+            mean_neg = float(target_scores[targets == 0].mean()) if n_neg else float("nan")
             log(f"  mean score: cases={mean_pos:.6f}  controls={mean_neg:.6f}  diff={mean_pos - mean_neg:.6f}")
-            if np.isfinite(g).all():
-                log(f"  mean genetic_score:   cases={float(g[y==1].mean()):.6f}  controls={float(g[y==0].mean()):.6f}")
-            if np.isfinite(c).all():
-                log(f"  mean covariate_score: cases={float(c[y==1].mean()):.6f}  controls={float(c[y==0].mean()):.6f}")
+            if np.isfinite(genetic_scores).all():
+                log(f"  mean genetic_score:   cases={float(genetic_scores[targets==1].mean()):.6f}  controls={float(genetic_scores[targets==0].mean()):.6f}")
+            if np.isfinite(covariate_scores).all():
+                log(f"  mean covariate_score: cases={float(covariate_scores[targets==1].mean()):.6f}  controls={float(covariate_scores[targets==0].mean()):.6f}")
 
-            auc_overall = _compute_auc_safe(y, p)
+            auc_overall = _compute_auc_safe(targets, target_scores)
             log(f"  ALL:           AUC={auc_overall if auc_overall is None else f'{auc_overall:.4f}'}  n={n_total:,}")
             results["test_holdout_auc_all"] = auc_overall
             results["test_holdout_n"] = n_total
@@ -475,23 +475,23 @@ def evaluate_all_of_us(
             results["test_holdout_mean_score_cases"] = mean_pos
             results["test_holdout_mean_score_controls"] = mean_neg
 
-            if np.isfinite(g).all():
-                auc_genetic_only = _compute_auc_safe(y, g)
+            if np.isfinite(genetic_scores).all():
+                auc_genetic_only = _compute_auc_safe(targets, genetic_scores)
                 log(f"  ALL (genetic-only):   AUC={auc_genetic_only if auc_genetic_only is None else f'{auc_genetic_only:.4f}'}")
                 results["test_holdout_auc_genetic_only"] = auc_genetic_only
-            if np.isfinite(c).all():
-                auc_covariate_only = _compute_auc_safe(y, c)
+            if np.isfinite(covariate_scores).all():
+                auc_covariate_only = _compute_auc_safe(targets, covariate_scores)
                 log(f"  ALL (covariate-only): AUC={auc_covariate_only if auc_covariate_only is None else f'{auc_covariate_only:.4f}'}")
                 results["test_holdout_auc_covariate_only"] = auc_covariate_only
 
             if eur_ids:
                 eur_mask = np.array([sid in eur_ids for sid in test_ids])
                 if eur_mask.any():
-                    auc_eur = _compute_auc_safe(y[eur_mask], p[eur_mask])
+                    auc_eur = _compute_auc_safe(targets[eur_mask], target_scores[eur_mask])
                     log(
                         f"  EUR only:      AUC={auc_eur if auc_eur is None else f'{auc_eur:.4f}'}  "
-                        f"n={int(eur_mask.sum()):,}  cases={int((y[eur_mask]==1).sum()):,}  "
-                        f"controls={int((y[eur_mask]==0).sum()):,}"
+                        f"n={int(eur_mask.sum()):,}  cases={int((targets[eur_mask]==1).sum()):,}  "
+                        f"controls={int((targets[eur_mask]==0).sum()):,}"
                     )
                     results["test_holdout_auc_eur"] = auc_eur
                     results["test_holdout_n_eur"] = int(eur_mask.sum())
