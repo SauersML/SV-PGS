@@ -16,6 +16,7 @@
 - Do not restrict or cap the number of variants included arbitrarily.
 - Do not restrict or cap the number of samples included.
 - The variant-class-specific prior structure is the core differentiator of this tool. Every inference path must use metadata-driven prior variances (variant type, length, repeat status) and per-variant local shrinkage (TPB). A generic LASSO/elastic net that applies the same penalty to all variants is not acceptable as a primary inference backend.
+- Every variant's prior variance, SNVs and indels included, depends on its structural-variant context: whether it lies in a tandem-repeat or SV locus, how strongly it tags a nearby SV, and the local SV landscape. The weights are learned by empirical Bayes. A SNV inside an SV locus never gets the same prior as a SNV far from any SV just because both are SNVs.
 - We have a single, best path for users. Options and choices must be absent unless absolutely necessary.
 - `# noqa` bypasses are never allowed. Fix the underlying issue or just ignore warning instead of silencing the linter.
 - No holdout splits or cross-validation to do the fit itself (fine for evaluation or testing fit). The Bayesian prior is the regularizer — all samples train the model.
