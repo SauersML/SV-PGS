@@ -80,7 +80,8 @@ Untagged numbers are derivations, definitions or targets.
   - the ruled layout: η shared, δ_c per class with its own roughness weight, one Gaussian pooling precision on the deviations' location and width, no class level; η's null space profiled;
   - exact tilted moments, unclipped mean-matched sites, cavities, the MacKay/REML noise update;
   - the fixed-cavity objective with its exact gradient and Hessian, a spectrum-shifted Newton M-step, and the Laplace evidence with the observed curvature and its exact gradient (third derivatives of log Z).
-  - Pending: the EP-re-solved curvature B from speed-ep's closed form in place of the fixed-cavity Hessian, and the exact λ = ∞ and width → 0 edges; until then the λ step is not certified and its tests are xfail.
+  - The λ step: every weight in [0, ∞] with exact edges (at ∞ the block's penalized directions are removed, at 0 the block is dropped, and an edge is released when V at the end of the resolvable range falls toward it); a trust region in ρ and in x (value-only trial passes, stopping at 1/(2K) nats); the two structural starts (warm and flat), keeping the certified maximum (−H positive definite) with the higher V, and a refit from the best certified solution.
+  - Pending: the EP-re-solved curvature B (speed-ep's closed form) in place of the fixed-cavity Hessian, and the Tierney–Kadane-corrected comparison of basins (below). The tests that depend on them are xfail with that reason.
 - **Certificate:** the Newton decrement of the hyper objective (in nats) together with the relative prediction change ‖XΔμ‖/‖Xμ‖. Parallel EP leaves a few sites in limit cycles, so the per-site maximum is not a certificate. The certificate is recorded in the artifact, and a fit without it is not accepted.
 - **Binary traits:** logistic EP with a Gauss–Hermite predictive refined until converged to fp64 rounding. Probit was rejected: VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
 - **Predictive variance:** K = 64 exact posterior draws by perturb-and-solve, riding Stage 2's passes and scored in the same single read.
@@ -93,6 +94,8 @@ Untagged numbers are derivations, definitions or targets.
   - The tagging and ρ² features.
   - The candidate set by the information rule N·Var(D_j)·r̂²_j·τ²_c ≥ c. It is variance-based, so copy-number rows are kept, and in exact Bayes it is a compute knob only.
 - **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet; it is gated against the dense EP-EB reference in `tests/ep_eb_reference.py` (see HANDOFF.md).
+  - **The slot Stage 2 consumes (the interface Stage 1 fills), per model (a trait on one training set):** the site precisions and shifts (τ, ν) over Stage 0's reduced columns, unclipped; the posterior mean; the prior's hyperparameters in the engine's layout (the coefficients x and the log penalty weights, with +∞ and −∞ at the edges); and the noise variance. Stage 2 reaches the same fixed point from any slot contents; the slot only shortens the path.
+  - **Until Stage 1 lands, Stage 2 starts from the prior itself:** moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, a zero mean, the start density, and the covariate-only residual variance as the noise.
 - **Stage 2: full-data certification** (`exact_polish.py`).
   - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40 [sim-only: synthetic store].
   - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate.

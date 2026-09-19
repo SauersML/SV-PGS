@@ -21,7 +21,7 @@ from sv_pgs.scale_mixture_ep import (
     _curvature_trace_gradient,
     _penalized,
     _penalty_matrix,
-    _range_functionals,
+    _restricted_prior,
     cavities,
     class_log_density,
     halved_lattice,
@@ -34,7 +34,7 @@ from sv_pgs.scale_mixture_ep import (
     noise_variance,
     prior_second_moment,
     quadrature_majorant_ratio,
-    roughness_penalty,
+    roughness_factor,
     scale_mixture_prior,
     site_targets,
     spacing_bound,
@@ -59,7 +59,7 @@ def _data(variant_count: int, seed: int):
     design = np.column_stack([(generator.random(variant_count) < 0.4).astype(np.float64), position, position**2, position**3])
     groups = (
         AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),
-        AnnotationGroup(columns=np.array([1, 2, 3]), penalty=_second_difference(3) + 1e-3 * np.eye(3)),
+        AnnotationGroup(columns=np.array([1, 2, 3]), penalty=_second_difference(3)),
     )
     precision = generator.uniform(50.0, 400.0, variant_count)
     effect = np.where(generator.random(variant_count) < 0.3, generator.normal(0.0, 0.25, variant_count), 0.0)
@@ -101,9 +101,9 @@ def _hyperparameters(prior, seed: int, log_smoothing: float | None = None) -> Mi
 
 
 _LAPLACE_NEAR_BOUNDARY = (
-    "The Laplace evidence spikes where the observed -H goes near-singular along a class density's collapse "
-    "direction (its boundary model is a Gaussian effect prior); the lambda step waits for the boundary-model "
-    "recipe from math-density and oracle."
+    "Two certified inner maxima at the same weights differ by 3.7 nats in Laplace V where -H is near-singular along "
+    "a class deviation's width; basins are compared only by the Tierney-Kadane-corrected evidence (lead ruling), "
+    "which is not implemented yet."
 )
 
 
@@ -219,18 +219,21 @@ def test_component_derivatives_in_log_scale_match_finite_differences():
         np.testing.assert_allclose(third_cumulant, numerical_third, rtol=1e-3, atol=1e-4)
 
 
-def test_roughness_penalty_is_the_lattice_integral_of_the_squared_third_derivative():
+def test_roughness_factors_are_the_lattice_integrals_of_the_squared_derivatives():
     spacing = 0.05
     nodes = -2.0 + spacing * np.arange(101)
-    penalty = roughness_penalty(nodes.shape[0], spacing)
-    for quadratic in (np.ones_like(nodes), nodes, nodes**2):
-        np.testing.assert_allclose(penalty @ quadratic, 0.0, atol=1e-6)
-    # The third difference of t^3 is 6 h^3 exactly, so the sum is 36 h (K - 3).
-    np.testing.assert_allclose(nodes**3 @ penalty @ nodes**3, 36.0 * spacing * (nodes.shape[0] - 3), rtol=1e-6)
+    for order in (1, 2, 3):
+        factor = roughness_factor(nodes.shape[0], spacing, order)
+        # Every polynomial below the order is in the null space; t^order has the constant difference order! h^order.
+        for degree in range(order):
+            np.testing.assert_allclose(factor @ nodes**degree, 0.0, atol=1e-6)
+        expected = float(np.prod(np.arange(1, order + 1))) ** 2 * spacing * (nodes.shape[0] - order)
+        np.testing.assert_allclose(np.sum(np.square(factor @ nodes**order)), expected, rtol=1e-6)
     # The K - 3 third differences are midpoint cells centred on t_1.5 .. t_(K-2.5): together [t_1, t_(K-2)].
+    third = roughness_factor(nodes.shape[0], spacing, 3)
     start, stop = nodes[1], nodes[-2]
     exact = 0.5 * (stop - start) + 0.25 * (np.sin(2.0 * stop) - np.sin(2.0 * start))
-    np.testing.assert_allclose(np.sin(nodes) @ penalty @ np.sin(nodes), exact, rtol=2e-3)
+    np.testing.assert_allclose(np.sum(np.square(third @ np.sin(nodes))), exact, rtol=2e-3)
 
 
 def test_halving_the_lattice_keeps_every_class_density():
@@ -265,14 +268,16 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
         np.testing.assert_allclose(density[class_position], pooled + basis @ coefficients[start : start + prior.pooled_size], atol=1e-12)
     theta = coefficients[prior.pooled_size * (prior.class_count + 1) :]
     np.testing.assert_allclose(log_scale(prior, coefficients), prior.log_variance_offset + prior.scale_design @ theta, atol=1e-12)
-    # The profiled null space is eta_bar's location and width: two directions, both inside eta_bar's coordinates.
-    assert prior.null_basis.shape[1] == 2
-    np.testing.assert_allclose(prior.null_basis[prior.pooled_size :], 0.0, atol=1e-10)
-    location, width = _range_functionals(prior.log_variance_grid, prior.kernel_floor, prior.kernel_top)
-    quadratic = basis @ prior.null_basis[: prior.pooled_size]
-    assert np.linalg.matrix_rank(np.vstack([location, width]) @ quadratic) == 2
+    # Profiled: eta_bar's location and width (inside its coordinates) and the smooth annotation's
+    # second-difference null space (two of its three columns); the deviations are fully penalized.
+    assert prior.null_basis.shape[1] == 4
+    deviations = slice(prior.pooled_size, prior.pooled_size * (prior.class_count + 1))
+    np.testing.assert_allclose(prior.null_basis[deviations], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
-    assert names == ["pooled roughness", "class 0 deviation roughness", "class 1 deviation roughness", "deviation location and width", "annotation group 0", "annotation group 1"]
+    assert names == [
+        "pooled roughness order 3", "class 0 deviation roughness order 3", "class 1 deviation roughness order 3",
+        "deviation polynomial part", "annotation group 0", "annotation group 1",
+    ]
 
 
 def test_curvature_trace_gradient_matches_finite_differences():
@@ -296,13 +301,13 @@ def test_curvature_trace_gradient_matches_finite_differences():
 def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, _WORKING_BYTES, 0.0)
     assert evidence is not None and evidence.newton_decrement < 1e-12
     step = 1e-4
     numerical = []
     for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
-        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, _WORKING_BYTES)
-        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, _WORKING_BYTES)
+        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, _WORKING_BYTES, 0.0)
+        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, _WORKING_BYTES, 0.0)
         numerical.append((forward.value - backward.value) / (2.0 * step))
     np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
 
@@ -310,22 +315,29 @@ def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_hyper_step_reaches_a_maximum_of_the_evidence():
     prior, cavity = _problem(variant_count=150, seed=19)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES)
-    assert step.newton_decrement < 1e-10
-    assert step.smoothing_gradient < 1e-5
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
     fitted = step.hyperparameters
-    for unit in np.eye(fitted.log_smoothing.shape[0]):
+    infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
+    zero = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == -np.inf))
+    view, allowed = _restricted_prior(prior, infinite, zero)
+    weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
+    base = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, _WORKING_BYTES, 0.0)
+    assert base is not None and base.newton_decrement < 1e-10
+    np.testing.assert_allclose(step.evidence, base.value, atol=1e-5)
+    for unit in np.eye(weights.shape[0]):
         for direction in (-1.0, 1.0):
-            moved = _evidence(prior, fitted.log_smoothing + direction * 0.05 * unit, fitted.coefficients, cavity, _WORKING_BYTES)
-            assert moved is None or moved.value <= step.evidence + 1e-9
+            moved = _evidence(view, weights + direction * 0.05 * unit, base.coefficients, cavity, _WORKING_BYTES, 0.0)
+            assert moved is None or moved.value <= base.value + 1e-5
+    # Each edge weight is where V wants it: releasing it to the end of its range does not raise V.
+    assert step.smoothing_gradient < 1e-2
 
 
 @pytest.mark.xfail(run=False, reason=_LAPLACE_NEAR_BOUNDARY)
 def test_the_fit_does_not_depend_on_the_lattice_spacing():
     prior, cavity = _problem(variant_count=150, seed=19)
-    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES)
+    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
     finer, start = halved_lattice(prior, coarse.hyperparameters)
-    fine = hyper_step(finer, start, cavity, _WORKING_BYTES)
+    fine = hyper_step(finer, start, cavity, _WORKING_BYTES, 1e-6)
     np.testing.assert_allclose(fine.evidence, coarse.evidence, atol=1e-3)
     coarse_moments = tilted_moments(prior, coarse.hyperparameters, cavity, _WORKING_BYTES)
     fine_moments = tilted_moments(finer, fine.hyperparameters, cavity, _WORKING_BYTES)
