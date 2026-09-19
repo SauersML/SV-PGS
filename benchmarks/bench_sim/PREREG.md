@@ -159,3 +159,9 @@ The user ruled on 2026-09-19: "never ever use any AoU related data outside of pe
 - **The production panel's size** is no longer quoted.
 - **Kept:** pure process facts about the production imputation, because they are software configuration, not AoU data: tool versions and flags, the hom-ref PL block rule, PLs only at simple sites, and the panel's allele-count ≥ 2 record filter.
 
+## Amendment 7 (2026-09-19, before any submission): group weights from the public 1kGP founder composition
+The cohort's group weights no longer come from any All of Us source. They are derived at build time (cohort.group_weights) as each group's superpopulation share of the 2,590 1kGP founders in the public 3,202-sample ped table: EUR 525, AFR 686, AMR 353, EAS 512, SAS 514, so the EUR, AFR-admixed, AMR-admixed, EAS and SAS groups get weights 525/2590, 686/2590, 353/2590, 512/2590 and 514/2590.
+- The admixed groups keep their non-AoU mean ancestry and admixture times (Bryc et al. 2015; Baharian et al. 2016).
+- The group-weight table in section 1 is superseded.
+- The cohort, annotations, dev and sealed truths, Beagle arm and kernels are rebuilt under these weights in `bench-sim/v7/`, with new commitments in COMMITMENTS.txt. The sealed master seed is unchanged.
+- Results from the earlier cohort, including the GLIMPSE2 calibration tables, are labelled "built under withdrawn weights".
