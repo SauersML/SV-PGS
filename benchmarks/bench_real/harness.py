@@ -13,8 +13,10 @@ are dropped. Window: the variant interval overlaps TSS +/- 1 Mb, the cis window 
 GTEx (GTEx Consortium 2020, Science 369:1318).
 """
 import dataclasses
+import hashlib
 import importlib.util
 import json
+import subprocess
 import os
 import pathlib
 import time
@@ -229,6 +231,12 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
     tag = "_".join(chromosomes)
+    method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
+    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
+    (out / f"{tag}.run.json").write_text(json.dumps({
+        "method": method_spec, "method_sha256": hashlib.sha256(method_file.read_bytes()).hexdigest(), "harness_commit": commit,
+        "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets), "gene_prefix": gene_prefix,
+        "genes": len(gene_rows), "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])

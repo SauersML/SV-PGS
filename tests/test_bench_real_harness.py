@@ -96,3 +96,38 @@ def test_training_constant_columns_are_dropped_even_when_heterozygous():
     train, test, _, _ = harness.build_gene_task(FakeDataset, window, {"train": ["a", "b", "c"], "test": ["d"]})
     assert train.genotypes.shape == (3, 1) and test.shape == (1, 1)
     assert list(train.variants.position) == [1]
+
+
+def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
+    import json
+
+    generator = np.random.default_rng(3)
+    sample_count, variant_count = 24, 8
+    samples = pd.DataFrame({"sample": [f"s{index}" for index in range(sample_count)], "FamilyID": [f"f{index}" for index in range(sample_count)],
+                            "FatherID": 0, "MotherID": 0, "Sex": 1, "Population": "CEU",
+                            "Superpopulation": ["AFR", "EUR"] * (sample_count // 2)})
+    samples.to_csv(tmp_path / "samples.tsv", sep="\t", index=False)
+    pd.DataFrame({"chrom": ["chr1"], "start": [99], "end": [100], "gene_id": ["g1"], "tss": [100]}).to_csv(tmp_path / "genes.tsv", sep="\t", index=False)
+    dosage = generator.binomial(2, 0.4, size=(variant_count, sample_count)).astype(np.int8)
+    np.save(tmp_path / "chr1.dosage.npy", dosage)
+    np.save(tmp_path / "expression.npy", (dosage[0] - dosage[3] + generator.normal(size=sample_count))[None, :].astype(np.float64))
+    np.save(tmp_path / "covariates.npy", np.zeros((sample_count, 0)))
+    is_sv = np.arange(variant_count) % 4 == 3
+    pd.DataFrame({"pos": 100 + np.arange(variant_count), "end": 100 + np.arange(variant_count), "id": ".", "ref_len": 1, "alt_len": np.where(is_sv, 61, 1),
+                  "symbolic": False, "sv_type": np.where(is_sv, "INS", "."), "sv_length": np.where(is_sv, 60, 0), "is_sv": is_sv,
+                  "source": "panel"}).to_csv(tmp_path / "chr1.variants.tsv", sep="\t", index=False)
+    split_list = [{"name": "loso/AFR", "test": list(samples["sample"][samples["Superpopulation"] == "AFR"]), "train": list(samples["sample"][samples["Superpopulation"] == "EUR"])},
+                  {"name": "loso/EUR", "test": list(samples["sample"][samples["Superpopulation"] == "EUR"]), "train": list(samples["sample"][samples["Superpopulation"] == "AFR"])}]
+    (tmp_path / "splits.json").write_text(json.dumps(split_list))
+    (tmp_path / "splits.sha256").write_text("synthetic\n")
+    (tmp_path / "gene_annotation.json").write_text(json.dumps({"g1": {"start": 90, "end": 110, "strand": "+", "exons": [[95, 105]], "coding_exons": []}}))
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    out = tmp_path / "results" / "top_variant" / "loso"
+    record = json.loads((out / "chr1.run.json").read_text())
+    assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
+    truth = np.load(out / "chr1.truth.npy")
+    for feature_set in ("snv", "snv_sv"):
+        predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")
+        assert np.isfinite(predictions).all() and np.isfinite(truth).all()
+    assert np.array_equal(np.load(out / "chr1.snv.predictions.npy"), np.load(out / "chr1.snv.predictions_without_sv.npy"))

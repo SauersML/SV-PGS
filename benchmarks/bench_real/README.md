@@ -47,6 +47,7 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 - **Feature sets:** `snv` (panel SNVs and indels under 50 bp), `snv_sv` (all panel rows), and `snv_pgsv` (panel SNVs/indels plus PanGenie SVs).
 - **Submitting:** a method lane sends a file and callable (`path.py:callable`), and bench-real runs it on the sealed splits. Lanes don't run the benchmark themselves.
 - **Costly methods:** they run on a sealed random gene sample, a prefix of `dataset/gene_order.tsv` (a seeded permutation of all genes), via `--gene-prefix N`.
+- **Run record:** each run writes `<chromosomes>.run.json`: the method spec and its file's sha256, the harness commit, design, feature sets, gene prefix N, gene count and the splits' sha256.
 - **Output:** out-of-fold predictions for every gene and sample, per design and feature set, plus per-fit CPU seconds and variant counts.
 
 ## Scoring
