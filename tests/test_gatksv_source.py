@@ -4,7 +4,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.gatksv_source import GatksvSource
@@ -115,13 +114,13 @@ def test_kgp_layout_reads_copy_number_not_the_placeholder_genotype(tmp_path: Pat
     assert source.sample_ids == ("R1", "R2", "R3", "R4")
 
 
-def test_copy_number_above_the_stored_range_raises(tmp_path: Path) -> None:
-    text = _KGP_LIKE_VCF.replace("0/1:5:5", "0/1:300:300")
-    vcf_path = tmp_path / "gatksv.vcf"
-    vcf_path.write_text(text, encoding="utf-8")
+def test_copy_number_above_the_stored_range_is_dropped_and_counted(tmp_path: Path) -> None:
+    # A satellite-scale array (1kGP HGSV_208635 reaches 652 copies) has no uint8 code.
+    source, blocks = _read_all(tmp_path, _KGP_LIKE_VCF.replace("0/1:5:5", "0/1:652:652"), block_records=10)
 
-    with pytest.raises(ValueError, match="exceeds the stored maximum"):
-        list(GatksvSource(vcf_path).blocks(10))
+    assert [variant_id for block in blocks for variant_id in block.variant_ids] == ["del_kgp"]
+    assert source.skipped_records == {"copy number above 254": 1}
+    assert source.kept_record_count == 1
 
 
 def test_blocks_align_to_store_samples_through_the_crosswalk(tmp_path: Path) -> None:

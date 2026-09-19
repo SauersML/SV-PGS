@@ -15,7 +15,10 @@ FILTER policy: a record is kept only when all its FILTER values are PASS (or the
 field is ``.``), with ``MULTIALLELIC`` also allowed on copy-number records.
 Every UNRESOLVED breakend, HIGH_NCR, LIKELY_REFERENCE_ARTIFACT or
 VARIABLE_ACROSS_BATCHES record is dropped. Breakends are dropped even when they
-pass, and so is any other multi-ALT record. Every drop is counted by reason.
+pass, and so is any other multi-ALT record. So is a copy-number record with a
+copy number past the store's uint8 range: a satellite-scale array such as the
+1kGP chr16 pericentromeric HGSV_208635, whose median copy number is 241 and
+whose maximum is 652. Every drop is counted by reason.
 
 No-calls are kept as a mask, never filled here. AoU's genotype filter turns
 uncertain carriers into no-calls, so missingness depends on the genotype; the
@@ -154,7 +157,7 @@ class GatksvSource:
             return "multi-allelic " + (svtype if svtype is not None else "untyped")
         return None
 
-    def _copy_numbers(self, record: Any) -> tuple[U8Array, BoolArray]:
+    def _copy_numbers(self, record: Any) -> tuple[I64Array, BoolArray]:
         if not self._format_fields:
             raise ValueError(f"{self.vcf_path} has copy-number record {record.ID} but no FORMAT/CN or FORMAT/RD_CN.")
         numbers = np.zeros(len(self.sample_ids), dtype=np.int64)
@@ -167,11 +170,7 @@ class GatksvSource:
             take = missing & ~field_missing
             numbers[take] = field_numbers[take]
             missing &= field_missing
-        if int(numbers.max(initial=0)) > MAXIMUM_STORED_VALUE:
-            raise ValueError(
-                f"copy number {int(numbers.max())} of {record.ID} exceeds the stored maximum {MAXIMUM_STORED_VALUE}."
-            )
-        return numbers.astype(np.uint8), missing
+        return numbers, missing
 
     def _allele_counts(self, record: Any) -> tuple[U8Array, BoolArray]:
         alleles = record.genotype.array()[:, :-1]
@@ -210,7 +209,14 @@ class GatksvSource:
                     svlen=None if svlen is None else float(svlen),
                     info_end=end,
                 )
-                values, no_call = self._copy_numbers(record) if copy_number else self._allele_counts(record)
+                if copy_number:
+                    copy_numbers, no_call = self._copy_numbers(record)
+                    if int(copy_numbers.max(initial=0)) > MAXIMUM_STORED_VALUE:
+                        self.skipped_records[f"copy number above {MAXIMUM_STORED_VALUE}"] += 1
+                        continue
+                    values = copy_numbers.astype(np.uint8)
+                else:
+                    values, no_call = self._allele_counts(record)
                 pending.append(
                     (
                         str(record.CHROM),
