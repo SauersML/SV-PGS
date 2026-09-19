@@ -5,7 +5,7 @@
 - **Where it comes from:** measured on MSI unless marked; COST_MODEL numbers from the speed lane.
 - **What dominates:** passes over the store. One uint8 pass is about 1.7 TB uncompressed.
 
-**Kernels (measured, exact):**
+**Kernels (measured, exact).** The exact int8 path's achieved rate on the A40 is in compute_floor.md §9.3: the raw GEMM runs at 68–73% of spec in the pass shape.
 - **int8 → int32 Gram:** 39 TOPS on V100, 242–277 on A100, 1.4–1.6 POPS on H100.
 - **int8 digit-split products X_b R with fp64 recombination** (`code_products.py`): 320 GB/s of codes on V100 at one right-hand side.
   - cuBLAS int8 GEMMs run only as TN, with dimensions and offsets that are multiples of 4, so tiles are zero-padded.
@@ -23,18 +23,36 @@
 - Expected 1–2 bits per code, i.e. 0.21–0.43 TB at 100k × 17M. That fits 8×H200 HBM, and 8×A100-40 at ≤ 1.5 bits per code.
 - Rare columns are sparse in storage only: sparse arithmetic loses to dense tensor cores at ~1,800 right-hand sides.
 
-**Stage 2** needs ~150 passes, each serving all 105 models plus 16 Hutchinson probes (~1,800 right-hand sides) [est]:
+**The floor and the gap** (derived and measured in [math/compute_floor.md](math/compute_floor.md)). All 105 models, n = 10⁵, p = 1.7·10⁷:
+- **Floor:** ~47 store passes after the one cold staging read.
+  - 105 right-hand sides per fit pass: no Hutchinson probes, since tr(ΛΣ) = p − Σ_j τ_jΣ_jj gives p_eff exactly.
+  - 3 int8 operand digits, from the certificate's tolerance.
+  - Sample-side solver state.
+  - Stage 0 fused into the staging read; in-cohort scoring riding the final pass.
+- **Floor totals:** about **6 min on 8×A100-40** and 4 min on 8×H100 (both staging-bound), ~36 min on one A40, and 1.5–2.6 h on one V100 or T4 (variance-bound).
+- **CPU ultramem VM (~3.8 TB RAM, ~2.3 TF fp64 [est]):** compute-bound for the fit, so it's for staging and Stage 0 only.
+- **Each additional disease** adds right-hand-side columns, not passes. Below the pass's compute-bound column count R\* = F_int8/(2·L·codes/s), it costs no pass time.
 
-| Configuration | Stage 2 total | Verdict |
-|---|---|---|
-| 8×A100-40 spot | ~20–25 min [est] | primary |
-| 8×H200 spot | ~8–10 min [est] | when spot capacity exists (unverified) |
-| CPU ultramem VM (~3.8 TB RAM) | ~110 h [est] | compute-bound: Stage 0 or staging only |
+**Gap today** (itemized in compute_floor.md §9):
 
-**Stage 1 is the bottleneck.**
-- The earlier implementation measured 39–55 µs per variant per model per sweep on H100, about 200× its flop bound.
-- It needs batched block Cholesky and site updates across blocks and models on the GPU, with no per-block Python. The target is ≤ 1 µs, i.e. about 1 h for all models on 8×A100.
-- An earlier branch, e2854ca in the wip history, has a measured fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement) and multi-GPU block dispatch. Carry it into the new Stage 1.
+| Item | Current or planned | Floor | Factor |
+|---|---|---|---|
+| Stage 1 | 39–55 µs per variant·model·sweep (H100), ~800 GPU-h | not a separate stage | ~10³× |
+| Columns per fit pass | 1,785 (16 probes per model) | 105 | 17× |
+| Solver state | ~6 variant-side fp64 host arrays, 1.46 TB at R = 1,785 (exceeds a 680 GB host) | sample-side n×R, 1.4 GB | infeasible → feasible |
+| Posterior draws | separate from-zero block-CG, R = 6,720 × ~25 passes | recycled through the last outer steps, with a block control variate | ~40× |
+| Stage 2 passes | ~131 (cold corrections per outer step) | ~42 (inexact, warm-started) | ~3× |
+| Operand digits | 6 | 3 | 2× |
+| Block-variance refreshes | a dense fp64 factor per model per refresh (1,030 s per A100 for 105 models) | on demand, TF32 with refinement, resolved-set factors | 8–50× [est] |
+| Exact path around the int8 GEMM (A40, measured) | matmat and rmatmat 4–10× over their raw GEMM | ≈ the raw GEMM | partly closed by speed-io, bit-identical |
+
+End to end: about 1,000× today, and 10–40× once Stage 1 is removed.
+
+**Stage 1 (lead ruling, 2026-09-19).**
+- Build and optimize the Stage-2-only path first. Stage 1 is optional until the production outer contraction ρ and the real partition's cut coupling are measured.
+- ρ decides whether Stage 1's pass-free outer steps are worth keeping: at ρ = 0.99 the fit needs ~160 outer steps, at ρ = 0.5 about 3.
+- If Stage 1 stays, it needs batched block factors across blocks and models on the GPU, with no per-block Python.
+- An earlier branch (e2854ca, in archive tags `build-stage1` and `wip-wt-build-store`) has a measured fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement) and multi-GPU block dispatch. The variance refreshes need that policy in either case.
 
 ## Cloud: the dedicated SV-PGS workspace
 - **Platform:** a Verily Workbench (AoU Researcher Workbench 2.0) workspace in us-central1.
