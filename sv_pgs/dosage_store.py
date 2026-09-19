@@ -996,10 +996,13 @@ class DosageStore:
     ) -> Iterator[tuple[int, int, U8Array]]:
         """Yield (start, stop, codes) for each range in order, reading ahead in the background.
 
-        On a CPU budget with every sample of a one-half raw store selected, this is the large-RAM
-        path: each range is a zero-copy page-cache view where it sits inside one shard (else it
-        is read into one spare buffer), and the next range is advised for read-ahead.  Every other
-        case streams through a ring of buffers filled by a background reader.  The ring is
+        On a CPU budget with every sample of a one-half raw store selected, and the whole store
+        small enough to stay in the page cache (at most ``budget.host_bytes``), this is the
+        large-RAM path: each range is a zero-copy page-cache view where it sits inside one shard
+        (else it is read into one spare buffer), and the next range is advised for read-ahead.
+        Views of a store that does not fit are page-fault streaming, which measured 84% of the
+        device rate on a local SSD and 7% on network storage, against 96-97% for the ring.  Every
+        other case streams through a ring of buffers filled by a background reader.  The ring is
         pinned host memory on a CUDA budget, and 2 to 3 buffers deep, as ``budget.host_bytes``
         allows.  A yielded block stays valid until the caller asks for the next one.
         """
@@ -1008,7 +1011,8 @@ class DosageStore:
         if not ranges:
             return
         raw_arrays = all(array.layout.codec == "raw" for arrays in self._arrays for array in arrays)
-        if budget.device_kind == "cpu" and selection.complete and len(self._arrays) == 1 and raw_arrays:
+        resident = self.n_variants * self.n_samples <= budget.host_bytes
+        if budget.device_kind == "cpu" and selection.complete and len(self._arrays) == 1 and raw_arrays and resident:
             spare = np.empty(0, dtype=np.uint8)
             for position, (start, stop) in enumerate(ranges):
                 if position + 1 < len(ranges):

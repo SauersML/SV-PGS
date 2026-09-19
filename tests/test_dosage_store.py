@@ -197,6 +197,10 @@ def test_raw_single_half_ranges_inside_a_shard_are_zero_copy_views(tmp_path: Pat
         views = [block for _, _, block in store.iter_codes([(0, 64), (64, 128), (120, 140)], None, _budget())]
         assert [block.flags.writeable for block in views[:2]] == [False, False]
         assert np.array_equal(views[1], half_codes[64:128])
+        # A store larger than the host budget streams through the ring instead of faulting in views.
+        ring_budget = _budget(store.n_variants * store.n_samples - 1)
+        streamed = [block.copy() for _, _, block in store.iter_codes([(0, 64), (64, 128)], None, ring_budget) if block.flags.writeable]
+        assert len(streamed) == 2 and np.array_equal(streamed[1], half_codes[64:128])
     with DosageStore.open(tmp_path / "zstd", half_indices=[1]) as store:
         assert store.read_codes(10, 100).flags.owndata
         assert np.array_equal(store.read_codes(10, 100), half_codes[10:100])
