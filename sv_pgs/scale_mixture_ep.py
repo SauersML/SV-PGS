@@ -16,26 +16,17 @@ with no point mass at zero.
   learned nonparametrically, held as its log values eta_ck at the nodes of a
   uniform lattice over the real line; integrals over t are trapezoid sums, so
   node k carries pi_ck = softmax(eta_c)_k.
-- The classes share one density shape: eta_c = eta_bar + delta_c. Roughness,
-  the integral of eta'''(t)^2, is penalized as lambda h^-5 ||D3 eta||^2 (the
-  lattice form, so lambda does not depend on the spacing h): with one weight on
-  eta_bar and one per class on delta_c. The penalty's null space is the
-  quadratics, so as a weight grows log g tends to a concave quadratic, a
-  log-normal mixing density that is proper on the real line; a first- or
-  second-derivative penalty would tend to an exponential in t, whose mass
-  depends on where the lattice ends. Linear log-tails carry no penalty, so
-  heavy tails stay free.
-- A deviation's null-space part, its location and width offsets (the Legendre
-  P1 and P2 coefficients over the kernel range), has a Gaussian pooling prior
-  with mean zero and a learned precision: eta_bar carries the common location,
-  so there is no separate class level, and a class's scale is its deviation's
-  location. The kernel range [floor, top] comes from the data, so neither
-  offset depends on the lattice's spacing or extent.
-- eta_bar's own null space (the log-normal limit's location and width) is
-  profiled: those coefficients are fixed effects, maximized rather than
-  integrated, because integrating them under a flat prior diverges where the
-  likelihood tends to a positive constant (the density collapsing to a point,
-  a Gaussian effect prior).
+- The classes share one density shape: eta_c = eta_bar + delta_c. Each of
+  eta_bar and every delta_c carries two learned roughness weights, on the
+  integrals of its squared first and second derivatives, penalized in their
+  lattice forms lambda_1 h^-1 ||D1 eta||^2 and lambda_2 h^-3 ||D2 eta||^2 (so
+  the weights do not depend on the spacing h). In sum-to-zero coordinates the
+  first difference has no null space, so every direction of the density is
+  penalized: none has to be profiled, and a density cannot collapse onto one
+  node at no cost. There is no separate class level: a class's scale is its
+  deviation's location.
+- Every weight lives in [0, infinity] with exact edges: at infinity the
+  block's penalized directions are zero, at zero the block is absent.
 - The lattice is a quadrature rule: its floor, top, spacing and extent are
   derived from the data and a tolerance (``kernel_floor``, ``kernel_top``,
   ``spacing_bound``, ``tail_mass``). Below the floor every kernel is flat to
@@ -68,9 +59,12 @@ Laplace marginal likelihood of x,
     V(rho) = F(x_rho) + 1/2 log|S_rho|_+ - 1/2 log|-H(x_rho)| + 1/2 log|N'(-H(x_rho))N|,
 
 with rho = log lambda, x_rho the penalized maximizer, H its observed Hessian
-and N a basis of the profiled null space. Its gradient is exact: dx/drho
-through the observed Hessian, and the change of H with x through the third
-derivatives of log Z. Across a stage's outer loop the curvature is the
+and N a basis of any directions no block penalizes (an annotation smooth's
+linear part, or a direction left bare by a weight at zero), which are
+profiled as fixed effects: integrating them under a flat prior diverges
+where the likelihood tends to a positive constant. Its gradient is exact:
+dx/drho through the observed Hessian, and the change of H with x through the
+third derivatives of log Z. Across a stage's outer loop the curvature is the
 EP-re-solved one; at fixed cavities it is H.
 
 Every derivative is computed in z = (eta_1, ..., eta_C, theta), where each variant's log Z_j depends on its
@@ -83,7 +77,7 @@ gamma = p - sum_j tau_j Sigma_jj, the covariates' flat prior removing k.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterator, Sequence
 
 import numpy as np
@@ -219,14 +213,9 @@ def _sum_to_zero_basis(size: int) -> F64Array:
     return basis[:, : size - 1]
 
 
-def roughness_factor(size: int, spacing: float) -> F64Array:
-    """R with ||R eta||^2 = h^-5 ||D3 eta||^2, the lattice form of the integral of eta'''(t)^2."""
-    return np.diff(np.eye(size), n=3, axis=0) / spacing**2.5
-
-
-def roughness_penalty(size: int, spacing: float) -> F64Array:
-    factor = roughness_factor(size, spacing)
-    return factor.T @ factor
+def roughness_factor(size: int, spacing: float, order: int) -> F64Array:
+    """R with ||R eta||^2 = h^-(2 order - 1) ||D_order eta||^2, the lattice form of the integral of eta^(order)(t)^2."""
+    return np.diff(np.eye(size), n=order, axis=0) / spacing ** (order - 0.5)
 
 
 def kernel_floor(single_precision: F64Array, single_shift: F64Array, log_scale_values: F64Array, tolerance: float) -> float:
@@ -264,30 +253,6 @@ def tail_mass(end_value: float, outward_slope: float, curvature: float) -> float
     if curvature == 0.0 and outward_slope < 0.0:
         return float(np.exp(end_value) / -outward_slope)
     return float("inf")
-
-
-def _range_functionals(nodes: F64Array, floor: float, top: float) -> tuple[F64Array, F64Array]:
-    """Node weights of the location and width of a function over [floor, top]: its Legendre P1 and P2 coefficients.
-
-    Trapezoid weights over the nodes inside the range (at least three nearest
-    the range's centre when it is narrower) keep both independent of the
-    spacing and of the lattice's extent.
-    """
-    distance = np.abs(nodes - 0.5 * (floor + top))
-    inside = (nodes >= floor) & (nodes <= top)
-    if int(inside.sum()) < 3:
-        inside = distance <= np.sort(distance)[2]
-    covered = nodes[inside]
-    centre = 0.5 * (covered[0] + covered[-1])
-    half = 0.5 * (covered[-1] - covered[0])
-    standardized = (covered - centre) / half
-    weights = np.full(covered.shape[0], covered[1] - covered[0])
-    weights[[0, -1]] *= 0.5
-    location = np.zeros(nodes.shape[0])
-    width = np.zeros(nodes.shape[0])
-    location[inside] = 1.5 / half * weights * standardized
-    width[inside] = 2.5 / half * weights * 0.5 * (3.0 * standardized * standardized - 1.0)
-    return location, width
 
 
 def scale_mixture_prior(
@@ -335,9 +300,8 @@ def scale_mixture_prior(
         raise ValueError("the lattice must be at least five evenly spaced increasing nodes")
     grid_size = lattice.shape[0]
     basis = _sum_to_zero_basis(grid_size)
-    roughness = roughness_factor(grid_size, float(spacing[0])) @ basis
-    location, width = _range_functionals(lattice, floor, top)
-    null_functionals = np.vstack([location, width]) @ basis
+    slope = roughness_factor(grid_size, float(spacing[0]), 1) @ basis
+    curvature = roughness_factor(grid_size, float(spacing[0]), 2) @ basis
     pooled_size = grid_size - 1
     deviation_count = class_count if class_count > 1 else 0
     deviation_size = deviation_count * pooled_size
@@ -350,14 +314,12 @@ def scale_mixture_prior(
             start = pooled_size + class_position * pooled_size
             coefficient_map[rows, start : start + pooled_size] = basis
     coefficient_map[class_count * grid_size :, pooled_size + deviation_size :] = np.eye(design.shape[1])
-    blocks = [SmoothingBlock("pooled roughness", np.arange(pooled_size), roughness)]
+    pooled = np.arange(pooled_size)
+    blocks = [SmoothingBlock("pooled slope", pooled, slope), SmoothingBlock("pooled curvature", pooled, curvature)]
     for class_position in range(deviation_count):
-        start = pooled_size + class_position * pooled_size
-        blocks.append(SmoothingBlock(f"class {class_position} deviation roughness", np.arange(start, start + pooled_size), roughness))
-    if deviation_count:
-        blocks.append(SmoothingBlock(
-            "deviation location and width", np.arange(pooled_size, pooled_size + deviation_size), np.kron(np.eye(deviation_count), null_functionals)
-        ))
+        deviation = pooled_size + class_position * pooled_size + np.arange(pooled_size)
+        blocks.append(SmoothingBlock(f"class {class_position} deviation slope", deviation, slope))
+        blocks.append(SmoothingBlock(f"class {class_position} deviation curvature", deviation, curvature))
     annotation_start = pooled_size + deviation_size
     for position, group in enumerate(annotation_groups):
         eigenvalues, eigenvectors = np.linalg.eigh(np.asarray(group.penalty, dtype=np.float64))
@@ -890,16 +852,52 @@ def _smoothing_bounds(prior: ScaleMixturePrior, objective: _Objective) -> list[t
     return bounds
 
 
-def _maximize_evidence(
+def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int], zero: frozenset[int]) -> tuple[ScaleMixturePrior, F64Array]:
+    """The prior with the weights in ``infinite`` at lambda = infinity and those in ``zero`` at lambda = 0, and the
+    basis K of the allowed x.
+
+    At lambda_i = infinity block i's penalized directions are exactly zero, so x = K z with K an orthonormal
+    basis of every such block's null space; at lambda_i = 0 block i is absent. The other blocks act on z
+    through their factors times K, and any direction none of them penalizes is profiled.
+    """
+    constraints = [np.zeros((0, prior.coefficient_size))]
+    for position in sorted(infinite):
+        block = prior.smoothing_blocks[position]
+        embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
+        embedded[:, block.coordinates] = block.factor
+        constraints.append(embedded)
+    constraint = np.vstack(constraints)
+    if constraint.shape[0]:
+        _left, singular, right = np.linalg.svd(constraint)
+        rank = int(np.sum(singular > _EPSILON * max(constraint.shape) * float(singular[0])))
+        allowed = right[rank:].T
+    else:
+        allowed = np.eye(prior.coefficient_size)
+    blocks = []
+    for position, block in enumerate(prior.smoothing_blocks):
+        if position in infinite or position in zero:
+            continue
+        embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
+        embedded[:, block.coordinates] = block.factor
+        blocks.append(SmoothingBlock(block.name, np.arange(allowed.shape[1]), embedded @ allowed))
+    total = sum((block.matrix for block in blocks), np.zeros((allowed.shape[1], allowed.shape[1])))
+    null_eigenvalues, null_vectors = np.linalg.eigh(total)
+    scale = max(float(null_eigenvalues[-1]) if null_eigenvalues.size else 0.0, np.finfo(np.float64).tiny)
+    null_basis = null_vectors[:, null_eigenvalues <= _EPSILON * allowed.shape[1] * scale]
+    view = replace(prior, coefficient_map=prior.coefficient_map @ allowed, smoothing_blocks=tuple(blocks), null_basis=null_basis)
+    return view, allowed
+
+
+def _ascend_evidence(
     prior: ScaleMixturePrior,
     start_weights: F64Array,
     start_coefficients: F64Array,
     cavity: Cavity,
     working_bytes: int,
-    bounds: list[tuple[float, float]],
-) -> tuple[F64Array, _Evidence, _Evidence]:
-    """Projected quasi-Newton ascent of V(rho) inside its bounds, backtracking on every trial point; returns the
-    weights, their evidence, and the evidence at the start.
+    lower: F64Array,
+    upper: F64Array,
+) -> tuple[F64Array, _Evidence]:
+    """Projected quasi-Newton ascent of V(rho) inside [lower, upper], backtracking on every trial point.
 
     A trial is kept only when it has a positive-definite penalized maximum and
     raises V; otherwise the step halves. The BFGS inverse Hessian of -V is
@@ -907,13 +905,10 @@ def _maximize_evidence(
     gain falls to V's rounding level, or when no step longer than half of
     double precision in rho raises V.
     """
-    lower = np.array([bound[0] for bound in bounds])
-    upper = np.array([bound[1] for bound in bounds])
     weights = np.clip(start_weights, lower, upper)
     current = _evidence(prior, weights, start_coefficients, cavity, working_bytes)
     if current is None:
         raise FloatingPointError("the penalized objective has no positive-definite maximum at the starting penalty weights")
-    start = current
     inverse_hessian = np.eye(weights.shape[0])
     while True:
         gradient = current.gradient
@@ -924,7 +919,7 @@ def _maximize_evidence(
             inverse_hessian = np.eye(weights.shape[0])
             direction[free] = gradient[free]
         if 0.5 * float(gradient[free] @ direction[free]) <= _EPSILON * current.magnitude:
-            return weights, current, start
+            return weights, current
         step_length = 1.0
         accepted = None
         while step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
@@ -935,7 +930,7 @@ def _maximize_evidence(
                 break
             step_length *= 0.5
         if accepted is None:
-            return weights, current, start
+            return weights, current
         trial_weights, trial = accepted
         displacement = trial_weights - weights
         gradient_change = gradient - trial.gradient
@@ -947,26 +942,93 @@ def _maximize_evidence(
         weights, current = trial_weights, trial
 
 
+def _maximize_evidence(
+    prior: ScaleMixturePrior,
+    start_weights: F64Array,
+    start_coefficients: F64Array,
+    cavity: Cavity,
+    working_bytes: int,
+    bounds: list[tuple[float, float]],
+) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
+    """Maximize V over every weight in [0, infinity], with exact edges at both ends.
+
+    A weight whose ascent reaches the top of its resolvable range (where its penalized directions are
+    frozen to half of double precision) moves to lambda = infinity exactly: x is confined to that block's
+    null space. One that reaches the bottom (where its penalty is lost in the data curvature's rounding)
+    moves to lambda = 0 exactly: the block is dropped. An edge weight is released when V at the end of
+    its range falls toward the edge. Returns the log weights (+inf and -inf at the edges), x in full
+    coordinates, V there, and V at the start.
+    """
+    lower = np.array([bound[0] for bound in bounds])
+    upper = np.array([bound[1] for bound in bounds])
+    infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
+    zero = frozenset(int(position) for position in np.flatnonzero(start_weights == -np.inf))
+    weights = np.where(start_weights == np.inf, upper, np.where(start_weights == -np.inf, lower, start_weights))
+    coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
+    start = None
+    while True:
+        edges = infinite | zero
+        finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
+        view, allowed = _restricted_prior(prior, infinite, zero)
+        finite_weights, evidence = _ascend_evidence(
+            view, weights[finite], allowed.T @ coefficients, cavity, working_bytes, lower[finite], upper[finite]
+        )
+        if start is None:
+            start = _evidence(view, np.clip(weights[finite], lower[finite], upper[finite]), allowed.T @ coefficients, cavity, working_bytes)
+        weights[finite] = finite_weights
+        coefficients = allowed @ evidence.coefficients
+        to_infinity = {int(finite[index]) for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))}
+        to_zero = {int(finite[index]) for index in np.flatnonzero((finite_weights <= lower[finite]) & (evidence.gradient <= 0.0))}
+        released = set()
+        for position in sorted(edges):
+            loose_infinite, loose_zero = infinite - {position}, zero - {position}
+            loose_view, loose_allowed = _restricted_prior(prior, loose_infinite, loose_zero)
+            loose_finite = [index for index in range(len(bounds)) if index not in loose_infinite | loose_zero]
+            trial_weights = weights.copy()
+            at_infinity = position in infinite
+            trial_weights[position] = upper[position] if at_infinity else lower[position]
+            trial = _evidence(loose_view, trial_weights[loose_finite], loose_allowed.T @ coefficients, cavity, working_bytes)
+            if trial is None:
+                continue
+            slope = trial.gradient[loose_finite.index(position)]
+            if (at_infinity and slope < 0.0) or (not at_infinity and slope > 0.0):
+                released.add(position)
+        if not to_infinity and not to_zero and not released:
+            log_smoothing = weights.copy()
+            log_smoothing[sorted(infinite)] = np.inf
+            log_smoothing[sorted(zero)] = -np.inf
+            return log_smoothing, coefficients, evidence, start
+        infinite = frozenset((infinite | to_infinity) - released)
+        zero = frozenset((zero | to_zero) - released)
+
+
 def hyper_step(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int
 ) -> HyperStep:
-    """Maximize V(rho) over the resolvable range, with x at the penalized maximum for each rho."""
+    """Maximize V over every penalty weight in (0, infinity], with x at the penalized maximum for each."""
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
+    infinite = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == np.inf))
+    zero = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == -np.inf))
+    view, allowed = _restricted_prior(prior, infinite, zero)
+    finite = np.isfinite(hyperparameters.log_smoothing)
+    start_coefficients = allowed.T @ hyperparameters.coefficients
     _value, start_gradient, start_hessian = _penalized(
-        prior, start_objective, hyperparameters.log_smoothing, _penalty_matrix(prior, hyperparameters.log_smoothing), hyperparameters.coefficients
+        view, _data_objective(view, start_coefficients, cavity, working_bytes), hyperparameters.log_smoothing[finite],
+        _penalty_matrix(view, hyperparameters.log_smoothing[finite]), start_coefficients,
     )
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     bounds = _smoothing_bounds(prior, start_objective)
-    log_smoothing, evidence, start_evidence = _maximize_evidence(
+    log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
         prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, working_bytes, bounds
     )
-    interior = np.array([bound[0] < weight < bound[1] for weight, bound in zip(log_smoothing, bounds)])
+    interior = np.array([np.isfinite(weight) and bound[0] < weight < bound[1] for weight, bound in zip(log_smoothing, bounds)])
+    interior_gradient = evidence.gradient[interior[np.isfinite(log_smoothing)]]
     return HyperStep(
-        hyperparameters=MixtureHyperparameters(coefficients=evidence.coefficients.copy(), log_smoothing=log_smoothing.copy()),
+        hyperparameters=MixtureHyperparameters(coefficients=coefficients, log_smoothing=log_smoothing),
         penalized_objective=evidence.penalized_value,
         evidence=evidence.value,
         newton_decrement=evidence.newton_decrement,
-        smoothing_gradient=float(np.max(np.abs(evidence.gradient[interior]))) if np.any(interior) else 0.0,
+        smoothing_gradient=float(np.max(np.abs(interior_gradient))) if interior_gradient.size else 0.0,
         start_decrement=start_decrement,
         evidence_gain=evidence.value - start_evidence.value,
     )

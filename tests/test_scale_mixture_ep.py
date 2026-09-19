@@ -21,7 +21,6 @@ from sv_pgs.scale_mixture_ep import (
     _curvature_trace_gradient,
     _penalized,
     _penalty_matrix,
-    _range_functionals,
     cavities,
     class_log_density,
     halved_lattice,
@@ -34,7 +33,7 @@ from sv_pgs.scale_mixture_ep import (
     noise_variance,
     prior_second_moment,
     quadrature_majorant_ratio,
-    roughness_penalty,
+    roughness_factor,
     scale_mixture_prior,
     site_targets,
     spacing_bound,
@@ -59,7 +58,7 @@ def _data(variant_count: int, seed: int):
     design = np.column_stack([(generator.random(variant_count) < 0.4).astype(np.float64), position, position**2, position**3])
     groups = (
         AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),
-        AnnotationGroup(columns=np.array([1, 2, 3]), penalty=_second_difference(3) + 1e-3 * np.eye(3)),
+        AnnotationGroup(columns=np.array([1, 2, 3]), penalty=_second_difference(3)),
     )
     precision = generator.uniform(50.0, 400.0, variant_count)
     effect = np.where(generator.random(variant_count) < 0.3, generator.normal(0.0, 0.25, variant_count), 0.0)
@@ -219,18 +218,18 @@ def test_component_derivatives_in_log_scale_match_finite_differences():
         np.testing.assert_allclose(third_cumulant, numerical_third, rtol=1e-3, atol=1e-4)
 
 
-def test_roughness_penalty_is_the_lattice_integral_of_the_squared_third_derivative():
+def test_roughness_factors_are_the_lattice_integrals_of_the_squared_derivatives():
     spacing = 0.05
     nodes = -2.0 + spacing * np.arange(101)
-    penalty = roughness_penalty(nodes.shape[0], spacing)
-    for quadratic in (np.ones_like(nodes), nodes, nodes**2):
-        np.testing.assert_allclose(penalty @ quadratic, 0.0, atol=1e-6)
-    # The third difference of t^3 is 6 h^3 exactly, so the sum is 36 h (K - 3).
-    np.testing.assert_allclose(nodes**3 @ penalty @ nodes**3, 36.0 * spacing * (nodes.shape[0] - 3), rtol=1e-6)
-    # The K - 3 third differences are midpoint cells centred on t_1.5 .. t_(K-2.5): together [t_1, t_(K-2)].
-    start, stop = nodes[1], nodes[-2]
-    exact = 0.5 * (stop - start) + 0.25 * (np.sin(2.0 * stop) - np.sin(2.0 * start))
-    np.testing.assert_allclose(np.sin(nodes) @ penalty @ np.sin(nodes), exact, rtol=2e-3)
+    slope, curvature = roughness_factor(nodes.shape[0], spacing, 1), roughness_factor(nodes.shape[0], spacing, 2)
+    # The K - order differences are midpoint cells: the first differences cover [t_0, t_(K-1)], the second [t_0.5, t_(K-1.5)].
+    np.testing.assert_allclose(slope @ np.ones_like(nodes), 0.0, atol=1e-12)
+    np.testing.assert_allclose(curvature @ nodes, 0.0, atol=1e-9)
+    np.testing.assert_allclose(np.sum(np.square(slope @ nodes)), nodes[-1] - nodes[0], rtol=1e-12)
+    np.testing.assert_allclose(np.sum(np.square(curvature @ nodes**2)), 4.0 * (nodes[-2] - nodes[1] + spacing), rtol=1e-9)
+    start, stop = nodes[0], nodes[-1]
+    exact_slope = 0.5 * (stop - start) + 0.25 * (np.sin(2.0 * stop) - np.sin(2.0 * start))
+    np.testing.assert_allclose(np.sum(np.square(slope @ np.sin(nodes))), exact_slope, rtol=2e-3)
 
 
 def test_halving_the_lattice_keeps_every_class_density():
@@ -265,14 +264,14 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
         np.testing.assert_allclose(density[class_position], pooled + basis @ coefficients[start : start + prior.pooled_size], atol=1e-12)
     theta = coefficients[prior.pooled_size * (prior.class_count + 1) :]
     np.testing.assert_allclose(log_scale(prior, coefficients), prior.log_variance_offset + prior.scale_design @ theta, atol=1e-12)
-    # The profiled null space is eta_bar's location and width: two directions, both inside eta_bar's coordinates.
-    assert prior.null_basis.shape[1] == 2
-    np.testing.assert_allclose(prior.null_basis[prior.pooled_size :], 0.0, atol=1e-10)
-    location, width = _range_functionals(prior.log_variance_grid, prior.kernel_floor, prior.kernel_top)
-    quadratic = basis @ prior.null_basis[: prior.pooled_size]
-    assert np.linalg.matrix_rank(np.vstack([location, width]) @ quadratic) == 2
+    # The first difference has no null space in sum-to-zero coordinates; only the smooth annotation's linear part is profiled.
+    assert prior.null_basis.shape[1] == 1
+    np.testing.assert_allclose(prior.null_basis[: prior.pooled_size * (prior.class_count + 1)], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
-    assert names == ["pooled roughness", "class 0 deviation roughness", "class 1 deviation roughness", "deviation location and width", "annotation group 0", "annotation group 1"]
+    assert names == [
+        "pooled slope", "pooled curvature", "class 0 deviation slope", "class 0 deviation curvature",
+        "class 1 deviation slope", "class 1 deviation curvature", "annotation group 0", "annotation group 1",
+    ]
 
 
 def test_curvature_trace_gradient_matches_finite_differences():
