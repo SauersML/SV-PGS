@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sv_pgs.gcsfuse_staging import is_gcsfuse_path
+from sv_pgs.path_policy import is_gcsfuse_path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass

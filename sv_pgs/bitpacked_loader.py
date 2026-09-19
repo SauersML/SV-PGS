@@ -27,9 +27,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from sv_pgs.gcsfuse_staging import is_gcsfuse_path
 from sv_pgs.dosage_store import _allocate_pinned, _release_pinned
-from sv_pgs.path_policy import assert_safe_for_purpose
+from sv_pgs.path_policy import assert_safe_for_purpose, is_gcsfuse_path
 from sv_pgs.plink import (
     _BYTE_DECODE_LUT_A1,
     _BYTE_DECODE_LUT_A2,

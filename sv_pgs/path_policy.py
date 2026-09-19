@@ -19,14 +19,14 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-from sv_pgs.gcsfuse_staging import is_gcsfuse_path
-
 __all__ = [
     "StorageClass",
     "classify_path",
     "assert_hot_local_path",
     "assert_safe_for_purpose",
     "is_local_hot",
+    "is_gcsfuse_path",
+    "gcsfuse_mounts",
 ]
 
 
@@ -52,6 +52,106 @@ def _resolve_safely(path: Path) -> Path:
         return path.resolve()
     except (OSError, RuntimeError):
         return path
+
+
+def _parse_proc_mounts() -> list[tuple[Path, str, str, str]]:
+    """Parse /proc/mounts. Returns list of (mount_point, source, fstype, options).
+
+    Returns an empty list on any failure or on non-Linux platforms.
+    """
+    if not _is_linux():
+        return []
+    try:
+        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as fh:
+            raw_lines = fh.readlines()
+    except OSError:
+        return []
+
+    parsed: list[tuple[Path, str, str, str]] = []
+    for line in raw_lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        source, mount_point, fstype, options = parts[0], parts[1], parts[2], parts[3]
+        try:
+            mount_point_decoded = (
+                mount_point.encode("utf-8").decode("unicode_escape")
+            )
+        except UnicodeDecodeError:
+            mount_point_decoded = mount_point
+        parsed.append((Path(mount_point_decoded), source, fstype, options))
+    return parsed
+
+
+@lru_cache(maxsize=1)
+def gcsfuse_mounts() -> list[Path]:
+    """Return all detected gcsfuse mount points.
+
+    Detection strategy:
+      * Parse ``/proc/mounts`` on Linux.
+      * A mount qualifies as gcsfuse when its fstype begins with ``fuse`` AND
+        either its source string contains ``gcsfuse`` OR its mount options
+        contain ``gcsfuse`` / ``fuse.gcsfuse`` / ``fsname=gcsfuse``.
+      * Returns an empty list on non-Linux platforms.
+
+    Cached for the lifetime of the process — gcsfuse mounts do not change
+    while a run is in progress.
+    """
+    if not _is_linux():
+        return []
+
+    mounts: list[Path] = []
+    for mount_point, source, fstype, options in _parse_proc_mounts():
+        if not fstype.startswith("fuse"):
+            continue
+        source_lc = source.lower()
+        options_lc = options.lower()
+        fstype_lc = fstype.lower()
+        is_gcsfuse = (
+            "gcsfuse" in source_lc
+            or "gcsfuse" in options_lc
+            or "fuse.gcsfuse" in options_lc
+            or "fsname=gcsfuse" in options_lc
+            or fstype_lc == "fuse.gcsfuse"
+        )
+        if is_gcsfuse:
+            mounts.append(mount_point)
+    return mounts
+
+
+@lru_cache(maxsize=1024)
+def _is_gcsfuse_path_cached(resolved_str: str) -> bool:
+    resolved = Path(resolved_str)
+    mounts = gcsfuse_mounts()
+    if mounts:
+        for mount in mounts:
+            try:
+                resolved.relative_to(mount)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    if not _is_linux():
+        return False
+    try:
+        os.statvfs(str(resolved))
+    except OSError:
+        return False
+    return False
+
+
+def is_gcsfuse_path(path: Path) -> bool:
+    """Return True if ``path`` lives on a gcsfuse-mounted filesystem.
+
+    The check resolves symlinks first (AoU's runner symlinks files INTO the
+    gcsfuse mount, so the link target is what matters). Result is cached
+    per resolved path string. Always returns False on non-Linux platforms.
+    """
+    if not _is_linux():
+        return False
+    resolved = _resolve_safely(Path(path))
+    return _is_gcsfuse_path_cached(str(resolved))
 
 
 @lru_cache(maxsize=1)

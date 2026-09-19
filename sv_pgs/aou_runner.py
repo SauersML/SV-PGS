@@ -22,9 +22,8 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_disease_sample_table,
     resolve_disease_definition,
 )
-from sv_pgs.gcsfuse_staging import is_gcsfuse_path
 from sv_pgs.aou_storage import stage_gcs_object, verify_local_cache
-from sv_pgs.path_policy import assert_hot_local_path, assert_safe_for_purpose
+from sv_pgs.path_policy import assert_hot_local_path, assert_safe_for_purpose, is_gcsfuse_path
 from sv_pgs.preflight import (
     assert_preflight_ok,
     check_aou_preflight,
