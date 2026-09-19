@@ -12,7 +12,7 @@ the call error rate for simple sites, and realized r2 of the observed value to t
 from __future__ import annotations
 
 import argparse
-import subprocess
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -43,6 +43,22 @@ def batch_block(truth: np.ndarray, rows: np.ndarray, first: int, last: int) -> n
         selected = (rows >= start) & (rows < start + STREAM_ROWS)
         block[selected] = chunk[rows[selected] - start]
     return block
+
+
+_BLOCK_INPUTS: dict = {}
+
+
+def _simulate_calls(block_start: int) -> tuple[int, np.ndarray, list[bytes]]:
+    """One block of records: read-model calls and their target VCF lines. Runs in a forked worker."""
+    truth_block, errors, sites, simple_rows, seed = (_BLOCK_INPUTS[key] for key in ("truth", "errors", "sites", "rows", "seed"))
+    stop = block_start + ROW_BLOCK
+    rng = np.random.default_rng([*seed, block_start])
+    pl = simulated_pl(truth_block[block_start:stop].astype(np.intp), errors[block_start:stop, None], rng)
+    called = np.argmin(pl, axis=-1).astype(np.uint8)
+    text = UNPHASED[called].reshape(called.shape[0], -1)
+    text[:, -1] = ord("\n")
+    lines = [sites[row].encode() + body.tobytes() for row, body in zip(simple_rows[block_start:stop], text)]
+    return block_start, called, lines
 
 
 def main() -> None:
@@ -92,22 +108,19 @@ def main() -> None:
             continue
         last = min(first + args.batch, size)
         names = [f"s{index}" for index in range(first, last)]
-        rng = np.random.default_rng([20260919, batch_index, int(args.chrom.lstrip("chr")), 5])
         calls = np.zeros((simple_rows.size, last - first), dtype=np.uint8)
         truth_block = batch_block(truth, simple_rows, first, last)
         target = work / f"target{batch_index}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "GT"))
-        errors = np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]])
-        for block_start in range(0, simple_rows.size, ROW_BLOCK):
-            stop = block_start + ROW_BLOCK
-            pl = simulated_pl(truth_block[block_start:stop].astype(np.intp), errors[block_start:stop, None], rng)
-            called = np.argmin(pl, axis=-1)
-            calls[block_start:stop] = called
-            text = UNPHASED[called].reshape(called.shape[0], -1)
-            text[:, -1] = ord("\n")
-            for row, body in zip(simple_rows[block_start:stop], text):
-                process.stdin.write(sites[row].encode() + body.tobytes())
+        _BLOCK_INPUTS.update(
+            truth=truth_block, errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]),
+            sites=sites, rows=simple_rows, seed=(20260919, batch_index, int(args.chrom.lstrip("chr")), 5),
+        )
+        with Pool(args.threads) as pool:
+            for block_start, called, lines in pool.imap(_simulate_calls, range(0, simple_rows.size, ROW_BLOCK)):
+                calls[block_start:block_start + called.shape[0]] = called
+                process.stdin.write(b"".join(lines))
         finish(sink, process, target)
         out_prefix = work / f"imputed{batch_index}"
         run(["java", f"-Xmx{args.memory_gb}g", "-jar", args.beagle, f"ref={reference}", f"gt={target}",

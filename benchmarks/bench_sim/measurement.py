@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+from multiprocessing import Pool
 from pathlib import Path
 
 import numpy as np
@@ -105,6 +106,21 @@ def pl_text(pl: np.ndarray) -> np.ndarray:
     return out
 
 
+_BLOCK_INPUTS: dict = {}
+
+
+def _simulate_pl_lines(block_start: int) -> bytes:
+    """One block of simple-site records: read-model PLs as target VCF lines. Runs in a forked worker."""
+    truth, errors, prefix, simple_rows, first, last, seed = (
+        _BLOCK_INPUTS[key] for key in ("truth", "errors", "prefix", "rows", "first", "last", "seed"))
+    rows = simple_rows[block_start:block_start + ROW_BLOCK]
+    rng = np.random.default_rng([*seed, block_start])
+    pl = simulated_pl(truth[rows, first:last].astype(np.intp), errors[block_start:block_start + ROW_BLOCK, None], rng)
+    text = pl_text(pl.reshape(-1, 3)).reshape(rows.size, -1)
+    text[:, -1] = ord("\n")
+    return b"".join(prefix[row] + b"PL\t" + body.tobytes() for row, body in zip(rows, text))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dir", required=True)
@@ -182,19 +198,16 @@ def main() -> None:
             continue
         last = min(first + args.batch, size)
         names = [f"s{index}" for index in range(first, last)]
-        rng = np.random.default_rng([20260919, batch_index, int(args.chrom.lstrip("chr"))])
         target = work / f"gl{batch_index}{suffix}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "PL"))
-        errors = np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]])
-        for block_start in range(0, simple_rows.size, ROW_BLOCK):
-            rows = simple_rows[block_start:block_start + ROW_BLOCK]
-            genotype = truth[rows, first:last].astype(np.intp)
-            pl = simulated_pl(genotype, errors[block_start:block_start + ROW_BLOCK, None], rng)
-            text = pl_text(pl.reshape(-1, 3)).reshape(rows.size, -1)
-            text[:, -1] = ord("\n")
-            for row, body in zip(rows, text):
-                process.stdin.write(prefix[row] + b"PL\t" + body.tobytes())
+        _BLOCK_INPUTS.update(
+            truth=truth, errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]), prefix=prefix,
+            rows=simple_rows, first=first, last=last, seed=(20260919, batch_index, int(args.chrom.lstrip("chr"))),
+        )
+        with Pool(args.threads) as pool:
+            for lines in pool.imap(_simulate_pl_lines, range(0, simple_rows.size, ROW_BLOCK)):
+                process.stdin.write(lines)
         finish(sink, process, target)
         outputs = []
         for index, (chunk, binary) in enumerate(zip(chunks, binaries)):
