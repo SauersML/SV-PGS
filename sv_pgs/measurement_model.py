@@ -459,6 +459,14 @@ def calibration_pairs(
     return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
 
 
+def fit_block_map(pairs: BlockPairs, scales: NDArray) -> LeakageMap:
+    """One block's leakage map, from its pairs with each column recalibrated by its record's scale."""
+    block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
+    dosage = np.asarray(pairs.dosage, dtype=np.float64)
+    means = dosage.mean(axis=0)
+    return fit_leakage_map(means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+
+
 @dataclass(frozen=True)
 class MeasurementModel:
     """What the fit uses for its columns, offsets and predictive variance, and what was and wasn't applied.
@@ -524,10 +532,7 @@ def fit_measurement_model(
         scales[calibrated] = recalibration_scales(moments, labels[calibrated], feature_rows)
         residual[calibrated] = residual_variances(moments, scales[calibrated])
         offsets[calibrated] = log_reliability_offsets(variance[calibrated], scales[calibrated], residual[calibrated])
-        for pairs in calibration.blocks:
-            block_scales = scales[np.asarray(pairs.block.records, dtype=np.int64)]
-            block_means = pairs.dosage.mean(axis=0)
-            maps.append(fit_leakage_map(block_means + block_scales * (pairs.dosage - block_means), pairs.truth, pairs.block.targets))
+        maps = [fit_block_map(pairs, scales) for pairs in calibration.blocks]
     ratios = np.array([leakage.ridge_ratio for leakage in maps])
     certificate: dict[str, object] = {
         "calibration_samples": 0 if calibration is None else len(calibration.sample_ids),

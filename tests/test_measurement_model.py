@@ -257,8 +257,8 @@ def test_records_without_pairs_fall_back_to_the_reported_reliability_and_are_cou
     _, genotype, dosage = _records(6, 2000, 0.7, rng)
     dosage[4:] = np.nan
     pairs = calibration_pairs(tuple(ResearchId(str(index)) for index in range(2000)), dosage, genotype)
-    variance = np.nanvar(dosage, axis=1)
-    variance[4:] = 0.3
+    variance = np.full(6, 0.3)
+    variance[:4] = dosage[:4].var(axis=1)
     with pytest.raises(ValueError, match="2 records"):
         fit_measurement_model(pairs, variance, np.zeros(6, dtype=int))
     reported = np.full(6, 0.8)
