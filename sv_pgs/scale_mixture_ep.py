@@ -1892,8 +1892,9 @@ class FixedPoint:
     posterior: GaussianPosterior
 
 
-FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence[FixedPoint]]
-"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call."""
+FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
+"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call; None for a model where
+none exists (EP reaches no proper cavities there)."""
 
 
 @dataclass(frozen=True)
@@ -2012,6 +2013,8 @@ def fit_hyperparameters(
     count = len(starts)
     hyperparameters = list(starts)
     points = list(fixed_points(hyperparameters))
+    if any(point is None for point in points):
+        raise FloatingPointError("a starting point has no certified EP fixed point")
     fits: list[OuterFit | None] = [None] * count
     pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float] | None] = [None] * count
     radii: list[float | None] = [None] * count
@@ -2047,16 +2050,23 @@ def fit_hyperparameters(
         trial_points = list(fixed_points(trials))
         for model, entry in enumerate(pending):
             if entry is None:
+                if trial_points[model] is None:
+                    raise FloatingPointError("a certified model lost its EP fixed point")
                 points[model] = trial_points[model]
                 continue
             newton, step, proposal, radius = entry
-            gradient = _penalized_gradient(
-                newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_points[model].cavity, working_bytes,
-            )
-            if newton.definite:
-                accepted = _metric_decrement(newton, gradient) < newton.decrement
+            trial_point = trial_points[model]
+            if trial_point is None:
+                # No EP fixed point at the trial: refused, like a trial the test rejects.
+                accepted = False
             else:
-                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+                gradient = _penalized_gradient(
+                    newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
+                )
+                if newton.definite:
+                    accepted = _metric_decrement(newton, gradient) < newton.decrement
+                else:
+                    accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
             length = float(np.linalg.norm(proposal))
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
