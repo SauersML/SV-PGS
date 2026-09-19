@@ -53,8 +53,7 @@ Untagged numbers are derivations, definitions or targets.
 - **d_j, the same design for every variant** (SNVs included, SPEC 8a5a936). Continuous entries are smooths with learned smoothness, never bins; discrete entries stay discrete.
   - variant type, length and repeat status (SPEC). Classes carry no length bins: DEL and DUP are one class each, and length enters only here, as a learned smooth of log length;
   - SV context:
-    - the K = 3 nearest SV loci, each with its distance and locus diversity H_locus = 1 − Σ f_a², plus class and length;
-    - H_locus-weighted SV density within ±50 kb;
+    - one learned distance kernel over every other SV allele of the chromosome, f_j = Σ_k H_k · w_c(log(1 + gap_jk)) per class, with w_c a smooth of learned smoothness (a cubic B-spline basis in log(1 + gap)) and a log-length term; nesting in an SV is its own per-class term. No window, K or frequency cutoff;
     - TR-locus membership and locus properties;
     - tagging strength to SV/TR columns (max and summed r²), and ρ²_j = R²(SV column ~ local SNVs);
   - external association z² per source, with an absent indicator and a per-source EB weight, symmetric between SNVs and SVs:

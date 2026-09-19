@@ -44,10 +44,11 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - the connected component of GIAB v3.6 "AllTandemRepeatsandHomopolymers_slop5" intervals that the record's trimmed core overlaps;
   - a record bridging intervals merges them;
   - homopolymers are included, and there is no padding.
-- **SV context:** the K = 3 nearest SV loci (bubble or TR locus) with nonzero in-sample dosage variance. There is no frequency cutoff.
-  - For each of them: distance, locus diversity H_locus = 1 − Σ f_a² from the store's own sums, class and length (via a pointer).
-  - Plus an H_locus-weighted SV density within ±50 kb.
-  - All values are continuous; the prior applies learned smooths.
+- **SV context** (`store_converter.sv_kernel_features`): the features of one learned distance kernel over every SV allele of the chromosome outside the record's own bubble. There is no window, no K and no frequency cutoff.
+  - Each allele weighs 2f(1 − f), its genotype-variance share; this equals H_locus = 1 − Σ f_a² for a biallelic locus.
+  - Nesting (the record's core inside the allele's) is its own feature per class: the sum of weights.
+  - Every other allele adds weight × B_m(log(1 + gap)) per class, with the gap in bases between the cores and B_m cubic B-splines uniform in log(1 + gap) over [0, log(1 + the chromosome's extent)], once plain and once times log length.
+  - The knot spacing starts at one per octave and is halved until the fit's evidence stops changing; the smoothness is learned, and the fit centres the raw sums (docs/design/math/scale_model.md).
 - **Per-half sums:** sum_code, sum_code2 and no_calls. They give AF, variance and rsq_ds.
 
 ## Loci `loci/chrK`

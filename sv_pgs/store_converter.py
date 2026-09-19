@@ -12,8 +12,9 @@ pieces; each is a pure function of sites-only inputs or of one record block:
   g, with the stratum's truth-calibrated kappa, so that Cov(G, D*) = Var(D*).
 - ``tr_loci`` (A4.6/A4.7): each record's tandem-repeat locus, the connected components of
   repeat intervals that records bridge.
-- ``sv_context`` (A4.12): every record's distance to the nearest common SV and the number
-  of distinct SV-bearing bubbles around it.
+- ``sv_kernel_features`` (A4.12): every record's SV context as sums over the SV alleles of its
+  chromosome, weighted by their diversity, through a cubic B-spline basis in log(1 + gap) (the
+  features of one learned distance kernel; docs/design/math/scale_model.md).
 - ``unbreakable_group_first``: the store's ``group_first``, merging bubbles, same-POS sets and
   TR loci into contiguous row spans a Stage 0 block may never cut.
 - ``decode_batch`` / ``decode_called_batch`` / ``no_call_fill`` / ``assemble_half``: one batch
@@ -58,9 +59,6 @@ IMPUTATION_ERROR_RATE = 1e-3
 # pop keeps at most this many of a bubble's paths per haplotype (max_alleles).
 MAXIMUM_KEPT_PATHS = 10
 NO_LOCUS = np.uint32(0xFFFFFFFF)
-NO_RECORD = np.uint32(0xFFFFFFFF)
-NO_DISTANCE = np.uint32(0xFFFFFFFF)
-SV_CONTEXT_WINDOW = 50_000
 _UINT8, _UINT16, _UINT32, _INT64, _FLOAT64, _BOOL = (
     np.dtype(kind).itemsize for kind in (np.uint8, np.uint16, np.uint32, np.int64, np.float64, np.bool_)
 )
@@ -277,109 +275,111 @@ def tr_loci(
 
 
 @dataclass(frozen=True, slots=True)
-class SvContext:
-    """Every record's SV context on one chromosome (A4.12)."""
+class SvKernelFeatures:
+    """Every record's SV context on one chromosome (A4.12): the features of one learned kernel.
 
-    nearest_common_sv_distance: NDArray
-    nearest_common_sv_record: NDArray
-    sv_bubbles_nearby: NDArray
+    The SV alleles counted for record r are those of other bubbles. An allele with frequency f
+    weighs its genotype-variance share 2 f (1 - f), the diversity H of a biallelic locus.
+
+    - ``overlap[r, c]`` sums the weights of class-c alleles whose core overlaps r's core. Being
+      nested in an SV is its own relation, not distance 0.
+    - ``distance[r, c, m, l]`` sums, over class-c alleles whose core does not overlap r's, the
+      weight times B_m(x) times (1, log length)[l], with x = log(1 + gap), gap the bases between
+      the two cores (0 when adjacent), and B_m the cubic B-splines uniform in x at ``spacing``
+      on [0, log(1 + the chromosome's extent)]. The sums are raw; the fit centres them.
+    """
+
+    overlap: F64Array
+    distance: F64Array
+    spacing: float
 
 
-def sv_context(
+# Bytes per (record, SV allele) pair of the arrays one step of ``sv_kernel_features`` holds:
+# the gap and its two candidates, the overlap and own-bubble masks and their combinations, the
+# pair indices, the scaled log gap, its interval and offset, one B-spline weight at a time,
+# and the flat accumulator indices and weights.
+KERNEL_STEP_BYTES_PER_PAIR = 3 * _INT64 + 6 * _BOOL + 2 * _INT64 + 3 * _FLOAT64 + _INT64 + 2 * _FLOAT64 + 2 * _INT64
+
+
+def _uniform_cubic_weights(offset: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+    """The four nonzero uniform cubic B-splines at offset t in [0, 1) of their knot interval."""
+    squared = offset * offset
+    cubed = squared * offset
+    return (
+        (1.0 - offset) ** 3 / 6.0,
+        (3.0 * cubed - 6.0 * squared + 4.0) / 6.0,
+        (-3.0 * cubed + 3.0 * squared + 3.0 * offset + 1.0) / 6.0,
+        cubed / 6.0,
+    )
+
+
+def sv_kernel_features(
     core_starts: NDArray,
     core_ends: NDArray,
-    is_sv: BoolArray,
-    is_common_sv: BoolArray,
     bubble_indices: NDArray,
-    window: int = SV_CONTEXT_WINDOW,
-) -> SvContext:
-    """Distance to the nearest common SV and distinct SV-bearing bubbles within ``window`` bp.
+    is_sv: BoolArray,
+    frequencies: NDArray,
+    sv_classes: NDArray,
+    sv_lengths: NDArray,
+    class_count: int,
+    spacing: float,
+    budget: ComputeBudget,
+) -> SvKernelFeatures:
+    """The SV kernel features of one chromosome's records, from their cores and SV alleles.
 
-    Distances are between core spans (0 when they overlap) and exclude the record itself;
-    ties go to the lower record index. The bubble count covers every bubble whose SV records'
-    cores (their hull; a bubble's records share one POS) overlap [start - window, end + window],
-    other than the record's own bubble, and counts bubbles rather than records so that how a
-    locus's alleles are split does not change it. Both are sorted-interval searches, with no
-    per-record loop.
+    ``frequencies``, ``sv_classes`` (0..class_count-1) and ``sv_lengths`` (bp, at least 1) are
+    read where ``is_sv``. ``spacing`` is the knot spacing in log(1 + gap); the fit sets it by
+    halving until its evidence stops changing (docs/design/math/scale_model.md). Pairs are
+    evaluated exactly, in steps whose working set fits ``budget``'s host memory.
     """
     starts = np.asarray(core_starts, dtype=np.int64)
     ends = np.asarray(core_ends, dtype=np.int64)
-    sv = np.asarray(is_sv, dtype=bool)
-    common = np.asarray(is_common_sv, dtype=bool)
     bubbles = np.asarray(bubble_indices, dtype=np.int64)
+    sv = np.asarray(is_sv, dtype=bool)
     record_count = starts.shape[0]
-    if not (ends.shape == sv.shape == common.shape == bubbles.shape == (record_count,)):
-        raise ValueError("sv_context needs one core span, SV flag, common flag and bubble per record.")
-    if np.any(common & ~sv):
-        raise ValueError("a common SV record must be an SV record.")
-
-    distance = np.full(record_count, NO_DISTANCE, dtype=np.uint32)
-    nearest = np.full(record_count, NO_RECORD, dtype=np.uint32)
-    common_records = np.flatnonzero(common)
-    if common_records.shape[0]:
-        order = common_records[np.lexsort((common_records, starts[common_records]))]
-        sorted_starts = starts[order]
-        sorted_ends = ends[order]
-        # Prefix maximum of ends in start order, and where it is attained (first occurrence).
-        running_end = np.maximum.accumulate(sorted_ends)
-        new_maximum = np.concatenate([[True], sorted_ends[1:] > running_end[:-1]])
-        attained = np.maximum.accumulate(np.where(new_maximum, np.arange(order.shape[0]), 0))
-        rank_of_common = np.full(record_count, -1, dtype=np.int64)
-        rank_of_common[order] = np.arange(order.shape[0])
-        # Left candidates: common SVs strictly before the record in start order.
-        insertion = np.searchsorted(sorted_starts, starts, side="left")
-        own_rank = rank_of_common
-        left_limit = np.where(own_rank >= 0, own_rank, insertion)
-        right_rank = np.where(own_rank >= 0, own_rank + 1, insertion)
-        big = np.iinfo(np.int64).max
-        left_distance = np.full(record_count, big, dtype=np.int64)
-        left_record = np.full(record_count, -1, dtype=np.int64)
-        has_left = left_limit > 0
-        left_position = attained[left_limit[has_left] - 1]
-        left_distance[has_left] = np.maximum(0, starts[has_left] - running_end[left_limit[has_left] - 1])
-        left_record[has_left] = order[left_position]
-        right_distance = np.full(record_count, big, dtype=np.int64)
-        right_record = np.full(record_count, -1, dtype=np.int64)
-        has_right = right_rank < order.shape[0]
-        right_position = right_rank[has_right]
-        right_distance[has_right] = np.maximum(0, sorted_starts[right_position] - ends[has_right])
-        right_record[has_right] = order[right_position]
-        take_left = (left_distance < right_distance) | (
-            (left_distance == right_distance) & (left_record >= 0) & ((right_record < 0) | (left_record < right_record))
-        )
-        best_distance = np.where(take_left, left_distance, right_distance)
-        best_record = np.where(take_left, left_record, right_record)
-        found = best_record >= 0
-        distance[found] = best_distance[found].astype(np.uint32)
-        nearest[found] = best_record[found].astype(np.uint32)
-
-    nearby = np.zeros(record_count, dtype=np.uint16)
-    sv_records = np.flatnonzero(sv)
-    if sv_records.shape[0]:
-        sv_bubbles = np.unique(bubbles[sv_records])
-        bubble_start = np.full(sv_bubbles.shape[0], np.iinfo(np.int64).max, dtype=np.int64)
-        bubble_end = np.full(sv_bubbles.shape[0], np.iinfo(np.int64).min, dtype=np.int64)
-        slot = np.searchsorted(sv_bubbles, bubbles[sv_records])
-        np.minimum.at(bubble_start, slot, starts[sv_records])
-        np.maximum.at(bubble_end, slot, ends[sv_records])
-        low = starts - window
-        high = ends + window
-        # #intervals overlapping [low, high) = total - #(end <= low) - #(start >= high).
-        overlapping = (
-            sv_bubbles.shape[0]
-            - np.searchsorted(np.sort(bubble_end), low, side="right")
-            - (sv_bubbles.shape[0] - np.searchsorted(np.sort(bubble_start), high, side="left"))
-        )
-        own_slot = np.searchsorted(sv_bubbles, bubbles)
-        own_is_sv_bubble = (own_slot < sv_bubbles.shape[0]) & (sv_bubbles[np.minimum(own_slot, sv_bubbles.shape[0] - 1)] == bubbles)
-        own_slot = np.minimum(own_slot, sv_bubbles.shape[0] - 1)
-        own_overlaps = own_is_sv_bubble & (bubble_end[own_slot] > low) & (bubble_start[own_slot] < high)
-        nearby = np.minimum(overlapping - own_overlaps.astype(np.int64), np.iinfo(np.uint16).max).astype(np.uint16)
-    return SvContext(
-        nearest_common_sv_distance=distance,
-        nearest_common_sv_record=nearest,
-        sv_bubbles_nearby=nearby,
-    )
+    if not (ends.shape == bubbles.shape == sv.shape == np.shape(frequencies) == np.shape(sv_classes) == np.shape(sv_lengths) == (record_count,)):
+        raise ValueError("sv_kernel_features needs one core span, bubble, SV flag, frequency, class and length per record.")
+    if not spacing > 0.0:
+        raise ValueError("the knot spacing must be positive.")
+    sv_rows = np.flatnonzero(sv)
+    sv_frequencies = np.asarray(frequencies, dtype=np.float64)[sv_rows]
+    sv_class = np.asarray(sv_classes, dtype=np.int64)[sv_rows]
+    sv_length = np.asarray(sv_lengths, dtype=np.float64)[sv_rows]
+    if np.any((sv_frequencies < 0.0) | (sv_frequencies > 1.0)) or np.any((sv_class < 0) | (sv_class >= class_count)) or np.any(sv_length < 1.0):
+        raise ValueError("SV alleles need frequencies in [0, 1], classes below class_count and lengths of at least 1 bp.")
+    extent = int(ends.max() - starts.min()) if record_count else 0
+    basis_count = int(np.floor(np.log1p(extent) / spacing)) + 4
+    overlap = np.zeros((record_count, class_count), dtype=np.float64)
+    distance = np.zeros((record_count, class_count, basis_count, 2), dtype=np.float64)
+    if sv_rows.size == 0 or record_count == 0:
+        return SvKernelFeatures(overlap=overlap, distance=distance, spacing=float(spacing))
+    weight = 2.0 * sv_frequencies * (1.0 - sv_frequencies)
+    log_length = np.log(sv_length)
+    sv_starts, sv_ends, sv_bubbles = starts[sv_rows], ends[sv_rows], bubbles[sv_rows]
+    bytes_per_record = KERNEL_STEP_BYTES_PER_PAIR * sv_rows.size + 2 * _FLOAT64 * class_count * basis_count
+    step = max(1, int(budget.host_bytes) // bytes_per_record)
+    for first in range(0, record_count, step):
+        last = min(record_count, first + step)
+        gap = np.maximum(np.maximum(sv_starts[None, :] - ends[first:last, None], starts[first:last, None] - sv_ends[None, :]), 0)
+        nested = (sv_starts[None, :] < ends[first:last, None]) & (starts[first:last, None] < sv_ends[None, :])
+        counted = bubbles[first:last, None] != sv_bubbles[None, :]
+        rows, alleles = np.nonzero(counted & nested)
+        overlap[first:last] = np.bincount(
+            rows * class_count + sv_class[alleles], weights=weight[alleles], minlength=(last - first) * class_count
+        ).reshape(last - first, class_count)
+        rows, alleles = np.nonzero(counted & ~nested)
+        scaled = np.log1p(gap[rows, alleles]) / spacing
+        interval = np.floor(scaled).astype(np.int64)
+        offset = scaled - interval
+        cell = (rows * class_count + sv_class[alleles]) * basis_count + interval
+        cells = (last - first) * class_count * basis_count
+        block = np.zeros((cells, 2), dtype=np.float64)
+        for shift, basis_weight in enumerate(_uniform_cubic_weights(offset)):
+            contribution = weight[alleles] * basis_weight
+            block[:, 0] += np.bincount(cell + shift, weights=contribution, minlength=cells)
+            block[:, 1] += np.bincount(cell + shift, weights=contribution * log_length[alleles], minlength=cells)
+        distance[first:last] = block.reshape(last - first, class_count, basis_count, 2)
+    return SvKernelFeatures(overlap=overlap, distance=distance, spacing=float(spacing))
 
 
 def unbreakable_group_first(*group_ids: NDArray) -> I64Array:
