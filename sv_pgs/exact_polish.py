@@ -723,9 +723,14 @@ class FullDataGaussian:
     def draws(self, *, site_precision: NDArray, draw_count: int, tolerance: float) -> NDArray:
         """Exact draws of q(beta) per model: (p, K, draw_count), by perturb-and-solve.
 
+        The perturbation sqrt(tau) e needs every site precision non-negative; with negative (unclipped EP) sites the
+        draw must condition on them exactly first, so they are refused here rather than drawn wrongly.
+
         Draws are solved _DRAW_BLOCK_COLUMNS per model at a time, which bounds the
         block-CG work per iteration.
         """
+        if np.any(np.asarray(site_precision) < 0.0):
+            raise ValueError("perturb-and-solve draws need non-negative site precisions; negative sites need the exact split")
         chunks = [
             self._draw_chunk(site_precision=site_precision, draw_count=min(_DRAW_BLOCK_COLUMNS, draw_count - first), tolerance=tolerance)
             for first in range(0, draw_count, _DRAW_BLOCK_COLUMNS)

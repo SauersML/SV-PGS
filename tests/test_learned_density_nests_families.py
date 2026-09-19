@@ -21,10 +21,14 @@ from sv_pgs.scale_mixture_ep import (
     derived_lattice,
     hyper_step,
     initial_hyperparameters,
+    normal_means_posterior,
     scale_mixture_prior,
 )
 
 _WORKING_BYTES = 1 << 24
+# The resolution production fits to (MODEL.md: K = 64 posterior draws, 1/(2K) nats), for the lattice (Stage 0) and
+# the empirical Bayes step alike. The allowances compared below are nats, far above it.
+_RESOLUTION = 1.0 / (2.0 * 64.0)
 _LOG_2PI = float(np.log(2.0 * np.pi))
 _VARIANTS = 2000
 _NOISE = 0.8 / 20_000
@@ -75,7 +79,7 @@ def _learned(estimate):
     precision = np.full(_VARIANTS, 1.0 / _NOISE)
     cavity = Cavity(precision=precision, shift=estimate / _NOISE)
     offset = np.zeros(_VARIANTS)
-    nodes, floor, top = derived_lattice(precision, cavity.shift, offset, 1e-3)
+    nodes, floor, top = derived_lattice(precision, cavity.shift, offset, _RESOLUTION)
     prior = scale_mixture_prior(
         class_index=np.zeros(_VARIANTS, dtype=np.int64),
         log_variance_offset=offset,
@@ -85,7 +89,7 @@ def _learned(estimate):
         floor=floor,
         top=top,
     )
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, _WORKING_BYTES, 1e-6)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _RESOLUTION)
     variances = np.where(nodes >= floor, np.exp(nodes), 0.0)
     return variances, class_log_density(prior, step.hyperparameters.coefficients)[0], nodes.shape[0]
 
@@ -177,11 +181,6 @@ def test_the_learned_density_is_within_its_akaike_allowance_of_every_nested_fit(
         assert learned >= score - allowance, f"{name}: learned {learned:.3f} vs {score:.3f}, allowance {allowance:.1f}"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=FloatingPointError,
-    reason="engine: hyper_step finds no certified maximum at the start weights on this TPB-truth normal-means problem",
-)
 def test_the_engine_certifies_a_start_on_a_tpb_truth():
     estimate, _replicate = _normal_means("tpb", seed=20260921)
     _learned(estimate)
