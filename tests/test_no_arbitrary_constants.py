@@ -204,7 +204,7 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('config.py', 'ModelConfig.local_scale_floor'): ('e2e', frozenset({1e-08}), "B7: the engine's EB replaces the fixed prior-scale clamps"),
     ('data.py', 'VariantRecord.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
     ('data.py', 'normalize_variant_record.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
-    ('dosage_store.py', 'DEFAULT_SHARD_ROWS'): ('deslop-store', frozenset({65536}), 'store layout sizes: justify by a measured I/O sweep (STORE.md) or derive from the read path'),
+    ('dosage_store.py', 'DEFAULT_SHARD_ROWS'): ('speed-io', frozenset({65536}), 'read time does not depend on it (codec.md §3); derive from file and descriptor count against parallel shard writers'),
     ('exact_polish.py', '_MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS'): ('deslop-fit', frozenset({400}), 'stop on the CG A-norm error estimate or the fp64 floor (math-epeb); the dimension bound is exact'),
     ('exact_polish.py', '_DIRECTION_DROP'): ('deslop-fit', frozenset({1e-20}), 'block-CG deflation at eps x block norm'),
     ('exact_polish.py', '_DRAW_BLOCK_COLUMNS'): ('deslop-fit', frozenset({64}), 'measure from the device budget'),

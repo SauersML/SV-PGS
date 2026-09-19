@@ -29,17 +29,17 @@ Take a tier that delivers B bytes/s of stored data to a host with C cores, feedi
 
 rowdict beats zstd once b_r/8B < 1/(C·D_z), that is once B > b_r·C·D_z/8, and it beats raw whenever the tier or PCIe is the bound.
 
-**Measured [semi-real].** The data are the first 65,536 chr22 records × 20,000 samples, on an A40 host with 8 task CPUs, from warm page cache, with one reader thread. Rates are decoded GB/s for requests of L = 4096 records (`benchmarks/store_codec.py`; JSON at `/scratch.global/sauer354/svpgs-team/codec/store_codec_v7.json`).
+**Measured [semi-real].** The data are the first 65,536 chr22 records × 20,000 samples, on an A40 host with 8 task CPUs, from warm page cache, with one reader thread. Rates are decoded GB/s for requests of L = 4096 records (`benchmarks/store_codec.py` at 7f34651; JSON at `/scratch.global/sauer354/svpgs-team/codec/store_codec_v7_final.json`).
 
 | array, R = 64 | stored bits/code | CPU read | to device, end to end | kernels alone |
 |---|---|---|---|---|
-| raw | 8 | 2.8 | 8.7 (preadv to pinned, then copy) | — |
-| zstd(3) | 0.361 | 2.24 | — (host decode, then a raw copy) | — |
-| rowdict | 0.499 | 0.51 (reference decoder) | **47.7** | 268 |
+| raw | 8 | 2.4 | 7.3 (preadv to pinned, then copy) | — |
+| zstd(3) | 0.361 | 2.03 | — (host decode, then a raw copy) | — |
+| rowdict | 0.499 | 0.52 (reference decoder) | **51.9** | 266 |
 
-On all of chr22's 590,623 records, rowdict takes 0.674 bits/code and zstd 0.458 [semi-real]. rowdict is about 1.4× zstd's bytes, but decoding is 21× faster per host thread, and it is 16× smaller than raw.
+On all of chr22's 590,623 records, rowdict takes 0.674 bits/code and zstd 0.458 [semi-real]. rowdict is about 1.4× zstd's bytes, but decoding is 26× faster per host thread, and it is 16× smaller than raw.
 
-**Break-even.** With b_r ≈ 0.5 and D_z ≈ 2.2 GB/s, B* ≈ 0.14·C GB/s, about 2.2 GB/s at C = 16.
+**Break-even.** With b_r ≈ 0.5 and D_z ≈ 2.0 GB/s, B* ≈ 0.13·C GB/s, about 2.0 GB/s at C = 16.
 
 **The rule:**
 - a tier slower than B* (the bucket, network storage) stays zstd;
@@ -67,26 +67,26 @@ T is convex in R. Setting dT/dR = τŝ − t_c(L − 1)/R² to 0 gives
 
 For every request length, the chosen R's excess over T(R*; L) is at most the table's worst regret.
 
-**Measured fit [semi-real].** The fit is the least-squares host share of `read_rows_to_device` over R ∈ {1, 4, …, 1024} × L ∈ {64, 512, 4096} (maximum relative residual 0.20):
+**Measured fit [semi-real].** The fit is the least-squares host share of `read_rows_to_device` over R ∈ {1, 4, …, 1024} × L ∈ {64, 512, 4096} (maximum relative residual 0.20; the task shared its node):
 - τ = 2.0·10⁻¹⁰ s/byte (about 5 GB/s of stored bytes per thread);
-- t_c = 1.16 µs per chunk;
-- t_r = 112 µs per request;
+- t_c = 1.18 µs per chunk;
+- t_r = 110 µs per request;
 - ŝ = 1,247 bytes at n = 20,000.
 
-So t_c/(τŝ) = 4.6, and R* = 17, 49 and 137 at L = 64, 512 and 4096.
+So t_c/(τŝ) = 4.7, and R* = 17, 49 and 139 at L = 64, 512 and 4096.
 
 **Choosing R.** The request length is not known when the store is written. Stage 0 tiles are at least 64 records (`plan_genotype_pass`), and Stage 2 spans whole LD blocks. So R is taken as the divisor of the shard rows that minimizes the worst regret max_L T(R; L)/T(R*; L) − 1 over L ≥ 64, including the L → ∞ limit t_c/(Rτŝ).
 
 | R | 1 | 4 | 16 | 32 | **64** | 128 | 256 | 1024 |
 |---|---|---|---|---|---|---|---|---|
-| worst regret, % | 460 | 115 | 29 | 14 | **7.2** | 18 | 41 | 181 |
+| worst regret, % | 474 | 119 | 30 | 15 | **7.4** | 18 | 41 | 182 |
 
-The sweep's own optimum agrees: R = 64 has the fastest host share at L = 64 and at L = 4096, and is within 5% of R = 256 at L = 512. zstd's own sweep is best or within 4% at R = 64 for every L.
+The sweep agrees. R = 64 has the fastest host share at L = 64 and is within 3% of the fastest at L = 512 and 4096. zstd is fastest at R = 64 for L = 64, and within 5% of its fastest for every L.
 
-**What this fixes.** It fixes `DEFAULT_INNER_CHUNK_ROWS = 64` for every chain as a derived value. It does not fix the shard rows: a reader pays a shard's fixed cost (open, index read, crc) once per process, so read time does not depend on the shard rows while the index stays negligible (16 B per 64 records). That constant stays pending with deslop-store.
+**What this fixes.** It fixes `DEFAULT_INNER_CHUNK_ROWS = 64` for every chain as a derived value. It does not fix the shard rows: a reader pays a shard's fixed cost (open, index read, crc) once per process, so read time does not depend on the shard rows while the index stays negligible (16 B per 64 records). That constant stays pending with speed-io. What it trades is the file and descriptor count against how many writers can build one array's shards in parallel.
 
 ## 4. Result
 - **Lossless:** exact round trips are tested at every depth 0..8, with n not a multiple of 4 or 8 and both sample widths. The GPU decode matches the CPU reference (`tests/test_rowdict_codec*.py`). Corruption fails the chunk crc32c or the size-table checks.
-- **The remaining gap:** the host share is about 73 GB/s decoded per process against 268 GB/s for the kernels. It does not scale with threads: the per-chunk crc32c and the numpy frame location hold the GIL (1 thread: 72.9 GB/s; 8 threads: 74.7 GB/s).
+- **The remaining gap:** the host share is about 67–75 GB/s decoded per process against 266 GB/s for the kernels. It does not scale with threads: the per-chunk crc32c and the numpy frame location hold the GIL (1 thread: 66.6 GB/s; 8 threads: 74.6 GB/s).
   - The next steps are a device crc32c and device-side frame location from the size tables. Either one leaves the host a single preadv per request.
 - **Wiring:** Stage 0/2 consumers still take host codes. `DosageStore.read_codes_to_device` is the entry point for a rowdict cache; moving `StoreBlockSource` onto it is the consumer-side change.
