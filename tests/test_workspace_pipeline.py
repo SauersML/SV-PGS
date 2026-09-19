@@ -228,14 +228,15 @@ def _write_inputs(root: Path) -> _Synthetic:
 
 
 def _omop_rows(persons: list[str]) -> tuple[list[dict], list[dict]]:
-    """Disease-query and measurement-query rows: every person has EHR, except that 5041 has one afib date
-    (neither case nor control, so no disease row) and 9001 has no genotypes; most have bilirubin occasions."""
+    """Disease-query and measurement-query rows: every person has EHR and 9001 has no genotypes. 5049 has one
+    afib date (neither case nor control, so no disease row) and, like every person numbered 1 mod 8, no
+    bilirubin occasion, so no table lists it."""
     rng = np.random.default_rng(3)
     disease, measurement = [], []
     for person in persons + ["9001"]:
         number = int(person)
         sex = FEMALE if number % 2 == 0 else MALE
-        occurrences = 1 if person == "5041" else (3 if number % 3 == 0 else 0)
+        occurrences = 1 if person == "5049" else (3 if number % 3 == 0 else 0)
         disease.append({
             "sample_id": person, "person_id": person, "phenotype_occurrence_count": occurrences,
             "first_condition_date": "2020-01-01" if occurrences else None, "observation_start_date": "2015-01-01",
@@ -320,29 +321,32 @@ class _Recorder:
         self.fit_calls: list[dict] = []
         self.failing_fit = failing_fit
 
-    def fit(self, **arguments) -> _Fitted:
-        """A stand-in with fit_model.fit's keywords: marginal effects of the standardized codes on the training rows."""
+    def fit(self, *, store, store_columns, covariates, covariate_names, covariate_columns, targets, training, model_names,
+            trait_types, research_ids, log_variance_offset, budget, work_dir, seed) -> _Fitted:
+        """A stand-in with fit_model.fit's keywords: each model's own covariates by least squares, then marginal
+        effects of the standardized codes on the training rows."""
         if self.failing_fit:
             raise RuntimeError("preempted")
-        self.fit_calls.append(arguments)
-        store, columns, covariates = arguments["store"], arguments["store_columns"], arguments["covariates"]
-        codes = store.read_codes(0, store.n_variants, np.asarray(columns)).astype(np.float64) - 127.0
+        self.fit_calls.append(dict(locals()))
+        assert log_variance_offset.shape == (store.n_variants,) and np.all(log_variance_offset <= 0.0) and work_dir.is_dir()
+        codes = store.read_codes(0, store.n_variants, np.asarray(store_columns)).astype(np.float64) - 127.0
         models = []
-        for model, trait_type in enumerate(arguments["trait_types"]):
-            rows = arguments["training"][:, model]
+        for model, trait_type in enumerate(trait_types):
+            rows, own = training[:, model], covariate_columns[model]
             signed = codes[:, rows]
             means, scales = signed.mean(axis=1), signed.std(axis=1)
             active = np.flatnonzero(scales > 0.0)
-            target = arguments["targets"][rows, model]
-            design = np.column_stack([np.ones(rows.sum()), covariates[rows]])
-            alpha = np.linalg.lstsq(design, target, rcond=None)[0]
+            target = targets[rows, model]
+            design = np.column_stack([np.ones(rows.sum()), covariates[rows][:, own]])
+            coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
             standardized = (signed[active] - means[active, None]) / scales[active, None]
-            effects = standardized @ (target - design @ alpha) / rows.sum() / len(active)
+            effects = standardized @ (target - design @ coefficients) / rows.sum() / len(active)
             draws = effects[:, None] + np.random.default_rng(model).normal(0.0, 1e-3, (len(active), 4))
-            if trait_type == TraitType.BINARY:
-                alpha = np.zeros_like(alpha)
+            alpha = np.zeros(1 + covariates.shape[1])
+            if trait_type != TraitType.BINARY:
+                alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0))
-        return _Fitted(tuple(arguments["model_names"]), tuple(arguments["covariate_names"]), tuple(models), np.ones(len(models)))
+        return _Fitted(tuple(model_names), tuple(covariate_names), tuple(models), np.ones(len(models)))
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -382,6 +386,7 @@ def _bindings(recorder: _Recorder, client: _FakeBigQuery) -> WorkspaceBindings:
         calibration_moments=_calibration_moments,
         calibration_pairs=lambda sample_ids, moments, blocks=(): SimpleNamespace(sample_ids=sample_ids, moments=moments, blocks=blocks),
         fit_measurement_model=_fit_measurement_model,
+        pooled_log_reliability=lambda log_reliability, group_counts: np.log(np.exp(log_reliability) @ group_counts / group_counts.sum()),
         fit=recorder.fit,
         save_model=_save_model,
         load_model=_load_model,
@@ -451,20 +456,43 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         np.testing.assert_array_equal(after.read_codes(0, after.n_variants), encode_dosage_milli(expected))
         assert after.manifest_attributes["recalibrated"] is True
 
-    # The fit saw every (trait, fold) training set, with no held-out row and no intercept column.
+    # The fit saw every (trait, fold) training set, with no held-out row, no intercept column, and each
+    # model's own trait's covariates only.
     (call,) = recorder.fit_calls
     cohort = np.load(run / "cohort" / "cohort.npz")
     design = json.loads((run / "cohort" / "cohort.json").read_text())
     assert design["model_names"] == ["atrial_fibrillation/fold0", "atrial_fibrillation/fold1", "total_bilirubin/fold0", "total_bilirubin/fold1"]
-    assert {"pipeline_half=B", "genotype_source=long_read", "PC3", "sex_at_birth_concept_id=45880669"} <= set(design["covariate_names"])
-    assert call["covariates"].shape[1] == len(call["covariate_names"]) == len(design["covariate_names"]) - 1
+    names = design["covariate_names"]
+    structure = {"intercept", "pipeline_half=B", "genotype_source=long_read", "PC1", "PC2", "PC3"}
+    own = {
+        "atrial_fibrillation": {
+            "atrial_fibrillation:age_at_observation_end", "atrial_fibrillation:age_at_observation_end_squared",
+            "atrial_fibrillation:age_at_observation_end_x_female", "atrial_fibrillation:log1p_pre_landmark_condition_dates",
+            "atrial_fibrillation:sex_at_birth_concept_id=45880669",
+        },
+        "total_bilirubin": {
+            "total_bilirubin:age_at_measurement", "total_bilirubin:age_at_measurement_squared",
+            "total_bilirubin:age_at_measurement_x_female", "total_bilirubin:sex_at_birth_concept_id=45880669",
+        },
+    }
+    assert set(names) == structure | own["atrial_fibrillation"] | own["total_bilirubin"]
+    assert summaries["cohort"]["covariates"] == {trait: [name for name in names if name in structure | columns] for trait, columns in own.items()}
+    assert call["covariates"].shape[1] == len(call["covariate_names"]) == len(names) - 1
+    for model, trait in enumerate(["atrial_fibrillation"] * 2 + ["total_bilirubin"] * 2):
+        assert {name for name, used in zip(names[1:], call["covariate_columns"][model]) if used} == (structure | own[trait]) - {"intercept"}
+    # A trait's own columns are 0 on the rows it does not observe.
+    bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
+    assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)
     fitted_rows = cohort["training"].any(axis=1)
     folds = cohort["folds"][fitted_rows]
     for model in range(4):
         assert not np.any(call["training"][:, model] & (folds == model % 2))
         assert np.all(np.isnan(call["targets"][~call["training"][:, model], model]))
-    assert "5041" not in cohort["research_ids"] and "7099" in cohort["research_ids"]
+    # 5049 is genotyped but in no table: a cohort row with no target and no fit row.
+    untabled = list(cohort["research_ids"]).index("5049")
+    assert np.all(np.isnan(cohort["targets"][untabled])) and not fitted_rows[untabled] and "7099" in cohort["research_ids"]
     assert len(call["research_ids"]) == len(call["store_columns"])
+    np.testing.assert_array_equal(call["log_variance_offset"], measurement["log_variance_offset"])
 
     # Scores: every observed target has its own fold's held-out prediction.
     held_out = np.load(run / "score" / "predictions.npz")["held_out"]

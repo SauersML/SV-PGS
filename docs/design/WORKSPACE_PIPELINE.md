@@ -37,10 +37,10 @@ These are formats; the paths come from a run config supplied inside the workspac
 |---|---|---|---|
 | samples | batch headers, crosswalk, ancestry, relatedness | typed half manifests, cohort rows (`resolve_cohort_rows`), ancestry groups, calibration pairs, trait-agnostic folds (`kinship_folds`, strata half × ancestry) | step |
 | phenotypes | the CDR | one sample table per disease and trait (`all_of_us`) | step |
-| cohort | samples, phenotypes | C, the target matrix, every (trait, fold) training and held-out mask | step |
+| cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |
 | store | samples, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes | each batch's decode; each chromosome |
-| measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the store rewritten with D* where pairs exist | step |
-| fit | cohort, final store | every (trait, fold) model in one `fit_model.fit` call, saved by `artifact.save_model` | step |
+| measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the fit's prior offset, pooled over the fit rows' ancestry groups (`pooled_log_reliability`); the store rewritten with D* where pairs exist | step |
+| fit | cohort, measurement, final store | every (trait, fold) model in one `fit_model.fit` call, each projecting out its own trait's columns (`covariate_columns`), saved by `artifact.save_model` | step |
 | score | fit, cohort | every model's predictions of the cohort from one store read (`artifact.predict`), and each person's own-fold held-out prediction | step |
 | report | score, cohort | held-out accuracy per trait by fold, ancestry and half; counts of 1 to 20 suppressed | step |
 | export | report | the approved report files in `<run>/export` | step |
@@ -72,9 +72,19 @@ The derivation starts from COMPUTE.md's floor at its design workload (n = 10⁵,
 
 ## Open items, stated in the step summaries
 
-1. **The shared C.** One C serves every trait, so that every trait shares Stage 0. Its person-level columns are the disease covariates: age at the end of observation, its square, its product with female sex, log(1 + pre-landmark condition dates), and sex at birth. Every disease table lists them identically for a person, and a person missing from every disease table is left out. A measurement trait's own mean-age terms (PHENOTYPES.md) are therefore not in C. That needs a lead ruling: a per-trait C would lose the shared Gram.
-2. **The disease target is `target` (0/1).** The liability target (MODEL.md §1) is pheno-disease's to wire.
-3. **The measurement model's reliability offsets and residual variances** are persisted, but `fit_model.fit` does not take them yet. No LD-block pairs are passed, so the A-map is not built.
+1. **The disease target is `target`.** pheno-disease's latent-onset model replaces the 0/1 rule path with a reliability-weighted target, and its tables will list every EHR participant.
+2. **The fit's prior offset is pooled** over the fit rows' ancestry groups, log Σ_g n_g r²_jg / n, until the fit takes one per group. The per-group residual variances are persisted but not yet used, and no LD-block pairs are passed, so the A-map is not built.
+3. **The fit needs `covariate_columns`** (fit-api), and the engine a per-model F on each model's own columns. A run whose `fit_model.fit` lacks any keyword in `FIT_KEYWORDS` is refused before its first step.
 4. **The store lacks** the SV-context features (STORE.md: the storage plan is not yet written by the converter), and `tr_motif_len` and `r2_locus` in the loci table. A non-SNV record whose core overlaps a GIAB repeat interval is `str_vntr_repeat`.
 5. **Batch `SECURED.ok` files are not read.** The lockstep gate checks every record of every batch.
-6. **A measurement trait's `target_reliability`** (each person's precision) is not passed to the fit.
+6. **Each person's `target_reliability`** (their precision) is not passed to the fit until it takes `target_weights`.
+
+## Covariates (lead ruling, 2026-09-19: each trait its own)
+
+No covariate matrix is shared across traits.
+- **Shared by every trait, over the cohort rows:** the intercept, the pipeline-half indicators, the genotype-source indicator and the genetic PCs. A long-read row takes the reference half (`cohort.pipeline_half_levels`), so the two indicator sets stay distinct.
+- **Each trait's own columns:** its table's metadata `covariate_columns`, named `<trait>:<column>`. For a disease those are age at the end of observation, its square, its product with female sex, log(1 + pre-landmark condition dates) and sex at birth. For a quantitative trait they are mean age at measurement, its square, its product with female sex and sex at birth. Sex at birth becomes indicators over the trait's own rows.
+- **Off the rows a trait observes,** its columns are 0. None of its models weights those rows, and none predicts them.
+- **The fit gets the union matrix and a per-model mask.** One call keeps one Stage 0 pass and cross-trait hyperparameter pooling: X'(I − H_t)X = X'X − X'C_t (C_t'C_t)^+ C_t'X needs only the union's cross-products.
+- **No rank is required.** A trait's rows can take a column's rank away (a sex-restricted disease), and each model projects onto its own columns' span (`dual_solve.covariate_whitener`).
+- Every genotyped cohort row stays a row. A person no table lists has no target and is scored but never fitted.

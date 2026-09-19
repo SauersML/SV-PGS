@@ -20,14 +20,17 @@ Steps:
    through the crosswalk, KING duplicates of a truth genome are dropped), and the trait-agnostic
    kinship folds over both halves, frozen before any phenotype exists (EVALUATION.md, "Folds").
 2. ``phenotypes``: each configured disease's and trait's sample table from the CDR (``all_of_us``).
-3. ``cohort``: the shared covariates C and one target column per trait over the cohort rows
-   (``cohort.build_cohort``), and every (trait, fold) training set.
+3. ``cohort``: over the cohort rows, the structure covariates every trait shares, each trait's own
+   covariates from its own table, one target column per trait (``cohort.build_cohort``), and every
+   (trait, fold) training set.
 4. ``store``: the dosage store from the popped batches (``store_converter``). Every batch is
    checked in lockstep against the strata sidecar, and the popped records against the sidecar's
    sites and ids md5. Each half's sample manifest is typed by its namespace.
 5. ``measurement``: the measurement model, fitted on the calibration pairs from the truth rows, or
-   its explicit no-truth form. Where it recalibrates, the store is rewritten with D*.
-6. ``fit``: every (trait, fold) model in one call, saved to disk.
+   its explicit no-truth form, and the fit's prior offset from it. Where it recalibrates, the store
+   is rewritten with D*.
+6. ``fit``: every (trait, fold) model in one call, each projecting out its own trait's covariates,
+   saved to disk.
 7. ``score``: every model's predictions for the whole cohort from one read of the store. Each
    person's held-out prediction is the one from their own fold's model.
 8. ``report``: held-out accuracy per trait, in cells by fold, ancestry and half, with any count
@@ -78,6 +81,7 @@ from sv_pgs.all_of_us import (
 from sv_pgs.cohort import (
     LONG_READ_SOURCE,
     AncestryPcs,
+    TraitTable,
     build_cohort,
     kinship_components,
     kinship_folds,
@@ -155,17 +159,26 @@ CONFIG_KEYS = (
 )
 STRATA_COLUMNS = ("idx", "pos", "id", "refalt_md5", "ref_len", "alt_len", "n_paths", "n_paths_total", "cx")
 """The strata sidecar v2 columns the store needs (the imputation's chrK.strata.tsv.gz, header after '#')."""
-PERSON_COVARIATES = (
-    "age_at_observation_end",
-    "age_at_observation_end_squared",
-    "age_at_observation_end_x_female",
-    "log1p_pre_landmark_condition_dates",
-)
-"""The numeric person-level columns of all_of_us.disease_covariate_columns: every one is a function of
-the person alone (the EHR-depth landmark is the first observation start plus a fixed span), so the
-disease tables agree on them and they can enter the one C every trait shares."""
 SEX_COLUMN = "sex_at_birth_concept_id"
+"""The categorical covariate the sample tables write one-hot, as ``sex_at_birth_concept_id_<concept>``."""
 UNRECORDED_SEX = "unrecorded"
+FIT_KEYWORDS = (
+    "store",
+    "store_columns",
+    "covariates",
+    "covariate_names",
+    "covariate_columns",
+    "targets",
+    "training",
+    "model_names",
+    "trait_types",
+    "research_ids",
+    "log_variance_offset",
+    "budget",
+    "work_dir",
+    "seed",
+)
+"""The keywords the fit step passes to fit_model.fit; a fit that lacks one is refused before any step runs."""
 _INT64_BYTES = np.dtype(np.int64).itemsize
 _FLOAT64_BYTES = np.dtype(np.float64).itemsize
 
@@ -302,6 +315,7 @@ class WorkspaceBindings:
     calibration_moments: Callable[..., Any]
     calibration_pairs: Callable[..., Any]
     fit_measurement_model: Callable[..., Any]
+    pooled_log_reliability: Callable[..., Any]
     fit: Callable[..., Any]
     save_model: Callable[..., None]
     load_model: Callable[..., Any]
@@ -312,17 +326,22 @@ def workspace_bindings() -> WorkspaceBindings:
     """The production entry points: the measurement model (``measurement_model``) and the fit, model files and
     prediction (``fit_model``, ``artifact``).
 
-    They are imported when the run starts, so a checkout without them fails before any step runs. BigQuery gets
-    None, from which all_of_us builds the workspace's own client (GOOGLE_PROJECT).
+    They are imported, and fit's keywords checked against FIT_KEYWORDS, when the run starts, so a checkout
+    without them fails before any step runs. BigQuery gets None, from which all_of_us builds the workspace's
+    own client (GOOGLE_PROJECT).
     """
     measurement_model = importlib.import_module("sv_pgs.measurement_model")
     fit_model = importlib.import_module("sv_pgs.fit_model")
     artifact = importlib.import_module("sv_pgs.artifact")
+    missing = [keyword for keyword in FIT_KEYWORDS if keyword not in inspect.signature(fit_model.fit).parameters]
+    if missing:
+        raise RuntimeError(f"fit_model.fit takes no {missing}; the pipeline needs every trait's own covariates and the offsets.")
     return WorkspaceBindings(
         bigquery_client=lambda: None,
         calibration_moments=measurement_model.calibration_moments,
         calibration_pairs=measurement_model.CalibrationPairs,
         fit_measurement_model=measurement_model.fit_measurement_model,
+        pooled_log_reliability=measurement_model.pooled_log_reliability,
         fit=fit_model.fit,
         save_model=artifact.save_model,
         load_model=artifact.load_model,
@@ -633,50 +652,43 @@ def _read_table(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle, delimiter="\t"))
 
 
-def person_covariates(tables: Sequence[Sequence[Mapping[str, str]]]) -> dict[str, tuple[tuple[float, ...], str]]:
-    """Each person's PERSON_COVARIATES values and sex-at-birth level, from the disease tables that list them.
+def trait_table(rows: Sequence[Mapping[str, str]], covariate_columns: Sequence[str]) -> TraitTable:
+    """A sample table's targets and its own covariates (its metadata's ``covariate_columns``), keyed by person_id.
 
-    Every table computes them from the person alone, so a person listed twice must agree; a
-    disagreement is an error. The sex level is the concept ID whose one-hot column is 1, or
-    UNRECORDED_SEX where none is.
+    Every covariate but sex at birth is numeric. Sex at birth is written one-hot; a person's level is
+    the concept ID whose column is 1, or UNRECORDED_SEX where none is.
     """
-    persons: dict[str, tuple[tuple[float, ...], str]] = {}
     prefix = SEX_COLUMN + "_"
-    for rows in tables:
-        for row in rows:
-            levels = [name[len(prefix):] for name, value in row.items() if name.startswith(prefix) and value == "1"]
-            if len(levels) > 1:
-                raise ValueError(f"person {row['person_id']} has two sex-at-birth levels.")
-            entry = (tuple(float(row[name]) for name in PERSON_COVARIATES), levels[0] if levels else UNRECORDED_SEX)
-            if persons.setdefault(row["person_id"], entry) != entry:
-                raise ValueError(f"person {row['person_id']} has different person-level covariates in two disease tables.")
-    return persons
+    numeric = [name for name in covariate_columns if name != SEX_COLUMN]
+    levels: dict[str, str] = {}
+    for row in rows:
+        ones = [name[len(prefix):] for name, value in row.items() if name.startswith(prefix) and value == "1"]
+        if len(ones) > 1:
+            raise ValueError(f"person {row['person_id']} has two sex-at-birth levels.")
+        levels[row["person_id"]] = ones[0] if ones else UNRECORDED_SEX
+    return TraitTable(
+        targets={row["person_id"]: float(row["target"]) for row in rows},
+        numeric={name: {row["person_id"]: float(row[name]) for row in rows} for name in numeric},
+        categorical={SEX_COLUMN: levels} if SEX_COLUMN in covariate_columns else {},
+    )
 
 
 def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
     config = run.config
-    if not config.diseases:
-        raise ValueError("the shared covariates come from the disease tables (PERSON_COVARIATES); configure a disease.")
-    rows = _read_table(run.output("samples") / "rows.tsv")
-    tables = {name: _read_table(run.output("phenotypes") / f"{name}.tsv") for name in (*config.diseases, *config.traits)}
-    covariates_of = person_covariates([tables[name] for name in config.diseases])
-    kept = [row for row in rows if row["research_id"] in covariates_of]
-    LOGGER.info(
-        "cohort: %s genotyped rows have no disease-table row, hence no person-level covariates, and are left out",
-        reportable_count(len(rows) - len(kept)),
-    )
-    research_ids = [ResearchId(row["research_id"]) for row in kept]
-    values = [covariates_of[row["research_id"]] for row in kept]
-    sources = [row["genotype_source"] for row in kept]
+    kept = _read_table(run.output("samples") / "rows.tsv")
     trait_names = (*config.diseases, *config.traits)
+    tables = {}
+    for name in trait_names:
+        metadata = json.loads((run.output("phenotypes") / f"{name}.tsv.metadata.json").read_text(encoding="utf-8"))
+        tables[name] = trait_table(_read_table(run.output("phenotypes") / f"{name}.tsv"), metadata["covariate_columns"])
+    research_ids = [ResearchId(row["research_id"]) for row in kept]
+    sources = [row["genotype_source"] for row in kept]
     cohort = build_cohort(
         research_ids,
-        person_covariates={name: [entry[0][index] for entry in values] for index, name in enumerate(PERSON_COVARIATES)},
-        categorical_covariates={SEX_COLUMN: [entry[1] for entry in values]},
         ancestry=AncestryPcs.read(config.ancestry),
         pipeline_half=pipeline_half_levels([row["half"] for row in kept], sources),
         genotype_source=sources,
-        trait_targets={name: {row["person_id"]: float(row["target"]) for row in tables[name]} for name in trait_names},
+        traits=tables,
     )
     folds = np.array([int(row["fold"]) for row in kept], dtype=np.int64)
     model_traits = np.repeat(np.arange(len(trait_names)), config.fold_count)
@@ -689,6 +701,7 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         research_ids=np.array([research_id.value for research_id in research_ids]),
         store_columns=np.array([int(row["store_column"]) for row in kept], dtype=np.int64),
         covariates=cohort.covariates,
+        covariate_columns=cohort.covariate_columns,
         targets=cohort.targets,
         folds=folds,
         training=training,
@@ -710,9 +723,11 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
     return {
         "rows": len(kept),
         "fit_rows": int(training.any(axis=1).sum()),
-        "covariates": list(cohort.covariate_names),
+        "covariates": {
+            trait: [name for name, used in zip(cohort.covariate_names, cohort.covariate_columns[index]) if used]
+            for index, trait in enumerate(trait_names)
+        },
         "models": int(model_traits.shape[0]),
-        "shared_covariates": "person-level disease covariates; a measurement trait's own age terms are not in the shared C",
     }
 
 
@@ -722,6 +737,7 @@ class _Cohort:
     store_columns: I64Array
     covariates: F64Array
     covariate_names: tuple[str, ...]
+    covariate_columns: BoolArray
     targets: F64Array
     folds: I64Array
     training: BoolArray
@@ -747,6 +763,7 @@ def _read_cohort(run: _Run) -> _Cohort:
         store_columns=arrays["store_columns"],
         covariates=arrays["covariates"],
         covariate_names=tuple(record["covariate_names"]),
+        covariate_columns=arrays["covariate_columns"],
         targets=arrays["targets"],
         folds=arrays["folds"],
         training=arrays["training"],
@@ -1395,12 +1412,16 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         results.append(result)
         certificates[label] = {"pairs_supplied": len(members), **dict(result.certificate)}
     scales = np.column_stack([np.asarray(result.scales, dtype=np.float64) for result in results])
+    log_reliability = np.column_stack([np.asarray(result.log_reliability, dtype=np.float64) for result in results])
     np.savez(
         directory / "measurement.npz",
         groups=np.array(samples.legend),
+        fit_row_counts=counts,
         scales=scales,
         residual_variance=np.column_stack([np.asarray(result.residual_variance, dtype=np.float64) for result in results]),
-        log_reliability=np.column_stack([np.asarray(result.log_reliability, dtype=np.float64) for result in results]),
+        log_reliability=log_reliability,
+        # The fit's prior offset until it takes one per ancestry group: pooled over the fit rows' groups.
+        log_variance_offset=np.asarray(run.bindings.pooled_log_reliability(log_reliability, counts), dtype=np.float64),
     )
     _write_json(directory / "certificate.json", certificates)
     if calibrated:
@@ -1428,21 +1449,28 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     targets = np.where(cohort.training, cohort.targets[:, cohort.model_traits], np.nan)[rows]
     work = directory / "work"
     work.mkdir(exist_ok=True)
+    offset = np.load(run.output("measurement") / "measurement.npz")["log_variance_offset"]
     with DosageStore.open(_final_store(run)) as store:
-        fitted = run.bindings.fit(
-            store=store,
-            store_columns=cohort.store_columns[rows],
-            covariates=cohort.covariates[rows][:, 1:],
-            covariate_names=cohort.covariate_names[1:],
-            targets=targets,
-            training=cohort.training[rows],
-            model_names=cohort.model_names,
-            trait_types=tuple(cohort.trait_types[trait] for trait in cohort.model_traits.tolist()),
-            research_ids=tuple(research_id for research_id, fitted_row in zip(cohort.research_ids, rows) if fitted_row),
-            budget=run.budget,
-            work_dir=work,
-            seed=run.config.seed,
-        )
+        arguments = {
+            "store": store,
+            "store_columns": cohort.store_columns[rows],
+            "covariates": cohort.covariates[rows][:, 1:],
+            "covariate_names": cohort.covariate_names[1:],
+            # Each model projects out its own trait's columns and the structure columns, never another trait's.
+            "covariate_columns": cohort.covariate_columns[cohort.model_traits][:, 1:],
+            "targets": targets,
+            "training": cohort.training[rows],
+            "model_names": cohort.model_names,
+            "trait_types": tuple(cohort.trait_types[trait] for trait in cohort.model_traits.tolist()),
+            "research_ids": tuple(research_id for research_id, fitted_row in zip(cohort.research_ids, rows) if fitted_row),
+            "log_variance_offset": offset,
+            "budget": run.budget,
+            "work_dir": work,
+            "seed": run.config.seed,
+        }
+        if tuple(arguments) != FIT_KEYWORDS:
+            raise AssertionError("the fit step's keywords drifted from FIT_KEYWORDS, which the run checks at its start.")
+        fitted = run.bindings.fit(**arguments)
     if tuple(fitted.model_names) != cohort.model_names:
         raise ValueError("the fit returned other models than the cohort's (trait, fold) training sets.")
     run.bindings.save_model(directory / "model", fitted)
@@ -1450,7 +1478,10 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     return {
         "models": list(fitted.model_names),
         "refusals": [str(refusal) for refusal in getattr(fitted, "refusals", ())],
-        "measurement_terms": "not passed: the fit takes no reliability offsets or residual variances yet",
+        "measurement_terms": (
+            "log_variance_offset: the measurement model's reliability pooled over the fit rows' ancestry groups; "
+            "residual variances and each person's target_reliability are recorded, not yet fit inputs"
+        ),
     }
 
 
@@ -1544,7 +1575,7 @@ def _export_step(run: _Run, directory: Path) -> dict[str, Any]:
 _STEPS = (
     _Step("samples", (), _samples_inputs, (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs), _samples_step),
     _Step("phenotypes", (), _phenotype_inputs, (all_of_us, _phenotypes_step), _phenotypes_step),
-    _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, person_covariates), _cohort_step),
+    _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, trait_table), _cohort_step),
     _Step(
         "store",
         ("samples",),

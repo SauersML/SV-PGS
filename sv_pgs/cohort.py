@@ -1,11 +1,11 @@
-"""The cohort every fit shares: covariates, multi-trait targets and kinship-grouped folds.
+"""The cohort every fit shares: genotype rows, kinship-grouped folds, and each trait's own design.
 
-All traits and arms share one covariate matrix C (intercept, person-level covariates,
-indicators, genetic PCs, the pipeline-half and cohort indicators) so they share one
-genotype pass. Targets are one column per trait, NaN where a participant has no value
-for that trait. Folds are assigned once, before any phenotype is built: relatives stay
-inside one fold, and every stratum (pipeline half x ancestry) is spread evenly over the
-folds (docs/design/EVALUATION.md, "Folds").
+Every trait sees the same genotype rows and the same structure covariates (intercept, genetic
+PCs, the pipeline-half and cohort indicators). Its other covariates are its own, from its own
+sample table (lead ruling, 2026-09-19: no covariate matrix is shared across traits). Targets are
+one column per trait, NaN where a participant has no value for that trait. Folds are assigned
+once, before any phenotype is built: relatives stay inside one fold, and every stratum (pipeline
+half x ancestry) is spread evenly over the folds (docs/design/EVALUATION.md, "Folds").
 """
 
 from __future__ import annotations
@@ -308,12 +308,32 @@ def kinship_folds(components: I64Array, strata: Sequence[str], fold_count: int, 
 
 
 @dataclass(frozen=True, slots=True)
+class TraitTable:
+    """One trait's sample table, keyed by research ID: its targets and its own covariates.
+
+    ``numeric`` maps each covariate to a value per person with a target; ``categorical`` maps each
+    categorical covariate to a level per person with a target.
+    """
+
+    targets: Mapping[str, float]
+    numeric: Mapping[str, Mapping[str, float]]
+    categorical: Mapping[str, Mapping[str, str]]
+
+
+@dataclass(frozen=True, slots=True)
 class Cohort:
-    """The shared design: C with its column names, and one target column per trait."""
+    """Every trait's design over one set of genotype rows.
+
+    ``covariates`` holds the structure columns every trait shares (intercept, pipeline-half and
+    genotype-source indicators, PCs), then each trait's own columns, named ``<trait>:<column>``.
+    ``covariate_columns[t]`` marks trait t's columns: the structure columns and its own. A trait's
+    own columns are 0 off the rows it observes, which none of its models weights or predicts.
+    """
 
     research_ids: tuple[ResearchId, ...]
     covariate_names: tuple[str, ...]
     covariates: F64Array
+    covariate_columns: BoolArray
     trait_names: tuple[str, ...]
     targets: F64Array
 
@@ -325,19 +345,19 @@ class Cohort:
 
 def build_cohort(
     research_ids: Sequence[ResearchId],
-    person_covariates: Mapping[str, Sequence[float]],
-    categorical_covariates: Mapping[str, Sequence[str]],
     ancestry: AncestryPcs,
     pipeline_half: Sequence[str],
     genotype_source: Sequence[str],
-    trait_targets: Mapping[str, Mapping[str, float]],
+    traits: Mapping[str, TraitTable],
 ) -> Cohort:
-    """Assemble C and the target matrix for ``research_ids``.
+    """Assemble every trait's covariates and the target matrix for ``research_ids``.
 
-    ``person_covariates`` are trait-agnostic numeric columns (one value per sample);
-    ``categorical_covariates``, ``pipeline_half`` (the imputation half, from pipeline_half_levels) and
-    ``genotype_source`` (imputed or long-read-called rows) become indicators. Each
-    trait's targets are keyed by research ID. C must have full column rank.
+    ``pipeline_half`` (the imputation half, from pipeline_half_levels) and ``genotype_source``
+    (imputed or long-read-called rows) become indicators over the cohort. Each trait's own
+    covariates come from its own table (lead ruling: no covariate matrix is shared across traits):
+    numeric columns as they are, categorical ones as indicators over the rows the trait observes.
+    No rank is required: a trait's rows can take a column's rank away (a sex-restricted disease),
+    and each model projects onto its own columns' span (dual_solve.covariate_whitener).
     """
     research_id_values = _research_id_values(research_ids)
     sample_count = len(research_ids)
@@ -345,16 +365,7 @@ def build_cohort(
         raise ValueError("research_ids repeats a participant; resolve the two halves with resolve_cohort_rows first.")
     names = ["intercept"]
     columns = [np.ones((sample_count, 1))]
-    for name, values in person_covariates.items():
-        column = np.asarray(values, dtype=np.float64).reshape(sample_count, 1)
-        if not np.all(np.isfinite(column)):
-            raise ValueError(f"covariate {name!r} has missing values.")
-        names.append(name)
-        columns.append(column)
-    indicator_sources = dict(categorical_covariates)
-    indicator_sources["pipeline_half"] = pipeline_half
-    indicator_sources["genotype_source"] = genotype_source
-    for name, levels in indicator_sources.items():
+    for name, levels in (("pipeline_half", pipeline_half), ("genotype_source", genotype_source)):
         if len(levels) != sample_count:
             raise ValueError(f"{name!r} needs one level per sample.")
         kept, values = indicator_columns(levels)
@@ -363,22 +374,41 @@ def build_cohort(
     components = ancestry.for_samples(research_ids)
     names.extend(f"PC{index + 1}" for index in range(components.shape[1]))
     columns.append(components)
-    covariates = np.concatenate(columns, axis=1)
-    if np.linalg.matrix_rank(covariates) < covariates.shape[1]:
-        raise ValueError("the covariate matrix is rank-deficient; remove the collinear covariate.")
-    targets = np.full((sample_count, len(trait_targets)), np.nan)
-    for trait_index, (trait, values_by_id) in enumerate(trait_targets.items()):
-        if not all(np.isfinite(value) for value in values_by_id.values()):
+    structure_count = len(names)
+    owners = [-1] * structure_count
+    row_of = {research_id: row for row, research_id in enumerate(research_id_values)}
+    targets = np.full((sample_count, len(traits)), np.nan)
+    for trait_index, (trait, table) in enumerate(traits.items()):
+        if not all(np.isfinite(value) for value in table.targets.values()):
             raise ValueError(f"trait {trait!r} has a non-finite target; leave a missing participant out instead.")
-        for row, research_id in enumerate(research_id_values):
-            if research_id in values_by_id:
-                targets[row, trait_index] = values_by_id[research_id]
-        if not np.any(np.isfinite(targets[:, trait_index])):
+        rows = np.array(sorted(row_of[person] for person in table.targets if person in row_of), dtype=np.int64)
+        if rows.size == 0:
             raise ValueError(f"trait {trait!r} has no target for any cohort sample; key its targets by research ID.")
+        people = [research_id_values[row] for row in rows]
+        targets[rows, trait_index] = [table.targets[person] for person in people]
+        for name, values_by_id in table.numeric.items():
+            values = np.array([values_by_id.get(person, np.nan) for person in people], dtype=np.float64)
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"covariate {trait}:{name} has missing values for participants with a target.")
+            column = np.zeros((sample_count, 1))
+            column[rows, 0] = values
+            names.append(f"{trait}:{name}")
+            columns.append(column)
+        for name, levels_by_id in table.categorical.items():
+            if not all(person in levels_by_id for person in people):
+                raise ValueError(f"covariate {trait}:{name} has no level for a participant with a target.")
+            kept, values = indicator_columns([levels_by_id[person] for person in people])
+            block = np.zeros((sample_count, len(kept)))
+            block[rows] = values
+            names.extend(f"{trait}:{name}={level}" for level in kept)
+            columns.append(block)
+        owners.extend([trait_index] * (len(names) - len(owners)))
+    owner = np.array(owners, dtype=np.int64)
     return Cohort(
         research_ids=tuple(research_ids),
         covariate_names=tuple(names),
-        covariates=covariates,
-        trait_names=tuple(trait_targets),
+        covariates=np.concatenate(columns, axis=1),
+        covariate_columns=(owner[None, :] < 0) | (owner[None, :] == np.arange(len(traits))[:, None]),
+        trait_names=tuple(traits),
         targets=targets,
     )
