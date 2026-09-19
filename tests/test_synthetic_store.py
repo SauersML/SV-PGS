@@ -133,7 +133,8 @@ def test_err_imp_floor_and_pop_normalization_set_the_background_code(tmp_path: P
     # The floor is the background mode where informed non-carriers are the majority of samples.
     mostly_informed = np.concatenate([noise["A"].uninformed for noise in plan.noise]) < 0.2
     rare = (frequency >= 0.005) & (frequency < 0.03) & mostly_informed
-    single = (kinds == RECORD_SINGLE) & rare & snv
+    # Read evidence sits at single-path SNVs and non-TR INDELs, so the no-evidence floor is checked on the other classes.
+    single = (kinds == RECORD_SINGLE) & rare
     assert np.all(mode[single & ~has_pl] == 2)
     assert np.all(mode[single & has_pl] == 0)
     assert np.any(single & has_pl) and np.any(single & ~has_pl)
