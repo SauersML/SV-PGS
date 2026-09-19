@@ -22,9 +22,9 @@ on the penalized log-likelihood (strictly concave, so Newton converges).
 Solve. Conjugate gradients is preconditioned by the block-Jacobi inverse M^-1:
 each LD block's restricted precision X_b' P_W X_b + diag(tau_b), at the model's
 exact curvature or at its mean curvature on the mask (one Gram per mask serves
-every model on it). Every model, probe and draw is a column of the same reads,
-and every model's columns (its mean step and probes, or its draws) share one
-block-Krylov space, so the probes' directions also serve the mean. One read
+every model on it). Every model and draw is a column of the same reads, and
+every model's columns (its mean step, or its draws) share one block-Krylov
+space. One read
 serves one block-CG iteration: with X P known, a read forms
 A P = X' P_W (X P) + diag(tau) P and M^-1 A P block by block and accumulates
 X M^-1 A P, so the next block's image follows by linearity. The
@@ -32,20 +32,15 @@ iteration's first read also factors the blocks, evaluates the start residuals
 and starts CG, so an iteration costs 1 + (CG iterations) reads. The answer
 depends only on the exact operator; the blocks set the rate.
 
-Variances. diag(A^-1) is estimated by the control-variate Hutchinson identity
-
-    diag(A^-1) = diag(B) + E_z[z * (A^-1 z - B z)],  z Rademacher,
-
-with B the block-Jacobi inverse, and projected onto its exact bounds
-1 / A_jj <= (A^-1)_jj <= 1 / tau_j (A >= diag(tau), and Cauchy-Schwarz). The
-probe systems A x = z are extra columns of the same reads, warm-started across
-iterations. With one block and the exact curvature the correction vanishes and
-the variances are exact.
+Variances. The EP sites take the diagonal of the block-Jacobi inverse, exact
+within each LD block at the state the blocks were last factored, and held
+fixed between refactors (the decoupled scheme). Stochastic diagonal estimates
+never enter the sites: parallel EP diverges on them. The exact draws below
+measure how far the block diagonal is from diag(A^-1).
 
 Certificate. The first read of every iteration evaluates, at the state the
-iteration starts from, the exact gradient g, the covariate gradient and the
-residual z - A x of every probe system, and diag(A) for the variance bounds.
-The iteration then solves the corrections from zero.
+iteration starts from, the exact gradient g and the covariate gradient. The
+iteration then solves the correction from zero.
 
 Draws. beta + A^-1 (X' s + sqrt(tau) e) with s = W^1/2 e_n minus its weighted
 projection onto the covariates, e and e_n standard normal, is an exact draw of
@@ -190,25 +185,11 @@ class StartCertificate:
 
     ``gradient_relative_norm`` is ||g|| / (||X' u~|| + ||tau beta - nu||), u~ the
     projected log-likelihood score; ``covariate_gradient_relative_norm`` is
-    ||C' u|| / ||C'|u| ||; ``probe_residual`` is the largest ||z - A x|| / ||z||.
+    ||C' u|| / ||C'|u| ||.
     """
 
     gradient_relative_norm: NDArray
     covariate_gradient_relative_norm: NDArray
-    probe_residual: NDArray
-
-
-@dataclass(frozen=True)
-class MarginalVariances:
-    """diag(A^-1) per model, its Hutchinson standard error and the share clamped to its bounds.
-
-    ``relative_standard_error`` is the standard error of sum_j Sigma_jj tau_j
-    relative to its value.
-    """
-
-    variance: NDArray
-    relative_standard_error: NDArray
-    clamped_fraction: NDArray
 
 
 class _Device:
@@ -225,7 +206,7 @@ class _SampleSystem:
     """Targets, masks, covariates and curvature of every model; the weighted covariate projection.
 
     Columns of sample-side arrays are models; ``column_models`` maps the columns
-    of a right-hand side (means, probes, draws) to their model.
+    of a right-hand side (means or draws) to their model.
     """
 
     def __init__(self, *, device: _Device, models: Sequence[GaussianModel], covariates: NDArray, sample_masks: NDArray) -> None:
@@ -451,7 +432,7 @@ def _block_conjugate_gradient(
 ) -> tuple[NDArray, Any, NDArray, int]:
     """Solve A x = r0 from x = 0 by block CG per model, one read per iteration.
 
-    Every model's columns (its mean step, probes or draws) share one Krylov
+    Every model's columns (its mean step or its draws) share one Krylov
     space: each iteration's direction block is an orthonormal basis of the
     model's preconditioned residuals plus the conjugated previous block. The
     read forms A P = X' P_W (X P) + diag(tau) P, M^-1 A P and X M^-1 A P, so
@@ -537,12 +518,12 @@ def _block_conjugate_gradient(
 
 
 class FullDataGaussian:
-    """The mean, probes and draws of q(beta) for every model, updated one Newton step at a time.
+    """The mean, block variances and draws of q(beta) for every model, updated one Newton step at a time.
 
     ``iterate`` takes the sites (tau, nu) and noise variances of this iteration.
     Its first read certifies the state it starts from (exact gradient,
-    covariate gradient, probe residuals), refactors the blocks when asked and
-    starts CG; the Newton step and the probe corrections then take one read per
+    covariate gradient), refactors the blocks when asked and starts CG; the
+    Newton step then takes one read per
     CG iteration.
     """
 
@@ -554,7 +535,6 @@ class FullDataGaussian:
         covariates: NDArray,
         sample_masks: NDArray,
         initial_mean: NDArray,
-        probe_count: int,
         seed: int,
     ) -> None:
         self.device = _Device(source.array_module)
@@ -566,20 +546,12 @@ class FullDataGaussian:
         if initial_mean.shape != (self.variant_count, model_count):
             raise ValueError("initial_mean must be (variants, models).")
         self.model_count = model_count
-        self.probe_count = int(probe_count)
         self.generator = np.random.default_rng(seed)
         self.mean = np.asarray(initial_mean, dtype=np.float64).copy()
-        self.probes = self.generator.choice(np.array([-1.0, 1.0]), size=(self.variant_count, self.probe_count))
-        self.probe_models = np.repeat(np.arange(model_count), self.probe_count)
-        self.probe_solution = np.zeros((self.variant_count, model_count * self.probe_count))
-        self.probe_image = array_module.zeros((source.sample_count, model_count * self.probe_count), dtype=array_module.float64)
         self.alpha = array_module.zeros((self.system.covariate_count, model_count), dtype=array_module.float64)
         self.genetic_image = self.reads.sweep(None, lambda _block, variants, _tile, _products: array_module.asarray(self.mean[variants]), model_count)
         self.preconditioner: _BlockJacobi | None = None
         self.noise_variance = np.ones(model_count)
-        # diag(X' P_W X), and W, at the curvature the probes were last solved for.
-        self.data_diagonal = np.zeros((self.variant_count, model_count))
-        self.probe_curvature = np.zeros((source.sample_count, model_count))
         # CG iterations (one read each) of the last iterate.
         self.conjugate_gradient_iterations = 0
         self._fit_covariates()
@@ -616,7 +588,7 @@ class FullDataGaussian:
         refactor: bool,
         exact_curvature: NDArray,
     ) -> StartCertificate:
-        """One certifying read at the start state, then one Newton step and the probe corrections.
+        """One certifying read at the start state, then one Newton step.
 
         ``refactor`` rebuilds the block-Jacobi inverse at this state within the
         first read, with the exact curvature for the models in ``exact_curvature``.
@@ -627,7 +599,7 @@ class FullDataGaussian:
         model_count = self.model_count
         self.noise_variance = np.asarray(noise_variance, dtype=np.float64).copy()
         mean_models = np.arange(model_count)
-        columns = np.concatenate([mean_models, self.probe_models])
+        columns = mean_models
         curvature = system.curvature(self.linear_predictor, self.noise_variance)
         inverses = system.covariate_inverses(curvature)
         refactor = refactor or self.preconditioner is None
@@ -643,13 +615,8 @@ class FullDataGaussian:
         weighted_covariates = array_module.concatenate(
             [curvature[:, model_index : model_index + 1] * system.covariates for model_index in range(model_count)], axis=1
         )
-        left = array_module.concatenate(
-            [projected_score, system.project(inverses, curvature, self.probe_image, self.probe_models), weighted_covariates],
-            axis=1,
-        )
-        probe_column_count = model_count * self.probe_count
-        host_inverses = device.to_host(inverses)
-        residual = np.empty((self.variant_count, model_count + probe_column_count))
+        left = array_module.concatenate([projected_score, weighted_covariates], axis=1)
+        residual = np.empty((self.variant_count, model_count))
         preconditioned = np.empty_like(residual)
         score_square_sum = np.zeros(model_count)
         penalty_square_sum = np.zeros(model_count)
@@ -657,29 +624,17 @@ class FullDataGaussian:
         def start(block_index: int, variants: NDArray, tile: GenotypeBlockTile, products: Any) -> Any:
             if refactor:
                 preconditioner.factor_block(block_index, variants, tile)
-            host_products = device.to_host(products)
-            score_products = host_products[:, :model_count]
-            probe_products = host_products[:, model_count : model_count + probe_column_count]
-            cross = host_products[:, model_count + probe_column_count :].reshape(variants.shape[0], model_count, system.covariate_count)
-            squares = device.to_host(tile.weighted_column_squares(curvature))
-            self.data_diagonal[variants] = squares - np.einsum("jma,mab,jmb->jm", cross, host_inverses, cross)
+            score_products = device.to_host(products)[:, :model_count]
             penalty = site_precision[variants] * self.mean[variants] - site_shift[variants]
             score_square_sum[:] += np.sum(score_products * score_products, axis=0)
             penalty_square_sum[:] += np.sum(penalty * penalty, axis=0)
-            residual[variants, :model_count] = score_products - penalty
-            residual[variants, model_count:] = (
-                np.tile(self.probes[variants], (1, model_count))
-                - probe_products
-                - site_precision[variants][:, self.probe_models] * self.probe_solution[variants]
-            )
+            residual[variants] = score_products - penalty
             block_preconditioned = preconditioner.apply_block(block_index, array_module.asarray(residual[variants]), columns)
             preconditioned[variants] = device.to_host(block_preconditioned)
             return block_preconditioned
 
         preconditioned_image = self.reads.sweep(left, start, int(columns.size))
-        self.probe_curvature = device.to_host(curvature)
-        gradient_norm = np.linalg.norm(residual[:, :model_count], axis=0)
-        probe_norm = np.linalg.norm(residual[:, model_count:], axis=0) / np.sqrt(self.variant_count)
+        gradient_norm = np.linalg.norm(residual, axis=0)
         certificate = StartCertificate(
             gradient_relative_norm=gradient_norm
             / np.maximum(np.sqrt(score_square_sum) + np.sqrt(penalty_square_sum), np.finfo(np.float64).tiny),
@@ -690,7 +645,6 @@ class FullDataGaussian:
                     np.finfo(np.float64).tiny,
                 )
             ),
-            probe_residual=np.max(probe_norm.reshape(model_count, self.probe_count), axis=1),
         )
         correction, correction_image, _residual, self.conjugate_gradient_iterations = _block_conjugate_gradient(
             reads=self.reads,
@@ -705,10 +659,8 @@ class FullDataGaussian:
             column_models=columns,
             tolerance=tolerance,
         )
-        self.probe_solution += correction[:, model_count:]
-        self.probe_image += correction_image[:, model_count:]
-        step = correction[:, :model_count]
-        step_image = correction_image[:, :model_count]
+        step = correction
+        step_image = correction_image
         # The covariates move with beta along the profiled Newton direction.
         alpha_step = system.solve_covariates(inverses, system.covariates.T @ (score - curvature * step_image), mean_models)
         sample_step = step_image + system.covariates @ alpha_step
@@ -731,25 +683,20 @@ class FullDataGaussian:
         self.linear_predictor = self.linear_predictor + device_length * sample_step
         return certificate
 
-    def marginal_variances(self, site_precision: NDArray) -> MarginalVariances:
-        """diag(A^-1) of the operator the probes were last solved for, projected onto [1/A_jj, 1/tau_j]."""
-        assert self.preconditioner is not None
-        repeated = np.tile(self.probes, (1, self.model_count))
-        control_images = self.preconditioner.apply(repeated, self.probe_models)
-        correction = (repeated * (self.probe_solution - control_images)).reshape(
-            self.variant_count, self.model_count, self.probe_count
-        )
-        estimate = self.preconditioner.inverse_diagonal + correction.mean(axis=2)
-        lower = 1.0 / (self.data_diagonal + site_precision)
-        upper = np.where(site_precision > 0.0, 1.0 / np.where(site_precision > 0.0, site_precision, 1.0), np.inf)
-        variance = np.clip(estimate, lower, upper)
-        leverage = np.sum(correction * site_precision[:, :, None], axis=0)
-        total = np.maximum(np.sum(variance * site_precision, axis=0), np.finfo(np.float64).tiny)
-        return MarginalVariances(
-            variance=variance,
-            relative_standard_error=np.std(leverage, axis=1, ddof=1) / np.sqrt(self.probe_count) / total,
-            clamped_fraction=np.mean((estimate < lower) | (estimate > upper), axis=0),
-        )
+    def block_variances(self) -> NDArray:
+        """(p, models): the diagonal of the block-Jacobi inverse at the state the blocks were last factored.
+
+        Exact within each LD block; the EP sites take it, frozen between refactors.
+        """
+        if self.preconditioner is None:
+            raise RuntimeError("the blocks are factored by the first iterate")
+        return self.preconditioner.inverse_diagonal.copy()
+
+    def residual_sum_of_squares(self) -> NDArray:
+        """(models,): sum over each model's training samples of (y - linear predictor)^2, at the current mean."""
+        array_module = self.device.array_module
+        residual = self.system.targets - self.linear_predictor
+        return self.device.to_host(array_module.sum(self.system.training * residual * residual, axis=0))
 
     def draws(self, *, site_precision: NDArray, draw_count: int, tolerance: float) -> NDArray:
         """Exact draws of q(beta) per model: (p, K, draw_count), by perturb-and-solve.
