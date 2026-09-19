@@ -81,7 +81,7 @@ def _build_sparse_dataset(
         if variant_idx in sv_variant_set:
             variant_records.append(VariantRecord(
                 variant_id="sv_" + str(variant_idx),
-                variant_class=VariantClass.DELETION_SHORT,
+                variant_class=VariantClass.DELETION,
                 chromosome=chromosome,
                 position=position,
                 length=800.0 + 200.0 * random_gen.random(),
@@ -336,8 +336,8 @@ class TestExactCorrelationSetHandling:
 
         variant_records = [
             VariantRecord("snp_0", VariantClass.SNV, "chr1", 100),
-            VariantRecord("del_1", VariantClass.DELETION_SHORT, "chr1", 100, length=500.0, training_support=sample_count),
-            VariantRecord("dup_2", VariantClass.DUPLICATION_SHORT, "chr1", 100, length=500.0, training_support=sample_count),
+            VariantRecord("del_1", VariantClass.DELETION, "chr1", 100, length=500.0, training_support=sample_count),
+            VariantRecord("dup_2", VariantClass.DUPLICATION, "chr1", 100, length=500.0, training_support=sample_count),
             VariantRecord("snp_3", VariantClass.SNV, "chr1", 50_000),
             VariantRecord("snp_4", VariantClass.SNV, "chr1", 100_000),
         ]

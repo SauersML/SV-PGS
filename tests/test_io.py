@@ -90,7 +90,7 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
         ),
         rows=(
             ("rs1", "snv", "", "false", "false", "0.25", "synonymous", "enhancer=0.2,promoter=0.8", "protein_coding>exon", ""),
-            ("sv1", "deletion_short", "2", "true", "true", "1.75", "lof", "enhancer=0.7,promoter=0.3", "protein_coding>intron", ""),
+            ("sv1", "deletion", "2", "true", "true", "1.75", "lof", "enhancer=0.7,promoter=0.3", "protein_coding>intron", ""),
         ),
     )
 
@@ -114,7 +114,7 @@ def test_load_dataset_from_vcf_uses_metadata_and_sample_alignment(tmp_path: Path
     np.testing.assert_allclose(dataset.variant_stats.support_counts, np.array([2, 1], dtype=np.int32))
     np.testing.assert_allclose(dataset.variant_stats.means, np.array([1.5, 0.5], dtype=np.float32))
     assert dataset.variant_records[0].variant_class == VariantClass.SNV
-    assert dataset.variant_records[1].variant_class == VariantClass.DELETION_SHORT
+    assert dataset.variant_records[1].variant_class == VariantClass.DELETION
     assert dataset.variant_records[0].prior_binary_features == {"coding_annotation": False}
     assert dataset.variant_records[0].prior_continuous_features == {"sv_length_score": 0.25}
     assert dataset.variant_records[0].prior_categorical_features == {"functional_state": "synonymous"}
@@ -525,7 +525,7 @@ def test_vcf_cache_written_before_the_filter_and_typing_changes_is_not_reused(
     variants = [
         _VariantDefaults(
             variant_id="sv_cnv",
-            variant_class=VariantClass.DUPLICATION_SHORT,
+            variant_class=VariantClass.DUPLICATION,
             chromosome="1",
             position=100,
             length=500.0,
@@ -1678,7 +1678,7 @@ def test_run_training_pipeline_from_plink_inputs_writes_outputs(tmp_path: Path):
         metadata_path,
         header=("variant_id", "variant_class", "training_support", "is_copy_number"),
         rows=(
-            ("sv1", "deletion_short", "4", "true"),
+            ("sv1", "deletion", "4", "true"),
         ),
     )
 
@@ -2245,9 +2245,9 @@ def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(
     targets = np.array([0.1, 1.2, 1.7, 1.1, 0.0, 2.8], dtype=np.float32)
     variant_records = [
         VariantRecord("rare_filtered", VariantClass.SNV, "1", 100),
-        VariantRecord("common_keep_1", VariantClass.DELETION_SHORT, "1", 200, length=400.0),
+        VariantRecord("common_keep_1", VariantClass.DELETION, "1", 200, length=400.0),
         VariantRecord("zero_filtered", VariantClass.SNV, "1", 300),
-        VariantRecord("common_keep_2", VariantClass.DUPLICATION_SHORT, "1", 400, length=900.0),
+        VariantRecord("common_keep_2", VariantClass.DUPLICATION, "1", 400, length=900.0),
     ]
     variant_stats = io_module.compute_variant_statistics(
         io_module.as_raw_genotype_matrix(genotype_matrix),
@@ -2314,8 +2314,8 @@ def test_run_training_pipeline_keeps_full_coefficient_alignment_after_filtering(
         "common_keep_2",
     ]
     assert [row["variant_class"] for row in coefficient_rows] == [
-        "deletion_short",
-        "duplication_short",
+        "deletion",
+        "duplication",
     ]
     assert float(coefficient_rows[0]["beta"]) == pytest.approx(1.25)
     assert float(coefficient_rows[1]["beta"]) == pytest.approx(-0.5)
@@ -2434,8 +2434,8 @@ def test_vcf_cli_end_to_end_recovers_binary_signal_with_symbolic_svs(tmp_path: P
         metadata_path,
         header=("variant_id", "variant_class", "training_support", "is_copy_number"),
         rows=(
-            ("sv_del", "deletion_short", str(sample_count), "true"),
-            ("sv_dup", "duplication_short", str(sample_count), "true"),
+            ("sv_del", "deletion", str(sample_count), "true"),
+            ("sv_dup", "duplication", str(sample_count), "true"),
         ),
     )
 
@@ -2560,8 +2560,8 @@ def test_plink_end_to_end_recovers_quantitative_signal_with_sv_style_alleles(tmp
         metadata_path,
         header=("variant_id", "variant_class", "training_support", "is_copy_number"),
         rows=(
-            ("sv_del", "deletion_short", str(sample_count), "true"),
-            ("sv_dup", "duplication_short", str(sample_count), "true"),
+            ("sv_del", "deletion", str(sample_count), "true"),
+            ("sv_dup", "duplication", str(sample_count), "true"),
         ),
     )
 
@@ -2765,8 +2765,8 @@ def test_vcf_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
     )
 
     assert [record.variant_class for record in dataset.variant_records] == [
-        VariantClass.DELETION_SHORT,
-        VariantClass.DUPLICATION_SHORT,
+        VariantClass.DELETION,
+        VariantClass.DUPLICATION,
         VariantClass.INSERTION_MEI,
         VariantClass.INVERSION,
     ]
@@ -2819,8 +2819,8 @@ def test_plink_symbolic_sv_type_is_inferred_without_metadata(tmp_path: Path):
     )
 
     assert [record.variant_class for record in dataset.variant_records] == [
-        VariantClass.DELETION_SHORT,
-        VariantClass.DUPLICATION_SHORT,
+        VariantClass.DELETION,
+        VariantClass.DUPLICATION,
         VariantClass.INSERTION_MEI,
         VariantClass.INVERSION,
     ]

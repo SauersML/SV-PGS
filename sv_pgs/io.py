@@ -1266,7 +1266,7 @@ _CACHE_DIR_NAME = ".sv_pgs_cache"
 # filter policy or the cache format changes, so stale caches are invalidated.
 # 4: FILTER/multi-allelic skips (e89974f, d35b173), sequence-resolved typing
 # (4cdb641), COPY_NUMBER and INVERSION classes.
-_CACHE_VERSION = 4
+_CACHE_VERSION = 5
 _VCF_CACHE_MANIFEST_VERSION = 2
 _VCF_CACHE_STATS_DTYPE = np.dtype(
     [
@@ -3973,7 +3973,7 @@ def _variant_defaults_from_vcf_record(record: Any) -> _VariantDefaults:
 def _infer_plink_variant_class(allele_1: str, allele_2: str) -> VariantClass:
     structural_token = _symbolic_variant_token(allele_1, allele_2)
     if structural_token is not None:
-        return structural_variant_class_from_token(structural_token, length=1.0)
+        return structural_variant_class_from_token(structural_token)
     if len(allele_1) == 1 and len(allele_2) == 1:
         return VariantClass.SNV
     return VariantClass.SMALL_INDEL

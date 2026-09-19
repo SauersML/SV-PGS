@@ -11,7 +11,6 @@ from typing import Any
 
 from sv_pgs.config import VariantClass
 
-SV_LENGTH_THRESHOLD = 1_000.0
 # SV size cutoff for sequence-resolved alleles: the imputation strata's rule
 # (lrma-strata scripts/finalqc/strata_build.py var_class / classify).
 SEQUENCE_RESOLVED_SV_MINIMUM_LENGTH = 50
@@ -37,19 +36,20 @@ def normalize_variant_token(value: Any) -> str | None:
     return normalized_value
 
 
-def structural_variant_class_from_token(token: str, length: float) -> VariantClass:
+def structural_variant_class_from_token(token: str) -> VariantClass:
     """Class of an SV from its SVTYPE or symbolic-ALT token.
 
     CNV is copy-number variation, not a duplication; INV has its own class. A
     breakend (BND) keeps the legacy inversion/breakend/complex class; the
-    GATK-SV store source drops breakends before typing.
+    GATK-SV store source drops breakends before typing. Length never splits a
+    class: it enters the prior as a continuous annotation.
     """
     if "DEL" in token:
-        return VariantClass.DELETION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DELETION_SHORT
+        return VariantClass.DELETION
     if "CNV" in token:
         return VariantClass.COPY_NUMBER
     if "DUP" in token:
-        return VariantClass.DUPLICATION_LONG if length >= SV_LENGTH_THRESHOLD else VariantClass.DUPLICATION_SHORT
+        return VariantClass.DUPLICATION
     if "INS" in token or "ME" in token:
         return VariantClass.INSERTION_MEI
     if "INV" in token:
@@ -109,7 +109,7 @@ def sequence_resolved_class_and_length(ref: str, alt: str) -> tuple[VariantClass
         return VariantClass.SMALL_INDEL, length
     if kind == "CPX":
         return VariantClass.OTHER_COMPLEX_SV, length
-    return structural_variant_class_from_token(kind, length), length
+    return structural_variant_class_from_token(kind), length
 
 
 def variant_class_and_length(
@@ -150,4 +150,4 @@ def variant_class_and_length(
         variant_token = None
     if variant_token is None:
         return VariantClass.OTHER_COMPLEX_SV, length
-    return structural_variant_class_from_token(variant_token, length), length
+    return structural_variant_class_from_token(variant_token), length

@@ -30,7 +30,7 @@ def _high_dimensional_sparse_quantitative_dataset() -> tuple[np.ndarray, np.ndar
     variant_records = [
         VariantRecord(
             variant_id=f"variant_{variant_index}",
-            variant_class=VariantClass.DELETION_SHORT if variant_index % 7 == 0 else VariantClass.SNV,
+            variant_class=VariantClass.DELETION if variant_index % 7 == 0 else VariantClass.SNV,
             chromosome="1",
             position=variant_index,
             training_support=sample_count if variant_index % 7 == 0 else None,

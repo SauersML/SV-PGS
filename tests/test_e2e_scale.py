@@ -20,8 +20,8 @@ from tests.test_prediction_accuracy import _covariate_only_holdout_prediction, _
 
 VARIANT_CLASS_CYCLE = (
     VariantClass.SNV,
-    VariantClass.DELETION_SHORT,
-    VariantClass.DUPLICATION_SHORT,
+    VariantClass.DELETION,
+    VariantClass.DUPLICATION,
     VariantClass.INSERTION_MEI,
     VariantClass.STR_VNTR_REPEAT,
     VariantClass.SNV,
@@ -45,7 +45,7 @@ def _variant_metadata(variant_index: int, block_index: int) -> VariantRecord:
         quality=min(quality, 0.98),
         training_support=64 if variant_class != VariantClass.SNV else None,
         is_repeat=variant_class == VariantClass.STR_VNTR_REPEAT,
-        is_copy_number=variant_class in {VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT},
+        is_copy_number=variant_class in {VariantClass.DELETION, VariantClass.DUPLICATION},
     )
 
 
@@ -78,7 +78,7 @@ def _make_correlated_genotypes(
     genotype_matrix[:, 2] = -genotype_matrix[:, 0]
     variant_records[1] = VariantRecord(
         variant_id=variant_records[1].variant_id,
-        variant_class=VariantClass.DELETION_SHORT,
+        variant_class=VariantClass.DELETION,
         chromosome=variant_records[1].chromosome,
         position=variant_records[1].position,
         length=600.0,
@@ -90,7 +90,7 @@ def _make_correlated_genotypes(
     )
     variant_records[2] = VariantRecord(
         variant_id=variant_records[2].variant_id,
-        variant_class=VariantClass.DUPLICATION_SHORT,
+        variant_class=VariantClass.DUPLICATION,
         chromosome=variant_records[2].chromosome,
         position=variant_records[2].position,
         length=900.0,
@@ -105,7 +105,7 @@ def _make_correlated_genotypes(
     genotype_matrix[0, 30] = 1.0
     variant_records[30] = VariantRecord(
         variant_id=variant_records[30].variant_id,
-        variant_class=VariantClass.DUPLICATION_SHORT,
+        variant_class=VariantClass.DUPLICATION,
         chromosome=variant_records[30].chromosome,
         position=variant_records[30].position,
         length=2_000.0,

@@ -65,16 +65,16 @@ def _make_checkpoint(class_names: list[str] | None) -> mi.VariationalFitCheckpoi
 
 
 def test_prior_class_names_are_column_ordered():
-    prior = _make_prior([VariantClass.SNV, VariantClass.DELETION_SHORT])
-    assert mi._checkpoint_prior_class_names(prior) == ["snv", "deletion_short"]
+    prior = _make_prior([VariantClass.SNV, VariantClass.DELETION])
+    assert mi._checkpoint_prior_class_names(prior) == ["snv", "deletion"]
 
 
 def test_reconcile_keeps_matching_adds_new_drops_removed():
-    old = [VariantClass.SNV, VariantClass.DELETION_SHORT]
+    old = [VariantClass.SNV, VariantClass.DELETION]
     checkpoint = _make_checkpoint(mi._checkpoint_prior_class_names(_make_prior(old)))
 
-    # SNV survives; DELETION_SHORT removed; DUPLICATION_SHORT added.
-    new_prior = _make_prior([VariantClass.SNV, VariantClass.DUPLICATION_SHORT])
+    # SNV survives; DELETION removed; DUPLICATION added.
+    new_prior = _make_prior([VariantClass.SNV, VariantClass.DUPLICATION])
     config = ModelConfig()
     result = mi._reconcile_checkpoint_categories(checkpoint, new_prior, config)
     assert result is not None
@@ -85,7 +85,7 @@ def test_reconcile_keeps_matching_adds_new_drops_removed():
     assert reconciled.tpb_shape_a_vector[0] == 11.0
     # New class is seeded from the config default, not zero.
     default_a = config.class_tpb_shape_a()
-    assert reconciled.tpb_shape_a_vector[1] == float(default_a.get(VariantClass.DUPLICATION_SHORT, 1.0))
+    assert reconciled.tpb_shape_a_vector[1] == float(default_a.get(VariantClass.DUPLICATION, 1.0))
     # previous_* vectors are remapped too (the present one), absent ones stay None.
     assert reconciled.previous_tpb_shape_a_vector[0] == 1.0
     assert reconciled.previous_tpb_shape_b_vector is None
@@ -96,20 +96,20 @@ def test_reconcile_keeps_matching_adds_new_drops_removed():
 
 
 def test_reconcile_reorder_only_preserves_values_by_name():
-    old = [VariantClass.SNV, VariantClass.DELETION_SHORT]
+    old = [VariantClass.SNV, VariantClass.DELETION]
     checkpoint = _make_checkpoint(mi._checkpoint_prior_class_names(_make_prior(old)))
     # Same classes, swapped order: values must follow their names, not columns.
-    new_prior = _make_prior([VariantClass.DELETION_SHORT, VariantClass.SNV])
+    new_prior = _make_prior([VariantClass.DELETION, VariantClass.SNV])
     result = mi._reconcile_checkpoint_categories(checkpoint, new_prior, ModelConfig())
     assert result is not None
     reconciled, tally = result
     assert tally == {"kept": 2, "added": 0, "dropped": 0}
-    assert reconciled.tpb_shape_a_vector[0] == 22.0  # deletion_short was 22.0
+    assert reconciled.tpb_shape_a_vector[0] == 22.0  # deletion was 22.0
     assert reconciled.tpb_shape_a_vector[1] == 11.0  # snv was 11.0
 
 
 def test_reconcile_returns_none_for_pre_category_aware_checkpoint():
     # An old pickle without recorded category names cannot be safely remapped.
     checkpoint = _make_checkpoint(None)
-    new_prior = _make_prior([VariantClass.SNV, VariantClass.DUPLICATION_SHORT])
+    new_prior = _make_prior([VariantClass.SNV, VariantClass.DUPLICATION])
     assert mi._reconcile_checkpoint_categories(checkpoint, new_prior, ModelConfig()) is None

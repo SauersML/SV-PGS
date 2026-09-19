@@ -33,8 +33,8 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 - **variant_class:** SNV → snv; INDEL → small_indel. For SVs, the first match wins:
   1. VNTR/STR context → str_vntr_repeat;
   2. INS/DUP with an MEI TE class → insertion_mei;
-  3. DEL → deletion_short or deletion_long, split at 1 kb;
-  4. DUP → duplication_short or duplication_long, split at 1 kb;
+  3. DEL → deletion;
+  4. DUP → duplication;
   5. otherwise other_complex_sv.
   - GATK-SV adds copy_number (multiallelic CNVs, read from FORMAT/CN) and inversion. Breakends are dropped.
 - **Grouping:** bubble_idx, same_pos_first.

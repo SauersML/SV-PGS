@@ -29,10 +29,8 @@ import numpy as np
 # ---------------------------------------------------------------------------
 
 SV_CLASS_LABELS: dict[str, str] = {
-    "deletion_short": "Short Deletion\n(< 5 kb)",
-    "deletion_long": "Long Deletion\n(\u2265 5 kb)",
-    "duplication_short": "Short Duplication\n(< 5 kb)",
-    "duplication_long": "Long Duplication\n(\u2265 5 kb)",
+    "deletion": "Deletion",
+    "duplication": "Duplication",
     "insertion_mei": "Mobile Element\nInsertion",
     "inversion_bnd_complex": "Inversion, Breakend,\nand Complex",
     "other_complex_sv": "Other Complex\nStructural Variant",
@@ -40,10 +38,8 @@ SV_CLASS_LABELS: dict[str, str] = {
 
 # Same but single-line for tight spaces (legends, bar charts)
 SV_CLASS_LABELS_SHORT: dict[str, str] = {
-    "deletion_short": "Short Deletion (< 5 kb)",
-    "deletion_long": "Long Deletion (\u2265 5 kb)",
-    "duplication_short": "Short Duplication (< 5 kb)",
-    "duplication_long": "Long Duplication (\u2265 5 kb)",
+    "deletion": "Deletion",
+    "duplication": "Duplication",
     "insertion_mei": "Mobile Element Insertion",
     "inversion_bnd_complex": "Inversion / Breakend / Complex",
     "other_complex_sv": "Other Complex SV",
@@ -51,10 +47,8 @@ SV_CLASS_LABELS_SHORT: dict[str, str] = {
 
 # Consistent colors per class
 SV_CLASS_COLORS: dict[str, str] = {
-    "deletion_short": "#2ca02c",
-    "deletion_long": "#ff7f0e",
-    "duplication_short": "#9467bd",
-    "duplication_long": "#8c564b",
+    "deletion": "#2ca02c",
+    "duplication": "#9467bd",
     "insertion_mei": "#1f77b4",
     "inversion_bnd_complex": "#d62728",
     "other_complex_sv": "#7f7f7f",
@@ -64,10 +58,8 @@ SV_CLASS_COLORS: dict[str, str] = {
 SV_CLASS_ORDER = [
     "inversion_bnd_complex",
     "insertion_mei",
-    "deletion_short",
-    "deletion_long",
-    "duplication_short",
-    "duplication_long",
+    "deletion",
+    "duplication",
     "other_complex_sv",
 ]
 

@@ -163,10 +163,8 @@ def make_variant_records(
     chromosome: str = "chr1",
 ) -> list[VariantRecord]:
     structural_variant_classes = {
-        VariantClass.DELETION_SHORT,
-        VariantClass.DELETION_LONG,
-        VariantClass.DUPLICATION_SHORT,
-        VariantClass.DUPLICATION_LONG,
+        VariantClass.DELETION,
+        VariantClass.DUPLICATION,
         VariantClass.INSERTION_MEI,
         VariantClass.INVERSION_BND_COMPLEX,
         VariantClass.STR_VNTR_REPEAT,

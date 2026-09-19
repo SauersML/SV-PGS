@@ -13,6 +13,7 @@ from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
     MANIFEST_FILE,
     MAXIMUM_CODE,
+    VARIANT_CLASS_LEGEND,
     VARIANT_CLASSES,
     CodeArray,
     CodeShardWriter,
@@ -71,7 +72,7 @@ def _write_store(root: Path, milli_by_half: list[dict[str, np.ndarray]], codec: 
             "ref_len": (lengths, {}),
             "alt_len": (lengths, {}),
             "cm": (positions / 1e6, {}),
-            "variant_class": (np.zeros(record_count, dtype=np.uint8), {}),
+            "variant_class": (np.zeros(record_count, dtype=np.uint8), {"legend": VARIANT_CLASS_LEGEND}),
             "group_first": (np.arange(record_count, dtype=np.int64), {}),
             "class": (np.zeros(record_count, dtype=np.uint8), {"legend": ["SNV", "INDEL", "SV"]}),
             "has_pl": (np.arange(record_count) % 3 == 0, {}),
@@ -227,6 +228,16 @@ def test_open_checks_the_sites_md5(tmp_path: Path) -> None:
     positions[5] += 1
     positions.flush()
     with pytest.raises(ValueError, match="md5"):
+        DosageStore.open(tmp_path / "store")
+
+
+def test_open_refuses_a_store_written_with_other_variant_classes(tmp_path: Path) -> None:
+    _write_store(tmp_path / "store", _two_half_dosage())
+    metadata_path = variant_column_directory(tmp_path / "store", "chr21", "variant_class") / "zarr.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["attributes"]["legend"] = ["snv", "small_indel", "deletion_short", "deletion_long"]
+    metadata_path.write_text(json.dumps(metadata))
+    with pytest.raises(ValueError, match="variant classes"):
         DosageStore.open(tmp_path / "store")
 
 

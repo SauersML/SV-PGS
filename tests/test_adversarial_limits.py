@@ -88,8 +88,8 @@ def test_mixed_exact_tie_set_should_not_collapse_onto_one_member():
     ).astype(np.float32)
     variant_records = [
         VariantRecord("snp_0", VariantClass.SNV, "1", 100),
-        VariantRecord("del_1", VariantClass.DELETION_SHORT, "1", 101, length=500.0, training_support=sample_count),
-        VariantRecord("dup_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=700.0, training_support=sample_count),
+        VariantRecord("del_1", VariantClass.DELETION, "1", 101, length=500.0, training_support=sample_count),
+        VariantRecord("dup_2", VariantClass.DUPLICATION, "1", 102, length=700.0, training_support=sample_count),
         VariantRecord("snp_3", VariantClass.SNV, "1", 50_000),
     ]
 

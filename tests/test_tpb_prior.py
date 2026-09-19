@@ -31,7 +31,7 @@ class TestClassSpecificTPBShapes:
     """Requirement 1: SVs must have different (a, b) from SNPs from day one."""
 
     def test_snv_and_deletion_have_different_shape_a(self):
-        assert DEFAULT_CLASS_TPB_SHAPE_A[VariantClass.SNV] != DEFAULT_CLASS_TPB_SHAPE_A[VariantClass.DELETION_LONG]
+        assert DEFAULT_CLASS_TPB_SHAPE_A[VariantClass.SNV] != DEFAULT_CLASS_TPB_SHAPE_A[VariantClass.DELETION]
 
     def test_snv_has_highest_shape_a(self):
         snv_shape_a = DEFAULT_CLASS_TPB_SHAPE_A[VariantClass.SNV]
@@ -42,7 +42,7 @@ class TestClassSpecificTPBShapes:
 
     def test_sv_classes_have_heavier_tails(self):
         snv_shape_b = DEFAULT_CLASS_TPB_SHAPE_B[VariantClass.SNV]
-        for variant_class in [VariantClass.DELETION_LONG, VariantClass.INVERSION_BND_COMPLEX]:
+        for variant_class in [VariantClass.DELETION, VariantClass.INVERSION_BND_COMPLEX]:
             assert DEFAULT_CLASS_TPB_SHAPE_B[variant_class] < snv_shape_b
 
     def test_all_classes_have_both_shapes(self):
@@ -88,7 +88,7 @@ class TestMetadataScaleModel:
 
     def test_sv_classes_have_larger_baseline(self):
         snv_scale = DEFAULT_CLASS_LOG_BASELINE_SCALE[VariantClass.SNV]
-        for variant_class in [VariantClass.DELETION_LONG, VariantClass.INVERSION_BND_COMPLEX]:
+        for variant_class in [VariantClass.DELETION, VariantClass.INVERSION_BND_COMPLEX]:
             assert DEFAULT_CLASS_LOG_BASELINE_SCALE[variant_class] > snv_scale
 
     def test_scale_model_ridge_penalty_exists(self):
@@ -99,9 +99,9 @@ class TestMetadataScaleModel:
 
     def test_vcf_fields_do_not_enter_scale_design_as_annotations(self):
         records = [
-            VariantRecord("sv_a", VariantClass.DELETION_SHORT, "chr1", 100, quality=0.95, allele_frequency=0.20),
-            VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, quality=0.50, allele_frequency=0.05, training_support=8),
-            VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
+            VariantRecord("sv_a", VariantClass.DELETION, "chr1", 100, quality=0.95, allele_frequency=0.20),
+            VariantRecord("sv_b", VariantClass.DELETION, "chr1", 101, quality=0.50, allele_frequency=0.05, training_support=8),
+            VariantRecord("sv_c", VariantClass.DELETION, "chr1", 102, quality=0.25, allele_frequency=0.01, training_support=3),
         ]
         prior_design = _build_prior_design(records)
         assert all("quality" not in feature_name for feature_name in prior_design.feature_names)
@@ -112,7 +112,7 @@ class TestMetadataScaleModel:
         records = [
             VariantRecord(
                 "sv_a",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 100,
                 allele_frequency=5e-4,
@@ -121,7 +121,7 @@ class TestMetadataScaleModel:
             ),
             VariantRecord(
                 "sv_b",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 101,
                 allele_frequency=5e-3,
@@ -130,7 +130,7 @@ class TestMetadataScaleModel:
             ),
             VariantRecord(
                 "sv_c",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 102,
                 allele_frequency=2e-2,
@@ -139,7 +139,7 @@ class TestMetadataScaleModel:
             ),
             VariantRecord(
                 "sv_d",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 103,
                 allele_frequency=0.2,
@@ -167,7 +167,7 @@ class TestMetadataScaleModel:
         records = [
             VariantRecord(
                 "sv_a",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 100,
                 allele_frequency=5e-4,
@@ -179,7 +179,7 @@ class TestMetadataScaleModel:
             ),
             VariantRecord(
                 "sv_b",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 101,
                 allele_frequency=5e-3,
@@ -191,7 +191,7 @@ class TestMetadataScaleModel:
             ),
             VariantRecord(
                 "sv_c",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 102,
                 allele_frequency=2e-2,
@@ -221,9 +221,9 @@ class TestMetadataScaleModel:
 
     def test_vcf_structural_fields_do_not_enter_scale_design_as_annotations(self):
         records = [
-            VariantRecord("sv_a", VariantClass.DELETION_SHORT, "chr1", 100, length=100.0, is_copy_number=False),
-            VariantRecord("sv_b", VariantClass.DELETION_SHORT, "chr1", 101, length=2_000.0, is_copy_number=True),
-            VariantRecord("sv_c", VariantClass.DELETION_SHORT, "chr1", 102, length=6_000.0, is_repeat=True),
+            VariantRecord("sv_a", VariantClass.DELETION, "chr1", 100, length=100.0, is_copy_number=False),
+            VariantRecord("sv_b", VariantClass.DELETION, "chr1", 101, length=2_000.0, is_copy_number=True),
+            VariantRecord("sv_c", VariantClass.DELETION, "chr1", 102, length=6_000.0, is_repeat=True),
         ]
         prior_design = _build_prior_design(records)
         assert all("log_length" not in feature_name for feature_name in prior_design.feature_names)
@@ -234,21 +234,21 @@ class TestMetadataScaleModel:
         records = [
             VariantRecord(
                 "sv_a",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 100,
                 prior_continuous_features={"sv_length_score": 0.1},
             ),
             VariantRecord(
                 "sv_b",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 101,
                 prior_continuous_features={"sv_length_score": 0.4},
             ),
             VariantRecord(
                 "sv_c",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 102,
                 prior_continuous_features={"sv_length_score": 0.9},
@@ -282,7 +282,7 @@ class TestMetadataScaleModel:
             records.append(
                 VariantRecord(
                     f"sv_{record_index}",
-                    VariantClass.DELETION_SHORT,
+                    VariantClass.DELETION,
                     "chr1",
                     100 + record_index,
                     prior_categorical_features={"functional_state": functional_state},
@@ -313,7 +313,7 @@ class TestMetadataScaleModel:
 
     def test_prior_design_is_full_rank_centered_and_unit_rms(self):
         random_generator = np.random.default_rng(8)
-        variant_classes = [VariantClass.SNV, VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT]
+        variant_classes = [VariantClass.SNV, VariantClass.DELETION, VariantClass.DUPLICATION]
         functional_states = ["lof", "missense", "neutral"]
         nested_paths = [
             ("coding", "exon"),
@@ -347,7 +347,7 @@ class TestMetadataScaleModel:
         assert singular_values[0] / singular_values[-1] < 500.0
 
     def test_reference_coding_preserves_saturated_class_varying_factor_predictors(self):
-        variant_classes = [VariantClass.SNV, VariantClass.DELETION_SHORT, VariantClass.DUPLICATION_SHORT]
+        variant_classes = [VariantClass.SNV, VariantClass.DELETION, VariantClass.DUPLICATION]
         records = [
             VariantRecord(
                 f"variant_{record_index}",
@@ -409,14 +409,14 @@ class TestMetadataScaleModel:
 
     def test_compiled_scaling_is_reused_for_a_shifted_member_distribution(self):
         training_records = [
-            VariantRecord("deletion", VariantClass.DELETION_SHORT, "chr1", 1),
+            VariantRecord("deletion", VariantClass.DELETION, "chr1", 1),
             VariantRecord("snv_1", VariantClass.SNV, "chr1", 2),
             VariantRecord("snv_2", VariantClass.SNV, "chr1", 3),
             VariantRecord("snv_3", VariantClass.SNV, "chr1", 4),
         ]
         prior_design = _build_prior_design(training_records)
         member_records = [
-            VariantRecord("member_deletion", VariantClass.DELETION_SHORT, "chr1", 5),
+            VariantRecord("member_deletion", VariantClass.DELETION, "chr1", 5),
             VariantRecord("member_snv", VariantClass.SNV, "chr1", 6),
         ]
 
@@ -434,7 +434,7 @@ class TestMetadataScaleModel:
             ),
         )
 
-        assert prior_design.feature_names == ["type_offset::deletion_short"]
+        assert prior_design.feature_names == ["type_offset::deletion"]
         training_rms = np.sqrt(3.0) / 4.0
         np.testing.assert_allclose(
             member_design[:, 0],
@@ -445,7 +445,7 @@ class TestMetadataScaleModel:
     def test_user_annotation_names_are_not_reserved_by_old_built_ins(self):
         record = VariantRecord(
             "sv_a",
-            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION,
             "chr1",
             100,
             prior_continuous_features={"log_length": 1.0},
@@ -456,7 +456,7 @@ class TestMetadataScaleModel:
         with pytest.raises(ValueError, match="cannot contain '::'"):
             VariantRecord(
                 "sv_a",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 100,
                 prior_continuous_features={"bad::name": 1.0},
@@ -466,7 +466,7 @@ class TestMetadataScaleModel:
         with pytest.raises(ValueError, match="unique across annotation families"):
             VariantRecord(
                 "sv_a",
-                VariantClass.DELETION_SHORT,
+                VariantClass.DELETION,
                 "chr1",
                 100,
                 prior_binary_features={"shared_name": True},

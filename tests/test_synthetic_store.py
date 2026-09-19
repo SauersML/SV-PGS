@@ -255,8 +255,8 @@ def test_source_loader_reads_design_credit_archives_and_maps_classes(tmp_path: P
     assert source.haplotypes.shape == (2 * kinds.size, 2 * founders)
     assert source.tile_range(0) == (0, kinds.size) and source.tile_range(3) == (kinds.size, 2 * kinds.size)
     expected = [
-        VariantClass.SNV, VariantClass.SMALL_INDEL, VariantClass.DELETION_LONG, VariantClass.DELETION_SHORT,
-        VariantClass.DUPLICATION_SHORT, VariantClass.INSERTION_MEI, VariantClass.INSERTION_MEI,
+        VariantClass.SNV, VariantClass.SMALL_INDEL, VariantClass.DELETION, VariantClass.DELETION,
+        VariantClass.DUPLICATION, VariantClass.INSERTION_MEI, VariantClass.INSERTION_MEI,
         VariantClass.INVERSION, VariantClass.STR_VNTR_REPEAT,
     ]
     assert [VARIANT_CLASSES[code] for code in source.variant_classes[: kinds.size]] == expected

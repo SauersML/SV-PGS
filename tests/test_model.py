@@ -69,12 +69,12 @@ def _synthetic_binary_dataset() -> tuple[np.ndarray, np.ndarray, np.ndarray, lis
     target_vector = random_generator.binomial(1, target_probabilities).astype(np.float32)
     variant_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100, length=1.0, allele_frequency=0.12, quality=1.0),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=600.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
-        VariantRecord("variant_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=1_200.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101, length=600.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
+        VariantRecord("variant_2", VariantClass.DUPLICATION, "1", 102, length=1_200.0, allele_frequency=0.02, quality=0.9, training_support=sample_count),
         VariantRecord("variant_3", VariantClass.SNV, "1", 2_000_000, length=1.0, allele_frequency=0.40, quality=1.0),
         VariantRecord(
             "variant_4",
-            VariantClass.DUPLICATION_SHORT,
+            VariantClass.DUPLICATION,
             "1",
             110,
             length=2_000.0,
@@ -1262,7 +1262,7 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
     records = [
         VariantRecord(
             "variant_0",
-            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION,
             "1",
             100,
             prior_binary_features={"coding_annotation": True},
@@ -1297,7 +1297,7 @@ def test_training_records_from_stats_preserve_prior_continuous_features():
 def test_normalize_variant_records_reuses_already_normalized_list():
     records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101),
     ]
 
     normalized = _normalize_variant_records(records)
@@ -1308,7 +1308,7 @@ def test_normalize_variant_records_reuses_already_normalized_list():
 def test_fit_checkpoint_hash_avoids_per_variant_json_for_plain_records(monkeypatch):
     records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101),
     ]
     raw_genotypes = as_raw_genotype_matrix(np.zeros((3, 2), dtype=np.int8))
     covariates = np.ones((3, 2), dtype=np.float32)
@@ -1453,9 +1453,9 @@ def test_coefficient_table_preserves_full_variant_alignment_after_filtering(tmp_
     target_vector = np.array([0.1, 1.0, 1.8, 1.1, 0.0, 2.7], dtype=np.float32)
     variant_records = [
         VariantRecord("rare_filtered", VariantClass.SNV, "1", 100, allele_frequency=0.01),
-        VariantRecord("common_keep_1", VariantClass.DELETION_SHORT, "1", 200, allele_frequency=0.25, length=400.0),
+        VariantRecord("common_keep_1", VariantClass.DELETION, "1", 200, allele_frequency=0.25, length=400.0),
         VariantRecord("zero_filtered", VariantClass.SNV, "1", 300, allele_frequency=0.0),
-        VariantRecord("common_keep_2", VariantClass.DUPLICATION_SHORT, "1", 400, allele_frequency=0.5, length=900.0),
+        VariantRecord("common_keep_2", VariantClass.DUPLICATION, "1", 400, allele_frequency=0.5, length=900.0),
     ]
     config = ModelConfig(
         trait_type=TraitType.QUANTITATIVE,

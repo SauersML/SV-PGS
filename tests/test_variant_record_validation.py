@@ -38,11 +38,11 @@ def _record(**overrides) -> VariantRecord:
     ("members", "membership", "message_fragment"),
     [
         ((VariantClass.SNV,), (float("nan"),), "finite"),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (float("inf"), 0.0), "finite"),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (-0.5, 1.5), "non-negative"),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (0.0, 0.0), "positive value"),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (3.0, 4.0), "must sum to 1.0"),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (0.4, 0.4), "must sum to 1.0"),
+        ((VariantClass.SNV, VariantClass.DELETION), (float("inf"), 0.0), "finite"),
+        ((VariantClass.SNV, VariantClass.DELETION), (-0.5, 1.5), "non-negative"),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.0, 0.0), "positive value"),
+        ((VariantClass.SNV, VariantClass.DELETION), (3.0, 4.0), "must sum to 1.0"),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.4, 0.4), "must sum to 1.0"),
         ((VariantClass.SNV, VariantClass.SNV), (0.4, 0.6), "duplicates"),
         ((VariantClass.SNV,), (), "same length"),
         ((), (1.0,), "same length"),
@@ -57,9 +57,9 @@ def test_invalid_class_membership_is_rejected(members, membership, message_fragm
     ("members", "membership"),
     [
         ((VariantClass.SNV,), (1.0,)),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (0.5, 0.5)),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (0.0, 1.0)),
-        ((VariantClass.SNV, VariantClass.DELETION_SHORT), (0.25, 0.75 + 1e-9)),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.5, 0.5)),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.0, 1.0)),
+        ((VariantClass.SNV, VariantClass.DELETION), (0.25, 0.75 + 1e-9)),
     ],
 )
 def test_valid_class_membership_is_accepted(members, membership):
@@ -73,14 +73,14 @@ def test_class_membership_validated_with_custom_prior_features():
     with pytest.raises(ValueError, match="must sum to 1.0"):
         _record(
             prior_binary_features={"in_gene": True},
-            prior_class_members=(VariantClass.SNV, VariantClass.DELETION_SHORT),
+            prior_class_members=(VariantClass.SNV, VariantClass.DELETION),
             prior_class_membership=(3.0, 4.0),
         )
 
 
 def test_omitted_class_membership_defaults_to_own_class():
-    record = _record(variant_class=VariantClass.DELETION_SHORT)
-    assert record.prior_class_members == (VariantClass.DELETION_SHORT,)
+    record = _record(variant_class=VariantClass.DELETION)
+    assert record.prior_class_members == (VariantClass.DELETION,)
     assert record.prior_class_membership == (1.0,)
 
 

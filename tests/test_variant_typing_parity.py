@@ -35,19 +35,19 @@ _RECORDS = (
     ("snv", 100, "A", "G", {"AF": "0.1"}, VariantClass.SNV, 1.0),
     ("small_deletion", 200, "ACG", "A", {"AF": "0.1"}, VariantClass.SMALL_INDEL, 2.0),
     ("substitution", 300, "AC", "GT", {"AF": "0.1"}, VariantClass.SMALL_INDEL, 2.0),
-    ("sequence_deletion", 400, _SEQUENCE_DELETION, "A", {"SVTYPE": "DEL", "SVLEN": "-120", "AF": "0.1"}, VariantClass.DELETION_SHORT, 120.0),
-    ("symbolic_deletion", 900, "A", "<DEL>", {"SVTYPE": "DEL", "SVLEN": "-2000", "END": "2900", "AF": "0.1"}, VariantClass.DELETION_LONG, 2000.0),
+    ("sequence_deletion", 400, _SEQUENCE_DELETION, "A", {"SVTYPE": "DEL", "SVLEN": "-120", "AF": "0.1"}, VariantClass.DELETION, 120.0),
+    ("symbolic_deletion", 900, "A", "<DEL>", {"SVTYPE": "DEL", "SVLEN": "-2000", "END": "2900", "AF": "0.1"}, VariantClass.DELETION, 2000.0),
     # GATK-SV multi-allelic CNVs are copy-number variation, not duplications,
     # and inversions have their own class.
     ("copy_number_variant", 1000, "N", "<CNV>", {"SVTYPE": "CNV", "SVLEN": "1064", "END": "2064", "AF": "0.3"}, VariantClass.COPY_NUMBER, 1064.0),
     ("inversion", 2500, "N", "<INV>", {"SVTYPE": "INV", "SVLEN": "400", "END": "2900", "AF": "0.1"}, VariantClass.INVERSION, 400.0),
     # Sequence-resolved SVs without SVTYPE/SVLEN, as long-read and imputed
     # panels write them: typed and sized from the alleles.
-    ("untyped_deletion", 3000, _SEQUENCE_DELETION, "A", {}, VariantClass.DELETION_SHORT, 120.0),
-    ("untyped_long_deletion", 4000, "C" + "AGT" * 500, "C", {}, VariantClass.DELETION_LONG, 1500.0),
+    ("untyped_deletion", 3000, _SEQUENCE_DELETION, "A", {}, VariantClass.DELETION, 120.0),
+    ("untyped_long_deletion", 4000, "C" + "AGT" * 500, "C", {}, VariantClass.DELETION, 1500.0),
     ("untyped_insertion", 6000, "G", "G" + "ACGT" * 100, {}, VariantClass.INSERTION_MEI, 400.0),
     ("indel_49", 7000, "A" + "C" * 49, "A", {}, VariantClass.SMALL_INDEL, 49.0),
-    ("deletion_50", 8000, "A" + "C" * 50, "A", {}, VariantClass.DELETION_SHORT, 50.0),
+    ("deletion_50", 8000, "A" + "C" * 50, "A", {}, VariantClass.DELETION, 50.0),
     ("complex_80", 9000, _COMPLEX_REF, _COMPLEX_ALT, {}, VariantClass.OTHER_COMPLEX_SV, 79.0),
 )
 

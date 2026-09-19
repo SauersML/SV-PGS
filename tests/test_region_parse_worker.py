@@ -144,6 +144,6 @@ def test_header_without_optional_info_tags_is_parsed(tmp_path: Path) -> None:
     variants = io_module._load_variant_metadata(Path(f"{prefix}.variants.npz"))
     assert [(variant.variant_id, variant.variant_class, variant.length) for variant in variants] == [
         ("a1", VariantClass.SNV, 1.0),
-        ("a2", VariantClass.DELETION_SHORT, 120.0),
+        ("a2", VariantClass.DELETION, 120.0),
     ]
     assert [variant.allele_frequency for variant in variants] == [-1.0, -1.0]

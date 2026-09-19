@@ -70,12 +70,12 @@ def test_aou_layout_filter_policy_classes_and_copy_number(tmp_path: Path) -> Non
     kept_ids = [variant_id for block in blocks for variant_id in block.variant_ids]
     assert kept_ids == ["del_pass", "ins_mei", "mcnv", "inv", "cpx", "dup_long"]
     assert [variant_class for block in blocks for variant_class in block.variant_classes] == [
-        VariantClass.DELETION_SHORT,
+        VariantClass.DELETION,
         VariantClass.INSERTION_MEI,
         VariantClass.COPY_NUMBER,
         VariantClass.INVERSION,
         VariantClass.OTHER_COMPLEX_SV,
-        VariantClass.DUPLICATION_LONG,
+        VariantClass.DUPLICATION,
     ]
     assert [svtype for block in blocks for svtype in block.svtypes] == ["DEL", "INS", "CNV", "INV", "CPX", "DUP"]
     assert np.concatenate([block.is_copy_number for block in blocks]).tolist() == [False, False, True, False, False, False]
@@ -102,7 +102,7 @@ def test_kgp_layout_reads_copy_number_not_the_placeholder_genotype(tmp_path: Pat
     source, blocks = _read_all(tmp_path, _KGP_LIKE_VCF, block_records=10)
 
     (block,) = blocks
-    assert block.variant_classes == (VariantClass.COPY_NUMBER, VariantClass.DELETION_LONG)
+    assert block.variant_classes == (VariantClass.COPY_NUMBER, VariantClass.DELETION)
     assert block.svtypes == ("CNV", "DEL")
     assert block.is_copy_number.tolist() == [True, False]
     # CN, falling back to RD_CN where CN is "." (sample R3); the GT is ignored.

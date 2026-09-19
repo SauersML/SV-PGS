@@ -13,15 +13,12 @@ class TraitType(str, Enum):
 class VariantClass(str, Enum):
     SNV = "snv"
     SMALL_INDEL = "small_indel"
-    DELETION_SHORT = "deletion_short"
-    DELETION_LONG = "deletion_long"
-    DUPLICATION_SHORT = "duplication_short"
-    DUPLICATION_LONG = "duplication_long"
+    DELETION = "deletion"
+    DUPLICATION = "duplication"
     INSERTION_MEI = "insertion_mei"
     INVERSION_BND_COMPLEX = "inversion_bnd_complex"
     STR_VNTR_REPEAT = "str_vntr_repeat"
     OTHER_COMPLEX_SV = "other_complex_sv"
-    # Appended, so the stored index of every earlier class is unchanged.
     # Integer copy number from FORMAT/CN (multi-allelic CNVs), not a GT dosage.
     COPY_NUMBER = "copy_number"
     INVERSION = "inversion"
@@ -35,10 +32,8 @@ class VariantClass(str, Enum):
 DEFAULT_CLASS_LOG_BASELINE_SCALE = {
     VariantClass.SNV: -4.5,
     VariantClass.SMALL_INDEL: -4.2,
-    VariantClass.DELETION_SHORT: -3.8,
-    VariantClass.DELETION_LONG: -3.3,
-    VariantClass.DUPLICATION_SHORT: -3.7,
-    VariantClass.DUPLICATION_LONG: -3.3,
+    VariantClass.DELETION: -3.55,
+    VariantClass.DUPLICATION: -3.5,
     VariantClass.INSERTION_MEI: -3.6,
     VariantClass.INVERSION_BND_COMPLEX: -3.1,
     VariantClass.STR_VNTR_REPEAT: -3.5,
@@ -61,10 +56,8 @@ DEFAULT_CLASS_LOG_BASELINE_SCALE = {
 DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
     VariantClass.SNV: 1.0,
     VariantClass.SMALL_INDEL: 0.9,
-    VariantClass.DELETION_SHORT: 0.7,
-    VariantClass.DELETION_LONG: 0.6,
-    VariantClass.DUPLICATION_SHORT: 0.7,
-    VariantClass.DUPLICATION_LONG: 0.6,
+    VariantClass.DELETION: 0.65,
+    VariantClass.DUPLICATION: 0.65,
     VariantClass.INSERTION_MEI: 0.65,
     VariantClass.INVERSION_BND_COMPLEX: 0.55,
     VariantClass.STR_VNTR_REPEAT: 0.6,
@@ -78,10 +71,8 @@ DEFAULT_CLASS_TPB_SHAPE_A: dict[VariantClass, float] = {
 DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
     VariantClass.SNV: 0.5,
     VariantClass.SMALL_INDEL: 0.5,
-    VariantClass.DELETION_SHORT: 0.45,
-    VariantClass.DELETION_LONG: 0.4,
-    VariantClass.DUPLICATION_SHORT: 0.45,
-    VariantClass.DUPLICATION_LONG: 0.4,
+    VariantClass.DELETION: 0.425,
+    VariantClass.DUPLICATION: 0.425,
     VariantClass.INSERTION_MEI: 0.42,
     VariantClass.INVERSION_BND_COMPLEX: 0.38,
     VariantClass.STR_VNTR_REPEAT: 0.4,
@@ -91,10 +82,8 @@ DEFAULT_CLASS_TPB_SHAPE_B: dict[VariantClass, float] = {
 }
 
 STRUCTURAL_VARIANT_CLASSES = (
-    VariantClass.DELETION_SHORT,
-    VariantClass.DELETION_LONG,
-    VariantClass.DUPLICATION_SHORT,
-    VariantClass.DUPLICATION_LONG,
+    VariantClass.DELETION,
+    VariantClass.DUPLICATION,
     VariantClass.INSERTION_MEI,
     VariantClass.INVERSION_BND_COMPLEX,
     VariantClass.STR_VNTR_REPEAT,

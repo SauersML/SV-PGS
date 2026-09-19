@@ -54,7 +54,7 @@ from sv_pgs.dosage_store import (
     DEFAULT_INNER_CHUNK_ROWS,
     DEFAULT_SHARD_ROWS,
     MAXIMUM_DOSAGE_MILLI,
-    VARIANT_CLASSES,
+    VARIANT_CLASS_LEGEND,
     Codec,
     CodeArrayLayout,
     CodeShardWriter,
@@ -204,14 +204,13 @@ class HaplotypeSource:
             raise ValueError(f"the source has no founder haplotypes for {missing}.")
         kinds = np.concatenate([archive["kinds"].astype(str) for archive in archives])
         tandem_repeat = np.concatenate([archive["in_tr"].astype(bool) for archive in archives])
-        sv_length = np.abs(np.concatenate([archive["sv_length"].astype(np.int64) for archive in archives]))
         return cls(
             positions=np.concatenate([archive["positions"].astype(np.int64) for archive in archives]),
             genetic_map_cm=np.concatenate([archive["cm"].astype(np.float64) for archive in archives]),
             reference_lengths=np.concatenate([archive["ref_len"].astype(np.int64) for archive in archives]),
             alternate_lengths=np.concatenate([archive["alt_len"].astype(np.int64) for archive in archives]),
             class_codes=np.select([kinds == "SNV", kinds == "INDEL"], [0, 1], default=2).astype(np.uint8),
-            variant_classes=_variant_classes(kinds, sv_length, tandem_repeat),
+            variant_classes=_variant_classes(kinds, tandem_repeat),
             tandem_repeat=tandem_repeat,
             chromosome_starts=np.concatenate([[0], np.cumsum([archive["positions"].shape[0] for archive in archives])]),
             haplotypes=haplotypes,
@@ -236,7 +235,7 @@ class HaplotypeSource:
         return int(self.chromosome_starts[chromosome]), int(self.chromosome_starts[chromosome + 1])
 
 
-def _variant_classes(kinds: NDArray, sv_length: I64Array, tandem_repeat: NDArray) -> NDArray:
+def _variant_classes(kinds: NDArray, tandem_repeat: NDArray) -> NDArray:
     """SV-PGS classes of 1kGP records: SNV and INDEL directly; SVs in tandem repeats are
     str_vntr_repeat (target-format §2.5); every other SV is typed from its kind token by the
     shared ``variant_typing`` rule."""
@@ -247,9 +246,7 @@ def _variant_classes(kinds: NDArray, sv_length: I64Array, tandem_repeat: NDArray
         if kind in ("SNV", "INDEL"):
             classes[members] = order[VariantClass.SNV if kind == "SNV" else VariantClass.SMALL_INDEL]
             continue
-        token = normalize_variant_token(kind)
-        for length in np.unique(sv_length[members]).tolist():
-            classes[members & (sv_length == length)] = order[structural_variant_class_from_token(token, float(length))]
+        classes[members] = order[structural_variant_class_from_token(normalize_variant_token(kind))]
         classes[members & tandem_repeat] = order[VariantClass.STR_VNTR_REPEAT]
     return classes
 
@@ -1003,7 +1000,7 @@ def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, 
         "ref_len": (reference_lengths, {}),
         "alt_len": (alternate_lengths, {}),
         "cm": (genetic_map, {}),
-        "variant_class": (source.variant_classes[source_index], {"legend": [member.value for member in VARIANT_CLASSES]}),
+        "variant_class": (source.variant_classes[source_index], {"legend": VARIANT_CLASS_LEGEND}),
         "group_first": (layout.bubble_start, {}),
         "class": (source.class_codes[source_index], {"legend": list(CLASS_LEGEND)}),
         "sv_ctx": (context, {"legend": list(SV_CONTEXT_LEGEND)}),

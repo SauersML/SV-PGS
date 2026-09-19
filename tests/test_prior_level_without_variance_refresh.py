@@ -42,7 +42,7 @@ def test_unrefreshed_binary_fit_beats_its_covariates() -> None:
     records = [
         VariantRecord(
             variant_id=f"v{variant_index}",
-            variant_class=VariantClass.DELETION_SHORT if structural else VariantClass.SNV,
+            variant_class=VariantClass.DELETION if structural else VariantClass.SNV,
             chromosome="1",
             position=variant_index + 1,
         )

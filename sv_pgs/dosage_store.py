@@ -178,6 +178,8 @@ DEFAULT_SHARD_ROWS = 65536
 DEFAULT_INNER_CHUNK_ROWS = 64
 ZSTD_LEVEL = 3
 VARIANT_CLASSES = tuple(VariantClass)
+# Stored with every variant_class column; a store whose legend differs is refused, never decoded.
+VARIANT_CLASS_LEGEND = [variant_class.value for variant_class in VARIANT_CLASSES]
 # On-disk variant columns every store carries; any other column is a prior annotation.
 REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first")
 Codec = Literal["raw", "zstd"]
@@ -895,6 +897,11 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             if values.shape[0] != record_count:
                 raise ValueError(f"variant column {chromosome}/{name} has {values.shape[0]} rows, not {record_count}.")
             columns[name] = values
+            if name == "variant_class" and attributes.get("legend") != VARIANT_CLASS_LEGEND:
+                raise ValueError(
+                    f"{chromosome} was written with variant classes {attributes.get('legend')}, not "
+                    f"{VARIANT_CLASS_LEGEND}; convert the store again."
+                )
             if name in names and (values.dtype == np.bool_ or "legend" in attributes):
                 legend = tuple(attributes["legend"]) if "legend" in attributes else ("false", "true")
                 if legends.setdefault(name, legend) != legend:
@@ -1247,7 +1254,7 @@ def write_variant_columns(root: Path, chromosome: str, table: VariantTable, rows
         ("ref_len", table.ref_length[rows].astype(np.int32), {}),
         ("alt_len", table.alt_length[rows].astype(np.int32), {}),
         ("cm", table.genetic_position_cm[rows], {}),
-        ("variant_class", table.variant_class[rows], {"legend": [variant_class.value for variant_class in VARIANT_CLASSES]}),
+        ("variant_class", table.variant_class[rows], {"legend": VARIANT_CLASS_LEGEND}),
         ("group_first", table.group_first[rows] - chromosome_start, {}),
     ):
         write_column(variant_column_directory(root, chromosome, name), values, attributes)

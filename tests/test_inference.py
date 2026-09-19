@@ -5477,7 +5477,7 @@ def test_tpb_shape_vectors_are_learned_from_local_scale_state():
 def test_member_prior_variances_preserve_member_metadata_with_ties():
     member_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, is_copy_number=True),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101, is_copy_number=True),
         VariantRecord("variant_2", VariantClass.SNV, "1", 102),
     ]
     tie_map = TieMap(
@@ -5505,7 +5505,7 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
                 kind="type_offset",
                 center_value=0.25,
                 rms_scale=0.25,
-                variant_class=VariantClass.DELETION_SHORT,
+                variant_class=VariantClass.DELETION,
             ),
         ),
         reduced_design_matrix=np.array([[1.0], [-1.0]], dtype=np.float64),
@@ -5526,8 +5526,8 @@ def test_member_prior_variances_preserve_member_metadata_with_ties():
 def test_member_prior_variances_bound_mixed_tie_extrapolation_to_reduced_support():
     member_records = [
         VariantRecord("snv_tie", VariantClass.SNV, "1", 100),
-        VariantRecord("deletion_tie", VariantClass.DELETION_SHORT, "1", 101),
-        VariantRecord("duplication_tie", VariantClass.DUPLICATION_SHORT, "1", 102),
+        VariantRecord("deletion_tie", VariantClass.DELETION, "1", 101),
+        VariantRecord("duplication_tie", VariantClass.DUPLICATION, "1", 102),
         VariantRecord("snv_singleton", VariantClass.SNV, "1", 103),
     ]
     tie_map = TieMap(
@@ -5556,7 +5556,7 @@ def test_member_prior_variances_bound_mixed_tie_extrapolation_to_reduced_support
                 kind="type_offset",
                 center_value=1.0 / 6.0,
                 rms_scale=1.0 / 6.0,
-                variant_class=VariantClass.DELETION_SHORT,
+                variant_class=VariantClass.DELETION,
             ),
         ),
         reduced_design_matrix=np.array([[1.0], [-1.0]], dtype=np.float64),

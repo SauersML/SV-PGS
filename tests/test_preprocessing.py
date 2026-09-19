@@ -30,8 +30,8 @@ def test_fold_preprocessing_and_exact_ties_ignore_variant_class():
     target_vector = np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32)
     variant_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100, length=1.0, allele_frequency=0.10, quality=1.0),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=500.0, allele_frequency=0.02, quality=0.8),
-        VariantRecord("variant_2", VariantClass.DUPLICATION_SHORT, "1", 102, length=800.0, allele_frequency=0.01, quality=0.7),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101, length=500.0, allele_frequency=0.02, quality=0.8),
+        VariantRecord("variant_2", VariantClass.DUPLICATION, "1", 102, length=800.0, allele_frequency=0.01, quality=0.7),
         VariantRecord("variant_3", VariantClass.SNV, "1", 103, length=1.0, allele_frequency=0.10, quality=0.80),
     ]
 
@@ -59,7 +59,7 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
     )
     variant_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100, length=1.0, allele_frequency=0.10, quality=1.0),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101, length=500.0, allele_frequency=0.02, quality=0.8),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101, length=500.0, allele_frequency=0.02, quality=0.8),
         VariantRecord("variant_2", VariantClass.SNV, "1", 200, length=1.0, allele_frequency=0.10, quality=0.9),
     ]
 
@@ -72,7 +72,7 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
     assert collapsed_records[0].position == 100
     assert collapsed_records[0].is_repeat is False
     assert collapsed_records[0].prior_class_members == (
-        VariantClass.DELETION_SHORT,
+        VariantClass.DELETION,
         VariantClass.SNV,
     )
     np.testing.assert_allclose(collapsed_records[0].prior_class_membership, [0.5, 0.5])
@@ -81,7 +81,7 @@ def test_mixed_class_tie_group_uses_symmetric_latent_class():
 def test_collapse_tie_groups_reuses_records_when_there_are_no_ties():
     variant_records = [
         VariantRecord("variant_0", VariantClass.SNV, "1", 100),
-        VariantRecord("variant_1", VariantClass.DELETION_SHORT, "1", 101),
+        VariantRecord("variant_1", VariantClass.DELETION, "1", 101),
     ]
     tie_map = TieMap(
         kept_indices=np.array([0, 1], dtype=np.int32),
@@ -384,7 +384,7 @@ def test_tie_map_verifies_hash_collisions_before_grouping(monkeypatch: pytest.Mo
 def test_select_active_variant_indices_filters_low_maf_variants_regardless_of_class():
     variant_records = [
         VariantRecord("snv_drop", VariantClass.SNV, "1", 100, allele_frequency=0.0002),
-        VariantRecord("sv_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.0020),
+        VariantRecord("sv_keep", VariantClass.DELETION, "1", 101, allele_frequency=0.0020),
         VariantRecord("snv_keep", VariantClass.SNV, "1", 102, allele_frequency=0.0200),
         VariantRecord("common_alt_keep", VariantClass.SNV, "1", 103, allele_frequency=0.9990),
     ]
@@ -399,7 +399,7 @@ def test_select_active_variant_indices_filters_low_maf_variants_regardless_of_cl
 def test_select_active_variant_indices_keeps_all_variants_when_maf_filter_is_disabled():
     variant_records = [
         VariantRecord("snv_0", VariantClass.SNV, "1", 100, allele_frequency=0.0001),
-        VariantRecord("sv_1", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.0002),
+        VariantRecord("sv_1", VariantClass.DELETION, "1", 101, allele_frequency=0.0002),
         VariantRecord("snv_2", VariantClass.SNV, "1", 102, allele_frequency=0.25),
     ]
 
@@ -414,7 +414,7 @@ def test_select_active_variant_indices_keeps_all_variants_when_maf_filter_is_dis
 def test_select_active_variant_indices_uses_only_maf_filter():
     variant_records = [
         VariantRecord("rare_drop", VariantClass.SNV, "1", 100, allele_frequency=0.0005),
-        VariantRecord("structural_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.0020),
+        VariantRecord("structural_keep", VariantClass.DELETION, "1", 101, allele_frequency=0.0020),
         VariantRecord("snv_keep", VariantClass.SNV, "1", 102, allele_frequency=0.0100),
         VariantRecord("common_ref_keep", VariantClass.SNV, "1", 103, allele_frequency=0.4000),
         VariantRecord("common_alt_keep", VariantClass.SNV, "1", 104, allele_frequency=0.9990),
@@ -431,7 +431,7 @@ def test_select_active_variant_indices_uses_only_maf_filter():
 def test_select_active_variant_indices_keeps_all_post_maf_variants():
     variant_records = [
         VariantRecord("snv_signal", VariantClass.SNV, "1", 100),
-        VariantRecord("sv_keep", VariantClass.DELETION_SHORT, "1", 101, training_support=1),
+        VariantRecord("sv_keep", VariantClass.DELETION, "1", 101, training_support=1),
         VariantRecord("snv_noise_0", VariantClass.SNV, "1", 102),
         VariantRecord("snv_noise_1", VariantClass.SNV, "1", 103),
         VariantRecord("snv_noise_2", VariantClass.SNV, "1", 104),
@@ -450,7 +450,7 @@ def test_select_active_variant_indices_keeps_all_post_maf_variants():
 def test_select_active_variant_indices_keeps_structural_and_snv_variants_after_maf_filter():
     variant_records = [
         VariantRecord("snv_signal", VariantClass.SNV, "1", 100, allele_frequency=0.1),
-        VariantRecord("structural_keep", VariantClass.DELETION_SHORT, "1", 101, allele_frequency=0.1),
+        VariantRecord("structural_keep", VariantClass.DELETION, "1", 101, allele_frequency=0.1),
         VariantRecord("snv_noise", VariantClass.SNV, "1", 102, allele_frequency=0.1),
     ]
 
@@ -538,7 +538,7 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
     variant_records = [
         VariantRecord(
             "variant_0",
-            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION,
             "1",
             100,
             training_support=6,
@@ -549,7 +549,7 @@ def test_collapse_tie_groups_preserves_support_and_continuous_features():
         ),
         VariantRecord(
             "variant_1",
-            VariantClass.DELETION_SHORT,
+            VariantClass.DELETION,
             "1",
             101,
             training_support=8,

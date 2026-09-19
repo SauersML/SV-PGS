@@ -73,7 +73,7 @@ def test_config_constructor_rejects_maximum_samples_kwarg():
 def test_select_active_keeps_all_variants_above_maf():
     n = 10000
     records = [
-        VariantRecord(f"v{i}", VariantClass.DELETION_SHORT, "1", i, allele_frequency=0.05)
+        VariantRecord(f"v{i}", VariantClass.DELETION, "1", i, allele_frequency=0.05)
         for i in range(n)
     ]
     result = select_active_variant_indices(records, ModelConfig(minimum_minor_allele_frequency=0.001))
