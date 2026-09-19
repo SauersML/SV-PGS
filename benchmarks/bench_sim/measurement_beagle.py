@@ -5,6 +5,11 @@ cohort member's true genotype at SNV and non-TR indel records into a call (the m
 calls are the target, the disjoint panel's phased haplotypes are the reference, and Beagle imputes the
 masked TR and SV records. Observed codes: calls for simple sites (code = call * 127), Beagle DS for TR/SV.
 
+Targets are written phased: a correct call keeps the member's true haplotype phase, and a miscalled
+heterozygote gets a random phase. Beagle 5 keeps fully phased input and skips statistical phasing, which
+at 5,000 targets costs about 7 minutes per iteration and window. The arm therefore carries no phasing
+error, making its imputation slightly optimistic (PREREG amendment 4).
+
 Writes <dir>/observed_beagle.npy and <dir>/imputation_beagle.npz (per-record DR2 for TR/SV records,
 the call error rate for simple sites, and realized r2 of the observed value to truth).
 """
@@ -22,30 +27,29 @@ from benchmarks.bench_sim.measurement import (
     BASE_ERROR,
     CODES_PER_DOSAGE,
     PHASED,
+    batch_block,
     bgzip_writer,
     encode_milli,
     finish,
     header,
+    realized_r2,
     run,
     simulated_pl,
 )
 
-UNPHASED = np.frombuffer(b"0/0\t0/1\t1/1\t", dtype=np.uint8).reshape(3, 4)
-STREAM_ROWS = 20_000
+PHASED_CALL = np.frombuffer(b"0|0\t0|1\t1|0\t1|1\t", dtype=np.uint8).reshape(4, 4)
 ROW_BLOCK = 256
 
 
-def batch_block(truth: np.ndarray, rows: np.ndarray, first: int, last: int) -> np.ndarray:
-    """truth[rows, first:last], read as sequential row blocks: strided memmap reads on a network filesystem are random I/O."""
-    block = np.empty((rows.size, last - first), dtype=np.uint8)
-    for start in range(0, truth.shape[0], STREAM_ROWS):
-        chunk = np.asarray(truth[start:start + STREAM_ROWS])[:, first:last]
-        selected = (rows >= start) & (rows < start + STREAM_ROWS)
-        block[selected] = chunk[rows[selected] - start]
-    return block
-
-
 _BLOCK_INPUTS: dict = {}
+
+
+def phased_call_index(called: np.ndarray, genotype: np.ndarray, true_first: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Row of PHASED_CALL (0|0, 0|1, 1|0, 1|1) for each call: a correct call keeps the true phase, a miscalled
+    heterozygote gets a random phase, and a miscalled homozygote has only one phase."""
+    first_allele = np.where(called == genotype, true_first,
+                            np.where(called == 1, rng.integers(0, 2, size=called.shape), called // 2)).astype(np.intp)
+    return 2 * first_allele + (called.astype(np.intp) - first_allele)
 
 
 def beagle_allele(alt: str, row: int) -> str:
@@ -56,12 +60,14 @@ def beagle_allele(alt: str, row: int) -> str:
 
 def _simulate_calls(block_start: int) -> tuple[int, np.ndarray, list[bytes]]:
     """One block of records: read-model calls and their target VCF lines. Runs in a forked worker."""
-    truth_block, errors, sites, simple_rows, seed = (_BLOCK_INPUTS[key] for key in ("truth", "errors", "sites", "rows", "seed"))
+    truth_block, first_block, errors, sites, simple_rows, seed = (
+        _BLOCK_INPUTS[key] for key in ("truth", "first", "errors", "sites", "rows", "seed"))
     stop = block_start + ROW_BLOCK
     rng = np.random.default_rng([*seed, block_start])
-    pl = simulated_pl(truth_block[block_start:stop].astype(np.intp), errors[block_start:stop, None], rng)
+    genotype = truth_block[block_start:stop].astype(np.intp)
+    pl = simulated_pl(genotype, errors[block_start:stop, None], rng)
     called = np.argmin(pl, axis=-1).astype(np.uint8)
-    text = UNPHASED[called].reshape(called.shape[0], -1)
+    text = PHASED_CALL[phased_call_index(called, genotype, first_block[block_start:stop], rng)].reshape(called.shape[0], -1)
     text[:, -1] = ord("\n")
     lines = [sites[row].encode() + body.tobytes() for row, body in zip(simple_rows[block_start:stop], text)]
     return block_start, called, lines
@@ -104,6 +110,7 @@ def main() -> None:
         finish(sink, process, reference)
 
     truth = np.load(root / "truth_G.npy", mmap_mode="r")
+    first_haplotype = np.load(root / "truth_hapA.npy", mmap_mode="r")
     size = truth.shape[1]
     starts = list(range(0, size, args.batch))
     for batch_index, first in enumerate(starts):
@@ -116,11 +123,12 @@ def main() -> None:
         names = [f"s{index}" for index in range(first, last)]
         calls = np.zeros((simple_rows.size, last - first), dtype=np.uint8)
         truth_block = batch_block(truth, simple_rows, first, last)
+        first_block = batch_block(first_haplotype, simple_rows, first, last)
         target = work / f"target{batch_index}.vcf.gz"
         sink, process = bgzip_writer(target, args.threads)
         process.stdin.write(header(args.chrom, length, names, "GT"))
         _BLOCK_INPUTS.update(
-            truth=truth_block, errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]),
+            truth=truth_block, first=first_block, errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]),
             sites=sites, rows=simple_rows, seed=(20260919, batch_index, int(args.chrom.lstrip("chr")), 5),
         )
         with Pool(args.threads) as pool:
@@ -158,15 +166,7 @@ def main() -> None:
         np.save(root / "observed_beagle.npy", observed)
         batch_sizes = np.array([min(first + args.batch, size) - first for first in starts], dtype=np.float64)
         dr2 = sum(np.load(work / f"dr2_{index}.npy") * batch_sizes[index] for index in range(len(starts))) / batch_sizes.sum()
-        realized = np.zeros(n_var)
-        for first in range(0, n_var, 5000):
-            true_block = np.asarray(truth[first:first + 5000]).astype(np.float64)
-            observed_block = observed[first:first + 5000].astype(np.float64) / CODES_PER_DOSAGE
-            true_block -= true_block.mean(axis=1, keepdims=True)
-            observed_block -= observed_block.mean(axis=1, keepdims=True)
-            numerator = (true_block * observed_block).sum(axis=1) ** 2
-            denominator = (true_block ** 2).sum(axis=1) * (observed_block ** 2).sum(axis=1)
-            realized[first:first + 5000] = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
+        realized = realized_r2(truth, observed)
         np.savez(root / "imputation_beagle.npz", info=dr2, realized_r2=realized)
         for code in range(4):
             members = cls == code

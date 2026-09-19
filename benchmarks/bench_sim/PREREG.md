@@ -137,3 +137,13 @@ Section 2 is replaced so that the measurement process follows the aou2 imputatio
 - **Truth file key:** the phenotype is stored as `phenotype`, not `y`, since the repo forbids single-letter names. The submission API exposes `train.phenotype`.
 - **ridge_inf:** the Haseman–Elston h² is truncated to its parameter space [0, 1]. At h² = 0 the prediction is zero; at h² = 1 the solve is the pseudo-inverse.
 - **Per-group R²:** it is reported for every group with more samples than regression parameters + 2.
+
+## Amendment 4 (2026-09-19, before any submission): measurement arms (lead ruling C)
+- **Arm "glimpse2"** (label GLIMPSE2-imputed): Amendment 1 exactly, run on a calibration subset, the first 2,500 cohort samples. Its group mix is iid from the cohort's weights.
+- **Arm "beagle"** (label Beagle-imputed): all 50,000 samples.
+  - Simple sites are observed as read-model calls, the minimum-PL genotype from the Amendment 1 read model.
+  - Targets are written phased: a correct call keeps the member's true phase, and a miscalled heterozygote gets a random phase.
+  - TR and SV records are imputed by Beagle 5.5 (27Feb25.75f) from the disjoint panel, with defaults and the PLINK GRCh38 map. Symbolic ALTs carry the record ID so Beagle sees them as distinct markers.
+  - The arm has no statistical phasing error, so it is mildly optimistic.
+- **Every result records its arm label.** Headline claims about draw-like columns wait for a GLIMPSE2 cohort if GLIMPSE2 DS proves draw-like (κ ≈ √r²).
+- **Donor/panel disjointness is verified:** 1,554 donor and 1,036 panel founders, with an intersection of 0. Cryptic relatedness between founders is not removed; that is a known limitation.

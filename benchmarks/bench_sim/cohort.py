@@ -4,7 +4,8 @@ PREREG.md section 1. Writes, under <out>/<chrom>/:
   variants.npz     per kept record: pos, end, ref_len, alt_len, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV),
                    svtype, ids, donor allele counts, superpopulation AFs of the donors
   donor_haps.u8    [n_var, 2 * n_donor] donor haplotypes (0/1), variant-major (kept for re-imputation)
-  truth_G.u8       [n_var, N] cohort genotypes 0/1/2, variant-major
+  truth_G.npy      [n_var, N] cohort genotypes 0/1/2, variant-major
+  truth_hapA.npy   [n_var, N] each member's first haplotype (0/1); truth_G - truth_hapA is the second
   samples.npz      cohort group, realized ancestry proportions, sex, age, batch, split
 and <out>/founders.tsv with the donor / panel split.
 """
@@ -300,6 +301,7 @@ def main() -> None:
     # Built in RAM (n_var x N bytes) and written once: column-block writes into a network-FS memmap are
     # random I/O and far slower than the mosaic itself.
     truth = np.zeros((n_var, args.size), dtype=np.uint8)
+    first_haplotype = np.zeros((n_var, args.size), dtype=np.uint8)
     realized = np.zeros((args.size, len(SUPERPOPS)), dtype=np.float32)
     donors_t = np.ascontiguousarray(haps.T)
     del haps
@@ -307,8 +309,9 @@ def main() -> None:
     for first in range(0, args.size, args.sample_batch):
         last = min(first + args.sample_batch, args.size)
         rows = np.zeros((last - first, n_var), dtype=np.uint8)
+        first_rows = np.zeros((last - first, n_var), dtype=np.uint8)
         for offset, person in enumerate(range(first, last)):
-            for _ in range(2):
+            for haplotype_index in range(2):
                 starts, donor_cols, ancestry = haplotype_path(cm, proportions[person], generations[person], donor_columns, rng)
                 stops = np.append(starts[1:], n_var)
                 for start, stop, column in zip(starts.tolist(), stops.tolist(), donor_cols.tolist()):
@@ -316,10 +319,14 @@ def main() -> None:
                         rows[offset, start:stop] += donors_t[column, start:stop]
                 seg_len = np.diff(np.append(morgan_span[starts], morgan_span[-1]))
                 np.add.at(realized[person], ancestry, seg_len / 2.0)
+                if haplotype_index == 0:
+                    first_rows[offset] = rows[offset]
         truth[:, first:last] = rows.T
+        first_haplotype[:, first:last] = first_rows.T
         print(f"cohort samples {last}/{args.size}", flush=True)
     np.save(out / "truth_G.npy", truth)
-    del truth
+    np.save(out / "truth_hapA.npy", first_haplotype)
+    del truth, first_haplotype
     realized /= realized.sum(axis=1, keepdims=True)
     np.savez(
         out / "samples.npz", group=group, group_names=np.asarray(list(GROUPS)), proportions=proportions,

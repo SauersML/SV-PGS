@@ -34,6 +34,33 @@ GQ_CAP = 99
 ERR_IMP = "1e-3"
 # Records simulated and written per vectorized step.
 ROW_BLOCK = 256
+STREAM_ROWS = 20_000
+
+
+def batch_block(matrix: np.ndarray, rows: np.ndarray, first: int, last: int) -> np.ndarray:
+    """matrix[rows, first:last] from a variant-major memmap, read as sequential row blocks: strided memmap
+    reads on a network filesystem are random I/O."""
+    block = np.empty((rows.size, last - first), dtype=matrix.dtype)
+    for start in range(0, matrix.shape[0], STREAM_ROWS):
+        chunk = np.asarray(matrix[start:start + STREAM_ROWS])[:, first:last]
+        selected = (rows >= start) & (rows < start + STREAM_ROWS)
+        block[selected] = chunk[rows[selected] - start]
+    return block
+
+
+def realized_r2(truth: np.ndarray, observed: np.ndarray) -> np.ndarray:
+    """corr^2(truth row, observed dosage row) for every record, streaming both variant-major matrices."""
+    result = np.zeros(truth.shape[0])
+    size = observed.shape[1]
+    for first in range(0, truth.shape[0], STREAM_ROWS):
+        true_block = np.asarray(truth[first:first + STREAM_ROWS])[:, :size].astype(np.float64)
+        observed_block = np.asarray(observed[first:first + STREAM_ROWS]).astype(np.float64) / CODES_PER_DOSAGE
+        true_block -= true_block.mean(axis=1, keepdims=True)
+        observed_block -= observed_block.mean(axis=1, keepdims=True)
+        numerator = (true_block * observed_block).sum(axis=1) ** 2
+        denominator = (true_block ** 2).sum(axis=1) * (observed_block ** 2).sum(axis=1)
+        result[first:first + STREAM_ROWS] = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
+    return result
 
 
 def encode_milli(milli: np.ndarray) -> np.ndarray:
@@ -111,11 +138,12 @@ _BLOCK_INPUTS: dict = {}
 
 def _simulate_pl_lines(block_start: int) -> bytes:
     """One block of simple-site records: read-model PLs as target VCF lines. Runs in a forked worker."""
-    truth, errors, prefix, simple_rows, first, last, seed = (
-        _BLOCK_INPUTS[key] for key in ("truth", "errors", "prefix", "rows", "first", "last", "seed"))
-    rows = simple_rows[block_start:block_start + ROW_BLOCK]
+    truth_block, errors, prefix, simple_rows, seed = (
+        _BLOCK_INPUTS[key] for key in ("truth", "errors", "prefix", "rows", "seed"))
+    stop = block_start + ROW_BLOCK
+    rows = simple_rows[block_start:stop]
     rng = np.random.default_rng([*seed, block_start])
-    pl = simulated_pl(truth[rows, first:last].astype(np.intp), errors[block_start:block_start + ROW_BLOCK, None], rng)
+    pl = simulated_pl(truth_block[block_start:stop].astype(np.intp), errors[block_start:stop, None], rng)
     text = pl_text(pl.reshape(-1, 3)).reshape(rows.size, -1)
     text[:, -1] = ord("\n")
     return b"".join(prefix[row] + b"PL\t" + body.tobytes() for row, body in zip(rows, text))
@@ -179,16 +207,9 @@ def main() -> None:
                  "--threads", str(args.threads)])
         binaries.append(binary)
 
-    # Whole matrices live in RAM: strided memmap access on the network filesystem is random I/O.
-    truth = np.load(root / "truth_G.npy")
+    truth = np.load(root / "truth_G.npy", mmap_mode="r")
     size = args.limit_samples or truth.shape[1]
     suffix = "_smoke" if args.limit_samples else ""
-    info_sum = np.zeros(n_var)
-    info_weight = np.zeros(n_var)
-    stats = work / f"stats{suffix}.npz"
-    if stats.exists():
-        saved = np.load(stats)
-        info_sum, info_weight = saved["info_sum"], saved["info_weight"]
     starts = list(range(0, size, args.batch))
     for batch_index, first in enumerate(starts):
         if args.only_batch >= 0 and batch_index != args.only_batch:
@@ -199,27 +220,36 @@ def main() -> None:
         last = min(first + args.batch, size)
         names = [f"s{index}" for index in range(first, last)]
         target = work / f"gl{batch_index}{suffix}.vcf.gz"
-        sink, process = bgzip_writer(target, args.threads)
-        process.stdin.write(header(args.chrom, length, names, "PL"))
-        _BLOCK_INPUTS.update(
-            truth=truth, errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]), prefix=prefix,
-            rows=simple_rows, first=first, last=last, seed=(20260919, batch_index, int(args.chrom.lstrip("chr"))),
-        )
-        with Pool(args.threads) as pool:
-            for lines in pool.imap(_simulate_pl_lines, range(0, simple_rows.size, ROW_BLOCK)):
-                process.stdin.write(lines)
-        finish(sink, process, target)
+        # Checkpoints: the GL file and each chunk's phase output are marked complete, so a crashed task
+        # resumes at the chunk in flight.
+        target_done = target.with_name(target.name + ".complete")
+        if not target_done.exists():
+            sink, process = bgzip_writer(target, args.threads)
+            process.stdin.write(header(args.chrom, length, names, "PL"))
+            _BLOCK_INPUTS.update(
+                truth=batch_block(truth, simple_rows, first, last), errors=np.array([BASE_ERROR[int(code)] for code in cls[simple_rows]]),
+                prefix=prefix, rows=simple_rows, seed=(20260919, batch_index, int(args.chrom.lstrip("chr"))),
+            )
+            with Pool(args.threads) as pool:
+                for lines in pool.imap(_simulate_pl_lines, range(0, simple_rows.size, ROW_BLOCK)):
+                    process.stdin.write(lines)
+            finish(sink, process, target)
+            target_done.touch()
         outputs = []
         for index, (chunk, binary) in enumerate(zip(chunks, binaries)):
             output = work / f"imp{batch_index}{suffix}_{index}.bcf"
-            run([str(tools / "GLIMPSE2_phase_static"), "--input-gl", str(target), "--reference", str(binary),
-                 "--output", str(output), "--threads", str(args.threads), "--err-imp", ERR_IMP])
+            output_done = output.with_name(output.name + ".complete")
+            if not output_done.exists():
+                run([str(tools / "GLIMPSE2_phase_static"), "--input-gl", str(target), "--reference", str(binary),
+                     "--output", str(output), "--threads", str(args.threads), "--err-imp", ERR_IMP])
+                output_done.touch()
             outputs.append(output)
         listing = work / f"ligate{batch_index}{suffix}.txt"
         listing.write_text("\n".join(str(path) for path in outputs) + "\n")
         ligated = work / f"imputed{batch_index}{suffix}.bcf"
         run([str(tools / "GLIMPSE2_ligate_static"), "--input", str(listing), "--output", str(ligated), "--threads", str(args.threads)])
         batch_codes = np.zeros((n_var, last - first), dtype=np.uint8)
+        batch_info = np.zeros(n_var)
         seen = np.zeros(n_var, dtype=bool)
         reader = VCF(str(ligated))
         for record in reader:
@@ -228,33 +258,28 @@ def main() -> None:
             milli = np.clip(np.rint(dosage * 1000.0), 0, 2000).astype(np.int64)
             batch_codes[row] = encode_milli(milli)
             seen[row] = True
-            info_sum[row] += float(record.INFO["INFO"]) * (last - first)
-            info_weight[row] += last - first
+            batch_info[row] = float(record.INFO["INFO"])
         reader.close()
         if not seen.all():
             raise SystemExit(f"batch {batch_index}: {int((~seen).sum())} records missing from the GLIMPSE2 output")
         np.save(work / f"codes{batch_index}{suffix}.npy", batch_codes)
-        np.savez(stats, info_sum=info_sum, info_weight=info_weight)
+        np.save(work / f"info{batch_index}{suffix}.npy", batch_info)
         for path in outputs:
             path.unlink()
+            path.with_name(path.name + ".complete").unlink()
         target.unlink()
+        target_done.unlink()
         flag.touch()
         print(f"batch {batch_index} imputed ({last}/{size})", flush=True)
 
     if all((work / f"batch{index}{suffix}.done").exists() for index in range(len(starts))):
         observed = np.concatenate([np.load(work / f"codes{index}{suffix}.npy") for index in range(len(starts))], axis=1)
         np.save(root / f"observed{suffix}.npy", observed)
-        realized = np.zeros(n_var)
-        for first in range(0, n_var, 5000):
-            true_block = truth[first:first + 5000, :size].astype(np.float64)
-            observed_block = observed[first:first + 5000].astype(np.float64) / CODES_PER_DOSAGE
-            true_block -= true_block.mean(axis=1, keepdims=True)
-            observed_block -= observed_block.mean(axis=1, keepdims=True)
-            numerator = (true_block * observed_block).sum(axis=1) ** 2
-            denominator = (true_block ** 2).sum(axis=1) * (observed_block ** 2).sum(axis=1)
-            realized[first:first + 5000] = np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
+        realized = realized_r2(truth, observed)
+        batch_sizes = np.array([min(first + args.batch, size) - first for first in starts], dtype=np.float64)
+        info = sum(np.load(work / f"info{index}{suffix}.npy") * batch_sizes[index] for index in range(len(starts))) / batch_sizes.sum()
         name = "imputation_smoke.npz" if args.limit_samples else "imputation.npz"
-        np.savez(root / name, info=info_sum / info_weight, realized_r2=realized)
+        np.savez(root / name, info=info, realized_r2=realized)
         for code in range(4):
             members = cls == code
             print(f"class {code}: median realized r2 {np.median(realized[members]):.3f}, "

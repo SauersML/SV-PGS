@@ -189,3 +189,30 @@ def test_beagle_alleles_are_unique_per_record() -> None:
     assert measurement_beagle.beagle_allele("<INS>", 7) == "<INS:v7>"
     assert measurement_beagle.beagle_allele("<INS>", 7) != measurement_beagle.beagle_allele("<INS>", 8)
     assert measurement_beagle.beagle_allele("ACGT", 7) == "ACGT"
+
+
+def test_phased_calls_keep_true_phase_when_the_call_is_right() -> None:
+    rng = np.random.default_rng(10)
+    first = rng.integers(0, 2, size=10_000)
+    second = rng.integers(0, 2, size=10_000)
+    genotype = first + second
+    index = measurement_beagle.phased_call_index(genotype.astype(np.uint8), genotype, first, rng)
+    assert np.array_equal(index // 2, first) and np.array_equal(index % 2, second)
+    miscalled = np.where(genotype == 1, 2, 1).astype(np.uint8)
+    index = measurement_beagle.phased_call_index(miscalled, genotype, first, rng)
+    assert np.array_equal(index // 2 + index % 2, miscalled)
+
+
+def test_batch_block_and_realized_r2_match_direct_computation() -> None:
+    rng = np.random.default_rng(11)
+    truth = rng.integers(0, 3, size=(50_000, 40)).astype(np.uint8)
+    rows = np.sort(rng.choice(truth.shape[0], size=700, replace=False))
+    assert np.array_equal(measurement.batch_block(truth, rows, 5, 30), truth[rows, 5:30])
+    noise = rng.integers(0, 40, size=truth.shape)
+    observed = np.clip(truth.astype(np.int64) * measurement.CODES_PER_DOSAGE + noise, 0, 254).astype(np.uint8)
+    r2 = measurement.realized_r2(truth, observed)
+    for row in rows[:20]:
+        if truth[row].std() > 0:
+            expected = np.corrcoef(truth[row], observed[row])[0, 1] ** 2
+            # r2 = cross^2 / (ss_truth * ss_observed): four length-n sums, each with relative error <= n * eps.
+            assert abs(r2[row] - expected) <= 4 * truth.shape[1] * EPSILON * max(expected, 1.0)
