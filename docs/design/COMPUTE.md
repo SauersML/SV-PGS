@@ -101,7 +101,7 @@ End to end: about 1,000× today, and 10–40× once Stage 1 is removed.
   - no task may call `sbatch` itself.
 - **Environments** (uv, Python 3.12, synced `--locked` from `svpgs-team/env-src`, a detached checkout of origin/main):
   - `svpgs-team/venv-cpu`: the dev and sim groups (msprime included);
-  - `svpgs-team/venv-gpu`: the same plus the `gpu` extra (cupy-cuda12x, jax[cuda12]). Export `LD_LIBRARY_PATH` from `venv-gpu/lib/python3.12/site-packages/nvidia/*/lib` before importing cupy or jax.
+  - `svpgs-team/venv-gpu`: the same plus the `gpu` extra (cupy-cuda12x and the CUDA 12 library wheels it loads). Export `LD_LIBRARY_PATH` from `venv-gpu/lib/python3.12/site-packages/nvidia/*/lib` before importing cupy.
   - Both are built with `--no-install-project`, so `sv_pgs` is never installed in them. Every run uses its own worktree as cwd (`python -m pytest`) or sets `PYTHONPATH` to it, and logs `sv_pgs.__file__` and the commit. A run without either fails at import instead of silently using another commit.
   - To refresh after a lock change: update `env-src` to origin/main, then rerun `uv sync --locked --no-install-project --group dev --group sim [--extra gpu]` with `UV_PROJECT_ENVIRONMENT` set to the venv.
   - The older `main/.venv` belongs to the shared clone, which another session depends on. It predates zstandard and duckdb, so it cannot collect the store tests. Never sync or install into it.

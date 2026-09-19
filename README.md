@@ -25,7 +25,7 @@ The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings b
 [docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps.
 - **On main:** the dosage store, Stage 0, the Stage 2 E-step, scoring, the reliability and fusion models, the prior design, the phenotypes and the evaluation tests.
 - **Not yet on main:** Stage 1 and the end-to-end fit.
-- **Being deleted:** the old fitting path, step by step ([CUTOVER.md](docs/design/CUTOVER.md)).
+- **Deleted:** the old fitting path, in cutover steps C2–C8 ([CUTOVER.md](docs/design/CUTOVER.md)); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## Install
 ```bash

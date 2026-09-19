@@ -1,6 +1,6 @@
 # SV-PGS design documents
 
-These documents describe SV-PGS: the one model, its dosage store, its phenotypes, its evaluation and its compute plan, plus the rulings behind each choice. The old fitting path is being deleted step by step (CUTOVER.md).
+These documents describe SV-PGS: the one model, its dosage store, its phenotypes, its evaluation and its compute plan, plus the rulings behind each choice. The old fitting path was deleted in cutover steps C2–C8 (CUTOVER.md).
 
 | Document | What it holds |
 |---|---|
@@ -11,6 +11,7 @@ These documents describe SV-PGS: the one model, its dosage store, its phenotypes
 | [PHENOTYPES.md](PHENOTYPES.md) | The 21-trait All of Us panel as built: disease and trait rules, targets, which values are standards, and the rules still to be replaced |
 | [COMPUTE.md](COMPUTE.md) | Cost model, cloud launch path, MSI notes |
 | [CUTOVER.md](CUTOVER.md) | The ordered deletion of the old path (C2–C8): files, tests, blockers, verification |
+| [CDR_LAYOUT.md](CDR_LAYOUT.md) | Where the All of Us CDR inputs live |
 | [DECISIONS.md](DECISIONS.md) | Dated log of the design rulings and the measurements behind them |
 | [math/scale_model.md](math/scale_model.md) | Derivation of the prior scale: the r² offset, joint leakage and the A-map, stacking, the frequency term from stabilizing selection, shape vs scale, the TR column, the SV-context kernel, the pooling pin |
 | [math/novel-evoprior.md](math/novel-evoprior.md) | The effect prior derived from mutation–selection–drift: exact folded SFS, the frequency-conditioned scale mixture and its ceiling, the S exponent in closed form, SV length as a subordinator, the TR diversity-deficit tilt, trait pooling, the SFS channel, identifiability (sim-only checks; adoption pending bench) |

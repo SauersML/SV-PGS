@@ -10,8 +10,6 @@ license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
-    "jax>=0.4.20,<0.5",
-    "jaxlib>=0.4.20,<0.5",
     "numpy>=1.24",
     "scipy>=1.15,<2",
     "cyvcf2>=0.31.4",
@@ -26,16 +24,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["jax[cuda12]>=0.4.20,<0.5", "cupy-cuda12x>=13.0", "nvidia-cuda-nvrtc-cu12"]
+# CuPy loads the CUDA 12 runtime, cuBLAS, cuSOLVER (with its cuSPARSE and nvJitLink) and NVRTC from these
+# wheels at run time; JAX's CUDA extra used to bring them in.
+gpu = [
+    "cupy-cuda12x>=13.0",
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-nvjitlink-cu12",
+    "nvidia-cuda-nvrtc-cu12",
+]
 
 [project.scripts]
 sv-pgs = "sv_pgs.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["sv_pgs*", "benchmarks*"]
-
-[tool.setuptools.package-data]
-sv_pgs = ["_data/*.tsv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -52,10 +57,6 @@ module = [
     "numpy.*",
     "pytest",
     "pytest.*",
-    "jax",
-    "jax.*",
-    "jaxlib",
-    "jaxlib.*",
     "sklearn",
     "sklearn.*",
     "google.cloud",
