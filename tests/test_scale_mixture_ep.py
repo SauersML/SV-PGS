@@ -551,7 +551,7 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
             - _penalty_value(prior, hyperparameters.log_smoothing, evidence.coefficients + step * directions[:, index])[0]
             for step in steps
         ])
-        reference = np.log(np.trapezoid(np.exp(line - value), steps)) - 0.5 * np.log(2.0 * np.pi)
+        reference = np.log(np.trapz(np.exp(line - value), steps)) - 0.5 * np.log(2.0 * np.pi)
         np.testing.assert_allclose(corrections[index], reference, atol=1e-6)
     # Where the Tierney-Kadane term is tiny, the exact correction is of its size.
     tiny = np.abs(terms) < 1e-5
