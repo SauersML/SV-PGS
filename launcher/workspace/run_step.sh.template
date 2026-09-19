@@ -1,0 +1,20 @@
+#!/bin/bash
+# TEMPLATE, never launched by an agent: launching is the user's decision.
+# The Batch task. It installs the staged wheelhouse into a venv on the run disk, then runs the pipeline
+# through ${THROUGH}. Status goes only to empty marker files in the workspace's ops bucket mount.
+set -uo pipefail
+OPS=/mnt/disks/ops/svpgs/${RUN_ID}
+RUN=/mnt/disks/run
+mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_$1"; }
+trap 'mark "terminated"; exit 75' TERM
+mark started
+if [ ! -x "$RUN/venv/bin/sv-pgs" ]; then
+  python3 -m venv "$RUN/venv" && "$RUN/venv/bin/pip" install --no-index --find-links "$OPS/wheels" sv-pgs || { mark "exit-install"; exit 1; }
+fi
+export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
+mkdir -p "$TMPDIR"
+"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" &
+wait $!
+status=$?
+mark "exit-${status}"
+exit "$status"

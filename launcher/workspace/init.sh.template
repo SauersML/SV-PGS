@@ -1,0 +1,12 @@
+#!/bin/bash
+# TEMPLATE, never launched by an agent: launching is the user's decision.
+# The Dataproc initialization action. It runs once on the zero-worker cluster's manager, inside the
+# workspace perimeter, as the workspace service account, and submits one Google Batch job. It sends
+# nothing outside the workspace.
+set -euo pipefail
+[ "$(/usr/share/google/get_metadata_value attributes/dataproc-role)" = "Master" ] || exit 0
+SPEC=/tmp/svpgs-job.json
+gcloud storage cp "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/launcher/job.json" "$SPEC"
+gcloud batch jobs submit "svpgs-${RUN_ID}-$(date -u +%Y%m%d%H%M%S)" \
+  --project="${PROJECT_ID}" --location="${REGION}" --config="$SPEC"
+: > /tmp/empty && gcloud storage cp /tmp/empty "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/markers/$(date -u +%Y%m%dT%H%M%SZ)_launcher_submitted"

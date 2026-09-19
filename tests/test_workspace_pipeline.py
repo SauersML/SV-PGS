@@ -15,6 +15,7 @@ import gzip
 import hashlib
 import json
 import pickle
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -555,3 +556,27 @@ def test_the_config_names_every_key_and_canonical_phenotypes(workspace) -> None:
         WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "truth_calls"})
     with pytest.raises(ValueError, match="canonical name"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "diseases": ["afib"]})
+
+
+LAUNCHER = Path(__file__).resolve().parents[1] / "launcher" / "workspace"
+
+
+def _filled(text: str) -> str:
+    """A template with its numeric placeholders set to 1 and every other placeholder to a name."""
+    for name in ("FOLD_SEED", "MAX_RETRIES", "GPU_COUNT"):
+        text = text.replace("${" + name + "}", "1")
+    return re.sub(r"\$\{[A-Z_]+\}", "placeholder", text)
+
+
+def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None:
+    raw = json.loads(_filled((LAUNCHER / "run_config.template.json").read_text()))
+    config = WorkspaceConfig.from_mapping(raw)
+    assert (len(config.diseases), len(config.traits), config.fold_count) == (10, 11, 5) and config.truth_calls is None
+    for job in ("job_store.json.template", "job_fit.json.template"):
+        network = json.loads(_filled((LAUNCHER / job).read_text()))["allocationPolicy"]["network"]["networkInterfaces"][0]
+        assert network["noExternalIpAddress"] is True
+
+
+def test_the_launcher_sends_nothing_outside_the_workspace() -> None:
+    text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.name != "README.md")
+    assert not re.search(r"https?://|curl|wget|webhook|notif|mail|slack|pubsub|scp |rsync", text)

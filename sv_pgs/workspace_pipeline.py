@@ -812,7 +812,7 @@ def read_strata_sites(directory: Path, chromosome: str) -> StrataSites:
     return StrataSites(
         positions=table["pos"].to_numpy(dtype=np.int64),
         identifiers=tuple(table["id"].astype(str)),
-        refalt_digests=np.array([int(value, 16) for value in table["refalt_md5"]], dtype=np.uint64),
+        refalt_digests=np.array([int.from_bytes(bytes.fromhex(value), "big") for value in table["refalt_md5"]], dtype=np.uint64),
         ref_lengths=table["ref_len"].to_numpy(dtype=np.int64),
         alt_lengths=table["alt_len"].to_numpy(dtype=np.int64),
         n_paths=table["n_paths"].to_numpy(dtype=np.int64),
