@@ -47,7 +47,7 @@ include = ["sv_pgs*", "benchmarks*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "slow: tests that take 30s+; can be deselected via -m 'not slow'",
+    "slow: a test over 60 s on a CI runner; excluded from the CI shards (-m 'not slow') and run on MSI by bug-recent's periodic full run",
 ]
 
 [tool.mypy]

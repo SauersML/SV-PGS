@@ -39,7 +39,7 @@ jobs:
         run: |
           set -o pipefail
           ls tests/test_*.py | sort | awk -v shard=${{ matrix.shard }} 'NR % 3 == shard' > shard_files.txt
-          uv run pytest -q -rfEs $(cat shard_files.txt) 2>&1 | tee pytest_output.txt
+          uv run pytest -q -rfEs -m "not slow" --durations=15 $(cat shard_files.txt) 2>&1 | tee pytest_output.txt
 
       - name: Upload pytest output on failure
         if: failure()
