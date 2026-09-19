@@ -19,36 +19,36 @@ import sqlglot
 from sqlglot import exp
 
 from sv_pgs.all_of_us import (
-    MEASUREMENT_EXCLUSION_REASONS,
     DiseaseDefinition,
     LabCriterion,
     MeasurementDefinition,
+    PersonOccasions,
     _prepare_training_rows,
     build_all_of_us_disease_query_parameters,
     build_all_of_us_disease_sql,
+    build_all_of_us_lab_criterion_query_parameters,
     build_all_of_us_measurement_census_query_parameters,
     build_all_of_us_measurement_census_sql,
     build_all_of_us_measurement_query_parameters,
     build_all_of_us_measurement_sql,
     build_all_of_us_measurement_targets,
+    lab_criterion_evidence,
+    person_occasions,
     resolve_disease_definition,
-    resolve_lab_criterion_measurement,
     resolve_measurement_definition,
 )
-from tests.phenotype_bounds import (
-    sampling_bound,
-    variance_component_standard_errors,
-    variance_condition,
-    within_rounding,
-)
+from tests.phenotype_bounds import sampling_bound, within_rounding
+
+WORKING_BYTES = 1 << 28
 
 DATASET = "aou_workspace.cdr_dataset"
 
 
-def _identity_mean_operations(occasion_count: int) -> int:
-    """A plain trait's occasion mean: the unit conversion (2) and the same-day
-    mean (2) per value, then the mean over the occasions."""
-    return 4 + occasion_count
+# A plain trait's occasion value: the unit conversion (2) and the same-day mean (2).
+_IDENTITY_OPERATIONS = 4
+# An eGFR occasion: the conversion (2), the ratio (1), two powers (4), the age term's power (2) and age (1),
+# four products (4) and the same-day mean (2).
+_EGFR_OPERATIONS = 16
 
 
 OMOP_TABLES = {
@@ -202,6 +202,8 @@ def _duckdb_query(sql: str, parameters: dict[str, tuple[str, object]]) -> str:
     def literal(parameter_type: str, value: object) -> exp.Expression:
         if isinstance(value, list):
             return exp.Array(expressions=[literal(parameter_type, element) for element in value])
+        if value is None:
+            return exp.cast(exp.Null(), "DOUBLE" if parameter_type == "FLOAT64" else "BIGINT")
         if parameter_type == "BOOL":
             return exp.Boolean(this=value)
         if parameter_type == "STRING":
@@ -292,12 +294,20 @@ class _Cdr:
         columns = [description[0] for description in cursor.description]
         return {row[0]: dict(zip(columns, row, strict=True)) for row in cursor.fetchall()}
 
-    def measurement_rows(
-        self, definition: MeasurementDefinition, criterion: LabCriterion | None = None
-    ) -> dict[str, dict[str, object]]:
-        return self._run(
-            build_all_of_us_measurement_sql(), build_all_of_us_measurement_query_parameters(definition, criterion)
-        )
+    def _all_rows(self, sql: str, parameters: dict[str, tuple[str, object]]) -> list[dict[str, object]]:
+        cursor = self.connection.execute(_duckdb_query(sql, parameters))
+        columns = [description[0] for description in cursor.description]
+        return [dict(zip(columns, row, strict=True)) for row in cursor.fetchall()]
+
+    def measurement_rows(self, definition: MeasurementDefinition) -> list[dict[str, object]]:
+        return self._all_rows(build_all_of_us_measurement_sql(), build_all_of_us_measurement_query_parameters(definition))
+
+    def measurement_people(self, definition: MeasurementDefinition) -> dict[str, PersonOccasions]:
+        return {person.person_id: person for person in person_occasions(self.measurement_rows(definition))}
+
+    def lab_evidence(self, criterion: LabCriterion) -> dict[str, dict[str, object]]:
+        rows = self._all_rows(build_all_of_us_measurement_sql(), build_all_of_us_lab_criterion_query_parameters(criterion))
+        return lab_criterion_evidence(criterion, person_occasions(rows))
 
     def disease_rows(self, definition: DiseaseDefinition) -> dict[str, dict[str, object]]:
         return self._run(build_all_of_us_disease_sql(definition), build_all_of_us_disease_query_parameters(definition))
@@ -326,10 +336,8 @@ def _ckd_epi_2021(creatinine_mg_dl: float, age: float, female: bool) -> float:
     return 142.0 * min(ratio, 1.0) ** alpha * max(ratio, 1.0) ** -1.2 * 0.9938**age * sex_factor
 
 
-def _excluded(row: dict[str, object]) -> dict[str, int]:
-    counts = {reason: row[f"{reason}_row_count"] for reason in MEASUREMENT_EXCLUSION_REASONS}
-    assert all(isinstance(count, int) for count in counts.values())
-    return {reason: count for reason, count in counts.items() if count}
+def _excluded(person: PersonOccasions) -> dict[str, int]:
+    return {reason: count for reason, count in person.excluded_row_counts.items() if count}
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +351,9 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
     cdr.measurement(1, "2015-03-01", 0.8)
     cdr.measurement(1, "2015-03-01", 0.9, unit_concept_id=None)
     cdr.measurement(1, "2016-05-10", 1.0, operator_concept_id=4172703, source_concept_id=3016723, concept_id=0)
+    # 25 mg/dL is a gross value, which a trait keeps for its noise density to weigh.
     cdr.measurement(1, "2017-01-01", 25.0)
+    cdr.measurement(1, "2017-01-15", 0.0)
     cdr.measurement(1, "2017-02-01", 0.3, operator_concept_id=4171756)
     cdr.measurement(1, "2017-03-01", 0.2, value_source_value="<0.2")
     cdr.measurement(1, "2017-04-01", 0.07, unit_concept_id=8753)
@@ -358,47 +368,39 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
     cdr.person(3, 1970, 903096)
     cdr.measurement(3, "2020-01-01", 1.0)
 
-    rows = cdr.measurement_rows(egfr)
-    assert set(rows) == {"1", "2", "3"}
+    people = cdr.measurement_people(egfr)
+    assert set(people) == {"1", "2", "3"}
 
-    first = rows["1"]
+    first = people["1"]
     # A row whose standard concept is unmapped (0) still counts through its source LOINC.
-    assert first["measurement_row_count"] == 9
-    assert _excluded(first) == {"censored": 2, "unrecognized_unit": 2, "implausible": 1, "self_reported": 1}
-    assert sorted(first["unrecognized_unit_labels"]) == ["millimole per liter", "percent"]
-    # 2015-03-01 has two rows (mg/dL and no unit): one occasion, the mean of their log eGFRs.
-    first_age = _age("2015-03-01", 1960)
-    first_occasion = np.mean([
-        math.log(_ckd_epi_2021(0.8, first_age, female=True)),
-        math.log(_ckd_epi_2021(0.9, first_age, female=True)),
-    ])
-    second_age = _age("2016-05-10", 1960)
-    second_occasion = math.log(_ckd_epi_2021(1.0, second_age, female=True))
-    assert first["untreated_occasion_count"] == 2
-    # An occasion value takes 20 rounded operations: the unit conversion, the
-    # CKD-EPI terms, the log, the same-day mean and the occasion mean.
-    occasions = [first_occasion, second_occasion]
-    assert first["untreated_mean"] == within_rounding(np.mean(occasions), 20)
-    assert first["untreated_variance"] == within_rounding(np.var(occasions), 26, variance_condition(occasions))
-    assert first["untreated_mean_age"] == within_rounding((first_age + second_age) / 2, 3)
-    assert first["untreated_mean_age_squared"] == within_rounding((first_age**2 + second_age**2) / 2, 4)
-    assert first["treated_occasion_count"] == 0
-    assert first["sex_at_birth_name"] == "female"
-
-    second = rows["2"]
-    assert _excluded(second) == {"under_minimum_age": 1}
-    male_occasions = [
-        math.log(_ckd_epi_2021(value, _age(date, 2000), female=False))
-        for date, value in (("2020-06-01", 1.1), ("2021-06-01", 0.9))
+    assert first.row_count == 10
+    assert _excluded(first) == {"censored": 2, "unrecognized_unit": 2, "nonpositive": 1, "self_reported": 1}
+    assert sorted(first.unrecognized_unit_labels) == ["millimole per liter", "percent"]
+    # 2015-03-01 has two rows (mg/dL and no unit): one occasion, the mean of their eGFRs on the linear scale.
+    ages = [_age(date, 1960) for date in ("2015-03-01", "2016-05-10", "2017-01-01")]
+    expected = [
+        np.mean([_ckd_epi_2021(0.8, ages[0], female=True), _ckd_epi_2021(0.9, ages[0], female=True)]),
+        _ckd_epi_2021(1.0, ages[1], female=True),
+        _ckd_epi_2021(25.0, ages[2], female=True),
     ]
-    assert second["untreated_occasion_count"] == 2
-    assert second["untreated_mean"] == within_rounding(np.mean(male_occasions), 20)
+    assert first.dates == (_date("2015-03-01"), _date("2016-05-10"), _date("2017-01-01"))
+    for value, target in zip(first.values, expected, strict=True):
+        assert value == within_rounding(target, _EGFR_OPERATIONS)
+    for age, target in zip(first.ages, ages, strict=True):
+        assert age == within_rounding(target, 1)
+    assert not first.treated.any()
+    assert first.sex_at_birth_name == "female"
+
+    second = people["2"]
+    assert _excluded(second) == {"under_minimum_age": 1}
+    male_values = [_ckd_epi_2021(value, _age(date, 2000), female=False) for date, value in (("2020-06-01", 1.1), ("2021-06-01", 0.9))]
+    for value, target in zip(second.values, male_values, strict=True):
+        assert value == within_rounding(target, _EGFR_OPERATIONS)
 
     # eGFR needs sex at birth; a skipped answer is not guessed.
-    third = rows["3"]
+    third = people["3"]
     assert _excluded(third) == {"sex_unknown": 1}
-    assert third["untreated_occasion_count"] == 0
-    assert third["untreated_mean"] is None
+    assert third.values.size == 0
 
 
 def test_acute_care_windows_span_thirty_days_around_each_stay(cdr: _Cdr):
@@ -417,10 +419,9 @@ def test_acute_care_windows_span_thirty_days_around_each_stay(cdr: _Cdr):
         ("2020-01-10", 86.0),  # at an outpatient visit: kept
     ):
         cdr.measurement(1, date, value, concept_id=3023599, unit_concept_id=8583)
-    row = cdr.measurement_rows(mcv)["1"]
-    assert _excluded(row) == {"acute_care": 4}
-    assert row["untreated_occasion_count"] == 3
-    assert row["untreated_mean"] == within_rounding(np.mean([80.0, 84.0, 86.0]), _identity_mean_operations(3))
+    person = cdr.measurement_people(mcv)["1"]
+    assert _excluded(person) == {"acute_care": 4}
+    np.testing.assert_array_equal(person.values, [80.0, 84.0, 86.0])
 
 
 def test_pregnancy_windows_come_from_conditions_and_antenatal_observations(cdr: _Cdr):
@@ -438,10 +439,9 @@ def test_pregnancy_windows_come_from_conditions_and_antenatal_observations(cdr: 
         ("2023-02-01", 85.0),  # after routine antenatal care (observation): excluded
     ):
         cdr.measurement(1, date, value, concept_id=3023599, unit_concept_id=8583)
-    row = cdr.measurement_rows(mcv)["1"]
-    assert _excluded(row) == {"pregnancy": 3}
-    assert row["untreated_occasion_count"] == 3
-    assert row["untreated_mean"] == within_rounding(np.mean([81.0, 83.0, 84.0]), _identity_mean_operations(3))
+    person = cdr.measurement_people(mcv)["1"]
+    assert _excluded(person) == {"pregnancy": 3}
+    np.testing.assert_array_equal(np.sort(person.values), [81.0, 83.0, 84.0])
 
 
 def test_clinical_windows_cover_conditions_procedures_and_drugs(cdr: _Cdr):
@@ -463,9 +463,9 @@ def test_clinical_windows_cover_conditions_procedures_and_drugs(cdr: _Cdr):
         ("2024-01-01", 98.0),  # after leukemia: excluded
     ):
         cdr.measurement(1, date, value, concept_id=3023599, unit_concept_id=8583)
-    row = cdr.measurement_rows(mcv)["1"]
-    assert _excluded(row) == {"clinical_exclusion": 5}
-    assert row["untreated_mean"] == within_rounding(np.mean([90.0, 92.0, 95.0, 97.0]), _identity_mean_operations(4))
+    person = cdr.measurement_people(mcv)["1"]
+    assert _excluded(person) == {"clinical_exclusion": 5}
+    np.testing.assert_array_equal(np.sort(person.values), [90.0, 92.0, 95.0, 97.0])
 
 
 def test_diabetes_removes_every_hba1c_value_of_the_person(cdr: _Cdr):
@@ -478,11 +478,11 @@ def test_diabetes_removes_every_hba1c_value_of_the_person(cdr: _Cdr):
     for person_id in (1, 2, 3):
         cdr.measurement(person_id, "2015-01-01", 5.6, concept_id=3004410, unit_concept_id=8554)
         cdr.measurement(person_id, "2016-01-01", 5.8, concept_id=3004410, unit_concept_id=None)
-    rows = cdr.measurement_rows(hba1c)
-    assert _excluded(rows["1"]) == {"clinical_exclusion": 2}
-    assert _excluded(rows["2"]) == {"clinical_exclusion": 2}
-    assert _excluded(rows["3"]) == {}
-    assert rows["3"]["untreated_mean"] == within_rounding(np.mean([5.6, 5.8]), _identity_mean_operations(2))
+    people = cdr.measurement_people(hba1c)
+    assert _excluded(people["1"]) == {"clinical_exclusion": 2}
+    assert _excluded(people["2"]) == {"clinical_exclusion": 2}
+    assert _excluded(people["3"]) == {}
+    np.testing.assert_array_equal(people["3"].values, [5.6, 5.8])
 
 
 def test_physical_measurements_use_protocol_means_and_convert_inches(cdr: _Cdr):
@@ -497,12 +497,12 @@ def test_physical_measurements_use_protocol_means_and_convert_inches(cdr: _Cdr):
     cdr.measurement(1, "2018-05-01", 131.0, concept_id=903118, source_concept_id=903118, unit_concept_id=8876)
     cdr.measurement(1, "2018-05-01", 150.0, concept_id=3004249, source_concept_id=903109, unit_concept_id=8876)
     cdr.measurement(1, "2019-05-01", 125.0, concept_id=3004249, unit_concept_id=None)
-    heights = cdr.measurement_rows(height)["1"]
-    assert heights["untreated_occasion_count"] == 3
-    assert heights["untreated_mean"] == within_rounding(np.mean([180.0, 71.0 * 2.54000508, 70.0 * 2.54]), _identity_mean_operations(3))
-    pressures = cdr.measurement_rows(systolic)["1"]
-    assert pressures["measurement_row_count"] == 2
-    assert pressures["untreated_mean"] == within_rounding(np.mean([131.0, 125.0]), _identity_mean_operations(2))
+    heights = cdr.measurement_people(height)["1"]
+    for value, target in zip(heights.values, [180.0, 71.0 * 2.54000508, 70.0 * 2.54], strict=True):
+        assert value == within_rounding(target, _IDENTITY_OPERATIONS)
+    pressures = cdr.measurement_people(systolic)["1"]
+    assert pressures.row_count == 2
+    np.testing.assert_array_equal(pressures.values, [131.0, 125.0])
 
 
 def test_occasions_on_or_after_the_first_exposure_are_treated(cdr: _Cdr):
@@ -515,51 +515,70 @@ def test_occasions_on_or_after_the_first_exposure_are_treated(cdr: _Cdr):
     cdr.measurement(1, "2018-06-01", 90.0, concept_id=3028437)
     cdr.person(2, 1955, FEMALE)
     cdr.measurement(2, "2017-06-01", 104.0, concept_id=3028437, unit_concept_id=None)
-    rows = cdr.measurement_rows(ldl)
-    treated_person = rows["1"]
-    assert treated_person["untreated_occasion_count"] == 1
-    assert treated_person["untreated_mean"] == within_rounding(160.0, _identity_mean_operations(1))
-    assert treated_person["treated_occasion_count"] == 2
-    assert treated_person["treated_mean"] == within_rounding(100.0, _identity_mean_operations(2))
-    # The population variance adds a mean, two deviations, two squares and their mean.
-    assert treated_person["treated_variance"] == within_rounding(
-        100.0, _identity_mean_operations(2) + 6, variance_condition([110.0, 90.0])
-    )
-    assert rows["2"]["untreated_mean"] == within_rounding(104.0, _identity_mean_operations(1))
-    assert rows["2"]["treated_occasion_count"] == 0
+    people = cdr.measurement_people(ldl)
+    treated_person = people["1"]
+    np.testing.assert_array_equal(treated_person.values, [160.0, 110.0, 90.0])
+    np.testing.assert_array_equal(treated_person.treated, [False, True, True])
+    np.testing.assert_array_equal(people["2"].values, [104.0])
+    assert not people["2"].treated.any()
+
+
+def _mcv_cohort(cdr: _Cdr, generator: np.random.Generator, persons: int) -> dict[str, float]:
+    effects = {}
+    for person_id in range(1, persons + 1):
+        cdr.person(person_id, int(generator.integers(1940, 1990)), FEMALE if person_id % 2 else MALE)
+        effects[str(person_id)] = generator.normal(0.0, 5.0)
+        for occasion in range(int(generator.integers(1, 6))):
+            cdr.measurement(
+                person_id,
+                f"{2010 + occasion}-0{1 + occasion}-15",
+                90.0 + effects[str(person_id)] + generator.normal(0.0, 3.0),
+                concept_id=3023599,
+                unit_concept_id=8583,
+            )
+    return effects
 
 
 def test_query_rows_feed_the_target_builder_end_to_end(cdr: _Cdr):
     generator = np.random.default_rng(0)
     mcv = resolve_measurement_definition("mean_corpuscular_volume")
-    person_effects = {}
-    for person_id in range(1, 301):
-        cdr.person(person_id, int(generator.integers(1940, 1990)), FEMALE if person_id % 2 else MALE)
-        person_effects[str(person_id)] = generator.normal(0.0, 5.0)
-        for occasion in range(int(generator.integers(1, 6))):
-            cdr.measurement(
-                person_id,
-                f"{2010 + occasion}-0{1 + occasion}-15",
-                90.0 + person_effects[str(person_id)] + generator.normal(0.0, 3.0),
-                concept_id=3023599,
-                unit_concept_id=8583,
-            )
-    rows = list(cdr.measurement_rows(mcv).values())
-    training_rows, _columns, summary = build_all_of_us_measurement_targets(mcv, rows)
+    effects = _mcv_cohort(cdr, generator, 300)
+    training_rows, _columns, summary = build_all_of_us_measurement_targets(mcv, cdr.measurement_rows(mcv), WORKING_BYTES)
     assert summary["n_persons"] == 300
-    between_variance, within_variance = 25.0, 9.0
-    counts = np.array([row["untreated_occasion_count"] for row in rows], dtype=np.float64)
-    between_standard_error, within_standard_error = variance_component_standard_errors(
-        counts, between_variance, within_variance
-    )
-    assert abs(summary["within_person_variance"] - within_variance) < sampling_bound(within_standard_error)
-    assert abs(summary["between_person_variance"] - between_variance) < sampling_bound(between_standard_error)
-    # The BLUP of each long-run mean correlates with the true effect by sqrt(mean reliability).
     targets = np.array([row["target"] for row in training_rows])
-    effects = np.array([person_effects[row["person_id"]] for row in training_rows])
-    expected_correlation = np.sqrt(np.mean(between_variance / (between_variance + within_variance / counts)))
-    correlation_standard_error = (1.0 - expected_correlation**2) / np.sqrt(len(counts))
-    assert np.corrcoef(targets, effects)[0, 1] > expected_correlation - sampling_bound(correlation_standard_error)
+    true_effects = np.array([effects[row["person_id"]] for row in training_rows])
+    # The target correlates with the true effect by about the root mean reliability.
+    reliability = np.array([row["target_reliability"] for row in training_rows])
+    expected_correlation = float(np.sqrt(reliability.mean()))
+    correlation_standard_error = (1.0 - expected_correlation**2) / np.sqrt(len(training_rows))
+    assert np.corrcoef(targets, true_effects)[0, 1] > expected_correlation - sampling_bound(correlation_standard_error)
+
+
+def test_gross_errors_reach_the_model_and_are_downweighted_by_its_learned_density(cdr: _Cdr):
+    # Typos of x10 in MCV, and creatinine in umol/L under the unit label whose rows carry mg/dL values: the
+    # trait keeps them (no range) and the learned noise density keeps them from moving a person's level.
+    generator = np.random.default_rng(5)
+    mcv = resolve_measurement_definition("mean_corpuscular_volume")
+    clean = _Cdr()
+    clean.connection.execute(f"SET search_path = '{DATASET}'")
+    effects = _mcv_cohort(cdr, generator, 250)
+    _mcv_cohort(clean, np.random.default_rng(5), 250)
+    typo_people = [str(person_id) for person_id in range(1, 251, 25)]
+    for position, person_id in enumerate(typo_people):
+        cdr.measurement(int(person_id), f"2019-0{1 + position % 9}-20", 10.0 * (90.0 + effects[person_id]), concept_id=3023599, unit_concept_id=8583)
+    contaminated_rows, _columns, contaminated_summary = build_all_of_us_measurement_targets(mcv, cdr.measurement_rows(mcv), WORKING_BYTES)
+    clean_rows, _columns, clean_summary = build_all_of_us_measurement_targets(mcv, clean.measurement_rows(mcv), WORKING_BYTES)
+    assert contaminated_summary["n_occasions"] == clean_summary["n_occasions"] + len(typo_people)
+    contaminated = {row["person_id"]: row for row in contaminated_rows}
+    reference = {row["person_id"]: row for row in clean_rows}
+    level_variance = contaminated_summary["level_variance"]
+    for person_id in typo_people:
+        # One posterior sd of the person's level, on the contaminated fit's scale.
+        sd = np.sqrt(level_variance * (1.0 - contaminated[person_id]["target_reliability"]))
+        if contaminated_summary["box_cox_exponent"] == clean_summary["box_cox_exponent"]:
+            assert abs(contaminated[person_id]["target"] - reference[person_id]["target"]) < sd
+        # Whatever the transform, the typo leaves the person on the same side of the cohort's centre.
+        assert np.sign(contaminated[person_id]["target"]) == np.sign(reference[person_id]["target"])
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +661,6 @@ def test_diagnosis_roots_distinct_drug_dates_and_case_procedures(cdr: _Cdr):
 def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     kidney = resolve_disease_definition("ckd")
     egfr_criterion, albuminuria_criterion = kidney.lab_criteria
-    egfr = resolve_lab_criterion_measurement(egfr_criterion)
     for person_id in (1, 2, 3):
         _observed_with_early_ehr(cdr, person_id, 1960, FEMALE)
     # Person 1: eGFR about 44 and 41 (creatinine 1.4 and 1.5 mg/dL at 54), 151 days
@@ -659,19 +677,22 @@ def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     cdr.condition(3, 91000012, "2017-01-01")
     cdr.condition(3, 91000012, "2018-01-01")
 
-    lab_rows = cdr.measurement_rows(egfr, egfr_criterion)
-    assert lab_rows["1"]["qualifying_occasion_count"] == 2
-    assert lab_rows["1"]["first_qualifying_date"] == _date("2015-01-10")
-    assert lab_rows["1"]["last_qualifying_date"] == _date("2015-06-10")
-    assert lab_rows["2"]["qualifying_occasion_count"] == 1
-    assert "3" not in lab_rows
-    # A trait query carries no criterion.
-    assert cdr.measurement_rows(egfr)["1"]["qualifying_occasion_count"] == 0
+    # Person 4: creatinine 25 mg/dL twice, outside the criterion's plausible range: no evidence, although the
+    # eGFR trait keeps such readings for its noise density.
+    _observed_with_early_ehr(cdr, 4, 1960, FEMALE)
+    cdr.measurement(4, "2015-01-10", 25.0)
+    cdr.measurement(4, "2015-06-10", 25.0)
+    egfr_evidence = cdr.lab_evidence(egfr_criterion)
+    assert egfr_evidence["1"] == {
+        "qualifying_occasion_count": 2, "first_qualifying_date": _date("2015-01-10"), "last_qualifying_date": _date("2015-06-10"),
+    }
+    assert egfr_evidence["2"]["qualifying_occasion_count"] == 1
+    assert "3" not in egfr_evidence and "4" not in egfr_evidence
+    assert cdr.measurement_people(resolve_measurement_definition("egfr"))["4"].values.shape == (2,)
 
-    egfr_evidence = {person: row for person, row in lab_rows.items() if row["qualifying_occasion_count"]}
     rows = list(cdr.disease_rows(kidney).values())
     training_rows, _columns, counts = _prepare_training_rows(kidney, rows, [egfr_evidence, {}])
-    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1}
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1, "4": 0}
     assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
     assert albuminuria_criterion.measurement == "urine_albumin_creatinine_ratio"
 
