@@ -1191,6 +1191,18 @@ def test_blup_target_tracks_the_true_long_run_mean_better_than_the_raw_mean():
     )
 
 
+def test_no_statistic_of_the_occasions_is_a_trait_covariate():
+    # How often a trait is measured depends on its level, so adjusting the
+    # genetic fit for the occasion count attenuates every effect
+    # (novel-pheno Theorem 5); precision enters through target_reliability.
+    assert not any("occasion" in column for column in measurement_covariate_columns())
+    rows, _true_means = _synthetic_person_rows(50, between_variance=1.0, within_variance=1.0, seed=6)
+    training_rows, _columns, _summary = build_all_of_us_measurement_targets(
+        resolve_measurement_definition("mean_corpuscular_volume"), rows
+    )
+    assert "log_occasion_count" not in training_rows[0]
+
+
 def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     rows, _true_means = _synthetic_person_rows(200, between_variance=1.0, within_variance=1.0, seed=1)
     rows[0]["unrecognized_unit_labels"] = ["millimole per liter", "millimole per liter"]
@@ -1203,7 +1215,7 @@ def test_training_rows_carry_targets_covariates_and_one_hot_sex():
     assert female_row["age_at_measurement_squared"] == rows[0]["untreated_mean_age_squared"]
     assert female_row["age_at_measurement_x_female"] == rows[0]["untreated_mean_age"]
     assert male_row["age_at_measurement_x_female"] == 0.0
-    assert female_row["log_occasion_count"] == math.log(rows[0]["untreated_occasion_count"])
+    assert female_row["occasion_count"] == rows[0]["untreated_occasion_count"]
     assert female_row["sex_at_birth_concept_id_45878463"] == 1
     assert "sex_at_birth_concept_id" not in female_row
     assert 0.0 < female_row["target_reliability"] < 1.0
@@ -1232,9 +1244,9 @@ def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path
     with outputs.sample_table_path.open(encoding="utf-8") as handle:
         table = list(csv.DictReader(handle, delimiter="\t"))
     assert len(table) == 120
-    assert list(table[0])[:10] == [
+    assert list(table[0])[:9] == [
         "sample_id", "person_id", "target", "occasion_count", "target_reliability", "measurement_source",
-        "age_at_measurement", "age_at_measurement_squared", "age_at_measurement_x_female", "log_occasion_count",
+        "age_at_measurement", "age_at_measurement_squared", "age_at_measurement_x_female",
     ]
     assert outputs.sql_path.read_text(encoding="utf-8").strip() == build_all_of_us_measurement_sql()
     metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))

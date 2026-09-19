@@ -53,7 +53,7 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
 - **Target.** The empirical BLUP of the person's long-run mean under a random-intercept model:
   - the variance components come from closed-form, unbiased Henderson III moment estimators;
   - each target carries its reliability.
-- **Covariates:** mean age, its square, its product with female sex, sex at birth, and log(occasion count).
+- **Covariates:** mean age, its square, its product with female sex, and sex at birth. The occasion count is not a covariate: how often a trait is measured depends on its level, so adjusting for it attenuates every genetic effect (novel-pheno Theorem 5). Each person's precision enters through the target's reliability instead.
 
 ## Which values are standards
 Kept, and cited where they are defined:
@@ -110,6 +110,6 @@ None of these values is a published standard for these data. They must be replac
 4. **The analysis scale.** Log vs linear is chosen by hand for each trait.
 
    **Replacement:** a Box–Cox exponent learned by the marginal likelihood of the per-occasion model.
-5. **Covariate functional forms.** Age, age², age × female, log(1 + EHR depth) and log(occasion count).
+5. **Covariate functional forms.** Age, age², age × female and log(1 + EHR depth).
 
    **Replacement:** smooths with learned smoothness in the cohort builder. They are projected out exactly (MODEL.md §1).

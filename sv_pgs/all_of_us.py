@@ -1661,7 +1661,6 @@ def build_all_of_us_measurement_targets(
             "age_at_measurement": occasion_summary.mean_age,
             "age_at_measurement_squared": occasion_summary.mean_age_squared,
             "age_at_measurement_x_female": occasion_summary.mean_age * is_female,
-            "log_occasion_count": math.log(occasion_summary.count),
             "sex_at_birth_concept_id": row.get("sex_at_birth_concept_id"),
         }
         for row, occasion_summary, source, is_female, target, reliability
@@ -1696,13 +1695,19 @@ def build_all_of_us_measurement_targets(
 
 
 def measurement_covariate_columns() -> tuple[str, ...]:
-    """Covariates of a trait's fit, before one-hot expansion of sex at birth."""
+    """Covariates of a trait's fit, before one-hot expansion of sex at birth.
+
+    The occasion count is not one: how often a trait is measured depends on
+    its level, and with T = beta x + u and K = a T + v, regressing T on (x, K)
+    shrinks the genetic coefficient to beta sigma_v^2 / (a^2 sigma_u^2 +
+    sigma_v^2) (docs/design/math/novel-pheno.md, Theorem 5). Its legitimate
+    role, each person's precision, is target_reliability's.
+    """
     return (
         "age_at_measurement",
         "age_at_measurement_squared",
         "age_at_measurement_x_female",
         "sex_at_birth_concept_id",
-        "log_occasion_count",
     )
 
 
@@ -1736,7 +1741,6 @@ def prepare_all_of_us_measurement_sample_table(
         "age_at_measurement",
         "age_at_measurement_squared",
         "age_at_measurement_x_female",
-        "log_occasion_count",
         *encoded_categorical_columns,
     )
     _write_tsv(sample_table_path, header, training_rows)
