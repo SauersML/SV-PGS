@@ -42,8 +42,6 @@ jobs:
         run: uv sync
 
       - name: Run every test file in this shard
-        env:
-          JAX_PLATFORMS: cpu
         run: |
           set -o pipefail
           ls tests/test_*.py | sort | awk -v shard=${{ matrix.shard }} 'NR % 3 == shard' > shard_files.txt

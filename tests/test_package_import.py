@@ -10,23 +10,10 @@ import textwrap
 import pytest
 
 
-KEPT_MODULES = (
-    "sv_pgs.code_products",
-    "sv_pgs.compute_budget",
-    "sv_pgs.dosage_store",
-    "sv_pgs.exact_polish",
-    "sv_pgs.fast_scoring",
-    "sv_pgs.genotype_buffers",
-    "sv_pgs.genotype_statistics",
-    "sv_pgs.store_converter",
-    "sv_pgs.synthetic_store",
-)
+def test_importing_the_package_loads_no_jax_and_keeps_the_cuda_math_mode():
+    """Importing the package or any of its modules must not import JAX or change the CUDA math mode.
 
-
-def test_kept_modules_load_neither_jax_nor_the_old_path():
-    """Importing the package or any kept module must not import JAX or change the CUDA math mode.
-
-    The old path's ``_jax`` shim imported JAX, enabled x64 and set ``CUPY_TF32`` for the whole
+    The deleted ``_jax`` shim imported JAX, enabled x64 and set ``CUPY_TF32`` for the whole
     process as an import side effect.
     """
     completed = subprocess.run(
@@ -34,20 +21,16 @@ def test_kept_modules_load_neither_jax_nor_the_old_path():
             sys.executable,
             "-c",
             textwrap.dedent(
-                f"""
-                import importlib, json, os, sys
+                """
+                import importlib, json, os, pkgutil, sys
                 import sv_pgs
-                for name in {KEPT_MODULES!r}:
-                    importlib.import_module(name)
-                print(json.dumps({{
+                for module in pkgutil.walk_packages(sv_pgs.__path__, "sv_pgs."):
+                    importlib.import_module(module.name)
+                print(json.dumps({
                     "jax": sorted(name for name in sys.modules if name.split(".")[0] in ("jax", "jaxlib")),
-                    "old": sorted(
-                        name for name in sys.modules
-                        if name == "sv_pgs._jax"
-                    ),
                     "CUPY_TF32": os.environ.get("CUPY_TF32"),
                     "exports": sorted(sv_pgs.__all__),
-                }}))
+                }))
                 """
             ),
         ],
@@ -60,7 +43,6 @@ def test_kept_modules_load_neither_jax_nor_the_old_path():
     loaded = json.loads(completed.stdout.strip())
     assert loaded == {
         "jax": [],
-        "old": [],
         "CUPY_TF32": None,
         "exports": ["ModelConfig", "TraitType", "VariantClass", "VariantRecord"],
     }

@@ -19,7 +19,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
 | C4 | landed: `model.py`, `runtime_policy.py`; `artifact.py` stays until the engine extends or replaces it; `test_prior_level_without_variance_refresh` went here (its helper was in `test_prediction_accuracy`) |
 | C5 | landed: `mixture_inference`, `linear_solvers`, `tr_newton`, `elbo`, `forcing_sequence`, `precision_policy`, `inference`, `gpu_scheduler`, and `numeric` (`stable_sigmoid` duplicated `scipy.special.expit`; the probit scale was superseded by the Gauss–Hermite predictive); `anderson.py` and `prior_design.py` stay for the engine |
 | C6 | landed: `genotype`, `io`, `preprocessing`, `screening_pipeline`, `plink`, `mmap_reader`, `gcsfuse_staging`, `gds`, `bitpacked/`, `bitpacked_loader`, `bitpacked_matrix`, `bitpacked_profile`, `ld_blocks`, `ld_block_partition`, `_data/`, `sample_table`, `path_policy`, `diagnostics`; `collapse_tie_groups` tests moved to `test_tie_group_collapse`. The config keys moved to C8; the dead symbols in other lanes' files (`data.VariantStatistics`/`PreparedArrays`, `tie_map._empty_tie_map`, `_typing.I8Array`/`I16Array`, two docstrings) went to their owners |
-| C7 | pending |
+| C7 | landed: `_jax.py` and its tests; `test_package_import` imports every module and checks no JAX and no `CUPY_TF32`; the jax/jaxlib dependency drop is deslop-hygiene's pyproject change |
 | C8 | pending |
 
 ## Size
