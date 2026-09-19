@@ -12,7 +12,7 @@
   - `external_annotations.py` (Bai 2026 SV/VNTR, Pan-UKB SNV, record and locus maps);
   - `gatksv_source.py`, `gatksv_store_rows.py`, `sv_fusion.py` (the general two-source measurement model) and `sample_crosswalk.py`;
   - `held_out_comparison.py` (the evaluation tests and gates);
-  - `compute_budget.py`, `tie_map.py`, `sample_table.py`;
+  - `compute_budget.py`, `tie_map.py`;
   - `cohort.py` (the shared covariates, multi-trait targets and kinship-grouped folds);
   - phenotypes in `all_of_us.py`, trimmed to the 21-trait panel.
 - **SPEC.md** carries the rulings: one model; CPU/GPU first-class; certification of approximate stages; EP-EB with a certificate; the r² prior; the TR length column; SV context in every prior; the learned mixing density; no hand-chosen priors.
