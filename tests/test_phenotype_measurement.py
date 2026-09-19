@@ -9,6 +9,7 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal, norm
 
 from sv_pgs.phenotype_measurement import (
+    LevelGrid,
     Occasions,
     _density_prior,
     _log_modulus_bound,
@@ -97,7 +98,7 @@ def test_the_certified_quadrature_matches_brute_force(residuals):
     variances = np.exp(prior.log_variance_grid)
     level_variance, tolerance = 4.0, person_tolerance(50_000)
     residual_array = np.array([residuals])
-    posterior = level_posterior(residual_array, level_variance, np.log(masses), variances, tolerance, None, None, True, WORKING_BYTES)
+    posterior = level_posterior(residual_array, level_variance, np.log(masses), variances, tolerance, None, True, WORKING_BYTES)
     log_likelihood, mean, second, brute_error = _brute(residual_array[0], level_variance, masses, variances)
     first_error, second_error, _variance_error = _moment_errors(tolerance, mean, second)
     # The certificate bounds L's relative error by the tolerance; the brute force adds its own error estimate.
@@ -107,14 +108,18 @@ def test_the_certified_quadrature_matches_brute_force(residuals):
 
 
 @pytest.mark.parametrize("residuals", [[0.7], [1.3, 48.0], [3.0, 3.0], [0.4, -1.1, 2.0, 3.0, 3.0, 55.0]])
-def test_the_closed_form_modulus_bound_covers_the_mass_weighted_modulus(residuals):
+def test_the_modulus_bound_covers_the_mass_weighted_modulus(residuals):
     prior = _lattice(1.0 / 12.0, 5000.0, 12, 2)
     hyperparameters = _density(prior, {_node(prior, 1.0): 0.9, _node(prior, 1.0 / 12.0): 0.05, _node(prior, 2500.0): 0.05})
     masses = np.exp(class_log_density(prior, hyperparameters.coefficients)[0])
     variances = np.exp(prior.log_variance_grid)
     level_variance, residual_array = 4.0, np.array([residuals])
-    for half_width in (0.05, 0.3, 1.0):
-        bound = _log_modulus_bound(residual_array, level_variance, np.log(masses), variances, np.array([half_width]))[0]
+    for step, half_width in ((0.05, 0.3), (0.4, 0.05), (1.0, 1.0)):
+        # Nodes over part of the line only, so the two tail bounds carry the rest.
+        levels = np.arange(-3.0, 6.0 + step, step)[None, :]
+        valid = np.ones_like(levels, dtype=bool)
+        bound = _log_modulus_bound(residual_array, levels, valid, np.array([step]), level_variance, np.log(masses), variances,
+                                   np.array([half_width]))[0]
         widened = masses * np.exp(0.5 * half_width**2 / variances)
 
         def integrand(level: float, power: int) -> float:
@@ -124,11 +129,7 @@ def test_the_closed_form_modulus_bound_covers_the_mass_weighted_modulus(residual
 
         for power in (0, 1, 2):
             value, error = _integral(integrand, power, residual_array[0])
-            # Hoelder and the power mean are equalities for one occasion, so the bound is then the modulus itself.
-            if len(residuals) == 1:
-                assert bound[power] == pytest.approx(np.log(value), abs=error / value + 2.0 * rounding_gamma(8 * prior.grid_size))
-            else:
-                assert bound[power] >= np.log(value - error)
+            assert bound[power] >= np.log(value - error)
 
 
 def _integral(integrand, power: int, residuals: np.ndarray) -> tuple[float, float]:
@@ -180,7 +181,7 @@ def test_the_likelihood_is_a_density_over_the_reading_at_the_log_transform():
     level_variance, centre, tolerance = 0.25, float(np.log(80.0)), person_tolerance(1)
 
     def density(log_reading: float) -> float:
-        posterior = level_posterior(np.array([[log_reading - centre]]), level_variance, np.log(masses), variances, tolerance, None, None, False, WORKING_BYTES)
+        posterior = level_posterior(np.array([[log_reading - centre]]), level_variance, np.log(masses), variances, tolerance, None, False, WORKING_BYTES)
         return float(np.exp(posterior.log_likelihood[0]))  # the density of log y; its Jacobian dy = y d(log y) cancels
 
     total, error = integrate.quad(density, -np.inf, np.inf)
@@ -198,14 +199,16 @@ def test_louis_information_is_the_curvature_of_the_exact_log_likelihood():
 
     def log_likelihood(coefficients: np.ndarray) -> float:
         log_masses = class_log_density(prior, coefficients)[0]
-        return float(level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, centres, False, WORKING_BYTES).log_likelihood.sum())
+        return float(level_posterior(residuals, 4.0, log_masses, variances, tolerance, fixed, False, WORKING_BYTES).log_likelihood.sum())
 
     log_masses = class_log_density(prior, base)[0]
     # Half the admissible steps stay certified at the nearby densities of the differences, so every likelihood
     # below is one trapezoid rule on the same centred nodes, a finite mixture, for which Louis' identity is exact.
-    first = level_posterior(residuals, 4.0, log_masses, variances, tolerance, None, None, False, WORKING_BYTES)
-    steps, centres = 0.5 * first.admissible_step, first.level_mean
-    posterior = level_posterior(residuals, 4.0, log_masses, variances, tolerance, steps, centres, True, WORKING_BYTES)
+    first = level_posterior(residuals, 4.0, log_masses, variances, tolerance, None, False, WORKING_BYTES)
+    grid = first.grid
+    # Twice the reaches, so no perturbed density grows a grid either.
+    fixed = LevelGrid(0.5 * first.admissible_step, first.level_mean, 2.0 * grid.lower_reach, 2.0 * grid.upper_reach, grid.half_width)
+    posterior = level_posterior(residuals, 4.0, log_masses, variances, tolerance, fixed, True, WORKING_BYTES)
     masses = np.exp(log_masses)
     louis = mapping.T @ (posterior.counts.sum() * (np.diag(masses) - np.outer(masses, masses)) - posterior.missing_information) @ mapping
 
