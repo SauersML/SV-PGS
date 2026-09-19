@@ -100,6 +100,8 @@ MAXIMUM_CODE = 254
 MISSING_CODE = 255
 MAXIMUM_DOSAGE_MILLI = 2000
 DEFAULT_SHARD_ROWS = 65536
+# Minimizes the worst relative read-time regret over request runs of at least one Stage 0 tile,
+# given the measured per-byte, per-chunk and per-request costs (docs/design/math/codec.md §3).
 DEFAULT_INNER_CHUNK_ROWS = 64
 # libzstd's ZSTD_CLEVEL_DEFAULT; decoding does not depend on the level.
 ZSTD_LEVEL = 3

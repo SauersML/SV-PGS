@@ -46,7 +46,8 @@ def test_chunks_round_trip_exactly_at_every_depth(samples: int) -> None:
     payload = rowdict_codec.encode_chunk(codes)
     assert np.array_equal(_decode_chunk(payload, codes.shape[0], samples), codes)
     if samples == 4099:
-        starts = codes.shape[0] * 4 + np.concatenate(([0], np.cumsum(_frame_sizes(payload, codes.shape[0]))[:-1]))
+        sizes = _frame_sizes(payload, codes.shape[0]).astype(np.int64)
+        starts = codes.shape[0] * 4 + np.cumsum(sizes) - sizes
         depths = np.frombuffer(payload, dtype=np.uint8)[starts]
         assert depths[: rowdict_codec.MAXIMUM_DEPTH + 1].tolist() == list(range(rowdict_codec.MAXIMUM_DEPTH + 1))
 
@@ -71,7 +72,7 @@ def test_wide_rows_store_exception_samples_as_uint32() -> None:
     codes = np.zeros((3, samples), dtype=np.uint8)
     codes[0, [0, 65535, 65536, samples - 1]] = [9, 17, 33, 254]
     codes[1] = rng.integers(0, 4, size=samples)
-    codes[1, [70000, samples - 2]] = [200, 201]
+    codes[1, [65537, samples - 1]] = [200, 201]
     codes[2] = rng.integers(0, 255, size=samples)
     assert rowdict_codec.exception_sample_dtype(samples) == np.dtype("<u4")
     assert rowdict_codec.exception_sample_dtype(1 << 16) == np.dtype("<u2")

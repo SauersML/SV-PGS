@@ -12,9 +12,10 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - Names of the two namespaces collide by chance (different people), so they are never compared across namespaces. Only a `dragen_sample` half goes through the CDR crosswalk (`sample_crosswalk` refuses any other), and cross-half identity comes only from that map or from genotype (KING). A name repeated within a half fails conversion.
 - **Code:** `(DS_milli·127 + 500) // 1000`, where DS_milli is the corrected dosage below. 255 is never written.
 - **Encoding:**
-  - shards of 65,536 rows with 64-row inner chunks (registered pending constants: to be derived from the measured read path, speed-io; the GPU-decodable codec may replace this layout);
+  - shards of 65,536 rows (a registered pending constant, to be derived by speed-io) with 64-row inner chunks (derived from the measured read path, `docs/design/math/codec.md` §3);
   - zstd at libzstd's default level (3), with a crc32c-checked shard index;
-  - a `transcode_store` step builds an uncompressed local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded raw and its code sums re-checked.
+  - a `transcode_store` step builds a local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded (raw, or rowdict for a GPU host) and its code sums re-checked;
+  - **rowdict** (`[bytes, svpgs_rowdict, crc32c]`, `rowdict_codec.py`): one frame per record, a dictionary of its 2^k most frequent codes with k the exact size minimizer, k-bit slots and exceptions. The host reads the bytes and checks the chunk crc32c; `read_rows_to_device` decodes on the GPU; the CPU decoder is the reference. Which tier takes which codec comes from the cost model in `docs/design/math/codec.md` §2: the bucket stays zstd.
 - **Kernels** read codes as signed `code − 127` and accumulate in int32, exactly.
 - **Background removal ("value matched"),** applied before quantization and before any sums:
   - Per record, K_v = min(10, N_PATHS_TOTAL); m_v = the number of kept paths carrying the record's ID; w = ε/(1−ε) with the imputation error ε = 0.001.

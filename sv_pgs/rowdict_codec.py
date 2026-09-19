@@ -38,7 +38,6 @@ CODE_VALUES = 1 << BITS_PER_CODE
 MAXIMUM_DEPTH = BITS_PER_CODE
 ROW_SIZE_DTYPE = np.dtype("<u4")
 _DEPTH_BYTES = np.dtype(np.uint8).itemsize
-_WINDOW_BYTES = np.dtype(np.uint16).itemsize
 
 
 def exception_sample_dtype(sample_count: int) -> np.dtype[Any]:
@@ -189,13 +188,13 @@ def decode_rows(buffer: U8Array, frames: RowFrames, sample_count: int, out: U8Ar
 _GPU_SOURCE = r"""
 extern "C" __global__
 void decode_row_slots(const unsigned char* __restrict__ frames, const long long* __restrict__ dictionary_offset,
-                      const long long* __restrict__ slot_offset, const int* __restrict__ depth,
+                      const long long* __restrict__ slot_offset, const long long* __restrict__ depth,
                       unsigned char* __restrict__ out, long long first_row, long long samples, long long out_stride) {
     // One block row per variant row: the row's dictionary is staged in shared memory, then each
     // thread decodes samples from a 16-bit window at the sample's first slot bit.
     __shared__ unsigned char values[256];
     long long row = first_row + blockIdx.y;
-    int bits = depth[row];
+    int bits = (int)depth[row];
     int size = 1 << bits;
     for (int at = threadIdx.x; at < size; at += blockDim.x) values[at] = frames[dictionary_offset[row] + at];
     __syncthreads();
@@ -258,11 +257,11 @@ class GpuRowDecoder:
         if out.shape != (rows, sample_count) or out.dtype != cp.uint8 or out.strides[1] != 1:
             raise ValueError(f"out must be uint8 [{rows}, {sample_count}] with contiguous rows.")
         with stream if stream is not None else cp.cuda.Stream.null:
-            dictionary_offset = cp.asarray(frames.dictionary_offset)
-            slot_offset = cp.asarray(frames.slot_offset)
-            depth = cp.asarray(frames.depth.astype(np.int32))
-            exception_offset = cp.asarray(frames.exception_offset)
-            exception_count = cp.asarray(frames.exception_count)
+            # The frames' fields go to the device in one copy.
+            fields = cp.asarray(np.stack([
+                frames.dictionary_offset, frames.slot_offset, frames.depth, frames.exception_offset, frames.exception_count
+            ]))
+            dictionary_offset, slot_offset, depth, exception_offset, exception_count = fields
             stride = np.int64(out.strides[0])
             # Enough blocks per row to fill the device when the rows alone do not.
             blocks_per_row = max(1, min(-(-sample_count // self._threads), self._resident_blocks // min(rows, self._resident_blocks)))
