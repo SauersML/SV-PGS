@@ -30,7 +30,8 @@ def _smooth_basis(values: np.ndarray, basis_size: int) -> np.ndarray:
 def _prior(rng, likelihood_precision, linear_term, class_count: int = 2) -> reference.ReferencePrior:
     variant_count = linear_term.shape[0]
     log_variance_offset = np.log(rng.uniform(0.3, 1.0, size=variant_count))
-    smooth = _smooth_basis(rng.uniform(0.0, 1.0, size=variant_count), 5)
+    # The class centring removes the basis's constant, so one column goes.
+    smooth = _smooth_basis(rng.uniform(0.0, 1.0, size=variant_count), 5)[:, 1:]
     design = np.column_stack([rng.integers(0, 2, size=variant_count).astype(np.float64), smooth])
     groups = (
         reference.AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),
@@ -51,7 +52,7 @@ def _random_hyperparameters(rng, prior: reference.ReferencePrior) -> reference.R
     return reference.ReferenceHyperparameters(
         mixing_coordinates=rng.normal(0.0, 1.0, size=(prior.class_count, prior.grid_size - 1)),
         annotation_coefficients=rng.normal(0.0, 0.3, size=prior.feature_count),
-        mixing_penalty=np.full(prior.class_count, 2.0),
+        mixing_penalty=np.full((prior.class_count, 2), 2.0),
         annotation_penalty=np.full(len(prior.annotation_groups), 3.0),
     )
 
@@ -94,9 +95,12 @@ def _quadrature_moments(components, precision: float, shift: float):
 
 
 def _ld_problem(seed: int, sample_count: int, variant_count: int, causal_count: int = 4):
+    """Standardized genotypes with AR(1) LD (ρ = 0.6), a sparse effect vector, unit noise."""
     rng = np.random.default_rng(seed)
     latent = rng.standard_normal((sample_count, variant_count))
-    genotypes = np.cumsum(latent, axis=1) / np.sqrt(np.arange(1, variant_count + 1))  # AR-like LD
+    genotypes = latent.copy()
+    for column in range(1, variant_count):
+        genotypes[:, column] = 0.6 * genotypes[:, column - 1] + 0.8 * latent[:, column]
     genotypes = (genotypes - genotypes.mean(axis=0)) / genotypes.std(axis=0)
     effects = np.zeros(variant_count)
     causal = rng.choice(variant_count, size=causal_count, replace=False)
@@ -171,7 +175,7 @@ def test_penalized_objective_gradient_matches_finite_differences() -> None:
 
 def test_fit_is_a_joint_fixed_point_and_deterministic() -> None:
     rng = np.random.default_rng(5)
-    likelihood_precision, linear_term, effects = _ld_problem(seed=5, sample_count=300, variant_count=40)
+    likelihood_precision, linear_term, effects = _ld_problem(seed=5, sample_count=400, variant_count=60, causal_count=6)
     prior = _prior(rng, likelihood_precision, linear_term)
     fit = reference.fit_reference(prior, likelihood_precision, linear_term)
     reference.assert_converged(fit)

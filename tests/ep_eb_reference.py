@@ -15,8 +15,10 @@ a continuous Gaussian scale mixture with no point mass at zero.
 - s_k is a log-even grid of variances whose support is set by the data (see
   data_driven_variance_grid).
 - π_c = softmax(φ_c) is class c's mixing density, learned nonparametrically. φ_c
-  is kept sum-to-zero, and its roughness φ_cᵀSφ_c (squared second differences
-  in log s) is penalized with a learned weight λ_c.
+  is kept sum-to-zero; its first and second differences in log s are penalized,
+  each with its own learned weight. A second-difference penalty alone leaves the
+  linear tilt of log π free, and the maximizer then runs the density onto a grid
+  end; the learned first-difference weight is what decides how far it may tilt.
 - o_j is the fixed measurement offset log r²_j: the prior is on the effect of
   the true genotype, so the observed column's prior variance carries r²_j with
   coefficient exactly 1.
@@ -30,10 +32,12 @@ Inference.
   mean-matched, with exact tilted moments on the grid.
 - (φ, θ) maximize the penalized EP cavity marginal Σ_j log Z_j with the
   cavities held fixed (type-II ML under EP).
-- Each penalty weight λ solves the Laplace marginal-likelihood stationarity
-  condition (the MacKay / Fellner–Schall fixed point),
-  λ = (rank S − λ tr(H⁻¹S)) / (x̂ᵀSx̂), with H the negative Hessian of the
-  penalized objective.
+- Each penalty weight solves the Laplace marginal-likelihood stationarity
+  condition in its Fellner–Schall form,
+  λ_i ← λ_i (tr(S_λ⁺S_i) − tr(H⁻¹S_i)) / (x̂ᵀS_ix̂), with S_λ = Σ_i λ_iS_i the
+  block's total penalty and H the negative Hessian of the penalized objective.
+  A weight at the top of its numerical range (e^25) means the term has shrunk
+  out, which is the marginal-likelihood optimum when the data do not support it.
 
 The fixed point is where the sites, (φ, θ) and λ all stop moving. It does not
 depend on damping or update order, which is what lets a stage be compared with it.
@@ -53,6 +57,7 @@ from scipy.special import logsumexp
 GRID_LOG_SPACING = 0.5 * np.log(2.0)
 GRID_LOWER_FACTOR = 1e-2
 GRID_UPPER_FACTOR = 4.0
+LOG_PENALTY_RANGE = 25.0
 
 
 def data_driven_variance_grid(likelihood_precision: np.ndarray, linear_term: np.ndarray, log_variance_offset: np.ndarray):
@@ -67,9 +72,13 @@ def data_driven_variance_grid(likelihood_precision: np.ndarray, linear_term: np.
     return np.linspace(np.log(lower), np.log(upper), point_count)
 
 
-def second_difference_penalty(size: int) -> np.ndarray:
-    difference = np.diff(np.eye(size), n=2, axis=0)
+def difference_penalty(size: int, order: int) -> np.ndarray:
+    difference = np.diff(np.eye(size), n=order, axis=0)
     return difference.T @ difference
+
+
+def second_difference_penalty(size: int) -> np.ndarray:
+    return difference_penalty(size, 2)
 
 
 def sum_to_zero_basis(size: int) -> np.ndarray:
@@ -101,6 +110,11 @@ class ReferencePrior:
         for class_position in range(self.class_count):
             members = self.class_index == class_position
             centred[members] -= centred[members].mean(axis=0)
+        if centred.shape[1] and np.linalg.matrix_rank(centred) < centred.shape[1]:
+            raise ValueError(
+                "The class-centred annotation design must have full column rank: a smooth basis must "
+                "drop its constant (the class means are the mixing density's location)."
+            )
         object.__setattr__(self, "centred_design", centred)
 
     @property
@@ -118,7 +132,10 @@ class ReferencePrior:
 
 @dataclass(frozen=True)
 class ReferenceHyperparameters:
-    """ψ (C x (K-1)), the sum-to-zero coordinates of the log mixing weights; θ; the penalty weights."""
+    """ψ (C x (K-1)), the sum-to-zero coordinates of the log mixing weights; θ; the penalty weights.
+
+    ``mixing_penalty`` is (C x 2): each class's first- and second-difference weights.
+    """
 
     mixing_coordinates: np.ndarray
     annotation_coefficients: np.ndarray
@@ -189,9 +206,10 @@ def tilted_terms(
     }
 
 
-def _mixing_penalty_matrix(prior: ReferencePrior) -> np.ndarray:
+def _mixing_penalty_matrices(prior: ReferencePrior) -> tuple[np.ndarray, np.ndarray]:
+    """First- and second-difference roughness of φ, in the sum-to-zero coordinates ψ."""
     basis = sum_to_zero_basis(prior.grid_size)
-    return basis.T @ second_difference_penalty(prior.grid_size) @ basis
+    return tuple(basis.T @ difference_penalty(prior.grid_size, order) @ basis for order in (1, 2))
 
 
 def penalized_objective(
@@ -206,7 +224,7 @@ def penalized_objective(
     terms = tilted_terms(prior, mixing_coordinates, annotation_coefficients, cavity_precision, cavity_shift)
     density = mixing_density(prior, mixing_coordinates)
     basis = sum_to_zero_basis(prior.grid_size)
-    mixing_penalty_matrix = _mixing_penalty_matrix(prior)
+    penalty_matrices = _mixing_penalty_matrices(prior)
     value = float(np.sum(terms["log_normalizer"]))
     # ∂/∂φ_ck of Σ_j log Σ_k π_ck Z_jk is Σ_{j in c} (w_jk - π_ck); ψ enters through φ = Bψ.
     responsibility_sums = np.zeros((prior.class_count, prior.grid_size))
@@ -215,8 +233,11 @@ def penalized_objective(
     mixing_gradient = (responsibility_sums - class_sizes[:, None] * density) @ basis
     for class_position in range(prior.class_count):
         coordinates = mixing_coordinates[class_position]
-        value -= 0.5 * hyperparameters.mixing_penalty[class_position] * float(coordinates @ mixing_penalty_matrix @ coordinates)
-        mixing_gradient[class_position] -= hyperparameters.mixing_penalty[class_position] * (mixing_penalty_matrix @ coordinates)
+        total_penalty = sum(
+            weight * matrix for weight, matrix in zip(hyperparameters.mixing_penalty[class_position], penalty_matrices)
+        )
+        value -= 0.5 * float(coordinates @ total_penalty @ coordinates)
+        mixing_gradient[class_position] -= total_penalty @ coordinates
     annotation_gradient = prior.centred_design.T @ terms["scale_derivative"]
     for group_position, group in enumerate(prior.annotation_groups):
         coefficients = annotation_coefficients[group.columns]
@@ -259,33 +280,52 @@ def maximize_coefficients(prior, hyperparameters, start, cavity_precision, cavit
     return vector
 
 
+def _fellner_schall(weights, matrices, coefficients, inverse_block) -> np.ndarray:
+    """λ_i ← λ_i (tr(S_λ⁺S_i) − tr(H⁻¹S_i)) / (x̂ᵀS_ix̂) for one coefficient block."""
+    total = sum(weight * matrix for weight, matrix in zip(weights, matrices))
+    total_inverse = np.linalg.pinv(total, hermitian=True)
+    updated = np.empty_like(weights)
+    for position, (weight, matrix) in enumerate(zip(weights, matrices)):
+        numerator = float(np.trace(total_inverse @ matrix)) - float(np.trace(inverse_block @ matrix))
+        size = float(coefficients @ matrix @ coefficients)
+        proposal = weight * max(numerator, 0.0) / max(size, 1e-300)
+        updated[position] = np.exp(np.clip(np.log(max(proposal, 1e-300)), -LOG_PENALTY_RANGE, LOG_PENALTY_RANGE))
+    return updated
+
+
 def update_penalties(prior, hyperparameters, vector, cavity_precision, cavity_shift) -> ReferenceHyperparameters:
-    """One MacKay / Fellner–Schall step for every penalty weight at the current optimum."""
+    """One Fellner–Schall step for every penalty weight at the current optimum."""
 
     def objective(candidate):
         return penalized_objective(prior, hyperparameters, candidate, cavity_precision, cavity_shift)
 
     inverse = np.linalg.inv(-_numerical_hessian(objective, vector))
     mixing_coordinates, annotation_coefficients = _unpack(prior, vector)
-    mixing_penalty_matrix = _mixing_penalty_matrix(prior)
-    mixing_rank = np.linalg.matrix_rank(mixing_penalty_matrix)
+    penalty_matrices = _mixing_penalty_matrices(prior)
     block = prior.grid_size - 1
-    mixing_penalty = hyperparameters.mixing_penalty.copy()
-    for class_position in range(prior.class_count):
-        span = slice(class_position * block, (class_position + 1) * block)
-        coordinates = mixing_coordinates[class_position]
-        trace = float(np.trace(inverse[span, span] @ mixing_penalty_matrix))
-        roughness = float(coordinates @ mixing_penalty_matrix @ coordinates)
-        mixing_penalty[class_position] = max(mixing_rank - mixing_penalty[class_position] * trace, 1e-12) / max(roughness, 1e-300)
-    annotation_penalty = hyperparameters.annotation_penalty.copy()
+    mixing_penalty = np.array(
+        [
+            _fellner_schall(
+                hyperparameters.mixing_penalty[class_position],
+                penalty_matrices,
+                mixing_coordinates[class_position],
+                inverse[class_position * block : (class_position + 1) * block, class_position * block : (class_position + 1) * block],
+            )
+            for class_position in range(prior.class_count)
+        ]
+    )
     offset = prior.class_count * block
-    for group_position, group in enumerate(prior.annotation_groups):
-        indices = offset + group.columns
-        coefficients = annotation_coefficients[group.columns]
-        trace = float(np.trace(inverse[np.ix_(indices, indices)] @ group.penalty))
-        rank = np.linalg.matrix_rank(group.penalty)
-        size = float(coefficients @ group.penalty @ coefficients)
-        annotation_penalty[group_position] = max(rank - annotation_penalty[group_position] * trace, 1e-12) / max(size, 1e-300)
+    annotation_penalty = np.array(
+        [
+            _fellner_schall(
+                hyperparameters.annotation_penalty[group_position : group_position + 1],
+                (group.penalty,),
+                annotation_coefficients[group.columns],
+                inverse[np.ix_(offset + group.columns, offset + group.columns)],
+            )[0]
+            for group_position, group in enumerate(prior.annotation_groups)
+        ]
+    )
     return ReferenceHyperparameters(
         mixing_coordinates=mixing_coordinates.copy(),
         annotation_coefficients=annotation_coefficients.copy(),
@@ -385,7 +425,7 @@ def initial_hyperparameters(prior: ReferencePrior) -> ReferenceHyperparameters:
     return ReferenceHyperparameters(
         mixing_coordinates=np.zeros((prior.class_count, prior.grid_size - 1)),
         annotation_coefficients=np.zeros(prior.feature_count),
-        mixing_penalty=np.ones(prior.class_count),
+        mixing_penalty=np.ones((prior.class_count, 2)),
         annotation_penalty=np.ones(len(prior.annotation_groups)),
     )
 
@@ -417,7 +457,7 @@ def fit_reference(
         return np.concatenate(
             [
                 _pack(prior, current.mixing_coordinates, current.annotation_coefficients),
-                np.log(current.mixing_penalty),
+                np.log(current.mixing_penalty).ravel(),
                 np.log(current.annotation_penalty),
             ]
         )
@@ -428,8 +468,12 @@ def fit_reference(
         return ReferenceHyperparameters(
             mixing_coordinates=mixing_coordinates.copy(),
             annotation_coefficients=annotation_coefficients.copy(),
-            mixing_penalty=np.exp(vector[coefficient_size : coefficient_size + prior.class_count]),
-            annotation_penalty=np.exp(vector[coefficient_size + prior.class_count :]),
+            mixing_penalty=np.exp(
+                np.clip(vector[coefficient_size : coefficient_size + 2 * prior.class_count], -LOG_PENALTY_RANGE, LOG_PENALTY_RANGE)
+            ).reshape(prior.class_count, 2),
+            annotation_penalty=np.exp(
+                np.clip(vector[coefficient_size + 2 * prior.class_count :], -LOG_PENALTY_RANGE, LOG_PENALTY_RANGE)
+            ),
         )
 
     for outer_iteration in range(1, maximum_outer_iterations + 1):
