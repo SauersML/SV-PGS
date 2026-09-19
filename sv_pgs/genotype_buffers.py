@@ -31,13 +31,11 @@ import numpy as np
 from numpy.typing import NDArray
 from threadpoolctl import ThreadpoolController
 
+from sv_pgs.dosage_store import MAXIMUM_CODE
 from sv_pgs.ld_partition import PAIR_WEIGHT_SCALE, fixed_point_pair_weights
 
 SIGNED_CODE_OFFSET = 127
 """``s = code - SIGNED_CODE_OFFSET`` lies in [-127, 127] for every stored code."""
-
-MAXIMUM_STORED_CODE = 254
-"""Codes 0..254 are dosages; 255 (missing) must never reach Stage 0."""
 
 INT32_EXACT_ROWS = (2**31 - 1) // (SIGNED_CODE_OFFSET * SIGNED_CODE_OFFSET)
 """Largest sample count whose int32 sum of ``s_i s_j`` cannot overflow (133,144)."""
@@ -272,7 +270,7 @@ class HostGenotypeBuffer:
         def load(row_range: tuple[int, int]) -> None:
             start, stop = row_range
             gathered = np.take(codes[start:stop], self._gather, axis=1)
-            if int(gathered.max()) > MAXIMUM_STORED_CODE:
+            if int(gathered.max()) > MAXIMUM_CODE:
                 invalid[0] = True
             target = self._buffer[slot + start : slot + stop]
             np.subtract(gathered.view(np.int8), np.int8(SIGNED_CODE_OFFSET), out=target)
@@ -284,7 +282,7 @@ class HostGenotypeBuffer:
 
         self._parallel(load, self._row_ranges(rows, -(-rows // self._worker_count)))
         if invalid[0]:
-            raise ValueError(f"a dosage code above {MAXIMUM_STORED_CODE} (missing) reached Stage 0")
+            raise ValueError(f"a dosage code above {MAXIMUM_CODE} (missing) reached Stage 0")
 
     def pair_weights(
         self, window_slot: int, tile_slot: int, tile_rows: int, maximum_distance: int
@@ -428,12 +426,12 @@ extern "C" __global__ void stage0_shift_gather(
     signed char value = 0;
     if (source >= 0) {
         const int code = codes[row * code_stride + source];
-        if (code > MAXIMUM_STORED_CODE) atomicOr(invalid, 1);
+        if (code > MAXIMUM_CODE) atomicOr(invalid, 1);
         value = (signed char)(code - SIGNED_CODE_OFFSET);
     }
     out[row * out_stride + column] = value;
 }
-""".replace("MAXIMUM_STORED_CODE", str(MAXIMUM_STORED_CODE)).replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET))
+""".replace("MAXIMUM_CODE", str(MAXIMUM_CODE)).replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET))
 
 _CUDA_PAIR_WEIGHTS = r"""
 extern "C" __global__ void stage0_pair_weights(
@@ -583,7 +581,7 @@ class CudaGenotypeBuffer:
         """Raise if any loaded code exceeded the dosage range (code 255 = missing)."""
         with self._device:
             if int(self._invalid.get(stream=self._compute)[0]):
-                raise ValueError(f"a dosage code above {MAXIMUM_STORED_CODE} (missing) reached Stage 0")
+                raise ValueError(f"a dosage code above {MAXIMUM_CODE} (missing) reached Stage 0")
 
     def _gemm(self, left_row: int, left_rows: int, right_row: int, right_rows: int, sample_low: int, samples: int,
               output: Any, output_offset: int, output_lead: int, accumulate: bool) -> None:
