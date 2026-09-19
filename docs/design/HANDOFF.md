@@ -1,81 +1,70 @@
-# Handoff: state at pause (2026-09-19) and how to resume
+# Handoff: current state (2026-09-19)
 
-## On main, all passing full-suite CI
-- **New-path modules:**
-  - `dosage_store.py` (8-bit store, halves, zstd, ring reads) and `store_converter.py` (background removal, recalibration hook, TR loci, SV context, long-read half);
-  - `synthetic_store.py`;
-  - `genotype_statistics.py` and `code_products.py` (Stage 0 and exact int8 products);
-  - `exact_polish.py` (the Stage 2 E-step, block CG per model);
-  - `fast_scoring.py` (one-pass scoring with posterior draws);
-  - `imputation_reliability.py` (triad r², reliability model, linear D*);
-  - `prior_design.py` and annotation-coefficient pooling across traits;
-  - `external_annotations.py` (Bai 2026 SV/VNTR, Pan-UKB SNV, record and locus maps);
-  - `gatksv_source.py`, `gatksv_store_rows.py`, `sv_fusion.py` (the general two-source measurement model) and `sample_crosswalk.py`;
-  - `held_out_comparison.py` (the evaluation tests and gates);
-  - `compute_budget.py`, `tie_map.py`;
-  - `cohort.py` (the shared covariates, multi-trait targets and kinship-grouped folds);
-  - phenotypes in `all_of_us.py`, trimmed to the 21-trait panel.
-- **SPEC.md** carries the rulings: one model; CPU/GPU first-class; certification of approximate stages; EP-EB with a certificate; the r² prior; the TR length column; SV context in every prior; the learned mixing density; no hand-chosen priors.
-- **The old path is deleted** (cutover C0–C8, CUTOVER.md); it is recoverable from tag `archive/2026-09-19/old-path-final`.
+This is the single entry point for the project's state. The model is in [MODEL.md](MODEL.md), the rulings in [DECISIONS.md](DECISIONS.md), compute and the landing gate in [COMPUTE.md](COMPUTE.md), and evaluation and benchmark results in [EVALUATION.md](EVALUATION.md). Evidence tags are defined in MODEL.md.
 
-## What remains, in order
-1. **Stage 1 (EP-EB LD-space warm start) is not on main.**
-   - **The dense EP-EB reference is on main:** `tests/ep_eb_reference.py`, checked by `tests/test_ep_eb_reference.py` (see MODEL.md §3–4). It is the exactness oracle; its gates for Stage 1 are in the oracle lane's STAGE1_GATES.md.
-   - **Its full fit is not yet tested.** On the sparse test problem (6 causal of 60) the coefficient maximization finds no interior optimum: the shared density's unpenalized quadratic part lets mass escape toward zero variance or pile at the range ends. That is the EB optimum sitting at a model boundary; it needs a ruling from the lead with math-density.
-   - Land Stage 1 gated against the reference.
-   - Gates: rel ≤ 1e-6 to the dense reference; within ~2% of Gibbs; calibration slope ≥ 0.85; stable across sweeps 20–150.
-   - Fix the implementation overhead: it needs batched block Cholesky and site updates across blocks and models (see COMPUTE.md).
-   - Fold in the fp64/fp32 Cholesky policy and multi-GPU dispatch from e2854ca (tags `archive/2026-09-19/build-stage1` and `archive/2026-09-19/wip-wt-build-store`).
-   - Settle the prior family: the learned mixing density vs TPB and BayesR on the reliability, TR-locus and multi-trait scenarios.
-2. **Wire the full path end to end:** store → Stage 0 → Stage 1 → Stage 2 → score. Run it on synthetic data first; the harness is tag `archive/2026-09-19/lane-e2e` (and `lane-e2e-nodamp`).
-3. **Cutover: done** (C0–C8, `21cdec3`…`3d63745`). The step-by-step record, and the old tests whose intent the engine's tests carry, are in [CUTOVER.md](CUTOVER.md); the CDR input locations the old runner documented are in [CDR_LAYOUT.md](CDR_LAYOUT.md). The pre-cutover tree is tag `archive/2026-09-19/old-path-final`.
-4. **Reliability inputs are computed only inside the AoU workspace, by the pipeline itself.** Nothing AoU-derived is delivered to SV-PGS outside the workspace, and no AoU-derived number is requested from the imputation team (user rule, 2026-09-19; the imputation team confirmed). The pipeline fits and uses, in-workspace, from the long-read truth rows:
-   - the r̂ model: target corr²(stored D, G), triad-corrected, with smooth terms in AF, log N_PATHS_TOTAL, log size and rsq_ds;
-   - the per-stratum, per-ancestry E[G|DS] calibration, which gives κ for D*;
-   - the has_pl mapping and the TR-locus size distribution;
-   - the A-map's per-block Σ_DG (scale_model.md §3).
-5. **In-workspace pieces:**
-   - the fusion's E[B | SL] no-call fill (it needs the GATK-SV SL field, checked in the VCF header inside the workspace);
-   - service-half gates S1–S3 when that half arrives.
-   - the phenotype rules that are not standards (PHENOTYPES.md): the disease evidence rules, the measurement windows, the lab criteria's plausible ranges, the treatment corrections and the covariate forms. Each needs its learned model, validated on synthetic OMOP first, before the case definitions are frozen (EVALUATION.md). The quantitative traits' measurement model (learned noise density and Box–Cox scale) is built and validated on synthetic OMOP.
-6. **Measurements to rerun when compute is back:**
-   - every `[sim-only]` result a ruling rests on (MODEL.md, DECISIONS.md, EVALUATION.md), re-measured on the neutral benchmarks bench-real and bench-sim. Until then those rulings are provisional;
-   - the evaluation validity set (QT, Q0, Q3, QC1, QS_pop, B0) and the red-team sweep;
-   - credit identifiability;
-   - the post-hoc TR read-evidence update, on public HPRC v2 with 1kGP 30× CRAM slices, scored cross-truth;
-   - SV-context and external-annotation ablations (the B − A prior gain);
-   - TR mutation-rate features;
-   - the family-history liability targets for the diseases.
-7. **Pilot:**
-   - P0, before the case definitions are frozen: the in-workspace checks of the quantitative-trait measurement model, V-B (corr² of each current target with the model's) and V-D (held-out PGS R² paired over folds, and z-scores at known loci), novel-pheno.md §8. Aggregate-only, every cell n ≥ 21, run only with the user's authorization.
-   - P1: the store converter on one chromosome of the real imputed data inside the imputation workspace, with QC read inside the workspace only; no value leaves it.
-   - P2: chr22 with two quantitative traits, SNV vs SNV+SV, on one spot VM.
-   - Both run through the in-perimeter launcher (COMPUTE.md). Validate on synthetic data first.
+## On main (`8432a67`)
+- **Store:** `dosage_store`, `store_converter` (per-half manifest, typed sample IDs), `store_block_source` (the streamed reader), and `synthetic_store` (public 1kGP haplotype mosaics, with reliability targets from bench-sim's v7 cohort).
+- **Stage 0:** `genotype_statistics` (adjacent-block Grams, rank-deficient covariate projection) and `code_products` (code-domain products with derived digit counts).
+- **Engine:** `scale_mixture_ep` — variant-side EP-EB with the D3-penalized mixing density, the λ step, the certified V, and the stationarity certificate.
+- **Stage 2 solves:** `dual_solve` (DualGaussian, the negative-site split, information_solve) and `marginal_variances` (leave-block-out marginals, the information certificate, variance_jvp).
+- **Scoring:** `fast_scoring` (trapezoid-rule predictive, Student-t).
+- **Measurement and prior:** `imputation_reliability`, `sv_fusion`, `gatksv_source`, `prior_design`, `variant_typing` (merged classes), `sv_prior_features`, `external_annotations`, `hyperprior_pooling`.
+- **Cohort and phenotypes:** `cohort`, `sample_ids`, `sample_crosswalk`, `all_of_us`, `phenotype_measurement` (the per-occasion measurement model with a learned noise density), `held_out_comparison`.
+- **Benchmarks:** `benchmarks/bench_real` and `benchmarks/bench_sim` (v7 cohort from the public 1kGP founder composition, PREREG amendment 7).
+- **Guards:** `tests/ep_eb_reference.py` (the EP-EB oracle) and `tests/test_no_arbitrary_constants.py`.
+- **Still on main but being deleted:** `anderson.py` (lane/engine-anderson).
+- **Not on main:** the certified outer loop, the Stage 2 driver (`full_data_fit.py`), logistic EP, and so any end-to-end fit. No SV-PGS accuracy number exists yet.
 
-## Steps only the user can take
-1. **Attach the All of Us Controlled Tier data collection (v9)** to the SV-PGS workspace: Resources → Data from Catalog → All of Us Controlled Tier, then pick the version and its genomics bucket. This supplies phenotypes, person tables, the GATK-SV VCFs and the ID crosswalk.
-2. **Confirm the ID-map source.** Imputed samples are keyed by sequencing IDs; the model needs research IDs.
-3. **Approve the data pull.**
-   - The plan: build the 8-bit stores inside the imputation workspace, then pull only the stores into the SV-PGS workspace with an in-perimeter copy.
-   - The imputed store is about 0.45 TB for 50k samples (8-bit codes); the long-read half is smaller.
-   - The copy is same-region, so there is no egress. No permission changes are needed.
-   - Agents never move data between workspaces without this approval.
+## Process
+- **Landing:** lane branch → READY line in LANDQ → land-train runs the full MSI suite on the exact tip (runq cpu-node, under a memory ulimit, plus GPU tests if CUDA code changed) → fast-forward of main. GitHub CI runs on main pushes only, as a secondary signal (COMPUTE.md).
+- **Coordination** lives outside the repo, in the team folder (`~/svpgs-team/`): TEAM_RULES.md (binding), LANDQ.md, FIXLOG.md, and each lane's STATUS.md.
+- **Compute:** MSI only, through the runq task runners; the laptop does git and reading only. The Slurm submit counter is still wrapped, so normal `sbatch` fails (COMPUTE.md).
+- **Evidence:** accuracy claims come only from bench-real, bench-sim, or later AoU held-out data inside the workspace. A lane's own simulations check math only.
 
-## Branches
-- GitHub has only `main`. Every other branch, local-only branch and dirty worktree state was checked against main and then deleted. Each one is kept as an `archive/2026-09-19/*` tag (33 tags), so any of them can be recovered with `git checkout -b <name> archive/2026-09-19/<tag>`.
-- Tags worth reviving:
-  - `build-ep-oracle`: the Stage 1 reference;
-  - `build-stage1` and `wip-wt-build-store`: e2854ca;
-  - `lane-e2e` and `lane-e2e-nodamp`: the end-to-end harness;
-  - `local-lane-cutover-sim`: the unfinished msprime dependency group;
-  - `dirty-*`: uncommitted worktree state.
-- The rest hold only obsolete or superseded work, for example the old Stage 1 files `ld_space_fit.py` and `fast_fit.py`.
+## In flight, by lane
+Queued in LANDQ (READY, not yet landed):
+- **aou-audit** (URGENT): `lane/aou-audit-pipeline` replaces the untraced `PIPELINE_R2_LOSS` in `synthetic_store`.
+- **deslop-hygiene** (URGENT): `lane/deslop-hygiene-replicates`, a memory-sizing fix for the phenotype replicate test.
+- **e2e:** `lane/engine-anderson` deletes `anderson.py`.
+- **bench-sim:** `lane/bench-sim-commit7` (sealed v7 commitments) and `lane/bench-sim-truthhalf` (the beagle_truthhalf arm, PREREG amendment 8).
+- **speed-floor:** `lane/speed-floor-pooled`, compute_floor.md §10 re-measured on bench-sim v7.
+- **ablate:** `lane/ablate-prereg`, the pre-registered term ablations (benchmarks/ABLATION_PLAN.md).
+- **binary-ep:** `lane/binary-ep-logistic`, certified sample-side logistic EP (`logistic_ep.py`).
+- **docs-sync:** this documentation pass.
 
-## MSI at pause
-- All SV-PGS jobs and processes are stopped; nothing is queued.
-- **Scratch cleanup, about 345 GB freed:**
-  - kept: the main clone and its `.venv`; the stores `s1M_100k` (94 GB) and `mini`; `build-lead/synth` (127 GB); `lit-review`; the Descent olean cache; public-data caches; result dirs;
-  - deleted by an interrupted cleanup: the agent script and log dirs, `venv-cpu-fast`, `venv-fast`, the Descent clone and `runq_bin`;
-  - the venvs and the task runner were rebuilt on resume (`venv-cpu`, `venv-gpu`, `runq_bin`; see COMPUTE.md);
-  - re-clone Descent from d86c2669 if it's needed.
-- **Slurm:** the account's submit counter is still wrapped at −260 (see COMPUTE.md for the root cause). Check `scontrol show assoc_mgr users=<user> flags=assoc` before submitting. Until an admin reset, only the `interactive` partitions work.
+Working:
+- **e2e:** `wip/engine-driver`, the certified outer loop (Newton-B plus a trust region) and the Stage 2 driver; `lane/engine-fdbound` (a flaky-test fix); the EM regression test awaits the v7 fixture.
+- **e2e-scale:** runs the driver at chr22 scale on bench-sim's public v7 store and profiles it against the floor [machinery].
+- **oracle:** `fit_reference` fails on real-LD windows; being fixed.
+- **verify-engine, verify-stage2, bug-engine, bug-stage2:** randomized verification and bug review of the engine, `dual_solve` and `marginal_variances`.
+- **novel-inference:** the control-variate certificate, exact quadratics, the derived cavity tolerance, the b±2 window.
+- **speed-floor, speed-krylov:** the learned-λ outer rate on the engine at chr22; batched multi-disease solves.
+- **gpu-engine, multi-gpu, codec:** fused GPU kernels in the engine; multi-GPU sharding of Stage 0 and Stage 2; a GPU-decodable store codec.
+- **measure-path:** D* recalibration and the A-map for draw-like imputed dosages (MODEL.md §2).
+- **prior-terms:** the frequency, pooling, SV-context and shape terms.
+- **fit-api:** the public fit/score API, the model artifact and the CLI.
+- **pheno-disease, deslop-hygiene:** the disease channel model; the DE/sinh level transform and the R2 lattice extent.
+- **workspace-pipeline:** the in-workspace pipeline driver, tested on synthetic data only.
+- **bench-real:** the svfunction and portable arms; evoprior pending; waits for the engine entry point.
+- **bench-sim:** the v7 Beagle arm, kernels, dev baselines; the GLIMPSE2 v7 subset at low priority.
+- **novel-measure:** the `beagle_rb` arm, waiting on v7 Beagle output.
+- **bug-recent:** guards main's CI and reviews each landing.
+- **land-train:** runs the queue. **env:** successor runq runners.
+
+## Next, in order
+1. Land the queue.
+2. The certified outer loop and Stage 2 driver (e2e), then the logistic EP hook.
+3. The end-to-end fit: synthetic first, then chr22 on bench-sim v7 (e2e-scale).
+4. Score SV-PGS on both benchmarks, bench-real and bench-sim's sealed test, then the pre-registered ablations.
+5. The in-workspace pipeline, which needs the user's decisions below.
+
+## The user's pending decisions
+Agents never act on these and never contact anyone about them; the user decides and acts.
+1. **Git history.** AoU-derived values remain in the public git history and in the `archive/2026-09-19/*` tags. Whether to rewrite history, delete tags, or leave them is the user's decision. A purge of the orphaned commit `ba1b71e` (blob `0b20f6b750f8b7899a860045a5fe6a4d5e2f20c0`) from GitHub's caches is also the user's call.
+2. **Attach the All of Us Controlled Tier data collection (v9)** to the SV-PGS workspace. It holds the phenotypes, person tables, GATK-SV VCFs, and the only DRAGEN-to-research-ID crosswalk.
+3. **Approve the store pull:** build the 8-bit stores inside the imputation workspace and copy only the stores into the SV-PGS workspace, in-perimeter. Agents never move data between workspaces without this approval.
+4. **The MSI Slurm counter reset** (COMPUTE.md): whether to pursue it.
+
+## Branches and archive
+- GitHub holds `main` plus the lane branches above (`lane/*`, `wip/*`).
+- Pre-restart branches are kept as `archive/2026-09-19/*` tags; recover one with `git checkout -b <name> archive/2026-09-19/<tag>`. The old fitting path is `archive/2026-09-19/old-path-final`.
