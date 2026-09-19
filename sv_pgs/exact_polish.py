@@ -69,6 +69,8 @@ _MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS = 400
 # SVQB drops a model's direction whose squared norm in its block falls below this
 # fraction of the largest (a converged or dependent column), so block CG cannot break down.
 _DIRECTION_DROP = 1e-20
+# Posterior draws solved per model at a time (one block-CG block).
+_DRAW_BLOCK_COLUMNS = 64
 # Backtracking of a binary model's Newton step on its penalized log-likelihood.
 _MINIMUM_NEWTON_STEP = 2.0**-30
 # Newton iterations and relative step tolerance of the covariate-only fit at the start.
@@ -400,24 +402,28 @@ class _BlockJacobi:
 
 
 def _orthonormal_directions(
-    array_module: Any, values: NDArray, values_image: Any, column_models: NDArray, model_count: int
+    array_module: Any, values: NDArray, values_image: Any, column_models: NDArray, capacity: NDArray
 ) -> tuple[NDArray, Any, NDArray]:
     """Per model, an orthonormal basis of its columns' span (SVQB), dropping dependent directions.
 
     Returns (basis, X basis, model of every basis column). The drop keeps block
-    CG breakdown-free when some of a model's columns have converged.
+    CG breakdown-free when some of a model's columns have converged, and a model
+    keeps at most ``capacity`` directions, its unexplored Krylov dimension.
     """
     bases = []
     images = []
     models = []
-    for model_index in range(model_count):
+    for model_index in range(capacity.shape[0]):
         columns = np.flatnonzero(column_models == model_index)
-        if columns.size == 0:
+        if columns.size == 0 or capacity[model_index] <= 0:
             continue
         block = values[:, columns]
         gram = block.T @ block
+        if not np.all(np.isfinite(gram)):
+            raise FloatingPointError("A block-CG direction is not finite.")
         eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (gram + gram.T))
         kept = eigenvalues > max(_DIRECTION_DROP * float(eigenvalues[-1]), np.finfo(np.float64).tiny)
+        kept[: max(eigenvalues.shape[0] - int(capacity[model_index]), 0)] = False
         if not np.any(kept):
             continue
         transform = eigenvectors[:, kept] / np.sqrt(eigenvalues[kept])
@@ -464,9 +470,12 @@ def _block_conjugate_gradient(
     safe_norm = np.where(right_hand_side_norm > 0.0, right_hand_side_norm, 1.0)
     relative_residual = np.where(right_hand_side_norm > 0.0, 1.0, 0.0)
     active_models = np.unique(column_models[relative_residual > tolerance])
+    # Block CG explores at most p directions per model; past that its space is complete.
+    capacity = np.full(model_count, residual.shape[0])
     direction, direction_image, direction_models = _orthonormal_directions(
-        array_module, preconditioned, preconditioned_image, np.where(np.isin(column_models, active_models), column_models, -1), model_count
+        array_module, preconditioned, preconditioned_image, np.where(np.isin(column_models, active_models), column_models, -1), capacity
     )
+    capacity -= np.bincount(direction_models, minlength=model_count)
     iterations = 0
     for iterations in range(_MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS + 1):
         if direction.shape[1] == 0 or iterations == _MAXIMUM_CONJUGATE_GRADIENT_ITERATIONS:
@@ -493,6 +502,8 @@ def _block_conjugate_gradient(
             applied = operator_direction[:, block_columns]
             curvature_matrix = block.T @ applied
             curvature_matrix = 0.5 * (curvature_matrix + curvature_matrix.T)
+            if not np.all(np.isfinite(curvature_matrix)):
+                raise FloatingPointError("A block-CG curvature is not finite.")
             step = np.linalg.solve(curvature_matrix, block.T @ residual[:, model_columns])
             device_step = array_module.asarray(step)
             device_block_columns = array_module.asarray(block_columns)
@@ -519,8 +530,9 @@ def _block_conjugate_gradient(
             np.concatenate(next_candidates, axis=1),
             array_module.concatenate(next_candidate_images, axis=1),
             np.concatenate(next_models),
-            model_count,
+            capacity,
         )
+        capacity -= np.bincount(direction_models, minlength=model_count)
     return solution, solution_image, relative_residual, iterations
 
 
@@ -740,7 +752,18 @@ class FullDataGaussian:
         )
 
     def draws(self, *, site_precision: NDArray, draw_count: int, tolerance: float) -> NDArray:
-        """Exact draws of q(beta) per model: (p, K, draw_count), by one perturb-and-solve."""
+        """Exact draws of q(beta) per model: (p, K, draw_count), by perturb-and-solve.
+
+        Draws are solved _DRAW_BLOCK_COLUMNS per model at a time, which bounds the
+        block-CG work per iteration.
+        """
+        chunks = [
+            self._draw_chunk(site_precision=site_precision, draw_count=min(_DRAW_BLOCK_COLUMNS, draw_count - first), tolerance=tolerance)
+            for first in range(0, draw_count, _DRAW_BLOCK_COLUMNS)
+        ]
+        return np.concatenate(chunks, axis=2)
+
+    def _draw_chunk(self, *, site_precision: NDArray, draw_count: int, tolerance: float) -> NDArray:
         device = self.device
         array_module = device.array_module
         system = self.system
