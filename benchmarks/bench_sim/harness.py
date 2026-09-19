@@ -27,6 +27,11 @@ import numpy as np
 from scipy.stats import norm
 
 CODES_PER_DOSAGE = 127
+# Measurement arms: observed codes and their per-record quality, plus the label every result carries.
+ARMS = {
+    "glimpse2": ("observed.npy", "imputation.npz", "GLIMPSE2-imputed"),
+    "beagle": ("observed_beagle.npy", "imputation_beagle.npz", "Beagle-imputed"),
+}
 VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
 ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")
 
@@ -76,10 +81,10 @@ class ScoreData:
         return np.asarray(self._observed[rows])[..., self._columns]
 
 
-def public_variant_table(cohort: Path) -> dict:
+def public_variant_table(cohort: Path, arm: str) -> dict:
     variants = np.load(cohort / "variants.npz")
     annotations = np.load(cohort / "annotations.npz")
-    imputation = np.load(cohort / "imputation.npz")
+    imputation = np.load(cohort / ARMS[arm][1])
     table = {name: variants[name] for name in VARIANT_FIELDS}
     table.update({name: annotations[name] for name in ANNOTATION_FIELDS})
     table["imputation_info"] = imputation["info"]
@@ -87,9 +92,9 @@ def public_variant_table(cohort: Path) -> dict:
     return table
 
 
-def covariate_matrix(cohort: Path) -> tuple[np.ndarray, tuple]:
+def covariate_matrix(cohort: Path, arm: str) -> tuple[np.ndarray, tuple]:
     samples = np.load(cohort / "samples.npz")
-    pcs = np.load(cohort / "pcs.npz")["pcs"]
+    pcs = np.load(cohort / f"pcs_{arm}.npz")["pcs"]
     age = samples["age"]
     matrix = np.column_stack([samples["sex"], (age - age.mean()) / age.std(), samples["batch"], pcs])
     names = ("sex", "age", "batch", *[f"pc{index + 1}" for index in range(pcs.shape[1])])
@@ -103,13 +108,13 @@ def load_method(path: Path):
     return module
 
 
-def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int) -> None:
+def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: str) -> None:
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     train_columns, test_columns = np.flatnonzero(~is_test), np.flatnonzero(is_test)
-    observed = np.load(cohort / "observed.npy", mmap_mode="r")
-    table = public_variant_table(cohort)
-    covariates, names = covariate_matrix(cohort)
+    observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
+    table = public_variant_table(cohort, arm)
+    covariates, names = covariate_matrix(cohort, arm)
     params = json.loads((scenario / "scenario.json").read_text())["params"]
     phenotype = np.load(scenario / "truth.npz")["phenotype"]
     train = TrainData(
@@ -132,7 +137,7 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int) -> No
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
     meta = {
-        "method": str(method), "scenario": str(scenario), "cores": cores,
+        "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
         "fit_seconds": fitted - started, "score_seconds": finished - fitted,
         "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
     }
@@ -164,18 +169,18 @@ def auc(outcome: np.ndarray, score: np.ndarray) -> float:
     return float((ranks[positives].sum() - count_positive * (count_positive + 1) / 2) / (count_positive * count_negative))
 
 
-def score(cohort: Path, scenario: Path, prediction_path: Path) -> dict:
+def score(cohort: Path, scenario: Path, prediction_path: Path, arm: str) -> dict:
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     test_columns = np.flatnonzero(is_test)
-    covariates, _ = covariate_matrix(cohort)
+    covariates, _ = covariate_matrix(cohort, arm)
     record = json.loads((scenario / "scenario.json").read_text())
     params = record["params"]
     truth = np.load(scenario / "truth.npz")
     outcome = truth["phenotype"][test_columns]
     prediction = np.load(prediction_path)
     total = prediction["total"]
-    result: dict = {"scenario": scenario.name}
+    result: dict = {"scenario": scenario.name, "measurement": ARMS[arm][2]}
     gain, slope = incremental_r2(outcome, total, covariates[test_columns])
     result["incremental_r2"] = gain
     result["calibration_slope"] = slope
@@ -206,15 +211,17 @@ def main() -> None:
     run_parser.add_argument("--scenario", required=True)
     run_parser.add_argument("--out", required=True)
     run_parser.add_argument("--cores", type=int, default=16)
+    run_parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     score_parser = sub.add_parser("score")
     score_parser.add_argument("--cohort", required=True)
     score_parser.add_argument("--scenario", required=True)
     score_parser.add_argument("--prediction", required=True)
+    score_parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     args = parser.parse_args()
     if args.command == "run":
-        run(Path(args.method), Path(args.cohort), Path(args.scenario), Path(args.out), args.cores)
+        run(Path(args.method), Path(args.cohort), Path(args.scenario), Path(args.out), args.cores, args.arm)
     else:
-        print(json.dumps(score(Path(args.cohort), Path(args.scenario), Path(args.prediction)), indent=1))
+        print(json.dumps(score(Path(args.cohort), Path(args.scenario), Path(args.prediction), args.arm), indent=1))
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.bench_sim.harness import covariate_matrix
+from benchmarks.bench_sim.harness import ARMS, covariate_matrix
 
 CODES_PER_DOSAGE = 127
 
@@ -27,13 +27,13 @@ def residualized(outcome: np.ndarray, covariates: np.ndarray) -> tuple[np.ndarra
     return residual / residual.std(), float(residual.std())
 
 
-def baselines(cohort: Path, scenario: Path, results: Path) -> None:
+def baselines(cohort: Path, scenario: Path, results: Path, arm: str) -> None:
     samples = np.load(cohort / "samples.npz")
     train = np.flatnonzero(~samples["is_test"])
     test = np.flatnonzero(samples["is_test"])
     truth = np.load(scenario / "truth.npz")
-    covariates, _ = covariate_matrix(cohort)
-    observed = np.load(cohort / "observed.npy", mmap_mode="r")
+    covariates, _ = covariate_matrix(cohort, arm)
+    observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     cls = np.load(cohort / "variants.npz")["cls"]
 
     # oracle_observed: the true additive effects applied to observed dosages.
@@ -46,25 +46,26 @@ def baselines(cohort: Path, scenario: Path, results: Path) -> None:
     out = results / "oracle_observed" / scenario.name
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / "prediction.npz", total=effects @ dosage, structural=effects[structural] @ dosage[structural])
+    (out / "meta.json").write_text(json.dumps({"measurement": ARMS[arm][2]}))
 
     # ridge_inf, two arms.
     standardized, phenotype_scale = residualized(truth["phenotype"][train], covariates[train])
-    counts = json.loads((cohort / "kernel_counts.json").read_text())
-    simple = np.load(cohort / "kernel_simple.npy", mmap_mode="r")
-    structural_kernel = np.load(cohort / "kernel_structural.npy", mmap_mode="r")
+    counts = json.loads((cohort / f"kernel_counts_{arm}.json").read_text())
+    simple = np.load(cohort / f"kernel_simple_{arm}.npy", mmap_mode="r")
+    structural_kernel = np.load(cohort / f"kernel_structural_{arm}.npy", mmap_mode="r")
     weight_structural = counts["structural"] / (counts["simple"] + counts["structural"])
     cross_simple = np.asarray(simple[test][:, train], dtype=np.float64)
     cross_structural = np.asarray(structural_kernel[test][:, train], dtype=np.float64)
-    for arm in ("simple", "all"):
-        values = np.load(cohort / f"eig_{arm}_values.npy").astype(np.float64)
-        vectors = np.load(cohort / f"eig_{arm}_vectors.npy", mmap_mode="r")
+    for kernel_arm in ("simple", "all"):
+        values = np.load(cohort / f"eig_{kernel_arm}_{arm}_values.npy").astype(np.float64)
+        vectors = np.load(cohort / f"eig_{kernel_arm}_{arm}_vectors.npy", mmap_mode="r")
         projected = np.asarray(vectors.T @ standardized, dtype=np.float64)
         quadratic = float(projected @ (values * projected))
-        diagonal = np.asarray(simple[train, train] if arm == "simple" else
+        diagonal = np.asarray(simple[train, train] if kernel_arm == "simple" else
                               (1 - weight_structural) * simple[train, train] + weight_structural * structural_kernel[train, train], dtype=np.float64)
         frobenius = float(values @ values)
         heritability = (quadratic - diagonal @ (standardized * standardized)) / (frobenius - diagonal @ diagonal)
-        out = results / f"ridge_inf_{arm}" / scenario.name
+        out = results / f"ridge_inf_{kernel_arm}" / scenario.name
         out.mkdir(parents=True, exist_ok=True)
         # h2 is truncated to its parameter space [0, 1]; at h2 = 1 the solve is the pseudo-inverse.
         heritability_used = float(np.clip(heritability, 0.0, 1.0))
@@ -75,13 +76,13 @@ def baselines(cohort: Path, scenario: Path, results: Path) -> None:
             shifted = values + ridge
             inverse = np.divide(1.0, shifted, out=np.zeros_like(shifted), where=shifted > 0)
             alpha = np.asarray(vectors @ (projected * inverse), dtype=np.float64)
-            if arm == "simple":
+            if kernel_arm == "simple":
                 total, structural_part = cross_simple @ alpha, np.zeros(test.size)
             else:
                 structural_part = weight_structural * (cross_structural @ alpha)
                 total = (1 - weight_structural) * (cross_simple @ alpha) + structural_part
             np.savez(out / "prediction.npz", total=phenotype_scale * total, structural=phenotype_scale * structural_part)
-        (out / "meta.json").write_text(json.dumps({"he_h2": heritability, "h2_used": heritability_used}))
+        (out / "meta.json").write_text(json.dumps({"he_h2": heritability, "h2_used": heritability_used, "measurement": ARMS[arm][2]}))
 
 
 def main() -> None:
@@ -89,9 +90,10 @@ def main() -> None:
     parser.add_argument("--cohort", required=True)
     parser.add_argument("--scenarios", nargs="+", required=True)
     parser.add_argument("--results", required=True)
+    parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     args = parser.parse_args()
     for scenario in args.scenarios:
-        baselines(Path(args.cohort), Path(scenario), Path(args.results))
+        baselines(Path(args.cohort), Path(scenario), Path(args.results) / args.arm, args.arm)
         print("baselines", scenario, flush=True)
 
 

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.bench_sim.harness import score
+from benchmarks.bench_sim.harness import ARMS, score
 
 BREAKDOWNS = ("shape", "sv_mode", "tr_mode", "annotation_mode", "binary", "frequency_source")
 
@@ -32,8 +32,9 @@ def main() -> None:
     parser.add_argument("--results", required=True)
     parser.add_argument("--reference", required=True)
     parser.add_argument("--methods", nargs="*")
+    parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     args = parser.parse_args()
-    cohort, scenarios, results = Path(args.cohort), Path(args.scenarios), Path(args.results)
+    cohort, scenarios, results = Path(args.cohort), Path(args.scenarios), Path(args.results) / args.arm
     methods = args.methods or sorted(path.name for path in results.iterdir() if path.is_dir())
     table: dict[str, dict[str, dict]] = {}
     for method in methods:
@@ -43,11 +44,11 @@ def main() -> None:
             if metrics_path.exists() and metrics_path.stat().st_mtime >= prediction.stat().st_mtime:
                 metrics = json.loads(metrics_path.read_text())
             else:
-                metrics = score(cohort, scenarios / name, prediction)
+                metrics = score(cohort, scenarios / name, prediction, args.arm)
                 metrics_path.write_text(json.dumps(metrics, indent=1))
             table.setdefault(method, {})[name] = metrics
     reference = table[args.reference]
-    report = {"reference": args.reference, "methods": {}}
+    report = {"reference": args.reference, "measurement": ARMS[args.arm][2], "methods": {}}
     for method, rows in table.items():
         shared = sorted(set(rows) & set(reference))
         differences = np.array([primary(rows[name]) - primary(reference[name]) for name in shared])

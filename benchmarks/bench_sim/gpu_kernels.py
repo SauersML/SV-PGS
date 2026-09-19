@@ -17,15 +17,17 @@ from pathlib import Path
 import cupy as cp
 import numpy as np
 
+from benchmarks.bench_sim.harness import ARMS
+
 CODES_PER_DOSAGE = 127
 PC_COUNT = 10
 
 
-def prepare(cohort: Path, block_rows: int) -> None:
+def prepare(cohort: Path, block_rows: int, arm: str) -> None:
     samples = np.load(cohort / "samples.npz")
     train = np.flatnonzero(~samples["is_test"])
     cls = np.load(cohort / "variants.npz")["cls"]
-    observed = np.load(cohort / "observed.npy", mmap_mode="r")
+    observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     n_var, size = observed.shape
     train_gpu = cp.asarray(train)
     kernels = {"simple": cp.zeros((size, size), dtype=cp.float32), "structural": cp.zeros((size, size), dtype=cp.float32)}
@@ -46,15 +48,15 @@ def prepare(cohort: Path, block_rows: int) -> None:
             print(f"kernel rows {first}/{n_var}", flush=True)
     for name in kernels:
         kernels[name] /= max(counts[name], 1)
-        np.save(cohort / f"kernel_{name}.npy", cp.asnumpy(kernels[name]))
-    (cohort / "kernel_counts.json").write_text(json.dumps(counts))
+        np.save(cohort / f"kernel_{name}_{arm}.npy", cp.asnumpy(kernels[name]))
+    (cohort / f"kernel_counts_{arm}.json").write_text(json.dumps(counts))
     combined = (counts["simple"] * kernels["simple"] + counts["structural"] * kernels["structural"]) / (counts["simple"] + counts["structural"])
     del kernels["structural"]
     for name, matrix in (("simple", kernels["simple"]), ("all", combined)):
         train_block = matrix[train_gpu[:, None], train_gpu[None, :]]
         values, vectors = cp.linalg.eigh(train_block)
-        np.save(cohort / f"eig_{name}_values.npy", cp.asnumpy(values))
-        np.save(cohort / f"eig_{name}_vectors.npy", cp.asnumpy(vectors))
+        np.save(cohort / f"eig_{name}_{arm}_values.npy", cp.asnumpy(values))
+        np.save(cohort / f"eig_{name}_{arm}_vectors.npy", cp.asnumpy(vectors))
         if name == "simple":
             top = cp.argsort(values)[::-1][:PC_COUNT]
             scale = np.sqrt(train.size)
@@ -64,7 +66,7 @@ def prepare(cohort: Path, block_rows: int) -> None:
             test_gpu = cp.asarray(test)
             cross = matrix[test_gpu[:, None], train_gpu[None, :]]
             pcs[test] = cp.asnumpy(cross @ vectors[:, top] / values[top]) * scale
-            np.savez(cohort / "pcs.npz", pcs=pcs, eigenvalues=cp.asnumpy(values[top]))
+            np.savez(cohort / f"pcs_{arm}.npz", pcs=pcs, eigenvalues=cp.asnumpy(values[top]))
         del train_block, vectors
         print(f"eigendecomposition {name} done", flush=True)
 
@@ -74,8 +76,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cohort", required=True)
     parser.add_argument("--block-rows", type=int, default=2048)
+    parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     args = parser.parse_args()
-    prepare(Path(args.cohort), args.block_rows)
+    prepare(Path(args.cohort), args.block_rows, args.arm)
 
 
 if __name__ == "__main__":
