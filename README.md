@@ -17,14 +17,13 @@ The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings b
 - **Pipeline:**
   1. an 8-bit dosage store;
   2. Stage 0, one phenotype-independent genotype pass;
-  3. Stage 1, an LD-space warm start;
-  4. Stage 2, exact full-data certification;
-  5. one-pass scoring with posterior draws.
+  3. Stage 2, EP-EB on the full data from the prior, with certified marginals and a Newton-B outer loop;
+  4. one-pass scoring with posterior draws.
 
 ## Status
 [docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps.
 - **On main:** the dosage store, Stage 0, the Stage 2 E-step, scoring, the reliability and fusion models, the prior design, the phenotypes and the evaluation tests.
-- **Not yet on main:** Stage 1 and the end-to-end fit.
+- **Not yet on main:** the end-to-end fit (Stage 2's driver, `full_data_fit.py`).
 - **Deleted:** the old fitting path, in cutover steps C2–C8 ([CUTOVER.md](docs/design/CUTOVER.md)); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## Install
