@@ -684,24 +684,31 @@ def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_di
     schur = moved.T @ negative @ moved
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
     directions = range_basis @ eigenvectors / np.sqrt(eigenvalues)[None, :]
-    # The exact 2-D integral of exp(profile - peak) in the standardized coordinates, on a Gauss-Hermite grid
-    # widened until the integral stops changing to the tolerance's share.
-    previous = None
-    for order in (24, 48, 96):
-        abscissae, weights = np.polynomial.hermite_e.hermegauss(order)
-        total = 0.0
-        for first, first_weight in zip(abscissae, weights):
-            for second, second_weight in zip(abscissae, weights):
-                start = centre + first * directions[:, 0] + second * directions[:, 1]
-                _point, value = _profile(prior, log_smoothing, cavity, start, null_basis)
-                standard_normal = -0.5 * (first * first + second * second)
-                total += first_weight * second_weight * np.exp(value - peak - standard_normal)
-        log_integral = float(np.log(total))
-        if previous is not None and abs(log_integral - previous) <= 0.25 * _EVIDENCE_TOLERANCE:
-            break
-        previous = log_integral
-    else:
-        pytest.fail("the reference quadrature did not converge: the harness cannot judge this case")
+    # The exact 2-D integral of exp(profile - peak) in the standardized coordinates: the trapezoid rule on a square
+    # grid (geometrically convergent for a smooth decaying integrand), each point's null coordinates re-profiled from
+    # its neighbour's. The square reaches sqrt(2 ln(1/eps)) standard units, where a Gaussian integrand is at eps of
+    # its peak; the integrand must be below that on the square's boundary, and spacings 1/2 and 1/4 must agree to
+    # the tolerance's share.
+    null_centre = null_basis.T @ centre
+    reach = np.sqrt(2.0 * np.log(1.0 / _EPSILON))
+    fine_spacing = 0.25
+    axis = np.arange(-reach, reach + 0.5 * fine_spacing, fine_spacing)
+    values = np.empty((axis.shape[0], axis.shape[0]))
+    null_part = null_centre
+    for row, first in enumerate(axis):
+        columns = range(axis.shape[0]) if row % 2 == 0 else range(axis.shape[0] - 1, -1, -1)
+        for column in columns:
+            start = centre + first * directions[:, 0] + axis[column] * directions[:, 1] + null_basis @ (null_part - null_centre)
+            point, value = _profile(prior, log_smoothing, cavity, start, null_basis)
+            null_part = null_basis.T @ point
+            values[row, column] = value - peak
+    boundary = max(float(np.max(values[[0, -1], :])), float(np.max(values[:, [0, -1]])))
+    if boundary > np.log(_EPSILON):
+        pytest.fail(f"the profiled integrand is {boundary:.3g} (log, of its peak) on the reference's boundary: the harness cannot judge this case")
+    fine = float(logsumexp(values)) + 2.0 * np.log(fine_spacing)
+    coarse = float(logsumexp(values[::2, ::2])) + 2.0 * np.log(2.0 * fine_spacing)
+    assert abs(fine - coarse) <= 0.25 * _EVIDENCE_TOLERANCE, ("the reference quadrature did not converge", fine, coarse)
+    log_integral = fine
     # The exact profiled evidence: F + 1/2 log|S|_+ + log of the integral over the range - (r/2) log(2 pi), where the
     # standardized coordinates carry the Schur determinant.
     exact = peak + 0.5 * log_penalty + log_integral - 0.5 * float(np.sum(np.log(eigenvalues))) - 0.5 * eigenvalues.shape[0] * np.log(2.0 * np.pi)
