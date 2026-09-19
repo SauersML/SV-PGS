@@ -558,3 +558,29 @@ def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
         np.testing.assert_allclose(back_products, expected, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(expected).max() * genotypes.shape[0])
         if resolved.size:
             np.testing.assert_allclose(resolved_coupling, coupling, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(coupling).max() * genotypes.shape[0])
+
+
+def test_a_warm_iterate_after_small_site_moves_reuses_the_previous_solution() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(63)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=10)
+    bound = np.full(MODEL_COUNT, np.sqrt(EPS))
+    cold = gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
+    moved = precision * np.exp(np.random.default_rng(64).normal(0.0, 0.01, precision.shape) * (precision > 0))
+    warm = gaussian.iterate(site_precision=moved, site_shift=shift, noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
+    assert warm.iterations < cold.iterations
+    for model in range(MODEL_COUNT):
+        posterior_precision, mean, _alpha, _rss, _design = _dense_gaussian(genotypes, covariates, training, noise, moved, shift, response, offsets, model)
+        error = gaussian.mean[:, model] - mean
+        assert np.sqrt(float(error @ posterior_precision @ error)) <= float(warm.error_bound[model]) + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * np.sqrt(float(mean @ posterior_precision @ mean))
+
+
+def test_a_start_worse_than_zero_is_discarded() -> None:
+    genotypes, source, models, _covariates, _weights, _variances, prior_mean, response = _setup(18)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    bound = _solve_bound(right)
+    cold = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), bound, dual_solve.PassCount())
+    far = cold.solution * 50.0
+    warm = dual_solve.certified_block_cg(source, models, right, far, np.arange(MODEL_COUNT), bound, dual_solve.PassCount())
+    assert np.all(warm.residual_norm <= bound)
+    assert warm.iterations <= cold.iterations

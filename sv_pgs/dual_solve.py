@@ -493,6 +493,12 @@ def certified_block_cg(
             residual = right_hand_side.copy()
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
+            if restarts == 0:
+                # A start whose residual is larger than the right-hand side's own is worse than zero:
+                # those columns restart from zero, where the residual is b without a product.
+                worse = array_module.linalg.norm(residual, axis=0) > array_module.linalg.norm(right_hand_side, axis=0)
+                solution[:, worse] = 0.0
+                residual[:, worse] = right_hand_side[:, worse]
         norms = array_module.linalg.norm(residual, axis=0)
         open_mask = _host(norms > bound)
         if not open_mask.any():
@@ -935,6 +941,7 @@ class DualGaussian:
         self.noise_variance = np.ones(self.model_count)
         self._duals: Any = None
         self._resolved: dict = {}
+        self._layout: dict = {}
         self.bulk_solves: list = []
         self._state: dict = {}
 
@@ -992,10 +999,7 @@ class DualGaussian:
         for position, model in enumerate(order):
             relative = min(probe_residual_ratio, float(target[model]) / max(float(column_norms[model]), np.finfo(np.float64).tiny))
             bound[offsets[position + 1] : offsets[position + 2]] = relative * column_norms[offsets[position + 1] : offsets[position + 2]]
-        start = array_module.zeros_like(stacked)
-        same_resolved = self._resolved.keys() == resolved.keys() and all(np.array_equal(self._resolved[model], resolved[model]) for model in resolved)
-        if self._duals is not None and self._duals.shape == stacked.shape and same_resolved:
-            start = self._duals
+        start = self._warm_start(stacked, order, designs, resolved)
         # The split removes every spike from the bulk operator, which is what the relaxed operand error
         # needs (certified_block_cg): an empty deflation says so.
         spike_free = Deflation({}, {}, {}, resolved)
@@ -1034,9 +1038,33 @@ class DualGaussian:
             start = result.solution
         self._duals = result.solution
         self._resolved = resolved
+        self._layout = {model: (resolved[model], int(offsets[position + 1])) for position, model in enumerate(order)}
         self._state = state | {"models": models, "bulk_mean": bulk_mean, "bulk_variances": bulk_variances, "precision": precision}
         self._finish(result, mean_duals, bulk_mean, bulk_variances, precision, models, state, resolved)
         return DualCertificate(certificate, target, np.array([resolved[model].size for model in range(self.model_count)]), iterations, restarts)
+
+    def _warm_start(self, stacked: Any, order: list, designs: dict, resolved: dict) -> Any:
+        """The previous iterate's solution, column by column: every model's mean dual and probes, and each
+        Z_L column whose variant was resolved before too (sites move a little between iterates, and the
+        resolved sets with them, so matching by variant keeps most of the previous work)."""
+        array_module = self.array_module
+        start = array_module.zeros_like(stacked)
+        if self._duals is None:
+            return start
+        previous = self._duals
+        previous_layout = self._layout
+        start[:, : self.model_count] = previous[:, : self.model_count]
+        start[:, -int(self.probes.shape[1]) :] = previous[:, -int(self.probes.shape[1]) :]
+        offset = self.model_count
+        for model in order:
+            width = int(designs[model].shape[1])
+            if model in previous_layout:
+                previous_indices, previous_offset = previous_layout[model]
+                common, current_positions, previous_positions = np.intersect1d(resolved[model], previous_indices, return_indices=True)
+                if common.size:
+                    start[:, array_module.asarray(offset + current_positions)] = previous[:, array_module.asarray(previous_offset + previous_positions)]
+            offset += width
+        return start
 
     def _finish(self, result: SolveResult, mean_duals: Any, bulk_mean: Any, bulk_variances: Any, precision: Any, models: DualModels, state: dict, resolved: dict) -> None:
         """One read: the bulk mean m + D Xt'z, its genetic image X mu, and C = Xt' Z_L on the LD windows."""
