@@ -363,7 +363,8 @@ def test_noise_update_reaches_the_reml_variance_of_a_gaussian_prior_regression()
             site_precision=site_precision,
             posterior_variance=np.diag(covariance),
         )
-    np.testing.assert_allclose(variance, expected, rtol=1e-8)
+    # The reference maximizer is located to half of double precision in log variance.
+    np.testing.assert_allclose(variance, expected, rtol=1e-6)
 
 
 def test_the_floor_bounds_the_flat_kernel_error_and_the_top_is_the_largest_mode():
