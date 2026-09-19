@@ -1218,6 +1218,11 @@ def _cholesky_log_determinant_and_inverse(matrix: F64Array) -> tuple[float, F64A
     return 2.0 * float(np.sum(np.log(np.diag(factor)))), inverse
 
 
+def _determinant_rounding(matrix: F64Array, inverse: F64Array) -> float:
+    """A bound on the rounding error of log|M| from its Cholesky factor: (n + 1) eps ||M||_F tr(M^-1)."""
+    return _EPSILON * (matrix.shape[0] + 1) * float(np.linalg.norm(matrix)) * float(np.trace(inverse))
+
+
 def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
     """The coordinates of each connected set of overlapping penalty blocks: log|S|_+ factors over them."""
     groups: list[set[int]] = []
@@ -1277,10 +1282,16 @@ def _evidence(
     total = _total_curvature(
         prior, coefficients, cavity, posterior_at(prior, coefficients), working_bytes, max(tolerance / coefficients.shape[0], _EPSILON)
     ) + penalty
+    total_null = null_basis.T @ total @ null_basis
     try:
         total_log_determinant, total_covariance = _cholesky_log_determinant_and_inverse(total)
-        total_null_log_determinant, _total_null_inverse = _cholesky_log_determinant_and_inverse(null_basis.T @ total @ null_basis)
+        total_null_log_determinant, total_null_inverse = _cholesky_log_determinant_and_inverse(total_null)
     except np.linalg.LinAlgError:
+        return None
+    # V is certified to ``tolerance`` only where its determinants are resolved: a Cholesky factor of M is exact for
+    # M + E with ||E||_2 <= (n + 1) eps ||M||_2 (Demmel), which moves log|M| by at most ||E||_2 tr(M^-1). Where that
+    # exceeds the tolerance (B + S near-singular against its own scale), the point is not a certified maximum.
+    if tolerance > 0.0 and 0.5 * (_determinant_rounding(total, total_covariance) + _determinant_rounding(total_null, total_null_inverse)) > tolerance:
         return None
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * total_log_determinant + 0.5 * total_null_log_determinant
     # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
