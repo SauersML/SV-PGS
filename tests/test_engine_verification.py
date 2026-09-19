@@ -28,6 +28,7 @@ from sv_pgs.scale_mixture_ep import (
     _data_value,
     _evidence,
     _kernel_terms,
+    _laplace_corrections,
     _penalty_matrix,
     _penalty_value,
     _restricted_prior,
@@ -733,8 +734,18 @@ def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_di
     # standardized coordinates carry the Schur determinant.
     exact = peak + 0.5 * log_penalty + log_integral - 0.5 * float(np.sum(np.log(eigenvalues))) - 0.5 * eigenvalues.shape[0] * np.log(2.0 * np.pi)
     assert corrected is not None
+    # For the failure message: the engine's per-direction corrections (straight lines along the first-order moved
+    # directions) and the profiled one-dimensional corrections along the same standardized axes, from the grid.
+    engine_corrections, terms, _directions = _laplace_corrections(prior, log_smoothing, laplace, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    profiled_lines = [
+        float(logsumexp([values[(index, 0) if axis == 0 else (0, index)] for index in range(-int(extent[axis, 0]), int(extent[axis, 1]) + 1)]))
+        + np.log(spacing) - 0.5 * np.log(2.0 * np.pi)
+        for axis in range(2)
+    ]
     assert abs(corrected.value - exact) <= _EVIDENCE_TOLERANCE, (
-        f"corrected V {corrected.value:.6f} vs exact {exact:.6f} (Laplace {laplace.laplace_value:.6f})"
+        f"corrected V {corrected.value:.6f} vs exact {exact:.6f} (Laplace {laplace.laplace_value:.6f}); engine corrections "
+        f"{engine_corrections} (TK terms {terms}); profiled line corrections {profiled_lines}; 2-D correction "
+        f"{log_integral - np.log(2.0 * np.pi):.6f}"
     )
 
 
