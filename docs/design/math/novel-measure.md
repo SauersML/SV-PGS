@@ -3,7 +3,7 @@
 **Status (2026-09-19):**
 - Theory: every numbered result below has a numerical check (19/19 pass), and math-scale's two-locus check independently confirms Results 2, 3 and 4″.
 - Numbers: every "measured" number here comes from our own simulator and is **sim-only** under the evidence rule. It checks the algebra, not accuracy.
-- Adoption: the Rao–Blackwellised column (§7) is a *candidate*, gated on the neutral benchmarks (GLIMPSE on masked public long-read SVs, and real held-out data).
+- Adoption: the Rao–Blackwellised column (§7) is a *candidate*, gated on the neutral benchmarks (bench-sim arm `beagle_rb`: Beagle re-imputation of public 1kGP SVs, against the same arm's DS).
 - Code: the prototype, its tests and the harness contract live with the novel-measure lane's scratch files.
 
 ## 0. Setup
@@ -125,10 +125,10 @@ with equality iff $h$ is affine in $X$.
 
 **Result 7 (the imputer's output mechanism fixes the gap).**
 - **Tempered posterior** ($GP \propto P^\tau$): $r^2(GP) = r^2(X)$ exactly, since the map is invertible. $r^2(DS) < r^2(GP)$, but only slightly. Measured: 0.329, 0.332, 0.336; the small GP–X gap is the binned estimator's resolution.
-- **One posterior draw:** $GP$ is one-hot, so $r^2(DS) = r^2(GP) = r_X^4$ and $\kappa = r_X^2 = \sqrt{r^2(DS)}$. That is exactly the "confident draws, $\kappa \approx \sqrt{r^2}$" signature in MODEL.md §2. Measured: $r_X^2 = 0.334$, $r^2(D) = 0.111$ against $0.1115$, $\kappa = 0.333$.
+- **One posterior draw:** $GP$ is one-hot, so $r^2(DS) = r^2(GP) = r_X^4$ and $\kappa = r_X^2 = \sqrt{r^2(DS)}$. bench-sim's calibration found this signature [semi-real] for TR and SV records under real GLIMPSE2 and Beagle re-imputation of public 1kGP haplotypes. Measured here [sim-only]: $r_X^2 = 0.334$, $r^2(D) = 0.111$ against $0.1115$, $\kappa = 0.333$.
 - **An average of $k$ draws:** $r^2 = r_X^4/(r_X^2 + (1-r_X^2)/k)$ and $\kappa = r_X^2/(r_X^2 + (1-r_X^2)/k)$ (verified for $k = 2, 4$).
 
-The measured $\kappa \approx \sqrt{r^2}$ therefore identifies the regime. Of the mechanisms simulated, only the single draw gives it (κ against $\sqrt{r^2}$: 0.454 against 0.455). The others don't:
+A measured $\kappa \approx \sqrt{r^2}$ therefore identifies the regime. Of the mechanisms simulated, only the single draw gives it (κ against $\sqrt{r^2}$: 0.454 against 0.455). The others don't:
 - a 4-draw average: 0.77 against 0.59;
 - a tempered posterior: 0.87 against 0.65;
 - a confidently wrong imputer: 0.79 against 0.59;
@@ -212,7 +212,7 @@ For those few loci, the principled term is the exact mixture likelihood, with th
 - An optional evidence-ridge recalibration with the imputer's GP is fitted on panel members' leave-one-out values. It is within-population only, because the map does not transfer across ancestries when the imputer is mis-specified.
 - The column is scaled by $\widehat{SD}(G)$ with no reliability offset (4‴), stored with a per-record code scale (8), and scored with the $\beta^\top V\beta$ predictive term (9-iii).
 
-**Decided by a diagnostic run inside the AoU workspace.** Its outcome is applied there, and no value leaves the workspace. On panel members, compare three leave-one-out reliabilities per stratum:
+**Decided by the neutral benchmarks.** bench-sim's `beagle_rb` arm builds this column from public 1kGP panel haplotypes and the cohort's phased calls only, and scores it against the Beagle arm [semi-real]. Any use on All of Us data is the user's decision. The column's own diagnostic, per stratum on a truth panel, compares three leave-one-out reliabilities:
 - $r^2(DS, T)$;
 - $r^2(\text{cohort DS averaged by phased local haplotype}, T)$;
 - $r^2(\text{RB}, T)$.
