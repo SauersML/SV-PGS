@@ -2,6 +2,8 @@
 
 Bayesian polygenic scoring for structural variants. Fits a joint empirical-Bayes GLM on all visible GPUs via CuPy (cuBLAS) with JAX for element-wise ops.
 
+The new path (8-bit dosage store, EP-EB with a learned mixing-density prior, certified Stage 0/1/2) is described in [docs/design/](docs/design/README.md); start with [HANDOFF.md](docs/design/HANDOFF.md). The quickstart below still describes the pre-cutover path.
+
 ## All of Us Quickstart
 
 **First-time setup** (installs uv + Python 3.12 + GPU dependencies):
