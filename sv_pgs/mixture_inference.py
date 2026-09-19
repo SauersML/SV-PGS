@@ -971,6 +971,9 @@ def checkpoint_from_result(
         else:
             tpb_shape_b_vector[class_index] = float(default_shape_b.get(variant_class, 1.0))
 
+    local_shape_a = np.asarray(
+        prior_design.class_membership_matrix @ tpb_shape_a_vector, dtype=np.float64
+    )
     local_shape_b = np.asarray(
         prior_design.class_membership_matrix @ tpb_shape_b_vector, dtype=np.float64
     )
@@ -1006,7 +1009,10 @@ def checkpoint_from_result(
         local_scale = np.ones(num_reduced, dtype=np.float64)
 
     if local_shape_b.shape == (num_reduced,):
-        auxiliary_delta = local_shape_b.copy()
+        # Every EM iteration ends with delta = (a + b) / (1 + lambda), the rate the
+        # next local-scale update uses; resetting it to the Gamma(b, 1) prior mean
+        # would restart the lambda-delta fixed point.
+        auxiliary_delta = (local_shape_a + local_shape_b) / np.maximum(1.0 + local_scale, config.local_scale_floor)
     else:
         auxiliary_delta = np.ones(num_reduced, dtype=np.float64)
 
