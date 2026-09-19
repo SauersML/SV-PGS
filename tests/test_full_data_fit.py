@@ -72,7 +72,7 @@ def test_reduced_code_blocks_multiply_the_standardized_reduced_columns(tmp_path)
     statistics = compute_genotype_statistics(
         source, training, covariates, targets[:, None], ModelConfig(minimum_minor_allele_frequency=0.01), _budget(), _BLOCK_CAP, tmp_path / "ld"
     )
-    blocks = ReducedCodeBlocks(_Codes(all_codes), statistics, np, _budget())
+    blocks = ReducedCodeBlocks(_Codes(all_codes), statistics, np, 1 << 24)
     signed = all_codes[blocks.store_rows].astype(np.float64) - 127.0
     standardized = ((signed - blocks.means[:, None]) / blocks.scales[:, None]).T
     right = np.random.default_rng(4).standard_normal((statistics.tie_map.kept_indices.shape[0], 3))
@@ -91,7 +91,7 @@ def test_stage2_from_the_prior_reaches_a_certified_fit_and_scores_held_out_sampl
     statistics = compute_genotype_statistics(
         source, training, covariates, targets[training, None], ModelConfig(minimum_minor_allele_frequency=0.01), _budget(), _BLOCK_CAP, tmp_path / "ld"
     )
-    blocks = ReducedCodeBlocks(_Codes(all_codes), statistics, np, _budget())
+    blocks = ReducedCodeBlocks(_Codes(all_codes), statistics, np, 1 << 24)
     reduced_count = blocks.store_rows.shape[0]
     draw_count = 16
     masks = np.zeros((1, _SAMPLES))

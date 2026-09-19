@@ -37,7 +37,6 @@ import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.code_products import CodeBlockTile
-from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.exact_polish import FullDataGaussian, GaussianModel
 from sv_pgs.fast_scoring import ScoringModel
@@ -76,10 +75,10 @@ class ReducedCodeBlocks:
     ``CodeBlockTile`` at the training means and scales Stage 0 standardized with.
     """
 
-    def __init__(self, codes: CodeRows, statistics: GenotypeSufficientStatistics, array_module: Any, budget: ComputeBudget) -> None:
+    def __init__(self, codes: CodeRows, statistics: GenotypeSufficientStatistics, array_module: Any, workspace_bytes: int) -> None:
         self._codes = codes
         self._array_module = array_module
-        self._budget = budget
+        self._workspace_bytes = int(workspace_bytes)
         kept = np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)
         self.store_rows = np.asarray(statistics.active_rows, dtype=np.int64)[kept]
         self.means = np.asarray(statistics.means, dtype=np.float64)[kept]
@@ -104,7 +103,7 @@ class ReducedCodeBlocks:
             codes = self._codes.read_codes(int(rows[0]), int(rows[-1]) + 1)[rows - rows[0]]
             signed = (codes.astype(np.int16) - int(SIGNED_CODE_OFFSET)).astype(np.int8)
             yield block_index, CodeBlockTile(
-                self._array_module.asarray(signed), self.means[columns], self.scales[columns], self._array_module, self._budget
+                self._array_module.asarray(signed), self.means[columns], self.scales[columns], self._array_module, self._workspace_bytes
             )
 
 
@@ -242,6 +241,15 @@ def _positive_definite_refactor(
         precision[negative] *= 0.5
 
 
+def _blended(old: MixtureHyperparameters, new: MixtureHyperparameters, fraction: float) -> MixtureHyperparameters:
+    """``fraction`` of the way from ``old`` to ``new``; a weight that moved to or from an edge (0 or infinity) moves fully."""
+    both_finite = np.isfinite(old.log_smoothing) & np.isfinite(new.log_smoothing)
+    log_smoothing = np.where(both_finite, old.log_smoothing + fraction * (np.where(both_finite, new.log_smoothing, 0.0) - np.where(both_finite, old.log_smoothing, 0.0)), new.log_smoothing)
+    if not np.all(both_finite == (np.isfinite(old.log_smoothing) | np.isfinite(new.log_smoothing))):
+        return new
+    return MixtureHyperparameters(coefficients=old.coefficients + fraction * (new.coefficients - old.coefficients), log_smoothing=log_smoothing)
+
+
 def _damped_site_update(
     gaussian: FullDataGaussian,
     site_precision: F64Array,
@@ -319,6 +327,7 @@ def fit_full_data(
     covariate_count = int(np.asarray(covariates).shape[1])
     effective = np.full(model_count, float(prior.variant_count))
     hyper_tolerance = 0.5 / draw_count
+    previous_remaining, outer_damping = np.full(model_count, np.inf), 1.0
     outer = 0
     while True:
         outer += 1
@@ -344,7 +353,8 @@ def fit_full_data(
             marginal_variance = 1.0 / (frozen_precision + site_precision)
             mean_move = np.sum(np.square(gaussian.mean - previous_mean) / marginal_variance, axis=0)
             effective = prior.variant_count - np.sum(site_precision * marginal_variance, axis=0)
-            if np.all(mean_move <= effective / draw_count):
+            # A damped pass moves damping^2 of the full step's squared size: converge on the full step.
+            if np.all(mean_move <= damping * damping * effective / draw_count):
                 break
             # A pass that does not shrink the move means an eigenvalue of the site map at or past -1: with
             # rho = sqrt(move ratio) its estimate, the damping 1 / (1 + rho) sends it to zero.
@@ -370,8 +380,14 @@ def fit_full_data(
                 shift=gaussian.mean[:, model_index] / marginal_variance[:, model_index] - site_shift[:, model_index],
             )
             steps.append(hyper_step(prior, hyperparameters[model_index], cavity, working_bytes, hyper_tolerance))
-            hyperparameters[model_index] = steps[-1].hyperparameters
         remaining = np.array([step.start_decrement + step.evidence_gain for step in steps])
+        # The fixed-cavity hyper step ignores how the cavities answer it, so the EP-EB map can overshoot; when the
+        # remaining gain stops shrinking, damp the step with the same spectral rule as the sites.
+        ratio = float(np.max(remaining / previous_remaining))
+        if ratio >= 1.0:
+            outer_damping = min(outer_damping, 1.0 / (1.0 + np.sqrt(ratio)))
+        previous_remaining = remaining
+        hyperparameters = [_blended(old, step.hyperparameters, outer_damping) for old, step in zip(hyperparameters, steps)]
         if np.all(remaining <= hyper_tolerance):
             return FullDataFit(
                 gaussian=gaussian,

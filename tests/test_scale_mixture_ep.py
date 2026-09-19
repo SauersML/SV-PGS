@@ -222,15 +222,18 @@ def test_component_derivatives_in_log_scale_match_finite_differences():
 def test_roughness_factors_are_the_lattice_integrals_of_the_squared_derivatives():
     spacing = 0.05
     nodes = -2.0 + spacing * np.arange(101)
-    slope, curvature = roughness_factor(nodes.shape[0], spacing, 1), roughness_factor(nodes.shape[0], spacing, 2)
-    # The K - order differences are midpoint cells: the first differences cover [t_0, t_(K-1)], the second [t_0.5, t_(K-1.5)].
-    np.testing.assert_allclose(slope @ np.ones_like(nodes), 0.0, atol=1e-12)
-    np.testing.assert_allclose(curvature @ nodes, 0.0, atol=1e-9)
-    np.testing.assert_allclose(np.sum(np.square(slope @ nodes)), nodes[-1] - nodes[0], rtol=1e-12)
-    np.testing.assert_allclose(np.sum(np.square(curvature @ nodes**2)), 4.0 * (nodes[-2] - nodes[1] + spacing), rtol=1e-9)
-    start, stop = nodes[0], nodes[-1]
-    exact_slope = 0.5 * (stop - start) + 0.25 * (np.sin(2.0 * stop) - np.sin(2.0 * start))
-    np.testing.assert_allclose(np.sum(np.square(slope @ np.sin(nodes))), exact_slope, rtol=2e-3)
+    for order in (1, 2, 3):
+        factor = roughness_factor(nodes.shape[0], spacing, order)
+        # Every polynomial below the order is in the null space; t^order has the constant difference order! h^order.
+        for degree in range(order):
+            np.testing.assert_allclose(factor @ nodes**degree, 0.0, atol=1e-6)
+        expected = float(np.prod(np.arange(1, order + 1))) ** 2 * spacing * (nodes.shape[0] - order)
+        np.testing.assert_allclose(np.sum(np.square(factor @ nodes**order)), expected, rtol=1e-6)
+    # The K - 3 third differences are midpoint cells centred on t_1.5 .. t_(K-2.5): together [t_1, t_(K-2)].
+    third = roughness_factor(nodes.shape[0], spacing, 3)
+    start, stop = nodes[1], nodes[-2]
+    exact = 0.5 * (stop - start) + 0.25 * (np.sin(2.0 * stop) - np.sin(2.0 * start))
+    np.testing.assert_allclose(np.sum(np.square(third @ np.sin(nodes))), exact, rtol=2e-3)
 
 
 def test_halving_the_lattice_keeps_every_class_density():
@@ -265,14 +268,15 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
         np.testing.assert_allclose(density[class_position], pooled + basis @ coefficients[start : start + prior.pooled_size], atol=1e-12)
     theta = coefficients[prior.pooled_size * (prior.class_count + 1) :]
     np.testing.assert_allclose(log_scale(prior, coefficients), prior.log_variance_offset + prior.scale_design @ theta, atol=1e-12)
-    # The first difference has no null space in sum-to-zero coordinates; only the smooth annotation's
-    # second-difference null space (two directions of its three columns) is profiled.
-    assert prior.null_basis.shape[1] == 2
-    np.testing.assert_allclose(prior.null_basis[: prior.pooled_size * (prior.class_count + 1)], 0.0, atol=1e-10)
+    # Profiled: eta_bar's location and width (inside its coordinates) and the smooth annotation's
+    # second-difference null space (two of its three columns); the deviations are fully penalized.
+    assert prior.null_basis.shape[1] == 4
+    deviations = slice(prior.pooled_size, prior.pooled_size * (prior.class_count + 1))
+    np.testing.assert_allclose(prior.null_basis[deviations], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
     assert names == [
-        "pooled slope", "pooled curvature", "class 0 deviation slope", "class 0 deviation curvature",
-        "class 1 deviation slope", "class 1 deviation curvature", "annotation group 0", "annotation group 1",
+        "pooled roughness order 3", "class 0 deviation roughness order 3", "class 1 deviation roughness order 3",
+        "deviation polynomial part", "annotation group 0", "annotation group 1",
     ]
 
 

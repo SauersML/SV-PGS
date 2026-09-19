@@ -16,15 +16,24 @@ with no point mass at zero.
   learned nonparametrically, held as its log values eta_ck at the nodes of a
   uniform lattice over the real line; integrals over t are trapezoid sums, so
   node k carries pi_ck = softmax(eta_c)_k.
-- The classes share one density shape: eta_c = eta_bar + delta_c. Each of
-  eta_bar and every delta_c carries two learned roughness weights, on the
-  integrals of its squared first and second derivatives, penalized in their
-  lattice forms lambda_1 h^-1 ||D1 eta||^2 and lambda_2 h^-3 ||D2 eta||^2 (so
-  the weights do not depend on the spacing h). In sum-to-zero coordinates the
-  first difference has no null space, so every direction of the density is
-  penalized: none has to be profiled, and a density cannot collapse onto one
-  node at no cost. There is no separate class level: a class's scale is its
-  deviation's location.
+- The classes share one density shape: eta_c = eta_bar + delta_c. Roughness,
+  the integral of eta'''(t)^2 (``ROUGHNESS_ORDERS``), is penalized in its
+  lattice form lambda h^-5 ||D3 eta||^2, so lambda does not depend on the
+  spacing h: one learned weight on eta_bar and one per class on delta_c. The
+  penalty's null space is the quadratics, so as a weight grows log g tends to
+  a concave quadratic, a log-normal mixing density proper on the real line;
+  lower orders tend to an exponential in t, whose mass depends on where the
+  lattice ends. Linear log-tails carry no penalty, so heavy tails stay free.
+- A deviation's null-space part, its location and width offsets (the Legendre
+  P1 and P2 coefficients over the kernel range), has a Gaussian pooling prior
+  with mean zero and a learned precision: eta_bar carries the common location,
+  so there is no separate class level, and a class's scale is its deviation's
+  location. The kernel range [floor, top] comes from the data, so neither
+  offset depends on the lattice's spacing or extent.
+- eta_bar's own null space (the log-normal limit's location and width) is
+  profiled (the Schur-complement form of the evidence below): integrating it
+  under a flat prior diverges where the likelihood tends to a positive
+  constant, and makes the evidence grid-dependent.
 - Every weight lives in [0, infinity] with exact edges: at infinity the
   block's penalized directions are zero, at zero the block is absent.
 - The lattice is a quadrature rule: its floor, top, spacing and extent are
@@ -89,6 +98,12 @@ from sv_pgs._typing import F64Array, I64Array
 _EPSILON = float(np.finfo(np.float64).eps)
 # Half of double precision: the resolution of a quantity whose square is compared at eps.
 _HALF_PRECISION = _EPSILON**0.5
+# The mixing density's roughness penalty: the integral of its squared third derivative, with a learned weight.
+# Third order is derived: its null space, the quadratics (a normal density in log s), is the only lambda =
+# infinity limit that is proper on the real line, and that null space is profiled. The first-plus-second
+# order form (no null space in sum-to-zero coordinates) is the alternative the benchmark's held-out log
+# predictive density adjudicates (lead ruling); any tuple of orders is supported.
+ROUGHNESS_ORDERS = (3,)
 
 
 @dataclass(frozen=True)
@@ -255,6 +270,30 @@ def tail_mass(end_value: float, outward_slope: float, curvature: float) -> float
     return float("inf")
 
 
+def _legendre_functionals(nodes: F64Array, floor: float, top: float, degree_count: int) -> F64Array:
+    """(degree_count, K): node weights of a function's Legendre P1..P_degree_count coefficients over [floor, top].
+
+    These are the polynomial parts a roughness penalty of order degree_count + 1 cannot see, beyond the
+    constant that normalization removes. Trapezoid weights over the nodes inside the range (at least three
+    nearest its centre when it is narrower) keep them independent of the spacing and of the lattice's extent.
+    """
+    distance = np.abs(nodes - 0.5 * (floor + top))
+    inside = (nodes >= floor) & (nodes <= top)
+    if int(inside.sum()) < 3:
+        inside = distance <= np.sort(distance)[2]
+    covered = nodes[inside]
+    centre = 0.5 * (covered[0] + covered[-1])
+    half = 0.5 * (covered[-1] - covered[0])
+    standardized = (covered - centre) / half
+    weights = np.full(covered.shape[0], covered[1] - covered[0])
+    weights[[0, -1]] *= 0.5
+    functionals = np.zeros((degree_count, nodes.shape[0]))
+    for degree in range(1, degree_count + 1):
+        polynomial = np.polynomial.legendre.Legendre.basis(degree)(standardized)
+        functionals[degree - 1, inside] = (2 * degree + 1) / (2.0 * half) * weights * polynomial
+    return functionals
+
+
 def scale_mixture_prior(
     *,
     class_index: I64Array,
@@ -300,8 +339,8 @@ def scale_mixture_prior(
         raise ValueError("the lattice must be at least five evenly spaced increasing nodes")
     grid_size = lattice.shape[0]
     basis = _sum_to_zero_basis(grid_size)
-    slope = roughness_factor(grid_size, float(spacing[0]), 1) @ basis
-    curvature = roughness_factor(grid_size, float(spacing[0]), 2) @ basis
+    factors = {order: roughness_factor(grid_size, float(spacing[0]), order) @ basis for order in ROUGHNESS_ORDERS}
+    null_functionals = _legendre_functionals(lattice, floor, top, min(ROUGHNESS_ORDERS) - 1) @ basis
     pooled_size = grid_size - 1
     deviation_count = class_count if class_count > 1 else 0
     deviation_size = deviation_count * pooled_size
@@ -315,11 +354,16 @@ def scale_mixture_prior(
             coefficient_map[rows, start : start + pooled_size] = basis
     coefficient_map[class_count * grid_size :, pooled_size + deviation_size :] = np.eye(design.shape[1])
     pooled = np.arange(pooled_size)
-    blocks = [SmoothingBlock("pooled slope", pooled, slope), SmoothingBlock("pooled curvature", pooled, curvature)]
+    blocks = [SmoothingBlock(f"pooled roughness order {order}", pooled, factor) for order, factor in factors.items()]
     for class_position in range(deviation_count):
         deviation = pooled_size + class_position * pooled_size + np.arange(pooled_size)
-        blocks.append(SmoothingBlock(f"class {class_position} deviation slope", deviation, slope))
-        blocks.append(SmoothingBlock(f"class {class_position} deviation curvature", deviation, curvature))
+        blocks.extend(SmoothingBlock(f"class {class_position} deviation roughness order {order}", deviation, factor) for order, factor in factors.items())
+    if deviation_count and null_functionals.shape[0]:
+        # A deviation's polynomial part below the penalty orders (its location and width, for order 3) has a
+        # Gaussian pooling prior with mean zero and one learned precision: eta_bar carries the common part.
+        blocks.append(SmoothingBlock(
+            "deviation polynomial part", np.arange(pooled_size, pooled_size + deviation_size), np.kron(np.eye(deviation_count), null_functionals)
+        ))
     annotation_start = pooled_size + deviation_size
     for position, group in enumerate(annotation_groups):
         eigenvalues, eigenvectors = np.linalg.eigh(np.asarray(group.penalty, dtype=np.float64))
