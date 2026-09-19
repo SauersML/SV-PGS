@@ -36,20 +36,20 @@ from sv_pgs.all_of_us import (
     TreatmentRule,
     UnitConversion,
     WindowConcept,
-    _estimate_person_variance_components,
     _liability_targets,
-    _person_blup,
-    _person_design,
+    _occasion_design,
     _prepare_training_rows,
     available_disease_names,
     available_measurement_names,
     build_all_of_us_disease_query_config,
     build_all_of_us_disease_query_parameters,
     build_all_of_us_disease_sql,
+    build_all_of_us_lab_criterion_query_parameters,
     build_all_of_us_measurement_query_config,
     build_all_of_us_measurement_query_parameters,
     build_all_of_us_measurement_sql,
     build_all_of_us_measurement_targets,
+    person_occasions,
     disease_covariate_columns,
     measurement_covariate_columns,
     phenotype_fingerprint,
@@ -62,6 +62,7 @@ from sv_pgs.all_of_us import (
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
+from sv_pgs.phenotype_measurement import Occasions, fit_at_exponent
 from tests.phenotype_bounds import (
     rounding_gamma,
     sampling_bound,
@@ -219,78 +220,64 @@ def _lab_row(count: int, first: str, last: str) -> dict[str, object]:
     return {"qualifying_occasion_count": count, "first_qualifying_date": first, "last_qualifying_date": last}
 
 
-def _person_row(
+def _person_days(
     person_id: int,
+    occasions: list[tuple[float, float]] | None = None,
     *,
-    untreated: tuple[int, float, float, float] | None = None,
-    treated: tuple[int, float, float, float] | None = None,
+    treated_occasions: list[tuple[float, float]] | None = None,
     sex_at_birth_concept_id: int | None = 45878463,
     excluded: dict[str, int] | None = None,
     unrecognized_unit_labels: list[str] | None = None,
-) -> dict[str, object]:
-    """One row shaped like the measurement query output.
-
-    untreated/treated = (occasion count, mean, population variance, mean age);
-    the mean squared age is mean_age^2 + 4 (a fixed within-person age spread).
-    """
-    excluded_counts = {reason: 0 for reason in MEASUREMENT_EXCLUSION_REASONS} | (excluded or {})
-    row: dict[str, object] = {
-        "sample_id": str(person_id),
-        "person_id": str(person_id),
-        "unrecognized_unit_labels": unrecognized_unit_labels or [],
-        "sex_at_birth_concept_id": sex_at_birth_concept_id,
-        "sex_at_birth_name": {45878463: "female", 45880669: "male"}.get(sex_at_birth_concept_id),
-    }
-    for reason, count in excluded_counts.items():
-        row[f"{reason}_row_count"] = count
-    occasion_rows = 0
-    for group, statistics in (("untreated", untreated), ("treated", treated)):
-        if statistics is None:
-            row[f"{group}_occasion_count"] = 0
-            for statistic in ("mean", "variance", "mean_age", "mean_age_squared"):
-                row[f"{group}_{statistic}"] = None
-            continue
-        count, mean, variance, mean_age = statistics
-        occasion_rows += count
-        row[f"{group}_occasion_count"] = count
-        row[f"{group}_mean"] = mean
-        row[f"{group}_variance"] = variance
-        row[f"{group}_mean_age"] = mean_age
-        row[f"{group}_mean_age_squared"] = mean_age**2 + 4.0
-    row["measurement_row_count"] = occasion_rows + sum(excluded_counts.values())
-    return row
+) -> list[dict[str, object]]:
+    """Person-day rows shaped like the measurement query output: one per (age, value) occasion, untreated then
+    treated, a day later each, plus one day holding the excluded rows when there are any."""
+    sex_name = {45878463: "female", 45880669: "male"}.get(sex_at_birth_concept_id)
+    days = [(age, value, False) for age, value in occasions or []] + [(age, value, True) for age, value in treated_occasions or []]
+    rows: list[dict[str, object]] = []
+    start = datetime.date(2015, 1, 1)
+    for position, (age, value, treated) in enumerate(days):
+        rows.append({
+            "sample_id": str(person_id), "person_id": str(person_id),
+            "measurement_date": start + datetime.timedelta(days=position), "age_at_occasion": age, "treated": treated,
+            "row_count": 1, **{f"{reason}_row_count": 0 for reason in MEASUREMENT_EXCLUSION_REASONS},
+            "retained_row_count": 1, "occasion_value": value, "unrecognized_unit_labels": [],
+            "sex_at_birth_concept_id": sex_at_birth_concept_id, "sex_at_birth_name": sex_name,
+        })
+    if excluded or unrecognized_unit_labels:
+        counts = {reason: 0 for reason in MEASUREMENT_EXCLUSION_REASONS} | (excluded or {})
+        rows.append({
+            "sample_id": str(person_id), "person_id": str(person_id),
+            "measurement_date": start + datetime.timedelta(days=len(days)), "age_at_occasion": 50.0, "treated": False,
+            "row_count": sum(counts.values()), **{f"{reason}_row_count": count for reason, count in counts.items()},
+            "retained_row_count": 0, "occasion_value": None, "unrecognized_unit_labels": unrecognized_unit_labels or [],
+            "sex_at_birth_concept_id": sex_at_birth_concept_id, "sex_at_birth_name": sex_name,
+        })
+    return rows
 
 
 def _synthetic_person_rows(
     person_count: int,
     *,
-    between_variance: float,
-    within_variance: float,
+    level_variance: float,
+    noise_variance: float,
     seed: int,
 ) -> tuple[list[dict[str, object]], np.ndarray]:
-    """Per-person rows simulated from the random-intercept model; returns the
-    rows and each person's true long-run mean."""
+    """Person-day rows simulated from the per-occasion model on the linear scale, recorded to 0.1 unit as a lab
+    reports them; returns the rows and each person's true long-run level net of the age and sex terms."""
     generator = np.random.default_rng(seed)
-    rows = []
-    true_means = np.empty(person_count)
+    rows: list[dict[str, object]] = []
+    levels = generator.normal(0.0, math.sqrt(level_variance), person_count)
     for person_index in range(person_count):
-        count = int(generator.integers(1, 7))
-        mean_age = float(generator.uniform(25.0, 80.0))
         female = person_index % 2 == 0
-        long_run_mean = (
-            10.0 + 0.03 * (mean_age - 50.0) + (0.5 if female else 0.0)
-            + generator.normal(0.0, math.sqrt(between_variance))
+        ages = generator.uniform(25.0, 80.0, int(generator.integers(1, 7)))
+        values = 90.0 + 0.03 * (ages - 50.0) + (0.5 if female else 0.0) + levels[person_index]
+        values = np.round(values + generator.normal(0.0, math.sqrt(noise_variance), ages.shape[0]), 1)
+        rows += _person_days(
+            person_index,
+            [(float(age), float(value)) for age, value in zip(ages, values, strict=True)],
+            sex_at_birth_concept_id=45878463 if female else 45880669,
         )
-        occasions = long_run_mean + generator.normal(0.0, math.sqrt(within_variance), size=count)
-        true_means[person_index] = long_run_mean
-        rows.append(
-            _person_row(
-                person_index,
-                untreated=(count, float(occasions.mean()), float(occasions.var()), mean_age),
-                sex_at_birth_concept_id=45878463 if female else 45880669,
-            )
-        )
-    return rows, true_means
+    return rows, levels
 
 
 _BASE_DEFINITION = MeasurementDefinition(
@@ -300,8 +287,6 @@ _BASE_DEFINITION = MeasurementDefinition(
     loinc_codes=("1-1",),
     canonical_unit="milligram per deciliter",
     unit_conversions=(UnitConversion("milligram per deciliter", 1.0),),
-    plausible_range=(1.0, 100.0),
-    log_scale=False,
 )
 
 
@@ -309,20 +294,22 @@ def _definition(**overrides: object) -> MeasurementDefinition:
     return dataclasses.replace(_BASE_DEFINITION, **overrides)
 
 
-def _captured_person_statistics(monkeypatch, definition: MeasurementDefinition, rows) -> dict[str, np.ndarray]:
-    """Run the target builder with the variance components pinned and return
-    the per-person means and within-person sums of squares it formed."""
-    captured: dict[str, np.ndarray] = {}
+def _captured_occasions(monkeypatch, definition: MeasurementDefinition, rows) -> tuple[Occasions, list, dict]:
+    """Run the target builder with the model replaced by a stand-in; return the occasions it was given, and the
+    training rows and summary it built from the stand-in's levels (each person's index, reliability one half)."""
+    captured: dict[str, Occasions] = {}
 
-    def capture_components(occasion_counts, person_means, within_sum_squares, design):
-        captured["counts"] = occasion_counts.copy()
-        captured["means"] = person_means.copy()
-        captured["within"] = within_sum_squares.copy()
-        return 1.0, 1.0
+    def stand_in(occasions: Occasions, working_bytes: int):
+        captured["occasions"] = occasions
+        persons = occasions.person_count
+        return type("Fit", (), {
+            "exponent": 1.0, "level_variance": 1.0, "noise_second_moment": 1.0, "log_evidence": 0.0,
+            "level_mean": np.arange(persons, dtype=np.float64), "reliability": np.full(persons, 0.5),
+        })()
 
-    monkeypatch.setattr("sv_pgs.all_of_us._estimate_person_variance_components", capture_components)
-    build_all_of_us_measurement_targets(definition, rows)
-    return captured
+    monkeypatch.setattr("sv_pgs.all_of_us.fit_occasion_model", stand_in)
+    training_rows, _columns, summary = build_all_of_us_measurement_targets(definition, rows, 1 << 28)
+    return captured["occasions"], training_rows, summary
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +479,9 @@ def test_every_lab_criterion_reads_a_known_measurement():
     for definition in (resolve_disease_definition(name) for name in available_disease_names()):
         for criterion in definition.lab_criteria:
             assert resolve_lab_criterion_measurement(criterion).canonical_name == criterion.measurement
+            # Only the lab-criterion path bounds its rows, by the criterion's own range.
+            parameters = build_all_of_us_lab_criterion_query_parameters(criterion)
+            assert (parameters["plausible_low"][1], parameters["plausible_high"][1]) == criterion.plausible_range
 
 
 
@@ -726,22 +716,7 @@ def test_medication_rules_follow_the_published_conventions():
             "unique and lower case",
         ),
         ({"unit_conversions": (UnitConversion("milligram per deciliter", 1.0), UnitConversion("mg/dL", 1.0))}, "lower case"),
-        ({"plausible_range": (5.0, 5.0)}, "empty plausible range"),
-        ({"log_scale": True, "plausible_range": (0.0, 5.0)}, "log scale needs"),
-        ({"log_offset": 0.05}, "log_offset without log scale"),
         ({"value_formula": "mdrd"}, "unknown value formula"),
-        (
-            {"log_scale": True, "treatment": TreatmentRule(LDL_LOWERING, TreatmentCorrection.ADD, 1.0, "test")},
-            "additive correction",
-        ),
-        (
-            {
-                "log_scale": True,
-                "log_offset": 0.05,
-                "treatment": TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
-            },
-            "ratio correction",
-        ),
         ({"loinc_codes": ("1-1", "1-1")}, "LOINC codes"),
     ],
 )
@@ -843,7 +818,7 @@ def test_measurement_sql_scans_the_measurement_table_once(monkeypatch):
     assert sql.count(f"`{DATASET}.measurement`") == 1
     for common_table in (
         "exclusion_windows", "measurement_rows", "analyte_rows", "classified_rows", "valued_rows",
-        "person_days", "person_summaries",
+        "person_days",
     ):
         assert f"{common_table} AS (" in sql
         assert len(re.findall(rf"\b(?:FROM|JOIN) {common_table}\b", sql)) == 1, common_table
@@ -874,9 +849,10 @@ def test_measurement_query_config_types_every_parameter():
     assert parameters["unit_labels"].values == ["millimeter mercury column", "no unit", "unit"]
     assert parameters["unit_scales"].array_type == "FLOAT64"
     assert parameters["treatment_atc_codes"].values == ["C02", "C03", "C07", "C08", "C09"]
-    assert isinstance(parameters["log_scale"], bigquery.ScalarQueryParameter)
-    assert parameters["log_scale"].type_ == "BOOL"
-    assert parameters["log_scale"].value is False
+    # A trait keeps every positive reading: its range parameters are typed NULLs.
+    assert isinstance(parameters["plausible_low"], bigquery.ScalarQueryParameter)
+    assert parameters["plausible_low"].type_ == "FLOAT64"
+    assert parameters["plausible_low"].value is None and parameters["plausible_high"].value is None
     assert parameters["minimum_age_years"].value == 18
     assert parameters["window_domains"].values == []
     height = {
@@ -927,73 +903,49 @@ def test_hba1c_ifcc_units_convert_by_the_ngsp_master_equation():
 # ---------------------------------------------------------------------------
 
 
-def test_untreated_occasions_take_precedence_and_treated_ones_are_corrected():
+def test_untreated_occasions_take_precedence_and_treated_ones_are_corrected(monkeypatch):
     ldl = resolve_measurement_definition("ldl_cholesterol")
-    rows, _true_means = _synthetic_person_rows(30, between_variance=400.0, within_variance=100.0, seed=4)
-    rows += [
-        _person_row(1001, untreated=(2, 150.0, 25.0, 50.0), treated=(3, 90.0, 16.0, 55.0)),
-        _person_row(1002, treated=(2, 70.0, 9.0, 60.0)),
-        _person_row(1003, excluded={"implausible": 2}),
-    ]
-    training_rows, _columns, summary = build_all_of_us_measurement_targets(ldl, rows)
+    rows, _levels = _synthetic_person_rows(30, level_variance=400.0, noise_variance=100.0, seed=4)
+    rows += _person_days(1001, [(50.0, 150.0), (50.5, 140.0)], treated_occasions=[(55.0, 90.0), (56.0, 85.0), (57.0, 95.0)])
+    rows += _person_days(1002, treated_occasions=[(60.0, 70.0), (61.0, 72.0)])
+    rows += _person_days(1003, excluded={"nonpositive": 2})
+    occasions, training_rows, summary = _captured_occasions(monkeypatch, ldl, rows)
     by_person = {row["person_id"]: row for row in training_rows}
     assert "1003" not in by_person
     assert len(by_person) == 32
     assert by_person["1001"]["measurement_source"] == "untreated"
     assert by_person["1001"]["occasion_count"] == 2
-    assert by_person["1001"]["age_at_measurement"] == 50.0
+    assert by_person["1001"]["age_at_measurement"] == 50.25
     assert by_person["1002"]["measurement_source"] == "treated_corrected"
     assert summary["n_persons_by_source"] == {"untreated": 31, "treated_corrected": 1}
     assert summary["n_persons_without_retained_occasion"] == 1
-    assert summary["excluded_row_counts"]["implausible"] == 2
+    assert summary["excluded_row_counts"]["nonpositive"] == 2
+    assert occasions.values.shape[0] == sum(row["occasion_count"] for row in training_rows)
 
 
 @pytest.mark.parametrize(
-    ("trait", "treated_mean", "treated_variance", "expected_mean", "expected_variance"),
+    ("trait", "treated", "expected"),
     [
-        # LDL / 0.7 on the linear scale scales the mean and the variance.
-        ("ldl_cholesterol", 70.0, 9.0, 100.0, 9.0 / 0.49),
-        # SBP + 15 mmHg shifts the mean only.
-        ("systolic_blood_pressure", 130.0, 25.0, 145.0, 25.0),
+        # LDL / 0.7 and SBP + 15 mmHg, occasion by occasion on the linear scale.
+        ("ldl_cholesterol", [70.0, 63.0], [100.0, 90.0]),
+        ("systolic_blood_pressure", [130.0, 125.0], [145.0, 140.0]),
     ],
 )
-def test_treatment_corrections_map_the_occasion_statistics_exactly(
-    monkeypatch, trait, treated_mean, treated_variance, expected_mean, expected_variance
-):
-    rows = [
-        _person_row(1, treated=(2, treated_mean, treated_variance, 60.0)),
-        _person_row(2, untreated=(2, 0.0, 1.0, 40.0), sex_at_birth_concept_id=45880669),
-        _person_row(3, untreated=(2, 0.0, 1.0, 50.0)),
-    ]
-    captured = _captured_person_statistics(monkeypatch, resolve_measurement_definition(trait), rows)
-    # One division or addition for the mean; the variance's division by the
-    # squared amount (2) and its product with the count (1), against the
-    # expected literals' own rounding (1).
-    assert captured["means"][0] == within_rounding(expected_mean, 2)
-    assert captured["within"][0] == within_rounding(2 * expected_variance, 4)
+def test_treatment_corrections_apply_to_every_treated_occasion(monkeypatch, trait, treated, expected):
+    rows = _person_days(1, treated_occasions=[(60.0, value) for value in treated])
+    rows += _person_days(2, [(40.0, 100.0), (41.0, 110.0)], sex_at_birth_concept_id=45880669)
+    occasions, _training_rows, _summary = _captured_occasions(monkeypatch, resolve_measurement_definition(trait), rows)
+    corrected = occasions.values[occasions.person_index == 0]
+    # One division or addition each.
+    for value, target in zip(corrected, expected, strict=True):
+        assert value == within_rounding(target, 2)
 
 
-def test_ratio_correction_on_the_log_scale_shifts_the_mean_by_log_amount(monkeypatch):
-    definition = _definition(
-        log_scale=True,
-        treatment=TreatmentRule(LDL_LOWERING, TreatmentCorrection.DIVIDE, 0.7, "test"),
-    )
-    rows = [
-        _person_row(1, treated=(3, math.log(70.0), 0.04, 60.0)),
-        _person_row(2, untreated=(2, 4.0, 0.1, 40.0), sex_at_birth_concept_id=45880669),
-        _person_row(3, untreated=(2, 4.5, 0.1, 50.0)),
-    ]
-    captured = _captured_person_statistics(monkeypatch, definition, rows)
-    # log(70) - log(0.7) against log(100): three libm logs and a subtraction.
-    assert captured["means"][0] == within_rounding(math.log(100.0), 7)
-    assert captured["within"][0] == within_rounding(3 * 0.04, 2)
-
-
-def test_treated_only_persons_are_dropped_when_no_correction_exists():
+def test_treated_only_persons_are_dropped_when_no_correction_exists(monkeypatch):
     heart_rate = resolve_measurement_definition("heart_rate")
-    rows, _true_means = _synthetic_person_rows(40, between_variance=50.0, within_variance=20.0, seed=3)
-    rows.append(_person_row(1000, treated=(4, 62.0, 30.0, 62.0)))
-    training_rows, _columns, summary = build_all_of_us_measurement_targets(heart_rate, rows)
+    rows, _levels = _synthetic_person_rows(40, level_variance=50.0, noise_variance=20.0, seed=3)
+    rows += _person_days(1000, treated_occasions=[(62.0, 62.0), (63.0, 66.0)])
+    _occasions, training_rows, summary = _captured_occasions(monkeypatch, heart_rate, rows)
     assert "1000" not in {row["person_id"] for row in training_rows}
     assert summary["n_persons_treated_only_excluded"] == 1
     assert summary["n_persons"] == 40
@@ -1002,158 +954,72 @@ def test_treated_only_persons_are_dropped_when_no_correction_exists():
 def test_treated_occasions_for_a_trait_without_a_medication_rule_raise():
     height = resolve_measurement_definition("height")
     with pytest.raises(ValueError, match="without a medication rule"):
-        build_all_of_us_measurement_targets(height, [_person_row(1, treated=(2, 170.0, 1.0, 50.0))])
+        build_all_of_us_measurement_targets(height, _person_days(1, treated_occasions=[(50.0, 170.0)]), 1 << 28)
 
 
-def test_person_blup_equals_the_dense_henderson_mixed_model_solution():
-    generator = np.random.default_rng(11)
-    occasion_counts = np.array([1, 2, 5, 3, 1, 4, 2, 6])
-    person_count = len(occasion_counts)
-    design = np.column_stack(
-        [np.ones(person_count), generator.normal(size=person_count), generator.integers(0, 2, person_count)]
-    )
-    between_variance, within_variance = 0.7, 1.3
-    occasions = [
-        generator.normal(1.0 + design[index, 1], 1.0, size=count) for index, count in enumerate(occasion_counts)
-    ]
-    # Occasion-level model y = X gamma + Z b + e with V = sigma_b^2 Z Z' + sigma_e^2 I.
-    occasion_values = np.concatenate(occasions)
-    membership = np.repeat(np.arange(person_count), occasion_counts)
-    occasion_design = design[membership]
-    incidence = np.zeros((len(occasion_values), person_count))
-    incidence[np.arange(len(occasion_values)), membership] = 1.0
-    covariance = between_variance * incidence @ incidence.T + within_variance * np.eye(len(occasion_values))
-    precision = np.linalg.inv(covariance)
-    fixed_effects = np.linalg.solve(
-        occasion_design.T @ precision @ occasion_design, occasion_design.T @ precision @ occasion_values
-    )
-    random_effects = between_variance * incidence.T @ precision @ (occasion_values - occasion_design @ fixed_effects)
-    expected = design @ fixed_effects + random_effects
-
-    person_means = np.array([values.mean() for values in occasions])
-    targets, reliabilities = _person_blup(
-        occasion_counts.astype(float), person_means, design, between_variance, within_variance
-    )
-    # Normwise forward error of the dense path's LU solves: gamma_{3n} times the
-    # condition numbers of V and of X'V^-1 X (Higham 2002, Theorem 9.4); the
-    # collapsed path's error is of the same order.
-    solve_bound = (
-        2.0 * rounding_gamma(3 * len(occasion_values)) * np.linalg.cond(covariance)
-        * np.linalg.cond(occasion_design.T @ precision @ occasion_design)
-    )
-    np.testing.assert_allclose(targets, expected, rtol=0.0, atol=solve_bound * np.max(np.abs(expected)))
-    repeatability = between_variance / (between_variance + within_variance)
-    np.testing.assert_allclose(
-        reliabilities,
-        occasion_counts * repeatability / (1.0 + (occasion_counts - 1.0) * repeatability),
-        rtol=2.0 * rounding_gamma(7),
-    )
-
-
-def test_variance_component_estimators_are_unbiased():
-    generator = np.random.default_rng(5)
-    between_variance, within_variance = 0.8, 0.5
-    person_count, replicate_count = 150, 600
-    occasion_counts = generator.integers(1, 5, size=person_count).astype(float)
-    ages = generator.uniform(20.0, 80.0, size=person_count)
-    design = np.column_stack([np.ones(person_count), ages - ages.mean(), (ages - ages.mean()) ** 2])
-    gamma = np.array([2.0, 0.05, -0.001])
-    estimates = np.empty((replicate_count, 2))
-    for replicate in range(replicate_count):
-        person_effects = generator.normal(0.0, math.sqrt(between_variance), size=person_count)
-        means = np.empty(person_count)
-        within_sum_squares = np.empty(person_count)
-        for index in range(person_count):
-            values = design[index] @ gamma + person_effects[index] + generator.normal(
-                0.0, math.sqrt(within_variance), size=int(occasion_counts[index])
-            )
-            means[index] = values.mean()
-            within_sum_squares[index] = ((values - values.mean()) ** 2).sum()
-        estimates[replicate] = _estimate_person_variance_components(
-            occasion_counts, means, within_sum_squares, design
-        )
-    mean_estimates = estimates.mean(axis=0)
-    standard_errors = estimates.std(axis=0) / math.sqrt(replicate_count)
-    assert abs(mean_estimates[0] - between_variance) < sampling_bound(standard_errors[0])
-    assert abs(mean_estimates[1] - within_variance) < sampling_bound(standard_errors[1])
-
-
-def test_variance_components_raise_without_repeats_or_between_person_signal():
-    design = np.ones((4, 1))
-    with pytest.raises(ValueError, match="not identifiable"):
-        _estimate_person_variance_components(np.ones(4), np.arange(4.0), np.zeros(4), design)
-    # Person means identical, large within-person scatter: sigma_b^2 estimate <= 0.
-    with pytest.raises(ValueError, match="no between-person variance"):
-        _estimate_person_variance_components(np.full(4, 5.0), np.full(4, 2.0), np.full(4, 40.0), design)
-
-
-def test_person_design_models_age_by_sex_and_drops_empty_columns():
-    ages = np.array([40.0, 50.0, 60.0, 70.0])
-    female = np.array([1.0, 0.0, 1.0, 0.0])
-    design = _person_design(ages, ages**2 + 4.0, female, [45878463, 45880669, 45878463, 45880669])
+def test_occasion_design_models_age_by_sex_and_drops_columns_that_add_no_rank():
+    ages = np.array([40.0, 50.0, 60.0, 70.0, 45.0, 55.0])
+    female = np.array([1.0, 0.0, 1.0, 0.0, 0.0, 1.0])
+    levels = ["45880669" if value == 0.0 else "45878463" for value in female]
+    design = _occasion_design(ages, female, levels)
     centered = ages - ages.mean()
     np.testing.assert_array_equal(design[:, -1], centered * female)
-    assert design.shape == (4, 5)
+    assert design.shape == (6, 5)
     # One sex only: no sex indicator and no interaction column.
-    single_sex = _person_design(ages, ages**2 + 4.0, np.zeros(4), [45880669] * 4)
-    assert single_sex.shape == (4, 3)
+    assert _occasion_design(ages, np.zeros(6), ["45880669"] * 6).shape == (6, 3)
+    # Four occasions cannot carry five columns: the last, the interaction, adds no rank.
+    assert _occasion_design(ages[:4], female[:4], levels[:4]).shape == (4, 4)
 
 
-def test_blup_target_tracks_the_true_long_run_mean_better_than_the_raw_mean():
-    rows, true_means = _synthetic_person_rows(3000, between_variance=1.0, within_variance=2.0, seed=7)
+def test_the_model_target_tracks_the_true_level_better_than_the_raw_mean():
+    # The full fit, the Box-Cox exponent included.
+    rows, levels = _synthetic_person_rows(150, level_variance=1.0, noise_variance=2.0, seed=7)
     definition = resolve_measurement_definition("mean_corpuscular_volume")
-    training_rows, _columns, summary = build_all_of_us_measurement_targets(definition, rows)
+    training_rows, _columns, summary = build_all_of_us_measurement_targets(definition, rows, 1 << 28)
+    people = {person.person_id: person for person in person_occasions(rows)}
+    # At the fitted transform, both are compared with the true level on that scale's own standardization.
     targets = np.array([row["target"] for row in training_rows])
-    raw_means = np.array([row["untreated_mean"] for row in rows])
-    assert np.mean((targets - true_means) ** 2) < np.mean((raw_means - true_means) ** 2)
-    between_variance, within_variance = 1.0, 2.0
-    counts = np.array([row["untreated_occasion_count"] for row in rows])
-    between_standard_error, within_standard_error = variance_component_standard_errors(
-        counts, between_variance, within_variance
-    )
-    assert abs(summary["between_person_variance"] - between_variance) < sampling_bound(between_standard_error)
-    assert abs(summary["within_person_variance"] - within_variance) < sampling_bound(within_standard_error)
-    # The delta method, the two estimators being independent.
-    total_variance = between_variance + within_variance
-    repeatability_standard_error = np.hypot(
-        within_variance * between_standard_error, between_variance * within_standard_error
-    ) / total_variance**2
-    assert abs(summary["repeatability"] - between_variance / total_variance) < sampling_bound(
-        repeatability_standard_error
-    )
+    raw_means = np.array([people[row["person_id"]].values.mean() for row in training_rows])
+    true_levels = levels[[int(row["person_id"]) for row in training_rows]]
+    assert np.corrcoef(targets, true_levels)[0, 1] > np.corrcoef(raw_means, true_levels)[0, 1]
+    assert 0.0 < summary["repeatability"] < 1.0
 
 
-def test_no_statistic_of_the_occasions_is_a_trait_covariate():
+def test_no_statistic_of_the_occasions_is_a_trait_covariate(monkeypatch):
     # How often a trait is measured depends on its level, so adjusting the
     # genetic fit for the occasion count attenuates every effect
     # (novel-pheno Theorem 5); precision enters through target_reliability.
     assert not any("occasion" in column for column in measurement_covariate_columns())
-    rows, _true_means = _synthetic_person_rows(50, between_variance=1.0, within_variance=1.0, seed=6)
-    training_rows, _columns, _summary = build_all_of_us_measurement_targets(
-        resolve_measurement_definition("mean_corpuscular_volume"), rows
-    )
+    rows, _levels = _synthetic_person_rows(50, level_variance=1.0, noise_variance=1.0, seed=6)
+    _occasions, training_rows, _summary = _captured_occasions(monkeypatch, resolve_measurement_definition("mcv"), rows)
     assert "log_occasion_count" not in training_rows[0]
 
 
-def test_training_rows_carry_targets_covariates_and_one_hot_sex():
-    rows, _true_means = _synthetic_person_rows(200, between_variance=1.0, within_variance=1.0, seed=1)
-    rows[0]["unrecognized_unit_labels"] = ["millimole per liter", "millimole per liter"]
-    rows[1]["unrecognized_unit_labels"] = ["millimole per liter", "unit_concept_id=9999"]
-    definition = resolve_measurement_definition("mean_corpuscular_volume")
-    training_rows, columns, summary = build_all_of_us_measurement_targets(definition, rows)
-    assert columns == ("sex_at_birth_concept_id_45878463", "sex_at_birth_concept_id_45880669")
+def test_training_rows_carry_targets_covariates_and_one_hot_sex(monkeypatch):
+    rows, _levels = _synthetic_person_rows(200, level_variance=1.0, noise_variance=1.0, seed=1)
+    rows += _person_days(900, [(50.0, 90.0)], unrecognized_unit_labels=["millimole per liter"], excluded={"unrecognized_unit": 2})
+    rows += _person_days(901, [(51.0, 91.0)], unrecognized_unit_labels=["millimole per liter", "unit_concept_id=9999"], excluded={"unrecognized_unit": 2})
+    occasions, training_rows, summary = _captured_occasions(monkeypatch, resolve_measurement_definition("mcv"), rows)
+    assert _columns_of(training_rows) >= {"sex_at_birth_concept_id_45878463", "sex_at_birth_concept_id_45880669"}
+    people = {person.person_id: person for person in person_occasions(rows)}
     female_row, male_row = training_rows[0], training_rows[1]
-    assert female_row["age_at_measurement"] == rows[0]["untreated_mean_age"]
-    assert female_row["age_at_measurement_squared"] == rows[0]["untreated_mean_age_squared"]
-    assert female_row["age_at_measurement_x_female"] == rows[0]["untreated_mean_age"]
+    ages = people[female_row["person_id"]].ages
+    assert female_row["age_at_measurement"] == ages.mean()
+    assert female_row["age_at_measurement_squared"] == np.mean(np.square(ages))
+    assert female_row["age_at_measurement_x_female"] == ages.mean()
     assert male_row["age_at_measurement_x_female"] == 0.0
-    assert female_row["occasion_count"] == rows[0]["untreated_occasion_count"]
+    assert female_row["occasion_count"] == ages.shape[0]
     assert female_row["sex_at_birth_concept_id_45878463"] == 1
     assert "sex_at_birth_concept_id" not in female_row
-    assert 0.0 < female_row["target_reliability"] < 1.0
+    assert female_row["target_reliability"] == 0.5
     assert "target_inverse_normal" not in female_row
     # Persons, not days, per unrecognized unit label.
     assert summary["unrecognized_unit_person_counts"] == {"millimole per liter": 2, "unit_concept_id=9999": 1}
+    assert occasions.design.shape == (occasions.values.shape[0], 5)
+
+
+def _columns_of(rows: list[dict[str, object]]) -> set[str]:
+    return set().union(*(row.keys() for row in rows))
 
 
 # ---------------------------------------------------------------------------
@@ -1161,10 +1027,19 @@ def test_training_rows_carry_targets_covariates_and_one_hot_sex():
 # ---------------------------------------------------------------------------
 
 
+def _identity_transform_fit(monkeypatch) -> None:
+    """The occasion model at the identity transform in a 256 MiB budget, for tests of the plumbing around it (the
+    exponent's search is tested in test_the_model_target_tracks_the_true_level_better_than_the_raw_mean)."""
+    monkeypatch.setattr(
+        "sv_pgs.all_of_us.fit_occasion_model", lambda occasions, working_bytes: fit_at_exponent(occasions, 1.0, min(working_bytes, 1 << 28))
+    )
+
+
 def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path: Path, monkeypatch):
+    _identity_transform_fit(monkeypatch)
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
     monkeypatch.setenv("WORKSPACE_CDR", DATASET)
-    rows, _true_means = _synthetic_person_rows(120, between_variance=1.0, within_variance=1.0, seed=2)
+    rows, _levels = _synthetic_person_rows(120, level_variance=1.0, noise_variance=1.0, seed=2)
     fake_client = _FakeBigQueryClient(rows)
     definition = resolve_measurement_definition("total_bilirubin")
     outputs = prepare_all_of_us_measurement_sample_table(
@@ -1185,7 +1060,7 @@ def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path
     assert metadata["trait"] == "total_bilirubin"
     assert metadata["phenotype_fingerprint"] == phenotype_fingerprint(definition)
     assert metadata["covariate_columns"] == list(measurement_covariate_columns())
-    assert metadata["analysis_scale"] == "log(value + 0)"
+    assert metadata["analysis_scale"].startswith("Box-Cox exponent ")
     assert metadata["treatment"] is None
     assert [window["name"] for window in metadata["clinical_windows"]] == ["acute_hepatobiliary", "cirrhosis"]
     assert metadata["query_parameters"]["loinc_codes"] == ["1975-2"]
