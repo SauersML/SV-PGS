@@ -50,6 +50,7 @@ from sv_pgs.marginal_variances import (
     BlockCertificate,
     BlockGrams,
     block_information_certificate,
+    certificate_level,
     certificate_tolerance,
     information_products,
     information_solve_tolerance,
@@ -334,7 +335,7 @@ class _FullDataFixedPoints:
         probes = self.generator.choice(np.array([-1.0, 1.0]), size=(solve.site_precision.shape[0], gaussian.probe_count))
         back_products, _coupling, _residual_norm = gaussian.information_solve(probes, model, residual)
         removed = information_products(solve, np.asarray(back_products, dtype=np.float64))
-        return block_information_certificate(solve, variances, grams.blocks, probes, removed, tolerance)
+        return block_information_certificate(solve, variances, grams.blocks, probes, removed, tolerance, certificate_level(self.draw_count))
 
     def _noise(self, variances: F64Array) -> F64Array:
         gaussian = self.gaussian

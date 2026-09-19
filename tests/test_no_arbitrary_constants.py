@@ -124,7 +124,6 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', '_variant_derivatives'): ('math', frozenset({3.0}), 'd Var / dh of a normal mixture: E[(mu - m)^3] + 3 E[c (mu - m)] (third central moment of a Gaussian mixture)'),
     ('scale_mixture_ep.py', '_stationarity_check'): ('derived', frozenset({3.0, 4.0, 0.75, 0.25}), 'central difference with V certified to e: error h^2 s/6 + e/h, least at h = (3e/s)^(1/3) where it is (3^(2/3)/2) s^(1/3) e^(2/3); e from 1/2 E^2/s = tolerance/(4n), i.e. e = (2 tolerance/(n 3^(4/3)))^(3/4) s^(1/4)'),
     ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
-    ('full_data_fit.py', '_FullDataFixedPoints.__call__'): ('derived', frozenset({0.25}), 'the noise update gains 1/2 (n_eff / 2) (delta log sigma^2)^2: the Gaussian profile likelihood has curvature n_eff / 2 in log sigma^2'),
     ('scale_mixture_ep.py', '_stationarity_check.bound'): ('derived', frozenset({6.0}), 'the central difference truncation h^2 s / 6 (Taylor remainder of V with |V\'\'\'| <= s)'),
     ('scale_mixture_ep.py', '_laplace_corrections'): ('math', frozenset({8.0, 5.0, 24.0}), 'Tierney and Kadane (1986): the O(1) Laplace term E[u^4]/24 k4 + E[u^6]/72 k3^2 = k4/8 + 5 k3^2/24'),
     ('store_converter.py', 'IMPUTATION_ERROR_RATE'): ('external-config', frozenset({0.001}), 'GLIMPSE2 --err-imp of the aou2_50k imputation run; the removed background is an exact function of it'),
