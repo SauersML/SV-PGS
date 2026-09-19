@@ -180,3 +180,18 @@ def test_build_cohort_rejects_collinear_covariates_and_missing_values() -> None:
             research_ids, person_covariates={"age": ages}, **{**common, "trait_targets": {"ldl": {"R0": np.nan}}}
         )
 
+
+def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
+    rng = np.random.default_rng(3)
+    research_ids = [str(1000 + index) for index in range(6)]
+
+    with pytest.raises(ValueError, match="'ldl' has no target for any cohort sample"):
+        build_cohort(
+            research_ids,
+            person_covariates={"age": rng.uniform(20, 80, 6)},
+            categorical_covariates={},
+            ancestry=_ancestry(research_ids, rng),
+            pipeline_half=["h0"] * 6,
+            genotype_source=["imputed"] * 6,
+            trait_targets={"ldl": {1000 + index: 1.0 for index in range(6)}},
+        )

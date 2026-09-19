@@ -196,6 +196,8 @@ def build_cohort(
         for row, research_id in enumerate(research_ids):
             if research_id in values_by_id:
                 targets[row, trait_index] = values_by_id[research_id]
+        if not np.any(np.isfinite(targets[:, trait_index])):
+            raise ValueError(f"trait {trait!r} has no target for any cohort sample; key its targets by research ID.")
     return Cohort(
         research_ids=tuple(research_ids),
         covariate_names=tuple(names),
