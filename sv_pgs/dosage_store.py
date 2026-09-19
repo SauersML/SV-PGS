@@ -809,12 +809,27 @@ def read_manifest(root: Path) -> dict[str, Any]:
     return manifest
 
 
-def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -> None:
-    encoded = [variant_id.encode() for variant_id in variant_ids]
+def write_identifier_columns(bytes_directory: Path, offsets_directory: Path, identifiers: Sequence[str]) -> None:
+    """Identifiers as one uint8 byte column plus uint64 offsets (len + 1), with no per-id object."""
+    encoded = [identifier.encode() for identifier in identifiers]
     offsets = np.zeros(len(encoded) + 1, dtype=np.uint64)
-    offsets[1:] = np.cumsum([len(variant_id) for variant_id in encoded], dtype=np.uint64)
-    write_column(variant_column_directory(root, chromosome, _ID_BYTES_COLUMN), np.frombuffer(b"".join(encoded), dtype=np.uint8))
-    write_column(variant_column_directory(root, chromosome, _ID_OFFSETS_COLUMN), offsets)
+    offsets[1:] = np.cumsum([len(identifier) for identifier in encoded], dtype=np.uint64)
+    write_column(bytes_directory, np.frombuffer(b"".join(encoded), dtype=np.uint8))
+    write_column(offsets_directory, offsets)
+
+
+def read_identifier_columns(bytes_directory: Path, offsets_directory: Path) -> tuple[str, ...]:
+    buffer = np.asarray(open_column(bytes_directory)[0]).tobytes()
+    offsets = np.asarray(open_column(offsets_directory)[0], dtype=np.int64)
+    return tuple(buffer[int(offsets[row]) : int(offsets[row + 1])].decode() for row in range(offsets.shape[0] - 1))
+
+
+def write_variant_ids(root: Path, chromosome: str, variant_ids: Sequence[str]) -> None:
+    write_identifier_columns(
+        variant_column_directory(root, chromosome, _ID_BYTES_COLUMN),
+        variant_column_directory(root, chromosome, _ID_OFFSETS_COLUMN),
+        variant_ids,
+    )
 
 
 @dataclass(frozen=True, slots=True)

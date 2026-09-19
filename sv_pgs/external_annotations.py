@@ -4,7 +4,9 @@ Store spec A4.13-A4.15 (design-svcontent's matcher). An external association is 
 one allele, so a match is one-to-one in both directions, and an unmatched record has no row:
 absence is explicit, never a zero or a mean that would leak the catalogue's coverage into the
 prior. The per-trait payload (z^2 of the external association) is joined per trait by
-external id; this module builds the trait-independent maps.
+external id; this module builds the trait-independent maps and keeps them in the store at
+``ext/<source>/rec_map/<chrom>`` (store row, tier, external id) and
+``ext/<source>/locus_map/<chrom>`` (TR locus, external id).
 
 Record tiers, strongest first (the codes ``rec_map`` stores):
 
@@ -38,6 +40,7 @@ import numpy as np
 import pandas as pd
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray
+from sv_pgs.dosage_store import open_column, read_identifier_columns, write_column, write_identifier_columns
 from sv_pgs.variant_typing import sequence_resolved_kind_and_length, trimmed_allele_cores
 
 TIER_EXACT = 1
@@ -424,3 +427,49 @@ def annotate_records(record_keys: NDArray, associations: ExternalAssociations) -
     values = np.zeros(positions.shape[0])
     values[present] = np.log1p(associations.squared_z[positions[present]])
     return RecordAnnotation(log_squared_z=values, present=present)
+
+
+def _map_directory(root: Path, source: str, kind: str, chromosome: str) -> Path:
+    return Path(root) / "ext" / source / kind / chromosome
+
+
+def write_record_map(root: Path, source: str, chromosome: str, matches: RecordMatches) -> None:
+    """One source's record map of one chromosome: matched store rows, tiers and external ids."""
+    directory = _map_directory(root, source, "rec_map", chromosome)
+    write_column(directory / "rec_idx", matches.store_rows.astype(np.uint32))
+    write_column(directory / "tier", matches.tiers.astype(np.uint8), {"legend": ["", "exact", "sequence", "coordinate"]})
+    write_identifier_columns(directory / "id_bytes", directory / "id_offsets", matches.external_identifiers)
+
+
+def read_record_map(root: Path, source: str, chromosome: str) -> RecordMatches:
+    """A stored record map; ``displaced_pairs`` is a matching diagnostic the store does not keep."""
+    directory = _map_directory(root, source, "rec_map", chromosome)
+    return RecordMatches(
+        store_rows=np.asarray(open_column(directory / "rec_idx")[0], dtype=np.int64),
+        external_identifiers=read_identifier_columns(directory / "id_bytes", directory / "id_offsets"),
+        tiers=np.asarray(open_column(directory / "tier")[0], dtype=np.uint8),
+        displaced_pairs=0,
+    )
+
+
+def write_locus_map(root: Path, source: str, chromosome: str, matches: LocusMatches) -> None:
+    """One source's TR-locus map of one chromosome: matched loci and their external locus ids."""
+    directory = _map_directory(root, source, "locus_map", chromosome)
+    write_column(directory / "tr_locus", matches.loci.astype(np.uint32))
+    write_identifier_columns(directory / "id_bytes", directory / "id_offsets", matches.external_identifiers)
+
+
+def read_locus_map(root: Path, source: str, chromosome: str) -> LocusMatches:
+    directory = _map_directory(root, source, "locus_map", chromosome)
+    return LocusMatches(
+        loci=np.asarray(open_column(directory / "tr_locus")[0], dtype=np.int64),
+        external_identifiers=read_identifier_columns(directory / "id_bytes", directory / "id_offsets"),
+    )
+
+
+def mapped_keys(rows: NDArray, external_identifiers: Sequence[str], count: int) -> NDArray:
+    """Each of ``count`` store rows (records or loci) keyed by its matched external id, or by ""
+    where it has none, which ``annotate_records`` then leaves absent."""
+    keys = np.full(count, "", dtype=object)
+    keys[np.asarray(rows, dtype=np.int64)] = list(external_identifiers)
+    return keys

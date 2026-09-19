@@ -8,11 +8,20 @@ from sv_pgs.external_annotations import (
     TIER_COORDINATE,
     TIER_EXACT,
     TIER_SEQUENCE,
+    ExternalAssociations,
+    LocusMatches,
+    RecordMatches,
+    annotate_records,
     changed_sequences,
     majority_motif_length,
     match_records,
+    mapped_keys,
     match_tr_loci,
+    read_locus_map,
+    read_record_map,
     squared_z,
+    write_locus_map,
+    write_record_map,
 )
 
 _GENERATOR = np.random.default_rng(5)
@@ -108,3 +117,28 @@ def test_squared_z_is_scale_and_orientation_free() -> None:
     np.testing.assert_allclose(squared_z(np.array([0.2, -0.2]), np.array([0.1, 0.1])), [4.0, 4.0])
     with pytest.raises(ValueError, match="positive standard errors"):
         squared_z(np.array([0.1]), np.array([0.0]))
+
+
+def test_maps_round_trip_through_the_store_and_key_the_payload_join(tmp_path) -> None:
+    records = RecordMatches(
+        store_rows=np.array([3, 1], dtype=np.int64),
+        external_identifiers=("chr1_SV_7", "chr1_SV_9"),
+        tiers=np.array([TIER_EXACT, TIER_COORDINATE], dtype=np.uint8),
+        displaced_pairs=0,
+    )
+    loci = LocusMatches(loci=np.array([2], dtype=np.int64), external_identifiers=("HQA241_HG38_chr1_100_200_15",))
+
+    write_record_map(tmp_path, "bai2026_sv", "chr1", records)
+    write_locus_map(tmp_path, "bai2026_vntr", "chr1", loci)
+
+    read = read_record_map(tmp_path, "bai2026_sv", "chr1")
+    assert read.store_rows.tolist() == [3, 1] and read.tiers.tolist() == [TIER_EXACT, TIER_COORDINATE]
+    assert read.external_identifiers == records.external_identifiers
+    read_loci = read_locus_map(tmp_path, "bai2026_vntr", "chr1")
+    assert read_loci.loci.tolist() == [2] and read_loci.external_identifiers == loci.external_identifiers
+    keys = mapped_keys(read.store_rows, read.external_identifiers, 5)
+    assert keys.tolist() == ["", "chr1_SV_9", "", "chr1_SV_7", ""]
+    payload = ExternalAssociations(keys=np.array(["chr1_SV_9", "chr1_SV_7", "chr1_SV_1"], dtype=object), squared_z=np.array([4.0, 0.5, 9.0]))
+    annotation = annotate_records(keys, payload)
+    assert annotation.present.tolist() == [False, True, False, True, False]
+    np.testing.assert_allclose(annotation.log_squared_z[[1, 3]], np.log1p([4.0, 0.5]))
