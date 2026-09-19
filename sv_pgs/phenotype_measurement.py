@@ -432,7 +432,10 @@ def level_posterior(
         node_precision = weighted @ (1.0 / variances)
         occasion_precision[rows] = node_precision.sum(axis=1)
         occasion_shift[rows] = np.sum(node_precision * node_levels[:, :, None], axis=1)
-        steps[pending[~done]] = certified[~done]
+        # A lattice sum moves by at most a factor 1 +- relative_tolerance between certified grids, which moves the
+        # certified step by less than a factor 1 + relative_tolerance: shrinking by that much more leaves room
+        # below the next certificate, where shrinking to it exactly creeps toward it from above.
+        steps[pending[~done]] = certified[~done] / (1.0 + relative_tolerance)
         pending = pending[~done]
     return LevelPosterior(
         log_likelihood=log_likelihood,
@@ -581,7 +584,8 @@ class _Model:
         sorted_persons = occasions.person_index[order]
         self.groups = [order[counts[sorted_persons] == count].reshape(-1, count) for count in np.unique(counts)]
         self.relative_tolerance = person_tolerance(occasions.person_count)
-        # Each person's last admissible trapezoid step and level mean, the start of their next E-step (NaN: none yet).
+        # Each person's last admissible trapezoid step (with level_posterior's room below it) and level mean, the
+        # start of their next E-step (NaN: none yet).
         self.steps = np.full(occasions.person_count, np.nan)
         self.centres = np.full(occasions.person_count, np.nan)
 
@@ -644,7 +648,7 @@ class _Model:
             shift[piece] = posterior.occasion_shift
             counts += posterior.counts
             missing += posterior.missing_information
-            self.steps[persons] = posterior.admissible_step
+            self.steps[persons] = posterior.admissible_step / (1.0 + self.relative_tolerance)
             self.centres[persons] = posterior.level_mean
         return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing)
 
