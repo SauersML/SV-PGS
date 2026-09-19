@@ -1,7 +1,7 @@
 # SV-PGS
 
 - Each type of variant will have a different prior on its effect size.
-- Very rare SVs will be filtered.
+- No variant is filtered by rarity or by any threshold. Rare variants enter the one model, and the prior shrinks what the data can't support. A variant is left out of computation only when a derived bound shows its posterior contribution to every score is below the certificate tolerance, e.g. a column that is monomorphic in the training fold.
 - Single letter variable names are not allowed anywhere for any reason.
 - Dead code is not allowed.
 - Duplicated code is not allowed.
@@ -11,8 +11,7 @@
 - Never silently swallow errors with bare `except Exception: pass`. If something fails, let it fail loud.
 - Only use UV, never pip.
 - The same math runs on a large-RAM CPU node, a single GPU, or several GPUs. With several GPUs, all visible CUDA devices share the resident genotype work (sharded by LD block or column). The device decision is logged at fit start, and a GPU that is exposed but unusable is an error, not a silent fallback.
-- Use JAX for iterative accelerator routes. Direct CPU posterior solves use
-  NumPy/SciPy and must not initialize JAX dtypes or projectors.
+- Accelerator routes use CuPy, with custom kernels where they're needed; CPU routes use NumPy/SciPy. Both compute the same math, and agree within the certified tolerance. JAX is not used.
 - Do not restrict or cap the number of variants included arbitrarily.
 - Do not restrict or cap the number of samples included.
 - The variant-class-specific prior structure is the core differentiator of this tool. Every inference path must use metadata-driven prior variances (variant type, length, repeat status) and per-variant local shrinkage. The effect prior is a continuous Gaussian scale mixture whose mixing density is learned nonparametrically by empirical Bayes for each variant class, over a data-driven scale range with a learned smoothness penalty. It has no point mass at zero, and fixed-shape families such as TPB or a BayesR grid are special cases of it. The variance scale is a continuous quantity, so its mixing density is a continuous function (log g is a smooth function of log s), never a set of discrete components.
