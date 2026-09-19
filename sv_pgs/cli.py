@@ -14,6 +14,7 @@ from sv_pgs.all_of_us import (
     available_disease_names,
     available_measurement_names,
     prepare_all_of_us_disease_sample_table,
+    prepare_all_of_us_measurement_census,
     prepare_all_of_us_measurement_sample_table,
     resolve_disease_definition,
     resolve_measurement_definition,
@@ -68,6 +69,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Built-in trait or alias. See list-all-of-us-traits for canonical names.",
     )
     aou_trait_parser.add_argument("--output", required=True, help="Output TSV path for the prepared sample table.")
+
+    census_parser = subparsers.add_parser(
+        "census-all-of-us-traits",
+        help=(
+            "Count participants and rows per trait, matched concept and unit label across every built-in "
+            "trait (cells under 20 participants suppressed): the first query to run on a new CDR."
+        ),
+    )
+    census_parser.add_argument("--output", required=True, help="Output TSV path for the census.")
 
     aou_run_parser = subparsers.add_parser(
         "run-all-of-us",
@@ -327,6 +337,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if args.command == "list-all-of-us-traits":
         for trait_name in available_measurement_names():
             print(trait_name)
+        return 0
+
+    if args.command == "census-all-of-us-traits":
+        print("census\t" + str(prepare_all_of_us_measurement_census(Path(args.output))))
         return 0
 
     if args.command == "prepare-all-of-us-trait":
