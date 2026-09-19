@@ -65,6 +65,7 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
             MixtureHyperparameters(coefficients=generator.normal(size=9), log_smoothing=generator.normal(size=3)) for _model in range(2)
         ),
         certificate={"remaining_gain": np.array([0.01, 0.02]), "negative_sites": np.array([0, 3]), "outer_iterations": np.array([4, 6])},
+        fit_counts={"refreshes": 3, "passes": 41},
         refusals=("model 1: no damped EP pass keeps the full-data precision positive definite",),
         provenance=Provenance(
             code_digest=code_digest(), store_digest=store_digest(store_root), sites_digest=sites_digest(store_root), cohort_digest=cohort_digest(["b", "a"])
@@ -88,6 +89,7 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     assert loaded.covariate_names == model.covariate_names
     assert loaded.trait_types == model.trait_types
     assert loaded.provenance == model.provenance
+    assert loaded.fit_counts == model.fit_counts
     assert loaded.refusals == model.refusals
     np.testing.assert_array_equal(loaded.noise_variance, model.noise_variance)
     for original, restored in zip(model.scoring, loaded.scoring, strict=True):

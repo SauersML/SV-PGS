@@ -16,6 +16,7 @@ from sv_pgs.all_of_us import (
 )
 from sv_pgs.artifact import write_predictions
 from sv_pgs.compute_budget import detect_compute_budget
+from sv_pgs.fit_model import write_model
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -67,6 +68,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     census_parser.add_argument("--output", required=True, help="Output TSV path for the census.")
 
+    fit_parser = subparsers.add_parser(
+        "fit",
+        help="Fit every (trait, training set) model of a cohort file on a dosage store and save the fitted model.",
+    )
+    fit_parser.add_argument("store", help="Dosage store directory.")
+    fit_parser.add_argument(
+        "cohort",
+        help=(
+            "NPZ with research_ids [n], store_columns [n], covariates [n, k] without the intercept, covariate_names [k], "
+            "targets [n, m], training [n, m] (bool), model_names [m] and trait_types [m]."
+        ),
+    )
+    fit_parser.add_argument("model", help="New fitted model directory; never overwritten.")
+
     score_parser = subparsers.add_parser(
         "score",
         help="Score store samples with a fitted model and write their genetic scores and posterior predictive.",
@@ -117,6 +132,11 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if args.command == "version":
         pkg_ver, git_sha = _resolve_version_info()
         print(f"sv-pgs {pkg_ver} commit {git_sha}")
+        return 0
+
+    if args.command == "fit":
+        write_model(args.store, args.cohort, args.model, detect_compute_budget())
+        print("model\t" + str(args.model))
         return 0
 
     if args.command == "score":
