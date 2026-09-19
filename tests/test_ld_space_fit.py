@@ -374,9 +374,6 @@ def _ep_sites_state(cavity_mean, cavity_variance):
         site_shift=np.zeros_like(cavity_mean),
         cavity_precision=1.0 / cavity_variance,
         cavity_shift=cavity_mean / cavity_variance,
-        site_damping=np.full_like(cavity_mean, 0.5),
-        previous_precision_step=np.zeros_like(cavity_mean),
-        previous_shift_step=np.zeros_like(cavity_mean),
     )
 
 
