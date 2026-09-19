@@ -304,9 +304,16 @@ def _fellner_schall(weights, matrices, coefficients, inverse_block) -> np.ndarra
     total_inverse = np.linalg.pinv(total, hermitian=True)
     updated = np.empty_like(weights)
     for position, (weight, matrix) in enumerate(zip(weights, matrices)):
-        numerator = float(np.trace(total_inverse @ matrix)) - float(np.trace(inverse_block @ matrix))
+        prior_dimension = float(np.trace(total_inverse @ matrix))
+        numerator = prior_dimension - float(np.trace(inverse_block @ matrix))
         size = float(coefficients @ matrix @ coefficients)
         proposal = weight * max(numerator, 0.0) / max(size, 1e-300)
+        # When the data use almost none of this penalty's subspace (relative
+        # effective degrees of freedom below 1e-4) and the step still raises λ,
+        # the marginal-likelihood optimum is λ = ∞ (the term shrinks into the
+        # penalty's null space); Fellner–Schall only creeps towards it, so go there.
+        if proposal > weight and numerator < 1e-4 * prior_dimension:
+            proposal = np.exp(LOG_PENALTY_RANGE)
         updated[position] = np.exp(np.clip(np.log(max(proposal, 1e-300)), -LOG_PENALTY_RANGE, LOG_PENALTY_RANGE))
     return updated
 
