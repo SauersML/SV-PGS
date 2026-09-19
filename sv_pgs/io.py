@@ -1860,9 +1860,7 @@ def _try_bitpacked_plink_variant_stats(
 
     Returns ``None`` (no fallback side-effects) on any import / GPU
     failure; the caller then drops back to the legacy int8 streaming
-    pass. The int8 ``.npy`` cache is never created on this path —
-    downstream EM consumes the bitpacked device matrix directly via
-    :func:`sv_pgs.pipeline._maybe_upgrade_to_bitpacked`.
+    pass. The int8 ``.npy`` cache is never created on this path.
     """
     stats_path = _plink_stats_cache_path(bed_path, sample_indices, config)
     cached = _load_plink_stats_from_cache(stats_path)

@@ -23,14 +23,12 @@ from sv_pgs.mixture_inference import (
     _initialize_alpha_state,
     _member_prior_variances_from_reduced_state,
     _orthogonal_probe_matrix,
-    _prefer_iterative_variant_space,
     _quantitative_posterior_state,
     _should_checkpoint_stochastic_block,
     _should_log_stochastic_block,
     _should_use_posterior_working_set,
     _restricted_precision_projector,
     ScaleModelFeatureSpec,
-    _sample_space_preconditioner,
     _solve_sample_space_rhs_gpu,
     _solve_sample_space_rhs_cpu,
     _stochastic_binary_newton_iterations,
@@ -41,7 +39,6 @@ from sv_pgs.mixture_inference import (
     _gpu_exact_variant_full_matrix_fits,
     _gpu_exact_variant_tile_size,
     _restricted_variant_space_operator,
-    _sample_space_operator,
     _update_local_scales,
     _use_exact_sample_space_solve,
     _use_gpu_exact_variant_solve,
@@ -1770,11 +1767,6 @@ def test_restricted_posterior_sample_space_merges_probe_rhs(monkeypatch: pytest.
     prior_variances = np.linspace(0.5, 1.1, variant_count, dtype=np.float64)
     diagonal_noise = np.linspace(0.8, 1.3, sample_count, dtype=np.float64)
     solve_rhs_shapes: list[tuple[int, int]] = []
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_preconditioner",
-        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
-    )
     monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
     def fake_solve_sample_space_rhs_cpu(
         genotype_matrix,
@@ -1852,11 +1844,6 @@ def test_restricted_posterior_sample_space_reuses_matching_warm_start(monkeypatc
     warm_start = mixture_inference._RestrictedPosteriorWarmStart(
         sample_space_inverse_covariance_rhs=np.ones((sample_count, 1 + covariate_matrix.shape[1] + 5), dtype=np.float64),
         sample_space_inverse_covariance_rhs_matrix_token=id(standardized),
-    )
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_preconditioner",
-        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
     )
     monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
     def fake_solve_sample_space_rhs_cpu(
@@ -2114,11 +2101,6 @@ def test_restricted_posterior_sample_space_fuses_beta_and_restricted_probe_trans
         if rhs.ndim == 1:
             rhs = rhs[:, None]
         return (rhs, 2) if return_iterations else rhs
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_preconditioner",
-        lambda **kwargs: np.ones(sample_count, dtype=np.float64),
-    )
     monkeypatch.setattr(mixture_inference, "_solve_sample_space_rhs_cpu", fake_solve_sample_space_rhs_cpu)
     monkeypatch.setattr(mixture_inference, "stochastic_logdet", lambda *args, **kwargs: 0.0)
     # Force the CPU sample-space path so the instrumented CPU solver and the
@@ -3275,38 +3257,6 @@ def test_sample_space_preconditioner_reuse_ignores_single_weight_outlier():
         prior_variances=np.ones(element_count, dtype=np.float64),
         diagonal_noise=diagonal_noise,
     )
-def test_sample_space_preconditioner_matches_exact_covariance_inverse_at_full_rank(monkeypatch: pytest.MonkeyPatch):
-    # This test checks the CPU preconditioner against the exact inverse at
-    # fp64 tolerance; force the CPU path so it is not pulled onto the GPU
-    # (fp32) path on a GPU host.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
-    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    apply_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    actual = np.asarray(apply_preconditioner(right_hand_side), dtype=np.float64)
-    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
 def test_sample_space_diagonal_preconditioner_uses_jax_dense_cache(monkeypatch: pytest.MonkeyPatch):
     genotype_matrix = np.array(
         [
@@ -3386,322 +3336,6 @@ def test_restricted_mean_exact_sample_space_uses_jax_dense_genotype_ops(monkeypa
     assert projected_targets.shape == (genotype_matrix.shape[0],)
     assert linear_predictor.shape == (genotype_matrix.shape[0],)
     assert np.isfinite(restricted_quadratic)
-def test_sample_space_preconditioner_gpu_path_matches_exact_covariance_inverse_at_full_rank(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
-    standardized._dense_cache = None
-    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
-    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    fake_cupy = make_fake_cupy()
-    fake_cupyx: Any = types.ModuleType("cupyx")
-    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
-    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
-    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
-    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    # ``_try_import_cupy`` caches the real module globally, so patching
-    # sys.modules alone is not enough on a GPU host — point the cached lookup
-    # at the fake too, otherwise the operator runs on real device arrays and
-    # mixes them with the numpy-backed fake's host arrays.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    apply_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
-def test_sample_space_preconditioner_uses_operator_sketch_without_subset_materialization(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0],
-            [0.0, 1.0],
-            [1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    prior_variances = np.array([2.0, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.5, 1.0, 2.0], dtype=np.float64)
-    right_hand_side = np.array([0.5, -1.0, 2.0], dtype=np.float64)
-    fake_cupy = make_fake_cupy()
-    fake_cupyx: Any = types.ModuleType("cupyx")
-    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
-    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
-    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
-    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    # ``_try_import_cupy`` caches the real module globally; point it at the fake
-    # so the operator does not run on real device arrays on a GPU host.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        type(standardized),
-        "try_materialize_gpu_subset",
-        lambda self, indices: (_ for _ in ()).throw(AssertionError("subset materialization should not be used")),
-    )
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    apply_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
-def test_sample_space_preconditioner_handles_semidefinite_sketch_exactly(monkeypatch: pytest.MonkeyPatch):
-    # CPU preconditioner vs exact inverse at fp64 tolerance — force CPU path.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
-    genotype_matrix = np.array(
-        [
-            [1.0, 1.0],
-            [0.0, 0.0],
-            [1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    prior_variances = np.array([1.5, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.0, 1.25, 0.8], dtype=np.float64)
-    right_hand_side = np.array([0.5, -1.0, 1.25], dtype=np.float64)
-    apply_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    actual = np.asarray(apply_preconditioner(right_hand_side), dtype=np.float64)
-    np.testing.assert_allclose(actual, expected, rtol=1e-7, atol=1e-7)
-def test_sample_space_preconditioner_reuses_cached_genotype_sketch(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    gram_call_count = 0
-    weighted_kernel_call_count = 0
-    original_gram = mixture_inference._sample_space_genotype_gram_matmat_cpu
-    original_weighted_kernel = mixture_inference._sample_space_kernel_matmat_cpu
-    def counted_gram(*args, **kwargs):
-        nonlocal gram_call_count
-        gram_call_count += 1
-        return original_gram(*args, **kwargs)
-    def counted_weighted_kernel(*args, **kwargs):
-        nonlocal weighted_kernel_call_count
-        weighted_kernel_call_count += 1
-        return original_weighted_kernel(*args, **kwargs)
-    monkeypatch.setattr(mixture_inference, "_sample_space_genotype_gram_matmat_cpu", counted_gram)
-    monkeypatch.setattr(mixture_inference, "_sample_space_kernel_matmat_cpu", counted_weighted_kernel)
-    # This test counts the CPU gram/kernel reuse; force the CPU path so it is
-    # exercised on a GPU host instead of dispatching to the GPU sketch.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: None)
-    _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=np.array([1.0, 0.5, 0.75], dtype=np.float64),
-        diagonal_noise=np.ones(genotype_matrix.shape[0], dtype=np.float64),
-        batch_size=2,
-        rank=2,
-        random_seed=11,
-    )
-    _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=np.array([0.75, 1.25, 0.4], dtype=np.float64),
-        diagonal_noise=np.full(genotype_matrix.shape[0], 1.5, dtype=np.float64),
-        batch_size=2,
-        rank=2,
-        random_seed=11,
-    )
-    assert gram_call_count == 1
-    assert weighted_kernel_call_count == 2
-def test_sample_space_preconditioner_gpu_path_handles_semidefinite_sketch_exactly(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 1.0],
-            [0.0, 0.0],
-            [1.0, 1.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
-    standardized._dense_cache = None
-    prior_variances = np.array([1.5, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.0, 1.25, 0.8], dtype=np.float64)
-    right_hand_side = np.array([0.5, -1.0, 1.25], dtype=np.float64)
-    fake_cupy = make_fake_cupy()
-    fake_cupyx: Any = types.ModuleType("cupyx")
-    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
-    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
-    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
-    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    # ``_try_import_cupy`` caches the real module globally, so patching
-    # sys.modules alone is not enough on a GPU host — point the cached lookup
-    # at the fake too, otherwise the operator runs on real device arrays and
-    # mixes them with the numpy-backed fake's host arrays.
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    apply_preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    actual = np.asarray(cast(Any, apply_preconditioner)(right_hand_side), dtype=np.float64)
-    # The GPU sample-space path runs the sketch in float32 (the _cupy_cache is
-    # float32), so it matches the fp64 exact inverse only to fp32 precision —
-    # same tolerance as the sibling gpu_path_matches_exact test.
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
-def test_gpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
-    standardized._dense_cache = None
-    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
-    right_hand_side = np.column_stack(
-        [
-            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
-            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
-        ]
-    )
-    timing_sync_calls: list[None] = []
-    fake_cupy = make_fake_cupy()
-    fake_cupy.sum = np.sum
-    fake_cupy.sqrt = np.sqrt
-    fake_cupy.abs = np.abs
-    fake_cupy.diag = np.diag
-    fake_cupy.maximum = np.maximum
-    fake_cupy.eye = np.eye
-    fake_cupy.zeros = np.zeros
-    fake_cupy.einsum = np.einsum
-    fake_cupy.dtype = np.dtype
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
-    fake_cupy.cuda = types.SimpleNamespace(
-        runtime=types.SimpleNamespace(getDeviceCount=lambda: 1),
-        Device=lambda: types.SimpleNamespace(synchronize=lambda: timing_sync_calls.append(None)),
-    )
-    fake_cupyx: Any = types.ModuleType("cupyx")
-    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
-    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
-    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
-    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    preconditioner = mixture_inference._sample_space_gpu_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=1,
-    )
-    actual = mixture_inference._solve_sample_space_rhs_gpu(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        right_hand_side=right_hand_side,
-        initial_guess=None,
-        tolerance=1e-7,
-        max_iterations=64,
-        preconditioner=preconditioner,
-        batch_size=2,
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
-    assert len(timing_sync_calls) >= 2
 
 
 def test_gpu_sample_space_block_cg_preserves_callable_preconditioner_columns():
@@ -3759,82 +3393,6 @@ def test_gpu_sample_space_block_cg_preserves_callable_preconditioner_columns():
     np.testing.assert_allclose(actual[:, 1:], expected[:, 1:], rtol=1e-4, atol=2e-5)
 
 
-def test_gpu_sample_space_block_cg_mixed_precision_refinement_matches_dense_solution(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    standardized._cupy_cache = standardized.materialize().astype(np.float32, copy=False)
-    standardized._dense_cache = None
-    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
-    right_hand_side = np.column_stack(
-        [
-            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
-            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
-        ]
-    )
-    fake_cupy = make_fake_cupy()
-    fake_cupy.sum = np.sum
-    fake_cupy.sqrt = np.sqrt
-    fake_cupy.abs = np.abs
-    fake_cupy.diag = np.diag
-    fake_cupy.maximum = np.maximum
-    fake_cupy.eye = np.eye
-    fake_cupy.zeros = np.zeros
-    fake_cupy.einsum = np.einsum
-    fake_cupy.dtype = np.dtype
-    fake_cupy.linalg = types.SimpleNamespace(cholesky=np.linalg.cholesky, qr=np.linalg.qr)
-    fake_cupyx: Any = types.ModuleType("cupyx")
-    fake_cupyx_scipy: Any = types.ModuleType("cupyx.scipy")
-    fake_cupyx_scipy_linalg: Any = types.ModuleType("cupyx.scipy.linalg")
-    fake_cupyx_scipy_linalg.solve_triangular = scipy_solve_triangular
-    fake_cupyx_scipy.linalg = fake_cupyx_scipy_linalg
-    monkeypatch.setitem(sys.modules, "cupy", fake_cupy)
-    monkeypatch.setitem(sys.modules, "cupyx", fake_cupyx)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy", fake_cupyx_scipy)
-    monkeypatch.setitem(sys.modules, "cupyx.scipy.linalg", fake_cupyx_scipy_linalg)
-    monkeypatch.setattr(mixture_inference, "_try_import_cupy", lambda: fake_cupy)
-    monkeypatch.setattr(mixture_inference, "_cupy_compute_dtype", lambda cupy_module: cupy_module.float32)
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    preconditioner = mixture_inference._sample_space_gpu_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    actual = mixture_inference._solve_sample_space_rhs_gpu(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        right_hand_side=right_hand_side,
-        initial_guess=None,
-        tolerance=1e-7,
-        max_iterations=64,
-        preconditioner=preconditioner,
-        batch_size=2,
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    np.testing.assert_allclose(actual, expected, rtol=2e-4, atol=5e-5)
 def test_gpu_sample_space_solver_retries_in_float64_after_mixed_precision_stalls(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -4137,56 +3695,6 @@ def test_binary_posterior_state_gpu_cache_avoids_numpy_genotype_matvec(monkeypat
     assert beta_variance.shape == (genotype_matrix.shape[1],)
     assert linear_predictor.shape == (genotype_matrix.shape[0],)
     assert np.isfinite(collapsed_objective)
-def test_cpu_sample_space_block_cg_matches_dense_solution(monkeypatch: pytest.MonkeyPatch):
-    genotype_matrix = np.array(
-        [
-            [1.0, 0.0, 1.0],
-            [0.0, 1.0, 1.0],
-            [1.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_matrix).standardized(
-        means=np.zeros(genotype_matrix.shape[1], dtype=np.float32),
-        scales=np.ones(genotype_matrix.shape[1], dtype=np.float32),
-    )
-    prior_variances = np.array([1.5, 0.75, 0.5], dtype=np.float64)
-    diagonal_noise = np.array([1.0, 1.25, 0.8, 1.1], dtype=np.float64)
-    right_hand_side = np.column_stack(
-        [
-            np.array([0.5, -1.0, 0.2, 1.5], dtype=np.float64),
-            np.array([-0.25, 0.75, 1.0, -0.5], dtype=np.float64),
-        ]
-    )
-    monkeypatch.setattr(
-        mixture_inference,
-        "_sample_space_diagonal_preconditioner",
-        lambda **kwargs: np.diag(
-            np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-        ).astype(np.float64, copy=False),
-    )
-    preconditioner = _sample_space_preconditioner(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        batch_size=2,
-        rank=genotype_matrix.shape[1],
-    )
-    actual = mixture_inference._solve_sample_space_rhs_cpu(
-        genotype_matrix=standardized,
-        prior_variances=prior_variances,
-        diagonal_noise=diagonal_noise,
-        right_hand_side=right_hand_side,
-        initial_guess=None,
-        tolerance=1e-7,
-        max_iterations=64,
-        preconditioner=preconditioner,
-        batch_size=2,
-    )
-    covariance_matrix = np.diag(diagonal_noise) + genotype_matrix @ np.diag(prior_variances) @ genotype_matrix.T
-    expected = np.linalg.solve(covariance_matrix, right_hand_side)
-    np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=2e-5)
 
 
 def test_cpu_sample_space_block_cg_preserves_callable_preconditioner_columns():
@@ -4575,49 +4083,6 @@ def test_quantitative_posterior_state_uses_mean_solver_without_diagnostics(monke
     assert linear_predictor.shape == (sample_count,)
     assert np.isfinite(collapsed_objective)
     assert np.isfinite(sigma_error2_new)
-def test_gpu_sample_space_operator_matmat_matches_dense_reference(random_generator):
-    sample_count, variant_count = 24, 96
-    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
-    prior_variances = random_generator.uniform(0.2, 1.2, size=variant_count).astype(np.float64)
-    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
-    rhs_matrix = random_generator.normal(size=(sample_count, 11)).astype(np.float64)
-    standardized = as_raw_genotype_matrix(genotype_values).standardized(
-        means=np.zeros(variant_count, dtype=np.float32),
-        scales=np.ones(variant_count, dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    operator = _sample_space_operator(standardized, prior_variances, diagonal_noise)
-    dense_matrix = genotype_values.astype(np.float64)
-    expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
-        prior_variances[:, None] * (dense_matrix.T @ rhs_matrix)
-    )
-    np.testing.assert_allclose(
-        np.asarray(operator.matmat(rhs_matrix), dtype=np.float64),
-        expected,
-        rtol=1e-5,
-        atol=1e-5,
-    )
-def test_streaming_sample_space_operator_matmat_matches_dense_reference(random_generator):
-    sample_count, variant_count = 24, 96
-    genotype_values = random_generator.normal(size=(sample_count, variant_count)).astype(np.float32)
-    prior_variances = random_generator.uniform(0.2, 1.2, size=variant_count).astype(np.float64)
-    diagonal_noise = random_generator.uniform(0.5, 1.5, size=sample_count).astype(np.float64)
-    rhs_matrix = random_generator.normal(size=(sample_count, 7)).astype(np.float64)
-    standardized = as_raw_genotype_matrix(genotype_values).standardized(
-        means=np.zeros(variant_count, dtype=np.float32),
-        scales=np.ones(variant_count, dtype=np.float32),
-    )
-    operator = _sample_space_operator(standardized, prior_variances, diagonal_noise, batch_size=11)
-    dense_matrix = genotype_values.astype(np.float64)
-    expected = diagonal_noise[:, None] * rhs_matrix + dense_matrix @ (
-        prior_variances[:, None] * (dense_matrix.T @ rhs_matrix)
-    )
-    np.testing.assert_allclose(
-        np.asarray(operator.matmat(rhs_matrix), dtype=np.float64),
-        expected,
-        rtol=1e-5,
-        atol=1e-5,
-    )
 def test_apply_sample_space_operator_gpu_dense_cache_uses_shared_gpu_matmuls(monkeypatch: pytest.MonkeyPatch):
     variant_count = 5
     genotype_values = np.array(
@@ -4679,66 +4144,6 @@ def test_apply_sample_space_operator_gpu_dense_cache_uses_shared_gpu_matmuls(mon
     assert transpose_calls["count"] == 1
     assert matmul_calls["count"] == 1
     np.testing.assert_allclose(np.asarray(result, dtype=np.float64), expected, rtol=1e-5, atol=1e-5)
-def test_prefer_iterative_variant_space_targets_fast_warm_started_point_estimate_updates():
-    sample_count, variant_count = 4, 6
-    genotype_values = np.array(
-        [
-            [1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
-            [0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
-            [1.0, 1.0, 0.0, 1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 1.0, 1.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    standardized = as_raw_genotype_matrix(genotype_values).standardized(
-        means=np.zeros(variant_count, dtype=np.float32),
-        scales=np.ones(variant_count, dtype=np.float32),
-    )
-    standardized._dense_cache = standardized.materialize()
-    assert not _prefer_iterative_variant_space(
-        genotype_matrix=standardized,
-        sample_count=sample_count,
-        variant_count=variant_count,
-        compute_beta_variance=True,
-        compute_logdet=False,
-        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
-    )
-    assert _prefer_iterative_variant_space(
-        genotype_matrix=standardized,
-        sample_count=sample_count,
-        variant_count=variant_count,
-        compute_beta_variance=False,
-        compute_logdet=False,
-        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
-    )
-    assert not _prefer_iterative_variant_space(
-        genotype_matrix=standardized,
-        sample_count=sample_count,
-        variant_count=variant_count,
-        compute_beta_variance=True,
-        compute_logdet=True,
-        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
-    )
-    assert not _prefer_iterative_variant_space(
-        genotype_matrix=standardized,
-        sample_count=sample_count,
-        variant_count=sample_count,
-        compute_beta_variance=False,
-        compute_logdet=False,
-        initial_beta_guess=np.zeros(sample_count, dtype=np.float64),
-    )
-    streamed = as_raw_genotype_matrix(genotype_values).standardized(
-        means=np.zeros(variant_count, dtype=np.float32),
-        scales=np.ones(variant_count, dtype=np.float32),
-    )
-    assert not _prefer_iterative_variant_space(
-        genotype_matrix=streamed,
-        sample_count=sample_count,
-        variant_count=variant_count,
-        compute_beta_variance=False,
-        compute_logdet=False,
-        initial_beta_guess=np.zeros(variant_count, dtype=np.float64),
-    )
 def test_use_exact_sample_space_solve_prefers_smaller_exact_cpu_system():
     assert not _use_exact_sample_space_solve(
         sample_count=32,

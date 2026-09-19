@@ -1,9 +1,7 @@
-"""Tests for the bitpacked engagement / fallback logging contract.
+"""Tests for the bitpacked variant-stats fallback logging contract.
 
-The production path silently fell back to int8 in three places (pipeline
-upgrade, io variant stats, model marginal-z screen). These tests pin the
-explicit ENGAGED/SKIPPED log lines and the host-RAM guardrail that refuses
-the legacy int8 stats path when there is not enough free memory.
+The io variant-stats path used to fall back to int8 silently. This test pins
+the explicit log line that names why the bitpacked path was abandoned.
 """
 from __future__ import annotations
 
@@ -14,62 +12,6 @@ import numpy as np
 import pytest
 
 import sv_pgs.io as io_module
-import sv_pgs.pipeline as pipeline_module
-
-
-def _make_loaded_dataset(genotypes: Any) -> Any:
-    """Build a minimal LoadedDataset around a fake genotype matrix."""
-    return io_module.LoadedDataset(
-        sample_ids=["s0", "s1", "s2"],
-        genotypes=genotypes,
-        covariates=np.zeros((3, 0), dtype=np.float32),
-        targets=np.zeros((3,), dtype=np.float32),
-        variant_records=[],
-        variant_stats=None,
-        variant_stats_minimum_scale=None,
-    )
-
-
-def _make_config_bitpacked() -> Any:
-    """Return a stand-in ModelConfig that requests the bitpacked backend.
-
-    SimpleNamespace is enough because ``_maybe_upgrade_to_bitpacked`` only
-    reads ``genotype_backend``; nothing else on ``config`` is touched.
-    """
-    return SimpleNamespace(genotype_backend="bitpacked")
-
-
-class _FakeBitpackedMatrix:
-    """Stand-in BitpackedDeviceMatrix carrying just enough surface for the
-    pipeline upgrade's success-log path (``_packed.nbytes`` etc.)."""
-
-    def __init__(self, n_samples: int, n_variants: int) -> None:
-        self.shape = (n_samples, n_variants)
-        bytes_per_variant = (n_samples + 3) // 4
-        self._packed = SimpleNamespace(nbytes=n_variants * bytes_per_variant)
-        self._mean = SimpleNamespace(nbytes=n_variants * 4)
-        self._std = SimpleNamespace(nbytes=n_variants * 4)
-
-
-def test_pipeline_maybe_upgrade_is_a_noop(
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The pre-fit hook is now a no-op; the bitpacked upgrade moved INSIDE
-    ``model.fit`` (see ``sv_pgs.model._try_upgrade_reduced_to_bitpacked``).
-
-    This test pins the new contract: ``_maybe_upgrade_to_bitpacked``
-    returns the dataset unchanged and logs a disabled-pre-fit-hook line.
-    """
-    fake_genotypes = SimpleNamespace(shape=(3, 4))
-    dataset = _make_loaded_dataset(fake_genotypes)
-    config = _make_config_bitpacked()
-
-    out = pipeline_module._maybe_upgrade_to_bitpacked(dataset, config)
-    assert out is dataset
-    assert out.genotypes is fake_genotypes
-
-    captured = capsys.readouterr().err
-    assert "pre-fit hook disabled" in captured
 
 
 def test_io_bitpacked_stats_fallback_logs_reason(

@@ -21,26 +21,6 @@ from sv_pgs.numeric import stable_sigmoid
 from sv_pgs.progress import log, mem
 
 
-def _maybe_upgrade_to_bitpacked(dataset: LoadedDataset, config: ModelConfig) -> LoadedDataset:
-    """Deprecated no-op pre-fit bitpacked upgrade.
-
-    The bitpacked GPU matrix upgrade moved INSIDE ``model.fit`` to run
-    AFTER active-variant selection (see
-    :func:`sv_pgs.model._try_upgrade_reduced_to_bitpacked`). Packing the
-    full ~1.7M-variant pre-fit matrix on AoU (319k x 1.7M ~= 139 GB
-    packed) does not fit a 40 GB A100, so the pre-fit hook always
-    skipped. The helper is kept as a no-op so existing imports/tests
-    continue to resolve; it returns the input dataset unchanged.
-    """
-    log(
-        "bitpacked upgrade: pre-fit hook disabled — "
-        "upgrade now runs post-active-selection inside model.fit "
-        f"(dataset variants={int(dataset.genotypes.shape[1]) if hasattr(dataset.genotypes, 'shape') else '?'}, "
-        f"backend={getattr(config, 'genotype_backend', None)!r})"
-    )
-    return dataset
-
-
 @dataclass(slots=True)
 class PipelineOutputs:
     artifact_dir: Path

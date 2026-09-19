@@ -93,15 +93,12 @@ from sv_pgs.genotype import (
     _cupy_cache_is_sharded,
     _cupy_cache_standardized_columns,
     _cupy_compute_dtype,
-    _cupy_to_jax,
     _gpu_free_bytes,
     _gpu_total_bytes,
     _iter_cupy_cache_standardized_batches,
     _iter_standardized_gpu_batches,
     _release_cupy_cached_memory,
     _sgm_variant_indices_is_identity,
-    _to_cupy_compute,
-    _to_cupy_float64,
     _try_import_cupy,
 )
 from sv_pgs.linear_solvers import build_linear_operator, solve_spd_system, stochastic_logdet
@@ -183,24 +180,6 @@ def _em_profile_sync_if_bitpacked(matrix: Any) -> None:
         _cp.cuda.runtime.deviceSynchronize()
     except Exception:  # pragma: no cover - sync failures must not abort EM
         pass
-
-
-def _em_profile_format_line(
-    *,
-    prefix: str,
-    matvec: float,
-    rmatvec: float,
-    gram: float,
-    posterior: float,
-    loss: float,
-    total: float,
-) -> str:
-    """Render the single-line profile log with 2-decimal precision."""
-    return (
-        f"{prefix} matvec={matvec:.2f}s rmatvec={rmatvec:.2f}s "
-        f"gram={gram:.2f}s posterior={posterior:.2f}s "
-        f"loss={loss:.2f}s total={total:.2f}s"
-    )
 
 
 def _gpu_exact_variant_tile_max_variants(
@@ -1385,7 +1364,6 @@ def _stochastic_sample_space_preconditioner_rank(
     minimum_rank = min(int(requested_rank), 96)
     scheduled_rank = int(np.ceil(int(requested_rank) * rank_fraction))
     return max(minimum_rank, min(int(requested_rank), scheduled_rank))
-
 
 
 def _stochastic_variant_blocks(
@@ -5934,142 +5912,6 @@ def _binary_posterior_state(
 # n_samples x n_samples, way too big), instead we define how to multiply
 # V times a vector.  This lets us solve V^{-1} @ b using iterative methods
 # (conjugate gradient) without ever storing the full matrix.
-def _sample_space_operator(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: NDArray,
-    diagonal_noise: NDArray,
-    batch_size: int = 1024,
-) -> Any:
-    compute_dtype = gpu_compute_jax_dtype()
-    diag_noise_jax = jnp.asarray(diagonal_noise, dtype=compute_dtype)
-    prior_var_jax = jnp.asarray(prior_variances, dtype=compute_dtype)
-    streaming_dtype = gpu_compute_numpy_dtype()
-    cupy = None
-    streaming_gpu_enabled = False
-    if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops() and genotype_matrix.raw is not None:
-        cupy = _try_import_cupy()
-        streaming_gpu_enabled = cupy is not None
-    if streaming_gpu_enabled:
-        assert cupy is not None
-        compute_cp_dtype = _cupy_compute_dtype(cupy)
-        diag_noise_gpu = cupy.asarray(diagonal_noise, dtype=compute_cp_dtype)
-        prior_var_gpu = cupy.asarray(prior_variances, dtype=compute_cp_dtype)
-
-    ld_block_partition = getattr(genotype_matrix, "_ld_block_partition", None)
-
-    def matvec(vector: JaxArray) -> JaxArray:
-        v = jnp.asarray(vector, dtype=compute_dtype)
-        if ld_block_partition is not None and not streaming_gpu_enabled and not (
-            genotype_matrix._cupy_cache is not None
-        ):
-            # CPU per-block accumulation: (sigma^2 I + X diag(tau^2) X^T) v
-            # decomposes cleanly across blocks since tau^2 is per-variant.
-            v_np = np.asarray(v, dtype=streaming_dtype)
-            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
-            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
-            if genotype_matrix.supports_jax_dense_ops():
-                full_proj = np.asarray(
-                    genotype_matrix.transpose_matvec(v_np, batch_size=batch_size),
-                    dtype=streaming_dtype,
-                )
-            else:
-                full_proj = np.asarray(
-                    genotype_matrix.transpose_matvec_numpy(v_np, batch_size=batch_size),
-                    dtype=streaming_dtype,
-                )
-            scaled = prior_var_stream * full_proj
-            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=streaming_dtype)
-            for _bid, idx in ld_block_partition.iter_blocks():
-                if idx.size == 0:
-                    continue
-                beta_b = np.zeros_like(scaled)
-                beta_b[idx] = scaled[idx]
-                if genotype_matrix.supports_jax_dense_ops():
-                    contrib = np.asarray(
-                        genotype_matrix.matvec(beta_b, batch_size=batch_size),
-                        dtype=streaming_dtype,
-                    )
-                else:
-                    contrib = np.asarray(
-                        genotype_matrix.matvec_numpy(beta_b, batch_size=batch_size),
-                        dtype=streaming_dtype,
-                    )
-                genotype_term += contrib
-            return jnp.asarray(diag_noise_stream * v_np + genotype_term, dtype=compute_dtype)
-        if streaming_gpu_enabled:
-            assert cupy is not None
-            raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            vector_gpu = _to_cupy_compute(v)
-            result_gpu = diag_noise_gpu * vector_gpu
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                genotype_matrix.variant_indices,
-                genotype_matrix.means,
-                genotype_matrix.scales,
-                batch_size=batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                scaled_projection = prior_var_gpu[batch_slice] * (standardized_batch.T @ vector_gpu)
-                result_gpu += standardized_batch @ scaled_projection
-            return _cupy_to_jax(result_gpu)
-        if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
-            vector_np = np.asarray(v, dtype=streaming_dtype)
-            genotype_term = np.zeros(genotype_matrix.shape[0], dtype=streaming_dtype)
-            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
-            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
-            for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
-                genotype_batch = np.asarray(batch.values, dtype=streaming_dtype)
-                scaled_projection = prior_var_stream[batch.variant_indices] * (genotype_batch.T @ vector_np)
-                genotype_term += genotype_batch @ scaled_projection
-            return jnp.asarray(diag_noise_stream * vector_np + genotype_term, dtype=compute_dtype)
-        projected = genotype_matrix.transpose_matvec(v)
-        return diag_noise_jax * v + genotype_matrix.matvec(prior_var_jax * projected)
-
-    def matmat(matrix: JaxArray) -> JaxArray:
-        matrix_jax = jnp.asarray(matrix, dtype=compute_dtype)
-        if streaming_gpu_enabled:
-            assert cupy is not None
-            raw_matrix = cast(RawGenotypeMatrix, genotype_matrix.raw)
-            compute_cp_dtype = _cupy_compute_dtype(cupy)
-            matrix_gpu = _to_cupy_compute(matrix_jax)
-            result_gpu = diag_noise_gpu[:, None] * matrix_gpu
-            for batch_slice, standardized_batch in _iter_standardized_gpu_batches(
-                raw_matrix,
-                genotype_matrix.variant_indices,
-                genotype_matrix.means,
-                genotype_matrix.scales,
-                batch_size=batch_size,
-                cupy=cupy,
-                dtype=compute_cp_dtype,
-            ):
-                scaled_projection = prior_var_gpu[batch_slice, None] * (standardized_batch.T @ matrix_gpu)
-                result_gpu += standardized_batch @ scaled_projection
-            return _cupy_to_jax(result_gpu)
-        if genotype_matrix._cupy_cache is None and not genotype_matrix.supports_jax_dense_ops():
-            matrix_np = np.asarray(matrix_jax, dtype=streaming_dtype)
-            genotype_term = np.zeros((genotype_matrix.shape[0], matrix_np.shape[1]), dtype=streaming_dtype)
-            prior_var_stream = np.asarray(prior_variances, dtype=streaming_dtype)
-            diag_noise_stream = np.asarray(diagonal_noise, dtype=streaming_dtype)
-            for batch in genotype_matrix.iter_column_batches(batch_size=batch_size):
-                genotype_batch = np.asarray(batch.values, dtype=streaming_dtype)
-                scaled_projection = prior_var_stream[batch.variant_indices, None] * (genotype_batch.T @ matrix_np)
-                genotype_term += genotype_batch @ scaled_projection
-            return jnp.asarray(diag_noise_stream[:, None] * matrix_np + genotype_term, dtype=compute_dtype)
-        # X^T @ M gives (p, k), scale by prior variance, then X @ result gives (n, k)
-        projected = genotype_matrix.transpose_matmat(matrix_jax)  # (p, k)
-        scaled = prior_var_jax[:, None] * projected  # (p, k)
-        genotype_term_jax = genotype_matrix.matmat(scaled)
-        return diag_noise_jax[:, None] * matrix_jax + genotype_term_jax
-
-    return build_linear_operator(
-        shape=(genotype_matrix.shape[0], genotype_matrix.shape[0]),
-        matvec=matvec,
-        matmat=matmat,
-        dtype=compute_dtype,
-        jax_compatible=genotype_matrix.supports_jax_dense_ops(),
-    )
 
 
 def _sample_space_diagonal_preconditioner(
@@ -6354,27 +6196,6 @@ def _sample_space_nystrom_basis_gpu(
     return basis_gpu
 
 
-def _sample_space_nystrom_factor_cpu(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: NDArray,
-    batch_size: int,
-    rank: int,
-    random_seed: int,
-) -> NDArray | None:
-    basis_matrix = _sample_space_nystrom_basis_cpu(
-        genotype_matrix=genotype_matrix,
-        batch_size=batch_size,
-        rank=rank,
-        random_seed=random_seed,
-    )
-    return _sample_space_nystrom_factor_cpu_from_basis(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        basis_matrix=basis_matrix,
-        batch_size=batch_size,
-    )
-
-
 def _sample_space_nystrom_factor_cpu_from_basis(
     genotype_matrix: StandardizedGenotypeMatrix,
     prior_variances: NDArray,
@@ -6397,30 +6218,6 @@ def _sample_space_nystrom_factor_cpu_from_basis(
     if gram_factor is None:
         return None
     return np.asarray(basis_matrix @ gram_factor, dtype=np.float64)
-
-
-def _sample_space_nystrom_factor_gpu(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: NDArray,
-    batch_size: int,
-    rank: int,
-    random_seed: int,
-) -> Any | None:
-    cupy = _try_import_cupy()
-    if cupy is None:
-        return None
-    basis_gpu = _sample_space_nystrom_basis_gpu(
-        genotype_matrix=genotype_matrix,
-        batch_size=batch_size,
-        rank=rank,
-        random_seed=random_seed,
-    )
-    return _sample_space_nystrom_factor_gpu_from_basis(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        basis_gpu=basis_gpu,
-        batch_size=batch_size,
-    )
 
 
 def _sample_space_nystrom_factor_gpu_from_basis(
@@ -7017,178 +6814,6 @@ def _cached_sample_probe_projection(
         genotype_matrix._sample_space_probe_projection_gpu_cache[cache_key] = projection_gpu
         return projection_gpu
     return probe_projection_matrix
-
-
-def _sample_space_preconditioner(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: NDArray,
-    diagonal_noise: NDArray,
-    batch_size: int,
-    rank: int,
-    random_seed: int = 0,
-    diagonal_preconditioner: NDArray | None = None,
-) -> Callable[[JaxArray], JaxArray] | NDArray | JaxArray:
-    if diagonal_preconditioner is None:
-        diagonal_preconditioner = _sample_space_diagonal_preconditioner(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            batch_size=batch_size,
-        )
-    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
-    if rank <= 0:
-        return diagonal_preconditioner
-    selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
-    if selected_rank <= 0:
-        return diagonal_preconditioner
-    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        batch_size=batch_size,
-        rank=selected_rank,
-        random_seed=random_seed,
-    )
-    if low_rank_factor_gpu is not None:
-        import cupy as cp
-        cp_solve_triangular = _resolve_gpu_solve_triangular()
-
-        gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
-        effective_rank = int(low_rank_factor_gpu.shape[1])
-        log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
-        compute_cp_dtype = _cupy_compute_dtype(cp)
-        diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
-        compute_bundle = _build_sample_space_low_rank_bundle_gpu(
-            low_rank_factor_gpu,
-            diagonal_preconditioner_gpu,
-            cp=cp,
-            bundle_dtype=compute_cp_dtype,
-        )
-        float64_bundle = None
-
-        def apply_preconditioner_gpu(right_hand_side: JaxArray) -> JaxArray:
-            nonlocal float64_bundle
-            right_hand_side_array = np.asarray(right_hand_side)
-            use_float64_bundle = compute_cp_dtype != cp.float64 and right_hand_side_array.dtype == np.float64
-            if use_float64_bundle:
-                if float64_bundle is None:
-                    float64_bundle = _build_sample_space_low_rank_bundle_gpu(
-                        low_rank_factor_gpu,
-                        cp.asarray(diagonal_preconditioner, dtype=cp.float64),
-                        cp=cp,
-                        bundle_dtype=cp.float64,
-                    )
-                bundle = float64_bundle
-                right_hand_side_gpu = _to_cupy_float64(right_hand_side)
-            else:
-                bundle = compute_bundle
-                right_hand_side_gpu = _to_cupy_compute(right_hand_side)
-            return _cupy_to_jax(
-                _apply_sample_space_low_rank_preconditioner_gpu(
-                    right_hand_side_gpu,
-                    bundle,
-                    cp=cp,
-                    solve_triangular_gpu=cp_solve_triangular,
-                )
-            )
-
-        return apply_preconditioner_gpu
-    low_rank_factor = _sample_space_nystrom_factor_cpu(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        batch_size=batch_size,
-        rank=selected_rank,
-        random_seed=random_seed,
-    )
-    if low_rank_factor is None:
-        return diagonal_preconditioner
-    effective_rank = int(low_rank_factor.shape[1])
-    log(f"      sample-space preconditioner: CPU Nyström-Woodbury rank={effective_rank}")
-    return _sample_space_cpu_preconditioner_from_factor(
-        low_rank_factor=low_rank_factor,
-        diagonal_preconditioner=diagonal_preconditioner,
-    )
-
-
-def _sample_space_gpu_preconditioner(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    prior_variances: NDArray,
-    diagonal_noise: NDArray,
-    batch_size: int,
-    rank: int,
-    random_seed: int = 0,
-    diagonal_preconditioner: NDArray | None = None,
-) -> Callable[[Any], Any]:
-    import cupy as cp
-    cp_solve_triangular = _resolve_gpu_solve_triangular()
-
-    compute_cp_dtype = _cupy_compute_dtype(cp)
-    if diagonal_preconditioner is None:
-        diagonal_preconditioner = _sample_space_diagonal_preconditioner(
-            genotype_matrix=genotype_matrix,
-            prior_variances=prior_variances,
-            diagonal_noise=diagonal_noise,
-            batch_size=batch_size,
-        )
-    diagonal_preconditioner = np.asarray(diagonal_preconditioner, dtype=np.float64)
-    diagonal_preconditioner_gpu = cp.asarray(diagonal_preconditioner, dtype=compute_cp_dtype)
-
-    def apply_diagonal(right_hand_side_gpu: Any) -> Any:
-        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
-        resolved_dtype = cp.float64 if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64 else compute_cp_dtype
-        right_hand_side_gpu = cp.asarray(right_hand_side_gpu, dtype=resolved_dtype)
-        diagonal_vector = diagonal_preconditioner_gpu.astype(resolved_dtype, copy=False)
-        if right_hand_side_gpu.ndim == 2:
-            return right_hand_side_gpu / diagonal_vector[:, None]
-        return right_hand_side_gpu / diagonal_vector
-
-    if rank <= 0:
-        return apply_diagonal
-    selected_rank = min(int(rank), int(genotype_matrix.shape[0]))
-    if selected_rank <= 0:
-        return apply_diagonal
-    low_rank_factor_gpu = _sample_space_nystrom_factor_gpu(
-        genotype_matrix=genotype_matrix,
-        prior_variances=prior_variances,
-        batch_size=batch_size,
-        rank=selected_rank,
-        random_seed=random_seed,
-    )
-    if low_rank_factor_gpu is None:
-        return apply_diagonal
-
-    gpu_cache_source = _sgm_gpu_source_label(genotype_matrix, style="short")
-    effective_rank = int(low_rank_factor_gpu.shape[1])
-    log(f"      sample-space preconditioner: GPU Nyström-Woodbury rank={effective_rank} source={gpu_cache_source}")
-    compute_bundle = _build_sample_space_low_rank_bundle_gpu(
-        low_rank_factor_gpu,
-        diagonal_preconditioner_gpu,
-        cp=cp,
-        bundle_dtype=compute_cp_dtype,
-    )
-    float64_bundle = None
-
-    def apply_low_rank(right_hand_side_gpu: Any) -> Any:
-        nonlocal float64_bundle
-        rhs_dtype = getattr(right_hand_side_gpu, "dtype", compute_cp_dtype)
-        if compute_cp_dtype != cp.float64 and rhs_dtype == cp.float64:
-            if float64_bundle is None:
-                float64_bundle = _build_sample_space_low_rank_bundle_gpu(
-                    low_rank_factor_gpu,
-                    cp.asarray(diagonal_preconditioner, dtype=cp.float64),
-                    cp=cp,
-                    bundle_dtype=cp.float64,
-                )
-            bundle = float64_bundle
-        else:
-            bundle = compute_bundle
-        return _apply_sample_space_low_rank_preconditioner_gpu(
-            right_hand_side_gpu,
-            bundle,
-            cp=cp,
-            solve_triangular_gpu=cp_solve_triangular,
-        )
-
-    return apply_low_rank
 
 
 def _get_cached_sample_space_cpu_preconditioner(
@@ -8356,35 +7981,6 @@ def _streaming_cupy_backend_available(genotype_matrix: StandardizedGenotypeMatri
     )
 
 
-def _prefer_iterative_variant_space(
-    genotype_matrix: StandardizedGenotypeMatrix,
-    sample_count: int,
-    variant_count: int,
-    *,
-    compute_beta_variance: bool,
-    compute_logdet: bool,
-    initial_beta_guess: NDArray | None,
-) -> bool:
-    if _streaming_cupy_backend_available(genotype_matrix):
-        return False
-    streaming_matrix = (
-        genotype_matrix._cupy_cache is None
-        and genotype_matrix._dense_cache is None
-        and genotype_matrix._jax_cache is None
-        and genotype_matrix.raw is not None
-    )
-    if streaming_matrix:
-        return False
-    return (
-        not compute_beta_variance
-        and
-        not compute_logdet
-        and initial_beta_guess is not None
-        and genotype_matrix._cupy_cache is None
-        and variant_count > sample_count
-    )
-
-
 def _use_exact_sample_space_solve(
     *,
     sample_count: int,
@@ -8759,8 +8355,6 @@ def _release_cg_workset_resident_cache(
 # matvec call site that hammers the full active variant set can use them to
 # avoid re-decoding from PLINK BED on every iteration. The CG-named originals
 # above remain for back-compat with the existing inner-loop install.
-_try_install_resident_int8_cache = _try_install_cg_workset_resident_cache
-_release_resident_int8_cache = _release_cg_workset_resident_cache
 
 
 def _solve_sample_space_rhs_gpu(
