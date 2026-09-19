@@ -351,7 +351,9 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
                 view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0), cavity, posterior,
                 _WORKING_BYTES, _EVIDENCE_TOLERANCE,
             )
-            assert moved is None or moved.value <= base.value + _EVIDENCE_TOLERANCE
+            # The step certifies that a nearby move gains at most the tolerance, and each computed V is certified to it:
+            # the computed difference is at most three tolerances.
+            assert moved is None or moved.value <= base.value + 3.0 * _EVIDENCE_TOLERANCE
     # The B-evidence's own stationarity is certified: a Newton step on its differences gains at most the tolerance.
     assert step.stationarity_gain <= _EVIDENCE_TOLERANCE
 

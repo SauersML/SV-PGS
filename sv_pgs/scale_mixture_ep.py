@@ -1589,8 +1589,9 @@ def _maximize_evidence(
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
     """Maximize V over every weight in [0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and each edge evaluated exactly (lambda = infinity by confining x to the block's null space, lambda = 0 by
-    dropping the block), never by fitting at an extreme weight. A weight at the end of its range whose gradient
-    points past it moves to the edge when the edge's V is higher; an edge weight moves back to the end of its range
+    dropping the block), never by fitting at an extreme weight. Once the interior ascent converges, every finite
+    weight is compared with both of its edges (lead ruling: each weight compared at lambda = infinity and inside),
+    and the best edge that raises V past the tolerance is taken; an edge weight moves back to the end of its range
     when V is higher there. Every V is the best certified maximum over the warm, flat and global log-normal starts.
     Returns the log weights (+inf and -inf at the edges), x in full coordinates, V there, and V at the start.
     """
@@ -1632,18 +1633,17 @@ def _maximize_evidence(
         coefficients = allowed @ evidence.coefficients
         current_value = evidence.value
         moved = False
-        pushing = [
-            (int(finite[index]), "infinite")
-            for index in np.flatnonzero((finite_weights >= upper[finite]) & (evidence.gradient >= 0.0))
-        ] + [(int(finite[index]), "zero") for index in np.flatnonzero((finite_weights <= lower[finite]) & (evidence.gradient <= 0.0))]
-        for position, edge in pushing:
-            trial_infinite = infinite | {position} if edge == "infinite" else infinite
-            trial_zero = zero | {position} if edge == "zero" else zero
-            trial = _edge_evidence(prior, weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
-            if trial is not None and trial[1].value > current_value + tolerance:
-                infinite, zero, moved = frozenset(trial_infinite), frozenset(trial_zero), True
-                coefficients = trial[0] @ trial[1].coefficients
-                break
+        # Every finite weight is compared with both of its edges, not only one the gradient points to: the certified V
+        # can prefer an edge the Laplace gradient does not see. The best edge that raises V past the tolerance is taken.
+        best_edge = None
+        for position in (int(index) for index in finite):
+            for trial_infinite, trial_zero in ((infinite | {position}, zero), (infinite, zero | {position})):
+                trial = _edge_evidence(prior, weights, trial_infinite, trial_zero, [coefficients, flat, log_normal], cavity, posterior_at, working_bytes, tolerance)
+                if trial is not None and trial[1].value > current_value + tolerance and (best_edge is None or trial[1].value > best_edge[2][1].value):
+                    best_edge = (trial_infinite, trial_zero, trial)
+        if best_edge is not None:
+            infinite, zero, moved = frozenset(best_edge[0]), frozenset(best_edge[1]), True
+            coefficients = best_edge[2][0] @ best_edge[2][1].coefficients
         if not moved:
             for position in sorted(edges):
                 trial_infinite, trial_zero = infinite - {position}, zero - {position}
