@@ -852,6 +852,22 @@ def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, r
     return ResolvedBlock(design, precision, duals, residual, core, factor)
 
 
+def _core_error(array_module: Any, block: ResolvedBlock) -> tuple[float, float, float]:
+    """(lambda_min(core_hat), ||R_L||_2, delta): the computed core's error relative to itself.
+
+    With E = Z_L - Z_hat = S_S^-1 R_L, the exact core is core_hat + Delta, Delta = sym(Z_hat'R_L) +
+    R_L'S_S^-1 R_L, so -delta core_hat <= Delta <= delta core_hat with
+    delta = ||L^-1 sym(Z_hat'R_L) L^-T||_2 + ||R_L||_2^2 / lambda_min(core_hat) (core_hat = L L').
+    """
+    lowest = float(array_module.linalg.eigvalsh(block.core)[0])
+    residual_gram = block.residual.T @ block.residual
+    residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
+    coupling = block.duals.T @ block.residual
+    whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
+    core_error = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
+    return lowest, residual_norm, core_error
+
+
 def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: Any, residual: Any) -> tuple[Any, Any, Any]:
     """Columns sharing one model's split: their resolved block, their mean duals and their A-norm certificate.
 
@@ -871,20 +887,53 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     mean_duals = duals - block.duals @ resolved_mean
     bulk_residual = residual - block.residual @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
-    lowest = float(array_module.linalg.eigvalsh(block.core)[0])
+    lowest, residual_norm, core_error = _core_error(array_module, block)
     # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
     inverse_factor_norm = float(np.sqrt(1.0 / lowest))
-    residual_gram = block.residual.T @ block.residual
-    residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
-    coupling = block.duals.T @ block.residual
-    whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
-    core_error = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
     bulk_norms = array_module.linalg.norm(bulk_residual, axis=0)
     if core_error >= 1.0:
         return resolved_mean, mean_duals, array_module.full(bulk_norms.shape, np.inf)
     projected = array_module.linalg.solve(block.factor, stationarity + block.duals.T @ bulk_residual)
     quadratic = (array_module.linalg.norm(projected, axis=0) + inverse_factor_norm * residual_norm * bulk_norms) ** 2 / (1.0 - core_error)
     return resolved_mean, mean_duals, array_module.sqrt(bulk_norms * bulk_norms + quadratic)
+
+
+@dataclass(frozen=True)
+class SampleDiagonal:
+    """The exact parts of one model's per-sample posterior variance of the linear predictor.
+
+    Var(eta_i) = (1 - [(I - H) S^-1 (I - H)]_ii) / w_i on the training rows, with S the model's full
+    dual operator. Two identities make every part but one exact:
+    - S H = H (Xt'H = 0), so S^-1 = H + (I - H) S^-1 (I - H) and
+      [(I - H) S^-1 (I - H)]_ii = [S^-1]_ii - H_ii, with H_ii = `covariate_leverage`;
+    - with the resolved sites eliminated, I - Xt A^-1 Xt' = S_S^-1 - Z_L core^-1 Z_L' (Woodbury on L,
+      valid for any-sign Pi_L while core > 0), so [S^-1]_ii = [S_S^-1]_ii - resolved_i with
+      resolved_i = z_L,i' core^-1 z_L,i.
+    The one convention: the bulk diagonal [S_S^-1]_ii is of the spike-free bulk operator only, the
+    deterministic-equivalent map's to supply; `predictor_variance` is the one place that adds the
+    resolved term and H_ii to it.
+
+    `resolved_term` is resolved_i from the computed Z_L and core; `resolved_lower` and
+    `resolved_upper` bound the exact value row by row. With a_i = ||L^-1 z_hat_L,i|| (core_hat = L L')
+    and E = S_S^-1 R_L the error of Z_L (R_L its exact residuals), row i of E is e_i' S_S^-1 R_L, so
+    ||E_i|| <= ||S_S^-1 e_i|| ||R_L||_2 <= ||R_L||_2 (S_S >= I), and ||L^-1 E_i|| <= b = ||R_L||_2 /
+    sqrt(lambda_min(core_hat)). The core satisfies (1 - delta) core_hat <= core <= (1 + delta) core_hat
+    (_core_error), so resolved_i lies in [max(a_i - b, 0)^2 / (1 + delta), (a_i + b)^2 / (1 - delta)];
+    the bounds are infinite when delta is not below 1.
+    """
+
+    weights: Any
+    covariate_leverage: Any
+    resolved_term: Any
+    resolved_lower: Any
+    resolved_upper: Any
+
+    def predictor_variance(self, bulk_diagonal: Any, array_module: Any) -> tuple[Any, Any, Any]:
+        """(training rows, lower, upper) of Var(eta_i) = (1 - [S_S^-1]_ii + resolved_i + H_ii) / w_i, given
+        the bulk diagonal [S_S^-1]_ii (n,); the interval carries only the resolved term's bound."""
+        rows = array_module.flatnonzero(self.weights > 0.0)
+        base = 1.0 - bulk_diagonal[rows] + self.covariate_leverage[rows]
+        return rows, (base + self.resolved_lower[rows]) / self.weights[rows], (base + self.resolved_upper[rows]) / self.weights[rows]
 
 
 @dataclass(frozen=True)
@@ -1281,6 +1330,30 @@ class DualGaussian:
         if resolved_values is not None:
             solution[resolved] = resolved_values
         return solution
+
+    def sample_diagonal(self, model: int) -> SampleDiagonal:
+        """The exact parts of model m's per-sample predictor variance at the last iterate (SampleDiagonal); no read."""
+        array_module = self.array_module
+        state = self._state
+        models = state["models"]
+        weights = models.weights[:, model]
+        # H_ii = w_i c_i'(C'WC)^+ c_i = w_i ||F'c_i||^2 with F F' = (C'WC)^+ (covariate_whitener).
+        whitened_covariates = self.covariates @ models.covariate_factor[model]
+        covariate_leverage = weights * array_module.sum(whitened_covariates * whitened_covariates, axis=1)
+        block = state["blocks"].get(model)
+        if block is None:
+            zeros = array_module.zeros(self.source.sample_count)
+            return SampleDiagonal(weights, covariate_leverage, zeros, zeros, zeros)
+        whitened = array_module.linalg.solve(block.factor, block.duals.T)
+        resolved_term = array_module.sum(whitened * whitened, axis=0)
+        lowest, residual_norm, core_error = _core_error(array_module, block)
+        if core_error >= 1.0:
+            return SampleDiagonal(weights, covariate_leverage, resolved_term, array_module.zeros_like(resolved_term), array_module.full_like(resolved_term, np.inf))
+        root = array_module.sqrt(resolved_term)
+        reach = residual_norm / float(np.sqrt(lowest))
+        lower = array_module.maximum(root - reach, 0.0) ** 2 / (1.0 + core_error)
+        upper = (root + reach) ** 2 / (1.0 - core_error)
+        return SampleDiagonal(weights, covariate_leverage, resolved_term, lower, upper)
 
     def residual_sum_of_squares(self) -> np.ndarray:
         """(M,): each model's training sum of (y - linear predictor)^2 at the current mean."""

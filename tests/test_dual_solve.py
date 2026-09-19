@@ -717,3 +717,56 @@ def test_a_residual_that_is_not_finite_is_never_certified() -> None:
     right[5, 1] = np.nan
     with np.testing.assert_raises(FloatingPointError):
         _exact_solve(source, models, right, dual_solve.PassCount())
+
+
+def test_the_sample_diagonal_parts_match_the_dense_posterior() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(65)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    # Loose tolerances leave Z_L inexact, so the per-row bounds are exercised, not only rounding.
+    for error_scale, ratio in ((np.sqrt(EPS), np.sqrt(EPS)), (1e-2, 1e-3)):
+        gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=11)
+        gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, error_scale), probe_residual_ratio=ratio)
+        for model in (0, 1, 3):
+            parts = gaussian.sample_diagonal(model)
+            posterior_precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+            weights = training[:, model] / noise[model]
+            root = np.sqrt(weights)
+            weighted_covariates = root[:, None] * covariates
+            projector = weighted_covariates @ np.linalg.pinv(weighted_covariates)
+            np.testing.assert_allclose(parts.covariate_leverage, np.diag(projector), rtol=0.0, atol=np.sqrt(EPS))
+            resolved = gaussian.bulk_solves[model].resolved
+            bulk = np.setdiff1d(np.arange(genotypes.shape[1]), resolved)
+            bulk_operator = np.eye(genotypes.shape[0]) + design[:, bulk] @ (design[:, bulk] / precision[bulk, model][None, :]).T
+            bulk_diagonal = np.diag(np.linalg.inv(bulk_operator))
+            full = np.eye(genotypes.shape[0]) - design @ np.linalg.solve(posterior_precision, design.T)
+            exact_resolved = bulk_diagonal - np.diag(full)
+            rounding = np.linalg.cond(posterior_precision) * np.linalg.cond(bulk_operator) * genotypes.shape[0] * EPS
+            assert np.all(np.isfinite(parts.resolved_upper))
+            assert np.all(parts.resolved_lower - rounding <= exact_resolved)
+            assert np.all(exact_resolved <= parts.resolved_upper + rounding)
+            # The one assembler, fed the exact bulk diagonal, brackets the dense predictor variance.
+            complement = np.eye(genotypes.shape[0]) - projector
+            dense_variance = (1.0 - np.diag(complement @ full @ complement)) / np.where(weights > 0.0, weights, 1.0)
+            rows, lower, upper = parts.predictor_variance(bulk_diagonal, np)
+            np.testing.assert_array_equal(rows, np.flatnonzero(weights > 0.0))
+            slack = rounding / weights[rows]
+            assert np.all(lower - slack <= dense_variance[rows])
+            assert np.all(dense_variance[rows] <= upper + slack)
+
+
+def test_the_covariate_leverage_is_the_projectors_diagonal_when_the_covariates_lose_rank() -> None:
+    genotypes, bounds, covariates, weights, variances, _prior_mean, response = _rank_losing_problem(24)
+    training = (weights > 0).astype(np.float64)
+    noise = np.array([0.7, 0.9, 1.3, 1.1])
+    precision = 1.0 / variances
+    shift = np.zeros_like(precision)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=np.where(training > 0, response, np.nan), offsets=np.zeros_like(response),
+                                       covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=12)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    for model in (1, 2):
+        root = np.sqrt(training[:, model] / noise[model])
+        weighted_covariates = root[:, None] * covariates
+        assert np.linalg.matrix_rank(weighted_covariates) < covariates.shape[1]
+        projector = weighted_covariates @ np.linalg.pinv(weighted_covariates)
+        np.testing.assert_allclose(gaussian.sample_diagonal(model).covariate_leverage, np.diag(projector), rtol=0.0, atol=np.sqrt(EPS))
