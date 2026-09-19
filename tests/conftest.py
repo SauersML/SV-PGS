@@ -2,56 +2,8 @@ from __future__ import annotations
 
 import gc
 import sys
-import types
-from typing import Any
 
-import numpy as np
 import pytest
-
-from sv_pgs.config import VariantClass
-from sv_pgs.data import VariantRecord
-
-
-def make_fake_cupy(**overrides: Any) -> types.ModuleType:
-    """A numpy-backed stand-in for the ``cupy`` module.
-
-    Any attribute that is not explicitly overridden falls back (via PEP 562
-    module ``__getattr__``) to the matching numpy symbol, so production code
-    that reaches for a new ``cp.<fn>`` keeps working without per-test fake
-    maintenance — the single reason the previous hand-rolled fakes broke when
-    a code path started calling ``cp.isfinite``. Device-only helpers
-    (``asnumpy``) and a minimal ``cuda`` namespace are provided; pass keyword
-    overrides to replace any attribute (e.g. ``linalg=...``).
-    """
-    module = types.ModuleType("cupy")
-
-    def _module_getattr(name: str) -> Any:
-        attribute = getattr(np, name, None)
-        if attribute is None:
-            raise AttributeError(f"fake cupy has no attribute {name!r}")
-        return attribute
-
-    module.__getattr__ = _module_getattr  # type: ignore[attr-defined]
-    module.asnumpy = lambda array: np.asarray(array)  # type: ignore[attr-defined]
-    module.get_default_memory_pool = lambda: types.SimpleNamespace(  # type: ignore[attr-defined]
-        free_all_blocks=lambda: None
-    )
-    module.get_default_pinned_memory_pool = lambda: types.SimpleNamespace(  # type: ignore[attr-defined]
-        free_all_blocks=lambda: None
-    )
-    module.cuda = types.SimpleNamespace(  # type: ignore[attr-defined]
-        Device=lambda *args, **kwargs: types.SimpleNamespace(synchronize=lambda: None),
-        runtime=types.SimpleNamespace(getDeviceCount=lambda: 1),
-        Stream=types.SimpleNamespace(null=types.SimpleNamespace(synchronize=lambda: None)),
-    )
-    for attribute_name, attribute_value in overrides.items():
-        setattr(module, attribute_name, attribute_value)
-    return module
-
-
-@pytest.fixture
-def random_generator() -> np.random.Generator:
-    return np.random.default_rng(42)
 
 
 @pytest.fixture(autouse=True)
@@ -155,33 +107,3 @@ def clear_accelerator_caches():
         get_default_pinned_memory_pool = getattr(cupy_module, "get_default_pinned_memory_pool", None)
         if callable(get_default_pinned_memory_pool):
             get_default_pinned_memory_pool().free_all_blocks()
-
-
-def make_variant_records(
-    variant_count: int,
-    variant_class: VariantClass = VariantClass.SNV,
-    chromosome: str = "chr1",
-) -> list[VariantRecord]:
-    structural_variant_classes = {
-        VariantClass.DELETION,
-        VariantClass.DUPLICATION,
-        VariantClass.INSERTION_MEI,
-        VariantClass.INVERSION_BND_COMPLEX,
-        VariantClass.STR_VNTR_REPEAT,
-        VariantClass.OTHER_COMPLEX_SV,
-        VariantClass.COPY_NUMBER,
-        VariantClass.INVERSION,
-    }
-    return [
-        VariantRecord(
-            variant_id="variant_" + str(variant_index),
-            variant_class=variant_class,
-            chromosome=chromosome,
-            position=variant_index * 100,
-            length=1.0,
-            allele_frequency=0.1,
-            quality=1.0,
-            training_support=32 if variant_class in structural_variant_classes else None,
-        )
-        for variant_index in range(variant_count)
-    ]

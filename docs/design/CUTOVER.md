@@ -17,7 +17,7 @@ The pre-cutover tree is tagged `archive/2026-09-19/old-path-final` (`f025cce`).
 | C2 | landed: the CLI keeps the phenotype commands and `version`; `run`, `run-all-of-us`, `evaluate-all-of-us`, `doctor` and `run.sh` are gone (with `test_io`, `test_cli_doctor`) |
 | C3 | landed: `aou_runner`, `aou_storage`, `evaluate`, `pipeline`, `benchmark`, `preflight`, `__main__` and `scripts/analyze_model.py`; `progress.py` is `log`/`elapsed`/`mem`; CI keeps only the full-suite shards (no subset job, no timeout or retention constants) |
 | C4 | landed: `model.py`, `runtime_policy.py`; `artifact.py` stays until the engine extends or replaces it; `test_prior_level_without_variance_refresh` went here (its helper was in `test_prediction_accuracy`) |
-| C5 | pending |
+| C5 | landed: `mixture_inference`, `linear_solvers`, `tr_newton`, `elbo`, `forcing_sequence`, `precision_policy`, `inference`, `gpu_scheduler`, and `numeric` (`stable_sigmoid` duplicated `scipy.special.expit`; the probit scale was superseded by the Gauss–Hermite predictive); `anderson.py` and `prior_design.py` stay for the engine |
 | C6 | pending |
 | C7 | pending |
 | C8 | pending |
