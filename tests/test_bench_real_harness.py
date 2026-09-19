@@ -1,0 +1,71 @@
+"""Leakage and bookkeeping checks of the bench-real harness on synthetic inputs (no MAGE or 1kGP data)."""
+
+import numpy as np
+import pandas as pd
+
+from benchmarks.bench_real import baselines, harness, splits
+
+EPSILON = np.finfo(np.float64).eps
+
+
+def synthetic_variants(is_sv, source):
+    count = len(is_sv)
+    return harness.Variants(position=np.arange(count), end=np.arange(count), distance_to_tss=np.arange(count), is_sv=np.asarray(is_sv),
+                            sv_type=np.array(["."] * count), sv_length=np.zeros(count), allele_length_change=np.zeros(count),
+                            train_allele_frequency=np.full(count, 0.5), source=np.asarray(source))
+
+
+def test_residualization_never_reads_test_phenotypes():
+    generator = np.random.default_rng(0)
+    phenotype, covariates = generator.normal(size=40), generator.normal(size=(40, 3))
+    train_index, test_index = np.arange(30), np.arange(30, 40)
+    train_first, test_first = harness.residualize(phenotype, covariates, train_index, test_index)
+    changed = phenotype.copy()
+    changed[test_index] += generator.normal(size=10) * 1e3
+    train_second, test_second = harness.residualize(changed, covariates, train_index, test_index)
+    assert np.array_equal(train_first, train_second)
+    # The training fit is identical, so the adjusted test values differ by the change up to one rounding per subtraction.
+    assert np.allclose(test_second - test_first, changed[test_index] - phenotype[test_index], rtol=0, atol=4 * EPSILON * np.abs(changed).max())
+
+
+def test_feature_sets_select_the_documented_columns():
+    variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
+    assert list(harness.feature_mask(variants, "snv")) == [True, False, False, False]
+    assert list(harness.feature_mask(variants, "snv_sv")) == [True, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_pgsv")) == [True, False, False, True]
+
+
+def test_sv_masking_removes_exactly_the_sv_part_of_a_linear_prediction():
+    generator = np.random.default_rng(1)
+    genotypes = generator.binomial(2, 0.3, size=(50, 6)).astype(np.float64)
+    test = generator.binomial(2, 0.3, size=(20, 6)).astype(np.float64)
+    is_sv = np.array([False, True, False, False, True, False])
+    train = harness.TrainData(gene_id="g", chrom="chr1", tss=0, genotypes=genotypes, phenotype=generator.normal(size=50),
+                              variants=synthetic_variants(is_sv, ["panel"] * 6), superpopulation=np.array(["EUR"] * 50), population=np.array(["CEU"] * 50))
+    coefficients = generator.normal(size=6)
+    predictor = baselines.LinearPredictor(0.3, coefficients)
+    sv_part = predictor.predict(test) - predictor.predict(harness._without_structural_variants(train, test))
+    expected = (test[:, is_sv] - genotypes[:, is_sv].mean(axis=0)) @ coefficients[is_sv]
+    assert np.allclose(sv_part, expected, rtol=0, atol=64 * EPSILON * np.abs(test).max() * np.abs(coefficients).sum())
+
+
+def test_random_folds_keep_families_together_and_balance_superpopulations():
+    family_size = 3
+    families = [f"family{index // family_size}" for index in range(60)]
+    samples = pd.DataFrame({"sample": [f"sample{index}" for index in range(60)], "FamilyID": families,
+                            "Superpopulation": ["AFR" if index < 30 else "EUR" for index in range(60)]})
+    folds = splits.random_folds(samples)
+    fold_of = {sample: position for position, fold in enumerate(folds) for sample in fold["test"]}
+    assert len(fold_of) == 60
+    assert samples.assign(fold=samples["sample"].map(fold_of)).groupby("FamilyID")["fold"].nunique().max() == 1
+    counts = samples.assign(fold=samples["sample"].map(fold_of)).groupby(["Superpopulation", "fold"]).size()
+    # Greedy placement of whole families keeps fold sizes within one family of each other.
+    assert counts.max() - counts.min() <= family_size
+
+
+def test_leave_one_superpopulation_out_partitions_the_samples():
+    samples = pd.DataFrame({"sample": [f"s{index}" for index in range(10)], "FamilyID": [f"f{index}" for index in range(10)],
+                            "Superpopulation": ["AFR", "AMR", "EAS", "EUR", "SAS"] * 2})
+    held_out = [fold["test"] for fold in splits.leave_one_superpopulation_out(samples)]
+    assert sorted(sum(held_out, [])) == sorted(samples["sample"])
+    assert all(len(set(samples.set_index("sample").loc[group, "Superpopulation"])) == 1 for group in held_out)

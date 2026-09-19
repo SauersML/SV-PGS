@@ -1,6 +1,7 @@
 """The bench-real harness: cis-expression prediction in MAGE with 1kGP SNV/indel and SV genotypes.
 
 A method is a callable ``fit(train: TrainData) -> predictor``; the predictor has ``predict(genotypes) -> np.ndarray``.
+The harness also records each prediction with the SV columns set to their training means, for SV credit.
 Methods never see test phenotypes: the harness builds TrainData (genotypes, phenotype, variant annotations) and
 passes only test genotypes to ``predict``. Test phenotypes are read only when scoring.
 
@@ -166,6 +167,13 @@ def _init_worker(dataset_dir, method_spec, feature_sets):
     _WORKER["feature_sets"] = feature_sets
 
 
+def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
+    """Test genotypes with every SV column set to its training mean, so a predictor's SV contribution drops out."""
+    masked = test_genotypes.copy()
+    masked[:, train.variants.is_sv] = train.genotypes[:, train.variants.is_sv].mean(axis=0)
+    return masked
+
+
 def _run_gene(arguments):
     gene_row, split_names = arguments
     dataset, fit = _WORKER["dataset"], _WORKER["fit"]
@@ -176,9 +184,11 @@ def _run_gene(arguments):
         for feature_set in _WORKER["feature_sets"]:
             train, test_genotypes = subset(train_all, test_all, feature_set)
             started = time.process_time()
-            prediction = np.asarray(fit(train).predict(test_genotypes), dtype=np.float64)
+            predictor = fit(train)
+            prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
             seconds = time.process_time() - started
-            results.append((gene_row, split_name, feature_set, test_index, prediction, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds))
+            without_sv = np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64) if train.variants.is_sv.any() else prediction
+            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds))
     return results
 
 
@@ -191,14 +201,16 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     gene_rows = dataset.gene_rows(chromosomes, gene_prefix)
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
+    predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
     log = []
     position_of_row = {row: position for position, row in enumerate(gene_rows)}
     with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets)) as pool:
         for results in pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1):
-            for gene_row, split_name, feature_set, test_index, prediction, test_phenotype, variant_count, sv_count, seconds in results:
+            for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds in results:
                 position = position_of_row[gene_row]
                 predictions[feature_set][position, test_index] = prediction
+                predictions_without_sv[feature_set][position, test_index] = without_sv
                 truth[position, test_index] = test_phenotype
                 log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
     out = pathlib.Path(out_dir) / method_name / design
@@ -206,6 +218,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     tag = "_".join(chromosomes)
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
+        np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
     np.save(out / f"{tag}.truth.npy", truth)
     dataset.genes.iloc[gene_rows].to_csv(out / f"{tag}.genes.tsv", sep="\t", index=False)
     pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds"]).to_csv(out / f"{tag}.log.tsv", sep="\t", index=False)
