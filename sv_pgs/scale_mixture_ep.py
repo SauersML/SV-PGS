@@ -17,7 +17,7 @@ with no point mass at zero.
   uniform lattice over the real line; integrals over t are trapezoid sums, so
   node k carries pi_ck = softmax(eta_c)_k.
 - The classes share one density shape: eta_c = eta_bar + delta_c. Roughness,
-  the integral of eta'''(t)^2 (``ROUGHNESS_ORDERS``), is penalized in its
+  the integral of eta'''(t)^2 (``ROUGHNESS_ORDER``), is penalized in its
   lattice form lambda h^-5 ||D3 eta||^2, so lambda does not depend on the
   spacing h: one learned weight on eta_bar and one per class on delta_c. The
   penalty's null space is the quadratics, so as a weight grows log g tends to
@@ -98,12 +98,11 @@ from sv_pgs._typing import F64Array, I64Array
 _EPSILON = float(np.finfo(np.float64).eps)
 # Half of double precision: the resolution of a quantity whose square is compared at eps.
 _HALF_PRECISION = _EPSILON**0.5
-# The mixing density's roughness penalty: the integral of its squared third derivative, with a learned weight.
-# Third order is derived: its null space, the quadratics (a normal density in log s), is the only lambda =
-# infinity limit that is proper on the real line, and that null space is profiled. The first-plus-second
-# order form (no null space in sum-to-zero coordinates) is the alternative the benchmark's held-out log
-# predictive density adjudicates (lead ruling); any tuple of orders is supported.
-ROUGHNESS_ORDERS = (3,)
+# The mixing density's roughness penalty: the integral of its squared derivative of this order, with a learned
+# weight. Third order is derived: its null space, the quadratics (a normal density in log s), is the only lambda =
+# infinity limit that is proper on the real line and does not move with the range (<= 1e-4 nats when the range
+# doubles or quadruples; the first- and second-order limits move by 4-100 nats: math-density, lead ruling).
+ROUGHNESS_ORDER = 3
 
 
 @dataclass(frozen=True)
@@ -354,8 +353,8 @@ def scale_mixture_prior(
         raise ValueError("the lattice must be at least five evenly spaced increasing nodes")
     grid_size = lattice.shape[0]
     basis = _sum_to_zero_basis(grid_size)
-    factors = {order: roughness_factor(grid_size, float(spacing[0]), order) @ basis for order in ROUGHNESS_ORDERS}
-    null_functionals = _legendre_functionals(lattice, floor, top, min(ROUGHNESS_ORDERS) - 1) @ basis
+    roughness = roughness_factor(grid_size, float(spacing[0]), ROUGHNESS_ORDER) @ basis
+    null_functionals = _legendre_functionals(lattice, floor, top, ROUGHNESS_ORDER - 1) @ basis
     pooled_size = grid_size - 1
     deviation_count = class_count if class_count > 1 else 0
     deviation_size = deviation_count * pooled_size
@@ -369,15 +368,15 @@ def scale_mixture_prior(
             coefficient_map[rows, start : start + pooled_size] = basis
     coefficient_map[class_count * grid_size :, pooled_size + deviation_size :] = np.eye(design.shape[1])
     pooled = np.arange(pooled_size)
-    blocks = [SmoothingBlock(f"pooled roughness order {order}", pooled, factor) for order, factor in factors.items()]
+    blocks = [SmoothingBlock("pooled roughness", pooled, roughness)]
     for class_position in range(deviation_count):
         deviation = pooled_size + class_position * pooled_size + np.arange(pooled_size)
-        blocks.extend(SmoothingBlock(f"class {class_position} deviation roughness order {order}", deviation, factor) for order, factor in factors.items())
-    if deviation_count and null_functionals.shape[0]:
-        # A deviation's polynomial part below the penalty orders (its location and width, for order 3) has a
-        # Gaussian pooling prior with mean zero and one learned precision: eta_bar carries the common part.
+        blocks.append(SmoothingBlock(f"class {class_position} deviation roughness", deviation, roughness))
+    if deviation_count:
+        # A deviation's location and width (its part the penalty cannot see) have a Gaussian pooling prior with
+        # mean zero and one learned precision: eta_bar carries the common location and width.
         blocks.append(SmoothingBlock(
-            "deviation polynomial part", np.arange(pooled_size, pooled_size + deviation_size), np.kron(np.eye(deviation_count), null_functionals)
+            "deviation location and width", np.arange(pooled_size, pooled_size + deviation_size), np.kron(np.eye(deviation_count), null_functionals)
         ))
     annotation_start = pooled_size + deviation_size
     for position, group in enumerate(annotation_groups):
@@ -440,25 +439,38 @@ def log_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Array:
     return prior.log_variance_offset + prior.scale_design @ scale_coefficients
 
 
-def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
-    """The same model on the lattice with half the spacing; each class's eta at the new midpoints from the cubic through the old nodes."""
-    nodes = prior.log_variance_grid
-    finer = np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)
+def relattice(
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, nodes: F64Array, floor: float, top: float
+) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
+    """The same model on new nodes and a new kernel range: each class's eta from the cubic through the old
+    nodes inside the old lattice, and along its end slopes outside it, so the log-tails stay linear (which the
+    third-order penalty leaves free) rather than following a cubic's extrapolation."""
+    old_nodes = prior.log_variance_grid
     log_density, scale_coefficients = _density_and_scale(prior, hyperparameters.coefficients)
-    finer_density = CubicSpline(nodes, log_density.T)(finer).T
-    refined = scale_mixture_prior(
+    spline = CubicSpline(old_nodes, log_density.T)
+    new_nodes = np.asarray(nodes, dtype=np.float64)
+    inside = np.clip(new_nodes, old_nodes[0], old_nodes[-1])
+    slopes = np.where(new_nodes < old_nodes[0], spline(old_nodes[0], 1)[:, None], spline(old_nodes[-1], 1)[:, None])
+    new_density = spline(inside).T + slopes * (new_nodes - inside)[None, :]
+    moved = scale_mixture_prior(
         class_index=prior.class_index,
         log_variance_offset=prior.log_variance_offset,
         annotation_design=prior.scale_design,
         annotation_groups=prior.annotation_groups,
-        nodes=finer,
-        floor=prior.kernel_floor,
-        top=prior.kernel_top,
+        nodes=new_nodes,
+        floor=floor,
+        top=top,
     )
-    normalized = finer_density - finer_density.mean(axis=1, keepdims=True)
+    normalized = new_density - new_density.mean(axis=1, keepdims=True)
     target = np.concatenate([normalized.ravel(), scale_coefficients])
-    coefficients = np.linalg.lstsq(refined.coefficient_map, target, rcond=None)[0]
-    return refined, MixtureHyperparameters(coefficients=coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
+    coefficients = np.linalg.lstsq(moved.coefficient_map, target, rcond=None)[0]
+    return moved, MixtureHyperparameters(coefficients=coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
+
+
+def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
+    """The same model on the lattice with half the spacing over the same extent and kernel range."""
+    nodes = prior.log_variance_grid
+    return relattice(prior, hyperparameters, np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1), prior.kernel_floor, prior.kernel_top)
 
 
 def prior_second_moment(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> F64Array:

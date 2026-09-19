@@ -26,6 +26,7 @@ from sv_pgs.scale_mixture_ep import (
     class_log_density,
     derived_lattice,
     halved_lattice,
+    relattice,
     hyper_step,
     initial_hyperparameters,
     kernel_floor,
@@ -276,8 +277,8 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
     np.testing.assert_allclose(prior.null_basis[deviations], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
     assert names == [
-        "pooled roughness order 3", "class 0 deviation roughness order 3", "class 1 deviation roughness order 3",
-        "deviation polynomial part", "annotation group 0", "annotation group 1",
+        "pooled roughness", "class 0 deviation roughness", "class 1 deviation roughness",
+        "deviation location and width", "annotation group 0", "annotation group 1",
     ]
 
 
@@ -443,3 +444,28 @@ def test_the_derived_lattice_is_uniform_and_covers_the_kernel_range():
     assert top == kernel_top(cavity.precision, cavity.shift, offset, floor)
     np.testing.assert_allclose(np.diff(nodes), spacing_bound(60.0, 1e-3), rtol=1e-12)
     assert nodes[0] <= floor - (top - floor) + 1e-12 and nodes[-1] >= top + (top - floor) - 1e-12
+
+
+def test_relattice_extends_the_log_tails_linearly_and_keeps_the_density_inside():
+    class_index, offset, design, groups, _cavity = _data(30, 29)
+    nodes = np.arange(-8.0, 3.0, 0.05)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=offset, annotation_design=design, annotation_groups=groups,
+        nodes=nodes, floor=nodes[0], top=nodes[-1],
+    )
+    bump = -np.square((nodes + 2.5) / 0.8) + 0.3 * np.sin(2.0 * nodes)
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (bump - bump.mean())
+    hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+    wider = np.arange(-12.0, 6.0, 0.05)
+    moved, transferred = relattice(prior, hyperparameters, wider, -9.0, 4.0)
+    old_log_density = class_log_density(prior, hyperparameters.coefficients)
+    new_log_density = class_log_density(moved, transferred.coefficients)
+    inside = (wider >= nodes[0] - 1e-9) & (wider <= nodes[-1] + 1e-9)
+    # Inside the old lattice the density per unit t is unchanged, up to the constant normalization shifts.
+    difference = new_log_density[:, inside] - old_log_density[:, np.searchsorted(nodes, wider[inside] - 1e-9)]
+    np.testing.assert_allclose(difference - difference[:, :1], 0.0, atol=1e-6)
+    # Outside it the log density continues along the end slopes: its second differences vanish there.
+    outside = np.flatnonzero(wider > nodes[-1] + 0.2)
+    np.testing.assert_allclose(np.diff(new_log_density[:, outside], n=2, axis=1), 0.0, atol=1e-8)
+    assert moved.kernel_floor == -9.0 and moved.kernel_top == 4.0
