@@ -37,7 +37,7 @@
 5. **In-workspace pieces:**
    - the fusion's E[B | SL] no-call fill (it needs the GATK-SV SL field, checked in the VCF header inside the workspace);
    - service-half gates S1–S3 when that half arrives.
-   - the phenotype rules that are not standards (PHENOTYPES.md): the disease evidence rules, the measurement windows and plausible ranges, the treatment corrections, the analysis scale and the covariate forms. Each needs its learned model, validated on synthetic OMOP first, before the case definitions are frozen (EVALUATION.md).
+   - the phenotype rules that are not standards (PHENOTYPES.md): the disease evidence rules, the measurement windows, the lab criteria's plausible ranges, the treatment corrections and the covariate forms. Each needs its learned model, validated on synthetic OMOP first, before the case definitions are frozen (EVALUATION.md). The quantitative traits' measurement model (learned noise density and Box–Cox scale) is built and validated on synthetic OMOP.
 6. **Measurements to rerun when compute is back:**
    - every `[sim-only]` result a ruling rests on (MODEL.md, DECISIONS.md, EVALUATION.md), re-measured on the neutral benchmarks bench-real and bench-sim. Until then those rulings are provisional;
    - the evaluation validity set (QT, Q0, Q3, QC1, QS_pop, B0) and the red-team sweep;
@@ -47,6 +47,7 @@
    - TR mutation-rate features;
    - the family-history liability targets for the diseases.
 7. **Pilot:**
+   - P0, before the case definitions are frozen: the in-workspace checks of the quantitative-trait measurement model, V-B (corr² of each current target with the model's) and V-D (held-out PGS R² paired over folds, and z-scores at known loci), novel-pheno.md §8. Aggregate-only, every cell n ≥ 21, run only with the user's authorization.
    - P1: the store converter on one chromosome of the real imputed data inside the imputation workspace, with counts-only QC.
    - P2: chr22 with two quantitative traits, SNV vs SNV+SV, on one spot VM.
    - Both run through the in-perimeter launcher (COMPUTE.md). Validate on synthetic data first.

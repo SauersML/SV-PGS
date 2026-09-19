@@ -23,8 +23,8 @@ and its spacing is halved until its quadrature in t meets the evidence tolerance
 Inference is exact in T_i, which is one-dimensional (the lead's ruling): EM over the complete data
 (T_i, each occasion's lattice component).
 - E-step: p(T_i | z_i) by the trapezoid rule in T. Each person's step is certified by the Trefethen-Weideman
-  bound with the mass-weighted modulus on the strip where the integrand is analytic, and the ends by a tail
-  bound (``level_posterior``; math-density, mixing_density.md §11). Duplicated readings, whose integrand spikes,
+  bound with the mass-weighted modulus on a strip where the integrand is analytic (its width searched per
+  person), and the ends by a tail bound (``level_posterior``; math-density, mixing_density.md §11). Duplicated readings, whose integrand spikes,
   need no separate treatment: their modulus bound is large, so their step is small. At every node come each
   occasion's component responsibilities.
 - M-step: gamma by weighted least squares (weights E[1/s]), tau^2 = mean E[T_i^2], and the density's
@@ -66,11 +66,10 @@ _EPSILON = float(np.finfo(np.float64).eps)
 _HALF_PRECISION = _EPSILON**0.5
 _LOG_TWO_PI = float(np.log(2.0 * np.pi))
 _GOLDEN = 0.5 * (3.0 - np.sqrt(5.0))
-# The E-step's float64 arrays per (person, node, occasion, component) entry live at once: the log components, and
-# either the log kernels with the widened sum's argument and logsumexp's two temporaries, or the responsibilities,
-# their weighted product and one temporary.
+# The E-step's float64 arrays per (person, node, occasion, component) entry live at once: the log components, the
+# responsibilities, their weighted product and one temporary (logsumexp's, or an einsum's).
 _FLOAT64_BYTES = 8
-_ENTRY_BYTES = 5 * _FLOAT64_BYTES
+_ENTRY_BYTES = 4 * _FLOAT64_BYTES
 
 
 def box_cox(values: F64Array, exponent: float) -> tuple[F64Array, F64Array]:
@@ -180,7 +179,6 @@ class LevelPosterior:
     occasion_shift: F64Array
     missing_information: F64Array
     admissible_step: F64Array
-    half_width: F64Array
 
 
 def _log_components(residuals: F64Array, levels: F64Array, log_masses: F64Array, variances: F64Array) -> F64Array:
@@ -228,6 +226,48 @@ def _log_tail(residuals: F64Array, edge: F64Array, level_variance: float, log_ma
     return occasions[:, None] + _log_prior_tail_moments(np.abs(edge), level_variance)
 
 
+def _log_modulus_bound(
+    residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, half_width: F64Array
+) -> F64Array:
+    """log of a closed-form bound on the strip modulus M_m(b), m = 0, 1, 2, at each person's b (persons x 3).
+
+    On |Im T| = y < b, |N(e + i y; 0, s)| = N(e; 0, s) e^(y^2 / (2 s)) and |T^m| <= (|x| + b)^m, so with
+    w_k = pi_k e^(b^2 / (2 s_k)), A = sum_k w_k, W_j(x) = sum_k w_k N(r_j - x; 0, s_k) and
+    q(x) = (|x| + b)^m N(x; 0, tau^2) e^(b^2 / (2 tau^2)), M_m(b) <= integral q prod_j W_j (the mass-weighted
+    modulus, mixing_density.md section 11). Hoelder's inequality over the J occasions bounds that by
+    prod_j (integral q W_j^J)^(1 / J), and the power-mean inequality inside each mixture by
+    W_j^J <= A^(J - 1) sum_k w_k N(r_j - x; 0, s_k)^J. Each term is closed-form:
+    N(e; 0, s)^J = (2 pi s)^(-(J - 1) / 2) J^(-1/2) N(e; 0, s / J), and
+    N(x; 0, tau^2) N(r - x; 0, s / J) = N(r; 0, tau^2 + s / J) N(x; mu, v), under which E(|X| + b)^m is a
+    folded-normal moment. The bound is exact at J = 1, tight when the occasions agree (duplicated readings), and
+    needs no quadrature, so it cannot miss a narrow component the nodes step over.
+    """
+    occasion_count = residuals.shape[1]
+    widening = 0.5 * np.square(half_width)
+    log_weights = log_masses[None, :] + widening[:, None] / variances[None, :]
+    log_total = logsumexp(log_weights, axis=1)
+    narrowed = variances / occasion_count
+    marginal = level_variance + narrowed
+    log_marginal = -0.5 * (_LOG_TWO_PI + np.log(marginal) + np.square(residuals[:, :, None]) / marginal)
+    mean = residuals[:, :, None] * (level_variance / marginal)
+    variance = level_variance * narrowed / marginal
+    scale = np.sqrt(variance)
+    folded = scale * np.sqrt(2.0 / np.pi) * np.exp(-0.5 * np.square(mean) / variance) + mean * -np.expm1(np.log(2.0) + log_ndtr(-mean / scale))
+    offset = half_width[:, None, None]
+    log_moments = np.log(np.stack(
+        [np.ones_like(mean), folded + offset, np.square(mean) + variance + 2.0 * offset * folded + np.square(offset)], axis=3
+    ))
+    log_power_terms = (
+        log_weights[:, None, :, None]
+        - 0.5 * (occasion_count - 1) * (_LOG_TWO_PI + np.log(variances))[None, None, :, None]
+        - 0.5 * np.log(occasion_count)
+        + log_marginal[..., None]
+        + log_moments
+    )
+    log_powers = (occasion_count - 1) * log_total[:, None, None] + logsumexp(log_power_terms, axis=2)
+    return (widening / level_variance)[:, None] + log_powers.sum(axis=1) / occasion_count
+
+
 class PieceTooLarge(MemoryError):
     """An E-step piece whose persons x nodes x J x K working arrays exceed the memory budget."""
 
@@ -243,9 +283,9 @@ def _log_moment_sums(log_integrand: F64Array, levels: F64Array, steps: F64Array,
 def _level_grid(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, steps: F64Array, relative_tolerance: float,
     working_bytes: int,
-) -> tuple[F64Array, np.ndarray, F64Array]:
-    """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask) and the log integrals of
-    |T|^m F, m = 0, 1, 2 (persons x 3).
+) -> tuple[F64Array, np.ndarray, F64Array, F64Array]:
+    """Trapezoid nodes on each person's grid n h_p (persons x nodes, a validity mask), the log components at
+    them (``_log_components``) and the log integrals of |T|^m F, m = 0, 1, 2 (persons x 3).
 
     Each side starts sqrt(2) tau past 0, the mode of T^2 N(T; 0, tau^2), so that every |T|^m N(T; 0, tau^2)
     decreases past either edge and the trapezoid terms beyond it sum to at most its tail integral; it doubles
@@ -261,7 +301,8 @@ def _level_grid(
         levels = (lower[:, None] + np.minimum(offsets, counts[:, None] - 1)) * steps[:, None]
         if levels.size * residuals.shape[1] * variances.shape[0] * _ENTRY_BYTES > working_bytes:
             raise PieceTooLarge(f"{levels.shape[0]} persons need {levels.shape[1]} level nodes each")
-        per_occasion = logsumexp(_log_components(residuals, levels, log_masses, variances), axis=3)
+        log_components = _log_components(residuals, levels, log_masses, variances)
+        per_occasion = logsumexp(log_components, axis=3)
         log_integrand = np.where(valid, _log_prior(levels, level_variance) + per_occasion.sum(axis=2), -np.inf)
         log_totals = _log_moment_sums(log_integrand, levels, steps, 0.0)
         if not np.all(np.isfinite(log_totals[:, 0])):
@@ -270,29 +311,28 @@ def _level_grid(
         grow_lower = np.any(_log_tail(residuals, lower * steps, level_variance, log_masses, variances, upper=False) > bound, axis=1)
         grow_upper = np.any(_log_tail(residuals, upper * steps, level_variance, log_masses, variances, upper=True) > bound, axis=1)
         if not (np.any(grow_lower) or np.any(grow_upper)):
-            return levels, valid, log_totals
+            return levels, valid, log_components, log_totals
         lower = np.where(grow_lower, 2.0 * lower, lower)
         upper = np.where(grow_upper, 2.0 * upper, upper)
 
 
 def level_posterior(
     residuals: F64Array, level_variance: float, log_masses: F64Array, variances: F64Array, relative_tolerance: float,
-    steps: F64Array | None, half_widths: F64Array | None, louis: bool, working_bytes: int,
+    steps: F64Array | None, louis: bool, working_bytes: int,
 ) -> LevelPosterior:
     """The exact E-step for persons with J occasions each (``residuals`` is persons x J).
 
-    L_i and the absolute moment integrals of |T| F and T^2 F each have relative error at most
-    ``relative_tolerance``: half from the trapezoid rule, a quarter from each truncated tail. The trapezoid's
-    bound uses the mass-weighted modulus (math-density, mixing_density.md section 11): on the strip |Im T| < b,
-    |N(e + i y; 0, s)| = N(e; 0, s) e^(y^2 / (2 s)) exactly and |T^m| <= (|x| + b)^m, so
-    M_m(b) <= integral (|x| + b)^m N(x; 0, tau^2) e^(b^2 / (2 tau^2)) prod_j sum_k pi_k N(r_j - x; 0, s_k)
-    e^(b^2 / (2 s_k)) dx, one lattice sum on the same nodes. A person's step h is certified when
-    h <= max_b min_m 2 pi b / ln(1 + 2 M_m(b) / (eps I_m)).
+    L_i and the absolute moment integrals I_m of |T| F and T^2 F each have relative error at most
+    ``relative_tolerance``: half from the trapezoid rule, a quarter from each truncated tail. The trapezoid
+    rule's error is at most 2 M_m(b) / (e^(2 pi b / h) - 1) for any strip |Im T| < b (Trefethen and Weideman
+    2014, Theorem 5.1), with M_m(b) bounded in closed form (``_log_modulus_bound``), so a person's step h is
+    certified when h <= max_b min_m 2 pi b / ln(1 + 2 M_m(b) / (eps I_m)), I_m at least its lattice sum over
+    1 + relative_tolerance.
 
     Every b is valid, so b only sets the cost. It is searched on a ladder of halvings between the strips that are
-    optimal for Gaussian occasions of the largest and of the smallest variance (``strip_half_width``), or on
-    {b / 2, b, 2 b} around a person's last best ``half_widths``. ``steps`` (None or NaN: ``gaussian_step`` at the
-    density's harmonic-mean variance) shrink to the certified step until every person's is.
+    optimal for Gaussian occasions of the largest and of the smallest variance (``strip_half_width``). ``steps``
+    (None or NaN: ``gaussian_step`` at the density's harmonic-mean variance) shrink to the certified step until
+    every person's is.
     """
     persons, occasion_count = residuals.shape
     trapezoid_share = 0.5 * relative_tolerance
@@ -301,28 +341,17 @@ def level_posterior(
     harmonic = 1.0 / float(np.exp(logsumexp(log_masses - np.log(variances))))
     start = gaussian_step(level_variance, occasion_count, harmonic, trapezoid_share)
     steps = np.full(persons, start) if steps is None else np.where(np.isnan(steps), start, steps)
-    if half_widths is None or np.any(np.isnan(half_widths)):
-        rungs = int(np.ceil(np.log2(widest / narrowest))) + 1
-        ladder = np.broadcast_to(np.maximum(widest * np.exp2(-np.arange(rungs)), narrowest), (persons, rungs))
-    else:
-        ladder = np.clip(half_widths[:, None] * np.exp2(np.arange(-1.0, 2.0)), narrowest, widest)
+    ladder = np.maximum(widest * np.exp2(-np.arange(int(np.ceil(np.log2(widest / narrowest))) + 1)), narrowest)
+    log_moduli = [_log_modulus_bound(residuals, level_variance, log_masses, variances, np.full(persons, width)) for width in ladder]
     while True:
-        levels, valid, log_totals = _level_grid(residuals, level_variance, log_masses, variances, steps, relative_tolerance, working_bytes)
-        log_components = _log_components(residuals, levels, log_masses, variances)
-        log_kernels = log_components - log_masses
-        log_prior = _log_prior(levels, level_variance)
-        admissible, half_width = np.zeros(persons), np.full(persons, narrowest)
-        for rung in ladder.T:
-            widening = 0.5 * np.square(rung)
-            widened = logsumexp(log_kernels + (log_masses[None, :] + widening[:, None] / variances[None, :])[:, None, None, :], axis=3)
-            log_widened = np.where(valid, log_prior + (widening / level_variance)[:, None] + widened.sum(axis=2), -np.inf)
-            log_modulus = _log_moment_sums(log_widened, levels, steps, rung)
-            certified = np.min(
-                2.0 * np.pi * rung[:, None] / np.logaddexp(0.0, np.log(2.0) + log_modulus - log_totals - np.log(trapezoid_share)), axis=1
-            )
-            better = certified > admissible
-            admissible, half_width = np.where(better, certified, admissible), np.where(better, rung, half_width)
-        del log_kernels
+        levels, valid, log_components, log_totals = _level_grid(
+            residuals, level_variance, log_masses, variances, steps, relative_tolerance, working_bytes
+        )
+        log_lower = log_totals - np.log1p(relative_tolerance)
+        admissible = np.max([
+            np.min(2.0 * np.pi * width / np.logaddexp(0.0, np.log(2.0) + log_modulus - log_lower - np.log(trapezoid_share)), axis=1)
+            for width, log_modulus in zip(ladder, log_moduli)
+        ], axis=0)
         uncertified = steps > admissible
         if not np.any(uncertified):
             break
@@ -356,7 +385,6 @@ def level_posterior(
         occasion_shift=np.einsum("pnjk,k,pn->pj", weighted, inverse_variances, levels),
         missing_information=missing,
         admissible_step=admissible,
-        half_width=half_width,
     )
 
 
@@ -495,9 +523,8 @@ class _Model:
         sorted_persons = occasions.person_index[order]
         self.groups = [order[counts[sorted_persons] == count].reshape(-1, count) for count in np.unique(counts)]
         self.relative_tolerance = person_tolerance(occasions.person_count)
-        # Each person's last certified trapezoid step and best strip, the start of their next E-step (NaN: none yet).
+        # Each person's last admissible trapezoid step, the start of their next E-step (NaN: none yet).
         self.steps = np.full(occasions.person_count, np.nan)
-        self.half_widths = np.full(occasions.person_count, np.nan)
 
     def start(self) -> _State:
         """Least-squares fixed effects, the moment level variance, and the engine's start density on the lattice
@@ -542,7 +569,7 @@ class _Model:
             try:
                 posterior = level_posterior(
                     residuals[piece], state.level_variance, log_masses, variances, self.relative_tolerance,
-                    self.steps[persons], self.half_widths[persons], louis, self.working_bytes,
+                    self.steps[persons], louis, self.working_bytes,
                 )
             except PieceTooLarge:
                 if piece.shape[0] == 1:
@@ -557,7 +584,6 @@ class _Model:
             counts += posterior.counts
             missing += posterior.missing_information
             self.steps[persons] = posterior.admissible_step
-            self.half_widths[persons] = posterior.half_width
         return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing)
 
     def maximization(self, state: _State, expectation: _Expectation, log_smoothing: F64Array) -> _State:

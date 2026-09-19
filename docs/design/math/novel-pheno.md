@@ -248,7 +248,7 @@ This is aggregate-only, with every reported cell n ≥ 21, and runs only with th
 **The real-data check, NHANES 2017–March 2020 (P_BPXO + P_DEMO; SHA256SUMS with the data).**
 - *What it is:* three oscillometric readings 60 s apart; train on odd SEQN, test on even SEQN.
 - *The metric:* the held-out mean log predictive density of each reading given the other two, on the original scale, as paired differences against the current rules (A0: linear, Gaussian, plausible range, age ≥ 18). The mean model is identical across arms.
-- **This is [real] for the measurement component only: within-exam noise, not EHR occasions, and not genetics.**
+- **This is [real, NHANES replicates] for the measurement component only: within-exam noise, not EHR occasions, and not genetics.**
 
 | Arm | SBP (n_test = 4,003) | Pulse (n_test = 3,649) |
 |---|---|---|
