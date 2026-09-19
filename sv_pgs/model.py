@@ -3785,15 +3785,11 @@ def _tie_group_export_weights(
     tie_map: TieMap,
     fit_result: VariationalFitResult,
 ) -> list[F32Array]:
-    if not tie_map.reduced_to_group:
-        return []
     member_prior_variances = np.asarray(fit_result.member_prior_variances, dtype=np.float32)
-    group_weights: list[F32Array] = []
-    for tie_group in tie_map.reduced_to_group:
-        member_variances = np.asarray(member_prior_variances[tie_group.member_indices], dtype=np.float32)
-        normalized_weights = member_variances / np.maximum(np.sum(member_variances), 1e-12)
-        group_weights.append(normalized_weights.astype(np.float32))
-    return group_weights
+    return [
+        np.asarray(group_weights, dtype=np.float32)
+        for group_weights in tie_map.prior_variance_group_weights(member_prior_variances)
+    ]
 
 
 def _representative_beta_variance(
