@@ -250,15 +250,16 @@ def maximize_hyperparameters(
         options={"maxiter": 10_000, "ftol": 1e-16, "gtol": 1e-12},
     )
     vector = np.asarray(result.x, dtype=np.float64)
-    # Polish with Newton steps on the free coordinates.
-    for _newton_step in range(30):
+    # Polish with Newton steps on the free coordinates (the finite-difference
+    # Hessian is accurate to ~1e-10, so steps stop shrinking around there).
+    for _newton_step in range(12):
         free = _free_coordinates(prior, vector)
         _value, gradient = hyperparameter_objective(prior, vector, cavity_precision, cavity_shift)
         negative_hessian = -_numerical_hessian(prior, vector, cavity_precision, cavity_shift)[np.ix_(free, free)]
         step = np.linalg.solve(negative_hessian, gradient[free])
         vector[free] += step
         vector[1 + feature_count :] = np.clip(vector[1 + feature_count :], np.log(MINIMUM_SHAPE_B), np.log(MAXIMUM_SHAPE_B))
-        if float(np.max(np.abs(step))) < 1e-13:
+        if float(np.max(np.abs(step))) < 1e-12:
             break
     return vector
 
@@ -348,10 +349,15 @@ def fit_reference(
     likelihood_precision: np.ndarray,
     linear_term: np.ndarray,
     damping: float = 0.3,
-    tolerance: float = 1e-12,
-    maximum_outer_iterations: int = 400,
+    site_tolerance: float = 1e-12,
+    hyperparameter_tolerance: float = 1e-10,
+    maximum_outer_iterations: int = 200,
 ) -> ReferenceFit:
-    """The EP-EB fixed point: EP to convergence at fixed hyperparameters, then the exact type-II step, repeated."""
+    """The EP-EB fixed point: EP to convergence at fixed hyperparameters, then the exact type-II step, repeated.
+
+    The hyperparameter tolerance sits above the Newton polish's noise floor
+    (~1e-10 from the finite-difference Hessian); gates compare at 1e-6.
+    """
     variant_count = linear_term.shape[0]
     vector = start.vector()
     site_precision = 1.0 / np.exp(log_prior_variance(prior, start))
@@ -365,11 +371,11 @@ def fit_reference(
     for outer_iteration in range(1, maximum_outer_iterations + 1):
         hyperparameters = _unpack(prior, vector)
         site_precision, site_shift, posterior_mean, posterior_variance, cavity_precision, cavity_shift = run_sites(
-            prior, hyperparameters, likelihood_precision, linear_term, site_precision, site_shift, damping, tolerance, 20_000
+            prior, hyperparameters, likelihood_precision, linear_term, site_precision, site_shift, damping, site_tolerance, 20_000
         )
         mapped = maximize_hyperparameters(prior, vector, cavity_precision, cavity_shift)
         residual = mapped - vector
-        if float(np.max(np.abs(residual))) < tolerance:
+        if float(np.max(np.abs(residual))) < hyperparameter_tolerance:
             vector = mapped
             break
         history_points.append(vector.copy())
@@ -393,7 +399,7 @@ def fit_reference(
         vector = proposal
     hyperparameters = _unpack(prior, vector)
     site_precision, site_shift, posterior_mean, posterior_variance, cavity_precision, cavity_shift = run_sites(
-        prior, hyperparameters, likelihood_precision, linear_term, site_precision, site_shift, damping, tolerance, 20_000
+        prior, hyperparameters, likelihood_precision, linear_term, site_precision, site_shift, damping, site_tolerance, 20_000
     )
     return ReferenceFit(
         posterior_mean=posterior_mean,
@@ -406,3 +412,8 @@ def fit_reference(
         newton_decrement=newton_decrement(prior, vector, cavity_precision, cavity_shift),
         outer_iterations=outer_iteration,
     )
+
+
+def assert_converged(fit: ReferenceFit, maximum_outer_iterations: int = 200) -> None:
+    if fit.outer_iterations >= maximum_outer_iterations:
+        raise AssertionError(f"The reference did not converge in {maximum_outer_iterations} outer iterations.")

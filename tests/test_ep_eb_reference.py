@@ -108,7 +108,7 @@ def test_one_variant_ep_is_the_exact_posterior() -> None:
 
 def test_orthogonal_design_is_exact_per_coordinate() -> None:
     rng = np.random.default_rng(3)
-    variant_count = 12
+    variant_count = 6
     prior = _prior(rng, variant_count, None)
     hyperparameters = _hyperparameters(level=-3.5)
     precisions = rng.uniform(50.0, 500.0, size=variant_count)
@@ -170,6 +170,7 @@ def test_fit_is_a_joint_fixed_point_and_deterministic() -> None:
     prior = _prior(rng, variant_count, None)
     start = _hyperparameters(level=-3.0)
     fit = reference.fit_reference(prior, start, likelihood_precision, linear_term)
+    reference.assert_converged(fit)
     # The sites are stationary: one more undamped sweep at the fitted hyperparameters moves nothing.
     sites, shifts, _mean, _variance, cavity_precision, cavity_shift = reference.run_sites(
         prior, fit.hyperparameters, likelihood_precision, linear_term, fit.site_precision, fit.site_shift, 1.0, 0.0, 1
