@@ -191,7 +191,9 @@ def test_bench_real_predictions_match_the_store_scorer_and_mask_svs_exactly(tmp_
     masked_signed = masked.T[order].astype(np.float64) * CODES_PER_DOSAGE - SIGNED_CODE_OFFSET
     _masked_scores, masked_rounding = _scores(scoring, masked_signed[scoring.store_rows])
     sv_rows = train.variants.is_sv[order][scoring.store_rows]
-    change = CODES_PER_DOSAGE * (test[:, predictor.columns] - masked[:, predictor.columns]) / scoring.signed_scales
+    # The harness's arrays are float32; the difference is taken in float64, as predict widens them before any arithmetic.
+    widened = test[:, predictor.columns].astype(np.float64) - masked[:, predictor.columns].astype(np.float64)
+    change = CODES_PER_DOSAGE * widened / scoring.signed_scales
     sv_part = change[:, sv_rows] @ scoring.coefficients[sv_rows]
     sv_rounding = float(np.max(_EPSILON * (np.abs(change) @ np.abs(scoring.coefficients)) * _COLUMNS))
     # Each prediction is within its rounding bound of X beta, and the SV part within its own.
