@@ -468,6 +468,8 @@ class ProjectedLdBlock:
 
 
 _LD_INDEX = "ld_blocks.json"
+_PENDING_BLOCK_WRITES = 4
+"""Blocks the writer thread may hold while the disk catches up (bounds the host memory in flight)."""
 _LD_ARRAYS = {
     "gram": ("ld_grams.f32", np.float32),
     "score": ("ld_projected_scores.f64", np.float64),
@@ -501,6 +503,10 @@ class LdGramStore:
     @property
     def block_count(self) -> int:
         return len(self._blocks)
+
+    @property
+    def stored_bytes(self) -> int:
+        return sum(array.nbytes for array in self._arrays.values())
 
     def block(self, block_index: int) -> ProjectedLdBlock:
         entry = self._blocks[block_index]
@@ -547,7 +553,8 @@ class LdGramStore:
 
 
 class _LdGramWriter:
-    """Appends projected blocks as they arrive from any device; the index is written in store order."""
+    """Appends projected blocks as they arrive from any device, on its own thread so the disk
+    overlaps the devices; the index is written in store order."""
 
     def __init__(self, directory: Path, sample_count: int, target_count: int, covariate_count: int) -> None:
         self.directory = Path(directory)
@@ -557,20 +564,40 @@ class _LdGramWriter:
         self._offsets = {name: 0 for name in _LD_ARRAYS}
         self._target_count = target_count
         self._covariate_count = covariate_count
-        self._lock = threading.Lock()
+        self._pending: queue.Queue = queue.Queue(maxsize=_PENDING_BLOCK_WRITES)
+        self._failures: list[BaseException] = []
+        self._thread = threading.Thread(target=self._write_all, name="stage0-ld-writer", daemon=True)
+        self._thread.start()
         self.entries: dict[tuple[str, int], dict[str, Any]] = {}
 
     def append(self, chromosome: str, start: int, arrays: dict[str, NDArray]) -> None:
-        with self._lock:
-            entry: dict[str, Any] = {"chromosome": chromosome}
-            for name, values in arrays.items():
-                entry[f"{name}_offset"] = self._offsets[name]
-                self._files[name].write(memoryview(np.ascontiguousarray(values, dtype=_LD_ARRAYS[name][1])).cast("B"))
-                self._offsets[name] += int(values.size)
-            self.entries[(chromosome, start)] = entry
+        """Queue one block (the arrays must stay unchanged until written)."""
+        if self._failures:
+            raise self._failures[0]
+        self._pending.put((chromosome, start, arrays))
+
+    def _write_all(self) -> None:
+        while True:
+            item = self._pending.get()
+            if item is None:
+                return
+            chromosome, start, arrays = item
+            try:
+                entry: dict[str, Any] = {"chromosome": chromosome}
+                for name, values in arrays.items():
+                    entry[f"{name}_offset"] = self._offsets[name]
+                    self._files[name].write(memoryview(np.ascontiguousarray(values, dtype=_LD_ARRAYS[name][1])).cast("B"))
+                    self._offsets[name] += int(values.size)
+                self.entries[(chromosome, start)] = entry
+            except BaseException as error:
+                self._failures.append(error)
 
     def finish(self, ordered_blocks: list[tuple[str, int, int, int]]) -> LdGramStore:
         """Write the index for ``(chromosome, start, reduced_start, reduced_stop)`` in store order."""
+        self._pending.put(None)
+        self._thread.join()
+        if self._failures:
+            raise self._failures[0]
         for handle in self._files.values():
             handle.close()
         blocks = []
@@ -843,6 +870,7 @@ def compute_genotype_statistics(
     summaries_lock = threading.Lock()
 
     buffers = build_genotype_buffers(budget, layout, plan, store_columns)
+    log(f"stage0: {len(buffers)} {budget.device_kind} buffer(s), block cap {block_cap}, {layout.width:,} laid-out samples")
 
     def sink(block: BlockStatistics, buffer: GenotypeBuffer) -> None:
         block_summary, arrays = _project_block(block, projection, buffer)
@@ -855,6 +883,17 @@ def compute_genotype_statistics(
         buffer.close()
     return _assemble_statistics(source, summary, summaries, writer, indices.shape[0], block_cap,
                                 covariate_gram, covariate_target, target_matrix.T @ target_matrix)
+
+
+def _tie_map(representative: NDArray[np.int64], sign: NDArray[np.float32]) -> TieMap:
+    """The TieMap of the active variants from each one's representative and sign."""
+    members = np.arange(representative.shape[0], dtype=np.int64)
+    if np.array_equal(representative, members):
+        return _compact_identity_tie_map(representative.shape[0])
+    groups: dict[int, list[tuple[int, float]]] = {}
+    for member, (root, member_sign) in enumerate(zip(representative.tolist(), sign.tolist())):
+        groups.setdefault(root, []).append((member, member_sign))
+    return tie_map_from_groups(representative.shape[0], groups)
 
 
 def _assemble_statistics(
@@ -871,11 +910,11 @@ def _assemble_statistics(
     """Put the per-block results in store order and index the reduced space."""
     chromosomes = tuple(source.chromosomes())
     active_rows, means, scales, frequency = [], [], [], []
-    tie_groups: dict[int, list[tuple[int, float]]] = {}
+    representatives: list[NDArray[np.int64]] = []
+    signs: list[NDArray[np.float32]] = []
     ordered_blocks, block_of_reduced = [], []
     block_chromosomes, block_starts, block_stops = [], [], []
     active_cursor = reduced_cursor = 0
-    ties_found = False
     for chromosome_index, chromosome in enumerate(chromosomes):
         store_rows = np.asarray(source.store_rows(chromosome), dtype=np.int64)
         boundaries = summary.chromosomes[chromosome].boundaries
@@ -886,10 +925,8 @@ def _assemble_statistics(
             means.append(block_summary.means[local_active])
             scales.append(block_summary.scales[local_active])
             frequency.append(block_summary.frequency[local_active])
-            for member, (root, member_sign) in enumerate(zip(block_summary.representative.tolist(),
-                                                             block_summary.sign.tolist())):
-                tie_groups.setdefault(active_cursor + root, []).append((active_cursor + member, member_sign))
-                ties_found |= root != member
+            representatives.append(active_cursor + block_summary.representative)
+            signs.append(block_summary.sign)
             ordered_blocks.append((chromosome, start, reduced_cursor, reduced_cursor + block_summary.reduced_count))
             block_of_reduced.append(np.full(block_summary.reduced_count, len(ordered_blocks) - 1, dtype=np.int32))
             block_chromosomes.append(chromosome_index)
@@ -897,7 +934,7 @@ def _assemble_statistics(
             block_stops.append(int(store_rows[stop - 1]) + 1)
             active_cursor += local_active.shape[0]
             reduced_cursor += block_summary.reduced_count
-    tie_map = tie_map_from_groups(active_cursor, tie_groups) if ties_found else _compact_identity_tie_map(active_cursor)
+    tie_map = _tie_map(np.concatenate(representatives), np.concatenate(signs))
     boundaries = LdBlockBoundaries(
         block_cap=block_cap,
         chromosomes=chromosomes,
@@ -907,9 +944,11 @@ def _assemble_statistics(
         cut_costs={name: item.cut_costs for name, item in summary.chromosomes.items()},
         forced_cuts=sum(item.forced_cuts for item in summary.chromosomes.values()),
     )
+    ld = writer.finish(ordered_blocks)
     log(
         f"stage0: {active_cursor:,} active variants, {reduced_cursor:,} reduced columns in "
-        f"{len(ordered_blocks):,} LD blocks ({boundaries.forced_cuts} forced cuts) in {summary.seconds:.1f}s"
+        f"{len(ordered_blocks):,} LD blocks ({boundaries.forced_cuts} forced cuts); pass {summary.seconds:.1f}s, "
+        f"LD store {ld.stored_bytes / 1e9:.2f} GB"
     )
     return GenotypeSufficientStatistics(
         sample_count=sample_count,
@@ -922,6 +961,6 @@ def _assemble_statistics(
         covariate_gram=covariate_gram,
         covariate_target=covariate_target,
         target_gram=target_gram,
-        ld=writer.finish(ordered_blocks),
+        ld=ld,
         boundaries=boundaries,
     )
