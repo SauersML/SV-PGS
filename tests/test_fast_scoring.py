@@ -118,7 +118,7 @@ def test_every_model_scores_to_its_dense_standardized_product_in_one_read():
     assert max(stop - start for start, stop in source.reads) <= 16
 
 
-def test_scores_do_not_depend_on_the_thread_count_and_samples_can_be_selected():
+def test_thread_count_changes_scores_only_at_rounding_and_samples_can_be_selected():
     random_generator = np.random.default_rng(1)
     codes = random_codes(random_generator, variant_count=120, sample_count=70)
     plan = ScoringPlan.from_models(two_fold_models(codes, random_generator))
@@ -130,7 +130,7 @@ def test_scores_do_not_depend_on_the_thread_count_and_samples_can_be_selected():
         InMemoryCodes(codes), plan, cpu_budget(sample_count=70, block_rows=32, threads=2), sample_indices=selected
     )
 
-    np.testing.assert_array_equal(one_thread, four_threads)
+    np.testing.assert_allclose(one_thread, four_threads, rtol=1e-13, atol=1e-13)
     np.testing.assert_allclose(subset, one_thread[selected], rtol=1e-13, atol=1e-13)
 
 

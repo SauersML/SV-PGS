@@ -18,8 +18,8 @@ Exactness. Codes are small integers, exact in fp64, and the weights and the
 accumulator are fp64, so a score equals X beta to fp64 rounding: in-sample
 scores reproduce the fitted model's linear predictor. On the CPU each sample
 column is owned by one worker that adds the blocks in store order with
-single-threaded BLAS, so for a given block size the result does not depend on
-the thread count.
+single-threaded BLAS; thread and device counts change a score only at fp64
+rounding (BLAS kernels may order a panel's sums by its width).
 
 Binary models. The posterior predictive of a binary model damps its logit by
 kappa_i = sqrt(1 + (pi / 8) s2_i), with s2_i the posterior variance of the
