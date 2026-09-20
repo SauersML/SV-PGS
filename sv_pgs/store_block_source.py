@@ -5,9 +5,10 @@ One Stage 2 read visits every LD block once. Three stages of it overlap:
 1. the host: ``DosageStore.iter_codes`` reads and decodes the next blocks' row spans ahead, on
    its reader threads, into a ring of (pinned, on CUDA) host buffers;
 2. the copy engine: the next block's span goes host -> device on its own stream while the
-   current block computes. A rowdict store skips the host decode: the span's encoded bytes go
-   to the device, and ``DosageStore.read_codes_to_device`` decodes them there on the copy
-   stream, so the host only reads, checks crc32c and locates frames;
+   current block computes. A rowdict store skips the host decode: only the chunks holding the
+   block's rows go to the device, and ``DosageStore.read_codes_to_device`` checks and decodes
+   just those rows there, on the copy stream, into a compact [block rows, n] buffer; the host
+   only reads bytes;
 3. the device: one kernel picks the block's rows out of its span and writes them as signed codes
    ``s = code - 127`` into an aligned buffer, which a ``CodeBlockTile`` wraps without copying.
 
@@ -120,12 +121,17 @@ class StoreGenotypeBlockSource:
         self.resident_bytes = sum(int(slot.nbytes) for slot in self._signed) + int(self._means.nbytes) + int(self._scales.nbytes)
         if self._cupy is not None:
             cupy = self._cupy
-            self._spans_on_device = [cupy.empty((widest_span, self._samples), dtype=cupy.uint8) for _ in range(2)]
-            self._rows_in_span = [cupy.asarray(rows - rows[0]) for rows in self._block_rows]
+            self._decoder = rowdict_codec.GpuRowDecoder(cupy) if store.codecs == frozenset({"rowdict"}) else None
+            # a rowdict read lands the block's rows compactly, so the gather is the identity there
+            staged_rows = widest_block if self._decoder is not None else widest_span
+            self._spans_on_device = [cupy.empty((staged_rows, self._samples), dtype=cupy.uint8) for _ in range(2)]
+            self._rows_in_span = [
+                cupy.arange(rows.shape[0], dtype=cupy.int64) if self._decoder is not None else cupy.asarray(rows - rows[0])
+                for rows in self._block_rows
+            ]
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
-            self._decoder = rowdict_codec.GpuRowDecoder(cupy) if store.codecs == frozenset({"rowdict"}) else None
 
     @classmethod
     def from_statistics(
@@ -220,7 +226,7 @@ class StoreGenotypeBlockSource:
         )
 
     def _iter_decoded_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
-        """The rowdict path: each span decodes on the device, on the copy stream.
+        """The rowdict path: each block's rows decode on the device, on the copy stream.
 
         Block b + 1's span is fetched after block b is yielded, so its host work (read, crc32c,
         frame location, the host -> device copy) overlaps the products the caller queued for b.
@@ -235,10 +241,11 @@ class StoreGenotypeBlockSource:
         def fetch(position: int) -> None:
             slot = position % 2
             start, stop = self._spans[position]
-            # the span buffer is free once the gather of the block that last used it has run
+            rows = self._block_rows[position]
+            # the staging buffer is free once the gather of the block that last used it has run
             self._copy_stream.wait_event(gathered[slot])
             with self._copy_stream:
-                self._store.read_codes_to_device(start, stop, self._spans_on_device[slot][: stop - start], self._decoder)
+                self._store.read_codes_to_device(start, stop, self._spans_on_device[slot][: rows.shape[0]], self._decoder, rows=rows)
             decoded[slot].record(self._copy_stream)
 
         fetch(0)
