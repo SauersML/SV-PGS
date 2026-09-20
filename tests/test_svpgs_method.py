@@ -145,16 +145,49 @@ _COLUMNS = 12
 _REAL_SAMPLES = 60
 
 
+class _SmallNStub:
+    """Marginal regression of the centred target on the standardized training codes, as ``fit_small_n`` returns it."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def __call__(self, **arguments: Any) -> Any:
+        self.calls.append(arguments)
+        signed = arguments["codes"].astype(np.float64) - SIGNED_CODE_OFFSET
+        live = np.flatnonzero(signed.std(axis=0) > 0.0)
+        means, scales = signed[:, live].mean(axis=0), signed[:, live].std(axis=0)
+        standardized = (signed[:, live] - means) / scales
+        target = arguments["target"] - arguments["target"].mean()
+        coefficients = standardized.T @ target / (target.shape[0] * live.shape[0])
+        generator = np.random.default_rng(arguments["seed"])
+        scoring = ScoringModel(
+            store_rows=live.astype(np.int64), signed_means=means, signed_scales=scales, coefficients=coefficients,
+            posterior_draws=coefficients[:, None] + generator.normal(scale=np.abs(coefficients).mean(), size=(live.shape[0], 3)),
+            alpha=np.array([arguments["target"].mean()]), trait_type=TraitType.QUANTITATIVE, predictive_intercept_shift=0.0,
+        )
+        return type("SmallNFit", (), {"scoring": scoring})()
+
+
+@pytest.fixture
+def small_n(monkeypatch: pytest.MonkeyPatch) -> _SmallNStub:
+    stub = _SmallNStub()
+    monkeypatch.setattr(svpgs_method, "fit_small_n", stub)
+    return stub
+
+
 def _bench_real_train(generator: np.random.Generator) -> tuple[bench_real.TrainData, np.ndarray]:
-    # Panel rows in position order, then PanGenie rows appended out of order, as the dataset stores them.
+    # Panel rows in position order, then PanGenie rows appended out of order, as the dataset stores them. Rows 4, 7 and
+    # 11 are symbolic SVs (harness change 0, END past POS): a deletion, a duplication and a deletion; row 10 is a
+    # symbolic insertion (END = POS) and row 2 a sequence-resolved 2 bp deletion typed DEL.
     position = np.array([100, 150, 150, 220, 300, 410, 500, 640, 700, 810, 140, 505])
-    end = position + np.array([0, 0, 2, 0, 350, 0, 0, 0, 0, 0, 0, 90])
+    end = position + np.array([0, 0, 2, 0, 350, 0, 0, 900, 0, 0, 0, 90])
     sv_type = np.array([".", ".", "DEL", ".", "DEL", "INS", ".", "DUP", ".", ".", "INS", "DEL"])
     is_sv = np.array([False, False, False, False, True, False, False, True, False, False, True, True])
-    change = np.array([0, 0, -2, 0, -350, 3, 0, 0, 0, 0, 480, -90])
+    change = np.array([0, 0, -2, 0, 0, 3, 0, 0, 0, 0, 0, 0])
+    sv_length = np.array([0, 0, 0, 0, 350, 0, 0, 900, 0, 0, 480, 90])
     variants = bench_real.Variants(
         position=position, end=end, distance_to_tss=position - 400, is_sv=is_sv, sv_type=sv_type,
-        sv_length=np.abs(change), allele_length_change=change, train_allele_frequency=np.full(_COLUMNS, 0.3),
+        sv_length=sv_length, allele_length_change=change, train_allele_frequency=np.full(_COLUMNS, 0.3),
         source=np.array(["panel"] * 10 + ["pangenie"] * 2),
     )
     genotypes = generator.binomial(2, 0.35, size=(_REAL_SAMPLES + 20, _COLUMNS)).astype(np.float32)
@@ -166,52 +199,50 @@ def _bench_real_train(generator: np.random.Generator) -> tuple[bench_real.TrainD
     return train, genotypes[_REAL_SAMPLES:]
 
 
-def test_the_bench_real_store_holds_the_calls_in_position_order(driver: _StubDriver) -> None:
+def test_symbolic_svs_get_their_signed_length_change_from_their_type() -> None:
+    train, _test = _bench_real_train(np.random.default_rng(3))
+    np.testing.assert_array_equal(svpgs_method.bench_real_signed_change(train.variants), [0, 0, -2, 0, -350, 3, 0, 900, 0, 0, 480, -90])
+
+
+def test_the_full_model_gets_the_training_codes_and_the_sv_classes(small_n: _SmallNStub) -> None:
     train, _test = _bench_real_train(np.random.default_rng(4))
     svpgs_method.fit_expression(train)
-    store: DosageStore = driver.calls[0]["store"]
-    order = np.argsort(train.variants.position, kind="stable")
-    np.testing.assert_array_equal(store.read_codes(0, store.n_variants), (train.genotypes.T[order] * CODES_PER_DOSAGE).astype(np.uint8))
-    table = store.variant_table
-    assert list(store.chromosomes) == ["chr6"]
-    np.testing.assert_array_equal(table.position, train.variants.position[order])
+    (call,) = small_n.calls
+    np.testing.assert_array_equal(call["codes"], (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))
+    np.testing.assert_array_equal(call["target"], train.phenotype)
+    np.testing.assert_array_equal(call["covariates"], np.ones((_REAL_SAMPLES, 1)))
     expected = {".": VariantClass.SNV, "DEL": VariantClass.DELETION, "INS": VariantClass.INSERTION, "DUP": VariantClass.DUPLICATION}
-    assert [_CLASSES[code] for code in table.variant_class] == [expected[token] for token in train.variants.sv_type[order]]
-    assert "train_allele_frequency" not in table.annotations
-    assert sorted(table.annotations) == ["allele_length_change", "log1p_sv_length", "log1p_tss_distance", "source", "sv_type"]
-    assert table.annotation_legends["source"] == tuple(sorted({"panel", "pangenie"}))
-    assert driver.calls[0]["covariates"].shape == (_REAL_SAMPLES, 1)
+    assert [_CLASSES[code] for code in call["variant_class"]] == [expected[token] for token in train.variants.sv_type]
+    assert call["log_variance_offset"] is None and call["draw_count"] == fit_model.DRAW_COUNT
 
 
-def test_bench_real_predictions_match_the_store_scorer_and_mask_svs_exactly(tmp_path, driver: _StubDriver) -> None:
+@pytest.mark.parametrize("centering", ["training", "target"])
+def test_bench_real_predictions_are_the_fitted_scores_and_mask_svs_exactly(small_n: _SmallNStub, centering: str) -> None:
     train, test = _bench_real_train(np.random.default_rng(5))
-    predictor = svpgs_method.fit_expression(train)
-    scoring = driver.results[0].scoring[0]
-    order = np.argsort(train.variants.position, kind="stable")
-    signed = test.T[order].astype(np.float64) * CODES_PER_DOSAGE - SIGNED_CODE_OFFSET
-    expected, rounding = _scores(scoring, signed[scoring.store_rows])
+    arm = svpgs_method.fit_expression if centering == "training" else svpgs_method.fit_expression_target_centered
+    predictor = arm(train)
+    scoring = predictor.scoring
+    signed = test[:, scoring.store_rows].astype(np.float64) * CODES_PER_DOSAGE - SIGNED_CODE_OFFSET
+    centre = scoring.signed_means if centering == "training" else signed.mean(axis=0)
+    expected, rounding = _scores(scoring, (signed - centre).T + scoring.signed_means[:, None])
     np.testing.assert_allclose(predictor.predict(test), expected + scoring.alpha[0], rtol=0.0, atol=rounding + _EPSILON * abs(scoring.alpha[0]))
     masked = bench_real._without_structural_variants(train, test)
-    masked_signed = masked.T[order].astype(np.float64) * CODES_PER_DOSAGE - SIGNED_CODE_OFFSET
-    _masked_scores, masked_rounding = _scores(scoring, masked_signed[scoring.store_rows])
-    sv_rows = train.variants.is_sv[order][scoring.store_rows]
-    # The harness's arrays are float32; the difference is taken in float64, as predict widens them before any arithmetic.
-    widened = test[:, predictor.columns].astype(np.float64) - masked[:, predictor.columns].astype(np.float64)
+    sv_rows = train.variants.is_sv[scoring.store_rows]
+    widened = test[:, scoring.store_rows].astype(np.float64) - masked[:, scoring.store_rows].astype(np.float64)
     change = CODES_PER_DOSAGE * widened / scoring.signed_scales
+    if centering == "target":
+        change -= change.mean(axis=0)
     sv_part = change[:, sv_rows] @ scoring.coefficients[sv_rows]
-    sv_rounding = float(np.max(_EPSILON * (np.abs(change) @ np.abs(scoring.coefficients)) * _COLUMNS))
-    # Each prediction is within its rounding bound of X beta, and the SV part within its own.
-    np.testing.assert_allclose(
-        predictor.predict(test) - predictor.predict(masked), sv_part, rtol=0.0, atol=rounding + masked_rounding + sv_rounding
-    )
+    bound = 4.0 * rounding + float(np.max(_EPSILON * (np.abs(change) @ np.abs(scoring.coefficients)) * _COLUMNS))
+    np.testing.assert_allclose(predictor.predict(test) - predictor.predict(masked), sv_part, rtol=0.0, atol=bound)
 
 
-def test_bench_real_refuses_training_genotypes_that_are_not_allele_counts(driver: _StubDriver) -> None:
+def test_bench_real_refuses_training_genotypes_that_are_not_allele_counts(small_n: _SmallNStub) -> None:
     train, _test = _bench_real_train(np.random.default_rng(6))
     train.genotypes[0, 0] = 0.5
     with pytest.raises(ValueError, match="allele counts"):
         svpgs_method.fit_expression(train)
-    assert driver.calls == []
+    assert small_n.calls == []
 
 
 def test_each_bench_real_fit_gets_one_cores_share(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -229,28 +260,22 @@ def test_both_harnesses_load_the_method_file_their_own_way() -> None:
     assert callable(bench_real.load_method(f"{path}:fit_expression"))
     assert callable(bench_real.load_method(f"{path}:fit_expression_no_sv_terms"))
     assert callable(bench_real.load_method(f"{path}:fit_expression_no_annotations"))
+    assert callable(bench_real.load_method(f"{path}:fit_expression_target_centered"))
     assert callable(bench_sim.load_method(path).fit)
 
 
-@pytest.mark.parametrize(
-    ("arm", "annotations"),
-    [(svpgs_method.fit_expression_no_sv_terms, ["log1p_tss_distance"]), (svpgs_method.fit_expression_no_annotations, [])],
-)
-def test_the_ablation_arms_withhold_their_prior_terms_and_nothing_else(driver: _StubDriver, arm: Any, annotations: list[str]) -> None:
-    train, test = _bench_real_train(np.random.default_rng(7))
-    predictor = arm(train)
-    store: DosageStore = driver.calls[0]["store"]
-    table = store.variant_table
-    order = np.argsort(train.variants.position, kind="stable")
-    classes = [_CLASSES[code] for code in table.variant_class]
-    if arm is svpgs_method.fit_expression_no_annotations:
+@pytest.mark.parametrize("arm", ["no_sv_terms", "no_annotations"])
+def test_the_ablation_arms_withhold_their_prior_terms_and_nothing_else(small_n: _SmallNStub, arm: str) -> None:
+    train, _test = _bench_real_train(np.random.default_rng(7))
+    getattr(svpgs_method, f"fit_expression_{arm}")(train)
+    (call,) = small_n.calls
+    classes = [_CLASSES[code] for code in call["variant_class"]]
+    if arm == "no_annotations":
         assert set(classes) == {VariantClass.SNV}
     else:
-        # The small-variant rule on allele lengths: SNVs and indels keep their classes, and no SV type is read.
-        reference_length = train.variants.end - train.variants.position + 1
-        alternate_length = reference_length + train.variants.allele_length_change
-        assert classes == [_expected_class(1, ref_len, alt_len) for ref_len, alt_len in zip(reference_length[order], alternate_length[order])]
-        assert VariantClass.DUPLICATION not in classes and {VariantClass.SNV, VariantClass.DELETION, VariantClass.INSERTION} <= set(classes)
-    assert sorted(table.annotations) == annotations
-    np.testing.assert_array_equal(store.read_codes(0, _COLUMNS), (train.genotypes.T[order] * CODES_PER_DOSAGE).astype(np.uint8))
-    assert predictor.predict(test).shape == (test.shape[0],)
+        # The small-variant rule on allele lengths, symbolic SVs by their signed change: no SV type is read.
+        assert classes == [
+            VariantClass.SNV, VariantClass.SNV, VariantClass.DELETION, VariantClass.SNV, VariantClass.DELETION, VariantClass.INSERTION,
+            VariantClass.SNV, VariantClass.INSERTION, VariantClass.SNV, VariantClass.SNV, VariantClass.INSERTION, VariantClass.DELETION,
+        ]
+    np.testing.assert_array_equal(call["codes"], (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))

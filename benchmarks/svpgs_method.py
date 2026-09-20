@@ -4,30 +4,35 @@
 - **bench-real:** ``fit_expression(train) -> predictor`` and ``predictor.predict(genotypes)``, per
   benchmarks/bench_real/harness.py. The method spec is ``benchmarks/svpgs_method.py:fit_expression``.
 
-Each training view becomes a one-chromosome dosage store holding the harness's public variant table as the store's
-prior columns. Codes are dosage x 127, the store's own format, and bench-real's 0/1/2 calls map onto codes exactly.
-``sv_pgs.fit_model.fit`` then fits one model on every training sample, and the test view is scored with that model's
-standardized effects:
-- bench-sim's test codes go through the production scorer (``fast_scoring.score_genetic``), read straight from the
-  harness's code view;
-- bench-real's test genotypes are dosages, not codes: its SV-credit arm sets SV columns to their training means. So
-  they are scored in closed form from the same ``ScoringModel``, with no rounding to codes.
+bench-sim's training view becomes a one-chromosome dosage store holding the harness's public variant table as the
+store's prior columns (codes are dosage x 127, the store's own format); ``sv_pgs.fit_model.fit`` fits one model on
+every training sample, and the test codes go through the production scorer (``fast_scoring.score_genetic``), read
+straight from the harness's code view.
+
+bench-real's cis windows have far fewer samples than columns, so they go by the small-n route
+(``sv_pgs.small_n.fit_small_n``: Stage 0 dense and Stage 2's EP-EB with exact algebra in the n x n kernel form) on
+the training calls as codes, which 0/1/2 map onto exactly. The small-n prior reads each record's variant class and
+reliability (1 for called genotypes) only: annotation columns wait for e2e's prior design builder. Test genotypes
+are dosages (the SV-credit arm sets SV columns to their training means), so they are scored in closed form from the
+fitted ``ScoringModel``, with no rounding to codes.
 
 The prediction is the posterior-mean genetic score (plus the fitted intercept for bench-real, whose phenotype is
 already residualized). Covariate effects are left out, as the harnesses adjust for covariates themselves.
 
-Two bench-real ablation arms, benchmark adapters only (no production path), withhold prior information from the
-store they fit on:
-- ``fit_expression_no_sv_terms``: the SV-specific prior terms. Every record is classed by the small-variant rule
-  from its allele lengths (so SNVs, deletions and insertions keep their classes, and no SV type is used), and the
-  SV-type, source, length and length-change columns are withheld; the TSS distance stays.
-- ``fit_expression_no_annotations``: every annotation. One class for every record and no annotation columns, so the
-  prior sees only the genotypes, as mr.ash does.
+bench-real arms, benchmark adapters only (no production path):
+- ``fit_expression``: the full model, classes by SVTYPE where a record has one.
+- ``fit_expression_no_sv_terms``: the SV-specific prior terms withheld. Every record is classed by the small-variant
+  rule on its allele lengths (so SNVs, deletions and insertions keep their classes, symbolic SVs included, and no SV
+  type is read).
+- ``fit_expression_no_annotations``: one class for every record, so the prior sees only the genotypes, as mr.ash does.
+- ``fit_expression_target_centered``: the full fit, scored with each column centred at the scored genotypes' own
+  mean (the target population's frequency) instead of its training mean.
 
 Both harnesses load this file without registering it as a module, so it has no ``from __future__ import
 annotations``: dataclasses would then look the module up to resolve its string annotations, and fail.
 """
 
+import hashlib
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -48,6 +53,7 @@ from sv_pgs.dosage_store import (
     write_dosage_store,
 )
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel, ScoringPlan, score_genetic
+from sv_pgs.small_n import fit_small_n
 from sv_pgs.variant_typing import normalize_variant_token, structural_variant_class_from_token
 
 _CLASS_CODES = {variant_class: index for index, variant_class in enumerate(VariantClass)}
@@ -267,36 +273,52 @@ def fit(train: Any) -> BenchSimModel:
 # ---------------------------------------------------------------------------
 
 
-def bench_real_classes(variants: Any) -> np.ndarray:
-    """SV-PGS classes of bench-real rows: by the SVTYPE token where there is one (an indel's is its SV counterpart's),
-    else by allele lengths."""
-    reference_length, alternate_length = bench_real_allele_lengths(variants)
-    classes = _length_class(reference_length, alternate_length)
-    for token in np.unique(np.asarray(variants.sv_type, dtype=str)).tolist():
+def bench_real_signed_change(variants: Any) -> np.ndarray:
+    """Each record's signed allele-length change. A sequence-resolved record carries it in the harness; a symbolic SV
+    has harness change 0, so it comes from its type: a deletion loses the bases it spans (END - POS, or its SVLEN if
+    longer), a duplication gains them, an insertion gains its SVLEN, and a balanced event (INV, BND) changes none."""
+    change = np.asarray(variants.allele_length_change, dtype=np.int64).copy()
+    span = np.asarray(variants.end, dtype=np.int64) - np.asarray(variants.position, dtype=np.int64)
+    length = np.abs(np.asarray(variants.sv_length, dtype=np.int64))
+    tokens = np.asarray(variants.sv_type, dtype=str)
+    for token in np.unique(tokens).tolist():
         normalized = normalize_variant_token(token)
-        if normalized not in (None, "."):  # "." is VCF's missing value
-            classes[np.asarray(variants.sv_type, dtype=str) == token] = _CLASS_CODES[structural_variant_class_from_token(normalized)]
-    return classes
+        if normalized in (None, "."):  # "." is VCF's missing value
+            continue
+        symbolic = (tokens == token) & (change == 0)
+        variant_class = structural_variant_class_from_token(normalized)
+        if variant_class == VariantClass.DELETION:
+            change[symbolic] = -np.maximum(span, length)[symbolic]
+        elif variant_class in (VariantClass.DUPLICATION, VariantClass.COPY_NUMBER):
+            change[symbolic] = np.maximum(span, length)[symbolic]
+        elif variant_class in (VariantClass.INSERTION, VariantClass.INSERTION_MEI):
+            change[symbolic] = length[symbolic]
+    return change
 
 
 def bench_real_allele_lengths(variants: Any) -> tuple[np.ndarray, np.ndarray]:
-    """REF length from the record's span (END = POS + len(REF) - 1) and ALT length from the length change; a symbolic
-    ALT has change 0 in the harness, so its ALT length is recorded as the REF length."""
+    """REF length from the record's span (END = POS + len(REF) - 1, which a symbolic record's END also gives) and
+    ALT length = REF length + the signed change."""
     reference_length = np.asarray(variants.end, dtype=np.int64) - np.asarray(variants.position, dtype=np.int64) + 1
-    return reference_length, reference_length + np.asarray(variants.allele_length_change, dtype=np.int64)
+    return reference_length, reference_length + bench_real_signed_change(variants)
 
 
-# Each arm's annotation columns: the full model's, the SV-specific ones withheld, or none.
-_ARM_ANNOTATIONS = {
-    "full": ("log1p_tss_distance", "log1p_sv_length", "allele_length_change", "sv_type", "source"),
-    "no_sv_terms": ("log1p_tss_distance",),
-    "no_annotations": (),
-}
+def bench_real_classes(variants: Any) -> np.ndarray:
+    """SV-PGS classes of bench-real rows: by the SVTYPE token where there is one (an indel's is its SV counterpart's),
+    else by allele lengths."""
+    classes = _length_class(*bench_real_allele_lengths(variants))
+    tokens = np.asarray(variants.sv_type, dtype=str)
+    for token in np.unique(tokens).tolist():
+        normalized = normalize_variant_token(token)
+        if normalized not in (None, "."):
+            classes[tokens == token] = _CLASS_CODES[structural_variant_class_from_token(normalized)]
+    return classes
 
 
 def bench_real_classes_for_arm(variants: Any, arm: str) -> np.ndarray:
-    """The full model's classes; the small-variant length rule for every record without the SV terms; one class
-    without any annotation."""
+    """The full model's classes; without the SV terms, every record by the small-variant rule on its allele lengths
+    (SNV, deletion, insertion; a balanced multi-base event is complex), so no SV type is read; one class without any
+    annotation."""
     if arm == "full":
         return bench_real_classes(variants)
     if arm == "no_sv_terms":
@@ -304,32 +326,25 @@ def bench_real_classes_for_arm(variants: Any, arm: str) -> np.ndarray:
     return np.full(np.asarray(variants.position).shape[0], _CLASS_CODES[VariantClass.SNV], dtype=np.uint8)
 
 
-def bench_real_annotations(variants: Any, arm: str) -> tuple[dict[str, np.ndarray], dict[str, tuple[str, ...]]]:
-    """The arm's prior columns; training allele frequencies stay out (Stage 0 computes them itself)."""
-    sv_type, sv_type_legend = _categorical(variants.sv_type)
-    source, source_legend = _categorical(variants.source)
-    columns = {
-        "log1p_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
-        "log1p_sv_length": np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))),
-        "allele_length_change": np.asarray(variants.allele_length_change, dtype=np.float64),
-        "sv_type": sv_type,
-        "source": source,
-    }
-    annotations = _informative_annotations({name: columns[name] for name in _ARM_ANNOTATIONS[arm]})
-    legends = {name: legend for name, legend in (("sv_type", sv_type_legend), ("source", source_legend)) if name in annotations}
-    return annotations, legends
+CENTERINGS = ("training", "target")
 
 
 @dataclass(frozen=True)
 class BenchRealPredictor:
+    """``centering`` says where each column is centred when scoring: at its training mean (the fitted model's
+    x_j = (127 d_j - 127 - mu_j) / sigma_j), or at the mean of the genotypes being scored, the target population's
+    own frequency (novel-portable, Theorem 1). The two differ by one constant per scored set."""
+
     scoring: ScoringModel
     columns: np.ndarray
+    centering: str
 
     def predict(self, genotypes: np.ndarray) -> np.ndarray:
-        """The genetic score plus the intercept, in closed form from dosages: x_j = (127 d_j - 127 - mu_j) / sigma_j."""
+        """The genetic score plus the intercept, in closed form from dosages."""
         dosages = np.asarray(genotypes, dtype=np.float64)[:, self.columns]
         signed = CODES_PER_DOSAGE * dosages - SIGNED_CODE_OFFSET
-        standardized = (signed - self.scoring.signed_means) / self.scoring.signed_scales
+        centre = self.scoring.signed_means if self.centering == "training" else signed.mean(axis=0)
+        standardized = (signed - centre) / self.scoring.signed_scales
         return standardized @ self.scoring.coefficients + self.scoring.alpha[0]
 
 
@@ -351,45 +366,45 @@ def one_core_budget() -> ComputeBudget:
 
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
-    return _fit_expression(train, "full")
+    return _fit_expression(train, "full", "training")
 
 
 def fit_expression_no_sv_terms(train: Any) -> BenchRealPredictor:
     """bench-real ablation arm: ``fit_expression`` with the SV-specific prior terms withheld (module docstring)."""
-    return _fit_expression(train, "no_sv_terms")
+    return _fit_expression(train, "no_sv_terms", "training")
 
 
 def fit_expression_no_annotations(train: Any) -> BenchRealPredictor:
     """bench-real ablation arm: ``fit_expression`` on the genotypes alone, every annotation withheld (module docstring)."""
-    return _fit_expression(train, "no_annotations")
+    return _fit_expression(train, "no_annotations", "training")
 
 
-def _fit_expression(train: Any, arm: str) -> BenchRealPredictor:
-    budget = one_core_budget()
+def fit_expression_target_centered(train: Any) -> BenchRealPredictor:
+    """bench-real: ``fit_expression``'s fit, scored with each column centred at the scored genotypes' own mean."""
+    return _fit_expression(train, "full", "target")
+
+
+def _fit_expression(train: Any, arm: str, centering: str) -> BenchRealPredictor:
+    """The small-n route (``sv_pgs.small_n``): n training samples against a cis window's columns, with exact dense
+    algebra in the n x n kernel form."""
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
         raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
-    variants = train.variants
-    order = np.argsort(np.asarray(variants.position), kind="stable")
-    reference_length, alternate_length = bench_real_allele_lengths(variants)
-    annotations, legends = bench_real_annotations(variants, arm)
-    classes = bench_real_classes_for_arm(variants, arm)
-    codes = (np.asarray(genotypes, dtype=np.uint8).T * np.uint8(CODES_PER_DOSAGE))[order]
-    with tempfile.TemporaryDirectory(prefix="svpgs-bench-real.") as scratch:
-        store = write_store(
-            Path(scratch) / "store",
-            chromosome=f"chr{str(train.chrom).removeprefix('chr')}",
-            position=np.asarray(variants.position)[order],
-            # bench-real carries no genetic map and no fitting step reads one: the store records it as unknown.
-            genetic_position_cm=np.full(order.shape[0], np.nan),
-            reference_length=reference_length[order],
-            alternate_length=alternate_length[order],
-            variant_class=classes[order],
-            annotations={name: values[order] for name, values in annotations.items()},
-            annotation_legends=legends,
-            code_rows=lambda rows: np.ascontiguousarray(codes[rows]),
-            sample_count=genotypes.shape[0],
-        )
-        (Path(scratch) / "work").mkdir()
-        scoring = _fit_one(store, np.empty((genotypes.shape[0], 0)), (), train.phenotype, TraitType.QUANTITATIVE, Path(scratch) / "work", budget)
-    return BenchRealPredictor(scoring=scoring, columns=order[scoring.store_rows])
+    samples = genotypes.shape[0]
+    fitted = fit_small_n(
+        codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
+        covariates=np.ones((samples, 1)),
+        target=np.asarray(train.phenotype, dtype=np.float64),
+        variant_class=bench_real_classes_for_arm(train.variants, arm),
+        log_variance_offset=None,
+        draw_count=fit_model.DRAW_COUNT,
+        working_bytes=one_core_budget().working_bytes,
+        seed=_training_seed(genotypes, train.phenotype),
+    )
+    return BenchRealPredictor(scoring=fitted.scoring, columns=fitted.scoring.store_rows, centering=centering)
+
+
+def _training_seed(genotypes: np.ndarray, phenotype: np.ndarray) -> int:
+    """The fit's seed from its training data, so the same training set always gives the same model."""
+    digest = hashlib.sha256(np.ascontiguousarray(genotypes, dtype=np.uint8).tobytes() + np.asarray(phenotype, dtype="<f8").tobytes()).digest()
+    return int.from_bytes(digest[:8], "big")
