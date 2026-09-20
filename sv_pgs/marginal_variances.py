@@ -49,6 +49,7 @@ beyond its window, shows up as a block whose measured trace error provably excee
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 from functools import cached_property
@@ -524,8 +525,25 @@ def prepare_windows(solve: BulkSolve, grams: BlockGrams) -> WindowPreparation:
     return WindowPreparation(cross=cross, bulk_variance=bulk_variance, core_inverse=core_inverse, is_resolved=is_resolved)
 
 
+def _exact_bulk_block(
+    covariance: NDArray[np.float64], members: NDArray[np.int64], bulk_variance: NDArray[np.float64], is_resolved: NDArray[np.bool_], quadratic: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Sigma_bb with its bulk-bulk part from identity 1 on an exact M_b: D - D M_b D. The bulk-resolved and
+    resolved-resolved entries stay the window's (exact through core, less resolved sites beyond the window)."""
+    bulk = np.flatnonzero(~is_resolved[members])
+    variance = bulk_variance[members[bulk]]
+    exact = covariance.copy()
+    exact[np.ix_(bulk, bulk)] = np.diag(variance) - variance[:, None] * np.asarray(quadratic, dtype=np.float64)[np.ix_(bulk, bulk)] * variance[None, :]
+    return exact
+
+
 def block_covariance(
-    solve: BulkSolve, grams: BlockGrams, block: int, array_module: Any = np, prepared: WindowPreparation | None = None
+    solve: BulkSolve,
+    grams: BlockGrams,
+    block: int,
+    array_module: Any = np,
+    prepared: WindowPreparation | None = None,
+    exact_quadratic: NDArray[np.float64] | None = None,
 ) -> NDArray[np.float64]:
     """Sigma_bb for one block, (|b| x |b|) host float64: the window algebra's own-block covariance.
 
@@ -534,17 +552,27 @@ def block_covariance(
     chance term, which ``marginal_variances`` adds to the diagonal by its expectation). ``grams`` may be Stage 0's
     shared float32 Grams with the model's ``scale``; each window is promoted to float64. The window algebra runs on
     ``array_module`` (cupy for a device). ``prepared`` (``prepare_windows``) saves recomputing the model's shared
-    state for every block.
+    state for every block. ``exact_quadratic``, the block's exact M_b (as in ``marginal_variances``), makes the
+    bulk-bulk entries exact.
     """
     state = prepared if prepared is not None else prepare_windows(solve, grams)
     terms = _block_terms(solve, grams, state.cross, state.bulk_variance, state.core_inverse, block, array_module)
     covariance = terms.covariance
+    if exact_quadratic is not None:
+        covariance = _exact_bulk_block(covariance, grams.blocks[block], state.bulk_variance, state.is_resolved, exact_quadratic)
     return 0.5 * (covariance + covariance.T)
 
 
-def marginal_variances(solve: BulkSolve, grams: BlockGrams, array_module: Any = np) -> NDArray[np.float64]:
+def marginal_variances(
+    solve: BulkSolve, grams: BlockGrams, array_module: Any = np, exact_quadratics: Mapping[int, NDArray[np.float64]] | None = None
+) -> NDArray[np.float64]:
     """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring). The windows' dense algebra runs on
     ``array_module`` (numpy by default; pass cupy to use a device).
+
+    ``exact_quadratics`` maps a block to its exact bulk quadratics M_b = Xt_b' Q Xt_b (|b| x |b| in the block's
+    order, zero on resolved sites; ``exact_quadratics.exact_block_quadratics``), for blocks the certificate
+    flagged. There identity 1 is exact, Sigma_jj = D_j - D_j^2 M_jj with every resolved site in Q, so the window's
+    quadratic and the far-resolved expectation are replaced.
 
     With C kept on LD windows only, a bulk j's coupling to resolved sites beyond its window, D_j^2 c_j,far
     core^-1 c_j,far', enters by its expectation. For far pairs Sigma_jl ~ -D_j c_jl (core^-1)_ll and
@@ -557,17 +585,23 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams, array_module: Any = 
     sandwich = np.zeros(variant_count)
     near_totals = np.zeros(len(grams.blocks))
     resolved_variance = np.diag(core_inverse)
+    exact = {} if exact_quadratics is None else exact_quadratics
+    is_exact = np.zeros(variant_count, dtype=bool)
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
-        near_variance[members] = np.diag(terms.covariance)
-        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block))
+        covariance = terms.covariance
+        if block in exact:
+            covariance = _exact_bulk_block(covariance, members, bulk_variance, is_resolved, exact[block])
+            is_exact[members] = True
+        near_variance[members] = np.diag(covariance)
+        sandwich[members] = sandwich_diagonal(covariance, grams.within_block(block))
     resolved_weight = sandwich[solve.resolved] / resolved_variance if solve.resolved.shape[0] else np.zeros(0)
     for block in range(len(grams.blocks)):
         near_totals[block] = float(np.sum(resolved_weight[cross.positions[block]]))
     far_scale = solve.kernel_square_trace / solve.sample_count
     block_of = _block_index(grams)
     far = sandwich * far_scale * (float(np.sum(resolved_weight)) - near_totals[block_of])
-    variances = np.where(is_resolved, near_variance, near_variance + far)
+    variances = np.where(is_resolved | is_exact, near_variance, near_variance + far)
     # Every marginal obeys 1 / A_jj <= Sigma_jj (Cauchy-Schwarz, for any positive-definite A). The upper bound
     # Sigma_jj <= 1 / Pi_j holds only when every site precision is positive: A >= diag(Pi) gives
     # A^-1 <= diag(Pi)^-1 only for diag(Pi) > 0, and a non-positive resolved site breaks it, since the bulk block
