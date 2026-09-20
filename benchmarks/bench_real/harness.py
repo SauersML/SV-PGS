@@ -101,9 +101,10 @@ class Dataset:
                 raise ValueError(f"{self.directory} does not carry its parent's sealed confirmation genes")
         return set(pd.read_csv(path, sep="\t")["gene_id"]) if path.exists() else set()
 
-    def gene_rows(self, chromosomes, gene_prefix=None, gene_list=None, confirmation=False):
+    def gene_rows(self, chromosomes, gene_prefix=None, gene_list=None, confirmation=False, gene_ranks=None):
         """Genes on the chromosomes; with gene_prefix, only those among the first gene_prefix of gene_order.tsv; with
-        gene_list (a TSV with a gene_id column, e.g. a frozen screened list), only the genes it names.
+        gene_list (a TSV with a gene_id column, e.g. a frozen screened list), only the genes it names; with gene_ranks
+        (start, stop), only the list's rows start..stop-1, so a ranked list can be run top first in checkpointed chunks.
 
         The sealed confirmation genes are never scored unless confirmation is set, and then only they are. A gene list
         naming a sealed gene is an error rather than a silent drop, so a leak is caught where it starts."""
@@ -114,7 +115,12 @@ class Dataset:
             leading = set(pd.read_csv(self.directory / "gene_order.tsv", sep="\t")["gene_id"].head(gene_prefix))
             on_chromosomes &= self.genes["gene_id"].isin(leading)
         if gene_list is not None:
-            named = set(pd.read_csv(gene_list, sep="\t")["gene_id"])
+            listed = pd.read_csv(gene_list, sep="\t")["gene_id"]
+            if listed.duplicated().any():
+                raise ValueError("the gene list names a gene twice")
+            if gene_ranks is not None:
+                listed = listed.iloc[gene_ranks[0]:gene_ranks[1]]
+            named = set(listed)
             if not confirmation and named & sealed:
                 raise ValueError(f"the gene list names {len(named & sealed)} sealed confirmation genes")
             unknown = named - set(self.genes["gene_id"])
@@ -332,7 +338,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene"):
+        confirmation=False, contract="gene", gene_ranks=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
@@ -341,7 +347,9 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
     dataset = Dataset(dataset_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
-    gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation)
+    if gene_ranks is not None and gene_list is None:
+        raise ValueError("gene ranks need a gene list")
+    gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation, gene_ranks)
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
@@ -360,13 +368,14 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
-    tag = "_".join(chromosomes)
+    tag = "_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
     method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
     (out / f"{tag}.run.json").write_text(json.dumps({
         "method": method_spec, "method_sha256": hashlib.sha256(method_file.read_bytes()).hexdigest(), "harness_commit": commit,
         "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets), "gene_prefix": gene_prefix,
-        "gene_list": str(gene_list) if gene_list is not None else None, "confirmation": confirmation,
+        "gene_list": str(gene_list) if gene_list is not None else None, "gene_ranks": list(gene_ranks) if gene_ranks is not None else None,
+        "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
         "genes": len(gene_rows), "contract": contract, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
@@ -394,6 +403,8 @@ if __name__ == "__main__":
     parser.add_argument("--genes", help="run only the genes a TSV with a gene_id column names (a frozen screened list)")
     parser.add_argument("--confirmation", action="store_true", help="score only the sealed confirmation genes (only when the lead calls it)")
     parser.add_argument("--contract", choices=["gene", "batch"], default="gene", help="gene: fit(train); batch: fit_batch(trains) once per split")
+    parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
-        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract)
+        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None)

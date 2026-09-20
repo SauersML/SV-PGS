@@ -267,3 +267,30 @@ def test_a_batch_refuses_a_sealed_gene(tmp_path):
         assert "sealed" in str(error)
     else:
         raise AssertionError("a batch containing a sealed gene must be refused")
+
+
+def test_gene_ranks_take_a_slice_of_the_list_in_list_order(tmp_path):
+    pd.DataFrame({"chrom": ["chr1"] * 4, "start": [1, 2, 3, 4], "end": [2, 3, 4, 5], "gene_id": ["g1", "g2", "g3", "g4"], "tss": [2, 3, 4, 5]}).to_csv(
+        tmp_path / "genes.tsv", sep="\t", index=False)
+    pd.DataFrame({"gene_id": ["g3", "g1", "g4", "g2"]}).to_csv(tmp_path / "ranked.tsv", sep="\t", index=False)
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory, dataset.genes = tmp_path, pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    assert dataset.gene_rows(["chr1"], gene_list=tmp_path / "ranked.tsv", gene_ranks=(0, 2)) == [0, 2]
+    assert dataset.gene_rows(["chr1"], gene_list=tmp_path / "ranked.tsv", gene_ranks=(2, 4)) == [1, 3]
+
+
+def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
+    import itertools
+
+    from benchmarks.bench_real import genome_total
+
+    values = np.array([0.3, -0.1, 0.7, 0.2, 0.05, 0.4, -0.2])
+    targeted = {1, 4}
+    population, sample_size = len(values), 3
+    estimates = []
+    for sample in itertools.combinations(range(population), sample_size):
+        scored = sorted(targeted | set(sample))
+        genes = pd.DataFrame({"gene_id": [f"g{index}" for index in scored], "chrom": [f"chr{index % 3 + 1}" for index in scored],
+                              "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
+        estimates.append(genome_total.horvitz_thompson_total(genes, population, sample_size)[0])
+    assert np.isclose(np.mean(estimates), values.sum(), rtol=0, atol=64 * EPSILON)

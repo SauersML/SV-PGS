@@ -77,6 +77,14 @@ The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML opt
 - **Tandem repeats aren't annotated** in the panel, so the TR signed-length term isn't tested.
 - **Lymphoblastoid-line expression** is a molecular phenotype. Its architecture (strong cis, larger SV enrichment) differs from complex traits.
 
+## Targeted runs on the screened ranked list
+- **The list:** a genotype-only ranked list (sv-screen's sv_ranked_v2.tsv) runs top first, in checkpointed chunks, via `--genes <list> --gene-ranks START STOP`. run.json records the list's sha256 and the rank range.
+- **Strata:**
+  - development: every gene bench-real had already scored when the ordering was chosen (genes_already_scored.tsv, 5,430 genes);
+  - held out: ranked genes never scored before.
+  - Only the held-out stratum, and later the sealed confirmation set, supports discovery claims.
+- **Genome-wide totals** combine the targeted set (a certainty stratum, weight 1) with the random gene-order prefix (weight |U| / n on its genes outside the targeted set), by Horvitz–Thompson weighting (genome_total.py). The standard error is a delete-one-chromosome jackknife.
+
 ## Which open design questions it can answer
 **Can answer, on real biology:**
 - **Do SVs add held-out accuracy?** Compare `snv_sv` with `snv` per method. It also shows whether a method that gives SVs their own prior class extracts more of that value than GBLUP or mr.ash.
