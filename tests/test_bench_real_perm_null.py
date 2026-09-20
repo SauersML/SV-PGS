@@ -50,7 +50,7 @@ def direct_gain(dataset, gene_row):
         train_all, test_all, test_phenotype, test_index = harness.build_gene_task(dataset, window, dataset.splits[name])
         values = {}
         for feature_set in ("snv", "snv_sv"):
-            train, test = harness.subset(train_all, test_all, feature_set)
+            train, test = harness.subset(train_all, test_all, feature_set, name)
             prediction = baselines.top_variant(train).predict(test)
             values[feature_set] = robust.group_metrics(np.ones((1, len(test_index))), prediction[None], test_phenotype[None])["r2"][0, 0]
         gains.append(values["snv_sv"] - values["snv"])
