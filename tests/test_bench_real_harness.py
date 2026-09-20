@@ -387,7 +387,7 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     overlay.mkdir()
     dosage = np.load(tmp_path / "chr1.dosage.npy")
     imputed = (dosage[[3, 7]] * 0.9 + 0.05).astype(np.float32)
-    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed)
+    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed, dr2=np.array([0.8, 0.4]))
     dataset = harness.Dataset(tmp_path, overlay)
     window = harness.load_gene_window(dataset, 0)
     assert window.genotypes.shape[1] == dosage.shape[0] + 2 and list(window.table["source"].iloc[-2:]) == ["svimp", "svimp"]
@@ -397,6 +397,8 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     called, _ = harness.subset(train, test, "snv_sv", "loso/AFR")
     assert joint.variants.is_sv.sum() == called.variants.is_sv.sum() == 2
     assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
+    assert joint.variants.reliability[joint.variants.is_sv].tolist() == [0.8, 0.4]
+    assert (joint.variants.reliability[~joint.variants.is_sv] == 1.0).all() and (called.variants.reliability == 1.0).all()
 
 
 def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):

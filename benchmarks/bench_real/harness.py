@@ -60,6 +60,11 @@ class Variants:
     # Row of each variant in its chromosome's variant table: with source, it identifies one column across overlapping
     # gene windows, so a method can share work between genes (fit_views).
     chromosome_row: np.ndarray = None
+    # Each column's measurement reliability: the expected squared correlation of the stored dosage with the true genotype.
+    # 1 for direct calls; a derived dataset supplies it (a variants.tsv "reliability" column) where dosages were filled
+    # or imputed, and an imputed overlay supplies its imputation r^2 estimate (svimp.npz "dr2"). A method that cannot
+    # use it simply sees the dosages.
+    reliability: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,7 +114,12 @@ class Dataset:
             if "samples" in data and list(data["samples"]) != list(self.samples["sample"]):
                 raise ValueError(f"{path}: sample order differs from samples.tsv")
             self._overlay_chrom, self._overlay = chrom, (data["rows"].astype(np.int64), data["ds"])
+            self._overlay_dr2 = data["dr2"].astype(np.float64) if "dr2" in data else None
         return self._overlay
+
+    def overlay_reliability(self, chrom: str):
+        """The overlay's per-row imputation r^2 estimate (Beagle DR2), or None."""
+        return self._overlay_dr2 if self.overlay(chrom) is not None else None
 
     def chromosome(self, chrom: str):
         """The variant table and memory-mapped dosages of one chromosome; only the latest one stays cached."""
@@ -202,6 +212,10 @@ def load_gene_window(dataset: Dataset, gene_row: int):
         present = np.flatnonzero(np.isin(imputed_rows, rows))
         if len(present):
             imputed_table = table.iloc[imputed_rows[present]].reset_index(drop=True).assign(source="svimp")
+            if dataset.overlay_reliability(chrom) is not None:
+                imputed_table["reliability"] = dataset.overlay_reliability(chrom)[present]
+            if "reliability" in imputed_table and "reliability" not in window_table:
+                window_table = window_table.assign(reliability=1.0)
             genotypes = np.hstack([genotypes, imputed[present].T.astype(np.float32)])
             window_table = pd.concat([window_table, imputed_table], ignore_index=True)
             chromosome_rows = np.concatenate([chromosome_rows, imputed_rows[present]])
@@ -250,7 +264,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
                         sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=length, allele_length_change=length_change,
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
                         window_row=np.flatnonzero(polymorphic),
-                        chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None)
+                        chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None,
+                        reliability=selected["reliability"].to_numpy(dtype=np.float64) if "reliability" in selected else np.ones(len(selected)))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]
