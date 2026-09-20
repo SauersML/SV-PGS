@@ -404,10 +404,13 @@ def _edgeworth_correction(skewness: float, probe_count: int, cut: float) -> floa
 
 def _heavy_cut(skewness: float, probe_count: int, side: float, quantile: float) -> tuple[float, bool]:
     """The heavy tail's cut x >= ``quantile`` whose corrected tail t_{k-1}(x) + correction(x) spends ``side``, and
-    whether the expansion is usable there (its correction below the Student-t term it corrects).
+    whether the expansion is usable there: its first-order term below its zeroth-order term, the normal tail
+    beyond x (Hall's expansion is about Phi; the Student-t base only adds the O(1/k) term exact for Gaussian values).
 
     Both terms fall as x grows past the t quantile, so the cut is bracketed by doubling from it. With zero
     skewness it is the t quantile itself: the certificate is unchanged for symmetric probe values.
+    [sim-only, review-stats stopgap_sim2: comparing against the Student-t tail instead left rank-1 blocks at k = 16
+    missing 4x the level.]
     """
     def excess(cut: float) -> float:
         return float(student_t.sf(cut, probe_count - 1)) + _edgeworth_correction(skewness, probe_count, cut) - side
@@ -419,11 +422,15 @@ def _heavy_cut(skewness: float, probe_count: int, side: float, quantile: float) 
         while excess(upper) > 0.0:
             upper *= 2.0
         cut = brentq(excess, quantile, upper)
-    return cut, _edgeworth_correction(skewness, probe_count, cut) < float(student_t.sf(cut, probe_count - 1))
+    return cut, _edgeworth_correction(skewness, probe_count, cut) < float(norm.sf(cut))
 
 
 def _certificate(
-    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: "float | NDArray[np.float64]", level: float
+    estimate: NDArray[np.float64],
+    per_probe: list[NDArray[np.float64]],
+    tolerance: "float | NDArray[np.float64]",
+    level: float,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Intervals from k probe values per block, at family-wise ``level`` over the B blocks (Bonferroni, two-sided).
 
@@ -438,6 +445,10 @@ def _certificate(
     term it corrects), the block is undecided: k probes cannot place that tail, and more probes (or the exact
     diagonal) must decide it. [sim-only, review-stats certsim: with the plain t cut, rank-1 blocks at k = 16 missed
     on the heavy side 9.5x the nominal rate for one block and ~280x under Bonferroni over 144 blocks.]
+
+    ``skewness``, when given, is each block's probe-value skewness known from structure (e.g. the exact Rademacher
+    cumulants of a deflated remainder's proxy); otherwise the probes' own sample skewness is used, which is
+    conservative only through the undecided rule, because a draw lacking the large values also looks less skewed.
 
     A block whose estimate is zero has no finite relative error. With zero probe spread too (every site resolved,
     so the block is exact), it is certified. Otherwise the probes see information the estimate says is absent
@@ -469,14 +480,17 @@ def _certificate(
             continue
         relative[position] = (float(np.mean(values)) - computed) / computed
         standard[position] = spread / abs(computed)
-        centred = values - float(np.mean(values))
-        second = float(np.mean(centred * centred))
-        skewness = float(np.mean(centred**3)) / second**1.5 if second > 0.0 else 0.0
-        heavy, usable = _heavy_cut(skewness, probe_count, side, quantile)
+        if skewness is None:
+            centred = values - float(np.mean(values))
+            second = float(np.mean(centred * centred))
+            block_skewness = float(np.mean(centred**3)) / second**1.5 if second > 0.0 else 0.0
+        else:
+            block_skewness = float(skewness[position])
+        heavy, usable = _heavy_cut(block_skewness, probe_count, side, quantile)
         unusable[position] = not usable
         # Right-skewed values make the studentized mean's lower tail the heavy one: the truth lies above the mean more
         # often than t says, so the mean's interval moves out above (and below for left skew).
-        mean_above, mean_below = (heavy, quantile) if skewness > 0.0 else (quantile, heavy)
+        mean_above, mean_below = (heavy, quantile) if block_skewness > 0.0 else (quantile, heavy)
         # The relative error (mean - computed) / computed falls with the mean when the estimate is negative.
         below[position], above[position] = (mean_below, mean_above) if computed > 0.0 else (mean_above, mean_below)
     with np.errstate(invalid="ignore"):
@@ -498,6 +512,7 @@ def block_trace_certificate(
     covariance_probes: NDArray[np.float64],
     tolerance: "float | NDArray[np.float64]",
     level: float,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
 
@@ -507,7 +522,7 @@ def block_trace_certificate(
     """
     per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
     estimate = np.array([float(np.sum(variances[members])) for members in blocks])
-    return _certificate(estimate, per_probe, tolerance, level)
+    return _certificate(estimate, per_probe, tolerance, level, skewness)
 
 
 def stage_level(level: float, stage: int) -> float:
@@ -637,6 +652,7 @@ def block_information_certificate(
     tolerance: "float | NDArray[np.float64]",
     level: float,
     control: ControlVariate,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
 
@@ -671,7 +687,7 @@ def block_information_certificate(
         for position, members in enumerate(blocks)
     ]
     estimate = np.array([float(np.sum(removed[members])) if control.resolvable[position] else 0.0 for position, members in enumerate(blocks)])
-    return _certificate(estimate, per_probe, tolerance, level)
+    return _certificate(estimate, per_probe, tolerance, level, skewness)
 
 
 @dataclass(frozen=True)
