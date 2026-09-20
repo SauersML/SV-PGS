@@ -1293,7 +1293,6 @@ def _total_curvature_columns(
     precondition = None if posterior.local_response is None else posterior.local_response(left, gain, diagonal, weight)
     inner = relative_tolerance
     solution = np.zeros(shape)
-    previous = np.inf
     while True:
         try:
             _shift, offset, start_response = through(np.zeros(shape), inner)
@@ -1321,9 +1320,9 @@ def _total_curvature_columns(
         residual = result.residual_norm
         if residual <= target:
             break
-        if residual >= previous:
-            raise LinearResponseError(f"the EP fixed point's linear response did not converge (true residual {residual:.3e} against {target:.3e})")
-        previous = residual
+        # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
+        # the measured excess each round, which ends where they reach float64's attainable accuracy (the solver then
+        # refuses, above) rather than on one noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34).
         inner *= 0.5 * target / residual
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
@@ -2570,7 +2569,7 @@ class FixedPoint:
 
     Where one fixed point holds several independently scored models sharing x (the pooled arm's genes),
     ``precision_norm`` returns one move per model and ``effective_effects`` their p_eff: the prediction check then
-    holds each model to its own p_eff / K, so no model uses another's budget (fit-api P1)."""
+    holds each model to its own budget, so no model uses another's (fit-api P1)."""
 
     cavity: Cavity
     posterior: GaussianPosterior
@@ -2591,7 +2590,8 @@ class OuterFit:
     ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
     returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
     tolerance. ``prediction_move`` is the posterior-mean move of the certifying Newton step in q's posterior metric,
-    against ``prediction_tolerance`` = p_eff / K (K = 1 / (2 tolerance) draws). ``iterations`` counts accepted steps,
+    against ``prediction_tolerance`` = 1 / K = 2 tolerance, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (K = 1 / (2
+    tolerance) draws; in evidence units, as every other certificate, so it stays defined where p_eff collapses). ``iterations`` counts accepted steps,
     ``halvings`` the trials refused (by the test, or for having no EP fixed point), and ``unresolved`` those of them
     that had no EP fixed point at all, so a loop that keeps refusing near its answer is visible in the certificate.
     """
@@ -2723,7 +2723,8 @@ def fit_hyperparameters(
       shortened to it.
     The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
     remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
-    by at most p_eff / K in q's posterior metric (MODEL.md: the certificate includes the prediction change), taken
+    by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
+    prediction change; in evidence units, well defined as p_eff -> 0, lead ruling via speed-smalln), taken
     at the step's own EP fixed point, not on the quadratic model. With K = 1 / (2 tolerance) posterior draws that is
     the scorer's own Monte Carlo resolution, as for the EP fixed point. Where the data barely identify a direction
     (the profiled null space at small n) the evidence can be flat to the tolerance while predictions still move; a
@@ -2790,7 +2791,7 @@ def fit_hyperparameters(
                 # A shortened certifying step moves q's mean by its fraction, to first order: the full step's move is
                 # its own over fraction^2 in the squared metric.
                 moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64)) / (fraction * fraction)
-                allowed = 2.0 * tolerance * np.atleast_1d(np.asarray(current.effective_effects, dtype=np.float64))
+                allowed = np.full(moves.shape[0], 2.0 * tolerance)
                 # Reported as the most-used share of a block's budget, in that block's units.
                 with np.errstate(divide="ignore", invalid="ignore"):
                     shares = np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))
@@ -2800,7 +2801,7 @@ def fit_hyperparameters(
                     certified_step, remaining = steps_taken[model]
                     # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
                     # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers the
-                    # move: the decrement at x, and q's mean moved by at most p_eff / K.
+                    # move: the decrement at x, and q's mean moved by at most 1 / K in its metric (KL <= 1 / (2K)).
                     hyperparameters[model], points[model] = trials[model], trial_point
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
@@ -2838,7 +2839,7 @@ def fit_hyperparameters(
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
                         remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
-                        prediction_tolerance=float(np.min(2.0 * tolerance * np.atleast_1d(np.asarray(points[model].effective_effects, dtype=np.float64)))),
+                        prediction_tolerance=2.0 * tolerance,
                         iterations=iterations[model],
                         halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
                     )
