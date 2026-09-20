@@ -122,9 +122,25 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
-# QUADPACK's QK15I pairs a 7-point Gauss rule with its 15-point Kronrod extension; the line integrals pair the same
-# Gauss rule with its double.
-_GAUSS_ORDER = 7
+# QUADPACK's QK15I (dqk15i, Piessens et al. 1983): the 15-point Kronrod nodes on [0, 1) and their weights, with the
+# embedded 7-point Gauss rule's weights at the same nodes (zero where a node is Kronrod's alone), and its error
+# estimate's scale and power: err = asc min(1, (200 |K - G| / asc)^1.5).
+_KRONROD_NODES = np.array([
+    0.991455371120812639206854697526329, 0.949107912342758524526189684047851, 0.864864423359769072789712788640926,
+    0.741531185599394439863864773280788, 0.586087235467691130294144845693013, 0.405845151377397166906606412076961,
+    0.207784955007898467600689403773245, 0.0,
+])
+_KRONROD_WEIGHTS = np.array([
+    0.022935322010529224963732008058970, 0.063092092629978553290700663189204, 0.104790010322250183839876322541518,
+    0.140653259715525918745189590510238, 0.169004726639267902826583426598550, 0.190350578064785409913256402421014,
+    0.204432940075298892414161999234649, 0.209482141084727828012999174891714,
+])
+_GAUSS_WEIGHTS = np.array([
+    0.0, 0.129484966168869693270611432679082, 0.0, 0.279705391489276667901467771423780, 0.0,
+    0.381830050505118944950369775488975, 0.0, 0.417959183673469387755102040816327,
+])
+_QUADPACK_ERROR_SCALE = 200.0
+_QUADPACK_ERROR_POWER = 1.5
 
 
 @dataclass(frozen=True)
@@ -1535,56 +1551,78 @@ def _line(
     return values
 
 
-def _line_log_integral(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
-) -> float:
-    """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
-    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
+def _line_log_integrals(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, directions: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
+) -> F64Array:
+    """For each standardized direction b (a column, unit curvature at the maximum x): the log of the line integral
+    of exp(F - P - value) over its Laplace term sqrt(2 pi), each to ``share`` in its log.
 
-    The rule is QUADPACK's for an infinite range (QAGI: t = (1 - u) / u folds both half-lines onto u in (0, 1]),
-    adaptive by bisection, with each interval's value from a Gauss-Legendre pair of QK15I's Gauss order and its
-    double, the difference its error estimate; every round evaluates all its intervals' nodes in one pass over the
-    variants (``_line``). It stops when the errors sum to the share of the integral, or to half of double precision
-    when rounding is what stops it, and raises when an interval can no longer be halved.
+    QUADPACK's rule for an infinite range, vectorized: QAGI folds both half-lines onto u in (0, 1] by
+    t = (1 - u) / u, and each interval takes QK15I's 15-point Kronrod rule with its embedded 7-point Gauss rule and
+    QUADPACK's own error estimate (Piessens et al. 1983). Every round evaluates the nodes of every open interval of
+    every direction in one pass over the variants per direction (``_line``), bisects the intervals whose error is
+    over their share of the target by width, and stops a direction once its errors sum to ``share`` of its integral
+    (or to half of double precision when rounding is what stops it). It raises when an interval can no longer be
+    halved, as QUADPACK reports a failure. (QUADPACK's epsilon extrapolation is not used: the integrands are
+    analytic, and bisection alone meets the tolerance.)
 
     Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
     on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
     tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
-    line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
+    count = directions.shape[1]
+    lines = [_line(prior, log_smoothing, origin, directions[:, column], cavity, working_bytes) for column in range(count)]
     tolerance = max(share, _HALF_PRECISION)
-    coarse_nodes, coarse_weights = np.polynomial.legendre.leggauss(_GAUSS_ORDER)
-    fine_nodes, fine_weights = np.polynomial.legendre.leggauss(2 * _GAUSS_ORDER)
-    lows, highs = np.array([0.0]), np.array([1.0])
-
-    def rules(lows: F64Array, highs: F64Array) -> tuple[F64Array, F64Array]:
-        middles, halves = 0.5 * (lows + highs), 0.5 * (highs - lows)
-        estimates = []
-        for nodes, weights in ((coarse_nodes, coarse_weights), (fine_nodes, fine_weights)):
-            points = middles[:, None] + halves[:, None] * nodes[None, :]
+    nodes = np.concatenate([-_KRONROD_NODES[:-1], _KRONROD_NODES[::-1]])
+    kronrod = np.concatenate([_KRONROD_WEIGHTS[:-1], _KRONROD_WEIGHTS[::-1]])
+    gauss = np.concatenate([_GAUSS_WEIGHTS[:-1], _GAUSS_WEIGHTS[::-1]])
+    intervals = [(np.array([0.0]), np.array([1.0])) for _column in range(count)]
+    done_value, done_error = np.zeros(count), np.zeros(count)
+    logs = np.full(count, np.nan)
+    open_ = list(range(count))
+    while open_:
+        still_open = []
+        for column in open_:
+            lows, highs = intervals[column]
+            centres, halves = 0.5 * (lows + highs), 0.5 * (highs - lows)
+            points = centres[:, None] + halves[:, None] * nodes[None, :]
             steps = (1.0 - points) / points
-            both = line(np.concatenate([steps.ravel(), -steps.ravel()])) - value
-            heights = np.exp(both[: steps.size]).reshape(steps.shape) + np.exp(both[steps.size :]).reshape(steps.shape)
-            estimates.append(halves * ((heights / np.square(points)) @ weights))
-        return estimates[1], np.abs(estimates[1] - estimates[0])
+            both = lines[column](np.concatenate([steps.ravel(), -steps.ravel()])) - value
+            folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
+            kronrod_value = folded @ kronrod
+            gauss_value = folded @ gauss
+            # QUADPACK's error estimate (dqk15i): |K - G| scaled against the integrand's mean absolute deviation.
+            deviation = np.abs(folded - 0.5 * kronrod_value[:, None]) @ kronrod
+            error = np.abs(kronrod_value - gauss_value) * halves
+            scale = deviation * halves
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where(scale > 0.0, np.minimum(1.0, (_QUADPACK_ERROR_SCALE * error / np.where(scale > 0.0, scale, 1.0)) ** _QUADPACK_ERROR_POWER), 1.0)
+            error = np.where((scale > 0.0) & (error > 0.0), scale * ratio, error)
+            error = np.maximum(error, _QUADPACK_RELATIVE_FLOOR * np.abs(folded) @ kronrod * halves)
+            estimates = kronrod_value * halves
+            total = done_value[column] + float(np.sum(estimates))
+            target = tolerance * total
+            if done_error[column] + float(np.sum(error)) <= target:
+                logs[column] = float(np.log(total) - 0.5 * np.log(2.0 * np.pi))
+                continue
+            settled = error <= target * (highs - lows)
+            done_value[column] += float(np.sum(estimates[settled]))
+            done_error[column] += float(np.sum(error[settled]))
+            lows, highs = lows[~settled], highs[~settled]
+            if np.any((highs - lows) <= _EPSILON * np.maximum(highs, _EPSILON)):
+                raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
+            middles = 0.5 * (lows + highs)
+            intervals[column] = (np.concatenate([lows, middles]), np.concatenate([middles, highs]))
+            still_open.append(column)
+        open_ = still_open
+    return logs
 
-    done_value, done_error = 0.0, 0.0
-    while True:
-        estimates, errors = rules(lows, highs)
-        total = done_value + float(np.sum(estimates))
-        target = tolerance * total
-        if done_error + float(np.sum(errors)) <= target:
-            return float(np.log(total) - 0.5 * np.log(2.0 * np.pi))
-        # An interval keeps its share of the target by width; the others are halved.
-        widths = highs - lows
-        settled = errors <= target * widths
-        done_value += float(np.sum(estimates[settled]))
-        done_error += float(np.sum(errors[settled]))
-        lows, highs = lows[~settled], highs[~settled]
-        if np.any((highs - lows) <= _EPSILON * np.maximum(highs, _EPSILON)):
-            raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
-        middles = 0.5 * (lows + highs)
-        lows, highs = np.concatenate([lows, middles]), np.concatenate([middles, highs])
+
+def _line_log_integral(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
+) -> float:
+    """``_line_log_integrals`` for one direction."""
+    return float(_line_log_integrals(prior, log_smoothing, origin, direction[:, None], value, cavity, working_bytes, share)[0])
 
 
 def _laplace_corrections(
@@ -1627,8 +1665,8 @@ def _laplace_corrections(
     remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
     replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
     share = 0.5 * tolerance / max(replaced.shape[0], 1)
-    for index in replaced:
-        corrections[index] = _line_log_integral(prior, log_smoothing, evidence.coefficients, directions[:, index], value, cavity, working_bytes, share)
+    if replaced.shape[0]:
+        corrections[replaced] = _line_log_integrals(prior, log_smoothing, evidence.coefficients, directions[:, replaced], value, cavity, working_bytes, share)
     return corrections, terms, directions
 
 
