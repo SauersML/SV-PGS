@@ -1425,6 +1425,7 @@ class _DenseFixedPoints:
 
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
+        previous_divergence: float | None = None
         while True:
             variances, frozen = self._refresh(hyperparameters)
             mean = self.mean.copy()
@@ -1434,6 +1435,13 @@ class _DenseFixedPoints:
             # posterior metric is r' Sigma r, exactly.
             divergence = self.kernel.update_divergence(self.noise, target_precision - self.site_precision, target_shift - self.site_shift, mean)
             self.mean_move = 2.0 * divergence
+            # The check bounds the undamped step, and the distance to the fixed point is the step over 1 - rho, rho
+            # the iteration's rate: KL_step / (1 - rho)^2, with rho = sqrt(KL_t / KL_(t-1)) from successive refreshes
+            # (theory-ep: no extra build; the step's own KL where no rate is known yet, and no certificate while the
+            # iteration does not contract).
+            rate = float(np.sqrt(divergence / previous_divergence)) if previous_divergence else 0.0
+            distance = divergence / (1.0 - rate) ** 2 if rate < 1.0 else np.inf
+            previous_divergence = divergence
             noise = self._noise(variances)
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
             # The fixed point is certified in evidence units, as every other certificate: the undamped update moves q
@@ -1442,7 +1450,7 @@ class _DenseFixedPoints:
             # to p_eff (the scorer's Monte Carlo resolution, p_eff / K) goes to rounding where the prior collapses
             # (p_eff -> 0 at an edge trial), and EP then ran for minutes on the move's own rounding before refusing;
             # there the KL is second order in the prior's scale and the check passes at the first refresh.
-            if divergence <= tolerance and self.noise_gain <= tolerance:
+            if distance <= tolerance and self.noise_gain <= tolerance:
                 # Each fixed point alive at once (the outer loop holds the current one and one trial) gets an equal share
                 # of the working memory for its posterior's p x p matrices. The exact response replaces the curvature's
                 # GMRES, whose memory it takes; where it does not fit, GMRES has half (``fit_small_n``).
