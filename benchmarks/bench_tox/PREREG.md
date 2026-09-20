@@ -84,3 +84,30 @@ The power section above assumes an infinitesimal (Daetwyler) architecture. A com
    - Confirmation compounds join the pool only in the single confirmation run.
 
 **Power statement, for both architectures:** an infinitesimal architecture is undetectable at this n, as above. An oligogenic architecture with loci explaining ≥ 2.3–4.8% of variance is detectable, and is where SV gains can appear. The empirical heritability and the discovery counts decide which regime each compound is in.
+
+## Amendment 2 (2026-09-20, before any scoring): one genome-wide comparison. This supersedes the method lists above and all of Amendment 1.
+Per the user, "no discover than predict slop, dont spam methods" and "we want full big genome wide stuff". Sealing is unchanged: the same rule and the same confirmation list (sha256 d154565847dc7915…).
+
+**Removed**, and never scored:
+- the regional arm (Amendment 1.1);
+- the nested discovery-then-OLS arm (Amendment 1.3);
+- the cis-candidate CNV permutation analysis;
+- BayesR, GBLUP and top_variant;
+- SV-PGS's no-SV-terms and no-annotations variants;
+- the `sv`, `snv_matched` and `snv_svimp` feature sets.
+
+**The one comparison:** genome-wide, every panel record (no thresholds), on `snv` and on `snv_sv`, over the splits and in-fold covariates above.
+1. **SV-PGS:** the one model, with its prior hyperparameters pooled across the development compounds (hyperprior_pooling). Each compound keeps its own effects, so there's no multi-trait effect model. Pooling uses only a split's training lines, and confirmation compounds join the pool only in the single confirmation run.
+2. **mr.ashr** at the mr-ash-workflow settings (Lasso init, 2,000 iterations), genome-wide, fitted per compound.
+
+**Reported,** pooled over the development compounds and folds, with the bootstrap over lines (relatedness clusters crossed with chromosome blocks):
+- each method's SV gain Δ = r²(snv_sv) − r²(snv), plus out-of-sample R² (the training-mean baseline and the centred form);
+- the paired difference SV-PGS − mr.ashr, on `snv_sv` (the headline) and on `snv`;
+- wall time and peak RSS per fit.
+
+**Power statement, both architectures, kept:**
+- **Infinitesimal (Daetwyler et al. 2008):** at n ≈ 634 training, the expected r² is 0.0003–0.0067, against a pooled SE of about 0.0011 (13.2 effective compounds). Undetectable to marginal.
+- **Oligogenic:** single effects explaining ≥ 4.8% of variance are detectable genome-wide with 80% power at n = 793. Where they exist, a sparse genome-wide prior can predict them.
+- **Which regime:** each compound's empirical heritability (HE/GREML on training folds) says which regime it is in, and is reported alongside.
+
+**Order:** mr.ashr runs as soon as the genotypes are built. SV-PGS runs when its genome-wide fit at this n is available from fit-api.
