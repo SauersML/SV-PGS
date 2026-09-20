@@ -34,9 +34,9 @@ def _posterior_moments(r, gamma, variances, weights):
     log_likelihood -= log_likelihood.max(axis=1, keepdims=True)
     responsibility = np.exp(log_likelihood)
     responsibility /= responsibility.sum(axis=1, keepdims=True)
-    shrink = variances / total
+    shrink = variances / (variances + noise)
     component_mean = shrink[None, :] * r[:, None]
-    component_variance = variances * noise / total
+    component_variance = variances * noise / (variances + noise)
     mean = np.sum(responsibility * component_mean, axis=1)
     second = np.sum(responsibility * (component_variance[None, :] + component_mean ** 2), axis=1)
     return mean, second - mean ** 2
