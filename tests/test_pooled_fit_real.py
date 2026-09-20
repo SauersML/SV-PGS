@@ -65,20 +65,21 @@ def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused
     # Every double loop's EC free energy must fall at every outer step, to rounding (lead: the rwAMR decrease assertion).
     from sv_pgs import small_n
 
-    traces: list[list[float]] = []
+    traces: list[tuple[int, list[float]]] = []
     original = small_n.double_loop_sites
 
     def traced(*arguments, **keywords):
         trace: list[float] = []
-        traces.append(trace)
+        traces.append((int(np.asarray(arguments[3]).shape[0]), trace))
         return original(*arguments, **(keywords | {"trace": trace}))
 
     monkeypatch.setattr(small_n, "double_loop_sites", traced)
     wall, cpu = time.perf_counter(), time.process_time()
     (point,) = oracle([start])
-    for trace in traces:
+    for sites, trace in traces:
         values = np.asarray(trace, dtype=np.float64)
-        rounding = np.finfo(np.float64).eps * np.maximum(np.abs(values[1:]), 1.0) * values.shape[0]
+        # F sums a term per site, each to its rounding: its evaluation error is at most eps |F| per site.
+        rounding = np.finfo(np.float64).eps * np.maximum(np.abs(values[1:]), 1.0) * sites
         assert np.all(values[1:] <= values[:-1] + rounding), f"the double loop's free energy rose: {values.tolist()}"
     record = {
         "split": split, "genes": len(genes), "members": [int(rows.stop - rows.start) for rows in oracle.rows], "wall_s": time.perf_counter() - wall,
