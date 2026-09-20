@@ -2255,8 +2255,11 @@ def _stationarity(
     from it.
     """
     count = weights.shape[0]
-    gradient, error = _full_gradient(view, weights, evidence, cavity, correction, working_bytes, tolerance)
-    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
+    # The gradient is taken at x_rho resolved to double precision, so x's own error barely enters it.
+    refined = _corrected(view, weights, _evidence(view, weights, evidence.coefficients, cavity, correction, working_bytes, 0.0), cavity, correction, working_bytes, tolerance)
+    base = evidence if refined is None else refined
+    gradient, error = _full_gradient(view, weights, base, cavity, correction, working_bytes, tolerance)
+    scale = np.maximum(0.5 * (base.effective_degrees + base.penalty_sizes), _EPSILON * base.magnitude)
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
     curvature = np.zeros((count, count))
     steps = np.zeros(count)
@@ -2272,7 +2275,7 @@ def _stationarity(
                 trial_weights = weights + side * step * unit
                 trial = _corrected(
                     view, trial_weights,
-                    _evidence(view, trial_weights, evidence.coefficients + side * step * evidence.responses[:, position], cavity, correction, working_bytes, 0.0),
+                    _evidence(view, trial_weights, base.coefficients + side * step * base.responses[:, position], cavity, correction, working_bytes, 0.0),
                     cavity, correction, working_bytes, tolerance,
                 )
                 if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
