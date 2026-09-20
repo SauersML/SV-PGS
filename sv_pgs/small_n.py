@@ -6,7 +6,8 @@ solve or a probe certificate:
 
 - q's precision is A = Xp' Xp / sigma^2 + diag tau with Xp = (I - H_C) X~ on the training rows. With the scaled sites
   t = sigma^2 tau it is A = A' / sigma^2, A' = Xp' Xp + diag t, and Sigma = sigma^2 A'^-1.
-- The columns split into the bulk P (t > 0) and the rest N (t <= 0; EP is unclipped). On P, Woodbury gives
+- The columns split into the bulk P (t >= ||x_j||^2, where Woodbury keeps every digit) and the rest N (every other
+  site, negative ones included: EP is unclipped). On P, Woodbury gives
   A'_PP^-1 = T^-1 - T^-1 Xp_P' K^-1 Xp_P T^-1 with the kernel K = I_n + Xp_P T^-1 Xp_P' (always positive definite).
   N enters exactly through its Schur complement S = T_N + Xp_N' K^-1 Xp_N, and A' is positive definite exactly when
   S is (``np.linalg.LinAlgError`` otherwise).
@@ -101,6 +102,7 @@ class _Design:
         self.members = np.arange(self.group_count, dtype=np.int64) if members is None else np.asarray(members, dtype=np.int64)
         self.variant_count = int(self.members.shape[0])
         self.tied = not np.array_equal(self.members, np.arange(self.group_count))
+        self._squares: F64Array | None = None
         self._sum = sparse.csr_matrix(
             (np.ones(self.variant_count), (self.members, np.arange(self.variant_count))), shape=(self.group_count, self.variant_count)
         ) if self.tied else None
@@ -161,6 +163,13 @@ class _Design:
     def columns(self, columns: I64Array) -> F64Array:
         """Xp's member columns ``columns`` (n x |c|, F-ordered)."""
         return self.group_columns(self.members[columns])
+
+    @property
+    def squares(self) -> F64Array:
+        """``column_squares()``, computed once."""
+        if self._squares is None:
+            self._squares = self.column_squares()
+        return self._squares
 
     def column_squares(self) -> F64Array:
         """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
@@ -308,9 +317,14 @@ class _Kernel:
         self.design = design
         self.precision = scaled_precision
         self.variant_count = design.variant_count
-        positive = scaled_precision > 0.0
-        self.bulk = np.flatnonzero(positive)
-        self.rest = np.flatnonzero(~positive)
+        # A positive site's variance by Woodbury is d (1 - d q) + f (d = 1/t, q = x_j' K^-1 x_j): 1 - d q carries d q's
+        # rounding amplified by d q / (1 - d q) = x_j' K_-j^-1 x_j / t_j <= ||x_j||^2 / t_j (K_-j >= I). So a site stays
+        # in the bulk only where that amplification is at most 1, t_j >= ||x_j||^2; every other one goes by the Schur
+        # route, which never inverts t and is exact for any sign (review-mathbugs K1: at t_j = 1e-8 ||x_j||^2 the
+        # Woodbury variance was 770% off an exact rational reference).
+        bulk_mask = (scaled_precision > 0.0) & (scaled_precision >= design.squares)
+        self.bulk = np.flatnonzero(bulk_mask)
+        self.rest = np.flatnonzero(~bulk_mask)
         self.inverse = 1.0 / scaled_precision[self.bulk]
         weights = np.zeros(self.variant_count)
         weights[self.bulk] = self.inverse
@@ -322,8 +336,8 @@ class _Kernel:
         self._factors: tuple[F64Array, F64Array, F64Array] | None = None
         self._units: _Units | None = None
         if self.rest.size:
-            rest_groups = design.members[self.rest]
-            if np.unique(rest_groups).shape[0] < rest_groups.shape[0]:
+            non_positive_groups = design.members[self.rest[scaled_precision[self.rest] <= 0.0]]
+            if np.unique(non_positive_groups).shape[0] < non_positive_groups.shape[0]:
                 # Two members of one group with t <= 0: A' along their difference (e_j - e_k, oriented; the data see
                 # neither) is t_j + t_k <= 0, so A' is not positive definite (exactly).
                 raise np.linalg.LinAlgError("two tie members with non-positive sites share a group: A' is not positive definite")

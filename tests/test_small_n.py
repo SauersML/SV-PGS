@@ -642,3 +642,37 @@ def test_the_log_evidence_is_the_references_and_selection_keeps_the_highest(monk
     best = candidates[int(np.argmax(evidence))]
     np.testing.assert_array_equal(chosen[0], best[0])
     assert profile["double_loop_candidates"] == 2
+
+
+def _exact_inverse_diagonal(matrix):
+    """diag(M^-1) exactly, in rationals (Gauss-Jordan on Fractions of the float entries)."""
+    from fractions import Fraction
+
+    size = matrix.shape[0]
+    rows = [[Fraction(float(matrix[i, j])) for j in range(size)] + [Fraction(int(i == j)) for j in range(size)] for i in range(size)]
+    for column in range(size):
+        pivot = next(row for row in range(column, size) if rows[row][column] != 0)
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        head = rows[column][column]
+        rows[column] = [value / head for value in rows[column]]
+        for row in range(size):
+            if row != column and rows[row][column] != 0:
+                factor = rows[row][column]
+                rows[row] = [value - factor * base for value, base in zip(rows[row], rows[column])]
+    return np.array([float(rows[i][size + i]) for i in range(size)])
+
+
+@pytest.mark.parametrize("tiny", [1e-4, 1e-8, 1e-12])
+def test_a_tiny_positive_site_keeps_its_variance_exact(tiny):
+    """review-mathbugs K1: a positive site far below its column's data (t_0 << ||x_0||^2, p > n) lost every digit of
+    its Woodbury variance (770% off at 1e-8). It now goes by the Schur route: variances and cavities against an exact
+    rational inverse."""
+    rng = np.random.default_rng(99)
+    design = _design(rng, 8, 10)
+    precision = rng.uniform(0.5, 2.0, 10)
+    precision[0] = tiny
+    matrix = design.T @ design + np.diag(precision)
+    exact = _exact_inverse_diagonal(matrix)
+    variances, removed, cavity = _Kernel(_Design.dense(design), precision).cavity()
+    np.testing.assert_allclose(variances, exact, rtol=1e-12)
+    np.testing.assert_allclose(cavity, 1.0 / exact - precision, rtol=1e-9)
