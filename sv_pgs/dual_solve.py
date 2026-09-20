@@ -399,6 +399,8 @@ class SolveResult:
     relative_errors: list
     operator_scale: float
     model_scales: dict
+    # The bound each column's exact residual met: the one asked for, or float64's floor where that lies below it.
+    residual_bound: Any
 
 
 def _conjugate_gradient_rate(operator_scale: float) -> float:
@@ -473,9 +475,12 @@ def certified_block_cg(
     start needs no product, since then r = b. `deflation` solves each model's spikes exactly and CG
     the rest.
 
-    There is no iteration cap. A bound below what float64 can attain for a column,
-    (n + p) eps lambda_max ||z||, the rounding of one exact product S z, is refused up front, and a
-    restart whose exact residual did not fall below the previous one fails loudly instead of looping.
+    There is no iteration cap. float64 cannot resolve a residual below the rounding of one exact
+    product S z, (n + p) eps lambda ||z|| (lambda the largest Ritz value seen): a column's bound below
+    that floor is raised to it at each restart, the smallest target the exact residual can be shown to
+    meet, and ``residual_bound`` reports the bound each column met, so a caller sees where float64, not
+    its request, set the accuracy. A restart whose exact residual did not fall below the previous one
+    fails loudly instead of looping.
     """
     array_module = source.array_module
     host_models = _host(column_models)
@@ -494,12 +499,11 @@ def certified_block_cg(
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
         norms = array_module.linalg.norm(residual, axis=0)
+        floor = (source.sample_count + source.variant_count) * np.finfo(np.float64).eps * operator_scale * array_module.linalg.norm(solution, axis=0)
+        bound = array_module.maximum(bound, floor)
         open_mask = _host(norms > bound)
         if not open_mask.any():
-            return SolveResult(solution, residual, norms, iterations, restarts, relative_errors, operator_scale, model_scales)
-        attainable = (source.sample_count + source.variant_count) * np.finfo(np.float64).eps * operator_scale * array_module.linalg.norm(solution, axis=0)
-        if bool(array_module.any((bound <= attainable)[array_module.asarray(np.flatnonzero(open_mask))])):
-            raise ValueError("a residual bound lies below the accuracy float64 can attain for S z.")
+            return SolveResult(solution, residual, norms, iterations, restarts, relative_errors, operator_scale, model_scales, bound)
         if restarts and bool(array_module.any((norms >= previous_norms)[array_module.asarray(np.flatnonzero(open_mask))])):
             raise FloatingPointError("an exact residual did not fall across a restart; the solve stagnated.")
         previous_norms = norms
@@ -807,6 +811,20 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     return resolved_mean, mean_duals, array_module.sqrt(bulk_norms * bulk_norms + quadratic)
 
 
+def exact_resolved_certificate(array_module: Any, block: ResolvedBlock, shift: Any, duals: Any, residual: Any) -> Any:
+    """split_columns' certificate as it would be with Z_L exact (R_L = 0): the part the bulk residual alone sets.
+
+    With R_L = 0 the bulk residual is the solve's own, the core is exact (delta = 0) and the cross term
+    vanishes, so the certificate is sqrt(||r_b||^2 + ||L^-1 (r_L + Z_hat'r_b)||^2). What split_columns adds
+    above it is Z_L's.
+    """
+    resolved_mean = _cholesky_solve(array_module, block.factor, shift + block.design.T @ duals)
+    mean_duals = duals - block.duals @ resolved_mean
+    stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
+    projected = array_module.linalg.solve(block.factor, stationarity + block.duals.T @ residual)
+    return array_module.sqrt(array_module.sum(residual * residual, axis=0) + array_module.sum(projected * projected, axis=0))
+
+
 @dataclass(frozen=True)
 class DualCertificate:
     """Per model, the certified bound on the mean's error ||mu_hat - mu||_A, and the bound asked for.
@@ -1024,6 +1042,15 @@ class DualGaussian:
             open_models = _host(certificate > target)
             if not open_models.any():
                 break
+            # A model whose mean and Z_L columns all met float64's floor instead of their bounds cannot tighten: its
+            # certificate is the accuracy float64 allows, and DualCertificate reports it above the bound asked for.
+            floored = _host(result.residual_bound > bound)
+            for position, model in enumerate(order):
+                if floored[model] and not floored[offsets[position + 1] : offsets[position + 2]].all():
+                    floored[model] = False
+            open_models &= ~floored[: self.model_count]
+            if not open_models.any():
+                break
             # Tighten the open models' mean and Z_L columns by the measured shortfall and continue.
             for model in np.flatnonzero(open_models):
                 shortfall = float(target[model] / certificate[model]) if bool(array_module.isfinite(certificate[model])) else float(target[model] / max(float(column_norms[model]), np.finfo(np.float64).tiny))
@@ -1146,14 +1173,24 @@ class DualGaussian:
         self.count.note(columns, 0.0, "information-products")
         return back_products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
 
-    def posterior_solve(self, right: Any, model: int, error_bound: Any) -> Any:
-        """A_m^-1 right (p x r) at the last iterate's sites, each column certified to ||x_hat - x||_A <= error_bound.
+    def posterior_solve(self, right: Any, model: int, error_bound: Any) -> tuple[Any, Any]:
+        """A_m^-1 right (p x r) at the last iterate's sites, and each column's certified ||x_hat - x||_A.
 
         It is the split mean with no data and shift `right`: the bulk dual solves
         S_S z_b = -Xt_S D_S v_S, the resolved rows are x_L = core^-1 (v_L + Xt_L'z_b), and
-        x_S = D_S v_S + D_S Xt_S'(z_b - Z_L x_L), with split_columns' certificate. The last iterate's
-        Z_L is reused; when the certificate needs it, the columns and Z_L are tightened by the
-        measured shortfall. Two reads plus the CG passes.
+        x_S = D_S v_S + D_S Xt_S'(z_b - Z_L x_L), with split_columns' certificate. Every certificate meets
+        `error_bound` except where float64 cannot: a column whose bulk solve is at float64's floor
+        (certified_block_cg's residual_bound) while Z_L cannot lower its certificate stops there, and its
+        certificate, above the request, says so to the caller.
+
+        The last iterate's Z_L is reused, and refined only where it is what misses: where the certificate
+        with Z_L exact (exact_resolved_certificate, c0) meets the bound e and the full one, c, does not, or
+        where the inexact core leaves no certificate. The squared certificate is convex in a scale t of R_L
+        (a squared norm affine in t over the concave 1 - delta), so t = (e^2 - c0^2) / (c^2 - c0^2) brings c
+        to e with the rest held; Z_L's residuals are tightened by the smallest such t, and the next round's
+        certificate decides. A column its bulk residual limits tightens its bulk bound by the shortfall e / c.
+        Tightening Z_L for every miss instead compounds across the solves that share it, down to float64's
+        floor. Two reads plus the CG passes.
         """
         array_module = self.array_module
         source = self.source
@@ -1172,23 +1209,42 @@ class DualGaussian:
             result = certified_block_cg(source, models, rhs, start, column_models, bound, self.count, deflation=spike_free, label="posterior")
             if block is None:
                 duals, certificate, resolved_values = result.solution, result.residual_norm, None
+                exact = certificate
             else:
                 resolved_values, duals, certificate = split_columns(array_module, block, values[resolved], result.solution, result.residual)
+                exact = exact_resolved_certificate(array_module, block, values[resolved], result.solution, result.residual)
             open_mask = _host(certificate > target)
             if not open_mask.any():
                 break
-            finite = array_module.isfinite(certificate)
-            fallback = target / array_module.maximum(array_module.linalg.norm(rhs, axis=0), np.finfo(np.float64).tiny)
-            shortfall = array_module.where(finite, target / array_module.where(finite, certificate, 1.0), fallback)
-            open_columns = array_module.asarray(np.flatnonzero(open_mask))
-            bound[open_columns] *= shortfall[open_columns]
-            if block is not None:
-                tightening = float(array_module.min(shortfall[open_columns]))
+            finite = _host(array_module.isfinite(certificate))
+            resolved_limited = open_mask & (_host(exact <= target) | ~finite) if block is not None else np.zeros_like(open_mask)
+            moved = False
+            if resolved_limited.any():
+                limited = array_module.asarray(np.flatnonzero(resolved_limited & finite))
+                if limited.size:
+                    excess = certificate[limited] ** 2 - exact[limited] ** 2
+                    tightening = float(array_module.min((target[limited] ** 2 - exact[limited] ** 2) / excess))
+                else:
+                    tightening = float(array_module.min(target / array_module.maximum(array_module.linalg.norm(rhs, axis=0), np.finfo(np.float64).tiny)))
                 resolved_columns = array_module.full(int(block.design.shape[1]), model)
                 resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
                 refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="posterior-resolved")
                 block = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
                 state["blocks"][model] = block
+                if bool(array_module.any(refined.residual_bound <= resolved_bound)):
+                    moved = True
+                else:
+                    # Every Z_L column is at float64's floor: only the bulk can still lower these certificates.
+                    resolved_limited = np.zeros_like(open_mask)
+            bulk_limited = open_mask & ~resolved_limited & ~_host(result.residual_bound > bound)
+            if bulk_limited.any():
+                tighten = array_module.asarray(np.flatnonzero(bulk_limited))
+                bound[tighten] *= target[tighten] / certificate[tighten]
+                moved = True
+            if not moved:
+                # Every open column's bulk solve and Z_L are at float64's floor: its certificate is the accuracy
+                # float64 allows, returned above the request.
+                break
             start = result.solution
         left = models.sample_to_design(duals, column_models)
         solution = bulk_variances[:, None] * bulk_values
@@ -1197,7 +1253,7 @@ class DualGaussian:
         self.count.note(columns, 0.0, "posterior-solution")
         if resolved_values is not None:
             solution[resolved] = resolved_values
-        return solution
+        return solution, certificate
 
     def residual_sum_of_squares(self) -> np.ndarray:
         """(M,): each model's training sum of (y - linear predictor)^2 at the current mean."""

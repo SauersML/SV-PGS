@@ -262,9 +262,13 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
         ensure()
         while live.size:
-            solved = np.asarray(_host(gaussian.posterior_solve(values[:, live], model, bound)), dtype=np.float64)
-            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), bound)
-            done = bound <= relative_tolerance * lower
+            solved, certified = gaussian.posterior_solve(values[:, live], model, bound)
+            solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
+            if not np.all(np.isfinite(certified)):
+                raise ValueError("a posterior solve has no certificate at float64's accuracy")
+            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), certified)
+            # A certificate above the bound asked for is float64's floor: no solve certifies the column better.
+            done = (certified <= relative_tolerance * lower) | (certified > bound)
             solution[:, live[done]] = solved[:, done]
             bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
             live = live[~done]
@@ -505,12 +509,16 @@ class _FullDataFixedPoints:
 
     def _move_bounds(self, model: int, right: F64Array, threshold: float) -> float:
         """An upper bound on ||Sigma right||_A^2 that decides it against ``threshold``: the solve's bound halves until
-        the two-sided bounds from r'x_hat fall on one side."""
+        the two-sided bounds from r'x_hat fall on one side. Where float64's floor stops the solve first, the move lies
+        within float64's accuracy of the threshold, and the upper bound, then above it, is returned."""
         bound = np.array([0.5 * np.sqrt(threshold)])
         while True:
-            solved = np.asarray(_host(self.gaussian.posterior_solve(right[:, None], model, bound)), dtype=np.float64)
-            lower, upper = _norm_bounds(np.array([float(right @ solved[:, 0])]), bound)
-            if upper[0] * upper[0] <= threshold or lower[0] * lower[0] > threshold:
+            solved, certified = self.gaussian.posterior_solve(right[:, None], model, bound)
+            solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
+            if not np.all(np.isfinite(certified)):
+                raise ValueError("a posterior solve has no certificate at float64's accuracy")
+            lower, upper = _norm_bounds(np.array([float(right @ solved[:, 0])]), certified)
+            if upper[0] * upper[0] <= threshold or lower[0] * lower[0] > threshold or certified[0] > bound[0]:
                 return float(upper[0] * upper[0])
             bound = 0.5 * bound
 

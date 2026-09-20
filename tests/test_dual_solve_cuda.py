@@ -97,7 +97,7 @@ def test_cuda_posterior_and_information_solves_match_the_host() -> None:
         )
         gaussian.iterate(site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
                          error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
-        solved = gaussian.posterior_solve(array_module.asarray(right), 0, np.sqrt(EPS))
+        solved, _certificate = gaussian.posterior_solve(array_module.asarray(right), 0, np.sqrt(EPS))
         back, coupling, _norms = gaussian.information_solve(array_module.asarray(right), 0, np.sqrt(EPS))
         outputs.append([np.asarray(item.get() if hasattr(item, "get") else item) for item in (solved, back, coupling)])
     for host, device in zip(*outputs):

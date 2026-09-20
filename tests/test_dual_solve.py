@@ -274,18 +274,18 @@ def test_the_refresh_pass_applies_the_new_sites_in_the_same_read() -> None:
     np.testing.assert_array_equal(models.variances, new_variances)
 
 
-def test_a_bound_below_float64_resolution_is_refused() -> None:
+def test_a_bound_below_float64_resolution_is_met_at_its_floor() -> None:
     genotypes, source, models, _covariates, _weights, _variances, prior_mean, response = _setup(14)
     right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
     count = dual_solve.PassCount()
     first = _exact_solve(source, models, right, count)
-    try:
-        dual_solve.certified_block_cg(source, models, right, first.solution, np.arange(MODEL_COUNT), np.zeros(MODEL_COUNT), count,
-                                      operator_scale=first.operator_scale)
-    except ValueError as error:
-        assert "below the accuracy" in str(error)
-    else:
-        raise AssertionError("a zero bound must be refused")
+    result = dual_solve.certified_block_cg(source, models, right, first.solution, np.arange(MODEL_COUNT), np.zeros(MODEL_COUNT), count,
+                                           operator_scale=first.operator_scale)
+    # A zero bound becomes float64's floor, the rounding of one exact product S z, and the exact residual meets it.
+    floor = (source.sample_count + source.variant_count) * EPS * result.operator_scale * np.linalg.norm(result.solution, axis=0)
+    np.testing.assert_allclose(result.residual_bound, floor, rtol=4 * EPS, atol=0.0)
+    assert np.all(result.residual_bound > 0.0)
+    assert np.all(result.residual_norm <= result.residual_bound)
 
 
 def test_a_column_budget_keeps_the_largest_spikes() -> None:
@@ -506,11 +506,58 @@ def test_posterior_solve_is_the_dense_inverse_with_negative_sites() -> None:
         exact = np.linalg.solve(posterior_precision, right)
         scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
         bound = np.sqrt(EPS) * scale
-        solved = gaussian.posterior_solve(right, model, bound)
+        solved, certificate = gaussian.posterior_solve(right, model, bound)
+        assert np.all(certificate <= bound)
         error = solved - exact
         energy = np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error))
-        assert np.all(energy <= bound + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
+        assert np.all(energy <= certificate + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
     assert set(negative) <= set(gaussian.bulk_solves[0].resolved)
+
+
+def test_solves_sharing_z_l_refine_it_only_where_it_limits_the_certificate() -> None:
+    # A Krylov loop around posterior_solve asks the same relative accuracy of ever smaller right-hand sides. Each
+    # is the first one scaled, so every certificate scales with it: once Z_L suffices for the first, it suffices
+    # for all, and refining Z_L on every miss (the bulk's included) would compound it down to float64's floor.
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(57)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=7)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, 0)[0]
+    right = np.random.default_rng(59).standard_normal((genotypes.shape[1], 3))
+    exact = np.linalg.solve(posterior_precision, right)
+    relative = np.sqrt(np.sqrt(EPS))
+    bound = relative * np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+
+    def refinements() -> int:
+        return sum(1 for label, _columns, _error in gaussian.count.records if label.startswith("posterior-resolved"))
+
+    gaussian.posterior_solve(right, 0, bound)
+    after_first = refinements()
+    for power in range(1, 60):
+        scale = 0.5**power
+        solved, certificate = gaussian.posterior_solve(scale * right, 0, scale * bound)
+        assert np.all(certificate <= scale * bound)
+        error = solved - scale * exact
+        rounding = np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale * bound / relative
+        assert np.all(np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error)) <= certificate + rounding)
+    assert refinements() == after_first
+
+
+def test_a_posterior_bound_below_float64_resolution_returns_the_floors_certificate() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(57)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=7)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, 0)[0]
+    right = np.random.default_rng(60).standard_normal((genotypes.shape[1], 2))
+    exact = np.linalg.solve(posterior_precision, right)
+    solved, certificate = gaussian.posterior_solve(right, 0, np.zeros(2))
+    # No solve certifies a zero error; the answer is float64's best, with the certificate it has.
+    assert np.all(np.isfinite(certificate)) and np.all(certificate > 0.0)
+    scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+    assert np.all(certificate <= np.sqrt(EPS) * scale)
+    error = solved - exact
+    assert np.all(np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error)) <= certificate + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
 
 
 def test_the_recursive_share_minimizes_the_cycles_digit_passes() -> None:
