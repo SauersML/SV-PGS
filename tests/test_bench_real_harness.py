@@ -361,3 +361,11 @@ def test_cross_mappable_partner_inside_the_lead_sv_is_flagged(tmp_path):
     table = pd.DataFrame({"gene_id": ["ENSG1.9"], "chrom": ["chr1"], "lead_sv_id": ["sv"], "lead_sv_start": [500], "lead_sv_end": [5000]})
     flagged = sv_gene_table.add_cross_mappability(table, tmp_path / "crossmap.txt.gz", tmp_path / "genes.gtf.gz")
     assert flagged["lead_sv_crossmappable_partners"].tolist() == [1] and flagged["lead_sv_max_crossmappability"].tolist() == [12.5]
+
+
+def test_allele_lengths_are_signed_and_never_zeroed_below_the_sv_threshold():
+    table = pd.DataFrame({"alt_len": [-1, -1, -1, 1, 50, 10, 1], "ref_len": [1, 1, 1, 50, 1, 1, 1],
+                          "sv_length": [5000, 3000, 700, 49, 49, 0, 0], "sv_type": ["DEL", "DUP", "INV", "DEL", "INS", "INS", "."]})
+    length, change = harness.allele_lengths(table)
+    assert length.tolist() == [5000, 3000, 700, 49, 49, 9, 0]
+    assert change.tolist() == [-5000, 3000, 0, -49, 49, 9, 0]

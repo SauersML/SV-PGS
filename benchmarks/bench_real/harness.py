@@ -170,6 +170,29 @@ def load_gene_window(dataset: Dataset, gene_row: int):
                       genotypes=np.asarray(dosage[rows], dtype=np.float32).T, table=table.iloc[rows].reset_index(drop=True))
 
 
+# The sign of a symbolic allele's length change by its SV type: deletions lose sequence, insertions and duplications
+# gain it; inversions, breakends, complex and multi-allelic copy-number records have no single signed change.
+LENGTH_CHANGE_SIGN = {"DEL": -1, "INS": 1, "DUP": 1}
+
+
+def allele_lengths(table: pd.DataFrame):
+    """(length, signed allele-length change) for every record, SV or not.
+
+    Sequence-resolved alleles: change = len(ALT) - len(REF), and length = |change|, or the record's stored SV length when
+    it has one (SVLEN). Symbolic alleles (alt_len -1): length is the stored SV length (SVLEN, else END - POS), and the
+    change is signed by the SV type (LENGTH_CHANGE_SIGN). The 50 bp threshold lives only in is_sv, the reporting label:
+    a length is never zeroed for being short, so a length-dependent prior sees a continuous length."""
+    alternate, reference = table["alt_len"].to_numpy(), table["ref_len"].to_numpy()
+    stored = table["sv_length"].to_numpy()
+    symbolic = alternate < 0
+    resolved_change = np.where(symbolic, 0, alternate - reference)
+    length = np.where(symbolic | (stored > 0), stored, np.abs(resolved_change))
+    base_type = np.array([str(value).split(":")[0] for value in table["sv_type"]])
+    sign = np.array([LENGTH_CHANGE_SIGN.get(value, 0) for value in base_type])
+    change = np.where(symbolic, sign * length, resolved_change)
+    return length, change
+
+
 def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     train_index = np.array([dataset.sample_index[sample] for sample in split["train"]])
     test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
@@ -183,10 +206,9 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     selected = window.table[polymorphic]
     position, end = selected["pos"].to_numpy(), selected["end"].to_numpy()
     distance = np.where(position > window.tss, position - window.tss, np.where(end < window.tss, end - window.tss, 0))
-    alternate_length = selected["alt_len"].to_numpy()
+    length, length_change = allele_lengths(selected)
     variants = Variants(position=position, end=end, distance_to_tss=distance, is_sv=selected["is_sv"].to_numpy(dtype=bool),
-                        sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=selected["sv_length"].to_numpy(),
-                        allele_length_change=np.where(alternate_length < 0, 0, alternate_length - selected["ref_len"].to_numpy()),
+                        sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=length, allele_length_change=length_change,
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
                         window_row=np.flatnonzero(polymorphic))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
