@@ -92,9 +92,10 @@ def _bench_sim_views(generator: np.random.Generator, trait_type: str) -> tuple[b
     train = bench_sim.TrainData(
         variants=variants, covariates=covariates[train_columns], covariate_names=names, phenotype=phenotype[train_columns],
         trait_type=trait_type, prevalence=None if trait_type == "quantitative" else 0.3, cores=1,
+        truth_half=np.zeros(train_columns.shape[0], dtype=bool), reads=None,
         _observed=observed, _columns=train_columns, _records=records,
     )
-    test = bench_sim.ScoreData(variants=variants, covariates=covariates[test_columns], covariate_names=names,
+    test = bench_sim.ScoreData(variants=variants, covariates=covariates[test_columns], covariate_names=names, reads=None,
                                _observed=observed, _columns=test_columns, _records=records)
     return train, test, variants
 
@@ -362,11 +363,10 @@ def test_the_batch_arms_take_the_whole_process_less_what_it_holds(monkeypatch: p
 
 def test_bench_reals_covariates_are_the_fits_fixed_effects(small_n: _SmallNStub) -> None:
     """review-mathbugs C2: the phenotype was residualized on [1, C], so the fit projects on the same [1, C]."""
-    import types
-
     train, test = _bench_real_train(np.random.default_rng(15))
     covariates = np.random.default_rng(16).normal(size=(_REAL_SAMPLES + 20, 2))
-    with_covariates = types.SimpleNamespace(**{field.name: getattr(train, field.name) for field in dataclasses.fields(train)}, covariates=covariates[:_REAL_SAMPLES])
+    with_covariates = dataclasses.replace(train, covariates=covariates[:_REAL_SAMPLES])
+    train = dataclasses.replace(train, covariates=None)
     predictor = svpgs_method.fit_expression(with_covariates)
     np.testing.assert_array_equal(small_n.calls[0]["covariates"], np.column_stack([np.ones(_REAL_SAMPLES), covariates[:_REAL_SAMPLES]]))
     alpha = predictor.scoring.alpha
