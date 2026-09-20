@@ -267,6 +267,8 @@ def test_without_truth_the_model_degrades_loudly_and_records_it() -> None:
     variance = np.array([0.4, 0.3])
     with pytest.raises(ValueError, match="reported_reliability"):
         fit_measurement_model(None, variance, np.zeros(2, dtype=int), np.array([0.9, 1.5]))
+    with pytest.raises(ValueError, match="undefined"):
+        fit_measurement_model(None, variance, np.zeros(2, dtype=int), np.array([0.9, np.nan]))
     reported = np.array([0.9, 0.5])
     model = fit_measurement_model(None, variance, np.zeros(2, dtype=int), reported)
     np.testing.assert_array_equal(model.scales, np.ones(2))

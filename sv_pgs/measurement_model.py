@@ -696,8 +696,12 @@ def fit_measurement_model(
     reported = np.asarray(reported_reliability, dtype=np.float64)
     if variance.ndim != 1 or np.any(variance < 0.0) or labels.shape != variance.shape:
         raise ValueError("fit_measurement_model needs one nonnegative cohort variance and one stratum per record.")
-    if reported.shape != variance.shape or np.any((reported < 0.0) | (reported > 1.0)):
-        raise ValueError("reported_reliability needs one r^2 in [0, 1] per record.")
+    if reported.shape != variance.shape:
+        raise ValueError("reported_reliability needs one r^2 per record.")
+    undefined = ~((reported >= 0.0) & (reported <= 1.0))
+    if np.any(undefined):
+        # NaN passes a range test; an undefined r^2 must be replaced (e.g. by a reliability curve), never logged.
+        raise ValueError(f"reported_reliability needs one r^2 in [0, 1] per record; {int(undefined.sum())} are outside it or undefined.")
     varying = variance > 0.0
     calibrated = np.zeros(variance.shape, dtype=bool)
     if calibration is not None:
