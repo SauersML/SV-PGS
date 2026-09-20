@@ -450,6 +450,7 @@ def certified_block_cg(
     operator_scale: float = 1.0,
     deflation: Deflation | None = None,
     label: str = "cg",
+    confirm: bool = True,
 ) -> SolveResult:
     """Solve S_m z = b for every column; each model's columns share one block Krylov space.
 
@@ -473,6 +474,10 @@ def certified_block_cg(
     start needs no product, since then r = b. `deflation` solves each model's spikes exactly and CG
     the rest.
 
+    With ``confirm`` False the solve returns once a cycle's recursive residuals (plus their drift) meet the bounds,
+    without the exact-residual read that would certify them: for a caller whose next read gives the exact residual
+    anyway (outer_economy's fused finish), which then certifies it or continues.
+
     There is no iteration cap. A bound below what float64 can attain for a column,
     (n + p) eps lambda_max ||z||, the rounding of one exact product S z, is refused up front, and a
     restart whose exact residual did not fall below the previous one fails loudly instead of looping.
@@ -491,6 +496,8 @@ def certified_block_cg(
     while True:
         if zero_start and restarts == 0:
             residual = right_hand_side.copy()
+        elif not confirm and restarts:
+            return SolveResult(solution, residual, array_module.linalg.norm(residual, axis=0), iterations, restarts, relative_errors, operator_scale, model_scales)
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
         norms = array_module.linalg.norm(residual, axis=0)
