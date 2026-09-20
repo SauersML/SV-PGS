@@ -91,6 +91,7 @@ from sv_pgs.cohort import (
     reportable_count,
     resolve_cohort_rows,
 )
+from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
@@ -1195,6 +1196,9 @@ def _convert_chromosome(run: _Run, directory: Path, root: Path, chromosome: str,
         ref_length=strata.ref_lengths.astype(np.int32),
         alt_length=strata.alt_lengths.astype(np.int32),
         variant_class=classes,
+        # Every record the driver stores is an ALT count from the popped BCFs: its value is code / 127.
+        codes_per_unit=allele_count_decode(record_count)[0],
+        value_origin=allele_count_decode(record_count)[1],
         group_first=group_first,
         sum_code=sums.astype(np.uint64),
         sum_code2=squares.astype(np.uint64),
