@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from benchmarks.bench_sim.measurement import measured_records
+from benchmarks.bench_sim.records import measured_records
 
 CODES_PER_DOSAGE = 127
 CLASS_NAMES = ("SNV", "INDEL", "TR", "SV")
