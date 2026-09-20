@@ -89,6 +89,28 @@ No covariate matrix is shared across traits.
 - **No rank is required.** A trait's rows can take a column's rank away (a sex-restricted disease), and each model projects onto its own columns' span (`dual_solve.covariate_whitener`).
 - Every genotyped cohort row stays a row. A person no table lists has no target and is scored but never fitted.
 
+## Diseases under the disease measurement model (specified; lands after lane/pheno-disease-model)
+
+pheno-disease's disease model (docs/design/math/disease_measurement.md) replaces 0/1 case status with a latent onset read through the EHR. The pipeline changes as follows:
+
+- **The target.** Each person gets a Gaussian site on the liability scale: precision-mean s_i (`liability_score`) and precision R_i (`target_reliability`), which can be ≤ 0 and is never clipped.
+  - Until the fit takes the site, a disease is a QUANTITATIVE fit on `target` = s/mean R, unweighted, with `target_variance` None. That is the unbiased engine target, and fit-api agrees.
+  - A binary fit would refuse these targets, since they aren't 0/1.
+  - fit-api has proposed `target_precision` (signed) to e2e for the site proper.
+- **Fold-strict disease fits** (lead ruling, EVALUATION.md claim (a)). The disease model's parameters are fitted on each training fold only, and the PGS of model (disease, k) is trained on the sites of that training-fold fit. So:
+  - The phenotypes step reads the samples step's frozen folds; it runs after `samples` and keys on it.
+  - Per disease there is one CDR query and one disease-model fit per training fold. Every other fold's persons are scored under that fold's parameters.
+  - A disease's targets differ by fold. The cohort's target matrix is [rows, models], not [rows, traits], and the fit already takes it per model.
+- **Kept in the workspace** for the exact held-out score: each disease's per-person records (`PersonRecord`), and each training fold's fitted parameters and knots. The TSV alone isn't enough.
+- **The report's disease score** is each held-out person's exact log-likelihood of their own records under their fold's training-fold fit, with the arm's held-out linear predictor f_i as a liability shift: `disease_posterior_at(persons, knots, parameters, working_bytes, liability_shift=f)`.
+  - The gain is ℓ_i(η_i + f_i) − ℓ_i(η_i + f_0,i), in nats, where f_0 is the same fold's fit on the trait's covariates and PCs alone. It is averaged over folds with weights n_f/n.
+  - The exact ℓ_i is used, never the site's quadratic, since a negative R makes the quadratic unbounded.
+  - `onset_probability` is display-only and enters no score.
+- **Needed from other lanes before this lands:**
+  - pheno-disease: a fold-strict entry point. Given the fold of each person, it runs one query and K training-fold fits, and writes per-fold tables, per-fold parameters and knots, and the records.
+  - fit-api: a covariate-only fit f_0 with the same likelihood.
+  - novel-inference: the disease pair term. Until then the variance is conservative (EVALUATION.md, Pending).
+
 ## Direct read-based SV/CNV channel (specified; not yet built)
 
 **Why.** SVs imputed from SNVs keep little of the real SV signal: median r² 0.33, and 0.00–0.77 at the CNVs that drive the signal [real: bench-sim, as reported by the lead, 2026-09-20]. So the pipeline must carry a second, direct measurement of the same people's SVs and CNVs, read from their short reads, beside the imputed long-read-panel DS. measure-path's fusion combines the two (MODEL.md §2: B = α_B + ρ_B·G + e_B).
