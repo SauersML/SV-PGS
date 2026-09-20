@@ -142,6 +142,9 @@ def test_sharing_cost_counts():
     assert cost.fold_factor_direct == 2 * 125 / 3
     assert cost.nested_shared == 100 * 2
     assert cost.ratios()["fold_factors"] < 1
+    no_columns = fold_share.sharing_cost(sample_count=10, held_out_sizes=[5, 5], window_sizes=[4], unique_columns=4,
+                                         segment_window_memberships=1, added_columns=[])
+    assert np.isnan(no_columns.ratios()["nested_columns_common_weights"])
 
 
 def test_sharing_cost_excludes_the_always_trained_prefix_from_trailing_blocks():

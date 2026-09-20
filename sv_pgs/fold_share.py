@@ -261,10 +261,12 @@ class SharingCost:
     nested_shared: float
 
     def ratios(self) -> dict[str, float]:
-        return {"windows": self.window_direct / self.window_shared,
-                "fold_kernels_common_weights": self.fold_kernel_direct / self.fold_kernel_shared,
-                "fold_factors": self.fold_factor_direct / self.fold_factor_shared,
-                "nested_columns_common_weights": self.nested_direct / self.nested_shared}
+        """Direct over shared for each identity; NaN where the benchmark has nothing of that kind to share."""
+        pairs = {"windows": (self.window_direct, self.window_shared),
+                 "fold_kernels_common_weights": (self.fold_kernel_direct, self.fold_kernel_shared),
+                 "fold_factors": (self.fold_factor_direct, self.fold_factor_shared),
+                 "nested_columns_common_weights": (self.nested_direct, self.nested_shared)}
+        return {name: direct / shared if shared > 0 else float("nan") for name, (direct, shared) in pairs.items()}
 
 
 def sharing_cost(
