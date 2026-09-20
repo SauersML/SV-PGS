@@ -1403,7 +1403,7 @@ class _DenseFixedPoints:
             for density in np.unique(classes):
                 members = np.flatnonzero(classes == density)
                 terms = _components(
-                    log_density[members[0]], scales[members], prior.log_variance_grid, prior.kernel_floor,
+                    log_density[members[0]], scales[members], prior.log_variance_grid,
                     np.asarray(cavity_precision)[members], np.asarray(cavity_shift)[members],
                 )
                 shift = np.asarray(cavity_shift)[members][:, None]
