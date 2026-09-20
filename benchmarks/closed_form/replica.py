@@ -42,8 +42,25 @@ def _posterior_moments(r, gamma, variances, weights):
     return mean, second - mean ** 2
 
 
-def scalar_mmse(gamma, variances, weights, order=QUADRATURE_ORDER):
-    """E[(beta - E[beta | r])^2] for r = beta + N(0, 1/gamma), beta ~ sum_k w_k N(0, v_k)."""
+def scalar_mmse(gamma, variances, weights, order=None):
+    """E[(beta - E[beta | r])^2] for r = beta + N(0, 1/gamma), beta ~ sum_k w_k N(0, v_k).
+
+    With `order=None` the Gauss-Hermite order doubles from QUADRATURE_ORDER until two successive values agree to
+    sqrt(float64 eps) relative, so the answer is converged rather than taken at a fixed order.
+    """
+    if order is not None:
+        return _scalar_mmse_at(gamma, variances, weights, order)
+    current = _scalar_mmse_at(gamma, variances, weights, QUADRATURE_ORDER)
+    order = QUADRATURE_ORDER
+    while True:
+        order = 2 * order + 1
+        refined = _scalar_mmse_at(gamma, variances, weights, order)
+        if abs(refined - current) <= np.sqrt(np.finfo(np.float64).eps) * max(refined, current, np.finfo(np.float64).tiny):
+            return refined
+        current = refined
+
+
+def _scalar_mmse_at(gamma, variances, weights, order):
     variances, weights = np.asarray(variances, dtype=np.float64), np.asarray(weights, dtype=np.float64)
     nodes, node_weights = hermegauss(order)
     node_weights = node_weights / node_weights.sum()
