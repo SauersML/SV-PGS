@@ -35,12 +35,13 @@ SEALED_GENES = "sealed_confirmation_genes.tsv"
 PARENT_DATASET = "parent_dataset.txt"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
-                "svimp", "snv_svimp")
+                "svimp", "snv_svimp", "ctyper", "snv_ctyper", "hprc2", "snv_hprc2")
 # Rows of these sources are SVs; each set is its source alone, or panel SNVs/indels plus it (lr-sv's derived datasets).
 SOURCE_SETS = {"hgsvc3": "hgsvc3", "ont": "ont", "sv_merged": "panel_merged", "pgsv_merged": "pangenie_merged", "hgsvc3_merged": "hgsvc3_merged",
-               "gatksv": "gatksv", "svimp": "svimp"}
+               "gatksv": "gatksv", "svimp": "svimp", "ctyper": "ctyper", "hprc2": "hprc2"}
 JOINT_SOURCE_SETS = {"snv_hgsvc3": "hgsvc3", "snv_ont": "ont", "snv_sv_merged": "panel_merged", "snv_pgsv_merged": "pangenie_merged",
-                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv", "snv_svimp": "svimp"}
+                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv", "snv_svimp": "svimp", "snv_ctyper": "ctyper",
+                     "snv_hprc2": "hprc2"}
 MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
 
@@ -322,7 +323,9 @@ def feature_mask(variants: Variants, feature_set: str, draw_key: str):
     panel SNVs/indels plus those SVs. The long-read rows exist only in the derived datasets that carry them.
     *_merged: the same SV sources after truvari collapse, one row per collapsed site; gatksv / snv_sv_cn: the GATK-SV 1kGP
     callset, whose multi-allelic CNV rows carry copies above the lowest copy number (so train_allele_frequency on them
-    is half a mean copy offset, not an allele frequency). See SOURCE_SETS and JOINT_SOURCE_SETS."""
+    is half a mean copy offset, not an allele frequency); ctyper / snv_ctyper: Ctyper paralog-specific copy numbers (one row per
+    gene-family copy, placed at its locus); hprc2 / snv_hprc2: HPRC release-2 pangenome SV genotypes. See SOURCE_SETS and
+    JOINT_SOURCE_SETS."""
     panel = variants.source == "panel"
     small = panel & ~variants.is_sv
     pangenie_sv = (variants.source == "pangenie") & variants.is_sv

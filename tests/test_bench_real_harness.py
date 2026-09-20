@@ -440,3 +440,9 @@ def test_per_split_runs_merge_to_the_full_design_run(tmp_path):
     for name in ("snv.predictions", "snv_sv.predictions_without_sv", "truth"):
         assert np.array_equal(np.load(tmp_path / f"results/full/loso/chr1.{name}.npy"), np.load(tmp_path / f"results/parts/loso/chr1.merged.{name}.npy"),
                               equal_nan=True)
+
+
+def test_ctyper_and_hprc2_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True], ["panel", "panel", "ctyper", "hprc2"])
+    assert list(harness.feature_mask(variants, "snv_ctyper", "g/s")) == [True, False, True, False]
+    assert list(harness.feature_mask(variants, "snv_hprc2", "g/s")) == [True, False, False, True]
