@@ -1091,6 +1091,34 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
     assert fit.prediction_move <= fit.prediction_tolerance
 
 
+def test_the_prediction_check_holds_each_block_to_its_own_budget():
+    # Two independently scored blocks share x: a move within the summed budget but over one block's own must not
+    # certify (fit-api P1). Normal means, as in the refusal test; block 0 gets a vanishing budget.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    halves = (slice(0, 30), slice(30, 60))
+
+    def fixed_points(hyperparameters, starve):
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            variance = moments.variance
+
+            def norm(direction, variance=variance):
+                return np.array([float(np.sum(np.square(direction[part]) / variance[part])) for part in halves])
+
+            effective = np.array([float(np.sum(cavity.precision[part] * variance[part])) for part in halves])
+            if starve:
+                effective[0] = 0.0
+            points.append(FixedPoint(cavity=cavity, posterior=diagonal_posterior(variance), mean=moments.mean, precision_norm=norm, effective_effects=effective))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, False), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert fit.certified and fit.prediction_move <= fit.prediction_tolerance
+    (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, True), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    # Block 0 has no budget: no step that moves its mean can certify, so the fit is returned uncertified.
+    assert not starved.certified or starved.prediction_move == 0.0
+
+
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
     prior, cavity = _problem(variant_count=40, seed=48, node_count=10)
     coefficients = _hyperparameters(prior, 49).coefficients

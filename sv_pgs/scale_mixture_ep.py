@@ -2563,13 +2563,17 @@ def hyper_step(
 class FixedPoint:
     """A model's certified EP fixed point at a prior's hyperparameters: each variant's cavity, q's linear responses
     there (valid until the next fixed point is solved), q's mean, ``precision_norm(d)`` = d' Sigma^-1 d in q's
-    posterior metric, and the effective number of effects p_eff = p - sum_j tau_j Sigma_jj."""
+    posterior metric, and the effective number of effects p_eff = p - sum_j tau_j Sigma_jj.
+
+    Where one fixed point holds several independently scored models sharing x (the pooled arm's genes),
+    ``precision_norm`` returns one move per model and ``effective_effects`` their p_eff: the prediction check then
+    holds each model to its own p_eff / K, so no model uses another's budget (fit-api P1)."""
 
     cavity: Cavity
     posterior: GaussianPosterior
     mean: F64Array
-    precision_norm: Callable[[F64Array], float]
-    effective_effects: float
+    precision_norm: Callable[[F64Array], float | F64Array]
+    effective_effects: float | F64Array
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
@@ -2759,9 +2763,14 @@ def fit_hyperparameters(
                 current = points[model]
                 # A shortened certifying step moves q's mean by its fraction, to first order: the full step's move is
                 # its own over fraction^2 in the squared metric.
-                move = current.precision_norm(trial_point.mean - current.mean) / (fraction * fraction)
-                allowed_move = 2.0 * tolerance * current.effective_effects
-                if move <= allowed_move:
+                moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64)) / (fraction * fraction)
+                allowed = 2.0 * tolerance * np.atleast_1d(np.asarray(current.effective_effects, dtype=np.float64))
+                # Reported as the most-used share of a block's budget, in that block's units.
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    shares = np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))
+                worst = int(np.argmax(shares))
+                move, allowed_move = float(moves[worst]), float(allowed[worst])
+                if bool(np.all(moves <= allowed)):
                     certified_step, remaining = steps_taken[model]
                     # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
                     # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers the
@@ -2804,7 +2813,8 @@ def fit_hyperparameters(
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
                         remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
-                        prediction_tolerance=2.0 * tolerance * points[model].effective_effects, iterations=iterations[model],
+                        prediction_tolerance=float(np.min(2.0 * tolerance * np.atleast_1d(np.asarray(points[model].effective_effects, dtype=np.float64)))),
+                        iterations=iterations[model],
                         halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
                     )
                     pending[model] = None
