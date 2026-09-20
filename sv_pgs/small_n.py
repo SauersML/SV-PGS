@@ -765,7 +765,8 @@ def _loop_point(
     variance = noise * kernel.variances()
     log_normalizer, tilted_mean, tilted_variance, third, fourth = tilted(cavity_precision, marginal_shift - site_shift)
     values = (log_normalizer, tilted_mean, tilted_variance, third, fourth)
-    # A point-mass tilted law (variance 0) has no finite site: outside the domain.
+    # A computed tilted variance of 0 (the engine's below-floor approximation, not the model: review-mathbugs N1) has no
+    # finite site: outside the domain.
     if not (all(np.all(np.isfinite(value)) for value in values) and np.all(tilted_variance > 0.0)):
         return None
     value = 0.5 * float(scaled_shift @ mean) / noise - 0.5 * kernel.log_determinant() + float(np.sum(log_normalizer))
@@ -862,8 +863,8 @@ def double_loop_sites(
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
     problem, the minimum of the convex Phi over the sites, is solved by Newton with sufficient-decrease halving until no
-    representable step along Newton's direction lowers Phi by half its quadratic model's decrease, or Newton's decrement
-    falls below Phi's rounding. Each outer step is
+    representable step along Newton's direction lowers Phi by half its quadratic model's decrease; below Phi's rounding,
+    where values cannot tell a decrease, full Newton steps continue while Newton's decrement (from the gradient) falls. Each outer step is
     majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
     accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
     update's KL 1/2 r' Sigma r at most 1/(2K) nats, or when an outer step leaves the sites unchanged, which is EP's fixed
@@ -887,7 +888,7 @@ def double_loop_sites(
         cavity_precision = cavity_scaled / noise
         log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
         if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
-            raise NoFixedPoint("a tilted law is a point mass at q's cavities: no finite EP site")
+            raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
         # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
         target_precision = 1.0 / tilted_variance - cavity_precision
         target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
@@ -898,17 +899,18 @@ def double_loop_sites(
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
             # The sites are in the domain (the start was checked, and every later outer step starts from an accepted
-            # inner point), so only the tilted law at the new marginals' cavities can fail: a point mass, which no
-            # finite site matches.
-            raise NoFixedPoint("a tilted law is a point mass at q's marginals' cavities: no finite EP site")
+            # inner point), so only the tilted moments at the new marginals' cavities can fail: a computed variance of 0
+            # (the engine's below-floor approximation), which no finite site matches.
+            raise NoFixedPoint("a computed tilted variance is 0 at q's marginals' cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
+        polish_decrement: float | None = None
+        polish_origin = point
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
-            # A decrease below Phi's own rounding cannot be told from it.
-            if not decrement > _EPSILON * abs(point.value):
+            if not decrement > 0.0:
                 break
-            fraction = 1.0
             accepted = None
+            fraction = 1.0 if decrement > _EPSILON * abs(point.value) else 0.0
             while fraction * float(np.max(np.abs(step))) > _EPSILON * (1.0 + max(float(np.max(np.abs(point.site_precision))), float(np.max(np.abs(point.site_shift))))):
                 candidate = _loop_point(
                     design, noise, data_score, point.site_precision + fraction * step[size:], point.site_shift + fraction * step[:size],
@@ -924,7 +926,20 @@ def double_loop_sites(
                     break
                 fraction *= 0.5
             if accepted is None:
-                break
+                # Phi's values cannot tell a decrease along the step (it is below Phi's evaluation error), and a
+                # value-based stop resolves the minimum only to sqrt(eps). Newton's decrement comes from the gradient,
+                # not from differences of Phi: in this quadratic regime the full step is taken while that decrement
+                # keeps falling; a step after which it does not fall is undone.
+                if polish_decrement is not None and not decrement < polish_decrement:
+                    point = polish_origin
+                    break
+                accepted = _loop_point(
+                    design, noise, data_score, point.site_precision + step[size:], point.site_shift + step[:size],
+                    marginal_precision, marginal_shift, tilted, largest_variance,
+                )
+                if accepted is None:
+                    break
+                polish_decrement, polish_origin = decrement, point
             point = accepted
             profile["double_loop_newton"] += 1
         precision, shift = point.site_precision, point.site_shift
@@ -1041,15 +1056,16 @@ class _DenseFixedPoints:
             self.site_precision[negative] *= 0.5
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
-        """The mean-matched sites; ``NoFixedPoint`` where a tilted law is a point mass (variance 0: the prior's mass all
-        on flat-kernel nodes at a far trial, review-mathbugs N1/N2), whose site precision is infinite: EP has no finite
-        fixed point there, and the outer loop halves the trial."""
+        """The mean-matched sites; ``NoFixedPoint`` where a computed tilted variance is 0 or a moment is not finite
+        (review-mathbugs N2). The model's tilted laws always have positive variance; a zero one is the engine's
+        flat-kernel approximation below the lattice floor (v = 0 there, N1, e2e's) putting all of a far trial's mass on
+        those nodes. No finite site matches it, so the trial is refused and the outer loop halves it."""
         started = time.perf_counter()
         moments = tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes)
         self.profile["tilted_seconds"] += time.perf_counter() - started
         if not (np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean)) and np.all(np.isfinite(moments.variance))):
             degenerate = int(np.sum(~(moments.variance > 0.0)))
-            raise NoFixedPoint(f"{degenerate} tilted laws are point masses (variance 0) at these hyperparameters: no finite EP site")
+            raise NoFixedPoint(f"{degenerate} computed tilted variances are 0 (point masses) at these hyperparameters: no finite EP site")
         return site_targets(moments, cavity)
 
     def _precision_norm(self) -> Callable[[F64Array], float]:
@@ -1178,8 +1194,16 @@ class _DenseFixedPoints:
                 raise NoFixedPoint("the frozen pass's move is not finite")
             if 0.5 * mean_move <= 0.5 / self.draw_count:
                 return
-            if mean_move / previous_move >= 1.0:
-                damping = min(damping, 1.0 / (1.0 + np.sqrt(mean_move / previous_move)))
+            ratio = mean_move / previous_move
+            if ratio >= 1.0:
+                if damping < 1.0:
+                    # A pass damped by 1/(1 + rho), exact for the map's eigenvalue at -rho^2, still does not contract:
+                    # the frozen-cavity map has a mode damping cannot reach (an eigenvalue past +1, or complex), and
+                    # mean-only EP does not converge here. EP falls back to the convergent double loop (MODEL.md
+                    # section 4), as where no damped pass stays positive definite (svpgs-profiler's slow genes 6, 7).
+                    self._double_loop(hyperparameters)
+                    return
+                damping = 1.0 / (1.0 + np.sqrt(ratio))
             previous_move = mean_move
             cavity = Cavity(precision=frozen, shift=self.mean / marginal - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)

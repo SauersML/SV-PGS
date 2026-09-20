@@ -57,47 +57,90 @@ def _group_sum(ties: TieGroups, values: F64Array) -> F64Array:
     return total
 
 
-def _column(ties: TieGroups, values: F64Array) -> F64Array:
-    """``ties.sign`` shaped to broadcast against ``values`` ((p,) or (p, M))."""
-    return ties.sign.reshape((-1,) + (1,) * (np.ndim(values) - 1))
+def tied_groups(ties: TieGroups) -> list[I64Array]:
+    """The members of every group with more than one member (singletons pass through exactly)."""
+    sizes = np.bincount(ties.group, minlength=ties.group_count)
+    order = np.argsort(ties.group, kind="stable")
+    bounds = np.concatenate([[0], np.cumsum(sizes)])
+    return [order[bounds[group] : bounds[group + 1]] for group in np.flatnonzero(sizes > 1)]
 
 
-def _site_moments(precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array]:
-    """(D, mu) of sites (precision, shift); a flat site (precision 0) has D = inf, and must have shift 0."""
-    precision = np.asarray(precision, dtype=np.float64)
-    shift = np.asarray(shift, dtype=np.float64)
-    flat = precision == 0.0
-    if np.any(flat & (shift != 0.0)):
-        raise ValueError("a flat site (precision 0) must have shift 0")
-    with np.errstate(divide="ignore"):
-        variance = np.where(flat, np.inf, 1.0 / np.where(flat, 1.0, precision))
-    return variance, np.where(flat, 0.0, shift * variance)
+def _as_columns(values: F64Array) -> F64Array:
+    values = np.asarray(values, dtype=np.float64)
+    return values[:, None] if values.ndim == 1 else values
+
+
+def tied_weights(precision: F64Array) -> tuple[F64Array, float, float]:
+    """For one tied group's member precisions t_j: the weights w_j = D_j / D_g, and the group's precision
+    t_g = 1 / D_g, computed from the ratios a_j = t_ref / t_j (|a_j| <= 1, t_ref the least |t_j|) so a near-flat member
+    neither overflows nor cancels; with the group's variance's sign. The members' law restricted to the hyperplane
+    s'beta = beta_g is proper exactly when every D_j > 0, or when one D_j < 0 and D_g < 0 (Haynsworth's inertia of
+    diag(t) on s-perp; speed-smalln): any other sites raise LinAlgError, as a precision that is not positive definite
+    does, so EP halves its negative sites."""
+    negative = int(np.count_nonzero(precision < 0.0))
+    if np.any(precision == 0.0):
+        raise np.linalg.LinAlgError("a tied member's site is flat: the members' posterior is improper along their difference")
+    reference = float(np.min(np.abs(precision)))
+    ratios = reference / precision
+    total = float(np.sum(ratios))
+    if negative > 1 or (negative == 1 and not total < 0.0) or total == 0.0:
+        raise np.linalg.LinAlgError("a tie group's member sites are not positive definite on their difference directions")
+    return ratios / total, reference / total, total
+
+
+def member_weights(ties: TieGroups, precision: F64Array) -> F64Array:
+    """w_j = s_j D_j / D_g for every member at one model's sites (p_members,): each member's share of its group's
+    posterior move (a singleton's is its sign)."""
+    weights = np.array(ties.sign, copy=True)
+    member_precision = np.asarray(precision, dtype=np.float64)
+    for members in tied_groups(ties):
+        weights[members] = ties.sign[members] * tied_weights(member_precision[members])[0]
+    return weights
 
 
 def group_sites(ties: TieGroups, precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array]:
-    """The groups' sites (precision, shift) from the members': the law of beta_g = sum_j s_j beta_j under them."""
-    variance, mean = _site_moments(precision, shift)
-    group_variance = _group_sum(ties, variance)
-    group_mean = _group_sum(ties, _column(ties, mean) * mean)
-    if np.any(group_variance == 0.0):
-        raise ValueError("a tie group's member site variances sum to zero: its site has no finite precision")
-    with np.errstate(divide="ignore"):
-        group_precision = np.where(np.isinf(group_variance), 0.0, 1.0 / group_variance)
-    return group_precision, group_mean * group_precision
+    """The groups' sites (precision, shift) from the members': the law of beta_g = sum_j s_j beta_j under them,
+    t_g = 1 / sum_j D_j and nu_g = t_g sum_j s_j nu_j / t_j, in natural parameters (a singleton's is its own, signed)."""
+    shape = np.shape(precision)
+    member_precision, member_shift = _as_columns(precision), _as_columns(shift)
+    group_precision = np.zeros((ties.group_count, member_precision.shape[1]))
+    group_shift = np.zeros_like(group_precision)
+    group_precision[ties.group] = member_precision
+    group_shift[ties.group] = ties.sign[:, None] * member_shift
+    for members in tied_groups(ties):
+        group = int(ties.group[members[0]])
+        for column in range(member_precision.shape[1]):
+            weights, precision_g, _total = tied_weights(member_precision[members, column])
+            group_precision[group, column] = precision_g
+            # nu_g = t_g sum_j s_j nu_j / t_j = sum_j s_j nu_j w_j t_g / t_j ... = sum_j s_j nu_j (D_j / D_g).
+            group_shift[group, column] = float(np.sum(ties.sign[members] * member_shift[members, column] * weights))
+    output_shape = (ties.group_count,) + tuple(shape[1:])
+    return group_precision.reshape(output_shape), group_shift.reshape(output_shape)
 
 
 def member_moments(
     ties: TieGroups, precision: F64Array, shift: F64Array, group_mean: F64Array, group_variance: F64Array
 ) -> tuple[F64Array, F64Array]:
     """Each member's posterior mean and variance from its group's (``group_mean``, ``group_variance``: the solver's
-    posterior of beta_g), by conditioning on the sum."""
-    variance, mean = _site_moments(precision, shift)
-    total_variance = _group_sum(ties, variance)
-    total_mean = _group_sum(ties, _column(ties, mean) * mean)
-    ratio = variance / total_variance[ties.group]
-    member_mean = mean + _column(ties, mean) * ratio * (np.asarray(group_mean)[ties.group] - total_mean[ties.group])
-    member_variance = variance - variance * ratio + np.square(ratio) * np.asarray(group_variance)[ties.group]
-    return member_mean, member_variance
+    posterior of beta_g), by conditioning on the sum: m_j = mu_j + s_j w_j (m_g - mu_g) and
+    Var_j = D_j (1 - w_j) + w_j^2 Var_g with w_j = D_j / D_g (a singleton's are its group's, signed)."""
+    shape = np.shape(precision)
+    member_precision, member_shift = _as_columns(precision), _as_columns(shift)
+    means, variances = _as_columns(group_mean), _as_columns(group_variance)
+    member_mean = ties.sign[:, None] * means[ties.group]
+    member_variance = np.array(variances[ties.group], copy=True)
+    for members in tied_groups(ties):
+        group = int(ties.group[members[0]])
+        signs = ties.sign[members]
+        for column in range(member_precision.shape[1]):
+            weights, precision_g, _total = tied_weights(member_precision[members, column])
+            site_means = member_shift[members, column] / member_precision[members, column]
+            group_site_mean = float(np.sum(signs * site_means))
+            member_mean[members, column] = site_means + signs * weights * (means[group, column] - group_site_mean)
+            member_variance[members, column] = (1.0 - weights) / member_precision[members, column] + np.square(weights) * variances[group, column]
+    if not (np.all(np.isfinite(member_mean)) and np.all(np.isfinite(member_variance))):
+        raise np.linalg.LinAlgError("a tie group's member moments are not finite at these sites")
+    return member_mean.reshape(shape), member_variance.reshape(shape)
 
 
 def member_draws(
@@ -105,23 +148,22 @@ def member_draws(
 ) -> F64Array:
     """Exact posterior draws of every member (p_members, K) from draws of the groups' effects (p_groups, K): each
     group's members given its sum are the sites' Gaussian on the hyperplane sum_j s_j beta_j = beta_g, independent of
-    the data, sampled by its Cholesky factor on the hyperplane (a singleton is its group's draw). Raises when that
-    restriction is not positive definite (a negative site the sum cannot absorb)."""
-    variance, mean = _site_moments(precision, shift)
+    the data, sampled by its Cholesky factor on the hyperplane (a singleton is its group's draw, signed)."""
     draws = np.asarray(group_draws, dtype=np.float64)
     member = draws[ties.group] * ties.sign[:, None]
-    sizes = np.bincount(ties.group, minlength=ties.group_count)
-    for group in np.flatnonzero(sizes > 1):
-        members = np.flatnonzero(ties.group == group)
+    member_precision = np.asarray(precision, dtype=np.float64)
+    member_shift = np.asarray(shift, dtype=np.float64)
+    for members in tied_groups(ties):
+        group = int(ties.group[members[0]])
         signs = ties.sign[members]
-        site_precision = 1.0 / variance[members]
+        weights, _precision_g, _total = tied_weights(member_precision[members])
+        site_means = member_shift[members] / member_precision[members]
         # A basis of the hyperplane s'beta = 0 and the sites' precision restricted to it.
         basis = np.linalg.svd(signs[None, :])[2][1:].T
-        restricted = basis.T @ (site_precision[:, None] * basis)
+        restricted = basis.T @ (member_precision[members][:, None] * basis)
         factor = np.linalg.cholesky(0.5 * (restricted + restricted.T))
-        # The conditional mean given the sum: the sites' mean moved along D s to meet the sum.
-        weights = variance[members] * signs / float(np.sum(variance[members]))
-        base = mean[members][:, None] + weights[:, None] * (draws[group][None, :] - float(signs @ mean[members]))
+        # The conditional mean given the sum: the sites' mean moved along D s to meet it.
+        base = site_means[:, None] + (signs * weights)[:, None] * (draws[group][None, :] - float(signs @ site_means))
         noise = np.linalg.solve(factor.T, generator.standard_normal((basis.shape[1], draws.shape[1])))
         member[members] = base + basis @ noise
     return member
