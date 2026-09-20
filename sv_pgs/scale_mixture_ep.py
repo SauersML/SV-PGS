@@ -103,6 +103,7 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
+from scipy.optimize import brentq
 from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx
 
@@ -121,9 +122,6 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
-# The degree in t of the Tierney-Kadane expansion of a standardized line integrand's ratio to its Gaussian, through
-# the O(1) term: 1 + k3 t^3 / 6 + k4 t^4 / 24 + k3^2 t^6 / 72.
-_TIERNEY_KADANE_DEGREE = 6
 
 
 @dataclass(frozen=True)
@@ -436,12 +434,33 @@ def scale_mixture_prior(
     )
 
 
-def initial_hyperparameters(prior: ScaleMixturePrior) -> MixtureHyperparameters:
-    """A start, not a prior: every class at the log-normal centred on the lattice whose density at the lattice's
-    ends is eps of its peak; no deviation or annotation effect; unit penalty weights."""
+def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | None = None) -> MixtureHyperparameters:
+    """A start, not a prior: every class at one log-normal on the lattice, of the width whose density at the lattice's
+    ends is eps of its peak when it is centred; no deviation or annotation effect; unit penalty weights.
+
+    It is centred on the lattice unless ``mean_variance`` is given: the start's mean of e^t over the lattice, so that
+    every prior variance E[beta_j^2] starts at mean_variance u_j (``moment_start``). The centre then moves along the
+    lattice until the lattice mean equals it (the mean rises with the centre), or stops at the lattice's end nearer a
+    target beyond its reach. The start only moves the fit's first iterate, never its certified answer.
+    """
     nodes = prior.log_variance_grid
-    centre = 0.5 * (nodes[0] + nodes[-1])
     width = 0.5 * (nodes[-1] - nodes[0]) / np.sqrt(2.0 * np.log(1.0 / _EPSILON))
+
+    def log_mean(centre: float) -> float:
+        quadratic = -0.5 * np.square((nodes - centre) / width)
+        return float(_log_sum_exp(quadratic + nodes, axis=0) - _log_sum_exp(quadratic, axis=0))
+
+    centre = 0.5 * (nodes[0] + nodes[-1])
+    if mean_variance is not None:
+        if not mean_variance > 0.0:
+            raise ValueError("mean_variance must be positive")
+        target = float(np.log(mean_variance))
+        if log_mean(float(nodes[0])) >= target:
+            centre = float(nodes[0])
+        elif log_mean(float(nodes[-1])) <= target:
+            centre = float(nodes[-1])
+        else:
+            centre = float(brentq(lambda value: log_mean(value) - target, float(nodes[0]), float(nodes[-1])))
     quadratic = -0.5 * np.square((nodes - centre) / width)
     coefficients = np.zeros(prior.coefficient_size)
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
@@ -459,6 +478,55 @@ def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Arra
     with np.errstate(divide="ignore"):
         total = np.log(np.sum(shifted, axis=axis, keepdims=True)) + shift
     return total if keepdims else np.squeeze(total, axis=axis)
+
+
+@dataclass(frozen=True)
+class MomentStart:
+    """Where EB starts on a trait: its phenotypic variance split into genetic and noise parts.
+
+    ``heritability`` is the share of y's residual variance (after the covariates) the start gives the genotypes,
+    ``genetic_variance`` and ``noise`` its two parts per sample, and ``mean_variance`` the start's mean of e^t, so
+    that every E[beta_j^2] starts at mean_variance u_j (``initial_hyperparameters``); ``resolution`` is the moment
+    estimate's standard error under no signal.
+    """
+
+    heritability: float
+    genetic_variance: float
+    noise: float
+    mean_variance: float
+    resolution: float
+
+
+def moment_start(
+    *, target_square: float, residual_dimension: float, score_square: float, gram_trace: float, weighted_diagonal: float, weighted_square: float, gram_square: float
+) -> MomentStart:
+    """The EB start from Haseman-Elston moments: the genetic variance can never exceed the phenotypic.
+
+    With y (after the covariates, in r = n - k dimensions) = X beta + e, beta_j independent with variance c u_j and
+    e ~ N(0, sigma^2 I), and G = X'X, the two moments are exact for a fixed design:
+        E[y'y]       = sigma^2 r      + c sum_j u_j G_jj           (``target_square``, ``weighted_diagonal``)
+        E[||X'y||^2] = sigma^2 tr G   + c sum_j u_j ||G e_j||^2    (``score_square``, ``gram_trace``, ``weighted_square``).
+    The first is held exactly, V_y = y'y / r = sigma^2 + c sum_j u_j G_jj / r, so the split always satisfies the
+    variance bound; the second then gives the heritability h^2 = c sum_j u_j G_jj / y'y. Under no signal ||X'y||^2
+    has variance 2 sigma^4 ||G||_F^2 (``gram_square``), which makes h^2's standard error the resolution s: the start
+    stays inside [s, 1 - s], at one resolution from either end the data cannot tell apart from it, and at 1/2 where
+    the moments cannot place h^2 at all (s >= 1/2, or no curvature between the two moments).
+    """
+    total = target_square / residual_dimension
+    denominator = target_square * weighted_square / weighted_diagonal - total * gram_trace
+    if denominator > 0.0:
+        resolution = float(np.sqrt(2.0 * gram_square) * total / denominator)
+        estimate = (score_square - total * gram_trace) / denominator
+    else:
+        resolution, estimate = np.inf, 0.5
+    heritability = 0.5 if resolution >= 0.5 else float(np.clip(estimate, resolution, 1.0 - resolution))
+    return MomentStart(
+        heritability=heritability,
+        genetic_variance=heritability * total,
+        noise=(1.0 - heritability) * total,
+        mean_variance=heritability * target_square / weighted_diagonal,
+        resolution=resolution,
+    )
 
 
 def _density_and_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[F64Array, F64Array]:
@@ -1250,32 +1318,38 @@ def _directional_derivatives(
     return third, fourth
 
 
-def _line_values(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, steps: F64Array, cavity: Cavity, working_bytes: int
-) -> F64Array:
-    """The penalized objective F(x + t b) - P(x + t b) at every step t, in one pass over the variants.
+def _line(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int
+) -> Callable[[F64Array], F64Array]:
+    """The penalized objective F(x + t b) - P(x + t b) as a function of the steps t, each call one pass over the
+    variants for all its steps.
 
     z = M x is affine in t, so every step's class log densities and log scales follow from those of x and b, and P
     is exactly quadratic in t: only the log normalizers are evaluated per step."""
-    count = steps.shape[0]
     density, _scale = _density_and_scale(prior, origin)
     density_step, scale_step = _density_and_scale(prior, direction)
-    log_weights = density[None] + steps[:, None, None] * density_step[None]
-    log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
     scales = log_scale(prior, origin)
     scale_slope = prior.scale_design @ scale_step
     penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
-    curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
-    values = -(penalty + steps * float(penalty_gradient @ direction) + 0.5 * np.square(steps) * curvature)
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
-            size = rows.shape[0] * count
-            normalizers = _log_normalizers(
-                np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
-                (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
-                prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
-            )
-            values += normalizers.reshape(rows.shape[0], count).sum(axis=0)
+    penalty_slope = float(penalty_gradient @ direction)
+    penalty_curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+
+    def values(steps: F64Array) -> F64Array:
+        count = steps.shape[0]
+        log_weights = density[None] + steps[:, None, None] * density_step[None]
+        log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
+        total = -(penalty + steps * penalty_slope + 0.5 * np.square(steps) * penalty_curvature)
+        for class_position, class_rows in enumerate(prior.class_rows):
+            for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
+                size = rows.shape[0] * count
+                normalizers = _log_normalizers(
+                    np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
+                    (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
+                    prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
+                )
+                total += normalizers.reshape(rows.shape[0], count).sum(axis=0)
+        return total
+
     return values
 
 
@@ -1283,39 +1357,23 @@ def _line_log_integral(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
 ) -> float:
     """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
-    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
-
-    The integrand is the Laplace term's Gaussian e^(-t^2/2) times h(t) = exp(l(t) + t^2 / 2), so the Gauss-Hermite
-    rules of that weight place their nodes where its mass is. They start at the fewest nodes exact for the
-    Tierney-Kadane expansion of h through its O(1) term (degree 6: k3^2 t^6 / 72), and double while the largest node
-    stays inside the Gaussian's double-precision extent sqrt(2 log(1 / eps)); past it, more nodes only resolve an h
-    that no low-degree polynomial follows. The first two consecutive rules whose logs agree to the share give the
-    larger rule's value. Where none do (a fold or a heavy tail), QUADPACK's adaptive rule over the whole line
-    decides, and its own error estimate must resolve the log to the share, or to half of double precision when
+    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log, by QUADPACK's adaptive rule over the
+    whole line; its own error estimate must resolve the log to the share, or to half of double precision when
     rounding is what stopped it.
+
+    Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
+    on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
+    tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
-    tolerance = max(share, _HALF_PRECISION)
-    extent = float(np.sqrt(2.0 * np.log(1.0 / _EPSILON)))
-    nodes = (_TIERNEY_KADANE_DEGREE + 2) // 2
-    previous = None
-    while True:
-        steps, weights = np.polynomial.hermite_e.hermegauss(nodes)
-        log_terms = np.log(weights) + _line_values(prior, log_smoothing, origin, direction, steps, cavity, working_bytes) - value + 0.5 * np.square(steps)
-        estimate = float(_log_sum_exp(log_terms, axis=0)) - 0.5 * np.log(2.0 * np.pi)
-        if previous is not None and abs(estimate - previous) <= tolerance:
-            return estimate
-        if float(steps[-1]) > extent:
-            break
-        previous = estimate
-        nodes *= 2
+    line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
 
     def integrand(step: float) -> float:
-        return float(np.exp(_line_values(prior, log_smoothing, origin, direction, np.array([step]), cavity, working_bytes)[0] - value))
+        return float(np.exp(line(np.array([step]))[0] - value))
 
     integral, error, _information, *message = quad(
         integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
     )
-    if message and error > tolerance * abs(integral):
+    if message and error > max(share, _HALF_PRECISION) * abs(integral):
         raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
     return float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
 

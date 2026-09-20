@@ -34,7 +34,7 @@ from sv_pgs.scale_mixture_ep import (
     _best_certified,
     _laplace_corrections,
     _line_log_integral,
-    _line_values,
+    _line,
     _log_normal_start,
     _maximize_coefficients,
     _penalized,
@@ -52,6 +52,7 @@ from sv_pgs.scale_mixture_ep import (
     relattice,
     hyper_step,
     initial_hyperparameters,
+    moment_start,
     kernel_floor,
     kernel_top,
     log_scale,
@@ -667,7 +668,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
     direction = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
     steps = np.array([-3.0, -0.4, 0.0, 0.9, 2.5])
     for working_bytes in (_WORKING_BYTES, 1 << 12):
-        values = _line_values(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, steps, cavity, working_bytes)
+        values = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, working_bytes)(steps)
         expected = np.array([
             _data_value(prior, hyperparameters.coefficients + step * direction, cavity, _WORKING_BYTES)
             - _penalty_value(prior, hyperparameters.log_smoothing, hyperparameters.coefficients + step * direction)[0]
@@ -676,7 +677,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
         np.testing.assert_allclose(values, expected, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(expected))))
 
 
-def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
+def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
     posterior = INDEPENDENT_EFFECTS
@@ -711,6 +712,46 @@ def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
         prior, hyperparameters.log_smoothing, [hyperparameters.coefficients, nearby], cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE
     )
     assert best is not None and len(calls) == 1
+
+
+def test_the_variance_matched_start_has_the_asked_prior_variances():
+    prior, _cavity = _problem(variant_count=60, seed=39, node_count=12)
+    nodes = prior.log_variance_grid
+    offsets = np.exp(log_scale(prior, initial_hyperparameters(prior).coefficients))
+    for mean_variance in (float(np.exp(nodes[2])), float(np.exp(0.5 * (nodes[0] + nodes[-1]))), float(np.exp(nodes[-3]))):
+        start = initial_hyperparameters(prior, mean_variance)
+        np.testing.assert_allclose(prior_second_moment(prior, start), mean_variance * offsets, rtol=1e-10)
+    # Beyond the lattice's reach the centre stops at the nearer end.
+    below = initial_hyperparameters(prior, float(np.exp(nodes[0] - 1.0)))
+    assert np.all(prior_second_moment(prior, below) < np.exp(nodes[2]) * offsets)
+
+
+def _moments(genotypes, target, weights):
+    gram = genotypes.T @ genotypes
+    return dict(
+        target_square=float(target @ target), residual_dimension=float(genotypes.shape[0]), score_square=float(np.sum(np.square(genotypes.T @ target))),
+        gram_trace=float(np.trace(gram)), weighted_diagonal=float(weights @ np.diag(gram)),
+        weighted_square=float(weights @ np.sum(np.square(gram), axis=0)), gram_square=float(np.sum(np.square(gram))),
+    )
+
+
+def test_the_moment_start_splits_the_phenotypic_variance_and_tracks_the_heritability():
+    generator = np.random.default_rng(61)
+    samples, variants = 2000, 300
+    genotypes = generator.standard_normal((samples, variants))
+    weights = generator.uniform(0.5, 2.0, variants)
+    for heritability in (0.2, 0.6):
+        effects = generator.standard_normal(variants) * np.sqrt(weights)
+        signal = genotypes @ effects
+        noise = generator.standard_normal(samples) * np.sqrt(np.var(signal) * (1.0 - heritability) / heritability)
+        start = moment_start(**_moments(genotypes, signal + noise, weights))
+        total = float((signal + noise) @ (signal + noise)) / samples
+        # The split is exact: the genetic variance never exceeds the phenotypic.
+        np.testing.assert_allclose(start.genetic_variance + start.noise, total, rtol=1e-12)
+        assert abs(start.heritability - heritability) <= 0.15
+    # Under no signal the start stays within a few resolutions of zero, and never at it.
+    null = moment_start(**_moments(genotypes, generator.standard_normal(samples), weights))
+    assert null.resolution <= null.heritability <= 4.0 * null.resolution
 
 
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
