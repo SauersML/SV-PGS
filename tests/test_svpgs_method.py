@@ -5,6 +5,8 @@ The engine driver is the stub of tests/test_fit_model.py, so these tests pin the
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -219,3 +221,21 @@ def test_each_bench_real_fit_gets_one_cores_share(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(svpgs_method, "detect_compute_budget", lambda: machine)
     budget = svpgs_method.one_core_budget()
     assert (budget.device_kind, budget.cpu_threads, budget.host_bytes) == ("cpu", 1, machine.host_bytes // machine.cpu_threads)
+
+
+def test_both_harnesses_load_the_method_file_their_own_way() -> None:
+    path = Path(svpgs_method.__file__)
+    assert callable(bench_real.load_method(f"{path}:fit_expression"))
+    assert callable(bench_real.load_method(f"{path}:fit_expression_no_sv_terms"))
+    assert callable(bench_sim.load_method(path).fit)
+
+
+def test_the_no_sv_terms_arm_withholds_the_sv_specific_prior_terms(driver: _StubDriver) -> None:
+    train, test = _bench_real_train(np.random.default_rng(7))
+    predictor = svpgs_method.fit_expression_no_sv_terms(train)
+    table = driver.calls[0]["store"].variant_table
+    assert set(table.variant_class.tolist()) == {_CLASSES.index(VariantClass.SNV)}
+    assert sorted(table.annotations) == ["log1p_tss_distance"]
+    order = np.argsort(train.variants.position, kind="stable")
+    np.testing.assert_array_equal(driver.calls[0]["store"].read_codes(0, _COLUMNS), (train.genotypes.T[order] * CODES_PER_DOSAGE).astype(np.uint8))
+    assert predictor.predict(test).shape == (test.shape[0],)
