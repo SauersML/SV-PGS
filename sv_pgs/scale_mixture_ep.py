@@ -991,7 +991,6 @@ def _maximize_coefficients(
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
 
 
-
 @dataclass(frozen=True)
 class GaussianPosterior:
     """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
@@ -2151,16 +2150,6 @@ def _certified_evidence(
     warm = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
     chosen = warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, correction, working_bytes, tolerance)
     return _corrected(prior, log_smoothing, chosen, cavity, correction, working_bytes, tolerance)
-
-
-def _same_basin(first: _Evidence, second: _Evidence) -> bool:
-    """Whether two certified inner maxima are one: each point lies within sqrt(2 d) of its maximum in the -H metric
-    (d its inner decrement), so one maximum is within the sum of the radii of both points; their V must then agree
-    to within their certified errors."""
-    step = first.coefficients - second.coefficients
-    radius = np.sqrt(2.0 * first.inner_decrement) + np.sqrt(2.0 * second.inner_decrement)
-    distance = np.sqrt(max(float(step @ first.precision @ step), 0.0))
-    return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
 
 
 def _same_basin(first: _Evidence, second: _Evidence) -> bool:
