@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 import numpy as np
+from scipy import linalg
 
 from sv_pgs._typing import F64Array
 from sv_pgs.config import TraitType
@@ -124,6 +125,42 @@ def pooled_prior(
     )
 
 
+def _transient_response(
+    kernel: _Kernel, noise: float, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array, profile: dict
+) -> F64Array:
+    """``small_n._DensePosterior.linear_response`` for one call, in one p x p buffer: Sigma o Sigma is formed, its
+    product with the low-rank factor taken, and the response matrix then built in the same buffer (Sigma o Sigma is not
+    needed again) and LU-factored there. The matrix is the same as ``_DensePosterior._response_matrix``'s."""
+    started = time.perf_counter()
+    squared = kernel.covariance()
+    squared *= noise
+    np.square(squared, out=squared)
+    delta, phi, psi = kernel.factors()
+    d0 = diagonal + noise * left * delta * right
+    factor_rows = np.vstack([phi, psi]) if psi.shape[0] else phi
+    signs = np.concatenate([-np.ones(phi.shape[0]), np.ones(psi.shape[0])])
+    low = (noise * left)[:, None] * (factor_rows.T * signs[None, :])  # U (p x r)
+    high = factor_rows * right[None, :]  # V' (r x p)
+    squared_low = squared @ low
+    matrix = squared
+    matrix *= d0[None, :]
+    step = max(1, high.shape[0])
+    for start in range(0, matrix.shape[0], step):
+        rows = slice(start, min(start + step, matrix.shape[0]))
+        matrix[rows] += squared_low[rows] @ high
+        matrix[rows] *= weight[rows, None]
+        matrix[rows] -= low[rows] @ high
+    matrix[np.diag_indices_from(matrix)] += 1.0 - d0
+    # LAPACK factors a Fortran-ordered array in place, and a C-ordered matrix is its transpose's Fortran form: factor the
+    # transpose there and solve with it transposed.
+    factor = linalg.lu_factor(matrix.T, overwrite_a=True, check_finite=False)
+    solution = linalg.lu_solve(factor, rhs, trans=1, check_finite=False)
+    profile["response_factorizations"] += 1
+    profile["responses"] += 1
+    profile["response_seconds"] += time.perf_counter() - started
+    return solution
+
+
 class _PooledPosterior:
     """The joint posterior's responses as the direct sum of the genes' (``small_n._DensePosterior`` each).
 
@@ -169,10 +206,17 @@ class _PooledPosterior:
         return self._each(weights, lambda posterior, values, _rows: posterior.variance_jvp(values))
 
     def linear_response(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array) -> F64Array:
-        # The response matrix is block diagonal by gene (Sigma and Sigma o Sigma are), so each gene solves its own block.
-        return self._each(
-            rhs, lambda posterior, values, rows: posterior.linear_response(left[rows], right[rows], diagonal[rows], weight[rows], values)
-        )
+        # The response matrix is block diagonal by gene (Sigma and Sigma o Sigma are), so each gene solves its own block:
+        # a resident gene from its kept factor, every other one in a single p x p buffer freed after the call.
+        values = np.asarray(rhs, dtype=np.float64)
+        result = np.empty_like(values)
+        for gene, rows in enumerate(self.rows):
+            arguments = (left[rows], right[rows], diagonal[rows], weight[rows], values[rows])
+            if gene in self.resident:
+                result[rows] = self.resident[gene].linear_response(*arguments)
+            else:
+                result[rows] = _transient_response(self.kernels[gene], float(self.noises[gene]), *arguments, self.profile)
+        return result
 
     def gaussian_posterior(self) -> GaussianPosterior:
         return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if self.exact else None)
