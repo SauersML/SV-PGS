@@ -127,6 +127,8 @@ def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
     more = rng.standard_normal((25, 2))
     np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, more), np.linalg.solve(matrix, more), rtol=1e-8, atol=1e-10)
     assert posterior.profile["response_factorizations"] == 1 and posterior.profile["responses"] == 2
+    # The factor is LAPACK's in place on the matrix's own buffer (Fortran order), not a copy.
+    assert posterior._response_factor[0].flags.f_contiguous
 
 
 def test_the_total_curvature_by_the_exact_response_equals_gmres():
