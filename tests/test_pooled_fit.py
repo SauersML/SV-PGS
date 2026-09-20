@@ -176,3 +176,22 @@ def test_non_finite_site_targets_refuse_the_trial_instead_of_looping():
     target_precision[3] = np.nan
     with pytest.raises(NoFixedPoint, match="non-finite"):
         oracle._frozen_passes(start, frozen, target_precision, target_shift)
+
+
+@pytest.mark.xfail(strict=True, reason="gene levels still pass through the engine's class-centring (review-mathbugs P2); gene-owned offsets await e2e's prior hook")
+def test_every_row_of_a_gene_carries_exactly_its_level():
+    """review-mathbugs P2 (lead ruling): gene levels are gene-owned offsets, sum-to-zero over genes, never class-centred.
+    Two genes, each with SNV and deletion rows: every row of gene g must shift its log prior variance by l_g exactly."""
+    from sv_pgs.scale_mixture_ep import _sum_to_zero_basis, log_scale
+
+    rng = np.random.default_rng(12)
+    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (28, 14)]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    levels = np.array([1.0, -1.0])
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[prior.coefficient_size - 1 :] = _sum_to_zero_basis(2).T @ levels
+    shift = log_scale(prior, coefficients) - log_scale(prior, np.zeros(prior.coefficient_size))
+    rows = [slice(0, statistics[0].design.variant_count), slice(statistics[0].design.variant_count, prior.variant_count)]
+    for gene, gene_rows in enumerate(rows):
+        np.testing.assert_allclose(shift[gene_rows], levels[gene], rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps))
