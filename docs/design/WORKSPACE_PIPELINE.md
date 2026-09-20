@@ -87,3 +87,72 @@ No covariate matrix is shared across traits.
 - **The fit gets the union matrix and a per-model mask.** One call keeps one Stage 0 pass and cross-trait hyperparameter pooling: X'(I − H_t)X = X'X − X'C_t (C_t'C_t)^+ C_t'X needs only the union's cross-products.
 - **No rank is required.** A trait's rows can take a column's rank away (a sex-restricted disease), and each model projects onto its own columns' span (`dual_solve.covariate_whitener`).
 - Every genotyped cohort row stays a row. A person no table lists has no target and is scored but never fitted.
+
+## Direct read-based SV/CNV channel (specified; not yet built)
+
+**Why.** SVs imputed from SNVs keep little of the real SV signal: median r² 0.33, and 0.00–0.77 at the CNVs that drive the signal [real: bench-sim, as reported by the lead, 2026-09-20]. So the pipeline must carry a second, direct measurement of the same people's SVs and CNVs, read from their short reads, beside the imputed long-read-panel DS. measure-path's fusion combines the two (MODEL.md §2: B = α_B + ρ_B·G + e_B).
+
+**Status.** This section is a specification with placeholders. The driver reads none of it yet. The step lands with its synthetic tests:
+- a synthetic GATK-SV VCF like `tests/test_gatksv_source.py`'s, carrying CNV/MULTIALLELIC and biallelic records, no-calls and FILTER values;
+- the same synthetic cohort the dry run uses;
+- no AoU data, and no workspace action by an agent.
+
+### Inputs (software and configuration; every path a placeholder)
+
+| Source | Product | Software and configuration | Fields read | Samples |
+|---|---|---|---|---|
+| B, primary | The CDR's srWGS structural-variant call set, one VCF per chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/` (CDR_LAYOUT.md; the file pattern is checked against the attached release) | GATK-SV joint calling, release version as the CDR documents | INFO SVTYPE, SVLEN, END; FILTER; FORMAT GT, CN, RD_CN, and SL where the header declares it | research IDs, joined to the store only through the crosswalk (`gatksv_source`) |
+| C, optional third source | Per-sample read-depth CNV calls, if the attached CDR carries them (DRAGEN CNV VCFs, for example) | the caller and version the CDR documents; format only: FORMAT CN per segment | segment CN | research IDs |
+| Targeted loci, optional | Copy-number calls at segmental-duplication genes GATK-SV genotypes poorly, from targeted callers run on the CRAMs inside the workspace | open-source targeted callers, configured per locus; a lead decision on cost | per-locus CN | research IDs |
+
+- **Filters:** `gatksv_source.GatksvSource`'s FILTER policy applies. It keeps PASS, plus MULTIALLELIC on copy-number records, and drops breakends, multi-ALT non-CN records and copy numbers beyond the code range, each counted by reason.
+- **Which products exist** in the attached CDR is read inside the workspace from its documentation and VCF headers, never by an agent.
+- **Questions for the imputation peer** (software and configuration only): whether any srWGS SV/CNV product fed the imputation, the DRAGEN version and CNV-caller configuration of the srWGS CRAMs, and the GATK-SV release version. No imputation session was reachable on 2026-09-20; the questions go through the lead.
+
+Run-config fragment, a template (the driver doesn't read it yet):
+
+```json
+"direct_sv": {
+  "gatksv_calls": "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/${GATKSV_FILE_PATTERN}",
+  "read_depth_cnv_calls": null,
+  "targeted_copy_numbers": null,
+  "truth_copy_numbers": null
+}
+```
+
+Each optional source is an explicit `null`, and a null source is stated in the step summary and the certificate.
+
+### Conversion into store columns (measure-path-cn encoding)
+
+A new step, `direct_sv`, sits between `measurement` and `fit`. It needs the imputed D* and each imputed record's r²_A, and it writes the final store the fit reads. Per chromosome:
+1. **Read and align.** `GatksvSource` reads the chromosome. `GatksvBlock.aligned_to_store_samples` puts its research-ID samples in store column order.
+   - An imputed half's columns come from `sample_crosswalk.source_columns_for_store_samples`.
+   - The long-read half is named by research ID, the call set's own namespace, so its columns are looked up by research ID. That is not a name match across namespaces.
+   - A store sample the call set lacks is a no-call.
+2. **Copy-number records** (SVTYPE=CNV or FILTER MULTIALLELIC), class COPY_NUMBER: value = CN − modal CN, with `codes_per_unit` = ⌊254 / max CN⌋ and `value_origin` = −modal CN (`copy_number.modal_copy_numbers`, `copy_number_codes_per_unit`, `encode_copy_numbers`). They never pair with an imputed record, because a copy number isn't the ALT count of an imputed allele (`gatksv_store_rows`).
+3. **Biallelic DEL, DUP, INS and CPX records** are ALT counts: `codes_per_unit` 127, `value_origin` 0. `sv_fusion.candidate_pairs` pairs them with the imputed SV records of the same chromosome.
+   - An accepted pair, resolved one to one, becomes one fused row. It replaces its imputed record, so the locus is one column.
+   - Every other record is a row of its own (`gatksv_store_rows.gatksv_store_rows`).
+4. **No-calls** are never zero. Each is filled inside the measurement model: E[B | DS] from the best-paired imputed DS, E[B | SL] where the record carries SL, or the record's observed mean.
+5. **Rows and annotations.**
+   - The GATK-SV-only rows go into the chromosome in coordinate order, after the popped records at the same POS.
+   - `group_first` merges them with overlapping bubbles and TR loci (`unbreakable_group_first`).
+   - A `row_source` annotation (popped, fused, direct) records each row's origin, and `sv_length` comes from |SVLEN| or the END span.
+   - The store's sites md5 covers the merged list, and its MANIFEST records the call set's release and the FILTER policy.
+6. **Arms (EVALUATION.md).** Arm A drops every SV, CN and fused row through its −inf offset. Arm C keeps them. C-null permutes them within ancestry.
+
+### How the channel enters the measurement model
+
+- **Fused ALT-count pairs** (`sv_fusion.calibrate_two_sources`), given the imputed record's r²_A:
+  - In a stratum verified Berkson, r²_A = V_A/V_G. Elsewhere it is the pair's mean anchor, shrunk toward the reliability model's prediction with the stratum's anchor error model (`fit_anchor_error_model`). That model is fitted on truth loci, the long-read panel members' calls at the same SVs.
+  - The fused value is the best linear predictor from both sources.
+  - Where B is a no-call, the value is the recalibrated imputed dosage with slope κ_A = r²_A/ρ_A.
+- **False-positive intercepts α_B** per class and length, with their variances (`gatksv_store_rows.FalsePositiveRates`): estimated in-workspace from the long-read panel members' GATK-SV calls against their long-read truth. With no truth calls the step refuses the fusion and says so; it never uses a default rate.
+- **The third source C** (RD_CN, or a separate read-depth call set): where a record carries it, r²_A = C_AB·C_AC/(C_BC·V_A) replaces the anchor once measure-path has validated it (MODEL.md §2).
+- **Copy-number rows** have no imputed partner.
+  - Their reliability needs a truth copy number for the long-read panel members (`truth_copy_numbers`, the long-read call set's CN at those loci if it carries one). Their calibration moments are then in copies: truth CN − modal CN (`copy_number.decode_values`).
+  - **Open (measure-path):** without CN truth, fit_measurement_model has no reported r² for these rows. The fallback must be decided, and stated in the certificate, before the step lands.
+- **Moments in value units.** Every moment the measurement model sees, calibration and fitted-cohort alike, is computed on decoded values (code / codes_per_unit + value_origin), so a CN row is in copies and an ALT-count row in dosage.
+- **Offsets and scoring.** The fit's `log_variance_offset` covers the merged store's rows: fused rows take the fused r², direct rows the model's r² for B, and CN rows the CN r². Scoring, Stage 0 and Stage 2 are affine-invariant per column and need no change (`copy_number` module docstring).
+
+**Restart.** The step's key covers the call-set files by size, the crosswalk, the measurement step's key and its code. Each chromosome is a sub-checkpoint, as in the store step.
