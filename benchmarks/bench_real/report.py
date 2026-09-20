@@ -79,26 +79,48 @@ def jackknife(differences: pd.Series, blocks: pd.Series):
 
 
 def paired(scores: pd.DataFrame, arm_a, arm_b):
+    """Paired differences between two arms, reported two ways when fits failed (--record-failures):
+    complete-case (difference, se): only genes every compared arm completed, with failed_genes counted;
+    intention-to-treat (itt_difference, itt_se): every gene, a failed group scored as the training-mean prediction
+    (r^2 = 0), so an arm cannot gain by failing on hard genes. Without failures the two coincide."""
     rows = []
     key = ["gene_id", "chrom", "design", "superpopulation"]
     left = scores[(scores["method"] == arm_a[0]) & (scores["feature_set"] == arm_a[1])][key + ["r2"]]
     right = scores[(scores["method"] == arm_b[0]) & (scores["feature_set"] == arm_b[1])][key + ["r2"]]
     merged = left.merge(right, on=key, suffixes=("_a", "_b"))
-    pooled = merged.groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].mean().assign(superpopulation=POOLED)
+    pooled = merged.groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].agg(lambda values: values.mean(skipna=False)).assign(
+        superpopulation=POOLED)
+    pooled_itt = merged.fillna({"r2_a": 0.0, "r2_b": 0.0}).groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].mean()
+    itt = pd.concat([pooled_itt.assign(superpopulation=POOLED), merged.fillna({"r2_a": 0.0, "r2_b": 0.0})], ignore_index=True)
+    itt_groups = dict(list(itt.groupby(["design", "superpopulation"], sort=False)))
     for (design, superpopulation), group in pd.concat([pooled, merged], ignore_index=True).groupby(["design", "superpopulation"], sort=False):
-        mean, error, kind = jackknife(group["r2_a"] - group["r2_b"], group["chrom"])
-        rows.append({"arm_a": "/".join(arm_a), "arm_b": "/".join(arm_b), "design": design, "superpopulation": superpopulation, "genes": len(group),
-                     "mean_r2_a": group["r2_a"].mean(), "mean_r2_b": group["r2_b"].mean(), "difference": mean, "se": error, "se_kind": kind})
+        failed = int(group[["r2_a", "r2_b"]].isna().any(axis=1).sum())
+        complete = group.dropna(subset=["r2_a", "r2_b"])
+        mean, error, kind = jackknife(complete["r2_a"] - complete["r2_b"], complete["chrom"])
+        whole = itt_groups[(design, superpopulation)]
+        itt_mean, itt_error, _ = jackknife(whole["r2_a"] - whole["r2_b"], whole["chrom"])
+        rows.append({"arm_a": "/".join(arm_a), "arm_b": "/".join(arm_b), "design": design, "superpopulation": superpopulation, "genes": len(complete),
+                     "mean_r2_a": complete["r2_a"].mean(), "mean_r2_b": complete["r2_b"].mean(), "difference": mean, "se": error, "se_kind": kind,
+                     "failed_genes": failed, "itt_genes": len(whole), "itt_mean_r2_a": whole["r2_a"].mean(), "itt_mean_r2_b": whole["r2_b"].mean(),
+                     "itt_difference": itt_mean, "itt_se": itt_error})
     return rows
 
 
 def pooled_r2(scores: pd.DataFrame):
-    """Per method, feature set and design: the mean over genes of each gene's r^2 averaged over the held-out groups."""
-    per_gene = scores.groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False)["r2"].mean()
+    """Per method, feature set and design: the mean over genes of each gene's r^2 averaged over the held-out groups,
+    complete-case (failed genes dropped and counted) and intention-to-treat (a failed group scored as r^2 = 0)."""
+    per_gene = scores.groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False)["r2"].agg(lambda values: values.mean(skipna=False))
+    per_gene_itt = scores.fillna({"r2": 0.0}).groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False)["r2"].mean()
+    itt_groups = dict(list(per_gene_itt.groupby(["method", "feature_set", "design"])))
     rows = []
     for key, group in per_gene.groupby(["method", "feature_set", "design"]):
-        mean, error, kind = jackknife(group["r2"], group["chrom"])
-        rows.append(dict(zip(["method", "feature_set", "design"], key), superpopulation=POOLED, genes=len(group), mean_r2=mean, se=error, se_kind=kind))
+        failed = int(group["r2"].isna().sum())
+        complete = group.dropna(subset=["r2"])
+        mean, error, kind = jackknife(complete["r2"], complete["chrom"])
+        whole = itt_groups[key]
+        itt_mean, itt_error, _ = jackknife(whole["r2"], whole["chrom"])
+        rows.append(dict(zip(["method", "feature_set", "design"], key), superpopulation=POOLED, genes=len(complete), mean_r2=mean, se=error, se_kind=kind,
+                         failed_genes=failed, itt_genes=len(whole), itt_mean_r2=itt_mean, itt_se=itt_error))
     return pd.DataFrame(rows)
 
 
@@ -132,6 +154,10 @@ def sv_credit(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str,
 
 
 def summarize_sv_credit(credit: pd.DataFrame):
+    # Genes with a failed fit in any group are dropped whole: a NaN covariance must not enter a sum as 0.
+    failed = credit[["covariance_full", "covariance_sv"]].isna().any(axis=1)
+    bad = set(map(tuple, credit.loc[failed, ["method", "feature_set", "design", "gene_id"]].to_numpy()))
+    credit = credit[[tuple(row) not in bad for row in credit[["method", "feature_set", "design", "gene_id"]].to_numpy()]]
     pooled = credit.groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False).agg(
         covariance_full=("covariance_full", "sum"), covariance_sv=("covariance_sv", "sum"), r2_drop=("r2_drop", "mean")).assign(superpopulation=POOLED)
     rows = []

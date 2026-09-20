@@ -457,10 +457,11 @@ def load_method(spec: str):
 _WORKER = {}
 
 
-def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None):
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False):
     _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
+    _WORKER["record_failures"] = record_failures
 
 
 def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
@@ -510,18 +511,28 @@ def _run_gene(arguments):
         for feature_set in _WORKER["feature_sets"]:
             train, test_genotypes = subset(train_all, test_all, feature_set, split_name)
             started = time.process_time()
-            predictor = fit(train)
+            try:
+                predictor = fit(train)
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
+                coefficients, status = sv_coefficients(train, predictor, window.gene_id, split_name, feature_set), "ok"
+            except Exception as error:
+                # A failed fit is never replaced by a stand-in predictor. By default it stops the run; with
+                # --record-failures it is kept as a failure: NaN predictions (unscored) and the error in the log.
+                if not _WORKER["record_failures"]:
+                    raise
+                prediction = without_sv = np.full(len(test_index), np.nan)
+                coefficients, status = None, f"failed: {type(error).__name__}: {str(error)[:300]}"
             seconds = time.process_time() - started
-            prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
-            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds,
-                            sv_coefficients(train, predictor, window.gene_id, split_name, feature_set)))
+            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
+                            int(train.variants.is_sv.sum()), seconds, coefficients, status))
     return results
 
 
-def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None, rows_dirs=None, sample_subset=None):
+def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None, rows_dirs=None, sample_subset=None,
+                      record_failures=False):
     from multiprocessing import get_context
 
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset)) as pool:
+    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures)) as pool:
         yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
 
 
@@ -607,7 +618,7 @@ def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
         train, test_genotypes, test_phenotype, test_index = views._task(key)
         prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
         yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]))
+               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok")
     if len(seen) != len(views):
         raise ValueError(f"fit_views returned {len(seen)} of {len(views)} requested views")
 
@@ -625,11 +636,12 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 train, test_genotypes, test_phenotype, test_index = trains._task(index)
                 prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set))
+                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set), "ok")
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None, rows_dirs=None, sample_subset=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None, rows_dirs=None, sample_subset=None,
+        record_failures=False):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
@@ -657,16 +669,18 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     elif contract == "views":
         results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
-        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset) for result in chunk)
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset,
+                                                            record_failures) for result in chunk)
     coefficient_tables = []
-    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients in results:
+    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status in results:
         if coefficients is not None:
             coefficient_tables.append(coefficients)
         position = position_of_row[gene_row]
         predictions[feature_set][position, test_index] = prediction
         predictions_without_sv[feature_set][position, test_index] = without_sv
         truth[position, test_index] = test_phenotype
-        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
+        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds, status,
+                    bool(np.isfinite(prediction).all() and np.ptp(prediction) == 0)))
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
     tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
@@ -681,6 +695,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
         "genes": len(gene_rows), "contract": contract, "splits": split_names, "prediction_rule": PREDICTION_RULE,
+        "record_failures": record_failures, "failed_fits": sum(entry[6] != "ok" for entry in log),
+        "constant_predictions": sum(bool(entry[7]) for entry in log),
         "rows_dirs": [{"dir": str(path), "provenance_sha256": hashlib.sha256((path / "PROVENANCE.json").read_bytes()).hexdigest()
                        if (path / "PROVENANCE.json").exists() else None} for path in dataset.rows_dirs],
         "sample_subset": str(sample_subset) if sample_subset is not None else None,
@@ -695,7 +711,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     if coefficient_tables:
         pd.concat(coefficient_tables, ignore_index=True).to_csv(out / f"{tag}.sv_coefficients.tsv.gz", sep="\t", index=False)
     dataset.genes.iloc[gene_rows].to_csv(out / f"{tag}.genes.tsv", sep="\t", index=False)
-    pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds"]).to_csv(out / f"{tag}.log.tsv", sep="\t", index=False)
+    pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds", "status", "constant_prediction"]).to_csv(
+        out / f"{tag}.log.tsv", sep="\t", index=False)
 
 
 if __name__ == "__main__":
@@ -721,8 +738,9 @@ if __name__ == "__main__":
     parser.add_argument("--note", help="a JSON file recorded verbatim in run.json (arm label, test status, rulings)")
     parser.add_argument("--rows", action="append", metavar="NAME=DIR", help="an extra-rows overlay (repeatable; merged in the given order)")
     parser.add_argument("--sample-subset", help="a file of sample ids, one per line: every split is cut to these people")
+    parser.add_argument("--record-failures", action="store_true", help="keep going when a fit raises: the fit is recorded as failed (NaN, never a stand-in)")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
         tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note,
-        [value.split("=", 1)[1] for value in arguments.rows] if arguments.rows else None, arguments.sample_subset)
+        [value.split("=", 1)[1] for value in arguments.rows] if arguments.rows else None, arguments.sample_subset, arguments.record_failures)

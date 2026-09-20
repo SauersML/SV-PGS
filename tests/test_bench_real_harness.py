@@ -554,3 +554,48 @@ def test_covariate_projected_genotypes_are_orthogonal_to_the_covariates():
     projected = baselines.covariate_projected(train, genotypes)
     design = np.column_stack([np.ones(50), covariates])
     assert np.abs(design.T @ projected).max() <= 1e3 * EPSILON * np.abs(genotypes).sum()
+
+
+FAILING_METHOD = (
+    "def fit(train):\n"
+    "    if train.variants.is_sv.any():\n"
+    "        raise RuntimeError('kernel failed to compile')\n"
+    "    import numpy as np\n"
+    "    class Predictor:\n"
+    "        def predict(self, genotypes):\n"
+    "            return genotypes[:, 0].astype(float)\n"
+    "    return Predictor()\n")
+
+
+def test_a_fit_failure_raises_by_default(tmp_path):
+    tiny_dataset(tmp_path)
+    (tmp_path / "failing.py").write_text(FAILING_METHOD)
+    try:
+        harness.run(tmp_path, f"{tmp_path}/failing.py:fit", "failing", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    except RuntimeError as error:
+        assert "compile" in str(error)
+    else:
+        raise AssertionError("a fit that raises must stop the run, never be replaced by a stand-in predictor")
+
+
+def test_recorded_failures_are_nan_logged_and_never_scored(tmp_path):
+    import json
+
+    from benchmarks.bench_real import report
+
+    tiny_dataset(tmp_path)
+    (tmp_path / "failing.py").write_text(FAILING_METHOD)
+    harness.run(tmp_path, f"{tmp_path}/failing.py:fit", "failing", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), record_failures=True)
+    out = tmp_path / "results/failing/loso"
+    assert np.isnan(np.load(out / "chr1.snv_sv.predictions.npy")).all()
+    assert np.isfinite(np.load(out / "chr1.snv.predictions.npy")).all()
+    log = pd.read_csv(out / "chr1.log.tsv", sep="\t")
+    assert (log.loc[log["feature_set"] == "snv_sv", "status"].str.startswith("failed: RuntimeError")).all()
+    assert (log.loc[log["feature_set"] == "snv", "status"] == "ok").all()
+    assert json.loads((out / "chr1.run.json").read_text())["failed_fits"] == 2
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "failing", "loso")
+    table = pd.DataFrame(report.paired(scores, ("failing", "snv_sv"), ("failing", "snv")))
+    pooled = table[table["superpopulation"] == report.POOLED].iloc[0]
+    assert pooled["genes"] == 0 and pooled["failed_genes"] == 1
+    # Intention-to-treat scores the failed arm as the training-mean prediction (r^2 = 0) on every gene.
+    assert pooled["itt_genes"] == 1 and pooled["itt_mean_r2_a"] == 0.0 and np.isclose(pooled["itt_difference"], -pooled["itt_mean_r2_b"])
