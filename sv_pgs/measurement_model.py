@@ -155,7 +155,8 @@ def octave_spline_basis(log2_values: NDArray) -> F64Array:
     position = values - low
     segment = np.minimum(np.floor(position), segments - 1).astype(np.int64)
     weights = _uniform_cubic_weights(position - segment)
-    basis = np.zeros((values.shape[0], segments + 3))
+    # A spline of degree d has segments + d basis functions, d + 1 of them nonzero on each segment.
+    basis = np.zeros((values.shape[0], segments + len(weights) - 1))
     rows = np.arange(values.shape[0])
     for shift, weight in enumerate(weights):
         basis[rows, segment + shift] = weight
