@@ -124,6 +124,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', '_variant_derivatives'): ('math', frozenset({3.0}), 'd Var / dh of a normal mixture: E[(mu - m)^3] + 3 E[c (mu - m)] (third central moment of a Gaussian mixture)'),
     ('scale_mixture_ep.py', '_stationarity_check'): ('derived', frozenset({3.0, 4.0, 0.75, 0.25}), 'central difference with V certified to e: error h^2 s/6 + e/h, least at h = (3e/s)^(1/3) where it is (3^(2/3)/2) s^(1/3) e^(2/3); e from 1/2 E^2/s = tolerance/(4n), i.e. e = (2 tolerance/(n 3^(4/3)))^(3/4) s^(1/4)'),
     ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
+    ('scale_mixture_ep.py', 'tilted_cumulants'): ('math', frozenset({3.0, 4, 6.0}), 'central moments of a Gaussian component: E[(d + sqrt(c) Z)^3] = d^3 + 3 d c, E[(d + sqrt(c) Z)^4] = d^4 + 6 d^2 c + 3 c^2; kappa4 = m4 - 3 m2^2'),
     ('small_n.py', '_site_blocks'): ('math', frozenset({0.25, 4.0}), 'the covariance of the statistics (beta, -beta^2/2) from the tilted central moments: Var(beta^2)/4 = (k4 + 2v^2 + 4 m k3 + 4 m^2 v)/4'),
     ('small_n.py', '_Kernel.update_divergence'): ('math', frozenset({0.25}), 'the second-order KL of a site change: the Fisher metric of (beta, -beta^2/2), 1/2 r Sigma r + 1/4 dtau (Sigma o Sigma) dtau'),
     ('scale_mixture_ep.py', '_stationarity_check.bound'): ('derived', frozenset({6.0}), 'the central difference truncation h^2 s / 6 (Taylor remainder of V with |V\'\'\'| <= s)'),

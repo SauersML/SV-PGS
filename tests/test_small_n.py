@@ -601,6 +601,8 @@ def test_frozen_passes_that_do_not_contract_fall_back_to_the_double_loop(monkeyp
     monkeypatch.setattr(oracle, "_targets", repelling)
     (point,) = oracle([start])
     assert point is not None and oracle.profile["double_loops"] >= 1
+    # Certified at EP's fixed point in the certificate's own units: the true update's KL is at most 1/(2K) nats.
     variances, frozen = oracle._refresh(start)
     precision, shift = true_targets(start, Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift))
-    np.testing.assert_allclose(precision, oracle.site_precision, rtol=1e-4)
+    divergence = oracle.kernel.update_divergence(oracle.noise, precision - oracle.site_precision, shift - oracle.site_shift, oracle.mean)
+    assert divergence <= 0.5 / 64
