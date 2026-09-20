@@ -41,6 +41,25 @@ def test_kernel_solve_variances_and_jvp_match_the_dense_inverse(negative):
         np.testing.assert_allclose(posterior.solve(right, 0.0), noise * inverse @ right, rtol=_ROUNDING, atol=_ROUNDING)
 
 
+def test_the_cavity_precision_keeps_its_digits_where_the_data_barely_inform_a_column():
+    rng = np.random.default_rng(9)
+    design = _design(rng, 10, 6)
+    design[:, 0] *= 1e-7  # a column whose data information q ~ 1e-14 of its site precision
+    precision = rng.uniform(0.5, 2.0, 6)
+    precision[0] = 1e3
+    _variances, removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+    # Reference, no cancellation: the cavity precision of column j is x_j' (I + X_-j T_-j^-1 X_-j')^-1 x_j.
+    for column in range(6):
+        others = np.delete(np.arange(6), column)
+        kernel = np.eye(10) + design[:, others] @ np.diag(1.0 / precision[others]) @ design[:, others].T
+        expected = float(design[:, column] @ np.linalg.solve(kernel, design[:, column]))
+        np.testing.assert_allclose(cavity[column], expected, rtol=1e-9)
+        np.testing.assert_allclose(removed[column], expected / (expected + precision[column]), rtol=1e-9)
+    # The naive 1/z - t has no digits left for column 0.
+    naive = 1.0 / _Kernel(np.asfortranarray(design), precision).variances()[0] - precision[0]
+    assert abs(naive - cavity[0]) > 1e-6 * abs(cavity[0])
+
+
 def test_kernel_refuses_an_indefinite_precision():
     rng = np.random.default_rng(7)
     design = _design(rng, 5, 20)

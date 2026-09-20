@@ -246,6 +246,20 @@ class _Kernel:
         delta, phi, psi = self.factors()
         return delta - np.einsum("ij,ij->j", phi, phi) + np.einsum("ij,ij->j", psi, psi)
 
+    def cavity(self) -> tuple[F64Array, F64Array, F64Array]:
+        """(z', 1 - t z', 1/z' - t): the variances of A'^-1, each site's share of its variance the data remove, and its
+        cavity precision, without cancellation. For a bulk column z' = d - d^2 q + f (d = 1/t, q = ||U^-T x_j||^2,
+        f = ||Psi_j||^2), so 1 - t z' = d q - t f exactly; forming 1/z' - t from z' instead loses every digit where the
+        data inform a column far less than its site does (d q below eps), which is most rare variants at the start."""
+        delta, phi, psi = self.factors()
+        extra = np.einsum("ij,ij->j", psi, psi)
+        variances = delta - np.einsum("ij,ij->j", phi, phi) + extra
+        removed = np.empty(self.variant_count)
+        whitened = self.whitened()
+        removed[self.bulk] = self.inverse * np.einsum("ij,ij->j", whitened, whitened) - self.precision[self.bulk] * extra[self.bulk]
+        removed[self.rest] = 1.0 - self.precision[self.rest] * variances[self.rest]
+        return variances, removed, removed / variances
+
     def draws(self, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x draws) exact draws of N(0, A'^-1): beta_N from its marginal N(0, S^-1), then beta_P | beta_N with
         precision A'_PP (Bhattacharya et al. 2016: u ~ N(0, T^-1), e ~ N(0, I_n), u - T^-1 Xp_P' K^-1 (Xp_P u + e))."""
@@ -394,11 +408,13 @@ class _DenseFixedPoints:
         self.profile["passes"] += 1
         self.profile["factor_seconds"] += time.perf_counter() - started
 
-    def _variances(self) -> F64Array:
+    def _cavity(self) -> tuple[F64Array, F64Array, F64Array]:
+        """(z, 1 - tau z, P = 1/z - tau) at the current sites, from the kernel without cancellation (z = sigma^2 z',
+        tau = t / sigma^2, so 1 - tau z = 1 - t z' and P = (1/z' - t) / sigma^2)."""
         started = time.perf_counter()
-        variances = self.noise * self.kernel.variances()
+        variances, removed, precision = self.kernel.cavity()
         self.profile["variance_seconds"] += time.perf_counter() - started
-        return variances
+        return self.noise * variances, removed, precision / self.noise
 
     def _residual_sum_of_squares(self) -> float:
         residual = self.statistics.projected_target - self.design @ self.mean
@@ -410,21 +426,22 @@ class _DenseFixedPoints:
             site_precision=self.site_precision, posterior_variance=variances, noise=self.noise,
         )
 
-    def _refresh(self) -> F64Array:
-        """The mean and the exact marginal variances at the current sites; negative sites halve while the precision is
-        not positive definite or a cavity is not proper (``full_data_fit``'s refresh)."""
+    def _refresh(self) -> tuple[F64Array, F64Array]:
+        """The mean, the exact marginal variances and the cavity precisions at the current sites; negative sites halve
+        while the precision is not positive definite or a cavity is not proper (``full_data_fit``'s refresh)."""
         while True:
             try:
                 self._iterate(self.site_precision, self.site_shift)
             except np.linalg.LinAlgError:
                 failure = "the precision is not positive definite with non-negative sites"
             else:
-                variances = self._variances()
-                if not np.any(1.0 / variances - self.site_precision <= 0.0):
+                variances, removed, cavity_precision = self._cavity()
+                if not np.any(cavity_precision <= 0.0):
                     self.profile["refreshes"] += 1
                     count = self.prior.variant_count
-                    self.effective = max(count - float(np.sum(self.site_precision * variances)), _EPSILON * count)
-                    return variances
+                    # p_eff = sum_j (1 - tau_j z_j), each term without cancellation, floored at its rounding p eps.
+                    self.effective = max(float(np.sum(removed)), _EPSILON * count)
+                    return variances, cavity_precision
                 failure = "a cavity is improper (1/z - tau <= 0) with non-negative sites"
             negative = self.site_precision < 0.0
             if not np.any(negative):
@@ -472,8 +489,7 @@ class _DenseFixedPoints:
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
         while True:
-            variances = self._refresh()
-            frozen = 1.0 / variances - self.site_precision
+            variances, frozen = self._refresh()
             mean = self.mean.copy()
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)
