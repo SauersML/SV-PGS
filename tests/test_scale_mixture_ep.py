@@ -334,17 +334,21 @@ def test_curvature_trace_gradient_matches_finite_differences():
 
 
 def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
+    # Also with a correction C = B - A that is not zero (a PSD one of the form M'(B_z - A_z)M): the gradient is the
+    # B-evidence's own, with W_B in its trace terms, not the fixed-cavity form's.
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-    assert evidence is not None and evidence.newton_decrement < 1e-12
-    step = 1e-4
-    numerical = []
-    for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
-        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-        numerical.append((forward.value - backward.value) / (2.0 * step))
-    np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
+    mapping = prior.coefficient_map
+    for correction in (INDEPENDENT_EFFECTS, CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (0.3 * np.eye(mapping.shape[0])) @ mapping)):
+        evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+        assert evidence is not None and evidence.newton_decrement < 1e-12
+        step = 1e-4
+        numerical = []
+        for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
+            forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+            backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+            numerical.append((forward.value - backward.value) / (2.0 * step))
+        np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
 
 
 @pytest.mark.xfail(strict=False, raises=FloatingPointError, reason=_FOLD_REASON)

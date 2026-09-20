@@ -1676,15 +1676,15 @@ def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
 def _evidence(
     prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
-    """V(rho) with the total curvature B, and the fixed-cavity gradient that steers the search; x_rho re-maximized
-    from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
+    """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
 
     V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved, the
     second-order approximation of the actual marginal likelihood, taken as A + ``correction`` (``CurvatureCorrection``);
-    the null space N is profiled. The gradient is that of the fixed-cavity form (-H in place of B), whose terms move with x_rho through
-    dx/drho_i = -(-H)^-1 lambda_i S_i x and the third derivatives of log Z (``_curvature_trace_gradient``); it only
-    chooses the search direction, and every step is accepted on V itself.
+    the null space N is profiled. The gradient is V's own (C held, as V holds it): its determinant terms move with
+    rho through S and through x_rho, dx/drho_i = -(-H)^-1 lambda_i S_i x, by the third derivatives of log Z
+    contracted with W_B (``_curvature_trace_gradient``); x_rho itself maximizes F - P, so F moves only through the
+    penalty (the envelope). Every step is still accepted on V itself.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     null_basis = prior.null_basis
@@ -1731,7 +1731,10 @@ def _evidence(
         return None
     total_covariance = profiled_total.inverse
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * profiled_total.schur_log_determinant
-    # W = (-H)^-1 - N (N'(-H)N)^-1 N' carries both determinants' dependence on x (computed above).
+    # V's own rho-gradient: W_B = (B + S)^-1 - N (N'(B + S)N)^-1 N' carries both determinants' dependence on rho,
+    # through S directly and through x_rho in A(x_rho) (C is held), with dx/drho_i = -(-H)^-1 lambda_i S_i x.
+    total_weight = profiled_total.weight
+    total_curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, total_weight, working_bytes)
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
     effective_degrees = np.empty(len(prior.smoothing_blocks))
     penalty_sizes = np.empty(len(prior.smoothing_blocks))
@@ -1755,8 +1758,8 @@ def _evidence(
         evidence_gradient[position] = (
             -0.5 * lambda_weight * float(residual @ residual)
             + 0.5 * lambda_weight * _pseudo_inverse_trace(penalty[np.ix_(group, group)], embedded)
-            - 0.5 * lambda_weight * float(np.sum(weight[np.ix_(coordinates, coordinates)] * block.matrix))
-            + 0.5 * float(curvature_gradient @ (covariance @ pull))
+            - 0.5 * lambda_weight * float(np.sum(total_weight[np.ix_(coordinates, coordinates)] * block.matrix))
+            + 0.5 * float(total_curvature_gradient @ (covariance @ pull))
         )
     return _Evidence(
         value=evidence_value,
