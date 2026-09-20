@@ -154,7 +154,6 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('sv_fusion.py', 'MAXIMUM_BREAKPOINT_DISTANCE'): ('spec', frozenset({100}), 'GATK-SV re-clustering rule'),
     ('sv_fusion.py', 'MINIMUM_CALIBRATION_SAMPLES'): ('math', frozenset({4}), 'Fisher z has standard error 1/sqrt(n - 3), so n > 3'),
     ('sv_fusion.py', '_fisher_z'): ('math', frozenset({3}), 'Fisher z has standard error 1/sqrt(n - 3), so n > 3'),
-    ('sv_fusion.py', 'mean_anchor'): ('derived', frozenset({4.0}), 'delta-method variance of the intercept; 4 = 2^2 from the diploid dosage scale'),
     ('synthetic_store.py', 'HG38_AUTOSOME_MEGABASES'): ('scenario', frozenset({248.96, 242.19, 198.3, 190.21, 181.54, 170.81, 159.35, 145.14, 138.39, 133.8, 135.09, 133.28, 114.36, 107.04, 101.99, 90.34, 83.26, 80.37, 58.62, 64.44, 46.71, 50.82}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
     ('synthetic_store.py', 'COHORT_GROUPS'): ('scenario', frozenset({0.8, 0.2, 0.35, 0.15}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
     ('synthetic_store.py', 'ANCESTRY_DIRICHLET_CONCENTRATION'): ('scenario', frozenset({15.0}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
@@ -237,7 +236,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('prior_design.py', '_continuous_spline_knots'): ('e2e', frozenset({0.25, 0.75}), 'a rich basis with a learned roughness penalty instead of quartile knots'),
     ('prior_design.py', '_effective_prior_variances'): ('e2e', frozenset({1e-08}), "B7: the engine's EB replaces the floor"),
     ('sv_fusion.py', 'MINIMUM_PAIRING_Z'): ('novel-measure', frozenset({5.0}), 'fusion acceptance: one event vs two in LD needs a prior on r2_B, not a z or clamp threshold'),
-    ('sv_fusion.py', 'MAXIMUM_SECOND_RELIABILITY'): ('novel-measure', frozenset({1.25}), 'fusion acceptance: one event vs two in LD needs a prior on r2_B, not a z or clamp threshold'),
 }
 
 
