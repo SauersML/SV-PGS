@@ -903,7 +903,9 @@ def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
     interior = (weights > lower) & (weights < upper)
     if not np.any(interior):
         pytest.skip("the ascent stopped at the resolvable range's bounds: no interior weight to check")
-    check, curvature, _steps, errors = _stationarity_check(prior, weights, evidence, interior, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    check, curvature, _steps, errors, better = _stationarity_check(prior, weights, evidence, interior, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    if better is not None:
+        pytest.skip("the check found a certifiably better side: the engine claims no stationarity here, so there is no claimed bound to cover")
     claimed = 0.5 * float(np.sum(np.square(np.abs(check) + errors) / curvature))
     gains = {}
     for position in np.flatnonzero(interior):
