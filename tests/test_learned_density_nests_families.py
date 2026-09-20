@@ -16,12 +16,12 @@ from scipy.optimize import minimize, minimize_scalar
 from scipy.special import betainc, expit, logsumexp
 
 from sv_pgs.scale_mixture_ep import (
+    INDEPENDENT_EFFECTS,
     Cavity,
     class_log_density,
     derived_lattice,
     hyper_step,
     initial_hyperparameters,
-    normal_means_posterior,
     scale_mixture_prior,
 )
 
@@ -89,7 +89,7 @@ def _learned(estimate):
         floor=floor,
         top=top,
     )
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _RESOLUTION)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _RESOLUTION)
     variances = np.where(nodes >= floor, np.exp(nodes), 0.0)
     return variances, class_log_density(prior, step.hyperparameters.coefficients)[0], nodes.shape[0]
 

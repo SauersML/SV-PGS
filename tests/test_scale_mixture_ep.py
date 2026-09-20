@@ -15,6 +15,10 @@ from scipy.optimize import minimize_scalar
 
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
+    INDEPENDENT_EFFECTS,
+    CurvatureCorrection,
+    FixedPoint,
+    fit_hyperparameters,
     AnnotationGroup,
     Cavity,
     GaussianPosterior,
@@ -27,6 +31,7 @@ from sv_pgs.scale_mixture_ep import (
     _total_curvature,
     _directional_derivatives,
     _corrected,
+    _ascend_evidence,
     _best_certified,
     _laplace_corrections,
     _line_log_integral,
@@ -35,10 +40,13 @@ from sv_pgs.scale_mixture_ep import (
     _maximize_coefficients,
     _penalized,
     _penalty_matrix,
+    _proposal,
+    _newton_b,
     _penalty_value,
     _restricted_prior,
     _smoothing_bounds,
     cavities,
+    curvature_correction,
     class_log_density,
     derived_lattice,
     diagonal_posterior,
@@ -51,8 +59,8 @@ from sv_pgs.scale_mixture_ep import (
     kernel_top,
     log_scale,
     moment_matched_prior_sites,
+    noise_gain,
     noise_variance,
-    normal_means_posterior,
     prior_second_moment,
     quadrature_majorant_ratio,
     roughness_factor,
@@ -60,6 +68,7 @@ from sv_pgs.scale_mixture_ep import (
     site_targets,
     spacing_bound,
     tail_mass,
+    tilted_cumulants,
     tilted_moments,
 )
 
@@ -114,14 +123,6 @@ def _problem(*, variant_count: int, seed: int, node_count: int = 0):
         top=top,
     )
     return prior, cavity
-
-
-_FOLD_REASON = (
-    "two-sided stationarity certificate cannot certify a maximum at its basin's fold boundary: the rho-search can "
-    "stop where the base's inner basin ends within 1e-5 in rho and the neighbouring basin lies inside the sides' "
-    "certified errors, and which way rounding falls follows BLAS threads and kernel. Removed by lane/engine-stationarity "
-    "(a boundary-aware certificate with curvature certified over the step)."
-)
 
 
 def _hyperparameters(prior, seed: int, log_smoothing: float | None = None) -> MixtureHyperparameters:
@@ -326,38 +327,41 @@ def test_curvature_trace_gradient_matches_finite_differences():
 
 
 def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
+    # Also with a correction C = B - A that is not zero (a PSD one of the form M'(B_z - A_z)M): the gradient is the
+    # B-evidence's own, with W_B in its trace terms, not the fixed-cavity form's.
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-    assert evidence is not None and evidence.newton_decrement < 1e-12
-    step = 1e-4
-    numerical = []
-    for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
-        forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-        backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-        numerical.append((forward.value - backward.value) / (2.0 * step))
-    np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
+    mapping = prior.coefficient_map
+    for correction in (INDEPENDENT_EFFECTS, CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (0.3 * np.eye(mapping.shape[0])) @ mapping)):
+        evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+        assert evidence is not None and evidence.newton_decrement < 1e-12
+        step = 1e-4
+        numerical = []
+        for unit in np.eye(hyperparameters.log_smoothing.shape[0]):
+            forward = _evidence(prior, hyperparameters.log_smoothing + step * unit, evidence.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+            backward = _evidence(prior, hyperparameters.log_smoothing - step * unit, evidence.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
+            numerical.append((forward.value - backward.value) / (2.0 * step))
+        np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
 
 
-@pytest.mark.xfail(strict=False, raises=FloatingPointError, reason=_FOLD_REASON)
 def test_hyper_step_reaches_a_maximum_of_the_evidence():
     prior, cavity = _problem(variant_count=150, seed=19)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     fitted = step.hyperparameters
     infinite = frozenset(int(position) for position in np.flatnonzero(fitted.log_smoothing == np.inf))
     view, allowed = _restricted_prior(prior, infinite)
     weights = fitted.log_smoothing[np.isfinite(fitted.log_smoothing)]
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
-    laplace = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+    correction = INDEPENDENT_EFFECTS
+    laplace = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
     assert laplace is not None and laplace.newton_decrement < 1e-10
     # V is certified to the tolerance (its Tierney-Kadane corrections), so values computed apart agree to it.
-    base = _corrected(view, weights, laplace, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    base = _corrected(view, weights, laplace, cavity, correction, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert base is not None and abs(step.evidence - base.value) <= _EVIDENCE_TOLERANCE
     for unit in np.eye(weights.shape[0]):
         for direction in (-1.0, 1.0):
             moved_weights = weights + direction * 0.05 * unit
             moved = _corrected(
-                view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, posterior, _WORKING_BYTES, 0.0), cavity, posterior,
+                view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, correction, _WORKING_BYTES, 0.0), cavity, correction,
                 _WORKING_BYTES, _EVIDENCE_TOLERANCE,
             )
             # The step certifies that a nearby move gains at most the tolerance, and each computed V is certified to it:
@@ -367,10 +371,9 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
     assert step.stationarity_gain <= _EVIDENCE_TOLERANCE
 
 
-@pytest.mark.xfail(strict=False, raises=FloatingPointError, reason=_FOLD_REASON)
 def test_the_fit_does_not_depend_on_the_lattice_spacing():
     prior, cavity = _problem(variant_count=150, seed=19)
-    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     finer, start = halved_lattice(prior, coarse.hyperparameters)
     # At the same hyperparameters the two lattices are quadratures of one model with the same floor: the spacing bound
     # holds the trapezoid error of sum_j log Z_j to the tolerance the lattice is built to on each, so the two sums
@@ -380,7 +383,7 @@ def test_the_fit_does_not_depend_on_the_lattice_spacing():
     transferred_moments = tilted_moments(finer, start, cavity, _WORKING_BYTES)
     assert abs(float(np.sum(transferred_moments.log_normalizer - coarse_moments.log_normalizer))) <= 2.0 * _LATTICE_TOLERANCE
     # Refitting on the finer lattice finds no better fit: each V is a maximum certified to the tolerance.
-    fine = hyper_step(finer, start, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    fine = hyper_step(finer, start, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     np.testing.assert_allclose(fine.evidence, coarse.evidence, atol=2.0 * _EVIDENCE_TOLERANCE)
 
 
@@ -414,9 +417,23 @@ def test_noise_update_reaches_the_reml_variance_of_a_gaussian_prior_regression()
             covariate_count=covariates.shape[1],
             site_precision=site_precision,
             posterior_variance=np.diag(covariance),
+            noise=variance,
         )
     # The reference maximizer is located to half of double precision in log variance.
     np.testing.assert_allclose(variance, expected, rtol=1e-6)
+
+
+def test_the_noise_update_is_positive_and_its_gain_nonnegative_where_effects_outnumber_samples():
+    # gamma near p = 400 exceeds n - k = 290: the MacKay form has no solution there, the stationarity form does.
+    site_precision = np.full(400, 1e-8)
+    posterior_variance = np.full(400, 1e-3)
+    updated = noise_variance(
+        residual_sum_of_squares=100.0, sample_count=300, covariate_count=10, site_precision=site_precision,
+        posterior_variance=posterior_variance, noise=0.5,
+    )
+    assert updated > 0.0
+    for ratio in (1e-3, 0.5, 1.0, 2.0, 1e3):
+        assert noise_gain(0.5 * ratio, 0.5, 300, 10) >= 0.0
 
 
 def test_the_floor_bounds_the_flat_kernel_error_and_the_top_is_the_largest_mode():
@@ -545,12 +562,12 @@ def test_the_global_log_normal_start_reaches_the_null_models_maximum():
 
 def test_the_hyper_steps_evidence_is_at_least_the_exact_infinity_edges():
     prior, cavity = _log_normal_problem(33)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     view, allowed = _restricted_prior(prior, frozenset({0}))
     start = _log_normal_start(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    correction = INDEPENDENT_EFFECTS
     edge = _corrected(
-        view, np.zeros(0), _evidence(view, np.zeros(0), allowed.T @ start, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE), cavity, posterior,
+        view, np.zeros(0), _evidence(view, np.zeros(0), allowed.T @ start, cavity, correction, _WORKING_BYTES, _EVIDENCE_TOLERANCE), cavity, correction,
         _WORKING_BYTES, _EVIDENCE_TOLERANCE,
     )
     assert edge is not None
@@ -581,12 +598,28 @@ def test_a_null_annotation_is_penalized_at_an_interior_optimum_or_the_infinity_e
     # took it and left a null annotation unpenalized (verify-engine). With the edge gone, every weight is either at
     # the infinity edge or inside its resolvable range, never below it.
     prior, cavity = _null_annotation_problem(seed)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     weights = step.hyperparameters.log_smoothing
     assert not np.any(weights == -np.inf), weights
     bounds = _smoothing_bounds(prior, _data_objective(prior, initial_hyperparameters(prior).coefficients, cavity, _WORKING_BYTES))
     for weight, (lower, _upper) in zip(weights, bounds):
         assert weight == np.inf or weight >= lower, (weights, bounds)
+
+
+def test_tilted_cumulants_are_the_shift_derivatives_of_log_z():
+    # kappa_n = d^n log Z_j / d h_j^n at the cavity: central differences of the tilted mean (kappa_1) in the shift.
+    prior, cavity = _problem(variant_count=12, seed=1, node_count=9)
+    hyperparameters = _hyperparameters(prior, 2)
+    third, fourth = tilted_cumulants(prior, hyperparameters, cavity, _WORKING_BYTES)
+
+    def variance_at(shift):
+        return tilted_moments(prior, hyperparameters, Cavity(precision=cavity.precision, shift=shift), _WORKING_BYTES).variance
+
+    step = 1e-3 * (1.0 + np.abs(cavity.shift))
+    numeric_third = (variance_at(cavity.shift + step) - variance_at(cavity.shift - step)) / (2.0 * step)
+    numeric_fourth = (variance_at(cavity.shift + step) - 2.0 * variance_at(cavity.shift) + variance_at(cavity.shift - step)) / np.square(step)
+    np.testing.assert_allclose(third, numeric_third, rtol=1e-5, atol=1e-10)
+    np.testing.assert_allclose(fourth, numeric_fourth, rtol=1e-3, atol=1e-8)
 
 
 def test_directional_third_and_fourth_derivatives_match_finite_differences():
@@ -606,9 +639,9 @@ def test_directional_third_and_fourth_derivatives_match_finite_differences():
 def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_directions():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
     assert evidence is not None
-    corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
     value = _data_value(prior, evidence.coefficients, cavity, _WORKING_BYTES) - _penalty_value(prior, hyperparameters.log_smoothing, evidence.coefficients)[0]
     steps = np.linspace(-12.0, 12.0, 4801)
     for index in np.argsort(-np.abs(terms))[:3]:
@@ -643,7 +676,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
 def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     assert evidence is not None
     _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, posterior, _WORKING_BYTES, 0.0)
@@ -666,7 +699,7 @@ def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
 def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     nearby = hyperparameters.coefficients + 1e-3 * np.random.default_rng(41).standard_normal(prior.coefficient_size)
     calls = []
     corrected = engine._corrected
@@ -735,6 +768,131 @@ def test_the_moment_start_splits_the_phenotypic_variance_and_tracks_the_heritabi
     assert null.resolution <= null.heritability <= 4.0 * null.resolution
 
 
+def test_the_correction_gradient_is_the_held_direction_corrections_derivative():
+    # Each replaced direction b held, its correction is log int exp(l(x_rho + t b) - l(x_rho)) dt + log(kappa) / 2
+    # - log(2 pi) / 2 at every rho: central differences of that sum must match the analytic gradient.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    tolerance = 1e-4
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+    assert evidence is not None
+    gradient, error = engine._correction_gradient(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
+    _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
+    order = np.argsort(-np.abs(terms))
+    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
+    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
+    assert replaced.shape[0] >= 2
+
+    def held(weights):
+        point = _evidence(prior, weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+        penalty = _penalty_matrix(prior, weights)
+        _value, _gradient, hessian = _penalized(prior, _data_objective(prior, point.coefficients, cavity, _WORKING_BYTES), weights, penalty, point.coefficients)
+        total = 0.0
+        for index in replaced:
+            direction = directions[:, index]
+            total += _line_log_integral(prior, weights, point.coefficients, direction, point.penalized_value, cavity, _WORKING_BYTES, 1e-11)
+            total += 0.5 * np.log(float(direction @ (-hessian) @ direction))
+        return total
+
+    step = 1e-4
+    numerical = np.array([
+        (held(hyperparameters.log_smoothing + step * unit) - held(hyperparameters.log_smoothing - step * unit)) / (2.0 * step)
+        for unit in np.eye(hyperparameters.log_smoothing.shape[0])
+    ])
+    np.testing.assert_allclose(gradient, numerical, rtol=1e-4, atol=1e-5 + 2.0 * float(np.max(error)))
+
+
+def _annotated_problem(seed: int):
+    """One class, ten nodes and one annotation column that scales the effects (verify-engine's finding-3 case)."""
+    generator = np.random.default_rng(seed)
+    variant_count = 80
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    position = generator.uniform(-1.0, 1.0, variant_count)
+    offset = np.log(generator.uniform(0.2, 1.0, variant_count))
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variant_count, np.int64), log_variance_offset=offset, annotation_design=position[:, None],
+        annotation_groups=(AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    precision = generator.uniform(50.0, 400.0, variant_count)
+    effect = np.where(generator.random(variant_count) < 0.4, generator.normal(0.0, 0.25, variant_count), 0.0) * np.exp(0.5 * position)
+    shift = precision * (effect + generator.standard_normal(variant_count) / np.sqrt(precision))
+    return prior, Cavity(precision=precision, shift=shift)
+
+
+def _ascended(prior, cavity):
+    flat = initial_hyperparameters(prior).coefficients
+    start = _corrected(prior, np.zeros(2), _evidence(prior, np.zeros(2), flat, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                       cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    bounds = _smoothing_bounds(prior, _data_objective(prior, start.coefficients, cavity, _WORKING_BYTES))
+    lower, upper = np.array([bound[0] for bound in bounds]), np.array([bound[1] for bound in bounds])
+    weights, evidence = _ascend_evidence(prior, np.zeros(2), start, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, lower, upper, _EVIDENCE_TOLERANCE, flat)
+    return weights, evidence, (weights > lower) & (weights < upper)
+
+
+@pytest.mark.parametrize("seed", (101, 202, 303))
+def test_the_weights_remaining_gain_covers_every_nearby_weight(seed):
+    # verify-engine finding 3: the old check's 1/2 (|c| + E)^2 / s used an upper bound on |V''| and so understated the
+    # gain (0.0245 claimed where V rose 0.0645 within one unit of rho, seed 303). The remaining gain must cover the
+    # best certified V over a neighbourhood of the ascent's stop, up to the two sides' certified tolerances.
+    prior, cavity = _annotated_problem(seed)
+    weights, evidence, interior = _ascended(prior, cavity)
+    if not np.any(interior):
+        pytest.skip("the ascent stopped at the resolvable range's bounds")
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is None
+    gains = []
+    for position in np.flatnonzero(interior):
+        for distance in (-1.0, -0.3, -0.1, 0.1, 0.3, 1.0):
+            moved_weights = weights.copy()
+            moved_weights[position] += distance
+            moved = _corrected(
+                prior, moved_weights, _evidence(prior, moved_weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+            )
+            if moved is not None:
+                gains.append(moved.value - evidence.value)
+    assert max(gains) <= check.gain + 2.0 * _EVIDENCE_TOLERANCE, (max(gains), check.gain, check.gradient, check.curvature)
+
+
+def test_a_maximum_at_its_basins_fold_is_certified_one_sided(monkeypatch):
+    # The basin ends just past the stop on the side the gradient climbs: the weight's gain is at most what V can climb
+    # before the fold, and the curvature comes from the other side.
+    prior, cavity = _annotated_problem(101)
+    weights, evidence, interior = _ascended(prior, cavity)
+    position = int(np.flatnonzero(interior)[0])
+    gradient = engine._full_gradient(prior, weights, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)[0]
+    climb = 1.0 if gradient[position] >= 0.0 else -1.0
+    corrected = engine._corrected
+
+    def folded(view, trial_weights, trial, *rest):
+        if climb * (trial_weights[position] - weights[position]) > 0.0:
+            return None
+        return corrected(view, trial_weights, trial, *rest)
+
+    monkeypatch.setattr(engine, "_corrected", folded)
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is None and check.folds[position] > 0.0
+    reach = abs(check.gradient[position]) + check.error[position]
+    assert check.gain >= reach * check.folds[position]
+    assert np.isfinite(check.curvature[position, position])
+
+
+def test_a_certifiably_better_side_is_taken_not_certified(monkeypatch):
+    prior, cavity = _annotated_problem(101)
+    weights, evidence, interior = _ascended(prior, cavity)
+    corrected = engine._corrected
+
+    def lifted(view, trial_weights, trial, *rest):
+        found = corrected(view, trial_weights, trial, *rest)
+        if found is None or np.array_equal(trial_weights, weights):
+            return found
+        return replace(found, value=found.value + 1.0)
+
+    monkeypatch.setattr(engine, "_corrected", lifted)
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is not None and check.better[1].value > evidence.value + _EVIDENCE_TOLERANCE
+
+
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
     # x = T x' with T orthogonal within each coefficient block: every log-determinant moves by log|det T| = 0,
     # so V and the tilted means must agree to rounding. A normalization or log-determinant error would not.
@@ -757,8 +915,8 @@ def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_
         ),
         null_basis=rotation.T @ prior.null_basis,
     )
-    original = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
-    transformed = _evidence(rotated, hyperparameters.log_smoothing, rotation.T @ hyperparameters.coefficients, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    original = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+    transformed = _evidence(rotated, hyperparameters.log_smoothing, rotation.T @ hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
     assert original is not None and transformed is not None
     np.testing.assert_allclose(transformed.value, original.value, rtol=0.0, atol=1e-8)
     np.testing.assert_allclose(transformed.gradient, original.gradient, rtol=1e-6, atol=1e-8)
@@ -806,7 +964,7 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     start = moment_matched_prior_sites(prior, MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks))))
     sites, covariance, cavity = _dense_ep(prior, coefficients, likelihood_precision, linear_term, start)
     posterior = GaussianPosterior(
-        solve=lambda right: covariance @ right, variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance)
+        solve=lambda right, _relative_tolerance: covariance @ right, variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance)
     )
     analytic = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13)
     mapping = prior.coefficient_map
@@ -824,6 +982,83 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     np.testing.assert_allclose(analytic, numerical, rtol=1e-5, atol=1e-5 * float(np.max(np.abs(numerical))))
     fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
     assert np.max(np.abs(analytic - fixed_cavity)) > 1e-3 * float(np.max(np.abs(fixed_cavity)))
+
+    # A posterior that solves the linear response exactly gives the same B as GMRES.
+    squared = np.square(covariance)
+
+    def linear_response(left, right, diagonal, weight, right_hand):
+        matrix = np.eye(variant_count) - (np.eye(variant_count) - weight[:, None] * squared) @ (left[:, None] * covariance * right[None, :] + np.diag(diagonal))
+        return np.linalg.solve(matrix, right_hand)
+
+    exact = _total_curvature(prior, coefficients, cavity, replace(posterior, linear_response=linear_response), _WORKING_BYTES, 1e-13)
+    np.testing.assert_allclose(exact, analytic, rtol=1e-9, atol=1e-9 * float(np.max(np.abs(analytic))))
+
+    # The correction is solved only on the directions a view asks for: first an edge's free coefficients, then the
+    # released ones; on each it is the whole correction's restriction.
+    whole = analytic + mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping
+    lazy = curvature_correction(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13 * coefficients.shape[0])
+    view, allowed = _restricted_prior(prior, frozenset(range(len(prior.smoothing_blocks))))
+    scale = float(np.max(np.abs(whole)))
+    np.testing.assert_allclose(lazy.on(view.coefficient_map), allowed.T @ whole @ allowed, rtol=1e-8, atol=1e-8 * scale)
+    # One direction per independent column of the view's map (M is not injective: eta_bar and the class deviations
+    # overlap in z), and only the new ones when every edge is released.
+    assert lazy.solved_directions == np.linalg.matrix_rank(view.coefficient_map) < np.linalg.matrix_rank(mapping)
+    np.testing.assert_allclose(lazy.on(mapping), whole, rtol=1e-8, atol=1e-8 * scale)
+    assert lazy.solved_directions == np.linalg.matrix_rank(mapping)
+
+
+def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():
+    # A correction C = B - A of the form every real one has, M'(B_z - A_z)M, here with B_z = -A_z - I: then
+    # B + S = S - A - M'M, a saddle. The Newton-B model reports it as indefinite with an infinite decrement (so no
+    # certificate can be issued there), and its step is the trust-region maximizer of the model inside the radius.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
+    penalty = _penalty_matrix(prior, hyperparameters.log_smoothing)
+    objective = _data_objective(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    _value, _gradient, hessian = _penalized(prior, objective, hyperparameters.log_smoothing, penalty, hyperparameters.coefficients)
+    mapping = prior.coefficient_map
+    saddle = CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (2.0 * objective.hessian - np.eye(mapping.shape[0])) @ mapping)
+    expected = -hessian + saddle.matrix
+    assert np.linalg.eigvalsh(0.5 * (expected + expected.T))[0] < 0.0
+    point = FixedPoint(
+        cavity=cavity, posterior=diagonal_posterior(np.ones(prior.variant_count)), mean=np.zeros(prior.variant_count),
+        precision_norm=lambda direction: float(direction @ direction), effective_effects=float(prior.variant_count),
+    )
+    newton = _newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, saddle, _WORKING_BYTES)
+    assert not newton.definite and newton.decrement == np.inf
+    np.testing.assert_allclose(newton.total, 0.5 * (expected + expected.T), rtol=1e-10, atol=1e-10)
+    radius = 0.5
+    step = _proposal(newton, radius)
+    assert np.linalg.norm(step) <= radius * (1.0 + 1e-12)
+    # The model rises along the step: g's - s'(B + S)s / 2 > 0.
+    assert float(newton.gradient @ step) - 0.5 * float(step @ newton.total @ step) > 0.0
+
+
+def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifies():
+    # Normal means: each effect's cavity is its own likelihood whatever the prior, so the exact fixed point is the
+    # tilted law itself. The oracle has no fixed point at its second call (the first trial): the loop must refuse that
+    # trial, count it, and go on to certify.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    calls = []
+
+    def fixed_points(hyperparameters):
+        calls.append(len(calls))
+        if len(calls) == 2:
+            return [None] * len(hyperparameters)
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            points.append(FixedPoint(
+                cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                precision_norm=lambda direction, variance=moments.variance: float(np.sum(np.square(direction) / variance)),
+                effective_effects=float(np.sum(cavity.precision * moments.variance)),
+            ))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert fit.unresolved >= 1 and len(calls) > 2
+    assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
+    assert fit.prediction_move <= fit.prediction_tolerance
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
