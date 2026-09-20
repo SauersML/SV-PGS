@@ -83,7 +83,7 @@ EP-re-solved one; at fixed cavities it is H.
 Outer loop (``fit_hyperparameters``). At an EP fixed point the EP evidence's
 gradient in x is the fixed-cavity one, and its negative Hessian is the total
 curvature B + S, with the cavities re-solved (``_total_curvature``). So x moves
-by Newton on B + S, globalized by the natural monotonicity test. It never moves
+by Newton on B + S, accepting only a resolved rise of the evidence. It never moves
 by the fixed-cavity maximizer: that EP-EM step solves with A + S, and it
 overshoots where (A + S)^-1 (B + S) exceeds 2.
 
@@ -2531,7 +2531,8 @@ def hyper_step(
     The search steers by V's own Laplace gradient and accepts on the certified V (with B). At the end, V's
     stationarity is checked from its analytic gradient, corrections included, and a forward difference of that
     gradient per interior weight (``_stationarity``): while the weights' Newton decrement exceeds ``tolerance``, the
-    search takes the Newton step, accepting only steps that raise V; a weight whose basin ends on its climbing side
+    search takes the Newton step, accepting only steps whose gain's certified lower bound exceeds ``tolerance`` (so
+    every move gains a resolved amount and the search ends: V is bounded above); a weight whose basin ends on its climbing side
     within the difference's step contributes the most V can climb before the fold.
     """
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
@@ -2568,7 +2569,7 @@ def hyper_step(
             break
         if moved is None:
             # Newton on the difference curvature over the weights whose basin does not end on their climbing side
-            # (on its magnitude where it is indefinite), accepted only when the certified V rises.
+            # (on its magnitude where it is indefinite), accepted only when the certified V rises by more than the tolerance.
             open_ = interior & ~(check.folds > 0.0)
             direction = np.zeros_like(weights)
             if np.any(open_):
@@ -2586,7 +2587,10 @@ def hyper_step(
                      final_allowed.T @ initial_hyperparameters(prior).coefficients],
                     cavity, correction, working_bytes, tolerance,
                 )
-                if trial is not None and trial.value > evidence.value:
+                # The gain's lower bound (both values at their certified bounds, as ``_stationarity``'s better side) must
+                # exceed the tolerance: a rise within the certificate's resolution is not resolved, and only a resolved
+                # gain per move bounds the number of moves by V's range, so the search ends.
+                if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
                     moved = (trial_weights, trial)
                     break
                 step_length *= 0.5
@@ -2703,12 +2707,6 @@ def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficient
     return _penalized(prior, objective, weights, _penalty_matrix(prior, weights), coefficients)[1]
 
 
-def _metric_decrement(newton: _NewtonB, gradient: F64Array) -> float:
-    """1/2 g'(B + S)^-1 g in the step's own metric (B + S positive definite)."""
-    components = newton.eigenvectors.T @ gradient
-    return 0.5 * float(np.sum(components * components / newton.eigenvalues))
-
-
 def _newton_b(
     prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, point: FixedPoint, correction: CurvatureCorrection, working_bytes: int
 ) -> _NewtonB:
@@ -2743,7 +2741,7 @@ def _newton_step(newton: _NewtonB) -> F64Array:
 
 
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by the monotonicity test, not by a
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by halving a refused step, not by a
     radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
     the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
     curvature out of a saddle."""
@@ -2778,15 +2776,17 @@ def fit_hyperparameters(
     genome scale B + S itself is indefinite at the true prior (speed-floor [semi-real]), so the trust region below
     is the production case, not an edge case.
 
-    - Where B + S is positive definite the step is Newton's, accepted by the natural monotonicity test (Deuflhard,
-      Newton Methods for Nonlinear Problems, 2004, Section 3.1.4): at the trial's fixed point g'(B + S)^-1 g, taken
-      with the step's own B + S, must fall, and otherwise the step halves. It needs no evidence value, which a
-      full-data fixed point does not give, and it is invariant to x's coordinates.
-    - Where B + S is indefinite (as at the true prior on real LD: speed-floor [semi-real]) the step maximizes the
-      model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
-      value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
-      a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
-      at the Cauchy step's length on |B + S| (``_cauchy_radius``).
+    - Where B + S is positive definite the step is Newton's, halved when refused; where it is indefinite (as at the
+      true prior on real LD: speed-floor [semi-real]) the step maximizes the model inside a radius (More and
+      Sorensen), which starts at the Cauchy step's length on |B + S| (``_cauchy_radius``) and doubles when an
+      accepted step reached it.
+    - Either step is accepted when the evidence rises along it by more than ``tolerance``, the certificate's
+      resolution, so each accepted step gains a resolved amount and the loop ends (the evidence is bounded above).
+      With no evidence value, which a full-data fixed point does not give, the rise is the trapezoid rule of the
+      path integral of the gradient, (g_x + g_trial)' s / 2, exact for a quadratic. A refused step whose model gain
+      is within the tolerance cannot be accepted shorter: at the full Newton step (the model's maximum) or after a
+      halving, x is then at its maximum to the resolution; a trust-region step lengthens instead, until its first
+      halving at that x. Any other refused step halves.
     The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
     remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
     by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
@@ -2810,6 +2810,8 @@ def fit_hyperparameters(
     # (the model, its hyper step, the trial step, the radius, whether it certifies, the fraction of Newton's step)
     pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float, bool, float] | None] = [None] * count
     radii: list[float | None] = [None] * count
+    # Whether a trial at the model's current x has been halved (after which its trials only halve).
+    shortened = [False] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
     histories: list[list[float]] = [[] for _model in range(count)]
@@ -2837,6 +2839,7 @@ def fit_hyperparameters(
                 radius = _cauchy_radius(newton)
                 radii[model] = radius
             pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
+            shortened[model] = False
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -2881,10 +2884,10 @@ def fit_hyperparameters(
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
                 )
-                if newton.definite:
-                    accepted = _metric_decrement(newton, gradient) < newton.decrement
-                else:
-                    accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+                # The evidence's rise along the step, the trapezoid rule of its path integral (exact for a quadratic),
+                # must exceed the tolerance: a rise within the certificate's resolution is not resolved, and only a
+                # resolved gain per accepted step bounds their number by the evidence's range, so the loop ends.
+                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > tolerance
             length = float(np.linalg.norm(proposal))
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
@@ -2893,11 +2896,18 @@ def fit_hyperparameters(
                     radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
             halvings[model] += 1
-            if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
+            # Where the quadratic model's own gain along the step is within the tolerance, no shorter step can be
+            # accepted (halving only lowers that gain). A positive definite model's first trial is the full Newton
+            # step, whose gain, the decrement, is the most any step gains, and a halved step gains less still: x is
+            # then at its maximum to the resolution. A trust-region step not yet halved at this x lengthens instead.
+            predicted = float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
+            short = trial_point is not None and predicted <= tolerance
+            at_resolution = short and (newton.definite or shortened[model])
+            if at_resolution or length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
                 if newton.definite and step is not None:
-                    # x is at its maximum to double precision (no trial can lower a decrement at its rounding), and what
-                    # stops the certificate is the weights' remaining gain or the prediction check: the fit is returned
-                    # with its measured remaining gain, uncertified, at the point the oracle last solved.
+                    # x is at its maximum to the resolution (no step can gain more than the tolerance) or to double
+                    # precision, and what stops the certificate is the weights' remaining gain or the prediction check:
+                    # the fit is returned with its measured remaining gain, uncertified, at the point the oracle last solved.
                     if trial_point is not None:
                         hyperparameters[model], points[model] = trials[model], trial_point
                     fits[model] = OuterFit(
@@ -2913,6 +2923,12 @@ def fit_hyperparameters(
                     "the Newton-B step makes no certified progress at the EP fixed point "
                     + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
                 )
+            if short:
+                radius = 2.0 * length
+                radii[model] = radius
+                pending[model] = (newton, step, _proposal(newton, radius), radius, False, 1.0)
+                continue
+            shortened[model] = True
             # A certifying step refused for having no fixed point stays certifying at half the length; one whose
             # move was too large, or an ordinary one, becomes an ordinary shorter trial.
             keep = certifying and trial_point is None
