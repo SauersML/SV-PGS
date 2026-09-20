@@ -677,6 +677,24 @@ def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
     assert best is not None and len(calls) == 1
 
 
+def test_a_trait_with_no_effect_above_the_noise_still_gets_a_lattice_and_a_fit_start():
+    # prior-terms' case: every single-variant likelihood is flat to the tolerance, so the kernel range is empty.
+    generator = np.random.default_rng(71)
+    count = 400
+    precision = np.full(count, 4.0)
+    shift = 4.0 * 0.1 * generator.standard_normal(count)
+    frequency = generator.uniform(0.01, 0.5, count)
+    offset = np.log(generator.uniform(0.3, 1.0, count)) + np.log(2.0 * frequency * (1.0 - frequency))
+    nodes, floor, top = derived_lattice(precision, shift, offset, _LATTICE_TOLERANCE)
+    assert nodes.shape[0] > engine.ROUGHNESS_ORDER
+    prior = scale_mixture_prior(
+        class_index=np.zeros(count, dtype=np.int64), log_variance_offset=offset, annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    moments = tilted_moments(prior, initial_hyperparameters(prior), Cavity(precision=precision, shift=shift), _WORKING_BYTES)
+    assert np.all(np.isfinite(moments.mean)) and np.all(moments.variance > 0.0)
+
+
 def test_the_variance_matched_start_has_the_asked_prior_variances():
     prior, _cavity = _problem(variant_count=60, seed=39, node_count=12)
     nodes = prior.log_variance_grid
