@@ -672,6 +672,10 @@ class _FullDataFixedPoints:
         # The last refresh's KL bounds per model, for the contraction rate; None where there is no earlier refresh of
         # the same map in this call (the first, or after a noise update moved the likelihood under a certified KL).
         previous: tuple[F64Array, F64Array] | None = None
+        # The share of each refresh's frozen-pass move the sites take. Undamped at first; a refresh whose KL does not fall
+        # measures an oscillating mode (J's eigenvalue -lambda, lambda >= rho), which the fraction f / (1 + rho) removes
+        # (the damped map's 1 - f (1 + lambda) at lambda = (1 + rho) / f - 1).
+        fraction = 1.0
         while True:
             variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
@@ -688,7 +692,8 @@ class _FullDataFixedPoints:
             # converge, so the certificate is on the distance to it (theory-ep's ruled form, the lead's ruling): with
             # rho = sqrt(KL_k / KL_(k-1)) the measured contraction, the remaining steps' KL sums to at most
             # KL_k / (1 - rho)^2, certified at 1/(2K) nats. For KL_(k-1) = b that is KL_k <= c b / (sqrt b + sqrt c)^2,
-            # c = 1/(2K): a threshold on KL_k, taken at b's lower bound so the rate is never understated.
+            # c = 1/(2K): a threshold on KL_k, taken at b's lower bound so the rate is never understated. Where the sites
+            # take a share f of each move, the next step's KL is f^2 KL_k and the threshold c b / (f sqrt b + sqrt c)^2.
             snapshot = self._snapshot()
             posteriors = [
                 _member_posterior(
@@ -703,6 +708,7 @@ class _FullDataFixedPoints:
                 max(-float(precision_step[:, model] @ posteriors[model].variance_jvp(precision_step[:, [model]])[:, 0]), 0.0) for model in range(model_count)
             ])
             budget = 0.5 / self.draw_count
+            damped = fraction
             lower, upper = np.empty(model_count), np.empty(model_count)
             certified = np.zeros(model_count, dtype=bool)
             for model in range(model_count):
@@ -712,24 +718,20 @@ class _FullDataFixedPoints:
                 if previous is None:
                     continue
                 last = float(previous[0][model])
-                certified[model] = upper[model] <= budget * last / (np.sqrt(last) + np.sqrt(budget)) ** 2
+                certified[model] = upper[model] <= budget * last / (fraction * np.sqrt(last) + np.sqrt(budget)) ** 2
                 if certified[model] or upper[model] <= last:
                     continue
-                # Not within the certificate, and not measurably below the last refresh's KL: decided against that
-                # KL's lower bound, a KL not below it is no contraction, and nothing certifies a fixed point the
-                # refreshes do not approach (the outer loop shortens its step instead).
+                # Not within the certificate, and not measurably below the last refresh's KL (decided against that KL's
+                # lower bound): no contraction at this share, so the next move is damped by the measured rate.
                 if fixed < last:
                     mean_lower, mean_upper = self._move_bounds(model, right[:, model], 2.0 * (last - fixed))
                     lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
                 if not upper[model] <= last:
-                    raise NoFixedPoint(
-                        f"model {model}: the EP refreshes do not contract: the undamped update's KL is {lower[model]:.3e}..{upper[model]:.3e} "
-                        f"nats after {last:.3e}..{float(previous[1][model]):.3e}"
-                    )
+                    damped = min(damped, fraction / (1.0 + float(np.sqrt(upper[model] / last)) if last > 0.0 else 0.0))
             with np.errstate(divide="ignore", invalid="ignore"):
                 rate = np.sqrt(upper / previous[0]) if previous is not None else np.full(model_count, np.inf)
                 # Twice the certified distance's KL, against 1 / K (the certificate's units).
-                self.mean_move = np.where(rate < 1.0, 2.0 * upper / np.square(1.0 - rate), np.inf)
+                self.mean_move = np.where(rate < 1.0, 2.0 * fraction * fraction * upper / np.square(1.0 - rate), np.inf)
             draw_tolerance = np.full(model_count, 2.0 * budget)
             noise = self._noise(variances)
             covariate_count = int(gaussian.covariates.shape[1])
@@ -751,7 +753,19 @@ class _FullDataFixedPoints:
             # A noise update moves the likelihood, so the next refresh is of a new map where the sites had met their
             # certificate: the rate starts again there.
             previous = None if np.all(certified) else (lower, upper)
+            fraction = damped
+            start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
+            if fraction < 1.0:
+                change = max(float(np.max(np.abs(self.site_precision - start_precision))), float(np.max(np.abs(self.site_shift - start_shift))))
+                scale = 1.0 + max(float(np.max(np.abs(start_precision))), float(np.max(np.abs(start_shift))))
+                if not fraction * change > _EPSILON * scale:
+                    raise NoFixedPoint("no damped refresh moves the sites past their rounding: EP does not converge at these hyperparameters")
+                # A convex combination of two sets of sites that each give a positive definite precision gives one too.
+                blended_precision = start_precision + fraction * (self.site_precision - start_precision)
+                blended_shift = start_shift + fraction * (self.site_shift - start_shift)
+                self._iterate(blended_precision, blended_shift)
+                self.site_precision, self.site_shift = blended_precision, blended_shift
             self.noise = self._noise(1.0 / (frozen + self.site_precision))
 
     def _frozen_passes(self, hyperparameters: Sequence[MixtureHyperparameters], frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
