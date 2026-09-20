@@ -498,15 +498,25 @@ class _PooledFixedPoints:
                     # PD failures halved this gene's damped step to its sites' rounding: its EP falls back to the
                     # convergent double loop at these hyperparameters and its noise (MODEL.md section 4), per gene.
                     self._double_loop(gene, hyperparameters)
-                    moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) * (frozen[rows] + self.site_precision[rows])))
+                    done[gene] = True
                     continue
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
                 if not np.isfinite(moves[gene]):
                     raise NoFixedPoint(f"gene {gene}: a non-finite EP move at these hyperparameters")
-                if previous[gene] > 0.0 and moves[gene] / previous[gene] >= 1.0:
-                    damping[gene] = min(float(damping[gene]), 1.0 / (1.0 + np.sqrt(moves[gene] / previous[gene])))
+                ratio = moves[gene] / previous[gene] if previous[gene] > 0.0 else 0.0
+                if 0.5 * moves[gene] > 0.5 / self.draw_count and ratio >= 1.0:
+                    if damping[gene] < 1.0:
+                        # A pass damped by 1/(1 + rho), exact for the map's eigenvalue at -rho^2, still does not contract:
+                        # this gene's frozen-cavity map has a mode damping cannot reach, so its EP falls back to the
+                        # convergent double loop (small_n 8643ab5; verify-engine's real slices of genes 3 and 4).
+                        self._double_loop(gene, hyperparameters)
+                        # At its EP fixed point (the double loop's), the gene leaves the frozen passes; the solve's
+                        # next refresh certifies it.
+                        done[gene] = True
+                        continue
+                    damping[gene] = 1.0 / (1.0 + np.sqrt(ratio))
             # A gene is done once its own frozen move, in nats (half its squared move in the posterior metric), is at
             # most 1/(2K), as small_n's; the passes end when every gene is.
             done |= 0.5 * moves <= 0.5 / self.draw_count
