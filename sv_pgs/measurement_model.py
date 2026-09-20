@@ -69,6 +69,7 @@ import numpy as np
 from sv_pgs._typing import F64Array, I64Array, NDArray
 from sv_pgs.progress import log
 from sv_pgs.sample_ids import ResearchId
+from sv_pgs.store_converter import _uniform_cubic_weights
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,73 @@ def _bisect_to_exhaustion(score, low: float, high: float) -> float:
             high = middle
 
 
+def octave_spline_basis(log2_values: NDArray) -> F64Array:
+    """Cubic B-splines uniform in log2 of a positive feature, one knot per octave over the data's range.
+
+    The one-per-octave spacing is the convention of the store's SV-context kernel
+    (docs/design/STORE.md), and the basis polynomials are its ``_uniform_cubic_weights``.
+    The columns sum to 1 on the range, so the basis spans the intercept.
+    """
+    values = np.asarray(log2_values, dtype=np.float64)
+    low = float(np.floor(values.min()))
+    segments = max(int(np.ceil(values.max())) - int(low), 1)
+    position = values - low
+    segment = np.minimum(np.floor(position), segments - 1).astype(np.int64)
+    weights = _uniform_cubic_weights(position - segment)
+    basis = np.zeros((values.shape[0], segments + 3))
+    rows = np.arange(values.shape[0])
+    for shift, weight in enumerate(weights):
+        basis[rows, segment + shift] = weight
+    return basis
+
+
+@dataclass(frozen=True)
+class CalibrationCurve:
+    """kappa(x) = x' beta and lambda(x) = x' gamma per stratum, fitted over the stratum's truth pairs."""
+
+    strata: tuple[object, ...]
+    kappa_coefficients: F64Array
+    ratio_coefficients: F64Array
+
+    def predict(self, strata: NDArray, design: NDArray) -> tuple[F64Array, F64Array]:
+        """(kappa, lambda) at each row; a stratum the curve has no fit for gives NaN."""
+        labels = np.asarray(strata)
+        rows = np.asarray(design, dtype=np.float64)
+        kappa = np.full(labels.shape[0], np.nan)
+        ratio = np.full(labels.shape[0], np.nan)
+        for index, stratum in enumerate(self.strata):
+            members = labels == stratum
+            kappa[members] = rows[members] @ self.kappa_coefficients[index]
+            ratio[members] = rows[members] @ self.ratio_coefficients[index]
+        return kappa, ratio
+
+
+def fit_calibration_curve(moments: CalibrationMoments, strata: NDArray, design: NDArray) -> CalibrationCurve:
+    """Energy-weighted least squares of kappa and lambda on the design, per stratum (see ``pooled_calibration``).
+
+    The coefficients are the minimum-norm solution, so the fitted values are unique
+    even for a rank-deficient design. The design may hold smooth bases of record
+    features (e.g. B-splines in log length and logit frequency, a segdup fraction),
+    so a record without truth pairs gets kappa(x) and lambda(x), hence
+    r^2(x) = kappa(x)^2 / lambda(x), from the records that have them.
+    """
+    labels = np.asarray(strata)
+    rows = np.asarray(design, dtype=np.float64)
+    counts = moments.pair_counts.astype(np.float64)
+    energy = counts * moments.dosage_variance
+    kept, betas, gammas = [], [], []
+    for stratum in np.unique(labels):
+        members = labels == stratum
+        if not energy[members].sum() > 0.0:
+            continue
+        gram = rows[members].T @ (energy[members, None] * rows[members])
+        betas.append(np.linalg.lstsq(gram, rows[members].T @ (counts[members] * moments.covariance[members]), rcond=None)[0])
+        gammas.append(np.linalg.lstsq(gram, rows[members].T @ (counts[members] * moments.truth_variance[members]), rcond=None)[0])
+        kept.append(stratum.item() if hasattr(stratum, "item") else stratum)
+    width = rows.shape[1]
+    return CalibrationCurve(tuple(kept), np.array(betas).reshape(-1, width), np.array(gammas).reshape(-1, width))
+
+
 @dataclass(frozen=True)
 class PooledCalibration:
     """Per record: the pooled scale kappa_j, the variance ratio lambda_j = Var(G_j) / Var(D_j),
@@ -197,11 +265,9 @@ def pooled_calibration(
         rows, energy = features[members], dosage_energy[members]
         if not energy.sum() > 0.0:
             raise ValueError(f"stratum {stratum!r} has no dosage variation among its calibration pairs.")
-        # The least-squares fitted values are unique even where the design's coefficients are not.
-        gram = rows.T @ (energy[:, None] * rows)
+        curve = fit_calibration_curve(moments.subset(members), labels[members], rows)
+        prior, ratio = curve.predict(labels[members], rows)
         cross_energy = counts[members] * moments.covariance[members]
-        prior = rows @ np.linalg.lstsq(gram, rows.T @ cross_energy, rcond=None)[0]
-        ratio = rows @ np.linalg.lstsq(gram, rows.T @ (counts[members] * moments.truth_variance[members]), rcond=None)[0]
         informative = energy > 0.0
         slopes = np.divide(cross_energy, energy, out=np.zeros_like(energy), where=informative)
         # S_DD s_j: the sandwich sum_i w_i^2 e_i^2 / S_DD with e = u - kappa(x_j) w.
@@ -676,6 +742,7 @@ def fit_measurement_model(
     cohort_dosage_variance: NDArray,
     strata: NDArray,
     reported_reliability: NDArray,
+    features: NDArray | None = None,
 ) -> MeasurementModel:
     """The measurement model for every stored record, from calibration pairs where there are any.
 
@@ -723,10 +790,23 @@ def fit_measurement_model(
         residual[uncalibrated] = variance[uncalibrated] * (1.0 - reported[uncalibrated]) / reported[uncalibrated]
     maps: list[LeakageMap] = []
     absorbed = np.zeros(variance.shape, dtype=bool)
+    extra = np.zeros((variance.shape[0], 0)) if features is None else np.asarray(features, dtype=np.float64)
+    if extra.ndim != 2 or extra.shape[0] != variance.shape[0] or not np.all(np.isfinite(extra)):
+        raise ValueError("features needs one finite row per record.")
+    predicted = np.zeros(variance.shape, dtype=bool)
     if calibration is not None and np.any(calibrated):
         moments = calibration.moments.subset(calibrated)
-        design = np.column_stack([np.ones(int(calibrated.sum())), reported[calibrated], np.log(variance[calibrated])])
+        full_design = np.column_stack([np.ones(variance.shape[0]), reported, np.log(np.where(varying, variance, 1.0)), extra])
+        design = full_design[calibrated]
         pooled = pooled_calibration(moments, variance[calibrated], labels[calibrated], design)
+        if extra.shape[1]:
+            # A record without its own pairs takes kappa(x) and lambda(x) from the records that have them.
+            curve = fit_calibration_curve(moments, labels[calibrated], design)
+            kappa, ratio = curve.predict(labels, full_design)
+            predicted = uncalibrated & np.isfinite(kappa) & (kappa > 0.0) & (ratio > 0.0)
+            scales[predicted] = kappa[predicted]
+            residual[predicted] = variance[predicted] * np.maximum(ratio[predicted] - kappa[predicted] ** 2, 0.0)
+            offsets[predicted] = _log_signal_share(kappa[predicted] ** 2 * variance[predicted], residual[predicted])
         scales[calibrated] = pooled.scales
         residual[calibrated] = residual_variances(variance[calibrated], pooled.scales, pooled.variance_ratios)
         offsets[calibrated] = log_reliability_offsets(variance[calibrated], scales[calibrated], residual[calibrated])
@@ -750,6 +830,7 @@ def fit_measurement_model(
         "uncalibrated_records": int(uncalibrated.sum()),
         "records_without_cohort_variation": int((~varying).sum()),
         "direct_calls_fused": int(absorbed.sum()),
+        "records_from_the_calibration_curve": int(predicted.sum()),
         "recalibration": (
             f"applied to {int(calibrated.sum())} records: kappa pooled by stratum on [1, reported r^2, log V] "
             f"from the calibration pairs; not applied to {int(uncalibrated.sum())} records with fewer than 3 pairs "

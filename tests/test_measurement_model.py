@@ -13,6 +13,7 @@ from sv_pgs.measurement_model import (
     calibration_pairs,
     concatenate_calibration_moments,
     engine_blocks,
+    octave_spline_basis,
     fit_ancestry_measurement_models,
     fit_leakage_map,
     fit_measurement_model,
@@ -461,3 +462,29 @@ def test_ancestry_pooling_borrows_kappa_across_groups_and_keeps_real_differences
     assert abs(np.mean(models[2].scales) - keeps[2]) < abs(np.mean(models[2].scales) - keeps[0])
     # A group without pairs borrows the pooled kappa, never 1.
     assert np.all(models[3].scales < 1.0)
+def test_the_octave_basis_is_a_partition_of_unity_with_one_knot_per_octave() -> None:
+    values = np.linspace(5.6, 17.2, 500)
+    basis = octave_spline_basis(values)
+    assert basis.shape[1] == (18 - 5) + 3
+    np.testing.assert_allclose(basis.sum(axis=1), 1.0, rtol=rounding_gamma(16))
+    assert np.all(basis >= 0.0)
+
+
+def test_records_without_pairs_take_the_calibration_curve_of_their_features() -> None:
+    rng = np.random.default_rng(73)
+    records, pairs = 400, 1500
+    log_length = rng.uniform(6.0, 14.0, records)
+    keep = 0.4 + 0.04 * (log_length - 6.0)
+    frequency = rng.uniform(0.1, 0.5, records)
+    genotype = rng.binomial(2, frequency[:, None], size=(records, pairs)).astype(float)
+    dosage = np.where(rng.random(genotype.shape) < keep[:, None], genotype, rng.binomial(2, frequency[:, None], size=genotype.shape))
+    dosage[300:] = np.nan
+    calibration = calibration_pairs(tuple(ResearchId(str(index)) for index in range(pairs)), dosage, genotype)
+    variance = 2 * frequency * (1 - frequency)
+    features = octave_spline_basis(log_length)
+    model = fit_measurement_model(calibration, variance, np.zeros(records, dtype=int), np.full(records, 0.9), features=features)
+    assert model.certificate["records_from_the_calibration_curve"] == 100
+    # A draw keeps the genotype's variance, so r^2 = kappa^2 = keep^2; the curve predicts it from length.
+    predicted = np.exp(model.log_reliability[300:])
+    assert np.mean(np.abs(predicted - keep[300:] ** 2)) < np.mean(np.abs(0.9 - keep[300:] ** 2))
+    assert np.corrcoef(model.scales[300:], keep[300:])[0, 1] > 0.0
