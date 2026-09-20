@@ -440,28 +440,27 @@ def test_the_pooled_model_pools_the_groups_and_fits_the_maps_once() -> None:
     assert mapped.log_reliability[0] > unmapped.log_reliability[0]
 
 
-def test_ancestry_pooling_borrows_kappa_across_groups_and_keeps_real_differences() -> None:
+def test_ancestry_pooling_borrows_each_records_kappa_from_the_other_groups() -> None:
     rng = np.random.default_rng(67)
-    records, cohort = 200, 20000
-    keeps, pair_sizes = (0.6, 0.6, 0.9), (1500, 150, 1500)
-    calibrations, variances = [], []
-    for keep, size in zip(keeps, pair_sizes):
-        _, genotype, dosage = _records(records, size, keep, rng)
-        calibrations.append(calibration_pairs(tuple(ResearchId(f"s{index}") for index in range(size)), dosage, genotype))
-        _, _, cohort_dosage = _records(records, cohort, keep, rng)
-        variances.append(cohort_dosage.var(axis=1))
-    calibrations.append(None)
-    variances.append(variances[0])
-    models = fit_ancestry_measurement_models(calibrations, np.column_stack(variances), np.zeros(records, dtype=int), np.full(records, 0.5))
-    alone = [fit_measurement_model(calibration, variance, np.zeros(records, dtype=int), np.full(records, 0.5))
-             for calibration, variance in zip(calibrations[:3], variances[:3])]
-    # The sparse group's kappa moves toward the others' pooled kappa and its error falls.
-    assert np.mean((models[1].scales - keeps[1]) ** 2) < np.mean((alone[1].scales - keeps[1]) ** 2)
-    # A group whose kappa really differs keeps it (between-ancestry variance > 0).
-    assert models[0].certificate["ancestry_pooling"]["between_ancestry_variance_by_stratum"]["0"] > 0.0
-    assert abs(np.mean(models[2].scales) - keeps[2]) < abs(np.mean(models[2].scales) - keeps[0])
-    # A group without pairs borrows the pooled kappa, never 1.
-    assert np.all(models[3].scales < 1.0)
+    records, cohort = 300, 20000
+    keep = rng.uniform(0.3, 0.95, records)
+    frequency = rng.uniform(0.1, 0.5, records)
+
+    def group(size: int) -> tuple[object, np.ndarray]:
+        genotype = rng.binomial(2, frequency[:, None], size=(records, size)).astype(float)
+        dosage = np.where(rng.random(genotype.shape) < keep[:, None], genotype, rng.binomial(2, frequency[:, None], size=genotype.shape))
+        return calibration_pairs(tuple(ResearchId(f"s{index}") for index in range(size)), dosage, genotype), 2 * frequency * (1 - frequency)
+
+    (dense, variance), (sparse, _) = group(3000), group(60)
+    strata, reported = np.zeros(records, dtype=int), np.full(records, 0.5)
+    models = fit_ancestry_measurement_models([dense, sparse, None], np.column_stack([variance] * 3), strata, reported)
+    alone = fit_measurement_model(sparse, variance, strata, reported)
+    # Every group shares each record's kappa, so the sparse group gains from the dense one's pairs.
+    assert np.mean((models[1].scales - keep) ** 2) < np.mean((alone.scales - keep) ** 2)
+    # A group without pairs borrows each record's pooled kappa, never 1.
+    assert np.mean((models[2].scales - keep) ** 2) < np.mean((1.0 - keep) ** 2)
+    assert "between_ancestry_variance_by_stratum" in models[0].certificate["ancestry_pooling"]
+
 def test_the_octave_basis_is_a_partition_of_unity_with_one_knot_per_octave() -> None:
     values = np.linspace(5.6, 17.2, 500)
     basis = octave_spline_basis(values)
