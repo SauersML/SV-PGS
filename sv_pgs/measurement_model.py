@@ -18,8 +18,8 @@ truth samples, and on public benchmarks from their truth.
    pooled within a stratum: kappa(x) is a least-squares fit, linear in a
    caller-given design, over all the stratum's pairs, and each record's own
    slope is shrunk toward it by a normal-normal empirical Bayes whose
-   between-record variance is chosen by marginal likelihood (0 when the records
-   agree).
+   between-record variance is the energy-weighted moment estimate (0 when the
+   records agree).
 2. Conditional moments. With D* calibrated, the residual variance
    v_j = E[(G - D*_j)^2] = Var(G_j) - Var(D*_j) = V_j (lambda_j - kappa_j^2),
    with lambda = Var(G) / Var(D) fitted like kappa(x), enters the predictive
@@ -142,15 +142,6 @@ def concatenate_calibration_moments(parts: Sequence[CalibrationMoments]) -> Cali
     return CalibrationMoments(*(np.concatenate([getattr(part, field.name) for part in parts]) for field in fields(CalibrationMoments)))
 
 
-@dataclass(frozen=True)
-class NormalPooling:
-    """Empirical-Bayes pooling of estimates y_j ~ N(x_j' beta, tau^2 + s_j)."""
-
-    coefficients: F64Array
-    between_variance: float
-    shrunk: F64Array
-
-
 def _bisect_to_exhaustion(score, low: float, high: float) -> float:
     """Root of a score that is positive at ``low`` and negative at ``high``, to the last float."""
     while True:
@@ -163,60 +154,14 @@ def _bisect_to_exhaustion(score, low: float, high: float) -> float:
             high = middle
 
 
-def pool_normal(estimates: NDArray, sampling_variances: NDArray, design: NDArray | None = None) -> NormalPooling:
-    """Marginal maximum likelihood for the normal-normal model, and each estimate's posterior mean.
-
-    ``design`` is [estimates, features] for the prior mean x_j' beta; the default is
-    an intercept. Estimates with infinite sampling variance don't enter the fit
-    and are shrunk all the way to their prior mean; estimates with zero sampling
-    variance are exact, don't enter the fit either, and are kept. The between-record variance is
-    the root of its profile score, found by bisection to the last float. It is
-    exactly 0 when the score is not positive there, i.e. when the estimates
-    scatter no more than their own sampling error.
-    """
-    values = np.asarray(estimates, dtype=np.float64)
-    variances = np.asarray(sampling_variances, dtype=np.float64)
-    features = np.ones((values.shape[0], 1)) if design is None else np.asarray(design, dtype=np.float64)
-    if values.ndim != 1 or variances.shape != values.shape or features.shape[0] != values.shape[0]:
-        raise ValueError("pool_normal needs one sampling variance and one design row per estimate.")
-    if not np.all(variances >= 0.0):
-        raise ValueError("pool_normal needs nonnegative sampling variances.")
-    exact = variances == 0.0
-    informative = np.isfinite(variances) & ~exact
-    if informative.sum() < features.shape[1]:
-        raise ValueError("pool_normal needs at least as many informative estimates as design features.")
-    fit_values, fit_variances, fit_features = values[informative], variances[informative], features[informative]
-
-    def coefficients_at(between: float) -> F64Array:
-        weights = 1.0 / (between + fit_variances)
-        gram = fit_features.T @ (weights[:, None] * fit_features)
-        return np.linalg.solve(gram, fit_features.T @ (weights * fit_values))
-
-    def score(between: float) -> float:
-        weights = 1.0 / (between + fit_variances)
-        residuals = fit_values - fit_features @ coefficients_at(between)
-        return float(np.sum(weights**2 * residuals**2 - weights))
-
-    between = 0.0
-    if score(0.0) > 0.0:
-        high = float(np.var(fit_values))
-        while score(high) > 0.0:
-            high *= 2
-        between = _bisect_to_exhaustion(score, 0.0, high)
-    coefficients = coefficients_at(between)
-    prior_means = features @ coefficients
-    shrinkage = np.where(informative, between / (between + np.where(informative, variances, 1.0)), 0.0)
-    shrunk = prior_means + shrinkage * (values - prior_means)
-    shrunk[exact] = values[exact]
-    return NormalPooling(coefficients, between, shrunk)
-
-
 @dataclass(frozen=True)
 class PooledCalibration:
-    """Per record: the pooled scale kappa_j and the variance ratio lambda_j = Var(G_j) / Var(D_j)."""
+    """Per record: the pooled scale kappa_j, the variance ratio lambda_j = Var(G_j) / Var(D_j),
+    and the between-record variance tau^2 of its stratum."""
 
     scales: F64Array
     variance_ratios: F64Array
+    between_variances: F64Array
 
 
 def pooled_calibration(
@@ -228,15 +173,23 @@ def pooled_calibration(
     intercept), fitted by least squares over all the stratum's pairs:
     kappa(x) from sum_j S_DT,j x_j = sum_j S_DD,j x_j x_j' beta, and lambda(x) from
     sum_j S_TT,j x_j = sum_j S_DD,j x_j x_j' gamma, with S the per-record sums of
-    centred products. The pooled fits weigh each record by its dosage energy, so a
-    record whose few pairs happen to fit exactly carries no more weight than its
-    energy. Each record's own slope then enters a normal-normal empirical Bayes
-    around kappa(x_j), with the model's sampling variance
-    V_j (lambda(x_j) - kappa(x_j)^2) / S_DD,j, where V_j is the record's cohort
-    dosage variance: a sparse record's own residual collapses to 0 by chance, the
-    model's does not. The between-record variance is chosen by marginal likelihood.
-    A stratum whose pooled model leaves no residual keeps every informative slope,
-    which is then exact, and gives the others kappa(x_j).
+    centred products. Each record's own slope kappa_hat_j = S_DT,j / S_DD,j then
+    has the model's sampling variance s_j = sigma_j^2 / S_DD,j, with
+    sigma_j^2 = V_j (lambda(x_j) - kappa(x_j)^2) and V_j the record's cohort dosage
+    variance (a sparse record's own residual collapses to 0 by chance; the
+    model's does not), and its posterior mean under kappa_j ~ N(kappa(x_j), tau^2)
+    is kappa(x_j) + tau^2 / (tau^2 + s_j) (kappa_hat_j - kappa(x_j)).
+
+    Everything is weighed by dosage energy S_DD, the metric in which a scale error
+    costs: sum_j V_j (kappa_j - kappa_j^true)^2. So tau^2 is the energy-weighted
+    moment estimate, E[S_DD,j (kappa_hat_j - kappa(x_j))^2] = S_DD,j tau^2 + sigma_j^2
+    summed over the stratum (the pooled fit treated as known), projected to 0 when
+    negative. A normal likelihood would let a sparse record whose one carrier sits at
+    a tiny dosage (slope 127, a heavy-tailed outlier) inflate tau^2; its energy is
+    tiny, so here it cannot. Cov(G, D) >= 0 for any mixture of posterior means and
+    draws, so a negative posterior mean is projected to 0: that column carries no
+    signal. A stratum whose pooled model leaves no residual keeps every informative
+    slope, which is then exact.
     """
     labels = np.asarray(strata)
     cohort_variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
@@ -249,26 +202,28 @@ def pooled_calibration(
     dosage_energy = counts * moments.dosage_variance
     scales = np.empty_like(cohort_variance)
     ratios = np.empty_like(cohort_variance)
+    between_variances = np.empty_like(cohort_variance)
     for stratum in np.unique(labels):
         members = labels == stratum
         rows, energy = features[members], dosage_energy[members]
         gram = rows.T @ (energy[:, None] * rows)
         if np.linalg.matrix_rank(gram) < rows.shape[1]:
             raise ValueError(f"stratum {stratum!r} has too little dosage variation to fit its design.")
-        slope_prior = rows @ np.linalg.solve(gram, rows.T @ (counts[members] * moments.covariance[members]))
+        cross_energy = counts[members] * moments.covariance[members]
+        prior = rows @ np.linalg.solve(gram, rows.T @ cross_energy)
         ratio = rows @ np.linalg.solve(gram, rows.T @ (counts[members] * moments.truth_variance[members]))
         informative = energy > 0.0
-        slopes = np.divide(counts[members] * moments.covariance[members], energy, out=np.zeros_like(energy), where=informative)
-        residual_scale = cohort_variance[members] * np.maximum(ratio - slope_prior**2, 0.0)
-        sampling = np.divide(residual_scale, energy, out=np.full_like(energy, np.inf), where=informative)
-        uncertain = np.isfinite(sampling) & (sampling > 0.0)
-        if uncertain.sum() >= rows.shape[1]:
-            scales[members] = pool_normal(slopes, sampling, rows).shrunk
-        else:
-            # The pooled model leaves no residual: every informative slope is exact.
-            scales[members] = np.where(informative, slopes, slope_prior)
+        slopes = np.divide(cross_energy, energy, out=np.zeros_like(energy), where=informative)
+        residual = cohort_variance[members] * np.maximum(ratio - prior**2, 0.0)
+        excess = np.sum(np.divide((cross_energy - prior * energy) ** 2, energy, out=np.zeros_like(energy), where=informative))
+        between = max(float((excess - residual[informative].sum()) / energy.sum()), 0.0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            weight = np.where(residual > 0.0, between * energy / (between * energy + residual), 1.0)
+        weight = np.where(informative, weight, 0.0)
+        scales[members] = np.maximum(prior + weight * (slopes - prior), 0.0)
         ratios[members] = ratio
-    return PooledCalibration(scales, ratios)
+        between_variances[members] = between
+    return PooledCalibration(scales, ratios, between_variances)
 
 
 def residual_variances(cohort_dosage_variance: NDArray, scales: NDArray, variance_ratios: NDArray) -> F64Array:

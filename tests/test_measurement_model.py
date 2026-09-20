@@ -16,7 +16,6 @@ from sv_pgs.measurement_model import (
     log_reliability_offsets,
     mapped_gram,
     merge_calibration_moments,
-    pool_normal,
     pooled_calibration,
     pooled_log_reliability,
     residual_variances,
@@ -63,29 +62,30 @@ def test_a_rare_record_whose_few_pairs_fit_exactly_is_pooled_to_its_stratum() ->
     assert pooled.scales[-1] < 1.0
 
 
-def test_estimates_that_agree_within_their_error_are_pooled_with_no_between_variance() -> None:
-    variances = np.linspace(0.01, 0.04, 50)
-    pooled = pool_normal(np.full(50, 0.7), variances)
-    assert pooled.between_variance == 0.0
-    np.testing.assert_array_equal(pooled.shrunk, np.full(50, 0.7))
+def test_records_that_agree_within_their_error_are_pooled_with_no_between_variance() -> None:
+    rng = np.random.default_rng(43)
+    _, genotype, dosage = _records(100, 500, 0.7, rng)
+    moments = calibration_moments(dosage, genotype)
+    pooled = pooled_calibration(moments, dosage.var(axis=1), np.zeros(100, dtype=int))
+    # One kappa for every record: the moment estimate of tau^2 is at most its own sampling error.
+    residual = dosage.var(axis=1) * (1 - 0.7**2)
+    bound = sampling_bound(float(np.sqrt(2 * np.sum(residual**2)) / np.sum(moments.pair_counts * moments.dosage_variance)))
+    assert pooled.between_variances[0] <= bound
 
 
-def test_the_between_variance_is_recovered_by_marginal_likelihood() -> None:
+def test_the_between_record_variance_is_recovered() -> None:
     rng = np.random.default_rng(7)
-    count, between = 4000, 0.02
-    variances = rng.uniform(0.005, 0.03, size=count)
-    estimates = 0.6 + rng.normal(0.0, np.sqrt(between), count) + rng.normal(0.0, np.sqrt(variances))
-    pooled = pool_normal(estimates, variances)
-    information = np.sum(1.0 / (pooled.between_variance + variances) ** 2) / 2
-    assert abs(pooled.between_variance - between) <= sampling_bound(float(np.sqrt(1.0 / information)))
-
-
-def test_an_exact_estimate_is_kept_and_an_uninformative_one_gets_the_prior_mean() -> None:
-    estimates = np.array([0.9, 0.5, 0.6, 0.55, 0.3])
-    variances = np.array([0.0, 0.01, 0.01, 0.01, np.inf])
-    pooled = pool_normal(estimates, variances)
-    assert pooled.shrunk[0] == 0.9
-    assert pooled.shrunk[4] == pytest.approx(pooled.coefficients[0])
+    records, pairs, spread = 400, 2000, 0.05
+    keeps = 0.7 + rng.normal(0.0, spread, records)
+    frequency = rng.uniform(0.2, 0.5, size=records)
+    genotype = rng.binomial(2, frequency[:, None], size=(records, pairs)).astype(float)
+    redraw = rng.binomial(2, frequency[:, None], size=genotype.shape).astype(float)
+    dosage = np.where(rng.random(genotype.shape) < keeps[:, None], genotype, redraw)
+    pooled = pooled_calibration(calibration_moments(dosage, genotype), dosage.var(axis=1), np.zeros(records, dtype=int))
+    # Each record's slope has sampling variance (1 - keep^2) / pairs, so the moment
+    # estimate of tau^2 has standard error about sqrt(2 / records) (tau^2 + s).
+    sampling = (1 - np.mean(keeps) ** 2) / pairs
+    assert abs(pooled.between_variances[0] - spread**2) <= sampling_bound(float(np.sqrt(2 / records) * (spread**2 + sampling)))
 
 
 def test_reliability_of_a_calibrated_draw_is_the_square_of_its_scale() -> None:
