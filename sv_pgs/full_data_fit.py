@@ -192,8 +192,8 @@ class FitCertificate:
     - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, from its analytic gradient,
       with the curvature's difference steps in ``stationarity_steps`` and the gradient's error bounds in
       ``stationarity_errors``;
-    - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
-      the final refresh, against ``draw_tolerance`` = 1 / K, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (evidence units,
+    - ``mean_move``: an upper bound on twice the undamped EP update's KL(q || q') at the final refresh (the mean's move
+      in the posterior metric plus half the variances' move, dtau'(Sigma o Sigma) dtau), against ``draw_tolerance`` = 1 / K, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (evidence units,
       defined as p_eff -> 0; lead ruling via speed-smalln); ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
@@ -653,10 +653,29 @@ class _FullDataFixedPoints:
                 # A trial whose tilted laws give no finite site (review-mathbugs N2) has no fixed point here: refused,
                 # so the outer loop counts it unresolved and shortens its step.
                 raise NoFixedPoint("a site target is not finite at these hyperparameters")
-            # The undamped update moves the mean by Sigma (delta nu - delta tau o mu), to first order in the site change.
-            right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            draw_tolerance = np.full(model_count, 1.0 / self.draw_count)
-            self.mean_move = np.array([self._move_bounds(model, right[:, model], float(draw_tolerance[model])) for model in range(model_count)])
+            # The undamped update's KL(q || q') to second order in the site change (dtau, dnu): 1/2 r'Sigma r +
+            # 1/4 dtau'(Sigma o Sigma) dtau with r = dnu - dtau o mu, the Fisher metric of q's statistics (beta, -beta^2/2)
+            # (speed-smalln: the mean part alone left the site variances off). Certified at 1/(2K) nats.
+            snapshot = self._snapshot()
+            posteriors = [
+                _member_posterior(
+                    _posterior(gaussian, model, grams[model], group_variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
+                    self.ties, self.site_precision[:, model], group_variances[:, model],
+                )
+                for model in range(model_count)
+            ]
+            precision_step = target_precision - self.site_precision
+            right = (target_shift - self.site_shift) - precision_step * mean
+            spread = np.array([
+                max(-float(precision_step[:, model] @ posteriors[model].variance_jvp(precision_step[:, [model]])[:, 0]), 0.0) for model in range(model_count)
+            ])
+            budget = 1.0 / self.draw_count
+            self.mean_move = np.array([
+                (self._move_bounds(model, right[:, model], budget - 0.5 * float(spread[model])) if 0.5 * spread[model] < budget else np.inf)
+                + 0.5 * float(spread[model])
+                for model in range(model_count)
+            ])
+            draw_tolerance = np.full(model_count, budget)
             noise = self._noise(variances)
             covariate_count = int(gaussian.covariates.shape[1])
             self.noise_gain = np.array([
@@ -664,14 +683,10 @@ class _FullDataFixedPoints:
                 for model in range(model_count)
             ])
             if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
-                snapshot = self._snapshot()
                 return [
                     FixedPoint(
                         cavity=cavities[model],
-                        posterior=_member_posterior(
-                            _posterior(gaussian, model, grams[model], group_variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
-                            self.ties, self.site_precision[:, model], group_variances[:, model],
-                        ),
+                        posterior=posteriors[model],
                         mean=mean[:, model].copy(),
                         precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model], self.ties),
                         effective_effects=float(self.effective[model]),
