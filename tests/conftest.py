@@ -18,6 +18,8 @@ SLOW_TESTS = {
     "tests/test_scale_mixture_ep.py::test_the_fit_does_not_depend_on_the_lattice_spacing": (368, "e2e"),
     "tests/test_phenotype_measurement.py::test_gross_errors_are_downweighted_by_the_learned_density": (174, "deslop-hygiene"),
     "tests/test_all_of_us_sql.py::test_gross_errors_reach_the_model_and_are_downweighted_by_its_learned_density": (161, "deslop-hygiene"),
+    # λ ascent at an interior optimum on 40 real-LD variants (acl42, 1 BLAS thread).
+    "tests/test_ep_eb_reference.py::test_fit_on_real_ld_is_certified[0.3-40]": (225, "oracle"),
 }
 
 

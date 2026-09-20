@@ -50,7 +50,7 @@ def _windows(data):
             annotation_design=np.zeros((size, 0)),
             annotation_groups=(),
         )
-        windows.append((reference.ReferencePrior(design, quadrature), data[f"window{window}_likelihood_precision"], data[f"window{window}_linear_term"]))
+        windows.append((reference.ReferencePrior(design, quadrature, _RESOLUTION), data[f"window{window}_likelihood_precision"], data[f"window{window}_linear_term"]))
     return windows
 
 
