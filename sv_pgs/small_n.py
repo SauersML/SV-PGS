@@ -10,9 +10,16 @@ solve or a probe certificate:
   A'_PP^-1 = T^-1 - T^-1 Xp_P' K^-1 Xp_P T^-1 with the kernel K = I_n + Xp_P T^-1 Xp_P' (always positive definite).
   N enters exactly through its Schur complement S = T_N + Xp_N' K^-1 Xp_N, and A' is positive definite exactly when
   S is (``np.linalg.LinAlgError`` otherwise).
-- So Sigma = sigma^2 (Delta - Phi'Phi + Psi'Psi): Delta = diag(1/t) on P and 0 on N, Phi = U^-T Xp_P T^-1 (n x |P|,
-  zero on N, K = U'U), and Psi = [S_U^-T E' | -S_U^-T] (|N| x p, S = S_U'S_U, E = T^-1 Xp_P' K^-1 Xp_N). The marginal
-  variances, solves, the variance JVP -(Sigma o Sigma) W and exact posterior draws all come from these factors.
+- So A'^-1 = Delta - Phi'Phi + Psi'Psi: Delta = diag(1/t) on P and 0 on N, Phi = U^-T Xp_P T^-1 (K = U'U), and
+  Psi = [S_U^-T E' | -S_U^-T] (|N| x p, S = S_U'S_U, E = T^-1 Xp_P' K^-1 Xp_N). The marginal variances, the cavities
+  (without cancellation), solves, the variance JVP -(Sigma o Sigma) W and exact posterior draws all come from these.
+
+The design is kept as Xp = (I - H_C) G, with H_C = Q Q' and G each reduced column's minor-allele codes over its SD,
+signed so that (I - H_C) G equals (I - H_C) X~ exactly (H_C removes every column's constant, since the intercept is a
+covariate). G is sparse where that is cheaper, by the flop counts (rare variants have few carriers): the kernel's
+P G T^-1 G' P then costs sum_j nnz_j^2 instead of n^2 p, the variances' x_j' K^-1 x_j = g_j' (P K^-1 P) g_j the same,
+and Xp_P' K^-1 Xp_P = G_P' (P K^-1 P) G_P for the formed Sigma costs nnz |P| instead of n |P|^2 (bench-real chr22
+[real]: 13-17x fewer kernel flops).
 
 The fixed-point iteration and the outer loop are Stage 2's (``full_data_fit._FullDataFixedPoints`` and
 ``scale_mixture_ep.fit_hyperparameters``), with every certified quantity replaced by its exact value: the mean move
@@ -21,19 +28,18 @@ r' Sigma r, the variances diag Sigma, and no cavity-information certificate (the
 The genotype side is Stage 0's (``genotype_statistics``) on a dense training matrix: signed codes (code - 127), their
 training means and population SDs, every polymorphic record active (no rarity or other threshold filter: SPEC), and
 exact ties (equal or negated standardized columns) merged by the same integer test, over the whole window rather than
-within an LD block. The dense route's cost per site update is O(n^2 p) in BLAS-3; the variance JVP is formed as
-Sigma o Sigma once per fixed point when it fits the working memory (one GEMM per call after that), else from the
-factors at O(n^2 p) per column (``DENSE_JVP_BYTES`` is what decides; see ``_DensePosterior``).
+within an LD block. The variance JVP forms Sigma o Sigma once per fixed point when it fits its memory share (one GEMM
+per call after that), else works from the factors at O(n^2 p) per column (see ``_DensePosterior``).
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
-from scipy import linalg
+from scipy import linalg, sparse
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.config import TraitType
@@ -67,6 +73,83 @@ _FLOAT_BYTES = np.dtype(np.float64).itemsize
 _LIVE_FIXED_POINTS = 2
 
 
+# ------------------------------------------------------------------ the design
+
+
+class _Design:
+    """Xp = P G with P = I - Q Q' (Q an orthonormal basis of the covariates' columns) and G ``carriers`` (n x p),
+    either a scipy.sparse CSC matrix or a dense Fortran-ordered array."""
+
+    def __init__(self, carriers: Any, basis: F64Array) -> None:
+        self.carriers = carriers
+        self.basis = basis
+        self.sample_count, self.variant_count = (int(size) for size in carriers.shape)
+        self.is_sparse = sparse.issparse(carriers)
+
+    @classmethod
+    def dense(cls, projected: F64Array) -> _Design:
+        """An already projected dense design (no covariates left to project)."""
+        return cls(np.asfortranarray(projected, dtype=np.float64), np.zeros((projected.shape[0], 0)))
+
+    def project(self, samples: F64Array) -> F64Array:
+        return samples - self.basis @ (self.basis.T @ samples) if self.basis.shape[1] else samples
+
+    def project_both(self, matrix: F64Array) -> F64Array:
+        """P M P for a symmetric (n x n) M."""
+        if not self.basis.shape[1]:
+            return matrix
+        left = self.basis.T @ matrix
+        return matrix - self.basis @ left - left.T @ self.basis.T + self.basis @ (left @ self.basis) @ self.basis.T
+
+    def image(self, values: F64Array) -> F64Array:
+        """Xp v for v (p,) or (p, q)."""
+        return self.project(np.asarray(self.carriers @ values))
+
+    def back(self, samples: F64Array) -> F64Array:
+        """Xp' u for u (n,) or (n, q)."""
+        return np.asarray(self.carriers.T @ self.project(samples))
+
+    def weighted_gram(self, weights: F64Array) -> F64Array:
+        """Xp diag(w) Xp' (n x n) for w >= 0: sum_j nnz_j^2 flops when sparse."""
+        if self.is_sparse:
+            gram = np.asarray(((self.carriers @ sparse.diags(weights)) @ self.carriers.T).todense())
+        else:
+            scaled = self.carriers * np.sqrt(weights)[None, :]
+            gram = linalg.blas.dsyrk(1.0, scaled)
+            gram = np.triu(gram) + np.triu(gram, 1).T
+        return self.project_both(gram)
+
+    def quadratic_diagonal(self, core: F64Array) -> F64Array:
+        """x_j' core x_j for every column, core (n x n) symmetric with P core P = core."""
+        # core G = (G' core)', with the sparse factor on the left of every product.
+        product = np.asarray(self.carriers.T @ core).T
+        if self.is_sparse:
+            return np.asarray(self.carriers.multiply(product).sum(axis=0)).ravel()
+        return np.einsum("ij,ij->j", self.carriers, product)
+
+    def quadratic(self, core: F64Array, columns: I64Array) -> F64Array:
+        """Xp_c' core Xp_c (|c| x |c|) for core (n x n) with P core P = core: nnz_c |c| flops when sparse."""
+        block = self.carriers[:, columns]
+        return np.asarray(block.T @ np.asarray(block.T @ core).T)
+
+    def columns(self, columns: I64Array) -> F64Array:
+        """Xp's columns ``columns``, dense and F-ordered (n x |c|)."""
+        block = self.carriers[:, columns]
+        block = block.toarray() if self.is_sparse else np.asarray(block)
+        return np.asfortranarray(self.project(block))
+
+    def column_squares(self) -> F64Array:
+        """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
+        if self.is_sparse:
+            squares = np.asarray(self.carriers.multiply(self.carriers).sum(axis=0)).ravel()
+        else:
+            squares = np.einsum("ij,ij->j", self.carriers, self.carriers)
+        if not self.basis.shape[1]:
+            return squares
+        loading = np.asarray(self.carriers.T @ self.basis)
+        return squares - np.einsum("jk,jk->j", loading, loading)
+
+
 # ------------------------------------------------------------------ the genotype side (Stage 0, dense)
 
 
@@ -75,16 +158,15 @@ class DenseStatistics:
     """Stage 0 of one training set on a dense code matrix.
 
     ``active_rows`` are the input columns with training variance (the store rows of ``fast_scoring``), ``means`` and
-    ``scales`` their signed-code means and population SDs, ``tie_map`` their ties; ``projected`` (n x reduced,
-    Fortran order) is (I - H_C) X~ of the reduced columns, ``loading`` = C' X~ (k x reduced), and ``projected_target``
-    = (I - H_C) y.
+    ``scales`` their signed-code means and population SDs, ``tie_map`` their ties; ``design`` is Xp = (I - H_C) X~ of
+    the reduced columns, ``loading`` = C' X~ (k x reduced), and ``projected_target`` = (I - H_C) y.
     """
 
     active_rows: I64Array
     means: F64Array
     scales: F64Array
     tie_map: TieMap
-    projected: F64Array
+    design: _Design
     loading: F64Array
     covariates: F64Array
     covariate_pseudo_inverse: F64Array
@@ -93,12 +175,17 @@ class DenseStatistics:
 
     @property
     def sample_count(self) -> int:
-        return int(self.projected.shape[0])
+        return self.design.sample_count
 
     @property
     def reduced_rows(self) -> I64Array:
         """The input columns of the reduced columns (each tie group's representative)."""
         return self.active_rows[np.asarray(self.tie_map.kept_indices, dtype=np.int64)]
+
+    @property
+    def projected(self) -> F64Array:
+        """Xp, dense (n x reduced)."""
+        return self.design.columns(np.arange(self.design.variant_count))
 
 
 def _ties(signed: np.ndarray, sums: np.ndarray, count: int) -> TieMap:
@@ -125,11 +212,21 @@ def _ties(signed: np.ndarray, sums: np.ndarray, count: int) -> TieMap:
     return tie_map_from_groups(width, members)
 
 
+def _covariate_basis(covariates: F64Array) -> F64Array:
+    """An orthonormal basis of the covariates' numerical column space, by Stage 0's rank rule (``max(n, k) eps s_max``,
+    as ``_covariate_gram_pseudo_inverse``)."""
+    if not covariates.shape[1]:
+        return np.zeros((covariates.shape[0], 0))
+    left, singular, _right = np.linalg.svd(covariates, full_matrices=False)
+    return left[:, singular > max(covariates.shape) * _EPSILON * singular[0]]
+
+
 def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) -> DenseStatistics:
     """Stage 0 of ``codes`` (n x records, store codes 0..254 = dosage x 127) with ``covariates`` (n x k, intercept
     included) and ``target`` (n,)."""
     values = np.asarray(codes)
-    if values.ndim != 2 or values.min(initial=0) < 0 or values.max(initial=0) > 2 * SIGNED_CODE_OFFSET:
+    full = int(2 * SIGNED_CODE_OFFSET)
+    if values.ndim != 2 or values.min(initial=0) < 0 or values.max(initial=0) > full:
         raise ValueError("codes must be store codes 0..254 of shape [samples, records].")
     count = int(values.shape[0])
     signed = values.astype(np.int64) - int(SIGNED_CODE_OFFSET)
@@ -142,24 +239,37 @@ def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) 
     scales = np.sqrt(numerator[active].astype(np.float64)) / count
     tie_map = _ties(signed, sums, count)
     kept = np.asarray(tie_map.kept_indices, dtype=np.int64)
-    standardized = (signed[:, kept] - means[kept][None, :]) / scales[kept][None, :]
+    # G: each reduced column's codes from its minor end (codes of the fewer carriers), over its SD, signed so that
+    # code_j = offset_j + scale_j g_j; P g_j = P X~_j because P removes the constant (the intercept is a covariate).
+    reduced_codes = signed[:, kept] + int(SIGNED_CODE_OFFSET)
+    flip = np.count_nonzero(reduced_codes == full, axis=0) > np.count_nonzero(reduced_codes == 0, axis=0)
+    minor = np.where(flip[None, :], full - reduced_codes, reduced_codes)
+    column_factor = np.where(flip, -1.0, 1.0) / scales[kept]
+    offsets = np.where(flip, full, 0.0)
+    carrier_counts = np.count_nonzero(minor, axis=0).astype(np.float64)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    pseudo_inverse = _covariate_gram_pseudo_inverse(covariate_matrix)
-    loading = covariate_matrix.T @ standardized
-    projected = np.asfortranarray(standardized - covariate_matrix @ (pseudo_inverse @ loading))
+    basis = _covariate_basis(covariate_matrix)
+    if float(np.sum(carrier_counts * carrier_counts)) < float(count) * count * kept.shape[0]:
+        rows, columns = np.nonzero(minor)
+        carriers = sparse.csc_matrix((minor[rows, columns] * column_factor[columns], (rows, columns)), shape=minor.shape)
+    else:
+        carriers = np.asfortranarray(minor * column_factor[None, :])
+    design = _Design(carriers, basis)
+    # C' X~_j = C' g_j + C'1 (offset_j - 127 - mean_j) / scale_j.
+    constants = (offsets - SIGNED_CODE_OFFSET - means[kept]) / scales[kept]
+    loading = np.asarray(carriers.T @ covariate_matrix).T + np.outer(covariate_matrix.sum(axis=0), constants)
     target_values = np.asarray(target, dtype=np.float64)
-    projected_target = target_values - covariate_matrix @ (pseudo_inverse @ (covariate_matrix.T @ target_values))
     return DenseStatistics(
         active_rows=active.astype(np.int64),
         means=means,
         scales=scales,
         tie_map=tie_map,
-        projected=projected,
+        design=design,
         loading=loading,
         covariates=covariate_matrix,
-        covariate_pseudo_inverse=pseudo_inverse,
+        covariate_pseudo_inverse=_covariate_gram_pseudo_inverse(covariate_matrix),
         target=target_values,
-        projected_target=projected_target,
+        projected_target=design.project(target_values),
     )
 
 
@@ -169,28 +279,29 @@ def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) 
 class _Kernel:
     """A' = Xp' Xp + diag t at the scaled sites t (see the module docstring), factored once.
 
-    ``solve(R)`` is A'^-1 R, ``variances()`` diag A'^-1, and ``factors()`` (Delta, Phi, Psi) with
-    A'^-1 = Delta - Phi'Phi + Psi'Psi. Raises ``np.linalg.LinAlgError`` when A' is not positive definite.
+    ``solve(R)`` is A'^-1 R, ``cavity()`` the variances, removed shares and cavity precisions, ``covariance()``
+    A'^-1 formed, and ``factors()`` (Delta, Phi, Psi) with A'^-1 = Delta - Phi'Phi + Psi'Psi. Raises
+    ``np.linalg.LinAlgError`` when A' is not positive definite.
     """
 
-    def __init__(self, design: F64Array, scaled_precision: F64Array) -> None:
+    def __init__(self, design: _Design, scaled_precision: F64Array) -> None:
         self.design = design
         self.precision = scaled_precision
-        self.variant_count = int(design.shape[1])
+        self.variant_count = design.variant_count
         positive = scaled_precision > 0.0
         self.bulk = np.flatnonzero(positive)
         self.rest = np.flatnonzero(~positive)
         self.inverse = 1.0 / scaled_precision[self.bulk]
-        # Xp_P as an F-ordered (n x |P|) block: BLAS reads it without a copy.
-        self.bulk_design = np.asfortranarray(design[:, self.bulk])
-        scaled = self.bulk_design * np.sqrt(self.inverse)[None, :]
-        kernel = linalg.blas.dsyrk(1.0, scaled)
+        weights = np.zeros(self.variant_count)
+        weights[self.bulk] = self.inverse
+        kernel = design.weighted_gram(weights)
         kernel[np.diag_indices_from(kernel)] += 1.0
         self.upper = linalg.cholesky(kernel, lower=False, check_finite=False, overwrite_a=True)
-        self._whitened: F64Array | None = None
+        self._core: F64Array | None = None
+        self._rest_factors: tuple[F64Array, F64Array] | None = None
         self._factors: tuple[F64Array, F64Array, F64Array] | None = None
         if self.rest.size:
-            self.rest_design = np.asfortranarray(design[:, self.rest])
+            self.rest_design = design.columns(self.rest)
             self.rest_whitened = linalg.solve_triangular(self.upper, self.rest_design, trans="T", lower=False, check_finite=False)
             schur = self.rest_whitened.T @ self.rest_whitened
             schur[np.diag_indices_from(schur)] += scaled_precision[self.rest]
@@ -199,11 +310,20 @@ class _Kernel:
     def _kernel_solve(self, values: F64Array) -> F64Array:
         return linalg.cho_solve((self.upper, False), values, check_finite=False)
 
+    def _expand(self, bulk_values: F64Array) -> F64Array:
+        full = np.zeros((self.variant_count,) + bulk_values.shape[1:])
+        full[self.bulk] = bulk_values
+        return full
+
+    def _bulk_back(self, samples: F64Array) -> F64Array:
+        """Xp_P' u."""
+        return self.design.back(samples)[self.bulk]
+
     def _bulk_apply(self, values: F64Array) -> tuple[F64Array, F64Array]:
         """(A'_PP^-1 v, Xp_P T^-1 v) for v (|P| x q)."""
         scaled = self.inverse[:, None] * values
-        image = self.bulk_design @ scaled
-        return scaled - self.inverse[:, None] * (self.bulk_design.T @ self._kernel_solve(image)), image
+        image = self.design.image(self._expand(scaled))
+        return scaled - self.inverse[:, None] * self._bulk_back(self._kernel_solve(image)), image
 
     def solve(self, right: F64Array) -> F64Array:
         values = np.asarray(right, dtype=np.float64)
@@ -215,53 +335,82 @@ class _Kernel:
             # x_N = S^-1 (r_N - Xp_N' K^-1 Xp_P T^-1 r_P), x_P = A'_PP^-1 (r_P - Xp_P' Xp_N x_N).
             whitened_image = linalg.solve_triangular(self.upper, image, trans="T", lower=False, check_finite=False)
             rest_part = linalg.cho_solve((self.schur_upper, False), values[self.rest] - self.rest_whitened.T @ whitened_image, check_finite=False)
-            correction, _ = self._bulk_apply(self.bulk_design.T @ (self.rest_design @ rest_part))
+            correction, _ = self._bulk_apply(self._bulk_back(self.rest_design @ rest_part))
             bulk_part = bulk_part - correction
             solution[self.rest] = rest_part
         solution[self.bulk] = bulk_part
         return solution[:, 0] if column else solution
 
-    def whitened(self) -> F64Array:
-        """U^-T Xp_P (n x |P|), for the variances and the factors."""
-        if self._whitened is None:
-            self._whitened = linalg.solve_triangular(self.upper, self.bulk_design, trans="T", lower=False, check_finite=False)
-        return self._whitened
+    def core(self) -> F64Array:
+        """P K^-1 P (n x n), so x_j' K^-1 x_k = g_j' (P K^-1 P) g_k."""
+        if self._core is None:
+            self._core = self.design.project_both(self._kernel_solve(np.eye(self.upper.shape[0])))
+        return self._core
+
+    def rest_factors(self) -> tuple[F64Array, F64Array]:
+        """(Psi_P = S_U^-T E' (|N| x |P|), Psi_N = -S_U^-T (|N| x |N|)), E' = Xp_N' K^-1 Xp_P T^-1."""
+        if self._rest_factors is None:
+            cross = self._bulk_back(self._kernel_solve(self.rest_design)).T * self.inverse[None, :]
+            psi_bulk = linalg.solve_triangular(self.schur_upper, cross, trans="T", lower=False, check_finite=False)
+            psi_rest = -linalg.solve_triangular(self.schur_upper, np.eye(self.rest.size), trans="T", lower=False, check_finite=False)
+            self._rest_factors = (psi_bulk, psi_rest)
+        return self._rest_factors
+
+    def cavity(self) -> tuple[F64Array, F64Array, F64Array]:
+        """(z', 1 - t z', 1/z' - t): the variances of A'^-1, each site's share of its variance the data remove, and its
+        cavity precision, without cancellation. For a bulk column z' = d - d^2 q + f (d = 1/t, q = x_j' K^-1 x_j,
+        f = ||Psi_j||^2), so 1 - t z' = d q - t f exactly; forming 1/z' - t from z' instead loses every digit where the
+        data inform a column far less than its site does (d q below eps), which is most rare variants at the start."""
+        quadratic = self.design.quadratic_diagonal(self.core())[self.bulk]
+        variances = np.empty(self.variant_count)
+        removed = np.empty(self.variant_count)
+        extra = np.zeros(self.bulk.size)
+        if self.rest.size:
+            psi_bulk, psi_rest = self.rest_factors()
+            extra = np.einsum("ij,ij->j", psi_bulk, psi_bulk)
+            variances[self.rest] = np.einsum("ij,ij->j", psi_rest, psi_rest)
+            removed[self.rest] = 1.0 - self.precision[self.rest] * variances[self.rest]
+        variances[self.bulk] = self.inverse - self.inverse * self.inverse * quadratic + extra
+        removed[self.bulk] = self.inverse * quadratic - self.precision[self.bulk] * extra
+        return variances, removed, removed / variances
+
+    def variances(self) -> F64Array:
+        return self.cavity()[0]
+
+    def covariance(self) -> F64Array:
+        """A'^-1 formed (p x p): Delta - T^-1 Xp_P' K^-1 Xp_P T^-1 on P, plus Psi'Psi."""
+        bulk_block = self.design.quadratic(self.core(), self.bulk)
+        bulk_block *= -self.inverse[:, None]
+        bulk_block *= self.inverse[None, :]
+        bulk_block[np.diag_indices_from(bulk_block)] += self.inverse
+        if not self.rest.size:
+            return bulk_block
+        covariance = np.zeros((self.variant_count, self.variant_count))
+        covariance[np.ix_(self.bulk, self.bulk)] = bulk_block
+        psi_bulk, psi_rest = self.rest_factors()
+        psi = np.zeros((self.rest.size, self.variant_count))
+        psi[:, self.bulk] = psi_bulk
+        psi[:, self.rest] = psi_rest
+        covariance += psi.T @ psi
+        return covariance
 
     def factors(self) -> tuple[F64Array, F64Array, F64Array]:
-        """(delta (p,), Phi (n x p), Psi (|N| x p)) with A'^-1 = diag(delta) - Phi'Phi + Psi'Psi."""
+        """(delta (p,), Phi (n x p), Psi (|N| x p)) with A'^-1 = diag(delta) - Phi'Phi + Psi'Psi (the O(n^2 p) route of
+        the variance JVP, when Sigma o Sigma is too large to form)."""
         if self._factors is not None:
             return self._factors
         delta = np.zeros(self.variant_count)
         delta[self.bulk] = self.inverse
         phi = np.zeros((self.upper.shape[0], self.variant_count), order="F")
-        whitened = self.whitened()
+        whitened = linalg.solve_triangular(self.upper, self.design.columns(self.bulk), trans="T", lower=False, check_finite=False)
         phi[:, self.bulk] = whitened * self.inverse[None, :]
         psi = np.zeros((self.rest.size, self.variant_count))
         if self.rest.size:
-            # E' = Xp_N' K^-1 Xp_P T^-1 = (U^-T Xp_N)'(U^-T Xp_P) T^-1; Psi_P = S_U^-T E', Psi_N = -S_U^-T.
-            cross = (self.rest_whitened.T @ whitened) * self.inverse[None, :]
-            psi[:, self.bulk] = linalg.solve_triangular(self.schur_upper, cross, trans="T", lower=False, check_finite=False)
-            psi[:, self.rest] = -linalg.solve_triangular(self.schur_upper, np.eye(self.rest.size), trans="T", lower=False, check_finite=False)
+            psi_bulk, psi_rest = self.rest_factors()
+            psi[:, self.bulk] = psi_bulk
+            psi[:, self.rest] = psi_rest
         self._factors = (delta, phi, psi)
         return self._factors
-
-    def variances(self) -> F64Array:
-        delta, phi, psi = self.factors()
-        return delta - np.einsum("ij,ij->j", phi, phi) + np.einsum("ij,ij->j", psi, psi)
-
-    def cavity(self) -> tuple[F64Array, F64Array, F64Array]:
-        """(z', 1 - t z', 1/z' - t): the variances of A'^-1, each site's share of its variance the data remove, and its
-        cavity precision, without cancellation. For a bulk column z' = d - d^2 q + f (d = 1/t, q = ||U^-T x_j||^2,
-        f = ||Psi_j||^2), so 1 - t z' = d q - t f exactly; forming 1/z' - t from z' instead loses every digit where the
-        data inform a column far less than its site does (d q below eps), which is most rare variants at the start."""
-        delta, phi, psi = self.factors()
-        extra = np.einsum("ij,ij->j", psi, psi)
-        variances = delta - np.einsum("ij,ij->j", phi, phi) + extra
-        removed = np.empty(self.variant_count)
-        whitened = self.whitened()
-        removed[self.bulk] = self.inverse * np.einsum("ij,ij->j", whitened, whitened) - self.precision[self.bulk] * extra[self.bulk]
-        removed[self.rest] = 1.0 - self.precision[self.rest] * variances[self.rest]
-        return variances, removed, removed / variances
 
     def draws(self, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x draws) exact draws of N(0, A'^-1): beta_N from its marginal N(0, S^-1), then beta_P | beta_N with
@@ -270,28 +419,17 @@ class _Kernel:
         prior_noise = generator.standard_normal((self.bulk.size, draw_count))
         sample_noise = generator.standard_normal((self.upper.shape[0], draw_count))
         spread = np.sqrt(self.inverse)[:, None] * prior_noise
-        image = self.bulk_design @ spread + sample_noise
-        bulk_draw = spread - self.inverse[:, None] * (self.bulk_design.T @ self._kernel_solve(image))
+        image = self.design.image(self._expand(spread)) + sample_noise
+        bulk_draw = spread - self.inverse[:, None] * self._bulk_back(self._kernel_solve(image))
         if self.rest.size:
             rest_noise = generator.standard_normal((self.rest.size, draw_count))
             rest_offset = linalg.solve_triangular(self.schur_upper, rest_noise, lower=False, check_finite=False)
             draws[self.rest] += rest_offset
             # E (beta_N - mean_N) with E = A'_PP^-1 A'_PN = A'_PP^-1 Xp_P' Xp_N.
-            conditional, _ = self._bulk_apply(self.bulk_design.T @ (self.rest_design @ rest_offset))
+            conditional, _ = self._bulk_apply(self._bulk_back(self.rest_design @ rest_offset))
             bulk_draw = bulk_draw - conditional
         draws[self.bulk] += bulk_draw
         return draws
-
-
-def _symmetrize_upper(matrix: F64Array) -> None:
-    """Copy the upper triangle over the lower one in place, in row panels (no p x p temporary)."""
-    size = matrix.shape[0]
-    step = max(1, int(np.sqrt(size)))
-    for start in range(0, size, step):
-        stop = min(start + step, size)
-        matrix[stop:, start:stop] = matrix[start:stop, stop:].T
-        block = matrix[start:stop, start:stop]
-        block[...] = np.triu(block) + np.triu(block, 1).T
 
 
 def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -> F64Array:
@@ -305,10 +443,9 @@ def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -
 
 class _DensePosterior:
     """q's responses at one fixed point (``scale_mixture_ep.GaussianPosterior``): Sigma R exactly, and
-    -(Sigma o Sigma) W exactly. Sigma o Sigma is formed once (O(n p^2) and 8 p^2 bytes) when that fits
-    ``jvp_bytes``, and each call is then one GEMM; otherwise each column costs O(n^2 p) from the factors.
-    Forming it pays as soon as a call has more than p / (2 n) columns, which the total curvature's (p x D) GMRES
-    iterates always have, so memory alone decides."""
+    -(Sigma o Sigma) W exactly. Sigma o Sigma is formed once (8 p^2 bytes) when that fits ``jvp_bytes``, and each call
+    is then one GEMM; otherwise each column costs O(n^2 p) from the factors. Forming it pays as soon as a call has more
+    than p / (2 n) columns, which the total curvature's (p x D) GMRES iterates always have, so memory alone decides."""
 
     def __init__(self, kernel: _Kernel, noise: float, jvp_bytes: int, profile: dict) -> None:
         self.kernel = kernel
@@ -327,12 +464,7 @@ class _DensePosterior:
     def _explicit(self) -> F64Array:
         if self._squared is None:
             started = time.perf_counter()
-            delta, phi, psi = self.kernel.factors()
-            covariance = linalg.blas.dsyrk(-1.0, phi, trans=1)
-            if psi.shape[0]:
-                covariance = linalg.blas.dsyrk(1.0, psi, beta=1.0, c=covariance, trans=1, overwrite_c=1)
-            _symmetrize_upper(covariance)
-            covariance[np.diag_indices_from(covariance)] += delta
+            covariance = self.kernel.covariance()
             covariance *= self.noise
             np.square(covariance, out=covariance)
             self._squared = covariance
@@ -382,8 +514,8 @@ class _DenseFixedPoints:
         self.prior = prior
         self.draw_count = int(draw_count)
         self.working_bytes = int(working_bytes)
-        self.design = statistics.projected
-        self.data_score = self.design.T @ statistics.target
+        self.design = statistics.design
+        self.data_score = self.design.back(statistics.target)
         self.sample_count = statistics.sample_count
         self.covariate_count = int(statistics.covariates.shape[1])
         precision, shift = moment_matched_prior_sites(prior, initial_hyperparameters(prior))
@@ -420,7 +552,7 @@ class _DenseFixedPoints:
         return self.noise * variances, removed, precision / self.noise
 
     def _residual_sum_of_squares(self) -> float:
-        residual = self.statistics.projected_target - self.design @ self.mean
+        residual = self.statistics.projected_target - self.design.image(self.mean)
         return float(residual @ residual)
 
     def _noise(self, variances: F64Array) -> float:
@@ -477,7 +609,7 @@ class _DenseFixedPoints:
 
         def norm(direction: F64Array) -> float:
             values = np.asarray(direction, dtype=np.float64)
-            image = design @ values
+            image = design.image(values)
             return float(image @ image) / noise + float(np.sum(precision * values * values))
 
         return norm
@@ -586,9 +718,8 @@ def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_va
     offsets = np.asarray(log_variance_offset, dtype=np.float64)[reduced]
     residual = statistics.projected_target
     start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariates.shape[1])
-    design = statistics.projected
-    single_precision = np.einsum("ij,ij->j", design, design) / start_noise
-    single_shift = (design.T @ statistics.target) / start_noise
+    single_precision = statistics.design.column_squares() / start_noise
+    single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     return scale_mixture_prior(
         class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=np.zeros((reduced.shape[0], 0)),
@@ -671,7 +802,8 @@ def fit_small_n(
         "total_seconds": time.perf_counter() - started,
         "samples": statistics.sample_count,
         "active": int(statistics.active_rows.shape[0]),
-        "reduced": int(statistics.projected.shape[1]),
+        "reduced": int(statistics.design.variant_count),
+        "sparse": bool(statistics.design.is_sparse),
         "coefficients": int(prior.coefficient_size),
         "grid": int(prior.grid_size),
         "classes": int(prior.class_count),
