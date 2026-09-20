@@ -582,7 +582,8 @@ def _posterior(
         return solution
 
     return GaussianPosterior(
-        solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values, local_response=local_response(solve, grams),
+        solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values,
+        local_response=local_response(solve, grams, gaussian.array_module),
     )
 
 
