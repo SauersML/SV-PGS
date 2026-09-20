@@ -120,7 +120,7 @@ def operand_digits(dense: Any, array_module: ModuleType, digit_count: int = OPER
     """
     values = array_module.asarray(dense, dtype=array_module.float64)
     rows, columns = values.shape
-    magnitude = array_module.max(array_module.abs(values), axis=0) if rows else array_module.zeros(columns)
+    magnitude = _column_max(array_module.abs(values), array_module) if rows else array_module.zeros(columns)
     exponent = (DIGIT_BITS * digit_count - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0)))
     scale = array_module.exp2(exponent)
     integers = array_module.rint(values * scale[None, :]).astype(array_module.int64)
@@ -146,6 +146,24 @@ INT8_GEMM_ALIGNMENT = 4
 """cuBLAS runs int8 GEMMs only when the reduction length, both leading dimensions and every operand
 offset are multiples of 4 (CUBLAS_STATUS_NOT_SUPPORTED otherwise). A block is zero-padded to
 multiples of 4 on both axes: a zero signed code adds nothing to any product."""
+
+
+def _column_max(values: Any, array_module: ModuleType) -> Any:
+    """The largest entry of each column of a C-order [rows, K] array.
+
+    On CUDA in two stages over groups of ceil(sqrt(rows)) rows: a reduction along the leading axis of a
+    C-order array otherwise runs one thread block per column, which K columns cannot fill. The maximum is
+    exact in any order.
+    """
+    rows = int(values.shape[0])
+    if array_module is np or rows == 0:
+        return values.max(axis=0)
+    group = math.isqrt(rows - 1) + 1
+    whole = rows // group * group
+    largest = values[:whole].reshape(rows // group, group, -1).max(axis=1).max(axis=0)
+    if whole < rows:
+        largest = array_module.maximum(largest, values[whole:].max(axis=0))
+    return largest
 
 
 def _aligned(count: int) -> int:
@@ -454,9 +472,10 @@ class CodeBlockTile:
         xp = self._array_module
         values = xp.asarray(right, dtype=xp.float64)
         quotient = values / self._scales[:, None]
-        magnitude = xp.abs(quotient).max(axis=0)
-        support = xp.sqrt(((quotient != 0) * xp.square(self._scales)[:, None]).sum(axis=0))
-        norm = xp.sqrt(xp.square(values).sum(axis=0))
+        magnitude = _column_max(xp.abs(quotient), xp)
+        # column sums as products with a vector (one GEMV each), which fill the device where axis-0 reductions do not
+        support = xp.sqrt(xp.square(self._scales) @ (quotient != 0).astype(xp.float64))
+        norm = xp.sqrt(xp.ones(int(values.shape[0])) @ xp.square(values))
         live = norm > 0
         ratio = xp.where(live, magnitude * support / xp.where(live, norm, 1.0), 0.0)
         return _digits_for_ratio(float(ratio.max()) if ratio.size else 0.0, relative_error)
