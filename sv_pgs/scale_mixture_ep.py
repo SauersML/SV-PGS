@@ -1775,6 +1775,16 @@ def _same_basin(first: _Evidence, second: _Evidence) -> bool:
     return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
 
 
+def _same_basin(first: _Evidence, second: _Evidence) -> bool:
+    """Whether two certified inner maxima are one: each point lies within sqrt(2 d) of its maximum in the -H metric
+    (d its inner decrement), so one maximum is within the sum of the radii of both points; their V must then agree
+    to within their certified errors."""
+    step = first.coefficients - second.coefficients
+    radius = np.sqrt(2.0 * first.inner_decrement) + np.sqrt(2.0 * second.inner_decrement)
+    distance = np.sqrt(max(float(step @ first.precision @ step), 0.0))
+    return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
+
+
 def _best_certified(
     prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
