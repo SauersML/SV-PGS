@@ -1773,6 +1773,26 @@ def _correction_slopes(
     return slopes, errors, second
 
 
+def _halved_data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
+    """sum_j log Z_j with the same density on the lattice of half the spacing (``halved_lattice``'s: each class's
+    log g the natural spline of least roughness through its nodal values), the same scales and kernel floor."""
+    nodes = prior.log_variance_grid
+    finer = np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)
+    log_weights, _scale = _density_and_scale(prior, coefficients)
+    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
+    spline = make_interp_spline(nodes, log_weights.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
+    fine_weights = spline(finer).T
+    log_density = fine_weights - _log_sum_exp(fine_weights, axis=1, keepdims=True)
+    scales = log_scale(prior, coefficients)
+    total = 0.0
+    for class_position, class_rows in enumerate(prior.class_rows):
+        for rows in _row_chunks(class_rows, finer.shape[0], working_bytes):
+            total += float(np.sum(_log_normalizers(
+                log_density[class_position], scales[rows], finer, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            )))
+    return total
+
+
 def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
@@ -1783,7 +1803,8 @@ def _corrected(
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None or a line integral cannot be certified.
+    None when the evidence is None, a line integral cannot be certified, or the lattice does not resolve the density
+    (its trapezoid sum moves by more than the tolerance on half the spacing).
     """
     if evidence is None:
         return None
@@ -1797,8 +1818,16 @@ def _corrected(
     replaced = int(np.argmax(remaining <= 0.5 * tolerance))
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
+    # The lattice must resolve the density x_rho puts on it (lead ruling B): the same density on half the spacing
+    # changes sum_j log Z_j by the trapezoid's error at h (the rule converges geometrically in 1/h for these analytic
+    # integrands, so the h/2 sum is exact beside it). A density narrower than the spacing aliases to a few atoms, whose
+    # lattice sum rises above any continuous density's [semi-real, oracle's v7 x1000 windows: 23.59 to 24.27]; its
+    # halved sum falls back. Where the difference exceeds the tolerance, V is not certified there and never steers.
+    quadrature = abs(_halved_data_value(prior, evidence.coefficients, cavity, working_bytes) - _data_value(prior, evidence.coefficients, cavity, working_bytes))
+    if quadrature > tolerance:
+        return None
     return replace(
-        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder + quadrature,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
     )
 
