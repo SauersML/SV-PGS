@@ -115,6 +115,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', '_ROW_INTERMEDIATES'): ('derived', frozenset({20}), "byte accounting: the (rows x K) float64 arrays alive at once in a chunk"),
     ('scale_mixture_ep.py', '_QUADPACK_RELATIVE_FLOOR'): ('spec', frozenset({50.0}), 'QUADPACK / scipy.integrate.quad: epsrel must exceed 50 x machine epsilon'),
     ('scale_mixture_ep.py', 'kernel_floor'): ('derived', frozenset({0.25, 4.0}), '|log L| <= v|h^2 - P|/2 + (vP)^2/4, the second-order bound; its root in the stable form 2c/(b + sqrt(b^2 + 4ac))'),
+    ('scale_mixture_ep.py', 'tilted_cumulants'): ('math', frozenset({3.0, 4, 6.0}), 'central moments of a Gaussian component: E[(d + sqrt(c) Z)^3] = d^3 + 3 d c, E[(d + sqrt(c) Z)^4] = d^4 + 6 d^2 c + 3 c^2; kappa4 = m4 - 3 m2^2'),
     ('scale_mixture_ep.py', 'tail_mass'): ('math', frozenset({-2.0}), 'Gaussian integral by completing the square: erfcx form of the half-line integral'),
     ('scale_mixture_ep.py', '_legendre_functionals'): ('definitional', frozenset({3}), 'a quadratic (the Legendre P0..P2 span) needs three nodes'),
     ('scale_mixture_ep.py', '_components.third'): ('derived', frozenset({6.0}), 'the recursion A_(n+1) = r A_n - r(1 - r) A_n\', B_(n+1) = -r(1 - r) B_n\' for d^n log Z_k / d eta^n (docstring)'),
