@@ -294,3 +294,32 @@ def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
                               "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
         estimates.append(genome_total.horvitz_thompson_total(genes, population, sample_size)[0])
     assert np.isclose(np.mean(estimates), values.sum(), rtol=0, atol=64 * EPSILON)
+
+
+def _every_sample(values, targeted, sample_size):
+    import itertools
+
+    from benchmarks.bench_real import genome_total
+
+    results = []
+    for sample in itertools.combinations(range(len(values)), sample_size):
+        scored = sorted(targeted | set(sample))
+        genes = pd.DataFrame({"gene_id": [f"g{index}" for index in scored], "chrom": [f"chr{index % 3 + 1}" for index in scored],
+                              "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
+        results.append(genome_total.horvitz_thompson_total(genes, len(values), sample_size))
+    return np.array([total for total, _, _ in results]), np.array([error for _, error, _ in results])
+
+
+def test_horvitz_thompson_variance_estimate_is_exactly_unbiased_over_every_random_sample():
+    values = np.array([0.3, -0.1, 0.7, 0.2, 0.05, 0.4, -0.2, 0.9])
+    totals, errors = _every_sample(values, {1, 4}, 4)
+    # Every sample is equally likely, so the design variance is the population variance of the estimates.
+    assert np.isclose(np.mean(errors ** 2), np.var(totals), rtol=0, atol=64 * EPSILON)
+
+
+def test_horvitz_thompson_census_of_the_signal_has_no_design_error():
+    # All of y sits in the targeted stratum, on one chromosome: the total is known exactly from every sample.
+    values = np.array([0.0, 0.8, 0.0, 0.0, 0.6, 0.0, 0.0])
+    totals, errors = _every_sample(values, {1, 4}, 3)
+    assert np.allclose(totals, values.sum(), rtol=0, atol=64 * EPSILON)
+    assert np.allclose(errors, 0.0, rtol=0, atol=64 * EPSILON)
