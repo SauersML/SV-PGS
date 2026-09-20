@@ -1212,7 +1212,13 @@ def _total_curvature_columns(
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
-    variance = derivatives.variance[:, None]
+    # A variant whose tilted law is a point mass at zero (all its prior mass on flat-kernel nodes: v = 0) does not
+    # respond: its mean and every derivative are zero for every cavity, so dh = dP = 0 exactly (the limit of the map,
+    # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset (speed-smalln).
+    live = derivatives.variance > 0.0
+    inverse = np.where(live, 1.0 / np.where(live, derivatives.variance, 1.0), 0.0)
+    inverse_column = inverse[:, None]
+    live_column = live[:, None].astype(np.float64)
 
     def through(precision_step: F64Array, inner: float, affine: bool = True) -> tuple[F64Array, F64Array, F64Array]:
         # The map is affine in dP. With ``affine`` False its constant (the E terms) is dropped, which leaves its linear
@@ -1220,26 +1226,25 @@ def _total_curvature_columns(
         # constant, as a difference of two solves would be (speed-recycle a7752ae).
         mean_constant = mean_by_z if affine else np.zeros_like(mean_by_z)
         mean_step = posterior.solve(
-            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_constant / variance, inner
+            (derivatives.mean + derivatives.mean_by_precision * inverse)[:, None] * precision_step + mean_constant * inverse_column, inner
         )
-        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_constant) / variance
+        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_constant) * inverse_column
         variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step
         if affine:
             variance_step = variance_step + variance_by_z
-        response = variance_step / variance**2 + precision_step
-        return shift_step, response + posterior.variance_jvp(response) / variance**2, response
+        response = variance_step * inverse_column**2 + live_column * precision_step
+        return shift_step, response + posterior.variance_jvp(response) * inverse_column**2, response
 
     shape = mean_by_z.shape
     if posterior.linear_response is not None:
         # ``through`` is affine in dP, with linear part (I - diag(1/v^2) (Sigma o Sigma)) R and R = diag(v_h / v^3) Sigma
         # diag(m + m_P / v) + diag(1 + v_P / v^2 - v_h m_P / v^3): the posterior solves its fixed point exactly.
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
-        tilted = derivatives.variance
         precision_step = posterior.linear_response(
-            derivatives.variance_by_shift / tilted**3,
-            derivatives.mean + derivatives.mean_by_precision / tilted,
-            1.0 + derivatives.variance_by_precision / tilted**2 - derivatives.variance_by_shift * derivatives.mean_by_precision / tilted**3,
-            1.0 / tilted**2,
+            derivatives.variance_by_shift * inverse**3,
+            derivatives.mean + derivatives.mean_by_precision * inverse,
+            live + derivatives.variance_by_precision * inverse**2 - derivatives.variance_by_shift * derivatives.mean_by_precision * inverse**3,
+            inverse**2,
             offset,
         )
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
