@@ -590,6 +590,19 @@ def _loop_point(
     )
 
 
+def _in_domain(
+    design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted, largest_variance: F64Array
+) -> bool:
+    """Whether the sites lie in EP's domain: A' positive definite, and every cavity at q's own marginals proper."""
+    try:
+        kernel = _Kernel(design, noise * site_precision)
+    except np.linalg.LinAlgError:
+        return False
+    mean = kernel.solve(data_score + noise * site_shift)
+    variance = noise * kernel.variances()
+    return _loop_point(design, noise, data_score, site_precision, site_shift, 1.0 / variance, mean / variance, tilted, largest_variance) is not None
+
+
 def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     """Each site's 2 x 2 block of Cov_r of the statistics (beta, -beta^2 / 2) under its tilted law: (a, b, c) =
     (v, -(k3 + 2 m v) / 2, (k4 + 2 v^2 + 4 m k3 + 4 m^2 v) / 4), from the central moments m, v, k3 and mu4 = k4 + 3 v^2."""
@@ -675,6 +688,8 @@ def double_loop_sites(
     precision = np.array(site_precision, dtype=np.float64, copy=True)
     shift = np.array(site_shift, dtype=np.float64, copy=True)
     size = precision.shape[0]
+    if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
+        raise ValueError("the EP double loop's start lies outside EP's domain")
     while True:
         profile["double_loop_outer"] += 1
         kernel = _Kernel(design, noise * precision)
@@ -691,9 +706,9 @@ def double_loop_sites(
         if float(right @ (noise * kernel.solve(right))) <= effective / draw_count:
             return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
+        # In the domain: the start was checked, and every later outer step starts from an accepted inner point.
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
-        if point is None:
-            raise ValueError("the EP double loop's start lies outside EP's domain")
+        assert point is not None
         start_precision, start_shift = precision.copy(), shift.copy()
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
@@ -919,6 +934,12 @@ class _DenseFixedPoints:
         variance = self.noise * kernel.variances()
         if _loop_point(self.design, self.noise, self.data_score, start_precision, start_shift, 1.0 / variance, mean / variance, tilted, largest) is None:
             start_precision, start_shift = moment_matched_prior_sites(self.prior, hyperparameters)
+            if not _in_domain(self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest):
+                # Every strictly positive site precision lies in EP's domain (A' is then positive definite and every
+                # cavity precision non-negative). The moment-matched ones leave it only where 1/E[beta^2] underflows to 0,
+                # i.e. where the trial's prior second moment overflows: that trial has no representable start, and the
+                # outer loop halves its step (fit-api pool5).
+                raise NoFixedPoint("the trial's prior second moment overflows: its moment-matched sites leave the precision singular")
         precision, shift = double_loop_sites(
             self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest, self.draw_count,
             self.working_bytes // _LIVE_FIXED_POINTS, self.profile,

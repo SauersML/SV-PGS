@@ -331,3 +331,27 @@ def test_the_kernel_log_determinant_is_the_precisions():
     precision = rng.uniform(0.5, 2.0, 12)
     precision[:2] = -0.05
     np.testing.assert_allclose(_Kernel(_Design.dense(design), precision).log_determinant(), np.linalg.slogdet(design.T @ design + np.diag(precision))[1], rtol=1e-12)
+
+
+def test_a_trial_whose_prior_second_moment_overflows_is_refused_not_raised(monkeypatch):
+    """At a far trial the moment-matched precision 1/E[beta^2] underflows to 0; with dependent columns the precision is
+    then singular. The fallback refuses the trial (NoFixedPoint: the outer loop halves), never a LinAlgError."""
+    from sv_pgs import small_n
+    from sv_pgs.full_data_fit import NoFixedPoint
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(81)
+    samples, variants = 12, 40
+    dosage = rng.binomial(2, rng.uniform(0.2, 0.5, variants), size=(samples, variants))
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 64, 10**9)
+    count = statistics.design.variant_count
+    oracle.site_precision = np.full(count, -1.0)  # current sites outside the domain
+    monkeypatch.setattr(small_n, "moment_matched_prior_sites", lambda _prior, _hyperparameters: (np.zeros(count), np.zeros(count)))
+    with pytest.raises(NoFixedPoint):
+        oracle._double_loop(start)
+    with pytest.raises(ValueError):
+        small_n.double_loop_sites(statistics.design, start_noise, statistics.design.back(statistics.target), np.zeros(count), np.zeros(count),
+                                  oracle._tilted(start), oracle._largest_variances(start), 64, 10**9, _new_profile())
