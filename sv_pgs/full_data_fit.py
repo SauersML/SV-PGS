@@ -48,7 +48,7 @@ from sv_pgs.config import TraitType
 from sv_pgs.dual_solve import DualGaussian, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.krylov_recycle import RecycledSpace, local_response
+from sv_pgs.krylov_recycle import local_response
 from sv_pgs.marginal_variances import (
     BlockCertificate,
     ControlVariate,
@@ -241,9 +241,7 @@ def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Arra
     return lower, upper
 
 
-def _posterior(
-    gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None], recycled: RecycledSpace | None = None
-) -> GaussianPosterior:
+def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None]) -> GaussianPosterior:
     """q's responses at this refresh for the total curvature: Sigma R by the dual solver, each column to a relative
     error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map. ``ensure`` puts the dual
     solver back at this refresh's sites before it is asked (a later trial may have moved it)."""
@@ -268,7 +266,7 @@ def _posterior(
 
     return GaussianPosterior(
         solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values,
-        local_response=local_response(solve, grams), recycled=recycled,
+        local_response=local_response(solve, grams),
     )
 
 
@@ -333,8 +331,6 @@ class _FullDataFixedPoints:
         self.information: list[BlockCertificate] = []
         self.refreshes = 0
         self.passes = 0
-        # Each model's Krylov space for B's linear response, carried from one outer step to the next.
-        self.recycled = [RecycledSpace() for _model in range(model_count)]
         # The dual solver's state changes with every solve; a FixedPoint records the version it was built at.
         self.version = 0
         # Blocks the information certificate left undecided at its probe limit, over the whole fit.
@@ -537,9 +533,7 @@ class _FullDataFixedPoints:
                 return [
                     FixedPoint(
                         cavity=cavities[model],
-                        posterior=_posterior(
-                            gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot), self.recycled[model]
-                        ),
+                        posterior=_posterior(gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
                         mean=mean[:, model].copy(),
                         precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model]),
                         effective_effects=float(self.effective[model]),
