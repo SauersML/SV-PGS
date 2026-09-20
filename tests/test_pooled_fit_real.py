@@ -35,7 +35,7 @@ def _method():
 
 @pytest.mark.slow
 @pytest.mark.parametrize(("split", "refused_gene"), [("loso/AMR", 13), ("loso/EUR", 6), ("loso/EAS", 7), ("loso/SAS", 15), ("loso/AFR", None)])
-def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused_gene):
+def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused_gene, monkeypatch):
     from benchmarks.bench_real import harness
     from sv_pgs import fit_model
     from sv_pgs.pooled_fit import GeneData, _PooledFixedPoints, _gene_rows, _held_bytes, _pooled_start, pooled_prior
@@ -62,12 +62,28 @@ def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused
     start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
     working = int(os.environ.get("RUNQ_MEM_BYTES", str(8 << 30))) - sum(_held_bytes(gene) + _held_bytes(gene.design) for gene in statistics)
     oracle = _PooledFixedPoints(statistics, prior, start, noise, draw_count, working // 2)
+    # Every double loop's EC free energy must fall at every outer step, to rounding (lead: the rwAMR decrease assertion).
+    from sv_pgs import small_n
+
+    traces: list[list[float]] = []
+    original = small_n.double_loop_sites
+
+    def traced(*arguments, **keywords):
+        trace: list[float] = []
+        traces.append(trace)
+        return original(*arguments, **(keywords | {"trace": trace}))
+
+    monkeypatch.setattr(small_n, "double_loop_sites", traced)
     wall, cpu = time.perf_counter(), time.process_time()
     (point,) = oracle([start])
+    for trace in traces:
+        values = np.asarray(trace, dtype=np.float64)
+        rounding = np.finfo(np.float64).eps * np.maximum(np.abs(values[1:]), 1.0) * values.shape[0]
+        assert np.all(values[1:] <= values[:-1] + rounding), f"the double loop's free energy rose: {values.tolist()}"
     record = {
         "split": split, "genes": len(genes), "members": [int(rows.stop - rows.start) for rows in oracle.rows], "wall_s": time.perf_counter() - wall,
         "cpu_s": time.process_time() - cpu, "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(), "tilted_seconds": oracle.profile["tilted_seconds"],
-        "gene_refreshes": [int(gene.profile["refreshes"]) for gene in oracle.genes], "double_loops": oracle.profile["double_loops"],
+        "gene_refreshes": [int(gene.profile["refreshes"]) for gene in oracle.genes], "double_loops": oracle.profile["double_loops"], "double_loop_traces": len(traces),
         "refusals": oracle.refusals, "reached": point is not None,
     }
     if os.environ.get("SVPGS_PROFILE_OUT"):
