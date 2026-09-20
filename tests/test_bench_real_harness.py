@@ -599,3 +599,30 @@ def test_recorded_failures_are_nan_logged_and_never_scored(tmp_path):
     assert pooled["genes"] == 0 and pooled["failed_genes"] == 1
     # Intention-to-treat scores the failed arm as the training-mean prediction (r^2 = 0) on every gene.
     assert pooled["itt_genes"] == 1 and pooled["itt_mean_r2_a"] == 0.0 and np.isclose(pooled["itt_difference"], -pooled["itt_mean_r2_b"])
+
+
+def test_raw_scores_reproduce_the_scored_predictions_and_merge_along_splits(tmp_path):
+    import json
+
+    from benchmarks.bench_real import merge_splits
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "full", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    out = tmp_path / "results/full/loso"
+    raw = np.load(out / "chr1.snv_sv.raw_scores.npy").astype(np.float64)
+    splits_order = json.loads((out / "chr1.raw_splits.json").read_text())
+    predictions = np.load(out / "chr1.snv_sv.predictions.npy").astype(np.float64)
+    dataset = harness.Dataset(tmp_path)
+    for position, split_name in enumerate(splits_order):
+        train_index = np.array([dataset.sample_index[s] for s in dataset.splits[split_name]["train"]])
+        test_index = np.array([dataset.sample_index[s] for s in dataset.splits[split_name]["test"]])
+        design = np.column_stack([np.ones(len(dataset.samples)), dataset.covariates])
+        coefficients, *_ = np.linalg.lstsq(design[train_index], raw[0, position, train_index], rcond=None)
+        rescored = raw[0, position, test_index] - design[test_index] @ coefficients
+        assert np.allclose(rescored, predictions[0, test_index], rtol=0, atol=64 * np.finfo(np.float32).eps * max(np.abs(raw).max(), 1.0))
+    for split in ("loso/AFR", "loso/EUR"):
+        harness.run(tmp_path, method, "parts", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",), split_subset=[split])
+    merge_splits.merge(tmp_path / "results/parts/loso", "chr1")
+    merged = np.load(tmp_path / "results/parts/loso/chr1.merged.snv_sv.raw_scores.npy")
+    assert merged.shape[1] == 2 and json.loads((tmp_path / "results/parts/loso/chr1.merged.raw_splits.json").read_text()) == ["loso/AFR", "loso/EUR"]

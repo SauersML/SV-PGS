@@ -478,7 +478,7 @@ def _call_predict(predictor, genotypes, covariates):
     return np.asarray(predictor.predict(genotypes), dtype=np.float64)
 
 
-def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, test_covariates: np.ndarray):
+def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, test_covariates: np.ndarray, raw=None):
     """The held-out predictions scored against the truth, full and with the SV columns held at their training means.
 
     The truth is the test expression minus [1, C_test] a, with a the training OLS coefficients of expression on
@@ -487,18 +487,30 @@ def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, t
     therefore treats every method's score the way it treats the truth: it fits the score on [1, C] over the training
     samples and removes [1, C_test] times those coefficients from the test score. For a linear score X b this gives
     exactly (X_test - [1, C_test] B) b, whatever b is; for a score already orthogonal to [1, C] in training it changes
-    nothing. One rule for every method (review-mathbugs C2)."""
+    nothing. One rule for every method (review-mathbugs C2).
+
+    With raw a dict, the method's unadjusted scores are also returned in it (train, test, and both with the SV columns
+    held at their training means), so a fit can be re-scored under any other truth definition without refitting."""
     design_train = np.column_stack([np.ones(train.genotypes.shape[0]), train.covariates])
     design_test = np.column_stack([np.ones(test_genotypes.shape[0]), test_covariates])
 
-    def adjusted(train_genotypes, genotypes):
-        coefficients, *_ = np.linalg.lstsq(design_train, _call_predict(predictor, train_genotypes, train.covariates), rcond=None)
-        return _call_predict(predictor, genotypes, test_covariates) - design_test @ coefficients
+    def adjusted(train_genotypes, genotypes, label):
+        train_score, test_score = _call_predict(predictor, train_genotypes, train.covariates), _call_predict(predictor, genotypes, test_covariates)
+        if raw is not None:
+            raw[label] = (train_score, test_score)
+        coefficients, *_ = np.linalg.lstsq(design_train, train_score, rcond=None)
+        return test_score - design_test @ coefficients
 
-    prediction = adjusted(train.genotypes, test_genotypes)
+    prediction = adjusted(train.genotypes, test_genotypes, "full")
     if not train.variants.is_sv.any():
+        if raw is not None:
+            raw["without_sv"] = raw["full"]
         return prediction, prediction
-    return prediction, adjusted(_without_structural_variants(train, train.genotypes), _without_structural_variants(train, test_genotypes))
+    return prediction, adjusted(_without_structural_variants(train, train.genotypes), _without_structural_variants(train, test_genotypes), "without_sv")
+
+
+def _train_index(dataset, split_name):
+    return np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["train"]])
 
 
 def _run_gene(arguments):
@@ -513,7 +525,8 @@ def _run_gene(arguments):
             started = time.process_time()
             try:
                 predictor = fit(train)
-                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
+                raw = {}
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
                 coefficients, status = sv_coefficients(train, predictor, window.gene_id, split_name, feature_set), "ok"
             except Exception as error:
                 # A failed fit is never replaced by a stand-in predictor. By default it stops the run; with
@@ -521,10 +534,11 @@ def _run_gene(arguments):
                 if not _WORKER["record_failures"]:
                     raise
                 prediction = without_sv = np.full(len(test_index), np.nan)
+                raw = None
                 coefficients, status = None, f"failed: {type(error).__name__}: {str(error)[:300]}"
             seconds = time.process_time() - started
             results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                            int(train.variants.is_sv.sum()), seconds, coefficients, status))
+                            int(train.variants.is_sv.sum()), seconds, coefficients, status, raw, _train_index(dataset, split_name)))
     return results
 
 
@@ -616,9 +630,10 @@ def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
         seen.add(key)
         seconds = (time.process_time() - started) / len(views)
         train, test_genotypes, test_phenotype, test_index = views._task(key)
-        prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
+        raw = {}
+        prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
         yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok")
+               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok", raw, _train_index(dataset, key[1]))
     if len(seen) != len(views):
         raise ValueError(f"fit_views returned {len(seen)} of {len(views)} requested views")
 
@@ -634,9 +649,11 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 raise ValueError(f"fit_batch returned {len(predictors)} predictors for {len(gene_rows)} genes")
             for index, (gene_row, predictor) in enumerate(zip(gene_rows, predictors)):
                 train, test_genotypes, test_phenotype, test_index = trains._task(index)
-                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
+                raw = {}
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set), "ok")
+                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set), "ok", raw,
+                       _train_index(dataset, split_name))
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
@@ -661,6 +678,11 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
+    # The raw (unadjusted) scores of every sample, per split: genes x splits x samples, so a fit can be re-scored under
+    # another truth definition without refitting. NaN where a sample was not scored in that split (or the fit failed).
+    raw_scores = {(feature_set, kind): np.full((len(gene_rows), len(split_names), sample_count), np.nan, dtype=np.float32)
+                  for feature_set in feature_sets for kind in ("full", "without_sv")}
+    split_position = {name: position for position, name in enumerate(split_names)}
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
     log = []
     position_of_row = {row: position for position, row in enumerate(gene_rows)}
@@ -672,12 +694,17 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset,
                                                             record_failures) for result in chunk)
     coefficient_tables = []
-    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status in results:
+    for (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status,
+         raw, train_index) in results:
         if coefficients is not None:
             coefficient_tables.append(coefficients)
         position = position_of_row[gene_row]
         predictions[feature_set][position, test_index] = prediction
         predictions_without_sv[feature_set][position, test_index] = without_sv
+        if raw is not None:
+            for kind, (train_score, test_score) in raw.items():
+                raw_scores[(feature_set, kind)][position, split_position[split_name], train_index] = train_score
+                raw_scores[(feature_set, kind)][position, split_position[split_name], test_index] = test_score
         truth[position, test_index] = test_phenotype
         log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds, status,
                     bool(np.isfinite(prediction).all() and np.ptp(prediction) == 0)))
@@ -707,6 +734,9 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
+        np.save(out / f"{tag}.{feature_set}.raw_scores.npy", raw_scores[(feature_set, "full")])
+        np.save(out / f"{tag}.{feature_set}.raw_scores_without_sv.npy", raw_scores[(feature_set, "without_sv")])
+    (out / f"{tag}.raw_splits.json").write_text(json.dumps(split_names))
     np.save(out / f"{tag}.truth.npy", truth)
     if coefficient_tables:
         pd.concat(coefficient_tables, ignore_index=True).to_csv(out / f"{tag}.sv_coefficients.tsv.gz", sep="\t", index=False)

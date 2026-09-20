@@ -23,6 +23,10 @@ def merge(directory: pathlib.Path, base: str):
             raise ValueError(f"{part} scores different genes")
     arrays = sorted({path.name.removeprefix(f"{parts[0]}.") for path in directory.glob(f"{parts[0]}.*.npy")})
     for name in arrays:
+        if ".raw_scores" in f".{name}":
+            # genes x splits x samples: each part holds its own splits, so the parts stack along the split axis.
+            np.save(directory / f"{base}.merged.{name}", np.concatenate([np.load(directory / f"{part}.{name}") for part in parts], axis=1))
+            continue
         merged = None
         for part in parts:
             values = np.load(directory / f"{part}.{name}")
@@ -35,6 +39,8 @@ def merge(directory: pathlib.Path, base: str):
             merged = np.where(np.isnan(merged), values, merged)
         np.save(directory / f"{base}.merged.{name}", merged)
     genes.to_csv(directory / f"{base}.merged.genes.tsv", sep="\t", index=False)
+    if all((directory / f"{part}.raw_splits.json").exists() for part in parts):
+        (directory / f"{base}.merged.raw_splits.json").write_text(json.dumps(sum((json.loads((directory / f"{part}.raw_splits.json").read_text()) for part in parts), [])))
     pd.concat([pd.read_csv(directory / f"{part}.log.tsv", sep="\t") for part in parts]).to_csv(directory / f"{base}.merged.log.tsv", sep="\t", index=False)
     records = [json.loads((directory / f"{part}.run.json").read_text()) for part in parts]
     (directory / f"{base}.merged.run.json").write_text(json.dumps({"merged_from": parts, "parts": records}, indent=1))
