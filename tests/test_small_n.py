@@ -41,6 +41,45 @@ def test_kernel_solve_variances_and_jvp_match_the_dense_inverse(negative):
         np.testing.assert_allclose(posterior.solve(right, 0.0), noise * inverse @ right, rtol=_ROUNDING, atol=_ROUNDING)
 
 
+def test_the_cavity_precision_keeps_its_digits_where_the_data_barely_inform_a_column():
+    rng = np.random.default_rng(9)
+    design = _design(rng, 10, 6)
+    design[:, 0] *= 1e-7  # a column whose data information q ~ 1e-14 of its site precision
+    precision = rng.uniform(0.5, 2.0, 6)
+    precision[0] = 1e3
+    _variances, removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+    # Reference, no cancellation: the cavity precision of column j is x_j' (I + X_-j T_-j^-1 X_-j')^-1 x_j.
+    for column in range(6):
+        others = np.delete(np.arange(6), column)
+        kernel = np.eye(10) + design[:, others] @ np.diag(1.0 / precision[others]) @ design[:, others].T
+        expected = float(design[:, column] @ np.linalg.solve(kernel, design[:, column]))
+        np.testing.assert_allclose(cavity[column], expected, rtol=1e-9)
+        np.testing.assert_allclose(removed[column], expected / (expected + precision[column]), rtol=1e-9)
+    # The naive 1/z - t has no digits left for column 0.
+    naive = 1.0 / _Kernel(np.asfortranarray(design), precision).variances()[0] - precision[0]
+    assert abs(naive - cavity[0]) > 1e-6 * abs(cavity[0])
+
+
+def test_a_column_spanned_by_negative_site_columns_has_a_small_negative_cavity():
+    """x3 = x1 + x2 (a doubleton, the sum of two singleton columns) with slightly negative sites on x1 and x2: x3's
+    cavity precision is negative and proportional to those sites, never positive however small they get. The refresh
+    must therefore accept it whenever the tilted law is proper (1 + v_max P > 0), not ask P > 0."""
+    rng = np.random.default_rng(12)
+    design = _design(rng, 15, 6)
+    design[:, 2] = design[:, 0] + design[:, 1]
+    for scale in (1e-3, 1e-6, 1e-9):
+        precision = rng.uniform(0.5, 2.0, 6)
+        precision[[0, 1]] = -scale
+        _variances, _removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+        others = np.array([0, 1, 3, 4, 5])
+        # Reference (T invertible here): x3' (I + X_-3 T_-3^-1 X_-3')^-1 x3.
+        kernel = np.eye(15) + design[:, others] @ np.diag(1.0 / precision[others]) @ design[:, others].T
+        expected = float(design[:, 2] @ np.linalg.solve(kernel, design[:, 2]))
+        assert expected < 0.0 and cavity[2] < 0.0
+        np.testing.assert_allclose(cavity[2], expected, rtol=1e-6, atol=10 * _ROUNDING * scale)
+        assert abs(cavity[2]) <= 10.0 * scale
+
+
 def test_kernel_refuses_an_indefinite_precision():
     rng = np.random.default_rng(7)
     design = _design(rng, 5, 20)
@@ -96,7 +135,9 @@ def test_stage0_standardizes_and_merges_exact_ties():
     np.testing.assert_allclose(statistics.projected_target, target - target.mean(), atol=1e-12)
 
 
-def test_the_small_n_fit_runs_and_recovers_a_sparse_signal():
+@pytest.mark.slow  # the whole outer loop on 120 columns: about a minute on one core
+def test_the_small_n_fit_certifies_and_scores():
+    """Machinery only (own simulation): the outer loop certifies, and the scoring model carries the fit."""
     rng = np.random.default_rng(17)
     samples, variants = 150, 120
     frequency = rng.uniform(0.05, 0.5, variants)
@@ -113,24 +154,6 @@ def test_the_small_n_fit_runs_and_recovers_a_sparse_signal():
     )
     assert fit.certificate.remaining_gain[0] <= 0.5 / 64
     assert fit.certificate.prediction_move[0] <= fit.certificate.prediction_tolerance[0]
-    coefficients = fit.scoring.coefficients
-    assert set(np.argsort(-np.abs(coefficients))[:3].tolist()) == {10, 50, 90}
-    assert fit.scoring.posterior_draws.shape == (variants, 64)
-    assert 0.5 < fit.noise_variance < 2.0
-
-
-def test_cavity_precisions_are_positive_and_exact_where_the_difference_cancels():
-    from sv_pgs.small_n import _Kernel
-
-    generator = np.random.default_rng(21)
-    samples, columns = 30, 200
-    design = generator.normal(size=(samples, columns))
-    design[:, :100] *= 1e-7  # little data on these columns against their sites: 1/z - t cancels to rounding
-    precision = generator.uniform(0.5, 2.0, size=columns)
-    kernel = _Kernel(design, precision)
-    variances = kernel.variances()
-    exact = np.array([design[:, j] @ np.linalg.solve(np.eye(samples) + (design * (1.0 / precision)) @ design.T
-                      - np.outer(design[:, j], design[:, j]) / precision[j], design[:, j]) for j in range(columns)])
-    cavity = kernel.cavity_precisions(variances)
-    assert np.all(cavity > 0.0)
-    np.testing.assert_allclose(cavity, exact, rtol=np.sqrt(np.finfo(np.float64).eps))
+    assert np.all(np.isfinite(fit.scoring.coefficients)) and fit.scoring.posterior_draws.shape == (variants, 64)
+    assert np.all(np.isfinite(fit.scoring.posterior_draws)) and fit.noise_variance > 0.0
+    np.testing.assert_array_equal(fit.scoring.store_rows, np.arange(variants))

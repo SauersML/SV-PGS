@@ -50,6 +50,7 @@ from sv_pgs.scale_mixture_ep import (
     derived_lattice,
     fit_hyperparameters,
     initial_hyperparameters,
+    log_scale,
     moment_matched_prior_sites,
     noise_gain,
     noise_variance,
@@ -62,6 +63,8 @@ from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
+# ``fit_hyperparameters`` holds each model's current fixed point and the trial's: two posteriors are alive at once.
+_LIVE_FIXED_POINTS = 2
 
 
 # ------------------------------------------------------------------ the genotype side (Stage 0, dense)
@@ -246,20 +249,19 @@ class _Kernel:
         delta, phi, psi = self.factors()
         return delta - np.einsum("ij,ij->j", phi, phi) + np.einsum("ij,ij->j", psi, psi)
 
-    def cavity_precisions(self, variances: F64Array) -> F64Array:
-        """1/z - t for the scaled variances z = diag A'^-1, without forming it as that difference.
-
-        On the bulk z = 1/t - a + b (a = |phi_j|^2 = |U^-T x_j|^2 / t^2, b = |psi_j|^2), so 1 - t z = t (a - b) and
-        1/z - t = t (a - b) / z exactly. The difference 1/z - t cancels to rounding where the data's information on a
-        column is small against its site precision (a rare column under a narrow start); this form keeps it to
-        relative rounding, and it is positive whenever the sites are (b = 0 and a > 0). Where t <= 0 both terms of
-        1/z - t are non-negative, so it has no cancellation there."""
-        _delta, phi, psi = self.factors()
-        cavity = 1.0 / variances - self.precision
-        bulk = self.bulk
-        gap = np.einsum("ij,ij->j", phi[:, bulk], phi[:, bulk]) - np.einsum("ij,ij->j", psi[:, bulk], psi[:, bulk])
-        cavity[bulk] = self.precision[bulk] * gap / variances[bulk]
-        return cavity
+    def cavity(self) -> tuple[F64Array, F64Array, F64Array]:
+        """(z', 1 - t z', 1/z' - t): the variances of A'^-1, each site's share of its variance the data remove, and its
+        cavity precision, without cancellation. For a bulk column z' = d - d^2 q + f (d = 1/t, q = ||U^-T x_j||^2,
+        f = ||Psi_j||^2), so 1 - t z' = d q - t f exactly; forming 1/z' - t from z' instead loses every digit where the
+        data inform a column far less than its site does (d q below eps), which is most rare variants at the start."""
+        delta, phi, psi = self.factors()
+        extra = np.einsum("ij,ij->j", psi, psi)
+        variances = delta - np.einsum("ij,ij->j", phi, phi) + extra
+        removed = np.empty(self.variant_count)
+        whitened = self.whitened()
+        removed[self.bulk] = self.inverse * np.einsum("ij,ij->j", whitened, whitened) - self.precision[self.bulk] * extra[self.bulk]
+        removed[self.rest] = 1.0 - self.precision[self.rest] * variances[self.rest]
+        return variances, removed, removed / variances
 
     def draws(self, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x draws) exact draws of N(0, A'^-1): beta_N from its marginal N(0, S^-1), then beta_P | beta_N with
@@ -409,15 +411,13 @@ class _DenseFixedPoints:
         self.profile["passes"] += 1
         self.profile["factor_seconds"] += time.perf_counter() - started
 
-    def _variances(self) -> F64Array:
+    def _cavity(self) -> tuple[F64Array, F64Array, F64Array]:
+        """(z, 1 - tau z, P = 1/z - tau) at the current sites, from the kernel without cancellation (z = sigma^2 z',
+        tau = t / sigma^2, so 1 - tau z = 1 - t z' and P = (1/z' - t) / sigma^2)."""
         started = time.perf_counter()
-        variances = self.noise * self.kernel.variances()
+        variances, removed, precision = self.kernel.cavity()
         self.profile["variance_seconds"] += time.perf_counter() - started
-        return variances
-
-    def _cavity_precisions(self, variances: F64Array) -> F64Array:
-        """1/z - tau in the model's units: the kernel's scaled form, divided by sigma^2 (A = A' / sigma^2)."""
-        return self.kernel.cavity_precisions(variances / self.noise) / self.noise
+        return self.noise * variances, removed, precision / self.noise
 
     def _residual_sum_of_squares(self) -> float:
         residual = self.statistics.projected_target - self.design @ self.mean
@@ -429,22 +429,38 @@ class _DenseFixedPoints:
             site_precision=self.site_precision, posterior_variance=variances, noise=self.noise,
         )
 
-    def _refresh(self) -> F64Array:
-        """The mean and the exact marginal variances at the current sites; negative sites halve while the precision is
-        not positive definite or a cavity is not proper (``full_data_fit``'s refresh)."""
+    def _largest_variances(self, hyperparameters: MixtureHyperparameters) -> F64Array:
+        """Each variant's largest prior variance on the lattice, u_j exp(t_K): its tilted law is proper exactly when
+        1 + v P > 0 at every node (``scale_mixture_ep._kernel_terms``'s own test), i.e. when its cavity precision
+        exceeds -1 / this."""
+        return np.exp(log_scale(self.prior, hyperparameters.coefficients) + self.prior.log_variance_grid[-1])
+
+    def _refresh(self, hyperparameters: MixtureHyperparameters) -> tuple[F64Array, F64Array]:
+        """The mean, the exact marginal variances and the cavity precisions at the current sites; negative sites halve
+        while the precision is not positive definite or a cavity's tilted law is not proper (``full_data_fit``'s
+        refresh).
+
+        A cavity is proper when its tilted law is, 1 + v P > 0 at every lattice node, which admits a negative cavity
+        precision down to -1 / v_max. ``full_data_fit`` asks P > 0 instead, which EP cannot reach where a column is
+        an exact linear combination of columns whose sites are negative (a doubleton is the sum of two singletons):
+        its cavity is then proportional to those sites, negative for every negative value, and exactly 0 only when
+        they underflow, so halving runs until they do (bench-real chr22 gene 1 [real]: 7 negative sites halved past
+        1e-250 over 870 refactorizations while one column's cavity stayed at -9e-16, its rounding of 0)."""
+        largest = self._largest_variances(hyperparameters)
         while True:
             try:
                 self._iterate(self.site_precision, self.site_shift)
             except np.linalg.LinAlgError:
                 failure = "the precision is not positive definite with non-negative sites"
             else:
-                variances = self._variances()
-                if not np.any(self._cavity_precisions(variances) <= 0.0):
+                variances, removed, cavity_precision = self._cavity()
+                if np.all(1.0 + largest * cavity_precision > 0.0):
                     self.profile["refreshes"] += 1
                     count = self.prior.variant_count
-                    self.effective = max(count - float(np.sum(self.site_precision * variances)), _EPSILON * count)
-                    return variances
-                failure = "a cavity is improper (1/z - tau <= 0) with non-negative sites"
+                    # p_eff = sum_j (1 - tau_j z_j), each term without cancellation, floored at its rounding p eps.
+                    self.effective = max(float(np.sum(removed)), _EPSILON * count)
+                    return variances, cavity_precision
+                failure = "a cavity's tilted law is improper (1 + v P <= 0 on the lattice) with non-negative sites"
             negative = self.site_precision < 0.0
             if not np.any(negative):
                 raise NoFixedPoint(failure)
@@ -491,8 +507,7 @@ class _DenseFixedPoints:
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
         while True:
-            variances = self._refresh()
-            frozen = self._cavity_precisions(variances)
+            variances, frozen = self._refresh(hyperparameters)
             mean = self.mean.copy()
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)
@@ -504,7 +519,9 @@ class _DenseFixedPoints:
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
             draw_tolerance = self.effective / self.draw_count
             if self.mean_move <= draw_tolerance and self.noise_gain <= tolerance:
-                posterior = _DensePosterior(self.kernel, self.noise, self.working_bytes // 4, self.profile)
+                # Sigma o Sigma gets the half of the working memory the curvature's GMRES does not (``fit_small_n``), shared
+                # by the fixed points alive at once: the outer loop holds the current one and one trial.
+                posterior = _DensePosterior(self.kernel, self.noise, self.working_bytes // 2 // _LIVE_FIXED_POINTS, self.profile)
                 return FixedPoint(
                     cavity=cavity, posterior=posterior.gaussian_posterior(), mean=mean, precision_norm=self._precision_norm(),
                     effective_effects=float(self.effective),
@@ -604,7 +621,7 @@ def fit_small_n(
     oracle = _DenseFixedPoints(statistics, prior, draw_count, working_bytes)
     tolerance = 0.5 / draw_count
     try:
-        (outer,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], oracle, working_bytes, tolerance)
+        (outer,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; EP refusals: {oracle.refusals}") from error
     # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
