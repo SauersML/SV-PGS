@@ -2160,6 +2160,12 @@ def _maximize_evidence(
     coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
     first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
+        # The warm weights (a fit on another lattice, or at a fold of their basin) can have no certified maximum:
+        # the search then starts from the canonical start's weights, every edge released.
+        infinite = frozenset()
+        weights = np.clip(initial_hyperparameters(prior).log_smoothing, lower, upper)
+        first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
+    if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
     best_corrected = -np.inf
@@ -2387,9 +2393,13 @@ def hyper_step(
             step_length = 1.0
             while step_length * float(np.max(np.abs(direction), initial=0.0)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
                 trial_weights = np.clip(weights + step_length * direction, lower, upper)
-                trial = _certified_evidence(
-                    final_view, trial_weights, evidence.coefficients + evidence.responses @ (trial_weights - weights), cavity, correction,
-                    working_bytes, tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
+                # The first-order predictor can carry x into a worse inner basin than the base's own: the trial is the
+                # best certified maximum over the predictor, the base's x and the flat start.
+                trial = _best_certified(
+                    final_view, trial_weights,
+                    [evidence.coefficients + evidence.responses @ (trial_weights - weights), evidence.coefficients,
+                     final_allowed.T @ initial_hyperparameters(prior).coefficients],
+                    cavity, correction, working_bytes, tolerance,
                 )
                 if trial is not None and trial.value > evidence.value:
                     moved = (trial_weights, trial)
