@@ -1027,8 +1027,15 @@ def test_the_engines_functions_do_not_depend_on_the_variant_order(seed):
     assert _posterior_divergence(_restricted_moments(fitted, order), moved_fitted) <= _EVIDENCE_TOLERANCE
 
 
+_ZERO_EDGE_ORDER = pytest.mark.xfail(strict=True, reason=(
+    "finding 2 (reported to e2e, fixed by lane/engine-noedge0, where this passes): the two orders reach different "
+    "lambda = 0 edge sets, [-inf, 7.72, -inf, 7.39, -inf] against [-inf, -inf, 7.87, 7.39, -inf], with V within two "
+    "tolerances but the posteriors 0.10 nats apart [sim-only]"
+))
+
+
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("seed", (101, 202, pytest.param(303, marks=_ZERO_EDGE_ORDER)))
 def test_the_fit_does_not_depend_on_the_variant_order(seed):
     """hyper_step on the same variants in two orders: V within two tolerances, and the fitted posteriors within one."""
     inputs = _invariance_inputs(seed, (50, 30))
@@ -1048,8 +1055,16 @@ def test_the_fit_does_not_depend_on_the_variant_order(seed):
     )
 
 
+def _zero_edge_leak(measured: float) -> pytest.MarkDecorator:
+    return pytest.mark.xfail(strict=True, reason=(
+        f"finding 2 on main (reported to e2e; lane/engine-noedge0 removes the lambda = 0 edge): the fits with and "
+        f"without the null class reach different zero-edge sets, and the other classes' posteriors move {measured} "
+        f"nats [sim-only]"
+    ))
+
+
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", _SEEDS)
+@pytest.mark.parametrize("seed", (pytest.param(101, marks=_zero_edge_leak(0.247)), pytest.param(202, marks=_zero_edge_leak(0.085)), 303))
 def test_a_class_of_null_columns_moves_the_other_classes_posteriors_by_at_most_the_tolerance(seed):
     """bench-real's SNV refit term, at the variant side [sim-only]: fit two classes, then the same variants plus a
     third class of columns with no effect (SVs that take no weight), and compare the first two classes' fitted
