@@ -7,15 +7,14 @@ FALSE_FAILURE_PROBABILITY, so a correct implementation fails with at most that p
 from __future__ import annotations
 
 import gzip
+import json
 import subprocess
 import sys
 
 import numpy as np
 from scipy.stats import norm
 
-import json
-
-from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, records, truth
+from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, records, truth, truth_out
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -345,3 +344,97 @@ def test_harness_imports_without_cyvcf2() -> None:
               "builtins.__import__ = guard\n"
               "import benchmarks.bench_sim.harness, benchmarks.bench_sim.compare\n")
     subprocess.run([sys.executable, "-c", script], check=True)
+
+
+def out_of_family_cohort(tmp_path):
+    """A tiny chromosome: 400 records (SNV, INDEL, TR, SV) over 3 cM, 600 samples, one gene with two exons, one CpG island."""
+    rng = np.random.default_rng(15)
+    n_var, size = 400, 600
+    pos = np.sort(rng.choice(np.arange(1_000, 3_000_000), size=n_var, replace=False))
+    cls = rng.choice(4, size=n_var, p=[0.6, 0.15, 0.15, 0.1]).astype(np.int8)
+    svtype = np.where(cls == 3, rng.choice(["DEL", "DUP", "INS"], size=n_var), "")
+    end = np.where(cls == 3, pos + rng.integers(100, 50_000, size=n_var), pos)
+    # Two SVs in the gene's exons: a deletion across part of the first exon, an insertion inside the second.
+    for target, kind, span in ((520_000, "DEL", 40_000), (850_000, "INS", 0)):
+        row = int(np.argmin(np.abs(pos - target)))
+        pos[row], cls[row], svtype[row], end[row] = target, 3, kind, target + span
+    np.savez(tmp_path / "variants.npz", pos=pos, end=end, ref_len=np.ones(n_var, dtype=np.int64), cls=cls, cm=np.linspace(0.0, 3.0, n_var),
+             svtype=svtype, len_change=np.where(cls == 3, -(end - pos), 0))
+    frequency = rng.uniform(0.01, 0.5, size=n_var)
+    genotype = rng.binomial(2, frequency[:, None], size=(n_var, size)).astype(np.uint8)
+    np.save(tmp_path / "truth_G.npy", genotype)
+    np.savez(tmp_path / "annotations.npz", ld_subsample_af=genotype.mean(axis=1) / 2.0)
+    np.save(tmp_path / "measured.npy", rng.random(n_var) < 0.8)
+    np.savez(tmp_path / "samples.npz", age=rng.uniform(18, 80, size), sex=rng.integers(0, 2, size), batch=rng.integers(0, 2, size),
+             realized_proportions=rng.dirichlet(np.ones(5), size=size))
+    with gzip.open(tmp_path / "refseq.txt.gz", "wt") as handle:
+        handle.write("0\tNM_1\tchr22\t+\t500000\t900000\t500000\t900000\t2\t500000,800000,\t600000,900000,\t0\tGENE1\n")
+    with gzip.open(tmp_path / "cpg.txt.gz", "wt") as handle:
+        handle.write("0\tchr22\t1000000\t1200000\tCpG: 1\n")
+    return genotype, cls
+
+
+def test_out_of_family_copy_change_rule() -> None:
+    gene = {"start": 100, "end": 400, "exons": [[100, 200], [300, 400]], "exonic_bases": 200}
+    assert truth_out.copy_change("DEL", 150, 250, gene) == -0.25
+    assert truth_out.copy_change("DUP", 50, 450, gene) == 1.0
+    assert truth_out.copy_change("DUP", 150, 250, gene) == -0.25
+    assert truth_out.copy_change("INS", 310, 312, gene) == -1.0
+    assert truth_out.copy_change("INS", 220, 222, gene) == 0.0
+
+
+def test_pareto_magnitudes_have_a_floor_and_the_drawn_tail() -> None:
+    rng = np.random.default_rng(16)
+    count, tail = 400_000, 1.8
+    magnitude = truth_out.pareto_magnitudes(rng, count, tail)
+    assert magnitude.min() >= 1.0
+    # P(|beta| > 2) = 2^-tail; binomial standard error.
+    probability = 2.0 ** -tail
+    assert abs((magnitude > 2.0).mean() - probability) <= Z_BOUND * np.sqrt(probability * (1 - probability) / count)
+
+
+def test_out_of_family_truths(tmp_path) -> None:
+    genotype, cls = out_of_family_cohort(tmp_path)
+    variants = np.load(tmp_path / "variants.npz")
+    for seed, family in enumerate(truth_out.FAMILIES):
+        out = tmp_path / f"scenario_{family}"
+        truth_out.build(seed, family, tmp_path, out, tmp_path / "refseq.txt.gz", tmp_path / "cpg.txt.gz", "chr22")
+        record = json.loads((out / "scenario.json").read_text())
+        stored = np.load(out / "truth.npz")
+        assert record["params"]["family"] == family and "shape" not in record["params"]
+        value = stored["genetic_value"]
+        # The genetic value is scaled to the drawn h2 exactly (population variance), up to rounding.
+        assert abs(value.var() - record["params"]["h2"]) <= 1e3 * EPSILON
+        rows, effects = stored["causal"], stored["per_allele"]
+        centred = genotype[rows].astype(np.float64) - genotype[rows].mean(axis=1, keepdims=True)
+        additive = effects @ centred
+        if family != "epistasis":
+            assert np.max(np.abs(additive - value)) <= 1e3 * EPSILON * np.max(np.abs(value))
+        if family == "fixed_count":
+            assert rows.size == record["params"]["causal_count"]
+            per_sd = np.abs(effects) * genotype[rows].std(axis=1)
+            assert np.allclose(per_sd, per_sd[0], rtol=1e3 * EPSILON)
+        if family == "hidden_annotation":
+            span_start, span_end = truth_out.record_spans(variants)
+            inside = (span_end[rows] > 1_000_000 - truth_out.SHORE_BASES) & (span_start[rows] < 1_200_000 + truth_out.SHORE_BASES)
+            assert inside.all()
+        if family == "clustered_loci":
+            locus = np.floor(variants["cm"][rows] / record["params"]["locus_cm"]).astype(int)
+            for locus_id in np.unique(locus):
+                assert np.unique(effects[locus == locus_id]).size == 1
+        if family == "sv_gene_dosage":
+            changes = truth_out.sv_gene_changes(variants, truth_out.gene_models(tmp_path / "refseq.txt.gz", "chr22"))
+            sv_rows = np.array(sorted(row for row, _ in changes))
+            ratio = effects[np.searchsorted(rows, sv_rows)] / np.array([changes[row, 0] for row in sv_rows])
+            assert np.allclose(ratio, ratio[0], rtol=1e3 * EPSILON)  # one gene: every SV effect is its copy change x one gene effect
+        if family == "panel_absent":
+            measured = np.load(tmp_path / "measured.npy")
+            assert (~measured[rows]).sum() >= 1
+        again = tmp_path / f"again_{family}"
+        truth_out.build(seed, family, tmp_path, again, tmp_path / "refseq.txt.gz", tmp_path / "cpg.txt.gz", "chr22")
+        assert np.array_equal(np.load(again / "truth.npz")["phenotype"], stored["phenotype"])
+
+
+def test_out_of_family_sealed_seeds_are_disjoint_from_the_in_family_ones() -> None:
+    master = "ef" * 32
+    assert not set(truth_out.sealed_out_seeds(master, 64)) & set(truth.sealed_seeds(master, 64))
