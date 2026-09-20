@@ -119,3 +119,42 @@ def test_a_gene_at_its_frozen_fixed_point_takes_no_step_while_the_others_move():
     target_precision[rows[1]] *= 1.5  # gene 0's targets are its own sites: its update is exactly zero
     oracle._frozen_passes(start, frozen, target_precision, target_shift)  # refused before the fix
     assert np.all(np.isfinite(oracle.site_precision)) and np.all(np.isfinite(oracle.mean))
+
+
+@pytest.mark.slow
+def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
+    from sv_pgs.pooled_fit import _PooledPosterior, _total_curvature, pooled_curvature_blocks
+    from sv_pgs.scale_mixture_ep import Cavity
+
+    rng = np.random.default_rng(9)
+    genes = [_gene(rng, 100, width, _sparse_effects(rng, width, count)) for width, count in ((50, 2), (40, 1))]
+    fit = fit_pooled_small_n(genes, draw_count=64, working_bytes=2 * 10**9, seed=2)
+    curvature = pooled_curvature_blocks(fit, 2 * 10**9)
+    oracle = fit.oracle
+    (point,) = oracle([fit.hyperparameters])
+    joint = _PooledPosterior(oracle.kernels, oracle.noise, oracle.rows, 10**9, _new_profile()).gaussian_posterior()
+    relative = max(0.5 / 64 / fit.hyperparameters.coefficients.shape[0], np.finfo(np.float64).eps)
+    pooled = _total_curvature(fit.prior, fit.hyperparameters.coefficients, point.cavity, joint, 10**9, relative)
+    scale = np.max(np.abs(pooled))
+    np.testing.assert_allclose(curvature.blocks.sum(axis=0), pooled, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
+    assert curvature.blocks.shape == (2,) + pooled.shape
+
+
+def test_a_genes_double_loop_is_small_ns_on_its_rows():
+    """The pooled fallback (MODEL.md section 4) runs small_n's double loop on the gene's own rows of the pooled prior:
+    for one gene it is small_n's exactly."""
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+    from sv_pgs.small_n import _DenseFixedPoints
+
+    rng = np.random.default_rng(10)
+    gene = _gene(rng, 60, 40, _sparse_effects(rng, 40, 2))
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target)]
+    prior = pooled_prior(statistics, [gene.variant_class], [np.zeros(40)], np.ones(1), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    pooled = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    single = _DenseFixedPoints(statistics[0], prior, start, float(noise[0]), 64, 10**9)
+    pooled._double_loop(0, start)
+    single._double_loop(start)
+    np.testing.assert_array_equal(pooled.site_precision, single.site_precision)
+    np.testing.assert_array_equal(pooled.site_shift, single.site_shift)
+    np.testing.assert_array_equal(pooled.mean, single.mean)
