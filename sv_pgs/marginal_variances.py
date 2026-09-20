@@ -220,20 +220,12 @@ def window_bulk_quadratic(gram: NDArray[np.float64], bulk_variance: NDArray[np.f
 
 
 def _window(grams: BlockGrams, block: int) -> tuple[NDArray[np.float64], NDArray[np.int64], slice]:
-    """The window's Gram, its variant indices, and the own block's rows in it.
+    """The window's Gram as Stage 0 stores it, its variant indices, and the own block's rows in it.
 
-    Stage 0 supplies each block's Gram and the Gram with its successor, not the (b-1, b+1) corner. Left at zero, the
-    corner makes a three-block window indefinite whenever LD reaches past a thin block (e2e-scale, v7 chr22 at cap
-    1024: 22 of 24 interior windows, lambda_min down to -8% of lambda_max, every within block and two-block window
-    positive definite). The corner is completed as R_{b-1,b} R_bb^-1 R_{b,b+1}, the maximum-determinant positive
-    completion of the tridiagonal pattern (Grone, Johnson, Sa and Wolkowicz 1984): b-1 and b+1 conditionally
-    uncorrelated given b. The Schur complement with respect to R_bb is then block-diagonal, the two-block Schur
-    complements, so the window is positive semidefinite whenever its two two-block windows are.
+    Stage 0 supplies each block's Gram and the Gram with its successor, not the (b-1, b+1) corner, which is left at
+    zero here: ``_whitened_window`` completes it in the model's metric, where its rounding allowance is defined.
     """
-    if grams.next_cross:
-        members = [neighbour for neighbour in (block - 1, block, block + 1) if 0 <= neighbour < len(grams.blocks)]
-    else:
-        members = [block]
+    members = _window_blocks(grams, block)
     sizes = [grams.blocks[member].shape[0] for member in members]
     starts = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
     gram = np.zeros((int(starts[-1]), int(starts[-1])))
@@ -245,19 +237,84 @@ def _window(grams: BlockGrams, block: int) -> tuple[NDArray[np.float64], NDArray
             cross = grams.cross_block(member)
             gram[span, following] = cross
             gram[following, span] = cross.T
-    if len(members) == len((block - 1, block, block + 1)):
-        first, middle, last = (slice(int(starts[position]), int(starts[position + 1])) for position in range(len(members)))
-        centre = gram[middle, middle]
-        # R_bb^-1 R_{b,b+1} by a least-squares solve: exact for a positive-definite R_bb, and the minimum-norm
-        # completion when a tie-free but rank-deficient block (n < |b|) makes R_bb singular.
-        solved, *_rest = np.linalg.lstsq(centre, gram[middle, last], rcond=None)
-        corner = gram[first, middle] @ solved
-        gram[first, last] = corner
-        gram[last, first] = corner.T
     columns = np.concatenate([grams.blocks[member] for member in members])
     own_position = members.index(block)
     own = slice(int(starts[own_position]), int(starts[own_position + 1]))
     return gram, columns, own
+
+
+def _storage_allowance(whitened: Any, array_module: Any) -> float:
+    """How far below zero a stored Gram's whitened spectrum may fall by rounding alone: u32 |B|_F.
+
+    Stored in float32 (LdGramStore), each entry is rounded once, |E_ij| <= u32 |B_ij|, so by Weyl's inequality every
+    eigenvalue moves by at most |E|_2 <= |E|_F <= u32 |B|_F.
+    """
+    return np.finfo(np.float32).eps / 2 * float(_to_host(array_module.linalg.norm(whitened)))
+
+
+def _whitened_window(
+    gram: NDArray[np.float64], window_variance: NDArray[np.float64], own: slice, block: int, array_module: Any
+) -> tuple[Any, Any, Any]:
+    """The window's R and B = D^1/2 R D^1/2 on ``array_module``, with the (b-1, b+1) corner completed, and D^1/2.
+
+    The corner is the maximum-determinant positive completion of the tridiagonal pattern (Grone, Johnson, Sa and
+    Wolkowicz 1984), b-1 and b+1 conditionally uncorrelated given b, taken of B + eps I with eps the two stored
+    two-block windows' rounding allowance: B_{b-1,b+1} = B_{b-1,b} (B_bb + eps I)^-1 B_{b,b+1}. Each stored two-block
+    window T is within eps of a Gram matrix, so T + eps I is positive semidefinite; the Schur complement of the
+    completed B + eps I with respect to B_bb + eps I is then block-diagonal (the two T + eps I's Schur complements),
+    and B >= -eps I, inside the guard's allowance. Without eps (e2e-scale, full chr22, blocks up to 4,009: a window at
+    lambda_min -2.6e-4 against an allowance of 2.8e-5) R_bb^-1 amplifies the float32 rounding of R_{b,b+1} along R_bb's
+    smallest eigenvalues, which are rounding themselves when LD is near-collinear or n < |b|. The completed corner
+    is written into R as D_{b-1}^-1/2 B_{b-1,b+1} D_{b+1}^-1/2 = R_{b-1,b} D_b^1/2 (B_bb + eps I)^-1 D_b^1/2 R_{b,b+1},
+    which needs no inverse of D (zero on resolved sites).
+    """
+    xp = array_module
+    device_gram = xp.asarray(gram)
+    root = xp.sqrt(xp.asarray(window_variance))
+    whitened = root[:, None] * device_gram * root[None, :]
+    if own.start > 0 and own.stop < whitened.shape[0]:
+        first, last = slice(0, own.start), slice(own.stop, whitened.shape[0])
+        allowance = max(_storage_allowance(whitened[: own.stop, : own.stop], xp), _storage_allowance(whitened[own.start :, own.start :], xp))
+        centre = whitened[own, own].copy()
+        centre[xp.arange(centre.shape[0]), xp.arange(centre.shape[0])] += allowance
+        lower = _positive_cholesky(centre, xp)
+        if lower is None:
+            raise ValueError(f"block {block}: its Gram is not positive semidefinite within rounding: {_inconsistency(whitened, own, xp)}")
+        del centre
+        solved = _cholesky_solve(xp, lower, root[own, None] * device_gram[own, last])  # (B_bb + eps I)^-1 D_b^1/2 R_{b,b+1}
+        del lower
+        corner = device_gram[first, own] @ (root[own, None] * solved)
+        device_gram[first, last] = corner
+        device_gram[last, first] = corner.T
+        whitened[first, last] = root[first, None] * corner * root[None, last]
+        whitened[last, first] = whitened[first, last].T
+    return device_gram, whitened, root
+
+
+def _positive_cholesky(matrix: Any, array_module: Any) -> Any:
+    """The lower Cholesky factor of ``matrix``, or None when it is not numerically positive definite (numpy raises;
+    a device factorization leaves a non-positive pivot on the diagonal)."""
+    try:
+        lower = array_module.linalg.cholesky(matrix)
+    except np.linalg.LinAlgError:
+        return None
+    return lower if bool(_to_host(array_module.all(array_module.diagonal(lower) > 0.0))) else None
+
+
+def _inconsistency(whitened: Any, own: slice, array_module: Any) -> str:
+    """The stored pieces' smallest whitened eigenvalues against their rounding allowances, for a refusal message:
+    a stored piece below its allowance is inconsistent in Stage 0's store; otherwise the completion is at fault."""
+    pieces = {"own block": (own.start, own.stop)}
+    if own.start > 0:
+        pieces["with the previous block"] = (0, own.stop)
+    if own.stop < whitened.shape[0]:
+        pieces["with the next block"] = (own.start, whitened.shape[0])
+    reports = []
+    for name, (start, stop) in pieces.items():
+        piece = whitened[start:stop, start:stop]
+        smallest = float(_to_host(array_module.linalg.eigvalsh(piece))[0])
+        reports.append(f"{name} {smallest:.3e} (allows {-_storage_allowance(piece, array_module):.3e})")
+    return "; ".join(reports)
 
 
 def marginals_from_quadratics(
@@ -336,7 +393,9 @@ class _BlockTerms:
     covariance: NDArray[np.float64]
 
 
-def _window_quadratic(gram: NDArray[np.float64], window_variance: NDArray[np.float64], own: slice, solve: BulkSolve, array_module: Any) -> NDArray[np.float64]:
+def _window_quadratic(
+    gram: NDArray[np.float64], window_variance: NDArray[np.float64], own: slice, block: int, solve: BulkSolve, array_module: Any
+) -> NDArray[np.float64]:
     """The window's bulk quadratic rows (own x window): (omega_F R - omega_F^2 R D^1/2 (I + omega_F B)^-1 D^1/2 R)[own].
 
     B's spectrum is needed only for omega_F, and (I + omega_F B)^-1 only on the own block's columns: eigenvalues
@@ -345,20 +404,19 @@ def _window_quadratic(gram: NDArray[np.float64], window_variance: NDArray[np.flo
     ``array_module`` (numpy, or cupy on a device), in float64; omega_F's scalar root is found on host.
     """
     xp = array_module
-    device_gram = xp.asarray(gram)
-    root = xp.sqrt(xp.asarray(window_variance))
-    whitened = root[:, None] * device_gram * root[None, :]
+    device_gram, whitened, root = _whitened_window(gram, window_variance, own, block, xp)
     raw_eigenvalues = _to_host(xp.linalg.eigvalsh(whitened))
     # A window Gram must be positive semidefinite, and then every quadratic here is >= 0: omega R (I + omega D R)^-1
-    # = omega R^1/2 (I + omega R^1/2 D R^1/2)^-1 R^1/2. Stored in float32 (LdGramStore), each entry is rounded once,
-    # |E_ij| <= u32 |R_ij|, so B's smallest eigenvalue can fall below 0 by at most u32 |B|_F, plus the float64
-    # eigensolver's |W| u64 |B|_F. Anything beyond that means the within- and cross-block Grams are not the Gram of
-    # one design (different rows, units, projection or block order): the map would be wrong, so refuse.
-    rounding = (np.finfo(np.float32).eps / 2 + whitened.shape[0] * np.finfo(np.float64).eps / 2) * float(_to_host(xp.linalg.norm(whitened)))
+    # = omega R^1/2 (I + omega R^1/2 D R^1/2)^-1 R^1/2. The stored pieces' rounding and the completion keep B above
+    # -u32 |B|_F (``_whitened_window``), and the float64 eigensolver adds |W| u64 |B|_F. Anything beyond that means
+    # the within- and cross-block Grams are not the Gram of one design (different rows, units, projection or block
+    # order): the map would be wrong, so refuse.
+    rounding = _storage_allowance(whitened, xp) + whitened.shape[0] * np.finfo(np.float64).eps / 2 * float(_to_host(xp.linalg.norm(whitened)))
     if raw_eigenvalues.shape[0] and float(raw_eigenvalues[0]) < -rounding:
         raise ValueError(
-            f"a window Gram is not positive semidefinite (smallest whitened eigenvalue {float(raw_eigenvalues[0]):.3e}, "
-            f"rounding allows {-rounding:.3e}): the within- and cross-block Grams do not come from one design"
+            f"block {block}: a window Gram is not positive semidefinite (smallest whitened eigenvalue "
+            f"{float(raw_eigenvalues[0]):.3e}, rounding allows {-rounding:.3e}): the within- and cross-block Grams do "
+            f"not come from one design; {_inconsistency(whitened, own, xp)}"
         )
     eigenvalues = np.maximum(raw_eigenvalues, 0.0)
     far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
@@ -415,7 +473,7 @@ def _block_terms(
     gram, columns, own = _window(grams, block)
     members = grams.blocks[block]
     window_variance = bulk_variance[columns]
-    quadratic = _window_quadratic(gram, window_variance, own, solve, array_module)
+    quadratic = _window_quadratic(gram, window_variance, own, block, solve, array_module)
     near = cross.positions[block]
     near_inverse = core_inverse[np.ix_(near, near)]
     window_cross_rows = np.concatenate([_cross_rows(cross, member, near) for member in _window_blocks(grams, block)], axis=0)
