@@ -9,7 +9,11 @@ Metrics, per gene and held-out superpopulation:
             r2 ~ Beta(1/2, (n-2)/2) when either vector is spherically symmetric after centring, so E[r2] = 1/(n-1);
             r2_floor = (r2 - 1/(n-1)) / (1 - 1/(n-1)) is 0 in expectation under the null and 1 at r2 = 1.
   oos_r2    out-of-sample R2 = 1 - sum (y - yhat)^2 / sum (y - ybar)^2 over the held-out group. It also charges the
-            prediction's scale and location, which r2 ignores.
+            prediction's scale and location, which r2 ignores. Under loso the location term is dominated by the held-out
+            group's mean offset (training-fit covariates, including genotype PCs, extrapolated to a new ancestry, and the
+            score's mean shift with allele frequencies), so it is not a genetic-prediction metric there.
+  oos_r2_centred  the same with both vectors centred within the group: it charges scale miscalibration but not the
+            group mean offset. It equals 2 r k - k^2 with k = sd(yhat)/sd(y), so it reaches r2 only at k = r (calibrated).
 A pooled value is the mean over genes of the mean over the five held-out groups; under loso every person is held out once.
 
 Uncertainty is the pigeonhole bootstrap for a crossed genes x people design (Owen 2007, Ann. Appl. Stat. 1:541).
@@ -40,7 +44,7 @@ import pandas as pd
 from scipy import stats
 
 GROUPS = ("AFR", "AMR", "EAS", "EUR", "SAS")
-METRICS = ("r2", "r2_floor", "oos_r2")
+METRICS = ("r2", "r2_floor", "oos_r2", "oos_r2_centred")
 MASKED = "/masked"
 BASELINE_SET = "snv"
 LEVEL = 0.95  # the conventional two-sided interval level; it also sets the conventional q <= 1 - LEVEL count
@@ -115,8 +119,10 @@ def group_metrics(weights: np.ndarray, prediction: np.ndarray, truth: np.ndarray
     r2 = np.divide(covariance ** 2, product, out=np.zeros_like(covariance), where=product > 0)
     squared_error = weights @ ((truth - prediction) ** 2).T / total
     oos = 1.0 - np.divide(squared_error, truth_variance, out=np.full_like(squared_error, np.nan), where=truth_variance > 0)
+    centred = 1.0 - np.divide(truth_variance + prediction_variance - 2.0 * covariance, truth_variance,
+                              out=np.full_like(covariance, np.nan), where=truth_variance > 0)
     floor = null_r2(count)
-    return {"r2": r2, "r2_floor": (r2 - floor) / (1.0 - floor), "oos_r2": oos}
+    return {"r2": r2, "r2_floor": (r2 - floor) / (1.0 - floor), "oos_r2": oos, "oos_r2_centred": centred}
 
 
 def family_weights(families: np.ndarray, replicates: int, generator: np.random.Generator):
@@ -323,6 +329,16 @@ def run(results_dirs, dataset_dir, methods, designs, replicates, chunk, out_dir)
                 keep = genes["chrom"].to_numpy() != chrom
                 leave_rows.append({"contrast": name, "metric": metric, "left_out": chrom, "genes": int(keep.sum()), "estimate": float(point[keep].mean())})
     pd.DataFrame(contrast_rows).to_csv(out / "contrasts.tsv", sep="\t", index=False)
+    group_contrast_rows = []
+    for name, (plus, minus) in planned_contrasts(statistics).items():
+        if not statistics[plus].genes["gene_id"].equals(statistics[minus].genes["gene_id"]):
+            continue
+        for metric in METRICS:
+            for position, group in enumerate(GROUPS):
+                point = statistics[plus].group_point[metric][position] - statistics[minus].group_point[metric][position]
+                boot = statistics[plus].group_boot[metric][:, position] - statistics[minus].group_boot[metric][:, position]
+                group_contrast_rows.append({"contrast": name, "metric": metric, "group": group, **summarize(point, boot)})
+    pd.DataFrame(group_contrast_rows).to_csv(out / "per_group_contrasts.tsv", sep="\t", index=False)
     pd.DataFrame(leave_rows).to_csv(out / "leave_one_chromosome_out.tsv", sep="\t", index=False)
 
     tests = pd.concat([gene_tests(statistics, list(statistics), metric) for metric in METRICS], ignore_index=True)

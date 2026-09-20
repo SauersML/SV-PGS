@@ -33,6 +33,20 @@ def test_out_of_sample_r2_is_one_minus_sse_over_sst():
     assert np.allclose(value, direct, rtol=0, atol=1e2 * EPSILON)
 
 
+def test_centred_out_of_sample_r2_ignores_a_group_mean_offset_and_matches_its_slope_form():
+    generator = np.random.default_rng(6)
+    truth = generator.normal(size=(1, 40))
+    prediction = 0.7 * truth + generator.normal(size=(1, 40))
+    base = robust.group_metrics(np.ones((1, 40)), prediction, truth)
+    shifted = robust.group_metrics(np.ones((1, 40)), prediction + 5.0, truth)
+    assert np.allclose(base["oos_r2_centred"], shifted["oos_r2_centred"], rtol=0, atol=1e3 * EPSILON)
+    assert shifted["oos_r2"][0, 0] < base["oos_r2"][0, 0]
+    p, t = prediction[0] - prediction.mean(), truth[0] - truth.mean()
+    r = (p @ t) / np.sqrt((p @ p) * (t @ t))
+    scale = np.sqrt((p @ p) / (t @ t))
+    assert np.isclose(base["oos_r2_centred"][0, 0], 2 * r * scale - scale ** 2, rtol=0, atol=1e3 * EPSILON)
+
+
 def test_the_floor_corrected_r2_is_unbiased_for_an_independent_prediction():
     generator = np.random.default_rng(2)
     count, draws = 20, 20000
@@ -99,6 +113,8 @@ def test_end_to_end_split_is_exact_and_finds_only_the_planted_gene(tmp_path):
     assert json.loads((root / "out" / "summary.json").read_text())["replicates"] == 200
     leave = pd.read_csv(root / "out" / "leave_one_chromosome_out.tsv", sep="\t")
     assert set(leave["left_out"]) == {"chr1", "chr2", "chr3"}
+    groups = pd.read_csv(root / "out" / "per_group_contrasts.tsv", sep="\t")
+    assert set(groups["group"]) == set(robust.GROUPS) and "alpha/loso: snv_sv SV part" in set(groups["contrast"])
 
 
 def test_pooled_point_is_the_gene_mean_and_constant_statistics_have_no_spread():
