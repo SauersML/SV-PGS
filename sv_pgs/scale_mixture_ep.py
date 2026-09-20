@@ -1085,6 +1085,9 @@ class GaussianPosterior:
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
     # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
+    # Whether ``solve``, ``variance_jvp`` and ``linear_response`` are exact to rounding whatever tolerance they are
+    # asked for (a dense factor, or independent effects): B's response is then charged its rounding, not the request.
+    exact: bool = False
 
 
 class NoCertifiedProgress(FloatingPointError):
@@ -1120,8 +1123,11 @@ class CurvatureCorrection:
         mapping: F64Array | None = None,
         columns: Callable[[F64Array], F64Array] | None = None,
         fixed_curvature: F64Array | None = None,
+        resolutions: list[float] | None = None,
     ) -> None:
         self.coefficient_map = coefficient_map
+        # The relative residuals B's response columns were solved to (``columns`` appends them); none for a given C.
+        self._resolutions = [] if resolutions is None else resolutions
         self.matrix = matrix
         self._mapping = mapping
         self._columns = columns
@@ -1129,6 +1135,11 @@ class CurvatureCorrection:
         # An orthonormal basis Q (x coordinates) of the directions solved so far, and B_z M Q.
         self._basis: F64Array | None = None
         self._total: F64Array | None = None
+
+    @property
+    def resolution(self) -> float:
+        """The largest relative residual B's response has been solved to so far (0 for a correction given whole)."""
+        return max(self._resolutions, default=0.0)
 
     @property
     def solved_directions(self) -> int:
@@ -1218,10 +1229,12 @@ def curvature_correction(
     B + S), never past what double precision resolves."""
     relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
     fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    achieved: list[float] = []
     return CurvatureCorrection(
         mapping=prior.coefficient_map,
-        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions),
+        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved),
         fixed_curvature=0.5 * (fixed + fixed.T),
+        resolutions=achieved,
     )
 
 
@@ -1229,7 +1242,7 @@ def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
     """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
     cavities do not move with the prior, so B equals the fixed-cavity curvature."""
     column = np.asarray(variance, dtype=np.float64)[:, None]
-    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
+    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights, exact=True)
 
 
 @dataclass(frozen=True)
@@ -1334,6 +1347,7 @@ def _total_curvature_columns(
     working_bytes: int,
     relative_tolerance: float,
     directions: F64Array,
+    achieved: list[float] | None = None,
 ) -> F64Array:
     """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
     B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
@@ -1345,7 +1359,8 @@ def _total_curvature_columns(
         dh = (dm - m_P dP - m_x E) / v
         v^2 dP = -(Sigma o Sigma)_off (dv / v^2 + dP),  dv = v_h dh + v_P dP + v_x E   (``posterior.variance_jvp``)
     dP is the fixed point of that affine map, found by GMRES on all directions at once to ``relative_tolerance``, with
-    the restart length that fits ``working_bytes``.
+    the restart length that fits ``working_bytes``. ``achieved``, when given, receives the relative residual the
+    solve reached (its rounding where the posterior is ``exact``).
     """
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
@@ -1386,6 +1401,8 @@ def _total_curvature_columns(
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
         try:
             precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+            if achieved is not None:
+                achieved.append(_EPSILON if posterior.exact else relative_tolerance)
         except np.linalg.LinAlgError as error:
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
@@ -1428,6 +1445,8 @@ def _total_curvature_columns(
         target = max(relative_tolerance * float(np.linalg.norm(offset)), rounding)
         residual = result.residual_norm
         if residual <= target:
+            if achieved is not None:
+                achieved.append(max(residual, rounding) / max(float(np.linalg.norm(offset)), np.finfo(np.float64).tiny))
             break
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
         # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
@@ -2092,9 +2111,9 @@ def _evidence(
         previous = coefficients
         inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
-    # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; its bound below
-    # takes the response as solved to a relative residual that moves 1/2 log|B + S| by at most D / 2 times it.
-    response_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
+    # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; a relative residual
+    # e of that response moves 1/2 log|B + S| by at most D e / 2, charged below at the residual the solve reached
+    # (``CurvatureCorrection.resolution``: its rounding where the posterior is exact, 0 for a correction given whole).
     if prior.anchor is not None:
         # With the local model's anchor, -H is already A + C + S (``_Anchor``): C enters once, and x_rho's own factor
         # is the determinant's.
@@ -2143,9 +2162,8 @@ def _evidence(
     return _Evidence(
         value=evidence_value,
         laplace_value=evidence_value,
-        # The inner maximizer, the determinant's rounding, and B solved to a relative residual that moves
-        # 1/2 log|B + S| by at most D / 2 times it.
-        error=inner_error + 0.5 * profiled_total.rounding + 0.5 * coefficients.shape[0] * response_tolerance,
+        # The inner maximizer, the determinant's rounding, and B's response at the residual its solve reached.
+        error=inner_error + 0.5 * profiled_total.rounding + 0.5 * coefficients.shape[0] * correction.resolution,
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
