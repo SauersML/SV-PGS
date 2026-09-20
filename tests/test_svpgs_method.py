@@ -296,3 +296,23 @@ def test_the_coefficients_are_the_genotype_scale_effects_of_the_prediction(small
         moved[:, column] += 1.0
         change = predictor.predict(moved) - base
         np.testing.assert_allclose(change, predictor.coefficients[column], rtol=0.0, atol=rounding(test) + rounding(moved))
+
+
+def test_the_batch_arm_fits_every_gene_with_one_pooled_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    single = _SmallNStub()
+    calls: list[Any] = []
+
+    def pooled(genes: Any, **arguments: Any) -> Any:
+        calls.append((genes, arguments))
+        fits = [single(codes=gene.codes, target=gene.target, seed=index) for index, gene in enumerate(genes)]
+        return type("PooledFit", (), {"scoring": tuple(fit.scoring for fit in fits)})()
+
+    monkeypatch.setattr(svpgs_method, "fit_pooled_small_n", pooled)
+    trains = [_bench_real_train(np.random.default_rng(seed)) for seed in (10, 11, 12)]
+    predictors = svpgs_method.fit_expression_batch([train for train, _test in trains])
+    (genes, arguments), = calls
+    assert len(genes) == len(predictors) == 3 and arguments["draw_count"] == fit_model.DRAW_COUNT
+    for (train, test), gene, predictor in zip(trains, genes, predictors):
+        np.testing.assert_array_equal(gene.codes, (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))
+        np.testing.assert_array_equal(gene.variant_class, svpgs_method.bench_real_classes(train.variants))
+        assert predictor.predict(test).shape == (test.shape[0],)

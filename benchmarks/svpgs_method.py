@@ -53,6 +53,7 @@ from sv_pgs.dosage_store import (
     write_dosage_store,
 )
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel, ScoringPlan, score_genetic
+from sv_pgs.pooled_fit import GeneData, fit_pooled_small_n
 from sv_pgs.small_n import fit_small_n
 from sv_pgs.variant_typing import normalize_variant_token, structural_variant_class_from_token
 
@@ -422,3 +423,26 @@ def _training_seed(genotypes: np.ndarray, phenotype: np.ndarray) -> int:
     """The fit's seed from its training data, so the same training set always gives the same model."""
     digest = hashlib.sha256(np.ascontiguousarray(genotypes, dtype=np.uint8).tobytes() + np.asarray(phenotype, dtype="<f8").tobytes()).digest()
     return int.from_bytes(digest[:8], "big")
+
+
+def fit_expression_batch(trains: Sequence[Any]) -> list[BenchRealPredictor]:
+    """bench-real's pooled arm (batch_design.md rev 2): every gene of one split and feature set fitted at once, with
+    one prior (the mixing density, the class deviations and each gene's level) learned from all of them by
+    ``sv_pgs.pooled_fit``; one predictor per gene, in order."""
+    genes = []
+    for train in trains:
+        genotypes = np.asarray(train.genotypes)
+        if not np.all(np.isin(genotypes, (0, 1, 2))):
+            raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
+        genes.append(GeneData(
+            codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
+            covariates=np.ones((genotypes.shape[0], 1)),
+            target=np.asarray(train.phenotype, dtype=np.float64),
+            variant_class=bench_real_classes_for_arm(train.variants, "full"),
+        ))
+    digest = hashlib.sha256(b"".join(_training_seed(gene.codes, gene.target).to_bytes(8, "big") for gene in genes)).digest()
+    fitted = fit_pooled_small_n(genes, draw_count=fit_model.DRAW_COUNT, working_bytes=one_core_budget().working_bytes, seed=int.from_bytes(digest[:8], "big"))
+    return [
+        BenchRealPredictor(scoring=scoring, columns=scoring.store_rows, centering="training", input_columns=gene.codes.shape[1])
+        for scoring, gene in zip(fitted.scoring, genes)
+    ]
