@@ -1568,14 +1568,13 @@ def _laplace_corrections(
 
 
 def _line_slopes(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, vectors: F64Array, cavity: Cavity, working_bytes: int
-) -> Callable[[float], tuple[float, F64Array]]:
-    """At a step t along x + t b: F - P there and grad F(x + t b) . v for each column v of ``vectors``.
+    prior: ScaleMixturePrior, origin: F64Array, direction: F64Array, vectors: F64Array, cavity: Cavity, working_bytes: int
+) -> Callable[[float], F64Array]:
+    """At a step t along x + t b: grad F(x + t b) . v for each column v of ``vectors``.
 
     log Z_j = LSE_k(log pi_ck + L_jk(e_j)) with pi_c normalized, so its slope along v is
     sum_k w_jk (eta'_ck + dL_jk/de e'_j) - pi_c . eta'_c, with w the node responsibilities, eta' and e' the
     density and log-scale parts of M v, and dL/de the kernel's own first derivative (``_components``)."""
-    line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
     density, _scale = _density_and_scale(prior, origin)
     density_step, scale_step = _density_and_scale(prior, direction)
     scales = log_scale(prior, origin)
@@ -1584,7 +1583,7 @@ def _line_slopes(
     density_slopes = np.stack([part[0] for part in parts], axis=-1) if parts else np.zeros(density.shape + (0,))
     scale_slopes = np.column_stack([prior.scale_design @ part[1] for part in parts]) if parts else np.zeros((prior.variant_count, 0))
 
-    def at(step: float) -> tuple[float, F64Array]:
+    def at(step: float) -> F64Array:
         log_weights = density + step * density_step
         log_density = log_weights - _log_sum_exp(log_weights, axis=1, keepdims=True)
         slopes = np.zeros(vectors.shape[1])
@@ -1599,7 +1598,7 @@ def _line_slopes(
                 weights = components.responsibility
                 slopes += np.sum(weights @ class_slopes, axis=0) - rows.shape[0] * mean_slope
                 slopes += np.sum(weights * components.first, axis=1) @ scale_slopes[rows]
-        return float(line(np.array([step]))[0]), slopes
+        return slopes
 
     return at
 
@@ -1642,12 +1641,16 @@ def _correction_gradient(
     value = evidence.penalized_value
     for index in replaced:
         direction = directions[:, index]
-        slopes = _line_slopes(prior, log_smoothing, origin, direction, moves, cavity, working_bytes)
+        line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
+        slopes = _line_slopes(prior, origin, direction, moves, cavity, working_bytes)
 
         def integrand(step: float) -> F64Array:
-            height, slope = slopes(step)
-            density = np.exp(height - value)
-            return density * np.concatenate([[1.0, step, step * step], slope - origin_slope])
+            # Far out the integrand is zero to double precision (where every node's kernel has overflowed): its
+            # slopes, whose responsibilities are 0/0 there, are not needed.
+            density = float(np.exp(line(np.array([step]))[0] - value))
+            if density == 0.0:
+                return np.zeros(3 + moves.shape[1])
+            return density * np.concatenate([[1.0, step, step * step], slopes(step) - origin_slope])
 
         moments, moment_error = quad_vec(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=share, norm="max")
         mass = float(moments[0])

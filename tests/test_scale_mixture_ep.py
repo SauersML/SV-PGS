@@ -915,10 +915,12 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     # released ones; on each it is the whole correction's restriction.
     whole = analytic + mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping
     lazy = curvature_correction(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13 * coefficients.shape[0])
-    view, allowed = _restricted_prior(prior, frozenset({0}))
+    view, allowed = _restricted_prior(prior, frozenset(range(len(prior.smoothing_blocks))))
     scale = float(np.max(np.abs(whole)))
     np.testing.assert_allclose(lazy.on(view.coefficient_map), allowed.T @ whole @ allowed, rtol=1e-8, atol=1e-8 * scale)
-    assert lazy.solved_directions == allowed.shape[1] < coefficients.shape[0]
+    # One direction per independent column of the view's map (M is not injective: eta_bar and the class deviations
+    # overlap in z), and only the new ones when every edge is released.
+    assert lazy.solved_directions == np.linalg.matrix_rank(view.coefficient_map) < np.linalg.matrix_rank(mapping)
     np.testing.assert_allclose(lazy.on(mapping), whole, rtol=1e-8, atol=1e-8 * scale)
     assert lazy.solved_directions == np.linalg.matrix_rank(mapping)
 
