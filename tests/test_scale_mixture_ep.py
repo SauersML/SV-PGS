@@ -13,6 +13,7 @@ import pytest
 from scipy.integrate import quad
 from scipy.optimize import minimize_scalar
 
+import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
     INDEPENDENT_EFFECTS,
     CurvatureCorrection,
@@ -30,7 +31,10 @@ from sv_pgs.scale_mixture_ep import (
     _total_curvature,
     _directional_derivatives,
     _corrected,
+    _best_certified,
     _laplace_corrections,
+    _line_log_integral,
+    _line,
     _log_normal_start,
     _maximize_coefficients,
     _penalized,
@@ -654,6 +658,59 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
     # Where the Tierney-Kadane term is tiny, the exact correction is of its size.
     tiny = np.abs(terms) < 1e-5
     assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
+
+
+def test_the_line_values_are_the_penalized_objective_at_each_step():
+    # One batched pass along x + t b must give F - P at every step, also when the variants are cut into many chunks.
+    prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    direction = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
+    steps = np.array([-3.0, -0.4, 0.0, 0.9, 2.5])
+    for working_bytes in (_WORKING_BYTES, 1 << 12):
+        values = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, working_bytes)(steps)
+        expected = np.array([
+            _data_value(prior, hyperparameters.coefficients + step * direction, cavity, _WORKING_BYTES)
+            - _penalty_value(prior, hyperparameters.log_smoothing, hyperparameters.coefficients + step * direction)[0]
+            for step in steps
+        ])
+        np.testing.assert_allclose(values, expected, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(expected))))
+
+
+def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
+    assert evidence is not None
+    _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, posterior, _WORKING_BYTES, 0.0)
+    value = evidence.penalized_value
+    share = _EVIDENCE_TOLERANCE / 16.0
+    for index in np.argsort(-np.abs(terms))[:3]:
+        direction = directions[:, index]
+        found = _line_log_integral(prior, hyperparameters.log_smoothing, evidence.coefficients, direction, value, cavity, _WORKING_BYTES, share)
+
+        def integrand(step: float) -> float:
+            point = evidence.coefficients + step * direction
+            return float(np.exp(
+                _data_value(prior, point, cavity, _WORKING_BYTES) - _penalty_value(prior, hyperparameters.log_smoothing, point)[0] - value
+            ))
+
+        integral, _error = quad(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=1e-12)
+        assert abs(found - (np.log(integral) - 0.5 * np.log(2.0 * np.pi))) <= share
+
+
+def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    nearby = hyperparameters.coefficients + 1e-3 * np.random.default_rng(41).standard_normal(prior.coefficient_size)
+    calls = []
+    corrected = engine._corrected
+    monkeypatch.setattr(engine, "_corrected", lambda *arguments: calls.append(None) or corrected(*arguments))
+    best = _best_certified(
+        prior, hyperparameters.log_smoothing, [hyperparameters.coefficients, nearby], cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE
+    )
+    assert best is not None and len(calls) == 1
 
 
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
