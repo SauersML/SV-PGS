@@ -9,6 +9,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from scipy.sparse.linalg import LinearOperator, gmres
 
 import sv_pgs.krylov_recycle as krylov
@@ -30,7 +31,6 @@ def _operator(seed: int, size: int, spread: float):
 
 def _solve(matrix, right, **keywords):
     keywords.setdefault("working_bytes", 64 * right.shape[0] * EPS.dtype.itemsize * right.shape[1])
-    keywords.setdefault("application_limit", right.shape[0] * right.shape[1])
     keywords.setdefault("absolute_tolerance", 0.0)
     return block_gcro_dr(lambda values: matrix @ values, right, **keywords)
 
@@ -43,6 +43,16 @@ def test_every_column_meets_its_tolerance_on_a_true_residual() -> None:
     np.testing.assert_allclose(result.residual_norm, np.linalg.norm(right - matrix @ result.solution), rtol=1e-12)
     exact = np.linalg.solve(matrix, right)
     assert np.linalg.norm(result.solution - exact) <= 1e-10 * np.linalg.cond(matrix) * np.linalg.norm(exact)
+
+
+def test_a_solve_that_stops_making_progress_raises_instead_of_counting_on() -> None:
+    # The cyclic shift A e_i = e_(i+1): every cycle shorter than the size minimizes over images orthogonal to e_1, so
+    # restarted (block) GMRES from e_1 never lowers the residual. The solve stops on that measured stall, with no cap.
+    size = 20
+    matrix = np.roll(np.eye(size), 1, axis=0)
+    right = np.eye(size)[:, :1]
+    with pytest.raises(FloatingPointError, match="stagnated"):
+        _solve(matrix, right, relative_tolerance=1e-8, working_bytes=12 * size * EPS.dtype.itemsize)
 
 
 def test_one_block_space_serves_every_column_in_fewer_applications_than_flattened_gmres() -> None:

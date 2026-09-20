@@ -1298,11 +1298,10 @@ def _total_curvature_columns(
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
-    size = int(np.prod(shape))
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
     # columns (``krylov_recycle.block_gcro_dr``, speed-recycle): each application serves them all, restarts keep the
-    # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it. At most ``size`` applications,
-    # the flattened GMRES's own cap. Each product solves the posterior only to ``inner``, so the operator itself errs,
+    # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it; it stops where a cycle no longer
+    # lowers its residual. Each product solves the posterior only to ``inner``, so the operator itself errs,
     # and the Krylov residual estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci.
     # Comput. 25, 2003): half the tolerance goes to the Krylov solve, half to the products. The true residual is
     # measured once the solve meets its own tolerance; while it exceeds the tolerance, the inner solves tighten by the
@@ -1328,7 +1327,7 @@ def _total_curvature_columns(
         try:
             result = block_gcro_dr(
                 linear_part, offset, relative_tolerance=0.5 * relative_tolerance, absolute_tolerance=rounding, working_bytes=working_bytes,
-                application_limit=size, start=solution, precondition=precondition,
+                start=solution, precondition=precondition,
             )
         except (FloatingPointError, ValueError) as error:
             raise LinearResponseError(f"the EP fixed point's linear response did not converge: {error}") from error
@@ -1338,9 +1337,17 @@ def _total_curvature_columns(
         if residual <= target:
             break
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
-        # the measured excess each round, which ends where they reach float64's attainable accuracy (the solver then
-        # refuses, above) rather than on one noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34).
-        inner *= 0.5 * target / residual
+        # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
+        # noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34). That end is either the solver refusing (above)
+        # or, where it returns a certificate above the request instead (speed-krylov cf364bd), a request below float64's
+        # unit roundoff, which no solve delivers.
+        tightened = inner * 0.5 * target / residual
+        if tightened < _EPSILON:
+            raise LinearResponseError(
+                f"the EP fixed point's linear response cannot be resolved in float64: its true residual {residual:.3e} stays above "
+                f"{target:.3e} with the posterior solves at relative accuracy {inner:.3e}"
+            )
+        inner = tightened
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
 
