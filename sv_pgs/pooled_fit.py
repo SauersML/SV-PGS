@@ -235,6 +235,11 @@ class _PooledFixedPoints:
         self.gene_noise_gain = np.full(len(self.rows), np.inf)
         self.refusals: list[str] = []
         self.profile = _new_profile()
+        # CPU seconds (every thread's) each gene's own work took (factorizations, cavities, double loops), the pooled
+        # tilted-moment passes, and the sweeps they ran in: the per-gene cost of a fixed point, for the profiler.
+        self.gene_cpu_seconds = np.zeros(len(self.rows))
+        self.tilted_cpu_seconds = 0.0
+        self.sweeps = 0
 
     @property
     def gene_count(self) -> int:
@@ -242,10 +247,13 @@ class _PooledFixedPoints:
 
     def _iterate(self, gene: int, site_precision: F64Array, site_shift: F64Array) -> None:
         """Gene ``gene``'s exact mean at the sites; ``LinAlgError`` when its precision is not positive definite."""
-        started = time.perf_counter()
+        started, cpu = time.perf_counter(), time.process_time()
         noise = float(self.noise[gene])
-        kernel = _Kernel(self.statistics[gene].design, noise * site_precision)
-        self.mean[self.rows[gene]] = kernel.solve(self.scores[gene] + noise * site_shift)
+        try:
+            kernel = _Kernel(self.statistics[gene].design, noise * site_precision)
+            self.mean[self.rows[gene]] = kernel.solve(self.scores[gene] + noise * site_shift)
+        finally:
+            self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self.kernels[gene] = kernel
         self.profile["factorizations"] += 1
         self.profile["passes"] += 1
@@ -264,9 +272,10 @@ class _PooledFixedPoints:
                 except np.linalg.LinAlgError:
                     failure = f"gene {gene}: the precision is not positive definite with non-negative sites"
                 else:
-                    started = time.perf_counter()
+                    started, cpu = time.perf_counter(), time.process_time()
                     scaled_variances, removed, scaled_precision = self.kernels[gene].cavity()
                     self.profile["variance_seconds"] += time.perf_counter() - started
+                    self.gene_cpu_seconds[gene] += time.process_time() - cpu
                     noise = float(self.noise[gene])
                     gene_variances, gene_precision = noise * scaled_variances, scaled_precision / noise
                     if np.all(1.0 + largest[rows] * gene_precision > 0.0):
@@ -282,9 +291,10 @@ class _PooledFixedPoints:
         return variances, cavity_precision
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
-        started = time.perf_counter()
+        started, cpu = time.perf_counter(), time.process_time()
         targets = site_targets(tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes // _LIVE_FIXED_POINTS), cavity)
         self.profile["tilted_seconds"] += time.perf_counter() - started
+        self.tilted_cpu_seconds += time.process_time() - cpu
         return targets
 
     def _residual_sum_of_squares(self, gene: int) -> float:
@@ -398,6 +408,7 @@ class _PooledFixedPoints:
             return moments.log_normalizer, moments.mean, moments.variance, third, fourth
 
         self.profile["double_loops"] += 1
+        cpu = time.process_time()
         start_precision, start_shift = self.site_precision[rows].copy(), self.site_shift[rows].copy()
         kernel = _Kernel(design, noise * start_precision)
         mean = kernel.solve(self.scores[gene] + noise * start_shift)
@@ -420,6 +431,7 @@ class _PooledFixedPoints:
             self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
         )
         self.site_precision[rows], self.site_shift[rows] = precision, shift
+        self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self._iterate(gene, precision, shift)
 
     def _frozen_passes(self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
@@ -429,6 +441,7 @@ class _PooledFixedPoints:
         damping = np.ones(self.gene_count)
         done = np.zeros(self.gene_count, dtype=bool)
         while True:
+            self.sweeps += 1
             moves = np.zeros(self.gene_count)
             for gene, rows in enumerate(self.rows):
                 if done[gene]:
@@ -583,7 +596,8 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         "stage0_seconds": stage0_seconds, "total_seconds": time.perf_counter() - started, "genes": len(genes),
         "reduced": int(prior.variant_count), "coefficients": int(prior.coefficient_size), "classes": int(prior.class_count),
         "outer_iterations": int(outer.iterations),
-        "gene_divergence": oracle.gene_divergence.tolist(),
+        "gene_divergence": oracle.gene_divergence.tolist(), "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(),
+        "tilted_cpu_seconds": oracle.tilted_cpu_seconds, "sweeps": oracle.sweeps,
         "gene_noise_gain": oracle.gene_noise_gain.tolist(),
     }
     return PooledFit(

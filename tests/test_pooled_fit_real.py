@@ -9,7 +9,9 @@ start's fixed point: about 20 minutes on 2 cores, so the cases run only where th
 """
 
 import importlib.util
+import json
 import os
+import time
 from pathlib import Path
 
 import numpy as np
@@ -60,7 +62,17 @@ def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused
     start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
     working = int(os.environ.get("RUNQ_MEM_BYTES", str(8 << 30))) - sum(_held_bytes(gene) + _held_bytes(gene.design) for gene in statistics)
     oracle = _PooledFixedPoints(statistics, prior, start, noise, draw_count, working // 2)
+    wall, cpu = time.perf_counter(), time.process_time()
     (point,) = oracle([start])
+    record = {
+        "split": split, "genes": len(genes), "members": [int(rows.stop - rows.start) for rows in oracle.rows], "wall_s": time.perf_counter() - wall,
+        "cpu_s": time.process_time() - cpu, "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(), "tilted_cpu_seconds": oracle.tilted_cpu_seconds,
+        "sweeps": oracle.sweeps, "refreshes": oracle.profile["refreshes"], "double_loops": oracle.profile["double_loops"],
+        "refusals": oracle.refusals, "reached": point is not None,
+    }
+    if os.environ.get("SVPGS_PROFILE_OUT"):
+        with open(os.environ["SVPGS_PROFILE_OUT"], "a") as handle:
+            handle.write(json.dumps(record) + "\n")
     assert point is not None, f"refused: {oracle.refusals}"
     assert oracle.mean_move <= 1.0 and oracle.noise_gain <= 0.5 / draw_count
     assert refused_gene is None or refused_gene < len(genes)
