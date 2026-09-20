@@ -284,6 +284,25 @@ def test_halving_the_lattice_keeps_every_class_density():
     np.testing.assert_allclose(log_scale(finer, transferred.coefficients), log_scale(prior, hyperparameters.coefficients), atol=1e-12)
 
 
+def test_halving_a_three_class_lattice_keeps_every_class_density():
+    # review-mathbugs L-0: the natural end conditions were scalars for a spline over C classes, which scipy accepted
+    # only when C equalled their count (two).
+    generator = np.random.default_rng(71)
+    count = 90
+    class_index = np.repeat(np.arange(3), count // 3)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 12)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.log(generator.uniform(0.3, 1.0, count)), annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    hyperparameters = _hyperparameters(prior, 72)
+    finer, moved = halved_lattice(prior, hyperparameters)
+    # Each class's log g passes through its old nodal values (up to the class's normalizing constant).
+    fine = engine._density_and_scale(finer, moved.coefficients)[0][:, ::2]
+    coarse = engine._density_and_scale(prior, hyperparameters.coefficients)[0]
+    np.testing.assert_allclose(np.diff(fine, axis=1), np.diff(coarse, axis=1), rtol=1e-9, atol=1e-9)
+
+
 def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotations():
     prior, _cavity = _problem(variant_count=40, seed=7, node_count=12)
     hyperparameters = _hyperparameters(prior, 8)

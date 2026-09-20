@@ -585,7 +585,8 @@ def relattice(
     """
     old_nodes = prior.log_variance_grid
     log_density, scale_coefficients = _density_and_scale(prior, hyperparameters.coefficients)
-    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
+    # One end condition per class: the spline is vector-valued over the classes (review-mathbugs L-0).
+    natural = [(order, np.zeros(log_density.shape[0])) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
     spline = make_interp_spline(old_nodes, log_density.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
     new_nodes = np.asarray(nodes, dtype=np.float64)
     inside = np.clip(new_nodes, old_nodes[0], old_nodes[-1])
