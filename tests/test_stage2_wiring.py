@@ -72,3 +72,26 @@ def test_the_bench_real_adapter_fits_a_synthetic_gene_with_the_engine() -> None:
     )
     prediction = svpgs_method.fit_expression(train).predict(genotypes[samples:])
     assert prediction.shape == (40,) and np.all(np.isfinite(prediction))
+
+
+def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path) -> None:
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.dosage_store import DosageStore
+    from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
+    from sv_pgs.stage2_wiring import stage0_candidates
+    from tests.test_dosage_store import _write_store
+
+    generator = np.random.default_rng(4)
+    samples, records = 90, 200
+    frequency = np.concatenate([np.zeros(10), generator.uniform(0.0, 0.03, size=100), generator.uniform(0.03, 0.5, size=90)])
+    milli = (generator.binomial(2, frequency[:, None], size=(records, samples)) * 1000).astype(np.int64)
+    _write_store(tmp_path / "store", [{"chr22": milli}])
+    store = DosageStore.open(tmp_path / "store")
+    columns = np.arange(samples, dtype=np.int64)
+    everything = np.arange(records, dtype=np.int64)
+    candidates = stage0_candidates(store, columns, np.zeros(records), ModelConfig())
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, everything), columns, np.ones((samples, 1)), generator.normal(size=(samples, 1)), ModelConfig(), _budget(), 256, tmp_path / "ld"
+    )
+    assert set(np.asarray(statistics.active_rows).tolist()) <= set(candidates.tolist())
+    assert candidates.shape[0] < records

@@ -25,7 +25,8 @@ from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
 from sv_pgs.genotype_buffers import build_sample_layout
-from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
+from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
+from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -50,6 +51,38 @@ def store_log_reliability(store: DosageStore) -> F64Array:
         return np.zeros(store.n_variants)
     with np.errstate(divide="ignore"):
         return np.log(np.asarray(quality, dtype=np.float64))
+
+
+def stage0_candidates(store: DosageStore, training_columns: I64Array, log_reliability: F64Array, config: ModelConfig) -> I64Array:
+    """The store rows Stage 0 reads: every record with signal, less those Stage 0 would find inactive.
+
+    When the training samples are all of the store's, the sidecar's code sums are their sums, so a record's training
+    frequency and variance are known before the pass; one that is monomorphic, or rarer than the minimum minor
+    allele frequency by more than one code unit's frequency (a margin that keeps every record Stage 0's own float
+    test could keep), is dropped here rather than after its Grams are formed. Otherwise every record is a candidate.
+    """
+    rows = np.flatnonzero(np.isfinite(log_reliability)).astype(np.int64)
+    count = training_columns.shape[0]
+    if count != store.n_samples:
+        return rows
+    table = store.variant_table
+    sums = np.asarray(table.sum_code, dtype=np.float64)[rows]
+    variance_numerator = count * np.asarray(table.sum_code2, dtype=np.float64)[rows] - sums * sums
+    frequency = sums / (2.0 * SIGNED_CODE_OFFSET * count)
+    margin = 1.0 / (2.0 * SIGNED_CODE_OFFSET * count)
+    keep = (variance_numerator > 0.0) & (np.minimum(frequency, 1.0 - frequency) >= config.minimum_minor_allele_frequency - margin)
+    return rows[keep]
+
+
+def _block_cap(store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget) -> int:
+    """The memory's largest cap, but no larger than a chromosome's candidate count (in cap steps): Stage 0's buffers
+    grow with the cap, and a block never holds more than its chromosome's candidates."""
+    sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
+    sample_groups[training_columns] = 0
+    memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
+    chromosome_of_row = np.searchsorted(np.asarray(store.chromosome_starts), candidates, side="right") - 1
+    largest = int(np.bincount(chromosome_of_row).max())
+    return min(memory_cap, -(-largest // BLOCK_CAP_STEP) * BLOCK_CAP_STEP)
 
 
 def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificate:
@@ -82,12 +115,11 @@ def _fit_one(
 ) -> tuple[ScoringModel, float, MixtureHyperparameters, FitCertificate]:
     """One quantitative model on the sorted store columns ``training_columns``, whose covariates (intercept first) and
     targets follow them."""
-    active = np.flatnonzero(np.isfinite(log_reliability)).astype(np.int64)
-    sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
-    sample_groups[training_columns] = 0
-    block_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariates.shape[1] + 1)
+    config = ModelConfig()
+    candidates = stage0_candidates(store, training_columns, log_reliability, config)
+    block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
     statistics = compute_genotype_statistics(
-        DosageStoreTileSource(store, active), training_columns, covariates, targets[:, None], ModelConfig(), budget, block_cap, work_dir / "ld"
+        DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
     )
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     offsets = log_reliability[kept_rows]
