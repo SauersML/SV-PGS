@@ -1397,6 +1397,10 @@ class _Evidence:
     # maximum it approximates in that metric, which is how two starts are recognized as one basin.
     precision: F64Array
     inner_decrement: float
+    # After ``_corrected``: the standardized directions whose Laplace terms it replaced by line integrals, and the
+    # share of the tolerance each was resolved to (their gradient reuses them, ``_correction_gradient``).
+    replaced_directions: F64Array | None = None
+    replaced_share: float = 0.0
     # Per weight, the two rho-dependent parts of dV/drho_i: the effective degrees of freedom
     # lambda_i tr((B + S)^-1 S_i) and the penalty's size lambda_i ||R_i x||^2.
     effective_degrees: F64Array
@@ -1620,14 +1624,19 @@ def _correction_gradient(
     corrections' redesign replaces both. The integrals share one adaptive rule (``quad_vec``), each resolved to the
     share of the tolerance that its correction was.
     """
-    try:
-        _corrections, terms, directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance)
-    except FloatingPointError:
-        return np.zeros(len(prior.smoothing_blocks)), np.full(len(prior.smoothing_blocks), np.inf)
-    order = np.argsort(-np.abs(terms))
-    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
-    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
-    share = max(0.5 * tolerance / max(replaced.shape[0], 1), _QUADPACK_RELATIVE_FLOOR)
+    if evidence.replaced_directions is not None:
+        directions, share = evidence.replaced_directions, evidence.replaced_share
+    else:
+        try:
+            _corrections, terms, all_directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance)
+        except FloatingPointError:
+            return np.zeros(len(prior.smoothing_blocks)), np.full(len(prior.smoothing_blocks), np.inf)
+        order = np.argsort(-np.abs(terms))
+        remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
+        directions = all_directions[:, order[: int(np.argmax(remaining <= 0.5 * tolerance))]]
+        share = 0.5 * tolerance / max(directions.shape[1], 1)
+    replaced = np.arange(directions.shape[1])
+    share = max(share, _QUADPACK_RELATIVE_FLOOR)
     weight_count = len(prior.smoothing_blocks)
     gradient = np.zeros(weight_count)
     error = np.zeros(weight_count)
@@ -1701,7 +1710,10 @@ def _corrected(
     replaced = int(np.argmax(remaining <= 0.5 * tolerance))
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
-    return replace(evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder)
+    return replace(
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
+        replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
+    )
 
 
 def _range_projector(matrix: F64Array) -> tuple[F64Array, F64Array]:
@@ -1968,7 +1980,7 @@ def _ascend_evidence(
 ) -> tuple[F64Array, _Evidence]:
     """Trust-region quasi-Newton ascent of V(rho) inside [lower, upper], from a certified evidence ``start``.
 
-    The model is V's gradient with a BFGS approximation of -V's Hessian; each trial maximizes it inside a
+    The model is the certified V's gradient (``_full_gradient``) with a BFGS approximation of -V's Hessian; each trial maximizes it inside a
     radius, projected onto the bounds, and the radius follows the ratio of actual to predicted gain
     (Nocedal and Wright, Algorithm 4.1). A trial's x starts from the first-order predictor
     x_rho + (dx/drho) delta; a trial whose inner answer is not a certified maximum counts as V = -infinity.
@@ -1977,10 +1989,12 @@ def _ascend_evidence(
     """
     weights = np.clip(start_weights, lower, upper)
     current = start
+    # The certified V's own gradient, corrections included (lead ruling A): the Laplace V is biased up at small lambda,
+    # so its gradient would steer toward densities the corrections reject.
+    gradient = _full_gradient(prior, weights, current, cavity, correction, working_bytes, tolerance)[0]
     hessian = np.eye(weights.shape[0])
-    radius = float(np.linalg.norm(current.gradient))
+    radius = float(np.linalg.norm(gradient))
     while True:
-        gradient = current.gradient
         free = ~(((weights <= lower) & (gradient < 0.0)) | ((weights >= upper) & (gradient > 0.0)))
         if not np.any(free):
             return weights, current
@@ -2004,12 +2018,13 @@ def _ascend_evidence(
             radius = 2.0 * radius
         if trial is None or actual <= 0.0:
             continue
-        gradient_change = gradient - trial.gradient
+        trial_gradient = _full_gradient(prior, trial_weights, trial, cavity, correction, working_bytes, tolerance)[0]
+        gradient_change = gradient - trial_gradient
         curvature = float(step @ gradient_change)
         if curvature > 0.0:
             image = hessian @ step
             hessian = hessian - np.outer(image, image) / float(step @ image) + np.outer(gradient_change, gradient_change) / curvature
-        weights, current = trial_weights, trial
+        weights, current, gradient = trial_weights, trial, trial_gradient
 
 
 def _certified_evidence(
@@ -2253,6 +2268,9 @@ def _stationarity(
     as an indefinite B + S has none for x. A side whose certified V beats the base's by the tolerance, both at their
     certified bounds, is returned as ``better`` at once: the base is then not the maximum, and the search resumes
     from it.
+
+    This is a Newton decrement on the local model (K is a difference estimate), with an indefinite model refused: the
+    same standard as the x-certificate, not a global curvature bound over the step.
     """
     count = weights.shape[0]
     # The gradient is taken at x_rho resolved to double precision, so x's own error barely enters it.
