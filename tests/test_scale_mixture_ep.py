@@ -667,6 +667,20 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
     assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
 
 
+def test_the_kronrod_rule_is_quadpacks():
+    # The embedded Gauss rule is the 7-point Gauss-Legendre rule, and the 15-point Kronrod rule integrates every
+    # polynomial of degree 22 exactly (3 n + 1 for n = 7).
+    nodes = np.concatenate([-engine._KRONROD_NODES[:-1], engine._KRONROD_NODES[::-1]])
+    kronrod = np.concatenate([engine._KRONROD_WEIGHTS[:-1], engine._KRONROD_WEIGHTS[::-1]])
+    gauss = np.concatenate([engine._GAUSS_WEIGHTS[:-1], engine._GAUSS_WEIGHTS[::-1]])
+    gauss_nodes, gauss_weights = np.polynomial.legendre.leggauss(7)
+    np.testing.assert_allclose(np.sort(nodes[gauss > 0.0]), np.sort(gauss_nodes), atol=1e-15)
+    np.testing.assert_allclose(gauss[gauss > 0.0][np.argsort(nodes[gauss > 0.0])], gauss_weights[np.argsort(gauss_nodes)], atol=1e-15)
+    for degree in range(23):
+        exact = (1.0 - (-1.0) ** (degree + 1)) / (degree + 1)
+        assert abs(float(kronrod @ nodes**degree) - exact) <= 1e-14
+
+
 def test_the_line_values_are_the_penalized_objective_at_each_step():
     # One batched pass along x + t b must give F - P at every step, also when the variants are cut into many chunks.
     prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
