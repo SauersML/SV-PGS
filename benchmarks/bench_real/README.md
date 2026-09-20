@@ -44,9 +44,14 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 - **The method:** `fit(train: TrainData) -> predictor`, where `predictor.predict(test_genotypes) -> ndarray`.
 - **What TrainData holds:** training genotypes, the adjusted phenotype, variant annotations, superpopulation and population labels, and the target gene's GENCODE v38 body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 - **Sealing:** test phenotypes never reach method code; the harness reads them only to score.
+- **Batch contract:** a method that pools hyperparameters across genes (as SV-PGS does across traits) is `fit_batch(trains) -> list[predictor]`, run with `--contract batch`. It's called once per split and feature set, with a lazy sequence of every selected gene's TrainData. The sequence exposes no test data and refuses any sealed gene. Scoring and run.json are unchanged.
+- **Confirmation genes:** `dataset/sealed_confirmation_genes.tsv` is never scored except under `--confirmation`, and only when the lead calls it.
+  - A `--genes` list naming a sealed gene is refused.
+  - A derived dataset (parent_dataset.txt) must carry its parent's sealed list byte for byte.
 - **Feature sets:** `snv` (panel SNVs and indels under 50 bp), `snv_sv` (all panel rows), and `snv_pgsv` (panel SNVs/indels plus PanGenie SVs).
 - **Submitting:** a method lane sends a file and callable (`path.py:callable`), and bench-real runs it on the sealed splits. Lanes don't run the benchmark themselves.
 - **Costly methods:** they run on a sealed random gene sample, a prefix of `dataset/gene_order.tsv` (a seeded permutation of all genes), via `--gene-prefix N`.
+- **Run record:** each run writes `<chromosomes>.run.json`: the method spec and its file's sha256, the harness commit, design, feature sets, gene prefix N, gene count and the splits' sha256.
 - **Output:** out-of-fold predictions for every gene and sample, per design and feature set, plus per-fit CPU seconds and variant counts.
 
 ## Scoring
@@ -71,6 +76,14 @@ The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML opt
 - **Genotypes are direct high-coverage calls,** not imputed. There's no imputation-reliability channel, so the r² offset and fusion terms of the model aren't exercised. The PanGenie arm (short-read genotyping of long-read SVs) is the nearest public proxy.
 - **Tandem repeats aren't annotated** in the panel, so the TR signed-length term isn't tested.
 - **Lymphoblastoid-line expression** is a molecular phenotype. Its architecture (strong cis, larger SV enrichment) differs from complex traits.
+
+## Targeted runs on the screened ranked list
+- **The list:** a genotype-only ranked list (sv-screen's sv_ranked_v2.tsv) runs top first, in checkpointed chunks, via `--genes <list> --gene-ranks START STOP`. run.json records the list's sha256 and the rank range.
+- **Strata:**
+  - development: every gene bench-real had already scored when the ordering was chosen (genes_already_scored.tsv, 5,430 genes);
+  - held out: ranked genes never scored before.
+  - Only the held-out stratum, and later the sealed confirmation set, supports discovery claims.
+- **Genome-wide totals** combine the targeted set (a certainty stratum, weight 1) with the random gene-order prefix (weight |U| / n on its genes outside the targeted set), by Horvitz–Thompson weighting (genome_total.py). The standard error is a delete-one-chromosome jackknife.
 
 ## Which open design questions it can answer
 **Can answer, on real biology:**

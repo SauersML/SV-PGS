@@ -30,9 +30,9 @@ def test_residualization_never_reads_test_phenotypes():
 
 def test_feature_sets_select_the_documented_columns():
     variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
-    assert list(harness.feature_mask(variants, "snv")) == [True, False, False, False]
-    assert list(harness.feature_mask(variants, "snv_sv")) == [True, True, False, False]
-    assert list(harness.feature_mask(variants, "snv_pgsv")) == [True, False, False, True]
+    assert list(harness.feature_mask(variants, "snv", "g/s")) == [True, False, False, False]
+    assert list(harness.feature_mask(variants, "snv_sv", "g/s")) == [True, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_pgsv", "g/s")) == [True, False, False, True]
 
 
 def test_sv_masking_removes_exactly_the_sv_part_of_a_linear_prediction():
@@ -96,3 +96,201 @@ def test_training_constant_columns_are_dropped_even_when_heterozygous():
     train, test, _, _ = harness.build_gene_task(FakeDataset, window, {"train": ["a", "b", "c"], "test": ["d"]})
     assert train.genotypes.shape == (3, 1) and test.shape == (1, 1)
     assert list(train.variants.position) == [1]
+
+
+def tiny_dataset(tmp_path):
+    import json
+
+    generator = np.random.default_rng(3)
+    sample_count, variant_count = 24, 8
+    samples = pd.DataFrame({"sample": [f"s{index}" for index in range(sample_count)], "FamilyID": [f"f{index}" for index in range(sample_count)],
+                            "FatherID": 0, "MotherID": 0, "Sex": 1, "Population": "CEU",
+                            "Superpopulation": ["AFR", "EUR"] * (sample_count // 2)})
+    samples.to_csv(tmp_path / "samples.tsv", sep="\t", index=False)
+    pd.DataFrame({"chrom": ["chr1"], "start": [99], "end": [100], "gene_id": ["g1"], "tss": [100]}).to_csv(tmp_path / "genes.tsv", sep="\t", index=False)
+    dosage = generator.binomial(2, 0.4, size=(variant_count, sample_count)).astype(np.int8)
+    np.save(tmp_path / "chr1.dosage.npy", dosage)
+    np.save(tmp_path / "expression.npy", (dosage[0] - dosage[3] + generator.normal(size=sample_count))[None, :].astype(np.float64))
+    np.save(tmp_path / "covariates.npy", np.zeros((sample_count, 0)))
+    is_sv = np.arange(variant_count) % 4 == 3
+    pd.DataFrame({"pos": 100 + np.arange(variant_count), "end": 100 + np.arange(variant_count), "id": ".", "ref_len": 1, "alt_len": np.where(is_sv, 61, 1),
+                  "symbolic": False, "sv_type": np.where(is_sv, "INS", "."), "sv_length": np.where(is_sv, 60, 0), "is_sv": is_sv,
+                  "source": "panel"}).to_csv(tmp_path / "chr1.variants.tsv", sep="\t", index=False)
+    split_list = [{"name": "loso/AFR", "test": list(samples["sample"][samples["Superpopulation"] == "AFR"]), "train": list(samples["sample"][samples["Superpopulation"] == "EUR"])},
+                  {"name": "loso/EUR", "test": list(samples["sample"][samples["Superpopulation"] == "EUR"]), "train": list(samples["sample"][samples["Superpopulation"] == "AFR"])}]
+    (tmp_path / "splits.json").write_text(json.dumps(split_list))
+    (tmp_path / "splits.sha256").write_text("synthetic\n")
+    (tmp_path / "gene_annotation.json").write_text(json.dumps({"g1": {"start": 90, "end": 110, "strand": "+", "exons": [[95, 105]], "coding_exons": []}}))
+    return tmp_path
+
+
+def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
+    import hashlib
+    import json
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    (tmp_path / "screened.tsv").write_text("gene_id\tscore\ng1\t3.2\n")
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv")
+    out = tmp_path / "results" / "top_variant" / "loso"
+    record = json.loads((out / "chr1.run.json").read_text())
+    assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
+    assert record["gene_list_sha256"] == hashlib.sha256((tmp_path / "screened.tsv").read_bytes()).hexdigest()
+    truth = np.load(out / "chr1.truth.npy")
+    for feature_set in ("snv", "snv_sv"):
+        predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")
+        assert np.isfinite(predictions).all() and np.isfinite(truth).all()
+    assert np.array_equal(np.load(out / "chr1.snv.predictions.npy"), np.load(out / "chr1.snv.predictions_without_sv.npy"))
+
+
+def test_pooled_paired_difference_averages_each_gene_over_the_held_out_groups():
+    from benchmarks.bench_real import report
+
+    generator = np.random.default_rng(4)
+    rows = []
+    for gene in range(12):
+        for group in report.SUPERPOPULATIONS:
+            for method in ("a", "b"):
+                rows.append({"gene_id": f"g{gene}", "chrom": f"chr{gene % 3 + 1}", "design": "loso", "superpopulation": group,
+                             "method": method, "feature_set": "snv", "r2": generator.uniform()})
+    scores = pd.DataFrame(rows)
+    table = pd.DataFrame(report.paired(scores, ("a", "snv"), ("b", "snv")))
+    pooled = table[table["superpopulation"] == report.POOLED].iloc[0]
+    wide = scores.pivot_table(index=["gene_id", "superpopulation"], columns="method", values="r2")
+    expected = (wide["a"] - wide["b"]).groupby(level="gene_id").mean().mean()
+    assert pooled["genes"] == 12 and np.isclose(pooled["difference"], expected, rtol=0, atol=16 * EPSILON)
+    assert set(table["superpopulation"]) == {report.POOLED, *report.SUPERPOPULATIONS}
+
+
+def matched_fixture(seed):
+    generator = np.random.default_rng(seed)
+    count = 400
+    is_sv = np.zeros(count, dtype=bool)
+    is_sv[generator.choice(count, 12, replace=False)] = True
+    source = np.where(np.arange(count) % 7 == 0, "pangenie", "panel")
+    return harness.Variants(position=np.arange(count), end=np.arange(count), distance_to_tss=generator.integers(-10**6, 10**6, count),
+                            is_sv=is_sv, sv_type=np.array(["."] * count), sv_length=np.zeros(count), allele_length_change=np.zeros(count),
+                            train_allele_frequency=generator.uniform(0.01, 0.99, count), source=source)
+
+
+def test_matched_small_variants_draw_one_panel_small_variant_per_panel_sv_reproducibly():
+    variants = matched_fixture(5)
+    mask = harness.feature_mask(variants, "snv_matched", "g/loso/AFR")
+    panel_sv = (variants.source == "panel") & variants.is_sv
+    assert mask.sum() == panel_sv.sum()
+    assert not (mask & variants.is_sv).any() and (variants.source[mask] == "panel").all()
+    assert np.array_equal(mask, harness.feature_mask(variants, "snv_matched", "g/loso/AFR"))
+
+
+def test_matched_small_variant_is_the_nearest_on_frequency_and_distance():
+    count = 6
+    variants = harness.Variants(position=np.arange(count), end=np.arange(count), distance_to_tss=np.array([100, 100, 100_000, 5_000, 100, 90]),
+                                is_sv=np.array([True, False, False, False, False, False]), sv_type=np.array(["."] * count),
+                                sv_length=np.zeros(count), allele_length_change=np.zeros(count),
+                                train_allele_frequency=np.array([0.2, 0.45, 0.2, 0.2, 0.05, 0.21]), source=np.array(["panel"] * count))
+    assert list(np.flatnonzero(harness.feature_mask(variants, "snv_matched", "g/s"))) == [5]
+
+
+def test_sv_only_feature_sets_select_the_documented_columns():
+    variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
+    assert list(harness.feature_mask(variants, "sv", "g/s")) == [False, True, False, False]
+    assert list(harness.feature_mask(variants, "pgsv", "g/s")) == [False, False, False, True]
+
+
+def test_sealed_confirmation_genes_are_never_scored_outside_the_confirmation(tmp_path):
+    pd.DataFrame({"chrom": ["chr1"] * 3, "start": [1, 2, 3], "end": [2, 3, 4], "gene_id": ["g1", "g2", "g3"], "tss": [2, 3, 4]}).to_csv(
+        tmp_path / "genes.tsv", sep="\t", index=False)
+    pd.DataFrame({"gene_id": ["g2"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory, dataset.genes = tmp_path, pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    assert dataset.gene_rows(["chr1"]) == [0, 2]
+    assert dataset.gene_rows(["chr1"], confirmation=True) == [1]
+    pd.DataFrame({"gene_id": ["g1", "g2"]}).to_csv(tmp_path / "list.tsv", sep="\t", index=False)
+    try:
+        dataset.gene_rows(["chr1"], gene_list=tmp_path / "list.tsv")
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a gene list naming a sealed gene must be refused")
+
+
+def test_long_read_feature_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True, False], ["panel", "panel", "hgsvc3", "ont", "ont"])
+    assert list(harness.feature_mask(variants, "hgsvc3", "g/s")) == [False, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_hgsvc3", "g/s")) == [True, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_ont", "g/s")) == [True, False, False, True, False]
+
+
+def test_a_derived_dataset_must_carry_its_parents_sealed_genes(tmp_path):
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    pd.DataFrame({"gene_id": ["g2"]}).to_csv(parent / harness.SEALED_GENES, sep="\t", index=False)
+    (child / harness.PARENT_DATASET).write_text(str(parent) + "\n")
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory = child
+    try:
+        dataset.sealed_genes()
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a derived dataset without the parent's sealed list must be refused")
+    (child / harness.SEALED_GENES).write_bytes((parent / harness.SEALED_GENES).read_bytes())
+    assert dataset.sealed_genes() == {"g2"}
+
+
+def test_batch_contract_matches_the_per_gene_contract_for_a_per_gene_method(tmp_path):
+    tiny_dataset(tmp_path)
+    baselines_path = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py"
+    (tmp_path / "batch_method.py").write_text(
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('baselines_for_batch', {baselines_path!r})\n"
+        "baselines = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(baselines)\n\n\n"
+        "def fit_batch(trains):\n"
+        "    return [baselines.top_variant(train) for train in trains]\n")
+    harness.run(tmp_path, f"{baselines_path}:top_variant", "gene", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    harness.run(tmp_path, f"{tmp_path}/batch_method.py:fit_batch", "batch", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="batch")
+    for feature_set in ("snv", "snv_sv"):
+        for kind in ("predictions", "predictions_without_sv"):
+            assert np.array_equal(np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy"),
+                                  np.load(tmp_path / f"results/batch/loso/chr1.{feature_set}.{kind}.npy"))
+
+
+def test_a_batch_refuses_a_sealed_gene(tmp_path):
+    tiny_dataset(tmp_path)
+    pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    dataset = harness.Dataset(tmp_path)
+    try:
+        harness._LazyTrains(dataset, [0], "loso/AFR", "snv")
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a batch containing a sealed gene must be refused")
+
+
+def test_gene_ranks_take_a_slice_of_the_list_in_list_order(tmp_path):
+    pd.DataFrame({"chrom": ["chr1"] * 4, "start": [1, 2, 3, 4], "end": [2, 3, 4, 5], "gene_id": ["g1", "g2", "g3", "g4"], "tss": [2, 3, 4, 5]}).to_csv(
+        tmp_path / "genes.tsv", sep="\t", index=False)
+    pd.DataFrame({"gene_id": ["g3", "g1", "g4", "g2"]}).to_csv(tmp_path / "ranked.tsv", sep="\t", index=False)
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory, dataset.genes = tmp_path, pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    assert dataset.gene_rows(["chr1"], gene_list=tmp_path / "ranked.tsv", gene_ranks=(0, 2)) == [0, 2]
+    assert dataset.gene_rows(["chr1"], gene_list=tmp_path / "ranked.tsv", gene_ranks=(2, 4)) == [1, 3]
+
+
+def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
+    import itertools
+
+    from benchmarks.bench_real import genome_total
+
+    values = np.array([0.3, -0.1, 0.7, 0.2, 0.05, 0.4, -0.2])
+    targeted = {1, 4}
+    population, sample_size = len(values), 3
+    estimates = []
+    for sample in itertools.combinations(range(population), sample_size):
+        scored = sorted(targeted | set(sample))
+        genes = pd.DataFrame({"gene_id": [f"g{index}" for index in scored], "chrom": [f"chr{index % 3 + 1}" for index in scored],
+                              "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
+        estimates.append(genome_total.horvitz_thompson_total(genes, population, sample_size)[0])
+    assert np.isclose(np.mean(estimates), values.sum(), rtol=0, atol=64 * EPSILON)
