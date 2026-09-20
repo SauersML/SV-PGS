@@ -22,6 +22,7 @@ from sv_pgs.scale_mixture_ep import (
     Cavity,
     GaussianPosterior,
     MixtureHyperparameters,
+    TiltedMoments,
     _ascend_evidence,
     _corrected,
     _data_objective,
@@ -919,4 +920,161 @@ def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
     assert gains[best_move] <= claimed + 2.0 * _EVIDENCE_TOLERANCE, (
         f"a move {best_move} (weight, distance in rho) gains {gains[best_move]:.4g} nats; claimed {claimed:.4g}; "
         f"c {check}, s {curvature}, E {errors}"
+    )
+
+
+# ---------------------------------------------------------------- 8. invariances of the fit (review-ideas item 6)
+#
+# mr.ash's refit moved predictions on genes where the added columns took no weight (its coordinate ascent depends on
+# the column order and stops at a convergence tolerance). SV-PGS's variant-side fit is a function of the set of
+# (class, offset, annotation, cavity) rows, not of their order, and it is certified to the evidence tolerance. So:
+#   - reordering the variants may change V by at most two tolerances (each fit certified to one), and the fitted
+#     posteriors by at most the tolerance in the same nats: the KL divergence between the two fits' per-effect
+#     Gaussian posteriors, summed over effects, in either direction;
+#   - at fixed hyperparameters the engine's functions are order-invariant to their rounding.
+# An exact duplicate never reaches this engine: Stage 0 merges exact ties (and sign-flipped copies) into one reduced
+# column (genotype_statistics._exact_ties; tests/test_genotype_statistics.py). A column that carries no signal does
+# reach it, and refitting the prior with it is a genuine change of the empirical-Bayes fit, which the last test
+# measures against the same tolerance.
+
+
+def _invariance_inputs(seed: int, class_sizes: tuple[int, ...], *, null_classes: tuple[int, ...] = ()):
+    """Per-variant inputs of a problem with classes of the given sizes and one annotation column: (class index,
+    log-variance offset, annotation design, cavity). The classes in ``null_classes`` carry no effect at all (their
+    shifts are pure noise), like SV columns that take no weight."""
+    generator = np.random.default_rng(seed)
+    class_index = np.repeat(np.arange(len(class_sizes)), class_sizes).astype(np.int64)
+    variant_count = class_index.shape[0]
+    offset = np.log(generator.uniform(0.2, 1.0, variant_count))
+    design = generator.uniform(-1.0, 1.0, (variant_count, 1))
+    precision = generator.uniform(50.0, 400.0, variant_count)
+    effect = np.where(generator.random(variant_count) < 0.3, generator.normal(0.0, 0.25, variant_count), 0.0)
+    effect[np.isin(class_index, null_classes)] = 0.0
+    shift = precision * (effect + generator.standard_normal(variant_count) / np.sqrt(precision))
+    return class_index, offset, design, Cavity(precision=precision, shift=shift)
+
+
+def _invariance_prior(class_index, offset, design, nodes):
+    return scale_mixture_prior(
+        class_index=class_index, log_variance_offset=offset, annotation_design=design,
+        annotation_groups=(AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),), nodes=nodes,
+        floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+
+
+def _permuted(inputs, order: np.ndarray):
+    class_index, offset, design, cavity = inputs
+    return class_index[order], offset[order], design[order], Cavity(precision=cavity.precision[order], shift=cavity.shift[order])
+
+
+def _posterior_divergence(first: TiltedMoments, second: TiltedMoments) -> float:
+    """The KL divergence between two sets of per-effect Gaussian posteriors, summed over effects, the larger of the
+    two directions."""
+
+    def divergence(left: TiltedMoments, right: TiltedMoments) -> float:
+        return float(np.sum(0.5 * (
+            np.log(right.variance / left.variance) + (left.variance + np.square(left.mean - right.mean)) / right.variance - 1.0
+        )))
+
+    return max(divergence(first, second), divergence(second, first))
+
+
+def _restricted_moments(moments: TiltedMoments, rows: np.ndarray) -> TiltedMoments:
+    return TiltedMoments(log_normalizer=moments.log_normalizer[rows], mean=moments.mean[rows], variance=moments.variance[rows])
+
+
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_the_engines_functions_do_not_depend_on_the_variant_order(seed):
+    """At fixed hyperparameters, the tilted moments (permuted) and sum_j log Z_j; and the Laplace V at its stationary
+    point from the same start, with its fitted posteriors."""
+    inputs = _invariance_inputs(seed, (30, 20, 10))
+    order = np.random.default_rng(seed + 1).permutation(inputs[0].shape[0])
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    prior, cavity = _invariance_prior(*inputs[:3], nodes), inputs[3]
+    moved_inputs = _permuted(inputs, order)
+    moved_prior, moved_cavity = _invariance_prior(*moved_inputs[:3], nodes), moved_inputs[3]
+    assert prior.coefficient_size == moved_prior.coefficient_size
+    point = _random_coefficients(np.random.default_rng(seed + 2), prior)
+    hyperparameters = _hyperparameters(prior, point)
+    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+    moved = tilted_moments(moved_prior, hyperparameters, moved_cavity, _WORKING_BYTES)
+    # Each variant's moments are its own K-term sums, whatever its row: at most 4K roundings apart.
+    summation = 4.0 * nodes.shape[0] * _EPSILON
+    np.testing.assert_allclose(moved.log_normalizer, moments.log_normalizer[order], rtol=summation, atol=summation)
+    np.testing.assert_allclose(moved.mean, moments.mean[order], rtol=summation, atol=summation * float(np.max(np.sqrt(moments.variance))))
+    np.testing.assert_allclose(moved.variance, moments.variance[order], rtol=2.0 * summation)
+    objective = _data_objective(prior, point, cavity, _WORKING_BYTES)
+    moved_value = _data_value(moved_prior, point, moved_cavity, _WORKING_BYTES)
+    # The same p terms summed in another order: recursive summation errs by at most (p - 1) eps sum_j |log Z_j| each
+    # way, on top of each term's own rounding.
+    rounding = 2.0 * (_objective_rounding(prior, point, cavity) + prior.variant_count * _EPSILON * objective.magnitude)
+    assert abs(moved_value - objective.value) <= rounding
+    mapping = prior.coefficient_map
+    log_smoothing = np.zeros(len(prior.smoothing_blocks))
+    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    start = initial_hyperparameters(prior).coefficients
+    evidence = _evidence(prior, log_smoothing, start, cavity, posterior, _WORKING_BYTES, 0.0)
+    moved_evidence = _evidence(moved_prior, log_smoothing, start, moved_cavity, normal_means_posterior(moved_cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    if evidence is None or moved_evidence is None:
+        assert evidence is None and moved_evidence is None, "V certified in one order and refused in the other"
+        pytest.skip("no certified maximum at these weights in either order: the engine refuses V there")
+    negative = -(mapping.T @ _data_objective(prior, evidence.coefficients, cavity, _WORKING_BYTES).hessian @ mapping) + _penalty_matrix(prior, log_smoothing)
+    # As in the V-formula test: both are the Laplace value at a stationary point, each to D eps cond(B + S).
+    bound = 2.0 * 16.0 * negative.shape[0] * _EPSILON * float(np.linalg.cond(negative)) * (1.0 + abs(evidence.laplace_value))
+    assert abs(moved_evidence.laplace_value - evidence.laplace_value) <= bound
+    fitted = tilted_moments(prior, _hyperparameters(prior, evidence.coefficients), cavity, _WORKING_BYTES)
+    moved_fitted = tilted_moments(moved_prior, _hyperparameters(moved_prior, moved_evidence.coefficients), moved_cavity, _WORKING_BYTES)
+    assert _posterior_divergence(_restricted_moments(fitted, order), moved_fitted) <= _EVIDENCE_TOLERANCE
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_the_fit_does_not_depend_on_the_variant_order(seed):
+    """hyper_step on the same variants in two orders: V within two tolerances, and the fitted posteriors within one."""
+    inputs = _invariance_inputs(seed, (50, 30))
+    order = np.random.default_rng(seed + 1).permutation(inputs[0].shape[0])
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    fits = []
+    for variant_inputs in (inputs, _permuted(inputs, order)):
+        prior, cavity = _invariance_prior(*variant_inputs[:3], nodes), variant_inputs[3]
+        step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+        fits.append((step, tilted_moments(prior, step.hyperparameters, cavity, _WORKING_BYTES)))
+    (first, first_moments), (second, second_moments) = fits
+    divergence = _posterior_divergence(_restricted_moments(first_moments, order), second_moments)
+    assert abs(first.evidence - second.evidence) <= 2.0 * _EVIDENCE_TOLERANCE, (first.evidence, second.evidence)
+    assert divergence <= _EVIDENCE_TOLERANCE, (
+        f"posteriors {divergence:.3g} nats apart; weights {first.hyperparameters.log_smoothing} vs {second.hyperparameters.log_smoothing}; "
+        f"max |mean change| {float(np.max(np.abs(first_moments.mean[order] - second_moments.mean))):.3g}"
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_a_class_of_null_columns_moves_the_other_classes_posteriors_by_at_most_the_tolerance(seed):
+    """bench-real's SNV refit term, at the variant side [sim-only]: fit two classes, then the same variants plus a
+    third class of columns with no effect (SVs that take no weight), and compare the first two classes' fitted
+    posteriors. The prior's classes share a density (eta_bar) and pool their deviations' location and width, so the
+    null class can reach the others only through that pooling; the test measures how far, in the tolerance's nats."""
+    base = _invariance_inputs(seed, (50, 30))
+    extended = _invariance_inputs(seed, (50, 30, 40), null_classes=(2,))
+    # The same first 80 variants in both: the extension's leading rows are replaced by the base problem's.
+    kept = base[0].shape[0]
+    extended = (
+        np.concatenate([base[0], extended[0][kept:]]), np.concatenate([base[1], extended[1][kept:]]),
+        np.concatenate([base[2], extended[2][kept:]]),
+        Cavity(precision=np.concatenate([base[3].precision, extended[3].precision[kept:]]), shift=np.concatenate([base[3].shift, extended[3].shift[kept:]])),
+    )
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    fits = []
+    for variant_inputs in (base, extended):
+        prior, cavity = _invariance_prior(*variant_inputs[:3], nodes), variant_inputs[3]
+        step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+        fits.append((step, tilted_moments(prior, step.hyperparameters, cavity, _WORKING_BYTES)))
+    (first, first_moments), (second, second_moments) = fits
+    rows = np.arange(kept)
+    divergence = _posterior_divergence(first_moments, _restricted_moments(second_moments, rows))
+    assert divergence <= _EVIDENCE_TOLERANCE, (
+        f"the null class moved the other classes' posteriors by {divergence:.3g} nats; max |mean change| "
+        f"{float(np.max(np.abs(first_moments.mean - second_moments.mean[rows]))):.3g}; weights {first.hyperparameters.log_smoothing} "
+        f"vs {second.hyperparameters.log_smoothing}"
     )
