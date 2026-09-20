@@ -449,3 +449,14 @@ def test_ctyper_and_hprc2_sets_select_their_source():
     variants = synthetic_variants([False, True, True, True], ["panel", "panel", "ctyper", "hprc2"])
     assert list(harness.feature_mask(variants, "snv_ctyper", "g/s")) == [True, False, True, False]
     assert list(harness.feature_mask(variants, "snv_hprc2", "g/s")) == [True, False, False, True]
+
+
+def test_undefined_quality_values_pass_through_as_nan(tmp_path):
+    tiny_dataset(tmp_path)
+    table = pd.read_csv(tmp_path / "chr1.variants.tsv", sep="\t")
+    table["called_r2"] = np.where(table["is_sv"], np.nan, 1.0)
+    table.to_csv(tmp_path / "chr1.variants.tsv", sep="\t", index=False)
+    dataset = harness.Dataset(tmp_path)
+    train, _, _, _ = harness.build_gene_task(dataset, harness.load_gene_window(dataset, 0), dataset.splits["loso/AFR"])
+    assert np.isnan(train.variants.called_r2[train.variants.is_sv]).all()
+    assert (train.variants.called_r2[~train.variants.is_sv] == 1.0).all()

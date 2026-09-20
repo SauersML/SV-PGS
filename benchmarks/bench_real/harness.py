@@ -71,6 +71,8 @@ class Variants:
     concordance: np.ndarray = None
     # The exact squared correlation of the stored dosage with the CALLED genotype under the fill mixture (lr-sv): an upper
     # bound on the r^2 with the true genotype, so not the reliability either. 1 where absent.
+    # In reliability, concordance and called_r2 alike, NaN means "undefined" (e.g. called_r2 on a row whose called people
+    # are all homozygous reference, where every carrier is a fill): no reported value, never a value of 0 or 1.
     called_r2: np.ndarray = None
 
 
