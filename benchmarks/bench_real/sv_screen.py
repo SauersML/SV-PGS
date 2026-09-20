@@ -11,6 +11,10 @@ single small-variant proxy leaves unexplained. R is the harness's cis radius.
 Per gene: over the SVs in the harness's own cis window (the SV interval overlaps TSS +/- R), the sums of u for panel
 and for PanGenie SVs, the largest single u, SV counts, whether an SV overlaps the gene body or its merged exons, and
 the leading SVs. Genes are ranked by the panel sum, ties broken by the sealed gene order.
+
+Outputs: screen_<version>.tsv (every column, one row per gene in rank order), sv_ranked_<version>.tsv (a `gene_id`
+column only, in rank order, for the harness's gene-list option), sv_proxies_<version>.tsv.gz (per SV), and SEALED.txt
+with the sha256 of all three.
 """
 import argparse
 import concurrent.futures
@@ -216,8 +220,7 @@ def main():
     ranked_list = out_dir / f"sv_ranked_{arguments.version}.tsv"
     table = out_dir / f"sv_proxies_{arguments.version}.tsv.gz"
     ranked.to_csv(screen, sep="\t", index=False)
-    ranked[["rank", "gene_id", "chrom", "U_panel", "U_pgsv", "n_sv_panel", *(f"in_prefix_{prefix}" for prefix in FITTED_PREFIXES)]].to_csv(
-        ranked_list, sep="\t", index=False)
+    ranked[["gene_id"]].to_csv(ranked_list, sep="\t", index=False)
     structural.to_csv(table, sep="\t", index=False)
     (out_dir / "SEALED.txt").write_text("".join(f"{_sha256(path)}  {path.name}\n" for path in (screen, ranked_list, table)))
     print((out_dir / "SEALED.txt").read_text(), flush=True)
