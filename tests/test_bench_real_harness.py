@@ -683,6 +683,7 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
         assert np.isclose(row.r2, expected, rtol=0, atol=1e3 * EPSILON)
         # The exact null expectation: people minus the rank of [1, C_T].
         assert row.null_r2 == 1.0 / (40 - 4) and row.people == 40
+        assert np.isfinite(row.mismatched_r2)
     # Any covariate combination added to the score, or taken from the truth, leaves the metric unchanged.
     shifted = predictions + (np.column_stack([np.ones(len(covariates)), covariates]) @ np.arange(1.0, 5.0))[None, :]
     np.save(tmp_path / "results/m/loso/chr.snv.predictions.npy", shifted)
@@ -725,3 +726,10 @@ def test_a_constant_fit_is_scored_as_no_prediction():
     assert (prediction == 0).all() and (without_sv == 0).all()
     residual, rank = report.within_group_residual(np.full((1, test_count), 0.37), covariates[train_count:])
     assert rank == 5 and (residual == 0).all()
+
+
+def test_mismatched_partners_pair_each_gene_with_the_next_gene_on_another_chromosome():
+    from benchmarks.bench_real import report
+
+    assert list(report.mismatched_partners(np.array(["chr1", "chr1", "chr2", "chr3", "chr3"]))) == [2, 2, 3, 0, 0]
+    assert list(report.mismatched_partners(np.array(["chr1", "chr1"]))) == [-1, -1]

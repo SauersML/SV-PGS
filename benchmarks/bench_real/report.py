@@ -9,6 +9,8 @@ superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted ov
            out, and it is checked against y (HeldOut.expression_for), so a mismatched --dataset stops the report.
   oos_r2   1 - |R_T (y - s)|^2 / |R_T y|^2: it also charges the score's scale, which r2 ignores.
   null_r2  1 / (n_T - rank[1, C_T]), the exact expectation of r2 for a score unrelated to expression.
+  mismatched_r2  the standing negative control: gene i's expression against the score of the next gene of its chunk on
+           another chromosome (review-stats). Its mean must sit at null_r2; above it is signal no gene owns.
 R_T s is the same for any two scores that differ by one covariate combination, so raw and covariate-adjusted scores
 score alike, and fits made before the harness adjusted scores (C2) re-score from their saved predictions. Under loso
 that is exact. Under random5 a group's people come from five training fits, so a score adjusted fold by fold keeps a
@@ -72,16 +74,19 @@ def group_basis(covariates, weights=None):
 def residual_on(basis, values, weights=None):
     """Each row of values (rows x the group's people) minus its projection on the basis. A row in the span (a constant,
     or any covariate combination) has residual 0, and it is set so rather than left as float rounding noise, which would
-    score as a random direction: a row is in the span when it is constant, or when its residual is within the rank
-    tolerance of group_basis (the larger dimension times the float64 epsilon) relative to the row. With weights, the
-    residual of the sqrt(weight)-scaled rows, so plain sums of products of two residuals are the weighted sums."""
-    values = np.asarray(values, dtype=np.float64)
+    score as a random direction. A row is in the span when it is constant, or when its residual is within what rounding
+    leaves of a row in the span: its storage precision (half an ulp per entry of a float32 prediction moves the row by at
+    most eps32 / 2 of its norm) plus group_basis's rank tolerance for the float64 projection. With weights, the residual
+    of the sqrt(weight)-scaled rows, so plain sums of products of two residuals are the weighted sums."""
+    values = np.asarray(values)
+    storage = np.finfo(values.dtype).eps if np.issubdtype(values.dtype, np.floating) else 0.0
+    values = values.astype(np.float64)
     constant = np.ptp(values, axis=1) == 0
     if weights is not None:
         values = values * np.sqrt(weights)
     residual = values - (values @ basis) @ basis.T
-    in_span = constant | (np.linalg.norm(residual, axis=1) <= max(basis.shape) * np.finfo(np.float64).eps * np.linalg.norm(values, axis=1))
-    residual[in_span] = 0.0
+    tolerance = storage + max(basis.shape) * np.finfo(np.float64).eps
+    residual[constant | (np.linalg.norm(residual, axis=1) <= tolerance * np.linalg.norm(values, axis=1))] = 0.0
     return residual
 
 
@@ -143,7 +148,7 @@ class HeldOut:
         exactly 0; the harness's adjustment left float rounding noise there, which is set back to 0. Needs the raw
         scores (saved since e448b16); an earlier unadjusted prediction of such a fit is exactly constant already."""
         suffix = "_without_sv" if masked else ""
-        predictions = np.load(directory / f"{tag}.{feature_set}.predictions{suffix}.npy").astype(np.float64)
+        predictions = np.load(directory / f"{tag}.{feature_set}.predictions{suffix}.npy")
         raw_path = directory / f"{tag}.{feature_set}.raw_scores{suffix}.npy"
         if raw_path.exists():
             raw = np.load(raw_path)
@@ -192,10 +197,27 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
             predictions = data.predictions(directory, tag, feature_set, masked=False)
             for group, rows, people, rank, truth, (score,) in data.within_groups(design, expression, predictions):
                 r2, oos_r2 = partial_scores(score, truth)
+                partner = mismatched_partners(genes["chrom"].to_numpy()[rows])
+                mismatched = np.where(partner >= 0, partial_scores(score[partner], truth)[0], np.nan)
                 frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
                                             "feature_set": feature_set, "design": design, "superpopulation": group, "r2": r2, "oos_r2": oos_r2,
-                                            "null_r2": 1.0 / (people - rank), "people": people}))
+                                            "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
     return pd.concat(frames, ignore_index=True)
+
+
+def mismatched_partners(chromosomes: np.ndarray) -> np.ndarray:
+    """The negative control's pairing (review-stats): each gene's partner is the next gene of its chunk, cyclically, on
+    another chromosome (-1 when every gene shares one). The r2 of gene i's expression against its partner's score is
+    signal that no gene owns, such as shared covariate or ancestry structure; under the within-group rule its mean sits
+    at null_r2."""
+    count = len(chromosomes)
+    doubled = np.concatenate([chromosomes, chromosomes])
+    # next_other[j]: the first position after j whose chromosome differs from j's, i.e. the end of j's run.
+    next_other = np.full(2 * count, 2 * count)
+    for position in range(2 * count - 2, -1, -1):
+        next_other[position] = position + 1 if doubled[position + 1] != doubled[position] else next_other[position + 1]
+    first = next_other[:count]
+    return np.where(first < np.arange(count) + count, first % max(count, 1), -1)
 
 
 def jackknife(differences: pd.Series, blocks: pd.Series):
@@ -240,7 +262,7 @@ def pooled_r2(scores: pd.DataFrame):
     averaged over the held-out groups, complete-case (failed genes dropped and counted) and intention-to-treat (a failed
     group scored as the training-mean prediction: r^2 = oos_r2 = 0)."""
     key = ["method", "feature_set", "design", "gene_id", "chrom"]
-    per_gene = scores.groupby(key, as_index=False)[["r2", "oos_r2", "null_r2"]].agg(lambda values: values.mean(skipna=False))
+    per_gene = scores.groupby(key, as_index=False)[["r2", "oos_r2", "null_r2", "mismatched_r2"]].agg(lambda values: values.mean(skipna=False))
     per_gene_itt = scores.fillna({"r2": 0.0}).groupby(key, as_index=False)["r2"].mean()
     itt_groups = dict(list(per_gene_itt.groupby(["method", "feature_set", "design"])))
     rows = []
@@ -252,7 +274,7 @@ def pooled_r2(scores: pd.DataFrame):
         whole = itt_groups[arm]
         itt_mean, itt_error, _ = jackknife(whole["r2"], whole["chrom"])
         rows.append(dict(zip(["method", "feature_set", "design"], arm), superpopulation=POOLED, genes=len(complete), mean_r2=mean, se=error, se_kind=kind,
-                         null_r2=complete["null_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error, failed_genes=failed, itt_genes=len(whole),
+                         null_r2=complete["null_r2"].mean(), mismatched_r2=complete["mismatched_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error, failed_genes=failed, itt_genes=len(whole),
                          itt_mean_r2=itt_mean, itt_se=itt_error))
     return pd.DataFrame(rows)
 
@@ -333,6 +355,7 @@ def main():
     if len(credit):
         summarize_sv_credit(credit).to_csv(pathlib.Path(arguments.out) / "sv_credit.tsv", sep="\t", index=False)
     summary = scores.groupby(["design", "superpopulation", "method", "feature_set"]).agg(mean=("r2", "mean"), count=("r2", "count"), null_r2=("null_r2", "mean"),
+                                                                                       mismatched_r2=("mismatched_r2", "mean"),
                                                                                        mean_oos_r2=("oos_r2", "mean"), people=("people", "max")).reset_index()
     summary.to_csv(pathlib.Path(arguments.out) / "mean_r2.tsv", sep="\t", index=False)
     headline = pooled_r2(scores)
