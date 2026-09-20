@@ -862,6 +862,16 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
     assert np.max(np.abs(analytic - fixed_cavity)) > 1e-3 * float(np.max(np.abs(fixed_cavity)))
 
+    # A posterior that solves the linear response exactly gives the same B as GMRES.
+    squared = np.square(covariance)
+
+    def linear_response(left, right, diagonal, weight, right_hand):
+        matrix = np.eye(variant_count) - (np.eye(variant_count) - weight[:, None] * squared) @ (left[:, None] * covariance * right[None, :] + np.diag(diagonal))
+        return np.linalg.solve(matrix, right_hand)
+
+    exact = _total_curvature(prior, coefficients, cavity, replace(posterior, linear_response=linear_response), _WORKING_BYTES, 1e-13)
+    np.testing.assert_allclose(exact, analytic, rtol=1e-9, atol=1e-9 * float(np.max(np.abs(analytic))))
+
 
 def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():
     # A correction C = B - A of the form every real one has, M'(B_z - A_z)M, here with B_z = -A_z - I: then
