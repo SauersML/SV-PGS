@@ -14,12 +14,12 @@ The bulk diagonal [K^-1]_ii is returned alone, in binary-ep's convention: the re
 covariate leverage are added once, by dual_solve.SampleDiagonal.predictor_variance, and adding them here too
 would count them twice.
 
-These are marginal_variances' identity 1 with K^-1 applied exactly (its KernelFactor route, here with the
-rounding certified): one Cholesky K = RR' replaces the window and its far-field equivalent, so nothing is
-estimated and no probe certificate is needed. With u = R^-1 x every quantity above is an inner product of
-forward solves, run on the array module's device. Two passes over the columns (form K and gather U, then
-forward-solve every column) cost n^2 p flops each, the factor n^3/3, and diag(K^-1) another n^3 when it is
-asked for, in blocks of identity columns, so no second n x n array is held. `exact_dual_cost` gives the counts.
+These are marginal_variances' identity 1 with K^-1 applied exactly: one Cholesky K = RR' replaces the window
+and its far-field equivalent, so nothing is estimated and no probe certificate is needed. With u = R^-1 x every
+quantity above is an inner product of forward solves, run on the array module's device. Two passes over the
+columns (form K and gather U, then forward-solve every column) cost n^2 p flops each, the factor n^3/3, and
+diag(K^-1) another n^3 when it is asked for, in blocks of identity columns, so no second n x n array is held.
+`exact_dual_cost` gives the counts.
 
 Certificate. The algebra is exact, so the bound covers floating point only. Let u be the unit roundoff and
 gamma_m = m u / (1 - m u) (Higham 2002, Accuracy and Stability of Numerical Algorithms, section 3.1).
@@ -73,7 +73,7 @@ class NotCertified(ArithmeticError):
 
 @dataclass(frozen=True)
 class KernelParts:
-    """The factored bulk kernel, for callers that keep it (marginal_variances.KernelFactor's fields): `lower` is R
+    """The factored bulk kernel, for callers that keep it (DualGaussian.kernel_factor): `lower` is R
     with RR' = K_S, `resolved_solves` is K_S^-1 Xt_L (n x |L|) and `resolved_core` is Pi_L + Xt_L' K_S^-1 Xt_L,
     both with the resolved sites in ExactMarginals.resolved order. `lower` and `resolved_solves` stay on the array
     module's device; the core is on the host."""
