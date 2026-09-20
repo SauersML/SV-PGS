@@ -30,6 +30,7 @@ from sv_pgs.marginal_variances import (
     marginal_variances,
     marginals_from_quadratics,
     variance_jvp,
+    variance_jvp_operator,
     window_bulk_quadratic,
     window_cross,
 )
@@ -420,3 +421,16 @@ def test_a_zero_estimate_with_probe_signal_is_violated_not_an_error():
     certificate = block_trace_certificate(removed_estimate, blocks, probes, removed, 0.5, certificate_level(64))
     assert certificate.violated[2] and not certificate.certified[2]
     assert np.isinf(certificate.relative_error[2])
+
+
+def test_the_cached_jvp_operator_is_the_jvp():
+    generator, columns, precision, blocks, solve = _strong_case(7)
+    grams = _grams(columns, blocks)
+    operator = variance_jvp_operator(solve, grams, 1 << 30)
+    for _direction in range(3):
+        direction = generator.uniform(0.0, 1.0, size=(columns.shape[1], 2)) * precision[:, None]
+        expected = variance_jvp(solve, grams, direction)
+        product = operator(direction)
+        assert np.array_equal(product.values, expected.values)
+        assert np.array_equal(product.standard_error, expected.standard_error)
+        assert np.array_equal(product.window_part, expected.window_part)

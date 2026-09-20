@@ -60,7 +60,7 @@ from sv_pgs.marginal_variances import (
     information_products,
     information_solve_tolerance,
     marginal_variances,
-    variance_jvp,
+    variance_jvp_operator,
 )
 from sv_pgs.scale_mixture_ep import (
     Cavity,
@@ -190,7 +190,9 @@ def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Arra
     return lower, upper
 
 
-def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None]) -> GaussianPosterior:
+def _posterior(
+    gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None], cache_bytes: int
+) -> GaussianPosterior:
     """q's responses at this refresh for the total curvature: Sigma R by the dual solver, each column to a relative
     error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map. ``ensure`` puts the dual
     solver back at this refresh's sites before it is asked (a later trial may have moved it)."""
@@ -213,7 +215,15 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
             live = live[~done]
         return solution
 
-    return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values)
+    # The leave-block-out map is formed once, at the first direction, and reused for every later one.
+    operator: list[Callable[[F64Array], object]] = []
+
+    def jvp(weights: F64Array) -> F64Array:
+        if not operator:
+            operator.append(variance_jvp_operator(solve, grams, cache_bytes))
+        return operator[0](weights).values
+
+    return GaussianPosterior(solve=relative_solve, variance_jvp=jvp)
 
 
 def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array) -> Callable[[F64Array], float]:
@@ -464,7 +474,9 @@ class _FullDataFixedPoints:
                 return [
                     FixedPoint(
                         cavity=cavities[model],
-                        posterior=_posterior(gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
+                        posterior=_posterior(
+                            gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot), self.working_bytes // 2
+                        ),
                         mean=mean[:, model].copy(),
                         precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model]),
                         effective_effects=float(self.effective[model]),

@@ -50,6 +50,7 @@ beyond its window, shows up as a block whose measured trace error provably excee
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 import numpy as np
 from numpy.typing import NDArray
@@ -688,58 +689,80 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     - **The block sandwich, not |xt_j|^2 Sigma_jj^2:** a variant's LD partners absorb most of its chance
       coupling with distant blocks.
     """
+    return variance_jvp_operator(solve, grams, 0)(direction)
+
+
+def variance_jvp_operator(solve: BulkSolve, grams: BlockGrams, cache_bytes: int) -> Callable[[NDArray[np.float64]], JacobianProduct]:
+    """``variance_jvp`` at one refresh as an operator on directions. Everything that does not depend on the direction
+    (the window algebra of every block, with its eigendecompositions, and the block sandwiches) is formed once; the
+    blocks' squared Sigma rows are kept while they fit in ``cache_bytes`` and are recomputed per direction beyond it."""
     cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
     variant_count = solve.site_precision.shape[0]
     squared_variance = np.square(bulk_variance)
     sandwich = np.zeros(variant_count)
+    kept: dict[int, tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]] = {}
+    spent = 0
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
         # diag(S R S) as one BLAS product and a row sum: a three-operand einsum loops over i, j and k in C, without BLAS.
         sandwich[members] = np.einsum("ij,ji->i", terms.covariance @ grams.within[block], terms.covariance)
+        size = terms.rows.nbytes + terms.loadings.nbytes
+        if spent + size <= cache_bytes:
+            kept[block] = (terms.columns, np.square(terms.rows), terms.loadings, terms.near)
+            spent += size
     pair_scale = solve.kernel_square_trace / solve.sample_count
-    chance_weight = sandwich[:, None] * direction
-    chance_total = chance_weight.sum(axis=0)
-    chance_square_total = np.square(chance_weight).sum(axis=0)
-    # Resolved rows take their resolved partners exactly from core^-1, so their chance sums run over bulk partners only.
-    bulk_chance_weight = np.where(is_resolved[:, None], 0.0, chance_weight)
     block_of = _block_index(grams)
-    values = np.zeros_like(direction)
-    variance = np.zeros_like(direction)
-    window_part = np.zeros_like(direction)
-    resolved_bulk_near = np.zeros((solve.resolved.shape[0], direction.shape[1]))
-    window_chance = np.zeros((len(grams.blocks), direction.shape[1]))
-    window_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
-    window_bulk_chance = np.zeros((len(grams.blocks), direction.shape[1]))
-    window_bulk_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
-    for block, members in enumerate(grams.blocks):
-        window_members = np.concatenate([grams.blocks[member] for member in _window_blocks(grams, block)])
-        window_chance[block] = chance_weight[window_members].sum(axis=0)
-        window_chance_square[block] = np.square(chance_weight[window_members]).sum(axis=0)
-        window_bulk_chance[block] = bulk_chance_weight[window_members].sum(axis=0)
-        window_bulk_chance_square[block] = np.square(bulk_chance_weight[window_members]).sum(axis=0)
-    for block, members in enumerate(grams.blocks):
+    window_members = [np.concatenate([grams.blocks[member] for member in _window_blocks(grams, block)]) for block in range(len(grams.blocks))]
+
+    def block_parts(block: int) -> tuple[NDArray[np.int64], NDArray[np.float64], NDArray[np.float64], NDArray[np.int64]]:
+        if block in kept:
+            return kept[block]
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
-        window_sum = np.square(terms.rows) @ direction[terms.columns]
-        loadings = terms.loadings  # (|b|, |L|)
-        near = terms.near
-        resolved_sum = squared_variance[members][:, None] * (np.square(loadings[:, near]) @ direction[solve.resolved[near]])
-        row_scale = sandwich[members] * pair_scale
-        chance_far = row_scale[:, None] * (chance_total - window_chance[block])[None, :]
-        values[members] = -(window_sum + resolved_sum + chance_far)
-        window_part[members] = window_sum
-        variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square_total - window_chance_square[block])[None, :]
-        # Resolved rows: bulk partners whose window holds the resolved site, exactly.
-        weighted = squared_variance[members][:, None, None] * np.square(loadings)[:, :, None] * direction[members][:, None, :]
-        resolved_bulk_near[near] += weighted.sum(axis=0)[near]
-    if solve.resolved.shape[0]:
-        resolved_blocks = block_of[solve.resolved]
-        resolved_scale = sandwich[solve.resolved] * pair_scale
-        resolved_rows = np.square(core_inverse) @ direction[solve.resolved]
-        bulk_total = bulk_chance_weight.sum(axis=0)
-        bulk_square_total = np.square(bulk_chance_weight).sum(axis=0)
-        chance_resolved = resolved_scale[:, None] * (bulk_total[None, :] - window_bulk_chance[resolved_blocks])
-        values[solve.resolved] = -(resolved_rows + resolved_bulk_near + chance_resolved)
-        variance[solve.resolved] = 2.0 * np.square(resolved_scale)[:, None] * (bulk_square_total[None, :] - window_bulk_chance_square[resolved_blocks])
-        window_part[solve.resolved] = resolved_bulk_near
-    return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
+        return terms.columns, np.square(terms.rows), terms.loadings, terms.near
+
+    def apply(direction: NDArray[np.float64]) -> JacobianProduct:
+        chance_weight = sandwich[:, None] * direction
+        chance_total = chance_weight.sum(axis=0)
+        chance_square_total = np.square(chance_weight).sum(axis=0)
+        # Resolved rows take their resolved partners exactly from core^-1, so their chance sums run over bulk partners only.
+        bulk_chance_weight = np.where(is_resolved[:, None], 0.0, chance_weight)
+        values = np.zeros_like(direction)
+        variance = np.zeros_like(direction)
+        window_part = np.zeros_like(direction)
+        resolved_bulk_near = np.zeros((solve.resolved.shape[0], direction.shape[1]))
+        window_chance = np.zeros((len(grams.blocks), direction.shape[1]))
+        window_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
+        window_bulk_chance = np.zeros((len(grams.blocks), direction.shape[1]))
+        window_bulk_chance_square = np.zeros((len(grams.blocks), direction.shape[1]))
+        for block in range(len(grams.blocks)):
+            members = window_members[block]
+            window_chance[block] = chance_weight[members].sum(axis=0)
+            window_chance_square[block] = np.square(chance_weight[members]).sum(axis=0)
+            window_bulk_chance[block] = bulk_chance_weight[members].sum(axis=0)
+            window_bulk_chance_square[block] = np.square(bulk_chance_weight[members]).sum(axis=0)
+        for block, members in enumerate(grams.blocks):
+            columns, squared_rows, loadings, near = block_parts(block)
+            window_sum = squared_rows @ direction[columns]
+            resolved_sum = squared_variance[members][:, None] * (np.square(loadings[:, near]) @ direction[solve.resolved[near]])
+            row_scale = sandwich[members] * pair_scale
+            chance_far = row_scale[:, None] * (chance_total - window_chance[block])[None, :]
+            values[members] = -(window_sum + resolved_sum + chance_far)
+            window_part[members] = window_sum
+            variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square_total - window_chance_square[block])[None, :]
+            # Resolved rows: bulk partners whose window holds the resolved site, exactly.
+            weighted = squared_variance[members][:, None, None] * np.square(loadings)[:, :, None] * direction[members][:, None, :]
+            resolved_bulk_near[near] += weighted.sum(axis=0)[near]
+        if solve.resolved.shape[0]:
+            resolved_blocks = block_of[solve.resolved]
+            resolved_scale = sandwich[solve.resolved] * pair_scale
+            resolved_rows = np.square(core_inverse) @ direction[solve.resolved]
+            bulk_total = bulk_chance_weight.sum(axis=0)
+            bulk_square_total = np.square(bulk_chance_weight).sum(axis=0)
+            chance_resolved = resolved_scale[:, None] * (bulk_total[None, :] - window_bulk_chance[resolved_blocks])
+            values[solve.resolved] = -(resolved_rows + resolved_bulk_near + chance_resolved)
+            variance[solve.resolved] = 2.0 * np.square(resolved_scale)[:, None] * (bulk_square_total[None, :] - window_bulk_chance_square[resolved_blocks])
+            window_part[solve.resolved] = resolved_bulk_near
+        return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
+
+    return apply
 
