@@ -295,7 +295,9 @@ def derived_lattice(single_precision: F64Array, single_shift: F64Array, log_scal
     floor = kernel_floor(single_precision, single_shift, log_scale_values, tolerance)
     top = kernel_top(single_precision, single_shift, log_scale_values, floor)
     spacing = spacing_bound(float(np.asarray(single_precision).shape[0]), tolerance)
-    width = max(top - floor, spacing)
+    # Where no effect clears the noise the kernel range is empty (floor = top), and the lattice still needs more
+    # nodes than the roughness order to carry a density: half the order in spacings on each side gives order + 1.
+    width = max(top - floor, 0.5 * ROUGHNESS_ORDER * spacing)
     return np.arange(floor - width, top + width + spacing, spacing), floor, top
 
 
