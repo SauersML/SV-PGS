@@ -61,3 +61,26 @@ Wall time and peak RSS are recorded for every fit.
 - **Context:** the DREAM challenge found genotype-based prediction of individual responses only modestly better than random (Eduati et al. 2015).
 - **Phenotype structure [real]:** in the development compounds' variance, continental group explains a median 0.6%, population 1.8%, batch 0.9% and sex 0.1%. So ancestry confounding of the phenotype is small.
 - **Empirical per-compound heritability:** HE regression and GREML on training folds with in-fold PCs, SE reported. It follows once the genome-wide GRM is built.
+
+## Amendment 1 (2026-09-20, before any scoring): sparse architectures
+The power section above assumes an infinitesimal (Daetwyler) architecture. A compound's architecture may instead be oligogenic, a few large effects such as transporter or metabolism CNVs. Sparse priors can predict that at this n: single effects of ≥ 2.3–4.8% of variance are detectable. This amendment adds four analyses. Sealing is unchanged: the same rule and the same confirmation list (sha256 d154565847dc7915…).
+
+1. **Regional prediction per compound (the first scored arm).**
+   - The windows are ±1 Mb around each gene in the pre-registered gene set (Cis-candidate analysis), using bench-real's cis rule: a variant whose interval overlaps TSS ± 1 Mb.
+   - Per compound and per window, fit SV-PGS, mr.ashr (workflow settings) and top_variant, each on `snv` and on `snv_sv`, over the same splits and covariates.
+   - The prediction for a compound sums the window predictors. The union of windows is the design, and overlapping windows are merged, so no variant counts twice.
+   - This is bench-real's per-gene design with compounds as traits.
+   - Reported: pooled out-of-sample R² and r², and Δ = r²(snv_sv) − r²(snv), with the bootstrap SE.
+2. **Genome-wide sparse fits.** mr.ashr, BayesR and SV-PGS on all records, evaluated exactly as the genome-wide arm.
+   - Achievable r² is reported under both architectures: the infinitesimal bound above, and a sparse bound.
+   - The sparse bound is Σ over detected loci of the variance share each would explain at its measured held-out effect, with the detection power from `power.locus_power` at each fold's n.
+3. **Nested discovery, then prediction.** Within each training fold only, and never using the test fold:
+   - scan every SNV, indel and SV genome-wide against the within-ancestry permutation null: 999 permutations within continental group, shared across compounds and variants;
+   - take the loci at BH q ≤ 0.05 within that fold, pruned by LD (r² from the training genotypes, keeping the lowest-p member of each connected set);
+   - fit an OLS predictor on them, with the in-fold covariates, and predict the held-out lines.
+   - Reported per fold: the number of discovered SNV and SV loci, and the held-out r² and Δ.
+4. **Cross-compound pooling of prior hyperparameters.** SV-PGS's pooled arm across the development compounds, about 13.2 effective, uses hyperprior_pooling. Each compound keeps its own effects, so no multi-trait effect model is used; only the prior's hyperparameters are pooled.
+   - Pooling is within a split's training lines only.
+   - Confirmation compounds join the pool only in the single confirmation run.
+
+**Power statement, for both architectures:** an infinitesimal architecture is undetectable at this n, as above. An oligogenic architecture with loci explaining ≥ 2.3–4.8% of variance is detectable, and is where SV gains can appear. The empirical heritability and the discovery counts decide which regime each compound is in.
