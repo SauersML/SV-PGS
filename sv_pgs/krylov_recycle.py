@@ -31,13 +31,13 @@ Three more things cut applications without changing what is accepted (the caller
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.linalg import eig, lu_factor, lu_solve
 
-from sv_pgs.marginal_variances import BlockGrams, BulkSolve, _block_terms, _prepare
+from sv_pgs.marginal_variances import BlockGrams, BulkSolve, block_covariance, prepare_windows
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _ITEM_BYTES = np.dtype(np.float64).itemsize
@@ -239,14 +239,15 @@ def block_gcro_dr(
     return KrylovSolve(solution, float(np.linalg.norm(true_residual)), target, counts["applications"], counts["columns"], counts["cycles"])
 
 
-def local_response(solve: BulkSolve, grams: BlockGrams) -> Callable[[F64, F64, F64, F64], Callable[[F64], F64]]:
+def local_response(solve: BulkSolve, grams: BlockGrams, array_module: Any = np) -> Callable[[F64, F64, F64, F64], Callable[[F64], F64]]:
     """The block-local preconditioner of the EP linear response: (left, right, diagonal, weight) -> V -> M^-1 V with
 
         M = I - (I - diag(weight) S2_loc) (diag(left) Sigma_loc diag(right) + diag(diagonal)),
 
-    Sigma_loc the block diagonal of the window covariance ``marginal_variances`` forms (each block's Sigma_bb, bulk and
-    resolved rows alike) and S2_loc = Sigma_loc o Sigma_loc. It costs no read: the window algebra is formed once here,
-    each block's p_b x p_b M_b is LU-factored once per call, and M^-1 applies to any number of columns.
+    Sigma_loc the block diagonal of the window covariance (``marginal_variances.block_covariance``, each block's Sigma_bb,
+    bulk and resolved rows alike; its window algebra on ``array_module``) and S2_loc = Sigma_loc o Sigma_loc. It costs
+    no read: the window algebra is formed once here, each block's p_b x p_b M_b is LU-factored once per call, and M^-1
+    applies to any number of columns.
     """
     variant_count = solve.site_precision.shape[0]
     covered = np.zeros(variant_count, dtype=bool)
@@ -259,8 +260,8 @@ def local_response(solve: BulkSolve, grams: BlockGrams) -> Callable[[F64, F64, F
 
     def build(left: F64, right: F64, diagonal: F64, weight: F64) -> Callable[[F64], F64]:
         if not covariances:
-            cross, bulk_variance, core_inverse, _is_resolved = _prepare(solve, grams)
-            covariances.extend(_block_terms(solve, grams, cross, bulk_variance, core_inverse, block).covariance for block in range(len(grams.blocks)))
+            prepared = prepare_windows(solve, grams)
+            covariances.extend(block_covariance(solve, grams, block, array_module, prepared=prepared) for block in range(len(grams.blocks)))
         factors = []
         for members, covariance in zip(grams.blocks, covariances):
             response = left[members, None] * covariance * right[None, members] + np.diag(diagonal[members])
