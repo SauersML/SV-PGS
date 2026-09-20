@@ -58,10 +58,9 @@ from sv_pgs.small_n import (
     DenseStatistics,
     _DensePosterior,
     _Kernel,
-    _loop_point,
+    _best_double_loop,
     _new_profile,
     dense_statistics,
-    double_loop_sites,
 )
 from sv_pgs.tie_map import _compact_identity_tie_map
 
@@ -412,8 +411,8 @@ class _PooledFixedPoints:
             self._refreshed[moving] = False
 
     def _double_loop(self, gene: int, hyperparameters: MixtureHyperparameters) -> None:
-        """Gene ``gene``'s EP fixed point by the double loop (``small_n.double_loop_sites``) on its own rows of the pooled
-        prior, from its current sites when they lie in EP's domain, else from the prior's moment-matched sites."""
+        """Gene ``gene``'s EP fixed point by the double loop on its own rows of the pooled prior, from both in-domain
+        starts, keeping the highest log Z_EP (``small_n._best_double_loop``)."""
         rows = self.rows[gene]
         prior = _gene_prior(self.prior, rows)
         noise = float(self.noise[gene])
@@ -430,27 +429,16 @@ class _PooledFixedPoints:
 
         self.profile["double_loops"] += 1
         cpu = time.process_time()
-        start_precision, start_shift = self.site_precision[rows].copy(), self.site_shift[rows].copy()
-        kernel = _Kernel(design, noise * start_precision)
-        mean = kernel.solve(self.scores[gene] + noise * start_shift)
-        variance = noise * kernel.variances()
-        if _loop_point(design, noise, self.scores[gene], start_precision, start_shift, 1.0 / variance, mean / variance, tilted, largest) is None:
-            start_precision, start_shift = moment_matched_prior_sites(prior, hyperparameters)
-            try:
-                kernel = _Kernel(design, noise * start_precision)
-            except np.linalg.LinAlgError:
-                kernel = None
-            if kernel is None or _loop_point(
-                design, noise, self.scores[gene], start_precision, start_shift, 1.0 / (noise * kernel.variances()),
-                kernel.solve(self.scores[gene] + noise * start_shift) / (noise * kernel.variances()), tilted, largest,
-            ) is None:
-                # The prior's own variances leave EP's domain at these hyperparameters (they over- or underflow far from
-                # where the fit lives): no fixed point exists to compute, so the trial is refused.
-                raise NoFixedPoint(f"gene {gene}: the prior's moment-matched sites lie outside EP's domain at these hyperparameters")
-        precision, shift = double_loop_sites(
-            design, noise, self.scores[gene], start_precision, start_shift, tilted, largest, self.draw_count,
-            self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
-        )
+        # From its current sites and from the prior's moment-matched ones (whichever lie in EP's domain), keeping the
+        # fixed point with the highest log Z_EP (lead ruling; ``small_n._best_double_loop``). None in the domain refuses
+        # the trial (NoFixedPoint), and the outer loop halves it.
+        starts = [(self.site_precision[rows].copy(), self.site_shift[rows].copy()), moment_matched_prior_sites(prior, hyperparameters)]
+        try:
+            precision, shift = _best_double_loop(
+                design, noise, self.scores[gene], starts, tilted, largest, self.draw_count, self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
+            )
+        except NoFixedPoint as error:
+            raise NoFixedPoint(f"gene {gene}: {error}") from error
         self.site_precision[rows], self.site_shift[rows] = precision, shift
         self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self._iterate(gene, precision, shift)
