@@ -6,6 +6,7 @@ The engine driver is the stub of tests/test_fit_model.py, so these tests pin the
 from __future__ import annotations
 
 import dataclasses
+import os
 from pathlib import Path
 from typing import Any
 
@@ -336,3 +337,18 @@ def test_the_views_arm_pools_each_split_and_feature_set_over_its_genes(monkeypat
     returned = dict(svpgs_method.fit_expression_views(trains))
     assert sorted(returned) == sorted(trains) and batches == [3, 3, 3, 3]
     assert all(returned[key] == f"predictor of {key[0]}" for key in trains)
+
+
+def test_the_batch_arms_take_the_whole_process_less_what_it_holds(monkeypatch: pytest.MonkeyPatch) -> None:
+    machine = ComputeBudget(
+        device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(), host_bytes=1 << 40, cpu_threads=16
+    )
+    monkeypatch.setattr(svpgs_method, "detect_compute_budget", lambda: machine)
+    monkeypatch.delenv("RUNQ_MEM_BYTES", raising=False)
+    assert (svpgs_method.process_budget().host_bytes, svpgs_method.process_budget().cpu_threads) == (1 << 40, 16)
+    allotment = 1 << 36
+    monkeypatch.setenv("RUNQ_MEM_BYTES", str(allotment))
+    budget = svpgs_method.process_budget()
+    with open("/proc/self/statm") as handle:
+        resident = int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+    assert allotment - 2 * resident <= budget.host_bytes <= allotment - resident // 2 and budget.cpu_threads == 16

@@ -33,6 +33,7 @@ annotations``: dataclasses would then look the module up to resolve its string a
 """
 
 import hashlib
+import os
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -41,7 +42,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import numpy as np
 
 from sv_pgs import fit_model
-from sv_pgs.compute_budget import ComputeBudget, detect_compute_budget
+from sv_pgs.compute_budget import RUNQ_MEMORY_VARIABLE, ComputeBudget, detect_compute_budget
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -379,6 +380,31 @@ def one_core_budget() -> ComputeBudget:
     )
 
 
+def process_budget() -> ComputeBudget:
+    """The whole process's share, for the batch and views contracts, which the harness runs in its one process (no
+    worker pool): every thread for BLAS, and the usable host memory less what the process already holds. MemAvailable
+    and the cgroup headroom already exclude it; the runner's per-task allotment covers the whole task, so it is
+    reduced by the resident bytes here. The pooled fit is dense host algebra, so the budget is the CPU's."""
+    machine = detect_compute_budget()
+    host_bytes = machine.host_bytes
+    allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
+    if allotment is not None:
+        with open("/proc/self/statm", encoding="utf-8") as handle:
+            resident = int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        host_bytes = min(host_bytes, int(allotment) - resident)
+    if host_bytes <= 0:
+        raise MemoryError("the task's memory allotment is already spent by the loaded views.")
+    return ComputeBudget(
+        device_kind="cpu",
+        device_ids=(),
+        device_names=(),
+        device_bytes=(),
+        device_compute_capabilities=(),
+        host_bytes=host_bytes,
+        cpu_threads=machine.cpu_threads,
+    )
+
+
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
     return _fit_expression(train, "full", "training")
@@ -441,7 +467,8 @@ def fit_expression_batch(trains: Sequence[Any]) -> list[BenchRealPredictor]:
             variant_class=bench_real_classes_for_arm(train.variants, "full"),
         ))
     digest = hashlib.sha256(b"".join(_training_seed(gene.codes, gene.target).to_bytes(8, "big") for gene in genes)).digest()
-    fitted = fit_pooled_small_n(genes, draw_count=fit_model.DRAW_COUNT, working_bytes=one_core_budget().working_bytes, seed=int.from_bytes(digest[:8], "big"))
+    # Measured after every gene's training data is loaded, so the fit's memory is what remains.
+    fitted = fit_pooled_small_n(genes, draw_count=fit_model.DRAW_COUNT, working_bytes=process_budget().working_bytes, seed=int.from_bytes(digest[:8], "big"))
     return [
         BenchRealPredictor(scoring=scoring, columns=scoring.store_rows, centering="training", input_columns=gene.codes.shape[1])
         for scoring, gene in zip(fitted.scoring, genes)
