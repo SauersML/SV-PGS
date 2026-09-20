@@ -18,6 +18,13 @@ of its SVs'. Reported per gene:
   - the leading event's leading SV: type, length, distance to the TSS, allele frequency, whether it overlaps the gene
     body or an exon, its largest r^2 with any panel SNV/indel of the window, the fraction of its span in segmental
     duplications (UCSC genomicSuperDups; a proxy for cross-mapping of short reads), and in how many splits it leads.
+  - with --crossmap, lead_sv_crossmappable_partners: the number of genes inside the lead SV's span that are
+    cross-mappable with the target gene (Saha & Battle 2018, F1000Research 7:1860; GENCODE v26 scores, matched by
+    unversioned gene id), and lead_sv_max_crossmappability, the largest such score. Any positive score counts: that is
+    the paper's own definition (at least one k-mer cross-maps between the two genes), and the pair file lists only such
+    pairs. Reads from those genes can be counted as the target's, so an SV deleting or duplicating them can move the
+    target's measured expression with no regulatory effect. The flag marks an artifact route, not an artifact: only
+    requantification from uniquely mapping reads settles an individual gene.
   - class: "none" when the SV part is not significant (BH q above the conventional 0.05 FDR level); otherwise
     "single" when one event carries 90% of var(s), else "multi".
 """
@@ -152,7 +159,56 @@ def gene_row(gene_id):
         "lead_sv_overlaps_gene_body": overlap(start, end, annotation["start"], annotation["end"]) > 0,
         "lead_sv_overlaps_exon": any(overlap(start, end, exon_start, exon_end) > 0 for exon_start, exon_end in annotation["exons"]),
         "lead_sv_max_r2_with_small_variant": max_small_r2, "lead_sv_segmental_duplication_fraction": segmental_duplication_fraction(window.chrom, start, end),
-        "lead_sv_splits_leading": int(sum(row == lead for row in leaders)), "splits": len(leaders)}
+        "lead_sv_splits_leading": int(sum(row == lead for row in leaders)), "splits": len(leaders), "lead_sv_start": start, "lead_sv_end": end}
+
+
+def cross_mappability_partners(path, targets):
+    """target unversioned gene id -> {partner unversioned id: symmetric cross-mappability}, from the sorted pair file."""
+    import gzip
+
+    partners = {target: {} for target in targets}
+    with gzip.open(path, "rt") as handle:
+        for line in handle:
+            first, second, score = line.rstrip("\n").split("\t")
+            first, second = first.split(".")[0], second.split(".")[0]
+            if first in partners:
+                partners[first][second] = float(score)
+            if second in partners:
+                partners[second][first] = float(score)
+    return partners
+
+
+def gene_bodies(gtf_path):
+    import gzip
+
+    rows = []
+    with gzip.open(gtf_path, "rt") as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+            fields = line.split("\t", 9)
+            if fields[2] == "gene":
+                rows.append((fields[8].split('gene_id "', 1)[1].split('"', 1)[0].split(".")[0], fields[0], int(fields[3]), int(fields[4])))
+    return pd.DataFrame(rows, columns=["gene", "chrom", "start", "end"]).drop_duplicates("gene").set_index("gene")
+
+
+def add_cross_mappability(table, crossmap_path, gtf_path):
+    targets = {gene_id.split(".")[0] for gene_id in table["gene_id"]}
+    partners = cross_mappability_partners(crossmap_path, targets)
+    bodies = gene_bodies(gtf_path)
+    counts, strongest = [], []
+    for _, row in table.iterrows():
+        partner_scores = partners.get(row["gene_id"].split(".")[0], {})
+        if pd.isna(row.get("lead_sv_id")) or not partner_scores:
+            counts.append(0)
+            strongest.append(0.0)
+            continue
+        start, end = int(row["lead_sv_start"]), int(row["lead_sv_end"])
+        inside = [score for partner, score in partner_scores.items() if partner in bodies.index and bodies.loc[partner, "chrom"] == row["chrom"]
+                  and bodies.loc[partner, "start"] <= end and bodies.loc[partner, "end"] >= start]
+        counts.append(len(inside))
+        strongest.append(max(inside, default=0.0))
+    return table.assign(lead_sv_crossmappable_partners=counts, lead_sv_max_crossmappability=strongest)
 
 
 def classify(table):
@@ -172,7 +228,11 @@ def main():
     parser.add_argument("--superdups", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--crossmap", help="Saha & Battle cross-mappability pair file (hg38, GENCODE v26)")
+    parser.add_argument("--gtf", help="GENCODE GTF for partner gene bodies (with --crossmap)")
     arguments = parser.parse_args()
+    if arguments.metric == "oos_r2" and arguments.design == "loso":
+        raise ValueError("raw oos_r2 under loso is dominated by the held-out group's mean offset; use r2 or oos_r2_centred")
     directory = pathlib.Path(arguments.results) / arguments.method / arguments.design
     effects = pd.concat([pd.read_csv(path, sep="\t") for path in sorted(directory.glob("*.sv_coefficients.tsv.gz"))], ignore_index=True)
     effects = effects[(effects["feature_set"] == arguments.feature_set)]
@@ -184,6 +244,8 @@ def main():
     tests = tests[(tests["method"] == arguments.method) & (tests["design"] == arguments.design) & (tests["feature_set"] == arguments.feature_set)
                   & (tests["metric"] == arguments.metric)]
     table = tests.merge(decomposition, on=["gene_id", "chrom"], how="left")
+    if arguments.crossmap:
+        table = add_cross_mappability(table, arguments.crossmap, arguments.gtf)
     table["class"] = classify(table)
     table.sort_values("gain", ascending=False).to_csv(arguments.out, sep="\t", index=False)
     print(table["class"].value_counts().to_string())

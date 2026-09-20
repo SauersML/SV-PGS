@@ -24,12 +24,17 @@ import pandas as pd
 
 SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 POOLED = "pooled"
-FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont")
-JOINT_SETS = ("snv_sv", "snv_pgsv", "snv_hgsvc3", "snv_ont")
-# Within a method: adding each SV source to SNVs, each long-read source against the panel SVs, and SVs alone against an
-# equal number of matched SNVs (and against each other).
-WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("snv_hgsvc3", "snv"), ("snv_ont", "snv"), ("snv_hgsvc3", "snv_sv"),
-                             ("snv_ont", "snv_sv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
+FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
+                "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn")
+JOINT_SETS = ("snv_sv", "snv_pgsv", "snv_hgsvc3", "snv_ont", "snv_sv_merged", "snv_pgsv_merged", "snv_hgsvc3_merged", "snv_sv_cn")
+# Within a method: adding each SV source to SNVs; each other source, and each collapsed source, against the panel SVs or its
+# uncollapsed self; and SVs alone against an equal number of matched SNVs (and against each other). HGSVC3 is the PanGenie
+# arm of record; HGSVC2 PanGenie (pgsv) stays as a labelled legacy comparison.
+WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("snv_hgsvc3", "snv"), ("snv_ont", "snv"), ("snv_sv_merged", "snv"),
+                             ("snv_pgsv_merged", "snv"), ("snv_hgsvc3_merged", "snv"), ("snv_sv_cn", "snv"),
+                             ("snv_hgsvc3", "snv_sv"), ("snv_ont", "snv_sv"), ("snv_sv_cn", "snv_sv"),
+                             ("snv_sv_merged", "snv_sv"), ("snv_pgsv_merged", "snv_pgsv"), ("snv_hgsvc3_merged", "snv_hgsvc3"),
+                             ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
 
 
 def squared_correlation(prediction, truth):

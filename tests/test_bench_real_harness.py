@@ -339,3 +339,25 @@ def test_gene_row_decomposes_the_sv_part_of_a_real_harness_run(tmp_path):
     assert record["svs"] == 2 and record["events"] in (1, 2)
     assert record["effective_events"] >= 1 and 0 <= record["lead_sv_max_r2_with_small_variant"] <= 1
     assert record["lead_sv_segmental_duplication_fraction"] == 1.0
+
+
+def test_collapsed_and_copy_number_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True, True], ["panel", "panel", "panel_merged", "gatksv", "hgsvc3_merged"])
+    assert list(harness.feature_mask(variants, "snv_sv_merged", "g/s")) == [True, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_sv_cn", "g/s")) == [True, False, False, True, False]
+    assert list(harness.feature_mask(variants, "hgsvc3_merged", "g/s")) == [False, False, False, False, True]
+
+
+def test_cross_mappable_partner_inside_the_lead_sv_is_flagged(tmp_path):
+    import gzip
+
+    from benchmarks.bench_real import sv_gene_table
+
+    with gzip.open(tmp_path / "crossmap.txt.gz", "wt") as handle:
+        handle.write("ENSG1.4\tENSG2.1\t12.5\nENSG1.4\tENSG3.2\t3.0\n")
+    with gzip.open(tmp_path / "genes.gtf.gz", "wt") as handle:
+        handle.write('chr1\tX\tgene\t1000\t2000\t.\t+\t.\tgene_id "ENSG2.7";\n')
+        handle.write('chr1\tX\tgene\t90000\t91000\t.\t+\t.\tgene_id "ENSG3.1";\n')
+    table = pd.DataFrame({"gene_id": ["ENSG1.9"], "chrom": ["chr1"], "lead_sv_id": ["sv"], "lead_sv_start": [500], "lead_sv_end": [5000]})
+    flagged = sv_gene_table.add_cross_mappability(table, tmp_path / "crossmap.txt.gz", tmp_path / "genes.gtf.gz")
+    assert flagged["lead_sv_crossmappable_partners"].tolist() == [1] and flagged["lead_sv_max_crossmappability"].tolist() == [12.5]
