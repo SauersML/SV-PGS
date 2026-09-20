@@ -86,6 +86,9 @@ def main():
                 variances = np.array([0.0, heritability / spec["causal"]])
                 weights = np.array([1.0 - share, share])
             predicted, detail = replica.predicted_r2(x_train, x_test, heritability, variances, weights)
+            # Ridge is linear, so its pooled r^2 depends on the prior only through E[beta beta^T] = (h^2 / p) I: the
+            # Gaussian-prior formula at the same h^2 is exact for it under every architecture.
+            predicted_ridge, _ = replica.predicted_r2(x_train, x_test, heritability, [1.0], [1.0])
             methods = ["ridge", "mr_ash"] + ([] if spec["causal"] is None else ["susie_oracle"])
             realized = {method: [] for method in methods}
             pooled = {method: [] for method in methods}
@@ -101,7 +104,8 @@ def main():
                     realized[method].append(rho2(beta, estimate, x_test, noise))
                     pooled[method].append(moments(beta, estimate, x_test, noise))
             row = {"gene_row": gene_row, "gene_id": window.gene_id, "split": split_name, "n": count, "p": dimension, "architecture": name,
-                   "replicates": replicates, "predicted_bayes_rho2": predicted, "gamma2": detail["gamma2"], "excess_risk": detail["excess_risk"]}
+                   "replicates": replicates, "predicted_bayes_rho2": predicted, "predicted_ridge_pooled_r2": predicted_ridge,
+                   "gamma2": detail["gamma2"], "excess_risk": detail["excess_risk"]}
             for method in methods:
                 values = np.array(realized[method])
                 row[f"{method}_rho2_mean"] = float(values.mean())
