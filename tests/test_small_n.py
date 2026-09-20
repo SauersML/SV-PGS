@@ -494,3 +494,24 @@ def test_the_prior_and_scoring_are_per_member():
     member_classes = np.unique(classes, return_inverse=True)[1]
     np.testing.assert_array_equal(prior.class_index, member_classes)
     assert prior.class_index[5] != prior.class_index[2]
+
+
+def test_a_collapsed_prior_is_a_fixed_point_at_the_first_refresh():
+    """At an edge trial whose prior collapses (every prior variance ~1e-26 of the data's scale: p_eff at its rounding),
+    EP's fixed point is the prior's own sites; the evidence-unit check (the update's KL <= 1/(2K) nats) passes at the
+    first refresh, with no frozen pass and no refusal."""
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior
+
+    rng = np.random.default_rng(95)
+    samples, variants = 50, 40
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.full(variants, -60.0), 64)
+    from sv_pgs.scale_mixture_ep import initial_hyperparameters
+    start = initial_hyperparameters(prior)
+    residual = statistics.projected_target
+    oracle = _DenseFixedPoints(statistics, prior, start, float(residual @ residual) / (samples - 1), 64, 10**9)
+    (point,) = oracle([start])
+    assert point is not None and not oracle.refusals
+    assert oracle.profile["refreshes"] == 1 and oracle.profile["factorizations"] == 1
+    assert oracle.effective < 1e-10

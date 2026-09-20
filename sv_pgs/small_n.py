@@ -842,7 +842,7 @@ def double_loop_sites(
     representable step along Newton's direction lowers Phi by half its quadratic model's decrease. Each outer step is
     majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
     accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
-    update's move r' Sigma r at most p_eff / K, or when an outer step leaves the sites unchanged, which is EP's fixed
+    update's KL 1/2 r' Sigma r at most 1/(2K) nats, or when an outer step leaves the sites unchanged, which is EP's fixed
     point: at an outer step's start (P_s, h_s) are q's own marginals, so Phi's gradient there, (mu - E_r[beta],
     -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
     means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), found no
@@ -858,7 +858,7 @@ def double_loop_sites(
         profile["double_loop_outer"] += 1
         kernel = _Kernel(design, noise * precision)
         mean = kernel.solve(data_score + noise * shift)
-        variances, removed, cavity_scaled = kernel.cavity()
+        variances, _removed, cavity_scaled = kernel.cavity()
         variance = noise * variances
         cavity_precision = cavity_scaled / noise
         log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
@@ -866,8 +866,8 @@ def double_loop_sites(
         target_precision = 1.0 / tilted_variance - cavity_precision
         target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
         right = (target_shift - shift) - (target_precision - precision) * mean
-        effective = max(float(np.sum(removed)), _EPSILON * size)
-        if float(right @ (noise * kernel.solve(right))) <= effective / draw_count:
+        # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
+        if 0.5 * float(right @ (noise * kernel.solve(right))) <= 0.5 / draw_count:
             return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
         # In the domain: the start was checked, and every later outer step starts from an accepted inner point.
@@ -1062,8 +1062,13 @@ class _DenseFixedPoints:
             self.mean_move = float(right @ (self.noise * self.kernel.solve(right)))
             noise = self._noise(variances)
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
-            draw_tolerance = self.effective / self.draw_count
-            if self.mean_move <= draw_tolerance and self.noise_gain <= tolerance:
+            # The fixed point is certified in evidence units, as every other certificate: the undamped update moves q
+            # by KL(q || q') = 1/2 r' Sigma r nats to first order in the site change, and the noise update gains
+            # ``noise_gain`` nats; both at most 1/(2K). A tolerance relative to p_eff (the scorer's Monte Carlo
+            # resolution, p_eff / K) goes to rounding where the prior collapses (p_eff -> 0 at an edge trial), and EP
+            # then ran for minutes on the move's own rounding before refusing; there the KL is second order in the
+            # prior's scale and the check passes at the first refresh.
+            if 0.5 * self.mean_move <= tolerance and self.noise_gain <= tolerance:
                 # Each fixed point alive at once (the outer loop holds the current one and one trial) gets an equal share
                 # of the working memory for its posterior's p x p matrices. The exact response replaces the curvature's
                 # GMRES, whose memory it takes; where it does not fit, GMRES has half (``fit_small_n``).
@@ -1112,7 +1117,7 @@ class _DenseFixedPoints:
         self._iterate(precision, shift)
 
     def _frozen_passes(self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
-        """Mean-only EP with the cavity precisions frozen until the frozen move is below p_eff / K
+        """Mean-only EP with the cavity precisions frozen until the frozen move's KL is below 1/(2K) nats
         (``full_data_fit._FullDataFixedPoints._frozen_passes``)."""
         previous_move, damping = np.inf, 1.0
         while True:
@@ -1136,7 +1141,7 @@ class _DenseFixedPoints:
             self.site_precision, self.site_shift = trial_precision, trial_shift
             marginal = 1.0 / (frozen + self.site_precision)
             mean_move = float(np.sum(np.square(self.mean - mean) / marginal)) / (fraction * fraction)
-            if mean_move <= self.effective / self.draw_count:
+            if 0.5 * mean_move <= 0.5 / self.draw_count:
                 return
             if mean_move / previous_move >= 1.0:
                 damping = min(damping, 1.0 / (1.0 + np.sqrt(mean_move / previous_move)))
@@ -1256,7 +1261,8 @@ def fit_small_n(
         stationarity_steps=(outer.step.stationarity_steps,),
         stationarity_errors=(outer.step.stationarity_errors,),
         mean_move=np.array([oracle.mean_move]),
-        draw_tolerance=np.array([oracle.effective / draw_count]),
+        # The move's tolerance: 1/2 r' Sigma r <= 1/(2K) nats.
+        draw_tolerance=np.array([1.0 / draw_count]),
         noise_gain=np.array([oracle.noise_gain]),
         # Exact algebra: the mean and the variances carry rounding only.
         mean_error=np.zeros(1),
