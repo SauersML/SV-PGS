@@ -174,10 +174,11 @@ def covariate_residual_variance(targets: F64Array, training: F64Array, covariate
 class FitCertificate:
     """Why a fit is accepted, per model; recorded in the artifact.
 
-    - ``remaining_gain``: the last outer check's Newton-B decrement plus its weights' B-evidence gain, in nats
-      (at most 1/(2K)); ``newton_decrement`` is its first part, 1/2 g'|B + S|^-1 g;
-    - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, by central differences, with
-      each difference's step and error bound in ``stationarity_steps`` and ``stationarity_errors``;
+    - ``remaining_gain``: the last outer check's Newton-B decrement plus its weights' B-evidence gain and remaining
+      gain, in nats (at most 1/(2K)); ``newton_decrement`` is its first part, 1/2 g'|B + S|^-1 g;
+    - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, from its analytic gradient,
+      with the curvature's difference steps in ``stationarity_steps`` and the gradient's error bounds in
+      ``stationarity_errors``;
     - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
       the final refresh, against ``draw_tolerance`` = p_eff / K; ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;

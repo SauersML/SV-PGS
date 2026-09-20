@@ -224,10 +224,11 @@ class HyperStep:
     starting ones, both in nats: the outer loop's certificate.
     ``newton_decrement`` is the same decrement at the returned
     hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
-    weights not held at an edge or a bound of their range, by central
-    differences of the B-evidence; ``stationarity_steps`` and
-    ``stationarity_errors`` are each difference's step and error bound, and ``stationarity_gain`` the certified
-    upper bound 1/2 sum (|c| + E)^2 / s on the gain a Newton step on them could still find (at most the tolerance).
+    weights not held at an edge or a bound of their range, from V's analytic
+    gradient; ``stationarity_steps`` are the curvature's difference steps,
+    ``stationarity_errors`` the gradient's error bounds, and ``stationarity_gain`` the weights' remaining gain
+    (``_stationarity``: their Newton decrement, plus what a fold lets them climb; at most the tolerance when the
+    step certified).
     """
 
     hyperparameters: MixtureHyperparameters
@@ -2188,7 +2189,39 @@ def _maximize_evidence(
             return log_smoothing, coefficients, evidence, start
 
 
-def _stationarity_check(
+@dataclass(frozen=True)
+class _Stationarity:
+    """The B-evidence's stationarity in the weights at a certified maximum x_rho (``_stationarity``).
+
+    ``gradient`` is V's analytic rho-gradient (the Laplace part's and the corrections', ``_correction_gradient``) with
+    its error bound ``error``; ``curvature`` the matrix -d2V/drho2 from forward differences of that gradient, of steps
+    ``steps``; ``folds`` is, per weight, the distance within which its basin ends on the side its gradient climbs to
+    (zero where it does not end); ``gain`` the remaining gain; ``better`` a side whose certified V is above the base's
+    by more than the tolerance, both at their certified bounds (weights and evidence), when one was found.
+    """
+
+    gradient: F64Array
+    error: F64Array
+    curvature: F64Array
+    steps: F64Array
+    folds: F64Array
+    gain: float
+    better: tuple[F64Array, _Evidence] | None
+
+
+def _full_gradient(
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+) -> tuple[F64Array, F64Array]:
+    """The certified V's rho-gradient and its error bound: the Laplace part's (exact at x_rho) and the corrections'."""
+    correction_gradient, correction_error = _correction_gradient(view, weights, evidence, cavity, correction, working_bytes, tolerance)
+    # x_rho's own error moves the Laplace gradient by its x-slope over x's error, sqrt(2 d) in the -H metric: bounded
+    # by the gradient's scale s_i times that radius (the same logistic bound as V's derivatives).
+    radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
+    scale = 0.5 * (evidence.effective_degrees + evidence.penalty_sizes)
+    return evidence.gradient + correction_gradient, correction_error + scale * radius + _EPSILON * evidence.magnitude
+
+
+def _stationarity(
     view: ScaleMixturePrior,
     weights: F64Array,
     evidence: _Evidence,
@@ -2197,76 +2230,73 @@ def _stationarity_check(
     correction: CurvatureCorrection,
     working_bytes: int,
     tolerance: float,
-) -> tuple[F64Array, F64Array, F64Array, F64Array, tuple[F64Array, _Evidence] | None]:
-    """The B-evidence's own gradient in each interior weight by one central difference: (gradient, curvature scale,
-    step, error bound, better). ``better`` is a side whose certified V is above the base's by more than the
-    tolerance, both taken at their certified bounds (its weights and evidence), found at once: the base is then not the maximum, only a point where its
-    own inner maximum is ending (a fold), and the search resumes from the better side instead of certifying.
+) -> _Stationarity:
+    """The weights' Newton decrement at a certified maximum, from V's analytic gradient (lead ruling: in place of
+    central differences of V, which cannot certify where the base's inner basin ends within their step).
 
-    Per eigen-direction of its block, V depends on rho_i through terms log(1 + e^(rho + a)) / 2 and
-    b sigma(rho + a) / 2; the first derivatives are sigma / 2 and b sigma' / 2, and every higher derivative of the
-    logistic is bounded by sigma itself. So s_i = (edf_i + lambda_i ||R_i x||^2) / 2 bounds |V''| and |V'''| in rho_i.
-
-    With each side's V certified to e (``_evidence``'s tolerance, never below V's rounding), the central difference
-    errs by at most E = h^2 s / 6 + e / h, least at h = (3 e / s)^(1/3), where E = (3^(2/3) / 2) s^(1/3) e^(2/3). The
-    caller certifies the gain's upper bound 1/2 sum (|c| + E)^2 / s against ``tolerance``; e is set so that the error
-    alone takes a quarter of it over the n interior weights, 1/2 E^2 / s = tolerance / (4 n):
-    e = (2 tolerance / (n 3^(4/3)))^(3/4) s^(1/4). That plans the step; the bound recorded, and the one the h/2
-    agreement below is tested against, use each side's own certified error (``_Evidence.error``: the inner maximizer,
-    the determinant's rounding, B's linear response and the Tierney-Kadane remainder, summed), which can exceed e.
-
-    The inner maxima of the penalized objective are not unique, so each side restarts from the base's x (not from
-    the first-order predictor, which along a direction the data barely curve extrapolates far past the basin). The
-    difference at h/2 must agree with the one at h within their two error bounds; otherwise a side reached another
-    inner maximum (V there is a different function of rho), and the step halves, as it does while a side has no
-    certified maximum.
+    The curvature is -dg/drho by one forward difference of the analytic gradient per interior weight, taken on the
+    side the gradient climbs (where a fold would be). With g's error E and V's third derivative in rho_i bounded by
+    s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of step h errs by
+    h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
+    there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
+    most V can climb before the fold. Elsewhere the gain is the Newton decrement 1/2 r K^-1 r with r = |g| + E on the
+    other interior weights and K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
+    as an indefinite B + S has none for x. A side whose certified V beats the base's by the tolerance, both at their
+    certified bounds, is returned as ``better`` at once: the base is then not the maximum, and the search resumes
+    from it.
     """
-    gradient = np.zeros(weights.shape[0])
-    rounding = _EPSILON * evidence.magnitude
-    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), rounding)
-    steps = np.zeros(weights.shape[0])
-    errors = np.zeros(weights.shape[0])
+    count = weights.shape[0]
+    gradient, error = _full_gradient(view, weights, evidence, cavity, correction, working_bytes, tolerance)
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
-    count = max(int(np.count_nonzero(interior)), 1)
+    curvature = np.zeros((count, count))
+    steps = np.zeros(count)
+    folds = np.zeros(count)
     for position in np.flatnonzero(interior):
-        unit = np.zeros(weights.shape[0])
+        unit = np.zeros(count)
         unit[position] = 1.0
-        accuracy = max((2.0 * tolerance / (count * 3.0 ** (4.0 / 3.0))) ** 0.75 * scale[position] ** 0.25, rounding)
-        step = (3.0 * accuracy / scale[position]) ** (1.0 / 3.0)
-
-        def bound(length: float, sides: list[_Evidence]) -> float:
-            # Truncation, and each side's own certified error over the difference's 2h.
-            return length * length * scale[position] / 6.0 + (sides[0].error + sides[1].error) / (2.0 * length)
-
-        while True:
-            if step <= limit:
-                raise FloatingPointError("the B-evidence has no certified maximum in one basin on both sides of a fitted penalty weight")
-            quotients, bounds = [], []
-            for length in (step, 0.5 * step):
-                both = [
-                    _corrected(
-                        view, weights + side * length * unit,
-                        _evidence(view, weights + side * length * unit, evidence.coefficients, cavity, correction, working_bytes, accuracy),
-                        cavity, correction, working_bytes, accuracy,
-                    )
-                    for side in (-1.0, 1.0)
-                ]
-                for side, candidate in zip((-1.0, 1.0), both):
-                    # Certified above: the side's lower bound beats the base's upper bound by the tolerance, so rounding
-                    # cannot send the search back and forth between two basins.
-                    if candidate is not None and candidate.value - candidate.error > evidence.value + evidence.error + tolerance:
-                        return gradient, scale, steps, errors, (weights + side * length * unit, candidate)
-                if any(side is None for side in both):
-                    break
-                quotients.append((both[1].value - both[0].value) / (2.0 * length))
-                bounds.append(bound(length, both))
-            if len(quotients) == 2 and abs(quotients[0] - quotients[1]) <= bounds[0] + bounds[1]:
+        climb = 1.0 if gradient[position] >= 0.0 else -1.0
+        step = max(2.0 * float(np.sqrt(error[position] / scale[position])), limit)
+        column = None
+        while column is None:
+            for side in (climb, -climb):
+                trial_weights = weights + side * step * unit
+                trial = _corrected(
+                    view, trial_weights,
+                    _evidence(view, trial_weights, evidence.coefficients + side * step * evidence.responses[:, position], cavity, correction, working_bytes, 0.0),
+                    cavity, correction, working_bytes, tolerance,
+                )
+                if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
+                    return _Stationarity(gradient, error, curvature, steps, folds, np.inf, (trial_weights, trial))
+                if trial is None:
+                    if side == climb:
+                        folds[position] = step
+                    continue
+                trial_gradient, _trial_error = _full_gradient(view, trial_weights, trial, cavity, correction, working_bytes, tolerance)
+                column = -(trial_gradient - gradient) / (side * step)
                 break
-            step *= 0.5
-        gradient[position] = quotients[0]
+            if column is None:
+                if step <= limit:
+                    raise FloatingPointError("the B-evidence has no certified maximum in one basin on either side of a fitted penalty weight")
+                folds[position] = 0.0
+                step = max(0.5 * step, limit)
+        curvature[:, position] = column
         steps[position] = step
-        errors[position] = bounds[0]
-    return gradient, scale, steps, errors, None
+    inside = np.flatnonzero(interior)
+    curvature[np.ix_(inside, inside)] = 0.5 * (curvature[np.ix_(inside, inside)] + curvature[np.ix_(inside, inside)].T)
+    folded = interior & (folds > 0.0)
+    open_ = np.flatnonzero(interior & ~folded)
+    reach = np.abs(gradient) + error
+    gain = float(np.sum(reach[folded] * folds[folded]))
+    if open_.shape[0]:
+        block = curvature[np.ix_(open_, open_)]
+        try:
+            factor = np.linalg.cholesky(block)
+        except np.linalg.LinAlgError:
+            return _Stationarity(gradient, error, curvature, steps, folds, np.inf, None)
+        solved = solve_triangular(factor, reach[open_], lower=True)
+        gain += 0.5 * float(solved @ solved)
+    return _Stationarity(gradient, error, curvature, steps, folds, gain, None)
 
 
 def hyper_step(
@@ -2275,9 +2305,11 @@ def hyper_step(
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
 
-    The search steers by the fixed-cavity gradient and accepts on V (with B). At the end, the B-evidence's own
-    stationarity is checked by one central difference per interior weight (lead ruling); while the gain a Newton step
-    on that difference predicts exceeds ``tolerance``, the search continues along it, accepting only steps that raise V.
+    The search steers by V's own Laplace gradient and accepts on the certified V (with B). At the end, V's
+    stationarity is checked from its analytic gradient, corrections included, and a forward difference of that
+    gradient per interior weight (``_stationarity``): while the weights' Newton decrement exceeds ``tolerance``, the
+    search takes the Newton step, accepting only steps that raise V; a weight whose basin ends on its climbing side
+    within the difference's step contributes the most V can climb before the fold.
     """
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
     bounds = _smoothing_bounds(prior, start_objective)
@@ -2307,29 +2339,38 @@ def hyper_step(
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     while True:
         interior = (weights > lower) & (weights < upper)
-        check, curvature, check_steps, check_errors, better = _stationarity_check(
-            final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance
-        )
-        gain_bound = 0.5 * float(np.sum(np.square(np.abs(check) + check_errors) / curvature))
-        if better is None and gain_bound <= tolerance:
+        check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
+        moved = check.better
+        if moved is None and check.gain <= tolerance:
             break
-        direction = check / curvature
-        step_length, moved = 1.0, better
-        while moved is None and step_length * float(np.max(np.abs(direction))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
-            trial_weights = np.clip(weights + step_length * direction, lower, upper)
-            trial = _certified_evidence(
-                final_view, trial_weights, evidence.coefficients, cavity, correction, working_bytes,
-                tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
-            )
-            if trial is not None and trial.value > evidence.value:
-                moved = (trial_weights, trial)
-                break
-            step_length *= 0.5
+        if moved is None:
+            # Newton on the difference curvature over the weights whose basin does not end on their climbing side
+            # (on its magnitude where it is indefinite), accepted only when the certified V rises.
+            open_ = interior & ~(check.folds > 0.0)
+            direction = np.zeros_like(weights)
+            if np.any(open_):
+                eigenvalues, eigenvectors = np.linalg.eigh(check.curvature[np.ix_(open_, open_)])
+                magnitudes = np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues))))
+                direction[open_] = eigenvectors @ ((eigenvectors.T @ check.gradient[open_]) / magnitudes)
+            step_length = 1.0
+            while step_length * float(np.max(np.abs(direction), initial=0.0)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights)))):
+                trial_weights = np.clip(weights + step_length * direction, lower, upper)
+                trial = _certified_evidence(
+                    final_view, trial_weights, evidence.coefficients + evidence.responses @ (trial_weights - weights), cavity, correction,
+                    working_bytes, tolerance, final_allowed.T @ initial_hyperparameters(prior).coefficients,
+                )
+                if trial is not None and trial.value > evidence.value:
+                    moved = (trial_weights, trial)
+                    break
+                step_length *= 0.5
         if moved is None:
             break
-        # The search resumes from the moved point, edges and structural starts included. It keeps the move when the
-        # resumed search ends lower (a basin chosen by its corrected V), so V rises at every pass and the loop ends.
         weights, evidence = moved
+        if check.better is None:
+            continue
+        # A certifiably better side is another basin: the search resumes from it, edges and structural starts included.
+        # It keeps the move when the resumed search ends lower (a basin chosen by its corrected V), so V rises at every
+        # pass and the loop ends.
         resumed_smoothing = log_smoothing.copy()
         resumed_smoothing[finite_final] = weights
         resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance)
@@ -2349,12 +2390,12 @@ def hyper_step(
         penalized_objective=evidence.penalized_value,
         evidence=evidence.value,
         newton_decrement=evidence.newton_decrement,
-        smoothing_gradient=float(np.max(np.abs(check))) if check.size else 0.0,
+        smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
         start_decrement=start_decrement,
         evidence_gain=evidence.value - start_evidence.value,
-        stationarity_steps=check_steps,
-        stationarity_errors=check_errors,
-        stationarity_gain=gain_bound,
+        stationarity_steps=check.steps,
+        stationarity_errors=check.error,
+        stationarity_gain=check.gain,
     )
 
 
@@ -2531,7 +2572,8 @@ def fit_hyperparameters(
                 step = None
             log_smoothing = hyperparameters[model].log_smoothing if step is None else step.hyperparameters.log_smoothing
             newton = _newton_b(prior, log_smoothing, hyperparameters[model].coefficients, point, correction, working_bytes)
-            remaining = newton.decrement + (np.inf if step is None else step.evidence_gain)
+            # The x step's decrement, the weights' realized gain at this fixed point, and the gain still left in them.
+            remaining = newton.decrement + (np.inf if step is None else step.evidence_gain + step.stationarity_gain)
             histories[model].append(float(remaining))
             certifying = step is not None and remaining <= tolerance
             if certifying:
