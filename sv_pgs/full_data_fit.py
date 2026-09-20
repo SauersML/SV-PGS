@@ -49,6 +49,8 @@ from sv_pgs.dual_solve import DualGaussian, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.krylov_recycle import local_response
+from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
+from sv_pgs.tie_map import _compact_identity_tie_map
 from sv_pgs.marginal_variances import (
     BlockCertificate,
     ControlVariate,
@@ -95,11 +97,13 @@ def stage0_lattice(
     statistics: GenotypeSufficientStatistics, target_index: int, noise: float, log_variance_offset: F64Array, tolerance: float
 ) -> tuple[F64Array, float, float]:
     """The start lattice for one trait from Stage 0's single-variant likelihoods: precision n R_jj / sigma^2 and shift
-    X~_j' y / sigma^2, which bound every cavity's."""
+    X~_j' y / sigma^2, which bound every cavity's; one per tie member (its group's column, signed), with
+    ``log_variance_offset`` over the members (Stage 0's active rows)."""
     ld = statistics.ld
+    ties = TieGroups.from_tie_map(statistics.tie_map)
     single_precision = statistics.sample_count * ld.ld_diagonal() / noise
     single_shift = np.concatenate([ld.block(block_index).projected_score[:, target_index] for block_index in range(ld.block_count)]) / noise
-    return derived_lattice(single_precision, single_shift, log_variance_offset, tolerance)
+    return derived_lattice(single_precision[ties.group], ties.sign * single_shift[ties.group], log_variance_offset, tolerance)
 
 
 def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0) -> BlockGrams:
@@ -127,7 +131,10 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     within each block and with its neighbours (the LD Stage 0 keeps; farther pairs enter as zero, which only moves
     the start)."""
     ld = statistics.ld
-    weights = np.exp(prior.log_variance_offset)
+    # A group's prior variance is its members' sum (tie_members): u_g = sum_j u_j.
+    ties = TieGroups.from_tie_map(statistics.tie_map)
+    weights = np.zeros(ties.group_count)
+    np.add.at(weights, ties.group, np.exp(prior.log_variance_offset))
     covariate_count = statistics.covariate_gram.shape[0]
     fitted = statistics.covariate_target.T @ np.linalg.pinv(statistics.covariate_gram) @ statistics.covariate_target
     target_square = np.diag(statistics.target_gram) - np.diag(fitted)
@@ -185,8 +192,9 @@ class FitCertificate:
     - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, from its analytic gradient,
       with the curvature's difference steps in ``stationarity_steps`` and the gradient's error bounds in
       ``stationarity_errors``;
-    - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
-      the final refresh, against ``draw_tolerance`` = p_eff / K; ``noise_gain``: the noise update's evidence gain there;
+    - ``mean_move``: an upper bound on twice the undamped EP update's KL(q || q') at the final refresh (the mean's move
+      in the posterior metric plus half the variances' move, dtau'(Sigma o Sigma) dtau), against ``draw_tolerance`` = 1 / K, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (evidence units,
+      defined as p_eff -> 0; lead ruling via speed-smalln); ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
       block's relative error in tr(D - Sigma), and the smallest per-block tolerance it is tested against
@@ -224,6 +232,9 @@ class FitCertificate:
     outer_history: tuple[tuple[float, ...], ...]
     refreshes: int
     passes: int
+    # Per model: whether the outer loop certified it (``OuterFit.certified``); an uncertified fit is reported, never
+    # passed as certified.
+    certified: F64Array | None = None
 
 
 @dataclass(frozen=True)
@@ -276,9 +287,61 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
     )
 
 
-def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array) -> Callable[[F64Array], float]:
-    """d -> d' A d for q's posterior precision A = X' P_W X + diag tau at the model's sites, one read of the store:
-    u = X d, and P_W = W - W C (C'WC)^-1 C' W with W the model's training rows over its noise variance."""
+def _member_posterior(reduced: GaussianPosterior, ties: TieGroups, member_precision: F64Array, group_marginals: F64Array) -> GaussianPosterior:
+    """q's responses over the tie members from the solver's over the groups (``tie_members``): with w_j = s_j D_j / D_g
+    and the within-group conditional covariance C_w = diag(D) - D s s' D / D_g (block diagonal over the tied groups,
+    zero for a singleton), Sigma_members = C_w + W Sigma_groups W', so Sigma R = C_w R + W Sigma_groups (W' R), and
+    (Sigma o Sigma) V = w^2 o [(Sigma_g o Sigma_g) group_sum(w^2 V)] + (C_w o C_w + 2 C_w o (w w' Sigma_gg)) V within
+    each tied group. The block-local preconditioner is the groups' own, carried over where every group is a single
+    member (a permutation); a tied model's Krylov solve runs without it."""
+    precision = np.asarray(member_precision, dtype=np.float64)
+    weight = member_weights(ties, precision)
+    tied = tied_groups(ties)
+    conditionals = []
+    for members in tied:
+        shares, _group_precision, _total = tied_weights(precision[members])
+        variance = 1.0 / precision[members]
+        signs = ties.sign[members]
+        conditionals.append(np.diag(variance) - np.outer(signs * shares, signs * variance))
+
+    def group_sum(values: F64Array) -> F64Array:
+        total = np.zeros((ties.group_count,) + values.shape[1:])
+        np.add.at(total, ties.group, values)
+        return total
+
+    def solve(right: F64Array, relative_tolerance: float) -> F64Array:
+        values = np.asarray(right, dtype=np.float64)
+        result = weight[:, None] * reduced.solve(group_sum(weight[:, None] * values), relative_tolerance)[ties.group]
+        for members, conditional in zip(tied, conditionals):
+            result[members] += conditional @ values[members]
+        return result
+
+    def variance_jvp(values: F64Array) -> F64Array:
+        values = np.asarray(values, dtype=np.float64)
+        squared = np.square(weight)[:, None]
+        result = squared * reduced.variance_jvp(group_sum(squared * values))[ties.group]
+        for members, conditional in zip(tied, conditionals):
+            # Var(beta_g) enters through w w' Sigma_gg, the groups' own marginal (the reduced diagonal).
+            spread = np.outer(weight[members], weight[members]) * float(group_marginals[ties.group[members[0]]])
+            result[members] -= (np.square(conditional) + 2.0 * conditional * spread) @ values[members]
+        return result
+
+    local = None
+    if not tied and reduced.local_response is not None:
+        member_of_group = np.empty(ties.group_count, dtype=np.int64)
+        member_of_group[ties.group] = np.arange(ties.member_count)
+
+        def local(left: F64Array, right: F64Array, diagonal: F64Array, weights: F64Array) -> Callable[[F64Array], F64Array]:
+            inverse = reduced.local_response(left[member_of_group], right[member_of_group], diagonal[member_of_group], weights[member_of_group])
+            return lambda values: inverse(np.asarray(values)[member_of_group])[ties.group]
+
+    return GaussianPosterior(solve=solve, variance_jvp=variance_jvp, local_response=local)
+
+
+def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array, ties: TieGroups) -> Callable[[F64Array], float]:
+    """d -> d' A d for q's posterior precision over the tie members, A = X' P_W X + diag tau at the model's member
+    sites, one read of the store: u = X d with each group's column once (its members' signed sum), and
+    P_W = W - W C (C'WC)^-1 C' W with W the model's training rows over its noise variance."""
     array_module = gaussian.array_module
     weights = np.asarray(_host(gaussian.training), dtype=np.float64)[:, model] / float(gaussian.noise_variance[model])
     covariates = np.asarray(_host(gaussian.covariates), dtype=np.float64)
@@ -286,7 +349,9 @@ def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array
     precision = np.array(site_precision, dtype=np.float64, copy=True)
 
     def norm(direction: F64Array) -> float:
-        values = array_module.asarray(np.asarray(direction, dtype=np.float64)[:, None])
+        grouped = np.zeros(ties.group_count)
+        np.add.at(grouped, ties.group, ties.sign * np.asarray(direction, dtype=np.float64))
+        values = array_module.asarray(grouped[:, None])
         image = array_module.zeros((gaussian.source.sample_count, 1))
         for start, stop, tile in gaussian.source.blocks():
             image += tile.matmat(values[start:stop])
@@ -331,6 +396,11 @@ class _FullDataFixedPoints:
         if window_bytes > working_bytes:
             raise MemoryError(f"the leave-block-out windows need {window_bytes} bytes of float64 working set, over the fit's {working_bytes}")
         model_count = gaussian.model_count
+        # Tie members keep their own sites and priors; the solver sees each group's signed sum (tie_members).
+        self.ties = TieGroups.from_tie_map(statistics.tie_map)
+        if prior.variant_count != self.ties.member_count:
+            raise ValueError("the prior must be over Stage 0's active rows (the tie members), in their order")
+        self.member_blocks = tuple(np.flatnonzero(np.isin(self.ties.group, block)) for block in self.grams.blocks)
         sites = [moment_matched_prior_sites(prior, start) for start in starts]
         self.site_precision = np.column_stack([precision for precision, _shift in sites])
         self.site_shift = np.column_stack([shift for _precision, shift in sites])
@@ -349,10 +419,19 @@ class _FullDataFixedPoints:
         self.undecided_blocks = 0
         self.refusals: list[str] = []
 
+    def _member_moments(self, reduced_variances: F64Array | None) -> tuple[F64Array, F64Array]:
+        """The members' posterior means and variances (p_members, M) from the solver's groups at the current sites
+        (variances zero where only the means are asked)."""
+        mean = np.asarray(_host(self.gaussian.mean), dtype=np.float64)
+        variances = np.zeros_like(mean) if reduced_variances is None else reduced_variances
+        return member_moments(self.ties, self.site_precision, self.site_shift, mean, variances)
+
     def _iterate(self, site_precision: F64Array, site_shift: F64Array) -> None:
+        group_precision, group_shift = group_sites(self.ties, site_precision, site_shift)
         certificate = self.gaussian.iterate(
-            site_precision=site_precision, site_shift=site_shift, noise_variance=self.noise,
-            error_bound=np.sqrt(self.effective / self.draw_count), probe_residual_ratio=self.probe_ratio,
+            site_precision=group_precision, site_shift=group_shift, noise_variance=self.noise,
+            # The mean's own error in q's metric, ||mu_hat - mu||_A^2 / 2 <= 1 / (2K) nats, as every EP certificate here.
+            error_bound=np.full(self.gaussian.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=self.probe_ratio,
         )
         self.mean_error = np.asarray(_host(certificate.error_bound), dtype=np.float64)
         self.passes += 1
@@ -376,9 +455,10 @@ class _FullDataFixedPoints:
         if self.version != snapshot["version"]:
             self._restore(snapshot)
 
-    def _refresh(self, hyperparameters: Sequence[MixtureHyperparameters]) -> tuple[F64Array, list[BlockGrams]]:
-        """Solve the mean and compute the certified marginal variances (p, M) at the current sites; negative sites
-        halve while the precision is not positive definite or a cavity is not proper."""
+    def _refresh(self, hyperparameters: Sequence[MixtureHyperparameters]) -> tuple[F64Array, F64Array, F64Array, list[BlockGrams]]:
+        """Solve the mean and compute the certified marginal variances at the current sites: the members' variances
+        and means (p_members, M), the groups' variances (p_groups, M) and the models' Grams; negative sites halve while
+        the precision is not positive definite or a cavity is not proper."""
         gaussian = self.gaussian
         while True:
             try:
@@ -387,9 +467,13 @@ class _FullDataFixedPoints:
                 failure = "the full-data precision is not positive definite with non-negative sites"
             else:
                 grams = [replace(self.grams, scale=1.0 / float(self.noise[model])) for model in range(gaussian.model_count)]
-                variances = np.column_stack([
+                group_variances = np.column_stack([
                     marginal_variances(solve, model_grams, gaussian.array_module) for solve, model_grams in zip(gaussian.bulk_solves, grams)
                 ])
+                try:
+                    mean, variances = self._member_moments(group_variances)
+                except np.linalg.LinAlgError:
+                    mean = variances = None
                 # A cavity is proper where the tilted law it makes is: 1 + v P > 0 at every node, v up to u_j e^(t_K) (the
                 # kernel's own test). P = 1/z - tau at or just below zero is a variant the data barely inform, not an
                 # improper one: a site that is an exact sum of negative sites keeps P ~ -eps there however far it halves.
@@ -397,22 +481,21 @@ class _FullDataFixedPoints:
                     np.exp(log_scale(self.prior, model_hyperparameters.coefficients) + self.prior.log_variance_grid[-1])
                     for model_hyperparameters in hyperparameters
                 ])
-                improper = 1.0 + largest * (1.0 / variances - self.site_precision) <= 0.0
+                improper = np.ones_like(largest, dtype=bool) if variances is None else 1.0 + largest * (1.0 / variances - self.site_precision) <= 0.0
                 if not np.any(improper):
                     self.refreshes += 1
                     self.probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in gaussian.bulk_solves)
                     # p_eff is known to its rounding, p eps: floored there, so p_eff / K is never zero.
                     count = self.prior.variant_count
                     self.effective = np.maximum(count - np.sum(self.site_precision * variances, axis=0), _EPSILON * count)
-                    mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
                     self.information = [
-                        self._information(model, variances[:, model], grams[model], hyperparameters[model], Cavity(
+                        self._information(model, group_variances[:, model], variances[:, model], grams[model], hyperparameters[model], Cavity(
                             precision=1.0 / variances[:, model] - self.site_precision[:, model],
                             shift=mean[:, model] / variances[:, model] - self.site_shift[:, model],
                         ))
                         for model in range(gaussian.model_count)
                     ]
-                    return variances, grams
+                    return variances, mean, group_variances, grams
                 models = sorted(set(np.flatnonzero(np.any(improper, axis=0)).tolist()))
                 failure = f"models {models}: a cavity is improper (1 + v (1/z - tau) <= 0 on the lattice) with non-negative sites"
             negative = self.site_precision < 0.0
@@ -421,7 +504,7 @@ class _FullDataFixedPoints:
             self.site_precision[negative] *= 0.5
 
     def _information(
-        self, model: int, variances: F64Array, grams: BlockGrams, hyperparameters: MixtureHyperparameters, cavity: Cavity
+        self, model: int, variances: F64Array, member_variances: F64Array, grams: BlockGrams, hyperparameters: MixtureHyperparameters, cavity: Cavity
     ) -> BlockCertificate:
         """Each block's information tr(D - Sigma) certified against the error the EP fixed point can see.
 
@@ -432,6 +515,11 @@ class _FullDataFixedPoints:
         re-test the undecided blocks at ``stage_level``, with the probe count ``probes_to_decide`` asks for: a
         violated block refuses the fixed point (``NoFixedPoint``), and a block still undecided once the probes reach
         p (where probing costs as much as the exact diagonal) is counted, not refused.
+
+        The tolerance is the members' (their tilted laws, over each block's members); the certificate is on the
+        groups' information, which the solver forms. A group's error dI_g moves its members' by
+        (sum_j D_j^2 / D_g^2) dI_g, so each block's tolerance is scaled by the least D_g^2 / sum_j D_j^2 over its
+        groups where that is below one (only where member sites of both signs share a group).
         """
         gaussian = self.gaussian
         solve = gaussian.bulk_solves[model]
@@ -441,8 +529,13 @@ class _FullDataFixedPoints:
         skewness = third / moments.variance ** 1.5
         blocks = grams.blocks
         tolerance = cavity_tolerance(
-            self.site_precision[:, model], variances, response, skewness, blocks, self.draw_count, float(self.effective[model])
+            self.site_precision[:, model], member_variances, response, skewness, self.member_blocks, self.draw_count, float(self.effective[model])
         )
+        spread = np.ones(self.ties.group_count)
+        for members in tied_groups(self.ties):
+            shares, _group_precision, _total = tied_weights(self.site_precision[members, model])
+            spread[self.ties.group[members[0]]] = min(1.0 / float(np.sum(np.square(shares))), 1.0)
+        tolerance = tolerance * np.array([float(np.min(spread[block])) if block.shape[0] else 1.0 for block in blocks])
         column_square_norms = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)[:, model] / float(self.noise[model])
         level = certificate_level(self.draw_count)
         variant_count = solve.site_precision.shape[0]
@@ -504,14 +597,35 @@ class _FullDataFixedPoints:
         return np.column_stack([column[0] for column in columns]), np.column_stack([column[1] for column in columns])
 
     def _move_bounds(self, model: int, right: F64Array, threshold: float) -> float:
-        """An upper bound on ||Sigma right||_A^2 that decides it against ``threshold``: the solve's bound halves until
-        the two-sided bounds from r'x_hat fall on one side."""
-        bound = np.array([0.5 * np.sqrt(threshold)])
+        """An upper bound on ||Sigma right||_A^2 = right' Sigma right over the members that decides it against
+        ``threshold``: Sigma = C_w + W Sigma_groups W' (``_member_posterior``), so the members' within-group part is
+        exact and the groups' part is the solver's, whose bound halves until the two-sided bounds from r'x_hat fall on
+        one side."""
+        precision = self.site_precision[:, model]
+        weight = member_weights(self.ties, precision)
+        grouped = np.zeros(self.ties.group_count)
+        np.add.at(grouped, self.ties.group, weight * right)
+        within = 0.0
+        for members in tied_groups(self.ties):
+            shares, _group_precision, _total = tied_weights(precision[members])
+            variance = 1.0 / precision[members]
+            signs = self.ties.sign[members]
+            conditional = np.diag(variance) - np.outer(signs * shares, signs * variance)
+            within += float(right[members] @ conditional @ right[members])
+        remaining = threshold - within
+        if remaining < 0.0:
+            return within
+        bound = np.array([0.5 * np.sqrt(remaining)])
         while True:
-            solved = np.asarray(_host(self.gaussian.posterior_solve(right[:, None], model, bound)), dtype=np.float64)
-            lower, upper = _norm_bounds(np.array([float(right @ solved[:, 0])]), bound)
-            if upper[0] * upper[0] <= threshold or lower[0] * lower[0] > threshold:
-                return float(upper[0] * upper[0])
+            try:
+                solved = np.asarray(_host(self.gaussian.posterior_solve(grouped[:, None], model, bound)), dtype=np.float64)
+            except ValueError as error:
+                # The move cannot be decided against its budget at float64's attainable accuracy: no certified fixed
+                # point here, so the outer loop shortens its step.
+                raise NoFixedPoint(f"model {model}: the EP move cannot be resolved against its budget: {error}") from error
+            lower, upper = _norm_bounds(np.array([float(grouped @ solved[:, 0])]), bound)
+            if upper[0] * upper[0] <= remaining or lower[0] * lower[0] > remaining:
+                return within + float(upper[0] * upper[0])
             bound = 0.5 * bound
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
@@ -530,15 +644,38 @@ class _FullDataFixedPoints:
         model_count = gaussian.model_count
         tolerance = 0.5 / self.draw_count
         while True:
-            variances, grams = self._refresh(hyperparameters)
+            variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
-            mean = np.asarray(_host(gaussian.mean), dtype=np.float64).copy()
+            mean = mean.copy()
             cavities = [Cavity(precision=frozen[:, model], shift=mean[:, model] / variances[:, model] - self.site_shift[:, model]) for model in range(model_count)]
             target_precision, target_shift = self._targets(hyperparameters, cavities)
-            # The undamped update moves the mean by Sigma (delta nu - delta tau o mu), to first order in the site change.
-            right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            draw_tolerance = self.effective / self.draw_count
-            self.mean_move = np.array([self._move_bounds(model, right[:, model], float(draw_tolerance[model])) for model in range(model_count)])
+            if not (np.all(np.isfinite(target_precision)) and np.all(np.isfinite(target_shift))):
+                # A trial whose tilted laws give no finite site (review-mathbugs N2) has no fixed point here: refused,
+                # so the outer loop counts it unresolved and shortens its step.
+                raise NoFixedPoint("a site target is not finite at these hyperparameters")
+            # The undamped update's KL(q || q') to second order in the site change (dtau, dnu): 1/2 r'Sigma r +
+            # 1/4 dtau'(Sigma o Sigma) dtau with r = dnu - dtau o mu, the Fisher metric of q's statistics (beta, -beta^2/2)
+            # (speed-smalln: the mean part alone left the site variances off). Certified at 1/(2K) nats.
+            snapshot = self._snapshot()
+            posteriors = [
+                _member_posterior(
+                    _posterior(gaussian, model, grams[model], group_variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
+                    self.ties, self.site_precision[:, model], group_variances[:, model],
+                )
+                for model in range(model_count)
+            ]
+            precision_step = target_precision - self.site_precision
+            right = (target_shift - self.site_shift) - precision_step * mean
+            spread = np.array([
+                max(-float(precision_step[:, model] @ posteriors[model].variance_jvp(precision_step[:, [model]])[:, 0]), 0.0) for model in range(model_count)
+            ])
+            budget = 1.0 / self.draw_count
+            self.mean_move = np.array([
+                (self._move_bounds(model, right[:, model], budget - 0.5 * float(spread[model])) if 0.5 * spread[model] < budget else np.inf)
+                + 0.5 * float(spread[model])
+                for model in range(model_count)
+            ])
+            draw_tolerance = np.full(model_count, budget)
             noise = self._noise(variances)
             covariate_count = int(gaussian.covariates.shape[1])
             self.noise_gain = np.array([
@@ -546,13 +683,12 @@ class _FullDataFixedPoints:
                 for model in range(model_count)
             ])
             if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
-                snapshot = self._snapshot()
                 return [
                     FixedPoint(
                         cavity=cavities[model],
-                        posterior=_posterior(gaussian, model, grams[model], variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
+                        posterior=posteriors[model],
                         mean=mean[:, model].copy(),
-                        precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model]),
+                        precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model], self.ties),
                         effective_effects=float(self.effective[model]),
                     )
                     for model in range(model_count)
@@ -567,9 +703,12 @@ class _FullDataFixedPoints:
         model_count = gaussian.model_count
         previous_move, damping = np.full(model_count, np.inf), 1.0
         while True:
-            mean = np.asarray(_host(gaussian.mean), dtype=np.float64).copy()
+            mean = self._member_moments(None)[0].copy()
             fraction = damping
             move = max(float(np.max(np.abs(target_precision - self.site_precision))), float(np.max(np.abs(target_shift - self.site_shift))))
+            if not np.isfinite(move):
+                # A non-finite target would never pass the halving test below (fraction nan is never small): refused.
+                raise NoFixedPoint("a frozen pass's site target is not finite")
             scale = 1.0 + max(float(np.max(np.abs(self.site_precision))), float(np.max(np.abs(self.site_shift))))
             while True:
                 if fraction * move <= _EPSILON * scale:
@@ -586,14 +725,16 @@ class _FullDataFixedPoints:
             self.site_precision, self.site_shift = trial_precision, trial_shift
             marginal = 1.0 / (frozen + self.site_precision)
             # A damped pass moves fraction^2 of the full step's squared size: converge on the full step.
-            mean_move = np.sum(np.square(_host(gaussian.mean) - mean) / marginal, axis=0) / (fraction * fraction)
-            if np.all(mean_move <= self.effective / self.draw_count):
+            new_mean = self._member_moments(None)[0]
+            mean_move = np.sum(np.square(new_mean - mean) / marginal, axis=0) / (fraction * fraction)
+            if not np.all(np.isfinite(mean_move)):
+                raise NoFixedPoint("a frozen pass's mean move is not finite")
+            if np.all(mean_move <= 1.0 / self.draw_count):
                 return
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
                 damping = min(damping, 1.0 / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
-            new_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
             cavities = [
                 Cavity(precision=frozen[:, model], shift=new_mean[:, model] / marginal[:, model] - self.site_shift[:, model]) for model in range(model_count)
             ]
@@ -632,7 +773,7 @@ def fit_full_data(
             stationarity_steps=tuple(fit.step.stationarity_steps for fit in fits),
             stationarity_errors=tuple(fit.step.stationarity_errors for fit in fits),
             mean_move=fixed_points.mean_move,
-            draw_tolerance=fixed_points.effective / draw_count,
+            draw_tolerance=np.full(gaussian.model_count, 1.0 / draw_count),
             noise_gain=fixed_points.noise_gain,
             mean_error=fixed_points.mean_error,
             information_bound=np.array([float(np.max(certificate.upper_bound)) for certificate in fixed_points.information]),
@@ -649,6 +790,7 @@ def fit_full_data(
             outer_history=tuple(fit.history for fit in fits),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
+            certified=np.array([fit.certified for fit in fits], dtype=bool),
         ),
     )
 
@@ -656,27 +798,32 @@ def fit_full_data(
 def scoring_models(
     fit: FullDataFit, prior: ScaleMixturePrior, statistics: GenotypeSufficientStatistics, trait_types: Sequence[TraitType], draw_count: int, seed: int
 ) -> list[ScoringModel]:
-    """One ``fast_scoring.ScoringModel`` per model: the posterior mean, K exact posterior draws and the covariate
-    coefficients, expanded from the reduced columns to every active store row. A tie group's members share their
-    representative's prior, so its effect splits in proportion to their prior variances."""
+    """One ``fast_scoring.ScoringModel`` per model over every active store row: each tie member's own posterior mean
+    and K exact posterior draws (``tie_members``: its group's, conditioned on the sum, with its own site and prior),
+    and the covariate coefficients. Tied members are equal on the training samples only, so each keeps its effect."""
     gaussian = fit.gaussian
-    error_bound = np.sqrt(fit.certificate.effective_effects / draw_count)
-    draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
-    active_to_reduced = np.asarray(statistics.tie_map.original_to_reduced, dtype=np.int64)
+    ties = TieGroups.from_tie_map(statistics.tie_map)
+    error_bound = np.full(len(trait_types), np.sqrt(1.0 / draw_count))
+    group_draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
     alpha = np.asarray(_host(gaussian.alpha), dtype=np.float64)
-    mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
-    return [
-        ScoringModel.from_reduced_fit(
+    group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
+    mean, _variance = member_moments(ties, fit.site_precision, fit.site_shift, group_mean, np.zeros_like(group_mean))
+    identity = _compact_identity_tie_map(ties.member_count)
+    models = []
+    for model, trait_type in enumerate(trait_types):
+        draws = member_draws(
+            ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
+        )
+        models.append(ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
             signed_means=np.asarray(statistics.means, dtype=np.float64),
             signed_scales=np.asarray(statistics.scales, dtype=np.float64),
-            tie_map=statistics.tie_map,
-            member_prior_variances=prior_second_moment(prior, fit.hyperparameters[model])[active_to_reduced],
+            tie_map=identity,
+            member_prior_variances=prior_second_moment(prior, fit.hyperparameters[model]),
             beta_reduced=mean[:, model],
-            posterior_draws_reduced=draws[:, model, :],
+            posterior_draws_reduced=draws,
             alpha=alpha[:, model],
             trait_type=trait_type,
             predictive_intercept_shift=0.0,
-        )
-        for model, trait_type in enumerate(trait_types)
-    ]
+        ))
+    return models

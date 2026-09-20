@@ -114,7 +114,6 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('phenotype_measurement.py', '_level_grid'): ('derived', frozenset({0.25}), 'the relative tolerance split: half to the trapezoid rule, a quarter to each truncated tail'),
     ('phenotype_measurement.py', '_log_prior_sum_bound'): ('derived', frozenset({3.0, 4.0}), 'moments m = 0, 1, 2; |T|^m N(T; 0, tau^2) has four monotone pieces for m > 0 (two for m = 0)'),
     ('progress.py', 'elapsed'): ('unit', frozenset({60}), 'seconds per minute and minutes per hour'),
-    ('krylov_recycle.py', 'block_gcro_dr'): ('derived', frozenset({3}), 'byte accounting: the solution, residual and right-hand side are the three p x r arrays kept beside the cycle'),
     ('scale_mixture_ep.py', 'ROUGHNESS_ORDER'): ('spec', frozenset({3}), 'third-difference roughness (lead ruling 6c9976a): its null space is a normal log-density, the proper lambda = infinity limit'),
     ('scale_mixture_ep.py', '_ROW_INTERMEDIATES'): ('derived', frozenset({20}), "byte accounting: the (rows x K) float64 arrays alive at once in a chunk"),
     ('scale_mixture_ep.py', '_KRONROD_NODES'): ('spec', frozenset({0.20778495500789848, 0.4058451513773972, 0.5860872354676911, 0.7415311855993945, 0.8648644233597691, 0.9491079123427585, 0.9914553711208126}), 'QUADPACK dqk15i (Piessens, de Doncker-Kapenga, Ueberhuber and Kahaner 1983): the 15-point Kronrod rule and its embedded 7-point Gauss rule'),
@@ -133,8 +132,9 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', 'quadrature_majorant_ratio'): ('math', frozenset({0.25}), '|(1 + i q)^(-1/2)| = (1 + q^2)^(-1/4) at t + i pi/2'),
     ('scale_mixture_ep.py', '_directional_derivatives'): ('math', frozenset({4, 3.0, 6.0, 4.0}), 'derivatives of a log-sum-exp as joint cumulants (Faa di Bruno): k4 = E[X^4] - 3 Var^2, d4 = k4 + 6 k(X, X, Y) + 3 Var(Y) + 4 Cov(X, Z) + E W'),
     ('scale_mixture_ep.py', '_variant_derivatives'): ('math', frozenset({3.0}), 'd Var / dh of a normal mixture: E[(mu - m)^3] + 3 E[c (mu - m)] (third central moment of a Gaussian mixture)'),
-    ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
     ('scale_mixture_ep.py', '_standardized'): ('math', frozenset({8.0, 5.0, 24.0}), 'Tierney and Kadane (1986): the O(1) Laplace term E[u^4]/24 k4 + E[u^6]/72 k3^2 = k4/8 + 5 k3^2/24'),
+    ('krylov_recycle.py', 'block_gcro_dr'): ('derived', frozenset({3}), 'byte accounting: the solution, residual and right-hand side are the three p x r arrays kept beside the cycle'),
+    ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
     ('store_converter.py', 'IMPUTATION_ERROR_RATE'): ('external-config', frozenset({0.001}), 'GLIMPSE2 --err-imp of the aou2_50k imputation run; the removed background is an exact function of it'),
     ('store_converter.py', 'MAXIMUM_KEPT_PATHS'): ('external-config', frozenset({10}), 'pop-glimpse2 max_alleles of the aou2_50k imputation run'),
     ('store_converter.py', 'NO_LOCUS'): ('definitional', frozenset({4294967295}), 'uint32 maximum as the no-locus sentinel'),
@@ -184,9 +184,9 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
 
 # (module path relative to sv_pgs/, symbol) -> (owner lane, values, what replaces them)
 PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
-    ('fit_model.py', 'DRAW_COUNT'): ('e2e', frozenset({64}), 'MODEL.md section 4 fixes K = 64 posterior draws, which also sets every certificate tolerance at 1/(2K): derive K from the Monte Carlo accuracy the scorer needs'),
     ('scale_mixture_ep.py', '_maximize_coefficients'): ('e2e', frozenset({0.25, 0.75}), 'the trust-region gain-ratio thresholds and radius factors are the illustrative defaults of Algorithm 4.1 (any eta in [0, 1/4) converges): set the radius from the accuracy of the model itself (the cubic-term bound) instead'),
     ('scale_mixture_ep.py', '_ascend_evidence'): ('e2e', frozenset({0.25, 0.75}), 'the trust-region gain-ratio thresholds and radius factors are the illustrative defaults of Algorithm 4.1 (any eta in [0, 1/4) converges): set the radius from the accuracy of the model itself (the cubic-term bound) instead'),
+    ('fit_model.py', 'DRAW_COUNT'): ('e2e', frozenset({64}), 'MODEL.md section 4 fixes K = 64 posterior draws, which also sets every certificate tolerance at 1/(2K): derive K from the Monte Carlo accuracy the scorer needs'),
     ('all_of_us.py', 'MIN_PRE_LANDMARK_CONDITION_DATES'): ('phenotypes', frozenset({5}), 'latent-class EHR evidence model (PHENOTYPES.md item 1)'),
     ('all_of_us.py', 'EHR_DEPTH_LANDMARK_DAYS'): ('phenotypes', frozenset({365}), 'latent-class EHR evidence model (PHENOTYPES.md item 1)'),
     ('all_of_us.py', 'DISEASE_DEFINITIONS.minimum_control_age_years'): ('phenotypes', frozenset({40.0, 50.0}), 'latent-class EHR evidence model (PHENOTYPES.md item 1)'),
