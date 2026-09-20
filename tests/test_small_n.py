@@ -265,6 +265,30 @@ def _engine_problem(seed, samples, variants, noise):
     return design, target, prior, hyperparameters, tilted, largest
 
 
+def _reference_marginals(design, noise, target, precision, shift):
+    """q's marginal means and variances at sites (precision, shift) on an explicit dense design (the reference's q)."""
+    inverse = np.linalg.inv(design.T @ design / noise + np.diag(precision))
+    return inverse @ (design.T @ target / noise + shift), np.diag(inverse)
+
+
+def _assert_same_fixed_point(design, noise, target, got, expected, tilted):
+    """The reference's EP fixed point (``solve_sites``: the double loop, then Newton to its 1e-12 moment residual) and
+    ours give the same q: marginal means and variances. The sites themselves are ill-conditioned wherever the data
+    barely inform a column (its site precision moves a lot for a small change in its marginal), so they are not what
+    either solver's stopping rule resolves; our own moment-matching residual is checked instead."""
+    got_mean, got_variance = _reference_marginals(design, noise, target, *got)
+    expected_mean, expected_variance = _reference_marginals(design, noise, target, expected.site_precision, expected.site_shift)
+    np.testing.assert_allclose(got_variance, expected_variance, rtol=1e-8)
+    np.testing.assert_allclose(got_mean, expected_mean, rtol=1e-8, atol=1e-8 * float(np.max(np.sqrt(expected_variance))))
+    cavity_precision = 1.0 / got_variance - got[0]
+    _log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, got_mean / got_variance - got[1])
+    residual = max(
+        float(np.max(np.abs(got_mean - tilted_mean) / np.sqrt(got_variance))),
+        float(np.max(np.abs(got_variance + got_mean**2 - tilted_variance - tilted_mean**2) / (got_variance + got_mean**2))),
+    )
+    assert residual < 1e-8
+
+
 def test_the_double_loop_reaches_the_reference_double_loops_stationary_point(monkeypatch):
     """small_n's matrix-free double loop against ``tests/ep_eb_reference.double_loop_sites`` itself (dense Cholesky,
     exact 2p x 2p Newton), run on the engine's tilted moments: the same EP stationary point."""
@@ -287,12 +311,11 @@ def test_the_double_loop_reaches_the_reference_double_loops_stationary_point(mon
     likelihood_precision, linear_term = design.T @ design / noise, design.T @ target / noise
     # The patched moments ignore the reference's own prior; its domain check only asks the vector to be finite.
     vector = np.zeros(1)
-    expected = reference.double_loop_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
+    expected = reference.solve_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
     profile = _new_profile()
     # A draw count whose tolerance is below the rounding: the loop runs to its stationarity, as the reference's does.
-    got_precision, got_shift = double_loop_sites(_Design.dense(design), noise, design.T @ target, precision, shift, tilted, largest, 2**60, 10**9, profile)
-    np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
-    np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
+    got = double_loop_sites(_Design.dense(design), noise, design.T @ target, precision, shift, tilted, largest, 2**60, 10**9, profile)
+    _assert_same_fixed_point(design, noise, target, got, expected, tilted)
     assert profile["double_loop_outer"] >= 1
 
 
@@ -473,12 +496,12 @@ def test_a_mixed_class_tie_group_reaches_the_reference_ep_fixed_point(monkeypatc
     precision, shift = moment_matched_prior_sites(prior, hyperparameters)
     likelihood_precision, linear_term = explicit.T @ explicit / noise, explicit.T @ target / noise
     vector = np.zeros(1)
-    expected = reference.double_loop_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
-    got_precision, got_shift = double_loop_sites(tied, noise, tied.back(target), precision, shift, tilted, largest, 2**60, 10**9, _new_profile())
-    np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
-    np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
-    # The tied members' sites differ: each keeps its own prior (no merged column, no b / M split).
-    assert not np.isclose(got_precision[0], got_precision[1])
+    expected = reference.solve_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
+    got = double_loop_sites(tied, noise, tied.back(target), precision, shift, tilted, largest, 2**60, 10**9, _new_profile())
+    _assert_same_fixed_point(explicit, noise, target, got, expected, tilted)
+    # The tied members' posteriors differ: each keeps its own prior (no merged column, no b / M split).
+    got_mean, got_variance = _reference_marginals(explicit, noise, target, *got)
+    assert not np.isclose(got_variance[0], got_variance[1]) and not np.isclose(got_mean[0], got_mean[1])
 
 
 def test_the_prior_and_scoring_are_per_member():
