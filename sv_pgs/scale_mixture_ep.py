@@ -585,7 +585,8 @@ def relattice(
     """
     old_nodes = prior.log_variance_grid
     log_density, scale_coefficients = _density_and_scale(prior, hyperparameters.coefficients)
-    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
+    # One end condition per class: the spline is vector-valued over the classes (review-mathbugs L-0).
+    natural = [(order, np.zeros(log_density.shape[0])) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
     spline = make_interp_spline(old_nodes, log_density.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
     new_nodes = np.asarray(nodes, dtype=np.float64)
     inside = np.clip(new_nodes, old_nodes[0], old_nodes[-1])
@@ -2675,13 +2676,12 @@ def _newton_step(newton: _NewtonB) -> F64Array:
 
 
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite, shortened to ``radius`` where it is longer,
-    else the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by the monotonicity test, not by a
+    radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
+    the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
     curvature out of a saddle."""
     if newton.definite:
-        step = _newton_step(newton)
-        length = float(np.linalg.norm(step))
-        return step if length <= radius else step * (radius / length)
+        return _newton_step(newton)
     return _trust_region_step(newton.total, newton.gradient, radius)
 
 
@@ -2719,8 +2719,7 @@ def fit_hyperparameters(
       model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
       value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
       a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
-      at the Cauchy step's length on |B + S| (``_cauchy_radius``), and a Newton step longer than the radius is
-      shortened to it.
+      at the Cauchy step's length on |B + S| (``_cauchy_radius``).
     The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
     remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
     by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
@@ -2770,10 +2769,7 @@ def fit_hyperparameters(
             if radius is None:
                 radius = _cauchy_radius(newton)
                 radii[model] = radius
-            proposal = _proposal(newton, radius)
-            # A Newton step shortened to the radius is its fraction of the full one (the certifying check scales by it).
-            full = float(np.linalg.norm(_newton_step(newton))) if newton.definite else float(np.linalg.norm(proposal))
-            pending[model] = (newton, step, proposal, radius, certifying, 1.0 if full == 0.0 else float(np.linalg.norm(proposal)) / full)
+            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -2826,7 +2822,8 @@ def fit_hyperparameters(
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
                 iterations[model] += 1
-                radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
+                if not newton.definite:
+                    radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
@@ -2853,7 +2850,6 @@ def fit_hyperparameters(
             # move was too large, or an ordinary one, becomes an ordinary shorter trial.
             keep = certifying and trial_point is None
             if newton.definite:
-                radii[model] = 0.5 * length
                 pending[model] = (newton, step, 0.5 * proposal, radius, keep, 0.5 * fraction)
             else:
                 radius = 0.5 * length

@@ -284,6 +284,25 @@ def test_halving_the_lattice_keeps_every_class_density():
     np.testing.assert_allclose(log_scale(finer, transferred.coefficients), log_scale(prior, hyperparameters.coefficients), atol=1e-12)
 
 
+def test_halving_a_three_class_lattice_keeps_every_class_density():
+    # review-mathbugs L-0: the natural end conditions were scalars for a spline over C classes, which scipy accepted
+    # only when C equalled their count (two).
+    generator = np.random.default_rng(71)
+    count = 90
+    class_index = np.repeat(np.arange(3), count // 3)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 12)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.log(generator.uniform(0.3, 1.0, count)), annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    hyperparameters = _hyperparameters(prior, 72)
+    finer, moved = halved_lattice(prior, hyperparameters)
+    # Each class's log g passes through its old nodal values (up to the class's normalizing constant).
+    fine = engine._density_and_scale(finer, moved.coefficients)[0][:, ::2]
+    coarse = engine._density_and_scale(prior, hyperparameters.coefficients)[0]
+    np.testing.assert_allclose(np.diff(fine, axis=1), np.diff(coarse, axis=1), rtol=1e-9, atol=1e-9)
+
+
 def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotations():
     prior, _cavity = _problem(variant_count=40, seed=7, node_count=12)
     hyperparameters = _hyperparameters(prior, 8)
@@ -956,6 +975,7 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
     """Damped parallel EP on the dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), run to machine precision."""
     site_precision, site_shift = (np.array(part, copy=True) for part in sites)
     hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    previous_change = np.inf
     for _sweep in range(20000):
         covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
         mean = covariance @ (linear_term + site_shift)
@@ -964,11 +984,11 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
         change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
         site_precision += 0.5 * (target_precision - site_precision)
         site_shift += 0.5 * (target_shift - site_shift)
-        # Machine precision: the site update cannot resolve its targets past the inverse's own relative rounding,
-        # eps times the condition number of the posterior precision.
-        rounding = float(np.finfo(np.float64).eps) * float(np.linalg.cond(likelihood_precision + np.diag(site_precision)))
-        if change < max(1e-14, rounding):
+        # Machine precision: the damped map contracts until its targets' rounding, where the change stops falling;
+        # past half of double precision a change that no longer falls is that floor.
+        if change < 1e-14 or (change >= previous_change and change < float(np.finfo(np.float64).eps) ** 0.5):
             return (site_precision, site_shift), covariance, cavity
+        previous_change = change
     raise AssertionError("dense EP did not converge")
 
 
@@ -1119,6 +1139,37 @@ def test_the_prediction_check_holds_each_block_to_its_own_budget():
     inflation = 1.0 / float(np.finfo(np.float64).eps) ** 2
     (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, inflation), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert not starved.certified
+
+
+def test_a_density_below_the_kernel_floor_is_a_near_zero_effect_not_a_point_mass():
+    # review-mathbugs N1 [real: gene 3 snv_sv's first outer trial]: with every node below the floor given v = 0, a
+    # class whose density sits there had tilted variance exactly 0, so the site targets were tau = inf, nu = nan.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    nodes = prior.log_variance_grid
+    below = initial_hyperparameters(prior, float(np.exp(nodes[0])))
+    moments = tilted_moments(prior, below, cavity, _WORKING_BYTES)
+    assert np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean))
+    precision, shift = site_targets(moments, cavity)
+    assert np.all(np.isfinite(precision)) and np.all(np.isfinite(shift))
+
+
+def test_the_first_trust_region_trial_is_bounded_by_the_cauchy_step():
+    # The first trust radius is the Cauchy step's length on |B + S|: a direction the data barely curve cannot send the
+    # first trial off to the rounding floor's 1 / eps (review-mathbugs: |x| 1.3e4 on a real gene). An indefinite model
+    # (the saddle correction of the outer-step test) steps inside it.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
+    objective = _data_objective(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    mapping = prior.coefficient_map
+    saddle = CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (2.0 * objective.hessian - np.eye(mapping.shape[0])) @ mapping)
+    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+    point = FixedPoint(cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                       precision_norm=lambda d: float(np.sum(np.square(d) / moments.variance)), effective_effects=1.0)
+    newton = engine._newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, saddle, _WORKING_BYTES)
+    assert not newton.definite
+    radius = engine._cauchy_radius(newton)
+    assert 0.0 < radius <= float(np.linalg.norm(newton.gradient)) / float(np.min(np.abs(newton.eigenvalues)))
+    assert float(np.linalg.norm(engine._proposal(newton, radius))) <= radius * (1.0 + 1e-9)
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
