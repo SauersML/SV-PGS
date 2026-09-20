@@ -24,7 +24,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from sv_pgs._typing import F64Array
+from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.config import TraitType
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
@@ -233,6 +233,11 @@ class _PooledFixedPoints:
         self.gene_cpu_seconds = np.zeros(len(self.rows))
         self.tilted_cpu_seconds = 0.0
         self.sweeps = 0
+        # Each gene's last refresh (its marginal variances and cavity precisions), valid while its sites and noise are
+        # unchanged within one fixed-point solve (at fixed x): a gene already certified is not rebuilt (theory-ep).
+        self._refreshed = np.zeros(len(self.rows), dtype=bool)
+        self._refresh_variances = np.empty(prior.variant_count)
+        self._refresh_cavity = np.empty(prior.variant_count)
 
     @property
     def gene_count(self) -> int:
@@ -242,9 +247,15 @@ class _PooledFixedPoints:
         """Gene ``gene``'s exact mean at the sites; ``LinAlgError`` when its precision is not positive definite."""
         started, cpu = time.perf_counter(), time.process_time()
         noise = float(self.noise[gene])
+        self._refreshed[gene] = False
         try:
             kernel = _Kernel(self.statistics[gene].design, noise * site_precision)
             self.mean[self.rows[gene]] = kernel.solve(self.scores[gene] + noise * site_shift)
+        except np.linalg.LinAlgError:
+            # A failed build costs its kernel's formation (n^2 p) before the Cholesky refuses: counted apart (theory-ep).
+            self.profile["failed_factorizations"] = self.profile.get("failed_factorizations", 0) + 1
+            self.profile["failed_factor_seconds"] = self.profile.get("failed_factor_seconds", 0.0) + time.perf_counter() - started
+            raise
         finally:
             self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self.kernels[gene] = kernel
@@ -259,6 +270,9 @@ class _PooledFixedPoints:
         variances = np.empty(self.prior.variant_count)
         cavity_precision = np.empty(self.prior.variant_count)
         for gene, rows in enumerate(self.rows):
+            if self._refreshed[gene]:
+                variances[rows], cavity_precision[rows] = self._refresh_variances[rows], self._refresh_cavity[rows]
+                continue
             while True:
                 try:
                     self._iterate(gene, self.site_precision[rows], self.site_shift[rows])
@@ -273,6 +287,8 @@ class _PooledFixedPoints:
                     gene_variances, gene_precision = noise * scaled_variances, scaled_precision / noise
                     if np.all(1.0 + largest[rows] * gene_precision > 0.0):
                         variances[rows], cavity_precision[rows] = gene_variances, gene_precision
+                        self._refresh_variances[rows], self._refresh_cavity[rows] = gene_variances, gene_precision
+                        self._refreshed[gene] = True
                         self.effective[gene] = max(float(np.sum(removed)), _EPSILON * (rows.stop - rows.start))
                         break
                     failure = f"gene {gene}: a cavity's tilted law is improper (1 + v P <= 0 on the lattice) with non-negative sites"
@@ -331,12 +347,15 @@ class _PooledFixedPoints:
         return {
             "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "noise": self.noise.copy(),
             "effective": self.effective.copy(), "kernels": list(self.kernels), "mean": self.mean.copy(),
+            "refreshed": self._refreshed.copy(), "refresh_variances": self._refresh_variances.copy(), "refresh_cavity": self._refresh_cavity.copy(),
         }
 
     def _restore(self, snapshot: dict) -> None:
         self.site_precision, self.site_shift = snapshot["site_precision"].copy(), snapshot["site_shift"].copy()
         self.noise, self.effective = snapshot["noise"].copy(), snapshot["effective"].copy()
         self.kernels, self.mean = list(snapshot["kernels"]), snapshot["mean"].copy()
+        self._refreshed, self._refresh_variances = snapshot["refreshed"].copy(), snapshot["refresh_variances"].copy()
+        self._refresh_cavity = snapshot["refresh_cavity"].copy()
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         (model_hyperparameters,) = hyperparameters
@@ -351,6 +370,8 @@ class _PooledFixedPoints:
 
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
+        # A refresh holds at one x only.
+        self._refreshed[:] = False
         while True:
             variances, frozen = self._refresh(hyperparameters)
             mean = self.mean.copy()
@@ -381,8 +402,14 @@ class _PooledFixedPoints:
                     cavity=cavity, posterior=self._posterior(), mean=mean, precision_norm=self._precision_norm(),
                     effective_effects=self.effective.copy(),
                 )
-            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
-            self.noise = self._noises(1.0 / (frozen + self.site_precision))
+            # A certified gene is at its own fixed point at this x (the genes are independent given x): it rests, keeping
+            # its sites, noise and refresh; the others take frozen passes and a noise update.
+            certified = (divergences <= tolerance) & (gains <= tolerance)
+            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift, certified)
+            noises = self._noises(1.0 / (frozen + self.site_precision))
+            moving = ~certified
+            self.noise[moving] = noises[moving]
+            self._refreshed[moving] = False
 
     def _double_loop(self, gene: int, hyperparameters: MixtureHyperparameters) -> None:
         """Gene ``gene``'s EP fixed point by the double loop (``small_n.double_loop_sites``) on its own rows of the pooled
@@ -428,12 +455,14 @@ class _PooledFixedPoints:
         self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self._iterate(gene, precision, shift)
 
-    def _frozen_passes(self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
+    def _frozen_passes(
+        self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array, resting: BoolArray | None = None
+    ) -> None:
         """Mean-only EP with the cavity precisions frozen, every gene stepping each sweep with its own damping, until
         the pooled frozen move is below sum_g p_eff,g / K (``small_n._DenseFixedPoints._frozen_passes``)."""
         previous = np.full(self.gene_count, np.inf)
         damping = np.ones(self.gene_count)
-        done = np.zeros(self.gene_count, dtype=bool)
+        done = np.zeros(self.gene_count, dtype=bool) if resting is None else np.asarray(resting, dtype=bool).copy()
         while True:
             self.sweeps += 1
             moves = np.zeros(self.gene_count)
