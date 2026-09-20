@@ -18,7 +18,7 @@ These are marginal_variances' identity 1 with K^-1 applied exactly (its KernelFa
 rounding certified): one Cholesky K = RR' replaces the window and its far-field equivalent, so nothing is
 estimated and no probe certificate is needed. With u = R^-1 x every quantity above is an inner product of
 forward solves, run on the array module's device. Two passes over the columns (form K and gather U, then
-forward-solve every column) cost n^2 p flops each, the factor n^3/3, and diag(K^-1) another n^3/3 when it is
+forward-solve every column) cost n^2 p flops each, the factor n^3/3, and diag(K^-1) another n^3 when it is
 asked for, in blocks of identity columns, so no second n x n array is held. `exact_dual_cost` gives the counts.
 
 Certificate. The algebra is exact, so the bound covers floating point only. Let u be the unit roundoff and
@@ -27,13 +27,20 @@ gamma_m = m u / (1 - m u) (Higham 2002, Accuracy and Stability of Numerical Algo
   with m the accumulation depth. Each entry is a sum of m products (Higham Thm 3.5), and the elementwise bound
   sum_j D_j |xt_j||xt_j|' is PSD, so its 2-norm is at most its trace.
 - Factor: the computed factor satisfies RR' = K_hat + E with |E| <= gamma_{n+1} |R||R'| (Thm 10.3), so
-  ||E||_2 <= gamma_{n+1} ||R||_F^2. Together ||RR' - K||_2 <= delta.
+  ||E||_2 <= gamma_{n+1} || |R| ||_2^2 <= gamma_{n+1} min(||R||_F^2, || |R| ||_1 || |R| ||_inf). The 1- and
+  inf-norms cost n^2 to read and, for K near I plus a small trace, are far below tr(K) = ||R||_F^2.
+  Together ||RR' - K||_2 <= delta.
 - Inner products: K >= I gives ||K^-1|| <= 1 and ||(RR')^-1|| <= 1 / (1 - delta), so every pair of columns has
-  |x_a'(RR')^-1 x_b - x_a'K^-1 x_b| <= ||x_a|| ||x_b|| delta / (1 - delta).
+  |x_a'(RR')^-1 x_b - x_a'K^-1 x_b| <= ||x_a|| ||x_b|| delta / (1 - delta). Since (RR')^-1 - K^-1 =
+  -(RR')^-1 E K^-1, it is also at most ||u_a|| ||u_b|| delta (1 + delta) / (1 - delta), with u = R^-1 x; the
+  smaller of the two is taken. The second removes a factor 1 + D_j ||xt_j||^2 on data-dominated sites, where
+  D_j (1 - D_j q_j) cancels.
 - Solves: each forward solve is backward stable, (R + F) u_hat = x with |F| <= gamma_n |R| (Thm 8.5), so
   u_hat = R^-1 x + e with ||e|| <= beta / (1 - beta) ||u_hat||, where
-  beta = gamma_n ||R||_F / (sqrt(1 - delta) - gamma_n ||R||_F). Each inner product carries a further relative
-  gamma_n.
+  beta = gamma_n || |R| ||_2 / (sqrt(1 - delta) - gamma_n || |R| ||_2). Each inner product carries a further
+  relative gamma_n.
+The bound expressions themselves are evaluated in float64, so each is exact to a relative few u of a bound
+that lies orders of magnitude above the error it bounds.
 That bounds every q, c, core and diag(K^-1) entry. The core terms go through the same argument on the small factor of
 core, with its smallest eigenvalue bounded below from that factor and its computed inverse. A core that isn't
 certifiably positive definite, or any bound that can't be established, raises NotCertified; nothing is guessed.
@@ -81,36 +88,82 @@ def _gamma(count: int) -> float:
     return product / (1 - product)
 
 
-def _backend(array_module: Any) -> tuple[Callable, Callable, Callable]:
-    if array_module is np:
-        return (lambda matrix: scipy.linalg.cholesky(matrix, lower=True, overwrite_a=True, check_finite=False),
-                lambda factor, right: scipy.linalg.solve_triangular(factor, right, lower=True, check_finite=False),
-                lambda values: values)
-    import cupyx.scipy.linalg
+class _Backend:
+    """The kernel's one n x n array, on the host or the device: K = I + sum of SYRK updates into its lower
+    triangle, in place, then factored in place (LAPACK / cuSOLVER potrf, lower). Fortran order throughout, so
+    the triangular solves read the factor without copying it; the strict upper triangle is never written and
+    stays exactly zero."""
 
-    return (lambda matrix: array_module.linalg.cholesky(matrix),
-            lambda factor, right: cupyx.scipy.linalg.solve_triangular(factor, right, lower=True),
-            array_module.asnumpy)
+    def __init__(self, array_module: Any) -> None:
+        self.xp = array_module
+        self.on_host = array_module is np
+
+    def identity(self, size: int) -> Any:
+        if self.on_host:
+            return np.eye(size, order="F")
+        kernel = self.xp.zeros((size, size), dtype=self.xp.float64, order="F")
+        self.xp.fill_diagonal(kernel, 1)
+        return kernel
+
+    def accumulate(self, kernel: Any, scaled: Any) -> Any:
+        """kernel += scaled scaled' on the lower triangle."""
+        if self.on_host:
+            return scipy.linalg.blas.dsyrk(1.0, scaled, beta=1.0, c=kernel, lower=1, overwrite_c=1)
+        import cupy.cublas
+
+        cupy.cublas.syrk("N", scaled, out=kernel, alpha=1.0, beta=1.0, lower=True)
+        return kernel
+
+    def cholesky(self, kernel: Any) -> Any:
+        if self.on_host:
+            factor, info = scipy.linalg.lapack.dpotrf(kernel, lower=1, clean=1, overwrite_a=1)
+        else:
+            from cupy.cuda import device
+            from cupy_backends.cuda.libs import cublas, cusolver
+
+            size = kernel.shape[0]
+            handle = device.get_cusolver_handle()
+            status = self.xp.empty(1, dtype=np.int32)
+            buffer_size = cusolver.dpotrf_bufferSize(handle, cublas.CUBLAS_FILL_MODE_LOWER, size, kernel.data.ptr, size)
+            workspace = self.xp.empty(buffer_size, dtype=self.xp.float64)
+            cusolver.dpotrf(handle, cublas.CUBLAS_FILL_MODE_LOWER, size, kernel.data.ptr, size,
+                            workspace.data.ptr, buffer_size, status.data.ptr)
+            factor, info = kernel, int(status.get()[0])
+        if info != 0:
+            raise NotCertified("the kernel K >= I lost positive definiteness in float64")
+        return factor
+
+    def forward(self, factor: Any, right: Any) -> Any:
+        if self.on_host:
+            return scipy.linalg.solve_triangular(factor, right, lower=True, check_finite=False)
+        import cupyx.scipy.linalg
+
+        return cupyx.scipy.linalg.solve_triangular(factor, right, lower=True)
+
+    def to_host(self, values: Any) -> Any:
+        return values if self.on_host else self.xp.asnumpy(values)
 
 
 @dataclass(frozen=True)
 class _FactorBounds:
-    """Pair error |fl(u_a'u_b) - x_a' M^-1 x_b| <= ||x_a|| ||x_b|| rho + ||u_a|| ||u_b|| sigma for a factor of M."""
+    """Pair error |fl(u_a'u_b) - x_a' M^-1 x_b| for a computed factor of M, from the columns' norms ||x|| and the
+    computed solves' norms ||u||: min(||x_a|| ||x_b|| rho, ||u_a|| ||u_b|| solved_rho) + ||u_a|| ||u_b|| sigma."""
     rho: float
+    solved_rho: float
     sigma: float
     inverse_norm: float
 
     def pair(self, x_a: NDArray[np.float64], x_b: NDArray[np.float64], u_a: NDArray[np.float64], u_b: NDArray[np.float64]) -> NDArray[np.float64]:
-        return x_a * x_b * self.rho + u_a * u_b * self.sigma
+        return np.minimum(x_a * x_b * self.rho, u_a * u_b * self.solved_rho) + u_a * u_b * self.sigma
 
 
-def _factor_bounds(delta: float, frobenius_squared: float, dimension: int, smallest_eigenvalue: float) -> _FactorBounds:
-    """Bounds for RR' = M + E, ||E||_2 <= delta, M >= smallest_eigenvalue I, given ||R||_F^2."""
+def _factor_bounds(delta: float, factor_norm_squared: float, dimension: int, smallest_eigenvalue: float) -> _FactorBounds:
+    """Bounds for RR' = M + E, ||E||_2 <= delta, M >= smallest_eigenvalue I, given an upper bound on || |R| ||_2^2."""
     margin = smallest_eigenvalue - delta
     if margin <= 0:
         raise NotCertified(f"the factor's error {delta:.3g} reaches the smallest eigenvalue {smallest_eigenvalue:.3g}")
     rho = delta / (smallest_eigenvalue * margin)
-    solve_error = _gamma(dimension) * np.sqrt(frobenius_squared)
+    solve_error = _gamma(dimension) * np.sqrt(factor_norm_squared)
     denominator = np.sqrt(margin) - solve_error
     if denominator <= 0:
         raise NotCertified("forward solves cannot be bounded: the factor is too ill-conditioned for float64")
@@ -118,12 +171,33 @@ def _factor_bounds(delta: float, frobenius_squared: float, dimension: int, small
     if beta >= 1:
         raise NotCertified("forward-solve error bound exceeds the solution")
     growth = beta / (1 - beta)
-    return _FactorBounds(rho=rho, sigma=growth * (1 + 1 / (1 - beta)) + _gamma(dimension), inverse_norm=1 / margin)
+    # (RR')^-1 - M^-1 = -(RR')^-1 E M^-1, with ||(RR')^-1 x|| <= ||R^-1|| ||R^-1 x||, ||M^-1 (RR')|| <= 1 + delta / lambda,
+    # ||R^-1||^2 <= 1 / margin and ||R^-1 x|| <= ||u_hat|| / (1 - beta).
+    solved_rho = delta * (1 + delta / smallest_eigenvalue) / (margin * (1 - beta) ** 2)
+    return _FactorBounds(rho=rho, solved_rho=solved_rho, sigma=growth * (1 + 1 / (1 - beta)) + _gamma(dimension),
+                         inverse_norm=1 / margin)
 
 
 def _upper(values: NDArray[np.float64], terms: int) -> NDArray[np.float64]:
     """Upper bound on a sum of `terms` non-negative floating-point terms from its computed value."""
     return values * (1 + _gamma(terms))
+
+
+def _factor_norm_squared(factor: Any, array_module: Any, to_host: Callable, width: int) -> float:
+    """Upper bound on || |R| ||_2^2 for a lower-triangular R: min(||R||_F^2, || |R| ||_1 || |R| ||_inf) (Higham 2002
+    section 6.3), read in row blocks of `width` so no second n x n array is formed."""
+    size = factor.shape[0]
+    row_largest, frobenius_squared = 0.0, 0.0
+    column_sums = array_module.zeros(size, dtype=array_module.float64)
+    for start in range(0, size, width):
+        stop = min(start + width, size)
+        magnitude = array_module.abs(factor[start:stop, :stop])
+        row_largest = max(row_largest, float(to_host(magnitude.sum(axis=1).max())))
+        column_sums[:stop] += magnitude.sum(axis=0)
+        frobenius_squared += float(to_host((magnitude * magnitude).sum()))
+    column_largest = float(to_host(column_sums.max()))
+    absolute = _upper(np.array([row_largest]), size)[0] * _upper(np.array([column_largest]), size)[0]
+    return float(min(_upper(np.array([frobenius_squared]), size * size)[0], absolute))
 
 
 def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count: int, *,
@@ -135,7 +209,8 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
     read twice. `resolved` names extra sites to eliminate through the core (non-positive sites always are).
     """
     xp = array_module
-    cholesky, forward, to_host = _backend(xp)
+    backend = _Backend(xp)
+    forward, to_host = backend.forward, backend.to_host
     precision = np.asarray(precision, dtype=np.float64)
     variant_count = precision.size
     resolved_mask = precision <= 0
@@ -144,15 +219,16 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
     bulk_variance = np.zeros(variant_count)
     bulk_variance[~resolved_mask] = 1 / precision[~resolved_mask]
 
-    kernel = xp.eye(sample_count, dtype=xp.float64)
+    kernel = backend.identity(sample_count)
     column_norm = np.zeros(variant_count)
     coverage = np.zeros(variant_count, dtype=np.int64)
-    load, depth = 0.0, 0
+    load, depth, widest = 0.0, 0, 0
     resolved_columns: list[NDArray[np.int64]] = []
     resolved_values: list[Any] = []
     for columns, block in blocks():
         columns = np.asarray(columns, dtype=np.int64)
         np.add.at(coverage, columns, 1)
+        widest = max(widest, columns.size)
         block = xp.asarray(block, dtype=xp.float64)
         norms = _upper(to_host((block * block).sum(axis=0)), sample_count + 1)
         column_norm[columns] = np.sqrt(norms)
@@ -160,7 +236,7 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
         if bulk.any():
             variance = bulk_variance[columns][bulk]
             scaled = block[:, xp.asarray(np.flatnonzero(bulk))] * xp.asarray(np.sqrt(variance))
-            kernel += scaled @ scaled.T
+            kernel = backend.accumulate(kernel, scaled)
             load += float((variance * norms[bulk]).sum())
             depth += int(bulk.sum()) + 1
         if not bulk.all():
@@ -170,11 +246,14 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
     if not np.all(coverage == 1):
         raise ValueError("blocks() must cover every column exactly once")
 
-    factor = cholesky(kernel)
-    frobenius_squared = float(_upper(np.array([to_host((factor * factor).sum())]), sample_count * sample_count)[0])
+    # Blocks of n x width temporaries, as wide as the widest column block the caller streams (its own working size).
+    width = identity_block or widest
+    factor = backend.cholesky(kernel)
+    del kernel
+    factor_norm_squared = _factor_norm_squared(factor, xp, to_host, width)
     delta = (_gamma(depth + FORMATION_ROUNDINGS) * load * (1 + _gamma(variant_count + sample_count))
-             + _gamma(sample_count + 1) * frobenius_squared)
-    kernel_bounds = _factor_bounds(delta, frobenius_squared, sample_count, 1.0)
+             + _gamma(sample_count + 1) * factor_norm_squared)
+    kernel_bounds = _factor_bounds(delta, factor_norm_squared, sample_count, 1.0)
 
     resolved_count = resolved_index.size
     if resolved_count:
@@ -191,21 +270,21 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             core_factor = np.linalg.cholesky(core)
         except np.linalg.LinAlgError as error:
             raise NotCertified("core is not positive definite in float64") from error
-        core_frobenius_squared = float(_upper(np.array([(core_factor * core_factor).sum()]), resolved_count * resolved_count)[0])
-        core_delta = _gamma(resolved_count + 1) * core_frobenius_squared
+        core_norm_squared = _factor_norm_squared(core_factor, np, np.asarray, resolved_count)
+        core_delta = _gamma(resolved_count + 1) * core_norm_squared
         # lambda_min(core) from its own factor, not an eigensolver's unstated error constant: the computed inverse
-        # factor Z has L Z = I - G with ||G||_2 <= gamma_r ||L||_F ||Z||_F (Thm 8.5, column by column), so
+        # factor Z has L Z = I - G with ||G||_2 <= gamma_r || |L| ||_2 ||Z||_F (Thm 8.5, column by column), so
         # sigma_min(L) >= (1 - ||G||) / ||Z||_F, and core >= sigma_min(L)^2 - core_delta (Thm 10.3).
         inverse_factor = scipy.linalg.solve_triangular(core_factor, np.eye(resolved_count), lower=True, check_finite=False)
         inverse_frobenius = float(np.sqrt(_upper(np.array([(inverse_factor * inverse_factor).sum()]), resolved_count * resolved_count)[0]))
-        residual = _gamma(resolved_count) * np.sqrt(core_frobenius_squared) * inverse_frobenius
+        residual = _gamma(resolved_count) * np.sqrt(core_norm_squared) * inverse_frobenius
         if residual >= 1:
             raise NotCertified("the core's inverse factor cannot be bounded: the core is too ill-conditioned for float64")
         computed_smallest = ((1 - residual) / inverse_frobenius) ** 2 - core_delta
         true_smallest = computed_smallest - core_error_norm
         if computed_smallest <= 0 or true_smallest <= 0:
             raise NotCertified(f"core is not certifiably positive definite (smallest eigenvalue >= {computed_smallest:.3g}, error {core_error_norm:.3g})")
-        core_bounds = _factor_bounds(core_delta, core_frobenius_squared, resolved_count, computed_smallest)
+        core_bounds = _factor_bounds(core_delta, core_norm_squared, resolved_count, computed_smallest)
         true_core_inverse_norm = 1 / true_smallest
     else:
         solved_resolved = None
@@ -256,16 +335,15 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
 
     diagonal_values = diagonal_bound = None
     if bulk_diagonal:
-        # [K^-1]_ii = ||R^-1 e_i||^2, and R^-1 e_i vanishes above row i, so rows start: of a block of identity
-        # columns come from the trailing sub-factor alone: n^3/3 flops over all blocks, one block resident.
+        # [K^-1]_ii = ||R^-1 e_i||^2, from blocks of identity columns solved against the whole factor: a trailing
+        # sub-factor would save two thirds of the n^3 flops but is a strided view the solvers copy (up to n^2).
         diagonal_values = np.zeros(sample_count)
         diagonal_bound = np.zeros(sample_count)
-        width = identity_block or sample_count
         for start in range(0, sample_count, width):
             stop = min(start + width, sample_count)
-            unit_columns = xp.zeros((sample_count - start, stop - start), dtype=xp.float64)
-            unit_columns[xp.arange(stop - start), xp.arange(stop - start)] = 1
-            solved = forward(factor[start:, start:], unit_columns)
+            unit_columns = xp.zeros((sample_count, stop - start), dtype=xp.float64, order="F")
+            unit_columns[xp.arange(start, stop), xp.arange(stop - start)] = 1
+            solved = forward(factor, unit_columns)
             diagonal = to_host((solved * solved).sum(axis=0))
             solved_norm = np.sqrt(_upper(diagonal, sample_count))
             ones = np.ones(stop - start)
@@ -283,7 +361,7 @@ def exact_dual_cost(sample_count: int, variant_count: int, resolved_count: int =
         "factor": n ** 3 / 3,
         "forward_solves": n * n * p,
         "resolved": n * n * resolved_count + n * p * resolved_count,
-        "diagonal_of_inverse": n ** 3 / 3 if bulk_diagonal else 0.0,
+        "diagonal_of_inverse": n ** 3 if bulk_diagonal else 0.0,
     }
     return {**flops, "total_flops": sum(flops.values()), "resident_bytes": np.dtype(np.float64).itemsize * n * n,
             "column_passes": 2.0}

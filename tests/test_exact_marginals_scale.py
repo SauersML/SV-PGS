@@ -62,6 +62,17 @@ def test_variances_and_bulk_diagonal_match_the_extended_precision_inverse_within
     assert np.array_equal(result.resolved, np.flatnonzero(precision <= 0))
 
 
+def test_data_dominated_sites_stay_within_the_certificate():
+    design, precision = _problem(6, 40, 50, negative=2)
+    norms = (design * design).sum(axis=0)
+    # D_j ||xt_j||^2 = 1e4 on five sites: their posterior is set by the data and D_j (1 - D_j q_j) cancels.
+    precision[:5] = norms[:5] * 1e-4
+    result = exact_marginals(_blocks(design, [20, 30]), precision, design.shape[0], bulk_diagonal=True, identity_block=9)
+    variances, diagonal = _reference(design, precision)
+    assert np.all(np.abs(result.variances - variances.astype(np.float64)) <= result.variance_bound)
+    assert np.all(np.abs(result.bulk_diagonal - diagonal.astype(np.float64)) <= result.bulk_diagonal_bound)
+
+
 def test_named_resolved_sites_give_the_same_marginals():
     design, precision = _problem(2, 40, 60)
     plain = exact_marginals(_blocks(design, [60]), precision, design.shape[0])
@@ -93,5 +104,6 @@ def test_blocks_must_cover_every_column():
 def test_cost_model_counts_the_two_passes_and_the_factor():
     cost = exact_dual_cost(50_000, 500_000, bulk_diagonal=True)
     assert cost["formation"] == cost["forward_solves"] == 50_000.0 ** 2 * 500_000
-    assert cost["factor"] == cost["diagonal_of_inverse"] == 50_000.0 ** 3 / 3
+    assert cost["factor"] == 50_000.0 ** 3 / 3
+    assert cost["diagonal_of_inverse"] == 50_000.0 ** 3
     assert cost["resident_bytes"] == 8 * 50_000.0 ** 2

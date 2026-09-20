@@ -60,7 +60,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('code_products.py', '_INT32_BYTES'): ('derived', frozenset({4}), "byte accounting of this module's arrays: itemsizes and the number of simultaneously live arrays"),
     ('exact_marginals_scale.py', 'FORMATION_ROUNDINGS'): ('definitional', frozenset({5}), 'roundings in one term D_j xt_ij xt_kj beyond the accumulation depth: the reciprocal (once), sqrt(D_j) in both factors, the two scalings; Higham 2002 Lemma 3.1'),
     ('exact_marginals_scale.py', 'VARIANCE_OPERATIONS'): ('definitional', frozenset({5}), 'roundings in D (1 - D v): the reciprocal D = 1 / Pi entering twice, the product, the difference and the scaling; Higham 2002 section 3.1'),
-    ('exact_marginals_scale.py', 'exact_dual_cost'): ('definitional', frozenset({3}), 'Cholesky and triangular-inverse flop counts n^3/3; Golub & Van Loan 2013 section 4.2'),
+    ('exact_marginals_scale.py', 'exact_dual_cost'): ('definitional', frozenset({3}), 'Cholesky flop count n^3/3; Golub & Van Loan 2013 section 4.2'),
     ('code_products.py', '_digit_working_bytes'): ('derived', frozenset({4}), "byte accounting of this module's arrays: itemsizes and the number of simultaneously live arrays"),
     ('code_products.py', 'INT8_GEMM_ALIGNMENT'): ('spec', frozenset({4}), 'cuBLAS int8 GEMM leading dimensions must be multiples of 4'),
     ('code_products.py', 'CodeBlockTile._codes_times'): ('derived', frozenset({3}), "byte accounting of this module's arrays: itemsizes and the number of simultaneously live arrays"),
