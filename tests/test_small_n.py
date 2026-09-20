@@ -123,6 +123,10 @@ def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
     matrix = np.eye(25) - (np.eye(25) - weight[:, None] * (sigma * sigma)) @ (left[:, None] * sigma * right[None, :] + np.diag(diagonal))
     posterior = _DensePosterior(_Kernel(_Design.dense(design), precision), noise, 10**9, _new_profile())
     np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, rhs), np.linalg.solve(matrix, rhs), rtol=1e-8, atol=1e-10)
+    # The lazy correction asks again for new directions at the same fixed point: the factor is reused.
+    more = rng.standard_normal((25, 2))
+    np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, more), np.linalg.solve(matrix, more), rtol=1e-8, atol=1e-10)
+    assert posterior.profile["response_factorizations"] == 1 and posterior.profile["responses"] == 2
 
 
 def test_the_total_curvature_by_the_exact_response_equals_gmres():
