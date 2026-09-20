@@ -680,3 +680,26 @@ def test_a_tiny_positive_site_keeps_its_variance_exact(tiny):
     variances, removed, cavity = _Kernel(_Design.dense(design), precision).cavity()
     np.testing.assert_allclose(variances, exact, rtol=1e-12)
     np.testing.assert_allclose(cavity, 1.0 / exact - precision, rtol=1e-9)
+
+
+def test_a_refresh_outside_eps_domain_is_repaired_by_the_double_loop_not_halved():
+    """theory-ep's fix (2): negative sites that put the precision or some cavities outside EP's domain are solved back
+    into it by the double loop on those variants at the rest's sites, in one repair, with no halving builds; the
+    refreshed cavities are proper."""
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(100)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    target = (dosage[:, 0] - dosage[:, 0].mean()) + rng.standard_normal(samples)
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), target)
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 64, 10**9)
+    oracle.site_precision = oracle.site_precision.copy()
+    oracle.site_precision[:4] = -1e6  # far outside: the precision is not positive definite
+    variances, cavity_precision = oracle._refresh(start)
+    largest = oracle._largest_variances(start)
+    assert np.all(1.0 + largest * cavity_precision > 0.0)
+    assert oracle.profile["repairs"] == 1 and oracle.profile["double_loops"] == 1
+    assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
