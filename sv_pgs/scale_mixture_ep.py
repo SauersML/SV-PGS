@@ -3052,6 +3052,9 @@ class _OuterTrial:
     proposal: F64Array | None = None
     radius: float = np.nan
     polishes: bool = False
+    # A joint trial from a state where V's formula has no certified value (x_k outside every basin of its integrand at
+    # rho_k): it enters one, accepted where the trial's state is certified, and uncounted (V at x_k is unmeasured).
+    enters: bool = False
 
 
 def fit_hyperparameters(
@@ -3074,7 +3077,10 @@ def fit_hyperparameters(
       measured (``_path_gain``). It is accepted when that gain less its resolution exceeds ``tolerance``: V(rho) then
       rises by more than the fit's resolution at every accepted joint step, so there are at most
       (V* - V(rho_0)) / tolerance of them. A refused joint trial is halved along its segment at rho-hat (where that
-      keeps the edges) while each halving raises the realized gain.
+      keeps the edges) while each halving raises the realized gain. From a state where V's formula has no certified
+      value (x_k outside every basin of its integrand at rho_k, as at an arbitrary start) the joint trial enters one:
+      it is accepted where the trial's own state is certified, uncounted, and every accepted joint step lands in a
+      certified state, so only an inner step can leave one.
     - Otherwise x takes inner steps at rho_k. An inner step ascends L_rho, not V (a function of the weights alone),
       so it is accepted on any certified rise: the natural monotonicity test where B + S is positive definite
       (Deuflhard, Newton Methods for Nonlinear Problems, 2004, Section 3.1.4: at the trial's fixed point
@@ -3137,9 +3143,12 @@ def fit_hyperparameters(
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
-        if step is None or state is None:
+        if step is None:
             histories[model].append(np.inf)
             return inner(model, step, np.inf, False)
+        if state is None:
+            histories[model].append(np.inf)
+            return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
         predicted = step.evidence - state.value
         error = remainders[model] + step.evidence_error + state.error
         remaining = predicted + step.stationarity_gain + error
@@ -3179,6 +3188,21 @@ def fit_hyperparameters(
                 continue
             trial, trial_point = trials[model], trial_points[model]
             displaced[model] = True
+            if entry.newton is None and entry.enters:
+                # The joint trial from a state outside every basin: accepted where the trial's state is certified.
+                assert entry.step is not None
+                if trial_point is None:
+                    unresolved[model] += 1
+                else:
+                    trial_correction, trial_state = solve_state(trial, trial_point)
+                    if trial_state is not None:
+                        hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
+                        displaced[model], pending[model] = False, None
+                        iterations[model] += 1
+                        continue
+                halvings[model] += 1
+                pending[model] = inner(model, entry.step, entry.remaining, False)
+                continue
             if entry.newton is None:
                 # The joint trial.
                 state = states[model]
