@@ -40,6 +40,54 @@ ROW_SIZE_DTYPE = np.dtype("<u4")
 _DEPTH_BYTES = np.dtype(np.uint8).itemsize
 
 
+CRC32C_POLYNOMIAL = 0x82F63B78
+"""The reflected Castagnoli polynomial: the store chain's crc32c."""
+
+
+def _crc32c_table() -> np.ndarray:
+    table = np.arange(CODE_VALUES, dtype=np.uint32)
+    for _ in range(BITS_PER_CODE):
+        table = np.where(table & 1, (table >> np.uint32(1)) ^ np.uint32(CRC32C_POLYNOMIAL), table >> np.uint32(1)).astype(np.uint32)
+    return table
+
+
+def _multiply_mod_polynomial(a: int, b: int) -> int:
+    """a(x) b(x) mod P(x) in the reflected bit order (zlib's multmodp)."""
+    top = 1 << 31
+    product = 0
+    while True:
+        if a & top:
+            product ^= b
+            if not a & (top - 1):
+                return product
+        top >>= 1
+        b = (b >> 1) ^ CRC32C_POLYNOMIAL if b & 1 else b >> 1
+
+
+def _power_table() -> list[int]:
+    """x^(2^k) mod P for k = 0..31 (zlib's x2n_table)."""
+    power = 1 << 30
+    table = [power]
+    for _ in range(31):
+        power = _multiply_mod_polynomial(power, power)
+        table.append(power)
+    return table
+
+
+_POWERS = _power_table()
+
+
+def byte_shift(byte_count: int) -> int:
+    """x^(8 byte_count) mod P: crc32c(A + B) = byte_shift(len(B)) (x) crc32c(A) ^ crc32c(B) (zlib's crc32_combine)."""
+    power, exponent, bit = 1 << 31, int(byte_count), 3
+    while exponent:
+        if exponent & 1:
+            power = _multiply_mod_polynomial(_POWERS[bit & 31], power)
+        exponent >>= 1
+        bit += 1
+    return power
+
+
 def exception_sample_dtype(sample_count: int) -> np.dtype[Any]:
     """Stored exception sample index: the narrower of little-endian uint16 / uint32 that holds n - 1."""
     return np.dtype("<u2") if sample_count <= np.iinfo(np.uint16).max + 1 else np.dtype("<u4")
@@ -231,6 +279,170 @@ void scatter_row_exceptions(const unsigned char* __restrict__ frames, const long
 }
 """
 
+_GPU_CHUNK_SOURCE = r"""
+__device__ unsigned int multiply_mod_polynomial(unsigned int a, unsigned int b) {
+    unsigned int top = 1u << 31, product = 0;
+    for (;;) {
+        if (a & top) { product ^= b; if ((a & (top - 1u)) == 0) break; }
+        top >>= 1;
+        b = (b & 1u) ? (b >> 1) ^ CRC32C_POLYNOMIAL : b >> 1;
+    }
+    return product;
+}
+
+__device__ unsigned int byte_shift(long long bytes, const unsigned int* __restrict__ powers) {
+    unsigned int power = 1u << 31;
+    int bit = 3;
+    for (long long exponent = bytes; exponent; exponent >>= 1, ++bit) {
+        if (exponent & 1) power = multiply_mod_polynomial(powers[bit & 31], power);
+    }
+    return power;
+}
+
+__device__ unsigned int read_u32(const unsigned char* at) {
+    return (unsigned int)at[0] | ((unsigned int)at[1] << 8) | ((unsigned int)at[2] << 16) | ((unsigned int)at[3] << 24);
+}
+
+extern "C" __global__
+void crc32c_segments(const unsigned char* __restrict__ data, const long long* __restrict__ chunk_offset,
+                     const long long* __restrict__ chunk_size, const long long* __restrict__ segment_start,
+                     long long chunks, long long segment_bytes, const unsigned int* __restrict__ table,
+                     unsigned int* __restrict__ segment_crc) {
+    // One thread per segment: the full crc32c (initial and final xor all ones) of its bytes.
+    __shared__ unsigned int lookup[256];
+    for (int at = threadIdx.x; at < 256; at += blockDim.x) lookup[at] = table[at];
+    __syncthreads();
+    long long segments = segment_start[chunks];
+    for (long long segment = (long long)blockIdx.x * blockDim.x + threadIdx.x; segment < segments;
+         segment += (long long)gridDim.x * blockDim.x) {
+        long long low = 0, high = chunks - 1;
+        while (low < high) {
+            long long middle = (low + high + 1) / 2;
+            if (segment_start[middle] <= segment) low = middle; else high = middle - 1;
+        }
+        long long first = chunk_offset[low] + (segment - segment_start[low]) * segment_bytes;
+        long long stop = min(first + segment_bytes, chunk_offset[low] + chunk_size[low]);
+        unsigned int crc = 0xFFFFFFFFu;
+        for (long long at = first; at < stop; ++at) crc = lookup[(crc ^ data[at]) & 0xFFu] ^ (crc >> 8);
+        segment_crc[segment] = ~crc;
+    }
+}
+
+extern "C" __global__
+void verify_chunks(const unsigned char* __restrict__ data, const long long* __restrict__ chunk_offset,
+                   const long long* __restrict__ chunk_size, const long long* __restrict__ segment_start,
+                   long long segment_bytes, const unsigned int* __restrict__ powers,
+                   const unsigned int* __restrict__ segment_crc, int chunk_rows,
+                   int* __restrict__ error, long long* __restrict__ first_bad) {
+    // One block per chunk: its segments' crc32c combine as a tree in shared memory (log2 of the
+    // segment count steps, each shifting the left crc by the right range's bytes), then the
+    // result is compared with the stored crc32c and the row size table with the payload size.
+    extern __shared__ long long shared[];
+    long long* length = shared;
+    unsigned int* crc = (unsigned int*)(shared + blockDim.x);
+    __shared__ unsigned long long table_total;
+    __shared__ int table_failure;
+    long long chunk = blockIdx.x;
+    long long offset = chunk_offset[chunk], size = chunk_size[chunk];
+    long long first = segment_start[chunk], count = segment_start[chunk + 1] - first;
+    int thread = threadIdx.x;
+    if (thread == 0) { table_total = 0; table_failure = 0; }
+    if (thread < count) {
+        crc[thread] = segment_crc[first + thread];
+        length[thread] = min(segment_bytes, size - thread * segment_bytes);
+    }
+    __syncthreads();
+    for (long long step = 1; step < count; step <<= 1) {
+        if (thread % (2 * step) == 0 && thread + step < count) {
+            crc[thread] = multiply_mod_polynomial(byte_shift(length[thread + step], powers), crc[thread]) ^ crc[thread + step];
+            length[thread] += length[thread + step];
+        }
+        __syncthreads();
+    }
+    long long table_bytes = 4LL * chunk_rows;
+    if (size >= table_bytes) {
+        for (int row = thread; row < chunk_rows; row += blockDim.x) {
+            unsigned int frame = read_u32(data + offset + 4LL * row);
+            if (frame < 1u) atomicOr(&table_failure, 2);
+            atomicAdd(&table_total, (unsigned long long)frame);
+        }
+    }
+    __syncthreads();
+    if (thread != 0) return;
+    int failure = crc[0] != read_u32(data + offset + size) ? 1 : 0;
+    if (!failure && (size < table_bytes || table_failure || (long long)table_total + table_bytes != size)) failure = 2;
+    if (failure) { atomicOr(error, failure); atomicMin((unsigned long long*)first_bad, (unsigned long long)chunk); }
+}
+
+extern "C" __global__
+void locate_frames(const unsigned char* __restrict__ data, const long long* __restrict__ chunk_offset,
+                   const long long* __restrict__ chunk_size, int chunk_rows, const long long* __restrict__ wanted, long long rows,
+                   long long samples, int sample_bytes, int* __restrict__ error,
+                   long long* __restrict__ depth, long long* __restrict__ dictionary_offset, long long* __restrict__ slot_offset,
+                   long long* __restrict__ exception_offset, long long* __restrict__ exception_count) {
+    // One thread per wanted row: its frame from the chunk's size table, checked against the frame
+    // size. A row that does not parse is flagged and given a one-byte dictionary and no
+    // exceptions inside its chunk, so no decode ever reads or writes outside its buffers.
+    long long row = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    long long global = wanted[row], chunk = global / chunk_rows;
+    int within = (int)(global % chunk_rows);
+    long long offset = chunk_offset[chunk], size = chunk_size[chunk], table_bytes = 4LL * chunk_rows;
+    int failure = 0;
+    long long start = offset, stop = offset, bits = 0, dictionary = offset, slots = offset, exceptions = offset, count = 0;
+    if (size < table_bytes) failure = 4;
+    else {
+        long long prefix = 0;
+        for (int earlier = 0; earlier < within; ++earlier) prefix += read_u32(data + offset + 4LL * earlier);
+        start = offset + table_bytes + prefix;
+        stop = start + read_u32(data + offset + 4LL * within);
+        if (stop <= start || stop > offset + size) failure = 4;
+        else {
+            bits = data[start];
+            if (bits > MAXIMUM_DEPTH) failure = 4;
+            else {
+                dictionary = start + 1;
+                slots = dictionary + (1LL << bits);
+                exceptions = slots + (samples * bits + 7) / 8;
+                long long remainder = stop - exceptions;
+                if (remainder < 0 || remainder % (sample_bytes + 1)) failure = 4;
+                else count = remainder / (sample_bytes + 1);
+            }
+        }
+    }
+    if (failure) {
+        atomicOr(error, failure);
+        bits = 0; dictionary = offset; slots = offset; exceptions = offset; count = 0;
+    }
+    depth[row] = bits; dictionary_offset[row] = dictionary; slot_offset[row] = slots;
+    exception_offset[row] = exceptions; exception_count[row] = count;
+}
+
+extern "C" __global__
+void scatter_checked_exceptions(const unsigned char* __restrict__ frames, const long long* __restrict__ exception_offset,
+                                const long long* __restrict__ exception_count, unsigned char* __restrict__ out,
+                                long long first_row, long long out_stride, int sample_bytes, long long samples,
+                                int* __restrict__ error) {
+    // scatter_row_exceptions, refusing (and flagging) a sample outside the row.
+    long long row = first_row + blockIdx.x;
+    long long count = exception_count[row];
+    const unsigned char* sample_bytes_at = frames + exception_offset[row];
+    const unsigned char* codes = sample_bytes_at + count * sample_bytes;
+    unsigned char* target = out + row * out_stride;
+    for (long long at = threadIdx.x; at < count; at += blockDim.x) {
+        unsigned long long sample = 0;
+        for (int byte = 0; byte < sample_bytes; ++byte) sample |= (unsigned long long)sample_bytes_at[at * sample_bytes + byte] << (8 * byte);
+        if (sample < (unsigned long long)samples) target[sample] = codes[at];
+        else atomicOr(error, 8);
+    }
+}
+"""
+
+
+CHUNK_FAILURES = {1: "fails its crc32c check", 2: "has a row size table that does not match its stored size",
+                  4: "holds a row frame that does not fit its depth", 8: "names an exception sample outside the row"}
+"""The device checks' failure bits, as ``read_rows_to_device`` reports them."""
+
 
 class GpuRowDecoder:
     """Decode located row frames on the GPU, writing each output byte once (slots, then exceptions)."""
@@ -247,6 +459,15 @@ class GpuRowDecoder:
         )
         self._grid_rows = int(attributes["MaxGridDimY"])
         self._grid_blocks = int(attributes["MaxGridDimX"])
+        chunk_module = cupy.RawModule(
+            code=_GPU_CHUNK_SOURCE.replace("CRC32C_POLYNOMIAL", f"{CRC32C_POLYNOMIAL:#x}u").replace("MAXIMUM_DEPTH", str(MAXIMUM_DEPTH))
+        )
+        self._crc_segments = chunk_module.get_function("crc32c_segments")
+        self._verify = chunk_module.get_function("verify_chunks")
+        self._locate = chunk_module.get_function("locate_frames")
+        self._checked_exceptions = chunk_module.get_function("scatter_checked_exceptions")
+        self._crc_table = cupy.asarray(_crc32c_table())
+        self._powers = cupy.asarray(np.asarray(_POWERS, dtype=np.uint32))
 
     def decode(self, device_buffer: Any, frames: RowFrames, sample_count: int, out: Any, stream: Any = None) -> None:
         """``device_buffer`` holds the chunks the frames lie in; ``out`` is uint8 [rows, n] with contiguous rows.
@@ -281,3 +502,71 @@ class GpuRowDecoder:
                     (min(self._grid_blocks, rows - first),), (self._threads,),
                     (device_buffer, exception_offset, exception_count, out, np.int64(first), stride, sample_bytes),
                 )
+
+    def decode_chunks(
+        self, device_buffer: Any, chunk_offsets: I64Array, payload_sizes: I64Array, chunk_rows: int,
+        rows: I64Array, sample_count: int, out: Any,
+    ) -> tuple[Any, Any]:
+        """Check the chunks at ``chunk_offsets`` in ``device_buffer`` and decode their ``rows``
+        (chunk-major: staged chunk position * ``chunk_rows`` + row in chunk) into ``out``, all on the device.
+
+        Each chunk's crc32c (the 4 bytes after its payload) is computed from segments, one thread
+        each, and combined by one block per chunk as a tree, its size table is checked against its payload size, and
+        every row's frame is located and checked; a row that does not parse decodes as zeros of
+        its dictionary's first byte and never reaches outside its buffers. Queued on the current
+        stream. Returns device ``(error, first_bad_chunk)``: nonzero ``error`` bits are
+        ``CHUNK_FAILURES``, and the caller reads them once the stream has run.
+        """
+        cp = self.cupy
+        wanted = np.asarray(rows, dtype=np.int64)
+        rows = int(wanted.shape[0])
+        if out.shape != (rows, sample_count) or out.dtype != cp.uint8 or out.strides[1] != 1:
+            raise ValueError(f"out must be uint8 [{rows}, {sample_count}] with contiguous rows.")
+        offsets = np.asarray(chunk_offsets, dtype=np.int64)
+        sizes = np.asarray(payload_sizes, dtype=np.int64)
+        chunks = int(offsets.shape[0])
+        error = cp.zeros(1, dtype=cp.int32)
+        first_bad = cp.full(1, np.iinfo(np.int64).max, dtype=cp.int64)
+        if chunks == 0:
+            return error, first_bad
+        # the smallest segments that still let one block combine a whole chunk's
+        segment_bytes = max(1, -(-int(sizes.max()) // self._threads))
+        segment_start = np.concatenate(([0], np.cumsum(np.maximum(1, -(-sizes // segment_bytes))))).astype(np.int64)
+        device_offsets, device_sizes, device_segment_start = (cp.asarray(values) for values in (offsets, sizes, segment_start))
+        segment_crc = cp.empty(int(segment_start[-1]), dtype=cp.uint32)
+        segments = int(segment_start[-1])
+        self._crc_segments(
+            (min(-(-segments // self._threads), self._resident_blocks),), (self._threads,),
+            (device_buffer, device_offsets, device_sizes, device_segment_start, np.int64(chunks), np.int64(segment_bytes),
+             self._crc_table, segment_crc),
+        )
+        self._verify(
+            (chunks,), (self._threads,),
+            (device_buffer, device_offsets, device_sizes, device_segment_start, np.int64(segment_bytes), self._powers,
+             segment_crc, np.int32(chunk_rows), error, first_bad),
+            shared_mem=self._threads * (np.dtype(np.int64).itemsize + np.dtype(np.uint32).itemsize),
+        )
+        if rows == 0:
+            return error, first_bad
+        sample_bytes = np.int32(exception_sample_dtype(sample_count).itemsize)
+        depth, dictionary_offset, slot_offset, exception_offset, exception_count = (cp.empty(rows, dtype=cp.int64) for _ in range(5))
+        self._locate(
+            (-(-rows // self._threads),), (self._threads,),
+            (device_buffer, device_offsets, device_sizes, np.int32(chunk_rows), cp.asarray(wanted), np.int64(rows),
+             np.int64(sample_count), sample_bytes, error, depth, dictionary_offset, slot_offset, exception_offset, exception_count),
+        )
+        stride = np.int64(out.strides[0])
+        blocks_per_row = max(1, min(-(-sample_count // self._threads), self._resident_blocks // min(rows, self._resident_blocks)))
+        for first in range(0, rows, self._grid_rows):
+            self._slots(
+                (blocks_per_row, min(self._grid_rows, rows - first)), (self._threads,),
+                (device_buffer, dictionary_offset, slot_offset, depth, out, np.int64(first), np.int64(sample_count), stride),
+            )
+        for first in range(0, rows, self._grid_blocks):
+            self._checked_exceptions(
+                (min(self._grid_blocks, rows - first),), (self._threads,),
+                (device_buffer, exception_offset, exception_count, out, np.int64(first), stride, sample_bytes,
+                 np.int64(sample_count), error),
+            )
+        return error, first_bad
+

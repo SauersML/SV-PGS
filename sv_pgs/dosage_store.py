@@ -645,13 +645,7 @@ class CodeArray:
         of the ``local_rows`` (ascending shard rows) that fall in these chunks are located.
         """
         layout = self.layout
-        sizes = shard.chunk_sizes[chunks]
-        positions = np.cumsum(sizes) - sizes
-        breaks = np.flatnonzero(np.diff(chunks) != 1) + 1
-        for first, last in zip([0, *breaks.tolist()], [*breaks.tolist(), chunks.shape[0]]):
-            begin, end = int(positions[first]), int(positions[last - 1] + sizes[last - 1])
-            _pread_exact(shard.descriptor, [memoryview(buffer[begin:end])], int(shard.chunk_offsets[chunks[first]]))
-        payload_sizes = sizes - _CRC32C_BYTES
+        positions, payload_sizes = self._read_chunks(shard, chunks, buffer)
         for chunk, offset, size in zip(chunks.tolist(), positions.tolist(), payload_sizes.tolist()):
             # google_crc32c takes read-only bytes only, so the chunk is copied once.
             stored = int.from_bytes(buffer[offset + size : offset + size + _CRC32C_BYTES].tobytes(), "little")
@@ -664,6 +658,17 @@ class CodeArray:
             return rowdict_codec.row_frames(buffer, positions, payload_sizes, layout.inner_rows, layout.sample_count, chunk_rows)
         except ValueError as error:
             raise ValueError(f"{self.directory}: {error}") from error
+
+    def _read_chunks(self, shard: _OpenShard, chunks: I64Array, buffer: U8Array) -> tuple[I64Array, I64Array]:
+        """Read ``chunks`` (ascending local chunk indices) of one shard into ``buffer``, back to back,
+        one read per run of consecutive chunks; return each chunk's position there and its payload size."""
+        sizes = shard.chunk_sizes[chunks]
+        positions = np.cumsum(sizes) - sizes
+        breaks = np.flatnonzero(np.diff(chunks) != 1) + 1
+        for first, last in zip([0, *breaks.tolist()], [*breaks.tolist(), chunks.shape[0]]):
+            begin, end = int(positions[first]), int(positions[last - 1] + sizes[last - 1])
+            _pread_exact(shard.descriptor, [memoryview(buffer[begin:end])], int(shard.chunk_offsets[chunks[first]]))
+        return positions, sizes - _CRC32C_BYTES
 
     def read_rows_into(self, row_start: int, row_stop: int, out: U8Array) -> None:
         """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice of a wider array)."""
@@ -695,10 +700,10 @@ class CodeArray:
         order.  Only the inner chunks that hold a wanted row are read.  They move host -> device
         still encoded, in windows of whole chunks through one pinned buffer and one device buffer
         of min(the chunks' encoded bytes, ``out``'s bytes), and at least the largest chunk: the
-        staging never exceeds the decoded rows it serves.  The host reads the bytes, checks each
-        chunk's crc32c and locates the wanted frames; ``decoder`` decodes only those.  The call
-        returns once the device has the last window's bytes, with the decodes queued on the
-        current stream.
+        staging never exceeds the decoded rows it serves.  The host only reads the bytes; on the
+        current stream, ``decoder`` checks each chunk's crc32c and size table, locates the wanted
+        frames and decodes only those (``GpuRowDecoder.decode_chunks``).  The call returns once
+        the stream has run the checks, and raises as the host path does if a chunk fails.
         """
         layout = self.layout
         if layout.codec != "rowdict":
@@ -722,6 +727,7 @@ class CodeArray:
         stream = cupy.cuda.get_current_stream()
         owner, pinned = _PINNED_POOL.acquire(cupy, window_bytes)
         copied = None
+        checks = []
         try:
             window = cupy.empty(window_bytes, dtype=cupy.uint8)
             out_row = 0
@@ -736,19 +742,37 @@ class CodeArray:
                     if copied is not None:
                         # The pinned buffer is refilled only once the device has its last window.
                         copied.synchronize()
-                    frames = self._stage_rowdict(shard, local, chunks[first:last], pinned)
+                    window_chunks = chunks[first:last]
+                    positions, payload_sizes = self._read_chunks(shard, window_chunks, pinned)
                     window[:filled].set(pinned[:filled], stream=stream)
                     copied = cupy.cuda.Event()
                     copied.record(stream)
+                    lower, upper = np.searchsorted(
+                        local, [int(window_chunks[0]) * layout.inner_rows, (int(window_chunks[-1]) + 1) * layout.inner_rows]
+                    )
+                    wanted_rows = local[lower:upper]
+                    chunk_rows = np.searchsorted(window_chunks, wanted_rows // layout.inner_rows) * layout.inner_rows
+                    chunk_rows += wanted_rows % layout.inner_rows
                     # The next window's copy is queued behind this decode on the same stream.
-                    count = int(frames.depth.shape[0])
-                    decoder.decode(window, frames, layout.sample_count, out[out_row : out_row + count], stream)
+                    count = int(wanted_rows.shape[0])
+                    with stream:
+                        error, first_bad = decoder.decode_chunks(
+                            window, positions, payload_sizes, layout.inner_rows, chunk_rows, layout.sample_count,
+                            out[out_row : out_row + count],
+                        )
+                    checks.append((error, first_bad, window_chunks))
                     out_row += count
                     first = last
         finally:
             if copied is not None:
                 copied.synchronize()
             _PINNED_POOL.release(owner)
+        for error, first_bad, window_chunks in checks:
+            failure = int(error.get(stream=stream)[0])
+            if failure:
+                reasons = "; ".join(text for bit, text in rowdict_codec.CHUNK_FAILURES.items() if failure & bit)
+                where = f"inner chunk {int(window_chunks[int(first_bad.get(stream=stream)[0])])}" if failure & 3 else "a row"
+                raise ValueError(f"{self.directory}: {where} {reasons}.")
 
     @property
     def shard_count(self) -> int:
