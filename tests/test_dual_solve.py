@@ -281,9 +281,9 @@ def test_a_bound_below_float64_resolution_is_met_at_its_floor() -> None:
     first = _exact_solve(source, models, right, count)
     result = dual_solve.certified_block_cg(source, models, right, first.solution, np.arange(MODEL_COUNT), np.zeros(MODEL_COUNT), count,
                                            operator_scale=first.operator_scale)
-    # A zero bound becomes float64's floor, the rounding of one exact product S z, or the residual at which a column
-    # stopped falling; the exact residual meets the bound reported.
-    floor = (source.sample_count + source.variant_count) * EPS * result.operator_scale * np.linalg.norm(result.solution, axis=0)
+    # A zero bound becomes float64's floor, the rounding of forming b - S z, or the residual at which a column stopped
+    # falling; the exact residual meets the bound reported.
+    floor = EPS * (np.linalg.norm(right, axis=0) + (source.sample_count + source.variant_count) * result.operator_scale * np.linalg.norm(result.solution, axis=0))
     assert np.all(result.residual_bound >= floor)
     assert np.all(result.residual_bound > 0.0)
     assert np.all(result.residual_norm <= result.residual_bound)

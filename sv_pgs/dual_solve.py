@@ -476,8 +476,8 @@ def certified_block_cg(
     the rest.
 
     There is no iteration cap; the residual's own progress bounds the loop. float64 cannot resolve a
-    residual below the rounding of one exact product S z, (n + p) eps lambda ||z|| (lambda the largest
-    Ritz value seen), so a column's bound below that estimate is raised to it at each restart, and a
+    residual below the rounding of forming b - S z, eps (||b|| + (n + p) lambda ||z||) (lambda the
+    largest Ritz value seen), so a column's bound below that estimate is raised to it at each restart, and a
     column whose exact residual did not fall across a restart has reached what float64 attains for it
     and stops at that residual. ``residual_bound`` reports the bound each column met, the one asked for
     or the one float64 set, so the caller sees which.
@@ -487,6 +487,7 @@ def certified_block_cg(
     solution = start.copy()
     requested = array_module.array(residual_bound, dtype=array_module.float64)
     bound = requested
+    right_norms = array_module.linalg.norm(right_hand_side, axis=0)
     relative_errors: list = []
     model_scales: dict[int, float] = {}
     scale_known = operator_scale > 1.0
@@ -500,7 +501,7 @@ def certified_block_cg(
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
         norms = array_module.linalg.norm(residual, axis=0)
-        floor = (source.sample_count + source.variant_count) * np.finfo(np.float64).eps * operator_scale * array_module.linalg.norm(solution, axis=0)
+        floor = np.finfo(np.float64).eps * (right_norms + (source.sample_count + source.variant_count) * operator_scale * array_module.linalg.norm(solution, axis=0))
         bound = array_module.maximum(requested, floor)
         open_mask = _host(norms > bound)
         if restarts:
