@@ -765,7 +765,8 @@ def _loop_point(
     variance = noise * kernel.variances()
     log_normalizer, tilted_mean, tilted_variance, third, fourth = tilted(cavity_precision, marginal_shift - site_shift)
     values = (log_normalizer, tilted_mean, tilted_variance, third, fourth)
-    # A point-mass tilted law (variance 0) has no finite site: outside the domain.
+    # A computed tilted variance of 0 (the engine's below-floor approximation, not the model: review-mathbugs N1) has no
+    # finite site: outside the domain.
     if not (all(np.all(np.isfinite(value)) for value in values) and np.all(tilted_variance > 0.0)):
         return None
     value = 0.5 * float(scaled_shift @ mean) / noise - 0.5 * kernel.log_determinant() + float(np.sum(log_normalizer))
@@ -887,7 +888,7 @@ def double_loop_sites(
         cavity_precision = cavity_scaled / noise
         log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
         if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
-            raise NoFixedPoint("a tilted law is a point mass at q's cavities: no finite EP site")
+            raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
         # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
         target_precision = 1.0 / tilted_variance - cavity_precision
         target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
@@ -898,9 +899,9 @@ def double_loop_sites(
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
             # The sites are in the domain (the start was checked, and every later outer step starts from an accepted
-            # inner point), so only the tilted law at the new marginals' cavities can fail: a point mass, which no
-            # finite site matches.
-            raise NoFixedPoint("a tilted law is a point mass at q's marginals' cavities: no finite EP site")
+            # inner point), so only the tilted moments at the new marginals' cavities can fail: a computed variance of 0
+            # (the engine's below-floor approximation), which no finite site matches.
+            raise NoFixedPoint("a computed tilted variance is 0 at q's marginals' cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
@@ -1041,15 +1042,16 @@ class _DenseFixedPoints:
             self.site_precision[negative] *= 0.5
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
-        """The mean-matched sites; ``NoFixedPoint`` where a tilted law is a point mass (variance 0: the prior's mass all
-        on flat-kernel nodes at a far trial, review-mathbugs N1/N2), whose site precision is infinite: EP has no finite
-        fixed point there, and the outer loop halves the trial."""
+        """The mean-matched sites; ``NoFixedPoint`` where a computed tilted variance is 0 or a moment is not finite
+        (review-mathbugs N2). The model's tilted laws always have positive variance; a zero one is the engine's
+        flat-kernel approximation below the lattice floor (v = 0 there, N1, e2e's) putting all of a far trial's mass on
+        those nodes. No finite site matches it, so the trial is refused and the outer loop halves it."""
         started = time.perf_counter()
         moments = tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes)
         self.profile["tilted_seconds"] += time.perf_counter() - started
         if not (np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean)) and np.all(np.isfinite(moments.variance))):
             degenerate = int(np.sum(~(moments.variance > 0.0)))
-            raise NoFixedPoint(f"{degenerate} tilted laws are point masses (variance 0) at these hyperparameters: no finite EP site")
+            raise NoFixedPoint(f"{degenerate} computed tilted variances are 0 (point masses) at these hyperparameters: no finite EP site")
         return site_targets(moments, cavity)
 
     def _precision_norm(self) -> Callable[[F64Array], float]:
