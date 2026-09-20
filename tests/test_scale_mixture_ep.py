@@ -671,9 +671,12 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
     # One batched pass along x + t b must give F - P at every step, also when the variants are cut into many chunks.
     prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
     hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
-    direction = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
+    moving = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
+    # A direction with no scale part keeps every kernel row: its steps are one product over the nodes.
+    still = moving.copy()
+    still[prior.coefficient_size - prior.scale_size :] = 0.0
     steps = np.array([-3.0, -0.4, 0.0, 0.9, 2.5])
-    for working_bytes in (_WORKING_BYTES, 1 << 12):
+    for working_bytes, direction in ((_WORKING_BYTES, moving), (1 << 12, moving), (_WORKING_BYTES, still), (1 << 12, still)):
         values = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, working_bytes)(steps)
         expected = np.array([
             _data_value(prior, hyperparameters.coefficients + step * direction, cavity, _WORKING_BYTES)

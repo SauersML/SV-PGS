@@ -100,7 +100,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Sequence
 
 import numpy as np
-from scipy.integrate import quad, quad_vec
+from scipy.integrate import quad_vec
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
@@ -122,6 +122,9 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
+# QUADPACK's QK15I pairs a 7-point Gauss rule with its 15-point Kronrod extension; the line integrals pair the same
+# Gauss rule with its double.
+_GAUSS_ORDER = 7
 
 
 @dataclass(frozen=True)
@@ -1473,7 +1476,10 @@ def _line(
     variants for all its steps.
 
     z = M x is affine in t, so every step's class log densities and log scales follow from those of x and b, and P
-    is exactly quadratic in t: only the log normalizers are evaluated per step."""
+    is exactly quadratic in t. A variant whose log scale does not move along b keeps its kernel row L_jk, so its
+    log Z_j(t) = LSE_k(L_jk + log pi_ck(t)) is one product of exp(L - max) with exp(log pi(t) - max) over the nodes
+    for all its steps (a GEMM of positive terms: exact to K eps in relative terms), with the rows whose product
+    falls to where subnormal terms could matter taken exactly. The other variants' kernels are evaluated per step."""
     density, _scale = _density_and_scale(prior, origin)
     density_step, scale_step = _density_and_scale(prior, direction)
     scales = log_scale(prior, origin)
@@ -1481,17 +1487,45 @@ def _line(
     penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
     penalty_slope = float(penalty_gradient @ direction)
     penalty_curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+    fixed_rows, moving_rows, kernels = [], [], []
+    for class_position, class_rows in enumerate(prior.class_rows):
+        still = class_rows[scale_slope[class_rows] == 0.0]
+        fixed_rows.append(still)
+        moving_rows.append(class_rows[scale_slope[class_rows] != 0.0])
+        rows_kernels = []
+        for rows in _row_chunks(still, prior.grid_size, working_bytes):
+            # L_jk: the kernel's log with a flat class density (its log pi part enters per step).
+            row_kernel = _kernel_terms(
+                np.zeros(prior.grid_size), scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            )[3]
+            peak = np.max(row_kernel, axis=1)
+            rows_kernels.append((rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel))
+        kernels.append(rows_kernels)
 
     def values(steps: F64Array) -> F64Array:
         count = steps.shape[0]
         log_weights = density[None] + steps[:, None, None] * density_step[None]
         log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
         total = -(penalty + steps * penalty_slope + 0.5 * np.square(steps) * penalty_curvature)
-        for class_position, class_rows in enumerate(prior.class_rows):
-            for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
+        for class_position in range(prior.class_count):
+            class_density = log_density[:, class_position]
+            density_peak = np.max(class_density, axis=1)
+            scaled = np.exp(class_density - density_peak[:, None]).T
+            for rows, peak, exponentials, row_kernel in kernels[class_position]:
+                products = exponentials @ scaled
+                # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
+                lost = products < np.finfo(np.float64).tiny / _EPSILON
+                with np.errstate(divide="ignore"):
+                    normalizers = np.log(products) + peak[:, None] + density_peak[None, :]
+                if np.any(lost):
+                    row_index, step_index = np.nonzero(lost)
+                    normalizers[row_index, step_index] = _log_sum_exp(row_kernel[row_index] + class_density[step_index], axis=1)
+                total += normalizers.sum(axis=0)
+            moving = moving_rows[class_position]
+            for rows in _row_chunks(moving, prior.grid_size * count, working_bytes):
                 size = rows.shape[0] * count
                 normalizers = _log_normalizers(
-                    np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
+                    np.broadcast_to(class_density[None], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
                     (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
                     prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
                 )
@@ -1505,25 +1539,52 @@ def _line_log_integral(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
 ) -> float:
     """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
-    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log, by QUADPACK's adaptive rule over the
-    whole line; its own error estimate must resolve the log to the share, or to half of double precision when
-    rounding is what stopped it.
+    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
+
+    The rule is QUADPACK's for an infinite range (QAGI: t = (1 - u) / u folds both half-lines onto u in (0, 1]),
+    adaptive by bisection, with each interval's value from a Gauss-Legendre pair of QK15I's Gauss order and its
+    double, the difference its error estimate; every round evaluates all its intervals' nodes in one pass over the
+    variants (``_line``). It stops when the errors sum to the share of the integral, or to half of double precision
+    when rounding is what stops it, and raises when an interval can no longer be halved.
 
     Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
     on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
     tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
     line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
+    tolerance = max(share, _HALF_PRECISION)
+    coarse_nodes, coarse_weights = np.polynomial.legendre.leggauss(_GAUSS_ORDER)
+    fine_nodes, fine_weights = np.polynomial.legendre.leggauss(2 * _GAUSS_ORDER)
+    lows, highs = np.array([0.0]), np.array([1.0])
 
-    def integrand(step: float) -> float:
-        return float(np.exp(line(np.array([step]))[0] - value))
+    def rules(lows: F64Array, highs: F64Array) -> tuple[F64Array, F64Array]:
+        middles, halves = 0.5 * (lows + highs), 0.5 * (highs - lows)
+        estimates = []
+        for nodes, weights in ((coarse_nodes, coarse_weights), (fine_nodes, fine_weights)):
+            points = middles[:, None] + halves[:, None] * nodes[None, :]
+            steps = (1.0 - points) / points
+            both = line(np.concatenate([steps.ravel(), -steps.ravel()])) - value
+            heights = np.exp(both[: steps.size]).reshape(steps.shape) + np.exp(both[steps.size :]).reshape(steps.shape)
+            estimates.append(halves * ((heights / np.square(points)) @ weights))
+        return estimates[1], np.abs(estimates[1] - estimates[0])
 
-    integral, error, _information, *message = quad(
-        integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
-    )
-    if message and error > max(share, _HALF_PRECISION) * abs(integral):
-        raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
-    return float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
+    done_value, done_error = 0.0, 0.0
+    while True:
+        estimates, errors = rules(lows, highs)
+        total = done_value + float(np.sum(estimates))
+        target = tolerance * total
+        if done_error + float(np.sum(errors)) <= target:
+            return float(np.log(total) - 0.5 * np.log(2.0 * np.pi))
+        # An interval keeps its share of the target by width; the others are halved.
+        widths = highs - lows
+        settled = errors <= target * widths
+        done_value += float(np.sum(estimates[settled]))
+        done_error += float(np.sum(errors[settled]))
+        lows, highs = lows[~settled], highs[~settled]
+        if np.any((highs - lows) <= _EPSILON * np.maximum(highs, _EPSILON)):
+            raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
+        middles = 0.5 * (lows + highs)
+        lows, highs = np.concatenate([lows, middles]), np.concatenate([middles, highs])
 
 
 def _laplace_corrections(
