@@ -127,6 +127,8 @@ def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
     more = rng.standard_normal((25, 2))
     np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, more), np.linalg.solve(matrix, more), rtol=1e-8, atol=1e-10)
     assert posterior.profile["response_factorizations"] == 1 and posterior.profile["responses"] == 2
+    # The factor is LAPACK's in place on the matrix's own buffer (Fortran order), not a copy.
+    assert posterior._response_factor[0].flags.f_contiguous
 
 
 def test_the_total_curvature_by_the_exact_response_equals_gmres():
@@ -231,3 +233,101 @@ def test_the_small_n_fit_certifies_and_scores():
     assert np.all(np.isfinite(fit.scoring.coefficients)) and fit.scoring.posterior_draws.shape == (variants, 64)
     assert np.all(np.isfinite(fit.scoring.posterior_draws)) and fit.noise_variance > 0.0
     np.testing.assert_array_equal(fit.scoring.store_rows, np.arange(variants))
+
+
+def _engine_problem(seed, samples, variants, noise):
+    """A small dense problem with the engine's lattice prior at its start hyperparameters: (design, target, prior,
+    hyperparameters, tilted, largest prior variance)."""
+    from sv_pgs.scale_mixture_ep import Cavity, derived_lattice, initial_hyperparameters, log_scale, scale_mixture_prior, tilted_cumulants, tilted_moments
+
+    rng = np.random.default_rng(seed)
+    design = _design(rng, samples, variants)
+    effects = np.zeros(variants)
+    effects[:2] = [1.2, -0.8]
+    target = design @ effects + np.sqrt(noise) * rng.standard_normal(samples)
+    nodes, floor, top = derived_lattice(np.einsum("ij,ij->j", design, design) / noise, design.T @ target / noise, np.zeros(variants), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variants, dtype=np.int64), log_variance_offset=np.zeros(variants), annotation_design=np.zeros((variants, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    hyperparameters = initial_hyperparameters(prior)
+
+    def tilted(cavity_precision, cavity_shift):
+        cavity = Cavity(precision=cavity_precision, shift=cavity_shift)
+        moments = tilted_moments(prior, hyperparameters, cavity, 10**8)
+        third, fourth = tilted_cumulants(prior, hyperparameters, cavity, 10**8)
+        return moments.log_normalizer, moments.mean, moments.variance, third, fourth
+
+    largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
+    return design, target, prior, hyperparameters, tilted, largest
+
+
+def test_the_double_loop_reaches_the_reference_double_loops_stationary_point(monkeypatch):
+    """small_n's matrix-free double loop against ``tests/ep_eb_reference.double_loop_sites`` itself (dense Cholesky,
+    exact 2p x 2p Newton), run on the engine's tilted moments: the same EP stationary point."""
+    import tests.ep_eb_reference as reference
+    from sv_pgs.scale_mixture_ep import moment_matched_prior_sites
+    from sv_pgs.small_n import double_loop_sites
+
+    noise = 0.6
+    design, target, prior, hyperparameters, tilted, largest = _engine_problem(51, 14, 9, noise)
+
+    def power_moments(_prior, _vector, cavity_precision, cavity_shift):
+        log_normalizer, mean, variance, third, fourth = tilted(cavity_precision, cavity_shift)
+        return {
+            "log_normalizer": log_normalizer, "first": mean, "second": variance + mean**2, "third": third + 3.0 * mean * variance + mean**3,
+            "fourth": fourth + 3.0 * variance**2 + 4.0 * mean * third + 6.0 * mean**2 * variance + mean**4,
+        }
+
+    monkeypatch.setattr(reference, "tilted_power_moments", power_moments)
+    precision, shift = moment_matched_prior_sites(prior, hyperparameters)
+    likelihood_precision, linear_term = design.T @ design / noise, design.T @ target / noise
+    expected = reference.double_loop_sites(None, None, likelihood_precision, linear_term, reference.site_state(None, None, likelihood_precision, linear_term, precision, shift))
+    profile = _new_profile()
+    # A draw count whose tolerance resolves the stationary point as far as the reference's own stopping rule does.
+    got_precision, got_shift = double_loop_sites(_Design.dense(design), noise, design.T @ target, precision, shift, tilted, largest, 2**30, 10**9, profile)
+    np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
+    np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
+    assert profile["double_loop_outer"] >= 1
+
+
+def test_the_frozen_passes_fall_back_to_the_double_loop_instead_of_refusing(monkeypatch):
+    """Where no damped pass keeps the precision positive definite (every trial refused here), EP falls back to the
+    double loop and reaches its fixed point: the refresh after it matches every site's moments."""
+    from sv_pgs.scale_mixture_ep import Cavity
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(61)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    target = (dosage[:, 0] - dosage[:, 0].mean()) + rng.standard_normal(samples)
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), target)
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 2**30, 10**9)
+    variances, frozen = oracle._refresh(start)
+    cavity = Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift)
+    target_precision, target_shift = oracle._targets(start, cavity)
+    iterate = oracle._iterate
+
+    def refuse_trials(precision, shift):
+        if not (np.array_equal(precision, oracle.site_precision) and np.array_equal(shift, oracle.site_shift)):
+            raise np.linalg.LinAlgError("trial refused")
+        iterate(precision, shift)
+
+    monkeypatch.setattr(oracle, "_iterate", refuse_trials)
+    oracle._frozen_passes(start, frozen, target_precision, target_shift)
+    assert oracle.profile["double_loops"] == 1
+    monkeypatch.setattr(oracle, "_iterate", iterate)
+    variances, frozen = oracle._refresh(start)
+    moments_mean = oracle._targets(start, Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift))
+    np.testing.assert_allclose(moments_mean[0], oracle.site_precision, rtol=1e-6)
+    np.testing.assert_allclose(moments_mean[1], oracle.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(oracle.site_shift))))
+
+
+def test_the_kernel_log_determinant_is_the_precisions():
+    rng = np.random.default_rng(71)
+    design = _design(rng, 7, 12)
+    precision = rng.uniform(0.5, 2.0, 12)
+    precision[:2] = -0.05
+    np.testing.assert_allclose(_Kernel(_Design.dense(design), precision).log_determinant(), np.linalg.slogdet(design.T @ design + np.diag(precision))[1], rtol=1e-12)
