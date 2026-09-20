@@ -394,8 +394,9 @@ def _tied_design(rng, samples, groups, members_of):
     return group_columns[:, members_of], _Design(group_columns, np.zeros((samples, 0)), members=members_of)
 
 
+@pytest.mark.parametrize("regime", ["bulk", "schur"])
 @pytest.mark.parametrize("negative", [False, True])
-def test_tie_members_keep_their_own_sites_exactly(negative):
+def test_tie_members_keep_their_own_sites_exactly(negative, regime):
     """review-mathbugs T1: every tie member is its own effect with its own site; duplicates are aggregated only in the
     kernel. Against the explicit member-level A' = X_m'X_m + diag t (duplicated columns): solve, marginal variances,
     cavities, covariance, the variance JVP and the exact linear response, with units of equal sites and a right-hand
@@ -404,7 +405,10 @@ def test_tie_members_keep_their_own_sites_exactly(negative):
     members_of = [0, 0, 0, 1, 2, 2, 3, 4, 4, 4, 5]
     explicit, tied = _tied_design(rng, 9, 6, members_of)
     count = len(members_of)
-    precision = rng.uniform(0.5, 2.0, count)
+    # "bulk": sites above every column's data (t >= ||x||^2: the Woodbury bulk, where tied members form units);
+    # "schur": sites below it (every member by the Schur route, each its own unit; review-mathbugs K1).
+    scale = float(np.max(np.einsum("ij,ij->j", explicit, explicit))) if regime == "bulk" else 1.0
+    precision = scale * rng.uniform(1.0, 2.0, count)
     precision[[1, 2]] = precision[0]      # a unit: three members of group 0 with one site
     precision[[8, 9]] = precision[7]      # and two of group 4 with one site
     if negative:
@@ -420,7 +424,7 @@ def test_tie_members_keep_their_own_sites_exactly(negative):
     np.testing.assert_allclose(cavity, 1.0 / np.diag(inverse) - precision, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(kernel.covariance(), inverse, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(kernel.log_determinant(), np.linalg.slogdet(explicit.T @ explicit + np.diag(precision))[1], rtol=1e-12)
-    assert kernel.units().size == count - 4  # two units of three and two members
+    assert kernel.units().size == (count - 4 if regime == "bulk" else count)  # bulk: units of three and two members
     direction = rng.standard_normal(count)
     np.testing.assert_allclose(kernel.hadamard_quadratic(direction), direction @ (inverse * inverse) @ direction, rtol=1e-9)
     noise = 1.3
@@ -642,3 +646,114 @@ def test_the_log_evidence_is_the_references_and_selection_keeps_the_highest(monk
     best = candidates[int(np.argmax(evidence))]
     np.testing.assert_array_equal(chosen[0], best[0])
     assert profile["double_loop_candidates"] == 2
+
+
+def _exact_inverse_diagonal(matrix):
+    """diag(M^-1) exactly, in rationals (Gauss-Jordan on Fractions of the float entries)."""
+    from fractions import Fraction
+
+    size = matrix.shape[0]
+    rows = [[Fraction(float(matrix[i, j])) for j in range(size)] + [Fraction(int(i == j)) for j in range(size)] for i in range(size)]
+    for column in range(size):
+        pivot = next(row for row in range(column, size) if rows[row][column] != 0)
+        rows[column], rows[pivot] = rows[pivot], rows[column]
+        head = rows[column][column]
+        rows[column] = [value / head for value in rows[column]]
+        for row in range(size):
+            if row != column and rows[row][column] != 0:
+                factor = rows[row][column]
+                rows[row] = [value - factor * base for value, base in zip(rows[row], rows[column])]
+    return np.array([float(rows[i][size + i]) for i in range(size)])
+
+
+@pytest.mark.parametrize("tiny", [1e-4, 1e-8, 1e-12])
+def test_a_tiny_positive_site_keeps_its_variance_exact(tiny):
+    """review-mathbugs K1: a positive site far below its column's data (t_0 << ||x_0||^2, p > n) lost every digit of
+    its Woodbury variance (770% off at 1e-8). It now goes by the Schur route: variances and cavities against an exact
+    rational inverse."""
+    rng = np.random.default_rng(99)
+    design = _design(rng, 8, 10)
+    precision = rng.uniform(0.5, 2.0, 10)
+    precision[0] = tiny
+    matrix = design.T @ design + np.diag(precision)
+    exact = _exact_inverse_diagonal(matrix)
+    variances, removed, cavity = _Kernel(_Design.dense(design), precision).cavity()
+    np.testing.assert_allclose(variances, exact, rtol=1e-12)
+    np.testing.assert_allclose(cavity, 1.0 / exact - precision, rtol=1e-9)
+
+
+def test_a_refresh_outside_eps_domain_is_repaired_by_the_double_loop_not_halved():
+    """theory-ep's fix (2): negative sites that put the precision or some cavities outside EP's domain are solved back
+    into it by the double loop on those variants at the rest's sites, in one repair, with no halving builds; the
+    refreshed cavities are proper."""
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(100)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    target = (dosage[:, 0] - dosage[:, 0].mean()) + rng.standard_normal(samples)
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), target)
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 64, 10**9)
+    oracle.site_precision = oracle.site_precision.copy()
+    oracle.site_precision[:4] = -1e6  # far outside: the precision is not positive definite
+    variances, cavity_precision = oracle._refresh(start)
+    largest = oracle._largest_variances(start)
+    assert np.all(1.0 + largest * cavity_precision > 0.0)
+    assert oracle.profile["repairs"] == 1 and oracle.profile["repair_rounds"] >= 1
+    assert oracle.profile["double_loops"] == oracle.profile["repair_rounds"]
+    assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
+
+
+def test_the_double_loop_never_evaluates_an_improper_cavity(monkeypatch):
+    """fit-api rwAMR [real]: an outer step's q-cavity 1/z - tau was improper (1 + v_max P <= 0) and the tilted moments
+    raised on it, uncaught. Here a doubleton column (x2 = x0 + x1) with negative sites on its singletons starts with an
+    improper q-cavity; the double loop reseeds its inner problem instead, never calls the tilted moments on an improper
+    cavity, and returns sites whose every q-cavity is proper and which pass the EP check."""
+    from sv_pgs import small_n
+    from sv_pgs.scale_mixture_ep import Cavity, derived_lattice, initial_hyperparameters, log_scale, scale_mixture_prior, tilted_cumulants, tilted_moments
+    from sv_pgs.small_n import double_loop_sites
+
+    rng = np.random.default_rng(101)
+    samples, variants, noise = 30, 6, 0.8
+    design = _design(rng, samples, variants)
+    design[:, 2] = design[:, 0] + design[:, 1]
+    target = design[:, 3] * 0.8 + np.sqrt(noise) * rng.standard_normal(samples)
+    nodes, floor, top = derived_lattice(np.einsum("ij,ij->j", design, design) / noise, design.T @ target / noise, np.zeros(variants), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variants, dtype=np.int64), log_variance_offset=np.zeros(variants), annotation_design=np.zeros((variants, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    hyperparameters = initial_hyperparameters(prior)
+    largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
+    calls = {"improper": 0}
+
+    def tilted(cavity_precision, cavity_shift):
+        calls["improper"] += int(np.sum(~(1.0 + largest * cavity_precision > 0.0)))
+        cavity = Cavity(precision=cavity_precision, shift=cavity_shift)
+        moments = tilted_moments(prior, hyperparameters, cavity, 10**8)
+        third, fourth = tilted_cumulants(prior, hyperparameters, cavity, 10**8)
+        return moments.log_normalizer, moments.mean, moments.variance, third, fourth
+
+    dense = _Design.dense(design)
+    precision = np.full(variants, 2.0)
+    # Negative singleton sites whose doubleton's cavity is improper, with the precision still definite.
+    for scale in 2.0 ** -np.arange(0, 30):
+        precision[[0, 1]] = -scale * np.min(np.einsum("ij,ij->j", design, design)) / noise
+        try:
+            kernel = _Kernel(dense, noise * precision)
+        except np.linalg.LinAlgError:
+            continue
+        cavity_precision = kernel.cavity()[2] / noise
+        if not (1.0 + largest[2] * cavity_precision[2] > 0.0):
+            break
+    else:
+        pytest.skip("no definite start with an improper doubleton cavity on this draw")
+    shift = np.zeros(variants)
+    profile = _new_profile()
+    got_precision, got_shift = double_loop_sites(dense, noise, design.T @ target, precision, shift, tilted, largest, 64, 10**9, profile)
+    assert calls["improper"] == 0 and profile["double_loop_reseeds"] >= 1
+    kernel = _Kernel(dense, noise * got_precision)
+    cavity_precision = kernel.cavity()[2] / noise
+    assert np.all(1.0 + largest * cavity_precision > 0.0)

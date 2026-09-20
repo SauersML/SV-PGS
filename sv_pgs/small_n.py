@@ -6,7 +6,8 @@ solve or a probe certificate:
 
 - q's precision is A = Xp' Xp / sigma^2 + diag tau with Xp = (I - H_C) X~ on the training rows. With the scaled sites
   t = sigma^2 tau it is A = A' / sigma^2, A' = Xp' Xp + diag t, and Sigma = sigma^2 A'^-1.
-- The columns split into the bulk P (t > 0) and the rest N (t <= 0; EP is unclipped). On P, Woodbury gives
+- The columns split into the bulk P (t >= ||x_j||^2, where Woodbury keeps every digit) and the rest N (every other
+  site, negative ones included: EP is unclipped). On P, Woodbury gives
   A'_PP^-1 = T^-1 - T^-1 Xp_P' K^-1 Xp_P T^-1 with the kernel K = I_n + Xp_P T^-1 Xp_P' (always positive definite).
   N enters exactly through its Schur complement S = T_N + Xp_N' K^-1 Xp_N, and A' is positive definite exactly when
   S is (``np.linalg.LinAlgError`` otherwise).
@@ -57,6 +58,8 @@ from sv_pgs.scale_mixture_ep import (
     ScaleMixturePrior,
     derived_lattice,
     fit_hyperparameters,
+    _components,
+    class_log_density,
     initial_hyperparameters,
     log_scale,
     moment_matched_prior_sites,
@@ -101,6 +104,7 @@ class _Design:
         self.members = np.arange(self.group_count, dtype=np.int64) if members is None else np.asarray(members, dtype=np.int64)
         self.variant_count = int(self.members.shape[0])
         self.tied = not np.array_equal(self.members, np.arange(self.group_count))
+        self._squares: F64Array | None = None
         self._sum = sparse.csr_matrix(
             (np.ones(self.variant_count), (self.members, np.arange(self.variant_count))), shape=(self.group_count, self.variant_count)
         ) if self.tied else None
@@ -161,6 +165,13 @@ class _Design:
     def columns(self, columns: I64Array) -> F64Array:
         """Xp's member columns ``columns`` (n x |c|, F-ordered)."""
         return self.group_columns(self.members[columns])
+
+    @property
+    def squares(self) -> F64Array:
+        """``column_squares()``, computed once."""
+        if self._squares is None:
+            self._squares = self.column_squares()
+        return self._squares
 
     def column_squares(self) -> F64Array:
         """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
@@ -308,9 +319,14 @@ class _Kernel:
         self.design = design
         self.precision = scaled_precision
         self.variant_count = design.variant_count
-        positive = scaled_precision > 0.0
-        self.bulk = np.flatnonzero(positive)
-        self.rest = np.flatnonzero(~positive)
+        # A positive site's variance by Woodbury is d (1 - d q) + f (d = 1/t, q = x_j' K^-1 x_j): 1 - d q carries d q's
+        # rounding amplified by d q / (1 - d q) = x_j' K_-j^-1 x_j / t_j <= ||x_j||^2 / t_j (K_-j >= I). So a site stays
+        # in the bulk only where that amplification is at most 1, t_j >= ||x_j||^2; every other one goes by the Schur
+        # route, which never inverts t and is exact for any sign (review-mathbugs K1: at t_j = 1e-8 ||x_j||^2 the
+        # Woodbury variance was 770% off an exact rational reference).
+        bulk_mask = (scaled_precision > 0.0) & (scaled_precision >= design.squares)
+        self.bulk = np.flatnonzero(bulk_mask)
+        self.rest = np.flatnonzero(~bulk_mask)
         self.inverse = 1.0 / scaled_precision[self.bulk]
         weights = np.zeros(self.variant_count)
         weights[self.bulk] = self.inverse
@@ -322,8 +338,8 @@ class _Kernel:
         self._factors: tuple[F64Array, F64Array, F64Array] | None = None
         self._units: _Units | None = None
         if self.rest.size:
-            rest_groups = design.members[self.rest]
-            if np.unique(rest_groups).shape[0] < rest_groups.shape[0]:
+            non_positive_groups = design.members[self.rest[scaled_precision[self.rest] <= 0.0]]
+            if np.unique(non_positive_groups).shape[0] < non_positive_groups.shape[0]:
                 # Two members of one group with t <= 0: A' along their difference (e_j - e_k, oriented; the data see
                 # neither) is t_j + t_k <= 0, so A' is not positive definite (exactly).
                 raise np.linalg.LinAlgError("two tie members with non-positive sites share a group: A' is not positive definite")
@@ -723,6 +739,7 @@ class _DensePosterior:
 
 
 Tilted = Callable[[F64Array, F64Array], tuple[F64Array, F64Array, F64Array, F64Array, F64Array]]
+_TILTED_FIELDS = ("log_normalizer", "mean", "variance", "third_cumulant", "fourth_cumulant")
 """(cavity precision, cavity shift) -> each site's tilted (log normalizer, mean, variance, third and fourth cumulant)."""
 
 
@@ -776,6 +793,15 @@ def _loop_point(
         site_precision=site_precision, site_shift=site_shift, kernel=kernel, mean=mean, variance=variance, tilted_mean=tilted_mean,
         tilted_variance=tilted_variance, third=third, fourth=fourth, value=value, gradient=gradient,
     )
+
+
+def _positive_definite(design: _Design, noise: float, site_precision: F64Array) -> bool:
+    """Whether A' = Xp'Xp + sigma^2 diag(tau) is positive definite (the double loop's only condition on its start)."""
+    try:
+        _Kernel(design, noise * site_precision)
+    except np.linalg.LinAlgError:
+        return False
+    return True
 
 
 def _in_domain(
@@ -872,13 +898,19 @@ def double_loop_sites(
     -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
     means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), found no
     representable fraction with sufficient decrease: Phi is stationary there to its rounding, and with it the moment-matching equations,
-    whose solutions are EP's fixed points. Sites are never clipped. The start must lie in EP's domain (ValueError
-    otherwise: the prior's moment-matched sites always do)."""
+    whose solutions are EP's fixed points. Sites are never clipped.
+
+    No tilted law is ever evaluated outside EP's domain, so no FloatingPointError is reachable from it: q's own
+    cavities are evaluated (the fixed-point check) only when every one is proper; the inner problem's start is moved
+    into its domain when they are not (the inner problem is convex, so its minimizer does not depend on the start, and
+    the marginals' own sites, zero cavities with positive sites, are always inside it); every inner step is accepted
+    only at a point ``_loop_point`` finds in the domain (definite precision, proper inner cavities, finite moments).
+    The start's precision must be positive definite (ValueError otherwise: the prior's moment-matched sites are)."""
     precision = np.array(site_precision, dtype=np.float64, copy=True)
     shift = np.array(site_shift, dtype=np.float64, copy=True)
     size = precision.shape[0]
-    if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
-        raise ValueError("the EP double loop's start lies outside EP's domain")
+    if not _positive_definite(design, noise, precision):
+        raise ValueError("the EP double loop's start leaves the precision not positive definite")
     while True:
         profile["double_loop_outer"] += 1
         kernel = _Kernel(design, noise * precision)
@@ -886,22 +918,38 @@ def double_loop_sites(
         variances, _removed, cavity_scaled = kernel.cavity()
         variance = noise * variances
         cavity_precision = cavity_scaled / noise
-        log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
-        if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
-            raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
-        # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
-        target_precision = 1.0 / tilted_variance - cavity_precision
-        target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
-        # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
-        if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
-            return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
+        proper = 1.0 + largest_variance * cavity_precision > 0.0
+        if np.all(proper):
+            log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
+            if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
+                raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
+            # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
+            target_precision = 1.0 / tilted_variance - cavity_precision
+            target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
+            if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
+                return precision, shift
+            reseeded = False
+        else:
+            # The outer step sets the frozen marginals to q's (CCCP), and q's own cavity 1/z - tau can then be improper
+            # (a tilted law can be wider than its cavity, so the inner optimum's marginals, the tilted moments at its
+            # proper inner cavities, need not leave 1/z - tau proper; fit-api rwAMR [real]). Such sites are no fixed
+            # point (every fixed point's cavities are proper) and are never evaluated; they only start the inner
+            # problem, whose convex minimizer does not depend on its start. The start is moved into its domain: the
+            # improper sites to the marginals' own (a zero cavity), and every site there if that leaves the precision
+            # not positive definite (all positive then, so it is definite, and every cavity is zero: in the domain).
+            profile["double_loop_reseeds"] += 1
+            precision, shift = precision.copy(), shift.copy()
+            precision[~proper], shift[~proper] = marginal_precision[~proper], marginal_shift[~proper]
+            if not _positive_definite(design, noise, precision):
+                precision, shift = marginal_precision.copy(), marginal_shift.copy()
+            reseeded = True
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
-            # The sites are in the domain (the start was checked, and every later outer step starts from an accepted
-            # inner point), so only the tilted moments at the new marginals' cavities can fail: a computed variance of 0
-            # (the engine's below-floor approximation), which no finite site matches.
-            raise NoFixedPoint("a computed tilted variance is 0 at q's marginals' cavities: no finite EP site")
+            # The start is in the inner domain (the precision is definite, and every inner cavity is either q's proper
+            # cavity or zero), so only a tilted moment can fail: a computed variance of 0 (the engine's below-floor
+            # approximation, N1), which no finite site matches.
+            raise NoFixedPoint("a computed tilted variance is 0 at the double loop's cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
         polish_decrement: float | None = None
         polish_origin = point
@@ -943,8 +991,9 @@ def double_loop_sites(
             point = accepted
             profile["double_loop_newton"] += 1
         precision, shift = point.site_precision, point.site_shift
-        if np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
-            # Phi stationary at q's own marginals to its rounding: EP's fixed point (see the docstring).
+        if not reseeded and np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
+            # Phi stationary at q's own marginals to its rounding, with q's cavities proper: EP's fixed point (see the
+            # docstring). A reseeded start is not q's own marginals, so its outer step is taken and checked afresh.
             profile["double_loop_stationary"] += 1
             return precision, shift
 
@@ -970,11 +1019,12 @@ def _best_double_loop(
     design: _Design, noise: float, data_score: F64Array, starts: Sequence[tuple[F64Array, F64Array]], tilted: Tilted, largest_variance: F64Array,
     draw_count: int, jvp_bytes: int, profile: dict,
 ) -> tuple[F64Array, F64Array]:
-    """The double loop from every start that lies in EP's domain, keeping the fixed point with the highest log Z_EP
-    (lead ruling: EP's fixed point is not unique in general, and the selection is by the evidence)."""
+    """The double loop from every start whose precision is positive definite (its only condition: an improper cavity
+    only reseeds the inner problem), keeping the fixed point with the highest log Z_EP (lead ruling: EP's fixed point
+    is not unique in general, and the selection is by the evidence)."""
     best: tuple[float, F64Array, F64Array] | None = None
     for precision, shift in starts:
-        if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
+        if not _positive_definite(design, noise, precision):
             continue
         found = double_loop_sites(design, noise, data_score, precision, shift, tilted, largest_variance, draw_count, jvp_bytes, profile)
         evidence = _log_evidence(design, noise, data_score, found[0], found[1], tilted)
@@ -982,7 +1032,7 @@ def _best_double_loop(
         if best is None or evidence > best[0]:
             best = (evidence, found[0], found[1])
     if best is None:
-        raise NoFixedPoint("no start of the double loop lies in EP's domain (the moment-matched sites leave the precision singular)")
+        raise NoFixedPoint("no start of the double loop leaves the precision positive definite (the moment-matched sites leave it singular)")
     return best[1], best[2]
 
 
@@ -993,6 +1043,7 @@ def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
         "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
+        "double_loop_reseeds", "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
@@ -1062,35 +1113,131 @@ class _DenseFixedPoints:
         return np.exp(log_scale(self.prior, hyperparameters.coefficients) + self.prior.log_variance_grid[-1])
 
     def _refresh(self, hyperparameters: MixtureHyperparameters) -> tuple[F64Array, F64Array]:
-        """The mean, the exact marginal variances and the cavity precisions at the current sites; negative sites halve
-        while the precision is not positive definite or a cavity's tilted law is not proper (``full_data_fit``'s
-        refresh).
+        """The mean, the exact marginal variances and the cavity precisions at the current sites. Where the precision
+        is not positive definite or a cavity's tilted law is not proper, the offending variants are solved back into
+        EP's domain by the double loop (``_repair``, growing the set while the rest's cavities leave it) rather than by
+        halving negative sites: each halving costs a full
+        build, erases the step that led there and returns the same targets (theory-ep's fix (2): a cycle of 33
+        halvings per refresh on svpgs-profiler's g3 [real]).
 
         A cavity is proper when its tilted law is, 1 + v P > 0 at every lattice node, which admits a negative cavity
         precision down to -1 / v_max. ``full_data_fit`` asks P > 0 instead, which EP cannot reach where a column is
         an exact linear combination of columns whose sites are negative (a doubleton is the sum of two singletons):
         its cavity is then proportional to those sites, negative for every negative value, and exactly 0 only when
-        they underflow, so halving runs until they do (bench-real chr22 gene 1 [real]: 7 negative sites halved past
-        1e-250 over 870 refactorizations while one column's cavity stayed at -9e-16, its rounding of 0)."""
+        they underflow (bench-real chr22 gene 1 [real]: 7 negative sites halved past 1e-250 over 870 refactorizations
+        while one column's cavity stayed at -9e-16, its rounding of 0)."""
         largest = self._largest_variances(hyperparameters)
+        members = self.design.members
+        offending = np.zeros(self.prior.variant_count, dtype=bool)
         while True:
+            improper = None
             try:
                 self._iterate(self.site_precision, self.site_shift)
             except np.linalg.LinAlgError:
                 failure = "the precision is not positive definite with non-negative sites"
             else:
                 variances, removed, cavity_precision = self._cavity()
-                if np.all(1.0 + largest * cavity_precision > 0.0):
+                improper = ~(1.0 + largest * cavity_precision > 0.0)
+                if not np.any(improper):
                     self.profile["refreshes"] += 1
                     count = self.prior.variant_count
                     # p_eff = sum_j (1 - tau_j z_j), each term without cancellation, floored at its rounding p eps.
                     self.effective = max(float(np.sum(removed)), _EPSILON * count)
                     return variances, cavity_precision
                 failure = "a cavity's tilted law is improper (1 + v P <= 0 on the lattice) with non-negative sites"
-            negative = self.site_precision < 0.0
+            negative = self.site_precision <= 0.0
             if not np.any(negative):
+                # Every site positive: A' is positive definite and every cavity precision non-negative, so this is
+                # Cholesky's own breakdown, not EP's domain.
                 raise NoFixedPoint(failure)
-            self.site_precision[negative] *= 0.5
+            # A repaired set's new sites, negative ones included, couple into the rest, so a cavity there can leave the
+            # domain after a correct repair: A grows by it and is solved again (theory-ep). A only grows, so this ends;
+            # at A = every variant it is the whole problem's double loop, which reaches a fixed point in the domain (the
+            # EC existence argument, with the lattice's finite top), so a set that cannot grow is numerics.
+            grown = offending | negative | (improper if improper is not None else False)
+            grown = np.isin(members, np.unique(members[grown]))
+            if np.array_equal(grown, offending):
+                raise NoFixedPoint(f"{failure}, after the double loop solved every offending variant back into EP's domain")
+            if not np.any(offending):
+                self.profile["repairs"] += 1
+            offending = grown
+            self.profile["repair_rounds"] += 1
+            self._repair(hyperparameters, offending)
+
+    def _repair(self, hyperparameters: MixtureHyperparameters, offending: F64Array) -> None:
+        """Solve the ``offending`` variants (improper cavities, non-positive sites) and their tie groups, A, back into
+        EP's domain at the rest's sites by the double loop (theory-ep's fix (2)). At fixed bulk sites (all positive
+        here) A's posterior is exact by the Schur complement (``_conditional_block``), A's problem is small-n EP with
+        the whitened design, and the double loop's convex inner problem is +inf outside EP's domain, so every step it
+        takes keeps every cavity proper; it starts from A's current sites where they lie in A's domain, and from the
+        prior's moment-matched ones, keeping the fixed point with the highest log Z_EP (lead ruling). One bulk build
+        and |A|-scale work, against a full build per halving."""
+        members = self.design.members
+        active = np.flatnonzero(np.isin(members, np.unique(members[np.flatnonzero(offending)])))
+        self.profile["repair_active_max"] = max(self.profile["repair_active_max"], int(active.size))
+        whitened, score = self._conditional_block(active, self.site_precision, self.site_shift)
+        design, noise = _Design.dense(whitened), float(self.noise)
+        tilted = self._tilted_rows(hyperparameters, active)
+        largest = self._largest_variances(hyperparameters)[active]
+        prior_precision, prior_shift = moment_matched_prior_sites(self.prior, hyperparameters)
+        starts = [(self.site_precision[active], self.site_shift[active]), (prior_precision[active], prior_shift[active])]
+        self.profile["double_loops"] += 1
+        tau, nu = _best_double_loop(design, noise, score, starts, tilted, largest, self.draw_count, self.working_bytes // _LIVE_FIXED_POINTS, self.profile)
+        self.site_precision, self.site_shift = self.site_precision.copy(), self.site_shift.copy()
+        self.site_precision[active], self.site_shift[active] = tau, nu
+
+    def _conditional_block(self, active: I64Array, site_precision: F64Array, site_shift: F64Array) -> tuple[F64Array, F64Array]:
+        """The active set A's posterior given the rest's (positive) sites, exactly, by the Schur complement: A's
+        problem is small-n EP with the whitened design W = U_B^-T X_A (n x |A|, K_B = U_B'U_B = I + X_B T_B^-1 X_B') and
+        the score s_A = X_A'y - X_A' K_B^-1 X_B T_B^-1 r'_B (r' = Xp'y + sigma^2 nu). One bulk build."""
+        design, noise, count = self.design, float(self.noise), self.prior.variant_count
+        bulk = np.setdiff1d(np.arange(count), active, assume_unique=True)
+        scaled_bulk = noise * site_precision[bulk]
+        weights = np.zeros(count)
+        weights[bulk] = 1.0 / scaled_bulk
+        kernel = design.weighted_gram(weights)
+        kernel[np.diag_indices_from(kernel)] += 1.0
+        upper = linalg.cholesky(kernel, lower=False, check_finite=False, overwrite_a=True)
+        self.profile["factorizations"] += 1
+        right = self.data_score + noise * site_shift
+        bulk_values = np.zeros(count)
+        bulk_values[bulk] = right[bulk] / scaled_bulk
+        solved = linalg.cho_solve((upper, False), design.image(bulk_values), check_finite=False)
+        columns = design.columns(active)
+        whitened = np.asfortranarray(linalg.solve_triangular(upper, columns, trans="T", lower=False, check_finite=False))
+        return whitened, self.data_score[active] - columns.T @ solved
+
+    def _tilted_rows(self, hyperparameters: MixtureHyperparameters, rows: I64Array) -> Tilted:
+        """``Tilted`` for the variants ``rows`` alone (each row's own class density and scale)."""
+        prior = self.prior
+        log_density = class_log_density(prior, hyperparameters.coefficients)[prior.class_index[rows]]
+        scales = log_scale(prior, hyperparameters.coefficients)[rows]
+
+        def tilted(cavity_precision: F64Array, cavity_shift: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
+            started = time.perf_counter()
+            values = [np.empty(rows.shape[0]) for _field in _TILTED_FIELDS]
+            classes = prior.class_index[rows]
+            for density in np.unique(classes):
+                members = np.flatnonzero(classes == density)
+                terms = _components(
+                    log_density[members[0]], scales[members], prior.log_variance_grid, prior.kernel_floor,
+                    np.asarray(cavity_precision)[members], np.asarray(cavity_shift)[members],
+                )
+                shift = np.asarray(cavity_shift)[members][:, None]
+                weights, conditional = terms.responsibility, terms.conditional_variance
+                centre = shift * conditional
+                mean = np.sum(weights * centre, axis=1)
+                offset = centre - mean[:, None]
+                second = np.sum(weights * (np.square(offset) + conditional), axis=1)
+                values[0][members] = terms.log_normalizer
+                values[1][members] = mean
+                values[2][members] = second
+                values[3][members] = np.sum(weights * (offset**3 + 3.0 * offset * conditional), axis=1)
+                values[4][members] = np.sum(weights * (offset**4 + 6.0 * np.square(offset) * conditional + 3.0 * np.square(conditional)), axis=1) - 3.0 * np.square(second)
+            self.profile["tilted_seconds"] += time.perf_counter() - started
+            return values[0], values[1], values[2], values[3], values[4]
+
+        return tilted
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
         """The mean-matched sites; ``NoFixedPoint`` where a computed tilted variance is 0 or a moment is not finite
