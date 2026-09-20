@@ -99,6 +99,7 @@ def test_training_constant_columns_are_dropped_even_when_heterozygous():
 
 
 def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
+    import hashlib
     import json
 
     generator = np.random.default_rng(3)
@@ -122,10 +123,12 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
     (tmp_path / "splits.sha256").write_text("synthetic\n")
     (tmp_path / "gene_annotation.json").write_text(json.dumps({"g1": {"start": 90, "end": 110, "strand": "+", "exons": [[95, 105]], "coding_exons": []}}))
     method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
-    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    (tmp_path / "screened.tsv").write_text("gene_id\tscore\ng1\t3.2\n")
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv")
     out = tmp_path / "results" / "top_variant" / "loso"
     record = json.loads((out / "chr1.run.json").read_text())
     assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
+    assert record["gene_list_sha256"] == hashlib.sha256((tmp_path / "screened.tsv").read_bytes()).hexdigest()
     truth = np.load(out / "chr1.truth.npy")
     for feature_set in ("snv", "snv_sv"):
         predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")
