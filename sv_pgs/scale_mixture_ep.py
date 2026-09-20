@@ -1309,6 +1309,7 @@ def _total_curvature_columns(
     precondition = None if posterior.local_response is None else posterior.local_response(left, gain, diagonal, weight)
     inner = relative_tolerance
     solution = np.zeros(shape)
+    floor_residual = np.inf
     while True:
         try:
             _shift, offset, start_response = through(np.zeros(shape), inner)
@@ -1339,14 +1340,17 @@ def _total_curvature_columns(
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
         # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
         # noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34). That end is either the solver refusing (above)
-        # or, where it returns a certificate above the request instead (speed-krylov cf364bd), a request below float64's
-        # unit roundoff, which no solve delivers.
+        # or, where it returns a certificate above the request instead (speed-krylov cf364bd), float64's unit roundoff:
+        # no solve delivers a request below it, so the solves stay there, and the Krylov solve continues from its true
+        # residual for as long as each such round lowers it.
         tightened = inner * 0.5 * target / residual
         if tightened < _EPSILON:
-            raise LinearResponseError(
-                f"the EP fixed point's linear response cannot be resolved in float64: its true residual {residual:.3e} stays above "
-                f"{target:.3e} with the posterior solves at relative accuracy {inner:.3e}"
-            )
+            if not residual < floor_residual:
+                raise LinearResponseError(
+                    f"the EP fixed point's linear response cannot be resolved in float64: its true residual {residual:.3e} stays above "
+                    f"{target:.3e} with the posterior solves at float64's unit roundoff"
+                )
+            floor_residual, tightened = residual, _EPSILON
         inner = tightened
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
