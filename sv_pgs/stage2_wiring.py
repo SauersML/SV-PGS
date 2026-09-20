@@ -115,7 +115,8 @@ def _fit_one(
 ) -> tuple[ScoringModel, float, MixtureHyperparameters, FitCertificate]:
     """One quantitative model on the sorted store columns ``training_columns``, whose covariates (intercept first) and
     targets follow them."""
-    config = ModelConfig()
+    # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
+    config = ModelConfig(minimum_minor_allele_frequency=0.0)
     candidates = stage0_candidates(store, training_columns, log_reliability, config)
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
     statistics = compute_genotype_statistics(
