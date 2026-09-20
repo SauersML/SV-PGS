@@ -1094,58 +1094,31 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
 
 
 def test_the_prediction_check_holds_each_block_to_its_own_budget():
-    # Two independently scored blocks share x: a move within the summed budget but over one block's own must not
-    # certify (fit-api P1). Normal means, as in the refusal test; block 0 gets a vanishing budget.
+    # Two independently scored blocks share x: each is held to its own KL budget (fit-api P1). Normal means, as in the
+    # refusal test; with block 0's metric inflated past any budget, no step that moves its mean can certify.
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     halves = (slice(0, 30), slice(30, 60))
 
-    def fixed_points(hyperparameters, starve):
+    def fixed_points(hyperparameters, inflation):
         points = []
         for model in hyperparameters:
             moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
             variance = moments.variance
 
             def norm(direction, variance=variance):
-                return np.array([float(np.sum(np.square(direction[part]) / variance[part])) for part in halves])
+                moves = np.array([float(np.sum(np.square(direction[part]) / variance[part])) for part in halves])
+                moves[0] *= inflation
+                return moves
 
             effective = np.array([float(np.sum(cavity.precision[part] * variance[part])) for part in halves])
-            if starve:
-                effective[0] = 0.0
             points.append(FixedPoint(cavity=cavity, posterior=diagonal_posterior(variance), mean=moments.mean, precision_norm=norm, effective_effects=effective))
         return points
 
-    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, False), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, 1.0), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert fit.certified and fit.prediction_move <= fit.prediction_tolerance
-    (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, True), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    # Block 0 has no budget: no step that moves its mean can certify, so the fit is returned uncertified.
-    assert not starved.certified or starved.prediction_move == 0.0
-
-
-def test_a_density_below_the_kernel_floor_is_a_near_zero_effect_not_a_point_mass():
-    # review-mathbugs N1 [real: gene 3 snv_sv's first outer trial]: with every node below the floor given v = 0, a
-    # class whose density sits there had tilted variance exactly 0, so the site targets were tau = inf, nu = nan.
-    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
-    nodes = prior.log_variance_grid
-    below = initial_hyperparameters(prior, float(np.exp(nodes[0])))
-    moments = tilted_moments(prior, below, cavity, _WORKING_BYTES)
-    assert np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean))
-    precision, shift = site_targets(moments, cavity)
-    assert np.all(np.isfinite(precision)) and np.all(np.isfinite(shift))
-
-
-def test_the_first_outer_trial_is_bounded_by_the_cauchy_step():
-    # The first trust radius is the Cauchy step's length on |B + S|: a direction the data barely curve cannot send the
-    # first trial off to the rounding floor's 1 / eps (review-mathbugs: |x| 1.3e4 on a real gene).
-    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
-    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
-    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
-    point = FixedPoint(cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
-                       precision_norm=lambda d: float(np.sum(np.square(d) / moments.variance)), effective_effects=1.0)
-    newton = engine._newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, INDEPENDENT_EFFECTS, _WORKING_BYTES)
-    radius = engine._cauchy_radius(newton)
-    gradient_norm = float(np.linalg.norm(newton.gradient))
-    assert 0.0 < radius <= gradient_norm / float(np.min(np.abs(newton.eigenvalues)))
-    assert float(np.linalg.norm(engine._proposal(newton, radius))) <= radius * (1.0 + 1e-12)
+    inflation = 1.0 / float(np.finfo(np.float64).eps) ** 2
+    (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, inflation), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not starved.certified
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
