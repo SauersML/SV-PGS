@@ -31,12 +31,13 @@ CIS_RADIUS_BP = 1_000_000
 SEALED_GENES = "sealed_confirmation_genes.tsv"
 PARENT_DATASET = "parent_dataset.txt"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
-                "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn")
+                "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
+                "svimp", "snv_svimp")
 # Rows of these sources are SVs; each set is its source alone, or panel SNVs/indels plus it (lr-sv's derived datasets).
 SOURCE_SETS = {"hgsvc3": "hgsvc3", "ont": "ont", "sv_merged": "panel_merged", "pgsv_merged": "pangenie_merged", "hgsvc3_merged": "hgsvc3_merged",
-               "gatksv": "gatksv"}
+               "gatksv": "gatksv", "svimp": "svimp"}
 JOINT_SOURCE_SETS = {"snv_hgsvc3": "hgsvc3", "snv_ont": "ont", "snv_sv_merged": "panel_merged", "snv_pgsv_merged": "pangenie_merged",
-                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv"}
+                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv", "snv_svimp": "svimp"}
 MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
 
@@ -73,8 +74,12 @@ class TrainData:
 
 
 class Dataset:
-    def __init__(self, dataset_dir):
+    def __init__(self, dataset_dir, overlay_dir=None):
         self.directory = pathlib.Path(dataset_dir)
+        # Imputed SV dosages (bench-sim's svimp): per chromosome, <overlay>/<chrom>.svimp.npz with rows (indices into the
+        # chromosome's variant table, panel SV rows) and ds (float32 [rows x samples] in samples.tsv order). They enter a
+        # gene window as extra columns with source "svimp", beside the called genotypes they impute.
+        self.overlay_dir = pathlib.Path(overlay_dir) if overlay_dir is not None else None
         self.samples = pd.read_csv(self.directory / "samples.tsv", sep="\t")
         self.genes = pd.read_csv(self.directory / "genes.tsv", sep="\t")
         self.expression = np.load(self.directory / "expression.npy")
@@ -83,6 +88,22 @@ class Dataset:
         self.gene_annotation = json.loads((self.directory / "gene_annotation.json").read_text())
         self.sample_index = {sample: index for index, sample in enumerate(self.samples["sample"])}
         self._chromosomes = {}
+
+    def overlay(self, chrom: str):
+        """(rows, dosages) of the chromosome's imputed SV overlay, or None."""
+        if self.overlay_dir is None:
+            return None
+        path = self.overlay_dir / f"{chrom}.svimp.npz"
+        if not path.exists():
+            return None
+        if getattr(self, "_overlay_chrom", None) != chrom:
+            data = np.load(path)
+            if data["ds"].shape[1] != len(self.samples):
+                raise ValueError(f"{path}: {data['ds'].shape[1]} samples, the dataset has {len(self.samples)}")
+            if "samples" in data and list(data["samples"]) != list(self.samples["sample"]):
+                raise ValueError(f"{path}: sample order differs from samples.tsv")
+            self._overlay_chrom, self._overlay = chrom, (data["rows"].astype(np.int64), data["ds"])
+        return self._overlay
 
     def chromosome(self, chrom: str):
         """The variant table and memory-mapped dosages of one chromosome; only the latest one stays cached."""
@@ -166,8 +187,16 @@ def load_gene_window(dataset: Dataset, gene_row: int):
     chrom, tss = gene["chrom"], int(gene["tss"])
     rows = dataset.cis_rows(chrom, tss)
     table, dosage = dataset.chromosome(chrom)
-    return GeneWindow(gene_row=gene_row, gene_id=gene["gene_id"], chrom=chrom, tss=tss,
-                      genotypes=np.asarray(dosage[rows], dtype=np.float32).T, table=table.iloc[rows].reset_index(drop=True))
+    genotypes, window_table = np.asarray(dosage[rows], dtype=np.float32).T, table.iloc[rows].reset_index(drop=True)
+    overlay = dataset.overlay(chrom)
+    if overlay is not None:
+        imputed_rows, imputed = overlay
+        present = np.flatnonzero(np.isin(imputed_rows, rows))
+        if len(present):
+            imputed_table = table.iloc[imputed_rows[present]].reset_index(drop=True).assign(source="svimp")
+            genotypes = np.hstack([genotypes, imputed[present].T.astype(np.float32)])
+            window_table = pd.concat([window_table, imputed_table], ignore_index=True)
+    return GeneWindow(gene_row=gene_row, gene_id=gene["gene_id"], chrom=chrom, tss=tss, genotypes=genotypes, table=window_table)
 
 
 # The sign of a symbolic allele's length change by its SV type: deletions lose sequence, insertions and duplications
@@ -307,8 +336,8 @@ def load_method(spec: str):
 _WORKER = {}
 
 
-def _init_worker(dataset_dir, method_spec, feature_sets):
-    _WORKER["dataset"] = Dataset(dataset_dir)
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None):
+    _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
 
@@ -339,10 +368,10 @@ def _run_gene(arguments):
     return results
 
 
-def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers):
+def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None):
     from multiprocessing import get_context
 
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets)) as pool:
+    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir)) as pool:
         yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
 
 
@@ -391,14 +420,14 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
     contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
     with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
-    dataset = Dataset(dataset_dir)
+    dataset = Dataset(dataset_dir, overlay_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
     if gene_ranks is not None and gene_list is None:
         raise ValueError("gene ranks need a gene list")
@@ -412,7 +441,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     if contract == "batch":
         results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
-        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers) for result in chunk)
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir) for result in chunk)
     coefficient_tables = []
     for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients in results:
         if coefficients is not None:
@@ -434,7 +463,9 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
+        "genes": len(gene_rows), "contract": contract, "overlay": str(overlay_dir) if overlay_dir is not None else None,
+        "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
+                           if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
@@ -462,7 +493,8 @@ if __name__ == "__main__":
     parser.add_argument("--confirmation", action="store_true", help="score only the sealed confirmation genes (only when the lead calls it)")
     parser.add_argument("--contract", choices=["gene", "batch"], default="gene", help="gene: fit(train); batch: fit_batch(trains) once per split")
     parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
+    parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
-        tuple(arguments.gene_ranks) if arguments.gene_ranks else None)
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay)

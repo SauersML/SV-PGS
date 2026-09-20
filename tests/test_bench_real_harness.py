@@ -369,3 +369,21 @@ def test_allele_lengths_are_signed_and_never_zeroed_below_the_sv_threshold():
     length, change = harness.allele_lengths(table)
     assert length.tolist() == [5000, 3000, 700, 49, 49, 9, 0]
     assert change.tolist() == [-5000, 3000, 0, -49, 49, 9, 0]
+
+
+def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
+    tiny_dataset(tmp_path)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    dosage = np.load(tmp_path / "chr1.dosage.npy")
+    imputed = (dosage[[3, 7]] * 0.9 + 0.05).astype(np.float32)
+    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed)
+    dataset = harness.Dataset(tmp_path, overlay)
+    window = harness.load_gene_window(dataset, 0)
+    assert window.genotypes.shape[1] == dosage.shape[0] + 2 and list(window.table["source"].iloc[-2:]) == ["svimp", "svimp"]
+    assert np.array_equal(window.genotypes[:, -2:], imputed.T)
+    train, test, _, _ = harness.build_gene_task(dataset, window, dataset.splits["loso/AFR"])
+    joint, _ = harness.subset(train, test, "snv_svimp", "loso/AFR")
+    called, _ = harness.subset(train, test, "snv_sv", "loso/AFR")
+    assert joint.variants.is_sv.sum() == called.variants.is_sv.sum() == 2
+    assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
