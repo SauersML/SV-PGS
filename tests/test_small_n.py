@@ -285,10 +285,12 @@ def test_the_double_loop_reaches_the_reference_double_loops_stationary_point(mon
     monkeypatch.setattr(reference, "tilted_power_moments", power_moments)
     precision, shift = moment_matched_prior_sites(prior, hyperparameters)
     likelihood_precision, linear_term = design.T @ design / noise, design.T @ target / noise
-    expected = reference.double_loop_sites(None, None, likelihood_precision, linear_term, reference.site_state(None, None, likelihood_precision, linear_term, precision, shift))
+    # The patched moments ignore the reference's own prior; its domain check only asks the vector to be finite.
+    vector = np.zeros(1)
+    expected = reference.double_loop_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
     profile = _new_profile()
-    # A draw count whose tolerance resolves the stationary point as far as the reference's own stopping rule does.
-    got_precision, got_shift = double_loop_sites(_Design.dense(design), noise, design.T @ target, precision, shift, tilted, largest, 2**30, 10**9, profile)
+    # A draw count whose tolerance is below the rounding: the loop runs to its stationarity, as the reference's does.
+    got_precision, got_shift = double_loop_sites(_Design.dense(design), noise, design.T @ target, precision, shift, tilted, largest, 2**60, 10**9, profile)
     np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
     np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
     assert profile["double_loop_outer"] >= 1
@@ -307,7 +309,7 @@ def test_the_frozen_passes_fall_back_to_the_double_loop_instead_of_refusing(monk
     statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), target)
     prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
     start, start_noise, _moment = small_n_start(statistics, prior)
-    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 2**30, 10**9)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 2**60, 10**9)
     variances, frozen = oracle._refresh(start)
     cavity = Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift)
     target_precision, target_shift = oracle._targets(start, cavity)
@@ -396,6 +398,8 @@ def test_tie_members_keep_their_own_sites_exactly(negative):
     np.testing.assert_allclose(kernel.covariance(), inverse, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(kernel.log_determinant(), np.linalg.slogdet(explicit.T @ explicit + np.diag(precision))[1], rtol=1e-12)
     assert kernel.units().size == count - 4  # two units of three and two members
+    direction = rng.standard_normal(count)
+    np.testing.assert_allclose(kernel.hadamard_quadratic(direction), direction @ (inverse * inverse) @ direction, rtol=1e-9)
     noise = 1.3
     sigma = noise * inverse
     weights = rng.standard_normal((count, 4))
@@ -468,8 +472,9 @@ def test_a_mixed_class_tie_group_reaches_the_reference_ep_fixed_point(monkeypatc
     largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
     precision, shift = moment_matched_prior_sites(prior, hyperparameters)
     likelihood_precision, linear_term = explicit.T @ explicit / noise, explicit.T @ target / noise
-    expected = reference.double_loop_sites(None, None, likelihood_precision, linear_term, reference.site_state(None, None, likelihood_precision, linear_term, precision, shift))
-    got_precision, got_shift = double_loop_sites(tied, noise, tied.back(target), precision, shift, tilted, largest, 2**30, 10**9, _new_profile())
+    vector = np.zeros(1)
+    expected = reference.double_loop_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
+    got_precision, got_shift = double_loop_sites(tied, noise, tied.back(target), precision, shift, tilted, largest, 2**60, 10**9, _new_profile())
     np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
     np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
     # The tied members' sites differ: each keeps its own prior (no merged column, no b / M split).
@@ -502,12 +507,17 @@ def test_a_collapsed_prior_is_a_fixed_point_at_the_first_refresh():
     first refresh, with no frozen pass and no refusal."""
     from sv_pgs.small_n import _DenseFixedPoints, small_n_prior
 
+    import dataclasses
+
+    from sv_pgs.scale_mixture_ep import initial_hyperparameters
+
     rng = np.random.default_rng(95)
     samples, variants = 50, 40
     dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
     statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
-    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.full(variants, -60.0), 64)
-    from sv_pgs.scale_mixture_ep import initial_hyperparameters
+    # The lattice at the data's scale, then every prior variance moved 60 nats below it (an edge trial's collapse).
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    prior = dataclasses.replace(prior, log_variance_offset=np.full(prior.variant_count, -60.0))
     start = initial_hyperparameters(prior)
     residual = statistics.projected_target
     oracle = _DenseFixedPoints(statistics, prior, start, float(residual @ residual) / (samples - 1), 64, 10**9)

@@ -450,6 +450,28 @@ class _Kernel:
             )
         return self._units
 
+    def hadamard_quadratic(self, direction: F64Array) -> float:
+        """d'(A'^-1 o A'^-1) d without forming it: with A'^-1 = E G E' + diag(delta) (``units``) and G = U' S U (U =
+        [Phi_u; Psi_u], S = diag(-1 on Phi, +1 on Psi)), it is tr(S M S M) + sum_j (2 delta_j G_jj + delta_j^2) d_j^2,
+        M = U diag(E' d) U' (r x r): O(p_u r^2)."""
+        units = self.units()
+        phi, psi = units.factors()
+        unit_direction = units.sum(direction)
+        factor_rows = np.vstack([phi, psi]) if psi.shape[0] else phi
+        signs = np.concatenate([-np.ones(phi.shape[0]), np.ones(psi.shape[0])])
+        middle = (factor_rows * unit_direction[None, :]) @ factor_rows.T
+        unit_diagonal = -np.einsum("ij,ij->j", phi, phi) + np.einsum("ij,ij->j", psi, psi)
+        delta = units.delta[units.of_member]
+        local = (2.0 * delta * unit_diagonal[units.of_member] + delta * delta) @ np.square(direction)
+        return float(np.sum(signs[:, None] * signs[None, :] * middle * middle) + local)
+
+    def update_divergence(self, noise: float, precision_step: F64Array, shift_step: F64Array, mean: F64Array) -> float:
+        """KL(q || q') to second order for the site change (d tau, d nu), in nats: the Fisher metric of q's natural
+        parameters, 1/2 r' Sigma r + 1/4 d tau' (Sigma o Sigma) d tau with r = d nu - d tau o mu (the mean's and the
+        variances' parts of q's covariance of the statistics (beta, -beta^2 / 2))."""
+        right = shift_step - precision_step * mean
+        return 0.5 * noise * float(right @ self.solve(right)) + 0.25 * noise * noise * self.hadamard_quadratic(precision_step)
+
     def factors(self) -> tuple[F64Array, F64Array, F64Array]:
         """(delta (p,), Phi (n x p), Psi (|N| x p)) with A'^-1 = diag(delta) - Phi'Phi + Psi'Psi (the O(n^2 p) route of
         the variance JVP, when Sigma o Sigma is too large to form)."""
@@ -839,7 +861,8 @@ def double_loop_sites(
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
     problem, the minimum of the convex Phi over the sites, is solved by Newton with sufficient-decrease halving until no
-    representable step along Newton's direction lowers Phi by half its quadratic model's decrease. Each outer step is
+    representable step along Newton's direction lowers Phi by half its quadratic model's decrease, or Newton's decrement
+    falls below Phi's rounding. Each outer step is
     majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
     accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
     update's KL 1/2 r' Sigma r at most 1/(2K) nats, or when an outer step leaves the sites unchanged, which is EP's fixed
@@ -865,9 +888,8 @@ def double_loop_sites(
         # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
         target_precision = 1.0 / tilted_variance - cavity_precision
         target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
-        right = (target_shift - shift) - (target_precision - precision) * mean
         # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
-        if 0.5 * float(right @ (noise * kernel.solve(right))) <= 0.5 / draw_count:
+        if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
             return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
         # In the domain: the start was checked, and every later outer step starts from an accepted inner point.
@@ -876,7 +898,8 @@ def double_loop_sites(
         start_precision, start_shift = precision.copy(), shift.copy()
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
-            if not decrement > 0.0:
+            # A decrease below Phi's own rounding cannot be told from it.
+            if not decrement > _EPSILON * abs(point.value):
                 break
             fraction = 1.0
             accepted = None
@@ -1058,17 +1081,17 @@ class _DenseFixedPoints:
             target_precision, target_shift = self._targets(hyperparameters, cavity)
             # The undamped update moves the mean by Sigma (delta nu - delta tau o mu): its squared size in the
             # posterior metric is r' Sigma r, exactly.
-            right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            self.mean_move = float(right @ (self.noise * self.kernel.solve(right)))
+            divergence = self.kernel.update_divergence(self.noise, target_precision - self.site_precision, target_shift - self.site_shift, mean)
+            self.mean_move = 2.0 * divergence
             noise = self._noise(variances)
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
             # The fixed point is certified in evidence units, as every other certificate: the undamped update moves q
-            # by KL(q || q') = 1/2 r' Sigma r nats to first order in the site change, and the noise update gains
-            # ``noise_gain`` nats; both at most 1/(2K). A tolerance relative to p_eff (the scorer's Monte Carlo
-            # resolution, p_eff / K) goes to rounding where the prior collapses (p_eff -> 0 at an edge trial), and EP
-            # then ran for minutes on the move's own rounding before refusing; there the KL is second order in the
-            # prior's scale and the check passes at the first refresh.
-            if 0.5 * self.mean_move <= tolerance and self.noise_gain <= tolerance:
+            # by KL(q || q') nats (``_Kernel.update_divergence``: its mean and variance parts, to second order in the
+            # site change), and the noise update gains ``noise_gain`` nats; both at most 1/(2K). A tolerance relative
+            # to p_eff (the scorer's Monte Carlo resolution, p_eff / K) goes to rounding where the prior collapses
+            # (p_eff -> 0 at an edge trial), and EP then ran for minutes on the move's own rounding before refusing;
+            # there the KL is second order in the prior's scale and the check passes at the first refresh.
+            if divergence <= tolerance and self.noise_gain <= tolerance:
                 # Each fixed point alive at once (the outer loop holds the current one and one trial) gets an equal share
                 # of the working memory for its posterior's p x p matrices. The exact response replaces the curvature's
                 # GMRES, whose memory it takes; where it does not fit, GMRES has half (``fit_small_n``).
@@ -1098,10 +1121,7 @@ class _DenseFixedPoints:
         largest = self._largest_variances(hyperparameters)
         tilted = self._tilted(hyperparameters)
         start_precision, start_shift = self.site_precision, self.site_shift
-        kernel = _Kernel(self.design, self.noise * start_precision)
-        mean = kernel.solve(self.data_score + self.noise * start_shift)
-        variance = self.noise * kernel.variances()
-        if _loop_point(self.design, self.noise, self.data_score, start_precision, start_shift, 1.0 / variance, mean / variance, tilted, largest) is None:
+        if not _in_domain(self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest):
             start_precision, start_shift = moment_matched_prior_sites(self.prior, hyperparameters)
             if not _in_domain(self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest):
                 # Every strictly positive site precision lies in EP's domain (A' is then positive definite and every
