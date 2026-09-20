@@ -98,7 +98,7 @@ from scipy.integrate import quad
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.sparse.linalg import LinearOperator, gmres
-from scipy.special import erfcx, logsumexp
+from scipy.special import erfcx
 
 from sv_pgs._typing import F64Array, I64Array
 
@@ -115,6 +115,9 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
+# The degree in t of the Tierney-Kadane expansion of a standardized line integrand's ratio to its Gaussian, through
+# the O(1) term: 1 + k3 t^3 / 6 + k4 t^4 / 24 + k3^2 t^6 / 72.
+_TIERNEY_KADANE_DEGREE = 6
 
 
 @dataclass(frozen=True)
@@ -439,6 +442,19 @@ def initial_hyperparameters(prior: ScaleMixturePrior) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
 
 
+def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Array:
+    """log sum exp over ``axis``, shifted by the largest term (-inf where every term is -inf). scipy's logsumexp
+    computes the same, but its array-API dispatch costs ~0.2 ms a call, which the line integrals' ~10^5 evaluations
+    of the data value per hyper step turned into most of its time [sim-only: 131 of 192 s]."""
+    largest = np.max(values, axis=axis, keepdims=True)
+    shift = np.where(np.isfinite(largest), largest, 0.0)
+    shifted = values - shift
+    np.exp(shifted, out=shifted)
+    with np.errstate(divide="ignore"):
+        total = np.log(np.sum(shifted, axis=axis, keepdims=True)) + shift
+    return total if keepdims else np.squeeze(total, axis=axis)
+
+
 def _density_and_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[F64Array, F64Array]:
     """z = M x split into the class log densities (C x K, unnormalized) and the scale coefficients (L,)."""
     values = prior.coefficient_map @ coefficients
@@ -448,7 +464,7 @@ def _density_and_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> tupl
 def class_log_density(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Array:
     """log pi_ck = eta_ck - log sum_m e^eta_cm: the lattice mass of node k (C x K); the uniform weight h cancels."""
     log_weights, _scale = _density_and_scale(prior, coefficients)
-    return log_weights - logsumexp(log_weights, axis=1, keepdims=True)
+    return log_weights - _log_sum_exp(log_weights, axis=1, keepdims=True)
 
 
 def log_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Array:
@@ -502,7 +518,7 @@ def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparame
 def prior_second_moment(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> F64Array:
     """E[beta_j^2] under the prior: u_j sum_k pi_ck e^t_k."""
     log_density = class_log_density(prior, hyperparameters.coefficients)
-    log_mean_variance = logsumexp(log_density + prior.log_variance_grid[None, :], axis=1)
+    log_mean_variance = _log_sum_exp(log_density + prior.log_variance_grid[None, :], axis=1)
     return np.exp(log_scale(prior, hyperparameters.coefficients) + log_mean_variance[prior.class_index])
 
 
@@ -555,7 +571,7 @@ def _kernel_terms(
 def _log_normalizers(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
 ) -> F64Array:
-    return logsumexp(_kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)[3], axis=1)
+    return _log_sum_exp(_kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)[3], axis=1)
 
 
 def _components(
@@ -567,7 +583,7 @@ def _components(
     B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
     Nodes below ``floor`` have a flat kernel: v = 0 there."""
     conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
-    log_normalizer = logsumexp(log_component, axis=1)
+    log_normalizer = _log_sum_exp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
     return _Components(
         log_normalizer=log_normalizer,
@@ -635,7 +651,7 @@ def quadrature_majorant_ratio(
             shift_square = np.square(cavity.shift[rows])[:, None]
             log_real = log_density[class_position] - 0.5 * np.log1p(ratio) + 0.5 * shift_square * variance / (1.0 + ratio)
             log_strip = log_density[class_position] - 0.25 * np.log1p(ratio * ratio) + 0.5 * shift_square * variance * ratio / (1.0 + ratio * ratio)
-            total += float(np.sum(np.exp(np.maximum(logsumexp(log_strip, axis=1) - logsumexp(log_real, axis=1), 0.0))))
+            total += float(np.sum(np.exp(np.maximum(_log_sum_exp(log_strip, axis=1) - _log_sum_exp(log_real, axis=1), 0.0))))
     return total
 
 
@@ -1097,6 +1113,10 @@ class _Evidence:
     penalized_value: float
     newton_decrement: float
     magnitude: float
+    # -H at x_rho and the inner maximizer's own decrement 1/2 g'(-H)^-1 g there: x_rho lies within sqrt(2 d) of the
+    # maximum it approximates in that metric, which is how two starts are recognized as one basin.
+    precision: F64Array
+    inner_decrement: float
     # Per weight, the two rho-dependent parts of dV/drho_i: the effective degrees of freedom
     # lambda_i tr((B + S)^-1 S_i) and the penalty's size lambda_i ||R_i x||^2.
     effective_degrees: F64Array
@@ -1162,6 +1182,76 @@ def _directional_derivatives(
     return third, fourth
 
 
+def _line_values(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, steps: F64Array, cavity: Cavity, working_bytes: int
+) -> F64Array:
+    """The penalized objective F(x + t b) - P(x + t b) at every step t, in one pass over the variants.
+
+    z = M x is affine in t, so every step's class log densities and log scales follow from those of x and b, and P
+    is exactly quadratic in t: only the log normalizers are evaluated per step."""
+    count = steps.shape[0]
+    density, _scale = _density_and_scale(prior, origin)
+    density_step, scale_step = _density_and_scale(prior, direction)
+    log_weights = density[None] + steps[:, None, None] * density_step[None]
+    log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
+    scales = log_scale(prior, origin)
+    scale_slope = prior.scale_design @ scale_step
+    penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
+    curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+    values = -(penalty + steps * float(penalty_gradient @ direction) + 0.5 * np.square(steps) * curvature)
+    for class_position, class_rows in enumerate(prior.class_rows):
+        for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
+            size = rows.shape[0] * count
+            normalizers = _log_normalizers(
+                np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
+                (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
+                prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
+            )
+            values += normalizers.reshape(rows.shape[0], count).sum(axis=0)
+    return values
+
+
+def _line_log_integral(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
+) -> float:
+    """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
+    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
+
+    The integrand is the Laplace term's Gaussian e^(-t^2/2) times h(t) = exp(l(t) + t^2 / 2), so the Gauss-Hermite
+    rules of that weight place their nodes where its mass is. They start at the fewest nodes exact for the
+    Tierney-Kadane expansion of h through its O(1) term (degree 6: k3^2 t^6 / 72), and double while the largest node
+    stays inside the Gaussian's double-precision extent sqrt(2 log(1 / eps)); past it, more nodes only resolve an h
+    that no low-degree polynomial follows. The first two consecutive rules whose logs agree to the share give the
+    larger rule's value. Where none do (a fold or a heavy tail), QUADPACK's adaptive rule over the whole line
+    decides, and its own error estimate must resolve the log to the share, or to half of double precision when
+    rounding is what stopped it.
+    """
+    tolerance = max(share, _HALF_PRECISION)
+    extent = float(np.sqrt(2.0 * np.log(1.0 / _EPSILON)))
+    nodes = (_TIERNEY_KADANE_DEGREE + 2) // 2
+    previous = None
+    while True:
+        steps, weights = np.polynomial.hermite_e.hermegauss(nodes)
+        log_terms = np.log(weights) + _line_values(prior, log_smoothing, origin, direction, steps, cavity, working_bytes) - value + 0.5 * np.square(steps)
+        estimate = float(_log_sum_exp(log_terms, axis=0)) - 0.5 * np.log(2.0 * np.pi)
+        if previous is not None and abs(estimate - previous) <= tolerance:
+            return estimate
+        if float(steps[-1]) > extent:
+            break
+        previous = estimate
+        nodes *= 2
+
+    def integrand(step: float) -> float:
+        return float(np.exp(_line_values(prior, log_smoothing, origin, direction, np.array([step]), cavity, working_bytes)[0] - value))
+
+    integral, error, _information, *message = quad(
+        integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
+    )
+    if message and error > tolerance * abs(integral):
+        raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
+    return float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
+
+
 def _laplace_corrections(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> tuple[F64Array, F64Array, F64Array]:
@@ -1203,22 +1293,7 @@ def _laplace_corrections(
     replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
     share = 0.5 * tolerance / max(replaced.shape[0], 1)
     for index in replaced:
-        direction = directions[:, index]
-
-        def integrand(step: float) -> float:
-            point = evidence.coefficients + step * direction
-            return float(np.exp(
-                _data_value(prior, point, cavity, working_bytes) - _penalty_value(prior, log_smoothing, point)[0] - value
-            ))
-
-        integral, error, _information, *message = quad(
-            integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
-        )
-        # The log of the integral is what enters V: accept QUADPACK's answer when its own error estimate resolves that
-        # log to its share, or to half of double precision when rounding is what stopped it.
-        if message and error > max(share, _HALF_PRECISION) * abs(integral):
-            raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
-        corrections[index] = float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
+        corrections[index] = _line_log_integral(prior, log_smoothing, evidence.coefficients, directions[:, index], value, cavity, working_bytes, share)
     return corrections, terms, directions
 
 
@@ -1434,6 +1509,8 @@ def _evidence(
         penalized_value=value,
         newton_decrement=0.5 * float(gradient @ total_covariance @ gradient),
         magnitude=objective.magnitude + abs(evidence_value),
+        precision=-hessian,
+        inner_decrement=newton_decrement,
     )
 
 
@@ -1562,18 +1639,36 @@ def _certified_evidence(
     return _corrected(prior, log_smoothing, chosen, cavity, posterior_at, working_bytes, tolerance)
 
 
+def _same_basin(first: _Evidence, second: _Evidence) -> bool:
+    """Whether two certified inner maxima are one: each point lies within sqrt(2 d) of its maximum in the -H metric
+    (d its inner decrement), so one maximum is within the sum of the radii of both points; their V must then agree
+    to within their certified errors."""
+    step = first.coefficients - second.coefficients
+    radius = np.sqrt(2.0 * first.inner_decrement) + np.sqrt(2.0 * second.inner_decrement)
+    distance = np.sqrt(max(float(step @ first.precision @ step), 0.0))
+    return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
+
+
 def _best_certified(
     prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, posterior_at: PosteriorAt, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
     """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
-    by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing."""
+    by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing.
+
+    Two starts found one basin when their points are within the inner maximizer's own radii of each other,
+    sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the one with the
+    smaller error stands for the basin, which is then corrected once."""
     certified: list[_Evidence] = []
     for start in starts:
         candidate = _evidence(prior, log_smoothing, start, cavity, posterior_at, working_bytes, tolerance)
         if candidate is None:
             continue
-        scale = 1.0 + float(np.max(np.abs(candidate.coefficients)))
-        if all(float(np.max(np.abs(candidate.coefficients - other.coefficients))) > _HALF_PRECISION * scale for other in certified):
+        for position, other in enumerate(certified):
+            if _same_basin(candidate, other):
+                if candidate.error < other.error:
+                    certified[position] = candidate
+                break
+        else:
             certified.append(candidate)
     corrected = [
         evidence
