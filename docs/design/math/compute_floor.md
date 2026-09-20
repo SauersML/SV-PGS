@@ -4,7 +4,7 @@ Lane speed-floor, 2026-09-19. It covers the whole pipeline for 21 traits × 5 fo
 - §1–§8 derive the floor; §9 measures the current and planned pipeline against it, stage by stage.
 - Related: ep_eb.md (the certificate and its tolerances, which set the accuracy the floor must reach) and COMPUTE.md (hardware, launch paths, MSI).
 
-**Ruling (lead, 2026-09-19):** build and optimize the Stage-2-only path first. Stage 1 is optional until the production outer contraction ρ and the real partition's cut coupling are measured (§9.4, items 1–2).
+**Ruling (lead, 2026-09-19, current):** Stage 1 is dropped, provisionally, on the cost argument of §3 alone. The first outer-contraction measurement (§10.1–10.3) was withdrawn, so the production ρ is unmeasured; the decision is revisited if the measurement at the fitted maximum (engine at chr22 scale, learned λ) shows production needs more outer steps × passes than a Stage 1 sweep costs. The cut coupling (§10.4) stands.
 
 
 **Scope.** The whole pipeline, 21 traits × F = 5 folds (M = 105 models, binary diseases included), from the stored codes to certified posteriors, draws and held-out scores.

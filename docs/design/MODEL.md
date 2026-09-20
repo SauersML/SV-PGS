@@ -2,10 +2,12 @@
 
 SV-PGS fits one Bayesian model to every variant. Speed comes from exact computation in the right order, never from a different model for some variants (SPEC).
 
-**Evidence tags** (scratchpad EVIDENCE_RULE):
+**Evidence tags** (the evidence rule: a lane's own simulation checks math, never accuracy; accuracy claims come from the neutral benchmarks bench-real and bench-sim, or from in-workspace held-out data):
 - `[sim-only]`: a lane's own simulation. It checks the math and the code, but it is not evidence of an accuracy gain.
 - `[semi-real]`: real public haplotypes or real imputation, with simulated effects and phenotypes.
 - `[real]`: measured on real data with nothing simulated: real phenotypes for accuracy claims, real genotype data for genotype-accuracy claims.
+- `[machinery]`: exactness, pass counts, iterations or time, measured against an exact reference. Never an accuracy claim.
+- `[est]`: an estimate from a derivation or cost model, not a measurement.
 - `[provenance unknown]`: no traceable source.
 - `[in-workspace]`: measured inside the AoU workspace. Its value is never reproduced outside it (user rule, 2026-09-19: no AoU-related data outside the permitted environment).
 
@@ -30,7 +32,7 @@ Untagged numbers are derivations, definitions or targets.
 
 ## 2. Measurement model
 
-- **The column is a measurement of the true genotype G_j.** Imputed SV and TR dosages behave like confident posterior draws (κ ≈ √r² per stratum), not calibrated posterior means [semi-real: bench-sim, public 1kGP haplotypes re-imputed with real GLIMPSE2 v2.0.0 and Beagle 5.5]. So INFO and dosage-based r² cannot rank SV reliability.
+- **The column is a measurement of the true genotype G_j.** Imputed SV and TR dosages behave like confident posterior draws (κ ≈ √r² per stratum, and Var(DS)/Var(G) far above r²), not calibrated posterior means. On bench-sim's v7 cohort (public 1kGP haplotypes re-imputed with Beagle 5.5, 5,000 samples), SVs at MAF 1–5% had κ 0.80 against √r² 0.83 and a variance ratio of 0.89 against r² 0.69; TRs at MAF 1–5% had κ 0.81 against √r² 0.81. Only below MAF 1% does κ move partway toward 1 [semi-real: bench-sim v7, Beagle 5.5; GLIMPSE2 v2.0.0 showed the same pattern on bench-sim's earlier cohort, and its v7 check is pending]. So INFO and dosage-based r² cannot rank SV reliability, and the D* recalibration and the A-map (scale_model.md §3) are required.
 - **Reliability:** r²_j = corr²(D_j, G_j). It is truth-calibrated and triad-corrected: r(D,T1)·r(D,T2)/r(T1,T2) over two independent long-read truths. A per-record model predicts it from site features (`sv_pgs/imputation_reliability.py`). The pipeline fits it inside the AoU workspace from the long-read truth rows, and its coefficients never leave the workspace.
   - Locus-level r² is predicted the same way for Z.
   - The r² estimate never enters the Gram. Adding E[x²] corrections shrinks every effect by r² (measured −0.2 to −3.2% R² [sim-only: design-trlocus]).
@@ -76,7 +78,7 @@ Untagged numbers are derivations, definitions or targets.
   - EP is unclipped, Newton on the moment equations with the Opper–Winther double loop as the fallback (the dense reference, `tests/ep_eb_reference.py`);
   - a warm-up before the first hyper step.
   - Plain EM converges at rate ≥ 1 − edf/p, about 0.99 at production scale. From the defaults its reported SV/SNV enrichment was 1.65 whatever the truth [sim-only: gam-eval reproducer].
-- **The production engine** (`sv_pgs/scale_mixture_ep.py`, shared by Stage 1 and Stage 2) holds everything that involves the prior, for a stage that supplies q's means and marginal variances:
+- **The production engine** (`sv_pgs/scale_mixture_ep.py`) holds everything that involves the prior, for a stage that supplies q's means and marginal variances:
   - g on a uniform lattice in t (nodal log g, roughness λh⁻⁵‖Δ³η‖² from square-root factors); the lattice's floor (flat-kernel bound), top (largest kernel mode), spacing (complex-strip trapezoid bound) and tails come from the data and a tolerance (math-density's rules);
   - the ruled layout: η shared, δ_c per class with its own roughness weight, one Gaussian pooling precision on the deviations' location and width, no class level; η's null space profiled;
   - exact tilted moments, unclipped mean-matched sites, cavities, the MacKay/REML noise update;
@@ -89,9 +91,16 @@ Untagged numbers are derivations, definitions or targets.
   - The determinants come from one Cholesky factor in the basis [N, C], with C keeping every coordinate outside N's support: the Schur log-determinant is the trailing diagonal, and W = (B+S)⁻¹ − N(N'(B+S)N)⁻¹N' is L⁻¹'s trailing rows squared, never a difference of inverses. V is not certified where Demmel's componentwise rounding bound (n+1)ε Σ|W_ij|√(M_ii M_jj) exceeds the tolerance.
   - The final stationarity check: one central difference of V per interior weight. Each side's V is certified to e = (2 tol/(n·3^{4/3}))^{3/4} s^{1/4}, with s = ½(edf + λ‖Rx‖²) bounding |V''| and |V'''|, at the optimal step h = (3e/s)^{1/3}, so the error E = h²s/6 + e/h takes a quarter of the tolerance. The sides restart from the base's x, and the h/2 difference must agree within both bounds, which detects a switch of inner maximum. The certificate is ½Σ(|c| + E)²/s ≤ tol (`stationarity_gain`); while it fails, the search moves along the difference and resumes, edges included.
   - Once the interior ascent converges, every finite weight is compared with both of its edges, and the best edge that raises V past the tolerance is taken.
-- **Certificate:** the Newton decrement of the hyper objective (in nats) together with the relative prediction change ‖XΔμ‖/‖Xμ‖. Parallel EP leaves a few sites in limit cycles, so the per-site maximum is not a certificate. The certificate is recorded in the artifact, and a fit without it is not accepted.
+- **The outer loop** (in flight on branch `wip/engine-driver`, not yet on main): Newton on the EP evidence with the total curvature B and a trust region, from a certified EP fixed point at every step.
+  - Plain EP-EM is never used. Its fixed-cavity M-step is ill-posed wherever A + S is indefinite, which happens on real LD: at the true prior of a pooled chr22 problem, B + S had negative eigenvalues in every measured configuration, so the true prior is a saddle, not a fixed point [semi-real: public 1kGP-haplotype chr22 LD with simulated effects; first measured on bench-sim's withdrawn-weights cohort, re-checked on the v7 cohort by the engine's real-LD regression test].
+  - The earlier outer-rate measurement (a spectrum "with no slow direction", 1–3 accelerated outer steps, "plain EP-EM diverges in 7 of 16") was withdrawn: it linearized at the true prior on a non-invariant subspace (compute_floor.md §10). The production outer rate is unmeasured; it will be measured on the engine at chr22 scale with learned λ.
+- **Certificate:** a fit is accepted only if
+  - B + S is positive definite at the returned point (certified Cholesky, not a sign test);
+  - the Newton decrement of the hyper objective is within the tolerance 1/(2K) nats, with B recomputed at the returned point;
+  - the certifying Newton step moves the posterior mean by at most p_eff/K in its own posterior metric, measured at the step's EP fixed point. The evidence alone can be flat along a direction where predictions still move (a 3.3e-6 eigenvalue along the profiled null space moved predictions up to 73% within its local radius [sim-only: engine test, p = 40, n = 60]).
+  - Trials where EP has no fixed point are counted as unresolved and never pass. Parallel EP leaves a few sites in limit cycles, so the per-site maximum is not a certificate. The certificate is recorded in the artifact, and a fit without it is not accepted.
 - **Binary traits:** logistic EP with a posterior predictive computed by the trapezoid rule, with its step and truncation derived a priori from the integrand's strip of analyticity so it is exact to fp64 for any predictor variance. Probit was rejected: VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
-- **Predictive variance:** K = 64 exact posterior draws by perturb-and-solve, riding Stage 2's passes and scored in the same single read.
+- **Predictive variance:** K exact posterior draws by perturb-and-solve (exact for a positive-definite global precision, with non-positive sites split out; dual_solve.md), riding Stage 2's passes and scored in the same single read. Credible intervals use Student-t_K quantiles, which are exact for any K. K itself is a registered pending constant, to be derived from the Monte Carlo error target of every reported quantity.
 
 ## 5. Pipeline
 
@@ -100,23 +109,17 @@ Untagged numbers are derivations, definitions or targets.
   - The TR length columns as an exact sparse map of stored codes.
   - The tagging and ρ² features.
   - The candidate set by the information rule N·Var(D_j)·r̂²_j·τ²_c ≥ c. It is variance-based, so copy-number rows are kept, and in exact Bayes it is a compute knob only.
-- **Stage 1: the LD-space EP-EB warm start**, one per trait × fold. It is not on main yet; it is gated against the dense EP-EB reference in `tests/ep_eb_reference.py` (see HANDOFF.md).
-  - **The slot Stage 2 consumes (the interface Stage 1 fills), per model (a trait on one training set):** the site precisions and shifts (τ, ν) over Stage 0's reduced columns, unclipped; the posterior mean; the prior's hyperparameters in the engine's layout (the coefficients x and the log penalty weights, with +∞ and −∞ at the edges); and the noise variance. Stage 2 reaches the same fixed point from any slot contents; the slot only shortens the path.
-  - **Until Stage 1 lands, Stage 2 starts from the prior itself:** moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, a zero mean, the start density, and the covariate-only residual variance as the noise.
-- **Stage 2: full-data certification** (`exact_polish.py`).
-  - Block-Jacobi PCG on the FWL-projected system, which needed 17–28 passes where block Gauss–Seidel needed over 40 [sim-only: synthetic store].
-  - Control-variate Hutchinson estimates of diag(Σ), using the block inverse as the control variate. These are being replaced by `marginal_variances.py`, the leave-block-out marginals:
-    - Block-Jacobi inverses are variances conditional on the other blocks' effects, which biases the EP fixed point.
-    - The replacement is exact elimination of the resolved sites plus a neighbour-window Woodbury, with a deterministic equivalent only for the far field. Every block carries a probe certificate.
-    - Measured against the dense inverse, with LD across cuts: max per-variant relative error 0.5–3.5%, below the equivalent's scale ‖K_S⁻¹‖_F/tr K_S⁻¹. Block-Jacobi was off by 16–58% [machinery: dense inverse].
-    - `variance_jvp` gives the variance map's derivative −diag(Σ diag(w) Σ) for the hyperparameter curvature products:
-      - resolved rows are exact (1e-13);
-      - bulk entries have mean relative error 0.2–0.6% (99th percentile 1–4%);
-      - block sums are within 0.7% [machinery: dense derivative].
-      - Distant pairs enter through the block sandwich diag(Σ_bb R_b Σ_bb). Per-variant norms overstated them 3–10×, because LD partners absorb the chance coupling.
-  - Posterior draws.
-  - This stage carries the real weight: a block-diagonal Stage 1 alone was 2.7× off at p/n = 20 [semi-real: design-credit].
-- **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [sim-only: synthetic store; timing].
+- **Stage 1 is dropped, provisionally** (lead, 2026-09-19), on cost alone: one Stage 1 sweep's variance refresh costs 75–600 Stage 2 pass-equivalents [est: compute_floor.md §3]. Stage 2 starts from the prior itself: moment-matched sites τ_j = 1/E_prior[β_j²], ν = 0, a zero mean, the start density, and the covariate-only residual variance as the noise. The Stage 1 slot interface is being removed in the engine driver branch.
+  - The decision is revisited only if the outer rate measured at the fitted maximum shows production needs more outer steps × passes than a Stage 1 sweep costs.
+- **Stage 2: full-data certification.**
+  - **The Gaussian E-step is `dual_solve.py`** (DualGaussian): the solves in dual form, sample-side state, every model, fold, probe and draw in one pass. Non-positive sites and spikes are eliminated exactly, with a Schur certificate; the operand digits come from each call's error budget (dual_solve.md). At n = 30,000 × 483,944 variants on an A40, a cold iterate for 12 models took 149–180 s, 6–9 reads and 3–6 CG iterations, and 192 draws took 16–21 s [machinery: semi-real genotypes, simulated sites]. The older block-Jacobi PCG in `exact_polish.py` needed 17–28 passes [sim-only: synthetic store].
+  - **Marginal variances come from `marginal_variances.py`**, never from block-Jacobi inverses (those are conditional on the other blocks' effects, which moves the EP fixed point) and never from stochastic estimates in the site updates.
+    - The leave-block-out marginals: exact elimination of the resolved sites plus a neighbour-window Woodbury, with a deterministic equivalent only for the far field. Every block carries an information certificate, which a failing block must pass before the fit may use its cavities.
+    - Against the dense inverse with LD across cuts: max per-variant relative variance error 0.5–3.5%, against 16–58% for block-Jacobi [machinery: dense inverse].
+    - On real chr22 LD (bench-sim, 12k variants × 50k people, 10 PCs projected), the implied cavity-precision error was median 2.7% / p99 23% at block cap 1024 and 0.33% / 6.4% at cap 4096, against 4.2% / 34% and 2.2% / 20% for block-Jacobi. The information certificate's interval covered the true block error in every block of every case [semi-real: public 1kGP-haplotype LD; 10 PCs only, not the production covariate set; to be re-measured on bench-sim v7 with the production covariates before these numbers are relied on]. At cap 1024 the window form is not yet accurate enough to certify EP; an exact repair for flagged blocks is in progress.
+    - `variance_jvp` gives the variance map's derivative −diag(Σ diag(w) Σ) for the curvature products: resolved rows exact (1e-13); bulk entries mean relative error 0.2–0.6% (99th percentile 1–4%); block sums within 0.7% [machinery: dense derivative].
+  - This stage carries the real weight: a block-diagonal fit alone was 2.7× off at p/n = 20 [semi-real: design-credit].
+- **Scoring** (`fast_scoring.py`): every trait × fold model and its posterior draws in one read of the store. It is exact to 1e-13; an H100 does 100k × 17.3M in about 100 s [machinery: synthetic store]. The binary predictive uses an a-priori trapezoid rule with no iteration.
 
 ## 6. Measured and rejected (do not re-propose without new evidence)
 A rejection resting only on a lane's own simulation (`[sim-only]`) is provisional. It stands until it is re-measured on the neutral benchmarks: bench-real (real held-out data) or bench-sim (real haplotypes, a misspecified truth family, sealed seeds). A `[sim-only]` rejection is not grounds to refuse a new measurement there.

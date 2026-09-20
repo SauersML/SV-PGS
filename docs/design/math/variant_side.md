@@ -98,14 +98,11 @@ B-products are in `b_products.md`. This note uses the same curvature convention,
 - EP-EM (EP to convergence, then maximization at fixed cavities) reached δ_B ≤ 1e-10 in 3–4 outer iterations, and the certificate in 1–2.
 - Unglobalized B-Newton took 9–13 iterations; at these sizes eig(A⁻¹B) ∈ [0.83, 1.7].
 
-**At genome scale** [machinery, semi-real: speed-floor's measurement on real chr22 LD, extrapolated to genome scale by the chromosome-to-window LD-score ratio; `svpgs-team/speed-floor/rho_genome.json` on MSI]:
-- At production signal, the outer pencil (B + S, A + S) has λ ∈ [0.89, 5.41], and mostly B ⪰ A.
-- The fixed-cavity step's contraction factor, ρ = max|1 − λ|, reaches 4.41. It is ≥ 1 in 3 of the 10 production rows at the unit penalty weight.
-- speed-floor reports that plain EP-EM diverges in 7 of its 16 configurations.
-- **So the outer step must use B,** via b_products.md's closed form, globalized. The dense result above, where EP-EM converged, does not carry over to scale.
+**At genome scale: WITHDRAWN (2026-09-19).** The genome-scale outer spectrum first quoted here (the pencil (B + S, A + S) with λ ∈ [0.89, 5.41], ρ = max|1 − λ| up to 4.41, and "plain EP-EM diverges in 7 of 16") came from speed-floor's measurement, which linearized at the true prior on a non-invariant subspace. The true prior is a saddle of that problem, not a fixed point (compute_floor.md §10.1–10.3). Those numbers are withdrawn.
+- **What still stands:** plain EP-EM's fixed-cavity M-step is ill-posed wherever A + S is indefinite, which it was at the true prior on real chr22 LD [semi-real]. **So the outer step uses B,** via b_products.md's closed form, globalized with a trust region. The production outer rate is unmeasured; it will be measured on the engine at chr22 scale with learned λ.
 
 **Block-variance cavities** [machinery, semi-real, speed-floor, `cut_coupling3.json`]:
-- Block-local marginal variances give cavity-precision errors with p99 of 28–58% at production block caps 1024–4096. The second-order cross-block term brings cap 4096 to p99 2%.
+- Block-local marginal variances give cavity-precision errors with p99 of 54% at block cap 1024 and 25% at cap 4096 on bench-sim's v7 cohort (earlier cohort: 28–58%). The second-order cross-block term brings cap 4096 to p99 1.5%.
 - B's variance channel therefore takes the cross-block marginal-variance map, `sv_pgs/marginal_variances.py` `variance_jvp` with its window and far-field terms, not the block-local (Σ_b∘Σ_b).
 
 ## 5. Variance-refresh trigger [proved; the demo is inconclusive]
