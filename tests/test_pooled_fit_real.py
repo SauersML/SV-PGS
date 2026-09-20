@@ -1,7 +1,8 @@
 """Regression cases on real bench-real genes (MAGE / 1kGP; public data): pooled start fixed points that refused.
 
-loso/AMR snv refused at gene 13 and loso/EUR snv at gene 6 of svpgs-pooled-run's 20 chr22 genes (18cc5df, before
-the per-gene double-loop fallback): "no damped EP pass keeps the precision positive definite". Each group's start fixed
+On svpgs-pooled-run's 20 chr22 genes (18cc5df, before the per-gene double-loop fallback) four of the five loso snv
+start fixed points refused, "no damped EP pass keeps the precision positive definite": AMR at gene 13, EUR at gene 6,
+EAS at gene 7 and SAS at gene 15 (AFR ran past an hour). Each group's start fixed
 point must now be reached. Each case builds the group's 20 genes as the batch arm does and asks the oracle for the
 start's fixed point: about 20 minutes on 2 cores, so the cases run only where the data are and when asked
 (SVPGS_REAL_REGRESSION=1, BENCH_REAL_DATASET, SVPGS_POOLED_GENES: the gene list, one gene_id per line after a header).
@@ -31,7 +32,7 @@ def _method():
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize(("split", "refused_gene"), [("loso/AMR", 13), ("loso/EUR", 6)])
+@pytest.mark.parametrize(("split", "refused_gene"), [("loso/AMR", 13), ("loso/EUR", 6), ("loso/EAS", 7), ("loso/SAS", 15), ("loso/AFR", None)])
 def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused_gene):
     from benchmarks.bench_real import harness
     from sv_pgs import fit_model
@@ -62,4 +63,4 @@ def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused
     (point,) = oracle([start])
     assert point is not None, f"refused: {oracle.refusals}"
     assert oracle.mean_move <= 1.0 and oracle.noise_gain <= 0.5 / draw_count
-    assert refused_gene < len(genes)
+    assert refused_gene is None or refused_gene < len(genes)
