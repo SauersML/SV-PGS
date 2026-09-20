@@ -225,7 +225,6 @@ def test_component_derivatives_in_log_scale_match_finite_differences():
             log_density[prior.class_index[variant]],
             scales[variant : variant + 1] + shift_in_log_scale,
             prior.log_variance_grid,
-            prior.kernel_floor,
             cavity.precision[variant : variant + 1],
             cavity.shift[variant : variant + 1],
         )
@@ -283,6 +282,25 @@ def test_halving_the_lattice_keeps_every_class_density():
     # Each coarse node's mass is split between two fine nodes: the density per unit t agrees.
     np.testing.assert_allclose(fine_density[:, ::2] * 2.0, coarse_density, rtol=2e-3, atol=1e-12)
     np.testing.assert_allclose(log_scale(finer, transferred.coefficients), log_scale(prior, hyperparameters.coefficients), atol=1e-12)
+
+
+def test_halving_a_three_class_lattice_keeps_every_class_density():
+    # review-mathbugs L-0: the natural end conditions were scalars for a spline over C classes, which scipy accepted
+    # only when C equalled their count (two).
+    generator = np.random.default_rng(71)
+    count = 90
+    class_index = np.repeat(np.arange(3), count // 3)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 12)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.log(generator.uniform(0.3, 1.0, count)), annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    hyperparameters = _hyperparameters(prior, 72)
+    finer, moved = halved_lattice(prior, hyperparameters)
+    # Each class's log g passes through its old nodal values (up to the class's normalizing constant).
+    fine = engine._density_and_scale(finer, moved.coefficients)[0][:, ::2]
+    coarse = engine._density_and_scale(prior, hyperparameters.coefficients)[0]
+    np.testing.assert_allclose(np.diff(fine, axis=1), np.diff(coarse, axis=1), rtol=1e-9, atol=1e-9)
 
 
 def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotations():
@@ -957,6 +975,7 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
     """Damped parallel EP on the dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), run to machine precision."""
     site_precision, site_shift = (np.array(part, copy=True) for part in sites)
     hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    previous_change = np.inf
     for _sweep in range(20000):
         covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
         mean = covariance @ (linear_term + site_shift)
@@ -965,8 +984,11 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
         change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
         site_precision += 0.5 * (target_precision - site_precision)
         site_shift += 0.5 * (target_shift - site_shift)
-        if change < 1e-14:
+        # Machine precision: the damped map contracts until its targets' rounding, where the change stops falling;
+        # past half of double precision a change that no longer falls is that floor.
+        if change < 1e-14 or (change >= previous_change and change < float(np.finfo(np.float64).eps) ** 0.5):
             return (site_precision, site_shift), covariance, cavity
+        previous_change = change
     raise AssertionError("dense EP did not converge")
 
 
@@ -1089,6 +1111,34 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
     np.testing.assert_array_equal(solved[-1], fit.hyperparameters.coefficients)
     assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
     assert fit.prediction_move <= fit.prediction_tolerance
+
+
+def test_the_prediction_check_holds_each_block_to_its_own_budget():
+    # Two independently scored blocks share x: each is held to its own KL budget (fit-api P1). Normal means, as in the
+    # refusal test; with block 0's metric inflated past any budget, no step that moves its mean can certify.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    halves = (slice(0, 30), slice(30, 60))
+
+    def fixed_points(hyperparameters, inflation):
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            variance = moments.variance
+
+            def norm(direction, variance=variance):
+                moves = np.array([float(np.sum(np.square(direction[part]) / variance[part])) for part in halves])
+                moves[0] *= inflation
+                return moves
+
+            effective = np.array([float(np.sum(cavity.precision[part] * variance[part])) for part in halves])
+            points.append(FixedPoint(cavity=cavity, posterior=diagonal_posterior(variance), mean=moments.mean, precision_norm=norm, effective_effects=effective))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, 1.0), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert fit.certified and fit.prediction_move <= fit.prediction_tolerance
+    inflation = 1.0 / float(np.finfo(np.float64).eps) ** 2
+    (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, inflation), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert not starved.certified
 
 
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
