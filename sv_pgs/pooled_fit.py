@@ -119,27 +119,20 @@ def pooled_prior(
 ) -> ScaleMixturePrior:
     """The prior over every gene's members (its active columns; review-mathbugs T1: an exact-tie member keeps its own
     class and offset), stacked in gene order: one class per variant class present in any gene, each member's log
-    reliability as its offset, the gene level as one ridge-penalized annotation group
-    (none for a single gene), and the lattice from every gene's single-variant likelihoods at its own start noise."""
+    reliability as its offset, the genes' levels as learned offset groups (none for a single gene), and the lattice from every gene's single-variant likelihoods at its own start noise."""
     reduced = [np.asarray(classes)[gene.active_rows] for gene, classes in zip(statistics, variant_classes)]
     _classes, class_index = np.unique(np.concatenate(reduced), return_inverse=True)
     stacked_offsets = np.concatenate([np.asarray(offset, dtype=np.float64)[gene.active_rows] for gene, offset in zip(statistics, offsets)])
     single_precision = np.concatenate([gene.design.column_squares() / noise for gene, noise in zip(statistics, start_noise)])
     single_shift = np.concatenate([gene.design.back(gene.target) / noise for gene, noise in zip(statistics, start_noise)])
     nodes, floor, top = derived_lattice(single_precision, single_shift, stacked_offsets, 0.5 / draw_count)
-    gene_count = len(statistics)
     rows = _gene_rows(statistics)
-    if gene_count > 1:
-        indicator = np.zeros((class_index.shape[0], gene_count))
-        for gene, gene_slice in enumerate(rows):
-            indicator[gene_slice, gene] = 1.0
-        design = indicator @ _sum_to_zero_basis(gene_count)
-        groups = (AnnotationGroup(columns=np.arange(gene_count - 1, dtype=np.int64), penalty=np.eye(gene_count - 1)),)
-    else:
-        design, groups = np.zeros((class_index.shape[0], 0)), ()
+    genes = np.concatenate([np.full(gene_rows.stop - gene_rows.start, gene, dtype=np.int64) for gene, gene_rows in enumerate(rows)])
+    # Each gene's level is a gene-owned offset of its rows (review-mathbugs P2, lead ruling): the same shift for every
+    # row of the gene whatever its class, sum-to-zero over genes, with one learned ridge weight; never class-centred.
     return scale_mixture_prior(
-        class_index=class_index.astype(np.int64), log_variance_offset=stacked_offsets, annotation_design=design, annotation_groups=groups,
-        nodes=nodes, floor=floor, top=top,
+        class_index=class_index.astype(np.int64), log_variance_offset=stacked_offsets, annotation_design=np.zeros((class_index.shape[0], 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top, offset_groups=genes if len(statistics) > 1 else None,
     )
 
 
@@ -312,17 +305,18 @@ class _PooledFixedPoints:
             for gene, (gene_statistics, rows) in enumerate(zip(self.statistics, self.rows))
         ])
 
-    def _precision_norm(self) -> Callable[[F64Array], float]:
+    def _precision_norm(self) -> Callable[[F64Array], F64Array]:
         designs = [gene.design for gene in self.statistics]
         precision, noise, rows = self.site_precision.copy(), self.noise.copy(), self.rows
 
-        def norm(direction: F64Array) -> float:
+        def norm(direction: F64Array) -> F64Array:
             values = np.asarray(direction, dtype=np.float64)
-            total = float(np.sum(precision * values * values))
+            moves = []
             for design, gene_noise, gene_rows in zip(designs, noise, rows):
                 image = design.image(values[gene_rows])
-                total += float(image @ image) / float(gene_noise)
-            return total
+                moves.append(float(image @ image) / float(gene_noise) + float(np.sum(precision[gene_rows] * values[gene_rows] ** 2)))
+            # One move per gene, each scored as its own model: the prediction check holds each to its own p_eff,g / K.
+            return np.array(moves)
 
         return norm
 
@@ -385,7 +379,7 @@ class _PooledFixedPoints:
             if self.mean_move <= 1.0 and self.noise_gain <= tolerance:
                 return FixedPoint(
                     cavity=cavity, posterior=self._posterior(), mean=mean, precision_norm=self._precision_norm(),
-                    effective_effects=float(np.sum(self.effective)),
+                    effective_effects=self.effective.copy(),
                 )
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
             self.noise = self._noises(1.0 / (frozen + self.site_precision))
@@ -620,6 +614,26 @@ class CurvatureBlocks:
     null_basis: F64Array
 
 
+def gene_owned_blocks(curvature: CurvatureBlocks, prior: ScaleMixturePrior) -> tuple[F64Array, F64Array, F64Array]:
+    """Each gene's block in gene-owned coordinates (theory-ep section 5): its rows see the levels only through their own
+    level l_g = q_g' z (q_g the gene's row of the sum-to-zero basis), so B_g's level part is b_g q_g q_g' and its
+    coupling to the shared coordinates is c_g q_g'. Returns (B_g on the shared coordinates [G, S, S], c_g [G, S],
+    b_g [G]) and leaves the shared-coordinate indices to ``prior``'s layout: every x coordinate but the last G - 1."""
+    level_size = prior.level_size
+    genes = level_size + 1
+    basis = _sum_to_zero_basis(genes)
+    shared = curvature.blocks.shape[1] - level_size
+    shared_blocks = curvature.blocks[:, :shared, :shared]
+    coupling = np.empty((genes, shared))
+    level = np.empty(genes)
+    for gene in range(genes):
+        row = basis[gene]
+        norm = float(row @ row)
+        coupling[gene] = curvature.blocks[gene, :shared, shared:] @ row / norm
+        level[gene] = float(row @ curvature.blocks[gene, shared:, shared:] @ row) / norm**2
+    return shared_blocks, coupling, level
+
+
 def _gene_prior(prior: ScaleMixturePrior, rows: slice) -> ScaleMixturePrior:
     """The prior on one gene's rows, in the pooled x coordinates: every per-variant field restricted, the lattice and
     x's layout shared. The data objective and B are sums over rows, so the genes' parts add up to the pooled one."""
@@ -632,6 +646,7 @@ def _gene_prior(prior: ScaleMixturePrior, rows: slice) -> ScaleMixturePrior:
         class_rows=tuple(np.split(order, np.cumsum(sizes)[:-1])),
         log_variance_offset=prior.log_variance_offset[rows],
         scale_design=prior.scale_design[rows],
+        offset_groups=None if prior.offset_groups is None else prior.offset_groups[rows],
     )
 
 

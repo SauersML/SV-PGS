@@ -138,6 +138,16 @@ def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
     scale = np.max(np.abs(pooled))
     np.testing.assert_allclose(curvature.blocks.sum(axis=0), pooled, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
     assert curvature.blocks.shape == (2,) + pooled.shape
+    # Gene-owned levels (review-mathbugs P2): each gene's level block is rank one along its own basis row, exactly.
+    from sv_pgs.pooled_fit import gene_owned_blocks
+    from sv_pgs.scale_mixture_ep import _sum_to_zero_basis
+
+    shared, coupling, level = gene_owned_blocks(curvature, fit.prior)
+    basis = _sum_to_zero_basis(2)
+    for gene in range(2):
+        rebuilt = level[gene] * np.outer(basis[gene], basis[gene])
+        np.testing.assert_allclose(curvature.blocks[gene, -1:, -1:], rebuilt, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
+        np.testing.assert_allclose(curvature.blocks[gene, :-1, -1:], np.outer(coupling[gene], basis[gene]), rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
 
 
 def test_a_genes_double_loop_is_small_ns_on_its_rows():
@@ -178,7 +188,6 @@ def test_non_finite_site_targets_refuse_the_trial_instead_of_looping():
         oracle._frozen_passes(start, frozen, target_precision, target_shift)
 
 
-@pytest.mark.xfail(strict=True, reason="gene levels still pass through the engine's class-centring (review-mathbugs P2); gene-owned offsets await e2e's prior hook")
 def test_every_row_of_a_gene_carries_exactly_its_level():
     """review-mathbugs P2 (lead ruling): gene levels are gene-owned offsets, sum-to-zero over genes, never class-centred.
     Two genes, each with SNV and deletion rows: every row of gene g must shift its log prior variance by l_g exactly."""
