@@ -249,12 +249,22 @@ def test_batch_contract_matches_the_per_gene_contract_for_a_per_gene_method(tmp_
         "spec.loader.exec_module(baselines)\n\n\n"
         "def fit_batch(trains):\n"
         "    return [baselines.top_variant(train) for train in trains]\n")
+    (tmp_path / "views_method.py").write_text(
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('baselines_for_views', {baselines_path!r})\n"
+        "baselines = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(baselines)\n\n\n"
+        "def fit_views(views):\n"
+        "    for key in views:\n"
+        "        yield key, baselines.top_variant(views[key])\n")
     harness.run(tmp_path, f"{baselines_path}:top_variant", "gene", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
     harness.run(tmp_path, f"{tmp_path}/batch_method.py:fit_batch", "batch", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="batch")
+    harness.run(tmp_path, f"{tmp_path}/views_method.py:fit_views", "views", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="views")
     for feature_set in ("snv", "snv_sv"):
         for kind in ("predictions", "predictions_without_sv"):
-            assert np.array_equal(np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy"),
-                                  np.load(tmp_path / f"results/batch/loso/chr1.{feature_set}.{kind}.npy"))
+            reference = np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy")
+            for contract in ("batch", "views"):
+                assert np.array_equal(reference, np.load(tmp_path / f"results/{contract}/loso/chr1.{feature_set}.{kind}.npy"))
 
 
 def test_a_batch_refuses_a_sealed_gene(tmp_path):
@@ -387,3 +397,29 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     called, _ = harness.subset(train, test, "snv_sv", "loso/AFR")
     assert joint.variants.is_sv.sum() == called.variants.is_sv.sum() == 2
     assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
+
+
+def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
+    tiny_dataset(tmp_path)
+    dataset = harness.Dataset(tmp_path)
+    views = harness._LazyViews(dataset, [0], ["loso/AFR", "loso/EUR"], ["snv"])
+    assert list(views) == [("g1", "loso/AFR", "snv"), ("g1", "loso/EUR", "snv")]
+    assert views[("g1", "loso/AFR", "snv")].variants.chromosome_row is not None
+
+    class Constant:
+        def predict(self, genotypes):
+            return np.zeros(genotypes.shape[0])
+
+    try:
+        list(harness._run_views(dataset, lambda views: {("g1", "loso/AFR", "snv"): Constant()}, [0], ["loso/AFR", "loso/EUR"], ["snv"]))
+    except ValueError as error:
+        assert "1 of 2" in str(error)
+    else:
+        raise AssertionError("a missing view must be refused")
+    pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    try:
+        harness._LazyViews(harness.Dataset(tmp_path), [0], ["loso/AFR"], ["snv"])
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("views containing a sealed gene must be refused")

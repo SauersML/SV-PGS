@@ -3,6 +3,9 @@
 A method is a callable ``fit(train: TrainData) -> predictor``; the predictor has ``predict(genotypes) -> np.ndarray``.
 A method that pools hyperparameters across genes uses the batch contract instead:
 ``fit_batch(trains: Sequence[TrainData]) -> list[predictor]``, called once per split with every selected gene.
+The most general contract is ``fit_views(views) -> {(gene_id, split, feature_set): predictor}`` (or an iterator of
+such pairs), called once with a lazy mapping of every requested view, so a method can share work across overlapping
+windows, folds and nested feature sets. The per-gene and batch contracts are its special cases.
 The harness also records each prediction with the SV columns set to their training means, for SV credit.
 Methods never see test phenotypes: the harness builds TrainData (genotypes, phenotype, variant annotations) and
 passes only test genotypes to ``predict``. Test phenotypes are read only when scoring.
@@ -22,7 +25,7 @@ import subprocess
 import os
 import pathlib
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -54,6 +57,9 @@ class Variants:
     source: np.ndarray
     # Row of each variant in its gene window (load_gene_window's table), a stable key for saved coefficients.
     window_row: np.ndarray = None
+    # Row of each variant in its chromosome's variant table: with source, it identifies one column across overlapping
+    # gene windows, so a method can share work between genes (fit_views).
+    chromosome_row: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -180,6 +186,7 @@ class GeneWindow:
     tss: int
     genotypes: np.ndarray
     table: pd.DataFrame
+    chromosome_rows: np.ndarray = None
 
 
 def load_gene_window(dataset: Dataset, gene_row: int):
@@ -188,6 +195,7 @@ def load_gene_window(dataset: Dataset, gene_row: int):
     rows = dataset.cis_rows(chrom, tss)
     table, dosage = dataset.chromosome(chrom)
     genotypes, window_table = np.asarray(dosage[rows], dtype=np.float32).T, table.iloc[rows].reset_index(drop=True)
+    chromosome_rows = np.asarray(rows)
     overlay = dataset.overlay(chrom)
     if overlay is not None:
         imputed_rows, imputed = overlay
@@ -196,7 +204,9 @@ def load_gene_window(dataset: Dataset, gene_row: int):
             imputed_table = table.iloc[imputed_rows[present]].reset_index(drop=True).assign(source="svimp")
             genotypes = np.hstack([genotypes, imputed[present].T.astype(np.float32)])
             window_table = pd.concat([window_table, imputed_table], ignore_index=True)
-    return GeneWindow(gene_row=gene_row, gene_id=gene["gene_id"], chrom=chrom, tss=tss, genotypes=genotypes, table=window_table)
+            chromosome_rows = np.concatenate([chromosome_rows, imputed_rows[present]])
+    return GeneWindow(gene_row=gene_row, gene_id=gene["gene_id"], chrom=chrom, tss=tss, genotypes=genotypes, table=window_table,
+                      chromosome_rows=chromosome_rows)
 
 
 # The sign of a symbolic allele's length change by its SV type: deletions lose sequence, insertions and duplications
@@ -239,7 +249,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     variants = Variants(position=position, end=end, distance_to_tss=distance, is_sv=selected["is_sv"].to_numpy(dtype=bool),
                         sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=length, allele_length_change=length_change,
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
-                        window_row=np.flatnonzero(polymorphic))
+                        window_row=np.flatnonzero(polymorphic),
+                        chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None)
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]
@@ -401,6 +412,69 @@ class _LazyTrains(Sequence):
         return train, test_genotypes, test_phenotype, test_index
 
 
+class _LazyViews(Mapping):
+    """Every requested (gene_id, split, feature_set) view's training data, built on access; test data unreachable.
+
+    Views are keyed in gene, then split, then feature-set order, and the latest gene's window stays loaded, so a method
+    that walks one gene's views together reads its window once. Variants.chromosome_row (with source) identifies a
+    column across overlapping windows, for sharing between genes."""
+
+    def __init__(self, dataset, gene_rows, split_names, feature_sets):
+        sealed = dataset.sealed_genes()
+        if any(dataset.genes.iloc[row]["gene_id"] in sealed for row in gene_rows):
+            raise ValueError("views may not contain a sealed confirmation gene")
+        self.dataset = dataset
+        self.row_of_gene = {dataset.genes.iloc[row]["gene_id"]: row for row in gene_rows}
+        self.keys_in_order = [(dataset.genes.iloc[row]["gene_id"], split, feature_set) for row in gene_rows for split in split_names for feature_set in feature_sets]
+        self.key_set = set(self.keys_in_order)
+        self._window = None
+
+    def __len__(self):
+        return len(self.keys_in_order)
+
+    def __iter__(self):
+        return iter(self.keys_in_order)
+
+    def __contains__(self, key):
+        return key in self.key_set
+
+    def __getitem__(self, key):
+        return self._task(key)[0]
+
+    def _task(self, key):
+        if key not in self.key_set:
+            raise KeyError(key)
+        gene_id, split_name, feature_set = key
+        if self._window is None or self._window.gene_id != gene_id:
+            self._window = load_gene_window(self.dataset, self.row_of_gene[gene_id])
+        train, test_genotypes, test_phenotype, test_index = build_gene_task(self.dataset, self._window, self.dataset.splits[split_name])
+        train, test_genotypes = subset(train, test_genotypes, feature_set, split_name)
+        return train, test_genotypes, test_phenotype, test_index
+
+
+def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
+    """fit_views(views) returns a mapping {key: predictor}, or yields (key, predictor) pairs so predictors needn't all be
+    held at once. Every requested key must come back exactly once."""
+    views = _LazyViews(dataset, gene_rows, split_names, feature_sets)
+    started = time.process_time()
+    returned = fit_views(views)
+    pairs = returned.items() if isinstance(returned, Mapping) else returned
+    seen = set()
+    for key, predictor in pairs:
+        if key not in views or key in seen:
+            raise ValueError(f"fit_views returned an unrequested or repeated view {key}")
+        seen.add(key)
+        seconds = (time.process_time() - started) / len(views)
+        train, test_genotypes, test_phenotype, test_index = views._task(key)
+        prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
+        without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
+                      if train.variants.is_sv.any() else prediction)
+        yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
+               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]))
+    if len(seen) != len(views):
+        raise ValueError(f"fit_views returned {len(seen)} of {len(views)} requested views")
+
+
 def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
     for split_name in split_names:
         for feature_set in feature_sets:
@@ -440,6 +514,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     position_of_row = {row: position for position, row in enumerate(gene_rows)}
     if contract == "batch":
         results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
+    elif contract == "views":
+        results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
         results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir) for result in chunk)
     coefficient_tables = []
@@ -491,7 +567,8 @@ if __name__ == "__main__":
     parser.add_argument("--gene-prefix", type=int, help="run only genes among the first N of the sealed gene_order.tsv")
     parser.add_argument("--genes", help="run only the genes a TSV with a gene_id column names (a frozen screened list)")
     parser.add_argument("--confirmation", action="store_true", help="score only the sealed confirmation genes (only when the lead calls it)")
-    parser.add_argument("--contract", choices=["gene", "batch"], default="gene", help="gene: fit(train); batch: fit_batch(trains) once per split")
+    parser.add_argument("--contract", choices=["gene", "batch", "views"], default="gene",
+                        help="gene: fit(train); batch: fit_batch(trains) once per split; views: fit_views(views) once over every view")
     parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
     parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
     arguments = parser.parse_args()
