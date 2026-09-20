@@ -632,12 +632,52 @@ def test_a_thin_middle_block_leaves_the_window_positive_semidefinite():
     columns = _genotypes(generator, 2000, 205, 0.99)
     blocks = (np.arange(0, 100), np.arange(100, 105), np.arange(105, 205))
     grams = _grams(columns, blocks)
-    gram, _columns, _own = marginal_variances_module._window(grams, 1)
-    zero_corner = gram.copy()
-    zero_corner[:100, 105:] = 0.0
-    zero_corner[105:, :100] = 0.0
-    assert np.linalg.eigvalsh(zero_corner)[0] < 0.0
-    assert np.linalg.eigvalsh(gram)[0] >= -np.finfo(np.float64).eps * gram.shape[0] * np.linalg.norm(gram)
+    gram, _columns, own = marginal_variances_module._window(grams, 1)
+    assert np.linalg.eigvalsh(gram)[0] < 0.0
+    _completed, whitened, _root = marginal_variances_module._whitened_window(gram, np.ones(gram.shape[0]), own, 1, np)
+    assert np.linalg.eigvalsh(whitened)[0] >= -marginal_variances_module._storage_allowance(whitened, np)
+
+
+def _unregularized_corner(gram: np.ndarray, own: slice) -> np.ndarray:
+    """The window with the completion R_{b-1,b} R_bb^+ R_{b,b+1} and no rounding allowance."""
+    completed = gram.copy()
+    first, last = slice(0, own.start), slice(own.stop, gram.shape[0])
+    corner = completed[first, own] @ np.linalg.lstsq(completed[own, own], completed[own, last], rcond=None)[0]
+    completed[first, last] = corner
+    completed[last, first] = corner.T
+    return completed
+
+
+def test_a_singular_float32_middle_block_completes_within_its_rounding():
+    # e2e-scale's full chr22 failure in small: n < |b| makes R_bb singular, float32 storage leaves its null space at
+    # the rounding level, and R_bb^+ amplifies the rounding of R_{b,b+1} there past the allowance. The completion of
+    # B + eps I stays inside it, and the marginals are computed.
+    generator = np.random.default_rng(32)
+    columns = _genotypes(generator, 120, 600, 0.99)
+    blocks = (np.arange(0, 200), np.arange(200, 400), np.arange(400, 600))
+    exact = _grams(columns, blocks)
+    stored = BlockGrams(blocks=blocks, within=tuple(w.astype(np.float32) for w in exact.within),
+                        next_cross=tuple(c.astype(np.float32) for c in exact.next_cross))
+    gram, _columns, own = marginal_variances_module._window(stored, 1)
+    unregularized = _unregularized_corner(gram, own)
+    assert np.linalg.eigvalsh(unregularized)[0] < -marginal_variances_module._storage_allowance(unregularized, np)
+    _completed, whitened, _root = marginal_variances_module._whitened_window(gram, np.ones(gram.shape[0]), own, 1, np)
+    assert np.linalg.eigvalsh(whitened)[0] >= -marginal_variances_module._storage_allowance(whitened, np)
+    precision = np.full(600, 600 / 0.5)
+    solve = _solve(columns, precision, np.zeros(0, dtype=np.int64))
+    variances = marginal_variances(solve, stored)
+    assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
+
+
+def test_a_refused_window_names_its_block_and_the_inconsistent_piece():
+    generator, columns, precision, blocks, solve = _strong_case(27)
+    grams = _grams(columns, blocks)
+    other = generator.standard_normal(columns.shape)
+    cross = list(grams.next_cross)
+    cross[1] = 3.0 * (other[:, blocks[1]].T @ other[:, blocks[2]])
+    wrong = BlockGrams(blocks=grams.blocks, within=grams.within, next_cross=tuple(cross))
+    with pytest.raises(ValueError, match=r"^block [12]: .*with the next block|^block [12]: .*with the previous block"):
+        marginal_variances(solve, wrong)
 
 
 def test_probes_to_decide_takes_a_per_block_tolerance_with_mixed_decisions():
