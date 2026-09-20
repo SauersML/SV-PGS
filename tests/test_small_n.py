@@ -606,3 +606,39 @@ def test_frozen_passes_that_do_not_contract_fall_back_to_the_double_loop(monkeyp
     precision, shift = true_targets(start, Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift))
     divergence = oracle.kernel.update_divergence(oracle.noise, precision - oracle.site_precision, shift - oracle.site_shift, oracle.mean)
     assert divergence <= 0.5 / 64
+
+
+def test_the_log_evidence_is_the_references_and_selection_keeps_the_highest(monkeypatch):
+    """``_log_evidence`` is ``tests/ep_eb_reference.site_state``'s log Z_EP in small_n's units (on the engine's tilted
+    moments), and ``_best_double_loop`` keeps the candidate fixed point with the highest (lead ruling)."""
+    import tests.ep_eb_reference as reference
+    from sv_pgs import small_n
+    from sv_pgs.small_n import _best_double_loop, _log_evidence
+
+    noise = 0.6
+    design, target, prior, hyperparameters, tilted, largest = _engine_problem(52, 14, 9, noise)
+
+    def power_moments(_prior, _vector, cavity_precision, cavity_shift):
+        log_normalizer, mean, variance, third, fourth = tilted(cavity_precision, cavity_shift)
+        return {
+            "log_normalizer": log_normalizer, "first": mean, "second": variance + mean**2, "third": third + 3.0 * mean * variance + mean**3,
+            "fourth": fourth + 3.0 * variance**2 + 4.0 * mean * third + 6.0 * mean**2 * variance + mean**4,
+        }
+
+    monkeypatch.setattr(reference, "tilted_power_moments", power_moments)
+    rng = np.random.default_rng(53)
+    precision, shift = rng.uniform(0.5, 3.0, 9), 0.3 * rng.standard_normal(9)
+    likelihood_precision, linear_term = design.T @ design / noise, design.T @ target / noise
+    expected = reference.site_state(None, np.zeros(1), likelihood_precision, linear_term, precision, shift).log_evidence
+    got = _log_evidence(_Design.dense(design), noise, design.T @ target, precision, shift, tilted)
+    np.testing.assert_allclose(got, expected, rtol=1e-10)
+    # Two candidate fixed points (the double loop's result stubbed per start): the one with the higher log Z_EP wins.
+    candidates = [(precision, shift), (precision * 1.5, shift * 0.5)]
+    results = iter(candidates)
+    monkeypatch.setattr(small_n, "double_loop_sites", lambda *arguments, **keywords: next(results))
+    evidence = [_log_evidence(_Design.dense(design), noise, design.T @ target, p_, s_, tilted) for p_, s_ in candidates]
+    profile = _new_profile()
+    chosen = _best_double_loop(_Design.dense(design), noise, design.T @ target, candidates, tilted, largest, 64, 10**9, profile)
+    best = candidates[int(np.argmax(evidence))]
+    np.testing.assert_array_equal(chosen[0], best[0])
+    assert profile["double_loop_candidates"] == 2

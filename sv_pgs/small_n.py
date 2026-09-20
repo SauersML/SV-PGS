@@ -949,13 +949,50 @@ def double_loop_sites(
             return precision, shift
 
 
+def _log_evidence(design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted) -> float:
+    """log Z_EP at these sites, up to terms shared by every candidate at the same hyperparameters and noise (the
+    fixed-point selection's criterion, lead ruling; ``tests/ep_eb_reference.site_state``'s log_evidence in small_n's
+    units): 1/2 r' A'^-1 r / sigma^2 - 1/2 log |A'| + p/2 log sigma^2 + sum_j log Z~_j - sum_j (m_j^2 / (2 v_j) + log(v_j) / 2),
+    r = Xp'y + sigma^2 nu, with every cavity from the kernel without cancellation."""
+    kernel = _Kernel(design, noise * site_precision)
+    right = data_score + noise * site_shift
+    mean = kernel.solve(right)
+    variances, _removed, cavity_scaled = kernel.cavity()
+    variance = noise * variances
+    log_normalizer = tilted(cavity_scaled / noise, mean / variance - site_shift)[0]
+    return (
+        0.5 * float(right @ mean) / noise - 0.5 * kernel.log_determinant() + 0.5 * mean.shape[0] * float(np.log(noise))
+        + float(np.sum(log_normalizer)) - float(np.sum(0.5 * np.square(mean) / variance + 0.5 * np.log(variance)))
+    )
+
+
+def _best_double_loop(
+    design: _Design, noise: float, data_score: F64Array, starts: Sequence[tuple[F64Array, F64Array]], tilted: Tilted, largest_variance: F64Array,
+    draw_count: int, jvp_bytes: int, profile: dict,
+) -> tuple[F64Array, F64Array]:
+    """The double loop from every start that lies in EP's domain, keeping the fixed point with the highest log Z_EP
+    (lead ruling: EP's fixed point is not unique in general, and the selection is by the evidence)."""
+    best: tuple[float, F64Array, F64Array] | None = None
+    for precision, shift in starts:
+        if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
+            continue
+        found = double_loop_sites(design, noise, data_score, precision, shift, tilted, largest_variance, draw_count, jvp_bytes, profile)
+        evidence = _log_evidence(design, noise, data_score, found[0], found[1], tilted)
+        profile["double_loop_candidates"] += 1
+        if best is None or evidence > best[0]:
+            best = (evidence, found[0], found[1])
+    if best is None:
+        raise NoFixedPoint("no start of the double loop lies in EP's domain (the moment-matched sites leave the precision singular)")
+    return best[1], best[2]
+
+
 # ------------------------------------------------------------------ the EP fixed points (Stage 2's, exact)
 
 
 def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
-        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary",
+        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
@@ -1144,22 +1181,14 @@ class _DenseFixedPoints:
 
     def _double_loop(self, hyperparameters: MixtureHyperparameters) -> None:
         """EP's fixed point at these hyperparameters and noise by the double loop (``double_loop_sites``), from the
-        current sites when they lie in EP's domain, else from the prior's moment-matched sites (always inside it)."""
+        current sites and from the prior's moment-matched ones (whichever lie in EP's domain), keeping the one with the
+        highest log Z_EP (``_best_double_loop``)."""
         self.profile["double_loops"] += 1
         largest = self._largest_variances(hyperparameters)
         tilted = self._tilted(hyperparameters)
-        start_precision, start_shift = self.site_precision, self.site_shift
-        if not _in_domain(self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest):
-            start_precision, start_shift = moment_matched_prior_sites(self.prior, hyperparameters)
-            if not _in_domain(self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest):
-                # Every strictly positive site precision lies in EP's domain (A' is then positive definite and every
-                # cavity precision non-negative). The moment-matched ones leave it only where 1/E[beta^2] underflows to 0,
-                # i.e. where the trial's prior second moment overflows: that trial has no representable start, and the
-                # outer loop halves its step (fit-api pool5).
-                raise NoFixedPoint("the trial's prior second moment overflows: its moment-matched sites leave the precision singular")
-        precision, shift = double_loop_sites(
-            self.design, self.noise, self.data_score, start_precision, start_shift, tilted, largest, self.draw_count,
-            self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
+        starts = [(self.site_precision, self.site_shift), moment_matched_prior_sites(self.prior, hyperparameters)]
+        precision, shift = _best_double_loop(
+            self.design, self.noise, self.data_score, starts, tilted, largest, self.draw_count, self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
         )
         self.site_precision, self.site_shift = precision, shift
         self._iterate(precision, shift)
