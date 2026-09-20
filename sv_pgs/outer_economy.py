@@ -142,7 +142,8 @@ class EconomicalDualGaussian(DualGaussian):
 
     # -- state for restores (item 4) ------------------------------------------------------------------------------
     def save(self) -> dict:
-        state = {name: getattr(self, name) for name in _SOLVER_STATE}
+        # Before the first mean solve some of these are not set yet (the oracle snapshots at its first call).
+        state = {name: getattr(self, name, None) for name in _SOLVER_STATE}
         state["_state"] = dict(self._state)
         if "blocks" in state["_state"]:
             state["_state"]["blocks"] = dict(state["_state"]["blocks"])

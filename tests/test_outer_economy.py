@@ -153,6 +153,8 @@ def test_a_saved_state_restores_the_solver_without_a_read() -> None:
     genotypes, covariates, training, noise, precision, shift, response, offsets = problem
     bound = np.sqrt(EPS) * _scales(problem)
     keywords = dict(noise_variance=noise, error_bound=bound, probe_residual_ratio=np.sqrt(EPS))
+    # The oracle snapshots before the first mean solve too.
+    economy.save()
     economy.iterate(site_precision=precision, site_shift=shift, **keywords)
     saved = economy.save()
     economy.iterate(site_precision=precision * 1.05, site_shift=shift * 0.95, **keywords)
