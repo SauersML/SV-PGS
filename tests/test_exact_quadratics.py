@@ -64,8 +64,11 @@ def _fit(seed: int, bound: float, duplicated: int = 0, noise_variance: float | N
     design = _design(genotypes, covariates, training)
     grams = _grams(design, bounds)
     if noise_variance is not None:
-        # Stage 0's shared float32 Grams with the model's metric 1 / sigma^2 as their scale
+        # Stage 0's shared float32 Grams with the model's metric 1 / sigma^2 as their scale. The sites scale with it,
+        # so A = (X'X + Pi) / sigma^2 and every D_j ||xt_j||^2, hence the resolved set, is the unit-noise fit's.
         noise = np.full(1, noise_variance)
+        precision = precision / noise_variance
+        shift = shift / noise_variance
         grams = BlockGrams(blocks=grams.blocks, within=tuple(w.astype(np.float32) for w in grams.within),
                            next_cross=tuple(c.astype(np.float32) for c in grams.next_cross), scale=1.0 / noise_variance)
     gaussian = dual_solve.DualGaussian(source=dual_solve.DenseDualSource(genotypes, bounds), training=training, targets=response, offsets=np.zeros_like(response),
