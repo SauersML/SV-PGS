@@ -41,7 +41,7 @@ from typing import Any, Callable, Iterator, Protocol
 
 import numpy as np
 
-from sv_pgs.marginal_variances import BlockGrams, BulkSolve, WindowCross
+from sv_pgs.marginal_variances import BlockGrams, BulkSolve, KernelFactor, WindowCross, exact_block_information
 
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
@@ -1556,3 +1556,54 @@ class DualGaussian:
         bound = array_module.asarray(error_bound, dtype=array_module.float64)[array_module.asarray(draw_models)]
         draws, _norms = self.draws_from_noise(prior_noise=prior_noise, sample_noise=sample_noise, resolved_noise=resolved_noise, draw_models=draw_models, error_bound=bound)
         return draws.reshape(self.source.variant_count, self.model_count, draw_count)
+
+    def _design_block(self, model: int, start: int, stop: int, tile: DualTile) -> Any:
+        """Xt_b = (I - H) W^1/2 X_b of one block for model m, dense (n x p_b)."""
+        return self._state["models"].design_to_sample(tile.columns(np.arange(stop - start)), self.array_module.full(stop - start, model))
+
+    def kernel_factor(self, model: int) -> KernelFactor:
+        """Model m's bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely at the last iterate's sites (host).
+
+        For shapes whose n x n kernel fits (marginal_variances.exact_route_is_cheaper): one read forms K_S
+        (n^2 p flops), its Cholesky factor gives Z_L = K_S^-1 Xt_L and core = Pi_L + Xt_L'Z_L (Pi_L of any
+        sign). Raises LinAlgError when the core, hence A, is not positive definite.
+        """
+        array_module = self.array_module
+        state = self._state
+        variances = state["models"].variances[:, model]
+        kernel = array_module.eye(self.source.sample_count)
+        for start, stop, tile in self.source.blocks():
+            block = self._design_block(model, start, stop, tile)
+            kernel += (block * variances[start:stop][None, :]) @ block.T
+        # The read multiplies every block by n sample-side columns.
+        self.count.note(self.source.sample_count, 0.0, "kernel-factor")
+        kernel = _host(kernel)
+        lower = np.linalg.cholesky(0.5 * (kernel + kernel.T))
+        block = state["blocks"].get(model)
+        if block is None:
+            return KernelFactor(lower=lower, resolved_solves=np.zeros((lower.shape[0], 0)), resolved_core=np.zeros((0, 0)))
+        design = _host(block.design)
+        resolved_solves = np.linalg.solve(lower.T, np.linalg.solve(lower, design))
+        core = np.diag(_host(block.precision)) + design.T @ resolved_solves
+        core = 0.5 * (core + core.T)
+        np.linalg.cholesky(core)
+        return KernelFactor(lower=lower, resolved_solves=resolved_solves, resolved_core=core)
+
+    def exact_marginals(self, model: int, factor: KernelFactor) -> np.ndarray:
+        """diag(A_m^-1) at the last iterate's sites (host, (p,)), exactly, from `kernel_factor`'s factor: one read.
+
+        Bulk sites take D_j - marginal_variances.exact_block_information, resolved sites diag(core^-1)
+        (A^-1_LL = core^-1, Schur's complement of A's bulk block). No probes and no certificate: the
+        only error is float64 rounding.
+        """
+        variances = _host(self._state["models"].variances[:, model])
+        marginals = np.empty(self.source.variant_count)
+        for start, stop, tile in self.source.blocks():
+            block_variances = variances[start:stop]
+            information = exact_block_information(factor, block_variances, _host(self._design_block(model, start, stop, tile)))
+            marginals[start:stop] = block_variances - information
+        self.count.note(self.source.sample_count, 0.0, "exact-marginals")
+        resolved = self._resolved[model]
+        if resolved.size:
+            marginals[resolved] = np.diag(np.linalg.inv(factor.resolved_core))
+        return marginals

@@ -220,6 +220,28 @@ def test_matheron_draws_have_the_posterior_covariance_exactly() -> None:
         assert np.linalg.norm(covariance - target) <= tolerance
 
 
+def test_exact_marginals_are_the_dense_posterior_diagonal_with_negative_sites() -> None:
+    from sv_pgs.marginal_variances import exact_bulk_diagonal
+
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(81)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=13)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    assert set(negative) <= set(gaussian.bulk_solves[0].resolved)
+    for model in range(MODEL_COUNT):
+        posterior_precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+        factor = gaussian.kernel_factor(model)
+        marginals = gaussian.exact_marginals(model, factor)
+        assert np.all(marginals > 0.0)
+        rounding = np.linalg.cond(posterior_precision) * genotypes.shape[0] * EPS
+        np.testing.assert_allclose(marginals, np.diag(np.linalg.inv(posterior_precision)), rtol=rounding, atol=0.0)
+        # The same factor gives each sample's leverage xt_i' Sigma xt_i = 1 - Q_ii exactly, with
+        # Q = K_S^-1 - Z_L core^-1 Z_L': the bulk diagonal minus the resolved term, added once.
+        leverage = np.einsum("ij,ji->i", design, np.linalg.solve(posterior_precision, design.T))
+        resolved_term = np.einsum("ij,ji->i", factor.resolved_solves, np.linalg.solve(factor.resolved_core, factor.resolved_solves.T)) if factor.resolved_solves.shape[1] else 0.0
+        np.testing.assert_allclose(1.0 - (exact_bulk_diagonal(factor) - resolved_term), leverage, rtol=0.0, atol=rounding)
+
+
 def test_the_fused_final_pass_gives_weights_scores_certificates_and_design_products() -> None:
     genotypes, source, models, covariates, weights, variances, prior_mean, response = _setup(5)
     rng = np.random.default_rng(11)
