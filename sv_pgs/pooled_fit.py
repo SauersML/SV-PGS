@@ -339,6 +339,13 @@ class _PooledFixedPoints:
         # The oracle's memory holds the live kernel sets (the current fixed point's, a trial's, and the snapshot a refused
         # trial restores) and the live fixed points' posteriors (the current one and a trial's), which share the rest.
         kernel_bytes = sum(_held_bytes(kernel) for kernel in self.kernels)
+        live_kernels = (_LIVE_FIXED_POINTS + 1) * kernel_bytes
+        if live_kernels > self.working_bytes:
+            # The kernel sets are a need, not a share: fail before the fit overruns its memory (svpgs-pooled-run).
+            raise MemoryError(
+                f"the pooled fit's live kernel sets need {live_kernels / 1e9:.2f} GB, more than the oracle's "
+                f"{self.working_bytes / 1e9:.2f} GB: give the fit at least {2 * live_kernels / 1e9:.2f} GB after its Stage 0 arrays"
+            )
         share = max(self.working_bytes - (_LIVE_FIXED_POINTS + 1) * kernel_bytes, 0) // _LIVE_FIXED_POINTS
         return _PooledPosterior(self.kernels, self.noise.copy(), self.rows, share, self.profile).gaussian_posterior()
 

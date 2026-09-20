@@ -369,18 +369,32 @@ class BenchRealPredictor:
         return score
 
 
+def _resident_bytes() -> int:
+    """This process's resident memory (Linux ``/proc/self/statm``)."""
+    with open("/proc/self/statm", encoding="utf-8") as handle:
+        return int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
 def one_core_budget() -> ComputeBudget:
     """One core's share of the machine: bench-real fits one gene per forked worker, one worker per core (its
     ``--workers`` defaults to the task's cores), so each fit gets one thread and its share of host memory, on the CPU
-    (a device can't be split between the workers)."""
+    (a device can't be split between the workers). MemAvailable and the cgroup headroom already exclude what the
+    workers hold; the runner's per-task allotment covers the whole task, so each worker's share of it is reduced by
+    what this worker already holds (svpgs-profiler: shares that ignored it summed past the allotment)."""
     machine = detect_compute_budget()
+    host_bytes = machine.host_bytes // machine.cpu_threads
+    allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
+    if allotment is not None:
+        host_bytes = min(host_bytes, int(allotment) // machine.cpu_threads - _resident_bytes())
+    if host_bytes <= 0:
+        raise MemoryError("a worker's share of the task's memory allotment is already spent by what it holds.")
     return ComputeBudget(
         device_kind="cpu",
         device_ids=(),
         device_names=(),
         device_bytes=(),
         device_compute_capabilities=(),
-        host_bytes=machine.host_bytes // machine.cpu_threads,
+        host_bytes=host_bytes,
         cpu_threads=1,
     )
 
@@ -394,9 +408,7 @@ def process_budget() -> ComputeBudget:
     host_bytes = machine.host_bytes
     allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
     if allotment is not None:
-        with open("/proc/self/statm", encoding="utf-8") as handle:
-            resident = int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-        host_bytes = min(host_bytes, int(allotment) - resident)
+        host_bytes = min(host_bytes, int(allotment) - _resident_bytes())
     if host_bytes <= 0:
         raise MemoryError("the task's memory allotment is already spent by the loaded views.")
     return ComputeBudget(

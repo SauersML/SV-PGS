@@ -254,8 +254,13 @@ def test_each_bench_real_fit_gets_one_cores_share(monkeypatch: pytest.MonkeyPatc
         host_bytes=(1 << 36) + 5, cpu_threads=16,
     )
     monkeypatch.setattr(svpgs_method, "detect_compute_budget", lambda: machine)
+    monkeypatch.delenv("RUNQ_MEM_BYTES", raising=False)
     budget = svpgs_method.one_core_budget()
     assert (budget.device_kind, budget.cpu_threads, budget.host_bytes) == ("cpu", 1, machine.host_bytes // machine.cpu_threads)
+    # Under the runner's allotment, a worker's share is reduced by what it already holds.
+    monkeypatch.setattr(svpgs_method, "_resident_bytes", lambda: 1 << 20)
+    monkeypatch.setenv("RUNQ_MEM_BYTES", str(1 << 34))
+    assert svpgs_method.one_core_budget().host_bytes == (1 << 34) // 16 - (1 << 20)
 
 
 def test_both_harnesses_load_the_method_file_their_own_way() -> None:
