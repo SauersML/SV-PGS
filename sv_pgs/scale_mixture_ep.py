@@ -42,8 +42,9 @@ with no point mass at zero.
 - The lattice is a quadrature rule: its floor, top, spacing and extent are
   derived from the data and a tolerance (``kernel_floor``, ``kernel_top``,
   ``spacing_bound``, ``tail_mass``). Below the floor every kernel is flat to
-  that tolerance, so those nodes carry the density's mass with no kernel
-  evaluation: an exact effective zero, not a point mass.
+  that tolerance (log Z's error there is bounded), but each node keeps its own
+  variance v = u e^t in the kernel, so a density with its mass below the floor
+  is a near-zero effect, never a point mass at zero (review-mathbugs N1).
 - o_j = log r2_j is the measurement offset, with coefficient exactly 1 by
   derivation (the prior is on the true genotype's effect).
 - d_j is the annotation row centred within its class; theta splits into
@@ -366,8 +367,8 @@ def scale_mixture_prior(
 ) -> ScaleMixturePrior:
     """Validate and centre the prior's inputs and lay out x; every class in 0..C-1 must have a member.
 
-    ``nodes`` is the uniform lattice in t; nodes below ``floor`` carry mass with a
-    flat kernel, and [floor, top] is the kernel range. x is laid out as (eta_bar in
+    ``nodes`` is the uniform lattice in t; below ``floor`` the kernel is flat to the lattice's tolerance (each node
+    still takes its own variance), and [floor, top] is the kernel range. x is laid out as (eta_bar in
     sum-to-zero coordinates, each class's deviation delta_c in the same
     coordinates when there are several classes, theta).
     """
@@ -644,14 +645,15 @@ class _Components:
 
 
 def _kernel_terms(
-    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
+    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array
 ) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
-    """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node; v = 0 below
-    ``floor``. Written so that an overflowing v (a node far past every effect's scale) gives its limits
-    v r = 1/P, r = 0, qr = 1 and a component of weight zero, not inf * 0."""
-    # An overflowing v and a flat node's v = 0 are both meant: the reciprocal forms below take their limits exactly.
+    """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node, with the
+    node's own variance v = u e^t (below the kernel floor too: the floor only bounds log Z's error there, and a flat
+    kernel's v = 0 would make those nodes a point mass at zero, which the model does not have; review-mathbugs N1).
+    Written so that an overflowing v (a node far past every effect's scale) gives its limits v r = 1/P, r = 0,
+    qr = 1 and a component of weight zero, not inf * 0; an underflowing v gives v r = 0 and r = 1 exactly."""
     with np.errstate(over="ignore", divide="ignore"):
-        variance = np.where(grid[None, :] >= floor, np.exp(log_scale_rows[:, None] + grid[None, :]), 0.0)
+        variance = np.exp(log_scale_rows[:, None] + grid[None, :])
         column_precision = precision[:, None]
         ratio = variance * column_precision
         if np.any(ratio <= -1.0):
@@ -665,20 +667,20 @@ def _kernel_terms(
 
 
 def _log_normalizers(
-    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
+    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array
 ) -> F64Array:
-    return _log_sum_exp(_kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)[3], axis=1)
+    return _log_sum_exp(_kernel_terms(log_density, log_scale_rows, grid, precision, shift)[3], axis=1)
 
 
 def _components(
-    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, floor: float, precision: F64Array, shift: F64Array
+    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array
 ) -> _Components:
     """With q = vP, r = 1/(1+q) and a = h^2 v r (so dr/deta = -r(1 - r) and da/deta = a r), each derivative of
     log Z_k in eta = log u is a A_n(r) - B_n(r): d1 = (a - q) r / 2, then A_(n+1) = r A_n - r(1 - r) A_n' and
     B_(n+1) = -r(1 - r) B_n', giving A_2 = r^2 - r/2, B_2 = r(1 - r)/2, A_3 = 3r^3 - 3r^2 + r/2,
     B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
-    Nodes below ``floor`` have a flat kernel: v = 0 there."""
-    conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, floor, precision, shift)
+    Every node takes its own variance v = u e^t (``_kernel_terms``)."""
+    conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, precision, shift)
     log_normalizer = _log_sum_exp(log_component, axis=1)
     responsibility = np.exp(log_component - log_normalizer[:, None])
     return _Components(
@@ -706,7 +708,7 @@ def _class_terms(
     for class_position, class_rows in enumerate(prior.class_rows):
         for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
             yield class_position, rows, _components(
-                log_density[class_position], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+                log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
             )
 
 
@@ -758,15 +760,16 @@ def quadrature_majorant_ratio(
 ) -> float:
     """sum_j M_j / Z_j with M_j = max(Z_j, sum_k pi_k |L_j(t_k + i pi/2)|), for ``spacing_bound``.
 
-    At t + i pi/2 the variance is i v, so log|L| = -log(1 + q^2)/4 + h^2 v q / (2 (1 + q^2)); flat nodes stay at 1.
+    At t + i pi/2 the variance is i v, so log|L| = -log(1 + q^2)/4 + h^2 v q / (2 (1 + q^2)), at every node with its
+    own v (``_kernel_terms``).
     """
     log_density = class_log_density(prior, hyperparameters.coefficients)
     scales = log_scale(prior, hyperparameters.coefficients)
-    kernel = prior.log_variance_grid[None, :] >= prior.kernel_floor
     total = 0.0
     for class_position, class_rows in enumerate(prior.class_rows):
         for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
-            variance = np.where(kernel, np.exp(scales[rows][:, None] + prior.log_variance_grid[None, :]), 0.0)
+            with np.errstate(over="ignore"):
+                variance = np.exp(scales[rows][:, None] + prior.log_variance_grid[None, :])
             ratio = variance * cavity.precision[rows][:, None]
             shift_square = np.square(cavity.shift[rows])[:, None]
             log_real = log_density[class_position] - 0.5 * np.log1p(ratio) + 0.5 * shift_square * variance / (1.0 + ratio)
@@ -876,7 +879,7 @@ def _data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity
     for class_position, class_rows in enumerate(prior.class_rows):
         for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
             total += float(np.sum(_log_normalizers(
-                log_density[class_position], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+                log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
             )))
     return total
 
@@ -1007,6 +1010,11 @@ class GaussianPosterior:
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
     # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
+
+
+class NoCertifiedProgress(FloatingPointError):
+    """The outer loop's step shrank to double precision with every trial refused, where no uncertified fit can be
+    returned honestly (the weights have no evaluated step, or B + S is indefinite there)."""
 
 
 class LinearResponseError(RuntimeError):
@@ -1151,7 +1159,7 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         weights = terms.responsibility
         conditional = terms.conditional_variance
         retained = _kernel_terms(
-            class_log_density(prior, coefficients)[_class], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            class_log_density(prior, coefficients)[_class], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
         )[1]
         centre = cavity.shift[rows][:, None] * conditional
 
@@ -1233,7 +1241,7 @@ def _total_curvature_columns(
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
-    # A variant whose tilted law is a point mass at zero (all its prior mass on flat-kernel nodes: v = 0) does not
+    # A variant whose tilted law is a point mass at zero (all its prior mass where v = u e^t underflows to 0) does not
     # respond: its mean and every derivative are zero for every cavity, so dh = dP = 0 exactly (the limit of the map,
     # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset (speed-smalln).
     live = derivatives.variance > 0.0
@@ -1267,7 +1275,11 @@ def _total_curvature_columns(
     if posterior.linear_response is not None:
         # The posterior solves its fixed point exactly.
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
-        precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+        try:
+            precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+        except np.linalg.LinAlgError as error:
+            # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
+            raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
     size = int(np.prod(shape))
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
@@ -1281,7 +1293,6 @@ def _total_curvature_columns(
     precondition = None if posterior.local_response is None else posterior.local_response(left, gain, diagonal, weight)
     inner = relative_tolerance
     solution = np.zeros(shape)
-    previous = np.inf
     while True:
         try:
             _shift, offset, start_response = through(np.zeros(shape), inner)
@@ -1309,9 +1320,9 @@ def _total_curvature_columns(
         residual = result.residual_norm
         if residual <= target:
             break
-        if residual >= previous:
-            raise LinearResponseError(f"the EP fixed point's linear response did not converge (true residual {residual:.3e} against {target:.3e})")
-        previous = residual
+        # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
+        # the measured excess each round, which ends where they reach float64's attainable accuracy (the solver then
+        # refuses, above) rather than on one noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34).
         inner *= 0.5 * target / residual
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
@@ -1508,7 +1519,7 @@ def _line(
         for rows in _row_chunks(still, prior.grid_size, working_bytes):
             # L_jk: the kernel's log with a flat class density (its log pi part enters per step).
             row_kernel = _kernel_terms(
-                np.zeros(prior.grid_size), scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+                np.zeros(prior.grid_size), scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
             )[3]
             peak = np.max(row_kernel, axis=1)
             rows_kernels.append((rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel))
@@ -1539,7 +1550,7 @@ def _line(
                 normalizers = _log_normalizers(
                     np.broadcast_to(class_density[None], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
                     (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
-                    prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
+                    prior.log_variance_grid, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
                 )
                 total += normalizers.reshape(rows.shape[0], count).sum(axis=0)
         return total
@@ -1698,8 +1709,17 @@ def _correction_value(
         return None
 
 
+def _coarse_targets(evidence: _Evidence, interior: F64Array, tolerance: float) -> F64Array:
+    """The correction slopes' error per weight before the curvature is known: with s bounding |V''| (MODEL.md S4) and
+    n interior weights, E^2 / (2 s) = tolerance / (4 n) leaves the error a quarter of the tolerance's gain at that
+    curvature (``_stationarity`` tightens it once the difference curvature is in)."""
+    count = max(int(np.count_nonzero(interior)), 1)
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
+    return np.sqrt(0.5 * tolerance * scale / count)
+
+
 def _correction_slopes(
-    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int, targets: F64Array
 ) -> tuple[F64Array, F64Array, F64Array]:
     """The rho-slopes of V's corrections at a corrected evidence, their error estimates, and their second
     differences, per interior weight (zero elsewhere).
@@ -1710,8 +1730,9 @@ def _correction_slopes(
     V's corrections' own, by central differences in rho_i with x on its first-order path x + h dx/drho_i (the
     corrections are smooth there, and no inner maximum is re-solved, so no fold can intervene; x's second-order
     error cancels in the central difference), at the same count of replaced directions. Each correction is resolved
-    to a share e / m of its log (m integrals) with e set so the difference errs by about the Laplace gradient's own
-    error, never below the rounding of the line values (eps times the objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
+    to a share e / m of its log (m integrals) with e set so the difference errs by about ``targets`` (the slope error
+    the certificate can carry, ``_stationarity``), never below the rounding of the line values (eps times the
+    objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
     V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
     halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
     complement is not positive definite there), the one-sided difference on the other side is used, with its larger
@@ -1724,9 +1745,8 @@ def _correction_slopes(
     count = 0 if evidence.replaced_directions is None else int(evidence.replaced_directions.shape[1])
     if count == 0:
         return slopes, errors, second
-    radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
     scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
-    target = scale * radius + _EPSILON * evidence.magnitude
+    target = np.asarray(targets, dtype=np.float64)
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
     for position in np.flatnonzero(interior):
         unit = np.zeros(count_weights)
@@ -1772,26 +1792,6 @@ def _correction_slopes(
     return slopes, errors, second
 
 
-def _halved_data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
-    """sum_j log Z_j with the same density on the lattice of half the spacing (``halved_lattice``'s: each class's
-    log g the natural spline of least roughness through its nodal values), the same scales and kernel floor."""
-    nodes = prior.log_variance_grid
-    finer = np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)
-    log_weights, _scale = _density_and_scale(prior, coefficients)
-    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
-    spline = make_interp_spline(nodes, log_weights.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
-    fine_weights = spline(finer).T
-    log_density = fine_weights - _log_sum_exp(fine_weights, axis=1, keepdims=True)
-    scales = log_scale(prior, coefficients)
-    total = 0.0
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, finer.shape[0], working_bytes):
-            total += float(np.sum(_log_normalizers(
-                log_density[class_position], scales[rows], finer, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
-            )))
-    return total
-
-
 def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
@@ -1802,8 +1802,7 @@ def _corrected(
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None, a line integral cannot be certified, or the lattice does not resolve the density
-    (its trapezoid sum moves by more than the tolerance on half the spacing).
+    None when the evidence is None or a line integral cannot be certified.
     """
     if evidence is None:
         return None
@@ -1817,16 +1816,8 @@ def _corrected(
     replaced = int(np.argmax(remaining <= 0.5 * tolerance))
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
-    # The lattice must resolve the density x_rho puts on it (lead ruling B): the same density on half the spacing
-    # changes sum_j log Z_j by the trapezoid's error at h (the rule converges geometrically in 1/h for these analytic
-    # integrands, so the h/2 sum is exact beside it). A density narrower than the spacing aliases to a few atoms, whose
-    # lattice sum rises above any continuous density's [semi-real, oracle's v7 x1000 windows: 23.59 to 24.27]; its
-    # halved sum falls back. Where the difference exceeds the tolerance, V is not certified there and never steers.
-    quadrature = abs(_halved_data_value(prior, evidence.coefficients, cavity, working_bytes) - _data_value(prior, evidence.coefficients, cavity, working_bytes))
-    if quadrature > tolerance:
-        return None
     return replace(
-        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder + quadrature,
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
     )
 
@@ -2348,11 +2339,11 @@ class _Stationarity:
 
 
 def _full_gradient(
-    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int, targets: F64Array
 ) -> tuple[F64Array, F64Array, F64Array]:
     """The certified V's rho-gradient, its error, and the corrections' second differences: the Laplace part's
-    gradient (exact at x_rho) plus the corrections' own slopes (``_correction_slopes``)."""
-    correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes)
+    gradient (exact at x_rho) plus the corrections' own slopes to ``targets`` (``_correction_slopes``)."""
+    correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes, targets)
     # x_rho's own error moves the Laplace gradient by its x-slope over x's error, sqrt(2 d) in the -H metric: bounded
     # by the gradient's scale s_i times that radius (the same logistic bound as V's derivatives).
     radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
@@ -2393,7 +2384,10 @@ def _stationarity(
     # The gradient is taken at x_rho resolved to double precision, so x's own error barely enters it.
     refined = _corrected(view, weights, _evidence(view, weights, evidence.coefficients, cavity, correction, working_bytes, 0.0), cavity, correction, working_bytes, tolerance)
     base = evidence if refined is None else refined
-    gradient, error, correction_second = _full_gradient(view, weights, base, interior, cavity, working_bytes)
+    # The corrections' slopes first to the error the curvature bound s allows (cheap), for the gradient's sign; once
+    # the difference curvature K is in, again where K asks for less: E^2 / (2 K) = tolerance / (4 n).
+    coarse = _coarse_targets(base, interior, tolerance)
+    gradient, error, correction_second = _full_gradient(view, weights, base, interior, cavity, working_bytes, coarse)
     scale = np.maximum(0.5 * (base.effective_degrees + base.penalty_sizes), _EPSILON * base.magnitude)
     laplace_error = scale * float(np.sqrt(2.0 * max(base.inner_decrement, 0.0))) + _EPSILON * base.magnitude
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
@@ -2428,9 +2422,19 @@ def _stationarity(
                 folds[position] = 0.0
                 step = max(0.5 * step, limit)
         curvature[:, position] = column
-        curvature[position, position] -= correction_second[position]
         steps[position] = step
     inside = np.flatnonzero(interior)
+    interior_count = max(inside.shape[0], 1)
+    laplace_curvature = np.abs(np.diag(curvature))
+    fine = np.sqrt(0.5 * tolerance * np.maximum(laplace_curvature, _EPSILON * scale) / interior_count)
+    tighter = interior & (fine < coarse)
+    if np.any(tighter):
+        refined_gradient, refined_error, refined_second = _full_gradient(view, weights, base, tighter, cavity, working_bytes, np.minimum(coarse, fine))
+        gradient = np.where(tighter, refined_gradient, gradient)
+        error = np.where(tighter, refined_error, error)
+        correction_second = np.where(tighter, refined_second, correction_second)
+    for position in inside:
+        curvature[position, position] -= correction_second[position]
     curvature[np.ix_(inside, inside)] = 0.5 * (curvature[np.ix_(inside, inside)] + curvature[np.ix_(inside, inside)].T)
     folded = interior & (folds > 0.0)
     open_ = np.flatnonzero(interior & ~folded)
@@ -2561,13 +2565,17 @@ def hyper_step(
 class FixedPoint:
     """A model's certified EP fixed point at a prior's hyperparameters: each variant's cavity, q's linear responses
     there (valid until the next fixed point is solved), q's mean, ``precision_norm(d)`` = d' Sigma^-1 d in q's
-    posterior metric, and the effective number of effects p_eff = p - sum_j tau_j Sigma_jj."""
+    posterior metric, and the effective number of effects p_eff = p - sum_j tau_j Sigma_jj.
+
+    Where one fixed point holds several independently scored models sharing x (the pooled arm's genes),
+    ``precision_norm`` returns one move per model and ``effective_effects`` their p_eff: the prediction check then
+    holds each model to its own budget, so no model uses another's (fit-api P1)."""
 
     cavity: Cavity
     posterior: GaussianPosterior
     mean: F64Array
-    precision_norm: Callable[[F64Array], float]
-    effective_effects: float
+    precision_norm: Callable[[F64Array], float | F64Array]
+    effective_effects: float | F64Array
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
@@ -2582,7 +2590,8 @@ class OuterFit:
     ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
     returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
     tolerance. ``prediction_move`` is the posterior-mean move of the certifying Newton step in q's posterior metric,
-    against ``prediction_tolerance`` = p_eff / K (K = 1 / (2 tolerance) draws). ``iterations`` counts accepted steps,
+    against ``prediction_tolerance`` = 1 / K = 2 tolerance, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (K = 1 / (2
+    tolerance) draws; in evidence units, as every other certificate, so it stays defined where p_eff collapses). ``iterations`` counts accepted steps,
     ``halvings`` the trials refused (by the test, or for having no EP fixed point), and ``unresolved`` those of them
     that had no EP fixed point at all, so a loop that keeps refusing near its answer is visible in the certificate.
     """
@@ -2598,6 +2607,9 @@ class OuterFit:
     unresolved: int
     # The decrement plus the weights' remaining gain at every outer evaluation, in order: the outer rate.
     history: tuple[float, ...]
+    # False when the loop stopped at double precision without certifying (``remaining_gain`` over the tolerance, or the
+    # prediction move unchecked): an honest fit, which callers count and report as uncertified, never as certified.
+    certified: bool = True
 
 
 @dataclass(frozen=True)
@@ -2658,12 +2670,31 @@ def _trial(newton: _NewtonB, step: F64Array) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + step), log_smoothing=newton.log_smoothing)
 
 
+def _newton_step(newton: _NewtonB) -> F64Array:
+    return newton.eigenvectors @ ((newton.eigenvectors.T @ newton.gradient) / newton.eigenvalues)
+
+
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite, else the maximizer of the quadratic model
-    inside ``radius`` (More and Sorensen), which follows B + S's negative curvature out of a saddle."""
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite, shortened to ``radius`` where it is longer,
+    else the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
+    curvature out of a saddle."""
     if newton.definite:
-        return newton.eigenvectors @ ((newton.eigenvectors.T @ newton.gradient) / newton.eigenvalues)
+        step = _newton_step(newton)
+        length = float(np.linalg.norm(step))
+        return step if length <= radius else step * (radius / length)
     return _trust_region_step(newton.total, newton.gradient, radius)
+
+
+def _cauchy_radius(newton: _NewtonB) -> float:
+    """The first trust radius: the Cauchy step's length on |B + S|, ||g||^3 / g'|B + S| g, the model's steepest-ascent
+    maximizer. Newton's step on |B + S| divides each direction's gradient by its own curvature, which the rounding
+    floor on a direction the data barely curve makes astronomically long (review-mathbugs: |x| 1.3e4 on the first
+    trial of a real gene, which put a class's density below the lattice); the Cauchy step weighs the gradient by
+    all the curvature it sees."""
+    components = newton.eigenvectors.T @ newton.gradient
+    curvature = float(np.sum(np.abs(newton.eigenvalues) * np.square(components)))
+    norm = float(np.linalg.norm(newton.gradient))
+    return norm**3 / curvature if curvature > 0.0 else 0.0
 
 
 def fit_hyperparameters(
@@ -2688,10 +2719,12 @@ def fit_hyperparameters(
       model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
       value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
       a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
-      at the length of the step on |B + S|.
+      at the Cauchy step's length on |B + S| (``_cauchy_radius``), and a Newton step longer than the radius is
+      shortened to it.
     The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
     remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
-    by at most p_eff / K in q's posterior metric (MODEL.md: the certificate includes the prediction change), taken
+    by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
+    prediction change; in evidence units, well defined as p_eff -> 0, lead ruling via speed-smalln), taken
     at the step's own EP fixed point, not on the quadratic model. With K = 1 / (2 tolerance) posterior draws that is
     the scorer's own Monte Carlo resolution, as for the EP fixed point. Where the data barely identify a direction
     (the profiled null space at small n) the evidence can be flat to the tolerance while predictions still move; a
@@ -2735,9 +2768,12 @@ def fit_hyperparameters(
                 steps_taken[model] = (step, remaining)
             radius = radii[model]
             if radius is None:
-                magnitudes = np.maximum(np.abs(newton.eigenvalues), _EPSILON * float(np.max(np.abs(newton.eigenvalues))))
-                radius = float(np.linalg.norm((newton.eigenvectors.T @ newton.gradient) / magnitudes))
-            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
+                radius = _cauchy_radius(newton)
+                radii[model] = radius
+            proposal = _proposal(newton, radius)
+            # A Newton step shortened to the radius is its fraction of the full one (the certifying check scales by it).
+            full = float(np.linalg.norm(_newton_step(newton))) if newton.definite else float(np.linalg.norm(proposal))
+            pending[model] = (newton, step, proposal, radius, certifying, 1.0 if full == 0.0 else float(np.linalg.norm(proposal)) / full)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -2754,10 +2790,19 @@ def fit_hyperparameters(
                 current = points[model]
                 # A shortened certifying step moves q's mean by its fraction, to first order: the full step's move is
                 # its own over fraction^2 in the squared metric.
-                move = current.precision_norm(trial_point.mean - current.mean) / (fraction * fraction)
-                allowed_move = 2.0 * tolerance * current.effective_effects
-                if move <= allowed_move:
+                moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64)) / (fraction * fraction)
+                allowed = np.full(moves.shape[0], 2.0 * tolerance)
+                # Reported as the most-used share of a block's budget, in that block's units.
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    shares = np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))
+                worst = int(np.argmax(shares))
+                move, allowed_move = float(moves[worst]), float(allowed[worst])
+                if bool(np.all(moves <= allowed)):
                     certified_step, remaining = steps_taken[model]
+                    # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
+                    # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers the
+                    # move: the decrement at x, and q's mean moved by at most 1 / K in its metric (KL <= 1 / (2K)).
+                    hyperparameters[model], points[model] = trials[model], trial_point
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
                         prediction_move=move, prediction_tolerance=allowed_move, iterations=iterations[model], halvings=halvings[model],
@@ -2781,18 +2826,37 @@ def fit_hyperparameters(
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
                 iterations[model] += 1
-                if not newton.definite:
-                    radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
+                radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
-                raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
+                if newton.definite and step is not None:
+                    # x is at its maximum to double precision (no trial can lower a decrement at its rounding), and what
+                    # stops the certificate is the weights' remaining gain or the prediction check: the fit is returned
+                    # with its measured remaining gain, uncertified, at the point the oracle last solved.
+                    if trial_point is not None:
+                        hyperparameters[model], points[model] = trials[model], trial_point
+                    fits[model] = OuterFit(
+                        hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
+                        remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
+                        prediction_tolerance=2.0 * tolerance,
+                        iterations=iterations[model],
+                        halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
+                    )
+                    pending[model] = None
+                    continue
+                raise NoCertifiedProgress(
+                    "the Newton-B step makes no certified progress at the EP fixed point "
+                    + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
+                )
             # A certifying step refused for having no fixed point stays certifying at half the length; one whose
             # move was too large, or an ordinary one, becomes an ordinary shorter trial.
             keep = certifying and trial_point is None
             if newton.definite:
+                radii[model] = 0.5 * length
                 pending[model] = (newton, step, 0.5 * proposal, radius, keep, 0.5 * fraction)
             else:
                 radius = 0.5 * length
                 radii[model] = radius
                 pending[model] = (newton, step, _proposal(newton, radius), radius, keep, 0.5 * fraction)
+
