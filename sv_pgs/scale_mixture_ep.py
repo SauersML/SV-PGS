@@ -988,7 +988,11 @@ class GaussianPosterior:
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
 
 
-@dataclass(frozen=True)
+class LinearResponseError(RuntimeError):
+    """B's linear response could not be solved to its tolerance. Not a FloatingPointError: the outer loop reads those
+    as "no certified maximum here" and steps on; without B the fit cannot be certified at all."""
+
+
 class CurvatureCorrection:
     """C = B - A at an EP fixed point: the total curvature's EP-response part, in the full prior's x coordinates.
 
@@ -997,17 +1001,69 @@ class CurvatureCorrection:
     exactly, which is where the certificate is taken; elsewhere it is B to first order in x_rho - x_k, as A is. A
     view's coordinates are x = K x_view with M_view = M K, so the correction there is K' C K. For independent effects
     (normal means) the cavities do not move with the prior, so C = 0 (``INDEPENDENT_EFFECTS``).
+
+    Either given whole (``coefficient_map`` and ``matrix``), or formed only where it is asked (``columns``, from
+    ``curvature_correction``): B's linear response is solved for the directions of the views asked for, starting
+    with the free coefficients of the current edges, and extended by the new directions when a view releases an
+    edge (lead ruling: the response on d_free directions, not all D).
     """
 
-    coefficient_map: F64Array | None = None
-    matrix: F64Array | None = None
+    def __init__(
+        self,
+        coefficient_map: F64Array | None = None,
+        matrix: F64Array | None = None,
+        *,
+        mapping: F64Array | None = None,
+        columns: Callable[[F64Array], F64Array] | None = None,
+        fixed_curvature: F64Array | None = None,
+    ) -> None:
+        self.coefficient_map = coefficient_map
+        self.matrix = matrix
+        self._mapping = mapping
+        self._columns = columns
+        self._fixed = fixed_curvature
+        # An orthonormal basis Q (x coordinates) of the directions solved so far, and B_z M Q.
+        self._basis: F64Array | None = None
+        self._total: F64Array | None = None
+
+    @property
+    def solved_directions(self) -> int:
+        """How many directions B's linear response has been solved for (lazy corrections only)."""
+        return 0 if self._basis is None else int(self._basis.shape[1])
 
     def on(self, coefficient_map: F64Array) -> F64Array:
         size = int(coefficient_map.shape[1])
+        if self._columns is not None:
+            return self._lazy(coefficient_map)
         if self.matrix is None or self.coefficient_map is None:
             return np.zeros((size, size))
         basis = np.linalg.lstsq(self.coefficient_map, coefficient_map, rcond=None)[0]
         return basis.T @ self.matrix @ basis
+
+    def _lazy(self, coefficient_map: F64Array) -> F64Array:
+        mapping, columns, fixed = self._mapping, self._columns, self._fixed
+        assert mapping is not None and columns is not None and fixed is not None
+        view = np.linalg.lstsq(mapping, coefficient_map, rcond=None)[0]
+        if view.shape[1] == 0:
+            return np.zeros((0, 0))
+        if self._basis is None:
+            missing = view
+        else:
+            missing = view - self._basis @ (self._basis.T @ view)
+        # A direction is new when the view has a part outside the solved span beyond the span's own rounding.
+        values, vectors = np.linalg.eigh(missing.T @ missing)
+        new = values > _EPSILON * view.shape[0] * max(float(np.max(np.linalg.eigvalsh(view.T @ view))), np.finfo(np.float64).tiny)
+        if np.any(new):
+            added = missing @ vectors[:, new] / np.sqrt(values[new])
+            if self._basis is not None:
+                added -= self._basis @ (self._basis.T @ added)
+            added = np.linalg.qr(added)[0]
+            total = columns(mapping @ added)
+            self._basis = added if self._basis is None else np.column_stack([self._basis, added])
+            self._total = total if self._total is None else np.column_stack([self._total, total])
+        assert self._basis is not None and self._total is not None
+        total = coefficient_map.T @ (self._total @ (self._basis.T @ view))
+        return 0.5 * (total + total.T) - coefficient_map.T @ fixed @ coefficient_map
 
 
 INDEPENDENT_EFFECTS = CurvatureCorrection()
@@ -1016,14 +1072,19 @@ INDEPENDENT_EFFECTS = CurvatureCorrection()
 def curvature_correction(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, tolerance: float
 ) -> CurvatureCorrection:
-    """C = B - A at the EP fixed point with q's responses ``posterior``: one linear-response solve per outer step.
+    """C = B - A at the EP fixed point with q's responses ``posterior``, solved lazily for the directions asked
+    (``CurvatureCorrection``): one linear-response solve per outer step on the free coefficients, and one more per
+    released edge.
 
     B to the tolerance over the dimension (a relative error e in B moves log|B + S| by at most D e for well-scaled
     B + S), never past what double precision resolves."""
-    total = _total_curvature(prior, coefficients, cavity, posterior, working_bytes, max(tolerance / coefficients.shape[0], _EPSILON))
-    mapping = prior.coefficient_map
-    fixed = -(mapping.T @ _data_objective(prior, coefficients, cavity, working_bytes).hessian @ mapping)
-    return CurvatureCorrection(coefficient_map=mapping, matrix=total - 0.5 * (fixed + fixed.T))
+    relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
+    fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    return CurvatureCorrection(
+        mapping=prior.coefficient_map,
+        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions),
+        fixed_curvature=0.5 * (fixed + fixed.T),
+    )
 
 
 def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
@@ -1121,7 +1182,23 @@ def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log
 def _total_curvature(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, relative_tolerance: float
 ) -> F64Array:
-    """B = -d2 log Z_EP / dx2 with EP re-solved, in x: M' B_z M (speed-ep, B_PRODUCTS.md), without re-solving EP.
+    """B in x: M' B_z M (``_total_curvature_columns`` on every direction)."""
+    directions = prior.coefficient_map
+    total = directions.T @ _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions)
+    return 0.5 * (total + total.T)
+
+
+def _total_curvature_columns(
+    prior: ScaleMixturePrior,
+    coefficients: F64Array,
+    cavity: Cavity,
+    posterior: GaussianPosterior,
+    working_bytes: int,
+    relative_tolerance: float,
+    directions: F64Array,
+) -> F64Array:
+    """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
+    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
 
     B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
     B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
@@ -1133,17 +1210,22 @@ def _total_curvature(
     the restart length that fits ``working_bytes``.
     """
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
-    directions = prior.coefficient_map
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     variance = derivatives.variance[:, None]
 
-    def through(precision_step: F64Array, inner: float) -> tuple[F64Array, F64Array, F64Array]:
+    def through(precision_step: F64Array, inner: float, affine: bool = True) -> tuple[F64Array, F64Array, F64Array]:
+        # The map is affine in dP. With ``affine`` False its constant (the E terms) is dropped, which leaves its linear
+        # part exactly: GMRES applies that, so each solve inside is accurate relative to what it applies, not to the
+        # constant, as a difference of two solves would be (speed-recycle a7752ae).
+        mean_constant = mean_by_z if affine else np.zeros_like(mean_by_z)
         mean_step = posterior.solve(
-            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance, inner
+            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_constant / variance, inner
         )
-        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
-        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
+        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_constant) / variance
+        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step
+        if affine:
+            variance_step = variance_step + variance_by_z
         response = variance_step / variance**2 + precision_step
         return shift_step, response + posterior.variance_jvp(response) / variance**2, response
 
@@ -1181,14 +1263,14 @@ def _total_curvature(
             if inner >= relative_tolerance:
                 raise
             # The solver cannot reach the tightened accuracy in float64: the response is not resolvable here.
-            raise FloatingPointError(f"the EP fixed point's linear response cannot be resolved: {error}") from error
+            raise LinearResponseError(f"the EP fixed point's linear response cannot be resolved: {error}") from error
         # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times
         # the terms that cancel, which is where GMRES's residual can stop.
         rounding = _EPSILON * float(np.linalg.norm(start_response))
 
-        def linear_part(vector: F64Array, inner: float = inner, offset: F64Array = offset) -> F64Array:
+        def linear_part(vector: F64Array, inner: float = inner) -> F64Array:
             precision_step = vector.reshape(shape)
-            return (precision_step - (through(precision_step, inner)[1] - offset)).ravel()
+            return (precision_step - through(precision_step, inner, affine=False)[1]).ravel()
 
         operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
         right = offset.ravel()
@@ -1200,7 +1282,7 @@ def _total_curvature(
         if residual <= target:
             break
         if residual >= previous:
-            raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+            raise LinearResponseError(f"the EP fixed point's linear response did not converge (gmres information {information})")
         previous = residual
         inner *= 0.5 * target / residual
     precision_step = solution.reshape(shape)
@@ -1211,13 +1293,11 @@ def _total_from_response(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, derivatives: _VariantDerivatives, directions: F64Array,
     shift_step: F64Array, precision_step: F64Array, working_bytes: int,
 ) -> F64Array:
-    """B in x from the cavity response (dh, dP) to every direction (``_total_curvature``)."""
+    """B_z E from the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
-    total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
+    return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
     )
-    total = directions.T @ total_z
-    return 0.5 * (total + total.T)
 
 
 # ------------------------------------------------------- the Laplace evidence for the weights
