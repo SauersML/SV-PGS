@@ -98,8 +98,7 @@ def test_training_constant_columns_are_dropped_even_when_heterozygous():
     assert list(train.variants.position) == [1]
 
 
-def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
-    import hashlib
+def tiny_dataset(tmp_path):
     import json
 
     generator = np.random.default_rng(3)
@@ -122,6 +121,14 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
     (tmp_path / "splits.json").write_text(json.dumps(split_list))
     (tmp_path / "splits.sha256").write_text("synthetic\n")
     (tmp_path / "gene_annotation.json").write_text(json.dumps({"g1": {"start": 90, "end": 110, "strand": "+", "exons": [[95, 105]], "coding_exons": []}}))
+    return tmp_path
+
+
+def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
+    import hashlib
+    import json
+
+    tiny_dataset(tmp_path)
     method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
     (tmp_path / "screened.tsv").write_text("gene_id\tscore\ng1\t3.2\n")
     harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv")
@@ -230,3 +237,33 @@ def test_a_derived_dataset_must_carry_its_parents_sealed_genes(tmp_path):
         raise AssertionError("a derived dataset without the parent's sealed list must be refused")
     (child / harness.SEALED_GENES).write_bytes((parent / harness.SEALED_GENES).read_bytes())
     assert dataset.sealed_genes() == {"g2"}
+
+
+def test_batch_contract_matches_the_per_gene_contract_for_a_per_gene_method(tmp_path):
+    tiny_dataset(tmp_path)
+    baselines_path = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py"
+    (tmp_path / "batch_method.py").write_text(
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('baselines_for_batch', {baselines_path!r})\n"
+        "baselines = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(baselines)\n\n\n"
+        "def fit_batch(trains):\n"
+        "    return [baselines.top_variant(train) for train in trains]\n")
+    harness.run(tmp_path, f"{baselines_path}:top_variant", "gene", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    harness.run(tmp_path, f"{tmp_path}/batch_method.py:fit_batch", "batch", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="batch")
+    for feature_set in ("snv", "snv_sv"):
+        for kind in ("predictions", "predictions_without_sv"):
+            assert np.array_equal(np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy"),
+                                  np.load(tmp_path / f"results/batch/loso/chr1.{feature_set}.{kind}.npy"))
+
+
+def test_a_batch_refuses_a_sealed_gene(tmp_path):
+    tiny_dataset(tmp_path)
+    pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    dataset = harness.Dataset(tmp_path)
+    try:
+        harness._LazyTrains(dataset, [0], "loso/AFR", "snv")
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a batch containing a sealed gene must be refused")

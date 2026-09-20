@@ -1,6 +1,8 @@
 """The bench-real harness: cis-expression prediction in MAGE with 1kGP SNV/indel and SV genotypes.
 
 A method is a callable ``fit(train: TrainData) -> predictor``; the predictor has ``predict(genotypes) -> np.ndarray``.
+A method that pools hyperparameters across genes uses the batch contract instead:
+``fit_batch(trains: Sequence[TrainData]) -> list[predictor]``, called once per split with every selected gene.
 The harness also records each prediction with the SV columns set to their training means, for SV credit.
 Methods never see test phenotypes: the harness builds TrainData (genotypes, phenotype, variant annotations) and
 passes only test genotypes to ``predict``. Test phenotypes are read only when scoring.
@@ -20,6 +22,7 @@ import subprocess
 import os
 import pathlib
 import time
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
@@ -277,11 +280,65 @@ def _run_gene(arguments):
     return results
 
 
-def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False):
-    """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design."""
+def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers):
     from multiprocessing import get_context
 
+    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets)) as pool:
+        yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
+
+
+class _LazyTrains(Sequence):
+    """The training data of every selected gene for one split and feature set, built on access so the batch never holds
+    every gene's genotypes at once. Test genotypes and phenotypes are not reachable from it."""
+
+    def __init__(self, dataset, gene_rows, split_name, feature_set):
+        sealed = dataset.sealed_genes()
+        if any(dataset.genes.iloc[row]["gene_id"] in sealed for row in gene_rows):
+            raise ValueError("a batch may not contain a sealed confirmation gene")
+        self.dataset, self.gene_rows, self.split_name, self.feature_set = dataset, gene_rows, split_name, feature_set
+
+    def __len__(self):
+        return len(self.gene_rows)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return [self[position] for position in range(*index.indices(len(self)))]
+        train, _, _, _ = self._task(index)
+        return train
+
+    def _task(self, index):
+        window = load_gene_window(self.dataset, self.gene_rows[index])
+        train, test_genotypes, test_phenotype, test_index = build_gene_task(self.dataset, window, self.dataset.splits[self.split_name])
+        train, test_genotypes = subset(train, test_genotypes, self.feature_set, self.split_name)
+        return train, test_genotypes, test_phenotype, test_index
+
+
+def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
+    for split_name in split_names:
+        for feature_set in feature_sets:
+            trains = _LazyTrains(dataset, gene_rows, split_name, feature_set)
+            started = time.process_time()
+            predictors = list(fit_batch(trains))
+            seconds = (time.process_time() - started) / len(gene_rows)
+            if len(predictors) != len(gene_rows):
+                raise ValueError(f"fit_batch returned {len(predictors)} predictors for {len(gene_rows)} genes")
+            for index, (gene_row, predictor) in enumerate(zip(gene_rows, predictors)):
+                train, test_genotypes, test_phenotype, test_index = trains._task(index)
+                prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
+                without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
+                              if train.variants.is_sv.any() else prediction)
+                yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
+                       int(train.variants.is_sv.sum()), seconds)
+
+
+def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
+        confirmation=False, contract="gene"):
+    """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
+
+    contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
+    contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
+    with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
+    sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
     dataset = Dataset(dataset_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
     gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation)
@@ -291,14 +348,16 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
     log = []
     position_of_row = {row: position for position, row in enumerate(gene_rows)}
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets)) as pool:
-        for results in pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1):
-            for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds in results:
-                position = position_of_row[gene_row]
-                predictions[feature_set][position, test_index] = prediction
-                predictions_without_sv[feature_set][position, test_index] = without_sv
-                truth[position, test_index] = test_phenotype
-                log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
+    if contract == "batch":
+        results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
+    else:
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers) for result in chunk)
+    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds in results:
+        position = position_of_row[gene_row]
+        predictions[feature_set][position, test_index] = prediction
+        predictions_without_sv[feature_set][position, test_index] = without_sv
+        truth[position, test_index] = test_phenotype
+        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
     tag = "_".join(chromosomes)
@@ -310,7 +369,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "gene_list": str(gene_list) if gene_list is not None else None, "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
+        "genes": len(gene_rows), "contract": contract, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
@@ -334,6 +393,7 @@ if __name__ == "__main__":
     parser.add_argument("--gene-prefix", type=int, help="run only genes among the first N of the sealed gene_order.tsv")
     parser.add_argument("--genes", help="run only the genes a TSV with a gene_id column names (a frozen screened list)")
     parser.add_argument("--confirmation", action="store_true", help="score only the sealed confirmation genes (only when the lead calls it)")
+    parser.add_argument("--contract", choices=["gene", "batch"], default="gene", help="gene: fit(train); batch: fit_batch(trains) once per split")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
-        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation)
+        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract)
