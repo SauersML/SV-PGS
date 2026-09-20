@@ -85,6 +85,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('dosage_store.py', 'open_column'): ('spec', frozenset({3}), 'Zarr format version 3'),
     ('dosage_store.py', 'chromosome_number'): ('spec', frozenset({22}), 'human autosomes chr1-chr22'),
     ('marginal_variances.py', 'exact_route_is_cheaper'): ('spec', frozenset({9.0, 3.0}), 'leading-order flop counts: symmetric eigendecomposition with vectors about 9 n^3, Cholesky n^3 / 3 (Golub and Van Loan, Matrix Computations, 4th ed., Table 8.3.1 and Section 4.2)'),
+    ('rowdict_codec.py', 'CRC32C_POLYNOMIAL'): ('spec', frozenset({0x82F63B78}), 'reflected Castagnoli crc32c polynomial, the store chain\'s crc32c codec (RFC 3720 §B.4; google_crc32c)'),
     ('dosage_store.py', 'DEFAULT_INNER_CHUNK_ROWS'): ('derived', frozenset({64}), 'minimax-regret chunk rows over read runs no shorter than the smallest Stage 0 tile, from the measured read-path cost fit (docs/design/math/codec.md §3)'),
     ('marginal_variances.py', 'window_working_bytes'): ('derived', frozenset({4}), "byte accounting of the window algebra's arrays: the number of simultaneously live |W| x |W| and |W| x |b| arrays"),
     ('dual_solve.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),

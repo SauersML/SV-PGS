@@ -771,7 +771,7 @@ class CodeArray:
             failure = int(error.get(stream=stream)[0])
             if failure:
                 reasons = "; ".join(text for bit, text in rowdict_codec.CHUNK_FAILURES.items() if failure & bit)
-                where = f"inner chunk {int(window_chunks[int(first_bad.get(stream=stream)[0])])}" if failure & 3 else "a row"
+                where = f"inner chunk {int(window_chunks[int(first_bad.get(stream=stream)[0])])}" if failure & rowdict_codec.CHUNK_LEVEL_FAILURES else "a row"
                 raise ValueError(f"{self.directory}: {where} {reasons}.")
 
     @property

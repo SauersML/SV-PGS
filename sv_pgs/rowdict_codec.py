@@ -41,7 +41,12 @@ _DEPTH_BYTES = np.dtype(np.uint8).itemsize
 
 
 CRC32C_POLYNOMIAL = 0x82F63B78
-"""The reflected Castagnoli polynomial: the store chain's crc32c."""
+"""The reflected Castagnoli polynomial of the store chain's crc32c (RFC 3720 §B.4)."""
+CRC_BITS = np.iinfo(np.uint32).bits
+_CRC_TOP = 1 << (CRC_BITS - 1)
+"""x^0 in the reflected bit order; x^k sits k bits below it."""
+_BYTE_EXPONENT = BITS_PER_CODE.bit_length() - 1
+"""log2 of the bits per byte: x^(8 n) = x^(2^(k + _BYTE_EXPONENT)) over n's set bits k."""
 
 
 def _crc32c_table() -> np.ndarray:
@@ -53,7 +58,7 @@ def _crc32c_table() -> np.ndarray:
 
 def _multiply_mod_polynomial(a: int, b: int) -> int:
     """a(x) b(x) mod P(x) in the reflected bit order (zlib's multmodp)."""
-    top = 1 << 31
+    top = _CRC_TOP
     product = 0
     while True:
         if a & top:
@@ -65,10 +70,10 @@ def _multiply_mod_polynomial(a: int, b: int) -> int:
 
 
 def _power_table() -> list[int]:
-    """x^(2^k) mod P for k = 0..31 (zlib's x2n_table)."""
-    power = 1 << 30
+    """x^(2^k) mod P for k = 0..CRC_BITS - 1 (zlib's x2n_table)."""
+    power = _CRC_TOP >> 1
     table = [power]
-    for _ in range(31):
+    for _ in range(CRC_BITS - 1):
         power = _multiply_mod_polynomial(power, power)
         table.append(power)
     return table
@@ -79,10 +84,10 @@ _POWERS = _power_table()
 
 def byte_shift(byte_count: int) -> int:
     """x^(8 byte_count) mod P: crc32c(A + B) = byte_shift(len(B)) (x) crc32c(A) ^ crc32c(B) (zlib's crc32_combine)."""
-    power, exponent, bit = 1 << 31, int(byte_count), 3
+    power, exponent, bit = _CRC_TOP, int(byte_count), _BYTE_EXPONENT
     while exponent:
         if exponent & 1:
-            power = _multiply_mod_polynomial(_POWERS[bit & 31], power)
+            power = _multiply_mod_polynomial(_POWERS[bit % CRC_BITS], power)
         exponent >>= 1
         bit += 1
     return power
@@ -363,14 +368,14 @@ void verify_chunks(const unsigned char* __restrict__ data, const long long* __re
     if (size >= table_bytes) {
         for (int row = thread; row < chunk_rows; row += blockDim.x) {
             unsigned int frame = read_u32(data + offset + 4LL * row);
-            if (frame < 1u) atomicOr(&table_failure, 2);
+            if (frame < 1u) atomicOr(&table_failure, FAILED_TABLE);
             atomicAdd(&table_total, (unsigned long long)frame);
         }
     }
     __syncthreads();
     if (thread != 0) return;
-    int failure = crc[0] != read_u32(data + offset + size) ? 1 : 0;
-    if (!failure && (size < table_bytes || table_failure || (long long)table_total + table_bytes != size)) failure = 2;
+    int failure = crc[0] != read_u32(data + offset + size) ? FAILED_CRC : 0;
+    if (!failure && (size < table_bytes || table_failure || (long long)table_total + table_bytes != size)) failure = FAILED_TABLE;
     if (failure) { atomicOr(error, failure); atomicMin((unsigned long long*)first_bad, (unsigned long long)chunk); }
 }
 
@@ -390,22 +395,22 @@ void locate_frames(const unsigned char* __restrict__ data, const long long* __re
     long long offset = chunk_offset[chunk], size = chunk_size[chunk], table_bytes = 4LL * chunk_rows;
     int failure = 0;
     long long start = offset, stop = offset, bits = 0, dictionary = offset, slots = offset, exceptions = offset, count = 0;
-    if (size < table_bytes) failure = 4;
+    if (size < table_bytes) failure = FAILED_FRAME;
     else {
         long long prefix = 0;
         for (int earlier = 0; earlier < within; ++earlier) prefix += read_u32(data + offset + 4LL * earlier);
         start = offset + table_bytes + prefix;
         stop = start + read_u32(data + offset + 4LL * within);
-        if (stop <= start || stop > offset + size) failure = 4;
+        if (stop <= start || stop > offset + size) failure = FAILED_FRAME;
         else {
             bits = data[start];
-            if (bits > MAXIMUM_DEPTH) failure = 4;
+            if (bits > MAXIMUM_DEPTH) failure = FAILED_FRAME;
             else {
                 dictionary = start + 1;
                 slots = dictionary + (1LL << bits);
                 exceptions = slots + (samples * bits + 7) / 8;
                 long long remainder = stop - exceptions;
-                if (remainder < 0 || remainder % (sample_bytes + 1)) failure = 4;
+                if (remainder < 0 || remainder % (sample_bytes + 1)) failure = FAILED_FRAME;
                 else count = remainder / (sample_bytes + 1);
             }
         }
@@ -433,14 +438,21 @@ void scatter_checked_exceptions(const unsigned char* __restrict__ frames, const 
         unsigned long long sample = 0;
         for (int byte = 0; byte < sample_bytes; ++byte) sample |= (unsigned long long)sample_bytes_at[at * sample_bytes + byte] << (8 * byte);
         if (sample < (unsigned long long)samples) target[sample] = codes[at];
-        else atomicOr(error, 8);
+        else atomicOr(error, FAILED_SAMPLE);
     }
 }
 """
 
 
-CHUNK_FAILURES = {1: "fails its crc32c check", 2: "has a row size table that does not match its stored size",
-                  4: "holds a row frame that does not fit its depth", 8: "names an exception sample outside the row"}
+_FAILURE_NAMES = ("FAILED_CRC", "FAILED_TABLE", "FAILED_FRAME", "FAILED_SAMPLE")
+_FAILURE_TEXT = (
+    "fails its crc32c check", "has a row size table that does not match its stored size",
+    "holds a row frame that does not fit its depth", "names an exception sample outside the row",
+)
+FAILURE_BITS = {name: 1 << index for index, name in enumerate(_FAILURE_NAMES)}
+CHUNK_FAILURES = {FAILURE_BITS[name]: text for name, text in zip(_FAILURE_NAMES, _FAILURE_TEXT)}
+CHUNK_LEVEL_FAILURES = FAILURE_BITS["FAILED_CRC"] | FAILURE_BITS["FAILED_TABLE"]
+"""Failures that name a chunk (``first_bad``); the others name a row."""
 """The device checks' failure bits, as ``read_rows_to_device`` reports them."""
 
 
@@ -460,7 +472,8 @@ class GpuRowDecoder:
         self._grid_rows = int(attributes["MaxGridDimY"])
         self._grid_blocks = int(attributes["MaxGridDimX"])
         chunk_module = cupy.RawModule(
-            code=_GPU_CHUNK_SOURCE.replace("CRC32C_POLYNOMIAL", f"{CRC32C_POLYNOMIAL:#x}u").replace("MAXIMUM_DEPTH", str(MAXIMUM_DEPTH))
+            code=_GPU_CHUNK_SOURCE.replace("CRC32C_POLYNOMIAL", f"{CRC32C_POLYNOMIAL:#x}u").replace("MAXIMUM_DEPTH", str(MAXIMUM_DEPTH)),
+            options=tuple(f"-D{name}={bit}" for name, bit in FAILURE_BITS.items()),
         )
         self._crc_segments = chunk_module.get_function("crc32c_segments")
         self._verify = chunk_module.get_function("verify_chunks")
@@ -549,7 +562,9 @@ class GpuRowDecoder:
         if rows == 0:
             return error, first_bad
         sample_bytes = np.int32(exception_sample_dtype(sample_count).itemsize)
-        depth, dictionary_offset, slot_offset, exception_offset, exception_count = (cp.empty(rows, dtype=cp.int64) for _ in range(5))
+        depth = cp.empty(rows, dtype=cp.int64)
+        dictionary_offset, slot_offset = cp.empty_like(depth), cp.empty_like(depth)
+        exception_offset, exception_count = cp.empty_like(depth), cp.empty_like(depth)
         self._locate(
             (-(-rows // self._threads),), (self._threads,),
             (device_buffer, device_offsets, device_sizes, np.int32(chunk_rows), cp.asarray(wanted), np.int64(rows),
