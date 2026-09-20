@@ -54,7 +54,7 @@ def gene_null(dataset, gene_row: int, inverse: np.ndarray):
     gains, wins = [], []
     for name in sorted(split for split in dataset.splits if split.startswith("loso/")):
         train_all, test_all, test_phenotype, test_index = harness.build_gene_task(dataset, window, dataset.splits[name])
-        train, test = harness.subset(train_all, test_all, "snv_sv")
+        train, test = harness.subset(train_all, test_all, "snv_sv", name)
         train_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[name]["train"]])
         is_sv = train.variants.is_sv
         genotypes, phenotype = np.asarray(train.genotypes, dtype=np.float64), train.phenotype

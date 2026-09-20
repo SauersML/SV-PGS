@@ -24,7 +24,7 @@ def split_gains(dataset, window, fit, splits: dict):
         train_all, test_all, test_phenotype, test_index = harness.build_gene_task(dataset, window, split)
         values = {}
         for feature_set in ("snv", "snv_sv"):
-            train, test = harness.subset(train_all, test_all, feature_set)
+            train, test = harness.subset(train_all, test_all, feature_set, name)
             prediction = np.asarray(fit(train).predict(test), dtype=np.float64)
             values[feature_set] = robust.group_metrics(np.ones((1, len(test_index))), prediction[None], test_phenotype[None])["r2"][0, 0]
         gains[name] = values["snv_sv"] - values["snv"]
