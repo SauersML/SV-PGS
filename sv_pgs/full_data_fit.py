@@ -13,7 +13,8 @@ genetic variance never exceeds the phenotypic. ``scale_mixture_ep.fit_hyperparam
 1. The EP fixed point at the current hyperparameters (``_FullDataFixedPoints``):
    a. Refresh: solve the mean at the current sites and compute the certified marginal variances z and the
       cavities (P = 1/z - tau). Negative sites are halved while the global precision is not positive definite or a
-      cavity is not proper. Non-negative sites always pass, so this ends; only the path to the fixed point changes.
+      cavity's tilted law is not proper (1 + v P <= 0 at a lattice node). Non-negative sites always pass, so this
+      ends; only the path to the fixed point changes.
       The cavity is the information the data removed, D - z, which amplifies a variance error by about 1/(D q)
       where each variant carries little data; so every refresh is certified on tr(D - z) per block
       (``block_information_certificate``, from the dual solve's own products, with the solve accuracy it derives),
@@ -73,6 +74,7 @@ from sv_pgs.scale_mixture_ep import (
     derived_lattice,
     fit_hyperparameters,
     initial_hyperparameters,
+    log_scale,
     moment_matched_prior_sites,
     moment_start,
     noise_gain,
@@ -370,7 +372,14 @@ class _FullDataFixedPoints:
             else:
                 grams = [block_grams(self.statistics, float(self.noise[model])) for model in range(gaussian.model_count)]
                 variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
-                improper = 1.0 / variances - self.site_precision <= 0.0
+                # A cavity is proper where the tilted law it makes is: 1 + v P > 0 at every node, v up to u_j e^(t_K) (the
+                # kernel's own test). P = 1/z - tau at or just below zero is a variant the data barely inform, not an
+                # improper one: a site that is an exact sum of negative sites keeps P ~ -eps there however far it halves.
+                largest = np.column_stack([
+                    np.exp(log_scale(self.prior, model_hyperparameters.coefficients) + self.prior.log_variance_grid[-1])
+                    for model_hyperparameters in hyperparameters
+                ])
+                improper = 1.0 + largest * (1.0 / variances - self.site_precision) <= 0.0
                 if not np.any(improper):
                     self.refreshes += 1
                     self.probe_ratio = min(certificate_tolerance(solve, gaussian.probe_count) for solve in gaussian.bulk_solves)
@@ -387,7 +396,7 @@ class _FullDataFixedPoints:
                     ]
                     return variances, grams
                 models = sorted(set(np.flatnonzero(np.any(improper, axis=0)).tolist()))
-                failure = f"models {models}: a cavity is improper (1/z - tau <= 0) with non-negative sites"
+                failure = f"models {models}: a cavity is improper (1 + v (1/z - tau) <= 0 on the lattice) with non-negative sites"
             negative = self.site_precision < 0.0
             if not np.any(negative):
                 raise NoFixedPoint(failure)
