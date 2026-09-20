@@ -188,3 +188,20 @@ def test_sv_only_feature_sets_select_the_documented_columns():
     variants = synthetic_variants([False, True, False, True], ["panel", "panel", "pangenie", "pangenie"])
     assert list(harness.feature_mask(variants, "sv", "g/s")) == [False, True, False, False]
     assert list(harness.feature_mask(variants, "pgsv", "g/s")) == [False, False, False, True]
+
+
+def test_sealed_confirmation_genes_are_never_scored_outside_the_confirmation(tmp_path):
+    pd.DataFrame({"chrom": ["chr1"] * 3, "start": [1, 2, 3], "end": [2, 3, 4], "gene_id": ["g1", "g2", "g3"], "tss": [2, 3, 4]}).to_csv(
+        tmp_path / "genes.tsv", sep="\t", index=False)
+    pd.DataFrame({"gene_id": ["g2"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory, dataset.genes = tmp_path, pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    assert dataset.gene_rows(["chr1"]) == [0, 2]
+    assert dataset.gene_rows(["chr1"], confirmation=True) == [1]
+    pd.DataFrame({"gene_id": ["g1", "g2"]}).to_csv(tmp_path / "list.tsv", sep="\t", index=False)
+    try:
+        dataset.gene_rows(["chr1"], gene_list=tmp_path / "list.tsv")
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a gene list naming a sealed gene must be refused")

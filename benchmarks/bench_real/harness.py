@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 
 CIS_RADIUS_BP = 1_000_000
+SEALED_GENES = "sealed_confirmation_genes.tsv"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched")
 MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
@@ -83,15 +84,27 @@ class Dataset:
             self._chromosomes[chrom] = (table, dosage)
         return self._chromosomes[chrom]
 
-    def gene_rows(self, chromosomes, gene_prefix=None, gene_list=None):
+    def sealed_genes(self):
+        """The sealed confirmation genes (lead ruling): scored once, only when the lead calls the confirmation."""
+        path = self.directory / SEALED_GENES
+        return set(pd.read_csv(path, sep="\t")["gene_id"]) if path.exists() else set()
+
+    def gene_rows(self, chromosomes, gene_prefix=None, gene_list=None, confirmation=False):
         """Genes on the chromosomes; with gene_prefix, only those among the first gene_prefix of gene_order.tsv; with
-        gene_list (a TSV with a gene_id column, e.g. a frozen screened list), only the genes it names."""
+        gene_list (a TSV with a gene_id column, e.g. a frozen screened list), only the genes it names.
+
+        The sealed confirmation genes are never scored unless confirmation is set, and then only they are. A gene list
+        naming a sealed gene is an error rather than a silent drop, so a leak is caught where it starts."""
+        sealed = self.sealed_genes()
         on_chromosomes = self.genes["chrom"].isin(chromosomes)
+        on_chromosomes &= self.genes["gene_id"].isin(sealed) if confirmation else ~self.genes["gene_id"].isin(sealed)
         if gene_prefix is not None:
             leading = set(pd.read_csv(self.directory / "gene_order.tsv", sep="\t")["gene_id"].head(gene_prefix))
             on_chromosomes &= self.genes["gene_id"].isin(leading)
         if gene_list is not None:
             named = set(pd.read_csv(gene_list, sep="\t")["gene_id"])
+            if not confirmation and named & sealed:
+                raise ValueError(f"the gene list names {len(named & sealed)} sealed confirmation genes")
             unknown = named - set(self.genes["gene_id"])
             if unknown:
                 raise ValueError(f"{len(unknown)} listed genes are not benchmark genes, e.g. {sorted(unknown)[:3]}")
@@ -250,13 +263,14 @@ def _run_gene(arguments):
     return results
 
 
-def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None):
+def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
+        confirmation=False):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design."""
     from multiprocessing import get_context
 
     dataset = Dataset(dataset_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
-    gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list)
+    gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation)
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
@@ -279,7 +293,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     (out / f"{tag}.run.json").write_text(json.dumps({
         "method": method_spec, "method_sha256": hashlib.sha256(method_file.read_bytes()).hexdigest(), "harness_commit": commit,
         "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets), "gene_prefix": gene_prefix,
-        "gene_list": str(gene_list) if gene_list is not None else None,
+        "gene_list": str(gene_list) if gene_list is not None else None, "confirmation": confirmation,
+        "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
         "genes": len(gene_rows), "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
@@ -304,6 +319,7 @@ if __name__ == "__main__":
     parser.add_argument("--feature-sets", nargs="+", default=list(FEATURE_SETS), choices=FEATURE_SETS)
     parser.add_argument("--gene-prefix", type=int, help="run only genes among the first N of the sealed gene_order.tsv")
     parser.add_argument("--genes", help="run only the genes a TSV with a gene_id column names (a frozen screened list)")
+    parser.add_argument("--confirmation", action="store_true", help="score only the sealed confirmation genes (only when the lead calls it)")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
-        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes)
+        tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation)
