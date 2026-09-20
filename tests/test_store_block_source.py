@@ -54,7 +54,7 @@ def _bits(array) -> np.ndarray:
     return np.ascontiguousarray(host).view(np.uint64)
 
 
-@pytest.mark.parametrize("codec", ["raw", "zstd"])
+@pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
 def test_cpu_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, codec: str) -> None:
     _write_store(tmp_path / "store", _two_half_dosage(), codec)
     source, signed, means, scales = _source(tmp_path / "store", "cpu")
@@ -81,7 +81,7 @@ def test_blocks_must_hold_ascending_distinct_rows(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
-@pytest.mark.parametrize("codec", ["raw", "zstd"])
+@pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
 def test_cuda_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, codec: str) -> None:
     _write_store(tmp_path / "store", _two_half_dosage(), codec)
     source, signed, means, scales = _source(tmp_path / "store", "cuda")

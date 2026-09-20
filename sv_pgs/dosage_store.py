@@ -1191,6 +1191,11 @@ class DosageStore:
     def n_samples(self) -> int:
         return int(self.half_sample_starts[-1])
 
+    @property
+    def codecs(self) -> frozenset[str]:
+        """The inner-chunk codecs of the selected halves' arrays."""
+        return frozenset(array.layout.codec for arrays in self._arrays for array in arrays)
+
     def statistic(self, name: str) -> I64Array:
         """A per-record integer sidecar statistic summed over the store's halves, in store order."""
         per_chromosome = []

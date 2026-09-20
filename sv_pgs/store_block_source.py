@@ -5,7 +5,9 @@ One Stage 2 read visits every LD block once. Three stages of it overlap:
 1. the host: ``DosageStore.iter_codes`` reads and decodes the next blocks' row spans ahead, on
    its reader threads, into a ring of (pinned, on CUDA) host buffers;
 2. the copy engine: the next block's span goes host -> device on its own stream while the
-   current block computes;
+   current block computes. A rowdict store skips the host decode: the span's encoded bytes go
+   to the device, and ``DosageStore.read_codes_to_device`` decodes them there on the copy
+   stream, so the host only reads, checks crc32c and locates frames;
 3. the device: one kernel picks the block's rows out of its span and writes them as signed codes
    ``s = code - 127`` into an aligned buffer, which a ``CodeBlockTile`` wraps without copying.
 
@@ -20,6 +22,7 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from sv_pgs import rowdict_codec
 from sv_pgs.code_products import INT8_GEMM_ALIGNMENT, CodeBlockTile
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore
@@ -122,6 +125,7 @@ class StoreGenotypeBlockSource:
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
+            self._decoder = rowdict_codec.GpuRowDecoder(cupy) if store.codecs == frozenset({"rowdict"}) else None
 
     @classmethod
     def from_statistics(
@@ -154,6 +158,9 @@ class StoreGenotypeBlockSource:
 
     def iter_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
         """Yield (block_index, tile) in block order; a tile is valid until the next is requested."""
+        if self._cupy is not None and self._decoder is not None:
+            yield from self._iter_decoded_tiles()
+            return
         spans = self._store.iter_codes(self._spans, None, self._budget)
         if self._cupy is None:
             for block_index, (start, _stop, codes) in enumerate(spans):
@@ -183,10 +190,6 @@ class StoreGenotypeBlockSource:
         count = len(self._spans)
         _start, _stop, first = next(spans)
         upload(0, first)
-        attributes = cupy.cuda.Device().attributes
-        threads = int(attributes["MaxThreadsPerBlock"])
-        # a grid-stride loop needs no more blocks than the device keeps resident at once
-        resident_blocks = int(attributes["MultiProcessorCount"]) * (int(attributes["MaxThreadsPerMultiProcessor"]) // threads)
         for block_index in range(count):
             slot = block_index % 2
             # iter_codes reuses the host buffer of this span once the next span is requested.
@@ -194,16 +197,57 @@ class StoreGenotypeBlockSource:
             if block_index + 1 < count:
                 _start, _stop, following = next(spans)
                 upload(block_index + 1, following)
-            rows = int(self._block_rows[block_index].shape[0])
             compute.wait_event(copied[slot])
-            padded_rows = _aligned(rows)
-            elements = padded_rows * self._padded_samples
-            self._gather(
-                (min(-(-elements // threads), resident_blocks),), (threads,),
-                (
-                    self._spans_on_device[slot], self._rows_in_span[block_index], self._signed[slot],
-                    np.int64(rows), np.int64(self._samples), np.int64(padded_rows), np.int64(self._padded_samples),
-                ),
-            )
+            self._gather_block(block_index, slot)
             yield block_index, self._tile(block_index, slot)
             computed[slot].record(compute)
+
+    def _gather_block(self, block_index: int, slot: int) -> None:
+        """Queue, on the current stream, block ``block_index``'s rows of its span as signed codes."""
+        cupy = self._cupy
+        attributes = cupy.cuda.Device().attributes
+        threads = int(attributes["MaxThreadsPerBlock"])
+        # a grid-stride loop needs no more blocks than the device keeps resident at once
+        resident_blocks = int(attributes["MultiProcessorCount"]) * (int(attributes["MaxThreadsPerMultiProcessor"]) // threads)
+        rows = int(self._block_rows[block_index].shape[0])
+        padded_rows = _aligned(rows)
+        self._gather(
+            (min(-(-padded_rows * self._padded_samples // threads), resident_blocks),), (threads,),
+            (
+                self._spans_on_device[slot], self._rows_in_span[block_index], self._signed[slot],
+                np.int64(rows), np.int64(self._samples), np.int64(padded_rows), np.int64(self._padded_samples),
+            ),
+        )
+
+    def _iter_decoded_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The rowdict path: each span decodes on the device, on the copy stream.
+
+        Block b + 1's span is fetched after block b is yielded, so its host work (read, crc32c,
+        frame location, the host -> device copy) overlaps the products the caller queued for b.
+        """
+        cupy = self._cupy
+        compute = cupy.cuda.get_current_stream()
+        decoded = [cupy.cuda.Event() for _ in range(2)]
+        gathered = [cupy.cuda.Event() for _ in range(2)]
+        for event in gathered:
+            event.record(compute)
+
+        def fetch(position: int) -> None:
+            slot = position % 2
+            start, stop = self._spans[position]
+            # the span buffer is free once the gather of the block that last used it has run
+            self._copy_stream.wait_event(gathered[slot])
+            with self._copy_stream:
+                self._store.read_codes_to_device(start, stop, self._spans_on_device[slot][: stop - start], self._decoder)
+            decoded[slot].record(self._copy_stream)
+
+        fetch(0)
+        for block_index in range(len(self._spans)):
+            slot = block_index % 2
+            compute.wait_event(decoded[slot])
+            self._gather_block(block_index, slot)
+            gathered[slot].record(compute)
+            yield block_index, self._tile(block_index, slot)
+            if block_index + 1 < len(self._spans):
+                fetch(block_index + 1)
+
