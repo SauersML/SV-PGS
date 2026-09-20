@@ -394,8 +394,9 @@ def _tied_design(rng, samples, groups, members_of):
     return group_columns[:, members_of], _Design(group_columns, np.zeros((samples, 0)), members=members_of)
 
 
+@pytest.mark.parametrize("regime", ["bulk", "schur"])
 @pytest.mark.parametrize("negative", [False, True])
-def test_tie_members_keep_their_own_sites_exactly(negative):
+def test_tie_members_keep_their_own_sites_exactly(negative, regime):
     """review-mathbugs T1: every tie member is its own effect with its own site; duplicates are aggregated only in the
     kernel. Against the explicit member-level A' = X_m'X_m + diag t (duplicated columns): solve, marginal variances,
     cavities, covariance, the variance JVP and the exact linear response, with units of equal sites and a right-hand
@@ -404,7 +405,10 @@ def test_tie_members_keep_their_own_sites_exactly(negative):
     members_of = [0, 0, 0, 1, 2, 2, 3, 4, 4, 4, 5]
     explicit, tied = _tied_design(rng, 9, 6, members_of)
     count = len(members_of)
-    precision = rng.uniform(0.5, 2.0, count)
+    # "bulk": sites above every column's data (t >= ||x||^2: the Woodbury bulk, where tied members form units);
+    # "schur": sites below it (every member by the Schur route, each its own unit; review-mathbugs K1).
+    scale = float(np.max(np.einsum("ij,ij->j", explicit, explicit))) if regime == "bulk" else 1.0
+    precision = scale * rng.uniform(1.0, 2.0, count)
     precision[[1, 2]] = precision[0]      # a unit: three members of group 0 with one site
     precision[[8, 9]] = precision[7]      # and two of group 4 with one site
     if negative:
@@ -420,7 +424,7 @@ def test_tie_members_keep_their_own_sites_exactly(negative):
     np.testing.assert_allclose(cavity, 1.0 / np.diag(inverse) - precision, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(kernel.covariance(), inverse, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(kernel.log_determinant(), np.linalg.slogdet(explicit.T @ explicit + np.diag(precision))[1], rtol=1e-12)
-    assert kernel.units().size == count - 4  # two units of three and two members
+    assert kernel.units().size == (count - 4 if regime == "bulk" else count)  # bulk: units of three and two members
     direction = rng.standard_normal(count)
     np.testing.assert_allclose(kernel.hadamard_quadratic(direction), direction @ (inverse * inverse) @ direction, rtol=1e-9)
     noise = 1.3
