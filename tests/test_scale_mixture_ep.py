@@ -679,7 +679,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
 def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     assert evidence is not None
     _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, posterior, _WORKING_BYTES, 0.0)
@@ -702,7 +702,7 @@ def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
 def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     nearby = hyperparameters.coefficients + 1e-3 * np.random.default_rng(41).standard_normal(prior.coefficient_size)
     calls = []
     corrected = engine._corrected
