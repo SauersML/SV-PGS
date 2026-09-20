@@ -34,5 +34,12 @@ where r²f is the floor-corrected r² in robust.py: `(r² − 1/(n−1)) / (1 �
 4. **Location and scale:** oos_r2_centred per group, plus the location split of raw out-of-sample R². Raw out-of-sample R² under loso is never used as a metric; it is dominated by the adjusted truth's group mean offset.
 
 ## Decision rule and error rate
-- **This is a secondary family.** It sits next to ablate's Amendment 2 headline H (pooled Δr² of SV-PGS − mr_ashr_init, loso, confirmation genes) and takes its own α_P from the same alpha-spending scheme. α_P is set with ablate and recorded here as an amendment before any result is read.
-- **The claim rule:** SV-PGS is said to port better than mr_ashr_init only if the two-sided (1 − α_P) interval of the primary comparison excludes 0, on claim-supporting genes. Otherwise the result is reported as no detectable difference, with its interval.
+- **This is a secondary family,** tested after ablate's headline H (pooled Δr² of SV-PGS − mr_ashr_init, loso, confirmation genes) in a fixed sequence.
+
+**Amendment 1 (2026-09-20, before any SV-PGS portability result exists; set with ablate, confirmed by the lead):** the error rate follows ABLATION_PLAN Amendment 3 (lane/ablate-prereg-a3 7bd3875).
+- **Version:** P shares H's version v, meaning the same fit and adapter shas. It takes no separate place in the alpha-spending order.
+- **Level:** α_v = 0.05·2^−(v+1), per ABLATION_PLAN Amendment 2 (acb1e5b).
+- **The claim rule:** SV-PGS is said to port better than mr_ashr_init only if H rejects at α_v in version v **and** the two-sided (1 − α_v) interval of the primary comparison excludes 0, on claim-supporting genes. Otherwise the result is reported as no detectable difference, with its interval.
+- **Error rate:** the fixed sequence keeps FWER over {H, P} ≤ α_v and leaves H's level unchanged.
+- **Timing:** P's confirmatory value is computed only at version v's confirmation run, together with H.
+- **Other secondaries:** they spend no α.
