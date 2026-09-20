@@ -41,7 +41,7 @@ from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
 from sv_pgs.copy_number import copy_number_codes_per_unit, modal_copy_numbers
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.gatksv_source import GatksvBlock
-from sv_pgs.sv_fusion import MINIMUM_PAIRING_Z, SvSites, candidate_pairs
+from sv_pgs.sv_fusion import MINIMUM_CALIBRATION_SAMPLES, MINIMUM_PAIRING_Z, SvSites, _fisher_z, candidate_pairs
 
 MAXIMUM_ALLELE_COUNT = 2
 
@@ -135,13 +135,11 @@ def _copy_number_codes(values: F64Array, calls: U8Array, observed: BoolArray) ->
 
 def _pairing(dosage: F64Array, calls: F64Array) -> tuple[float, float]:
     """(Fisher z of corr(DS, B), least-squares slope of B on DS) over the called samples; z = 0 when undefined."""
-    if dosage.shape[0] <= 3 or np.ptp(dosage) == 0.0 or np.ptp(calls) == 0.0:
+    if dosage.shape[0] < MINIMUM_CALIBRATION_SAMPLES or np.ptp(dosage) == 0.0 or np.ptp(calls) == 0.0:
         return 0.0, float("nan")
     covariance = np.cov(np.vstack([dosage, calls]), bias=True)
-    correlation = float(np.clip(covariance[0, 1] / np.sqrt(covariance[0, 0] * covariance[1, 1]), -1.0, 1.0))
-    with np.errstate(divide="ignore"):
-        z = float(np.arctanh(correlation) * np.sqrt(dosage.shape[0] - 3))
-    return z, float(covariance[0, 1] / covariance[0, 0])
+    correlation = float(covariance[0, 1] / np.sqrt(covariance[0, 0] * covariance[1, 1]))
+    return _fisher_z(correlation, dosage.shape[0]), float(covariance[0, 1] / covariance[0, 0])
 
 
 def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, FusionPairs]:
