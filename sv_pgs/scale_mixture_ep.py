@@ -950,7 +950,23 @@ def _trust_region_step(negative_hessian: F64Array, gradient: F64Array, radius: f
             lower = middle
         else:
             upper = middle
-    return eigenvectors @ (components / (eigenvalues + upper))
+    shifted = eigenvalues + upper
+    # More and Sorensen's hard case: -H is not positive definite, and no mu > -lambda_min reaches the boundary, because
+    # g has no part on -H's lowest eigenspace (or one below mu's resolution, where mu = -lambda_min exactly and the
+    # shifted eigenvalue there is 0) and the rest of the step at mu = -lambda_min lies inside the radius. The
+    # maximizer then keeps the rest at mu = -lambda_min and reaches the boundary along the lowest eigenvector, on g's
+    # side where g has a part there (either side ascends equally where it has none).
+    at_lower = eigenvalues + lower
+    lowest = ~(at_lower > 0.0)
+    rest = np.where(lowest, 0.0, components / np.where(lowest, 1.0, at_lower))
+    unresolved = not np.all(shifted > 0.0)
+    orthogonal = not np.any(components[lowest] != 0.0) and float(rest @ rest) <= radius * radius
+    if eigenvalues[0] > 0.0 or not (unresolved or orthogonal):
+        return eigenvectors @ (components / shifted)
+    reach = float(np.sqrt(max(radius * radius - float(rest @ rest), 0.0)))
+    first = int(np.flatnonzero(lowest)[0])
+    rest[first] = reach if components[first] >= 0.0 else -reach
+    return eigenvectors @ rest
 
 
 def _maximize_coefficients(
