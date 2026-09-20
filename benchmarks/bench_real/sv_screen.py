@@ -12,9 +12,10 @@ Per gene: over the SVs in the harness's own cis window (the SV interval overlaps
 and for PanGenie SVs, the largest single u, SV counts, whether an SV overlaps the gene body or its merged exons, and
 the leading SVs. Genes are ranked by the panel sum, ties broken by the sealed gene order.
 
-Outputs: screen_<version>.tsv (every column, one row per gene in rank order), sv_ranked_<version>.tsv (a `gene_id`
-column only, in rank order, for the harness's gene-list option), sv_proxies_<version>.tsv.gz (per SV), and SEALED.txt
-with the sha256 of all three.
+Outputs: screen_<version>.tsv (every column, one row per gene in rank order, with a `confirm` flag),
+sv_ranked_<version>.tsv (a `gene_id` column only, in rank order, without the confirmation genes, for the harness's
+gene-list option), confirm_genes_<version>.tsv (the sealed confirmation genes, used exactly once for the final
+confirmation), sv_proxies_<version>.tsv.gz (per SV), and SEALED.txt with the sha256 of all four.
 """
 import argparse
 import concurrent.futures
@@ -28,9 +29,9 @@ import pandas as pd
 
 from benchmarks.bench_real.harness import CIS_RADIUS_BP
 
-SV_COLUMNS = ["chrom", "row", "id", "source", "pos", "end", "sv_type", "sv_length", "allele_frequency", "genotype_variance",
-              "max_r2", "proxy_id", "proxies", "untagged_variance"]
-TABLE_COLUMNS = {"pos", "end", "id", "is_sv", "source", "sv_type", "sv_length"}
+SV_COLUMNS = ["chrom", "row", "source", "pos", "end", "sv_type", "sv_length", "allele_frequency", "genotype_variance",
+              "max_r2", "proxy_row", "proxy_pos", "proxies", "untagged_variance"]
+TABLE_COLUMNS = {"pos": np.int64, "end": np.int64, "is_sv": bool, "source": "category", "sv_type": "category", "sv_length": np.int64}
 LEADING_SVS = 3  # how many SVs each gene row lists; display only
 FITTED_PREFIXES = (2000, 5000)  # the --gene-prefix values of bench-real's v2 runs (mr.ash; lead variant and GBLUP)
 
@@ -64,12 +65,17 @@ def resident_bytes():
 
 
 def worker_memory_bytes(workers):
-    """One worker's memory: the runner's per-task allotment when it sets one, otherwise the task's cores-proportional
-    share of the host's usable memory (the runners' default rule), split evenly over the workers."""
-    from sv_pgs.compute_budget import RUNQ_MEMORY_VARIABLE, _usable_host_bytes
+    """One worker's memory: the task's usable memory split evenly over the workers.
+
+    The usable memory is what is free now: MemAvailable capped by the memory cgroups' headroom and by the runner's
+    per-task allotment. Only on a bare host, with neither a cgroup cap nor an allotment, is it shared with every other
+    user, and then the task takes its cores-proportional share (the runners' default rule).
+    """
+    from sv_pgs.compute_budget import RUNQ_MEMORY_VARIABLE, _cgroup_memory_headroom_bytes, _usable_host_bytes
     usable = _usable_host_bytes()
-    share = usable if RUNQ_MEMORY_VARIABLE in os.environ else usable * workers // os.cpu_count()
-    return share // workers
+    if RUNQ_MEMORY_VARIABLE not in os.environ and _cgroup_memory_headroom_bytes() is None:
+        usable = usable * workers // os.cpu_count()
+    return usable // workers
 
 
 def _batches(positions, ends, radius):
@@ -142,13 +148,12 @@ def sv_proxies(chrom, table, dosage, radius=CIS_RADIUS_BP, chunk_rows=None, work
                 top = int(np.argmax(squared))
                 if squared[top] > best[index]:
                     best[index], proxy[index] = squared[top], small[begin + covered[top]]
-    identifiers = table["id"].to_numpy()
-    frame = pd.DataFrame({"chrom": chrom, "row": structural, "id": identifiers[structural],
-                          "source": table["source"].to_numpy()[structural], "pos": positions[structural],
-                          "end": ends[structural], "sv_type": table["sv_type"].to_numpy()[structural],
+    frame = pd.DataFrame({"chrom": chrom, "row": structural,
+                          "source": np.asarray(table["source"].to_numpy(), dtype=object)[structural], "pos": positions[structural],
+                          "end": ends[structural], "sv_type": np.asarray(table["sv_type"].to_numpy(), dtype=object)[structural],
                           "sv_length": table["sv_length"].to_numpy()[structural], "allele_frequency": frequency,
                           "genotype_variance": variance, "max_r2": np.minimum(best, 1.0),
-                          "proxy_id": np.where(proxy >= 0, identifiers[np.maximum(proxy, 0)], ""), "proxies": proxies})
+                          "proxy_row": proxy, "proxy_pos": np.where(proxy >= 0, positions[np.maximum(proxy, 0)], -1), "proxies": proxies})
     frame["untagged_variance"] = frame["genotype_variance"] * (1.0 - frame["max_r2"])
     return frame[SV_COLUMNS]
 
@@ -159,7 +164,7 @@ def window_members(sv_positions, sv_ends, tss, radius=CIS_RADIUS_BP):
 
 
 def _describe(frame):
-    return ";".join(f"{row.sv_type}:{row.sv_length}:{row.untagged_variance:.4g}:{row.max_r2:.3f}:{row.allele_frequency:.3f}:{row.id}"
+    return ";".join(f"{row.sv_type}:{row.sv_length}:{row.untagged_variance:.4g}:{row.max_r2:.3f}:{row.allele_frequency:.3f}:{row.chrom}:{row.pos}-{row.end}"
                     for row in frame.itertuples())
 
 
@@ -191,6 +196,17 @@ def gene_scores(genes, annotation, structural, radius=CIS_RADIUS_BP):
     return pd.DataFrame(records)
 
 
+CONFIRM_SALT = "bench-real/confirm/"
+CONFIRM_MODULUS = 4  # lead ruling: a quarter of the genes outside the fitted mr.ash prefix are sealed for confirmation
+
+
+def confirmation_genes(gene_ids, development_genes):
+    """The sealed confirmation genes: outside the development set, int(sha256(salt + gene_id), 16) % modulus == 0."""
+    development = set(development_genes)
+    return np.array([gene not in development and int(hashlib.sha256((CONFIRM_SALT + gene).encode()).hexdigest(), 16) % CONFIRM_MODULUS == 0
+                     for gene in gene_ids])
+
+
 def rank_genes(scores, gene_order):
     """Order by the panel sum of untagged variance, ties broken by the sealed gene order; mark the fitted prefixes."""
     order = {gene: index for index, gene in enumerate(gene_order)}
@@ -205,7 +221,7 @@ def _chromosome_proxies(arguments):
     target = out_dir / f"{chrom}.sv_proxies.tsv.gz"
     if not target.exists():
         number = chrom.removeprefix("chr")
-        table = pd.read_csv(dataset_dir / f"chr{number}.variants.tsv", sep="\t", usecols=lambda column: column in TABLE_COLUMNS)
+        table = pd.read_csv(dataset_dir / f"chr{number}.variants.tsv", sep="\t", usecols=list(TABLE_COLUMNS), dtype=TABLE_COLUMNS)
         if "source" not in table:
             table["source"] = "panel"
         dosage = np.load(dataset_dir / f"chr{number}.dosage.npy", mmap_mode="r")
@@ -247,13 +263,16 @@ def main():
     ranked = rank_genes(gene_scores(genes, annotation, structural), gene_order)
     for prefix in FITTED_PREFIXES:
         ranked[f"in_prefix_{prefix}"] = ranked["gene_order_index"] < prefix
+    ranked["confirm"] = confirmation_genes(ranked["gene_id"], gene_order[:min(FITTED_PREFIXES)])
     screen = out_dir / f"screen_{arguments.version}.tsv"
     ranked_list = out_dir / f"sv_ranked_{arguments.version}.tsv"
     table = out_dir / f"sv_proxies_{arguments.version}.tsv.gz"
     ranked.to_csv(screen, sep="\t", index=False)
-    ranked[["gene_id"]].to_csv(ranked_list, sep="\t", index=False)
+    confirm_list = out_dir / f"confirm_genes_{arguments.version}.tsv"
+    ranked.loc[~ranked["confirm"], ["gene_id"]].to_csv(ranked_list, sep="\t", index=False)
+    ranked.loc[ranked["confirm"], ["gene_id"]].sort_values("gene_id").to_csv(confirm_list, sep="\t", index=False)
     structural.to_csv(table, sep="\t", index=False)
-    (out_dir / "SEALED.txt").write_text("".join(f"{_sha256(path)}  {path.name}\n" for path in (screen, ranked_list, table)))
+    (out_dir / "SEALED.txt").write_text("".join(f"{_sha256(path)}  {path.name}\n" for path in (screen, ranked_list, confirm_list, table)))
     print((out_dir / "SEALED.txt").read_text(), flush=True)
 
 

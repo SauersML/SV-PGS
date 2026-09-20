@@ -96,8 +96,8 @@ def test_constant_svs_carry_no_untagged_variance_and_constant_proxies_never_tag(
     constant = frame[frame["genotype_variance"] == 0]
     assert len(constant) >= 2
     assert (constant["untagged_variance"] == 0).all() and (constant["max_r2"] == 0).all()
-    constant_proxy = table["id"].iloc[int(np.flatnonzero((dosage.var(axis=1) == 0) & ~table["is_sv"].to_numpy())[0])]
-    assert constant_proxy not in set(frame["proxy_id"])
+    constant_proxy = int(np.flatnonzero((dosage.var(axis=1) == 0) & ~table["is_sv"].to_numpy())[0])
+    assert constant_proxy not in set(frame["proxy_row"])
 
 
 def test_standardization_matches_numpy():
@@ -150,9 +150,9 @@ def test_gene_windows_match_the_harness_and_sums_match_the_proxies(tmp_path):
 
 
 def test_body_and_exon_overlap_flags():
-    frame = pd.DataFrame({"chrom": "chr1", "row": [0, 1], "id": ["a", "b"], "source": "panel", "pos": [1_000, 5_000],
+    frame = pd.DataFrame({"chrom": "chr1", "row": [0, 1], "source": "panel", "pos": [1_000, 5_000],
                           "end": [1_100, 5_010], "sv_type": "DEL", "sv_length": [100, 10], "allele_frequency": 0.2,
-                          "genotype_variance": 0.3, "max_r2": 0.1, "proxy_id": "", "proxies": 1, "untagged_variance": [0.27, 0.27]})
+                          "genotype_variance": 0.3, "max_r2": 0.1, "proxy_row": -1, "proxy_pos": -1, "proxies": 1, "untagged_variance": [0.27, 0.27]})
     genes = pd.DataFrame({"chrom": "chr1", "gene_id": ["exonic", "intronic", "outside"], "tss": [1_000, 5_000, 20_000]})
     annotation = {"exonic": {"start": 900, "end": 3_000, "exons": [[1_050, 1_060]]},
                   "intronic": {"start": 4_000, "end": 9_000, "exons": [[4_000, 4_100], [8_000, 9_000]]},
@@ -168,3 +168,15 @@ def test_ranking_orders_by_panel_sum_and_breaks_ties_by_the_sealed_gene_order():
     ranked = sv_screen.rank_genes(scores, ["d", "c", "b", "a"])
     assert ranked["gene_id"].tolist() == ["b", "c", "a", "d"]
     assert ranked["rank"].tolist() == [1, 2, 3, 4]
+
+
+def test_confirmation_genes_follow_the_sealed_hash_and_exclude_the_development_set():
+    genes = [f"ENSG{index:011d}.1" for index in range(4_000)]
+    development = genes[:1_000]
+    confirm = sv_screen.confirmation_genes(genes, development)
+    assert not confirm[:1_000].any()
+    import hashlib
+    for gene, flag in zip(genes[1_000:1_050], confirm[1_000:1_050]):
+        assert flag == (int(hashlib.sha256(("bench-real/confirm/" + gene).encode()).hexdigest(), 16) % 4 == 0)
+    share = confirm[1_000:].mean()
+    assert abs(share - 0.25) <= 4 * np.sqrt(0.25 * 0.75 / 3_000)
