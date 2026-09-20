@@ -203,3 +203,17 @@ The sv_gene_dosage copy-change rule, summed over genes:
 - In panel_absent, most causal effect is unmeasurable by design.
 
 **Reference arms:** MegaPRS and SBayesRC are added alongside ridge_inf and oracle_observed, because they also model frequency, LD and annotations. They're built by the compete lane at package defaults, frozen before the sealed run.
+
+## Amendment 10 (2026-09-20, before any sealed run): a read-depth copy-number channel
+- **Arm "beagle_readcn"** (label: Beagle-imputed + read-depth CN likelihoods) is the Beagle arm plus per-sample read-depth genotype likelihoods on every measured DEL and DUP record, simulated from the truth (benchmarks/bench_sim/measurement_readcn.py). It lets methods test fusing imputed DS with direct read evidence.
+- **Generating model:**
+  - The copy number is c = 2 − g for a DEL and 2 + g for a DUP.
+  - Reads over the span follow R ~ NB(mean s_i·30·L/150·(c + 2P)/(2 + 2P), size 1/φ), for 30× depth and 150 bp reads.
+  - The sample depth scale is s_i ~ LogNormal(0, σ_s).
+  - P counts the segmental-duplication partners (UCSC hg38 genomicSuperDups) overlapping the span with fracMatch ≥ identity. Their reads dilute the signal.
+- **The caller** assumes unique sequence (P = 0) and a depth scale with error exp(N(0, τ²)). It emits PL for g = 0, 1, 2, as `train.reads` / `test.reads`.
+- **Parameter ranges:** σ_s ~ U(0.05, 0.25), φ ~ LogUniform(0.01, 0.2), identity ~ U(0.97, 0.995), τ ~ U(0, 0.1).
+- **Two draws:**
+  - a public dev draw (seed 20260919·10) serves dev scenarios;
+  - a sealed draw, sha256("<master>:readcn"), stored under sealed/, serves sealed scenarios.
+  - The sealed parameter file's hash goes into COMMITMENTS.txt.

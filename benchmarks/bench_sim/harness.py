@@ -38,8 +38,34 @@ ARMS = {
     "beagle_rb": ("observed_beagle_rb.npy", "imputation_beagle_rb.npz", "Beagle-imputed + RB structural columns (novel-measure)"),
     # A flagged fifth of the training samples observed at their true genotypes (PREREG amendment 8).
     "beagle_truthhalf": ("observed_beagle_truth.npy", "imputation_beagle.npz", "Beagle-imputed with a true-genotype training half"),
+    # The Beagle arm plus a simulated read-depth copy-number channel on DEL/DUP records (PREREG amendment 10).
+    "beagle_readcn": ("observed_beagle.npy", "imputation_beagle.npz", "Beagle-imputed + read-depth CN likelihoods"),
 }
 TRUTH_HALF_ARMS = {"beagle_truthhalf": "truth_half.npy"}
+READ_ARMS = ("beagle_readcn",)
+
+
+@dataclass
+class ReadEvidence:
+    """Read-depth genotype likelihoods on DEL/DUP records. rows index codes()' row space; likelihoods(indices)
+    returns phred-scaled PL uint8 [len(indices), samples, 3] for ALT counts 0, 1, 2 (min-normalized)."""
+    rows: np.ndarray
+    _pl: np.ndarray = field(repr=False)
+    _columns: np.ndarray = field(repr=False)
+
+    def likelihoods(self, indices) -> np.ndarray:
+        return np.asarray(self._pl[indices])[:, self._columns, :]
+
+
+def read_evidence(cohort: Path, scenario: Path, arm: str, records: np.ndarray, columns: np.ndarray) -> ReadEvidence:
+    """Dev scenarios get the public draw of the read channel; sealed scenarios get the sealed draw."""
+    if arm not in READ_ARMS:
+        return ReadEvidence(rows=np.zeros(0, dtype=np.int64), _pl=np.zeros((0, 0, 3), dtype=np.uint8), _columns=columns)
+    draw = "sealed" if scenario.parent.name.startswith("sealed") else "dev"
+    directory = cohort.parent.parent / "sealed" if draw == "sealed" else cohort
+    channel = np.load(directory / f"readcn_{draw}.npz")
+    return ReadEvidence(rows=np.searchsorted(records, channel["rows"]), _pl=np.load(directory / f"readcn_{draw}_pl.npy", mmap_mode="r"),
+                        _columns=columns)
 VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
 ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")
 
@@ -55,6 +81,7 @@ class TrainData:
     prevalence: float | None
     cores: int
     truth_half: np.ndarray
+    reads: "ReadEvidence"
     _observed: np.ndarray = field(repr=False)
     _columns: np.ndarray = field(repr=False)
     _records: np.ndarray = field(repr=False)
@@ -76,6 +103,7 @@ class ScoreData:
     variants: dict
     covariates: np.ndarray
     covariate_names: tuple
+    reads: "ReadEvidence"
     _observed: np.ndarray = field(repr=False)
     _columns: np.ndarray = field(repr=False)
     _records: np.ndarray = field(repr=False)
@@ -136,9 +164,11 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
         prevalence=params["prevalence"] if params["binary"] else None, cores=cores,
         truth_half=(np.load(cohort / TRUTH_HALF_ARMS[arm])[train_columns] if arm in TRUTH_HALF_ARMS
                     else np.zeros(train_columns.size, dtype=bool)),
+        reads=read_evidence(cohort, scenario, arm, records, train_columns),
         _observed=observed, _columns=train_columns, _records=records,
     )
     test = ScoreData(variants=table, covariates=covariates[test_columns], covariate_names=names,
+                     reads=read_evidence(cohort, scenario, arm, records, test_columns),
                      _observed=observed, _columns=test_columns, _records=records)
     del phenotype
     module = load_method(method)

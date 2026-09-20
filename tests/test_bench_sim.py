@@ -14,7 +14,7 @@ import sys
 import numpy as np
 from scipy.stats import norm
 
-from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_truthhalf, records, truth, truth_out
+from benchmarks.bench_sim import baselines, cohort, harness, measurement, measurement_beagle, measurement_readcn, measurement_truthhalf, records, truth, truth_out
 from benchmarks.bench_sim.annotations import merged_intervals, overlaps
 from sv_pgs.dosage_store import encode_dosage_milli
 
@@ -438,3 +438,30 @@ def test_out_of_family_truths(tmp_path) -> None:
 def test_out_of_family_sealed_seeds_are_disjoint_from_the_in_family_ones() -> None:
     master = "ef" * 32
     assert not set(truth_out.sealed_out_seeds(master, 64)) & set(truth.sealed_seeds(master, 64))
+
+
+def test_read_depth_likelihood_matches_the_negative_binomial() -> None:
+    from scipy.stats import nbinom
+    reads = np.array([0.0, 3.0, 17.0, 40.0])
+    mean, size = np.array([2.5, 3.0, 20.0, 35.0]), 7.0
+    expected = nbinom.logpmf(reads, size, size / (size + mean))
+    got = measurement_readcn.negative_binomial_log_likelihood(reads, mean, size)
+    assert np.max(np.abs(got - expected)) <= 1e3 * EPSILON * np.max(np.abs(expected))
+
+
+def test_read_depth_calls_resolve_unique_cnvs_and_blur_paralogous_ones() -> None:
+    rng = np.random.default_rng(17)
+    samples = 4_000
+    genotype = rng.integers(0, 3, size=(2, samples)).astype(np.float64)
+    # 50 kb at 30x is about 5,000 reads per copy. With phi = 1e-3 and an exact depth scale (tau = 0) the relative
+    # read-count sd is about sqrt(phi + 1/mean) = 0.03, while adjacent copy numbers differ by at least 25%: calls are
+    # exact with overwhelming probability.
+    params = {"sigma_s": 0.1, "phi": 1e-3, "identity": 0.98, "tau": 0.0}
+    long_unique = measurement_readcn.simulate(genotype, np.array([True, False]), np.array([50_000.0, 50_000.0]),
+                                              np.array([0, 0]), params, rng)
+    assert long_unique.shape == (2, samples, 3) and np.all(long_unique.min(axis=-1) == 0)
+    called = np.argmin(long_unique, axis=-1)
+    assert np.array_equal(called, genotype)
+    paralogous = measurement_readcn.simulate(genotype, np.array([True, False]), np.array([50_000.0, 50_000.0]),
+                                             np.array([6, 6]), params, rng)
+    assert (np.argmin(paralogous, axis=-1) == genotype).mean() < (called == genotype).mean()
