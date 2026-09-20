@@ -292,13 +292,17 @@ class CodeBlockTile:
 
     @classmethod
     def from_aligned(
-        cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
+        cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float | None,
         array_module: ModuleType, workspace_bytes: int, sample_major: tuple[Any, int] | None = None,
     ) -> CodeBlockTile:
         """A tile over codes the caller already holds in an ``INT8_GEMM_ALIGNMENT``-aligned buffer (a
         streamed block's device buffer, say), without copying them. The alignment padding, at most
-        three rows and three columns, is cleared in place. ``scale_spread`` is max(scales) /
-        min(scales), which the caller knows on the host (so the tile never waits on the device).
+        three rows and three columns, is cleared in place.
+
+        ``scale_spread`` is max(scales) / min(scales) when the caller knows it on the host and the tile must
+        never wait on the device (a streamed block, whose next block's host work overlaps this one's products):
+        ``accumulate_matmat`` then takes its digits from the a-priori bound. ``None`` measures them on each
+        call's R instead (``accumulate_digits``), one device reduction and wait, never more digits.
 
         ``sample_major`` is ``(codes_t, column)`` when the caller also holds the same codes sample-major: a
         C-contiguous int8 [padded samples, lead] array with ``codes_t[i, column + j] == aligned_codes[j, i]``
@@ -317,11 +321,14 @@ class CodeBlockTile:
             ):
                 raise ValueError("sample_major must be C-contiguous int8 [padded samples, lead] holding this tile's aligned columns")
         tile = cls.__new__(cls)
-        tile._hold(codes, int(variant_count), int(sample_count), means, scales, float(scale_spread), array_module, workspace_bytes, sample_major)
+        tile._hold(
+            codes, int(variant_count), int(sample_count), means, scales, None if scale_spread is None else float(scale_spread),
+            array_module, workspace_bytes, sample_major,
+        )
         return tile
 
     def _hold(
-        self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
+        self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float | None,
         array_module: ModuleType, workspace_bytes: int, sample_major: tuple[Any, int] | None = None,
     ) -> None:
         self._array_module = array_module
@@ -356,10 +363,6 @@ class CodeBlockTile:
     def scales(self) -> Any:
         return self._scales
 
-    @property
-    def scale_spread(self) -> float:
-        return self._scale_spread
-
     def _variant_contiguous(self, start: int, stop: int) -> tuple[Any, int, int]:
         """(left, byte offset, lead) of samples start..stop with each sample's variants contiguous, the TN
         GEMM's operand when a product reduces over variants: the held sample-major codes, else a transpose."""
@@ -381,7 +384,10 @@ class CodeBlockTile:
         ``image`` is the read's C-contiguous float64 (n, K) sum. No (n, K) temporary is formed: on
         CUDA one kernel recombines each chunk's integer products, centers them and adds them in.
         The CUDA split holds R / scale, whose rounding moves column k of R by at most
-        sqrt(p_b) (max scale / min scale) 2^-(7m-2) ||R_k||_2, which sets m. At a budget of fp64
+        2^-(7m-2) max|R_k / scale| (sum of scale^2 over R_k's nonzero rows)^(1/2) <= sqrt(p_b)
+        (max scale / min scale) 2^-(7m-2) ||R_k||_2. The tile's scale spread sets m by the right-hand
+        bound without waiting on the device; a tile without one measures the left (``accumulate_digits``).
+        At a budget of fp64
         rounding (m = OPERAND_DIGITS) the values equal ``image += self.matmat(right)`` exactly; the
         CPU products are exact fp64 whatever the budget.
         """
@@ -404,7 +410,10 @@ class CodeBlockTile:
             return
         if variants > INT32_EXACT_DIGIT_ROWS:
             raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
-        digit_count = _digits_for_ratio(math.sqrt(self._variant_count) * self._scale_spread, relative_error)
+        if self._scale_spread is None:
+            digit_count = self.accumulate_digits(right, relative_error)
+        else:
+            digit_count = _digits_for_ratio(math.sqrt(self._variant_count) * self._scale_spread, relative_error)
         digits, scale = operand_digits(padded, xp, digit_count)
         if digit_count < OPERAND_DIGITS:
             # center with the operand the digits represent, so the image gets exactly X_b R~
@@ -433,6 +442,24 @@ class CodeBlockTile:
                 grid, block,
                 (products, np.int64(chunk), np.int32(digit_count), np.int64(columns), scale, offset, image, np.int64(start), np.int64(rows)),
             )
+
+    def accumulate_digits(self, right: Any, relative_error: float) -> int:
+        """The fewest digits whose split of R / scale moves no column k of R = ``right`` by more than
+        ``relative_error * ||R_k||_2``, at most ``OPERAND_DIGITS``.
+
+        The split rounds each entry of column k of Q = R / scale to within 2^-(7m-2) of max|Q_k| and keeps zeros
+        exact, so R_jk = scale_j Q_jk moves by at most scale_j 2^-(7m-2) max|Q_k| on Q_k's nonzero rows, and R_k by
+        2^-(7m-2) max|Q_k| (sum of scale_j^2 over them)^(1/2). The count is measured on R, one device reduction.
+        """
+        xp = self._array_module
+        values = xp.asarray(right, dtype=xp.float64)
+        quotient = values / self._scales[:, None]
+        magnitude = xp.abs(quotient).max(axis=0)
+        support = xp.sqrt(((quotient != 0) * xp.square(self._scales)[:, None]).sum(axis=0))
+        norm = xp.sqrt(xp.square(values).sum(axis=0))
+        live = norm > 0
+        ratio = xp.where(live, magnitude * support / xp.where(live, norm, 1.0), 0.0)
+        return _digits_for_ratio(float(ratio.max()) if ratio.size else 0.0, relative_error)
 
     def sample_operand(self, left: Any, relative_error: float) -> SampleOperand:
         """``left`` [n, K] prepared once for the ``rmatmat`` of every block of a read.

@@ -171,6 +171,31 @@ def test_from_aligned_wraps_the_callers_codes_without_copying() -> None:
         CodeBlockTile.from_aligned(aligned[:, :1002], 37, 1001, means, scales, 1.0, np, 1 << 34)
 
 
+def test_accumulate_digits_is_the_least_count_meeting_the_budget_on_r() -> None:
+    rng = np.random.default_rng(29)
+    codes = _signed_codes(rng, 57, 40)
+    _standardized_codes, means, scales = _standardized(codes)
+    tile = CodeBlockTile(codes, means, scales, np, 1 << 30)
+    right = rng.standard_normal((57, 4)) * np.exp(rng.uniform(-8, 8, 4))[None, :]
+    right[rng.random((57, 4)) < 0.3] = 0.0
+    right[:, 3] = 0.0
+    quotient = right / scales[:, None]
+    for relative_error in (1e-1, 1e-4, 1e-9):
+        count = tile.accumulate_digits(right, relative_error)
+        digits, scale = operand_digits(quotient, np, count)
+        represented = recombine_digit_products(digits.astype(np.int64), scale, np)
+        # the split moves R = scale Q, not Q, within the budget
+        moved = np.linalg.norm((represented - quotient) * scales[:, None], axis=0)
+        assert np.all(moved <= relative_error * np.linalg.norm(right, axis=0))
+        live = np.linalg.norm(right, axis=0) > 0
+        support = np.sqrt(((quotient[:, live] != 0) * np.square(scales)[:, None]).sum(axis=0))
+        ratio = np.abs(quotient[:, live]).max(axis=0) * support / np.linalg.norm(right[:, live], axis=0)
+        # the fewest digits whose guarantee 2^-(7m-2) ratio meets the budget
+        assert ratio.max() * 2.0 ** -(DIGIT_BITS * count - 2) <= relative_error
+        assert count == 1 or ratio.max() * 2.0 ** -(DIGIT_BITS * (count - 1) - 2) > relative_error
+    assert tile.accumulate_digits(right, FLOAT64_ROUNDING) == OPERAND_DIGITS
+
+
 def test_operand_digits_for_is_the_least_count_meeting_the_budget() -> None:
     rng = np.random.default_rng(15)
     values = rng.standard_normal((2000, 5)) * np.exp(rng.uniform(-8, 8, 5))[None, :]

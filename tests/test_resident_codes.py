@@ -130,4 +130,4 @@ def test_resident_codes_that_do_not_fit_the_plan_are_refused() -> None:
 def test_a_tile_rejects_a_sample_major_array_that_does_not_hold_it() -> None:
     codes = np.zeros((8, 12), dtype=np.int8)
     with pytest.raises(ValueError):
-        CodeBlockTile.from_aligned(codes, 8, 12, np.zeros(8), np.ones(8), 1.0, np, WORKSPACE_BYTES, (np.zeros((12, 6), dtype=np.int8), 0))
+        CodeBlockTile.from_aligned(codes, 8, 12, np.zeros(8), np.ones(8), None, np, WORKSPACE_BYTES, (np.zeros((12, 6), dtype=np.int8), 0))

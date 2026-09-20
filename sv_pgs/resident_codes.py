@@ -16,7 +16,10 @@ one operand split per block. Both costs are removable when the reduced codes fit
 
 The products are ``code_products.CodeBlockTile``'s, so their accuracy contracts are unchanged: over a read
 tile, ``accumulate_matmat``'s split moves column k of R by at most relative_error ||R_k||_2, and a split per
-block met the same bound on each block, hence on R. X' L's integer products are exact either way.
+block met the same bound on each block, hence on R. The resident tiles measure that split's digit count on
+each call's R (``CodeBlockTile.accumulate_digits``): a read waits on the device once per read tile, and a deep
+tile costs no more digits than its data need, where the a-priori bound grows with sqrt(depth). X' L's integer
+products are exact either way.
 ``blocks()`` still yields the LD blocks, as zero-copy tiles of the resident codes, for every per-block
 consumer (column squares, block Grams).
 
@@ -100,20 +103,17 @@ class ResidentCodeSource:
         # Alignment rows carry no variant: mean 0 and unit scale, so their products are zero (their codes are).
         means = xp.zeros(self.resident_rows, dtype=xp.float64)
         scales = xp.ones(self.resident_rows, dtype=xp.float64)
-        spreads = []
+        seen = 0
         for block_index, tile in source.iter_tiles():
             start, stop = int(self._offsets[block_index]), int(self._offsets[block_index + 1])
             size = int(sizes[block_index])
             codes[start:stop] = tile.aligned_codes
             means[start : start + size] = tile.means
             scales[start : start + size] = tile.scales
-            spreads.append(tile.scale_spread)
-        if len(spreads) != len(self.block_bounds):
+            seen += 1
+        if seen != len(self.block_bounds):
             raise ValueError("the source yielded a different number of blocks than it declares")
         self._codes, self._means, self._scales = codes, means, scales
-        self._block_spreads = spreads
-        host_scales = xp.asnumpy(scales) if xp is not np else scales
-        self._host_scales = np.asarray(host_scales, dtype=np.float64)
         self._real = np.zeros(self.resident_rows, dtype=bool)
         for block_index, size in enumerate(sizes):
             self._real[int(self._offsets[block_index]) : int(self._offsets[block_index]) + int(size)] = True
@@ -137,19 +137,17 @@ class ResidentCodeSource:
         """Whether the codes are also held sample-major."""
         return self._sample_major is not None
 
-    def _tile(self, start: int, stop: int, variant_count: int, spread: float) -> CodeBlockTile:
+    def _tile(self, start: int, stop: int, variant_count: int) -> CodeBlockTile:
         major = None if self._sample_major is None else (self._sample_major, start)
         return CodeBlockTile.from_aligned(
             self._codes[start:stop], variant_count, self.sample_count, self._means[start : start + variant_count],
-            self._scales[start : start + variant_count], spread, self.array_module, self._workspace_bytes, major,
+            self._scales[start : start + variant_count], None, self.array_module, self._workspace_bytes, major,
         )
 
     def blocks(self) -> Iterator[tuple[int, int, CodeBlockTile]]:
         """(start, stop, tile) for every LD block, in variant order; the tiles view the resident codes."""
         for block_index, (start, stop) in enumerate(self.block_bounds):
-            yield start, stop, self._tile(
-                int(self._offsets[block_index]), int(self._offsets[block_index + 1]), stop - start, self._block_spreads[block_index]
-            )
+            yield start, stop, self._tile(int(self._offsets[block_index]), int(self._offsets[block_index + 1]), stop - start)
 
     def read_tiles(self, columns: int) -> list[tuple[int, int, CodeBlockTile]]:
         """(first, last + 1, tile) of resident rows for a read of ``columns`` columns: consecutive ranges of at most
@@ -159,9 +157,7 @@ class ResidentCodeSource:
             tiles = []
             for start in range(0, self.resident_rows, limit):
                 stop = min(start + limit, self.resident_rows)
-                real = self._host_scales[start:stop][self._real[start:stop]]
-                spread = float(real.max() / real.min()) if real.size else 1.0
-                tiles.append((start, stop, self._tile(start, stop, stop - start, spread)))
+                tiles.append((start, stop, self._tile(start, stop, stop - start)))
             self._read_tiles[columns] = tiles
         return self._read_tiles[columns]
 
