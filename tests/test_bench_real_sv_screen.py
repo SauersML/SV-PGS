@@ -168,7 +168,8 @@ def test_ranking_orders_by_the_key_and_breaks_ties_by_the_sealed_gene_order():
     ranked = sv_screen.rank_genes(scores, ["d", "c", "b", "a"])
     assert ranked["gene_id"].tolist() == ["b", "c", "a", "d"]
     assert ranked["rank"].tolist() == [1, 2, 3, 4]
-    assert sv_screen.rank_genes(ranked, ["d", "c", "b", "a"], key="max_u_panel")["gene_id"].tolist() == ["d", "a", "c", "b"]
+    assert sv_screen.rank_genes(ranked, ["d", "c", "b", "a"], keys=("max_u_panel",))["gene_id"].tolist() == ["d", "a", "c", "b"]
+    assert sv_screen.rank_genes(ranked, ["d", "c", "b", "a"], keys=("max_u_panel", "U_panel"))["gene_id"].tolist() == ["a", "d", "c", "b"]
 
 
 def test_reorder_keeps_the_genes_marks_dev_refuses_a_changed_source_and_never_replaces(tmp_path):
@@ -178,16 +179,17 @@ def test_reorder_keeps_the_genes_marks_dev_refuses_a_changed_source_and_never_re
                            "already_scored": [True, False, False, True], "confirm": [False, False, True, False]})
     screen.to_csv(tmp_path / "screen_v1.tsv", sep="\t", index=False)
     (tmp_path / "SEALED.txt").write_text(f"{sv_screen._sha256(tmp_path / 'screen_v1.tsv')}  screen_v1.tsv\n")
-    ranked = sv_screen.reorder(tmp_path, "v1", "v2", "max_u_panel")
+    ranked = sv_screen.reorder(tmp_path, "v1", "v2", ("max_u_panel", "U_panel"), "reason")
     assert ranked["gene_id"].tolist() == ["b", "c", "d", "a"]
     assert ranked["dev"].tolist() == [False, False, True, True]
+    assert "# v2: reason" in (tmp_path / "SEALED.txt").read_text()
     assert pd.read_csv(tmp_path / "sv_ranked_v2.tsv", sep="\t")["gene_id"].tolist() == ["b", "d", "a"]
     assert "sv_ranked_v2.tsv" in (tmp_path / "SEALED.txt").read_text()
     with pytest.raises(RuntimeError):
-        sv_screen.reorder(tmp_path, "v1", "v2", "max_u_panel")
+        sv_screen.reorder(tmp_path, "v1", "v2", ("max_u_panel",), "reason")
     (tmp_path / "screen_v1.tsv").write_text("changed")
     with pytest.raises(RuntimeError):
-        sv_screen.reorder(tmp_path, "v1", "v3", "max_u_panel")
+        sv_screen.reorder(tmp_path, "v1", "v3", ("max_u_panel",), "reason")
 
 
 def test_confirmation_genes_follow_the_sealed_hash_and_exclude_every_scored_gene():

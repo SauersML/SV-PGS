@@ -210,16 +210,23 @@ def confirmation_genes(gene_ids, scored_genes):
                      for gene in gene_ids])
 
 
-def rank_genes(scores, gene_order, key="U_panel"):
-    """Order by ``key`` descending, ties broken by the sealed gene order."""
+def rank_genes(scores, gene_order, keys=("U_panel",)):
+    """Order by ``keys`` descending, in turn, with the remaining ties broken by the sealed gene order."""
     order = {gene: index for index, gene in enumerate(gene_order)}
     ranked = scores.drop(columns=["rank"], errors="ignore").assign(gene_order_index=scores["gene_id"].map(order))
-    ranked = ranked.sort_values([key, "gene_order_index"], ascending=[False, True], kind="stable").reset_index(drop=True)
+    ranked = ranked.sort_values([*keys, "gene_order_index"], ascending=[False] * len(keys) + [True], kind="stable").reset_index(drop=True)
     ranked.insert(0, "rank", np.arange(1, len(ranked) + 1))
     return ranked
 
 
-def reorder(out_dir, source_version, version, key):
+V2_PROVENANCE = ("ordering chosen after the check of 19 known big-SV-gain genes on development (already scored) genes: the v1 sum "
+                 "put 0/19 in its top 2,000; the genotype-only reason for the change is that cis SV effects are sparse, usually "
+                 "one causal SV per gene, so a gene's SV potential is its single best untagged candidate, while the sum tracks "
+                 "the window's SV count (Spearman 0.77). Rank by max_u_panel, then U_panel, then the sealed gene order. "
+                 "Enrichment on development genes is a consistency check only; discovery rates use never-scored genes.")
+
+
+def reorder(out_dir, source_version, version, keys, provenance):
     """A new sealed ordering of a sealed screen (lead ruling, v2: the largest single untagged SV, ``max_u_panel``).
 
     The screen's rows, confirmation flags and genes are unchanged; only the order is new. A ``dev`` column marks the
@@ -227,22 +234,26 @@ def reorder(out_dir, source_version, version, key):
     """
     sealed_record = out_dir / "SEALED.txt"
     source = out_dir / f"screen_{source_version}.tsv"
-    recorded = {line.split()[1]: line.split()[0] for line in sealed_record.read_text().splitlines() if line.strip()}
+    recorded = {line.split()[1]: line.split()[0] for line in sealed_record.read_text().splitlines() if line.strip() and not line.startswith("#")}
     if recorded.get(source.name) != _sha256(source):
         raise RuntimeError(f"{source} does not match its sha256 in {sealed_record}")
     screen = pd.read_csv(source, sep="\t", keep_default_na=False)
     gene_order = screen.sort_values("gene_order_index")["gene_id"].tolist()
-    ranked = rank_genes(screen, gene_order, key=key)
+    ranked = rank_genes(screen, gene_order, keys=keys)
     ranked["dev"] = ranked["already_scored"].astype(str) == "True"
     screen_out, ranked_list = out_dir / f"screen_{version}.tsv", out_dir / f"sv_ranked_{version}.tsv"
-    if screen_out.exists() or ranked_list.exists():
+    note = out_dir / f"sv_ranked_{version}.README.txt"
+    if screen_out.exists() or ranked_list.exists() or note.exists():
         raise RuntimeError(f"{version} is already sealed; a sealed ordering is never replaced")
     confirm = ranked["confirm"].astype(str) == "True"
     ranked.to_csv(screen_out, sep="\t", index=False)
     ranked.loc[~confirm, ["gene_id"]].to_csv(ranked_list, sep="\t", index=False)
+    note.write_text(f"{ranked_list.name} and {screen_out.name}: {provenance}\n"
+                    f"The ranked list keeps a bare gene_id header because the harness reads it as a table.\n")
     with open(sealed_record, "a") as handle:
-        handle.write(f"{_sha256(screen_out)}  {screen_out.name} (order by {key}; from {source.name})\n")
-        handle.write(f"{_sha256(ranked_list)}  {ranked_list.name} (order by {key}; confirmation genes excluded)\n")
+        handle.write(f"# {version}: {provenance}\n")
+        for path in (screen_out, ranked_list, note):
+            handle.write(f"{_sha256(path)}  {path.name} (order by {', '.join(keys)}; from {source.name})\n")
     return ranked
 
 
@@ -277,11 +288,11 @@ def main():
     parser.add_argument("--version", default="v1")
     parser.add_argument("--scored-genes", help="bench-real's reports/genes_already_scored.tsv (a gene_id column)")
     parser.add_argument("--reorder-from", help="seal a new ordering of this sealed screen version instead of screening")
-    parser.add_argument("--key", default="U_panel", help="the per-gene column the new ordering sorts by")
+    parser.add_argument("--keys", nargs="+", default=["max_u_panel", "U_panel"], help="the per-gene columns the new ordering sorts by, in turn")
     arguments = parser.parse_args()
     dataset_dir, out_dir = pathlib.Path(arguments.dataset), pathlib.Path(arguments.out)
     if arguments.reorder_from is not None:
-        reorder(out_dir, arguments.reorder_from, arguments.version, arguments.key)
+        reorder(out_dir, arguments.reorder_from, arguments.version, tuple(arguments.keys), V2_PROVENANCE)
         print((out_dir / "SEALED.txt").read_text(), flush=True)
         return
     if arguments.scored_genes is None:
