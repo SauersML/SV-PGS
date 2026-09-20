@@ -133,10 +133,14 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     np.testing.assert_array_equal(rows.lengths, gatksv.lengths[[1, 2, 3]])
     assert rows.filled_from_imputed.tolist() == [True, True, False]
     np.testing.assert_allclose(rows.observed_fractions, observed[[1, 2, 3]].mean(axis=1))
-    # Observed calls are stored exactly: 127 per allele, a copy number as itself.
+    # Observed calls are stored exactly: 127 per allele, and floor(254 / 3) = 84 per copy for
+    # the copy-number record, whose calls reach 3 copies and whose modal call is 2.
     for row, record in enumerate([1, 2]):
         np.testing.assert_array_equal(rows.codes[row][observed[record]], gatksv.values[record][observed[record]] * 127)
-    np.testing.assert_array_equal(rows.codes[2][observed[3]], gatksv.values[3][observed[3]])
+    assert gatksv.values[3][observed[3]].max() == 3
+    assert rows.codes_per_unit.tolist() == [127, 127, 84]
+    assert rows.value_origin.tolist() == [0, 0, -2]
+    np.testing.assert_array_equal(rows.codes[2][observed[3]], gatksv.values[3][observed[3]].astype(np.int64) * 84)
 
     # Every other record with a candidate fills its no-calls with E[B | DS] from that
     # candidate's imputed DS: the unrelated INS (a slope near 0, so near its observed mean)
@@ -160,7 +164,7 @@ def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> Non
     np.testing.assert_array_equal(rows.codes[1][gatksv.no_call[2]], expected[gatksv.no_call[2]])
     # Copy numbers never pair; their no-calls take the rounded observed mean.
     copy_number_mean = gatksv.values[3][observed[3]].mean()
-    assert set(rows.codes[2][gatksv.no_call[3]].tolist()) == {int(np.floor(copy_number_mean + 0.5))}
+    assert set(rows.codes[2][gatksv.no_call[3]].tolist()) == {int(np.floor(copy_number_mean * 84 + 0.5))}
     predicted = prediction[gatksv.no_call[2]]
     half_code = 0.5 / 127
     assert rows.clipped_counts.tolist() == [0, int(np.count_nonzero((predicted < -half_code) | (predicted >= 2 + half_code))), 0]

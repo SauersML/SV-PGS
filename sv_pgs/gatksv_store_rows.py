@@ -31,9 +31,11 @@ Calibration and fill statistics run over every store sample. They use
 genotypes only, never a phenotype, and SPEC trains on all samples, so they are
 the training statistics. ``observed_fractions`` keeps the share of each row
 that was called. Codes follow the store encoding: a dosage or ALT count x is
-round(127 x) and a copy number is stored as itself. A fused dosage or a
-predicted call outside the stored range is clipped to it, and every entry
-whose code the clip changed is counted.
+round(127 x), and a copy-number row's copy number c is round(c k) with
+k = floor(254 / its maximum called copy number), its value c - its modal
+called copy number (``copy_number``); each row carries its ``codes_per_unit``
+and ``value_origin``. A fused dosage or a predicted call outside the stored
+range is clipped to it, and every entry whose code the clip changed is counted.
 """
 
 from __future__ import annotations
@@ -44,7 +46,8 @@ from typing import Sequence
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
-from sv_pgs.dosage_store import CODES_PER_DOSAGE, MAXIMUM_CODE
+from sv_pgs.copy_number import copy_number_codes_per_unit, modal_copy_numbers
+from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.gatksv_source import GatksvBlock
 from sv_pgs.sv_fusion import (
     AnchorErrorModel,
@@ -113,13 +116,16 @@ class GatksvRows:
     ``filled_from_imputed[r]`` says the no-calls of row ``r`` were predicted
     from a paired imputed DS. ``lengths`` are the records' SV lengths (|SVLEN|
     or END span), which a symbolic record's REF/ALT do not carry, for the
-    store's length annotation. ``unobserved_records`` are the block records no
-    store sample has a call for, dropped.
+    store's length annotation. A row's value is ``codes / codes_per_unit +
+    value_origin``. ``unobserved_records`` are the block records no store
+    sample has a call for, dropped.
     """
 
     gatksv_records: I64Array
     lengths: F64Array
     codes: U8Array
+    codes_per_unit: U8Array
+    value_origin: I64Array
     observed_fractions: F64Array
     filled_from_imputed: BoolArray
     clipped_counts: I64Array
@@ -158,8 +164,12 @@ def _dosage_codes(values: F64Array) -> tuple[U8Array, int]:
     return _clipped_codes(values, float(MAXIMUM_ALLELE_COUNT), CODES_PER_DOSAGE)
 
 
-def _copy_number_codes(values: F64Array) -> tuple[U8Array, int]:
-    return _clipped_codes(values, float(MAXIMUM_CODE), 1)
+def _copy_number_codes(values: F64Array, calls: U8Array, observed: BoolArray) -> tuple[U8Array, int, int, int]:
+    """A copy-number row's codes, clip count, codes per copy and value origin (minus its modal copy number)."""
+    maximum = int(calls[observed].max())
+    codes_per_unit = int(copy_number_codes_per_unit(np.array([maximum]))[0])
+    codes, clipped = _clipped_codes(values, float(maximum), codes_per_unit)
+    return codes, clipped, codes_per_unit, -int(modal_copy_numbers(calls[None], observed[None])[0])
 
 
 def gatksv_store_rows(
@@ -255,6 +265,8 @@ def gatksv_store_rows(
         kept_records.append(record)
     row_codes = np.empty((len(kept_records), sample_count), dtype=np.uint8)
     row_clipped = np.zeros(len(kept_records), dtype=np.int64)
+    row_codes_per_unit = np.full(len(kept_records), CODES_PER_DOSAGE, dtype=np.uint8)
+    row_origins = np.zeros(len(kept_records), dtype=np.int64)
     filled_from_imputed = np.zeros(len(kept_records), dtype=bool)
     for row, record in enumerate(kept_records):
         calls = gatksv.values[record].astype(np.float64)
@@ -268,13 +280,19 @@ def gatksv_store_rows(
         else:
             prediction = np.full(sample_count, calls[observed[record]].mean())
         values = np.where(observed[record], calls, prediction)
-        encode = _copy_number_codes if gatksv.is_copy_number[record] else _dosage_codes
-        row_codes[row], row_clipped[row] = encode(values)
+        if gatksv.is_copy_number[record]:
+            row_codes[row], row_clipped[row], row_codes_per_unit[row], row_origins[row] = _copy_number_codes(
+                values, gatksv.values[record], observed[record]
+            )
+        else:
+            row_codes[row], row_clipped[row] = _dosage_codes(values)
     records = np.asarray(kept_records, dtype=np.int64)
     rows = GatksvRows(
         gatksv_records=records,
         lengths=gatksv.lengths[records],
         codes=row_codes,
+        codes_per_unit=row_codes_per_unit,
+        value_origin=row_origins,
         observed_fractions=observed_counts[records] / float(sample_count),
         filled_from_imputed=filled_from_imputed,
         clipped_counts=row_clipped,

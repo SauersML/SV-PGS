@@ -7,6 +7,7 @@ from scipy.interpolate import BSpline
 
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
+    CODES_PER_DOSAGE,
     MISSING_CODE,
     CodeArray,
     HalfSamples,
@@ -310,6 +311,8 @@ def test_decode_and_assemble_write_background_corrected_codes(tmp_path) -> None:
         ref_length=np.array([len(site[1]) for site in _SITES], dtype=np.int32),
         alt_length=np.array([len(site[2]) for site in _SITES], dtype=np.int32),
         variant_class=np.zeros(3, dtype=np.uint8),
+        codes_per_unit=np.full(3, CODES_PER_DOSAGE, dtype=np.uint8),
+        value_origin=np.zeros(3, dtype=np.int64),
         group_first=np.arange(3, dtype=np.int64),
         sum_code=sums.astype(np.uint64),
         sum_code2=squares.astype(np.uint64),
@@ -427,6 +430,8 @@ def test_a_long_read_half_joins_the_imputed_halves_on_the_same_sites(tmp_path) -
         ref_length=ref_lengths,
         alt_length=alt_lengths,
         variant_class=np.zeros(3, dtype=np.uint8),
+        codes_per_unit=np.full(3, CODES_PER_DOSAGE, dtype=np.uint8),
+        value_origin=np.zeros(3, dtype=np.int64),
         group_first=np.arange(3, dtype=np.int64),
         sum_code=(imputed_sums + long_read_sums).astype(np.uint64),
         sum_code2=(imputed_squares + long_read_squares).astype(np.uint64),

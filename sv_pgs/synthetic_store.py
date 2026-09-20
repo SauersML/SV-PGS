@@ -58,6 +58,7 @@ import numpy as np
 
 from sv_pgs._typing import F32Array, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.config import VariantClass
+from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.dosage_store import (
     DEFAULT_INNER_CHUNK_ROWS,
     MAXIMUM_DOSAGE_MILLI,
@@ -1003,12 +1004,16 @@ def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, 
     carried_paths = np.where(layout.record_kind == RECORD_NESTED, _popcount(layout.nested_path_mask), 1)
     reference_lengths = source.reference_lengths[source_index].astype(np.int32)
     alternate_lengths = source.alternate_lengths[source_index].astype(np.int32)
+    # Every synthetic record is an ALT count: its value is code / 127.
+    codes_per_unit, value_origin = allele_count_decode(positions.shape[0])
     columns: dict[str, tuple[NDArray, dict[str, Any]]] = {
         "pos": (positions.astype(np.int32), {}),
         "ref_len": (reference_lengths, {}),
         "alt_len": (alternate_lengths, {}),
         "cm": (genetic_map, {}),
         "variant_class": (source.variant_classes[source_index], {"legend": VARIANT_CLASS_LEGEND}),
+        "codes_per_unit": (codes_per_unit, {}),
+        "value_origin": (value_origin.astype(np.int16), {}),
         "group_first": (layout.bubble_start, {}),
         "class": (source.class_codes[source_index], {"legend": list(CLASS_LEGEND)}),
         "sv_ctx": (context, {"legend": list(SV_CONTEXT_LEGEND)}),

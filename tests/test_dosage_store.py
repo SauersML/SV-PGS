@@ -12,6 +12,7 @@ import pytest
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
+    CODES_PER_DOSAGE,
     MANIFEST_FILE,
     MAXIMUM_CODE,
     VARIANT_CLASS_LEGEND,
@@ -78,6 +79,8 @@ def _write_store(root: Path, milli_by_half: list[dict[str, np.ndarray]], codec: 
             "alt_len": (lengths, {}),
             "cm": (positions / 1e6, {}),
             "variant_class": (np.zeros(record_count, dtype=np.uint8), {"legend": VARIANT_CLASS_LEGEND}),
+            "codes_per_unit": (np.full(record_count, CODES_PER_DOSAGE, dtype=np.uint8), {}),
+            "value_origin": (np.zeros(record_count, dtype=np.int16), {}),
             "group_first": (np.arange(record_count, dtype=np.int64), {}),
             "class": (np.zeros(record_count, dtype=np.uint8), {"legend": ["SNV", "INDEL", "SV"]}),
             "has_pl": (np.arange(record_count) % 3 == 0, {}),
@@ -274,13 +277,17 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
     chromosome = np.repeat(np.array([2, 5], dtype=np.int8), counts)
     variant_count = sum(counts)
     ids = b"".join(f"v{row}".encode() for row in range(variant_count))
+    variant_class = rng.integers(0, len(VARIANT_CLASSES), variant_count).astype(np.uint8)
+    copy_number = variant_class == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
     table = VariantTable(
         chromosome=chromosome,
         position=np.concatenate([np.arange(counts[0]) * 7 + 3, np.arange(counts[1]) * 5 + 1]).astype(np.int64),
         genetic_position_cm=np.linspace(0.0, 3.0, variant_count),
         ref_length=rng.integers(1, 4, variant_count).astype(np.int32),
         alt_length=rng.integers(1, 60, variant_count).astype(np.int32),
-        variant_class=rng.integers(0, len(VARIANT_CLASSES), variant_count).astype(np.uint8),
+        variant_class=variant_class,
+        codes_per_unit=np.where(copy_number, 50, CODES_PER_DOSAGE).astype(np.uint8),
+        value_origin=np.where(copy_number, -2, 0).astype(np.int64),
         group_first=np.concatenate([np.arange(counts[0]) // 3 * 3, counts[0] + np.arange(counts[1]) // 2 * 2]).astype(np.int64),
         sum_code=wide.sum(axis=1),
         sum_code2=(wide * wide).sum(axis=1),
@@ -295,7 +302,10 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
         assert store.chromosomes == ("chr2", "chr5")
         assert np.array_equal(store.read_codes(0, variant_count), codes)
         read_table = store.variant_table
-        for field_name in ("chromosome", "position", "ref_length", "alt_length", "variant_class", "group_first", "sum_code", "sum_code2"):
+        for field_name in (
+            "chromosome", "position", "ref_length", "alt_length", "variant_class", "codes_per_unit", "value_origin",
+            "group_first", "sum_code", "sum_code2",
+        ):
             assert np.array_equal(getattr(read_table, field_name), getattr(table, field_name)), field_name
         assert np.allclose(read_table.genetic_position_cm, table.genetic_position_cm)
         assert np.array_equal(read_table.annotations["n_paths_total"], table.annotations["n_paths_total"])

@@ -10,7 +10,10 @@ Layout ("svpgs-store v1", target-format REPORT §2 with addenda A1/A2)::
 
 Encoding: ``code = (DS_milli * 127 + 500) // 1000`` in [0, 254] and DS = code / 127, so 0, 1
 and 2 are exact and the error is at most 1/254.  Code 255 is the Zarr fill value and is never
-written.  Dosages count the ALT allele.  The Stage 0 kernels (``genotype_buffers``) work on
+written.  Dosages count the ALT allele.  Every record's value is ``code / codes_per_unit +
+value_origin`` (two variant columns): an ALT-count record has 127 and 0, a copy-number record
+(``VariantClass.COPY_NUMBER``) floor(254 / its maximum copy number) and minus its modal copy
+number, so its value is CN - modal CN and every integer copy number is exact (``copy_number``).  The Stage 0 kernels (``genotype_buffers``) work on
 ``s = code - 127`` in [-127, 127]; standardization is affine in s, so (DS - mean_DS) / sd_DS =
 (s - mean_s) / sd_s exactly.
 
@@ -108,7 +111,8 @@ VARIANT_CLASSES = tuple(VariantClass)
 # Stored with every variant_class column; a store whose legend differs is refused, never decoded.
 VARIANT_CLASS_LEGEND = [variant_class.value for variant_class in VARIANT_CLASSES]
 # On-disk variant columns every store carries; any other column is a prior annotation.
-REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first")
+REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first", "codes_per_unit", "value_origin")
+_COPY_NUMBER_CODE = VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
 Codec = Literal["raw", "zstd", "rowdict"]
 
 _ZARR_METADATA_FILE = "zarr.json"
@@ -1041,8 +1045,9 @@ class VariantTable:
     ``variant_class`` indexes ``VARIANT_CLASSES`` (``tuple(VariantClass)``).  ``group_first`` is
     the first row of the record's unbreakable group (its bubble, same-POS set, duplicate group
     or TR locus; its own row if none).  ``sum_code``/``sum_code2`` are the sidecar's all-sample
-    code sums over the store's halves, for pre-filtering only.  ``annotations`` holds every
-    other sidecar column: categorical and boolean ones as int32 codes whose names are in
+    code sums over the store's halves, for pre-filtering only.  A record's value is
+    ``code / codes_per_unit + value_origin`` (see the module docstring).  ``annotations`` holds
+    every other sidecar column: categorical and boolean ones as int32 codes whose names are in
     ``annotation_legends``, the rest as float64.
     """
 
@@ -1052,6 +1057,8 @@ class VariantTable:
     ref_length: NDArray
     alt_length: NDArray
     variant_class: U8Array
+    codes_per_unit: U8Array
+    value_origin: I64Array
     group_first: I64Array
     sum_code: NDArray
     sum_code2: NDArray
@@ -1110,6 +1117,13 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             raise ValueError(f"{chromosome} sites (pos, ref_len, alt_len) do not match the manifest md5.")
         if int(columns["variant_class"].max()) >= len(VARIANT_CLASSES):
             raise ValueError(f"{chromosome} has variant_class codes outside tuple(VariantClass).")
+        codes_per_unit = columns["codes_per_unit"].astype(np.uint8)
+        value_origin = columns["value_origin"].astype(np.int64)
+        copy_number = columns["variant_class"] == _COPY_NUMBER_CODE
+        if np.any(codes_per_unit == 0):
+            raise ValueError(f"{chromosome} has a record with codes_per_unit 0.")
+        if np.any(~copy_number & ((codes_per_unit != CODES_PER_DOSAGE) | (value_origin != 0))):
+            raise ValueError(f"{chromosome} has an ALT-count record not decoded as code / {CODES_PER_DOSAGE}.")
         group_first = columns["group_first"].astype(np.int64)
         if np.any(group_first > np.arange(record_count)) or np.any(group_first < 0):
             raise ValueError(f"{chromosome} group_first must point at or before each row.")
@@ -1133,6 +1147,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             "ref_length": columns["ref_len"].astype(np.int32),
             "alt_length": columns["alt_len"].astype(np.int32),
             "variant_class": columns["variant_class"].astype(np.uint8),
+            "codes_per_unit": codes_per_unit,
+            "value_origin": value_origin,
             "group_first": group_first + chromosome_start,
             "sum_code": half_totals[0],
             "sum_code2": half_totals[1],
@@ -1156,6 +1172,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
         ref_length=merged["ref_length"],
         alt_length=merged["alt_length"],
         variant_class=merged["variant_class"],
+        codes_per_unit=merged["codes_per_unit"],
+        value_origin=merged["value_origin"],
         group_first=merged["group_first"],
         sum_code=merged["sum_code"],
         sum_code2=merged["sum_code2"],
@@ -1523,6 +1541,8 @@ def write_variant_columns(root: Path, chromosome: str, table: VariantTable, rows
         ("alt_len", table.alt_length[rows].astype(np.int32), {}),
         ("cm", table.genetic_position_cm[rows], {}),
         ("variant_class", table.variant_class[rows], {"legend": VARIANT_CLASS_LEGEND}),
+        ("codes_per_unit", table.codes_per_unit[rows].astype(np.uint8), {}),
+        ("value_origin", table.value_origin[rows].astype(np.int16), {}),
         ("group_first", table.group_first[rows] - chromosome_start, {}),
     ):
         write_column(variant_column_directory(root, chromosome, name), values, attributes)
