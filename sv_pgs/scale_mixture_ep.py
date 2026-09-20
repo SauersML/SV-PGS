@@ -990,7 +990,23 @@ def _trust_region_step(negative_hessian: F64Array, gradient: F64Array, radius: f
             lower = middle
         else:
             upper = middle
-    return eigenvectors @ (components / (eigenvalues + upper))
+    shifted = eigenvalues + upper
+    # More and Sorensen's hard case: -H is not positive definite, and no mu > -lambda_min reaches the boundary, because
+    # g has no part on -H's lowest eigenspace (or one below mu's resolution, where mu = -lambda_min exactly and the
+    # shifted eigenvalue there is 0) and the rest of the step at mu = -lambda_min lies inside the radius. The
+    # maximizer then keeps the rest at mu = -lambda_min and reaches the boundary along the lowest eigenvector, on g's
+    # side where g has a part there (either side ascends equally where it has none).
+    at_lower = eigenvalues + lower
+    lowest = ~(at_lower > 0.0)
+    rest = np.where(lowest, 0.0, components / np.where(lowest, 1.0, at_lower))
+    unresolved = not np.all(shifted > 0.0)
+    orthogonal = not np.any(components[lowest] != 0.0) and float(rest @ rest) <= radius * radius
+    if eigenvalues[0] > 0.0 or not (unresolved or orthogonal):
+        return eigenvectors @ (components / shifted)
+    reach = float(np.sqrt(max(radius * radius - float(rest @ rest), 0.0)))
+    first = int(np.flatnonzero(lowest)[0])
+    rest[first] = reach if components[first] >= 0.0 else -reach
+    return eigenvectors @ rest
 
 
 def _maximize_coefficients(
@@ -1322,11 +1338,10 @@ def _total_curvature_columns(
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
-    size = int(np.prod(shape))
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
     # columns (``krylov_recycle.block_gcro_dr``, speed-recycle): each application serves them all, restarts keep the
-    # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it. At most ``size`` applications,
-    # the flattened GMRES's own cap. Each product solves the posterior only to ``inner``, so the operator itself errs,
+    # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it; it stops where a cycle no longer
+    # lowers its residual. Each product solves the posterior only to ``inner``, so the operator itself errs,
     # and the Krylov residual estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci.
     # Comput. 25, 2003): half the tolerance goes to the Krylov solve, half to the products. The true residual is
     # measured once the solve meets its own tolerance; while it exceeds the tolerance, the inner solves tighten by the
@@ -1334,6 +1349,7 @@ def _total_curvature_columns(
     precondition = None if posterior.local_response is None else posterior.local_response(left, gain, diagonal, weight)
     inner = relative_tolerance
     solution = np.zeros(shape)
+    floor_residual = np.inf
     while True:
         try:
             _shift, offset, start_response = through(np.zeros(shape), inner)
@@ -1352,7 +1368,7 @@ def _total_curvature_columns(
         try:
             result = block_gcro_dr(
                 linear_part, offset, relative_tolerance=0.5 * relative_tolerance, absolute_tolerance=rounding, working_bytes=working_bytes,
-                application_limit=size, start=solution, precondition=precondition,
+                start=solution, precondition=precondition,
             )
         except (FloatingPointError, ValueError) as error:
             raise LinearResponseError(f"the EP fixed point's linear response did not converge: {error}") from error
@@ -1362,9 +1378,20 @@ def _total_curvature_columns(
         if residual <= target:
             break
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
-        # the measured excess each round, which ends where they reach float64's attainable accuracy (the solver then
-        # refuses, above) rather than on one noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34).
-        inner *= 0.5 * target / residual
+        # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
+        # noisy comparison (speed-recycle: 3.61 then 4.26 against 3.34). That end is either the solver refusing (above)
+        # or, where it returns a certificate above the request instead (speed-krylov cf364bd), float64's unit roundoff:
+        # no solve delivers a request below it, so the solves stay there, and the Krylov solve continues from its true
+        # residual for as long as each such round lowers it.
+        tightened = inner * 0.5 * target / residual
+        if tightened < _EPSILON:
+            if not residual < floor_residual:
+                raise LinearResponseError(
+                    f"the EP fixed point's linear response cannot be resolved in float64: its true residual {residual:.3e} stays above "
+                    f"{target:.3e} with the posterior solves at float64's unit roundoff"
+                )
+            floor_residual, tightened = residual, _EPSILON
+        inner = tightened
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
 
@@ -2716,13 +2743,12 @@ def _newton_step(newton: _NewtonB) -> F64Array:
 
 
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite, shortened to ``radius`` where it is longer,
-    else the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by the monotonicity test, not by a
+    radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
+    the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
     curvature out of a saddle."""
     if newton.definite:
-        step = _newton_step(newton)
-        length = float(np.linalg.norm(step))
-        return step if length <= radius else step * (radius / length)
+        return _newton_step(newton)
     return _trust_region_step(newton.total, newton.gradient, radius)
 
 
@@ -2760,8 +2786,7 @@ def fit_hyperparameters(
       model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
       value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
       a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
-      at the Cauchy step's length on |B + S| (``_cauchy_radius``), and a Newton step longer than the radius is
-      shortened to it.
+      at the Cauchy step's length on |B + S| (``_cauchy_radius``).
     The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
     remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
     by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
@@ -2811,10 +2836,7 @@ def fit_hyperparameters(
             if radius is None:
                 radius = _cauchy_radius(newton)
                 radii[model] = radius
-            proposal = _proposal(newton, radius)
-            # A Newton step shortened to the radius is its fraction of the full one (the certifying check scales by it).
-            full = float(np.linalg.norm(_newton_step(newton))) if newton.definite else float(np.linalg.norm(proposal))
-            pending[model] = (newton, step, proposal, radius, certifying, 1.0 if full == 0.0 else float(np.linalg.norm(proposal)) / full)
+            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
         if all(fit is not None for fit in fits):
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
@@ -2867,7 +2889,8 @@ def fit_hyperparameters(
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
                 iterations[model] += 1
-                radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
+                if not newton.definite:
+                    radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
@@ -2894,7 +2917,6 @@ def fit_hyperparameters(
             # move was too large, or an ordinary one, becomes an ordinary shorter trial.
             keep = certifying and trial_point is None
             if newton.definite:
-                radii[model] = 0.5 * length
                 pending[model] = (newton, step, 0.5 * proposal, radius, keep, 0.5 * fraction)
             else:
                 radius = 0.5 * length
