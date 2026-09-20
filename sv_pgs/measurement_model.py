@@ -59,7 +59,10 @@ are logged.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
+import hashlib
+import json
+from pathlib import Path
 
 import numpy as np
 
@@ -306,7 +309,9 @@ class LeakageMap:
     column is Xtilde_k = D*_k + sum_j coefficients[j, k] (D*_j - column_means[j]).
     ``ridge_ratio`` is the marginal-likelihood ratio t: 0 when the pairs show no
     leakage, infinite at the least-squares limit. ``fits_pairs_exactly`` marks a
-    ratio stopped where a target's residual on the pairs reaches 0.
+    ratio stopped where a target's residual on the pairs reaches 0. ``records`` are
+    the block's store rows (set by ``fit_block_map``), so a map is self-contained;
+    ``targets`` index into them.
     """
 
     targets: I64Array
@@ -314,6 +319,7 @@ class LeakageMap:
     coefficients: F64Array
     ridge_ratio: float
     fits_pairs_exactly: bool = False
+    records: I64Array = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
 
 
 def fit_leakage_map(cohort_covariance: NDArray, calibrated_pairs: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
@@ -547,7 +553,49 @@ def fit_block_map(pairs: BlockPairs, scales: NDArray) -> LeakageMap:
     block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
     dosage = np.asarray(pairs.dosage, dtype=np.float64)
     means = dosage.mean(axis=0)
-    return fit_leakage_map(_calibrated_block_covariance(pairs, scales), means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+    leakage = fit_leakage_map(_calibrated_block_covariance(pairs, scales), means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+    return replace(leakage, records=np.asarray(pairs.block.records, dtype=np.int64))
+
+
+def engine_blocks(
+    block_starts: NDArray, block_stops: NDArray, target_rows: NDArray, absorbed_rows: NDArray, absorbing_rows: NDArray
+) -> tuple[LdBlock, ...]:
+    """One LdBlock per engine LD block [start, stop) that holds a target, so every engine block has one A.
+
+    ``target_rows`` are the store rows to map (imputed SV/TR records); ``absorbed_rows[i]``
+    is a direct-call row fused into target ``absorbing_rows[i]``. The engine's sources
+    read each block's own records, so a fused pair must lie inside one engine block:
+    the store keeps them in one unbreakable group, and a pair that straddles a
+    boundary is refused here rather than silently split.
+    """
+    starts = np.asarray(block_starts, dtype=np.int64)
+    stops = np.asarray(block_stops, dtype=np.int64)
+    targets = np.unique(np.asarray(target_rows, dtype=np.int64))
+    absorbed = np.asarray(absorbed_rows, dtype=np.int64)
+    absorbing = np.asarray(absorbing_rows, dtype=np.int64)
+    if starts.shape != stops.shape or np.any(stops <= starts) or np.any(starts[1:] < stops[:-1]):
+        raise ValueError("engine_blocks needs ordered, disjoint, non-empty blocks.")
+    if absorbed.shape != absorbing.shape or not np.all(np.isin(absorbing, targets)):
+        raise ValueError("every absorbed row needs the target row it is fused into.")
+
+    def block_of(rows: I64Array) -> I64Array:
+        index = np.searchsorted(stops, rows, side="right")
+        inside = (index < starts.shape[0]) & (starts[np.minimum(index, starts.shape[0] - 1)] <= rows)
+        if not np.all(inside):
+            raise ValueError("a target or absorbed row lies outside every engine block.")
+        return index
+
+    if np.any(block_of(absorbed) != block_of(absorbing)):
+        raise ValueError("a fused pair straddles an engine block boundary; keep its rows in one unbreakable group.")
+    target_blocks = block_of(targets)
+    absorbed_blocks = block_of(absorbed)
+    blocks = []
+    for index in np.unique(target_blocks).tolist():
+        records = np.arange(starts[index], stops[index], dtype=np.int64)
+        blocks.append(
+            LdBlock(records, targets[target_blocks == index] - starts[index], absorbed[absorbed_blocks == index] - starts[index])
+        )
+    return tuple(blocks)
 
 
 def mapped_signal_variances(pairs: BlockPairs, scales: NDArray, leakage: LeakageMap) -> F64Array:
@@ -560,8 +608,8 @@ def mapped_signal_variances(pairs: BlockPairs, scales: NDArray, leakage: Leakage
 class MeasurementModel:
     """What the fit uses for its columns, offsets and predictive variance, and what was and wasn't applied.
 
-    ``residual_variance`` is v_j = E[(G - D*_j)^2], the predictive variance's
-    measurement term. For a record without calibration pairs it is the value the
+    ``residual_variance`` is v_j = E[(G - D*_j)^2] per record (not per person), the
+    predictive variance's measurement term. For a record without calibration pairs it is the value the
     reported r^2 implies for the unscaled column, Var(D) (1 - r^2) / r^2.
     """
 
@@ -570,6 +618,57 @@ class MeasurementModel:
     log_reliability: F64Array
     leakage_maps: tuple[LeakageMap, ...]
     certificate: dict[str, object]
+
+    def _arrays(self) -> dict[str, NDArray]:
+        maps = self.leakage_maps
+        return {
+            "scales": self.scales,
+            "residual_variance": self.residual_variance,
+            "log_reliability": self.log_reliability,
+            "map_records": np.concatenate([leakage.records for leakage in maps] or [np.zeros(0, np.int64)]),
+            "map_record_counts": np.array([leakage.records.shape[0] for leakage in maps], dtype=np.int64),
+            "map_targets": np.concatenate([leakage.targets for leakage in maps] or [np.zeros(0, np.int64)]),
+            "map_target_counts": np.array([leakage.targets.shape[0] for leakage in maps], dtype=np.int64),
+            "map_column_means": np.concatenate([leakage.column_means for leakage in maps] or [np.zeros(0)]),
+            "map_coefficients": np.concatenate([leakage.coefficients.ravel() for leakage in maps] or [np.zeros(0)]),
+            "map_ridge_ratios": np.array([leakage.ridge_ratio for leakage in maps], dtype=np.float64),
+            "map_fits_pairs_exactly": np.array([leakage.fits_pairs_exactly for leakage in maps], dtype=bool),
+            "certificate": np.array(json.dumps(self.certificate, sort_keys=True)),
+        }
+
+    def digest(self) -> str:
+        """sha256 over every array and the certificate, in a fixed order: the artifact's provenance of the model."""
+        hasher = hashlib.sha256()
+        for name, values in sorted(self._arrays().items()):
+            hasher.update(name.encode())
+            hasher.update(np.ascontiguousarray(values).tobytes())
+        return hasher.hexdigest()
+
+    def save(self, path: str | Path) -> None:
+        """Write the model as one npz (no pickled objects), readable by ``MeasurementModel.load``."""
+        np.savez(Path(path), **self._arrays())
+
+    @classmethod
+    def load(cls, path: str | Path) -> MeasurementModel:
+        with np.load(Path(path), allow_pickle=False) as archive:
+            arrays = {name: archive[name] for name in archive.files}
+        record_ends = np.cumsum(arrays["map_record_counts"])
+        target_ends = np.cumsum(arrays["map_target_counts"])
+        maps = []
+        coefficient_start = 0
+        for index in range(arrays["map_record_counts"].shape[0]):
+            records = arrays["map_records"][record_ends[index] - arrays["map_record_counts"][index] : record_ends[index]]
+            targets = arrays["map_targets"][target_ends[index] - arrays["map_target_counts"][index] : target_ends[index]]
+            means = arrays["map_column_means"][record_ends[index] - records.shape[0] : record_ends[index]]
+            size = records.shape[0] * targets.shape[0]
+            coefficients = arrays["map_coefficients"][coefficient_start : coefficient_start + size].reshape(records.shape[0], targets.shape[0])
+            coefficient_start += size
+            maps.append(
+                LeakageMap(targets, means, coefficients, float(arrays["map_ridge_ratios"][index]),
+                           bool(arrays["map_fits_pairs_exactly"][index]), records)
+            )
+        return cls(arrays["scales"], arrays["residual_variance"], arrays["log_reliability"], tuple(maps),
+                   json.loads(str(arrays["certificate"])))
 
 
 def fit_measurement_model(

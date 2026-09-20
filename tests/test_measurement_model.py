@@ -6,10 +6,12 @@ import pytest
 
 from sv_pgs.measurement_model import (
     LdBlock,
+    MeasurementModel,
     apply_leakage_map,
     calibration_moments,
     calibration_pairs,
     concatenate_calibration_moments,
+    engine_blocks,
     fit_leakage_map,
     fit_measurement_model,
     leakage_transform,
@@ -368,3 +370,36 @@ def test_a_direct_call_is_fused_into_its_imputed_record_and_leaves_the_fit() -> 
     # The offset is the fused column's share of the genotype variance; its error is that of
     # the variance ratios estimated from the calibration pairs.
     assert abs(model.log_reliability[0] - np.log(r2(fused))) <= sampling_bound(float(np.sqrt(4 / pairs)))
+
+
+def test_the_model_saves_and_loads_every_array_and_map(tmp_path) -> None:
+    rng = np.random.default_rng(59)
+    samples = 2000
+    sv, snp = _two_locus(rng, samples, 0.3, 0.9)
+    draw = _draw_type_column(sv[None], np.array([0.3]), 0.5, rng)[0]
+    pairs = calibration_pairs(
+        tuple(ResearchId(str(index)) for index in range(samples)), np.vstack([draw, snp]), np.vstack([sv, snp]),
+        blocks=(LdBlock(np.array([0, 1]), np.array([0])),), block_covariances=(np.cov(np.vstack([draw, snp]), bias=True),),
+    )
+    model = fit_measurement_model(pairs, np.array([np.var(draw), np.var(snp)]), np.array([0, 1]), np.array([0.3, 1.0]))
+    model.save(tmp_path / "measurement.npz")
+    loaded = MeasurementModel.load(tmp_path / "measurement.npz")
+    for name in ("scales", "residual_variance", "log_reliability"):
+        np.testing.assert_array_equal(getattr(loaded, name), getattr(model, name))
+    assert loaded.certificate == model.certificate and loaded.digest() == model.digest()
+    for original, restored in zip(model.leakage_maps, loaded.leakage_maps, strict=True):
+        for name in ("records", "targets", "column_means", "coefficients"):
+            np.testing.assert_array_equal(getattr(restored, name), getattr(original, name))
+        assert restored.ridge_ratio == original.ridge_ratio
+    np.testing.assert_array_equal(loaded.leakage_maps[0].records, [0, 1])
+
+
+def test_engine_blocks_fold_fused_pairs_into_their_block_and_refuse_a_split_pair() -> None:
+    starts, stops = np.array([0, 10, 25]), np.array([10, 25, 40])
+    blocks = engine_blocks(starts, stops, np.array([3, 12, 30]), np.array([4, 31]), np.array([3, 30]))
+    assert [block.records[0] for block in blocks] == [0, 10, 25]
+    assert blocks[0].targets.tolist() == [3] and blocks[0].absorbed.tolist() == [4]
+    assert blocks[1].targets.tolist() == [2] and blocks[1].absorbed.tolist() == []
+    assert blocks[2].targets.tolist() == [5] and blocks[2].absorbed.tolist() == [6]
+    with pytest.raises(ValueError, match="straddles"):
+        engine_blocks(starts, stops, np.array([9]), np.array([10]), np.array([9]))
