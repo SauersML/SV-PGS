@@ -50,9 +50,14 @@ beyond its window, shows up as a block whose measured trace error provably excee
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
+from functools import cached_property
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.linalg import solve_triangular
+from scipy.optimize import brentq
+from scipy.stats import norm
 from scipy.stats import t as student_t
 
 
@@ -94,21 +99,41 @@ class WindowCross:
 
 @dataclass(frozen=True)
 class BlockGrams:
-    """Stage 0 Grams in the model's metric: R_b per block and R_{b,b+1} between genome-adjacent blocks.
+    """Stage 0 Grams: R_b per block and R_{b,b+1} between genome-adjacent blocks, in the model's metric times
+    ``scale``.
 
-    ``next_cross`` has one entry per adjacent pair. An empty tuple makes each window its own block
-    alone; the certificate then carries any coupling across the cuts.
+    The arrays may be Stage 0's stored float32 Grams themselves (``LdGramStore``, memory-mapped). Every model of a
+    fit shares them, and a model's metric enters only through ``scale`` (1 / sigma^2 for a quantitative model):
+    ``dataclasses.replace(grams, scale=...)`` copies no array. They are promoted to float64 per window, inside the
+    window algebra, the only place their precision matters. ``next_cross`` has one entry per adjacent pair. An empty
+    tuple makes each window its own block alone; the certificate then carries any coupling across the cuts.
     """
 
     blocks: tuple[NDArray[np.int64], ...]
-    within: tuple[NDArray[np.float64], ...]
-    next_cross: tuple[NDArray[np.float64], ...]
+    within: tuple[NDArray, ...]
+    next_cross: tuple[NDArray, ...]
+    scale: float = 1.0
 
     def __post_init__(self) -> None:
         if len(self.within) != len(self.blocks):
             raise ValueError("one within-block Gram per block")
         if self.next_cross and len(self.next_cross) != len(self.blocks) - 1:
             raise ValueError("next_cross needs one Gram per adjacent block pair, or none")
+
+    def within_block(self, block: int) -> NDArray[np.float64]:
+        """R_b in the model's metric, in float64 (a new array, one block at a time)."""
+        return np.asarray(self.within[block], dtype=np.float64) * self.scale
+
+    def cross_block(self, block: int) -> NDArray[np.float64]:
+        """R_{b,b+1} in the model's metric, in float64."""
+        return np.asarray(self.next_cross[block], dtype=np.float64) * self.scale
+
+    def column_square_norms(self) -> NDArray[np.float64]:
+        """|xt_j|^2 for every variant, in variant order: the within blocks' diagonals."""
+        norms = np.empty(sum(members.shape[0] for members in self.blocks))
+        for members, within in zip(self.blocks, self.within):
+            norms[members] = np.diagonal(within).astype(np.float64) * self.scale
+        return norms
 
 
 @dataclass(frozen=True)
@@ -195,7 +220,16 @@ def window_bulk_quadratic(gram: NDArray[np.float64], bulk_variance: NDArray[np.f
 
 
 def _window(grams: BlockGrams, block: int) -> tuple[NDArray[np.float64], NDArray[np.int64], slice]:
-    """The window's Gram, its variant indices, and the own block's rows in it."""
+    """The window's Gram, its variant indices, and the own block's rows in it.
+
+    Stage 0 supplies each block's Gram and the Gram with its successor, not the (b-1, b+1) corner. Left at zero, the
+    corner makes a three-block window indefinite whenever LD reaches past a thin block (e2e-scale, v7 chr22 at cap
+    1024: 22 of 24 interior windows, lambda_min down to -8% of lambda_max, every within block and two-block window
+    positive definite). The corner is completed as R_{b-1,b} R_bb^-1 R_{b,b+1}, the maximum-determinant positive
+    completion of the tridiagonal pattern (Grone, Johnson, Sa and Wolkowicz 1984): b-1 and b+1 conditionally
+    uncorrelated given b. The Schur complement with respect to R_bb is then block-diagonal, the two-block Schur
+    complements, so the window is positive semidefinite whenever its two two-block windows are.
+    """
     if grams.next_cross:
         members = [neighbour for neighbour in (block - 1, block, block + 1) if 0 <= neighbour < len(grams.blocks)]
     else:
@@ -205,11 +239,21 @@ def _window(grams: BlockGrams, block: int) -> tuple[NDArray[np.float64], NDArray
     gram = np.zeros((int(starts[-1]), int(starts[-1])))
     for position, member in enumerate(members):
         span = slice(int(starts[position]), int(starts[position + 1]))
-        gram[span, span] = grams.within[member]
+        gram[span, span] = grams.within_block(member)
         if position + 1 < len(members):
             following = slice(int(starts[position + 1]), int(starts[position + 2]))
-            gram[span, following] = grams.next_cross[member]
-            gram[following, span] = grams.next_cross[member].T
+            cross = grams.cross_block(member)
+            gram[span, following] = cross
+            gram[following, span] = cross.T
+    if len(members) == len((block - 1, block, block + 1)):
+        first, middle, last = (slice(int(starts[position]), int(starts[position + 1])) for position in range(len(members)))
+        centre = gram[middle, middle]
+        # R_bb^-1 R_{b,b+1} by a least-squares solve: exact for a positive-definite R_bb, and the minimum-norm
+        # completion when a tie-free but rank-deficient block (n < |b|) makes R_bb singular.
+        solved, *_rest = np.linalg.lstsq(centre, gram[middle, last], rcond=None)
+        corner = gram[first, middle] @ solved
+        gram[first, last] = corner
+        gram[last, first] = corner.T
     columns = np.concatenate([grams.blocks[member] for member in members])
     own_position = members.index(block)
     own = slice(int(starts[own_position]), int(starts[own_position + 1]))
@@ -227,10 +271,19 @@ def marginals_from_quadratics(
     is_resolved = np.zeros(site_precision.shape[0], dtype=bool)
     is_resolved[resolved] = True
     bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, site_precision))
-    spikes = np.einsum("ik,ik->i", resolved_cross @ np.linalg.inv(resolved_core), resolved_cross) if resolved.shape[0] else 0.0
+    spikes = np.sum((resolved_cross @ np.linalg.inv(resolved_core)) * resolved_cross, axis=1) if resolved.shape[0] else 0.0
     variances = bulk_variance - np.square(bulk_variance) * (bulk_quadratic - spikes)
     variances[resolved] = np.diag(np.linalg.inv(resolved_core))
     return variances
+
+
+def sandwich_diagonal(covariance: NDArray[np.float64], gram: NDArray[np.float64]) -> NDArray[np.float64]:
+    """diag(S R S) as sum_k (S R)_ik S_ki: one BLAS product and an elementwise sum.
+
+    Unoptimized three-operand einsum loops over all (i, j, k) without BLAS; on one 4,430-variant block it was 99.8%
+    of a fit's time (engine's bench-real profile).
+    """
+    return np.sum((covariance @ gram) * covariance.T, axis=1)
 
 
 def _block_index(grams: BlockGrams) -> NDArray[np.int64]:
@@ -283,16 +336,86 @@ class _BlockTerms:
     covariance: NDArray[np.float64]
 
 
+def _window_quadratic(gram: NDArray[np.float64], window_variance: NDArray[np.float64], own: slice, solve: BulkSolve, array_module: Any) -> NDArray[np.float64]:
+    """The window's bulk quadratic rows (own x window): (omega_F R - omega_F^2 R D^1/2 (I + omega_F B)^-1 D^1/2 R)[own].
+
+    B's spectrum is needed only for omega_F, and (I + omega_F B)^-1 only on the own block's columns: eigenvalues
+    (about 4/3 |W|^3), one Cholesky (|W|^3 / 3) and solves for |b| columns, not a full eigendecomposition (about
+    9 |W|^3; e2e-scale: 37 min per model at |W| up to 3 x 2,144 on host). The dense algebra runs on
+    ``array_module`` (numpy, or cupy on a device), in float64; omega_F's scalar root is found on host.
+    """
+    xp = array_module
+    device_gram = xp.asarray(gram)
+    root = xp.sqrt(xp.asarray(window_variance))
+    whitened = root[:, None] * device_gram * root[None, :]
+    raw_eigenvalues = _to_host(xp.linalg.eigvalsh(whitened))
+    # A window Gram must be positive semidefinite, and then every quadratic here is >= 0: omega R (I + omega D R)^-1
+    # = omega R^1/2 (I + omega R^1/2 D R^1/2)^-1 R^1/2. Stored in float32 (LdGramStore), each entry is rounded once,
+    # |E_ij| <= u32 |R_ij|, so B's smallest eigenvalue can fall below 0 by at most u32 |B|_F, plus the float64
+    # eigensolver's |W| u64 |B|_F. Anything beyond that means the within- and cross-block Grams are not the Gram of
+    # one design (different rows, units, projection or block order): the map would be wrong, so refuse.
+    rounding = (np.finfo(np.float32).eps / 2 + whitened.shape[0] * np.finfo(np.float64).eps / 2) * float(_to_host(xp.linalg.norm(whitened)))
+    if raw_eigenvalues.shape[0] and float(raw_eigenvalues[0]) < -rounding:
+        raise ValueError(
+            f"a window Gram is not positive semidefinite (smallest whitened eigenvalue {float(raw_eigenvalues[0]):.3e}, "
+            f"rounding allows {-rounding:.3e}): the within- and cross-block Grams do not come from one design"
+        )
+    eigenvalues = np.maximum(raw_eigenvalues, 0.0)
+    far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
+    whitened *= far_trace  # in place: I + omega_F B, with no second |W| x |W| array
+    whitened[xp.arange(whitened.shape[0]), xp.arange(whitened.shape[0])] += 1.0
+    lower = xp.linalg.cholesky(whitened)
+    del whitened
+    right = root[:, None] * device_gram[:, own]  # D^1/2 R[:, own]
+    solved = _cholesky_solve(xp, lower, right)  # (I + omega_F B)^-1 D^1/2 R[:, own]
+    del lower
+    quadratic = far_trace * device_gram[:, own] - far_trace**2 * (device_gram @ (root[:, None] * solved))
+    return _to_host(quadratic.T)
+
+
+def window_working_bytes(grams: BlockGrams) -> int:
+    """The window algebra's peak float64 working set over the blocks, for the fit's working_bytes budget.
+
+    At most four |W| x |W| arrays are live in a window (the assembled Gram, its whitened form, the eigensolver's
+    workspace, the Cholesky factor) plus four |W| x |b| ones (the right-hand sides, their solve, the quadratic
+    rows and the covariance rows), with |W| the window's and |b| the block's size. The shared Grams themselves stay
+    where the caller keeps them (Stage 0's memory map).
+    """
+    itemsize = np.dtype(np.float64).itemsize
+    peak = 0
+    for block in range(len(grams.blocks)):
+        window = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
+        own = grams.blocks[block].shape[0]
+        peak = max(peak, (4 * window * window + 4 * window * own) * itemsize)
+    return peak
+
+
+def _to_host(values: Any) -> NDArray[np.float64]:
+    return values.get() if hasattr(values, "get") else np.asarray(values)
+
+
+def _cholesky_solve(xp: Any, lower: Any, right: Any) -> Any:
+    """(L L')^-1 right by two triangular solves, on numpy or cupy."""
+    if xp is np:
+        return solve_triangular(lower.T, solve_triangular(lower, right, lower=True), lower=False)
+    from cupyx.scipy.linalg import solve_triangular as device_triangular
+
+    return device_triangular(lower.T, device_triangular(lower, right, lower=True), lower=False)
+
+
 def _block_terms(
-    solve: BulkSolve, grams: BlockGrams, cross: WindowCross, bulk_variance: NDArray[np.float64], core_inverse: NDArray[np.float64], block: int
+    solve: BulkSolve,
+    grams: BlockGrams,
+    cross: WindowCross,
+    bulk_variance: NDArray[np.float64],
+    core_inverse: NDArray[np.float64],
+    block: int,
+    array_module: Any = np,
 ) -> _BlockTerms:
     gram, columns, own = _window(grams, block)
     members = grams.blocks[block]
     window_variance = bulk_variance[columns]
-    eigenvalues, eigenvectors = _whitened_spectrum(gram, window_variance)
-    far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
-    projected = (gram * np.sqrt(window_variance)[None, :]) @ eigenvectors
-    quadratic = far_trace * gram[own] - far_trace**2 * (projected[own] / (1.0 + far_trace * eigenvalues)[None, :]) @ projected.T
+    quadratic = _window_quadratic(gram, window_variance, own, solve, array_module)
     near = cross.positions[block]
     near_inverse = core_inverse[np.ix_(near, near)]
     window_cross_rows = np.concatenate([_cross_rows(cross, member, near) for member in _window_blocks(grams, block)], axis=0)
@@ -323,8 +446,9 @@ def _prepare(solve: BulkSolve, grams: BlockGrams) -> tuple[WindowCross, NDArray[
     return window_cross(solve, grams), bulk_variance, core_inverse, is_resolved
 
 
-def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float64]:
-    """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring).
+def marginal_variances(solve: BulkSolve, grams: BlockGrams, array_module: Any = np) -> NDArray[np.float64]:
+    """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring). The windows' dense algebra runs on
+    ``array_module`` (numpy by default; pass cupy to use a device).
 
     With C kept on LD windows only, a bulk j's coupling to resolved sites beyond its window, D_j^2 c_j,far
     core^-1 c_j,far', enters by its expectation. For far pairs Sigma_jl ~ -D_j c_jl (core^-1)_ll and
@@ -338,10 +462,9 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float6
     near_totals = np.zeros(len(grams.blocks))
     resolved_variance = np.diag(core_inverse)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         near_variance[members] = np.diag(terms.covariance)
-        # diag(S R S) as one BLAS product and a row sum: a three-operand einsum loops over i, j and k in C, without BLAS.
-        sandwich[members] = np.einsum("ij,ji->i", terms.covariance @ grams.within[block], terms.covariance)
+        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block))
     resolved_weight = sandwich[solve.resolved] / resolved_variance if solve.resolved.shape[0] else np.zeros(0)
     for block in range(len(grams.blocks)):
         near_totals[block] = float(np.sum(resolved_weight[cross.positions[block]]))
@@ -356,7 +479,7 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float6
     # (verify-stage2's counterexample: Xt'Xt = [[1, 1], [1, 1]], Pi = (2, -1/2) gives Sigma_11 = 1 > 1/2). The
     # approximation can cross the bounds, e.g. when a window's resolved spikes over-subtract, so project onto
     # the ones that hold, as exact_polish does for its estimates. The certificate still sees the error.
-    column_square_norms = np.concatenate([np.diag(within) for within in grams.within])[np.argsort(np.concatenate(grams.blocks))]
+    column_square_norms = grams.column_square_norms()
     lower = 1.0 / (column_square_norms + solve.site_precision)
     every_site_positive = bool(np.all(solve.site_precision > 0.0))
     upper = bulk_variance if every_site_positive else np.full(variant_count, np.inf)
@@ -380,14 +503,63 @@ def certificate_level(draw_count: int) -> float:
     return 1.0 / draw_count
 
 
+def _edgeworth_correction(skewness: float, probe_count: int, cut: float) -> float:
+    """The one-term Edgeworth correction to the studentized mean's tail beyond ``cut``, on its heavy side.
+
+    For the mean of k i.i.d. values of skewness g, T = (mean - mu) / (sd / sqrt k) has
+    P(T <= x) = Phi(x) + k^(-1/2) g (2 x^2 + 1) phi(x) / 6 + O(1/k) (Hall 1992, The Bootstrap and Edgeworth
+    Expansion, section 2.6), so the tail on the side the skewness weights gains |g| (2 x^2 + 1) phi(x) / (6 sqrt k).
+    """
+    return abs(skewness) * (2.0 * cut * cut + 1.0) * float(norm.pdf(cut)) / (6.0 * np.sqrt(probe_count))
+
+
+def _heavy_cut(skewness: float, probe_count: int, side: float, quantile: float) -> tuple[float, bool]:
+    """The heavy tail's cut x >= ``quantile`` whose corrected tail t_{k-1}(x) + correction(x) spends ``side``, and
+    whether the expansion is usable there: its first-order term below its zeroth-order term, the normal tail
+    beyond x (Hall's expansion is about Phi; the Student-t base only adds the O(1/k) term exact for Gaussian values).
+
+    Both terms fall as x grows past the t quantile, so the cut is bracketed by doubling from it. With zero
+    skewness it is the t quantile itself: the certificate is unchanged for symmetric probe values.
+    [sim-only, review-stats stopgap_sim2: comparing against the Student-t tail instead left rank-1 blocks at k = 16
+    missing 4x the level.]
+    """
+    def excess(cut: float) -> float:
+        return float(student_t.sf(cut, probe_count - 1)) + _edgeworth_correction(skewness, probe_count, cut) - side
+
+    if excess(quantile) <= 0.0:
+        cut = quantile
+    else:
+        upper = 2.0 * quantile
+        while excess(upper) > 0.0:
+            upper *= 2.0
+        cut = brentq(excess, quantile, upper)
+    return cut, _edgeworth_correction(skewness, probe_count, cut) < float(norm.sf(cut))
+
+
 def _certificate(
-    estimate: NDArray[np.float64], per_probe: list[NDArray[np.float64]], tolerance: "float | NDArray[np.float64]", level: float
+    estimate: NDArray[np.float64],
+    per_probe: list[NDArray[np.float64]],
+    tolerance: "float | NDArray[np.float64]",
+    level: float,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Intervals from k probe values per block, at family-wise ``level`` over the B blocks (Bonferroni, two-sided).
 
-    (mean - estimate) / (sd / sqrt k) is referred to Student's t with k - 1 degrees of freedom. That is exact for
-    Gaussian probe values. A block's probe value is a Rademacher quadratic form over many pairs, which is close to
-    Gaussian, so the level is approximate, and conservative in the tail compared with the normal quantile.
+    (mean - estimate) / (sd / sqrt k) is referred to Student's t with k - 1 degrees of freedom, which is exact for
+    Gaussian probe values. A block's probe value is a Rademacher quadratic form, and a block whose matrix has low
+    effective rank (strong LD: a few directions carry it) gives skewed values, close to tr * chi2_r / r. The
+    studentized mean of skewed values has a heavy tail on one side: a draw that lacks the rare large values has a
+    small mean and a small sd together. So the heavy side's cut is moved out by the one-term Edgeworth correction
+    (``_heavy_cut``, from the probes' own sample skewness) until that side spends its share of the level, and the
+    light side keeps the t quantile. The interval only widens, so a block can move from certified or violated to
+    undecided, never between the two. Where the expansion is not usable at the cut (its correction at least the
+    term it corrects), the block is undecided: k probes cannot place that tail, and more probes (or the exact
+    diagonal) must decide it. [sim-only, review-stats certsim: with the plain t cut, rank-1 blocks at k = 16 missed
+    on the heavy side 9.5x the nominal rate for one block and ~280x under Bonferroni over 144 blocks.]
+
+    ``skewness``, when given, is each block's probe-value skewness known from structure (e.g. the exact Rademacher
+    cumulants of a deflated remainder's proxy); otherwise the probes' own sample skewness is used, which is
+    conservative only through the undecided rule, because a draw lacking the large values also looks less skewed.
 
     A block whose estimate is zero has no finite relative error. With zero probe spread too (every site resolved,
     so the block is exact), it is certified. Otherwise the probes see information the estimate says is absent
@@ -396,9 +568,13 @@ def _certificate(
     """
     block_count = len(per_probe)
     probe_count = per_probe[0].shape[0]
-    quantile = float(student_t.isf(0.5 * level / block_count, probe_count - 1))
+    side = 0.5 * level / block_count
+    quantile = float(student_t.isf(side, probe_count - 1))
     relative = np.zeros(block_count)
     standard = np.zeros(block_count)
+    below = np.full(block_count, quantile)
+    above = np.full(block_count, quantile)
+    unusable = np.zeros(block_count, dtype=bool)
     unresolved_zero = np.zeros(block_count, dtype=bool)
     excludes_zero = np.zeros(block_count, dtype=bool)
     for position, values in enumerate(per_probe):
@@ -415,12 +591,25 @@ def _certificate(
             continue
         relative[position] = (float(np.mean(values)) - computed) / computed
         standard[position] = spread / abs(computed)
+        if skewness is None:
+            centred = values - float(np.mean(values))
+            second = float(np.mean(centred * centred))
+            block_skewness = float(np.mean(centred**3)) / second**1.5 if second > 0.0 else 0.0
+        else:
+            block_skewness = float(skewness[position])
+        heavy, usable = _heavy_cut(block_skewness, probe_count, side, quantile)
+        unusable[position] = not usable
+        # Right-skewed values make the studentized mean's lower tail the heavy one: the truth lies above the mean more
+        # often than t says, so the mean's interval moves out above (and below for left skew).
+        mean_above, mean_below = (heavy, quantile) if block_skewness > 0.0 else (quantile, heavy)
+        # The relative error (mean - computed) / computed falls with the mean when the estimate is negative.
+        below[position], above[position] = (mean_below, mean_above) if computed > 0.0 else (mean_above, mean_below)
     with np.errstate(invalid="ignore"):
-        lower = np.where(unresolved_zero, np.where(excludes_zero, relative, -np.inf), relative - quantile * standard)
-        upper = np.where(unresolved_zero, np.where(excludes_zero, relative, np.inf), relative + quantile * standard)
+        lower = np.where(unresolved_zero, np.where(excludes_zero, relative, -np.inf), relative - below * standard)
+        upper = np.where(unresolved_zero, np.where(excludes_zero, relative, np.inf), relative + above * standard)
     bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), relative.shape)
-    certified = (lower >= -bound) & (upper <= bound)
-    violated = (lower > bound) | (upper < -bound)
+    certified = (lower >= -bound) & (upper <= bound) & ~unusable
+    violated = ((lower > bound) | (upper < -bound)) & ~unusable
     return BlockCertificate(
         relative_error=relative, standard_error=standard, lower_bound=lower, upper_bound=upper,
         tolerance=tolerance, level=level, certified=certified, violated=violated,
@@ -434,6 +623,7 @@ def block_trace_certificate(
     covariance_probes: NDArray[np.float64],
     tolerance: "float | NDArray[np.float64]",
     level: float,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Test each block's tr(Sigma_bb) against Rademacher probes z (p x k) and Sigma z (from the solver).
 
@@ -443,7 +633,7 @@ def block_trace_certificate(
     """
     per_probe = [np.sum(probes[members] * covariance_probes[members], axis=0) for members in blocks]
     estimate = np.array([float(np.sum(variances[members])) for members in blocks])
-    return _certificate(estimate, per_probe, tolerance, level)
+    return _certificate(estimate, per_probe, tolerance, level, skewness)
 
 
 def stage_level(level: float, stage: int) -> float:
@@ -465,7 +655,8 @@ def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
     if not np.any(undecided):
         return probe_count
     half_width = (certificate.upper_bound - certificate.lower_bound)[undecided] / 2.0
-    margin = np.abs(np.abs(certificate.relative_error[undecided]) - certificate.tolerance[undecided])
+    tolerance = np.broadcast_to(np.asarray(certificate.tolerance, dtype=np.float64), certificate.relative_error.shape)
+    margin = np.abs(np.abs(certificate.relative_error[undecided]) - tolerance[undecided])
     ratio = float(np.max(half_width / np.maximum(margin, np.finfo(np.float64).tiny)))
     return int(np.ceil(probe_count * ratio * ratio))
 
@@ -499,8 +690,9 @@ def information_solve_tolerance(
     residual r leaves the error a_b' K_S^-1 r, and |a_b' K_S^-1 r| <= |a_b| |r|, since K_S >= I. For Rademacher
     z, exactly, E|a_b|^2 = M_b = sum_{j in b, bulk} D_j^2 |xt_j|^2 and E|u|^2 = M, the same sum over every bulk
     site. So E[|a_b| |u|] <= sqrt(M_b M) (Cauchy-Schwarz). With T_b = tr(D - Sigma)_b the block's information
-    from ``variances``, a relative residual of min_b (tolerance_b / 2) T_b / sqrt(M_b M) suffices. It is +infinity
-    when no block has bulk mass and information (every site resolved): then no solve is needed at all.
+    from ``variances``, a relative residual of min_b (tolerance_b / 2) |T_b| / sqrt(M_b M) suffices (with the ceiling
+    U_b in place of a zero T_b). It is +infinity only when no block has bulk mass (every site resolved): then no
+    solve is needed at all.
     """
     is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
     is_bulk[solve.resolved] = False
@@ -509,14 +701,58 @@ def information_solve_tolerance(
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     total = float(np.sum(mass))
     bound = np.broadcast_to(np.asarray(tolerance, dtype=np.float64), (len(blocks),))
-    # A block with no bulk mass is exact (every site resolved), and one with no information has nothing to
-    # resolve: neither constrains the solve. With none left, the minimum over the empty set is +infinity.
-    ratios = [
-        float(bound[position]) * float(np.sum(removed[members])) / np.sqrt(float(np.sum(mass[members])) * total)
-        for position, members in enumerate(blocks)
-        if float(np.sum(mass[members])) > 0.0 and float(np.sum(removed[members])) > 0.0
-    ]
+    # The certificate tests (probe mean - T_b) / |T_b|, so the solve must hold its move below (tolerance / 2) |T_b|
+    # for the estimate T_b it is tested against, whatever its sign; a non-positive-site model can make it negative.
+    # A zero estimate is decided on the probes' absolute value (_certificate), so its scale is the largest
+    # information the block can hold, U_b = sum_{j in b, bulk} (D_j - 1/A_jj), since Sigma_jj >= 1/A_jj for any
+    # positive-definite A. U_b > 0 whenever the block has bulk mass. Only a block with no bulk mass (every site
+    # resolved, so exact) constrains nothing; with none left, the minimum over the empty set is +infinity.
+    ceiling = information_ceiling(solve, blocks, column_square_norms)
+    resolvable = resolvable_blocks(solve, blocks, ceiling)
+    ratios = []
+    for position, members in enumerate(blocks):
+        # A block whose ceiling float64 cannot resolve holds no information the arithmetic can see, whatever
+        # rounding-level column mass it carries (a column that is zero on the fold's training rows): it is
+        # exact, and constrains nothing (``resolvable_blocks``).
+        if not resolvable[position]:
+            continue
+        estimate = abs(float(np.sum(removed[members])))
+        scale = estimate if estimate > 0.0 else float(ceiling[position])
+        ratios.append(float(bound[position]) * scale / np.sqrt(float(np.sum(mass[members])) * total))
     return 0.5 * min(ratios) if ratios else np.inf
+
+
+def resolvable_blocks(solve: BulkSolve, blocks: tuple[NDArray[np.int64], ...], ceiling: NDArray[np.float64]) -> NDArray[np.bool_]:
+    """Blocks whose information ceiling U_b exceeds the rounding of their own information in float64.
+
+    The information sum_{j in b} (D_j - Sigma_jj) over m bulk sites is computed from values of size D_j, so its
+    rounding is at most gamma_m sum_{j in b} D_j, with gamma_m = m u / (1 - m u) and u the unit roundoff
+    (Higham, Thm 4.3). A block with U_b at or below that holds no information float64 can resolve.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    prior = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
+    unit = np.finfo(np.float64).eps / 2.0
+    out = np.zeros(len(blocks), dtype=bool)
+    for position, members in enumerate(blocks):
+        count = int(np.sum(is_bulk[members]))
+        rounding = count * unit / (1.0 - count * unit) * float(np.sum(prior[members]))
+        out[position] = ceiling[position] > rounding
+    return out
+
+
+def information_ceiling(solve: BulkSolve, blocks: tuple[NDArray[np.int64], ...], column_square_norms: NDArray[np.float64]) -> NDArray[np.float64]:
+    """U_b = sum over block b's bulk sites of D_j - 1/A_jj: the most information the block can hold.
+
+    Sigma_jj >= 1/A_jj for any positive-definite A (Cauchy-Schwarz), with A_jj = |xt_j|^2 + Pi_j, so
+    D_j - Sigma_jj <= D_j - 1/A_jj. U_b is zero exactly when the block has no bulk site with a column that
+    float64 can tell from zero next to its site precision.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    precision = np.where(is_bulk, solve.site_precision, 1.0)
+    per_site = np.where(is_bulk, 1.0 / precision - 1.0 / (column_square_norms + precision), 0.0)
+    return np.array([float(np.sum(per_site[members])) for members in blocks])
 
 
 def block_information_certificate(
@@ -528,6 +764,7 @@ def block_information_certificate(
     tolerance: "float | NDArray[np.float64]",
     level: float,
     control: ControlVariate,
+    skewness: "NDArray[np.float64] | None" = None,
 ) -> BlockCertificate:
     """Test each block's data information tr(D_b - Sigma_bb), over its bulk sites, against probes.
 
@@ -555,9 +792,14 @@ def block_information_certificate(
     bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     difference = np.where(is_bulk[:, None], removed_products - control.removed_products, 0.0)
-    per_probe = [control.window_information[position] + np.sum(probes[members] * difference[members], axis=0) for position, members in enumerate(blocks)]
-    estimate = np.array([float(np.sum(removed[members])) for members in blocks])
-    return _certificate(estimate, per_probe, tolerance, level)
+    # A block that can hold no resolvable information (``resolvable_blocks``) is exact: test it as such.
+    per_probe = [
+        control.window_information[position] + np.sum(probes[members] * difference[members], axis=0)
+        if control.resolvable[position] else np.zeros(probes.shape[1])
+        for position, members in enumerate(blocks)
+    ]
+    estimate = np.array([float(np.sum(removed[members])) if control.resolvable[position] else 0.0 for position, members in enumerate(blocks)])
+    return _certificate(estimate, per_probe, tolerance, level, skewness)
 
 
 @dataclass(frozen=True)
@@ -565,14 +807,16 @@ class ControlVariate:
     """The window approximation's own (D - Sigma_hat) z on bulk rows, and each block's window information.
 
     Subtracting it from the solver's exact (D - Sigma) z leaves an estimator of the approximation's error whose
-    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass.
+    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass. ``resolvable`` marks the
+    blocks float64 can resolve (``resolvable_blocks``); the others are exact and certified as such.
     """
 
     removed_products: NDArray[np.float64]
     window_information: NDArray[np.float64]
+    resolvable: NDArray[np.bool_]
 
 
-def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.float64]) -> ControlVariate:
+def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.float64], array_module: Any = np) -> ControlVariate:
     """(D - Sigma_hat) z on bulk rows, with Sigma_hat the window approximation, and each block's tr(D - Sigma_hat).
 
     For bulk j in block b, Sigma_hat_{j,:} z = sum over window columns (identity 2 plus the window's resolved
@@ -583,14 +827,16 @@ def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.floa
     cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
     removed = np.zeros_like(probes)
     information = np.zeros(len(grams.blocks))
+    column_square_norms = grams.column_square_norms()
+    resolvable = resolvable_blocks(solve, grams.blocks, information_ceiling(solve, grams.blocks, column_square_norms))
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         own_variance = bulk_variance[members]
         products = terms.rows @ probes[terms.columns] - own_variance[:, None] * (terms.loadings @ probes[solve.resolved])
         bulk_rows = ~is_resolved[members]
         removed[members] = np.where(bulk_rows[:, None], own_variance[:, None] * probes[members] - products, 0.0)
         information[block] = float(np.sum(np.where(bulk_rows, own_variance - np.diag(terms.covariance), 0.0)))
-    return ControlVariate(removed_products=removed, window_information=information)
+    return ControlVariate(removed_products=removed, window_information=information, resolvable=resolvable)
 
 
 def cavity_tolerance(
@@ -672,8 +918,9 @@ def covariance_products(
     return products
 
 
-def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.float64]) -> JacobianProduct:
+def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.float64], array_module: Any = np) -> JacobianProduct:
     """d diag(Sigma) / d Pi applied to w (p x r): -diag(Sigma diag(w) Sigma), i.e. -sum_k Sigma_jk^2 w_k.
+    The windows' dense algebra runs on ``array_module`` (numpy by default; pass cupy to use a device).
 
     - **Resolved pairs:** Sigma_LL = core^-1 exactly. Sigma_Lk = -D_k (C_k core^-1)_L for bulk k whose window
       holds the resolved site, with C_k taken on k's window.
@@ -693,9 +940,8 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     squared_variance = np.square(bulk_variance)
     sandwich = np.zeros(variant_count)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
-        # diag(S R S) as one BLAS product and a row sum: a three-operand einsum loops over i, j and k in C, without BLAS.
-        sandwich[members] = np.einsum("ij,ji->i", terms.covariance @ grams.within[block], terms.covariance)
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block))
     pair_scale = solve.kernel_square_trace / solve.sample_count
     chance_weight = sandwich[:, None] * direction
     chance_total = chance_weight.sum(axis=0)
@@ -718,7 +964,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_bulk_chance[block] = bulk_chance_weight[window_members].sum(axis=0)
         window_bulk_chance_square[block] = np.square(bulk_chance_weight[window_members]).sum(axis=0)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         window_sum = np.square(terms.rows) @ direction[terms.columns]
         loadings = terms.loadings  # (|b|, |L|)
         near = terms.near
@@ -729,8 +975,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_part[members] = window_sum
         variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square_total - window_chance_square[block])[None, :]
         # Resolved rows: bulk partners whose window holds the resolved site, exactly.
-        weighted = squared_variance[members][:, None, None] * np.square(loadings)[:, :, None] * direction[members][:, None, :]
-        resolved_bulk_near[near] += weighted.sum(axis=0)[near]
+        resolved_bulk_near[near] += (np.square(loadings).T @ (squared_variance[members][:, None] * direction[members]))[near]
     if solve.resolved.shape[0]:
         resolved_blocks = block_of[solve.resolved]
         resolved_scale = sandwich[solve.resolved] * pair_scale
@@ -743,3 +988,68 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_part[solve.resolved] = resolved_bulk_near
     return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
 
+
+
+
+# --------------------------------------------------------------------------- the exact dual route (small n)
+
+
+@dataclass(frozen=True)
+class KernelFactor:
+    """The bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely: for shapes whose n x n fits in memory.
+
+    ``lower`` is its Cholesky factor, ``resolved_solves`` Z_L = K_S^-1 Xt_L, and ``resolved_core``
+    core = Pi_L + Xt_L' Z_L. Then Q = K^-1 = K_S^-1 - Z_L core^-1 Z_L' (Woodbury, valid for any core > 0).
+    """
+
+    lower: NDArray[np.float64]
+    resolved_solves: NDArray[np.float64]
+    resolved_core: NDArray[np.float64]
+
+    @cached_property
+    def core_inverse(self) -> NDArray[np.float64]:
+        """core^-1, formed once per factor and shared by every block's call (speed-krylov)."""
+        return np.linalg.inv(self.resolved_core) if self.resolved_core.shape[0] else np.zeros((0, 0))
+
+
+def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.float64], columns: NDArray[np.float64]) -> NDArray[np.float64]:
+    """D_j - Sigma_jj for one block's variants, exactly: D_j^2 (xt_j' K_S^-1 xt_j - c_j core^-1 c_j').
+
+    ``columns`` is the block's Xt_b (n x |b|) and ``bulk_variance`` its D_b (zero on resolved sites, whose rows
+    the caller takes from core^-1). The cost is n^2 |b| for the triangular solve plus n |b| |L|.
+    """
+    whitened = solve_triangular(factor.lower, columns, lower=True)
+    quadratic = np.sum(np.square(whitened), axis=0)
+    cross = columns.T @ factor.resolved_solves
+    spikes = np.sum((cross @ factor.core_inverse) * cross, axis=1) if cross.shape[1] else 0.0
+    return np.square(bulk_variance) * (quadratic - spikes)
+
+
+def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
+    """diag(K_S^-1), exactly: the column sums of squares of L^-1, with K_S = L L'. The cost is n^3 / 3.
+
+    This is the bulk diagonal only. The resolved sites' correction (Z_L core^-1 Z_L')_ii and the covariate
+    leverage are added once, by ``dual_solve.SampleDiagonal.predictor_variance``, the single assembler for the
+    exact and the windowed routes alike (binary-ep). Subtracting them here too would count them twice.
+    """
+    inverse_lower = solve_triangular(factor.lower, np.eye(factor.lower.shape[0]), lower=True)
+    return np.sum(np.square(inverse_lower), axis=0)
+
+
+def exact_route_is_cheaper(sample_count: int, grams: BlockGrams, working_bytes: int) -> bool:
+    """Whether the exact dual route costs fewer flops than the window route and its n x n factor fits.
+
+    Leading-order counts (Golub and Van Loan, Matrix Computations, 4th ed.: Cholesky n^3 / 3; a triangular solve
+    n^2 per column; the symmetric eigendecomposition with vectors about 9 n^3):
+    - exact: n^2 p (forming K_S) + n^3 / 3 (its factor) + n^2 p (the triangular solves);
+    - window: the sum over blocks of 9 |W_b|^3, with |W_b| the block's window size.
+    The exact route needs n^2 float64 for the factor and n^2 for its inverse (the leverages).
+    """
+    variant_count = sum(members.shape[0] for members in grams.blocks)
+    exact = 2.0 * sample_count**2 * variant_count + sample_count**3 / 3.0
+    window = 0.0
+    for block in range(len(grams.blocks)):
+        size = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
+        window += 9.0 * float(size) ** 3
+    fits = 2 * sample_count * sample_count * np.dtype(np.float64).itemsize <= working_bytes
+    return bool(fits and exact < window)

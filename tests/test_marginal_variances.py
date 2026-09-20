@@ -8,10 +8,13 @@ variances are wrong and to leave the others alone.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.stats import norm
 from scipy.stats import t as student_t
 
+from sv_pgs import marginal_variances as marginal_variances_module
 from sv_pgs.marginal_variances import (
+    BlockCertificate,
     BlockGrams,
     BulkSolve,
     approximation_scale,
@@ -19,7 +22,14 @@ from sv_pgs.marginal_variances import (
     control_variate,
     stage_level,
     information_products,
+    information_ceiling,
     information_solve_tolerance,
+    resolvable_blocks,
+    sandwich_diagonal,
+    KernelFactor,
+    exact_block_information,
+    exact_route_is_cheaper,
+    exact_bulk_diagonal,
     block_trace_certificate,
     cavity_tolerance,
     certificate_level,
@@ -33,6 +43,8 @@ from sv_pgs.marginal_variances import (
     window_bulk_quadratic,
     window_cross,
 )
+import sv_pgs.marginal_variances as marginal_variances_module
+from sv_pgs.marginal_variances import _heavy_cut
 
 
 def _genotypes(generator, sample_count: int, variant_count: int, correlation: float) -> np.ndarray:
@@ -420,3 +432,244 @@ def test_a_zero_estimate_with_probe_signal_is_violated_not_an_error():
     certificate = block_trace_certificate(removed_estimate, blocks, probes, removed, 0.5, certificate_level(64))
     assert certificate.violated[2] and not certificate.certified[2]
     assert np.isinf(certificate.relative_error[2])
+
+
+def test_information_solve_tolerance_stays_finite_with_non_positive_estimates():
+    # verify-stage2's case: a model whose estimated block information is <= 0 everywhere still has bulk mass,
+    # so the probe solve must run (a +inf tolerance skipped it).
+    generator = np.random.default_rng(21)
+    columns = generator.standard_normal((200, 120))
+    precision = generator.uniform(1.0, 30.0, 120)
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    solve = _solve(columns, precision, np.array([5]))
+    norms = np.sum(columns**2, axis=0)
+    too_large = 1.0 / precision * 1.5  # every bulk marginal above D: negative estimates
+    zero = 1.0 / precision  # every bulk marginal at D: zero estimates
+    for variances in (too_large, zero):
+        tolerance = information_solve_tolerance(solve, variances, blocks, norms, 0.01)
+        assert np.isfinite(tolerance) and tolerance > 0.0
+
+
+def test_a_block_of_rounding_level_columns_is_exact_not_a_zero_tolerance():
+    # verify-stage2's case: a fold whose training rows make a block's columns zero up to rounding.
+    generator = np.random.default_rng(22)
+    columns = generator.standard_normal((200, 120))
+    columns[:, 40:80] = 1e-30 * generator.standard_normal((200, 40))
+    precision = generator.uniform(1.0, 30.0, 120)
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    solve = _solve(columns, precision, np.array([5]))
+    norms = np.sum(columns**2, axis=0)
+    assert information_ceiling(solve, blocks, norms)[1] == 0.0
+    assert resolvable_blocks(solve, blocks, information_ceiling(solve, blocks, norms)).tolist() == [True, False, True]
+    variances = np.diag(np.linalg.inv(columns.T @ columns + np.diag(precision)))
+    tolerance = information_solve_tolerance(solve, variances, blocks, norms, 0.01)
+    assert np.isfinite(tolerance) and tolerance > 0.0
+    probes = generator.choice([-1.0, 1.0], size=(120, 16))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    grams = BlockGrams(blocks=blocks, within=tuple((columns.T @ columns)[np.ix_(b, b)] for b in blocks), next_cross=())
+    removed = probes / precision[:, None] - covariance @ probes
+    certificate = block_information_certificate(solve, variances, blocks, probes, removed, 0.5, certificate_level(64), control_variate(solve, grams, probes))
+    assert certificate.certified[1]
+
+
+def test_sandwich_diagonal_equals_the_three_operand_contraction():
+    generator = np.random.default_rng(23)
+    covariance = generator.standard_normal((40, 40))
+    gram = generator.standard_normal((40, 40))
+    reference = np.einsum("ij,jk,ki->i", covariance, gram, covariance)
+    assert np.allclose(sandwich_diagonal(covariance, gram), reference, rtol=1e-12, atol=1e-12 * np.abs(reference).max())
+
+
+def _low_rank_block(generator, size: int, rank: int) -> np.ndarray:
+    """A PSD block whose trace is spread evenly over ``rank`` random orthonormal directions (effective rank ``rank``)."""
+    basis = np.linalg.qr(generator.standard_normal((size, rank)))[0]
+    return basis @ basis.T
+
+
+@pytest.mark.parametrize(("rank", "probe_count"), [(1, 16), (2, 16), (20, 16), (20, 64)])
+def test_certificate_keeps_its_level_on_low_effective_rank_blocks(rank, probe_count):
+    # review-stats: strong LD makes a block's probe values z'Az skewed (close to tr chi2_r / r), and the plain t cut
+    # then missed on the heavy side up to 9.5x its level. With the exact variances the true relative error is zero and
+    # the tolerance is zero, so a block is violated exactly when its interval misses: the family-wise miss rate must
+    # stay within the binomial spread of the level.
+    # 400 families give the test power against the plain t cut, whose family-wise miss rate at rank 1 is ~3x the level.
+    generator = np.random.default_rng(100 + rank + probe_count)
+    size, block_count = 24, 4
+    level = certificate_level(8)
+    blocks = tuple(np.arange(start, start + size) for start in range(0, size * block_count, size))
+    covariance = np.zeros((size * block_count, size * block_count))
+    for members in blocks:
+        covariance[np.ix_(members, members)] = _low_rank_block(generator, size, rank)
+    variances = np.diag(covariance).copy()
+    trials = 400
+    misses = 0
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(size * block_count, probe_count))
+        certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, 0.0, level)
+        assert not certificate.certified.any()
+        misses += int(certificate.violated.any())
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+
+
+def test_heavy_cut_is_the_t_quantile_for_symmetric_values_and_moves_out_with_skewness():
+    side, probe_count = 1e-3, 16
+    quantile = float(student_t.isf(side, probe_count - 1))
+    assert _heavy_cut(0.0, probe_count, side, quantile) == (quantile, True)
+    cut, usable = _heavy_cut(0.05, probe_count, side, quantile)
+    assert cut > quantile and usable
+    # A skewness large enough that the one-term correction is not below the tail it corrects leaves the block undecided.
+    assert not _heavy_cut(10.0, probe_count, side, quantile)[1]
+
+
+def _kernel_factor(columns: np.ndarray, precision: np.ndarray, resolved: np.ndarray) -> KernelFactor:
+    bulk = 1.0 / precision
+    bulk[resolved] = 0.0
+    kernel = np.eye(columns.shape[0]) + (columns * bulk) @ columns.T
+    solves = np.linalg.solve(kernel, columns[:, resolved])
+    return KernelFactor(lower=np.linalg.cholesky(kernel), resolved_solves=solves,
+                        resolved_core=np.diag(precision[resolved]) + columns[:, resolved].T @ solves)
+
+
+def test_exact_dual_route_matches_the_dense_inverse_with_a_non_positive_site():
+    generator = np.random.default_rng(24)
+    columns = generator.standard_normal((60, 150))
+    precision = generator.uniform(1.0, 30.0, 150)
+    precision[[4, 90]] = [-0.5 * float(np.linalg.eigvalsh(columns.T @ columns)[0]), 0.01]
+    resolved = np.array([4, 90])
+    factor = _kernel_factor(columns, precision, resolved)
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    bulk = 1.0 / precision
+    bulk[resolved] = 0.0
+    block = np.arange(30, 80)
+    removed = exact_block_information(factor, bulk[block], columns[:, block])
+    expected = np.where(np.isin(block, resolved), 0.0, bulk[block] - np.diag(covariance)[block])
+    assert np.allclose(np.where(np.isin(block, resolved), 0.0, removed), expected, rtol=1e-8, atol=1e-14)
+    kernel = np.eye(columns.shape[0]) + (columns * bulk) @ columns.T
+    assert np.allclose(exact_bulk_diagonal(factor), np.diag(np.linalg.inv(kernel)), rtol=1e-8)
+    # With the resolved correction added once, 1 - Q_ii is the exact leverage h_i = xt_i' Sigma xt_i.
+    resolved_term = np.sum((factor.resolved_solves @ np.linalg.inv(factor.resolved_core)) * factor.resolved_solves, axis=1)
+    leverage = 1.0 - (exact_bulk_diagonal(factor) - resolved_term)
+    assert np.allclose(leverage, np.einsum("ij,jk,ik->i", columns, covariance, columns), rtol=1e-8)
+
+
+def test_exact_route_rule_prefers_the_dual_when_samples_are_few():
+    blocks = (np.arange(4430),)
+    grams = BlockGrams(blocks=blocks, within=(np.eye(4430),), next_cross=())
+    assert exact_route_is_cheaper(580, grams, 2**30)
+    assert not exact_route_is_cheaper(50_000, grams, 2**30)
+
+
+def test_kernel_factor_inverts_its_core_once():
+    generator = np.random.default_rng(25)
+    columns = generator.standard_normal((40, 60))
+    precision = generator.uniform(1.0, 30.0, 60)
+    factor = _kernel_factor(columns, precision, np.array([3, 7]))
+    assert factor.core_inverse is factor.core_inverse
+    assert np.allclose(factor.core_inverse @ factor.resolved_core, np.eye(2), atol=1e-12)
+
+
+def _rademacher_skewness(matrix: np.ndarray) -> float:
+    """The exact skewness of z'Az for Rademacher z: variance 2 (||A||_F^2 - sum a_ii^2) and third cumulant
+    8 (tr A^3 - 3 sum_i a_ii (A^2)_ii + 2 sum_i a_ii^3), the triangle terms of the off-diagonal chaos."""
+    diagonal = np.diag(matrix)
+    square = matrix @ matrix
+    variance = 2.0 * (float(np.sum(matrix * matrix)) - float(np.sum(diagonal**2)))
+    third = 8.0 * (float(np.trace(square @ matrix)) - 3.0 * float(np.sum(diagonal * np.diag(square))) + 2.0 * float(np.sum(diagonal**3)))
+    return third / variance**1.5
+
+
+@pytest.mark.parametrize("rank", [2, 20])
+def test_certificate_keeps_its_level_with_structural_skewness(rank):
+    generator = np.random.default_rng(200 + rank)
+    size, block_count, probe_count = 24, 4, 16
+    level = certificate_level(8)
+    blocks = tuple(np.arange(start, start + size) for start in range(0, size * block_count, size))
+    covariance = np.zeros((size * block_count, size * block_count))
+    skewness = np.zeros(block_count)
+    for position, members in enumerate(blocks):
+        block = _low_rank_block(generator, size, rank)
+        covariance[np.ix_(members, members)] = block
+        skewness[position] = _rademacher_skewness(block)
+    variances = np.diag(covariance).copy()
+    trials = 400
+    misses = 0
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(size * block_count, probe_count))
+        certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, 0.0, level, skewness)
+        misses += int(certificate.violated.any())
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+
+
+def test_zero_skewness_reproduces_the_student_t_interval():
+    generator = np.random.default_rng(24)
+    values = [generator.standard_normal(16) + 5.0 for _ in range(3)]
+    estimate = np.array([5.0, 5.0, 5.0])
+    level = certificate_level(64)
+    certificate = marginal_variances_module._certificate(estimate, values, 0.1, level, np.zeros(3))
+    quantile = float(student_t.isf(0.5 * level / 3, 15))
+    spread = np.array([np.std(v, ddof=1) / 4.0 / 5.0 for v in values])
+    relative = np.array([(np.mean(v) - 5.0) / 5.0 for v in values])
+    assert np.allclose(certificate.lower_bound, relative - quantile * spread, rtol=0, atol=1e-15)
+    assert np.allclose(certificate.upper_bound, relative + quantile * spread, rtol=0, atol=1e-15)
+
+
+def test_an_inconsistent_window_gram_is_refused():
+    generator, columns, precision, blocks, solve = _strong_case(27)
+    grams = _grams(columns, blocks)
+    # Cross-block Grams from another design: the assembled window is no longer a Gram matrix.
+    other = generator.standard_normal(columns.shape)
+    wrong = BlockGrams(blocks=grams.blocks, within=grams.within,
+                       next_cross=tuple(3.0 * (other[:, blocks[i]].T @ other[:, blocks[i + 1]]) for i in range(len(blocks) - 1)))
+    with pytest.raises(ValueError, match="not positive semidefinite"):
+        marginal_variances(solve, wrong)
+
+
+def test_a_thin_middle_block_leaves_the_window_positive_semidefinite():
+    # Strong LD across a 5-variant middle block: the zero corner would make the three-block window indefinite.
+    generator = np.random.default_rng(28)
+    columns = _genotypes(generator, 2000, 205, 0.99)
+    blocks = (np.arange(0, 100), np.arange(100, 105), np.arange(105, 205))
+    grams = _grams(columns, blocks)
+    gram, _columns, _own = marginal_variances_module._window(grams, 1)
+    zero_corner = gram.copy()
+    zero_corner[:100, 105:] = 0.0
+    zero_corner[105:, :100] = 0.0
+    assert np.linalg.eigvalsh(zero_corner)[0] < 0.0
+    assert np.linalg.eigvalsh(gram)[0] >= -np.finfo(np.float64).eps * gram.shape[0] * np.linalg.norm(gram)
+
+
+def test_probes_to_decide_takes_a_per_block_tolerance_with_mixed_decisions():
+    # speed-recycle's case: a per-block tolerance array and a stage with certified and undecided blocks.
+    # Dyadic values, so the expected probe count is exact in floating point.
+    relative = np.array([0.0, 0.0, 0.5, 0.5])
+    standard = np.full(4, 0.125)
+    tolerance = np.array([2.0, 2.0, 0.75, 0.75])
+    width = 3.0 * standard
+    certificate = BlockCertificate(
+        relative_error=relative, standard_error=standard, lower_bound=relative - width, upper_bound=relative + width,
+        tolerance=tolerance, level=certificate_level(64),
+        certified=(relative - width >= -tolerance) & (relative + width <= tolerance),
+        violated=(relative - width > tolerance) | (relative + width < -tolerance),
+    )
+    assert certificate.certified.tolist() == [True, True, False, False]
+    # The undecided blocks sit 0.25 inside their tolerance with half-width 0.375: (0.375 / 0.25)^2 = 2.25 times the probes.
+    assert probes_to_decide(certificate, 16) == 36
+
+
+
+def test_shared_float32_grams_with_a_scale_give_the_float64_answer():
+    _generator, columns, precision, blocks, solve = _strong_case(30)
+    grams = _grams(columns, blocks)
+    noise = 0.8
+    scaled = BlockGrams(blocks=grams.blocks, within=tuple(w * noise for w in grams.within),
+                        next_cross=tuple(c * noise for c in grams.next_cross))
+    stored = BlockGrams(blocks=scaled.blocks, within=tuple(w.astype(np.float32) for w in scaled.within),
+                        next_cross=tuple(c.astype(np.float32) for c in scaled.next_cross), scale=1.0 / noise)
+    reference = marginal_variances(solve, grams)
+    shared = marginal_variances(solve, stored)
+    # float32 storage rounds each Gram entry by u32; the variances move by at most that times the window's
+    # conditioning, which the tolerance bounds (I + omega_F B has eigenvalues >= 1).
+    window = max(sum(grams.blocks[m].shape[0] for m in marginal_variances_module._window_blocks(grams, b)) for b in range(len(blocks)))
+    bound = np.finfo(np.float32).eps * window * (1.0 + solve.bulk_trace * float(np.linalg.eigvalsh(columns.T @ columns)[-1]) * np.max(1.0 / precision))
+    assert np.all(np.abs(shared - reference) <= bound * np.abs(reference))
+    assert marginal_variances_module.window_working_bytes(stored) == marginal_variances_module.window_working_bytes(grams)
