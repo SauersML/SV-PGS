@@ -785,38 +785,32 @@ def test_the_moment_start_splits_the_phenotypic_variance_and_tracks_the_heritabi
     assert null.resolution <= null.heritability <= 4.0 * null.resolution
 
 
-def test_the_correction_gradient_is_the_held_direction_corrections_derivative():
-    # Each replaced direction b held, its correction is log int exp(l(x_rho + t b) - l(x_rho)) dt + log(kappa) / 2
-    # - log(2 pi) / 2 at every rho: central differences of that sum must match the analytic gradient.
-    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
-    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    tolerance = 1e-4
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-    assert evidence is not None
-    gradient, error = engine._correction_gradient(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
-    _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
-    order = np.argsort(-np.abs(terms))
-    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
-    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
-    assert replaced.shape[0] >= 2
-
-    def held(weights):
-        point = _evidence(prior, weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-        penalty = _penalty_matrix(prior, weights)
-        _value, _gradient, hessian = _penalized(prior, _data_objective(prior, point.coefficients, cavity, _WORKING_BYTES), weights, penalty, point.coefficients)
-        total = 0.0
-        for index in replaced:
-            direction = directions[:, index]
-            total += _line_log_integral(prior, weights, point.coefficients, direction, point.penalized_value, cavity, _WORKING_BYTES, 1e-11)
-            total += 0.5 * np.log(float(direction @ (-hessian) @ direction))
-        return total
-
-    step = 1e-4
-    numerical = np.array([
-        (held(hyperparameters.log_smoothing + step * unit) - held(hyperparameters.log_smoothing - step * unit)) / (2.0 * step)
-        for unit in np.eye(hyperparameters.log_smoothing.shape[0])
-    ])
-    np.testing.assert_allclose(gradient, numerical, rtol=1e-4, atol=1e-5 + 2.0 * float(np.max(error)))
+def test_the_correction_slopes_are_the_corrected_evidences_own():
+    # The corrections' slopes must be those of V's corrections as V computes them at every rho (x re-maximized, the
+    # standardized directions re-derived), not of held directions: on this case holding them gave +0.25 where V's own
+    # slope was +0.04 [sim-only]. The central difference of V's correction part, with x re-solved, is the reference.
+    prior, cavity = _annotated_problem(101)
+    weights, evidence, interior = _ascended(prior, cavity)
+    base = _corrected(prior, weights, _evidence(prior, weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0),
+                      cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert base is not None and base.replaced_directions is not None and base.replaced_directions.shape[1] > 0
+    slopes, errors, _second = engine._correction_slopes(prior, weights, base, interior, cavity, _WORKING_BYTES)
+    step = 0.02
+    for position in np.flatnonzero(interior):
+        unit = np.zeros(weights.shape[0])
+        unit[position] = step
+        sides = []
+        for sign in (1.0, -1.0):
+            moved = _corrected(
+                prior, weights + sign * unit,
+                _evidence(prior, weights + sign * unit, base.coefficients + sign * step * base.responses[:, position], cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0),
+                cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+            )
+            assert moved is not None and moved.replaced_directions.shape[1] == base.replaced_directions.shape[1]
+            sides.append(moved.value - moved.laplace_value)
+        reference = (sides[0] - sides[1]) / (2.0 * step)
+        # The reference's own error: each side's quadrature (its share) over 2 h, and its truncation.
+        assert abs(slopes[position] - reference) <= errors[position] + base.replaced_share * base.replaced_directions.shape[1] / step + 1e-3
 
 
 def _annotated_problem(seed: int):
@@ -890,7 +884,7 @@ def test_a_maximum_at_its_basins_fold_is_certified_one_sided(monkeypatch):
     prior, cavity = _annotated_problem(101)
     weights, evidence, interior = _ascended(prior, cavity)
     position = int(np.flatnonzero(interior)[0])
-    gradient = engine._full_gradient(prior, weights, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)[0]
+    gradient = engine._full_gradient(prior, weights, evidence, interior, cavity, _WORKING_BYTES)[0]
     climb = 1.0 if gradient[position] >= 0.0 else -1.0
     corrected = engine._corrected
 
