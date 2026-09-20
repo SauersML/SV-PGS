@@ -294,3 +294,20 @@ def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
                               "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
         estimates.append(genome_total.horvitz_thompson_total(genes, population, sample_size)[0])
     assert np.isclose(np.mean(estimates), values.sum(), rtol=0, atol=64 * EPSILON)
+
+
+def test_saved_sv_effects_reproduce_the_sv_part_of_the_prediction(tmp_path):
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    out = tmp_path / "results" / "mr_ash" / "loso"
+    effects = pd.read_csv(out / "chr1.sv_coefficients.tsv.gz", sep="\t")
+    dataset = harness.Dataset(tmp_path)
+    window = harness.load_gene_window(dataset, 0)
+    full = np.load(out / "chr1.snv_sv.predictions.npy")[0].astype(np.float64)
+    without = np.load(out / "chr1.snv_sv.predictions_without_sv.npy")[0].astype(np.float64)
+    for split_name, rows in effects.groupby("split"):
+        test_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["test"]])
+        sv_part = (window.genotypes[np.ix_(test_index, rows["window_row"].to_numpy())] - rows["train_mean"].to_numpy()) @ rows["effect"].to_numpy()
+        # The saved predictions are float32, so the comparison allows one float32 rounding of each prediction.
+        assert np.allclose(sv_part, (full - without)[test_index], rtol=0, atol=4 * np.finfo(np.float32).eps * max(np.abs(full).max(), 1.0))

@@ -45,6 +45,8 @@ class Variants:
     allele_length_change: np.ndarray
     train_allele_frequency: np.ndarray
     source: np.ndarray
+    # Row of each variant in its gene window (load_gene_window's table), a stable key for saved coefficients.
+    window_row: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,7 +181,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     variants = Variants(position=position, end=end, distance_to_tss=distance, is_sv=selected["is_sv"].to_numpy(dtype=bool),
                         sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=selected["sv_length"].to_numpy(),
                         allele_length_change=np.where(alternate_length < 0, 0, alternate_length - selected["ref_len"].to_numpy()),
-                        train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str))
+                        train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
+                        window_row=np.flatnonzero(polymorphic))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]
@@ -239,8 +242,25 @@ def feature_mask(variants: Variants, feature_set: str, draw_key: str):
 
 def subset(train: TrainData, test_genotypes: np.ndarray, feature_set: str, split_name: str):
     keep = feature_mask(train.variants, feature_set, f"{train.gene_id}/{split_name}")
-    variants = Variants(**{field.name: getattr(train.variants, field.name)[keep] for field in dataclasses.fields(Variants)})
+    variants = Variants(**{field.name: None if getattr(train.variants, field.name) is None else getattr(train.variants, field.name)[keep]
+                           for field in dataclasses.fields(Variants)})
     return dataclasses.replace(train, genotypes=train.genotypes[:, keep], variants=variants), test_genotypes[:, keep]
+
+
+def sv_coefficients(train: TrainData, predictor, gene_id: str, split_name: str, feature_set: str):
+    """The SV columns' effects on the genotype scale, for a linear predictor (intercept + (x - center) / scale @ beta).
+
+    With these and the training means, SV j's contribution to any person's score is beta_j (x_j - mean_j), so the SV
+    part of the score can be decomposed without refitting. Returns None for a predictor that is not linear."""
+    coefficients = getattr(predictor, "coefficients", None)
+    if coefficients is None or not train.variants.is_sv.any() or train.variants.window_row is None:
+        return None
+    scale = getattr(predictor, "scale", None)
+    effects = np.asarray(coefficients, dtype=np.float64) / (np.asarray(scale, dtype=np.float64) if scale is not None else 1.0)
+    columns = np.flatnonzero(train.variants.is_sv)
+    return pd.DataFrame({"gene_id": gene_id, "split": split_name, "feature_set": feature_set, "window_row": train.variants.window_row[columns],
+                         "source": train.variants.source[columns], "sv_type": train.variants.sv_type[columns],
+                         "train_mean": train.genotypes[:, columns].mean(axis=0), "effect": effects[columns]})
 
 
 def load_method(spec: str):
@@ -282,7 +302,8 @@ def _run_gene(arguments):
             prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
             seconds = time.process_time() - started
             without_sv = np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64) if train.variants.is_sv.any() else prediction
-            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds))
+            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds,
+                            sv_coefficients(train, predictor, window.gene_id, split_name, feature_set)))
     return results
 
 
@@ -334,7 +355,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
                               if train.variants.is_sv.any() else prediction)
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                       int(train.variants.is_sv.sum()), seconds)
+                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set))
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
@@ -360,7 +381,10 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
         results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers) for result in chunk)
-    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds in results:
+    coefficient_tables = []
+    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients in results:
+        if coefficients is not None:
+            coefficient_tables.append(coefficients)
         position = position_of_row[gene_row]
         predictions[feature_set][position, test_index] = prediction
         predictions_without_sv[feature_set][position, test_index] = without_sv
@@ -383,6 +407,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
     np.save(out / f"{tag}.truth.npy", truth)
+    if coefficient_tables:
+        pd.concat(coefficient_tables, ignore_index=True).to_csv(out / f"{tag}.sv_coefficients.tsv.gz", sep="\t", index=False)
     dataset.genes.iloc[gene_rows].to_csv(out / f"{tag}.genes.tsv", sep="\t", index=False)
     pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds"]).to_csv(out / f"{tag}.log.tsv", sep="\t", index=False)
 
