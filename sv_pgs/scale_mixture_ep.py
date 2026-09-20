@@ -1712,7 +1712,7 @@ def _correction_slopes(
     corrections are smooth there, and no inner maximum is re-solved, so no fold can intervene; x's second-order
     error cancels in the central difference), at the same count of replaced directions. Each correction is resolved
     to a share e / m of its log (m integrals) with e set so the difference errs by about the Laplace gradient's own
-    error, and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
+    error, never below the rounding of the line values (eps times the objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
     V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
     halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
     complement is not positive definite there), the one-sided difference on the other side is used, with its larger
@@ -1732,7 +1732,10 @@ def _correction_slopes(
     for position in np.flatnonzero(interior):
         unit = np.zeros(count_weights)
         unit[position] = 1.0
-        accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), count * _QUADPACK_RELATIVE_FLOOR)
+        # No integral is resolved past the rounding of the line values it integrates: each exponent is known to eps
+        # times the objective's magnitude, and QUADPACK's own floor is 50 eps.
+        floor = count * max(_QUADPACK_RELATIVE_FLOOR, _EPSILON * evidence.magnitude)
+        accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), floor)
         share = accuracy / count
         step = max(float((3.0 * accuracy / scale[position]) ** (1.0 / 3.0)), limit)
         centre = _correction_value(view, weights, evidence.coefficients, cavity, working_bytes, count, share)
@@ -2415,6 +2418,9 @@ def _stationarity(
     open_ = np.flatnonzero(interior & ~folded)
     reach = np.abs(gradient) + error
     gain = float(np.sum(reach[folded] * folds[folded]))
+    if not np.all(np.isfinite(reach[interior])):
+        # A slope that could not be resolved leaves the gain unbounded: the weights are not certified here.
+        return _Stationarity(gradient, error, curvature, steps, folds, np.inf, None)
     if open_.shape[0]:
         block = curvature[np.ix_(open_, open_)]
         try:

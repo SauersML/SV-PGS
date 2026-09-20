@@ -130,7 +130,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', 'quadrature_majorant_ratio'): ('math', frozenset({0.25}), '|(1 + i q)^(-1/2)| = (1 + q^2)^(-1/4) at t + i pi/2'),
     ('scale_mixture_ep.py', '_directional_derivatives'): ('math', frozenset({4, 3.0, 6.0, 4.0}), 'derivatives of a log-sum-exp as joint cumulants (Faa di Bruno): k4 = E[X^4] - 3 Var^2, d4 = k4 + 6 k(X, X, Y) + 3 Var(Y) + 4 Cov(X, Z) + E W'),
     ('scale_mixture_ep.py', '_variant_derivatives'): ('math', frozenset({3.0}), 'd Var / dh of a normal mixture: E[(mu - m)^3] + 3 E[c (mu - m)] (third central moment of a Gaussian mixture)'),
-    ('scale_mixture_ep.py', '_laplace_corrections'): ('math', frozenset({8.0, 5.0, 24.0}), 'Tierney and Kadane (1986): the O(1) Laplace term E[u^4]/24 k4 + E[u^6]/72 k3^2 = k4/8 + 5 k3^2/24'),
+    ('scale_mixture_ep.py', '_standardized'): ('math', frozenset({8.0, 5.0, 24.0}), 'Tierney and Kadane (1986): the O(1) Laplace term E[u^4]/24 k4 + E[u^6]/72 k3^2 = k4/8 + 5 k3^2/24'),
     ('store_converter.py', 'IMPUTATION_ERROR_RATE'): ('external-config', frozenset({0.001}), 'GLIMPSE2 --err-imp of the aou2_50k imputation run; the removed background is an exact function of it'),
     ('store_converter.py', 'MAXIMUM_KEPT_PATHS'): ('external-config', frozenset({10}), 'pop-glimpse2 max_alleles of the aou2_50k imputation run'),
     ('store_converter.py', 'NO_LOCUS'): ('definitional', frozenset({4294967295}), 'uint32 maximum as the no-locus sentinel'),
