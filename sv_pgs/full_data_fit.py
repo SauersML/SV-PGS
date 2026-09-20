@@ -416,6 +416,9 @@ class _FullDataFixedPoints:
         self.mean_move = np.full(model_count, np.inf)
         self.noise_gain = np.full(model_count, np.inf)
         self.mean_error = np.full(model_count, np.inf)
+        # The mean solve's error bound in q's metric: sqrt(1/K) (its KL 1/(2K)) until a refresh measures the step it
+        # must resolve, then that relative accuracy of the step (``_solve``).
+        self.mean_bound = np.full(model_count, np.sqrt(1.0 / draw_count))
         self.information: list[BlockCertificate] = []
         self.refreshes = 0
         self.passes = 0
@@ -432,12 +435,12 @@ class _FullDataFixedPoints:
         variances = np.zeros_like(mean) if reduced_variances is None else reduced_variances
         return member_moments(self.ties, self.site_precision, self.site_shift, mean, variances)
 
-    def _iterate(self, site_precision: F64Array, site_shift: F64Array) -> None:
+    def _iterate(self, site_precision: F64Array, site_shift: F64Array, error_bound: F64Array | None = None) -> None:
         group_precision, group_shift = group_sites(self.ties, site_precision, site_shift)
         certificate = self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=self.noise,
-            # The mean's own error in q's metric, ||mu_hat - mu||_A^2 / 2 <= 1 / (2K) nats, as every EP certificate here.
-            error_bound=np.full(self.gaussian.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=self.probe_ratio,
+            # The mean's own error in q's metric (``mean_bound`` unless the caller resolves a smaller move).
+            error_bound=self.mean_bound if error_bound is None else error_bound, probe_residual_ratio=self.probe_ratio,
         )
         self.mean_error = np.asarray(_host(certificate.error_bound), dtype=np.float64)
         self.passes += 1
@@ -692,6 +695,7 @@ class _FullDataFixedPoints:
         fraction = 1.0
         # The share taken by the step into the current refresh (None before the first step in this call).
         arrived: float | None = None
+        self.mean_bound = np.full(model_count, np.sqrt(1.0 / self.draw_count))
         while True:
             variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
@@ -785,6 +789,10 @@ class _FullDataFixedPoints:
             previous = None if np.all(certified) else (lower, upper, right.copy(), arrived)
             fraction = damped
             arrived = fraction
+            # The next refresh's mean resolves the next step (f sqrt(2 KL_k) in q's metric) to relative accuracy
+            # sqrt(1/K), as the KL itself is: a mean error at the step's own size would be what the ratio measures.
+            measured = np.where(lower > 0.0, lower, upper)
+            self.mean_bound = np.minimum(np.sqrt(1.0 / self.draw_count), np.sqrt(1.0 / self.draw_count) * fraction * np.sqrt(2.0 * measured))
             start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
             if fraction < 1.0:
@@ -821,7 +829,9 @@ class _FullDataFixedPoints:
                 trial_precision = self.site_precision + fraction * (target_precision - self.site_precision)
                 trial_shift = self.site_shift + fraction * (target_shift - self.site_shift)
                 try:
-                    self._iterate(trial_precision, trial_shift)
+                    # The pass's move is tested at fraction sqrt(1/K) in q's metric: each mean resolves that to relative
+                    # accuracy sqrt(1/K), so the solves' error is not what the test measures.
+                    self._iterate(trial_precision, trial_shift, np.full(model_count, fraction / self.draw_count))
                     break
                 except np.linalg.LinAlgError:
                     fraction *= 0.5
@@ -836,7 +846,9 @@ class _FullDataFixedPoints:
                 return
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
-                damping = min(damping, 1.0 / (1.0 + np.sqrt(ratio)))
+                # The ratio is the damped map's at this pass's fraction f: f / (1 + rho) removes the alternating mode it
+                # measures (theory-ep, as for the refreshes), where 1 / (1 + rho) would hold f once it is below that.
+                damping = min(damping, fraction / (1.0 + np.sqrt(ratio)))
             previous_move = mean_move
             cavities = [
                 Cavity(precision=frozen[:, model], shift=new_mean[:, model] / marginal[:, model] - self.site_shift[:, model]) for model in range(model_count)
