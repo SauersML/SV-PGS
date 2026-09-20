@@ -77,3 +77,24 @@ def test_from_tie_map_reads_groups_and_signs():
     np.testing.assert_array_equal(ties.group, [0, 1, 1, 2])
     np.testing.assert_array_equal(ties.sign, [1.0, 1.0, -1.0, 1.0])
     assert ties.group_count == 3
+
+
+def test_the_drivers_member_posterior_is_the_dense_member_posterior():
+    # full_data_fit's responses over the members (Sigma R and -(Sigma o Sigma) W, for the total curvature) from the
+    # solver's over the groups.
+    from sv_pgs.full_data_fit import _member_posterior
+    from sv_pgs.scale_mixture_ep import GaussianPosterior
+
+    reduced, members, group, sign, precision, shift, _target = _problem(9)
+    ties = TieGroups(group=group, sign=sign, group_count=reduced.shape[1])
+    group_precision, _group_shift = group_sites(ties, precision, shift)
+    reduced_covariance = np.linalg.inv(reduced.T @ reduced + np.diag(group_precision))
+    member_covariance = np.linalg.inv(members.T @ members + np.diag(precision))
+    posterior = _member_posterior(
+        GaussianPosterior(solve=lambda right, _e: reduced_covariance @ right, variance_jvp=lambda weights: -(np.square(reduced_covariance) @ weights)),
+        ties, precision, np.diag(reduced_covariance),
+    )
+    generator = np.random.default_rng(11)
+    right = generator.standard_normal((group.shape[0], 3))
+    np.testing.assert_allclose(posterior.solve(right, 1e-12), member_covariance @ right, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(posterior.variance_jvp(right), -(np.square(member_covariance) @ right), rtol=1e-9, atol=1e-12)

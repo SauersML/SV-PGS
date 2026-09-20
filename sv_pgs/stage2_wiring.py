@@ -123,8 +123,10 @@ def _fit_one(
         DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
     )
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
-    offsets = log_reliability[kept_rows]
-    _classes, class_index = np.unique(store.variant_table.variant_class[kept_rows], return_inverse=True)
+    # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
+    member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
+    offsets = log_reliability[member_rows]
+    _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
     mask = np.zeros((store.n_samples, 1))
     mask[training_columns, 0] = 1.0
     store_targets = np.zeros((store.n_samples, 1))
@@ -137,7 +139,7 @@ def _fit_one(
     prior = scale_mixture_prior(
         class_index=class_index.astype(np.int64),
         log_variance_offset=offsets,
-        annotation_design=np.zeros((kept_rows.shape[0], 0)),
+        annotation_design=np.zeros((member_rows.shape[0], 0)),
         annotation_groups=(),
         nodes=nodes,
         floor=floor,
