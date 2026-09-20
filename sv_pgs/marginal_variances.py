@@ -446,6 +446,41 @@ def _prepare(solve: BulkSolve, grams: BlockGrams) -> tuple[WindowCross, NDArray[
     return window_cross(solve, grams), bulk_variance, core_inverse, is_resolved
 
 
+@dataclass(frozen=True)
+class WindowPreparation:
+    """What every block's window algebra shares for one model: C on the LD windows, D on bulk sites, core^-1 and
+    the resolved mask. Build it once with ``prepare_windows`` and pass it to ``block_covariance`` for many blocks."""
+
+    cross: WindowCross
+    bulk_variance: NDArray[np.float64]
+    core_inverse: NDArray[np.float64]
+    is_resolved: NDArray[np.bool_]
+
+
+def prepare_windows(solve: BulkSolve, grams: BlockGrams) -> WindowPreparation:
+    """The shared state of every block's window algebra for one model (one core inversion, one window_cross)."""
+    cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
+    return WindowPreparation(cross=cross, bulk_variance=bulk_variance, core_inverse=core_inverse, is_resolved=is_resolved)
+
+
+def block_covariance(
+    solve: BulkSolve, grams: BlockGrams, block: int, array_module: Any = np, prepared: WindowPreparation | None = None
+) -> NDArray[np.float64]:
+    """Sigma_bb for one block, (|b| x |b|) host float64: the window algebra's own-block covariance.
+
+    Bulk-bulk entries come from identity 2 and the window's resolved spikes; bulk-resolved and resolved-resolved
+    entries are exact through core. Resolved sites beyond the window do not enter (their coupling to block b is a
+    chance term, which ``marginal_variances`` adds to the diagonal by its expectation). ``grams`` may be Stage 0's
+    shared float32 Grams with the model's ``scale``; each window is promoted to float64. The window algebra runs on
+    ``array_module`` (cupy for a device). ``prepared`` (``prepare_windows``) saves recomputing the model's shared
+    state for every block.
+    """
+    state = prepared if prepared is not None else prepare_windows(solve, grams)
+    terms = _block_terms(solve, grams, state.cross, state.bulk_variance, state.core_inverse, block, array_module)
+    covariance = terms.covariance
+    return 0.5 * (covariance + covariance.T)
+
+
 def marginal_variances(solve: BulkSolve, grams: BlockGrams, array_module: Any = np) -> NDArray[np.float64]:
     """(p,) diag(A^-1) for one model, by identities 1 and 2 (module docstring). The windows' dense algebra runs on
     ``array_module`` (numpy by default; pass cupy to use a device).
