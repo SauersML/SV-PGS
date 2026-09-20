@@ -140,6 +140,7 @@ def test_block_grams_share_stage0s_float32_arrays_across_models(tmp_path: Path) 
     assert all(np.asarray(values).dtype == np.float32 for values in shared.within)
     ld = statistics.ld
     for block_index in range(ld.block_count):
-        expected = np.asarray(ld.block(block_index).projected_gram, dtype=np.float64) / 0.7
+        # The model's metric enters as its scale, 1 / sigma^2, multiplying the promoted float32 values.
+        expected = np.asarray(ld.block(block_index).projected_gram, dtype=np.float64) * (1.0 / 0.7)
         assert np.array_equal(model.within_block(block_index), expected)
     assert window_working_bytes(model) > 0
