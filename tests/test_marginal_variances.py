@@ -698,6 +698,23 @@ def test_probes_to_decide_takes_a_per_block_tolerance_with_mixed_decisions():
     assert probes_to_decide(certificate, 16) == 36
 
 
+def test_probes_to_decide_counts_the_probes_that_place_a_zero_estimate():
+    # speed-recycle's and svpgs-integrator's NaN: a zero estimate whose probes see information has infinite relative
+    # bounds, and inf / inf gave NaN. It is decided once the absolute interval excludes zero, at k (q s / |m|)^2 probes.
+    k = 16
+    level = certificate_level(64)
+    quantile = float(student_t.isf(0.5 * level / 2, k - 1))
+    base = np.array([1.0, -1.0] * (k // 2))
+    straddling = 0.5 * quantile * np.std(base, ddof=1) / np.sqrt(k) + base  # mean = half the interval's half-width
+    exact = np.zeros(k)
+    certificate = marginal_variances_module._certificate(np.array([0.0, 0.0]), [straddling, exact], 0.1, level)
+    assert certificate.certified.tolist() == [False, True] and not certificate.violated.any()
+    assert np.isclose(certificate.zero_estimate_ratio[0], 2.0) and np.isnan(certificate.zero_estimate_ratio[1])
+    assert probes_to_decide(certificate, k) == int(np.ceil(k * certificate.zero_estimate_ratio[0] ** 2))
+    centred = marginal_variances_module._certificate(np.array([0.0]), [base], 0.1, level)
+    assert probes_to_decide(centred, k) == np.inf
+
+
 
 def test_shared_float32_grams_with_a_scale_give_the_float64_answer():
     _generator, columns, precision, blocks, solve = _strong_case(30)
