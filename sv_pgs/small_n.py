@@ -38,8 +38,9 @@ per call after that), else works from the factors at O(n^2 p) per column (see ``
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 from scipy import linalg, sparse
@@ -140,14 +141,36 @@ class _Design:
         """Xp' u for u (n,) or (n, q)."""
         return self.spread(self.carriers.T @ self.project(samples))
 
+    def _chunks(self) -> Iterator[slice]:
+        """Column panels n wide: every design pass below keeps its temporaries at n x n."""
+        step = max(1, self.sample_count)
+        for start in range(0, self.group_count, step):
+            yield slice(start, min(start + step, self.group_count))
+
     def weighted_gram(self, weights: F64Array) -> F64Array:
         """Xp diag(w) Xp' (n x n) for w >= 0: G diag(A' w) G', the members' weights summed within their group."""
-        gram = linalg.blas.dsyrk(1.0, self.carriers * np.sqrt(self.group_sum(weights))[None, :])
+        roots = np.sqrt(self.group_sum(weights))
+        gram = np.zeros((self.sample_count, self.sample_count), order="F")
+        for panel in self._chunks():
+            gram = linalg.blas.dsyrk(1.0, self.carriers[:, panel] * roots[None, panel], beta=1.0, c=gram, overwrite_c=True)
         return self.project_both(np.triu(gram) + np.triu(gram, 1).T)
+
+    def signed_gram(self, weights: F64Array) -> F64Array:
+        """Xp diag(w) Xp' (n x n) for weights of either sign."""
+        grouped = self.group_sum(weights)
+        gram = np.zeros((self.sample_count, self.sample_count))
+        for panel in self._chunks():
+            block = self.carriers[:, panel]
+            gram += (block * grouped[None, panel]) @ block.T
+        return self.project_both(0.5 * (gram + gram.T))
 
     def group_quadratic_diagonal(self, core: F64Array) -> F64Array:
         """x_g' core x_g for every group, core (n x n) symmetric with P core P = core."""
-        return np.einsum("ij,ij->j", self.carriers, core @ self.carriers)
+        values = np.empty(self.group_count)
+        for panel in self._chunks():
+            block = self.carriers[:, panel]
+            values[panel] = np.einsum("ij,ij->j", block, core @ block)
+        return values
 
     def quadratic_diagonal(self, core: F64Array) -> F64Array:
         """x_j' core x_j for every member."""
@@ -462,7 +485,10 @@ class _Kernel:
                 bulk_representative=self.bulk[representative],
                 count=np.concatenate([count, np.ones(self.rest.size, dtype=np.int64)]),
                 delta=np.concatenate([1.0 / self.precision[self.bulk[representative]], np.zeros(self.rest.size)]),
-                kernel=self,
+                # A weak reference: a strong one made each kernel and its units a cycle, which reference counting cannot
+                # free, so every Newton point's kernel and its n x p factors outlived the point (svpgs-profiler g3: RSS
+                # rising one factor matrix per Newton step to a MemoryError).
+                owner=weakref.ref(self),
             )
         return self._units
 
@@ -480,6 +506,39 @@ class _Kernel:
         delta = units.delta[units.of_member]
         local = (2.0 * delta * unit_diagonal[units.of_member] + delta * delta) @ np.square(direction)
         return float(np.sum(signs[:, None] * signs[None, :] * middle * middle) + local)
+
+    def hadamard_product(self, weights: F64Array) -> F64Array:
+        """(A'^-1 o A'^-1) W without forming Phi (n x p): with A'^-1 = Delta + E, E = -Phi'Phi + Psi'Psi, it is
+        Delta^2 W + 2 Delta diag(E) W + (E o E) W, and each column of (E o E) b = diag(E diag(b) E) is
+        diag(Phi'Phi B Phi'Phi)_j = d_j^2 x_j' K^-1 G_b K^-1 x_j (G_b = X diag(d^2 b) X'), minus twice
+        diag(Phi'Phi B Psi'Psi)_j = d_j x_j' K^-1 Y psi_j (Y = X diag(d b) Psi'), plus diag(Psi'Psi B Psi'Psi): two design
+        passes and two n x n solves per column, every temporary at most n x n (the design passes are panelled)."""
+        values = np.asarray(weights, dtype=np.float64)
+        count = self.variant_count
+        design = self.design
+        inverse = np.zeros(count)
+        inverse[self.bulk] = self.inverse
+        phi_squares = inverse * inverse * design.quadratic_diagonal(self.core())
+        psi = np.zeros((self.rest.size, count))
+        if self.rest.size:
+            psi_bulk, psi_rest = self.rest_factors()
+            psi[:, self.bulk] = psi_bulk
+            psi[:, self.rest] = psi_rest
+        psi_squares = np.einsum("ij,ij->j", psi, psi)
+        result = (inverse * inverse + 2.0 * inverse * (psi_squares - phi_squares))[:, None] * values
+        for column in range(values.shape[1]):
+            weight = values[:, column]
+            gram = design.signed_gram(inverse * inverse * weight)
+            core = self._kernel_solve(self._kernel_solve(gram).T)
+            both = inverse * inverse * design.quadratic_diagonal(design.project_both(0.5 * (core + core.T)))
+            if self.rest.size:
+                image = design.image((inverse * weight)[:, None] * psi.T)
+                cross = inverse * np.einsum("jr,rj->j", design.back(self.design.project(self._kernel_solve(image))), psi)
+                middle = (psi * weight[None, :]) @ psi.T
+                rest = np.einsum("ij,ij->j", psi, middle @ psi)
+                both = both - 2.0 * cross + rest
+            result[:, column] += both
+        return result
 
     def update_divergence(self, noise: float, precision_step: F64Array, shift_step: F64Array, mean: F64Array) -> float:
         """KL(q || q') to second order for the site change (d tau, d nu), in nats: the Fisher metric of q's natural
@@ -536,7 +595,7 @@ class _Units:
     bulk_representative: I64Array
     count: I64Array
     delta: F64Array
-    kernel: _Kernel
+    owner: Callable[[], _Kernel | None]
     _phi: F64Array | None = None
     _psi: F64Array | None = None
     _sum: object = None
@@ -554,7 +613,8 @@ class _Units:
 
     def factors(self) -> tuple[F64Array, F64Array]:
         if self._phi is None:
-            kernel = self.kernel
+            kernel = self.owner()
+            assert kernel is not None, "a kernel's units outlived it"
             bulk_units = self.bulk_representative.shape[0]
             groups = kernel.design.members[self.bulk_representative]
             phi = np.zeros((kernel.upper.shape[0], self.size), order="F")
@@ -578,15 +638,6 @@ def _symmetrize_upper(matrix: F64Array) -> None:
         matrix[stop:, start:stop] = matrix[start:stop, stop:].T
         block = matrix[start:stop, start:stop]
         block[...] = np.triu(block) + np.triu(block, 1).T
-
-
-def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -> F64Array:
-    """((L'L) o (R'R)) W, column by column: out_jc = l_j' (L diag(w_c) R') r_j."""
-    result = np.empty_like(weights)
-    for column in range(weights.shape[1]):
-        core = (left * weights[:, column][None, :]) @ right.T
-        result[:, column] = np.einsum("ij,ij->j", left, core @ right)
-    return result
 
 
 class _DensePosterior:
@@ -645,14 +696,7 @@ class _DensePosterior:
             squared, local = self._explicit()
             result = -((squared @ units.sum(values))[units.of_member] + local[units.of_member][:, None] * values)
         else:
-            delta, phi, psi = self.kernel.factors()
-            phi_squares = np.einsum("ij,ij->j", phi, phi)
-            psi_squares = np.einsum("ij,ij->j", psi, psi)
-            local = (delta * delta - 2.0 * delta * phi_squares + 2.0 * delta * psi_squares)[:, None] * values
-            nonlocal_part = _hadamard_gram_product(phi, phi, values)
-            if psi.shape[0]:
-                nonlocal_part += _hadamard_gram_product(psi, psi, values) - 2.0 * _hadamard_gram_product(phi, psi, values)
-            result = -(self.noise * self.noise) * (local + nonlocal_part)
+            result = -(self.noise * self.noise) * self.kernel.hadamard_product(values)
         self.profile["jvp_seconds"] += time.perf_counter() - started
         self.profile["jvp_columns"] += int(values.shape[1])
         return result[:, 0] if column else result

@@ -432,6 +432,9 @@ def test_tie_members_keep_their_own_sites_exactly(negative, regime):
     weights = rng.standard_normal((count, 4))
     posterior = _DensePosterior(kernel, noise, 10**9, _new_profile())
     np.testing.assert_allclose(posterior.variance_jvp(weights), -(sigma * sigma) @ weights, rtol=1e-9, atol=1e-11)
+    # Without the memory for Sigma o Sigma: the Phi-free route (n x n forms and design passes only).
+    unformed = _DensePosterior(kernel, noise, 0, _new_profile())
+    np.testing.assert_allclose(unformed.variance_jvp(weights), -(sigma * sigma) @ weights, rtol=1e-9, atol=1e-11)
     left, gain, diagonal, weight = (rng.standard_normal(count) for _ in range(4))
     for vector in (left, gain, diagonal, weight):
         vector[[1, 2]] = vector[0]
