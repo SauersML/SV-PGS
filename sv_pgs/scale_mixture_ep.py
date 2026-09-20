@@ -104,10 +104,10 @@ from scipy.integrate import quad
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
-from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.krylov_recycle import RecycledSpace, block_gcro_dr
 
 _EPSILON = float(np.finfo(np.float64).eps)
 # Half of double precision: the resolution of a quantity whose square is compared at eps.
@@ -986,6 +986,11 @@ class GaussianPosterior:
     solve: Callable[[F64Array, float], F64Array]
     variance_jvp: Callable[[F64Array], F64Array]
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
+    # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
+    # block-local part (read-free), the preconditioner of the Krylov route; ``recycled``: the model's Krylov space
+    # carried across outer steps (``krylov_recycle``, lane speed-recycle).
+    local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
+    recycled: RecycledSpace | None = None
 
 
 class LinearResponseError(RuntimeError):
@@ -1224,7 +1229,8 @@ def _total_curvature_columns(
         # The map is affine in dP. With ``affine`` False its constant (the E terms) is dropped, which leaves its linear
         # part exactly: GMRES applies that, so each solve inside is accurate relative to what it applies, not to the
         # constant, as a difference of two solves would be (speed-recycle a7752ae).
-        mean_constant = mean_by_z if affine else np.zeros_like(mean_by_z)
+        # A scalar zero, so the linear part applies to any number of columns (a block Krylov step's).
+        mean_constant = mean_by_z if affine else 0.0
         mean_step = posterior.solve(
             (derivatives.mean + derivatives.mean_by_precision * inverse)[:, None] * precision_step + mean_constant * inverse_column, inner
         )
@@ -1236,30 +1242,31 @@ def _total_curvature_columns(
         return shift_step, response + posterior.variance_jvp(response) * inverse_column**2, response
 
     shape = mean_by_z.shape
+    # ``through`` is affine in dP, with linear part (I - diag(1/v^2) (Sigma o Sigma)) R and R = diag(v_h / v^3) Sigma
+    # diag(m + m_P / v) + diag(1 + v_P / v^2 - v_h m_P / v^3), each 1/v taken as ``inverse`` (a point mass does not
+    # respond). The exact posterior solves its fixed point from these four vectors, and the block-local
+    # preconditioner (``local_response``) inverts the same matrix with Sigma replaced by its blocks.
+    left = derivatives.variance_by_shift * inverse**3
+    gain = derivatives.mean + derivatives.mean_by_precision * inverse
+    diagonal = live + derivatives.variance_by_precision * inverse**2 - derivatives.variance_by_shift * derivatives.mean_by_precision * inverse**3
+    weight = inverse**2
     if posterior.linear_response is not None:
-        # ``through`` is affine in dP, with linear part (I - diag(1/v^2) (Sigma o Sigma)) R and R = diag(v_h / v^3) Sigma
-        # diag(m + m_P / v) + diag(1 + v_P / v^2 - v_h m_P / v^3): the posterior solves its fixed point exactly.
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
-        precision_step = posterior.linear_response(
-            derivatives.variance_by_shift * inverse**3,
-            derivatives.mean + derivatives.mean_by_precision * inverse,
-            live + derivatives.variance_by_precision * inverse**2 - derivatives.variance_by_shift * derivatives.mean_by_precision * inverse**3,
-            inverse**2,
-            offset,
-        )
+        precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
     size = int(np.prod(shape))
-    # GMRES(r) keeps r + 1 basis vectors of ``size`` and an (r + 1) x r Hessenberg matrix, at most 2 (r + 1) size
-    # float64 values: r is the longest restart that fits ``working_bytes``. The cycles are capped so the total Krylov
-    # dimension is ``size``, where unrestarted GMRES is exact; a restarted one that has not converged by then raises.
-    restart = max(1, min(size, int(working_bytes) // (2 * np.dtype(np.float64).itemsize * size) - 1))
-    # Each product solves the posterior only to ``inner``, so the operator itself errs, and GMRES's own residual
+    # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
+    # columns (``krylov_recycle.block_gcro_dr``): each application serves them all, restarts keep the slowest harmonic
+    # Ritz space, the kept space is the posterior's to carry to the next outer step, and ``local_response`` (read-free)
+    # preconditions it. At most ``size`` applications, the unpreconditioned GMRES's own cap.
+    # Each product solves the posterior only to ``inner``, so the operator itself errs, and the Krylov residual
     # estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci. Comput. 25, 2003):
-    # half the tolerance goes to GMRES, half to the products. The true residual is measured once GMRES stops; while
-    # it exceeds the tolerance, the inner solves tighten by the measured excess (the operator's own amplification of
-    # their error) and GMRES continues from where it stopped.
+    # half the tolerance goes to the Krylov solve, half to the products. The true residual is measured once the solve
+    # stops; while it exceeds the tolerance, the inner solves tighten by the measured excess (the operator's own
+    # amplification of their error) and the solve continues from where it stopped.
+    precondition = None if posterior.local_response is None else posterior.local_response(left, gain, diagonal, weight)
     inner = relative_tolerance
-    solution = np.zeros(size)
+    solution = np.zeros(shape)
     previous = np.inf
     while True:
         try:
@@ -1273,24 +1280,26 @@ def _total_curvature_columns(
         # the terms that cancel, which is where GMRES's residual can stop.
         rounding = _EPSILON * float(np.linalg.norm(start_response))
 
-        def linear_part(vector: F64Array, inner: float = inner) -> F64Array:
-            precision_step = vector.reshape(shape)
-            return (precision_step - through(precision_step, inner, affine=False)[1]).ravel()
+        def linear_part(values: F64Array, inner: float = inner) -> F64Array:
+            return values - through(values, inner, affine=False)[1]
 
-        operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
-        right = offset.ravel()
-        solution, information = gmres(
-            operator, right, x0=solution, rtol=0.5 * relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart)
-        )
-        target = max(relative_tolerance * float(np.linalg.norm(right)), rounding)
-        residual = float(np.linalg.norm(right - linear_part(solution)))
+        try:
+            result = block_gcro_dr(
+                linear_part, offset, relative_tolerance=0.5 * relative_tolerance, absolute_tolerance=rounding, working_bytes=working_bytes,
+                application_limit=size, start=solution, precondition=precondition, recycled=posterior.recycled,
+            )
+        except FloatingPointError as error:
+            raise LinearResponseError(f"the EP fixed point's linear response did not converge: {error}") from error
+        solution = result.solution
+        target = max(relative_tolerance * float(np.linalg.norm(offset)), rounding)
+        residual = result.residual_norm
         if residual <= target:
             break
         if residual >= previous:
-            raise LinearResponseError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+            raise LinearResponseError(f"the EP fixed point's linear response did not converge (true residual {residual:.3e} against {target:.3e})")
         previous = residual
         inner *= 0.5 * target / residual
-    precision_step = solution.reshape(shape)
+    precision_step = solution
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, inner)[0], precision_step, working_bytes)
 
 
