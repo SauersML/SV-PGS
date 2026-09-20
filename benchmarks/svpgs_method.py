@@ -276,7 +276,8 @@ def fit(train: Any) -> BenchSimModel:
 def bench_real_signed_change(variants: Any) -> np.ndarray:
     """Each record's signed allele-length change. A sequence-resolved record carries it in the harness; a symbolic SV
     has harness change 0, so it comes from its type: a deletion loses the bases it spans (END - POS, or its SVLEN if
-    longer), a duplication gains them, an insertion gains its SVLEN, and a balanced event (INV, BND) changes none."""
+    longer), a duplication gains them, an insertion gains its SVLEN, and a balanced event (INV, BND) or a multi-allelic
+    copy-number record changes none (bench-real's convention)."""
     change = np.asarray(variants.allele_length_change, dtype=np.int64).copy()
     span = np.asarray(variants.end, dtype=np.int64) - np.asarray(variants.position, dtype=np.int64)
     length = np.abs(np.asarray(variants.sv_length, dtype=np.int64))
@@ -289,7 +290,7 @@ def bench_real_signed_change(variants: Any) -> np.ndarray:
         variant_class = structural_variant_class_from_token(normalized)
         if variant_class == VariantClass.DELETION:
             change[symbolic] = -np.maximum(span, length)[symbolic]
-        elif variant_class in (VariantClass.DUPLICATION, VariantClass.COPY_NUMBER):
+        elif variant_class == VariantClass.DUPLICATION:
             change[symbolic] = np.maximum(span, length)[symbolic]
         elif variant_class in (VariantClass.INSERTION, VariantClass.INSERTION_MEI):
             change[symbolic] = length[symbolic]
@@ -322,7 +323,11 @@ def bench_real_classes_for_arm(variants: Any, arm: str) -> np.ndarray:
     if arm == "full":
         return bench_real_classes(variants)
     if arm == "no_sv_terms":
-        return _length_class(*bench_real_allele_lengths(variants))
+        classes = _length_class(*bench_real_allele_lengths(variants))
+        # A typed record with no length change (an inversion, a breakend, a copy-number record) is complex, not an SNV.
+        typed = np.array([normalize_variant_token(token) not in (None, ".") for token in np.asarray(variants.sv_type, dtype=str)], dtype=bool)
+        classes[typed & (bench_real_signed_change(variants) == 0)] = _CLASS_CODES[VariantClass.OTHER_COMPLEX_SV]
+        return classes
     return np.full(np.asarray(variants.position).shape[0], _CLASS_CODES[VariantClass.SNV], dtype=np.uint8)
 
 
