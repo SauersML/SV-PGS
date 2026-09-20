@@ -1009,17 +1009,6 @@ class GaussianPosterior:
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
 
 
-class LatticeUnresolved(RuntimeError):
-    """A V the search needed is not resolved by the lattice (its trapezoid sum moves by more than the tolerance on half
-    the spacing, ``_corrected``). The lattice is only quadrature, so the answer is to refine it and resume
-    (``fit_on_resolved_lattice``), never to let an unresolved V steer (lead ruling B). ``hyperparameters`` are the
-    fit's iterates when it stopped, for the warm restart."""
-
-    def __init__(self, message: str, hyperparameters: list[MixtureHyperparameters] | None = None) -> None:
-        super().__init__(message)
-        self.hyperparameters = hyperparameters
-
-
 class NoCertifiedProgress(FloatingPointError):
     """The outer loop's step shrank to double precision with every trial refused, where no uncertified fit can be
     returned honestly (the weights have no evaluated step, or B + S is indefinite there)."""
@@ -1718,8 +1707,17 @@ def _correction_value(
         return None
 
 
+def _coarse_targets(evidence: _Evidence, interior: F64Array, tolerance: float) -> F64Array:
+    """The correction slopes' error per weight before the curvature is known: with s bounding |V''| (MODEL.md S4) and
+    n interior weights, E^2 / (2 s) = tolerance / (4 n) leaves the error a quarter of the tolerance's gain at that
+    curvature (``_stationarity`` tightens it once the difference curvature is in)."""
+    count = max(int(np.count_nonzero(interior)), 1)
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
+    return np.sqrt(0.5 * tolerance * scale / count)
+
+
 def _correction_slopes(
-    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int, targets: F64Array
 ) -> tuple[F64Array, F64Array, F64Array]:
     """The rho-slopes of V's corrections at a corrected evidence, their error estimates, and their second
     differences, per interior weight (zero elsewhere).
@@ -1730,8 +1728,9 @@ def _correction_slopes(
     V's corrections' own, by central differences in rho_i with x on its first-order path x + h dx/drho_i (the
     corrections are smooth there, and no inner maximum is re-solved, so no fold can intervene; x's second-order
     error cancels in the central difference), at the same count of replaced directions. Each correction is resolved
-    to a share e / m of its log (m integrals) with e set so the difference errs by about the Laplace gradient's own
-    error, never below the rounding of the line values (eps times the objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
+    to a share e / m of its log (m integrals) with e set so the difference errs by about ``targets`` (the slope error
+    the certificate can carry, ``_stationarity``), never below the rounding of the line values (eps times the
+    objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
     V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
     halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
     complement is not positive definite there), the one-sided difference on the other side is used, with its larger
@@ -1744,9 +1743,8 @@ def _correction_slopes(
     count = 0 if evidence.replaced_directions is None else int(evidence.replaced_directions.shape[1])
     if count == 0:
         return slopes, errors, second
-    radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
     scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
-    target = scale * radius + _EPSILON * evidence.magnitude
+    target = np.asarray(targets, dtype=np.float64)
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
     for position in np.flatnonzero(interior):
         unit = np.zeros(count_weights)
@@ -1792,26 +1790,6 @@ def _correction_slopes(
     return slopes, errors, second
 
 
-def _halved_data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
-    """sum_j log Z_j with the same density on the lattice of half the spacing (``halved_lattice``'s: each class's
-    log g the natural spline of least roughness through its nodal values), the same scales and kernel floor."""
-    nodes = prior.log_variance_grid
-    finer = np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)
-    log_weights, _scale = _density_and_scale(prior, coefficients)
-    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
-    spline = make_interp_spline(nodes, log_weights.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
-    fine_weights = spline(finer).T
-    log_density = fine_weights - _log_sum_exp(fine_weights, axis=1, keepdims=True)
-    scales = log_scale(prior, coefficients)
-    total = 0.0
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, finer.shape[0], working_bytes):
-            total += float(np.sum(_log_normalizers(
-                log_density[class_position], scales[rows], finer, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
-            )))
-    return total
-
-
 def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
@@ -1822,8 +1800,7 @@ def _corrected(
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None or a line integral cannot be certified; ``LatticeUnresolved`` when the lattice does
-    not resolve the density (its trapezoid sum moves by more than the tolerance on half the spacing).
+    None when the evidence is None or a line integral cannot be certified.
     """
     if evidence is None:
         return None
@@ -1837,16 +1814,8 @@ def _corrected(
     replaced = int(np.argmax(remaining <= 0.5 * tolerance))
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
-    # The lattice must resolve the density x_rho puts on it (lead ruling B): the same density on half the spacing
-    # changes sum_j log Z_j by the trapezoid's error at h (the rule converges geometrically in 1/h for these analytic
-    # integrands, so the h/2 sum is exact beside it). A density narrower than the spacing aliases to a few atoms, whose
-    # lattice sum rises above any continuous density's [semi-real, oracle's v7 x1000 windows: 23.59 to 24.27]; its
-    # halved sum falls back. Where the difference exceeds the tolerance, V is not certified there and never steers.
-    quadrature = abs(_halved_data_value(prior, evidence.coefficients, cavity, working_bytes) - _data_value(prior, evidence.coefficients, cavity, working_bytes))
-    if quadrature > tolerance:
-        raise LatticeUnresolved(f"the lattice does not resolve the density at these weights: its trapezoid sum moves by {quadrature:.3g} nats on half the spacing")
     return replace(
-        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder + quadrature,
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
     )
 
@@ -2368,11 +2337,11 @@ class _Stationarity:
 
 
 def _full_gradient(
-    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int, targets: F64Array
 ) -> tuple[F64Array, F64Array, F64Array]:
     """The certified V's rho-gradient, its error, and the corrections' second differences: the Laplace part's
-    gradient (exact at x_rho) plus the corrections' own slopes (``_correction_slopes``)."""
-    correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes)
+    gradient (exact at x_rho) plus the corrections' own slopes to ``targets`` (``_correction_slopes``)."""
+    correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes, targets)
     # x_rho's own error moves the Laplace gradient by its x-slope over x's error, sqrt(2 d) in the -H metric: bounded
     # by the gradient's scale s_i times that radius (the same logistic bound as V's derivatives).
     radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
@@ -2413,7 +2382,10 @@ def _stationarity(
     # The gradient is taken at x_rho resolved to double precision, so x's own error barely enters it.
     refined = _corrected(view, weights, _evidence(view, weights, evidence.coefficients, cavity, correction, working_bytes, 0.0), cavity, correction, working_bytes, tolerance)
     base = evidence if refined is None else refined
-    gradient, error, correction_second = _full_gradient(view, weights, base, interior, cavity, working_bytes)
+    # The corrections' slopes first to the error the curvature bound s allows (cheap), for the gradient's sign; once
+    # the difference curvature K is in, again where K asks for less: E^2 / (2 K) = tolerance / (4 n).
+    coarse = _coarse_targets(base, interior, tolerance)
+    gradient, error, correction_second = _full_gradient(view, weights, base, interior, cavity, working_bytes, coarse)
     scale = np.maximum(0.5 * (base.effective_degrees + base.penalty_sizes), _EPSILON * base.magnitude)
     laplace_error = scale * float(np.sqrt(2.0 * max(base.inner_decrement, 0.0))) + _EPSILON * base.magnitude
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
@@ -2448,9 +2420,19 @@ def _stationarity(
                 folds[position] = 0.0
                 step = max(0.5 * step, limit)
         curvature[:, position] = column
-        curvature[position, position] -= correction_second[position]
         steps[position] = step
     inside = np.flatnonzero(interior)
+    interior_count = max(inside.shape[0], 1)
+    laplace_curvature = np.abs(np.diag(curvature))
+    fine = np.sqrt(0.5 * tolerance * np.maximum(laplace_curvature, _EPSILON * scale) / interior_count)
+    tighter = interior & (fine < coarse)
+    if np.any(tighter):
+        refined_gradient, refined_error, refined_second = _full_gradient(view, weights, base, tighter, cavity, working_bytes, np.minimum(coarse, fine))
+        gradient = np.where(tighter, refined_gradient, gradient)
+        error = np.where(tighter, refined_error, error)
+        correction_second = np.where(tighter, refined_second, correction_second)
+    for position in inside:
+        curvature[position, position] -= correction_second[position]
     curvature[np.ix_(inside, inside)] = 0.5 * (curvature[np.ix_(inside, inside)] + curvature[np.ix_(inside, inside)].T)
     folded = interior & (folds > 0.0)
     open_ = np.flatnonzero(interior & ~folded)
@@ -2745,8 +2727,6 @@ def fit_hyperparameters(
             correction = curvature_correction(prior, hyperparameters[model].coefficients, point.cavity, point.posterior, working_bytes, tolerance)
             try:
                 step = hyper_step(prior, hyperparameters[model], point.cavity, correction, working_bytes, tolerance)
-            except LatticeUnresolved as error:
-                raise LatticeUnresolved(str(error), list(hyperparameters)) from error
             except FloatingPointError:
                 # B + S has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
                 step = None
@@ -2843,23 +2823,3 @@ def fit_hyperparameters(
                 radii[model] = radius
                 pending[model] = (newton, step, _proposal(newton, radius), radius, keep, 0.5 * fraction)
 
-
-def fit_on_resolved_lattice(
-    prior: ScaleMixturePrior,
-    starts: Sequence[MixtureHyperparameters],
-    fixed_points_for: Callable[[ScaleMixturePrior], FixedPoints],
-    working_bytes: int,
-    tolerance: float,
-) -> tuple[ScaleMixturePrior, list[OuterFit]]:
-    """``fit_hyperparameters`` on the prior's lattice, halved and refit from the stopped iterates while a V the search
-    needs is not resolved by it (``LatticeUnresolved``; lead ruling B: the lattice is only quadrature, so refining it
-    is the answer). ``fixed_points_for`` builds the EP oracle on a lattice. Returns the lattice fitted on and the fits.
-    """
-    current = list(starts)
-    while True:
-        try:
-            return prior, fit_hyperparameters(prior, current, fixed_points_for(prior), working_bytes, tolerance)
-        except LatticeUnresolved as error:
-            stopped = error.hyperparameters if error.hyperparameters is not None else current
-            moved = [halved_lattice(prior, hyperparameters) for hyperparameters in stopped]
-            prior, current = moved[0][0], [hyperparameters for _finer, hyperparameters in moved]

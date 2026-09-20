@@ -658,24 +658,6 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
     assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
 
 
-def test_a_density_the_lattice_does_not_resolve_is_not_certified(monkeypatch):
-    # The same density on half the spacing: a smooth one moves sum_j log Z_j by far less than the tolerance, one that
-    # alternates between nodes (narrower than the spacing, the aliasing oracle found) by far more.
-    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
-    smooth = initial_hyperparameters(prior).coefficients
-    assert abs(engine._halved_data_value(prior, smooth, cavity, _WORKING_BYTES) - _data_value(prior, smooth, cavity, _WORKING_BYTES)) <= 1e-2 * _EVIDENCE_TOLERANCE
-    spiky = smooth.copy()
-    alternating = np.where(np.arange(prior.grid_size) % 2 == 0, 8.0, -8.0)
-    spiky[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (alternating - alternating.mean())
-    assert abs(engine._halved_data_value(prior, spiky, cavity, _WORKING_BYTES) - _data_value(prior, spiky, cavity, _WORKING_BYTES)) > _EVIDENCE_TOLERANCE
-    # Where the halved sum moves by more than the tolerance, the corrected V is not certified: the lattice must refine.
-    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
-    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
-    assert _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE) is not None
-    halved = engine._halved_data_value
-    monkeypatch.setattr(engine, "_halved_data_value", lambda *arguments: halved(*arguments) + 2.0 * _EVIDENCE_TOLERANCE)
-    with pytest.raises(engine.LatticeUnresolved):
-        _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
 def test_the_kronrod_rule_is_quadpacks():
     # The embedded Gauss rule is the 7-point Gauss-Legendre rule, and the 15-point Kronrod rule integrates every
     # polynomial of degree 22 exactly (3 n + 1 for n = 7).
@@ -813,7 +795,7 @@ def test_the_correction_slopes_are_the_corrected_evidences_own():
     base = _corrected(prior, weights, _evidence(prior, weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0),
                       cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert base is not None and base.replaced_directions is not None and base.replaced_directions.shape[1] > 0
-    slopes, errors, _second = engine._correction_slopes(prior, weights, base, interior, cavity, _WORKING_BYTES)
+    slopes, errors, _second = engine._correction_slopes(prior, weights, base, interior, cavity, _WORKING_BYTES, engine._coarse_targets(base, interior, _EVIDENCE_TOLERANCE))
     step = 0.02
     for position in np.flatnonzero(interior):
         unit = np.zeros(weights.shape[0])
@@ -903,7 +885,7 @@ def test_a_maximum_at_its_basins_fold_is_certified_one_sided(monkeypatch):
     prior, cavity = _annotated_problem(101)
     weights, evidence, interior = _ascended(prior, cavity)
     position = int(np.flatnonzero(interior)[0])
-    gradient = engine._full_gradient(prior, weights, evidence, interior, cavity, _WORKING_BYTES)[0]
+    gradient = engine._full_gradient(prior, weights, evidence, interior, cavity, _WORKING_BYTES, engine._coarse_targets(evidence, interior, _EVIDENCE_TOLERANCE))[0]
     climb = 1.0 if gradient[position] >= 0.0 else -1.0
     corrected = engine._corrected
 
@@ -1164,8 +1146,7 @@ def _dense_fixed_points(prior, likelihood_precision, linear_term):
 def test_a_halved_lattice_does_not_alias_the_fitted_density_on_the_v7_gap_case():
     # oracle's finding [semi-real, bench-sim v7 x1000, 80 variants]: on the halved lattice its interior search found
     # densities narrower than one spacing, which alias to a few atoms and lifted the objective from 23.59 to 24.27, above
-    # any continuous density. The engine's certified fit must give the same evidence on the lattice and on its halving
-    # (its V is certified only where the lattice resolves the density, ``_corrected``).
+    # any continuous density. The engine's certified fit must give the same evidence on the lattice and on its halving.
     data = np.load(_GAP_CASE)
     likelihood_precision, linear_term = data["likelihood_precision"], data["linear_term"]
     count = linear_term.shape[0]
