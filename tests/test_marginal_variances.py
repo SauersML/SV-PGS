@@ -19,7 +19,9 @@ from sv_pgs.marginal_variances import (
     control_variate,
     stage_level,
     information_products,
+    information_ceiling,
     information_solve_tolerance,
+    resolvable_blocks,
     block_trace_certificate,
     cavity_tolerance,
     certificate_level,
@@ -436,3 +438,25 @@ def test_information_solve_tolerance_stays_finite_with_non_positive_estimates():
     for variances in (too_large, zero):
         tolerance = information_solve_tolerance(solve, variances, blocks, norms, 0.01)
         assert np.isfinite(tolerance) and tolerance > 0.0
+
+
+def test_a_block_of_rounding_level_columns_is_exact_not_a_zero_tolerance():
+    # verify-stage2's case: a fold whose training rows make a block's columns zero up to rounding.
+    generator = np.random.default_rng(22)
+    columns = generator.standard_normal((200, 120))
+    columns[:, 40:80] = 1e-30 * generator.standard_normal((200, 40))
+    precision = generator.uniform(1.0, 30.0, 120)
+    blocks = tuple(np.arange(start, start + 40) for start in range(0, 120, 40))
+    solve = _solve(columns, precision, np.array([5]))
+    norms = np.sum(columns**2, axis=0)
+    assert information_ceiling(solve, blocks, norms)[1] == 0.0
+    assert resolvable_blocks(solve, blocks, information_ceiling(solve, blocks, norms)).tolist() == [True, False, True]
+    variances = np.diag(np.linalg.inv(columns.T @ columns + np.diag(precision)))
+    tolerance = information_solve_tolerance(solve, variances, blocks, norms, 0.01)
+    assert np.isfinite(tolerance) and tolerance > 0.0
+    probes = generator.choice([-1.0, 1.0], size=(120, 16))
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    grams = BlockGrams(blocks=blocks, within=tuple((columns.T @ columns)[np.ix_(b, b)] for b in blocks), next_cross=())
+    removed = probes / precision[:, None] - covariance @ probes
+    certificate = block_information_certificate(solve, variances, blocks, probes, removed, 0.5, certificate_level(64), control_variate(solve, grams, probes))
+    assert certificate.certified[1]

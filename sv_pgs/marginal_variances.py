@@ -515,16 +515,52 @@ def information_solve_tolerance(
     # information the block can hold, U_b = sum_{j in b, bulk} (D_j - 1/A_jj), since Sigma_jj >= 1/A_jj for any
     # positive-definite A. U_b > 0 whenever the block has bulk mass. Only a block with no bulk mass (every site
     # resolved, so exact) constrains nothing; with none left, the minimum over the empty set is +infinity.
-    ceiling = np.where(is_bulk, bulk_variance - 1.0 / (column_square_norms + np.where(is_bulk, solve.site_precision, 1.0)), 0.0)
+    ceiling = information_ceiling(solve, blocks, column_square_norms)
+    resolvable = resolvable_blocks(solve, blocks, ceiling)
     ratios = []
     for position, members in enumerate(blocks):
-        block_mass = float(np.sum(mass[members]))
-        if block_mass <= 0.0:
+        # A block whose ceiling float64 cannot resolve holds no information the arithmetic can see, whatever
+        # rounding-level column mass it carries (a column that is zero on the fold's training rows): it is
+        # exact, and constrains nothing (``resolvable_blocks``).
+        if not resolvable[position]:
             continue
         estimate = abs(float(np.sum(removed[members])))
-        scale = estimate if estimate > 0.0 else float(np.sum(ceiling[members]))
-        ratios.append(float(bound[position]) * scale / np.sqrt(block_mass * total))
+        scale = estimate if estimate > 0.0 else float(ceiling[position])
+        ratios.append(float(bound[position]) * scale / np.sqrt(float(np.sum(mass[members])) * total))
     return 0.5 * min(ratios) if ratios else np.inf
+
+
+def resolvable_blocks(solve: BulkSolve, blocks: tuple[NDArray[np.int64], ...], ceiling: NDArray[np.float64]) -> NDArray[np.bool_]:
+    """Blocks whose information ceiling U_b exceeds the rounding of their own information in float64.
+
+    The information sum_{j in b} (D_j - Sigma_jj) over m bulk sites is computed from values of size D_j, so its
+    rounding is at most gamma_m sum_{j in b} D_j, with gamma_m = m u / (1 - m u) and u the unit roundoff
+    (Higham, Thm 4.3). A block with U_b at or below that holds no information float64 can resolve.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    prior = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
+    unit = np.finfo(np.float64).eps / 2.0
+    out = np.zeros(len(blocks), dtype=bool)
+    for position, members in enumerate(blocks):
+        count = int(np.sum(is_bulk[members]))
+        rounding = count * unit / (1.0 - count * unit) * float(np.sum(prior[members]))
+        out[position] = ceiling[position] > rounding
+    return out
+
+
+def information_ceiling(solve: BulkSolve, blocks: tuple[NDArray[np.int64], ...], column_square_norms: NDArray[np.float64]) -> NDArray[np.float64]:
+    """U_b = sum over block b's bulk sites of D_j - 1/A_jj: the most information the block can hold.
+
+    Sigma_jj >= 1/A_jj for any positive-definite A (Cauchy-Schwarz), with A_jj = |xt_j|^2 + Pi_j, so
+    D_j - Sigma_jj <= D_j - 1/A_jj. U_b is zero exactly when the block has no bulk site with a column that
+    float64 can tell from zero next to its site precision.
+    """
+    is_bulk = np.ones(solve.site_precision.shape[0], dtype=bool)
+    is_bulk[solve.resolved] = False
+    precision = np.where(is_bulk, solve.site_precision, 1.0)
+    per_site = np.where(is_bulk, 1.0 / precision - 1.0 / (column_square_norms + precision), 0.0)
+    return np.array([float(np.sum(per_site[members])) for members in blocks])
 
 
 def block_information_certificate(
@@ -563,8 +599,13 @@ def block_information_certificate(
     bulk_variance = np.where(is_bulk, 1.0 / np.where(is_bulk, solve.site_precision, 1.0), 0.0)
     removed = np.where(is_bulk, bulk_variance - variances, 0.0)
     difference = np.where(is_bulk[:, None], removed_products - control.removed_products, 0.0)
-    per_probe = [control.window_information[position] + np.sum(probes[members] * difference[members], axis=0) for position, members in enumerate(blocks)]
-    estimate = np.array([float(np.sum(removed[members])) for members in blocks])
+    # A block that can hold no resolvable information (``resolvable_blocks``) is exact: test it as such.
+    per_probe = [
+        control.window_information[position] + np.sum(probes[members] * difference[members], axis=0)
+        if control.resolvable[position] else np.zeros(probes.shape[1])
+        for position, members in enumerate(blocks)
+    ]
+    estimate = np.array([float(np.sum(removed[members])) if control.resolvable[position] else 0.0 for position, members in enumerate(blocks)])
     return _certificate(estimate, per_probe, tolerance, level)
 
 
@@ -573,11 +614,13 @@ class ControlVariate:
     """The window approximation's own (D - Sigma_hat) z on bulk rows, and each block's window information.
 
     Subtracting it from the solver's exact (D - Sigma) z leaves an estimator of the approximation's error whose
-    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass.
+    spread comes only from (Sigma_hat - Sigma), not from Sigma's off-diagonal LD mass. ``resolvable`` marks the
+    blocks float64 can resolve (``resolvable_blocks``); the others are exact and certified as such.
     """
 
     removed_products: NDArray[np.float64]
     window_information: NDArray[np.float64]
+    resolvable: NDArray[np.bool_]
 
 
 def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.float64]) -> ControlVariate:
@@ -591,6 +634,8 @@ def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.floa
     cross, bulk_variance, core_inverse, is_resolved = _prepare(solve, grams)
     removed = np.zeros_like(probes)
     information = np.zeros(len(grams.blocks))
+    column_square_norms = np.concatenate([np.diag(within) for within in grams.within])[np.argsort(np.concatenate(grams.blocks))]
+    resolvable = resolvable_blocks(solve, grams.blocks, information_ceiling(solve, grams.blocks, column_square_norms))
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
         own_variance = bulk_variance[members]
@@ -598,7 +643,7 @@ def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.floa
         bulk_rows = ~is_resolved[members]
         removed[members] = np.where(bulk_rows[:, None], own_variance[:, None] * probes[members] - products, 0.0)
         information[block] = float(np.sum(np.where(bulk_rows, own_variance - np.diag(terms.covariance), 0.0)))
-    return ControlVariate(removed_products=removed, window_information=information)
+    return ControlVariate(removed_products=removed, window_information=information, resolvable=resolvable)
 
 
 def cavity_tolerance(
