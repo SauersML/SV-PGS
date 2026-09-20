@@ -446,6 +446,10 @@ class _PooledFixedPoints:
             )
         except NoFixedPoint as error:
             raise NoFixedPoint(f"gene {gene}: {error}") from error
+        except FloatingPointError as error:
+            # The double loop reached an iterate where q's own cavity is improper (its outer step's EP check), which it
+            # does not yet continue from (speed-smalln): at these hyperparameters this gene has no fixed point to report.
+            raise NoFixedPoint(f"gene {gene}: the double loop left EP's domain ({error})") from error
         self.site_precision[rows], self.site_shift[rows] = precision, shift
         self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self._iterate(gene, precision, shift)
