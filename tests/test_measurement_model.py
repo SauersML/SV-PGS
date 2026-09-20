@@ -15,7 +15,6 @@ from sv_pgs.measurement_model import (
     leakage_transform,
     log_reliability_offsets,
     mapped_gram,
-    merge_calibration_moments,
     pooled_calibration,
     pooled_log_reliability,
     residual_variances,
@@ -67,8 +66,12 @@ def test_records_that_agree_within_their_error_are_pooled_with_no_between_varian
     _, genotype, dosage = _records(100, 500, 0.7, rng)
     moments = calibration_moments(dosage, genotype)
     pooled = pooled_calibration(moments, dosage.var(axis=1), np.zeros(100, dtype=int))
-    # One kappa for every record: the moment estimate of tau^2 is at most its own sampling error.
-    residual = dosage.var(axis=1) * (1 - 0.7**2)
+    # One kappa for every record: the moment estimate of tau^2 is at most its own
+    # sampling error, from each record's robust S_DD s_j at the common kappa.
+    keep = 0.7
+    residual = (
+        moments.dosage_squared_truth_squared - 2 * keep * moments.dosage_cubed_truth + keep**2 * moments.dosage_fourth
+    ) / moments.dosage_variance
     bound = sampling_bound(float(np.sqrt(2 * np.sum(residual**2)) / np.sum(moments.pair_counts * moments.dosage_variance)))
     assert pooled.between_variances[0] <= bound
 
@@ -131,23 +134,20 @@ def test_the_cohort_reliability_pools_the_groups_models_exactly() -> None:
     assert silent[0] == -np.inf
 
 
-def test_moments_merged_across_chunks_are_the_moments_of_all_pairs() -> None:
+def test_record_chunks_join_into_the_moments_of_all_records() -> None:
     rng = np.random.default_rng(23)
-    pairs = 900
-    _, genotype, dosage = _records(40, pairs, 0.6, rng)
+    _, genotype, dosage = _records(40, 900, 0.6, rng)
     dosage[rng.random(dosage.shape) < 0.1] = np.nan
     dosage[3] = np.nan
     whole = calibration_moments(dosage, genotype)
-    merged = calibration_moments(dosage[:, :0], genotype[:, :0])
-    for chunk in np.array_split(np.arange(pairs), 7):
-        merged = merge_calibration_moments(merged, calibration_moments(dosage[:, chunk], genotype[:, chunk]))
-    np.testing.assert_array_equal(merged.pair_counts, whole.pair_counts)
-    assert merged.pair_counts[3] == 0
+    assert whole.pair_counts[3] == 0 and whole.dosage_variance[3] == 0.0
     joined = concatenate_calibration_moments([calibration_moments(dosage[:17], genotype[:17]), calibration_moments(dosage[17:], genotype[17:])])
-    np.testing.assert_array_equal(joined.covariance, whole.covariance)
-    bound = 2 * rounding_gamma(4 * pairs)
-    for name, scale in (("dosage_mean", 2.0), ("truth_mean", 2.0), ("dosage_variance", 4.0), ("truth_variance", 4.0), ("covariance", 4.0)):
-        assert np.all(np.abs(getattr(merged, name) - getattr(whole, name)) <= bound * scale), name
+    for field in ("pair_counts", "covariance", "dosage_fourth", "dosage_cubed_truth", "dosage_squared_truth_squared"):
+        np.testing.assert_array_equal(getattr(joined, field), getattr(whole, field))
+    observed = np.isfinite(dosage[0])
+    w = dosage[0, observed] - dosage[0, observed].mean()
+    u = genotype[0, observed] - genotype[0, observed].mean()
+    assert abs(whole.dosage_cubed_truth[0] - np.mean(w**3 * u)) <= rounding_gamma(4 * observed.sum()) * np.mean(np.abs(w**3 * u))
 
 
 def _two_locus(rng: np.random.Generator, samples: int, frequency: float, linkage: float) -> tuple[np.ndarray, np.ndarray]:

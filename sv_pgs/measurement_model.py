@@ -43,9 +43,9 @@ truth samples, and on public benchmarks from their truth.
    becomes A' G A and its cross-products A' X'y.
 
 The calibration pairs are an explicit input (``CalibrationPairs``, keyed by
-typed research IDs). They enter as per-record sufficient statistics, which the
-store step accumulates in its one pass, plus the pair-level data of the LD blocks
-to be mapped, so no [records, samples] array is ever needed. In the AoU workspace
+typed research IDs). They enter as per-record sufficient statistics, computed
+chunk by chunk of records, plus the pair-level data of the LD blocks to be
+mapped, so no [records, samples] array of the whole store is ever needed. In the AoU workspace
 they come from a truth source the user supplies: the long-read panel members'
 hard calls are not part of the imputation deliverables. Where calibration pairs
 are missing, for a record or for everything, ``fit_measurement_model`` degrades
@@ -70,11 +70,14 @@ from sv_pgs.sample_ids import ResearchId
 
 @dataclass(frozen=True)
 class CalibrationMoments:
-    """Per-record moments over the calibration pairs observed in both D and T (1/n normalized).
+    """Per-record central moments over the calibration pairs observed in both D and T (1/n normalized).
 
-    A record with no pairs has count 0 and zero moments. Moments of disjoint sets of
-    pairs combine exactly with ``merge_calibration_moments``, so they can be
-    accumulated in one pass over the store, chunk by chunk.
+    With w = D - Dbar and u = T - Tbar over a record's pairs: the variances and
+    covariance, and the fourth-order products E[w^4], E[w^3 u] and E[w^2 u^2]
+    that give each slope its heteroscedasticity-robust sampling variance. A record
+    with no pairs has count 0 and zero moments. Each record's moments come from all
+    its pairs at once, so a pass over the store may split the records into chunks
+    (``concatenate_calibration_moments``) but not the pairs.
     """
 
     pair_counts: I64Array
@@ -83,6 +86,9 @@ class CalibrationMoments:
     dosage_variance: F64Array
     truth_variance: F64Array
     covariance: F64Array
+    dosage_fourth: F64Array
+    dosage_cubed_truth: F64Array
+    dosage_squared_truth_squared: F64Array
 
     def subset(self, records: NDArray) -> CalibrationMoments:
         return CalibrationMoments(*(getattr(self, field.name)[records] for field in fields(self)))
@@ -101,39 +107,17 @@ def calibration_moments(dosage: NDArray, truth: NDArray) -> CalibrationMoments:
     truth_mean = np.where(observed, truth_values, 0.0).sum(axis=1) / divisor
     dosage_centred = np.where(observed, dosage_values - dosage_mean[:, None], 0.0)
     truth_centred = np.where(observed, truth_values - truth_mean[:, None], 0.0)
+    dosage_squared = dosage_centred**2
     return CalibrationMoments(
         pair_counts=counts.astype(np.int64),
         dosage_mean=dosage_mean,
         truth_mean=truth_mean,
-        dosage_variance=(dosage_centred**2).sum(axis=1) / divisor,
+        dosage_variance=dosage_squared.sum(axis=1) / divisor,
         truth_variance=(truth_centred**2).sum(axis=1) / divisor,
         covariance=(dosage_centred * truth_centred).sum(axis=1) / divisor,
-    )
-
-
-def merge_calibration_moments(first: CalibrationMoments, second: CalibrationMoments) -> CalibrationMoments:
-    """The moments of the union of two disjoint sets of pairs (Chan, Golub and LeVeque's pairwise update)."""
-    if first.pair_counts.shape != second.pair_counts.shape:
-        raise ValueError("merge_calibration_moments needs moments of the same records.")
-    first_count = first.pair_counts.astype(np.float64)
-    second_count = second.pair_counts.astype(np.float64)
-    count = first_count + second_count
-    second_share = np.divide(second_count, count, out=np.zeros_like(count), where=count > 0)
-    cross_weight = first_count * second_share
-    dosage_step = second.dosage_mean - first.dosage_mean
-    truth_step = second.truth_mean - first.truth_mean
-
-    def pooled(first_moment: F64Array, second_moment: F64Array, product: F64Array) -> F64Array:
-        total = first_count * first_moment + second_count * second_moment + cross_weight * product
-        return np.divide(total, count, out=np.zeros_like(count), where=count > 0)
-
-    return CalibrationMoments(
-        pair_counts=first.pair_counts + second.pair_counts,
-        dosage_mean=first.dosage_mean + second_share * dosage_step,
-        truth_mean=first.truth_mean + second_share * truth_step,
-        dosage_variance=pooled(first.dosage_variance, second.dosage_variance, dosage_step**2),
-        truth_variance=pooled(first.truth_variance, second.truth_variance, truth_step**2),
-        covariance=pooled(first.covariance, second.covariance, dosage_step * truth_step),
+        dosage_fourth=(dosage_squared**2).sum(axis=1) / divisor,
+        dosage_cubed_truth=(dosage_squared * dosage_centred * truth_centred).sum(axis=1) / divisor,
+        dosage_squared_truth_squared=(dosage_squared * truth_centred**2).sum(axis=1) / divisor,
     )
 
 
@@ -174,15 +158,17 @@ def pooled_calibration(
     kappa(x) from sum_j S_DT,j x_j = sum_j S_DD,j x_j x_j' beta, and lambda(x) from
     sum_j S_TT,j x_j = sum_j S_DD,j x_j x_j' gamma, with S the per-record sums of
     centred products. Each record's own slope kappa_hat_j = S_DT,j / S_DD,j then
-    has the model's sampling variance s_j = sigma_j^2 / S_DD,j, with
-    sigma_j^2 = V_j (lambda(x_j) - kappa(x_j)^2) and V_j the record's cohort dosage
-    variance (a sparse record's own residual collapses to 0 by chance; the
-    model's does not), and its posterior mean under kappa_j ~ N(kappa(x_j), tau^2)
-    is kappa(x_j) + tau^2 / (tau^2 + s_j) (kappa_hat_j - kappa(x_j)).
+    has the heteroscedasticity-robust sampling variance
+    s_j = sum_i w_i^2 e_i^2 / S_DD,j^2 with the residual e = u - kappa(x_j) w taken
+    at the pooled slope: a draw-type column's residual grows with |w|, which a
+    homoscedastic variance misses, and a sparse record's own fitted residual
+    collapses to 0 by chance, while its residual at the pooled slope does not (one
+    carrier at a tiny dosage gives s_j = 1 / w_i^2). Its posterior mean under
+    kappa_j ~ N(kappa(x_j), tau^2) is kappa(x_j) + tau^2 / (tau^2 + s_j) (kappa_hat_j - kappa(x_j)).
 
     Everything is weighed by dosage energy S_DD, the metric in which a scale error
     costs: sum_j V_j (kappa_j - kappa_j^true)^2. So tau^2 is the energy-weighted
-    moment estimate, E[S_DD,j (kappa_hat_j - kappa(x_j))^2] = S_DD,j tau^2 + sigma_j^2
+    moment estimate, E[S_DD,j (kappa_hat_j - kappa(x_j))^2] = S_DD,j (tau^2 + s_j)
     summed over the stratum (the pooled fit treated as known), projected to 0 when
     negative. A normal likelihood would let a sparse record whose one carrier sits at
     a tiny dosage (slope 127, a heavy-tailed outlier) inflate tau^2; its energy is
@@ -214,7 +200,18 @@ def pooled_calibration(
         ratio = rows @ np.linalg.solve(gram, rows.T @ (counts[members] * moments.truth_variance[members]))
         informative = energy > 0.0
         slopes = np.divide(cross_energy, energy, out=np.zeros_like(energy), where=informative)
-        residual = cohort_variance[members] * np.maximum(ratio - prior**2, 0.0)
+        # S_DD s_j: the sandwich sum_i w_i^2 e_i^2 / S_DD with e = u - kappa(x_j) w.
+        residual = np.maximum(
+            np.divide(
+                moments.dosage_squared_truth_squared[members]
+                - 2.0 * prior * moments.dosage_cubed_truth[members]
+                + prior**2 * moments.dosage_fourth[members],
+                moments.dosage_variance[members],
+                out=np.zeros_like(energy),
+                where=informative,
+            ),
+            0.0,
+        )
         excess = np.sum(np.divide((cross_energy - prior * energy) ** 2, energy, out=np.zeros_like(energy), where=informative))
         between = max(float((excess - residual[informative].sum()) / energy.sum()), 0.0)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -471,8 +468,8 @@ class CalibrationPairs:
     """What the measurement model uses from the samples carrying both a stored column and a truth genotype.
 
     ``moments`` are the per-record moments over those samples (store record order),
-    which the store step accumulates in its one pass with ``calibration_moments``
-    and ``merge_calibration_moments``. ``blocks`` holds the pair-level data of the
+    from ``calibration_moments`` on record chunks joined by
+    ``concatenate_calibration_moments``. ``blocks`` holds the pair-level data of the
     LD blocks that get a leakage map. The truth must be an orthogonal call whose
     error is independent of the stored column given the genotype, with E[T | G] = G:
     a long-read or other independent genotyping, never the imputation itself. A
