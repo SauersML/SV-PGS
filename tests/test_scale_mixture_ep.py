@@ -964,7 +964,10 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
         change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
         site_precision += 0.5 * (target_precision - site_precision)
         site_shift += 0.5 * (target_shift - site_shift)
-        if change < 1e-14:
+        # Machine precision: the site update cannot resolve its targets past the inverse's own relative rounding,
+        # eps times the condition number of the posterior precision.
+        rounding = float(np.finfo(np.float64).eps) * float(np.linalg.cond(likelihood_precision + np.diag(site_precision)))
+        if change < max(1e-14, rounding):
             return (site_precision, site_shift), covariance, cavity
     raise AssertionError("dense EP did not converge")
 
