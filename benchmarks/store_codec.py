@@ -31,11 +31,20 @@ import numpy as np
 
 from sv_pgs import rowdict_codec
 from sv_pgs.compute_budget import _try_import_cupy
-from sv_pgs.dosage_store import _PINNED_POOL, CodeArray, CodeShardWriter, _pread_exact, create_code_array
+from sv_pgs.dosage_store import (
+    _PINNED_POOL,
+    DEFAULT_INNER_CHUNK_ROWS,
+    CodeArray,
+    CodeShardWriter,
+    _pread_exact,
+    create_code_array,
+)
 
 BEAGLE = Path("/scratch.global/sauer354/svpgs-team/bench-sim/v7/cohort/chr22/beagle")
 CHUNK_ROWS = (1, 4, 16, 64, 256, 1024)
 REQUEST_ROWS = (64, 512, 4096)
+# Fractions of each request's rows wanted by a selective read, drawn uniformly at random.
+SELECTED_FRACTIONS = (1.0, 0.5, 0.25, 0.125)
 
 
 def load_codes(rows: int) -> np.ndarray:
@@ -73,10 +82,18 @@ def cpu_pass(array: CodeArray, spans: list[tuple[int, int]], out: np.ndarray) ->
         array.read_rows_into(start, stop, out[: stop - start])
 
 
+def span_chunks(array: CodeArray, span: tuple[int, int]) -> np.ndarray:
+    rows = array.layout.inner_rows
+    return np.arange(span[0] // rows, -(-span[1] // rows), dtype=np.int64)
+
+
+def span_bytes(array: CodeArray, span: tuple[int, int]) -> int:
+    return int(array._shard(0).chunk_sizes[span_chunks(array, span)].sum())
+
+
 def host_share(array: CodeArray, span: tuple[int, int]) -> None:
-    shard = array._shard(0)
-    encoded = np.empty(array._encoded_bytes(shard, *span), dtype=np.uint8)
-    array._rowdict_frames(shard, span[0], span[1], encoded)
+    encoded = np.empty(span_bytes(array, span), dtype=np.uint8)
+    array._stage_rowdict(array._shard(0), np.arange(*span, dtype=np.int64), span_chunks(array, span), encoded)
 
 
 def host_pass(array: CodeArray, spans: list[tuple[int, int]], threads: int) -> None:
@@ -86,6 +103,34 @@ def host_pass(array: CodeArray, spans: list[tuple[int, int]], threads: int) -> N
         return
     with ThreadPoolExecutor(max_workers=threads) as pool:
         list(pool.map(lambda span: host_share(array, span), spans))
+
+
+def selected_reads(array: CodeArray, codes: np.ndarray, decoder, cupy) -> dict:
+    """Device reads of a random fraction of each request's rows into a compact target."""
+    rows, samples = codes.shape
+    spans = requests(rows, max(REQUEST_ROWS))
+    rng = np.random.default_rng(len(spans))
+    target = cupy.empty((max(REQUEST_ROWS), samples), dtype=cupy.uint8)
+    report = {}
+    for fraction in SELECTED_FRACTIONS:
+        picks = [np.sort(rng.choice(np.arange(start, stop), size=max(1, round(fraction * (stop - start))), replace=False))
+                 for start, stop in spans]
+
+        def selected_pass() -> None:
+            for (start, stop), pick in zip(spans, picks):
+                array.read_rows_to_device(start, stop, target[: pick.shape[0]], decoder, pick)
+            cupy.cuda.get_current_stream().synchronize()
+
+        selected_pass()
+        seconds = timed(selected_pass)
+        if not np.array_equal(cupy.asnumpy(target[: picks[-1].shape[0]]), codes[picks[-1]]):
+            raise AssertionError(f"a selective read of {fraction} of the rows decodes wrongly")
+        chunk_sizes = array._shard(0).chunk_sizes
+        touched = sum(int(chunk_sizes[np.unique(pick // array.layout.inner_rows)].sum()) for pick in picks)
+        wanted = sum(pick.shape[0] for pick in picks)
+        report[fraction] = {"decoded_gbps": wanted * samples / seconds / 1e9,
+                            "read_bytes_over_span_bytes": touched / sum(span_bytes(array, span) for span in spans)}
+    return report
 
 
 def main() -> None:
@@ -123,9 +168,8 @@ def main() -> None:
                     seconds = timed(host_pass, array, spans, 1)
                     entry["host_gbps"][request_rows] = decoded / seconds / 1e9
                     entry["host_all_cpus_gbps"][request_rows] = decoded / timed(host_pass, array, spans, threads) / 1e9
-                    shard = array._shard(0)
-                    chunks = sum(array._chunk_range(*span)[1] - array._chunk_range(*span)[0] for span in spans)
-                    read = sum(array._encoded_bytes(shard, *span) for span in spans)
+                    chunks = sum(span_chunks(array, span).shape[0] for span in spans)
+                    read = sum(span_bytes(array, span) for span in spans)
                     host_rows.append({"inner_rows": inner_rows, "request_rows": request_rows, "seconds": seconds,
                                       "bytes": read, "chunks": chunks, "requests": len(spans)})
                 if cupy is None:
@@ -159,9 +203,8 @@ def main() -> None:
                     _PINNED_POOL.release(owner)
             if codec == "rowdict" and cupy is not None:
                 # The kernels alone, on the whole array already on the device.
-                shard = array._shard(0)
-                encoded = np.empty(array._encoded_bytes(shard, 0, rows), dtype=np.uint8)
-                frames = array._rowdict_frames(shard, 0, rows, encoded)
+                encoded = np.empty(span_bytes(array, (0, rows)), dtype=np.uint8)
+                frames = array._stage_rowdict(array._shard(0), np.arange(rows, dtype=np.int64), span_chunks(array, (0, rows)), encoded)
                 device_bytes = cupy.asarray(encoded)
                 whole = cupy.empty((rows, samples), dtype=cupy.uint8)
                 decoder.decode(device_bytes, frames, samples, whole)
@@ -174,6 +217,8 @@ def main() -> None:
                 if not bool(cupy.array_equal(whole, cupy.asarray(codes))):
                     raise AssertionError(f"rowdict R={inner_rows} kernels decode wrongly")
                 del whole, device_bytes
+                if inner_rows == DEFAULT_INNER_CHUNK_ROWS:
+                    entry["selected"] = selected_reads(array, codes, decoder, cupy)
             array.close()
             shutil.rmtree(directory)
             report["arrays"].append(entry)

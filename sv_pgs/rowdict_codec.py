@@ -249,14 +249,17 @@ class GpuRowDecoder:
         self._grid_blocks = int(attributes["MaxGridDimX"])
 
     def decode(self, device_buffer: Any, frames: RowFrames, sample_count: int, out: Any, stream: Any = None) -> None:
-        """``device_buffer`` holds the chunks the frames lie in; ``out`` is uint8 [rows, n] with contiguous rows."""
+        """``device_buffer`` holds the chunks the frames lie in; ``out`` is uint8 [rows, n] with contiguous rows.
+
+        The kernels run on ``stream``, or else on the current stream.
+        """
         cp = self.cupy
         rows = int(frames.depth.shape[0])
         if rows == 0:
             return
         if out.shape != (rows, sample_count) or out.dtype != cp.uint8 or out.strides[1] != 1:
             raise ValueError(f"out must be uint8 [{rows}, {sample_count}] with contiguous rows.")
-        with stream if stream is not None else cp.cuda.Stream.null:
+        with stream if stream is not None else cp.cuda.get_current_stream():
             # The frames' fields go to the device in one copy.
             fields = cp.asarray(np.stack([
                 frames.dictionary_offset, frames.slot_offset, frames.depth, frames.exception_offset, frames.exception_count
