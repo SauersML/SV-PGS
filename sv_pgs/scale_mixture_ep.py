@@ -173,8 +173,8 @@ class SmoothingBlock:
 class ScaleMixturePrior:
     """Everything about the prior except the fitted hyperparameters. Build it with ``scale_mixture_prior``.
 
-    ``scale_design`` is the class-centred annotation design (p, F), over theta;
-    ``coefficient_map`` is M, from x to z.
+    ``scale_design`` is the class-centred annotation design (p, F), over theta, followed by the uncentred level columns
+    of ``offset_groups`` when there are any (see ``scale_mixture_prior``); ``coefficient_map`` is M, from x to z.
     """
 
     class_index: I64Array
@@ -190,6 +190,12 @@ class ScaleMixturePrior:
     smoothing_blocks: tuple[SmoothingBlock, ...]
     pooled_size: int
     null_basis: F64Array
+    offset_groups: I64Array | None = None
+
+    @property
+    def level_size(self) -> int:
+        """The number of level coordinates (G - 1 for G offset groups), the last columns of ``scale_design``."""
+        return 0 if self.offset_groups is None else int(np.unique(self.offset_groups).shape[0]) - 1
 
     @property
     def variant_count(self) -> int:
@@ -364,8 +370,16 @@ def scale_mixture_prior(
     nodes: F64Array,
     floor: float,
     top: float,
+    offset_groups: I64Array | None = None,
 ) -> ScaleMixturePrior:
     """Validate and centre the prior's inputs and lay out x; every class in 0..C-1 must have a member.
+
+    ``offset_groups`` (one group index per variant, e.g. its gene) gives each group a learned level: a shift l_g of every
+    one of its variants' log prior variance, the same whatever their class. The levels sum to zero over the groups (the
+    class densities carry the common location) and have a Gaussian prior with one learned precision (ridge I on
+    sum-to-zero coordinates); they enter log u_j uncentred, as the last G - 1 scale coefficients. They are identified
+    against the classes' locations when the groups and classes connect: a common shift of the levels is the only
+    direction they share, and sum-to-zero removes it.
 
     ``nodes`` is the uniform lattice in t; below ``floor`` the kernel is flat to the lattice's tolerance (each node
     still takes its own variance), and [floor, top] is the kernel range. x is laid out as (eta_bar in
@@ -394,6 +408,26 @@ def scale_mixture_prior(
                 "the class-centred annotation design must have full column rank: a smooth basis must "
                 "drop its constant (the class densities carry it)"
             )
+    annotation_size = design.shape[1]
+    groups = None
+    if offset_groups is not None:
+        groups = np.asarray(offset_groups, dtype=np.int64)
+        labels, group_of_row = np.unique(groups, return_inverse=True)
+        if groups.shape != classes.shape or labels.shape[0] < 2:
+            raise ValueError("offset_groups needs one group per variant and at least two groups")
+        indicator = np.zeros((classes.shape[0], labels.shape[0]))
+        indicator[np.arange(classes.shape[0]), group_of_row] = 1.0
+        # Uncentred: every variant of group g shifts by l_g exactly, whatever its class.
+        levels = indicator @ _sum_to_zero_basis(labels.shape[0])
+        # The levels must reach no class location (which the class densities carry) and no annotation: full column
+        # rank of [annotations | levels | class indicators], i.e. the groups connect the classes.
+        class_indicator = np.zeros((classes.shape[0], class_count))
+        class_indicator[np.arange(classes.shape[0]), classes] = 1.0
+        combined = np.column_stack([design, levels, class_indicator])
+        eigenvalues = np.linalg.eigvalsh(combined.T @ combined)
+        if eigenvalues[0] <= _EPSILON * combined.shape[0] * max(float(eigenvalues[-1]), 1.0):
+            raise ValueError("the offset groups' levels are not identified: the groups must connect the classes")
+        design = np.column_stack([design, levels])
     lattice = np.asarray(nodes, dtype=np.float64)
     spacing = np.diff(lattice)
     if lattice.shape[0] <= ROUGHNESS_ORDER or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
@@ -434,6 +468,9 @@ def scale_mixture_prior(
             annotation_start + np.asarray(group.columns, dtype=np.int64),
             np.sqrt(eigenvalues[kept])[:, None] * eigenvectors[:, kept].T,
         ))
+    level_size = design.shape[1] - annotation_size
+    if level_size:
+        blocks.append(SmoothingBlock("offset group levels", annotation_start + annotation_size + np.arange(level_size), np.eye(level_size)))
     total = np.zeros((coefficient_size, coefficient_size))
     for block in blocks:
         total[np.ix_(block.coordinates, block.coordinates)] += block.matrix
@@ -453,6 +490,7 @@ def scale_mixture_prior(
         smoothing_blocks=tuple(blocks),
         pooled_size=pooled_size,
         null_basis=null_basis,
+        offset_groups=groups,
     )
 
 
@@ -595,8 +633,9 @@ def relattice(
     moved = scale_mixture_prior(
         class_index=prior.class_index,
         log_variance_offset=prior.log_variance_offset,
-        annotation_design=prior.scale_design,
+        annotation_design=prior.scale_design[:, : prior.scale_size - prior.level_size],
         annotation_groups=prior.annotation_groups,
+        offset_groups=prior.offset_groups,
         nodes=new_nodes,
         floor=floor,
         top=top,

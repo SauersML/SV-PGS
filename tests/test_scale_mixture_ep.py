@@ -16,6 +16,7 @@ from scipy.optimize import minimize_scalar
 
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
+    _sum_to_zero_basis,
     INDEPENDENT_EFFECTS,
     CurvatureCorrection,
     FixedPoint,
@@ -103,8 +104,9 @@ def _data(variant_count: int, seed: int):
     return class_index, offset, design, groups, Cavity(precision=precision, shift=shift)
 
 
-def _problem(*, variant_count: int, seed: int, node_count: int = 0):
-    """With ``node_count`` a fixed lattice whose kernels are all active; otherwise the derived floor, top and spacing."""
+def _problem(*, variant_count: int, seed: int, node_count: int = 0, offset_group_count: int = 0):
+    """With ``node_count`` a fixed lattice whose kernels are all active; otherwise the derived floor, top and spacing.
+    With ``offset_group_count`` the variants are dealt round-robin into that many offset groups with learned levels."""
     class_index, offset, design, groups, cavity = _data(variant_count, seed)
     if node_count:
         nodes = np.linspace(np.log(1e-5), np.log(0.5), node_count)
@@ -122,6 +124,7 @@ def _problem(*, variant_count: int, seed: int, node_count: int = 0):
         nodes=nodes,
         floor=floor,
         top=top,
+        offset_groups=np.arange(variant_count) % offset_group_count if offset_group_count else None,
     )
     return prior, cavity
 
@@ -193,8 +196,9 @@ def test_moment_matched_prior_sites_carry_the_prior_second_moment():
     np.testing.assert_array_equal(shift, 0.0)
 
 
-def test_penalized_gradient_and_hessian_match_finite_differences():
-    prior, cavity = _problem(variant_count=25, seed=9, node_count=8)
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_penalized_gradient_and_hessian_match_finite_differences(offset_group_count):
+    prior, cavity = _problem(variant_count=25, seed=9, node_count=8, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 10)
     penalty = _penalty_matrix(prior, hyperparameters.log_smoothing)
     coefficients = hyperparameters.coefficients
@@ -327,8 +331,9 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
     ]
 
 
-def test_curvature_trace_gradient_matches_finite_differences():
-    prior, cavity = _problem(variant_count=30, seed=15, node_count=12)
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_curvature_trace_gradient_matches_finite_differences(offset_group_count):
+    prior, cavity = _problem(variant_count=30, seed=15, node_count=12, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 16)
     coefficients = hyperparameters.coefficients
     mapping = prior.coefficient_map
@@ -345,10 +350,11 @@ def test_curvature_trace_gradient_matches_finite_differences():
     np.testing.assert_allclose(analytic, numerical, rtol=1e-6, atol=1e-6)
 
 
-def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_evidence_gradient_in_the_log_weights_matches_finite_differences(offset_group_count):
     # Also with a correction C = B - A that is not zero (a PSD one of the form M'(B_z - A_z)M): the gradient is the
     # B-evidence's own, with W_B in its trace terms, not the fixed-cavity form's.
-    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
     mapping = prior.coefficient_map
     for correction in (INDEPENDENT_EFFECTS, CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (0.3 * np.eye(mapping.shape[0])) @ mapping)):
@@ -1261,3 +1267,34 @@ def test_the_trust_region_step_takes_the_hard_case_exactly():
         step = _trust_region_step(np.diag([-1.0, 2.0]), np.array([0.0, 1.5]), 1.0)
         np.testing.assert_allclose(step[1], 0.5, rtol=1e-12)
         np.testing.assert_allclose(float(np.linalg.norm(step)), 1.0, rtol=1e-12)
+
+
+def test_offset_group_levels_shift_every_variant_of_a_group_by_its_level_whatever_its_class():
+    """review-mathbugs P2 (lead ruling): levels are gene-owned offsets, sum-to-zero over groups, never class-centred."""
+    class_index = np.array([0, 1, 0, 1, 1, 0, 0, 1])
+    groups = np.array([0, 0, 0, 1, 1, 1, 1, 0])
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 8)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.zeros(8), annotation_design=np.zeros((8, 0)), annotation_groups=(),
+        nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=groups,
+    )
+    assert prior.level_size == 1 and prior.smoothing_blocks[-1].name == "offset group levels"
+    levels = np.array([0.7, -0.7])
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[-1:] = _sum_to_zero_basis(2).T @ levels
+    shift = log_scale(prior, coefficients) - log_scale(prior, np.zeros(prior.coefficient_size))
+    np.testing.assert_allclose(shift, levels[groups], rtol=0.0, atol=8 * np.finfo(np.float64).eps)
+    hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+    moved, moved_hyperparameters = relattice(prior, hyperparameters, np.linspace(nodes[0], nodes[-1], 12), nodes[0] - 1.0, nodes[-1])
+    np.testing.assert_array_equal(moved.offset_groups, groups)
+    moved_shift = log_scale(moved, moved_hyperparameters.coefficients) - log_scale(moved, np.zeros(moved.coefficient_size))
+    np.testing.assert_allclose(moved_shift, levels[groups], rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps))
+
+
+def test_offset_groups_that_do_not_connect_the_classes_are_refused():
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 8)
+    with pytest.raises(ValueError, match="connect the classes"):
+        scale_mixture_prior(
+            class_index=np.array([0, 0, 1, 1]), log_variance_offset=np.zeros(4), annotation_design=np.zeros((4, 0)), annotation_groups=(),
+            nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=np.array([0, 0, 1, 1]),
+        )
