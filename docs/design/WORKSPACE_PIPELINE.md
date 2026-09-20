@@ -104,7 +104,8 @@ No covariate matrix is shared across traits.
 |---|---|---|---|---|
 | B, primary | The CDR's srWGS structural-variant call set, one VCF per chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/` (CDR_LAYOUT.md; the file pattern is checked against the attached release) | GATK-SV joint calling, release version as the CDR documents | INFO SVTYPE, SVLEN, END; FILTER; FORMAT GT, CN, CNQ, RD_CN, and SL where the header declares it. The public 1kGP freeze V3's CNV records carry GT, GQ, RD_CN, RD_GQ, PE_GT, PE_GQ, SR_GT, SR_GQ, EV, CN and CNQ, with no GL or PL (measure-path); the user checks the attached release's header inside the workspace | research IDs, joined to an imputed half through the crosswalk and to the long-read half by research ID, its own namespace (`gatksv_source`) |
 | C, optional third source | Per-sample read-depth CNV calls, if the attached CDR carries them (DRAGEN CNV VCFs, for example) | the caller and version the CDR documents; format only: FORMAT CN per segment | segment CN | research IDs |
-| Targeted loci, optional | Copy-number calls at segmental-duplication genes GATK-SV genotypes poorly, from targeted callers run on the CRAMs inside the workspace | open-source targeted callers, configured per locus; a lead decision on cost | per-locus CN | research IDs |
+| Ctyper, optional | Paralog-specific integer copy numbers per pangenome-allele subgroup, aggregated per gene: 3,351 CNV genes plus 273 medically relevant genes. It gives no per-call confidence. | Ctyper (Nature Genetics 2025; github.com/ChaissonLab/Ctyper) with its database (Zenodo 13381931), which the user stages into the workspace; run from CRAM by the user | per sample, per gene or subgroup: integer CN | research IDs |
+| cn_estimator, optional | Fractional GC-corrected normalized copy number per sample and region (4 decimals), `${sample}.cn.txt.gz`. Its per-locus clustering into integer states, with a silhouette score per locus rather than per person, is not used | cn_estimator (github.com/pgarg-tools/cn_estimator, MIT), from CRAM plus a BED of regions (`${CN_REGIONS_BED}`); run by the user | per sample, per region: fractional CN | research IDs |
 
 - **Filters:** `gatksv_source.GatksvSource`'s FILTER policy applies. It keeps PASS, plus MULTIALLELIC on copy-number records, and drops breakends, multi-ALT non-CN records and copy numbers beyond the code range, each counted by reason.
 - **Which products exist** in the attached CDR is read inside the workspace from its documentation and VCF headers, never by an agent.
@@ -116,12 +117,19 @@ Run-config fragment, a template (the driver doesn't read it yet):
 "direct_sv": {
   "gatksv_calls": "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/${GATKSV_FILE_PATTERN}",
   "read_depth_cnv_calls": null,
-  "targeted_copy_numbers": null,
+  "ctyper_copy_numbers": null,
+  "cn_estimator_copy_numbers": null,
   "truth_copy_numbers": null
 }
 ```
 
 Each optional source is an explicit `null`, and a null source is stated in the step summary and the certificate.
+
+**What each optional caller costs to run,** at the published rates (both are the user's decision, and both run on the user's own compute):
+- **Ctyper:** about 1.5 CPU-hours and ~20 GB RAM per genome from CRAM (published), so n genomes cost 1.5·n CPU-hours [derived from the published rate].
+- **cn_estimator:** about $0.01 per sample (published).
+
+**Benchmark caveat.** Ctyper's database includes HPRC, HGSVC and 1kGP-overlapping samples. Any public benchmark of it must leave those samples out.
 
 ### Conversion into store columns (measure-path-cn encoding)
 
@@ -133,6 +141,9 @@ A new step, `direct_sv`, sits between `measurement` and `fit`. It needs the impu
 2. **Every kept GATK-SV record becomes a store row of its own.** `gatksv_store_rows(gatksv, imputed)` returns `(GatksvRows, FusionPairs)`; each row carries its codes, `codes_per_unit` and `value_origin` (measure-path-cn). The truth-free FusedRows path is gone: it assumed classical error on DS, which draw-type DS violates.
    - **Copy-number records** (SVTYPE=CNV or FILTER MULTIALLELIC) are class COPY_NUMBER: value = CN − modal CN, with `codes_per_unit` = ⌊254 / max CN⌋ and `value_origin` = −modal CN (`copy_number.modal_copy_numbers`, `copy_number_codes_per_unit`, `encode_copy_numbers`).
    - **Biallelic DEL, DUP, INS and CPX records** are ALT counts: `codes_per_unit` 127, `value_origin` 0.
+   - **A Ctyper gene or subgroup** is one COPY_NUMBER row: value = CN − modal CN, `codes_per_unit` = ⌊254 / max CN⌋. Its span is the gene interval, which gives the fusion geometry against the imputed DEL/DUP records overlapping the gene.
+   - **A cn_estimator region** is one COPY_NUMBER row holding the fractional copy number, not the clustered integer: value = CN − modal CN, quantized at 1/`codes_per_unit` of a copy. Its span is the BED region.
+   - A Ctyper or cn_estimator row enters the fusion as an absorbed column of the engine block that holds its span, like a GATK-SV row.
 3. **Pairs.** `sv_fusion.candidate_pairs(imputed SV sites, gatksv_sites(block))` pairs direct records with the imputed SV records of the same chromosome. The pairs are resolved one to one by |corr(DS, B)| over the fitted cohort.
 4. **No-calls** are never zero. `GatksvRows` fills each with E_lin[B | DS] from the best-paired imputed DS, or with the record's observed mean where no candidate pairs. E[B | SL] replaces that where the record carries SL.
 5. **Rows and annotations.**
@@ -161,7 +172,14 @@ The fusion is measure-path's `measurement_model` (lane/measure-path-model f043b2
 - **Copy-number truth.** A CN pair needs a truth copy number for the long-read panel members (`truth_copy_numbers`, the long-read call set's CN at those loci if it carries one).
 - **A direct row with no truth** is counted under `uncalibrated_records` in the certificate, with its reported r² as the source:
   - **A CN row** takes the CNQ bound (measure-path). CNQ is the phred read-depth genotype quality, so each sample's miscall probability is ε_i = 10^(−CNQ_i/10), and a miscall moves the copy number by at least one copy. That gives r² ≤ 1 − Σ_i ε_i / (n · Var(called CN)). The certificate says "CN reliability from CNQ (at least one copy per miscall; an upper bound)".
+    - **Where the bound is 0/0,** because every called person shares one copy number and the carriers come only from fills (lr-sv found 2,131 such rows in the public GATK-SV data [real: public 1kGP]), the row takes lr-sv's reliability curve for its type where one exists. Otherwise it is excluded (offset −inf) and counted in the certificate. It never defaults to 1, and `fit_measurement_model` refuses any reported r² that is NaN or outside [0, 1] (lane/measure-path-model 5213c4a).
   - **A hard-call ALT-count row** takes reported r² = 1: the call set's own claim of exactness, with no genotype likelihoods to give a better number.
+  - **A Ctyper row** has no per-call quality, so with truth pairs it is calibrated like any direct call. Without truth, its reported r² comes only from the published accuracy, labelled as such:
+    - ρ = 0.996 against HPRC assemblies, 0.2% missing and 2.4% extra copies, and 99.1% CN agreement leave-one-out [published: Ctyper, Nature Genetics 2025];
+    - it is worse in subtelomeric and sex-chromosome matrices, 18 of them above 15% discordance.
+    The conversion of that agreement into an r² is measure-path's.
+  - **A cn_estimator row** carries read-depth noise, which grows as a region has fewer tiles (short regions) and with segdup mappability. It is calibrated on the truth pairs. For the per-person posterior measure-path is building, P(obs | CN) comes from a mixture fitted in-workspace to the region's own fractional values, with no published constants.
+  - For every caller, the certificate names the caller and its source. With no truth pairs nothing is fused, as for GATK-SV.
 - **The third source C** (RD_CN, or a separate read-depth call set) stays gated. measure-path hasn't validated the three-source identity (MODEL.md §2), and it isn't on their queue.
 - **Moments in value units.** Every moment the measurement model sees, calibration and fitted-cohort alike, is computed on decoded values (code / codes_per_unit + value_origin). A CN row is in copies and an ALT-count row in dosage.
 - **Offsets and scoring.** The measurement model the fit reads covers the merged store's rows. Its pooling must keep a direct row's −inf, since that row is −inf in every group. Scoring, Stage 0 and Stage 2 are otherwise affine-invariant per column and need no change (`copy_number` module docstring).
