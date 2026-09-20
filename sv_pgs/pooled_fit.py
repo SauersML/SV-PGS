@@ -416,6 +416,17 @@ class _PooledFixedPoints:
         variance = noise * kernel.variances()
         if _loop_point(design, noise, self.scores[gene], start_precision, start_shift, 1.0 / variance, mean / variance, tilted, largest) is None:
             start_precision, start_shift = moment_matched_prior_sites(prior, hyperparameters)
+            try:
+                kernel = _Kernel(design, noise * start_precision)
+            except np.linalg.LinAlgError:
+                kernel = None
+            if kernel is None or _loop_point(
+                design, noise, self.scores[gene], start_precision, start_shift, 1.0 / (noise * kernel.variances()),
+                kernel.solve(self.scores[gene] + noise * start_shift) / (noise * kernel.variances()), tilted, largest,
+            ) is None:
+                # The prior's own variances leave EP's domain at these hyperparameters (they over- or underflow far from
+                # where the fit lives): no fixed point exists to compute, so the trial is refused.
+                raise NoFixedPoint(f"gene {gene}: the prior's moment-matched sites lie outside EP's domain at these hyperparameters")
         precision, shift = double_loop_sites(
             design, noise, self.scores[gene], start_precision, start_shift, tilted, largest, self.draw_count,
             self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
@@ -461,7 +472,7 @@ class _PooledFixedPoints:
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
-                if moves[gene] / previous[gene] >= 1.0:
+                if previous[gene] > 0.0 and moves[gene] / previous[gene] >= 1.0:
                     damping[gene] = min(float(damping[gene]), 1.0 / (1.0 + np.sqrt(moves[gene] / previous[gene])))
             if float(np.sum(moves)) <= float(np.sum(self.effective)) / self.draw_count:
                 return
