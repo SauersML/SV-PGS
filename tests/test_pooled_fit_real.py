@@ -66,8 +66,8 @@ def test_the_pooled_start_fixed_point_is_reached_where_it_refused(split, refused
     (point,) = oracle([start])
     record = {
         "split": split, "genes": len(genes), "members": [int(rows.stop - rows.start) for rows in oracle.rows], "wall_s": time.perf_counter() - wall,
-        "cpu_s": time.process_time() - cpu, "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(), "tilted_cpu_seconds": oracle.tilted_cpu_seconds,
-        "sweeps": oracle.sweeps, "refreshes": oracle.profile["refreshes"], "double_loops": oracle.profile["double_loops"],
+        "cpu_s": time.process_time() - cpu, "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(), "tilted_seconds": oracle.profile["tilted_seconds"],
+        "gene_refreshes": [int(gene.profile["refreshes"]) for gene in oracle.genes], "double_loops": oracle.profile["double_loops"],
         "refusals": oracle.refusals, "reached": point is not None,
     }
     if os.environ.get("SVPGS_PROFILE_OUT"):

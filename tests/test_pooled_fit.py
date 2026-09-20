@@ -103,25 +103,6 @@ def test_several_genes_fit_one_certified_prior():
         assert scoring.store_rows.max() < gene.codes.shape[1]
 
 
-def test_a_gene_at_its_frozen_fixed_point_takes_no_step_while_the_others_move():
-    """Regression (bench-real diag2 [real], 3 of 3 groups): a gene whose frozen update was below its sites' rounding was
-    taken for one whose damped passes all failed, and refused the whole pool."""
-    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
-
-    rng = np.random.default_rng(8)
-    genes = [_gene(rng, 80, width, _sparse_effects(rng, width, count)) for width, count in ((40, 2), (30, 1))]
-    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
-    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
-    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
-    oracle = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
-    _variances, frozen = oracle._refresh(start)
-    rows = oracle.rows
-    target_precision, target_shift = oracle.site_precision.copy(), oracle.site_shift.copy()
-    target_precision[rows[1]] *= 1.5  # gene 0's targets are its own sites: its update is exactly zero
-    oracle._frozen_passes(start, frozen, target_precision, target_shift)  # refused before the fix
-    assert np.all(np.isfinite(oracle.site_precision)) and np.all(np.isfinite(oracle.mean))
-
-
 @pytest.mark.slow
 def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
     from sv_pgs.pooled_fit import _PooledPosterior, _total_curvature, pooled_curvature_blocks
@@ -151,44 +132,6 @@ def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
         np.testing.assert_allclose(curvature.blocks[gene, :-1, -1:], np.outer(coupling[gene], basis[gene]), rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
 
 
-def test_a_genes_double_loop_is_small_ns_on_its_rows():
-    """The pooled fallback (MODEL.md section 4) runs small_n's double loop on the gene's own rows of the pooled prior:
-    for one gene it is small_n's exactly."""
-    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
-    from sv_pgs.small_n import _DenseFixedPoints
-
-    rng = np.random.default_rng(10)
-    gene = _gene(rng, 60, 40, _sparse_effects(rng, 40, 2))
-    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target)]
-    prior = pooled_prior(statistics, [gene.variant_class], [np.zeros(40)], np.ones(1), 64)
-    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
-    pooled = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
-    single = _DenseFixedPoints(statistics[0], prior, start, float(noise[0]), 64, 10**9)
-    pooled._double_loop(0, start)
-    single._double_loop(start)
-    np.testing.assert_array_equal(pooled.site_precision, single.site_precision)
-    np.testing.assert_array_equal(pooled.site_shift, single.site_shift)
-    np.testing.assert_array_equal(pooled.mean, single.mean)
-
-
-def test_non_finite_site_targets_refuse_the_trial_instead_of_looping():
-    """review-mathbugs N2: a NaN target made the damped halving and the sweep loop run forever."""
-    from sv_pgs.full_data_fit import NoFixedPoint
-    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
-
-    rng = np.random.default_rng(11)
-    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (30, 20)]
-    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
-    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
-    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
-    oracle = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
-    _variances, frozen = oracle._refresh(start)
-    target_precision, target_shift = oracle.site_precision.copy(), oracle.site_shift.copy()
-    target_precision[3] = np.nan
-    with pytest.raises(NoFixedPoint, match="non-finite"):
-        oracle._frozen_passes(start, frozen, target_precision, target_shift)
-
-
 def test_every_row_of_a_gene_carries_exactly_its_level():
     """review-mathbugs P2 (lead ruling): gene levels are gene-owned offsets, sum-to-zero over genes, never class-centred.
     Two genes, each with SNV and deletion rows: every row of gene g must shift its log prior variance by l_g exactly."""
@@ -205,3 +148,48 @@ def test_every_row_of_a_gene_carries_exactly_its_level():
     rows = [slice(0, statistics[0].design.variant_count), slice(statistics[0].design.variant_count, prior.variant_count)]
     for gene, gene_rows in enumerate(rows):
         np.testing.assert_allclose(shift[gene_rows], levels[gene], rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps))
+
+
+def test_the_pooled_oracle_is_the_direct_sum_of_small_ns_per_gene_oracles():
+    """Each gene's fixed point is small_n's own on its rows of the pooled prior: exactly, bit for bit."""
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_prior, _gene_rows, _pooled_start
+    from sv_pgs.small_n import _DenseFixedPoints
+
+    rng = np.random.default_rng(13)
+    genes = [_gene(rng, 70, width, _sparse_effects(rng, width, count)) for width, count in ((30, 1), (24, 2))]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    rows = _gene_rows(statistics)
+    start, noise = _pooled_start(statistics, prior, rows)
+    pooled = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    (point,) = pooled([start])
+    assert point is not None
+    for gene, gene_rows in enumerate(rows):
+        single = _DenseFixedPoints(statistics[gene], _gene_prior(prior, gene_rows), start, float(noise[gene]), 64, 10**9)
+        (alone,) = single([start])
+        np.testing.assert_array_equal(point.mean[gene_rows], alone.mean)
+        np.testing.assert_array_equal(point.cavity.precision[gene_rows], alone.cavity.precision)
+        assert float(point.effective_effects[gene]) == float(alone.effective_effects)
+    direction = rng.standard_normal(prior.variant_count)
+    assert point.precision_norm(direction).shape == (2,)
+
+
+def test_a_genes_refusal_refuses_the_trial_and_restores_every_gene():
+    from sv_pgs.full_data_fit import NoFixedPoint
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+
+    rng = np.random.default_rng(14)
+    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (20, 16)]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    pooled = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    before = pooled.site_precision.copy()
+
+    def refuse(_hyperparameters):
+        raise NoFixedPoint("no fixed point here")
+
+    pooled.genes[1]._solve = refuse
+    assert pooled([start]) == [None]
+    np.testing.assert_array_equal(pooled.site_precision, before)
+    assert pooled.refusals == ["gene 1: no fixed point here"]
