@@ -9,9 +9,11 @@ def test_scalar_mmse_is_exact_for_a_gaussian_prior_and_converged_in_order():
     for gamma in (0.1, 1.0, 37.0):
         assert np.isclose(replica.scalar_mmse(gamma, [2.0], [1.0]), 1.0 / (gamma + 0.5), rtol=1e-12)
     variances, weights = np.array([0.0, 0.01, 4.0]), np.array([0.9, 0.08, 0.02])
-    converged = replica.scalar_mmse(3.0, variances, weights)
-    finer = replica.scalar_mmse(3.0, variances, weights, order=8 * replica.QUADRATURE_ORDER + 7)
-    assert np.isclose(converged, finer, rtol=1e-7)
+    grid = np.linspace(-60.0, 60.0, 600_001)
+    density = sum(weight * np.exp(-0.5 * grid ** 2 / (variance + 1 / 3.0)) / np.sqrt(2 * np.pi * (variance + 1 / 3.0)) for variance, weight in zip(variances, weights))
+    _, posterior_variance = replica._posterior_moments(grid, 3.0, variances, weights)
+    brute = float(np.sum(density * posterior_variance) * (grid[1] - grid[0]))
+    assert np.isclose(replica.scalar_mmse(3.0, variances, weights), brute, rtol=1e-6)
 
 
 def test_scalar_mmse_matches_monte_carlo_for_a_sparse_mixture():

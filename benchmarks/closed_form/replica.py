@@ -17,13 +17,7 @@ Nishimori's identity (cov(yhat, y) = var(yhat) for the posterior mean).
 data, so that predictions can be compared with realized per-group r^2.
 """
 import numpy as np
-from numpy.polynomial.hermite_e import hermegauss
-from scipy import special
-
-# Gauss-Hermite order for the scalar channel. Each mixture component is integrated under its own marginal scale, so
-# the integrand (a ratio of Gaussian mixtures times r^2) is smooth. The order is checked for convergence in the tests
-# by doubling it.
-QUADRATURE_ORDER = 121
+from scipy import integrate, special
 
 
 def _posterior_moments(r, gamma, variances, weights):
@@ -38,39 +32,30 @@ def _posterior_moments(r, gamma, variances, weights):
     component_mean = shrink[None, :] * r[:, None]
     component_variance = variances * noise / (variances + noise)
     mean = np.sum(responsibility * component_mean, axis=1)
-    second = np.sum(responsibility * (component_variance[None, :] + component_mean ** 2), axis=1)
-    return mean, second - mean ** 2
+    # Law of total variance: within-component variance plus the spread of the component means, both nonnegative.
+    variance = np.sum(responsibility * (component_variance[None, :] + (component_mean - mean[:, None]) ** 2), axis=1)
+    return mean, variance
 
 
-def scalar_mmse(gamma, variances, weights, order=None):
-    """E[(beta - E[beta | r])^2] for r = beta + N(0, 1/gamma), beta ~ sum_k w_k N(0, v_k).
+def scalar_mmse(gamma, variances, weights):
+    """E[Var(beta | r)] for r = beta + N(0, 1/gamma), beta ~ sum_k w_k N(0, v_k).
 
-    With `order=None` the Gauss-Hermite order doubles from QUADRATURE_ORDER until two successive values agree to
-    sqrt(float64 eps) relative, so the answer is converged rather than taken at a fixed order.
+    Integrates the posterior variance, which is positive, so there is no cancellation against the prior second moment
+    at high SNR. Each mixture component is integrated under its own marginal N(0, v_k + 1/gamma) by adaptive QUADPACK
+    on the whole line at its default sqrt(eps) tolerances.
     """
-    if order is not None:
-        return _scalar_mmse_at(gamma, variances, weights, order)
-    current = _scalar_mmse_at(gamma, variances, weights, QUADRATURE_ORDER)
-    order = QUADRATURE_ORDER
-    while True:
-        order = 2 * order + 1
-        refined = _scalar_mmse_at(gamma, variances, weights, order)
-        if abs(refined - current) <= np.sqrt(np.finfo(np.float64).eps) * max(refined, current, np.finfo(np.float64).tiny):
-            return refined
-        current = refined
-
-
-def _scalar_mmse_at(gamma, variances, weights, order):
     variances, weights = np.asarray(variances, dtype=np.float64), np.asarray(weights, dtype=np.float64)
-    nodes, node_weights = hermegauss(order)
-    node_weights = node_weights / node_weights.sum()
-    second_moment = float(np.sum(weights * variances))
-    explained = 0.0
+    total = 0.0
     for variance, weight in zip(variances, weights):
-        r = np.sqrt(variance + 1.0 / gamma) * nodes
-        mean, _ = _posterior_moments(r, gamma, variances, weights)
-        explained += weight * float(np.sum(node_weights * mean ** 2))
-    return max(second_moment - explained, 0.0)
+        scale = np.sqrt(variance + 1.0 / gamma)
+
+        def integrand(z):
+            _, posterior_variance = _posterior_moments(np.array([scale * z]), gamma, variances, weights)
+            return float(posterior_variance[0]) * np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
+
+        value, _ = integrate.quad(integrand, -np.inf, np.inf)
+        total += weight * value
+    return total
 
 
 def lmmse_error(gamma2, eigenvalues, dimension, noise):
