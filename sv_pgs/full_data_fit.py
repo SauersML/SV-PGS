@@ -609,7 +609,9 @@ class _FullDataFixedPoints:
         columns = [site_targets(tilted_moments(self.prior, model, cavity, self.working_bytes), cavity) for model, cavity in zip(hyperparameters, cavities)]
         return np.column_stack([column[0] for column in columns]), np.column_stack([column[1] for column in columns])
 
-    def _move_bounds(self, model: int, right: F64Array, threshold: float | None = None) -> tuple[float, float]:
+    def _move_bounds(
+        self, model: int, right: F64Array, threshold: float | None = None, other: F64Array | None = None
+    ) -> tuple[float, float, float, float]:
         """Two-sided bounds on ||Sigma right||_A^2 = right' Sigma right over the members: Sigma = C_w + W Sigma_groups W'
         (``_member_posterior``), so the members' within-group part is exact and the groups' part is the solver's.
 
@@ -617,21 +619,29 @@ class _FullDataFixedPoints:
         solved to in the posterior metric (``_iterate``), so the refreshes' ratio is measured at the scorer's own
         resolution; with one, the solve's bound halves until the bounds fall on one side of it. Where float64's floor
         stops the solve first (its certificate above the bound asked for, speed-krylov cf364bd), the bounds are
-        returned as they are and the caller reads them on the cautious side."""
+        returned as they are and the caller reads them on the cautious side.
+
+        With ``other``, it also returns other' Sigma right from the same solve and that value's error bound
+        (||W'other||_Sigma_groups <= ||W'other||_(D_groups^-1) times the solve's certificate); nan otherwise."""
         precision = self.site_precision[:, model]
         weight = member_weights(self.ties, precision)
         grouped = np.zeros(self.ties.group_count)
         np.add.at(grouped, self.ties.group, weight * right)
-        within = 0.0
+        other_grouped = np.zeros(self.ties.group_count)
+        if other is not None:
+            np.add.at(other_grouped, self.ties.group, weight * other)
+        within, within_cross = 0.0, 0.0
         for members in tied_groups(self.ties):
             shares, _group_precision, _total = tied_weights(precision[members])
             variance = 1.0 / precision[members]
             signs = self.ties.sign[members]
             conditional = np.diag(variance) - np.outer(signs * shares, signs * variance)
             within += float(right[members] @ conditional @ right[members])
+            if other is not None:
+                within_cross += float(other[members] @ conditional @ right[members])
         remaining = None if threshold is None else threshold - within
         if remaining is not None and remaining < 0.0:
-            return within, np.inf
+            return within, np.inf, np.nan, np.nan
         relative = np.sqrt(1.0 / self.draw_count)
         # The first bound's scale: Sigma_groups <= D_groups^-1 (the data only add precision), so r_g' D_g^-1 r_g bounds
         # the norm from above where the groups' sites are proper; later bounds follow the solve's own lower bound.
@@ -651,7 +661,11 @@ class _FullDataFixedPoints:
             else:
                 done = upper[0] * upper[0] <= remaining or lower[0] * lower[0] > remaining
             if done or certified[0] > bound[0]:
-                return within + float(lower[0] * lower[0]), within + float(upper[0] * upper[0])
+                cross, cross_error = np.nan, np.nan
+                if other is not None:
+                    cross = within_cross + float(other_grouped @ solved[:, 0])
+                    cross_error = float(np.sqrt(np.sum(np.square(other_grouped) / group_precision))) * float(certified[0])
+                return within + float(lower[0] * lower[0]), within + float(upper[0] * upper[0]), cross, cross_error
             bound = 0.5 * bound if remaining is not None or not lower[0] > 0.0 else np.array([relative * float(lower[0])])
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
@@ -671,11 +685,13 @@ class _FullDataFixedPoints:
         tolerance = 0.5 / self.draw_count
         # The last refresh's KL bounds per model, for the contraction rate; None where there is no earlier refresh of
         # the same map in this call (the first, or after a noise update moved the likelihood under a certified KL).
-        previous: tuple[F64Array, F64Array] | None = None
+        previous: tuple[F64Array, F64Array, F64Array, float | None] | None = None
         # The share of each refresh's frozen-pass move the sites take. Undamped at first; a refresh whose KL does not fall
         # measures an oscillating mode (J's eigenvalue -lambda, lambda >= rho), which the fraction f / (1 + rho) removes
         # (the damped map's 1 - f (1 + lambda) at lambda = (1 + rho) / f - 1).
         fraction = 1.0
+        # The share taken by the step into the current refresh (None before the first step in this call).
+        arrived: float | None = None
         while True:
             variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
@@ -713,21 +729,35 @@ class _FullDataFixedPoints:
             certified = np.zeros(model_count, dtype=bool)
             for model in range(model_count):
                 fixed = 0.25 * float(spread[model])
-                mean_lower, mean_upper = self._move_bounds(model, right[:, model])
+                mean_lower, mean_upper, cross, cross_error = self._move_bounds(
+                    model, right[:, model], other=None if previous is None else previous[2][:, model]
+                )
                 lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
                 if previous is None:
                     continue
                 last = float(previous[0][model])
-                certified[model] = upper[model] <= budget * last / (fraction * np.sqrt(last) + np.sqrt(budget)) ** 2
+                # The ratio is the damped map's contraction only across steps at one share (theory-ep): a refresh
+                # reached right after the share changed is measured, not certified.
+                steady = previous[3] is None or previous[3] == arrived
+                certified[model] = steady and upper[model] <= budget * last / (fraction * np.sqrt(last) + np.sqrt(budget)) ** 2
                 if certified[model] or upper[model] <= last:
                     continue
                 # Not within the certificate, and not measurably below the last refresh's KL (decided against that KL's
                 # lower bound): no contraction at this share, so the next move is damped by the measured rate.
                 if fixed < last:
-                    mean_lower, mean_upper = self._move_bounds(model, right[:, model], 2.0 * (last - fixed))
+                    mean_lower, mean_upper, _cross, _error = self._move_bounds(model, right[:, model], 2.0 * (last - fixed))
                     lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
                 if not upper[model] <= last:
-                    damped = min(damped, fraction / (1.0 + float(np.sqrt(upper[model] / last)) if last > 0.0 else 0.0))
+                    # Which mode fails to contract (theory-ep): successive updates that alternate, r_k' Sigma r_(k-1) < 0,
+                    # are J's eigenvalue -lambda, which the damping removes; ones that line up are an eigenvalue at least
+                    # 1, which no share contracts (1 - f (1 - mu) >= 1), and that needs the double loop this route lacks.
+                    if cross > cross_error:
+                        raise NoFixedPoint(
+                            f"model {model}: the EP refreshes' updates line up with no contraction (KL {lower[model]:.3e}..{upper[model]:.3e} after "
+                            f"{last:.3e}, r_k' Sigma r_(k-1) = {cross:.3e} +- {cross_error:.3e}): no damping contracts it, and the full-data route "
+                            "has no double loop"
+                        )
+                    damped = min(damped, fraction / (1.0 + float(np.sqrt(upper[model] / last))) if last > 0.0 else 0.0)
             with np.errstate(divide="ignore", invalid="ignore"):
                 rate = np.sqrt(upper / previous[0]) if previous is not None else np.full(model_count, np.inf)
                 # Twice the certified distance's KL, against 1 / K (the certificate's units).
@@ -752,8 +782,9 @@ class _FullDataFixedPoints:
                 ]
             # A noise update moves the likelihood, so the next refresh is of a new map where the sites had met their
             # certificate: the rate starts again there.
-            previous = None if np.all(certified) else (lower, upper)
+            previous = None if np.all(certified) else (lower, upper, right.copy(), arrived)
             fraction = damped
+            arrived = fraction
             start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
             if fraction < 1.0:
