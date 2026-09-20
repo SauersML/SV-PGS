@@ -2145,14 +2145,16 @@ def _maximize_evidence(
     at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
     (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight moves back to the
     upper end of its range when V is higher there. There is no lambda = 0 edge (see the module docstring), so a
-    start weight of -inf means its range's lower end. Every V is the best certified maximum over the warm, flat and
+    start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
     global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
     the start.
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
-    infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
-    weights = np.where(start_weights == np.inf, upper, np.clip(start_weights, lower, upper))
+    # A start weight past its range's resolvable upper end (a fit on another lattice, whose range differs) is the
+    # lambda = infinity edge itself: V is not resolved there, and the edge is its limit.
+    infinite = frozenset(int(position) for position in np.flatnonzero((start_weights == np.inf) | (start_weights > upper)))
+    weights = np.where(np.isin(np.arange(start_weights.shape[0]), list(infinite)), upper, np.clip(start_weights, lower, upper))
     flat = initial_hyperparameters(prior).coefficients
     log_normal = _log_normal_start(prior, start_coefficients, cavity, working_bytes)
     coefficients = np.array(start_coefficients, dtype=np.float64, copy=True)
