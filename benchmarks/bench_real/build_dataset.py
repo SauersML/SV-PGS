@@ -78,7 +78,7 @@ def variant_rows(record: cyvcf2.Variant, alleles: np.ndarray):
         is_sv = symbolic or max(reference_length, 0 if symbolic else len(alternate)) >= STRUCTURAL_VARIANT_MIN_BP or abs(length_change) >= STRUCTURAL_VARIANT_MIN_BP
         yield dosage, (record.POS, int(end) if end is not None else record.POS + reference_length - 1, record.ID or ".", reference_length,
                        -1 if symbolic else len(alternate), symbolic, sv_type or ("INS" if length_change > 0 else "DEL" if length_change < 0 else "."),
-                       sv_length if is_sv else 0, is_sv)
+                       sv_length, is_sv)
 
 
 def read_rows(bcf_path: pathlib.Path, samples: list, structural_only: bool):

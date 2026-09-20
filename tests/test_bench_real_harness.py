@@ -249,12 +249,22 @@ def test_batch_contract_matches_the_per_gene_contract_for_a_per_gene_method(tmp_
         "spec.loader.exec_module(baselines)\n\n\n"
         "def fit_batch(trains):\n"
         "    return [baselines.top_variant(train) for train in trains]\n")
+    (tmp_path / "views_method.py").write_text(
+        "import importlib.util\n"
+        f"spec = importlib.util.spec_from_file_location('baselines_for_views', {baselines_path!r})\n"
+        "baselines = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(baselines)\n\n\n"
+        "def fit_views(views):\n"
+        "    for key in views:\n"
+        "        yield key, baselines.top_variant(views[key])\n")
     harness.run(tmp_path, f"{baselines_path}:top_variant", "gene", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
     harness.run(tmp_path, f"{tmp_path}/batch_method.py:fit_batch", "batch", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="batch")
+    harness.run(tmp_path, f"{tmp_path}/views_method.py:fit_views", "views", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), contract="views")
     for feature_set in ("snv", "snv_sv"):
         for kind in ("predictions", "predictions_without_sv"):
-            assert np.array_equal(np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy"),
-                                  np.load(tmp_path / f"results/batch/loso/chr1.{feature_set}.{kind}.npy"))
+            reference = np.load(tmp_path / f"results/gene/loso/chr1.{feature_set}.{kind}.npy")
+            for contract in ("batch", "views"):
+                assert np.array_equal(reference, np.load(tmp_path / f"results/{contract}/loso/chr1.{feature_set}.{kind}.npy"))
 
 
 def test_a_batch_refuses_a_sealed_gene(tmp_path):
@@ -294,3 +304,122 @@ def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
                               "y": values[scored], "targeted": [index in targeted for index in scored], "random": [index in sample for index in scored]})
         estimates.append(genome_total.horvitz_thompson_total(genes, population, sample_size)[0])
     assert np.isclose(np.mean(estimates), values.sum(), rtol=0, atol=64 * EPSILON)
+
+
+def test_saved_sv_effects_reproduce_the_sv_part_of_the_prediction(tmp_path):
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    out = tmp_path / "results" / "mr_ash" / "loso"
+    effects = pd.read_csv(out / "chr1.sv_coefficients.tsv.gz", sep="\t")
+    dataset = harness.Dataset(tmp_path)
+    window = harness.load_gene_window(dataset, 0)
+    full = np.load(out / "chr1.snv_sv.predictions.npy")[0].astype(np.float64)
+    without = np.load(out / "chr1.snv_sv.predictions_without_sv.npy")[0].astype(np.float64)
+    for split_name, rows in effects.groupby("split"):
+        test_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["test"]])
+        sv_part = (window.genotypes[np.ix_(test_index, rows["window_row"].to_numpy())] - rows["train_mean"].to_numpy()) @ rows["effect"].to_numpy()
+        # The saved predictions are float32, so the comparison allows one float32 rounding of each prediction.
+        assert np.allclose(sv_part, (full - without)[test_index], rtol=0, atol=4 * np.finfo(np.float32).eps * max(np.abs(full).max(), 1.0))
+
+
+def test_duplicate_sv_calls_merge_into_one_event():
+    from benchmarks.bench_real import sv_gene_table
+
+    table = pd.DataFrame({"pos": [100, 5000, 105, 9000], "end": [2100, 5000, 2080, 9500], "sv_length": [2000, 300, 1975, 500]})
+    generator = np.random.default_rng(6)
+    base = generator.binomial(2, 0.3, size=40).astype(np.float64)
+    genotypes = np.column_stack([base, generator.binomial(2, 0.3, size=40), generator.binomial(2, 0.3, size=40), base]).astype(np.float64)
+    labels = sv_gene_table.events(np.arange(4), table, genotypes)
+    # 0 and 2 share a span (reciprocal overlap); 0 and 3 share genotypes (r^2 = 1); 1 stands alone.
+    assert labels[0] == labels[2] == labels[3] != labels[1]
+
+
+def test_gene_row_decomposes_the_sv_part_of_a_real_harness_run(tmp_path):
+    from benchmarks.bench_real import sv_gene_table
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    effects = pd.read_csv(tmp_path / "results/mr_ash/loso/chr1.sv_coefficients.tsv.gz", sep="\t")
+    superdups = tmp_path / "superdups.txt.gz"
+    pd.DataFrame([[0, "chr1", 50, 150]]).to_csv(superdups, sep="\t", header=False, index=False)
+    sv_gene_table.initialize(tmp_path, superdups, effects.groupby("gene_id"))
+    record = sv_gene_table.gene_row("g1")
+    assert record["svs"] == 2 and record["events"] in (1, 2)
+    assert record["effective_events"] >= 1 and 0 <= record["lead_sv_max_r2_with_small_variant"] <= 1
+    assert record["lead_sv_segmental_duplication_fraction"] == 1.0
+
+
+def test_collapsed_and_copy_number_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True, True], ["panel", "panel", "panel_merged", "gatksv", "hgsvc3_merged"])
+    assert list(harness.feature_mask(variants, "snv_sv_merged", "g/s")) == [True, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_sv_cn", "g/s")) == [True, False, False, True, False]
+    assert list(harness.feature_mask(variants, "hgsvc3_merged", "g/s")) == [False, False, False, False, True]
+
+
+def test_cross_mappable_partner_inside_the_lead_sv_is_flagged(tmp_path):
+    import gzip
+
+    from benchmarks.bench_real import sv_gene_table
+
+    with gzip.open(tmp_path / "crossmap.txt.gz", "wt") as handle:
+        handle.write("ENSG1.4\tENSG2.1\t12.5\nENSG1.4\tENSG3.2\t3.0\n")
+    with gzip.open(tmp_path / "genes.gtf.gz", "wt") as handle:
+        handle.write('chr1\tX\tgene\t1000\t2000\t.\t+\t.\tgene_id "ENSG2.7";\n')
+        handle.write('chr1\tX\tgene\t90000\t91000\t.\t+\t.\tgene_id "ENSG3.1";\n')
+    table = pd.DataFrame({"gene_id": ["ENSG1.9"], "chrom": ["chr1"], "lead_sv_id": ["sv"], "lead_sv_start": [500], "lead_sv_end": [5000]})
+    flagged = sv_gene_table.add_cross_mappability(table, tmp_path / "crossmap.txt.gz", tmp_path / "genes.gtf.gz")
+    assert flagged["lead_sv_crossmappable_partners"].tolist() == [1] and flagged["lead_sv_max_crossmappability"].tolist() == [12.5]
+
+
+def test_allele_lengths_are_signed_and_never_zeroed_below_the_sv_threshold():
+    table = pd.DataFrame({"alt_len": [-1, -1, -1, 1, 50, 10, 1], "ref_len": [1, 1, 1, 50, 1, 1, 1],
+                          "sv_length": [5000, 3000, 700, 49, 49, 0, 0], "sv_type": ["DEL", "DUP", "INV", "DEL", "INS", "INS", "."]})
+    length, change = harness.allele_lengths(table)
+    assert length.tolist() == [5000, 3000, 700, 49, 49, 9, 0]
+    assert change.tolist() == [-5000, 3000, 0, -49, 49, 9, 0]
+
+
+def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
+    tiny_dataset(tmp_path)
+    overlay = tmp_path / "overlay"
+    overlay.mkdir()
+    dosage = np.load(tmp_path / "chr1.dosage.npy")
+    imputed = (dosage[[3, 7]] * 0.9 + 0.05).astype(np.float32)
+    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed)
+    dataset = harness.Dataset(tmp_path, overlay)
+    window = harness.load_gene_window(dataset, 0)
+    assert window.genotypes.shape[1] == dosage.shape[0] + 2 and list(window.table["source"].iloc[-2:]) == ["svimp", "svimp"]
+    assert np.array_equal(window.genotypes[:, -2:], imputed.T)
+    train, test, _, _ = harness.build_gene_task(dataset, window, dataset.splits["loso/AFR"])
+    joint, _ = harness.subset(train, test, "snv_svimp", "loso/AFR")
+    called, _ = harness.subset(train, test, "snv_sv", "loso/AFR")
+    assert joint.variants.is_sv.sum() == called.variants.is_sv.sum() == 2
+    assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
+
+
+def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
+    tiny_dataset(tmp_path)
+    dataset = harness.Dataset(tmp_path)
+    views = harness._LazyViews(dataset, [0], ["loso/AFR", "loso/EUR"], ["snv"])
+    assert list(views) == [("g1", "loso/AFR", "snv"), ("g1", "loso/EUR", "snv")]
+    assert views[("g1", "loso/AFR", "snv")].variants.chromosome_row is not None
+
+    class Constant:
+        def predict(self, genotypes):
+            return np.zeros(genotypes.shape[0])
+
+    try:
+        list(harness._run_views(dataset, lambda views: {("g1", "loso/AFR", "snv"): Constant()}, [0], ["loso/AFR", "loso/EUR"], ["snv"]))
+    except ValueError as error:
+        assert "1 of 2" in str(error)
+    else:
+        raise AssertionError("a missing view must be refused")
+    pd.DataFrame({"gene_id": ["g1"]}).to_csv(tmp_path / harness.SEALED_GENES, sep="\t", index=False)
+    try:
+        harness._LazyViews(harness.Dataset(tmp_path), [0], ["loso/AFR"], ["snv"])
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("views containing a sealed gene must be refused")

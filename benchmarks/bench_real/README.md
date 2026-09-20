@@ -45,12 +45,14 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 - **What TrainData holds:** training genotypes, the adjusted phenotype, variant annotations, superpopulation and population labels, and the target gene's GENCODE v38 body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 - **Sealing:** test phenotypes never reach method code; the harness reads them only to score.
 - **Batch contract:** a method that pools hyperparameters across genes (as SV-PGS does across traits) is `fit_batch(trains) -> list[predictor]`, run with `--contract batch`. It's called once per split and feature set, with a lazy sequence of every selected gene's TrainData. The sequence exposes no test data and refuses any sealed gene. Scoring and run.json are unchanged.
+- **Views contract:** `fit_views(views) -> {(gene_id, split, feature_set): predictor}`, run with `--contract views`. It may instead yield pairs, so predictors needn't all be held at once. It's called once with a lazy mapping of every requested view: training data only, and it refuses sealed genes. `Variants.chromosome_row` (with `source`) identifies a column across overlapping windows, so a method can share Grams across genes, folds and nested feature sets. The per-gene and batch contracts are special cases, and a test shows identical predictions under all three for a non-sharing method.
 - **Confirmation genes:** `dataset/sealed_confirmation_genes.tsv` is never scored except under `--confirmation`, and only when the lead calls it.
   - A `--genes` list naming a sealed gene is refused.
   - A derived dataset (parent_dataset.txt) must carry its parent's sealed list byte for byte.
 - **Feature sets:** `snv` (panel SNVs and indels under 50 bp), `snv_sv` (all panel rows), and `snv_pgsv` (panel SNVs/indels plus PanGenie SVs).
 - **Submitting:** a method lane sends a file and callable (`path.py:callable`), and bench-real runs it on the sealed splits. Lanes don't run the benchmark themselves.
 - **Costly methods:** they run on a sealed random gene sample, a prefix of `dataset/gene_order.tsv` (a seeded permutation of all genes), via `--gene-prefix N`.
+- **SV effects:** for linear predictors, each run also writes `<tag>.sv_coefficients.tsv.gz`: every SV column's effect on the genotype scale, its training mean, and its row in the gene window, per gene, split and feature set. So the SV part of any score decomposes into single SVs without refitting.
 - **Run record:** each run writes `<chromosomes>.run.json`: the method spec and its file's sha256, the harness commit, design, feature sets, gene prefix N, gene count and the splits' sha256.
 - **Output:** out-of-fold predictions for every gene and sample, per design and feature set, plus per-fit CPU seconds and variant counts.
 
