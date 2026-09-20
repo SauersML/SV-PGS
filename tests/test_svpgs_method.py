@@ -165,7 +165,8 @@ class _SmallNStub:
         scoring = ScoringModel(
             store_rows=live.astype(np.int64), signed_means=means, signed_scales=scales, coefficients=coefficients,
             posterior_draws=coefficients[:, None] + generator.normal(scale=np.abs(coefficients).mean(), size=(live.shape[0], 3)),
-            alpha=np.array([arguments["target"].mean()]), trait_type=TraitType.QUANTITATIVE, predictive_intercept_shift=0.0,
+            alpha=np.linalg.lstsq(arguments["covariates"], arguments["target"], rcond=None)[0], trait_type=TraitType.QUANTITATIVE,
+            predictive_intercept_shift=0.0,
         )
         return type("SmallNFit", (), {"scoring": scoring})()
 
@@ -352,3 +353,21 @@ def test_the_batch_arms_take_the_whole_process_less_what_it_holds(monkeypatch: p
     with open("/proc/self/statm") as handle:
         resident = int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
     assert allotment - 2 * resident <= budget.host_bytes <= allotment - resident // 2 and budget.cpu_threads == 16
+
+
+def test_bench_reals_covariates_are_the_fits_fixed_effects(small_n: _SmallNStub) -> None:
+    """review-mathbugs C2: the phenotype was residualized on [1, C], so the fit projects on the same [1, C]."""
+    import types
+
+    train, test = _bench_real_train(np.random.default_rng(15))
+    covariates = np.random.default_rng(16).normal(size=(_REAL_SAMPLES + 20, 2))
+    with_covariates = types.SimpleNamespace(**{field.name: getattr(train, field.name) for field in dataclasses.fields(train)}, covariates=covariates[:_REAL_SAMPLES])
+    predictor = svpgs_method.fit_expression(with_covariates)
+    np.testing.assert_array_equal(small_n.calls[0]["covariates"], np.column_stack([np.ones(_REAL_SAMPLES), covariates[:_REAL_SAMPLES]]))
+    alpha = predictor.scoring.alpha
+    np.testing.assert_allclose(
+        predictor.predict(test, covariates=covariates[_REAL_SAMPLES:]) - predictor.predict(test), covariates[_REAL_SAMPLES:] @ alpha[1:],
+        rtol=0.0, atol=64 * _EPSILON * (1.0 + np.abs(covariates[_REAL_SAMPLES:]) @ np.abs(alpha[1:])).max(),
+    )
+    svpgs_method.fit_expression(train)
+    np.testing.assert_array_equal(small_n.calls[1]["covariates"], np.ones((_REAL_SAMPLES, 1)))
