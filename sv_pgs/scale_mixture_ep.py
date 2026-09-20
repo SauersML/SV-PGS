@@ -82,10 +82,13 @@ EP-re-solved one; at fixed cavities it is H.
 
 Outer loop (``fit_hyperparameters``). At an EP fixed point the EP evidence's
 gradient in x is the fixed-cavity one, and its negative Hessian is the total
-curvature B + S, with the cavities re-solved (``_total_curvature``). So x moves
-by Newton on B + S, globalized by the natural monotonicity test. It never moves
-by the fixed-cavity maximizer: that EP-EM step solves with A + S, and it
-overshoots where (A + S)^-1 (B + S) exceeds 2.
+curvature B + S, with the cavities re-solved (``_total_curvature``). The loop
+ascends one function, V(rho), with x its inner solve: the weights and x move
+jointly to the maximum of V's local model (``hyper_step`` on the anchored
+objective), accepted on V's realized gain above the tolerance, and x alone by
+Newton on B + S at fixed weights, globalized by the natural monotonicity
+test. It never moves by the fixed-cavity maximizer: that EP-EM step solves
+with A + S, and it overshoots where (A + S)^-1 (B + S) exceeds 2.
 
 Every derivative is computed in z = (eta_1, ..., eta_C, theta), where each variant's log Z_j depends on its
 class's eta_c and its own log u_j, and carried to x by the linear map M.
@@ -191,6 +194,9 @@ class ScaleMixturePrior:
     pooled_size: int
     null_basis: F64Array
     offset_groups: I64Array | None = None
+    # The EP evidence's local model about the fixed point whose cavities the objective uses (``_Anchor``); set only
+    # inside ``hyper_step``, which searches that model.
+    anchor: _Anchor | None = None
 
     @property
     def level_size(self) -> int:
@@ -253,7 +259,10 @@ class HyperStep:
     gradient; ``stationarity_steps`` are the curvature's difference steps,
     ``stationarity_errors`` the gradient's error bounds, and ``stationarity_gain`` the weights' remaining gain
     (``_stationarity``: their Newton decrement, plus what a fold lets them climb; at most the tolerance when the
-    step certified).
+    step certified), with its parts ``stationarity_floor`` (the gain with exact correction slopes),
+    ``stationarity_decrement`` (1/2 g'K^-1 g) and ``stationarity_fold`` (the folded weights'). ``tighten(budget)``
+    re-checks the stationarity at the returned weights with the bound tightened to ``budget``, with no new search
+    (None where that check finds a better side or no finite bound).
     """
 
     hyperparameters: MixtureHyperparameters
@@ -266,6 +275,12 @@ class HyperStep:
     stationarity_steps: F64Array
     stationarity_errors: F64Array
     stationarity_gain: float
+    stationarity_floor: float = np.inf
+    stationarity_decrement: float = np.inf
+    stationarity_fold: float = np.inf
+    tighten: Callable[[float], "HyperStep | None"] | None = None
+    # The certified error of ``evidence`` (``_Evidence.error``): the outer loop's predicted gain carries it.
+    evidence_error: float = 0.0
 
 
 # ------------------------------------------------------------------ the lattice
@@ -947,14 +962,15 @@ def _penalty_value(prior: ScaleMixturePrior, log_smoothing: F64Array, coefficien
 def _penalized(
     prior: ScaleMixturePrior, objective: _Objective, log_smoothing: F64Array, penalty: F64Array, coefficients: F64Array
 ) -> tuple[float, F64Array, F64Array]:
-    """The penalized objective, its gradient and Hessian in x."""
+    """The penalized objective, its gradient and Hessian in x, less the local model's C term where the prior has an
+    anchor (``_Anchor``; ``penalty`` stays S alone)."""
     mapping = prior.coefficient_map
     penalty_value, penalty_gradient = _penalty_value(prior, log_smoothing, coefficients)
-    return (
-        objective.value - penalty_value,
-        mapping.T @ objective.gradient - penalty_gradient,
-        mapping.T @ objective.hessian @ mapping - penalty,
-    )
+    anchor_value, anchor_gradient = _anchor_value(prior, coefficients)
+    hessian = mapping.T @ objective.hessian @ mapping - penalty
+    if prior.anchor is not None:
+        hessian = hessian - prior.anchor.matrix
+    return objective.value - penalty_value - anchor_value, mapping.T @ objective.gradient - penalty_gradient - anchor_gradient, hessian
 
 
 def _ascent_direction(negative_hessian: F64Array, gradient: F64Array) -> F64Array:
@@ -1037,7 +1053,9 @@ def _maximize_coefficients(
         step = _trust_region_step(-hessian, gradient, radius)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
         candidate = coefficients + step
-        candidate_value = _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0]
+        candidate_value = (
+            _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0] - _anchor_value(prior, candidate)[0]
+        )
         actual = candidate_value - value
         ratio = actual / predicted if predicted > 0.0 else -np.inf
         step_norm = float(np.linalg.norm(step))
@@ -1067,6 +1085,9 @@ class GaussianPosterior:
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
     # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
+    # Whether ``solve``, ``variance_jvp`` and ``linear_response`` are exact to rounding whatever tolerance they are
+    # asked for (a dense factor, or independent effects): B's response is then charged its rounding, not the request.
+    exact: bool = False
 
 
 class NoCertifiedProgress(FloatingPointError):
@@ -1102,8 +1123,11 @@ class CurvatureCorrection:
         mapping: F64Array | None = None,
         columns: Callable[[F64Array], F64Array] | None = None,
         fixed_curvature: F64Array | None = None,
+        resolutions: list[float] | None = None,
     ) -> None:
         self.coefficient_map = coefficient_map
+        # The relative residuals B's response columns were solved to (``columns`` appends them); none for a given C.
+        self._resolutions = [] if resolutions is None else resolutions
         self.matrix = matrix
         self._mapping = mapping
         self._columns = columns
@@ -1111,6 +1135,11 @@ class CurvatureCorrection:
         # An orthonormal basis Q (x coordinates) of the directions solved so far, and B_z M Q.
         self._basis: F64Array | None = None
         self._total: F64Array | None = None
+
+    @property
+    def resolution(self) -> float:
+        """The largest relative residual B's response has been solved to so far (0 for a correction given whole)."""
+        return max(self._resolutions, default=0.0)
 
     @property
     def solved_directions(self) -> int:
@@ -1155,6 +1184,40 @@ class CurvatureCorrection:
 INDEPENDENT_EFFECTS = CurvatureCorrection()
 
 
+@dataclass(frozen=True)
+class _Anchor:
+    """The EP evidence's local model about the fixed point x_k where ``correction`` (C = B - A) was solved: EP
+    stationarity makes E and the fixed-cavity F_k share their gradient at x_k, with Hessians -B and -A, so
+    E(x) = F_k(x) - 1/2 (x - x_k)'C(x - x_k) + const + O(|x - x_k|^3) (theory-ep). The objective V integrates is
+    that model minus the penalty, whose curvature A + C + S is the one V's determinant takes: its maximizer, its
+    responses and its line integrals then belong to the same integrand. ``center`` is z_k = M x_k, the same in every
+    view; ``matrix``, ``linear`` and ``constant`` are this prior's K'CK, K'C x_k and x_k'C x_k (x = K x_view), so the
+    term is -(1/2 x'(K'CK)x - (K'C x_k)'x + 1/2 x_k'C x_k)."""
+
+    correction: CurvatureCorrection
+    center: F64Array
+    matrix: F64Array
+    linear: F64Array
+    constant: float
+
+
+def _anchored(prior: ScaleMixturePrior, correction: CurvatureCorrection, center: F64Array) -> ScaleMixturePrior:
+    """``prior`` with the local model about z_k = ``center`` in its own coordinates (``_Anchor``): C on the prior's
+    directions and on x_k's, from the correction's own lazy solve."""
+    size = prior.coefficient_size
+    blocks = correction.on(np.column_stack([prior.coefficient_map, center]))
+    return replace(prior, anchor=_Anchor(correction, center, blocks[:size, :size], blocks[:size, size], float(blocks[size, size])))
+
+
+def _anchor_value(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[float, F64Array]:
+    """1/2 (x - x_k)'C(x - x_k) and its gradient in the prior's coordinates (zero without an anchor)."""
+    anchor = prior.anchor
+    if anchor is None:
+        return 0.0, np.zeros_like(coefficients)
+    moved = anchor.matrix @ coefficients
+    return 0.5 * float(coefficients @ moved) - float(anchor.linear @ coefficients) + 0.5 * anchor.constant, moved - anchor.linear
+
+
 def curvature_correction(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, tolerance: float
 ) -> CurvatureCorrection:
@@ -1166,10 +1229,12 @@ def curvature_correction(
     B + S), never past what double precision resolves."""
     relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
     fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    achieved: list[float] = []
     return CurvatureCorrection(
         mapping=prior.coefficient_map,
-        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions),
+        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved),
         fixed_curvature=0.5 * (fixed + fixed.T),
+        resolutions=achieved,
     )
 
 
@@ -1177,7 +1242,7 @@ def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
     """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
     cavities do not move with the prior, so B equals the fixed-cavity curvature."""
     column = np.asarray(variance, dtype=np.float64)[:, None]
-    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights)
+    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights, exact=True)
 
 
 @dataclass(frozen=True)
@@ -1282,6 +1347,7 @@ def _total_curvature_columns(
     working_bytes: int,
     relative_tolerance: float,
     directions: F64Array,
+    achieved: list[float] | None = None,
 ) -> F64Array:
     """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
     B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
@@ -1293,7 +1359,8 @@ def _total_curvature_columns(
         dh = (dm - m_P dP - m_x E) / v
         v^2 dP = -(Sigma o Sigma)_off (dv / v^2 + dP),  dv = v_h dh + v_P dP + v_x E   (``posterior.variance_jvp``)
     dP is the fixed point of that affine map, found by GMRES on all directions at once to ``relative_tolerance``, with
-    the restart length that fits ``working_bytes``.
+    the restart length that fits ``working_bytes``. ``achieved``, when given, receives the relative residual the
+    solve reached (its rounding where the posterior is ``exact``).
     """
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
@@ -1334,6 +1401,8 @@ def _total_curvature_columns(
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
         try:
             precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+            if achieved is not None:
+                achieved.append(_EPSILON if posterior.exact else relative_tolerance)
         except np.linalg.LinAlgError as error:
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
@@ -1376,6 +1445,8 @@ def _total_curvature_columns(
         target = max(relative_tolerance * float(np.linalg.norm(offset)), rounding)
         residual = result.residual_norm
         if residual <= target:
+            if achieved is not None:
+                achieved.append(max(residual, rounding) / max(float(np.linalg.norm(offset)), np.finfo(np.float64).tiny))
             break
         # The residual is measured with products at ``inner``, so it carries their error: the inner solves tighten by
         # the measured excess each round, which ends where they reach float64's attainable accuracy rather than on one
@@ -1578,6 +1649,12 @@ def _line(
     penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
     penalty_slope = float(penalty_gradient @ direction)
     penalty_curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+    if prior.anchor is not None:
+        # The local model's C term is quadratic in t too (``_Anchor``).
+        anchor_value, anchor_gradient = _anchor_value(prior, origin)
+        penalty += anchor_value
+        penalty_slope += float(anchor_gradient @ direction)
+        penalty_curvature += float(direction @ prior.anchor.matrix @ direction)
     fixed_rows, moving_rows, kernels = [], [], []
     for class_position, class_rows in enumerate(prior.class_rows):
         still = class_rows[scale_slope[class_rows] == 0.0]
@@ -1977,17 +2054,28 @@ def _penalty_groups(prior: ScaleMixturePrior) -> list[I64Array]:
 
 
 def _evidence(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior,
+    log_smoothing: F64Array,
+    start: F64Array,
+    cavity: Cavity,
+    correction: CurvatureCorrection,
+    working_bytes: int,
+    tolerance: float,
+    maximize: bool = True,
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
+
+    With ``maximize`` false, V's formula is taken at ``start`` itself (an outer state's own x, ``_outer_state``): its
+    error then carries x's own decrement there, as the inner maximizer's share does.
 
     V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved, the
     second-order approximation of the actual marginal likelihood, taken as A + ``correction`` (``CurvatureCorrection``);
     the null space N is profiled. The gradient is V's own (C held, as V holds it): its determinant terms move with
     rho through S and through x_rho, dx/drho_i = -(-H)^-1 lambda_i S_i x, by the third derivatives of log Z
-    contracted with W_B (``_curvature_trace_gradient``); x_rho itself maximizes F - P, so F moves only through the
-    penalty (the envelope). Every step is still accepted on V itself.
+    contracted with W_B (``_curvature_trace_gradient``); x_rho itself maximizes F - P (less the local model's C term
+    where the prior has an anchor, ``_Anchor``, which makes -H = B + S), so F moves only through the penalty (the
+    envelope). Every step is still accepted on V itself.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     null_basis = prior.null_basis
@@ -1998,7 +2086,10 @@ def _evidence(
     coefficients = np.array(start, dtype=np.float64, copy=True)
     previous = None
     while True:
-        coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
+        if maximize:
+            coefficients, objective = _maximize_coefficients(prior, log_smoothing, coefficients, cavity, working_bytes, inner_tolerance)
+        else:
+            objective = _data_objective(prior, coefficients, cavity, working_bytes)
         value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
         try:
             fixed = _profiled_factor(-hessian, null_basis, complement)
@@ -2012,7 +2103,7 @@ def _evidence(
         # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
         # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
-        if 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
+        if not maximize or 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
         if previous is not None and np.array_equal(coefficients, previous):
             # The maximizer resolves x no further (its own rounding stop): V is as accurate as double precision gives.
@@ -2020,14 +2111,18 @@ def _evidence(
         previous = coefficients
         inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
-    # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; its bound below
-    # takes the response as solved to a relative residual that moves 1/2 log|B + S| by at most D / 2 times it.
-    response_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
-    total = -hessian + correction.on(prior.coefficient_map)
-    try:
-        profiled_total = _profiled_factor(total, null_basis, complement)
-    except np.linalg.LinAlgError:
-        return None
+    # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; a relative residual
+    # e of that response moves 1/2 log|B + S| by at most D e / 2, charged below at the residual the solve reached
+    # (``CurvatureCorrection.resolution``: its rounding where the posterior is exact, 0 for a correction given whole).
+    if prior.anchor is not None:
+        # With the local model's anchor, -H is already A + C + S (``_Anchor``): C enters once, and x_rho's own factor
+        # is the determinant's.
+        profiled_total = fixed
+    else:
+        try:
+            profiled_total = _profiled_factor(-hessian + correction.on(prior.coefficient_map), null_basis, complement)
+        except np.linalg.LinAlgError:
+            return None
     # V is certified to ``tolerance`` only where its determinant is resolved (``_Profiled.rounding``); where that
     # bound exceeds the tolerance (B + S near-singular off the profiled space), the point is not a certified maximum.
     if tolerance > 0.0 and 0.5 * profiled_total.rounding > tolerance:
@@ -2067,9 +2162,8 @@ def _evidence(
     return _Evidence(
         value=evidence_value,
         laplace_value=evidence_value,
-        # The inner maximizer, the determinant's rounding, and B solved to a relative residual that moves
-        # 1/2 log|B + S| by at most D / 2 times it.
-        error=inner_error + 0.5 * profiled_total.rounding + 0.5 * coefficients.shape[0] * response_tolerance,
+        # The inner maximizer, the determinant's rounding, and B's response at the residual its solve reached.
+        error=inner_error + 0.5 * profiled_total.rounding + 0.5 * coefficients.shape[0] * correction.resolution,
         gradient=evidence_gradient,
         coefficients=coefficients,
         responses=responses,
@@ -2137,7 +2231,10 @@ def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int]) -> tup
     null_eigenvalues, null_vectors = np.linalg.eigh(total)
     scale = max(float(null_eigenvalues[-1]) if null_eigenvalues.size else 0.0, np.finfo(np.float64).tiny)
     null_basis = null_vectors[:, null_eigenvalues <= _EPSILON * allowed.shape[1] * scale]
-    view = replace(prior, coefficient_map=prior.coefficient_map @ allowed, smoothing_blocks=tuple(blocks), null_basis=null_basis)
+    view = replace(prior, coefficient_map=prior.coefficient_map @ allowed, smoothing_blocks=tuple(blocks), null_basis=null_basis, anchor=None)
+    if prior.anchor is not None:
+        # The same local model, in the view's coordinates (x_k itself, which may lie outside the view).
+        view = _anchored(view, prior.anchor.correction, prior.anchor.center)
     return view, allowed
 
 
@@ -2404,6 +2501,11 @@ class _Stationarity:
     folds: F64Array
     gain: float
     better: tuple[F64Array, _Evidence] | None
+    # The gain's parts (theory-ep's split): ``floor`` with exact correction slopes (E at its fixed part), ``decrement``
+    # 1/2 g'K^-1 g on the open weights, ``fold`` the folded weights' (|g| + E) h; the rest of ``gain`` is E's.
+    floor: float = np.inf
+    decrement: float = np.inf
+    fold: float = np.inf
 
 
 def _full_gradient(
@@ -2412,11 +2514,15 @@ def _full_gradient(
     """The certified V's rho-gradient, its error, and the corrections' second differences: the Laplace part's
     gradient (exact at x_rho) plus the corrections' own slopes to ``targets`` (``_correction_slopes``)."""
     correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes, targets)
-    # x_rho's own error moves the Laplace gradient by its x-slope over x's error, sqrt(2 d) in the -H metric: bounded
-    # by the gradient's scale s_i times that radius (the same logistic bound as V's derivatives).
+    return evidence.gradient + correction_slopes, correction_errors + _laplace_gradient_error(evidence), correction_second
+
+
+def _laplace_gradient_error(evidence: _Evidence) -> F64Array:
+    """The Laplace gradient's error per weight, which no slope target lowers: x_rho's own error moves it by its x-slope
+    over x's error, sqrt(2 d) in the -H metric, bounded by the gradient's scale s_i times that radius (the same
+    logistic bound as V's derivatives), plus the rounding of the objective."""
     radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
-    scale = 0.5 * (evidence.effective_degrees + evidence.penalty_sizes)
-    return evidence.gradient + correction_slopes, correction_errors + scale * radius + _EPSILON * evidence.magnitude, correction_second
+    return 0.5 * (evidence.effective_degrees + evidence.penalty_sizes) * radius + _EPSILON * evidence.magnitude
 
 
 def _stationarity(
@@ -2428,9 +2534,15 @@ def _stationarity(
     correction: CurvatureCorrection,
     working_bytes: int,
     tolerance: float,
+    budget: float = np.inf,
 ) -> _Stationarity:
     """The weights' Newton decrement at a certified maximum, from V's analytic gradient (lead ruling: in place of
     central differences of V, which cannot certify where the base's inner basin ends within their step).
+
+    ``budget`` is the gain the certificate leaves the weights (``HyperStep.tighten``): where the bound exceeds it only
+    through the correction slopes' error, the slopes are resolved again to the error that meets it (theory-ep), for
+    as long as every slope's error falls. Where it exceeds it even with exact slopes (``floor``), the slopes are not
+    what stops the certificate. Infinite, the bound is reported as measured.
 
     The gradient is the Laplace part's (exact) plus the corrections' own slopes (``_correction_slopes``). The curvature
     is -dg/drho of the Laplace part by one forward difference per interior weight, taken on the side the gradient
@@ -2439,8 +2551,9 @@ def _stationarity(
     rho_i bounded by s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of
     step h errs by h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
     there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
-    most V can climb before the fold. Elsewhere the gain is the Newton decrement 1/2 r K^-1 r with r = |g| + E on the
-    other interior weights and K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
+    most V can climb before the fold. Elsewhere the gain is the most the Newton decrement 1/2 (g + d)'K^-1 (g + d)
+    reaches over the gradient's error box |d| <= E on the other interior weights, 1/2 g'K^-1 g + |K^-1 g|'E +
+    1/2 E'|K^-1|E (theory-ep), with K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
     as an indefinite B + S has none for x. A side whose certified V beats the base's by the tolerance, both at their
     certified bounds, is returned as ``better`` at once: the base is then not the maximum, and the search resumes
     from it.
@@ -2506,20 +2619,59 @@ def _stationarity(
     curvature[np.ix_(inside, inside)] = 0.5 * (curvature[np.ix_(inside, inside)] + curvature[np.ix_(inside, inside)].T)
     folded = interior & (folds > 0.0)
     open_ = np.flatnonzero(interior & ~folded)
-    reach = np.abs(gradient) + error
-    gain = float(np.sum(reach[folded] * folds[folded]))
-    if not np.all(np.isfinite(reach[interior])):
-        # A slope that could not be resolved leaves the gain unbounded: the weights are not certified here.
-        return _Stationarity(gradient, error, curvature, steps, folds, np.inf, None)
-    if open_.shape[0]:
-        block = curvature[np.ix_(open_, open_)]
-        try:
-            factor = np.linalg.cholesky(block)
-        except np.linalg.LinAlgError:
-            return _Stationarity(gradient, error, curvature, steps, folds, np.inf, None)
-        solved = solve_triangular(factor, reach[open_], lower=True)
-        gain += 0.5 * float(solved @ solved)
-    return _Stationarity(gradient, error, curvature, steps, folds, gain, None)
+
+    def terms(gradient: F64Array, fixed: F64Array, slopes: F64Array, curvature: F64Array) -> tuple[float, float, float, float, float]:
+        """(alpha, beta, gamma, decrement, fold): the gain bound alpha + beta t + gamma t^2 for the gradient's error
+        E = F + t E_c (theory-ep), 1/2 g'K^-1 g, and the folded weights' part at t = 1. On the open weights the bound
+        is the most 1/2 (g + d)'K^-1 (g + d) reaches over the box |d| <= E, with the signed g:
+        1/2 g'K^-1 g + |K^-1 g|'E + 1/2 E'|K^-1|E (|.| elementwise; K^-1's off-diagonals can be negative, where
+        1/2 (|g| + E)'K^-1 (|g| + E) would understate it). On the folded weights it is (|g| + E) h. Infinite where a
+        slope is unresolved or K is not positive definite (an indefinite model has no decrement, as an indefinite
+        B + S has none for x)."""
+        if not all(np.all(np.isfinite(values[interior])) for values in (gradient, fixed, slopes)):
+            return np.inf, 0.0, 0.0, np.inf, np.inf
+        alpha = float(np.sum((np.abs(gradient) + fixed)[folded] * folds[folded]))
+        beta = float(np.sum(slopes[folded] * folds[folded]))
+        fold = alpha + beta
+        gamma = decrement = 0.0
+        if open_.shape[0]:
+            try:
+                factor = np.linalg.cholesky(curvature[np.ix_(open_, open_)])
+            except np.linalg.LinAlgError:
+                return np.inf, 0.0, 0.0, np.inf, fold
+            root = solve_triangular(factor, np.eye(open_.shape[0]), lower=True)
+            inverse = root.T @ root
+            absolute = np.abs(inverse)
+            reach = np.abs(inverse @ gradient[open_])
+            floor, error = fixed[open_], slopes[open_]
+            decrement = 0.5 * float(gradient[open_] @ inverse @ gradient[open_])
+            alpha += decrement + float(reach @ floor) + 0.5 * float(floor @ absolute @ floor)
+            beta += float(reach @ error) + float(floor @ absolute @ error)
+            gamma = 0.5 * float(error @ absolute @ error)
+        return alpha, beta, gamma, decrement, fold
+
+    # E's part no slope target lowers (x_rho's own error and the rounding), and the slopes' part above it.
+    fixed = np.where(interior, _laplace_gradient_error(base), 0.0)
+    alpha, beta, gamma, decrement, fold = terms(gradient, fixed, np.maximum(error - fixed, 0.0), curvature)
+    gain = alpha + beta + gamma
+    while np.isfinite(gain) and alpha <= budget < gain:
+        # gain(t) rises in the slopes' error scale t (alpha, beta, gamma >= 0), from at most the budget at t = 0 to
+        # above it at t = 1: its one root in [0, 1) is the error that meets the budget.
+        room = budget - alpha
+        scale_down = 2.0 * room / (beta + float(np.sqrt(beta * beta + 4.0 * gamma * room)))
+        slopes = np.maximum(error - fixed, 0.0)
+        tighter = interior & (slopes > 0.0)
+        resolved = _full_gradient(view, weights, base, tighter, cavity, working_bytes, scale_down * slopes)
+        new_gradient, new_error, new_second = (np.where(tighter, new, old) for new, old in zip(resolved, (gradient, error, correction_second)))
+        if not np.all(new_error[tighter] < error[tighter]):
+            # A slope resolves no finer (its rounding floor, or its differences no longer agree): the bound stands.
+            break
+        for position in np.flatnonzero(tighter):
+            curvature[position, position] += correction_second[position] - new_second[position]
+        gradient, error, correction_second = new_gradient, new_error, new_second
+        alpha, beta, gamma, decrement, fold = terms(gradient, fixed, np.maximum(error - fixed, 0.0), curvature)
+        gain = alpha + beta + gamma
+    return _Stationarity(gradient, error, curvature, steps, folds, gain, None, floor=alpha, decrement=decrement, fold=fold)
 
 
 def hyper_step(
@@ -2531,9 +2683,20 @@ def hyper_step(
     The search steers by V's own Laplace gradient and accepts on the certified V (with B). At the end, V's
     stationarity is checked from its analytic gradient, corrections included, and a forward difference of that
     gradient per interior weight (``_stationarity``): while the weights' Newton decrement exceeds ``tolerance``, the
-    search takes the Newton step, accepting only steps that raise V; a weight whose basin ends on its climbing side
+    search takes the Newton step, accepting steps whose gain's certified lower bound exceeds ``tolerance`` (so every
+    such move gains a resolved amount: V is bounded above), and, where none does (the band: a real gain within the
+    tolerance), the full Newton step on a certified rise, kept only when the next check's decrement falls (natural
+    monotonicity, so Newton's local convergence ends it); a weight whose basin ends on its climbing side
     within the difference's step contributes the most V can climb before the fold.
+
+    The returned step's ``tighten`` re-checks its stationarity at the final weights with the bound tightened to a
+    budget (``_stationarity``), with no new search.
+
+    The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
+    ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
+    A + C + S is the one V's determinant takes, so V is the Laplace evidence of one integrand (theory-ep (a)).
     """
+    prior = _anchored(prior, correction, prior.coefficient_map @ hyperparameters.coefficients)
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
     bounds = _smoothing_bounds(prior, start_objective)
     # There is no lambda = 0 edge: a -inf start weight means its range's lower end.
@@ -2560,15 +2723,24 @@ def hyper_step(
     lower = np.array([bound[0] for bound in bounds])[finite_final]
     upper = np.array([bound[1] for bound in bounds])[finite_final]
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
+    # The weights, evidence and check before a band move (below), until the check after it has judged it.
+    band: tuple[F64Array, _Evidence, _Stationarity] | None = None
     while True:
         interior = (weights > lower) & (weights < upper)
         check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
+        if band is not None:
+            if check.better is None and not check.gain < band[2].gain:
+                # The band move did not lower the weights' Newton decrement (natural monotonicity): it is undone, and
+                # the search ends at the weights before it.
+                weights, evidence, check = band
+                break
+            band = None
         moved = check.better
         if moved is None and check.gain <= tolerance:
             break
         if moved is None:
             # Newton on the difference curvature over the weights whose basin does not end on their climbing side
-            # (on its magnitude where it is indefinite), accepted only when the certified V rises.
+            # (on its magnitude where it is indefinite), accepted only when the certified V rises by more than the tolerance.
             open_ = interior & ~(check.folds > 0.0)
             direction = np.zeros_like(weights)
             if np.any(open_):
@@ -2586,8 +2758,18 @@ def hyper_step(
                      final_allowed.T @ initial_hyperparameters(prior).coefficients],
                     cavity, correction, working_bytes, tolerance,
                 )
-                if trial is not None and trial.value > evidence.value:
+                # The gain's lower bound (both values at their certified bounds, as ``_stationarity``'s better side) must
+                # exceed the tolerance: a rise within the certificate's resolution is not resolved, and only a resolved
+                # gain per move bounds the number of moves by V's range, so the search ends.
+                if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
                     moved = (trial_weights, trial)
+                    break
+                # The band (theory-ep): where the remaining gain is real but within the tolerance, no move resolves it.
+                # The full Newton step is then taken on a certified rise, and kept only when the next check's decrement
+                # falls (natural monotonicity): Newton's local convergence ends it, not the tolerance's count.
+                if step_length == 1.0 and trial is not None and trial.value - trial.error > evidence.value + evidence.error:
+                    moved = (trial_weights, trial)
+                    band = (weights, evidence, check)
                     break
                 step_length *= 0.5
         if moved is None:
@@ -2612,18 +2794,33 @@ def hyper_step(
             evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
-    return HyperStep(
-        hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
-        penalized_objective=evidence.penalized_value,
-        evidence=evidence.value,
-        newton_decrement=evidence.newton_decrement,
-        smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
-        start_decrement=start_decrement,
-        evidence_gain=evidence.value - start_evidence.value,
-        stationarity_steps=check.steps,
-        stationarity_errors=check.error,
-        stationarity_gain=check.gain,
-    )
+
+    def checked(check: _Stationarity) -> HyperStep:
+        return HyperStep(
+            hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
+            penalized_objective=evidence.penalized_value,
+            evidence=evidence.value,
+            newton_decrement=evidence.newton_decrement,
+            smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
+            start_decrement=start_decrement,
+            evidence_gain=evidence.value - start_evidence.value,
+            stationarity_steps=check.steps,
+            stationarity_errors=check.error,
+            stationarity_gain=check.gain,
+            stationarity_floor=check.floor,
+            stationarity_decrement=check.decrement,
+            stationarity_fold=check.fold,
+            tighten=tighten,
+            evidence_error=evidence.error,
+        )
+
+    def tighten(budget: float) -> HyperStep | None:
+        """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the check
+        then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
+        tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
+        return checked(tightened) if tightened.better is None and np.isfinite(tightened.gain) else None
+
+    return checked(check)
 
 
 # ------------------------------------------------------------------ the outer loop
@@ -2655,13 +2852,19 @@ none exists (EP reaches no proper cavities there)."""
 class OuterFit:
     """One model's certified empirical Bayes.
 
-    ``remaining_gain`` is what the last check still found, in nats: ``newton_decrement``, 1/2 g'|B + S|^-1 g at the
-    returned coefficients, plus the B-evidence gain the weights still had (``step.evidence_gain``); it is at most the
-    tolerance. ``prediction_move`` is the posterior-mean move of the certifying Newton step in q's posterior metric,
-    against ``prediction_tolerance`` = 1 / K = 2 tolerance, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (K = 1 / (2
-    tolerance) draws; in evidence units, as every other certificate, so it stays defined where p_eff collapses). ``iterations`` counts accepted steps,
-    ``halvings`` the trials refused (by the test, or for having no EP fixed point), and ``unresolved`` those of them
-    that had no EP fixed point at all, so a loop that keeps refusing near its answer is visible in the certificate.
+    ``remaining_gain`` is what the last check still found, in nats: the gain V's local model predicts from the last
+    state to the weights' maximum, the weights' remaining stationarity gain beyond it, and that prediction's measured
+    error (``fit_hyperparameters``); it is at most the tolerance. ``newton_decrement`` is x's own decrement at the
+    last state, 1/2 g'(B + S)^-1 g. ``prediction_move`` is the posterior-mean move of the certifying step in q's
+    posterior metric, against ``prediction_tolerance`` = 1 / K = 2 tolerance, i.e. KL(q || q') = move / 2 <= 1 / (2K)
+    nats (K = 1 / (2 tolerance) draws; in evidence units, as every other certificate, so it stays defined where p_eff
+    collapses). ``iterations`` counts accepted steps, ``halvings`` the trials refused (by the test, or for having no
+    EP fixed point), and ``unresolved`` those of them that had no EP fixed point at all, so a loop that keeps refusing
+    near its answer is visible in the certificate.
+
+    ``fixed_point_term_measured`` is False while the decisions charge the fixed points' own error along the steps as
+    zero (theory-ep: the oracles' perturbation probes are not wired yet); callers treat such a fit as uncertified
+    even where ``certified`` holds.
     """
 
     hyperparameters: MixtureHyperparameters
@@ -2673,11 +2876,12 @@ class OuterFit:
     iterations: int
     halvings: int
     unresolved: int
-    # The decrement plus the weights' remaining gain at every outer evaluation, in order: the outer rate.
+    # The remaining gain at every outer evaluation, in order: the outer rate.
     history: tuple[float, ...]
     # False when the loop stopped at double precision without certifying (``remaining_gain`` over the tolerance, or the
     # prediction move unchecked): an honest fit, which callers count and report as uncertified, never as certified.
     certified: bool = True
+    fixed_point_term_measured: bool = False
 
 
 @dataclass(frozen=True)
@@ -2743,7 +2947,7 @@ def _newton_step(newton: _NewtonB) -> F64Array:
 
 
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by the monotonicity test, not by a
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by halving a refused step, not by a
     radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
     the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
     curvature out of a saddle."""
@@ -2764,117 +2968,299 @@ def _cauchy_radius(newton: _NewtonB) -> float:
     return norm**3 / curvature if curvature > 0.0 else 0.0
 
 
+@dataclass(frozen=True)
+class _State:
+    """V's formula at an outer state (x_j, rho_j) and its fixed point, with x_j itself, not re-maximized (theory-ep
+    (b)): W_j = E(x_j) - P(x_j) + 1/2 log|S|_+ - 1/2 log|B_j + S|_N + T_j, which V(rho_j) is within ``error`` of
+    (x_j's own decrement and its first-order move of the determinant and the corrections, and their rounding:
+    ``_evidence``'s and ``_corrected``'s error at x_j). E's value is not needed: ``value`` is W_j with the
+    fixed-cavity F_j(x_j) in E's place (the units ``hyper_step``'s V takes at this fixed point), ``rest`` is
+    W_j - F_j(x_j), and E's change between two states is the path integral of ``gradient`` (the EP evidence's
+    x-gradient, the fixed-cavity one at a fixed point), corrected by B's change along the step (``fixed_curvature``
+    A_j and ``correction`` C_j, in full x). ``decrement`` is x's own Newton decrement delta_j; ``polished`` marks a
+    state whose x inner steps have taken to its maximum at rho_j to double precision."""
+
+    value: float
+    rest: float
+    gradient: F64Array
+    fixed_curvature: F64Array
+    correction: CurvatureCorrection
+    error: float
+    decrement: float
+    polished: bool = False
+
+
+def _outer_state(
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, point: FixedPoint, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+) -> _State | None:
+    """``_State`` at ``hyperparameters`` = (x_j, rho_j) and its fixed point, where ``correction`` was solved; None where
+    B_j + S has no certified determinant at x_j (x_j is not inside a basin of V's integrand)."""
+    data = _data_objective(prior, hyperparameters.coefficients, point.cavity, working_bytes)
+    # As in ``hyper_step``: a -inf weight means its range's lower end.
+    lowest = np.array([bound[0] for bound in _smoothing_bounds(prior, data)])
+    log_smoothing = np.where(hyperparameters.log_smoothing == -np.inf, lowest, hyperparameters.log_smoothing)
+    infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+    view, allowed = _restricted_prior(_anchored(prior, correction, prior.coefficient_map @ hyperparameters.coefficients), infinite)
+    weights = log_smoothing[np.isfinite(log_smoothing)]
+    evidence = _evidence(view, weights, allowed.T @ hyperparameters.coefficients, point.cavity, correction, working_bytes, tolerance, maximize=False)
+    corrected = None if evidence is None else _corrected(view, weights, evidence, point.cavity, correction, working_bytes, tolerance)
+    if corrected is None:
+        return None
+    mapping = prior.coefficient_map
+    fixed = -(mapping.T @ data.hessian @ mapping)
+    return _State(
+        value=corrected.value, rest=corrected.value - data.value, gradient=mapping.T @ data.gradient, fixed_curvature=0.5 * (fixed + fixed.T),
+        correction=correction, error=corrected.error, decrement=evidence.inner_decrement,
+    )
+
+
+def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Array) -> tuple[float, float]:
+    """(G, eps): V's realized gain from ``start`` to ``end`` over the step ``move`` = x_end - x_start, and its
+    resolution (theory-ep (b)). E's change is the trapezoid rule of its path integral with its Euler-Maclaurin end
+    correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is quartic along s), whose plain
+    rule's error |s'(B_end - B_start)s| / 12 bounds the corrected one's; the penalty and the determinant terms
+    change in closed form (the states' ``rest``), and eps adds both states' own errors. The fixed points' gradient
+    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``)."""
+    if not np.any(move):
+        return end.rest - start.rest, start.error + end.error
+    along = (prior.coefficient_map @ move)[:, None]
+
+    def curvature(state: _State) -> float:
+        return float(move @ state.fixed_curvature @ move) + float(state.correction.on(along)[0, 0])
+
+    end_correction = (curvature(end) - curvature(start)) / 12.0
+    gain = 0.5 * float((start.gradient + end.gradient) @ move) + end_correction + end.rest - start.rest
+    return gain, abs(end_correction) + start.error + end.error
+
+
+@dataclass(frozen=True)
+class _OuterTrial:
+    """A pending outer trial: the joint step to ``hyperparameters`` at ``fraction`` of its segment (``newton`` None;
+    ``predicted`` the model's gain pi_k for the whole step, ``realized`` the previous, longer halving's realized
+    gain), or an inner x step at the state's weights (``newton``, its ``proposal`` and trust ``radius``, and whether
+    it ``polishes`` x after a refused joint trial or leaves a saddle). ``remaining`` and ``certifying`` are the
+    state's certificate."""
+
+    hyperparameters: MixtureHyperparameters
+    step: HyperStep | None
+    remaining: float
+    certifying: bool
+    fraction: float = 1.0
+    predicted: float = np.nan
+    realized: float = -np.inf
+    newton: _NewtonB | None = None
+    proposal: F64Array | None = None
+    radius: float = np.nan
+    polishes: bool = False
+    # A joint trial from a state where V's formula has no certified value (x_k outside every basin of its integrand at
+    # rho_k): it enters one, accepted where the trial's state is certified, and uncounted (V at x_k is unmeasured).
+    enters: bool = False
+
+
 def fit_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
 ) -> list[OuterFit]:
     """Every model's empirical Bayes at its EP fixed point, certified to ``tolerance`` nats (lead ruling: Newton-B,
-    never plain EP-EM).
+    never plain EP-EM), as the ascent of one function: V(rho), the certified EP-Laplace evidence of the weights,
+    with x its inner solve (theory-ep).
 
-    At an EP fixed point the EP evidence's x-gradient is the fixed-cavity g, and its negative Hessian is the total
-    curvature B + S. Each outer step sets the weights by ``hyper_step`` at the current fixed point, then moves x on
-    the quadratic model (g, B + S). The fixed-cavity maximizer (the EM step) solves with A + S instead: to first
-    order it maps the error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an eigenvalue
-    above 2, and where A + S is indefinite the fixed-cavity objective has no maximum near x at all. On real LD at
-    genome scale B + S itself is indefinite at the true prior (speed-floor [semi-real]), so the trust region below
-    is the production case, not an edge case.
+    At an EP fixed point x_k the EP evidence's x-gradient is the fixed-cavity g and its negative Hessian the total
+    curvature B = A + C, so its local model there is F_k - 1/2 (x - x_k)'C(x - x_k), which ``hyper_step`` searches
+    (``_Anchor``): its V is V's own model at x_k. The fixed-cavity maximizer (the EM step) solves with A + S instead:
+    to first order it maps the error e to (I - (A + S)^-1 (B + S)) e, which diverges wherever that pencil has an
+    eigenvalue above 2, and where A + S is indefinite the fixed-cavity objective has no maximum near x at all.
 
-    - Where B + S is positive definite the step is Newton's, accepted by the natural monotonicity test (Deuflhard,
-      Newton Methods for Nonlinear Problems, 2004, Section 3.1.4): at the trial's fixed point g'(B + S)^-1 g, taken
-      with the step's own B + S, must fall, and otherwise the step halves. It needs no evidence value, which a
-      full-data fixed point does not give, and it is invariant to x's coordinates.
-    - Where B + S is indefinite (as at the true prior on real LD: speed-floor [semi-real]) the step maximizes the
-      model inside a radius (More and Sorensen), and is accepted when the evidence rises along it. With no evidence
-      value, the rise is the trapezoid rule of the path integral of the gradient, (g_x + g_trial)' s / 2, exact for
-      a quadratic. A refused trial halves the radius; an accepted one that reached it doubles it. The radius starts
-      at the Cauchy step's length on |B + S| (``_cauchy_radius``).
-    The loop stops when, for every model, B + S is positive definite, the Newton decrement plus the weights'
-    remaining gain is at most ``tolerance`` (a saddle is never certified), and the Newton step then moves q's mean
-    by at most 1 / K in q's posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the
-    prediction change; in evidence units, well defined as p_eff -> 0, lead ruling via speed-smalln), taken
-    at the step's own EP fixed point, not on the quadratic model. With K = 1 / (2 tolerance) posterior draws that is
-    the scorer's own Monte Carlo resolution, as for the EP fixed point. Where the data barely identify a direction
-    (the profiled null space at small n) the evidence can be flat to the tolerance while predictions still move; a
-    step that fails the check is taken as an ordinary Newton trial. B's EP-response part is solved once per
-    outer iterate (``curvature_correction``) and serves both the weights' evidence and the x step; where B + S has
-    no certified maximum the weights wait while x steps.
+    Each outer iteration, at the state (x_k, rho_k) and its fixed point:
+    - ``hyper_step`` maximizes the model over the weights, to rho-hat and the model's own maximizer x there; the model
+      predicts V to gain pi_k = V_k(rho-hat) - W_k, with W_k V's formula at the state itself (``_outer_state``).
+    - The joint trial (rho-hat, x) is solved for its fixed point and its own B, and V's realized gain along the step
+      measured (``_path_gain``). It is accepted when that gain less its resolution exceeds ``tolerance``: V(rho) then
+      rises by more than the fit's resolution at every accepted joint step, so there are at most
+      (V* - V(rho_0)) / tolerance of them. A refused joint trial is halved along its segment at rho-hat (where that
+      keeps the edges) while each halving raises the realized gain. From a state where V's formula has no certified
+      value (x_k outside every basin of its integrand at rho_k, as at an arbitrary start) the joint trial enters one:
+      it is accepted where the trial's own state is certified, uncounted, and every accepted joint step lands in a
+      certified state, so only an inner step can leave one.
+    - Otherwise x takes inner steps at rho_k. An inner step ascends L_rho, not V (a function of the weights alone),
+      so it is accepted on any certified rise: the natural monotonicity test where B + S is positive definite
+      (Deuflhard, Newton Methods for Nonlinear Problems, 2004, Section 3.1.4: at the trial's fixed point
+      g'(B + S)^-1 g, in the step's own B + S, must fall), the trapezoid rule of the gradient's path integral where
+      it is not (the step then maximizes the model inside a radius, More and Sorensen, starting at the Cauchy step's
+      length on |B + S|, ``_cauchy_radius``, and doubling when an accepted step reached it); a refused one halves.
+      After a refused joint trial they polish x at rho_k until a step halves to double precision, and the state is
+      planned once more; where ``hyper_step`` finds no certified maximum (a saddle), one accepted inner step leads to
+      a new plan.
+    A model is certified when its state is inside a basin, the predicted gain plus the weights' remaining stationarity
+    gain and the prediction's measured error (the model's realized remainder at its last whole joint trial and both
+    values' own errors) is at most ``tolerance``, and the joint trial then moves q's mean by at most 1 / K in q's
+    posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the prediction change; in
+    evidence units, lead ruling via speed-smalln), at the trial's own EP fixed point. With K = 1 / (2 tolerance)
+    posterior draws that is the scorer's own Monte Carlo resolution, as for the EP fixed point. A trial that fails
+    the check is taken as an ordinary joint trial. Where the weights' stationarity bound is what stops the
+    certificate, it is tightened to the share the rest leaves it (``HyperStep.tighten``). A polished state whose
+    joint trial is refused again, or an inner step that halves to double precision at a saddle's weights with an
+    evaluated step, is returned uncertified with its measured remaining gain.
 
-    Each call of ``fixed_points`` passes every model's current hyperparameters, so on return its state is each
-    model's certified fixed point.
+    On return the oracle's state is each model's returned fixed point (it is solved there once more where the last
+    trial was elsewhere).
     """
     count = len(starts)
     hyperparameters = list(starts)
     points = list(fixed_points(hyperparameters))
     if any(point is None for point in points):
         raise FloatingPointError("a starting point has no certified EP fixed point")
+
+    def solve_state(trial: MixtureHyperparameters, point: FixedPoint) -> tuple[CurvatureCorrection, _State | None]:
+        correction = curvature_correction(prior, trial.coefficients, point.cavity, point.posterior, working_bytes, tolerance)
+        return correction, _outer_state(prior, trial, point, correction, working_bytes, tolerance)
+
+    solved = [solve_state(start, point) for start, point in zip(hyperparameters, points)]
+    corrections = [correction for correction, _state in solved]
+    states = [state for _correction, state in solved]
     fits: list[OuterFit | None] = [None] * count
-    # (the model, its hyper step, the trial step, the radius, whether it certifies, the fraction of Newton's step)
-    pending: list[tuple[_NewtonB, HyperStep | None, F64Array, float, bool, float] | None] = [None] * count
+    pending: list[_OuterTrial | None] = [None] * count
     radii: list[float | None] = [None] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
-    steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
+    # |G - pi| at the model's last whole joint trial: the local model's measured error (unknown before the first).
+    remainders = [np.inf] * count
+    # Whether the oracle's last solve for the model was elsewhere than the point it returns.
+    displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
+
+    def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial:
+        newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        radius = radii[model]
+        if radius is None:
+            radius = _cauchy_radius(newton)
+            radii[model] = radius
+        proposal = _proposal(newton, radius)
+        return _OuterTrial(_trial(newton, proposal), step, remaining, False, newton=newton, proposal=proposal, radius=radius, polishes=polishes)
+
+    def plan(model: int) -> _OuterTrial:
+        state = states[model]
+        try:
+            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, tolerance)
+        except FloatingPointError:
+            # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
+            step = None
+        if step is None:
+            histories[model].append(np.inf)
+            return inner(model, step, np.inf, False)
+        if state is None:
+            histories[model].append(np.inf)
+            return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
+        predicted = step.evidence - state.value
+        error = remainders[model] + step.evidence_error + state.error
+        remaining = predicted + step.stationarity_gain + error
+        if step.tighten is not None and predicted + error <= tolerance < remaining:
+            # What stops the certificate is the weights' bound: it is tightened to the share the rest leaves it, at the
+            # same weights (theory-ep), so the trial below may certify.
+            tightened = step.tighten(tolerance - predicted - error)
+            if tightened is not None:
+                step, remaining = tightened, predicted + tightened.stationarity_gain + error
+        histories[model].append(float(remaining))
+        return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted)
+
+    def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
+        fits[model] = OuterFit(
+            hyperparameters=hyperparameters[model], step=step, newton_decrement=newton_decrement, remaining_gain=entry.remaining,
+            prediction_move=np.inf, prediction_tolerance=2.0 * tolerance, iterations=iterations[model], halvings=halvings[model],
+            unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
+        )
+        pending[model] = None
+
     while True:
         for model in range(count):
-            if fits[model] is not None or pending[model] is not None:
-                continue
-            point = points[model]
-            correction = curvature_correction(prior, hyperparameters[model].coefficients, point.cavity, point.posterior, working_bytes, tolerance)
-            try:
-                step = hyper_step(prior, hyperparameters[model], point.cavity, correction, working_bytes, tolerance)
-            except FloatingPointError:
-                # B + S has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
-                step = None
-            log_smoothing = hyperparameters[model].log_smoothing if step is None else step.hyperparameters.log_smoothing
-            newton = _newton_b(prior, log_smoothing, hyperparameters[model].coefficients, point, correction, working_bytes)
-            # The x step's decrement, the weights' realized gain at this fixed point, and the gain still left in them.
-            remaining = newton.decrement + (np.inf if step is None else step.evidence_gain + step.stationarity_gain)
-            histories[model].append(float(remaining))
-            certifying = step is not None and remaining <= tolerance
-            if certifying:
-                steps_taken[model] = (step, remaining)
-            radius = radii[model]
-            if radius is None:
-                radius = _cauchy_radius(newton)
-                radii[model] = radius
-            pending[model] = (newton, step, _proposal(newton, radius), radius, certifying, 1.0)
+            if fits[model] is None and pending[model] is None:
+                pending[model] = plan(model)
         if all(fit is not None for fit in fits):
+            if any(displaced):
+                points = list(fixed_points(hyperparameters))
             return [fit for fit in fits if fit is not None]
-        trials = [hyperparameters[model] if entry is None else _trial(entry[0], entry[2]) for model, entry in enumerate(pending)]
+        trials = [hyperparameters[model] if entry is None else entry.hyperparameters for model, entry in enumerate(pending)]
         trial_points = list(fixed_points(trials))
         for model, entry in enumerate(pending):
             if entry is None:
                 # An oracle that refuses refuses every model at once; a model without a trial keeps its point.
                 if trial_points[model] is not None:
                     points[model] = trial_points[model]
+                displaced[model] = False
                 continue
-            newton, step, proposal, radius, certifying, fraction = entry
-            trial_point = trial_points[model]
-            if trial_point is not None and certifying:
-                current = points[model]
-                # A shortened certifying step moves q's mean by its fraction, to first order: the full step's move is
-                # its own over fraction^2 in the squared metric.
-                moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64)) / (fraction * fraction)
-                allowed = np.full(moves.shape[0], 2.0 * tolerance)
-                # Reported as the most-used share of a block's budget, in that block's units.
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    shares = np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))
-                worst = int(np.argmax(shares))
-                move, allowed_move = float(moves[worst]), float(allowed[worst])
-                if bool(np.all(moves <= allowed)):
-                    certified_step, remaining = steps_taken[model]
-                    # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
-                    # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers the
-                    # move: the decrement at x, and q's mean moved by at most 1 / K in its metric (KL <= 1 / (2K)).
-                    hyperparameters[model], points[model] = trials[model], trial_point
-                    fits[model] = OuterFit(
-                        hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
-                        prediction_move=move, prediction_tolerance=allowed_move, iterations=iterations[model], halvings=halvings[model],
-                        unresolved=unresolved[model], history=tuple(histories[model]),
-                    )
-                    pending[model] = None
-                    continue
+            trial, trial_point = trials[model], trial_points[model]
+            displaced[model] = True
+            if entry.newton is None and entry.enters:
+                # The joint trial from a state outside every basin: accepted where the trial's state is certified.
+                assert entry.step is not None
+                if trial_point is None:
+                    unresolved[model] += 1
+                else:
+                    trial_correction, trial_state = solve_state(trial, trial_point)
+                    if trial_state is not None:
+                        hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
+                        displaced[model], pending[model] = False, None
+                        iterations[model] += 1
+                        continue
+                halvings[model] += 1
+                pending[model] = inner(model, entry.step, entry.remaining, False)
+                continue
+            if entry.newton is None:
+                # The joint trial.
+                state = states[model]
+                assert state is not None and entry.step is not None
+                if trial_point is not None and entry.certifying and entry.fraction == 1.0:
+                    current = points[model]
+                    moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
+                    allowed = np.full(moves.shape[0], 2.0 * tolerance)
+                    # Reported as the most-used share of a block's budget, in that block's units.
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        shares = np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))
+                    worst = int(np.argmax(shares))
+                    if bool(np.all(moves <= allowed)):
+                        # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
+                        # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers
+                        # the move: V's remaining gain at the state, and q's mean moved by at most 1 / K in its metric.
+                        hyperparameters[model], points[model], displaced[model] = trial, trial_point, False
+                        fits[model] = OuterFit(
+                            hyperparameters=trial, step=entry.step, newton_decrement=state.decrement, remaining_gain=entry.remaining,
+                            prediction_move=float(moves[worst]), prediction_tolerance=float(allowed[worst]), iterations=iterations[model],
+                            halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]),
+                        )
+                        pending[model] = None
+                        continue
+                gain = -np.inf
+                if trial_point is None:
+                    # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
+                    unresolved[model] += 1
+                else:
+                    trial_correction, trial_state = solve_state(trial, trial_point)
+                    if trial_state is not None:
+                        gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+                        if entry.fraction == 1.0:
+                            remainders[model] = abs(gain - entry.predicted)
+                        if gain - resolution > tolerance:
+                            hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
+                            displaced[model], pending[model] = False, None
+                            iterations[model] += 1
+                            continue
+                halvings[model] += 1
+                target = entry.step.hyperparameters
+                segment = target.coefficients - hyperparameters[model].coefficients
+                fraction = 0.5 * entry.fraction
+                same_edges = np.array_equal(target.log_smoothing == np.inf, hyperparameters[model].log_smoothing == np.inf)
+                longer = fraction * float(np.linalg.norm(segment)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(hyperparameters[model].coefficients))))
+                if same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
+                    halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
+                    pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
+                elif state.polished:
+                    # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
+                    uncertified(model, entry, entry.step, state.decrement)
+                else:
+                    pending[model] = inner(model, entry.step, entry.remaining, True)
+                continue
+            # An inner step at the state's weights.
+            newton, proposal = entry.newton, entry.proposal
+            assert proposal is not None
             if trial_point is None:
-                # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                 accepted = False
                 unresolved[model] += 1
             else:
@@ -2887,39 +3273,36 @@ def fit_hyperparameters(
                     accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
             length = float(np.linalg.norm(proposal))
             if accepted:
-                hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
+                trial_correction, trial_state = solve_state(trial, trial_point)
+                hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
+                displaced[model] = False
                 iterations[model] += 1
                 if not newton.definite:
-                    radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
+                    radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
+                # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
+                pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
-                if newton.definite and step is not None:
-                    # x is at its maximum to double precision (no trial can lower a decrement at its rounding), and what
-                    # stops the certificate is the weights' remaining gain or the prediction check: the fit is returned
-                    # with its measured remaining gain, uncertified, at the point the oracle last solved.
-                    if trial_point is not None:
-                        hyperparameters[model], points[model] = trials[model], trial_point
-                    fits[model] = OuterFit(
-                        hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
-                        remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
-                        prediction_tolerance=2.0 * tolerance,
-                        iterations=iterations[model],
-                        halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
-                    )
+                if entry.polishes and states[model] is not None:
+                    # x is at its maximum at rho_k to double precision: the state is planned once more.
+                    states[model] = replace(states[model], polished=True)
                     pending[model] = None
+                    continue
+                if newton.definite and entry.step is not None:
+                    # x is at its maximum to double precision (no trial can lower a decrement at its rounding) and what
+                    # stops the certificate is not x: the fit is returned uncertified with its measured remaining gain.
+                    uncertified(model, entry, entry.step, newton.decrement)
                     continue
                 raise NoCertifiedProgress(
                     "the Newton-B step makes no certified progress at the EP fixed point "
                     + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
                 )
-            # A certifying step refused for having no fixed point stays certifying at half the length; one whose
-            # move was too large, or an ordinary one, becomes an ordinary shorter trial.
-            keep = certifying and trial_point is None
             if newton.definite:
-                pending[model] = (newton, step, 0.5 * proposal, radius, keep, 0.5 * fraction)
+                shorter = 0.5 * proposal
+                radius = entry.radius
             else:
                 radius = 0.5 * length
                 radii[model] = radius
-                pending[model] = (newton, step, _proposal(newton, radius), radius, keep, 0.5 * fraction)
-
+                shorter = _proposal(newton, radius)
+            pending[model] = replace(entry, hyperparameters=_trial(newton, shorter), proposal=shorter, radius=radius, fraction=0.5 * entry.fraction)
