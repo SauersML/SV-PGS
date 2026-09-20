@@ -486,10 +486,13 @@ class _DensePosterior:
         started = time.perf_counter()
         key = (left, right, diagonal, weight)
         if self._response_key is None or not all(np.array_equal(a, b) for a, b in zip(self._response_key, key)):
-            self._response_factor = linalg.lu_factor(self._response_matrix(left, right, diagonal, weight), overwrite_a=True, check_finite=False)
+            # The matrix is C-ordered: its transpose is the same buffer in Fortran order, which LAPACK factors in
+            # place (a C-ordered one it would copy, a third p x p), and the transposed solve then gives M X = B.
+            matrix = self._response_matrix(left, right, diagonal, weight)
+            self._response_factor = linalg.lu_factor(matrix.T, overwrite_a=True, check_finite=False)
             self._response_key = tuple(np.array(value, copy=True) for value in key)
             self.profile["response_factorizations"] += 1
-        solution = linalg.lu_solve(self._response_factor, np.asarray(rhs, dtype=np.float64), check_finite=False)
+        solution = linalg.lu_solve(self._response_factor, np.asarray(rhs, dtype=np.float64), trans=1, check_finite=False)
         self.profile["response_seconds"] += time.perf_counter() - started
         self.profile["responses"] += 1
         return solution
