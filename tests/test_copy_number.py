@@ -47,3 +47,42 @@ def test_allele_count_records_decode_as_today() -> None:
     scale, origin = allele_count_decode(1)
     assert scale[0] == CODES_PER_DOSAGE and origin[0] == 0
     np.testing.assert_array_equal(decode_values(codes, scale, origin), codes / CODES_PER_DOSAGE)
+
+
+def test_a_copy_number_column_passes_stage_0_as_its_decoded_copy_numbers(tmp_path) -> None:
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.genotype_statistics import compute_genotype_statistics
+    from tests.phenotype_bounds import rounding_gamma
+    from tests.stage0_support import InMemoryTileSource, bubble_groups, mosaic_codes
+
+    rng = np.random.default_rng(29)
+    samples, records, row = 400, 60, 7
+    codes = mosaic_codes(rng, samples, records, hotspot_spacing=60, regular_hotspots=False)
+    copy_numbers = rng.choice([1, 2, 3, 4], size=(1, samples), p=[0.15, 0.6, 0.2, 0.05])
+    scale = copy_number_codes_per_unit(copy_numbers.max(axis=1))
+    codes[row] = encode_copy_numbers(copy_numbers, scale)[0]
+    source = InMemoryTileSource(codes={"chr2": codes}, groups={"chr2": bubble_groups(rng, records)})
+    covariates = np.column_stack([np.ones(samples), rng.normal(size=samples)])
+    targets = rng.normal(size=(samples, 1))
+    budget = ComputeBudget(device_kind="cpu", device_ids=(), device_names=(), device_bytes=(),
+                           device_compute_capabilities=(), host_bytes=8 * 10**9, cpu_threads=2)
+    statistics = compute_genotype_statistics(
+        source, np.arange(samples), covariates, targets, ModelConfig(), budget, 128, tmp_path / "ld"
+    )
+    active = {int(record): index for index, record in enumerate(statistics.active_rows.tolist())}
+    reduced = statistics.tie_map.original_to_reduced[active[row]]
+    block_index = int(statistics.block_of_reduced[reduced])
+    block = statistics.ld.block(block_index)
+    position = int(np.flatnonzero(block.reduced_columns == reduced)[0])
+
+    # The reference works on the decoded values CN - modal CN, never on the codes.
+    modal = modal_copy_numbers(copy_numbers, np.ones_like(copy_numbers, dtype=bool))
+    values = decode_values(codes[[row]], scale, -modal)[0]
+    standardized = (values - values.mean()) / values.std()
+    hat = covariates @ np.linalg.solve(covariates.T @ covariates, covariates.T)
+    projected_x = standardized - hat @ standardized
+    projected_y = targets[:, 0] - hat @ targets[:, 0]
+    expected = projected_x @ projected_y
+    magnitude = np.abs(standardized) @ (np.abs(targets[:, 0]) + np.abs(hat) @ np.abs(targets[:, 0]))
+    assert abs(block.projected_score[position, 0] - expected) <= rounding_gamma(16 * (samples + covariates.shape[1])) * magnitude
