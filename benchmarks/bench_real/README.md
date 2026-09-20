@@ -85,7 +85,7 @@ The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML opt
   - development: every gene bench-real had already scored when the ordering was chosen (genes_already_scored.tsv, 5,430 genes);
   - held out: ranked genes never scored before.
   - Only the held-out stratum, and later the sealed confirmation set, supports discovery claims.
-- **Genome-wide totals** combine the targeted set (a certainty stratum, weight 1) with the random gene-order prefix (weight |U| / n on its genes outside the targeted set), by Horvitz–Thompson weighting (genome_total.py). The standard error is a delete-one-chromosome jackknife.
+- **Genome-wide totals** combine the targeted set (a certainty stratum, weight 1) with the random gene-order prefix (weight |U| / n on its genes outside the targeted set), by Horvitz–Thompson weighting (genome_total.py). The standard error is the design standard error of the random stratum (simple random sampling without replacement, finite-population corrected; the targeted stratum is a census with no design error), plus, when person-bootstrap replicates are given, the measurement variance of the total. A chromosome jackknife is not used here: it would charge the census stratum's between-chromosome heterogeneity (the SV gain is concentrated on chr16) as sampling error.
 
 ## Which open design questions it can answer
 **Can answer, on real biology:**
