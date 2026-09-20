@@ -311,3 +311,31 @@ def test_saved_sv_effects_reproduce_the_sv_part_of_the_prediction(tmp_path):
         sv_part = (window.genotypes[np.ix_(test_index, rows["window_row"].to_numpy())] - rows["train_mean"].to_numpy()) @ rows["effect"].to_numpy()
         # The saved predictions are float32, so the comparison allows one float32 rounding of each prediction.
         assert np.allclose(sv_part, (full - without)[test_index], rtol=0, atol=4 * np.finfo(np.float32).eps * max(np.abs(full).max(), 1.0))
+
+
+def test_duplicate_sv_calls_merge_into_one_event():
+    from benchmarks.bench_real import sv_gene_table
+
+    table = pd.DataFrame({"pos": [100, 5000, 105, 9000], "end": [2100, 5000, 2080, 9500], "sv_length": [2000, 300, 1975, 500]})
+    generator = np.random.default_rng(6)
+    base = generator.binomial(2, 0.3, size=40).astype(np.float64)
+    genotypes = np.column_stack([base, generator.binomial(2, 0.3, size=40), generator.binomial(2, 0.3, size=40), base]).astype(np.float64)
+    labels = sv_gene_table.events(np.arange(4), table, genotypes)
+    # 0 and 2 share a span (reciprocal overlap); 0 and 3 share genotypes (r^2 = 1); 1 stands alone.
+    assert labels[0] == labels[2] == labels[3] != labels[1]
+
+
+def test_gene_row_decomposes_the_sv_part_of_a_real_harness_run(tmp_path):
+    from benchmarks.bench_real import sv_gene_table
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    effects = pd.read_csv(tmp_path / "results/mr_ash/loso/chr1.sv_coefficients.tsv.gz", sep="\t")
+    superdups = tmp_path / "superdups.txt.gz"
+    pd.DataFrame([[0, "chr1", 50, 150]]).to_csv(superdups, sep="\t", header=False, index=False)
+    sv_gene_table.initialize(tmp_path, superdups, effects.groupby("gene_id"))
+    record = sv_gene_table.gene_row("g1")
+    assert record["svs"] == 2 and record["events"] in (1, 2)
+    assert record["effective_events"] >= 1 and 0 <= record["lead_sv_max_r2_with_small_variant"] <= 1
+    assert record["lead_sv_segmental_duplication_fraction"] == 1.0
