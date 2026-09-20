@@ -53,6 +53,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('all_of_us.py', 'MINIMUM_REPORTED_PARTICIPANTS'): ('spec', frozenset({21}), 'All of Us Data and Statistics Dissemination Policy: no count of 1 to 20'),
     ('all_of_us.py', '_age_on'): ('derived', frozenset({7, 365.25}), 'only the birth year is released, so July 1 (month 7) is the unbiased birthday; 365.25-day Julian year'),
     ('cli.py', 'main'): ('spec', frozenset({130}), 'POSIX exit status 128 + SIGINT'),
+    ('krylov_recycle.py', 'block_gcro_dr'): ('derived', frozenset({3}), 'byte accounting: the solution, residual and right-hand side are the three p x r arrays kept beside the cycle'),
     ('code_products.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('code_products.py', 'OPERAND_DIGITS'): ('derived', frozenset({8}), '7 x 8 - 2 >= 53 fp64 mantissa bits (math-epeb)'),
     ('code_products.py', 'INT32_EXACT_DIGIT_ROWS'): ('definitional', frozenset({31}), 'int32 range 2^31 - 1'),
