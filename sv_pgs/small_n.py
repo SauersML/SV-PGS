@@ -38,8 +38,9 @@ per call after that), else works from the factors at O(n^2 p) per column (see ``
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 from scipy import linalg, sparse
@@ -140,14 +141,36 @@ class _Design:
         """Xp' u for u (n,) or (n, q)."""
         return self.spread(self.carriers.T @ self.project(samples))
 
+    def _chunks(self) -> Iterator[slice]:
+        """Column panels n wide: every design pass below keeps its temporaries at n x n."""
+        step = max(1, self.sample_count)
+        for start in range(0, self.group_count, step):
+            yield slice(start, min(start + step, self.group_count))
+
     def weighted_gram(self, weights: F64Array) -> F64Array:
         """Xp diag(w) Xp' (n x n) for w >= 0: G diag(A' w) G', the members' weights summed within their group."""
-        gram = linalg.blas.dsyrk(1.0, self.carriers * np.sqrt(self.group_sum(weights))[None, :])
+        roots = np.sqrt(self.group_sum(weights))
+        gram = np.zeros((self.sample_count, self.sample_count), order="F")
+        for panel in self._chunks():
+            gram = linalg.blas.dsyrk(1.0, self.carriers[:, panel] * roots[None, panel], beta=1.0, c=gram, overwrite_c=True)
         return self.project_both(np.triu(gram) + np.triu(gram, 1).T)
+
+    def signed_gram(self, weights: F64Array) -> F64Array:
+        """Xp diag(w) Xp' (n x n) for weights of either sign."""
+        grouped = self.group_sum(weights)
+        gram = np.zeros((self.sample_count, self.sample_count))
+        for panel in self._chunks():
+            block = self.carriers[:, panel]
+            gram += (block * grouped[None, panel]) @ block.T
+        return self.project_both(0.5 * (gram + gram.T))
 
     def group_quadratic_diagonal(self, core: F64Array) -> F64Array:
         """x_g' core x_g for every group, core (n x n) symmetric with P core P = core."""
-        return np.einsum("ij,ij->j", self.carriers, core @ self.carriers)
+        values = np.empty(self.group_count)
+        for panel in self._chunks():
+            block = self.carriers[:, panel]
+            values[panel] = np.einsum("ij,ij->j", block, core @ block)
+        return values
 
     def quadratic_diagonal(self, core: F64Array) -> F64Array:
         """x_j' core x_j for every member."""
@@ -462,7 +485,10 @@ class _Kernel:
                 bulk_representative=self.bulk[representative],
                 count=np.concatenate([count, np.ones(self.rest.size, dtype=np.int64)]),
                 delta=np.concatenate([1.0 / self.precision[self.bulk[representative]], np.zeros(self.rest.size)]),
-                kernel=self,
+                # A weak reference: a strong one made each kernel and its units a cycle, which reference counting cannot
+                # free, so every Newton point's kernel and its n x p factors outlived the point (svpgs-profiler g3: RSS
+                # rising one factor matrix per Newton step to a MemoryError).
+                owner=weakref.ref(self),
             )
         return self._units
 
@@ -480,6 +506,39 @@ class _Kernel:
         delta = units.delta[units.of_member]
         local = (2.0 * delta * unit_diagonal[units.of_member] + delta * delta) @ np.square(direction)
         return float(np.sum(signs[:, None] * signs[None, :] * middle * middle) + local)
+
+    def hadamard_product(self, weights: F64Array) -> F64Array:
+        """(A'^-1 o A'^-1) W without forming Phi (n x p): with A'^-1 = Delta + E, E = -Phi'Phi + Psi'Psi, it is
+        Delta^2 W + 2 Delta diag(E) W + (E o E) W, and each column of (E o E) b = diag(E diag(b) E) is
+        diag(Phi'Phi B Phi'Phi)_j = d_j^2 x_j' K^-1 G_b K^-1 x_j (G_b = X diag(d^2 b) X'), minus twice
+        diag(Phi'Phi B Psi'Psi)_j = d_j x_j' K^-1 Y psi_j (Y = X diag(d b) Psi'), plus diag(Psi'Psi B Psi'Psi): two design
+        passes and two n x n solves per column, every temporary at most n x n (the design passes are panelled)."""
+        values = np.asarray(weights, dtype=np.float64)
+        count = self.variant_count
+        design = self.design
+        inverse = np.zeros(count)
+        inverse[self.bulk] = self.inverse
+        phi_squares = inverse * inverse * design.quadratic_diagonal(self.core())
+        psi = np.zeros((self.rest.size, count))
+        if self.rest.size:
+            psi_bulk, psi_rest = self.rest_factors()
+            psi[:, self.bulk] = psi_bulk
+            psi[:, self.rest] = psi_rest
+        psi_squares = np.einsum("ij,ij->j", psi, psi)
+        result = (inverse * inverse + 2.0 * inverse * (psi_squares - phi_squares))[:, None] * values
+        for column in range(values.shape[1]):
+            weight = values[:, column]
+            gram = design.signed_gram(inverse * inverse * weight)
+            core = self._kernel_solve(self._kernel_solve(gram).T)
+            both = inverse * inverse * design.quadratic_diagonal(design.project_both(0.5 * (core + core.T)))
+            if self.rest.size:
+                image = design.image((inverse * weight)[:, None] * psi.T)
+                cross = inverse * np.einsum("jr,rj->j", design.back(self.design.project(self._kernel_solve(image))), psi)
+                middle = (psi * weight[None, :]) @ psi.T
+                rest = np.einsum("ij,ij->j", psi, middle @ psi)
+                both = both - 2.0 * cross + rest
+            result[:, column] += both
+        return result
 
     def update_divergence(self, noise: float, precision_step: F64Array, shift_step: F64Array, mean: F64Array) -> float:
         """KL(q || q') to second order for the site change (d tau, d nu), in nats: the Fisher metric of q's natural
@@ -536,7 +595,7 @@ class _Units:
     bulk_representative: I64Array
     count: I64Array
     delta: F64Array
-    kernel: _Kernel
+    owner: Callable[[], _Kernel | None]
     _phi: F64Array | None = None
     _psi: F64Array | None = None
     _sum: object = None
@@ -554,7 +613,8 @@ class _Units:
 
     def factors(self) -> tuple[F64Array, F64Array]:
         if self._phi is None:
-            kernel = self.kernel
+            kernel = self.owner()
+            assert kernel is not None, "a kernel's units outlived it"
             bulk_units = self.bulk_representative.shape[0]
             groups = kernel.design.members[self.bulk_representative]
             phi = np.zeros((kernel.upper.shape[0], self.size), order="F")
@@ -578,15 +638,6 @@ def _symmetrize_upper(matrix: F64Array) -> None:
         matrix[stop:, start:stop] = matrix[start:stop, stop:].T
         block = matrix[start:stop, start:stop]
         block[...] = np.triu(block) + np.triu(block, 1).T
-
-
-def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -> F64Array:
-    """((L'L) o (R'R)) W, column by column: out_jc = l_j' (L diag(w_c) R') r_j."""
-    result = np.empty_like(weights)
-    for column in range(weights.shape[1]):
-        core = (left * weights[:, column][None, :]) @ right.T
-        result[:, column] = np.einsum("ij,ij->j", left, core @ right)
-    return result
 
 
 class _DensePosterior:
@@ -645,14 +696,7 @@ class _DensePosterior:
             squared, local = self._explicit()
             result = -((squared @ units.sum(values))[units.of_member] + local[units.of_member][:, None] * values)
         else:
-            delta, phi, psi = self.kernel.factors()
-            phi_squares = np.einsum("ij,ij->j", phi, phi)
-            psi_squares = np.einsum("ij,ij->j", psi, psi)
-            local = (delta * delta - 2.0 * delta * phi_squares + 2.0 * delta * psi_squares)[:, None] * values
-            nonlocal_part = _hadamard_gram_product(phi, phi, values)
-            if psi.shape[0]:
-                nonlocal_part += _hadamard_gram_product(psi, psi, values) - 2.0 * _hadamard_gram_product(phi, psi, values)
-            result = -(self.noise * self.noise) * (local + nonlocal_part)
+            result = -(self.noise * self.noise) * self.kernel.hadamard_product(values)
         self.profile["jvp_seconds"] += time.perf_counter() - started
         self.profile["jvp_columns"] += int(values.shape[1])
         return result[:, 0] if column else result
@@ -824,6 +868,78 @@ def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     return variance, -0.5 * (third + 2.0 * mean * variance), 0.25 * (fourth + 2.0 * variance**2 + 4.0 * mean * third + 4.0 * mean**2 * variance)
 
 
+def _hessian_product(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict) -> Callable[[F64Array], F64Array]:
+    """v -> H v for Phi's Hessian H = Cov_q + Cov_r in (nu, tau) at ``point`` (``_newton_step``)."""
+    size = point.mean.shape[0]
+    mean = point.mean
+    posterior = _DensePosterior(point.kernel, noise, jvp_bytes, profile)
+    a_r, b_r, c_r = _site_blocks(point)
+
+    def product(vector: F64Array) -> F64Array:
+        shift_part, precision_part = vector[:size], vector[size:]
+        weighted = posterior.solve(shift_part - mean * precision_part, 0.0)
+        return np.concatenate([
+            weighted + a_r * shift_part + b_r * precision_part,
+            -mean * weighted - 0.5 * posterior.variance_jvp(precision_part) + b_r * shift_part + c_r * precision_part,
+        ])
+
+    return product
+
+
+def _segment_start(
+    design: _Design, noise: float, data_score: F64Array, precision: F64Array, shift: F64Array, marginal_precision: F64Array,
+    marginal_shift: F64Array, cavity_precision: F64Array, tilted: Tilted, largest_variance: F64Array, jvp_bytes: int, profile: dict,
+) -> _LoopPoint | None:
+    """The inner problem's start when q's cavities at the current sites theta* leave its domain (theory-ep, THEORY_EP.md
+    section 7): on the segment theta(s) = theta0 + s (theta* - theta0) from the sites equal to q's new marginals, theta0
+    (every cavity zero, the precision definite), every cavity is s times q's cavity at theta*, and the precision stays
+    definite (a convex combination of two definite ones). The domain is then s < s_j = 1 / (v_j (-P*_j)) for each
+    negative cavity precision P*_j, and the start is the minimizer of the convex Phi on [0, min(1, min_j s_j)), where
+    Phi is +inf at the boundary: safeguarded Newton on s, with its derivative g'd and curvature d'Hd, bracketed by the
+    derivative's sign, until its decrement is below Phi's rounding. The inner problem's minimizer does not depend on
+    the start, so this only shortens the inner solve. None where a computed tilted variance is 0 (N1)."""
+    size = precision.shape[0]
+    direction = np.concatenate([shift - marginal_shift, precision - marginal_precision])
+    negative = cavity_precision < 0.0
+    limits = np.where(negative, 1.0 / np.where(negative, largest_variance * -cavity_precision, 1.0), np.inf)
+    upper = min(1.0, float(np.min(limits)) if limits.size else 1.0)
+    profile["double_loop_projected_starts"] += 1
+
+    def at(fraction: float) -> _LoopPoint | None:
+        profile["segment_evaluations"] += 1
+        return _loop_point(
+            design, noise, data_score, marginal_precision + fraction * direction[size:], marginal_shift + fraction * direction[:size],
+            marginal_precision, marginal_shift, tilted, largest_variance,
+        )
+
+    def slope_and_curvature(point: _LoopPoint) -> tuple[float, float]:
+        return float(point.gradient @ direction), float(direction @ _hessian_product(point, noise, jvp_bytes, profile)(direction))
+
+    lower, fraction = 0.0, 0.0
+    point = at(0.0)
+    if point is None:
+        return None
+    slope, curvature = slope_and_curvature(point)
+    while slope < 0.0 and curvature > 0.0 and slope * slope / curvature > _EPSILON * abs(point.value):
+        trial = fraction - slope / curvature
+        if not lower < trial < upper:
+            trial = 0.5 * (lower + upper)
+        if trial in (lower, upper, fraction):
+            break
+        candidate = at(trial)
+        if candidate is None:
+            upper = trial
+            continue
+        candidate_slope, candidate_curvature = slope_and_curvature(candidate)
+        if candidate_slope < 0.0:
+            lower = trial
+        else:
+            upper = trial
+        if candidate.value <= point.value:
+            fraction, point, slope, curvature = trial, candidate, candidate_slope, candidate_curvature
+    return point
+
+
 def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict) -> tuple[F64Array, float]:
     """A Newton step s ~ -H^-1 g of Phi and its decrement -g's, by conjugate gradients on H = Cov_q + Cov_r.
 
@@ -835,17 +951,9 @@ def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict)
     by the 2 x 2 site blocks of H."""
     size = point.mean.shape[0]
     mean = point.mean
-    posterior = _DensePosterior(point.kernel, noise, jvp_bytes, profile)
     a_r, b_r, c_r = _site_blocks(point)
     a_h, b_h, c_h = a_r + point.variance, b_r - point.variance * mean, c_r + 0.5 * point.variance**2 + mean**2 * point.variance
-
-    def product(vector: F64Array) -> F64Array:
-        shift_part, precision_part = vector[:size], vector[size:]
-        weighted = posterior.solve(shift_part - mean * precision_part, 0.0)
-        return np.concatenate([
-            weighted + a_r * shift_part + b_r * precision_part,
-            -mean * weighted - 0.5 * posterior.variance_jvp(precision_part) + b_r * shift_part + c_r * precision_part,
-        ])
+    product = _hessian_product(point, noise, jvp_bytes, profile)
 
     def block_solve(vector: F64Array, a: F64Array, b: F64Array, c: F64Array) -> F64Array:
         determinant = a * c - b * b
@@ -882,7 +990,7 @@ def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict)
 
 def double_loop_sites(
     design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted,
-    largest_variance: F64Array, draw_count: int, jvp_bytes: int, profile: dict,
+    largest_variance: F64Array, draw_count: int, jvp_bytes: int, profile: dict, trace: list | None = None,
 ) -> tuple[F64Array, F64Array]:
     """EP's sites at fixed hyperparameters and noise by the Opper-Winther double loop, which provably reaches a
     stationary point of the EP free energy (MODEL.md section 4's fallback; ``tests/ep_eb_reference.double_loop_sites``).
@@ -913,6 +1021,9 @@ def double_loop_sites(
         raise ValueError("the EP double loop's start leaves the precision not positive definite")
     while True:
         profile["double_loop_outer"] += 1
+        if trace is not None:
+            # Verification only (theory-ep's exact decrease check): the EC free energy at each outer step's start.
+            trace.append(_ec_free_energy(design, noise, data_score, precision, shift, tilted, largest_variance))
         kernel = _Kernel(design, noise * precision)
         mean = kernel.solve(data_score + noise * shift)
         variances, _removed, cavity_scaled = kernel.cavity()
@@ -931,25 +1042,27 @@ def double_loop_sites(
                 return precision, shift
             reseeded = False
         else:
+            reseeded = True
+        if reseeded:
             # The outer step sets the frozen marginals to q's (CCCP), and q's own cavity 1/z - tau can then be improper
             # (a tilted law can be wider than its cavity, so the inner optimum's marginals, the tilted moments at its
             # proper inner cavities, need not leave 1/z - tau proper; fit-api rwAMR [real]). Such sites are no fixed
-            # point (every fixed point's cavities are proper) and are never evaluated; they only start the inner
-            # problem, whose convex minimizer does not depend on its start. The start is moved into its domain: the
-            # improper sites to the marginals' own (a zero cavity), and every site there if that leaves the precision
-            # not positive definite (all positive then, so it is definite, and every cavity is zero: in the domain).
+            # point (every fixed point's cavities are proper) and are never evaluated; the inner problem starts on the
+            # segment toward the sites equal to q's new marginals (``_segment_start``), and its convex minimizer does
+            # not depend on the start.
             profile["double_loop_reseeds"] += 1
-            precision, shift = precision.copy(), shift.copy()
-            precision[~proper], shift[~proper] = marginal_precision[~proper], marginal_shift[~proper]
-            if not _positive_definite(design, noise, precision):
-                precision, shift = marginal_precision.copy(), marginal_shift.copy()
-            reseeded = True
-        point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
+            point = _segment_start(
+                design, noise, data_score, precision, shift, marginal_precision, marginal_shift, cavity_precision, tilted, largest_variance,
+                jvp_bytes, profile,
+            )
+        else:
+            point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
-            # The start is in the inner domain (the precision is definite, and every inner cavity is either q's proper
-            # cavity or zero), so only a tilted moment can fail: a computed variance of 0 (the engine's below-floor
-            # approximation, N1), which no finite site matches.
+            # The start is in the inner domain (the precision is definite, and every inner cavity is q's proper cavity,
+            # or on the segment a fraction of it inside the boundary), so only a tilted moment can fail: a computed
+            # variance of 0 (the engine's below-floor approximation, N1), which no finite site matches.
             raise NoFixedPoint("a computed tilted variance is 0 at the double loop's cavities: no finite EP site")
+        precision, shift = point.site_precision, point.site_shift
         start_precision, start_shift = precision.copy(), shift.copy()
         polish_decrement: float | None = None
         polish_origin = point
@@ -1015,6 +1128,76 @@ def _log_evidence(design: _Design, noise: float, data_score: F64Array, site_prec
     )
 
 
+def _ec_free_energy(
+    design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted,
+    largest_variance: F64Array,
+) -> float:
+    """The EC free energy F(eta) = A_q*(eta) + A_s*(eta) - A_r*(eta) at q's diagonal moments eta (theory-ep, THEORY_EP.md
+    section 7): the quantity the double loop's outer steps lower, so its decrease can be verified rather than assumed.
+    At an EP fixed point it equals -log Z_EP (``_log_evidence``) exactly.
+
+    A_q*(eta) = theta . eta - A_q(theta) at q's own sites; A_r*(eta) = -1/2 sum_j log(2 pi e z_j), the Gaussian's; and
+    A_s*(eta) = sum_j sup_lambda (lambda . eta_j - log Z~_j(lambda)), each a 2-D convex problem over the cavity lambda =
+    (h, P) whose tilted moments match eta_j: Newton on it with the tilted covariance of (beta, -beta^2 / 2) as its Hessian,
+    sufficient-decrease halving inside the tilted law's domain (1 + v_max P > 0), from q's own cavity where proper and
+    the zero cavity elsewhere, until no decrement exceeds its value's rounding."""
+    kernel = _Kernel(design, noise * site_precision)
+    right = data_score + noise * site_shift
+    mean = kernel.solve(right)
+    variances, _removed, cavity_scaled = kernel.cavity()
+    variance = noise * variances
+    count = mean.shape[0]
+    second = variance + np.square(mean)
+    theta_eta = float(site_shift @ mean) - 0.5 * float(site_precision @ second)
+    log_partition_q = 0.5 * float(right @ mean) / noise - 0.5 * (kernel.log_determinant() - count * float(np.log(noise))) + 0.5 * count * float(np.log(2.0 * np.pi))
+    entropy_r = -0.5 * float(np.sum(np.log(2.0 * np.pi * variance) + 1.0))
+    # A_s*: per site, the cavity whose tilted law has q's marginal moments.
+    cavity = cavity_scaled / noise
+    precision = np.where(1.0 + largest_variance * cavity > 0.0, cavity, 0.0)
+    shift = np.where(1.0 + largest_variance * cavity > 0.0, mean / variance - site_shift, 0.0)
+
+    def objective(precision_values: F64Array, shift_values: F64Array) -> tuple[F64Array, tuple[F64Array, ...]]:
+        values = tilted(precision_values, shift_values)
+        log_normalizer = values[0]
+        return log_normalizer - (shift_values * mean - 0.5 * precision_values * second), values
+
+    value, moments = objective(precision, shift)
+    live = np.ones(count, dtype=bool)
+    while np.any(live):
+        _log_normalizer, tilted_mean, tilted_variance, third, fourth = moments
+        gradient_shift = tilted_mean - mean
+        gradient_precision = -0.5 * (tilted_variance + np.square(tilted_mean) - second)
+        a, b, c = tilted_variance, -0.5 * (third + 2.0 * tilted_mean * tilted_variance), 0.25 * (fourth + 2.0 * tilted_variance**2 + 4.0 * tilted_mean * third + 4.0 * tilted_mean**2 * tilted_variance)
+        determinant = a * c - b * b
+        step_shift = -(c * gradient_shift - b * gradient_precision) / determinant
+        step_precision = -(a * gradient_precision - b * gradient_shift) / determinant
+        decrement = -(gradient_shift * step_shift + gradient_precision * step_precision)
+        live &= decrement > _EPSILON * np.maximum(np.abs(value), 1.0)
+        if not np.any(live):
+            break
+        fraction = np.where(live, 1.0, 0.0)
+        accepted = ~live
+        while not np.all(accepted):
+            trial_precision = np.where(accepted, precision, precision + fraction * step_precision)
+            trial_shift = np.where(accepted, shift, shift + fraction * step_shift)
+            inside = 1.0 + largest_variance * trial_precision > 0.0
+            safe_precision = np.where(inside, trial_precision, precision)
+            safe_shift = np.where(inside, trial_shift, shift)
+            trial_value, trial_moments = objective(safe_precision, safe_shift)
+            model = fraction * (1.0 - 0.5 * fraction) * decrement
+            good = inside & (trial_value <= value - 0.5 * model) & ~accepted
+            precision, shift = np.where(good, trial_precision, precision), np.where(good, trial_shift, shift)
+            value = np.where(good, trial_value, value)
+            moments = tuple(np.where(good, trial, current) for trial, current in zip(trial_moments, moments))
+            accepted |= good
+            fraction = np.where(accepted, fraction, 0.5 * fraction)
+            stalled = ~accepted & (fraction * np.maximum(np.abs(step_precision), np.abs(step_shift)) <= _EPSILON * (1.0 + np.maximum(np.abs(precision), np.abs(shift))))
+            live &= ~stalled
+            accepted |= stalled
+    conjugate_s = float(np.sum(-value))
+    return theta_eta - log_partition_q + conjugate_s - entropy_r
+
+
 def _best_double_loop(
     design: _Design, noise: float, data_score: F64Array, starts: Sequence[tuple[F64Array, F64Array]], tilted: Tilted, largest_variance: F64Array,
     draw_count: int, jvp_bytes: int, profile: dict,
@@ -1043,7 +1226,7 @@ def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
         "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
-        "double_loop_reseeds", "repairs", "repair_rounds", "repair_active_max",
+        "double_loop_reseeds", "double_loop_projected_starts", "segment_evaluations", "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
@@ -1286,6 +1469,7 @@ class _DenseFixedPoints:
 
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
+        previous_divergence: float | None = None
         while True:
             variances, frozen = self._refresh(hyperparameters)
             mean = self.mean.copy()
@@ -1295,6 +1479,13 @@ class _DenseFixedPoints:
             # posterior metric is r' Sigma r, exactly.
             divergence = self.kernel.update_divergence(self.noise, target_precision - self.site_precision, target_shift - self.site_shift, mean)
             self.mean_move = 2.0 * divergence
+            # The check bounds the undamped step, and the distance to the fixed point is the step over 1 - rho, rho
+            # the iteration's rate: KL_step / (1 - rho)^2, with rho = sqrt(KL_t / KL_(t-1)) from successive refreshes
+            # (theory-ep: no extra build; the step's own KL where no rate is known yet, and no certificate while the
+            # iteration does not contract).
+            rate = float(np.sqrt(divergence / previous_divergence)) if previous_divergence else 0.0
+            distance = divergence / (1.0 - rate) ** 2 if rate < 1.0 else np.inf
+            previous_divergence = divergence
             noise = self._noise(variances)
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
             # The fixed point is certified in evidence units, as every other certificate: the undamped update moves q
@@ -1303,7 +1494,7 @@ class _DenseFixedPoints:
             # to p_eff (the scorer's Monte Carlo resolution, p_eff / K) goes to rounding where the prior collapses
             # (p_eff -> 0 at an edge trial), and EP then ran for minutes on the move's own rounding before refusing;
             # there the KL is second order in the prior's scale and the check passes at the first refresh.
-            if divergence <= tolerance and self.noise_gain <= tolerance:
+            if distance <= tolerance and self.noise_gain <= tolerance:
                 # Each fixed point alive at once (the outer loop holds the current one and one trial) gets an equal share
                 # of the working memory for its posterior's p x p matrices. The exact response replaces the curvature's
                 # GMRES, whose memory it takes; where it does not fit, GMRES has half (``fit_small_n``).

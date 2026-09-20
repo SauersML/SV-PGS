@@ -432,6 +432,9 @@ def test_tie_members_keep_their_own_sites_exactly(negative, regime):
     weights = rng.standard_normal((count, 4))
     posterior = _DensePosterior(kernel, noise, 10**9, _new_profile())
     np.testing.assert_allclose(posterior.variance_jvp(weights), -(sigma * sigma) @ weights, rtol=1e-9, atol=1e-11)
+    # Without the memory for Sigma o Sigma: the Phi-free route (n x n forms and design passes only).
+    unformed = _DensePosterior(kernel, noise, 0, _new_profile())
+    np.testing.assert_allclose(unformed.variance_jvp(weights), -(sigma * sigma) @ weights, rtol=1e-9, atol=1e-11)
     left, gain, diagonal, weight = (rng.standard_normal(count) for _ in range(4))
     for vector in (left, gain, diagonal, weight):
         vector[[1, 2]] = vector[0]
@@ -752,8 +755,40 @@ def test_the_double_loop_never_evaluates_an_improper_cavity(monkeypatch):
         pytest.skip("no definite start with an improper doubleton cavity on this draw")
     shift = np.zeros(variants)
     profile = _new_profile()
-    got_precision, got_shift = double_loop_sites(dense, noise, design.T @ target, precision, shift, tilted, largest, 64, 10**9, profile)
-    assert calls["improper"] == 0 and profile["double_loop_reseeds"] >= 1
+    trace = []
+    got_precision, got_shift = double_loop_sites(dense, noise, design.T @ target, precision, shift, tilted, largest, 64, 10**9, profile, trace)
+    assert calls["improper"] == 0 and profile["double_loop_reseeds"] >= 1 and profile["double_loop_projected_starts"] >= 1
+    # theory-ep's exact decrease check: the EC free energy never rises across outer steps (to its rounding).
+    assert len(trace) >= 2
+    assert all(later <= earlier + 1e-9 * max(1.0, abs(earlier)) for earlier, later in zip(trace, trace[1:])), trace
     kernel = _Kernel(dense, noise * got_precision)
     cavity_precision = kernel.cavity()[2] / noise
     assert np.all(1.0 + largest * cavity_precision > 0.0)
+
+
+
+def test_the_ec_free_energy_is_minus_log_z_ep_at_a_fixed_point(monkeypatch):
+    """At an EP fixed point the EC free energy F(eta) (``_ec_free_energy``, per-site conjugates by 2-D Newton) equals
+    -log Z_EP (``_log_evidence``) exactly: the per-site inversion recovers the fixed point's own cavities."""
+    import tests.ep_eb_reference as reference
+    from sv_pgs.small_n import _ec_free_energy, _log_evidence
+    from sv_pgs.scale_mixture_ep import moment_matched_prior_sites
+
+    noise = 0.6
+    design, target, prior, hyperparameters, tilted, largest = _engine_problem(54, 14, 9, noise)
+
+    def power_moments(_prior, _vector, cavity_precision, cavity_shift):
+        log_normalizer, mean, variance, third, fourth = tilted(cavity_precision, cavity_shift)
+        return {
+            "log_normalizer": log_normalizer, "first": mean, "second": variance + mean**2, "third": third + 3.0 * mean * variance + mean**3,
+            "fourth": fourth + 3.0 * variance**2 + 4.0 * mean * third + 6.0 * mean**2 * variance + mean**4,
+        }
+
+    monkeypatch.setattr(reference, "tilted_power_moments", power_moments)
+    precision, shift = moment_matched_prior_sites(prior, hyperparameters)
+    likelihood_precision, linear_term = design.T @ design / noise, design.T @ target / noise
+    vector = np.zeros(1)
+    fixed = reference.solve_sites(None, vector, likelihood_precision, linear_term, reference.site_state(None, vector, likelihood_precision, linear_term, precision, shift))
+    dense, score = _Design.dense(design), design.T @ target
+    free_energy = _ec_free_energy(dense, noise, score, fixed.site_precision, fixed.site_shift, tilted, largest)
+    np.testing.assert_allclose(free_energy, -_log_evidence(dense, noise, score, fixed.site_precision, fixed.site_shift, tilted), rtol=1e-9)

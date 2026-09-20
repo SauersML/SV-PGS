@@ -136,6 +136,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('krylov_recycle.py', 'block_gcro_dr'): ('derived', frozenset({3}), 'byte accounting: the solution, residual and right-hand side are the three p x r arrays kept beside the cycle'),
     ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
     ('small_n.py', '_DenseFixedPoints._tilted_rows.tilted'): ('math', frozenset({3.0, 4, 6.0}), 'central moments of a Gaussian component: E[(d + sqrt(c) Z)^3] = d^3 + 3 d c, E[(d + sqrt(c) Z)^4] = d^4 + 6 d^2 c + 3 c^2; kappa4 = m4 - 3 m2^2'),
+    ('small_n.py', '_ec_free_energy'): ('math', frozenset({0.25, 4.0}), 'the tilted covariance of (beta, -beta^2/2) from its central moments, the Hessian of the per-site conjugate: Var(beta^2)/4 = (k4 + 2v^2 + 4 m k3 + 4 m^2 v)/4'),
     ('small_n.py', '_site_blocks'): ('math', frozenset({0.25, 4.0}), 'the covariance of the statistics (beta, -beta^2/2) from the tilted central moments: Var(beta^2)/4 = (k4 + 2v^2 + 4 m k3 + 4 m^2 v)/4'),
     ('small_n.py', '_Kernel.update_divergence'): ('math', frozenset({0.25}), 'the second-order KL of a site change: the Fisher metric of (beta, -beta^2/2), 1/2 r Sigma r + 1/4 dtau (Sigma o Sigma) dtau'),
     ('store_converter.py', 'IMPUTATION_ERROR_RATE'): ('external-config', frozenset({0.001}), 'GLIMPSE2 --err-imp of the aou2_50k imputation run; the removed background is an exact function of it'),
