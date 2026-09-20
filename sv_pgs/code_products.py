@@ -293,29 +293,42 @@ class CodeBlockTile:
     @classmethod
     def from_aligned(
         cls, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
-        array_module: ModuleType, workspace_bytes: int,
+        array_module: ModuleType, workspace_bytes: int, sample_major: tuple[Any, int] | None = None,
     ) -> CodeBlockTile:
         """A tile over codes the caller already holds in an ``INT8_GEMM_ALIGNMENT``-aligned buffer (a
         streamed block's device buffer, say), without copying them. The alignment padding, at most
         three rows and three columns, is cleared in place. ``scale_spread`` is max(scales) /
-        min(scales), which the caller knows on the host (so the tile never waits on the device)."""
+        min(scales), which the caller knows on the host (so the tile never waits on the device).
+
+        ``sample_major`` is ``(codes_t, column)`` when the caller also holds the same codes sample-major: a
+        C-contiguous int8 [padded samples, lead] array with ``codes_t[i, column + j] == aligned_codes[j, i]``
+        (``column`` a multiple of ``INT8_GEMM_ALIGNMENT``). The products that reduce over variants then read
+        it directly instead of transposing each sample chunk of the codes (CUDA)."""
         codes = array_module.asarray(aligned_codes)
         if codes.dtype != array_module.int8 or codes.shape != (_aligned(variant_count), _aligned(sample_count)):
             raise ValueError(f"aligned_codes must be int8 [{_aligned(variant_count)}, {_aligned(sample_count)}]")
         codes[variant_count:] = 0
         codes[:, sample_count:] = 0
+        if sample_major is not None:
+            major, column = sample_major
+            if (
+                major.dtype != array_module.int8 or major.ndim != 2 or not major.flags.c_contiguous or int(major.shape[0]) != int(codes.shape[1])
+                or column % INT8_GEMM_ALIGNMENT or column + int(codes.shape[0]) > int(major.shape[1])
+            ):
+                raise ValueError("sample_major must be C-contiguous int8 [padded samples, lead] holding this tile's aligned columns")
         tile = cls.__new__(cls)
-        tile._hold(codes, int(variant_count), int(sample_count), means, scales, float(scale_spread), array_module, workspace_bytes)
+        tile._hold(codes, int(variant_count), int(sample_count), means, scales, float(scale_spread), array_module, workspace_bytes, sample_major)
         return tile
 
     def _hold(
         self, aligned_codes: Any, variant_count: int, sample_count: int, means: Any, scales: Any, scale_spread: float,
-        array_module: ModuleType, workspace_bytes: int,
+        array_module: ModuleType, workspace_bytes: int, sample_major: tuple[Any, int] | None = None,
     ) -> None:
         self._array_module = array_module
         self._scale_spread = scale_spread
         self._variant_count, self._sample_count = variant_count, sample_count
         self._codes = aligned_codes
+        self._sample_major = sample_major
         self._means = array_module.asarray(means, dtype=array_module.float64)
         self._scales = array_module.asarray(scales, dtype=array_module.float64)
         if self._means.shape != (variant_count,) or self._scales.shape != (variant_count,):
@@ -329,6 +342,32 @@ class CodeBlockTile:
     @property
     def sample_count(self) -> int:
         return self._sample_count
+
+    @property
+    def aligned_codes(self) -> Any:
+        """The held int8 codes [variants, samples], zero-padded to ``INT8_GEMM_ALIGNMENT`` on both axes."""
+        return self._codes
+
+    @property
+    def means(self) -> Any:
+        return self._means
+
+    @property
+    def scales(self) -> Any:
+        return self._scales
+
+    @property
+    def scale_spread(self) -> float:
+        return self._scale_spread
+
+    def _variant_contiguous(self, start: int, stop: int) -> tuple[Any, int, int]:
+        """(left, byte offset, lead) of samples start..stop with each sample's variants contiguous, the TN
+        GEMM's operand when a product reduces over variants: the held sample-major codes, else a transpose."""
+        if self._sample_major is None:
+            return _transpose_codes(self._array_module, self._codes, start, stop), 0, int(self._codes.shape[0])
+        major, column = self._sample_major
+        lead = int(major.shape[1])
+        return major, start * lead + column, lead
 
     def matmat(self, right: Any) -> Any:
         """X_b @ right for right of shape (p_b, K); returns (n, K)."""
@@ -372,18 +411,20 @@ class CodeBlockTile:
             represented = recombine_digit_products(digits.astype(xp.int32), scale, xp)[: self._variant_count]
             offset = self._means @ represented
         digit_columns = digit_count * columns
-        # fixed: the operand and its digits; per sample: its variant-contiguous codes and integer products
+        # fixed: the operand and its digits; per sample: its variant-contiguous codes (unless held sample-major)
+        # and integer products
         fixed = _FLOAT64_BYTES * variants * columns + digit_columns * variants
-        chunk = self._sample_chunk(fixed, variants + _INT32_BYTES * digit_columns, samples)
+        transposed = variants if self._sample_major is None else 0
+        chunk = self._sample_chunk(fixed, transposed + _INT32_BYTES * digit_columns, samples)
         products = xp.empty((chunk, digit_columns), dtype=xp.int32, order="F")
         kernel, warp = _cuda_kernel(xp, "accumulate_recombined")
         scale, offset = xp.ascontiguousarray(scale), xp.ascontiguousarray(offset)
         for start in range(0, min(samples, self._sample_count), chunk):
             stop = min(start + chunk, samples)
-            variant_contiguous = _transpose_codes(xp, self._codes, start, stop)
+            left, left_offset, left_lead = self._variant_contiguous(start, stop)
             _cuda_int8_gemm(
                 xp, rows=stop - start, columns=digit_columns, depth=variants,
-                left=variant_contiguous, left_offset=0, left_lead=variants,
+                left=left, left_offset=left_offset, left_lead=left_lead,
                 right=digits, right_lead=variants, output=products, output_lead=chunk,
             )
             rows = min(stop, self._sample_count) - start
@@ -608,16 +649,16 @@ class CodeBlockTile:
         # fixed: the operand, its digits and the output; per sample: its variant-contiguous codes,
         # its integer products and two fp64 recombination terms
         fixed = _FLOAT64_BYTES * variants * columns + digit_columns * variants + output_bytes
-        per_sample = variants + _INT32_BYTES * digit_columns + 2 * _FLOAT64_BYTES * columns
+        per_sample = (variants if self._sample_major is None else 0) + _INT32_BYTES * digit_columns + 2 * _FLOAT64_BYTES * columns
         chunk = self._sample_chunk(fixed, per_sample, samples)
         products = xp.empty((chunk, digit_columns), dtype=xp.int32, order="F")
         out = xp.empty((samples, columns), dtype=xp.float64)
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
-            variant_contiguous = _transpose_codes(xp, self._codes, start, stop)
+            left, left_offset, left_lead = self._variant_contiguous(start, stop)
             _cuda_int8_gemm(
                 xp, rows=stop - start, columns=digit_columns, depth=variants,
-                left=variant_contiguous, left_offset=0, left_lead=variants,
+                left=left, left_offset=left_offset, left_lead=left_lead,
                 right=digits, right_lead=variants, output=products, output_lead=chunk,
             )
             out[start:stop] = recombine_digit_products(products[: stop - start], scale, xp)

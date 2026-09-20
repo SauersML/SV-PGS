@@ -86,6 +86,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('dual_solve.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('engine_kernels.py', '_tilted_row_bytes'): ('derived', frozenset({3}), "byte accounting of a chunk's device copies: its three float64 inputs (log u, P, h)"),
     ('engine_kernels.py', '_objective_row_bytes'): ('derived', frozenset({6}), "byte accounting of a chunk's device arrays: three float64 inputs, two outputs and the |log Z| temporary per row"),
+    ('resident_codes.py', 'read_tile_rows'): ('derived', frozenset({3}), "byte accounting of CodeBlockTile._codes_times: the fp64 total and two recombination terms per row"),
     ('external_annotations.py', 'TIER_COORDINATE'): ('definitional', frozenset({3}), 'enum code; (chromosome << 32 | position) site key'),
     ('external_annotations.py', 'MOTIF_MULTIPLES'): ('spec', frozenset({3}), 'TRF reports a period, or twice or three times it'),
     ('external_annotations.py', '_SITE_STRIDE'): ('definitional', frozenset({32}), 'enum code; (chromosome << 32 | position) site key'),
