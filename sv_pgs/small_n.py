@@ -824,6 +824,78 @@ def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     return variance, -0.5 * (third + 2.0 * mean * variance), 0.25 * (fourth + 2.0 * variance**2 + 4.0 * mean * third + 4.0 * mean**2 * variance)
 
 
+def _hessian_product(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict) -> Callable[[F64Array], F64Array]:
+    """v -> H v for Phi's Hessian H = Cov_q + Cov_r in (nu, tau) at ``point`` (``_newton_step``)."""
+    size = point.mean.shape[0]
+    mean = point.mean
+    posterior = _DensePosterior(point.kernel, noise, jvp_bytes, profile)
+    a_r, b_r, c_r = _site_blocks(point)
+
+    def product(vector: F64Array) -> F64Array:
+        shift_part, precision_part = vector[:size], vector[size:]
+        weighted = posterior.solve(shift_part - mean * precision_part, 0.0)
+        return np.concatenate([
+            weighted + a_r * shift_part + b_r * precision_part,
+            -mean * weighted - 0.5 * posterior.variance_jvp(precision_part) + b_r * shift_part + c_r * precision_part,
+        ])
+
+    return product
+
+
+def _segment_start(
+    design: _Design, noise: float, data_score: F64Array, precision: F64Array, shift: F64Array, marginal_precision: F64Array,
+    marginal_shift: F64Array, cavity_precision: F64Array, tilted: Tilted, largest_variance: F64Array, jvp_bytes: int, profile: dict,
+) -> _LoopPoint | None:
+    """The inner problem's start when q's cavities at the current sites theta* leave its domain (theory-ep, THEORY_EP.md
+    section 7): on the segment theta(s) = theta0 + s (theta* - theta0) from the sites equal to q's new marginals, theta0
+    (every cavity zero, the precision definite), every cavity is s times q's cavity at theta*, and the precision stays
+    definite (a convex combination of two definite ones). The domain is then s < s_j = 1 / (v_j (-P*_j)) for each
+    negative cavity precision P*_j, and the start is the minimizer of the convex Phi on [0, min(1, min_j s_j)), where
+    Phi is +inf at the boundary: safeguarded Newton on s, with its derivative g'd and curvature d'Hd, bracketed by the
+    derivative's sign, until its decrement is below Phi's rounding. The inner problem's minimizer does not depend on
+    the start, so this only shortens the inner solve. None where a computed tilted variance is 0 (N1)."""
+    size = precision.shape[0]
+    direction = np.concatenate([shift - marginal_shift, precision - marginal_precision])
+    negative = cavity_precision < 0.0
+    limits = np.where(negative, 1.0 / np.where(negative, largest_variance * -cavity_precision, 1.0), np.inf)
+    upper = min(1.0, float(np.min(limits)) if limits.size else 1.0)
+    profile["double_loop_projected_starts"] += 1
+
+    def at(fraction: float) -> _LoopPoint | None:
+        profile["segment_evaluations"] += 1
+        return _loop_point(
+            design, noise, data_score, marginal_precision + fraction * direction[size:], marginal_shift + fraction * direction[:size],
+            marginal_precision, marginal_shift, tilted, largest_variance,
+        )
+
+    def slope_and_curvature(point: _LoopPoint) -> tuple[float, float]:
+        return float(point.gradient @ direction), float(direction @ _hessian_product(point, noise, jvp_bytes, profile)(direction))
+
+    lower, fraction = 0.0, 0.0
+    point = at(0.0)
+    if point is None:
+        return None
+    slope, curvature = slope_and_curvature(point)
+    while slope < 0.0 and curvature > 0.0 and slope * slope / curvature > _EPSILON * abs(point.value):
+        trial = fraction - slope / curvature
+        if not lower < trial < upper:
+            trial = 0.5 * (lower + upper)
+        if trial in (lower, upper, fraction):
+            break
+        candidate = at(trial)
+        if candidate is None:
+            upper = trial
+            continue
+        candidate_slope, candidate_curvature = slope_and_curvature(candidate)
+        if candidate_slope < 0.0:
+            lower = trial
+        else:
+            upper = trial
+        if candidate.value <= point.value:
+            fraction, point, slope, curvature = trial, candidate, candidate_slope, candidate_curvature
+    return point
+
+
 def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict) -> tuple[F64Array, float]:
     """A Newton step s ~ -H^-1 g of Phi and its decrement -g's, by conjugate gradients on H = Cov_q + Cov_r.
 
@@ -835,17 +907,9 @@ def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict)
     by the 2 x 2 site blocks of H."""
     size = point.mean.shape[0]
     mean = point.mean
-    posterior = _DensePosterior(point.kernel, noise, jvp_bytes, profile)
     a_r, b_r, c_r = _site_blocks(point)
     a_h, b_h, c_h = a_r + point.variance, b_r - point.variance * mean, c_r + 0.5 * point.variance**2 + mean**2 * point.variance
-
-    def product(vector: F64Array) -> F64Array:
-        shift_part, precision_part = vector[:size], vector[size:]
-        weighted = posterior.solve(shift_part - mean * precision_part, 0.0)
-        return np.concatenate([
-            weighted + a_r * shift_part + b_r * precision_part,
-            -mean * weighted - 0.5 * posterior.variance_jvp(precision_part) + b_r * shift_part + c_r * precision_part,
-        ])
+    product = _hessian_product(point, noise, jvp_bytes, profile)
 
     def block_solve(vector: F64Array, a: F64Array, b: F64Array, c: F64Array) -> F64Array:
         determinant = a * c - b * b
@@ -882,7 +946,7 @@ def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict)
 
 def double_loop_sites(
     design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted,
-    largest_variance: F64Array, draw_count: int, jvp_bytes: int, profile: dict,
+    largest_variance: F64Array, draw_count: int, jvp_bytes: int, profile: dict, trace: list | None = None,
 ) -> tuple[F64Array, F64Array]:
     """EP's sites at fixed hyperparameters and noise by the Opper-Winther double loop, which provably reaches a
     stationary point of the EP free energy (MODEL.md section 4's fallback; ``tests/ep_eb_reference.double_loop_sites``).
@@ -913,6 +977,9 @@ def double_loop_sites(
         raise ValueError("the EP double loop's start leaves the precision not positive definite")
     while True:
         profile["double_loop_outer"] += 1
+        if trace is not None:
+            # Verification only (theory-ep's exact decrease check): the EC free energy at each outer step's start.
+            trace.append(_ec_free_energy(design, noise, data_score, precision, shift, tilted, largest_variance))
         kernel = _Kernel(design, noise * precision)
         mean = kernel.solve(data_score + noise * shift)
         variances, _removed, cavity_scaled = kernel.cavity()
@@ -931,25 +998,27 @@ def double_loop_sites(
                 return precision, shift
             reseeded = False
         else:
+            reseeded = True
+        if reseeded:
             # The outer step sets the frozen marginals to q's (CCCP), and q's own cavity 1/z - tau can then be improper
             # (a tilted law can be wider than its cavity, so the inner optimum's marginals, the tilted moments at its
             # proper inner cavities, need not leave 1/z - tau proper; fit-api rwAMR [real]). Such sites are no fixed
-            # point (every fixed point's cavities are proper) and are never evaluated; they only start the inner
-            # problem, whose convex minimizer does not depend on its start. The start is moved into its domain: the
-            # improper sites to the marginals' own (a zero cavity), and every site there if that leaves the precision
-            # not positive definite (all positive then, so it is definite, and every cavity is zero: in the domain).
+            # point (every fixed point's cavities are proper) and are never evaluated; the inner problem starts on the
+            # segment toward the sites equal to q's new marginals (``_segment_start``), and its convex minimizer does
+            # not depend on the start.
             profile["double_loop_reseeds"] += 1
-            precision, shift = precision.copy(), shift.copy()
-            precision[~proper], shift[~proper] = marginal_precision[~proper], marginal_shift[~proper]
-            if not _positive_definite(design, noise, precision):
-                precision, shift = marginal_precision.copy(), marginal_shift.copy()
-            reseeded = True
-        point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
+            point = _segment_start(
+                design, noise, data_score, precision, shift, marginal_precision, marginal_shift, cavity_precision, tilted, largest_variance,
+                jvp_bytes, profile,
+            )
+        else:
+            point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
-            # The start is in the inner domain (the precision is definite, and every inner cavity is either q's proper
-            # cavity or zero), so only a tilted moment can fail: a computed variance of 0 (the engine's below-floor
-            # approximation, N1), which no finite site matches.
+            # The start is in the inner domain (the precision is definite, and every inner cavity is q's proper cavity,
+            # or on the segment a fraction of it inside the boundary), so only a tilted moment can fail: a computed
+            # variance of 0 (the engine's below-floor approximation, N1), which no finite site matches.
             raise NoFixedPoint("a computed tilted variance is 0 at the double loop's cavities: no finite EP site")
+        precision, shift = point.site_precision, point.site_shift
         start_precision, start_shift = precision.copy(), shift.copy()
         polish_decrement: float | None = None
         polish_origin = point
@@ -1015,6 +1084,76 @@ def _log_evidence(design: _Design, noise: float, data_score: F64Array, site_prec
     )
 
 
+def _ec_free_energy(
+    design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted,
+    largest_variance: F64Array,
+) -> float:
+    """The EC free energy F(eta) = A_q*(eta) + A_s*(eta) - A_r*(eta) at q's diagonal moments eta (theory-ep, THEORY_EP.md
+    section 7): the quantity the double loop's outer steps lower, so its decrease can be verified rather than assumed.
+    At an EP fixed point it equals -log Z_EP (``_log_evidence``) exactly.
+
+    A_q*(eta) = theta . eta - A_q(theta) at q's own sites; A_r*(eta) = -1/2 sum_j log(2 pi e z_j), the Gaussian's; and
+    A_s*(eta) = sum_j sup_lambda (lambda . eta_j - log Z~_j(lambda)), each a 2-D convex problem over the cavity lambda =
+    (h, P) whose tilted moments match eta_j: Newton on it with the tilted covariance of (beta, -beta^2 / 2) as its Hessian,
+    sufficient-decrease halving inside the tilted law's domain (1 + v_max P > 0), from q's own cavity where proper and
+    the zero cavity elsewhere, until no decrement exceeds its value's rounding."""
+    kernel = _Kernel(design, noise * site_precision)
+    right = data_score + noise * site_shift
+    mean = kernel.solve(right)
+    variances, _removed, cavity_scaled = kernel.cavity()
+    variance = noise * variances
+    count = mean.shape[0]
+    second = variance + np.square(mean)
+    theta_eta = float(site_shift @ mean) - 0.5 * float(site_precision @ second)
+    log_partition_q = 0.5 * float(right @ mean) / noise - 0.5 * (kernel.log_determinant() - count * float(np.log(noise))) + 0.5 * count * float(np.log(2.0 * np.pi))
+    entropy_r = -0.5 * float(np.sum(np.log(2.0 * np.pi * variance) + 1.0))
+    # A_s*: per site, the cavity whose tilted law has q's marginal moments.
+    cavity = cavity_scaled / noise
+    precision = np.where(1.0 + largest_variance * cavity > 0.0, cavity, 0.0)
+    shift = np.where(1.0 + largest_variance * cavity > 0.0, mean / variance - site_shift, 0.0)
+
+    def objective(precision_values: F64Array, shift_values: F64Array) -> tuple[F64Array, tuple[F64Array, ...]]:
+        values = tilted(precision_values, shift_values)
+        log_normalizer = values[0]
+        return log_normalizer - (shift_values * mean - 0.5 * precision_values * second), values
+
+    value, moments = objective(precision, shift)
+    live = np.ones(count, dtype=bool)
+    while np.any(live):
+        _log_normalizer, tilted_mean, tilted_variance, third, fourth = moments
+        gradient_shift = tilted_mean - mean
+        gradient_precision = -0.5 * (tilted_variance + np.square(tilted_mean) - second)
+        a, b, c = tilted_variance, -0.5 * (third + 2.0 * tilted_mean * tilted_variance), 0.25 * (fourth + 2.0 * tilted_variance**2 + 4.0 * tilted_mean * third + 4.0 * tilted_mean**2 * tilted_variance)
+        determinant = a * c - b * b
+        step_shift = -(c * gradient_shift - b * gradient_precision) / determinant
+        step_precision = -(a * gradient_precision - b * gradient_shift) / determinant
+        decrement = -(gradient_shift * step_shift + gradient_precision * step_precision)
+        live &= decrement > _EPSILON * np.maximum(np.abs(value), 1.0)
+        if not np.any(live):
+            break
+        fraction = np.where(live, 1.0, 0.0)
+        accepted = ~live
+        while not np.all(accepted):
+            trial_precision = np.where(accepted, precision, precision + fraction * step_precision)
+            trial_shift = np.where(accepted, shift, shift + fraction * step_shift)
+            inside = 1.0 + largest_variance * trial_precision > 0.0
+            safe_precision = np.where(inside, trial_precision, precision)
+            safe_shift = np.where(inside, trial_shift, shift)
+            trial_value, trial_moments = objective(safe_precision, safe_shift)
+            model = fraction * (1.0 - 0.5 * fraction) * decrement
+            good = inside & (trial_value <= value - 0.5 * model) & ~accepted
+            precision, shift = np.where(good, trial_precision, precision), np.where(good, trial_shift, shift)
+            value = np.where(good, trial_value, value)
+            moments = tuple(np.where(good, trial, current) for trial, current in zip(trial_moments, moments))
+            accepted |= good
+            fraction = np.where(accepted, fraction, 0.5 * fraction)
+            stalled = ~accepted & (fraction * np.maximum(np.abs(step_precision), np.abs(step_shift)) <= _EPSILON * (1.0 + np.maximum(np.abs(precision), np.abs(shift))))
+            live &= ~stalled
+            accepted |= stalled
+    conjugate_s = float(np.sum(-value))
+    return theta_eta - log_partition_q + conjugate_s - entropy_r
+
+
 def _best_double_loop(
     design: _Design, noise: float, data_score: F64Array, starts: Sequence[tuple[F64Array, F64Array]], tilted: Tilted, largest_variance: F64Array,
     draw_count: int, jvp_bytes: int, profile: dict,
@@ -1043,7 +1182,7 @@ def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
         "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
-        "double_loop_reseeds", "repairs", "repair_rounds", "repair_active_max",
+        "double_loop_reseeds", "double_loop_projected_starts", "segment_evaluations", "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
