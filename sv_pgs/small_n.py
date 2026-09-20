@@ -71,6 +71,8 @@ _EPSILON = float(np.finfo(np.float64).eps)
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
 # ``fit_hyperparameters`` holds each model's current fixed point and the trial's: two posteriors are alive at once.
 _LIVE_FIXED_POINTS = 2
+# A posterior on the exact response keeps two p x p matrices: Sigma o Sigma and the response's LU factor.
+_EXACT_RESPONSE_MATRICES = 2
 
 
 # ------------------------------------------------------------------ the design
@@ -431,6 +433,8 @@ class _DensePosterior:
         self.jvp_bytes = int(jvp_bytes)
         self.profile = profile
         self._squared: F64Array | None = None
+        self._response_key: tuple | None = None
+        self._response_factor: tuple | None = None
 
     def solve(self, right: F64Array, _relative_tolerance: float) -> F64Array:
         started = time.perf_counter()
@@ -476,8 +480,21 @@ class _DensePosterior:
 
         Sigma = sigma^2 (diag(delta) - Phi'Phi + Psi'Psi) makes M = diag(d0) + U V' with rank r = n + |N|, so the matrix
         diag(1 - d0) - U V' + diag(w) (S2 diag(d0) + (S2 U) V') is formed in 3 p^2 r flops, and the LU costs 2 p^3 / 3,
-        whatever the number of directions."""
+        whatever the number of directions. The coefficients depend only on the fixed point and its hyperparameters,
+        which one correction holds for every view it is asked (the lazy correction extends its directions as edges
+        release), so the factor is kept and each later call costs 2 p^2 per direction."""
         started = time.perf_counter()
+        key = (left, right, diagonal, weight)
+        if self._response_key is None or not all(np.array_equal(a, b) for a, b in zip(self._response_key, key)):
+            self._response_factor = linalg.lu_factor(self._response_matrix(left, right, diagonal, weight), overwrite_a=True, check_finite=False)
+            self._response_key = tuple(np.array(value, copy=True) for value in key)
+            self.profile["response_factorizations"] += 1
+        solution = linalg.lu_solve(self._response_factor, np.asarray(rhs, dtype=np.float64), check_finite=False)
+        self.profile["response_seconds"] += time.perf_counter() - started
+        self.profile["responses"] += 1
+        return solution
+
+    def _response_matrix(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array) -> F64Array:
         squared = self._explicit()
         delta, phi, psi = self.kernel.factors()
         noise = self.noise
@@ -496,15 +513,12 @@ class _DensePosterior:
             matrix[rows] *= weight[rows, None]
             matrix[rows] -= low[rows] @ high
         matrix[np.diag_indices_from(matrix)] += 1.0 - d0
-        solution = linalg.solve(matrix, np.asarray(rhs, dtype=np.float64), overwrite_a=True, check_finite=False)
-        self.profile["response_seconds"] += time.perf_counter() - started
-        self.profile["responses"] += 1
-        return solution
+        return matrix
 
     def gaussian_posterior(self) -> GaussianPosterior:
-        """The responses; the exact linear response when S2 and the response matrix (two p x p) fit the memory share."""
+        """The responses; the exact linear response when this posterior's S2 and response factor fit its share."""
         p = self.kernel.variant_count
-        exact = 2 * _FLOAT_BYTES * p * p <= self.jvp_bytes
+        exact = _EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * p * p <= self.jvp_bytes
         return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if exact else None)
 
 
@@ -513,7 +527,7 @@ class _DensePosterior:
 
 def _new_profile() -> dict:
     return {name: 0 for name in (
-        "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses",
+        "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
@@ -666,9 +680,10 @@ class _DenseFixedPoints:
             self.noise_gain = noise_gain(noise, self.noise, self.sample_count, self.covariate_count)
             draw_tolerance = self.effective / self.draw_count
             if self.mean_move <= draw_tolerance and self.noise_gain <= tolerance:
-                # Sigma o Sigma gets the half of the working memory the curvature's GMRES does not (``fit_small_n``), shared
-                # by the fixed points alive at once: the outer loop holds the current one and one trial.
-                posterior = _DensePosterior(self.kernel, self.noise, self.working_bytes // 2 // _LIVE_FIXED_POINTS, self.profile)
+                # Each fixed point alive at once (the outer loop holds the current one and one trial) gets an equal share
+                # of the working memory for its posterior's p x p matrices. The exact response replaces the curvature's
+                # GMRES, whose memory it takes; where it does not fit, GMRES has half (``fit_small_n``).
+                posterior = _DensePosterior(self.kernel, self.noise, self.working_bytes // _LIVE_FIXED_POINTS, self.profile)
                 return FixedPoint(
                     cavity=cavity, posterior=posterior.gaussian_posterior(), mean=mean, precision_norm=self._precision_norm(),
                     effective_effects=float(self.effective),
