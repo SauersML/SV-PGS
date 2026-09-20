@@ -1280,17 +1280,23 @@ def _total_curvature_columns(
 
         operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
         right = offset.ravel()
-        solution, information = gmres(
-            operator, right, x0=solution, rtol=0.5 * relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart)
-        )
+        try:
+            solution, information = gmres(
+                operator, right, x0=solution, rtol=0.5 * relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart)
+            )
+            residual = float(np.linalg.norm(right - linear_part(solution)))
+        except ValueError as error:
+            raise LinearResponseError(f"the EP fixed point's linear response cannot be resolved: {error}") from error
         target = max(relative_tolerance * float(np.linalg.norm(right)), rounding)
-        residual = float(np.linalg.norm(right - linear_part(solution)))
         if residual <= target:
             break
         if residual >= previous:
             raise LinearResponseError(f"the EP fixed point's linear response did not converge (gmres information {information})")
         previous = residual
-        inner *= 0.5 * target / residual
+        if information == 0:
+            # GMRES met its own tolerance and the true residual did not: the products' error, so the inner solves
+            # tighten. Otherwise GMRES ran out of cycles, and it continues from where it stopped.
+            inner *= 0.5 * target / residual
     precision_step = solution.reshape(shape)
     return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, inner)[0], precision_step, working_bytes)
 
