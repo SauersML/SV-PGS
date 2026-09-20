@@ -597,14 +597,15 @@ def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     return variance, -0.5 * (third + 2.0 * mean * variance), 0.25 * (fourth + 2.0 * variance**2 + 4.0 * mean * third + 4.0 * mean**2 * variance)
 
 
-def _newton_step(point: _LoopPoint, noise: float, tolerance: float, jvp_bytes: int, profile: dict) -> tuple[F64Array, float]:
-    """The Newton step s = -H^-1 g of Phi and its decrement -g's, by conjugate gradients on H = Cov_q + Cov_r.
+def _newton_step(point: _LoopPoint, noise: float, jvp_bytes: int, profile: dict) -> tuple[F64Array, float]:
+    """A Newton step s ~ -H^-1 g of Phi and its decrement -g's, by conjugate gradients on H = Cov_q + Cov_r.
 
     Cov_q is q's covariance of the statistics (beta, -beta^2 / 2): with w = Sigma (a - mu o b) its product with (a, b) is
     (w, -mu o w + (Sigma o Sigma) b / 2), two kernel solves and one variance JVP. Cov_r is block-diagonal over the
-    sites, and H >= Cov_r, so r' Cov_r^-1 r bounds r' H^-1 r: CG stops when the model decrease it can still add,
-    at most that over 2, is within ``tolerance``, or at the dimension, where CG is exact. It is preconditioned by the
-    2 x 2 site blocks of H."""
+    sites, and H >= Cov_r, so the model decrease CG can still add, r' H^-1 r / 2, is at most r' Cov_r^-1 r / 2. CG stops
+    once that bound is no more than the decrease it has achieved, so the step always takes at least half of Newton's
+    model decrease (it stops at once only where g = 0), or at the dimension, where CG is exact. It is preconditioned
+    by the 2 x 2 site blocks of H."""
     size = point.mean.shape[0]
     mean = point.mean
     posterior = _DensePosterior(point.kernel, noise, jvp_bytes, profile)
@@ -631,14 +632,17 @@ def _newton_step(point: _LoopPoint, noise: float, tolerance: float, jvp_bytes: i
     preconditioned = block_solve(residual, a_h, b_h, c_h)
     direction = preconditioned.copy()
     product_value = float(residual @ preconditioned)
+    achieved = 0.0
     for _iteration in range(2 * size):
-        if bounded and 0.5 * float(residual @ block_solve(residual, a_r, b_r, c_r)) <= tolerance:
+        if bounded and 0.5 * float(residual @ block_solve(residual, a_r, b_r, c_r)) <= achieved:
             break
         image = product(direction)
         curvature = float(direction @ image)
         if not curvature > 0.0:
             break
         length = product_value / curvature
+        # Each PCG step lowers the quadratic model by length (r' M^-1 r) / 2.
+        achieved += 0.5 * length * product_value
         step += length * direction
         residual -= length * image
         preconditioned = block_solve(residual, a_h, b_h, c_h)
@@ -657,11 +661,15 @@ def double_loop_sites(
     stationary point of the EP free energy (MODEL.md section 4's fallback; ``tests/ep_eb_reference.double_loop_sites``).
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
-    problem, the minimum of the convex Phi over the sites, is solved by Newton with plain-decrease halving, to a
-    decrement of 1/(2K) nats. The loop ends at small_n's own EP check, the undamped update's move r' Sigma r at most
-    p_eff / K, and refuses (``NoFixedPoint``) only when an outer step leaves the sites unchanged to rounding while the
-    check still fails. Sites are never clipped. The start must lie in EP's domain."""
-    tolerance = 0.5 / draw_count
+    problem, the minimum of the convex Phi over the sites, is solved by Newton with plain-decrease halving until no
+    representable step along Newton's direction lowers Phi. The loop ends at small_n's own EP check, the undamped
+    update's move r' Sigma r at most p_eff / K, or when an outer step leaves the sites unchanged, which is EP's fixed
+    point: at an outer step's start (P_s, h_s) are q's own marginals, so Phi's gradient there, (mu - E_r[beta],
+    -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
+    means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), lowered Phi
+    at no representable fraction: Phi is stationary there to its rounding, and with it the moment-matching equations,
+    whose solutions are EP's fixed points. Sites are never clipped. The start must lie in EP's domain (ValueError
+    otherwise: the prior's moment-matched sites always do)."""
     precision = np.array(site_precision, dtype=np.float64, copy=True)
     shift = np.array(site_shift, dtype=np.float64, copy=True)
     size = precision.shape[0]
@@ -683,11 +691,11 @@ def double_loop_sites(
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
-            raise NoFixedPoint("the EP double loop's start lies outside EP's domain")
+            raise ValueError("the EP double loop's start lies outside EP's domain")
         start_precision, start_shift = precision.copy(), shift.copy()
         while True:
-            step, decrement = _newton_step(point, noise, tolerance, jvp_bytes, profile)
-            if not 0.5 * decrement > tolerance:
+            step, decrement = _newton_step(point, noise, jvp_bytes, profile)
+            if not decrement > 0.0:
                 break
             fraction = 1.0
             accepted = None
@@ -706,7 +714,9 @@ def double_loop_sites(
             profile["double_loop_newton"] += 1
         precision, shift = point.site_precision, point.site_shift
         if np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
-            raise NoFixedPoint("the EP double loop reaches no certified fixed point (an outer step leaves the sites unchanged)")
+            # Phi stationary at q's own marginals to its rounding: EP's fixed point (see the docstring).
+            profile["double_loop_stationary"] += 1
+            return precision, shift
 
 
 # ------------------------------------------------------------------ the EP fixed points (Stage 2's, exact)
@@ -715,7 +725,7 @@ def double_loop_sites(
 def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
-        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg",
+        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
