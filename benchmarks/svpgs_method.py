@@ -355,13 +355,18 @@ class BenchRealPredictor:
         np.add.at(effects, self.columns, CODES_PER_DOSAGE * self.scoring.coefficients / self.scoring.signed_scales)
         return effects
 
-    def predict(self, genotypes: np.ndarray) -> np.ndarray:
+    def predict(self, genotypes: np.ndarray, covariates: np.ndarray | None = None) -> np.ndarray:
         """The genetic score plus the intercept, in closed form from dosages."""
         dosages = np.asarray(genotypes, dtype=np.float64)[:, self.columns]
         signed = CODES_PER_DOSAGE * dosages - SIGNED_CODE_OFFSET
         centre = self.scoring.signed_means if self.centering == "training" else signed.mean(axis=0)
         standardized = (signed - centre) / self.scoring.signed_scales
-        return standardized @ self.scoring.coefficients + self.scoring.alpha[0]
+        score = standardized @ self.scoring.coefficients + self.scoring.alpha[0]
+        # The fixed covariate effects, when the harness passes the scored samples' covariates (the fit's own, without
+        # the intercept: ``bench_real_covariates``); its prediction rule residualizes the score on them either way.
+        if covariates is not None and self.scoring.alpha.shape[0] > 1:
+            score = score + np.asarray(covariates, dtype=np.float64) @ self.scoring.alpha[1:]
+        return score
 
 
 def one_core_budget() -> ComputeBudget:
@@ -405,6 +410,17 @@ def process_budget() -> ComputeBudget:
     )
 
 
+def bench_real_covariates(train: Any) -> np.ndarray:
+    """The fit's fixed-effect covariates, intercept first: [1, C] with C the covariates bench-real residualized the
+    phenotype on (``TrainData.covariates``: sex, genotype PCs, PEER factors; review-mathbugs C2), so the design is
+    projected on them and the noise has n - k dimensions; [1] for a harness that does not carry them."""
+    samples = np.asarray(train.genotypes).shape[0]
+    covariates = getattr(train, "covariates", None)
+    if covariates is None:
+        return np.ones((samples, 1))
+    return np.column_stack([np.ones(samples), np.asarray(covariates, dtype=np.float64)])
+
+
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
     return _fit_expression(train, "full", "training")
@@ -434,7 +450,7 @@ def _fit_expression(train: Any, arm: str, centering: str) -> BenchRealPredictor:
     samples = genotypes.shape[0]
     fitted = fit_small_n(
         codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
-        covariates=np.ones((samples, 1)),
+        covariates=bench_real_covariates(train),
         target=np.asarray(train.phenotype, dtype=np.float64),
         variant_class=bench_real_classes_for_arm(train.variants, arm),
         log_variance_offset=None,
@@ -462,7 +478,7 @@ def fit_expression_batch(trains: Sequence[Any]) -> list[BenchRealPredictor]:
             raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
         genes.append(GeneData(
             codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
-            covariates=np.ones((genotypes.shape[0], 1)),
+            covariates=bench_real_covariates(train),
             target=np.asarray(train.phenotype, dtype=np.float64),
             variant_class=bench_real_classes_for_arm(train.variants, "full"),
         ))

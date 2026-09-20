@@ -23,9 +23,8 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Sequence
 
 import numpy as np
-from scipy import linalg
 
-from sv_pgs._typing import F64Array
+from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.config import TraitType
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
@@ -64,6 +63,7 @@ from sv_pgs.small_n import (
     dense_statistics,
     double_loop_sites,
 )
+from sv_pgs.tie_map import _compact_identity_tie_map
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -96,8 +96,20 @@ class PooledFit:
     oracle: "_PooledFixedPoints | None" = field(default=None, repr=False, compare=False)
 
 
+def _held_bytes(value: object, depth: int = 2) -> int:
+    """Bytes of the arrays an object holds: its array attributes, tuples and lists of them, and those of the objects it
+    holds, to ``depth`` (a kernel's ``design`` is the statistics', counted with them)."""
+    if isinstance(value, np.ndarray):
+        return int(value.nbytes)
+    if isinstance(value, (tuple, list)):
+        return sum(_held_bytes(item, depth) for item in value)
+    if depth and hasattr(value, "__dict__"):
+        return sum(_held_bytes(item, depth - 1) for name, item in vars(value).items() if name != "design")
+    return 0
+
+
 def _gene_rows(statistics: Sequence[DenseStatistics]) -> tuple[slice, ...]:
-    stops = np.cumsum([int(gene.projected.shape[1]) for gene in statistics])
+    stops = np.cumsum([int(gene.design.variant_count) for gene in statistics])
     starts = np.concatenate([[0], stops[:-1]])
     return tuple(slice(int(start), int(stop)) for start, stop in zip(starts, stops))
 
@@ -105,72 +117,30 @@ def _gene_rows(statistics: Sequence[DenseStatistics]) -> tuple[slice, ...]:
 def pooled_prior(
     statistics: Sequence[DenseStatistics], variant_classes: Sequence[np.ndarray], offsets: Sequence[F64Array], start_noise: F64Array, draw_count: int
 ) -> ScaleMixturePrior:
-    """The prior over every gene's reduced columns, stacked in gene order: one class per variant class present in any
-    gene, each representative's log reliability as its offset, the gene level as one ridge-penalized annotation group
-    (none for a single gene), and the lattice from every gene's single-variant likelihoods at its own start noise."""
-    reduced = [np.asarray(classes)[gene.reduced_rows] for gene, classes in zip(statistics, variant_classes)]
+    """The prior over every gene's members (its active columns; review-mathbugs T1: an exact-tie member keeps its own
+    class and offset), stacked in gene order: one class per variant class present in any gene, each member's log
+    reliability as its offset, the genes' levels as learned offset groups (none for a single gene), and the lattice from every gene's single-variant likelihoods at its own start noise."""
+    reduced = [np.asarray(classes)[gene.active_rows] for gene, classes in zip(statistics, variant_classes)]
     _classes, class_index = np.unique(np.concatenate(reduced), return_inverse=True)
-    stacked_offsets = np.concatenate([np.asarray(offset, dtype=np.float64)[gene.reduced_rows] for gene, offset in zip(statistics, offsets)])
+    stacked_offsets = np.concatenate([np.asarray(offset, dtype=np.float64)[gene.active_rows] for gene, offset in zip(statistics, offsets)])
     single_precision = np.concatenate([gene.design.column_squares() / noise for gene, noise in zip(statistics, start_noise)])
     single_shift = np.concatenate([gene.design.back(gene.target) / noise for gene, noise in zip(statistics, start_noise)])
     nodes, floor, top = derived_lattice(single_precision, single_shift, stacked_offsets, 0.5 / draw_count)
-    gene_count = len(statistics)
     rows = _gene_rows(statistics)
-    if gene_count > 1:
-        indicator = np.zeros((class_index.shape[0], gene_count))
-        for gene, gene_slice in enumerate(rows):
-            indicator[gene_slice, gene] = 1.0
-        design = indicator @ _sum_to_zero_basis(gene_count)
-        groups = (AnnotationGroup(columns=np.arange(gene_count - 1, dtype=np.int64), penalty=np.eye(gene_count - 1)),)
-    else:
-        design, groups = np.zeros((class_index.shape[0], 0)), ()
+    genes = np.concatenate([np.full(gene_rows.stop - gene_rows.start, gene, dtype=np.int64) for gene, gene_rows in enumerate(rows)])
+    # Each gene's level is a gene-owned offset of its rows (review-mathbugs P2, lead ruling): the same shift for every
+    # row of the gene whatever its class, sum-to-zero over genes, with one learned ridge weight; never class-centred.
     return scale_mixture_prior(
-        class_index=class_index.astype(np.int64), log_variance_offset=stacked_offsets, annotation_design=design, annotation_groups=groups,
-        nodes=nodes, floor=floor, top=top,
+        class_index=class_index.astype(np.int64), log_variance_offset=stacked_offsets, annotation_design=np.zeros((class_index.shape[0], 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top, offset_groups=genes if len(statistics) > 1 else None,
     )
-
-
-def _transient_response(
-    kernel: _Kernel, noise: float, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array, profile: dict
-) -> F64Array:
-    """``small_n._DensePosterior.linear_response`` for one call, in one p x p buffer: Sigma o Sigma is formed, its
-    product with the low-rank factor taken, and the response matrix then built in the same buffer (Sigma o Sigma is not
-    needed again) and LU-factored there. The matrix is the same as ``_DensePosterior._response_matrix``'s."""
-    started = time.perf_counter()
-    squared = kernel.covariance()
-    squared *= noise
-    np.square(squared, out=squared)
-    delta, phi, psi = kernel.factors()
-    d0 = diagonal + noise * left * delta * right
-    factor_rows = np.vstack([phi, psi]) if psi.shape[0] else phi
-    signs = np.concatenate([-np.ones(phi.shape[0]), np.ones(psi.shape[0])])
-    low = (noise * left)[:, None] * (factor_rows.T * signs[None, :])  # U (p x r)
-    high = factor_rows * right[None, :]  # V' (r x p)
-    squared_low = squared @ low
-    matrix = squared
-    matrix *= d0[None, :]
-    step = max(1, high.shape[0])
-    for start in range(0, matrix.shape[0], step):
-        rows = slice(start, min(start + step, matrix.shape[0]))
-        matrix[rows] += squared_low[rows] @ high
-        matrix[rows] *= weight[rows, None]
-        matrix[rows] -= low[rows] @ high
-    matrix[np.diag_indices_from(matrix)] += 1.0 - d0
-    # LAPACK factors a Fortran-ordered array in place, and a C-ordered matrix is its transpose's Fortran form: factor the
-    # transpose there and solve with it transposed.
-    factor = linalg.lu_factor(matrix.T, overwrite_a=True, check_finite=False)
-    solution = linalg.lu_solve(factor, rhs, trans=1, check_finite=False)
-    profile["response_factorizations"] += 1
-    profile["responses"] += 1
-    profile["response_seconds"] += time.perf_counter() - started
-    return solution
 
 
 class _PooledPosterior:
     """The joint posterior's responses as the direct sum of the genes' (``small_n._DensePosterior`` each).
 
     Every response is block diagonal by gene, so each gene answers its own rows, one gene at a time. A gene's exact
-    response holds two p_g x p_g matrices (Sigma o Sigma and the response's LU); the genes' together rarely fit, so
+    response holds two matrices on its units (Sigma o Sigma's and the response's LU); the genes' together rarely fit, so
     the largest genes (whose matrices cost the most to form again, p^3 against p^2 bytes) stay resident within
     ``share`` less the room one other gene needs, and every other gene forms its matrices for the call and frees them.
     The responses are exact either way; residency only saves recomputation. Where one gene alone cannot hold its
@@ -182,7 +152,8 @@ class _PooledPosterior:
         self.rows = tuple(rows)
         self.share = int(share)
         self.profile = profile
-        need = np.array([_EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * (gene_rows.stop - gene_rows.start) ** 2 for gene_rows in self.rows])
+        # A gene's exact response holds two matrices on its units (members sharing a tie group and a site: ``small_n``).
+        need = np.array([_EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * kernel.units().size ** 2 for kernel in self.kernels])
         self.exact = bool(need.max(initial=0) <= self.share)
         room = self.share - int(need.max(initial=0))
         self.resident: dict[int, _DensePosterior] = {}
@@ -212,15 +183,13 @@ class _PooledPosterior:
 
     def linear_response(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array) -> F64Array:
         # The response matrix is block diagonal by gene (Sigma and Sigma o Sigma are), so each gene solves its own block:
-        # a resident gene from its kept factor, every other one in a single p x p buffer freed after the call.
+        # a resident gene from its kept factor, every other one with matrices formed for the call and freed after it.
         values = np.asarray(rhs, dtype=np.float64)
         result = np.empty_like(values)
         for gene, rows in enumerate(self.rows):
             arguments = (left[rows], right[rows], diagonal[rows], weight[rows], values[rows])
-            if gene in self.resident:
-                result[rows] = self.resident[gene].linear_response(*arguments)
-            else:
-                result[rows] = _transient_response(self.kernels[gene], float(self.noises[gene]), *arguments, self.profile)
+            posterior = self.resident.get(gene) or self._new(gene)
+            result[rows] = posterior.linear_response(*arguments)
         return result
 
     def gaussian_posterior(self) -> GaussianPosterior:
@@ -255,10 +224,20 @@ class _PooledFixedPoints:
         self.mean = np.zeros(prior.variant_count)
         self.mean_move = np.inf
         self.noise_gain = np.inf
-        self.gene_mean_move = np.full(len(self.rows), np.inf)
+        self.gene_divergence = np.full(len(self.rows), np.inf)
         self.gene_noise_gain = np.full(len(self.rows), np.inf)
         self.refusals: list[str] = []
         self.profile = _new_profile()
+        # CPU seconds (every thread's) each gene's own work took (factorizations, cavities, double loops), the pooled
+        # tilted-moment passes, and the sweeps they ran in: the per-gene cost of a fixed point, for the profiler.
+        self.gene_cpu_seconds = np.zeros(len(self.rows))
+        self.tilted_cpu_seconds = 0.0
+        self.sweeps = 0
+        # Each gene's last refresh (its marginal variances and cavity precisions), valid while its sites and noise are
+        # unchanged within one fixed-point solve (at fixed x): a gene already certified is not rebuilt (theory-ep).
+        self._refreshed = np.zeros(len(self.rows), dtype=bool)
+        self._refresh_variances = np.empty(prior.variant_count)
+        self._refresh_cavity = np.empty(prior.variant_count)
 
     @property
     def gene_count(self) -> int:
@@ -266,10 +245,19 @@ class _PooledFixedPoints:
 
     def _iterate(self, gene: int, site_precision: F64Array, site_shift: F64Array) -> None:
         """Gene ``gene``'s exact mean at the sites; ``LinAlgError`` when its precision is not positive definite."""
-        started = time.perf_counter()
+        started, cpu = time.perf_counter(), time.process_time()
         noise = float(self.noise[gene])
-        kernel = _Kernel(self.statistics[gene].design, noise * site_precision)
-        self.mean[self.rows[gene]] = kernel.solve(self.scores[gene] + noise * site_shift)
+        self._refreshed[gene] = False
+        try:
+            kernel = _Kernel(self.statistics[gene].design, noise * site_precision)
+            self.mean[self.rows[gene]] = kernel.solve(self.scores[gene] + noise * site_shift)
+        except np.linalg.LinAlgError:
+            # A failed build costs its kernel's formation (n^2 p) before the Cholesky refuses: counted apart (theory-ep).
+            self.profile["failed_factorizations"] = self.profile.get("failed_factorizations", 0) + 1
+            self.profile["failed_factor_seconds"] = self.profile.get("failed_factor_seconds", 0.0) + time.perf_counter() - started
+            raise
+        finally:
+            self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self.kernels[gene] = kernel
         self.profile["factorizations"] += 1
         self.profile["passes"] += 1
@@ -282,19 +270,25 @@ class _PooledFixedPoints:
         variances = np.empty(self.prior.variant_count)
         cavity_precision = np.empty(self.prior.variant_count)
         for gene, rows in enumerate(self.rows):
+            if self._refreshed[gene]:
+                variances[rows], cavity_precision[rows] = self._refresh_variances[rows], self._refresh_cavity[rows]
+                continue
             while True:
                 try:
                     self._iterate(gene, self.site_precision[rows], self.site_shift[rows])
                 except np.linalg.LinAlgError:
                     failure = f"gene {gene}: the precision is not positive definite with non-negative sites"
                 else:
-                    started = time.perf_counter()
+                    started, cpu = time.perf_counter(), time.process_time()
                     scaled_variances, removed, scaled_precision = self.kernels[gene].cavity()
                     self.profile["variance_seconds"] += time.perf_counter() - started
+                    self.gene_cpu_seconds[gene] += time.process_time() - cpu
                     noise = float(self.noise[gene])
                     gene_variances, gene_precision = noise * scaled_variances, scaled_precision / noise
                     if np.all(1.0 + largest[rows] * gene_precision > 0.0):
                         variances[rows], cavity_precision[rows] = gene_variances, gene_precision
+                        self._refresh_variances[rows], self._refresh_cavity[rows] = gene_variances, gene_precision
+                        self._refreshed[gene] = True
                         self.effective[gene] = max(float(np.sum(removed)), _EPSILON * (rows.stop - rows.start))
                         break
                     failure = f"gene {gene}: a cavity's tilted law is improper (1 + v P <= 0 on the lattice) with non-negative sites"
@@ -306,9 +300,10 @@ class _PooledFixedPoints:
         return variances, cavity_precision
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
-        started = time.perf_counter()
-        targets = site_targets(tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes), cavity)
+        started, cpu = time.perf_counter(), time.process_time()
+        targets = site_targets(tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes // _LIVE_FIXED_POINTS), cavity)
         self.profile["tilted_seconds"] += time.perf_counter() - started
+        self.tilted_cpu_seconds += time.process_time() - cpu
         return targets
 
     def _residual_sum_of_squares(self, gene: int) -> float:
@@ -326,38 +321,41 @@ class _PooledFixedPoints:
             for gene, (gene_statistics, rows) in enumerate(zip(self.statistics, self.rows))
         ])
 
-    def _gene_moves(self, right: F64Array) -> F64Array:
-        """Each gene's r_g' Sigma_g r_g in its own posterior metric."""
-        return np.array([float(right[rows] @ (float(self.noise[gene]) * self.kernels[gene].solve(right[rows]))) for gene, rows in enumerate(self.rows)])
-
-    def _precision_norm(self) -> Callable[[F64Array], float]:
+    def _precision_norm(self) -> Callable[[F64Array], F64Array]:
         designs = [gene.design for gene in self.statistics]
         precision, noise, rows = self.site_precision.copy(), self.noise.copy(), self.rows
 
-        def norm(direction: F64Array) -> float:
+        def norm(direction: F64Array) -> F64Array:
             values = np.asarray(direction, dtype=np.float64)
-            total = float(np.sum(precision * values * values))
+            moves = []
             for design, gene_noise, gene_rows in zip(designs, noise, rows):
                 image = design.image(values[gene_rows])
-                total += float(image @ image) / float(gene_noise)
-            return total
+                moves.append(float(image @ image) / float(gene_noise) + float(np.sum(precision[gene_rows] * values[gene_rows] ** 2)))
+            # One move per gene, each scored as its own model: the prediction check holds each to its own p_eff,g / K.
+            return np.array(moves)
 
         return norm
 
     def _posterior(self) -> GaussianPosterior:
-        # The live fixed points (the current one and a trial) share the working memory equally.
-        return _PooledPosterior(self.kernels, self.noise.copy(), self.rows, self.working_bytes // _LIVE_FIXED_POINTS, self.profile).gaussian_posterior()
+        # The oracle's memory holds the live kernel sets (the current fixed point's, a trial's, and the snapshot a refused
+        # trial restores) and the live fixed points' posteriors (the current one and a trial's), which share the rest.
+        kernel_bytes = sum(_held_bytes(kernel) for kernel in self.kernels)
+        share = max(self.working_bytes - (_LIVE_FIXED_POINTS + 1) * kernel_bytes, 0) // _LIVE_FIXED_POINTS
+        return _PooledPosterior(self.kernels, self.noise.copy(), self.rows, share, self.profile).gaussian_posterior()
 
     def _snapshot(self) -> dict:
         return {
             "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "noise": self.noise.copy(),
             "effective": self.effective.copy(), "kernels": list(self.kernels), "mean": self.mean.copy(),
+            "refreshed": self._refreshed.copy(), "refresh_variances": self._refresh_variances.copy(), "refresh_cavity": self._refresh_cavity.copy(),
         }
 
     def _restore(self, snapshot: dict) -> None:
         self.site_precision, self.site_shift = snapshot["site_precision"].copy(), snapshot["site_shift"].copy()
         self.noise, self.effective = snapshot["noise"].copy(), snapshot["effective"].copy()
         self.kernels, self.mean = list(snapshot["kernels"]), snapshot["mean"].copy()
+        self._refreshed, self._refresh_variances = snapshot["refreshed"].copy(), snapshot["refresh_variances"].copy()
+        self._refresh_cavity = snapshot["refresh_cavity"].copy()
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         (model_hyperparameters,) = hyperparameters
@@ -372,31 +370,46 @@ class _PooledFixedPoints:
 
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         tolerance = 0.5 / self.draw_count
+        # A refresh holds at one x only.
+        self._refreshed[:] = False
         while True:
             variances, frozen = self._refresh(hyperparameters)
             mean = self.mean.copy()
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)
-            right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            # Every gene is scored as its own model, so each is certified on its own: its mean move at most its own
-            # p_eff,g / K and its noise update's gain at most 1/(2K) (review-mathbugs P1: a pooled sum would let one
-            # gene spend the others' Monte Carlo budget).
-            moves = self._gene_moves(right)
+            if not (np.all(np.isfinite(target_precision)) and np.all(np.isfinite(target_shift))):
+                raise NoFixedPoint("non-finite EP site targets at these hyperparameters (review-mathbugs N2)")
+            # Every gene is scored as its own model, so each is certified on its own (review-mathbugs P1), in evidence
+            # units as small_n's fixed point is: its undamped update moves its q by KL(q || q') nats
+            # (``_Kernel.update_divergence``, the mean and variance parts to second order) and its noise update gains
+            # ``noise_gain`` nats, each at most 1/(2K).
+            divergences = np.array([
+                self.kernels[gene].update_divergence(
+                    float(self.noise[gene]), target_precision[rows] - self.site_precision[rows], target_shift[rows] - self.site_shift[rows], mean[rows]
+                )
+                for gene, rows in enumerate(self.rows)
+            ])
             noises = self._noises(variances)
             gains = np.array([
                 noise_gain(float(new), float(old), gene.sample_count, int(gene.covariates.shape[1]))
                 for new, old, gene in zip(noises, self.noise, self.statistics)
             ])
-            self.gene_mean_move, self.gene_noise_gain = moves, gains
-            self.mean_move = float(np.max(moves * self.draw_count / self.effective))
+            self.gene_divergence, self.gene_noise_gain = divergences, gains
+            self.mean_move = float(np.max(divergences)) / tolerance
             self.noise_gain = float(np.max(gains))
             if self.mean_move <= 1.0 and self.noise_gain <= tolerance:
                 return FixedPoint(
                     cavity=cavity, posterior=self._posterior(), mean=mean, precision_norm=self._precision_norm(),
-                    effective_effects=float(np.sum(self.effective)),
+                    effective_effects=self.effective.copy(),
                 )
-            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
-            self.noise = self._noises(1.0 / (frozen + self.site_precision))
+            # A certified gene is at its own fixed point at this x (the genes are independent given x): it rests, keeping
+            # its sites, noise and refresh; the others take frozen passes and a noise update.
+            certified = (divergences <= tolerance) & (gains <= tolerance)
+            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift, certified)
+            noises = self._noises(1.0 / (frozen + self.site_precision))
+            moving = ~certified
+            self.noise[moving] = noises[moving]
+            self._refreshed[moving] = False
 
     def _double_loop(self, gene: int, hyperparameters: MixtureHyperparameters) -> None:
         """Gene ``gene``'s EP fixed point by the double loop (``small_n.double_loop_sites``) on its own rows of the pooled
@@ -416,6 +429,7 @@ class _PooledFixedPoints:
             return moments.log_normalizer, moments.mean, moments.variance, third, fourth
 
         self.profile["double_loops"] += 1
+        cpu = time.process_time()
         start_precision, start_shift = self.site_precision[rows].copy(), self.site_shift[rows].copy()
         kernel = _Kernel(design, noise * start_precision)
         mean = kernel.solve(self.scores[gene] + noise * start_shift)
@@ -438,15 +452,19 @@ class _PooledFixedPoints:
             self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
         )
         self.site_precision[rows], self.site_shift[rows] = precision, shift
+        self.gene_cpu_seconds[gene] += time.process_time() - cpu
         self._iterate(gene, precision, shift)
 
-    def _frozen_passes(self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
+    def _frozen_passes(
+        self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array, resting: BoolArray | None = None
+    ) -> None:
         """Mean-only EP with the cavity precisions frozen, every gene stepping each sweep with its own damping, until
         the pooled frozen move is below sum_g p_eff,g / K (``small_n._DenseFixedPoints._frozen_passes``)."""
         previous = np.full(self.gene_count, np.inf)
         damping = np.ones(self.gene_count)
-        done = np.zeros(self.gene_count, dtype=bool)
+        done = np.zeros(self.gene_count, dtype=bool) if resting is None else np.asarray(resting, dtype=bool).copy()
         while True:
+            self.sweeps += 1
             moves = np.zeros(self.gene_count)
             for gene, rows in enumerate(self.rows):
                 if done[gene]:
@@ -455,6 +473,10 @@ class _PooledFixedPoints:
                 fraction = float(damping[gene])
                 delta_precision = target_precision[rows] - self.site_precision[rows]
                 delta_shift = target_shift[rows] - self.site_shift[rows]
+                if not (np.all(np.isfinite(delta_precision)) and np.all(np.isfinite(delta_shift))):
+                    # A non-finite target (a trial density with no mass where this gene's tilted laws live: review-mathbugs
+                    # N1/N2) has no damped step to take; the trial has no fixed point here, and the outer loop halves it.
+                    raise NoFixedPoint(f"gene {gene}: non-finite EP site targets at these hyperparameters")
                 move = max(float(np.max(np.abs(delta_precision), initial=0.0)), float(np.max(np.abs(delta_shift), initial=0.0)))
                 scale = 1.0 + max(float(np.max(np.abs(self.site_precision[rows]))), float(np.max(np.abs(self.site_shift[rows]))))
                 if fraction * move <= _EPSILON * scale:
@@ -481,10 +503,13 @@ class _PooledFixedPoints:
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
+                if not np.isfinite(moves[gene]):
+                    raise NoFixedPoint(f"gene {gene}: a non-finite EP move at these hyperparameters")
                 if previous[gene] > 0.0 and moves[gene] / previous[gene] >= 1.0:
                     damping[gene] = min(float(damping[gene]), 1.0 / (1.0 + np.sqrt(moves[gene] / previous[gene])))
-            # A gene is done once its own frozen move is below its p_eff,g / K; the passes end when every gene is.
-            done |= moves <= self.effective / self.draw_count
+            # A gene is done once its own frozen move, in nats (half its squared move in the posterior metric), is at
+            # most 1/(2K), as small_n's; the passes end when every gene is.
+            done |= 0.5 * moves <= 0.5 / self.draw_count
             if np.all(done):
                 return
             previous = moves
@@ -536,9 +561,15 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
     prior = pooled_prior(statistics, [gene.variant_class for gene in genes], offsets, residual_noise, draw_count)
     start, start_noise = _pooled_start(statistics, prior, _gene_rows(statistics))
     stage0_seconds = time.perf_counter() - started
-    oracle = _PooledFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
+    # The genes' Stage 0 arrays stay for the whole fit; the rest is shared equally by the engine's own working set
+    # (tilted-moment chunks; GMRES where an exact response does not fit) and the fixed-point oracle.
+    available = working_bytes - sum(_held_bytes(gene) + _held_bytes(gene.design) for gene in statistics)
+    if available <= 0:
+        raise MemoryError(f"the genes' Stage 0 arrays alone exceed the {working_bytes / 1e9:.2f} GB working memory.")
+    engine_bytes = available // 2
+    oracle = _PooledFixedPoints(statistics, prior, start, start_noise, draw_count, available - engine_bytes)
     try:
-        (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, 0.5 / draw_count)
+        (outer,) = fit_hyperparameters(prior, [start], oracle, engine_bytes, 0.5 / draw_count)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; EP refusals: {oracle.refusals}") from error
     second_moment = prior_second_moment(prior, outer.hyperparameters)
@@ -548,11 +579,14 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         mean = oracle.mean[rows]
         draws = mean[:, None] + np.sqrt(float(oracle.noise[gene_index])) * oracle.kernels[gene_index].draws(generator, draw_count)
         alpha = gene_statistics.covariate_pseudo_inverse @ (gene_statistics.covariates.T @ gene_statistics.target - gene_statistics.loading @ mean)
-        active_to_reduced = np.asarray(gene_statistics.tie_map.original_to_reduced, dtype=np.int64)
+        # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
+        # no split of a tie group's effect.
+        members = gene_statistics.active_rows.shape[0]
         scoring.append(ScoringModel.from_reduced_fit(
             active_rows=gene_statistics.active_rows, signed_means=gene_statistics.means, signed_scales=gene_statistics.scales,
-            tie_map=gene_statistics.tie_map, member_prior_variances=second_moment[rows][active_to_reduced], beta_reduced=mean,
-            posterior_draws_reduced=draws, alpha=alpha, trait_type=TraitType.QUANTITATIVE, predictive_intercept_shift=0.0,
+            tie_map=_compact_identity_tie_map(members), member_prior_variances=second_moment[rows], beta_reduced=gene_statistics.signs * mean,
+            posterior_draws_reduced=gene_statistics.signs[:, None] * draws, alpha=alpha, trait_type=TraitType.QUANTITATIVE,
+            predictive_intercept_shift=0.0,
         ))
     certificate = FitCertificate(
         remaining_gain=np.array([outer.remaining_gain]),
@@ -560,7 +594,7 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         smoothing_gradient=np.array([outer.step.smoothing_gradient]),
         stationarity_steps=(outer.step.stationarity_steps,),
         stationarity_errors=(outer.step.stationarity_errors,),
-        # Per gene, as the largest ratio of a gene's mean move to its own p_eff,g / K (so the tolerance is 1), and the
+        # Per gene, as the largest ratio of a gene's update divergence to 1/(2K) (so the tolerance is 1), and the
         # largest gene noise gain; the genes' own values are in the profile.
         mean_move=np.array([oracle.mean_move]),
         draw_tolerance=np.ones(1),
@@ -585,7 +619,8 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         "stage0_seconds": stage0_seconds, "total_seconds": time.perf_counter() - started, "genes": len(genes),
         "reduced": int(prior.variant_count), "coefficients": int(prior.coefficient_size), "classes": int(prior.class_count),
         "outer_iterations": int(outer.iterations),
-        "gene_mean_move": oracle.gene_mean_move.tolist(), "gene_draw_tolerance": (oracle.effective / draw_count).tolist(),
+        "gene_divergence": oracle.gene_divergence.tolist(), "gene_cpu_seconds": oracle.gene_cpu_seconds.tolist(),
+        "tilted_cpu_seconds": oracle.tilted_cpu_seconds, "sweeps": oracle.sweeps,
         "gene_noise_gain": oracle.gene_noise_gain.tolist(),
     }
     return PooledFit(
@@ -608,6 +643,26 @@ class CurvatureBlocks:
     null_basis: F64Array
 
 
+def gene_owned_blocks(curvature: CurvatureBlocks, prior: ScaleMixturePrior) -> tuple[F64Array, F64Array, F64Array]:
+    """Each gene's block in gene-owned coordinates (theory-ep section 5): its rows see the levels only through their own
+    level l_g = q_g' z (q_g the gene's row of the sum-to-zero basis), so B_g's level part is b_g q_g q_g' and its
+    coupling to the shared coordinates is c_g q_g'. Returns (B_g on the shared coordinates [G, S, S], c_g [G, S],
+    b_g [G]) and leaves the shared-coordinate indices to ``prior``'s layout: every x coordinate but the last G - 1."""
+    level_size = prior.level_size
+    genes = level_size + 1
+    basis = _sum_to_zero_basis(genes)
+    shared = curvature.blocks.shape[1] - level_size
+    shared_blocks = curvature.blocks[:, :shared, :shared]
+    coupling = np.empty((genes, shared))
+    level = np.empty(genes)
+    for gene in range(genes):
+        row = basis[gene]
+        norm = float(row @ row)
+        coupling[gene] = curvature.blocks[gene, :shared, shared:] @ row / norm
+        level[gene] = float(row @ curvature.blocks[gene, shared:, shared:] @ row) / norm**2
+    return shared_blocks, coupling, level
+
+
 def _gene_prior(prior: ScaleMixturePrior, rows: slice) -> ScaleMixturePrior:
     """The prior on one gene's rows, in the pooled x coordinates: every per-variant field restricted, the lattice and
     x's layout shared. The data objective and B are sums over rows, so the genes' parts add up to the pooled one."""
@@ -620,6 +675,7 @@ def _gene_prior(prior: ScaleMixturePrior, rows: slice) -> ScaleMixturePrior:
         class_rows=tuple(np.split(order, np.cumsum(sizes)[:-1])),
         log_variance_offset=prior.log_variance_offset[rows],
         scale_design=prior.scale_design[rows],
+        offset_groups=None if prior.offset_groups is None else prior.offset_groups[rows],
     )
 
 

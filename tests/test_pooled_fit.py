@@ -80,13 +80,14 @@ def test_the_exact_response_needs_room_for_the_largest_gene():
     assert _PooledPosterior(kernels, noises, rows, 2 * 8 * 20**2 - 1, _new_profile()).gaussian_posterior().linear_response is None
 
 
-def test_the_pooled_prior_stacks_the_genes_with_one_level_group():
+def test_the_pooled_prior_stacks_the_genes_with_their_levels_as_offset_groups():
     rng = np.random.default_rng(6)
     genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (30, 25, 40)]
     statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
     prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(3), 64)
     assert prior.variant_count == sum(int(gene.projected.shape[1]) for gene in statistics)
-    assert prior.class_count == 2 and len(prior.annotation_groups) == 1 and prior.scale_size == 2
+    # The genes' levels are offset groups (review-mathbugs P2): no annotation group, G - 1 level coordinates.
+    assert prior.class_count == 2 and len(prior.annotation_groups) == 0 and prior.level_size == 2 and prior.scale_size == 2
 
 
 @pytest.mark.slow
@@ -138,6 +139,16 @@ def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
     scale = np.max(np.abs(pooled))
     np.testing.assert_allclose(curvature.blocks.sum(axis=0), pooled, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
     assert curvature.blocks.shape == (2,) + pooled.shape
+    # Gene-owned levels (review-mathbugs P2): each gene's level block is rank one along its own basis row, exactly.
+    from sv_pgs.pooled_fit import gene_owned_blocks
+    from sv_pgs.scale_mixture_ep import _sum_to_zero_basis
+
+    shared, coupling, level = gene_owned_blocks(curvature, fit.prior)
+    basis = _sum_to_zero_basis(2)
+    for gene in range(2):
+        rebuilt = level[gene] * np.outer(basis[gene], basis[gene])
+        np.testing.assert_allclose(curvature.blocks[gene, -1:, -1:], rebuilt, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
+        np.testing.assert_allclose(curvature.blocks[gene, :-1, -1:], np.outer(coupling[gene], basis[gene]), rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
 
 
 def test_a_genes_double_loop_is_small_ns_on_its_rows():
@@ -158,3 +169,39 @@ def test_a_genes_double_loop_is_small_ns_on_its_rows():
     np.testing.assert_array_equal(pooled.site_precision, single.site_precision)
     np.testing.assert_array_equal(pooled.site_shift, single.site_shift)
     np.testing.assert_array_equal(pooled.mean, single.mean)
+
+
+def test_non_finite_site_targets_refuse_the_trial_instead_of_looping():
+    """review-mathbugs N2: a NaN target made the damped halving and the sweep loop run forever."""
+    from sv_pgs.full_data_fit import NoFixedPoint
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+
+    rng = np.random.default_rng(11)
+    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (30, 20)]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    oracle = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    _variances, frozen = oracle._refresh(start)
+    target_precision, target_shift = oracle.site_precision.copy(), oracle.site_shift.copy()
+    target_precision[3] = np.nan
+    with pytest.raises(NoFixedPoint, match="non-finite"):
+        oracle._frozen_passes(start, frozen, target_precision, target_shift)
+
+
+def test_every_row_of_a_gene_carries_exactly_its_level():
+    """review-mathbugs P2 (lead ruling): gene levels are gene-owned offsets, sum-to-zero over genes, never class-centred.
+    Two genes, each with SNV and deletion rows: every row of gene g must shift its log prior variance by l_g exactly."""
+    from sv_pgs.scale_mixture_ep import _sum_to_zero_basis, log_scale
+
+    rng = np.random.default_rng(12)
+    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (28, 14)]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    levels = np.array([1.0, -1.0])
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[prior.coefficient_size - 1 :] = _sum_to_zero_basis(2).T @ levels
+    shift = log_scale(prior, coefficients) - log_scale(prior, np.zeros(prior.coefficient_size))
+    rows = [slice(0, statistics[0].design.variant_count), slice(statistics[0].design.variant_count, prior.variant_count)]
+    for gene, gene_rows in enumerate(rows):
+        np.testing.assert_allclose(shift[gene_rows], levels[gene], rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps))
