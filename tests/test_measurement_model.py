@@ -314,3 +314,22 @@ def test_records_without_pairs_fall_back_to_the_reported_reliability_and_are_cou
     np.testing.assert_array_equal(model.scales[4:], np.ones(2))
     np.testing.assert_allclose(model.log_reliability[4:], np.log(reported[4:]), rtol=rounding_gamma(2))
     assert np.all(model.scales[:4] < 1.0)
+
+
+def test_a_copy_number_column_is_calibrated_in_copies() -> None:
+    rng = np.random.default_rng(47)
+    records, pairs, error = 300, 2000, 0.2
+    copy_numbers = rng.binomial(5, 0.4, size=(records, pairs)).astype(float)
+    # A miscall moves the measured copy number by one copy either way, independent of it.
+    measured = copy_numbers + rng.choice([-1.0, 0.0, 1.0], size=copy_numbers.shape, p=[error / 2, 1 - error, error / 2])
+    modal = 2.0
+    moments = calibration_moments(measured - modal, copy_numbers - modal)
+    pooled = pooled_calibration(moments, (measured - modal).var(axis=1), np.zeros(records, dtype=int))
+    # Classical error: kappa = lambda = Var(CN) / (Var(CN) + error), so r^2 = kappa^2 / lambda = kappa.
+    genotype_variance = 5 * 0.4 * 0.6
+    kappa = genotype_variance / (genotype_variance + error)
+    residual = genotype_variance - kappa**2 * (genotype_variance + error)
+    kappa_error = np.sqrt(residual / ((genotype_variance + error) * pairs * records))
+    assert abs(float(np.mean(pooled.scales)) - kappa) <= sampling_bound(float(kappa_error))
+    ratios = moments.truth_variance / moments.dosage_variance
+    assert abs(float(pooled.variance_ratios[0]) - kappa) <= sampling_bound(float(np.std(ratios) / np.sqrt(records)))
