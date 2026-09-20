@@ -261,10 +261,10 @@ def test_a_block_wider_than_its_pairs_still_gets_a_finite_map() -> None:
 
 def test_without_truth_the_model_degrades_loudly_and_records_it() -> None:
     variance = np.array([0.4, 0.3])
-    with pytest.raises(ValueError, match="reported r"):
-        fit_measurement_model(None, variance, np.zeros(2, dtype=int))
+    with pytest.raises(ValueError, match="reported_reliability"):
+        fit_measurement_model(None, variance, np.zeros(2, dtype=int), np.array([0.9, 1.5]))
     reported = np.array([0.9, 0.5])
-    model = fit_measurement_model(None, variance, np.zeros(2, dtype=int), reported_reliability=reported)
+    model = fit_measurement_model(None, variance, np.zeros(2, dtype=int), reported)
     np.testing.assert_array_equal(model.scales, np.ones(2))
     assert model.leakage_maps == ()
     assert model.certificate["calibrated_records"] == 0 and model.certificate["uncalibrated_records"] == 2
@@ -293,7 +293,7 @@ def test_with_truth_the_model_recalibrates_and_maps_each_block() -> None:
         blocks=(LdBlock(np.array([0, 1]), np.array([0])),),
         block_covariances=(np.cov(np.vstack([draw, snp]), bias=True),),
     )
-    model = fit_measurement_model(pairs, np.array([np.var(draw), np.var(snp)]), np.array([0, 1]))
+    model = fit_measurement_model(pairs, np.array([np.var(draw), np.var(snp)]), np.array([0, 1]), np.array([0.3, 1.0]))
     assert model.certificate["calibrated_records"] == 2 and model.certificate["uncalibrated_records"] == 0
     assert "applied to 1 LD blocks" in str(model.certificate["leakage_correction"])
     assert len(model.leakage_maps) == 1 and model.leakage_maps[0].ridge_ratio > 0.0
@@ -308,10 +308,8 @@ def test_records_without_pairs_fall_back_to_the_reported_reliability_and_are_cou
     pairs = calibration_pairs(tuple(ResearchId(str(index)) for index in range(2000)), dosage, genotype)
     variance = np.full(6, 0.3)
     variance[:4] = dosage[:4].var(axis=1)
-    with pytest.raises(ValueError, match="2 records"):
-        fit_measurement_model(pairs, variance, np.zeros(6, dtype=int))
     reported = np.full(6, 0.8)
-    model = fit_measurement_model(pairs, variance, np.zeros(6, dtype=int), reported_reliability=reported)
+    model = fit_measurement_model(pairs, variance, np.zeros(6, dtype=int), reported)
     assert model.certificate["calibrated_records"] == 4 and model.certificate["uncalibrated_records"] == 2
     np.testing.assert_array_equal(model.scales[4:], np.ones(2))
     np.testing.assert_allclose(model.log_reliability[4:], np.log(reported[4:]), rtol=rounding_gamma(2))
