@@ -135,6 +135,8 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', '_variant_derivatives'): ('math', frozenset({3.0}), 'd Var / dh of a normal mixture: E[(mu - m)^3] + 3 E[c (mu - m)] (third central moment of a Gaussian mixture)'),
     ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
     ('scale_mixture_ep.py', '_standardized'): ('math', frozenset({8.0, 5.0, 24.0}), 'Tierney and Kadane (1986): the O(1) Laplace term E[u^4]/24 k4 + E[u^6]/72 k3^2 = k4/8 + 5 k3^2/24'),
+    ('small_n.py', '_site_blocks'): ('math', frozenset({0.25, 4.0}), 'the covariance of the statistics (beta, -beta^2/2) from the tilted central moments: Var(beta^2)/4 = (k4 + 2v^2 + 4 m k3 + 4 m^2 v)/4'),
+    ('small_n.py', '_Kernel.update_divergence'): ('math', frozenset({0.25}), 'the second-order KL of a site change: the Fisher metric of (beta, -beta^2/2), 1/2 r Sigma r + 1/4 dtau (Sigma o Sigma) dtau'),
     ('store_converter.py', 'IMPUTATION_ERROR_RATE'): ('external-config', frozenset({0.001}), 'GLIMPSE2 --err-imp of the aou2_50k imputation run; the removed background is an exact function of it'),
     ('store_converter.py', 'MAXIMUM_KEPT_PATHS'): ('external-config', frozenset({10}), 'pop-glimpse2 max_alleles of the aou2_50k imputation run'),
     ('store_converter.py', 'NO_LOCUS'): ('definitional', frozenset({4294967295}), 'uint32 maximum as the no-locus sentinel'),
