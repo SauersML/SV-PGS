@@ -634,6 +634,9 @@ def _profile(prior, log_smoothing, cavity, point, null_basis):
 
     current = np.array(point, copy=True)
     value = penalized(current)
+    if not np.isfinite(value):
+        # Far in a tail the objective under- or overflows: the integrand there is zero to double precision.
+        return current, -np.inf
     for _iteration in range(400):
         objective = _data_objective(prior, current, cavity, _WORKING_BYTES)
         gradient = mapping.T @ objective.gradient - penalty @ current
@@ -642,8 +645,9 @@ def _profile(prior, log_smoothing, cavity, point, null_basis):
         null_hessian = null_basis.T @ hessian @ null_basis
         eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (null_hessian + null_hessian.T))
         # Newton on the magnitudes of the curvature: an ascent direction wherever the block is not concave.
-        step = eigenvectors @ ((eigenvectors.T @ null_gradient) / np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues)))))
-        if 0.5 * float(null_gradient @ step) <= _objective_rounding(prior, current, cavity):
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            step = eigenvectors @ ((eigenvectors.T @ null_gradient) / np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues)))))
+        if not np.all(np.isfinite(step)) or 0.5 * float(null_gradient @ step) <= _objective_rounding(prior, current, cavity):
             return current, value
         length = 1.0
         while length * float(np.max(np.abs(step))) > _EPSILON * (1.0 + float(np.max(np.abs(current)))):
@@ -712,7 +716,8 @@ def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_di
                     continue
                 start = centre + spacing * (first * directions[:, 0] + second * directions[:, 1]) + null_basis @ (null_part - null_centre)
                 point, value = _profile(prior, log_smoothing, cavity, start, null_basis)
-                null_part = null_basis.T @ point
+                if np.isfinite(value):
+                    null_part = null_basis.T @ point
                 values[(first, second)] = value - peak
         grown = False
         for axis in range(2):
