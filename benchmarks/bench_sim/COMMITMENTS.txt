@@ -9,3 +9,6 @@ e937142a730560774e559363861b9c76df9ee97a5b02f840847e7cf6682e558f  PREREG.md (v1,
 2026-09-20T00:22Z  out-of-family set (PREREG amendment 9), v7 cohort
   sha256(concatenated v7/sealed_out/scenario_*/scenario.json, 56 scenarios, 8 per family)  a21ae9e781b6545543b128341ff53bbae4e490d5951b0df366cbeaa7f4ecbaa5
   sha256(public/cpgIslandExt.txt.gz, UCSC hg38, the hidden annotation)  2339f8bad0ec9993211287b319b8d59ddeff30a5010505f649817332ed8222f8
+2026-09-20T02:16Z  read-depth CN channel (PREREG amendment 10), v7 cohort, 1,178 DEL/DUP records
+  sha256(v7/sealed/readcn_sealed_params.json, the sealed draw's generating parameters)  265ad293101f83fafaef972ffc8e70c0de37836a757e0d65ebc046db0175e85f
+  sha256(public/genomicSuperDups.txt.gz, UCSC hg38)  3f4388ed3eb7462034e89c1f45314160bdb14558502092326063105c095061df
