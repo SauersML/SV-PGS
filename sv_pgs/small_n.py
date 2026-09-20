@@ -26,8 +26,11 @@ r' Sigma r, the variances diag Sigma, and no cavity-information certificate (the
 
 The genotype side is Stage 0's (``genotype_statistics``) on a dense training matrix: signed codes (code - 127), their
 training means and population SDs, every polymorphic record active (no rarity or other threshold filter: SPEC), and
-exact ties (equal or negated standardized columns) merged by the same integer test, over the whole window rather than
-within an LD block. The variance JVP forms Sigma o Sigma once per fixed point when it fits its memory share (one GEMM
+exact ties (equal or negated standardized columns) found by the same integer test, over the whole window rather than
+within an LD block. Tie members keep their own effects, sites and class priors (review-mathbugs T1, lead ruling;
+``tie_members.TieGroups`` is the shared representation): only ``_Design`` aggregates them, inside the kernel, so the
+kernel costs what the tie groups do, and the posterior's p x p work runs on the units of members that share a group
+and a site (``_Kernel.units``). The variance JVP forms Sigma o Sigma once per fixed point when it fits its memory share (one GEMM
 per call after that), else works from the factors at O(n^2 p) per column (see ``_DensePosterior``).
 """
 
@@ -38,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
 import numpy as np
-from scipy import linalg
+from scipy import linalg, sparse
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.config import TraitType
@@ -67,6 +70,7 @@ from sv_pgs.scale_mixture_ep import (
     tilted_moments,
 )
 from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
+from sv_pgs.tie_members import TieGroups
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
@@ -80,18 +84,39 @@ _EXACT_RESPONSE_MATRICES = 2
 
 
 class _Design:
-    """Xp = P G with P = I - Q Q' (Q an orthonormal basis of the covariates' columns) and G ``carriers`` (n x p, dense,
-    Fortran-ordered)."""
+    """Xp over the model's effects (review-mathbugs T1, lead ruling): exact-tie members keep their own effects, so the
+    columns are the members, in oriented coordinates (member j's column is its group's x_g, its effect gamma_j = s_j
+    beta_j, whose prior is beta_j's: every prior is symmetric). Duplicates are aggregated only here: Xp = P G A' with
+    P = I - Q Q' (Q an orthonormal basis of the covariates' columns), G ``carriers`` (n x groups, dense, Fortran-ordered)
+    and A the members' group indicator (``members[j]`` is member j's column of G; None: one member per column). So a
+    member-level product costs a group-level one plus O(members).
 
-    def __init__(self, carriers: F64Array, basis: F64Array) -> None:
+    ``codes`` is (the groups' minor-allele codes, uint8 n x groups; each group's factor, G = codes * factor), when known."""
+
+    def __init__(self, carriers: F64Array, basis: F64Array, members: I64Array | None = None, codes: tuple[np.ndarray, F64Array] | None = None) -> None:
         self.carriers = np.asfortranarray(carriers, dtype=np.float64)
         self.basis = basis
-        self.sample_count, self.variant_count = (int(size) for size in carriers.shape)
+        self.codes = codes
+        self.sample_count, self.group_count = (int(size) for size in carriers.shape)
+        self.members = np.arange(self.group_count, dtype=np.int64) if members is None else np.asarray(members, dtype=np.int64)
+        self.variant_count = int(self.members.shape[0])
+        self.tied = not np.array_equal(self.members, np.arange(self.group_count))
+        self._sum = sparse.csr_matrix(
+            (np.ones(self.variant_count), (self.members, np.arange(self.variant_count))), shape=(self.group_count, self.variant_count)
+        ) if self.tied else None
 
     @classmethod
     def dense(cls, projected: F64Array) -> _Design:
         """An already projected dense design (no covariates left to project)."""
         return cls(np.asfortranarray(projected, dtype=np.float64), np.zeros((projected.shape[0], 0)))
+
+    def group_sum(self, values: F64Array) -> F64Array:
+        """A' v: each group's sum over its members, (groups,) or (groups, q)."""
+        return np.asarray(self._sum @ values) if self.tied else values
+
+    def spread(self, group_values: F64Array) -> F64Array:
+        """A u: each member's group's value."""
+        return group_values[self.members] if self.tied else group_values
 
     def project(self, samples: F64Array) -> F64Array:
         return samples - self.basis @ (self.basis.T @ samples) if self.basis.shape[1] else samples
@@ -105,37 +130,45 @@ class _Design:
 
     def image(self, values: F64Array) -> F64Array:
         """Xp v for v (p,) or (p, q)."""
-        return self.project(self.carriers @ values)
+        return self.project(self.carriers @ self.group_sum(values))
 
     def back(self, samples: F64Array) -> F64Array:
         """Xp' u for u (n,) or (n, q)."""
-        return self.carriers.T @ self.project(samples)
+        return self.spread(self.carriers.T @ self.project(samples))
 
     def weighted_gram(self, weights: F64Array) -> F64Array:
-        """Xp diag(w) Xp' (n x n) for w >= 0."""
-        gram = linalg.blas.dsyrk(1.0, self.carriers * np.sqrt(weights)[None, :])
+        """Xp diag(w) Xp' (n x n) for w >= 0: G diag(A' w) G', the members' weights summed within their group."""
+        gram = linalg.blas.dsyrk(1.0, self.carriers * np.sqrt(self.group_sum(weights))[None, :])
         return self.project_both(np.triu(gram) + np.triu(gram, 1).T)
 
-    def quadratic_diagonal(self, core: F64Array) -> F64Array:
-        """x_j' core x_j for every column, core (n x n) symmetric with P core P = core."""
+    def group_quadratic_diagonal(self, core: F64Array) -> F64Array:
+        """x_g' core x_g for every group, core (n x n) symmetric with P core P = core."""
         return np.einsum("ij,ij->j", self.carriers, core @ self.carriers)
+
+    def quadratic_diagonal(self, core: F64Array) -> F64Array:
+        """x_j' core x_j for every member."""
+        return self.spread(self.group_quadratic_diagonal(core))
 
     def quadratic(self, core: F64Array, columns: I64Array) -> F64Array:
         """Xp_c' core Xp_c (|c| x |c|) for core (n x n) with P core P = core."""
-        block = self.carriers[:, columns]
+        block = self.carriers[:, self.members[columns]]
         return block.T @ (core @ block)
 
+    def group_columns(self, groups: I64Array) -> F64Array:
+        """The groups' columns x_g (n x |g|, F-ordered)."""
+        return np.asfortranarray(self.project(self.carriers[:, groups]))
+
     def columns(self, columns: I64Array) -> F64Array:
-        """Xp's columns ``columns`` (n x |c|, F-ordered)."""
-        return np.asfortranarray(self.project(self.carriers[:, columns]))
+        """Xp's member columns ``columns`` (n x |c|, F-ordered)."""
+        return self.group_columns(self.members[columns])
 
     def column_squares(self) -> F64Array:
         """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
         squares = np.einsum("ij,ij->j", self.carriers, self.carriers)
-        if not self.basis.shape[1]:
-            return squares
-        loading = self.carriers.T @ self.basis
-        return squares - np.einsum("jk,jk->j", loading, loading)
+        if self.basis.shape[1]:
+            loading = self.carriers.T @ self.basis
+            squares = squares - np.einsum("jk,jk->j", loading, loading)
+        return self.spread(squares)
 
 
 # ------------------------------------------------------------------ the genotype side (Stage 0, dense)
@@ -146,14 +179,17 @@ class DenseStatistics:
     """Stage 0 of one training set on a dense code matrix.
 
     ``active_rows`` are the input columns with training variance (the store rows of ``fast_scoring``), ``means`` and
-    ``scales`` their signed-code means and population SDs, ``tie_map`` their ties; ``design`` is Xp = (I - H_C) X~ of
-    the reduced columns, ``loading`` = C' X~ (k x reduced), and ``projected_target`` = (I - H_C) y.
+    ``scales`` their signed-code means and population SDs, ``tie_map`` their exact ties and ``ties`` the same as
+    ``tie_members.TieGroups`` (each member's group and sign). Every effect is a member's (review-mathbugs T1): ``design``
+    is Xp = (I - H_C) X~ over the members in oriented coordinates (``_Design``; member j's effect gamma_j = s_j beta_j),
+    ``loading`` = C' X~ in the same coordinates (k x members), and ``projected_target`` = (I - H_C) y.
     """
 
     active_rows: I64Array
     means: F64Array
     scales: F64Array
     tie_map: TieMap
+    ties: TieGroups
     design: _Design
     loading: F64Array
     covariates: F64Array
@@ -166,13 +202,13 @@ class DenseStatistics:
         return self.design.sample_count
 
     @property
-    def reduced_rows(self) -> I64Array:
-        """The input columns of the reduced columns (each tie group's representative)."""
-        return self.active_rows[np.asarray(self.tie_map.kept_indices, dtype=np.int64)]
+    def signs(self) -> F64Array:
+        """Each member's sign: its standardized column is s_j x_g, and beta_j = s_j gamma_j."""
+        return self.ties.sign
 
     @property
     def projected(self) -> F64Array:
-        """Xp, dense (n x reduced)."""
+        """Xp over the members, dense (n x members, oriented)."""
         return self.design.columns(np.arange(self.design.variant_count))
 
 
@@ -235,16 +271,19 @@ def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) 
     column_factor = np.where(flip, -1.0, 1.0) / scales[kept]
     offsets = np.where(flip, full, 0.0)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    design = _Design(minor * column_factor[None, :], _covariate_basis(covariate_matrix))
-    # C' X~_j = C' g_j + C'1 (offset_j - 127 - mean_j) / scale_j.
+    ties = TieGroups.from_tie_map(tie_map)
+    design = _Design(minor * column_factor[None, :], _covariate_basis(covariate_matrix), members=ties.group, codes=(minor.astype(np.uint8), column_factor))
+    # C' X~_g = C' g_g + C'1 (offset_g - 127 - mean_g) / scale_g for each group's representative; a member's, in its
+    # oriented coordinates, is its group's.
     constants = (offsets - SIGNED_CODE_OFFSET - means[kept]) / scales[kept]
-    loading = (design.carriers.T @ covariate_matrix).T + np.outer(covariate_matrix.sum(axis=0), constants)
+    loading = ((design.carriers.T @ covariate_matrix).T + np.outer(covariate_matrix.sum(axis=0), constants))[:, ties.group]
     target_values = np.asarray(target, dtype=np.float64)
     return DenseStatistics(
         active_rows=active.astype(np.int64),
         means=means,
         scales=scales,
         tie_map=tie_map,
+        ties=ties,
         design=design,
         loading=loading,
         covariates=covariate_matrix,
@@ -281,7 +320,13 @@ class _Kernel:
         self._core: F64Array | None = None
         self._rest_factors: tuple[F64Array, F64Array] | None = None
         self._factors: tuple[F64Array, F64Array, F64Array] | None = None
+        self._units: _Units | None = None
         if self.rest.size:
+            rest_groups = design.members[self.rest]
+            if np.unique(rest_groups).shape[0] < rest_groups.shape[0]:
+                # Two members of one group with t <= 0: A' along their difference (e_j - e_k, oriented; the data see
+                # neither) is t_j + t_k <= 0, so A' is not positive definite (exactly).
+                raise np.linalg.LinAlgError("two tie members with non-positive sites share a group: A' is not positive definite")
             self.rest_design = design.columns(self.rest)
             self.rest_whitened = linalg.solve_triangular(self.upper, self.rest_design, trans="T", lower=False, check_finite=False)
             schur = self.rest_whitened.T @ self.rest_whitened
@@ -382,6 +427,29 @@ class _Kernel:
         covariance += psi.T @ psi
         return covariance
 
+    def units(self) -> _Units:
+        """Members whose columns of Phi and Psi coincide: the bulk members of one group with one site (their columns
+        and t agree; tied rare variants under one prior reach one site by symmetry), and each member of the rest on
+        its own. Then A'^-1 = E G E' + diag(delta) over the members, with G = -Phi_u'Phi_u + Psi_u'Psi_u on the units
+        (E the members' unit indicator, delta = 1/t on the bulk, 0 on the rest): p_units ~ the tie groups, not the
+        members (review-mathbugs T1)."""
+        if self._units is None:
+            groups = self.design.members
+            key = np.column_stack([groups[self.bulk].astype(np.float64), self.precision[self.bulk]])
+            _unique, representative, bulk_unit, count = np.unique(key, axis=0, return_index=True, return_inverse=True, return_counts=True)
+            bulk_units = representative.shape[0]
+            of_member = np.empty(self.variant_count, dtype=np.int64)
+            of_member[self.bulk] = np.asarray(bulk_unit).ravel()
+            of_member[self.rest] = bulk_units + np.arange(self.rest.size)
+            self._units = _Units(
+                of_member=of_member,
+                bulk_representative=self.bulk[representative],
+                count=np.concatenate([count, np.ones(self.rest.size, dtype=np.int64)]),
+                delta=np.concatenate([1.0 / self.precision[self.bulk[representative]], np.zeros(self.rest.size)]),
+                kernel=self,
+            )
+        return self._units
+
     def factors(self) -> tuple[F64Array, F64Array, F64Array]:
         """(delta (p,), Phi (n x p), Psi (|N| x p)) with A'^-1 = diag(delta) - Phi'Phi + Psi'Psi (the O(n^2 p) route of
         the variance JVP, when Sigma o Sigma is too large to form)."""
@@ -420,6 +488,60 @@ class _Kernel:
         return draws
 
 
+@dataclass
+class _Units:
+    """``_Kernel.units``: each member's unit, each bulk unit's representative member, the units' member counts and
+    delta (1/t, 0 on the rest), and (lazily) Phi_u (n x units) and Psi_u (|N| x units), the columns the unit's members
+    share."""
+
+    of_member: I64Array
+    bulk_representative: I64Array
+    count: I64Array
+    delta: F64Array
+    kernel: _Kernel
+    _phi: F64Array | None = None
+    _psi: F64Array | None = None
+    _sum: object = None
+
+    @property
+    def size(self) -> int:
+        return int(self.count.shape[0])
+
+    def sum(self, values: F64Array) -> F64Array:
+        """E' v: each unit's sum over its members."""
+        if self._sum is None:
+            members = self.of_member.shape[0]
+            self._sum = sparse.csr_matrix((np.ones(members), (self.of_member, np.arange(members))), shape=(self.size, members))
+        return np.asarray(self._sum @ values)
+
+    def factors(self) -> tuple[F64Array, F64Array]:
+        if self._phi is None:
+            kernel = self.kernel
+            bulk_units = self.bulk_representative.shape[0]
+            groups = kernel.design.members[self.bulk_representative]
+            phi = np.zeros((kernel.upper.shape[0], self.size), order="F")
+            whitened = linalg.solve_triangular(kernel.upper, kernel.design.group_columns(groups), trans="T", lower=False, check_finite=False)
+            phi[:, :bulk_units] = whitened * self.delta[:bulk_units][None, :]
+            psi = np.zeros((kernel.rest.size, self.size))
+            if kernel.rest.size:
+                psi_bulk, psi_rest = kernel.rest_factors()
+                psi[:, :bulk_units] = psi_bulk[:, np.searchsorted(kernel.bulk, self.bulk_representative)]
+                psi[:, bulk_units:] = psi_rest
+            self._phi, self._psi = phi, psi
+        return self._phi, self._psi
+
+
+def _symmetrize_upper(matrix: F64Array) -> None:
+    """Copy the upper triangle over the lower one in place, in row panels (no p x p temporary)."""
+    size = matrix.shape[0]
+    step = max(1, int(np.sqrt(size)))
+    for start in range(0, size, step):
+        stop = min(start + step, size)
+        matrix[stop:, start:stop] = matrix[start:stop, stop:].T
+        block = matrix[start:stop, start:stop]
+        block[...] = np.triu(block) + np.triu(block, 1).T
+
+
 def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -> F64Array:
     """((L'L) o (R'R)) W, column by column: out_jc = l_j' (L diag(w_c) R') r_j."""
     result = np.empty_like(weights)
@@ -430,10 +552,13 @@ def _hadamard_gram_product(left: F64Array, right: F64Array, weights: F64Array) -
 
 
 class _DensePosterior:
-    """q's responses at one fixed point (``scale_mixture_ep.GaussianPosterior``): Sigma R exactly, and
-    -(Sigma o Sigma) W exactly. Sigma o Sigma is formed once (8 p^2 bytes) when that fits ``jvp_bytes``, and each call
-    is then one GEMM; otherwise each column costs O(n^2 p) from the factors. Forming it pays as soon as a call has more
-    than p / (2 n) columns, which the total curvature's (p x D) GMRES iterates always have, so memory alone decides."""
+    """q's responses at one fixed point (``scale_mixture_ep.GaussianPosterior``): Sigma R, -(Sigma o Sigma) W and the
+    curvature's linear response, all exactly, over the members.
+
+    Sigma = sigma^2 (E G E' + diag(delta)) (``_Kernel.units``), so Sigma o Sigma = E (G o G) E' sigma^4 + diag(a) with
+    a = sigma^4 (2 delta G_uu + delta^2): G o G is formed once on the units (8 p_u^2 bytes) when that fits ``jvp_bytes``,
+    and each JVP is then one p_u^2 GEMM; otherwise each column costs O(n^2 p) from the member factors. Forming it pays
+    as soon as a call has more than p / (2 n) columns, which the curvature's direction blocks always have."""
 
     def __init__(self, kernel: _Kernel, noise: float, jvp_bytes: int, profile: dict) -> None:
         self.kernel = kernel
@@ -441,8 +566,10 @@ class _DensePosterior:
         self.jvp_bytes = int(jvp_bytes)
         self.profile = profile
         self._squared: F64Array | None = None
+        self._local: F64Array | None = None
         self._response_key: tuple | None = None
         self._response_factor: tuple | None = None
+        self._response_units: tuple | None = None
 
     def solve(self, right: F64Array, _relative_tolerance: float) -> F64Array:
         started = time.perf_counter()
@@ -451,24 +578,34 @@ class _DensePosterior:
         self.profile["solve_columns"] += int(np.asarray(right).shape[1]) if np.ndim(right) == 2 else 1
         return result
 
-    def _explicit(self) -> F64Array:
+    def _explicit(self) -> tuple[F64Array, F64Array]:
+        """(sigma^4 G o G on the units, a per unit)."""
         if self._squared is None:
             started = time.perf_counter()
-            covariance = self.kernel.covariance()
-            covariance *= self.noise
-            np.square(covariance, out=covariance)
-            self._squared = covariance
+            units = self.kernel.units()
+            phi, psi = units.factors()
+            gram = linalg.blas.dsyrk(-1.0, phi, trans=1)
+            if psi.shape[0]:
+                gram = linalg.blas.dsyrk(1.0, psi, beta=1.0, c=gram, trans=1, overwrite_c=1)
+            _symmetrize_upper(gram)
+            gram *= self.noise
+            diagonal = np.diag(gram).copy()
+            np.square(gram, out=gram)
+            delta = self.noise * units.delta
+            self._local = 2.0 * delta * diagonal + delta * delta
+            self._squared = gram
             self.profile["form_seconds"] += time.perf_counter() - started
-        return self._squared
+        return self._squared, self._local
 
     def variance_jvp(self, weights: F64Array) -> F64Array:
         started = time.perf_counter()
         values = np.asarray(weights, dtype=np.float64)
         column = values.ndim == 1
         values = values[:, None] if column else values
-        p = self.kernel.variant_count
-        if _FLOAT_BYTES * p * p <= self.jvp_bytes:
-            result = -(self._explicit() @ values)
+        units = self.kernel.units()
+        if _FLOAT_BYTES * units.size * units.size <= self.jvp_bytes:
+            squared, local = self._explicit()
+            result = -((squared @ units.sum(values))[units.of_member] + local[units.of_member][:, None] * values)
         else:
             delta, phi, psi = self.kernel.factors()
             phi_squares = np.einsum("ij,ij->j", phi, phi)
@@ -484,38 +621,65 @@ class _DensePosterior:
 
     def linear_response(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array) -> F64Array:
         """The exact X of (I - (I - diag(w) S2) M) X = B, S2 = Sigma o Sigma and M = diag(left) Sigma diag(right) +
-        diag(diagonal) (``scale_mixture_ep.GaussianPosterior``), by one LU of that p x p matrix.
+        diag(diagonal) (``scale_mixture_ep.GaussianPosterior``), over the members.
 
-        Sigma = sigma^2 (diag(delta) - Phi'Phi + Psi'Psi) makes M = diag(d0) + U V' with rank r = n + |N|, so the matrix
-        diag(1 - d0) - U V' + diag(w) (S2 diag(d0) + (S2 U) V') is formed in 3 p^2 r flops, and the LU costs 2 p^3 / 3,
-        whatever the number of directions. The coefficients depend only on the fixed point and its hyperparameters,
-        which one correction holds for every view it is asked (the lazy correction extends its directions as edges
-        release), so the factor is kept and each later call costs 2 p^2 per direction."""
+        Response units are the members that share a unit and all four coefficients. On a vector constant within them
+        the matrix is the p_r x p_r one below; on a vector that sums to zero within each, S2 acts as diag(a) and M as
+        diag(m0) (E' of it vanishes), so the matrix is diag(1 - (1 - w a) m0) there. B splits into the two parts
+        exactly, so X does. The reduced matrix: M_r = diag(d0) + U V' of rank r = n + |N| (G's factors, V scaled by the
+        units' counts) and S2_r = (G o G)[u_r, u_r] diag(k_r) + diag(a_r); diag(1 - d0) - U V' + diag(w) (S2_r diag(d0)
+        + (S2_r U) V') is formed in 3 p_r^2 r flops and its LU costs 2 p_r^3 / 3, whatever the number of directions.
+        The coefficients depend only on the fixed point and its hyperparameters, which one correction holds for every
+        view it is asked, so the factor is kept and each later call costs 2 p_r^2 per direction."""
         started = time.perf_counter()
+        units = self.kernel.units()
         key = (left, right, diagonal, weight)
         if self._response_key is None or not all(np.array_equal(a, b) for a, b in zip(self._response_key, key)):
+            rows = np.column_stack([units.of_member.astype(np.float64), left, right, diagonal, weight])
+            _unique, representative, of_member, count = np.unique(rows, axis=0, return_index=True, return_inverse=True, return_counts=True)
+            of_member = np.asarray(of_member).ravel()
+            unit = units.of_member[representative]
             # The matrix is C-ordered: its transpose is the same buffer in Fortran order, which LAPACK factors in
-            # place (a C-ordered one it would copy, a third p x p), and the transposed solve then gives M X = B.
-            matrix = self._response_matrix(left, right, diagonal, weight)
+            # place (a C-ordered one it would copy), and the transposed solve then gives M X = B.
+            matrix = self._response_matrix(left[representative], right[representative], diagonal[representative], weight[representative], unit, count)
             self._response_factor = linalg.lu_factor(matrix.T, overwrite_a=True, check_finite=False)
+            _squared, local = self._explicit()
+            member_local = local[units.of_member]
+            m0 = diagonal + self.noise * left * units.delta[units.of_member] * right
+            self._response_units = (of_member, count, 1.0 - (1.0 - weight * member_local) * m0)
             self._response_key = tuple(np.array(value, copy=True) for value in key)
             self.profile["response_factorizations"] += 1
-        solution = linalg.lu_solve(self._response_factor, np.asarray(rhs, dtype=np.float64), trans=1, check_finite=False)
+        of_member, count, within = self._response_units
+        values = np.asarray(rhs, dtype=np.float64)
+        column = values.ndim == 1
+        values = values[:, None] if column else values
+        summed = sparse.csr_matrix((np.ones(of_member.shape[0]), (of_member, np.arange(of_member.shape[0]))), shape=(count.shape[0], of_member.shape[0])) @ values
+        mean = np.asarray(summed) / count[:, None]
+        solution = linalg.lu_solve(self._response_factor, mean, trans=1, check_finite=False)[of_member]
+        shared = count[of_member] > 1
+        if np.any(shared):
+            solution[shared] += (values[shared] - mean[of_member[shared]]) / within[shared, None]
         self.profile["response_seconds"] += time.perf_counter() - started
         self.profile["responses"] += 1
-        return solution
+        return solution[:, 0] if column else solution
 
-    def _response_matrix(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array) -> F64Array:
-        squared = self._explicit()
-        delta, phi, psi = self.kernel.factors()
+    def _response_matrix(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, unit: I64Array, count: I64Array) -> F64Array:
+        """The reduced response matrix over response units (``linear_response``): ``unit`` each one's unit, ``count``
+        its members."""
+        squared, local = self._explicit()
+        units = self.kernel.units()
+        phi, psi = units.factors()
         noise = self.noise
-        d0 = diagonal + noise * left * delta * right
-        factor_rows = np.vstack([phi, psi]) if psi.shape[0] else phi
+        d0 = diagonal + noise * left * units.delta[unit] * right
+        factor_rows = np.vstack([phi[:, unit], psi[:, unit]]) if psi.shape[0] else phi[:, unit]
         signs = np.concatenate([-np.ones(phi.shape[0]), np.ones(psi.shape[0])])
-        low = (noise * left)[:, None] * (factor_rows.T * signs[None, :])  # U (p x r)
-        high = factor_rows * right[None, :]  # V' (r x p)
-        squared_low = squared @ low
-        matrix = squared * d0[None, :]
+        low = (noise * left)[:, None] * (factor_rows.T * signs[None, :])  # U (p_r x r)
+        high = factor_rows * (count * right)[None, :]  # V' (r x p_r)
+        matrix = squared[np.ix_(unit, unit)]
+        matrix *= count[None, :]
+        matrix[np.diag_indices_from(matrix)] += local[unit]
+        squared_low = matrix @ low
+        matrix *= d0[None, :]
         # Row panels of r rows keep every temporary the size of the factors.
         step = max(1, high.shape[0])
         for start in range(0, matrix.shape[0], step):
@@ -527,9 +691,9 @@ class _DensePosterior:
         return matrix
 
     def gaussian_posterior(self) -> GaussianPosterior:
-        """The responses; the exact linear response when this posterior's S2 and response factor fit its share."""
-        p = self.kernel.variant_count
-        exact = _EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * p * p <= self.jvp_bytes
+        """The responses; the exact linear response when this posterior's unit S2 and response factor fit its share."""
+        size = self.kernel.units().size
+        exact = _EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * size * size <= self.jvp_bytes
         return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if exact else None)
 
 
@@ -999,19 +1163,20 @@ class SmallNFit:
 
 
 def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_variance_offset: F64Array, draw_count: int) -> ScaleMixturePrior:
-    """The run wiring's prior on the reduced columns (``stage2_wiring._fit_one``): one class per variant class
-    present, each representative's log reliability as its offset, no annotation groups, and the start lattice from
-    the single-variant likelihoods at the covariate-only residual variance."""
-    reduced = statistics.reduced_rows
-    _classes, class_index = np.unique(np.asarray(variant_class)[reduced], return_inverse=True)
-    offsets = np.asarray(log_variance_offset, dtype=np.float64)[reduced]
+    """The run wiring's prior (``stage2_wiring._fit_one``) over every member (review-mathbugs T1: an exact-tie member
+    keeps its own class and offset, so an SV tied to SNVs keeps the SV prior): one class per variant class present,
+    each member's log reliability as its offset, no annotation groups, and the start lattice from the single-variant
+    likelihoods at the covariate-only residual variance."""
+    members = statistics.active_rows
+    _classes, class_index = np.unique(np.asarray(variant_class)[members], return_inverse=True)
+    offsets = np.asarray(log_variance_offset, dtype=np.float64)[members]
     residual = statistics.projected_target
     start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariates.shape[1])
     single_precision = statistics.design.column_squares() / start_noise
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     return scale_mixture_prior(
-        class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=np.zeros((reduced.shape[0], 0)),
+        class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=np.zeros((members.shape[0], 0)),
         annotation_groups=(), nodes=nodes, floor=floor, top=top,
     )
 
@@ -1069,15 +1234,17 @@ def fit_small_n(
     # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
     draws = oracle.mean[:, None] + np.sqrt(oracle.noise) * oracle.kernel.draws(np.random.default_rng(seed), draw_count)
     alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ oracle.mean)
-    active_to_reduced = np.asarray(statistics.tie_map.original_to_reduced, dtype=np.int64)
+    # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
+    # no split of a group's effect; the identity map carries each member's own mean and draws.
+    member_count = statistics.active_rows.shape[0]
     scoring = ScoringModel.from_reduced_fit(
         active_rows=statistics.active_rows,
         signed_means=statistics.means,
         signed_scales=statistics.scales,
-        tie_map=statistics.tie_map,
-        member_prior_variances=prior_second_moment(prior, outer.hyperparameters)[active_to_reduced],
-        beta_reduced=oracle.mean,
-        posterior_draws_reduced=draws,
+        tie_map=_compact_identity_tie_map(member_count),
+        member_prior_variances=prior_second_moment(prior, outer.hyperparameters),
+        beta_reduced=statistics.signs * oracle.mean,
+        posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
         trait_type=trait_type,
         predictive_intercept_shift=0.0,
@@ -1113,7 +1280,8 @@ def fit_small_n(
         "total_seconds": time.perf_counter() - started,
         "samples": statistics.sample_count,
         "active": int(statistics.active_rows.shape[0]),
-        "reduced": int(statistics.design.variant_count),
+        "members": int(statistics.design.variant_count),
+        "groups": int(statistics.design.group_count),
         "coefficients": int(prior.coefficient_size),
         "grid": int(prior.grid_size),
         "classes": int(prior.class_count),

@@ -103,9 +103,9 @@ def test_the_carrier_design_gives_the_projected_design_quantities():
     np.testing.assert_allclose(carrier_kernel.covariance(), projected_kernel.covariance(), rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(statistics.design.column_squares(), np.einsum("ij,ij->j", statistics.projected, statistics.projected), rtol=1e-10)
     # X~'s covariate loading, against the definition.
-    signed = codes[:, statistics.reduced_rows].astype(np.float64) - SIGNED_CODE_OFFSET
-    kept = np.asarray(statistics.tie_map.kept_indices)
-    standardized = (signed - statistics.means[kept]) / statistics.scales[kept]
+    # Every member, in its oriented coordinates (its standardized column times its sign, its group's column).
+    signed = codes[:, statistics.active_rows].astype(np.float64) - SIGNED_CODE_OFFSET
+    standardized = statistics.signs * (signed - statistics.means) / statistics.scales
     np.testing.assert_allclose(statistics.loading, statistics.covariates.T @ standardized, rtol=1e-9, atol=1e-9)
 
 
@@ -204,10 +204,13 @@ def test_stage0_standardizes_and_merges_exact_ties():
     signs = {int(group.representative_index): dict(zip(group.member_indices.tolist(), group.signs.tolist())) for group in tie_map.reduced_to_group}
     assert signs[0] == {0: 1.0, 2: 1.0, 3: -1.0}
     assert signs[4] == {4: 1.0, 5: 1.0}
-    # (I - H_C) X~ with the intercept: centred standardized columns of the representatives.
+    # (I - H_C) X~ with the intercept over every member (review-mathbugs T1), oriented: each member's column is its
+    # group representative's centred standardized column, and its sign carries the negation.
+    np.testing.assert_array_equal(statistics.signs, [1.0, 1.0, 1.0, -1.0, 1.0, 1.0])
     representatives = signed[:, [0, 1, 4]]
     standardized = (representatives - representatives.mean(axis=0)) / representatives.std(axis=0)
-    np.testing.assert_allclose(statistics.projected, standardized, atol=1e-12)
+    np.testing.assert_allclose(statistics.projected, standardized[:, [0, 1, 0, 0, 2, 2]], atol=1e-12)
+    assert statistics.design.variant_count == 6 and statistics.design.group_count == 3
     np.testing.assert_allclose(statistics.projected_target, target - target.mean(), atol=1e-12)
 
 
@@ -355,3 +358,139 @@ def test_a_trial_whose_prior_second_moment_overflows_is_refused_not_raised(monke
     with pytest.raises(ValueError):
         small_n.double_loop_sites(statistics.design, start_noise, statistics.design.back(statistics.target), np.zeros(count), np.zeros(count),
                                   oracle._tilted(start), oracle._largest_variances(start), 64, 10**9, _new_profile())
+
+
+
+def _tied_design(rng, samples, groups, members_of):
+    """A dense projected design over ``groups`` group columns and the members' ``members_of`` indicator, the explicit
+    member-level matrix (duplicated columns) and the member-aggregating ``_Design`` of the same model."""
+    group_columns = _design(rng, samples, groups)
+    members_of = np.asarray(members_of, dtype=np.int64)
+    return group_columns[:, members_of], _Design(group_columns, np.zeros((samples, 0)), members=members_of)
+
+
+@pytest.mark.parametrize("negative", [False, True])
+def test_tie_members_keep_their_own_sites_exactly(negative):
+    """review-mathbugs T1: every tie member is its own effect with its own site; duplicates are aggregated only in the
+    kernel. Against the explicit member-level A' = X_m'X_m + diag t (duplicated columns): solve, marginal variances,
+    cavities, covariance, the variance JVP and the exact linear response, with units of equal sites and a right-hand
+    side that is not constant within them."""
+    rng = np.random.default_rng(91)
+    members_of = [0, 0, 0, 1, 2, 2, 3, 4, 4, 4, 5]
+    explicit, tied = _tied_design(rng, 9, 6, members_of)
+    count = len(members_of)
+    precision = rng.uniform(0.5, 2.0, count)
+    precision[[1, 2]] = precision[0]      # a unit: three members of group 0 with one site
+    precision[[8, 9]] = precision[7]      # and two of group 4 with one site
+    if negative:
+        precision[3] = -0.05              # a singleton group's negative site
+        precision[6] = -0.04
+    inverse = _dense_inverse(explicit, precision)
+    kernel = _Kernel(tied, precision)
+    right = rng.standard_normal((count, 3))
+    np.testing.assert_allclose(kernel.solve(right), inverse @ right, rtol=1e-9, atol=1e-10)
+    variances, removed, cavity = kernel.cavity()
+    np.testing.assert_allclose(variances, np.diag(inverse), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(removed, 1.0 - precision * np.diag(inverse), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(cavity, 1.0 / np.diag(inverse) - precision, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(kernel.covariance(), inverse, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(kernel.log_determinant(), np.linalg.slogdet(explicit.T @ explicit + np.diag(precision))[1], rtol=1e-12)
+    assert kernel.units().size == count - 4  # two units of three and two members
+    noise = 1.3
+    sigma = noise * inverse
+    weights = rng.standard_normal((count, 4))
+    posterior = _DensePosterior(kernel, noise, 10**9, _new_profile())
+    np.testing.assert_allclose(posterior.variance_jvp(weights), -(sigma * sigma) @ weights, rtol=1e-9, atol=1e-11)
+    left, gain, diagonal, weight = (rng.standard_normal(count) for _ in range(4))
+    for vector in (left, gain, diagonal, weight):
+        vector[[1, 2]] = vector[0]
+        vector[[8, 9]] = vector[7]
+    weight = np.abs(weight)
+    rhs = rng.standard_normal((count, 3))  # not constant within the units
+    matrix = np.eye(count) - (np.eye(count) - weight[:, None] * (sigma * sigma)) @ (left[:, None] * sigma * gain[None, :] + np.diag(diagonal))
+    np.testing.assert_allclose(posterior.linear_response(left, gain, diagonal, weight, rhs), np.linalg.solve(matrix, rhs), rtol=1e-8, atol=1e-10)
+    # Response coefficients that differ within a unit split it: still exact.
+    left[2] += 0.3
+    matrix = np.eye(count) - (np.eye(count) - weight[:, None] * (sigma * sigma)) @ (left[:, None] * sigma * gain[None, :] + np.diag(diagonal))
+    np.testing.assert_allclose(posterior.linear_response(left, gain, diagonal, weight, rhs), np.linalg.solve(matrix, rhs), rtol=1e-8, atol=1e-10)
+
+
+def test_two_non_positive_sites_in_one_tie_group_are_not_positive_definite():
+    rng = np.random.default_rng(92)
+    _explicit, tied = _tied_design(rng, 8, 4, [0, 0, 1, 2, 3])
+    precision = np.array([-0.01, -0.02, 1.0, 1.0, 1.0])
+    with pytest.raises(np.linalg.LinAlgError):
+        _Kernel(tied, precision)
+
+
+def test_a_mixed_class_tie_group_reaches_the_reference_ep_fixed_point(monkeypatch):
+    """An SV tied with two SNVs (review-mathbugs T1 on real genes 3 and 4): each member keeps its own class prior and
+    site. small_n's double loop over the members against ``tests/ep_eb_reference.double_loop_sites`` (dense, exact
+    Newton) on the explicit member-level design with the duplicated columns, both on the engine's tilted moments:
+    the same EP stationary point, member by member."""
+    import tests.ep_eb_reference as reference
+    from sv_pgs.scale_mixture_ep import Cavity, derived_lattice, initial_hyperparameters, log_scale, moment_matched_prior_sites, scale_mixture_prior
+    from sv_pgs.scale_mixture_ep import tilted_cumulants, tilted_moments
+    from sv_pgs.small_n import double_loop_sites
+
+    rng = np.random.default_rng(93)
+    noise = 0.7
+    members_of = [0, 0, 0, 1, 2, 3, 4]
+    explicit, tied = _tied_design(rng, 16, 5, members_of)
+    target = explicit[:, 0] * 1.1 + explicit[:, 4] * -0.7 + np.sqrt(noise) * rng.standard_normal(16)
+    count = len(members_of)
+    class_index = np.array([1, 0, 0, 0, 0, 1, 0])  # member 0 (the SV) tied with members 1 and 2 (SNVs)
+    nodes, floor, top = derived_lattice(np.einsum("ij,ij->j", explicit, explicit) / noise, explicit.T @ target / noise, np.zeros(count), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.zeros(count), annotation_design=np.zeros((count, 0)), annotation_groups=(),
+        nodes=nodes, floor=floor, top=top,
+    )
+    hyperparameters = initial_hyperparameters(prior)
+    # Give the SV class a different density, so the tied members' priors differ.
+    coefficients = hyperparameters.coefficients.copy()
+    coefficients[prior.pooled_size : 2 * prior.pooled_size] = 0.3 * rng.standard_normal(prior.pooled_size)
+    hyperparameters = type(hyperparameters)(coefficients=coefficients, log_smoothing=hyperparameters.log_smoothing)
+
+    def tilted(cavity_precision, cavity_shift):
+        cavity = Cavity(precision=cavity_precision, shift=cavity_shift)
+        moments = tilted_moments(prior, hyperparameters, cavity, 10**8)
+        third, fourth = tilted_cumulants(prior, hyperparameters, cavity, 10**8)
+        return moments.log_normalizer, moments.mean, moments.variance, third, fourth
+
+    def power_moments(_prior, _vector, cavity_precision, cavity_shift):
+        log_normalizer, mean, variance, third, fourth = tilted(cavity_precision, cavity_shift)
+        return {
+            "log_normalizer": log_normalizer, "first": mean, "second": variance + mean**2, "third": third + 3.0 * mean * variance + mean**3,
+            "fourth": fourth + 3.0 * variance**2 + 4.0 * mean * third + 6.0 * mean**2 * variance + mean**4,
+        }
+
+    monkeypatch.setattr(reference, "tilted_power_moments", power_moments)
+    largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
+    precision, shift = moment_matched_prior_sites(prior, hyperparameters)
+    likelihood_precision, linear_term = explicit.T @ explicit / noise, explicit.T @ target / noise
+    expected = reference.double_loop_sites(None, None, likelihood_precision, linear_term, reference.site_state(None, None, likelihood_precision, linear_term, precision, shift))
+    got_precision, got_shift = double_loop_sites(tied, noise, tied.back(target), precision, shift, tilted, largest, 2**30, 10**9, _new_profile())
+    np.testing.assert_allclose(got_precision, expected.site_precision, rtol=1e-6)
+    np.testing.assert_allclose(got_shift, expected.site_shift, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(expected.site_shift))))
+    # The tied members' sites differ: each keeps its own prior (no merged column, no b / M split).
+    assert not np.isclose(got_precision[0], got_precision[1])
+
+
+def test_the_prior_and_scoring_are_per_member():
+    """An insertion tied with SNVs keeps its INSERTION class in the prior, and the scoring model has one coefficient
+    per active member, no representative-only rows."""
+    from sv_pgs.small_n import small_n_prior
+
+    rng = np.random.default_rng(94)
+    samples = 60
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.4, 8), size=(samples, 8))
+    dosage[:, 5] = dosage[:, 2]   # an insertion (column 5) tied with an SNV (column 2)
+    dosage[:, 6] = dosage[:, 2]   # and another SNV
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    classes = np.full(8, list(VariantClass).index(VariantClass.SNV), dtype=np.uint8)
+    classes[5] = list(VariantClass).index(VariantClass.INSERTION)
+    prior = small_n_prior(statistics, classes, np.zeros(8), 64)
+    assert prior.variant_count == 8 and statistics.design.group_count == 6
+    member_classes = np.unique(classes, return_inverse=True)[1]
+    np.testing.assert_array_equal(prior.class_index, member_classes)
+    assert prior.class_index[5] != prior.class_index[2]
