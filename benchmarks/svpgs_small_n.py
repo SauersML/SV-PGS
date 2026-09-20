@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.fit_model import DRAW_COUNT
@@ -37,6 +38,35 @@ class SmallNPredictor:
         return standardized @ self.scoring.coefficients + self.scoring.alpha[0]
 
 
+_CLASS_CODES = {variant_class: index for index, variant_class in enumerate(VariantClass)}
+_LOSS = {_CLASS_CODES[VariantClass.DELETION]}
+_GAIN = {_CLASS_CODES[variant_class] for variant_class in (VariantClass.INSERTION, VariantClass.DUPLICATION, VariantClass.INSERTION_MEI)}
+
+
+def signed_length_change(variants: Any) -> np.ndarray:
+    """Each record's signed allele-length change. bench-real stores 0 for a symbolic ALT (review F1), so a symbolic
+    record (an SV type token and change 0) takes -SVLEN for a loss (DEL), +SVLEN for a gain (INS, DUP, MEI) and 0
+    otherwise (INV, BND, CNV); sequence-resolved records keep their own change."""
+    change = np.asarray(variants.allele_length_change, dtype=np.int64).copy()
+    token_classes = _METHOD.bench_real_classes(variants)
+    length_only = _METHOD.bench_real_classes_for_arm(variants, "no_sv_terms")
+    symbolic = (token_classes != length_only) & (change == 0)
+    length = np.abs(np.asarray(variants.sv_length, dtype=np.int64))
+    change[symbolic & np.isin(token_classes, list(_LOSS))] = -length[symbolic & np.isin(token_classes, list(_LOSS))]
+    change[symbolic & np.isin(token_classes, list(_GAIN))] = length[symbolic & np.isin(token_classes, list(_GAIN))]
+    return change
+
+
+def classes_for_arm(variants: Any, arm: str) -> np.ndarray:
+    """``svpgs_method``'s classes, with the length rule applied to the signed change (review F1): the full model's
+    SV-type classes; the small-variant rule on (span, span + signed change) for every record without the SV terms, so
+    a symbolic DEL is a deletion and a symbolic INS/DUP an insertion; one class without any annotation."""
+    if arm != "no_sv_terms":
+        return _METHOD.bench_real_classes_for_arm(variants, arm)
+    reference_length = np.asarray(variants.end, dtype=np.int64) - np.asarray(variants.position, dtype=np.int64) + 1
+    return _METHOD._length_class(reference_length, reference_length + signed_length_change(variants))
+
+
 def _fit(train: Any, arm: str) -> SmallNPredictor:
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
@@ -47,7 +77,7 @@ def _fit(train: Any, arm: str) -> SmallNPredictor:
         codes=codes,
         covariates=np.ones((samples, 1)),
         target=np.asarray(train.phenotype, dtype=np.float64),
-        variant_class=_METHOD.bench_real_classes_for_arm(train.variants, arm),
+        variant_class=classes_for_arm(train.variants, arm),
         log_variance_offset=None,
         draw_count=DRAW_COUNT,
         working_bytes=_METHOD.one_core_budget().working_bytes,
