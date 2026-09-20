@@ -2665,8 +2665,10 @@ def hyper_step(
     The search steers by V's own Laplace gradient and accepts on the certified V (with B). At the end, V's
     stationarity is checked from its analytic gradient, corrections included, and a forward difference of that
     gradient per interior weight (``_stationarity``): while the weights' Newton decrement exceeds ``tolerance``, the
-    search takes the Newton step, accepting only steps whose gain's certified lower bound exceeds ``tolerance`` (so
-    every move gains a resolved amount and the search ends: V is bounded above); a weight whose basin ends on its climbing side
+    search takes the Newton step, accepting steps whose gain's certified lower bound exceeds ``tolerance`` (so every
+    such move gains a resolved amount: V is bounded above), and, where none does (the band: a real gain within the
+    tolerance), the full Newton step on a certified rise, kept only when the next check's decrement falls (natural
+    monotonicity, so Newton's local convergence ends it); a weight whose basin ends on its climbing side
     within the difference's step contributes the most V can climb before the fold.
 
     The returned step's ``tighten`` re-checks its stationarity at the final weights with the bound tightened to a
@@ -2703,9 +2705,18 @@ def hyper_step(
     lower = np.array([bound[0] for bound in bounds])[finite_final]
     upper = np.array([bound[1] for bound in bounds])[finite_final]
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
+    # The weights, evidence and check before a band move (below), until the check after it has judged it.
+    band: tuple[F64Array, _Evidence, _Stationarity] | None = None
     while True:
         interior = (weights > lower) & (weights < upper)
         check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
+        if band is not None:
+            if check.better is None and not check.gain < band[2].gain:
+                # The band move did not lower the weights' Newton decrement (natural monotonicity): it is undone, and
+                # the search ends at the weights before it.
+                weights, evidence, check = band
+                break
+            band = None
         moved = check.better
         if moved is None and check.gain <= tolerance:
             break
@@ -2734,6 +2745,13 @@ def hyper_step(
                 # gain per move bounds the number of moves by V's range, so the search ends.
                 if trial is not None and trial.value - trial.error > evidence.value + evidence.error + tolerance:
                     moved = (trial_weights, trial)
+                    break
+                # The band (theory-ep): where the remaining gain is real but within the tolerance, no move resolves it.
+                # The full Newton step is then taken on a certified rise, and kept only when the next check's decrement
+                # falls (natural monotonicity): Newton's local convergence ends it, not the tolerance's count.
+                if step_length == 1.0 and trial is not None and trial.value - trial.error > evidence.value + evidence.error:
+                    moved = (trial_weights, trial)
+                    band = (weights, evidence, check)
                     break
                 step_length *= 0.5
         if moved is None:
