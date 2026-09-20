@@ -21,9 +21,11 @@ Three more things cut applications without changing what is accepted (the caller
   Lago & Vasseur 2011). At each restart the harmonic Ritz vectors of the slowest part are kept as U with C = (I - L) U
   orthonormal, so a restarted cycle keeps what the last one learned. It holds one block (the right-hand side's rank):
   refreshing it for a new operator is one application, the cost of one block step.
-- **Recycling across outer steps.** U stays in the caller's ``RecycledSpace``. The next outer step's operator differs
-  only through the moved sites and hyperparameters, so its image C = (I - L') U, one application, starts that solve
-  with the slow directions already in hand; so does the next solve at a tightened inner tolerance.
+- **Recycling across solves** (``RecycledSpace``): the kept U, whose image under the next operator, one application,
+  starts that solve with the slow directions in hand. Measured on tests/test_full_data_fit's fixture [sim-only] it
+  saves nothing once the block-local preconditioner is on (it costs its one application per solve), so the engine
+  does not pass one; it is here to be measured again at chr22 scale, where the local preconditioner leaves more of
+  the cross-block coupling to the outer solve.
 """
 
 from __future__ import annotations

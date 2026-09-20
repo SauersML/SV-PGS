@@ -155,7 +155,7 @@ def _dense_problem():
     return prior, coefficients, cavity, covariance
 
 
-def test_the_block_krylov_curvature_is_the_exact_linear_response_and_recycles(monkeypatch) -> None:
+def test_the_block_krylov_curvature_is_the_exact_linear_response_and_preconditioning_saves_applications(monkeypatch) -> None:
     prior, coefficients, cavity, covariance = _dense_problem()
     variant_count = covariance.shape[0]
     squared = np.square(covariance)
@@ -203,16 +203,9 @@ def test_the_block_krylov_curvature_is_the_exact_linear_response_and_recycles(mo
     plain = columns(posterior)
     plain_cost = sum(applications)
     applications.clear()
-    recycled = RecycledSpace()
-    preconditioned = replace(posterior, local_response=local, recycled=recycled)
-    first = columns(preconditioned)
-    first_cost = sum(applications)
-    applications.clear()
-    second = columns(preconditioned)
-    second_cost = sum(applications)
+    preconditioned = columns(replace(posterior, local_response=local))
+    preconditioned_cost = sum(applications)
     scale = float(np.max(np.abs(exact_columns)))
-    for value in (plain, first, second):
+    for value in (plain, preconditioned):
         np.testing.assert_allclose(value, exact_columns, rtol=1e-9, atol=1e-9 * scale)
-    print({"plain": plain_cost, "preconditioned": first_cost, "recycled": second_cost})
-    assert first_cost < plain_cost
-    assert recycled.vectors is not None and second_cost <= first_cost
+    assert preconditioned_cost < plain_cost

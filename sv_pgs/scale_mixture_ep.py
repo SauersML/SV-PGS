@@ -107,7 +107,7 @@ from scipy.optimize import brentq
 from scipy.special import erfcx
 
 from sv_pgs._typing import F64Array, I64Array
-from sv_pgs.krylov_recycle import RecycledSpace, block_gcro_dr
+from sv_pgs.krylov_recycle import block_gcro_dr
 
 _EPSILON = float(np.finfo(np.float64).eps)
 # Half of double precision: the resolution of a quantity whose square is compared at eps.
@@ -987,10 +987,8 @@ class GaussianPosterior:
     variance_jvp: Callable[[F64Array], F64Array]
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
-    # block-local part (read-free), the preconditioner of the Krylov route; ``recycled``: the model's Krylov space
-    # carried across outer steps (``krylov_recycle``, lane speed-recycle).
+    # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
-    recycled: RecycledSpace | None = None
 
 
 class LinearResponseError(RuntimeError):
@@ -1257,8 +1255,9 @@ def _total_curvature_columns(
     size = int(np.prod(shape))
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
     # columns (``krylov_recycle.block_gcro_dr``): each application serves them all, restarts keep the slowest harmonic
-    # Ritz space, the kept space is the posterior's to carry to the next outer step, and ``local_response`` (read-free)
-    # preconditions it. At most ``size`` applications, the unpreconditioned GMRES's own cap.
+    # Ritz space, and ``local_response`` (read-free) preconditions it. At most ``size`` applications, the flattened
+    # GMRES's own cap. Carrying the kept space to the next outer step measured no gain once preconditioned (it costs one
+    # application per solve [sim-only, speed-recycle]), so each solve starts without it.
     # Each product solves the posterior only to ``inner``, so the operator itself errs, and the Krylov residual
     # estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci. Comput. 25, 2003):
     # half the tolerance goes to the Krylov solve, half to the products. The true residual is measured once the solve
@@ -1286,7 +1285,7 @@ def _total_curvature_columns(
         try:
             result = block_gcro_dr(
                 linear_part, offset, relative_tolerance=0.5 * relative_tolerance, absolute_tolerance=rounding, working_bytes=working_bytes,
-                application_limit=size, start=solution, precondition=precondition, recycled=posterior.recycled,
+                application_limit=size, start=solution, precondition=precondition,
             )
         except FloatingPointError as error:
             raise LinearResponseError(f"the EP fixed point's linear response did not converge: {error}") from error
