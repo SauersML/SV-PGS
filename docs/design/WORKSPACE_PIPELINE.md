@@ -101,7 +101,7 @@ No covariate matrix is shared across traits.
 
 | Source | Product | Software and configuration | Fields read | Samples |
 |---|---|---|---|---|
-| B, primary | The CDR's srWGS structural-variant call set, one VCF per chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/` (CDR_LAYOUT.md; the file pattern is checked against the attached release) | GATK-SV joint calling, release version as the CDR documents | INFO SVTYPE, SVLEN, END; FILTER; FORMAT GT, CN, RD_CN, and SL and GL where the header declares them | research IDs, joined to an imputed half through the crosswalk and to the long-read half by research ID, its own namespace (`gatksv_source`) |
+| B, primary | The CDR's srWGS structural-variant call set, one VCF per chromosome under `${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/` (CDR_LAYOUT.md; the file pattern is checked against the attached release) | GATK-SV joint calling, release version as the CDR documents | INFO SVTYPE, SVLEN, END; FILTER; FORMAT GT, CN, CNQ, RD_CN, and SL where the header declares it. The public 1kGP freeze V3's CNV records carry GT, GQ, RD_CN, RD_GQ, PE_GT, PE_GQ, SR_GT, SR_GQ, EV, CN and CNQ, with no GL or PL (measure-path); the user checks the attached release's header inside the workspace | research IDs, joined to an imputed half through the crosswalk and to the long-read half by research ID, its own namespace (`gatksv_source`) |
 | C, optional third source | Per-sample read-depth CNV calls, if the attached CDR carries them (DRAGEN CNV VCFs, for example) | the caller and version the CDR documents; format only: FORMAT CN per segment | segment CN | research IDs |
 | Targeted loci, optional | Copy-number calls at segmental-duplication genes GATK-SV genotypes poorly, from targeted callers run on the CRAMs inside the workspace | open-source targeted callers, configured per locus; a lead decision on cost | per-locus CN | research IDs |
 
@@ -129,15 +129,14 @@ A new step, `direct_sv`, sits between `measurement` and `fit`. It needs the impu
    - An imputed half's columns come from `sample_crosswalk.source_columns_for_store_samples`.
    - The long-read half is named by research ID, the call set's own namespace, so its columns are looked up by research ID. That is not a name match across namespaces.
    - A store sample the call set lacks is a no-call.
-2. **Every kept GATK-SV record becomes a store row of its own** (`gatksv_store_rows` → `GatksvRows`), with its codes, `codes_per_unit` and `value_origin` (measure-path-cn).
-   - `FusedRows` is not used. Its truth-free calibration assumes classical error on DS, which draw-type DS violates (measure-path).
+2. **Every kept GATK-SV record becomes a store row of its own.** `gatksv_store_rows(gatksv, imputed)` returns `(GatksvRows, FusionPairs)`; each row carries its codes, `codes_per_unit` and `value_origin` (measure-path-cn). The truth-free FusedRows path is gone: it assumed classical error on DS, which draw-type DS violates.
    - **Copy-number records** (SVTYPE=CNV or FILTER MULTIALLELIC) are class COPY_NUMBER: value = CN − modal CN, with `codes_per_unit` = ⌊254 / max CN⌋ and `value_origin` = −modal CN (`copy_number.modal_copy_numbers`, `copy_number_codes_per_unit`, `encode_copy_numbers`).
    - **Biallelic DEL, DUP, INS and CPX records** are ALT counts: `codes_per_unit` 127, `value_origin` 0.
 3. **Pairs.** `sv_fusion.candidate_pairs(imputed SV sites, gatksv_sites(block))` pairs direct records with the imputed SV records of the same chromosome. The pairs are resolved one to one by |corr(DS, B)| over the fitted cohort.
 4. **No-calls** are never zero. `GatksvRows` fills each with E_lin[B | DS] from the best-paired imputed DS, or with the record's observed mean where no candidate pairs. E[B | SL] replaces that where the record carries SL.
 5. **Rows and annotations.**
    - The GATK-SV-only rows go into the chromosome in coordinate order, after the popped records at the same POS.
-   - `group_first` merges them with overlapping bubbles and TR loci (`unbreakable_group_first`).
+   - `group_first` merges them with overlapping bubbles and TR loci (`unbreakable_group_first`). Each fusion pair is one more grouping, so an engine block never splits a pair.
    - A `row_source` annotation (popped, direct) records each row's origin, and `sv_length` comes from |SVLEN| or the END span.
    - The store's sites md5 covers the merged list, and its MANIFEST records the call set's release and the FILTER policy.
 6. **Arms (EVALUATION.md).** Arm A drops every SV, CN and direct row through its −inf offset. Arm C keeps them, with each fused pair's map. C-null permutes them within ancestry.
@@ -145,18 +144,19 @@ A new step, `direct_sv`, sits between `measurement` and `fit`. It needs the impu
 ### How the channel enters the measurement model
 
 The fusion is measure-path's `measurement_model` (lane/measure-path-model f043b26): a map fitted on the long-read truth pairs, not a truth-free calibration.
-- **Each accepted pair is a two-row block.** It is `LdBlock(records=[imputed_row, direct_row], targets=[0], absorbed=[1])`, passed in `CalibrationPairs.blocks` as a `BlockPairs` with:
-  - `dosage`: [truth pairs, 2], the stored values of both rows, decoded (`copy_number.decode_values`);
-  - `truth`: [truth pairs, 1], the event's truth ALT count, or truth CN − modal CN for a CN row;
-  - `cohort_covariance`: 2 × 2, from the fitted cohort's sums over both rows.
+- **Pairs fold into the engine's LD blocks.** `engine_blocks(block_starts, block_stops, target_rows, absorbed_rows, absorbing_rows)` gives one `LdBlock` per engine block, with targets = the imputed rows and absorbed = their fused direct rows. It refuses a pair split across a block boundary. Each is passed in `CalibrationPairs.blocks` as a `BlockPairs`:
+  - `dosage`: the truth pairs' decoded values of all the block's records (`copy_number.decode_values`);
+  - `truth`: the targets' truth ALT counts, or truth CN − modal CN for a CN target;
+  - `cohort_covariance`: from the fitted cohort's sums over the block's records.
   The truth pairs are the long-read panel members, with B already no-call-free.
 - **What the model returns.** It fits E_lin[G | D*, B] for the imputed row. It sets the direct row's offset to −inf, so the fit drops that column exactly while the map still reads it. The fused target gets its own offset and residual variance, and the certificate counts `direct_calls_fused`.
-- **Persisted.** The fusion maps (targets, column means, coefficients) are saved with the LD maps. e2e applies each map A in Stage 0, Stage 2 and scoring.
+- **Persisted.** The measurement model, fusion maps included, is written by `MeasurementModel.save` and read back by `load`; its `digest` enters the fit step's key. e2e applies each map A in Stage 0, Stage 2 and scoring.
   - **Open (fit-api/e2e):** `fit_model.fit` takes no map argument yet, so the step can't land before it does.
 - **No truth pairs: no fusion.** Both rows stay separate columns, the step summary and the certificate say so, and the run continues. The truth-free path (`sv_fusion.calibrate_two_sources`, anchor error models, false-positive rates) assumes classical error on DS, which draw-type DS violates, so the driver never uses it.
 - **Copy-number truth.** A CN pair needs a truth copy number for the long-read panel members (`truth_copy_numbers`, the long-read call set's CN at those loci if it carries one).
-- **A direct row with no truth,** CN or not, takes reported r² = 1: the hard-call set's own claim of exactness, with no better number and no genotype likelihoods (measure-path). The certificate counts it under `uncalibrated_records`, with the reported r² as its source.
-  - If the release carries GL for CN records, the principled value is 1 − mean_i Var(G | reads_i) / Var(posterior means), and measure-path adds that estimator. The user checks for GL in the VCF header inside the workspace.
+- **A direct row with no truth** is counted under `uncalibrated_records` in the certificate, with its reported r² as the source:
+  - **A CN row** takes the CNQ bound (measure-path). CNQ is the phred read-depth genotype quality, so each sample's miscall probability is ε_i = 10^(−CNQ_i/10), and a miscall moves the copy number by at least one copy. That gives r² ≤ 1 − Σ_i ε_i / (n · Var(called CN)). The certificate says "CN reliability from CNQ (at least one copy per miscall; an upper bound)".
+  - **A hard-call ALT-count row** takes reported r² = 1: the call set's own claim of exactness, with no genotype likelihoods to give a better number.
 - **The third source C** (RD_CN, or a separate read-depth call set) stays gated. measure-path hasn't validated the three-source identity (MODEL.md §2), and it isn't on their queue.
 - **Moments in value units.** Every moment the measurement model sees, calibration and fitted-cohort alike, is computed on decoded values (code / codes_per_unit + value_origin). A CN row is in copies and an ALT-count row in dosage.
 - **Offsets and scoring.** The fit's `log_variance_offset` covers the merged store's rows. `pooled_log_reliability` must keep a direct row's −inf, since it is −inf in every group. Scoring, Stage 0 and Stage 2 are otherwise affine-invariant per column and need no change (`copy_number` module docstring).
