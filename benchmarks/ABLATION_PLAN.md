@@ -84,3 +84,33 @@ Results are written to `benchmarks/ablations/` with the benchmark's evidence lab
 - **The 20%** is bench-sim's stated design choice, not a production quantity.
 - **Only the ablation adapter reads `train.truth_half`,** to estimate the stored-to-true map Σ_DG. F − t7 ignores it and uses the uncorrected stored columns.
 - **The t7 decision rule** is unchanged from §6, and applies to bench-sim only.
+
+## Amendment 2 (2026-09-19, before any ablation result and before any sealed or confirmation run): versions, confirmation genes and the headline test
+This amendment adopts review-stats' STATS_REVIEW §5. It replaces the sentences of §4–§5 named below, and everything else stands.
+
+### Versions and alpha-spending
+This replaces §4's sentence that a re-run "enlarges the multiplicity family", and §5's single level.
+- **A version** v = 0, 1, 2, … is a frozen pair: the main sha of F and the adapter sha. Versions are numbered in the order their confirmatory runs start.
+- **The level:** version v's decision family is the §5 family, fixed before its run. Holm controls it at FWER α_v = 0.05 · 2^−(v+1).
+  - Σ_v α_v ≤ 0.05 however many versions run, so the error rate holds even though later versions are chosen after earlier results are seen.
+  - The spending sequence is fixed here.
+- **Each decision stands at its own version's level.** An earlier version's results are reported, never pooled with a later version's.
+
+### bench-real decisions use the sealed confirmation genes
+This replaces §4's bench-real design wherever a decision is made.
+- **Which genes:** every bench-real ADOPT, REMOVE or REJECT test is computed once per version on the 3,504 sealed confirmation genes, `dataset/sealed_confirmation_genes.tsv` (sha256 5c0d5f1c…).
+  - Those genes are scored only under `--confirmation`, and only when the lead calls it.
+  - Every arm runs on all 3,504 genes, with no prefix or subset.
+  - random5 and loso remain separate family members.
+- **The SE** is the crossed bootstrap of `benchmarks/bench_real/robust.py` (Owen 2007): families within each held-out group, crossed with chromosomes. The delete-one-chromosome jackknife of §4 is kept for screening only.
+- **The non-sealed genes,** meaning the random5 and loso development runs including the gene-order prefix, are for screening and development only. No decision rests on them.
+
+### The headline test H: one primary test
+- **The claim:** SV-PGS predicts held-out expression better than the primary competitor.
+- **The test:** one-sided, Δ > 0, on the pooled paired Δr² of SV-PGS (F at version v) minus `mr_ashr_init`.
+  - It runs on loso, over the sealed confirmation genes, with the crossed-bootstrap SE.
+  - Pooled means the mean over genes of the mean over the five held-out groups, as in robust.py.
+- **The columns:** both arms use the `snv_sv` feature set, so H compares methods on the same columns.
+- **The competitor:** `mr_ashr_init` is mr-ash-workflow's mr.ash.init through mr.ashr 0.1-90 (3d65ce3), as `benchmarks/compete` specifies. That's on lane/compete-harness, not yet on main.
+- **The level:** H is its own family of one per version, at α_v. It is a separate claim from the term decisions of §6, so it's outside their Holm family.
+- **Everything else is secondary** and reported without a claim: mr_ashr_both and the other competitors, random5, other feature sets, results per group, and bench-sim.
