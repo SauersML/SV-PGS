@@ -255,6 +255,8 @@ class _PooledFixedPoints:
         self.mean = np.zeros(prior.variant_count)
         self.mean_move = np.inf
         self.noise_gain = np.inf
+        self.gene_mean_move = np.full(len(self.rows), np.inf)
+        self.gene_noise_gain = np.full(len(self.rows), np.inf)
         self.refusals: list[str] = []
         self.profile = _new_profile()
 
@@ -324,9 +326,9 @@ class _PooledFixedPoints:
             for gene, (gene_statistics, rows) in enumerate(zip(self.statistics, self.rows))
         ])
 
-    def _solve_mean_metric(self, right: F64Array) -> float:
-        """r' Sigma r in the joint posterior metric: the sum of every gene's own."""
-        return float(sum(right[rows] @ (float(self.noise[gene]) * self.kernels[gene].solve(right[rows])) for gene, rows in enumerate(self.rows)))
+    def _gene_moves(self, right: F64Array) -> F64Array:
+        """Each gene's r_g' Sigma_g r_g in its own posterior metric."""
+        return np.array([float(right[rows] @ (float(self.noise[gene]) * self.kernels[gene].solve(right[rows]))) for gene, rows in enumerate(self.rows)])
 
     def _precision_norm(self) -> Callable[[F64Array], float]:
         designs = [gene.design for gene in self.statistics]
@@ -376,15 +378,19 @@ class _PooledFixedPoints:
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)
             right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            self.mean_move = self._solve_mean_metric(right)
+            # Every gene is scored as its own model, so each is certified on its own: its mean move at most its own
+            # p_eff,g / K and its noise update's gain at most 1/(2K) (review-mathbugs P1: a pooled sum would let one
+            # gene spend the others' Monte Carlo budget).
+            moves = self._gene_moves(right)
             noises = self._noises(variances)
-            gains = [
+            gains = np.array([
                 noise_gain(float(new), float(old), gene.sample_count, int(gene.covariates.shape[1]))
                 for new, old, gene in zip(noises, self.noise, self.statistics)
-            ]
-            # The noise updates are independent parameters, so their evidence gains add.
-            self.noise_gain = float(np.sum(gains))
-            if self.mean_move <= float(np.sum(self.effective)) / self.draw_count and self.noise_gain <= tolerance:
+            ])
+            self.gene_mean_move, self.gene_noise_gain = moves, gains
+            self.mean_move = float(np.max(moves * self.draw_count / self.effective))
+            self.noise_gain = float(np.max(gains))
+            if self.mean_move <= 1.0 and self.noise_gain <= tolerance:
                 return FixedPoint(
                     cavity=cavity, posterior=self._posterior(), mean=mean, precision_norm=self._precision_norm(),
                     effective_effects=float(np.sum(self.effective)),
@@ -439,9 +445,12 @@ class _PooledFixedPoints:
         the pooled frozen move is below sum_g p_eff,g / K (``small_n._DenseFixedPoints._frozen_passes``)."""
         previous = np.full(self.gene_count, np.inf)
         damping = np.ones(self.gene_count)
+        done = np.zeros(self.gene_count, dtype=bool)
         while True:
-            moves = np.empty(self.gene_count)
+            moves = np.zeros(self.gene_count)
             for gene, rows in enumerate(self.rows):
+                if done[gene]:
+                    continue
                 mean = self.mean[rows].copy()
                 fraction = float(damping[gene])
                 delta_precision = target_precision[rows] - self.site_precision[rows]
@@ -474,7 +483,9 @@ class _PooledFixedPoints:
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
                 if previous[gene] > 0.0 and moves[gene] / previous[gene] >= 1.0:
                     damping[gene] = min(float(damping[gene]), 1.0 / (1.0 + np.sqrt(moves[gene] / previous[gene])))
-            if float(np.sum(moves)) <= float(np.sum(self.effective)) / self.draw_count:
+            # A gene is done once its own frozen move is below its p_eff,g / K; the passes end when every gene is.
+            done |= moves <= self.effective / self.draw_count
+            if np.all(done):
                 return
             previous = moves
             cavity = Cavity(precision=frozen, shift=self.mean / (1.0 / (frozen + self.site_precision)) - self.site_shift)
@@ -549,8 +560,10 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         smoothing_gradient=np.array([outer.step.smoothing_gradient]),
         stationarity_steps=(outer.step.stationarity_steps,),
         stationarity_errors=(outer.step.stationarity_errors,),
+        # Per gene, as the largest ratio of a gene's mean move to its own p_eff,g / K (so the tolerance is 1), and the
+        # largest gene noise gain; the genes' own values are in the profile.
         mean_move=np.array([oracle.mean_move]),
-        draw_tolerance=np.array([float(np.sum(oracle.effective)) / draw_count]),
+        draw_tolerance=np.ones(1),
         noise_gain=np.array([oracle.noise_gain]),
         mean_error=np.zeros(1),
         information_bound=np.zeros(1),
@@ -572,6 +585,8 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         "stage0_seconds": stage0_seconds, "total_seconds": time.perf_counter() - started, "genes": len(genes),
         "reduced": int(prior.variant_count), "coefficients": int(prior.coefficient_size), "classes": int(prior.class_count),
         "outer_iterations": int(outer.iterations),
+        "gene_mean_move": oracle.gene_mean_move.tolist(), "gene_draw_tolerance": (oracle.effective / draw_count).tolist(),
+        "gene_noise_gain": oracle.gene_noise_gain.tolist(),
     }
     return PooledFit(
         scoring=tuple(scoring), noise_variance=oracle.noise.copy(), hyperparameters=outer.hyperparameters, prior=prior,
