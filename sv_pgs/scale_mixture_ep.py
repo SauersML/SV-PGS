@@ -511,8 +511,9 @@ def moment_start(
     The first is held exactly, V_y = y'y / r = sigma^2 + c sum_j u_j G_jj / r, so the split always satisfies the
     variance bound; the second then gives the heritability h^2 = c sum_j u_j G_jj / y'y. Under no signal ||X'y||^2
     has variance 2 sigma^4 ||G||_F^2 (``gram_square``), which makes h^2's standard error the resolution s: the start
-    stays inside [s, 1 - s], at one resolution from either end the data cannot tell apart from it, and at 1/2 where
-    the moments cannot place h^2 at all (s >= 1/2, or no curvature between the two moments).
+    stays inside [s, 1 - s], at one resolution from either end the data cannot tell apart from it. Where the moments
+    cannot place h^2 at all (s >= 1/2, or no curvature between the two moments), it is 1/2: the minimax point of the
+    feasible interval [0, 1], the start whose largest distance to any heritability the data allow is least.
     """
     total = target_square / residual_dimension
     denominator = target_square * weighted_square / weighted_diagonal - total * gram_trace
