@@ -22,6 +22,7 @@ from sv_pgs.marginal_variances import (
     information_ceiling,
     information_solve_tolerance,
     resolvable_blocks,
+    sandwich_diagonal,
     block_trace_certificate,
     cavity_tolerance,
     certificate_level,
@@ -460,3 +461,11 @@ def test_a_block_of_rounding_level_columns_is_exact_not_a_zero_tolerance():
     removed = probes / precision[:, None] - covariance @ probes
     certificate = block_information_certificate(solve, variances, blocks, probes, removed, 0.5, certificate_level(64), control_variate(solve, grams, probes))
     assert certificate.certified[1]
+
+
+def test_sandwich_diagonal_equals_the_three_operand_contraction():
+    generator = np.random.default_rng(23)
+    covariance = generator.standard_normal((40, 40))
+    gram = generator.standard_normal((40, 40))
+    reference = np.einsum("ij,jk,ki->i", covariance, gram, covariance)
+    assert np.allclose(sandwich_diagonal(covariance, gram), reference, rtol=1e-12, atol=1e-12 * np.abs(reference).max())

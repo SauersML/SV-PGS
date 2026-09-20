@@ -227,10 +227,19 @@ def marginals_from_quadratics(
     is_resolved = np.zeros(site_precision.shape[0], dtype=bool)
     is_resolved[resolved] = True
     bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, site_precision))
-    spikes = np.einsum("il,lk,ik->i", resolved_cross, np.linalg.inv(resolved_core), resolved_cross) if resolved.shape[0] else 0.0
+    spikes = np.sum((resolved_cross @ np.linalg.inv(resolved_core)) * resolved_cross, axis=1) if resolved.shape[0] else 0.0
     variances = bulk_variance - np.square(bulk_variance) * (bulk_quadratic - spikes)
     variances[resolved] = np.diag(np.linalg.inv(resolved_core))
     return variances
+
+
+def sandwich_diagonal(covariance: NDArray[np.float64], gram: NDArray[np.float64]) -> NDArray[np.float64]:
+    """diag(S R S) as sum_k (S R)_ik S_ki: one BLAS product and an elementwise sum.
+
+    Unoptimized three-operand einsum loops over all (i, j, k) without BLAS; on one 4,430-variant block it was 99.8%
+    of a fit's time (engine's bench-real profile).
+    """
+    return np.sum((covariance @ gram) * covariance.T, axis=1)
 
 
 def _block_index(grams: BlockGrams) -> NDArray[np.int64]:
@@ -340,7 +349,7 @@ def marginal_variances(solve: BulkSolve, grams: BlockGrams) -> NDArray[np.float6
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
         near_variance[members] = np.diag(terms.covariance)
-        sandwich[members] = np.einsum("ij,jk,ki->i", terms.covariance, grams.within[block], terms.covariance)
+        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within[block])
     resolved_weight = sandwich[solve.resolved] / resolved_variance if solve.resolved.shape[0] else np.zeros(0)
     for block in range(len(grams.blocks)):
         near_totals[block] = float(np.sum(resolved_weight[cross.positions[block]]))
@@ -747,7 +756,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     sandwich = np.zeros(variant_count)
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block)
-        sandwich[members] = np.einsum("ij,jk,ki->i", terms.covariance, grams.within[block], terms.covariance)
+        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within[block])
     pair_scale = solve.kernel_square_trace / solve.sample_count
     chance_weight = sandwich[:, None] * direction
     chance_total = chance_weight.sum(axis=0)
@@ -781,8 +790,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_part[members] = window_sum
         variance[members] = 2.0 * np.square(row_scale)[:, None] * (chance_square_total - window_chance_square[block])[None, :]
         # Resolved rows: bulk partners whose window holds the resolved site, exactly.
-        weighted = squared_variance[members][:, None, None] * np.square(loadings)[:, :, None] * direction[members][:, None, :]
-        resolved_bulk_near[near] += weighted.sum(axis=0)[near]
+        resolved_bulk_near[near] += (np.square(loadings).T @ (squared_variance[members][:, None] * direction[members]))[near]
     if solve.resolved.shape[0]:
         resolved_blocks = block_of[solve.resolved]
         resolved_scale = sandwich[solve.resolved] * pair_scale
