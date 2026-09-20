@@ -230,8 +230,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('hyperprior_pooling.py', '_VARIANCE_SHRINK_LIMIT'): ('deslop-constants', frozenset({1e-06}), 'exact omega^2 = 0 boundary by the variance-component score test (math-epeb)'),
     ('hyperprior_pooling.py', '_QUADRATIC_FLOOR'): ('deslop-constants', frozenset({1e-12}), 'exact nu = infinity boundary by the T_k statistic (math-density)'),
     ('ld_partition.py', 'PAIR_WEIGHT_SCALE'): ('deslop-constants', frozenset({20}), "largest fixed-point scale the int64 cost range allows for the chromosome's size and block cap"),
-    ('prior_terms.py', '_CUBIC_SUPPORT'): ('definitional', frozenset({4}), 'a cubic B-spline is nonzero on degree + 1 knot intervals'),
-    ('prior_terms.py', '_cubic_curvatures'): ('math', frozenset({3.0}), 'second derivatives of the uniform cubic B-spline segment polynomials'),
     ('prior_design.py', '_continuous_spline_knots'): ('e2e', frozenset({0.25, 0.75}), 'a rich basis with a learned roughness penalty instead of quartile knots'),
     ('prior_design.py', '_effective_prior_variances'): ('e2e', frozenset({1e-08}), "B7: the engine's EB replaces the floor"),
     ('sv_fusion.py', 'MINIMUM_PAIRING_Z'): ('novel-measure', frozenset({5.0}), 'fusion acceptance: one event vs two in LD needs a prior on r2_B, not a z or clamp threshold'),
