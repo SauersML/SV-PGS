@@ -1061,13 +1061,15 @@ class DualGaussian:
             if not open_models.any():
                 break
             previous_certificate, previous_open = certificate.copy(), open_models
-            # Tighten the open models' mean and Z_L columns by the measured shortfall and continue.
+            # Tighten the open models' mean and Z_L columns by the measured shortfall from the residuals reached (a
+            # column that overshot its bound would meet the tightened one without an iteration) and continue.
             for model in np.flatnonzero(open_models):
                 shortfall = float(target[model] / certificate[model]) if bool(array_module.isfinite(certificate[model])) else float(target[model] / max(float(column_norms[model]), np.finfo(np.float64).tiny))
-                bound[model] *= shortfall
+                columns = slice(model, model + 1)
                 if model in order:
                     position = order.index(model)
-                    bound[offsets[position + 1] : offsets[position + 2]] *= shortfall
+                    columns = np.r_[model, np.arange(offsets[position + 1], offsets[position + 2])]
+                bound[columns] = array_module.minimum(bound[columns], result.residual_norm[columns]) * shortfall
             start = result.solution
         self._duals = result.solution
         self._resolved = resolved
@@ -1248,8 +1250,10 @@ class DualGaussian:
                 state["blocks"][model] = block
             bulk_limited = open_mask & ~resolved_limited
             if bulk_limited.any():
+                # From the residual reached, not the bound asked: a solve that overshot its bound would otherwise
+                # meet the tightened one without an iteration, and its unchanged certificate would read as a stall.
                 tighten = array_module.asarray(np.flatnonzero(bulk_limited))
-                bound[tighten] *= target[tighten] / certificate[tighten]
+                bound[tighten] = array_module.minimum(bound[tighten], result.residual_norm[tighten]) * (target[tighten] / certificate[tighten])
             start = result.solution
         left = models.sample_to_design(duals, column_models)
         solution = bulk_variances[:, None] * bulk_values
