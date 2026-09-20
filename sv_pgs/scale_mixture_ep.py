@@ -1130,9 +1130,9 @@ def _total_curvature(
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     variance = derivatives.variance[:, None]
 
-    def through(precision_step: F64Array) -> tuple[F64Array, F64Array]:
+    def through(precision_step: F64Array, inner: float) -> tuple[F64Array, F64Array, F64Array]:
         mean_step = posterior.solve(
-            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance, relative_tolerance
+            (derivatives.mean + derivatives.mean_by_precision / derivatives.variance)[:, None] * precision_step + mean_by_z / variance, inner
         )
         shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) / variance
         variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
@@ -1140,24 +1140,48 @@ def _total_curvature(
         return shift_step, response + posterior.variance_jvp(response) / variance**2, response
 
     shape = mean_by_z.shape
-    _shift, offset, start_response = through(np.zeros(shape))
-    # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times the
-    # terms that cancel, which is where GMRES's residual can stop.
-    rounding = _EPSILON * float(np.linalg.norm(start_response))
-
-    def linear_part(vector: F64Array) -> F64Array:
-        precision_step = vector.reshape(shape)
-        return (precision_step - (through(precision_step)[1] - offset)).ravel()
-
     size = int(np.prod(shape))
-    operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
     # GMRES(r) keeps r + 1 basis vectors of ``size`` and an (r + 1) x r Hessenberg matrix, at most 2 (r + 1) size
     # float64 values: r is the longest restart that fits ``working_bytes``. The cycles are capped so the total Krylov
     # dimension is ``size``, where unrestarted GMRES is exact; a restarted one that has not converged by then raises.
     restart = max(1, min(size, int(working_bytes) // (2 * np.dtype(np.float64).itemsize * size) - 1))
-    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart))
-    if information != 0:
-        raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+    # Each product solves the posterior only to ``inner``, so the operator itself errs, and GMRES's own residual
+    # estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci. Comput. 25, 2003):
+    # half the tolerance goes to GMRES, half to the products. The true residual is measured once GMRES stops; while
+    # it exceeds the tolerance, the inner solves tighten by the measured excess (the operator's own amplification of
+    # their error) and GMRES continues from where it stopped.
+    inner = relative_tolerance
+    solution = np.zeros(size)
+    previous = np.inf
+    while True:
+        try:
+            _shift, offset, start_response = through(np.zeros(shape), inner)
+        except ValueError as error:
+            if inner >= relative_tolerance:
+                raise
+            # The solver cannot reach the tightened accuracy in float64: the response is not resolvable here.
+            raise FloatingPointError(f"the EP fixed point's linear response cannot be resolved: {error}") from error
+        # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times
+        # the terms that cancel, which is where GMRES's residual can stop.
+        rounding = _EPSILON * float(np.linalg.norm(start_response))
+
+        def linear_part(vector: F64Array, inner: float = inner, offset: F64Array = offset) -> F64Array:
+            precision_step = vector.reshape(shape)
+            return (precision_step - (through(precision_step, inner)[1] - offset)).ravel()
+
+        operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
+        right = offset.ravel()
+        solution, information = gmres(
+            operator, right, x0=solution, rtol=0.5 * relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart)
+        )
+        target = max(relative_tolerance * float(np.linalg.norm(right)), rounding)
+        residual = float(np.linalg.norm(right - linear_part(solution)))
+        if residual <= target:
+            break
+        if residual >= previous:
+            raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+        previous = residual
+        inner *= 0.5 * target / residual
     precision_step = solution.reshape(shape)
     shift_step, _next, _response = through(precision_step)
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
