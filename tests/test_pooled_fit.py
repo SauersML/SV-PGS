@@ -119,3 +119,22 @@ def test_a_gene_at_its_frozen_fixed_point_takes_no_step_while_the_others_move():
     target_precision[rows[1]] *= 1.5  # gene 0's targets are its own sites: its update is exactly zero
     oracle._frozen_passes(start, frozen, target_precision, target_shift)  # refused before the fix
     assert np.all(np.isfinite(oracle.site_precision)) and np.all(np.isfinite(oracle.mean))
+
+
+@pytest.mark.slow
+def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
+    from sv_pgs.pooled_fit import _PooledPosterior, _total_curvature, pooled_curvature_blocks
+    from sv_pgs.scale_mixture_ep import Cavity
+
+    rng = np.random.default_rng(9)
+    genes = [_gene(rng, 100, width, _sparse_effects(rng, width, count)) for width, count in ((50, 2), (40, 1))]
+    fit = fit_pooled_small_n(genes, draw_count=64, working_bytes=2 * 10**9, seed=2)
+    curvature = pooled_curvature_blocks(fit, 2 * 10**9)
+    oracle = fit.oracle
+    (point,) = oracle([fit.hyperparameters])
+    joint = _PooledPosterior(oracle.kernels, oracle.noise, oracle.rows, 10**9, _new_profile()).gaussian_posterior()
+    relative = max(0.5 / 64 / fit.hyperparameters.coefficients.shape[0], np.finfo(np.float64).eps)
+    pooled = _total_curvature(fit.prior, fit.hyperparameters.coefficients, point.cavity, joint, 10**9, relative)
+    scale = np.max(np.abs(pooled))
+    np.testing.assert_allclose(curvature.blocks.sum(axis=0), pooled, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
+    assert curvature.blocks.shape == (2,) + pooled.shape

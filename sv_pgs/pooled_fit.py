@@ -19,7 +19,7 @@ move in the joint posterior metric against sum_g p_eff,g / K, and the noise upda
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Sequence
 
 import numpy as np
@@ -37,6 +37,7 @@ from sv_pgs.scale_mixture_ep import (
     MixtureHyperparameters,
     ScaleMixturePrior,
     _sum_to_zero_basis,
+    _total_curvature,
     derived_lattice,
     fit_hyperparameters,
     initial_hyperparameters,
@@ -89,6 +90,7 @@ class PooledFit:
     gene_rows: tuple[slice, ...]
     certificate: FitCertificate
     profile: dict = field(default_factory=dict)
+    oracle: "_PooledFixedPoints | None" = field(default=None, repr=False, compare=False)
 
 
 def _gene_rows(statistics: Sequence[DenseStatistics]) -> tuple[slice, ...]:
@@ -522,5 +524,61 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
     }
     return PooledFit(
         scoring=tuple(scoring), noise_variance=oracle.noise.copy(), hyperparameters=outer.hyperparameters, prior=prior,
-        gene_rows=oracle.rows, certificate=certificate, profile=profile,
+        gene_rows=oracle.rows, certificate=certificate, profile=profile, oracle=oracle,
+    )
+
+
+@dataclass(frozen=True)
+class CurvatureBlocks:
+    """Each gene's share of the total curvature at the fitted x: ``blocks[g]`` = B_g (D x D, in x) with
+    sum_g B_g = B, the outer step's B + S less S. ``penalty_blocks`` names each learned weight's x coordinates,
+    ``log_smoothing`` its fitted log weight (inf: at its edge, the term in its penalty's null space), and ``null_basis``
+    spans the total penalty's null space."""
+
+    coefficients: F64Array
+    blocks: F64Array
+    penalty_blocks: tuple[tuple[str, np.ndarray], ...]
+    log_smoothing: F64Array
+    null_basis: F64Array
+
+
+def _gene_prior(prior: ScaleMixturePrior, rows: slice) -> ScaleMixturePrior:
+    """The prior on one gene's rows, in the pooled x coordinates: every per-variant field restricted, the lattice and
+    x's layout shared. The data objective and B are sums over rows, so the genes' parts add up to the pooled one."""
+    class_index = prior.class_index[rows]
+    order = np.argsort(class_index, kind="stable")
+    sizes = np.bincount(class_index, minlength=prior.class_count)
+    return replace(
+        prior,
+        class_index=class_index,
+        class_rows=tuple(np.split(order, np.cumsum(sizes)[:-1])),
+        log_variance_offset=prior.log_variance_offset[rows],
+        scale_design=prior.scale_design[rows],
+    )
+
+
+def pooled_curvature_blocks(fit: PooledFit, working_bytes: int) -> CurvatureBlocks:
+    """B_g for every gene at the fitted x (theory-ep section 5): EP is re-solved there (the oracle's last fixed point
+    may be a trial's), and each gene's total curvature is the engine's own, on its rows with its exact response."""
+    oracle = fit.oracle
+    if oracle is None:
+        raise ValueError("the fit keeps no fixed-point oracle.")
+    hyperparameters = fit.hyperparameters
+    (point,) = oracle([hyperparameters])
+    if point is None:
+        raise FloatingPointError(f"no EP fixed point at the fitted hyperparameters; EP refusals: {oracle.refusals}")
+    tolerance = 0.5 / oracle.draw_count
+    relative_tolerance = max(tolerance / hyperparameters.coefficients.shape[0], _EPSILON)
+    share = working_bytes // _LIVE_FIXED_POINTS
+    blocks = []
+    for gene, rows in enumerate(oracle.rows):
+        posterior = _DensePosterior(oracle.kernels[gene], float(oracle.noise[gene]), share, oracle.profile).gaussian_posterior()
+        cavity = Cavity(precision=point.cavity.precision[rows], shift=point.cavity.shift[rows])
+        blocks.append(_total_curvature(_gene_prior(fit.prior, rows), hyperparameters.coefficients, cavity, posterior, share, relative_tolerance))
+    return CurvatureBlocks(
+        coefficients=hyperparameters.coefficients.copy(),
+        blocks=np.stack(blocks),
+        penalty_blocks=tuple((block.name, np.asarray(block.coordinates)) for block in fit.prior.smoothing_blocks),
+        log_smoothing=np.asarray(hyperparameters.log_smoothing, dtype=np.float64).copy(),
+        null_basis=fit.prior.null_basis.copy(),
     )
