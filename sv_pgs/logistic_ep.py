@@ -73,7 +73,8 @@ class NotConverged(RuntimeError):
 class TiltedMoments:
     """Moments of sigmoid(sign eta) N(eta; cavity), with their certified error.
 
-    ``log_normalizer`` is log of the tilted integral, ``mean`` and ``variance`` those of eta.
+    ``log_normalizer`` is log of the tilted integral, ``mean`` and ``variance`` those of eta, and
+    ``standardized_mean`` and ``standardized_variance`` those of z = (eta - cavity mean) / cavity sd.
     ``relative_error`` bounds |Z_hat - Z| / Z; the standardized moments E[z], E[z^2] carry at most
     ``moment_error`` absolute error each.
     """
@@ -83,6 +84,22 @@ class TiltedMoments:
     variance: F64Array
     relative_error: F64Array
     moment_error: F64Array
+    standardized_mean: F64Array
+    standardized_variance: F64Array
+
+    @property
+    def variance_error(self) -> F64Array:
+        """A bound on |standardized_variance - Var_t z|.
+
+        Var_t z = E z^2 - (E z)^2. With e = moment_error on each of E z and E z^2,
+        |m_hat^2 - m^2| <= e (2 |m_hat| + e), so the moments contribute e (1 + 2 |m_hat| + e). Forming
+        it rounds four times (the two ratios, the square and the difference), each by at most eps / 2
+        of its result, and the square doubles the rounding of m_hat: at most eps (E z^2 + 2 m_hat^2).
+        """
+        error = self.moment_error
+        square = self.standardized_mean * self.standardized_mean
+        second_moment = self.standardized_variance + square
+        return error * (1.0 + 2.0 * np.abs(self.standardized_mean) + error) + _EPSILON * (second_moment + 2.0 * square)
 
 
 @dataclass(frozen=True)
@@ -219,6 +236,8 @@ def tilted_moments(cavity_mean: F64Array, cavity_variance: F64Array, labels: F64
         variance=unsorted(sorted_spread * sorted_spread * standardized_variance),
         relative_error=unsorted(relative_error),
         moment_error=unsorted(moment_error),
+        standardized_mean=unsorted(standardized_mean),
+        standardized_variance=unsorted(standardized_variance),
     )
 
 
@@ -235,16 +254,13 @@ def cavities(marginal_mean: F64Array, marginal_variance: F64Array, sites: Sample
 def site_update(cavity_mean: F64Array, cavity_variance: F64Array, moments: TiltedMoments) -> SampleSites:
     """The sites whose product with each cavity has the tilted moments.
 
-    precision = 1 / tilted variance - 1 / cavity variance is >= 0 by log-concavity. A computed value
-    below zero lies within the moments' certified error (else it raises), and is projected onto the
-    true value's known sign.
+    precision = (1 / Var_t z - 1) / cavity variance is >= 0 by log-concavity, since Var_t z <= 1. A
+    computed Var_t z above one by at most its certified error (``TiltedMoments.variance_error``) is
+    projected onto the true value's known sign, precision zero; beyond that it raises.
     """
-    standardized_variance = moments.variance / cavity_variance
-    precision = (1.0 / standardized_variance - 1.0) / cavity_variance
-    tolerance = moments.moment_error / (standardized_variance * standardized_variance * cavity_variance)
-    if np.any(precision < -tolerance):
+    if np.any(moments.standardized_variance - 1.0 > moments.variance_error):
         raise ArithmeticError("a tilted variance exceeds its cavity's beyond the certified error: log-concavity is violated.")
-    precision = np.maximum(precision, 0.0)
+    precision = np.maximum(1.0 / moments.standardized_variance - 1.0, 0.0) / cavity_variance
     shift = moments.mean / moments.variance - cavity_mean / cavity_variance
     return SampleSites(precision=precision, shift=shift)
 

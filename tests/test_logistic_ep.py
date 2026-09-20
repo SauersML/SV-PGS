@@ -130,3 +130,48 @@ def test_an_improper_cavity_raises() -> None:
     sites = logistic_ep.SampleSites(precision=np.array([2.0]), shift=np.array([0.0]))
     with pytest.raises(logistic_ep.ImproperCavity):
         logistic_ep.cavities(np.array([0.0]), np.array([1.0]), sites)
+
+
+def _moments_at(standardized_mean: float, standardized_variance: float, moment_error: float) -> logistic_ep.TiltedMoments:
+    """Tilted moments against the standard cavity N(0, 1), so eta and z coincide."""
+
+    def entry(value: float) -> np.ndarray:
+        return np.array([value])
+
+    return logistic_ep.TiltedMoments(
+        log_normalizer=entry(0.0),
+        mean=entry(standardized_mean),
+        variance=entry(standardized_variance),
+        relative_error=entry(moment_error),
+        moment_error=entry(moment_error),
+        standardized_mean=entry(standardized_mean),
+        standardized_variance=entry(standardized_variance),
+    )
+
+
+def test_a_variance_above_one_within_the_mean_term_of_its_error_is_accepted() -> None:
+    # A tilt ten cavity sds out: Var_t z = E z^2 - (E z)^2 carries 2 |E z| e = 20 e from the mean, so an
+    # excess of 10 e over one is inside the certified error though above e alone.
+    moment_error, standardized_mean = 1e-10, 10.0
+    cavity_mean, cavity_variance = np.array([0.0]), np.array([1.0])
+    inside = _moments_at(standardized_mean, 1.0 + 10.0 * moment_error, moment_error)
+    assert inside.standardized_variance[0] - 1.0 > moment_error
+    sites = logistic_ep.site_update(cavity_mean, cavity_variance, inside)
+    assert sites.precision[0] == 0.0
+    probe = _moments_at(standardized_mean, 1.0, moment_error)
+    beyond = _moments_at(standardized_mean, 1.0 + 2.0 * float(probe.variance_error[0]), moment_error)
+    with pytest.raises(ArithmeticError):
+        logistic_ep.site_update(cavity_mean, cavity_variance, beyond)
+
+
+@pytest.mark.parametrize("cavity_mean, cavity_variance", [(-300.0, 100.0), (-3000.0, 900.0)])
+def test_the_wrong_side_exponential_tilt_has_a_zero_site_within_its_error(cavity_mean: float, cavity_variance: float) -> None:
+    # Far on the wrong side sigmoid(eta) is e^eta to fp64, so the tilt is N(c, 1) in z: E z = c, the cavity
+    # sd, and Var_t z = 1 up to e^eta's correction. This is the boundary |E z| large with Var_t z at one.
+    mean, variance, label = np.array([cavity_mean]), np.array([cavity_variance]), np.array([1.0])
+    moments = logistic_ep.tilted_moments(mean, variance, label)
+    spread = math.sqrt(cavity_variance)
+    assert abs(float(moments.standardized_mean[0]) - spread) <= float(moments.moment_error[0])
+    sites = logistic_ep.site_update(mean, variance, moments)
+    error = float(moments.variance_error[0])
+    assert 0.0 <= float(sites.precision[0]) * cavity_variance <= error / (1.0 - error)
