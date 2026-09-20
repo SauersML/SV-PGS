@@ -97,6 +97,7 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
+from scipy.optimize import brentq
 from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx
 
@@ -427,12 +428,33 @@ def scale_mixture_prior(
     )
 
 
-def initial_hyperparameters(prior: ScaleMixturePrior) -> MixtureHyperparameters:
-    """A start, not a prior: every class at the log-normal centred on the lattice whose density at the lattice's
-    ends is eps of its peak; no deviation or annotation effect; unit penalty weights."""
+def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | None = None) -> MixtureHyperparameters:
+    """A start, not a prior: every class at one log-normal on the lattice, of the width whose density at the lattice's
+    ends is eps of its peak when it is centred; no deviation or annotation effect; unit penalty weights.
+
+    It is centred on the lattice unless ``mean_variance`` is given: the start's mean of e^t over the lattice, so that
+    every prior variance E[beta_j^2] starts at mean_variance u_j (``moment_start``). The centre then moves along the
+    lattice until the lattice mean equals it (the mean rises with the centre), or stops at the lattice's end nearer a
+    target beyond its reach. The start only moves the fit's first iterate, never its certified answer.
+    """
     nodes = prior.log_variance_grid
-    centre = 0.5 * (nodes[0] + nodes[-1])
     width = 0.5 * (nodes[-1] - nodes[0]) / np.sqrt(2.0 * np.log(1.0 / _EPSILON))
+
+    def log_mean(centre: float) -> float:
+        quadratic = -0.5 * np.square((nodes - centre) / width)
+        return float(_log_sum_exp(quadratic + nodes, axis=0) - _log_sum_exp(quadratic, axis=0))
+
+    centre = 0.5 * (nodes[0] + nodes[-1])
+    if mean_variance is not None:
+        if not mean_variance > 0.0:
+            raise ValueError("mean_variance must be positive")
+        target = float(np.log(mean_variance))
+        if log_mean(float(nodes[0])) >= target:
+            centre = float(nodes[0])
+        elif log_mean(float(nodes[-1])) <= target:
+            centre = float(nodes[-1])
+        else:
+            centre = float(brentq(lambda value: log_mean(value) - target, float(nodes[0]), float(nodes[-1])))
     quadratic = -0.5 * np.square((nodes - centre) / width)
     coefficients = np.zeros(prior.coefficient_size)
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
@@ -450,6 +472,55 @@ def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Arra
     with np.errstate(divide="ignore"):
         total = np.log(np.sum(shifted, axis=axis, keepdims=True)) + shift
     return total if keepdims else np.squeeze(total, axis=axis)
+
+
+@dataclass(frozen=True)
+class MomentStart:
+    """Where EB starts on a trait: its phenotypic variance split into genetic and noise parts.
+
+    ``heritability`` is the share of y's residual variance (after the covariates) the start gives the genotypes,
+    ``genetic_variance`` and ``noise`` its two parts per sample, and ``mean_variance`` the start's mean of e^t, so
+    that every E[beta_j^2] starts at mean_variance u_j (``initial_hyperparameters``); ``resolution`` is the moment
+    estimate's standard error under no signal.
+    """
+
+    heritability: float
+    genetic_variance: float
+    noise: float
+    mean_variance: float
+    resolution: float
+
+
+def moment_start(
+    *, target_square: float, residual_dimension: float, score_square: float, gram_trace: float, weighted_diagonal: float, weighted_square: float, gram_square: float
+) -> MomentStart:
+    """The EB start from Haseman-Elston moments: the genetic variance can never exceed the phenotypic.
+
+    With y (after the covariates, in r = n - k dimensions) = X beta + e, beta_j independent with variance c u_j and
+    e ~ N(0, sigma^2 I), and G = X'X, the two moments are exact for a fixed design:
+        E[y'y]       = sigma^2 r      + c sum_j u_j G_jj           (``target_square``, ``weighted_diagonal``)
+        E[||X'y||^2] = sigma^2 tr G   + c sum_j u_j ||G e_j||^2    (``score_square``, ``gram_trace``, ``weighted_square``).
+    The first is held exactly, V_y = y'y / r = sigma^2 + c sum_j u_j G_jj / r, so the split always satisfies the
+    variance bound; the second then gives the heritability h^2 = c sum_j u_j G_jj / y'y. Under no signal ||X'y||^2
+    has variance 2 sigma^4 ||G||_F^2 (``gram_square``), which makes h^2's standard error the resolution s: the start
+    stays inside [s, 1 - s], at one resolution from either end the data cannot tell apart from it, and at 1/2 where
+    the moments cannot place h^2 at all (s >= 1/2, or no curvature between the two moments).
+    """
+    total = target_square / residual_dimension
+    denominator = target_square * weighted_square / weighted_diagonal - total * gram_trace
+    if denominator > 0.0:
+        resolution = float(np.sqrt(2.0 * gram_square) * total / denominator)
+        estimate = (score_square - total * gram_trace) / denominator
+    else:
+        resolution, estimate = np.inf, 0.5
+    heritability = 0.5 if resolution >= 0.5 else float(np.clip(estimate, resolution, 1.0 - resolution))
+    return MomentStart(
+        heritability=heritability,
+        genetic_variance=heritability * total,
+        noise=(1.0 - heritability) * total,
+        mean_variance=heritability * target_square / weighted_diagonal,
+        resolution=resolution,
+    )
 
 
 def _density_and_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[F64Array, F64Array]:
