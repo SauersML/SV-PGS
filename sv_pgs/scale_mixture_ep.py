@@ -253,7 +253,10 @@ class HyperStep:
     gradient; ``stationarity_steps`` are the curvature's difference steps,
     ``stationarity_errors`` the gradient's error bounds, and ``stationarity_gain`` the weights' remaining gain
     (``_stationarity``: their Newton decrement, plus what a fold lets them climb; at most the tolerance when the
-    step certified).
+    step certified), with its parts ``stationarity_floor`` (the gain with exact correction slopes),
+    ``stationarity_decrement`` (1/2 g'K^-1 g) and ``stationarity_fold`` (the folded weights'). ``tighten(budget)``
+    re-checks the stationarity at the returned weights with the bound tightened to ``budget``, with no new search
+    (None where that check finds a better side or no finite bound).
     """
 
     hyperparameters: MixtureHyperparameters
@@ -266,6 +269,10 @@ class HyperStep:
     stationarity_steps: F64Array
     stationarity_errors: F64Array
     stationarity_gain: float
+    stationarity_floor: float = np.inf
+    stationarity_decrement: float = np.inf
+    stationarity_fold: float = np.inf
+    tighten: Callable[[float], "HyperStep | None"] | None = None
 
 
 # ------------------------------------------------------------------ the lattice
@@ -2404,6 +2411,11 @@ class _Stationarity:
     folds: F64Array
     gain: float
     better: tuple[F64Array, _Evidence] | None
+    # The gain's parts (theory-ep's split): ``floor`` with exact correction slopes (E at its fixed part), ``decrement``
+    # 1/2 g'K^-1 g on the open weights, ``fold`` the folded weights' (|g| + E) h; the rest of ``gain`` is E's.
+    floor: float = np.inf
+    decrement: float = np.inf
+    fold: float = np.inf
 
 
 def _full_gradient(
@@ -2437,10 +2449,10 @@ def _stationarity(
     """The weights' Newton decrement at a certified maximum, from V's analytic gradient (lead ruling: in place of
     central differences of V, which cannot certify where the base's inner basin ends within their step).
 
-    ``budget`` is the gain the certificate leaves the weights (``hyper_step``): where the bound exceeds it only through
-    the slopes' error, the slopes are resolved again to the error that meets it (theory-ep), until the bound meets
-    it or stops falling. Where it exceeds it even with exact slopes, the slopes are not what stops the certificate.
-    Infinite, the bound is reported as measured.
+    ``budget`` is the gain the certificate leaves the weights (``HyperStep.tighten``): where the bound exceeds it only
+    through the correction slopes' error, the slopes are resolved again to the error that meets it (theory-ep), for
+    as long as every slope's error falls. Where it exceeds it even with exact slopes (``floor``), the slopes are not
+    what stops the certificate. Infinite, the bound is reported as measured.
 
     The gradient is the Laplace part's (exact) plus the corrections' own slopes (``_correction_slopes``). The curvature
     is -dg/drho of the Laplace part by one forward difference per interior weight, taken on the side the gradient
@@ -2449,8 +2461,9 @@ def _stationarity(
     rho_i bounded by s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of
     step h errs by h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
     there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
-    most V can climb before the fold. Elsewhere the gain is the Newton decrement 1/2 r K^-1 r with r = |g| + E on the
-    other interior weights and K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
+    most V can climb before the fold. Elsewhere the gain is the most the Newton decrement 1/2 (g + d)'K^-1 (g + d)
+    reaches over the gradient's error box |d| <= E on the other interior weights, 1/2 g'K^-1 g + |K^-1 g|'E +
+    1/2 E'|K^-1|E (theory-ep), with K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
     as an indefinite B + S has none for x. A side whose certified V beats the base's by the tolerance, both at their
     certified bounds, is returned as ``better`` at once: the base is then not the maximum, and the search resumes
     from it.
@@ -2517,60 +2530,62 @@ def _stationarity(
     folded = interior & (folds > 0.0)
     open_ = np.flatnonzero(interior & ~folded)
 
-    def terms(constant: F64Array, linear: F64Array, curvature: F64Array) -> tuple[float, float, float]:
-        """(a, b, c) with the gain a t^2 + b t + c for the reach |g| + E = constant + t linear: (|g| + E) h on the folded
-        weights plus 1/2 r'K^-1 r on the others; infinite where a slope is unresolved or K is not positive definite
-        (an indefinite model has no decrement, as an indefinite B + S has none for x)."""
-        if not (np.all(np.isfinite(constant[interior])) and np.all(np.isfinite(linear[interior]))):
-            return 0.0, 0.0, np.inf
-        quadratic, slope = 0.0, float(np.sum(linear[folded] * folds[folded]))
-        value = float(np.sum(constant[folded] * folds[folded]))
+    def terms(gradient: F64Array, fixed: F64Array, slopes: F64Array, curvature: F64Array) -> tuple[float, float, float, float, float]:
+        """(alpha, beta, gamma, decrement, fold): the gain bound alpha + beta t + gamma t^2 for the gradient's error
+        E = F + t E_c (theory-ep), 1/2 g'K^-1 g, and the folded weights' part at t = 1. On the open weights the bound
+        is the most 1/2 (g + d)'K^-1 (g + d) reaches over the box |d| <= E, with the signed g:
+        1/2 g'K^-1 g + |K^-1 g|'E + 1/2 E'|K^-1|E (|.| elementwise; K^-1's off-diagonals can be negative, where
+        1/2 (|g| + E)'K^-1 (|g| + E) would understate it). On the folded weights it is (|g| + E) h. Infinite where a
+        slope is unresolved or K is not positive definite (an indefinite model has no decrement, as an indefinite
+        B + S has none for x)."""
+        if not all(np.all(np.isfinite(values[interior])) for values in (gradient, fixed, slopes)):
+            return np.inf, 0.0, 0.0, np.inf, np.inf
+        alpha = float(np.sum((np.abs(gradient) + fixed)[folded] * folds[folded]))
+        beta = float(np.sum(slopes[folded] * folds[folded]))
+        fold = alpha + beta
+        gamma = decrement = 0.0
         if open_.shape[0]:
             try:
                 factor = np.linalg.cholesky(curvature[np.ix_(open_, open_)])
             except np.linalg.LinAlgError:
-                return 0.0, 0.0, np.inf
-            fixed_part = solve_triangular(factor, constant[open_], lower=True)
-            error_part = solve_triangular(factor, linear[open_], lower=True)
-            quadratic, slope, value = 0.5 * float(error_part @ error_part), slope + float(fixed_part @ error_part), value + 0.5 * float(fixed_part @ fixed_part)
-        return quadratic, slope, value
+                return np.inf, 0.0, 0.0, np.inf, fold
+            root = solve_triangular(factor, np.eye(open_.shape[0]), lower=True)
+            inverse = root.T @ root
+            absolute = np.abs(inverse)
+            reach = np.abs(inverse @ gradient[open_])
+            floor, error = fixed[open_], slopes[open_]
+            decrement = 0.5 * float(gradient[open_] @ inverse @ gradient[open_])
+            alpha += decrement + float(reach @ floor) + 0.5 * float(floor @ absolute @ floor)
+            beta += float(reach @ error) + float(floor @ absolute @ error)
+            gamma = 0.5 * float(error @ absolute @ error)
+        return alpha, beta, gamma, decrement, fold
 
-    # The part of E no slope target lowers (x_rho's own error and the rounding), and the slopes' part above it.
+    # E's part no slope target lowers (x_rho's own error and the rounding), and the slopes' part above it.
     fixed = np.where(interior, _laplace_gradient_error(base), 0.0)
-    quadratic, slope, value = terms(np.abs(gradient) + fixed, np.maximum(error - fixed, 0.0), curvature)
-    gain = quadratic + slope + value
-    while np.isfinite(gain) and gain > budget and value < budget:
-        # gain(t) is convex in the slopes' error scale t, below the budget at t = 0 and above it at t = 1: its one root
-        # in (0, 1) is the error that meets the budget.
-        room = budget - value
-        scale_down = 2.0 * room / (slope + float(np.sqrt(slope * slope + 4.0 * quadratic * room)))
-        slope_error = np.maximum(error - fixed, 0.0)
-        tighter = interior & (slope_error > 0.0)
-        resolved = _full_gradient(view, weights, base, tighter, cavity, working_bytes, scale_down * slope_error)
+    alpha, beta, gamma, decrement, fold = terms(gradient, fixed, np.maximum(error - fixed, 0.0), curvature)
+    gain = alpha + beta + gamma
+    while np.isfinite(gain) and alpha <= budget < gain:
+        # gain(t) rises in the slopes' error scale t (alpha, beta, gamma >= 0), from at most the budget at t = 0 to
+        # above it at t = 1: its one root in [0, 1) is the error that meets the budget.
+        room = budget - alpha
+        scale_down = 2.0 * room / (beta + float(np.sqrt(beta * beta + 4.0 * gamma * room)))
+        slopes = np.maximum(error - fixed, 0.0)
+        tighter = interior & (slopes > 0.0)
+        resolved = _full_gradient(view, weights, base, tighter, cavity, working_bytes, scale_down * slopes)
         new_gradient, new_error, new_second = (np.where(tighter, new, old) for new, old in zip(resolved, (gradient, error, correction_second)))
         if not np.all(new_error[tighter] < error[tighter]):
             # A slope resolves no finer (its rounding floor, or its differences no longer agree): the bound stands.
             break
-        new_curvature = curvature.copy()
         for position in np.flatnonzero(tighter):
-            new_curvature[position, position] += correction_second[position] - new_second[position]
-        new_quadratic, new_slope, new_value = terms(np.abs(new_gradient) + fixed, np.maximum(new_error - fixed, 0.0), new_curvature)
-        if not new_quadratic + new_slope + new_value < gain:
-            break
+            curvature[position, position] += correction_second[position] - new_second[position]
         gradient, error, correction_second = new_gradient, new_error, new_second
-        curvature, quadratic, slope, value = new_curvature, new_quadratic, new_slope, new_value
-        gain = quadratic + slope + value
-    return _Stationarity(gradient, error, curvature, steps, folds, gain, None)
+        alpha, beta, gamma, decrement, fold = terms(gradient, fixed, np.maximum(error - fixed, 0.0), curvature)
+        gain = alpha + beta + gamma
+    return _Stationarity(gradient, error, curvature, steps, folds, gain, None, floor=alpha, decrement=decrement, fold=fold)
 
 
 def hyper_step(
-    prior: ScaleMixturePrior,
-    hyperparameters: MixtureHyperparameters,
-    cavity: Cavity,
-    correction: CurvatureCorrection,
-    working_bytes: int,
-    tolerance: float,
-    budget: float = np.inf,
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> HyperStep:
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
@@ -2582,9 +2597,8 @@ def hyper_step(
     every move gains a resolved amount and the search ends: V is bounded above); a weight whose basin ends on its climbing side
     within the difference's step contributes the most V can climb before the fold.
 
-    ``budget`` is the share of the certificate the weights may use (``fit_hyperparameters``: the tolerance less x's
-    decrement): the stationarity bound is tightened to it less the weights' realized gain (``_stationarity``).
-    Infinite, the bound is reported as measured.
+    The returned step's ``tighten`` re-checks its stationarity at the final weights with the bound tightened to a
+    budget (``_stationarity``), with no new search.
     """
     start_objective = _data_objective(prior, hyperparameters.coefficients, cavity, working_bytes)
     bounds = _smoothing_bounds(prior, start_objective)
@@ -2614,10 +2628,7 @@ def hyper_step(
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     while True:
         interior = (weights > lower) & (weights < upper)
-        # What the budget leaves the stationarity bound once the weights' realized gain is counted.
-        check = _stationarity(
-            final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget - (evidence.value - start_evidence.value)
-        )
+        check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
         moved = check.better
         if moved is None and check.gain <= tolerance:
             break
@@ -2670,18 +2681,32 @@ def hyper_step(
             evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
-    return HyperStep(
-        hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
-        penalized_objective=evidence.penalized_value,
-        evidence=evidence.value,
-        newton_decrement=evidence.newton_decrement,
-        smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
-        start_decrement=start_decrement,
-        evidence_gain=evidence.value - start_evidence.value,
-        stationarity_steps=check.steps,
-        stationarity_errors=check.error,
-        stationarity_gain=check.gain,
-    )
+
+    def checked(check: _Stationarity) -> HyperStep:
+        return HyperStep(
+            hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
+            penalized_objective=evidence.penalized_value,
+            evidence=evidence.value,
+            newton_decrement=evidence.newton_decrement,
+            smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
+            start_decrement=start_decrement,
+            evidence_gain=evidence.value - start_evidence.value,
+            stationarity_steps=check.steps,
+            stationarity_errors=check.error,
+            stationarity_gain=check.gain,
+            stationarity_floor=check.floor,
+            stationarity_decrement=check.decrement,
+            stationarity_fold=check.fold,
+            tighten=tighten,
+        )
+
+    def tighten(budget: float) -> HyperStep | None:
+        """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the check
+        then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
+        tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
+        return checked(tightened) if tightened.better is None and np.isfinite(tightened.gain) else None
+
+    return checked(check)
 
 
 # ------------------------------------------------------------------ the outer loop
@@ -2866,9 +2891,6 @@ def fit_hyperparameters(
     radii: list[float | None] = [None] * count
     # Whether a trial at the model's current x has been halved (after which its trials only halve).
     shortened = [False] * count
-    # The share of the certificate the weights may use at the model's current x: infinite until x is at its maximum to
-    # the resolution, then the tolerance less x's decrement there, once (the weights' bound re-checked to it).
-    budgets = [np.inf] * count
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     steps_taken: list[tuple[HyperStep, float] | None] = [None] * count
     histories: list[list[float]] = [[] for _model in range(count)]
@@ -2879,7 +2901,7 @@ def fit_hyperparameters(
             point = points[model]
             correction = curvature_correction(prior, hyperparameters[model].coefficients, point.cavity, point.posterior, working_bytes, tolerance)
             try:
-                step = hyper_step(prior, hyperparameters[model], point.cavity, correction, working_bytes, tolerance, budgets[model])
+                step = hyper_step(prior, hyperparameters[model], point.cavity, correction, working_bytes, tolerance)
             except FloatingPointError:
                 # B + S has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
                 step = None
@@ -2887,6 +2909,13 @@ def fit_hyperparameters(
             newton = _newton_b(prior, log_smoothing, hyperparameters[model].coefficients, point, correction, working_bytes)
             # The x step's decrement, the weights' realized gain at this fixed point, and the gain still left in them.
             remaining = newton.decrement + (np.inf if step is None else step.evidence_gain + step.stationarity_gain)
+            if step is not None and step.tighten is not None and newton.definite and newton.decrement + step.evidence_gain <= tolerance < remaining:
+                # What stops the certificate is the weights' bound: it is tightened to the share x's decrement and the
+                # weights' realized gain leave it, at the same weights (theory-ep), so the trial below may certify.
+                tightened = step.tighten(tolerance - newton.decrement - step.evidence_gain)
+                if tightened is not None:
+                    step = tightened
+                    remaining = newton.decrement + step.evidence_gain + step.stationarity_gain
             histories[model].append(float(remaining))
             certifying = step is not None and remaining <= tolerance
             if certifying:
@@ -2949,7 +2978,6 @@ def fit_hyperparameters(
             if accepted:
                 hyperparameters[model], points[model], pending[model] = trials[model], trial_points[model], None
                 iterations[model] += 1
-                budgets[model] = np.inf
                 if not newton.definite:
                     radii[model] = 2.0 * radius if length >= radius * (1.0 - _HALF_PRECISION) else radius
                 continue
@@ -2968,13 +2996,6 @@ def fit_hyperparameters(
                     # the fit is returned with its measured remaining gain, uncertified, at the point the oracle last solved.
                     if trial_point is not None:
                         hyperparameters[model], points[model] = trials[model], trial_point
-                    # Where the weights' bound is what stops it and x leaves them a share, the bound is re-checked once,
-                    # tightened to that share, at the point the oracle last solved (theory-ep).
-                    share = tolerance - newton.decrement
-                    if at_resolution and not certifying and trial_point is not None and np.isinf(budgets[model]) and share > 0.0:
-                        budgets[model] = share
-                        pending[model] = None
-                        continue
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
                         remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
