@@ -164,6 +164,7 @@ def run(results_dirs, dataset_dir, tests_path, methods, designs, panel_dir, pedi
     genes_table = pd.read_csv(dataset_dir / "genes.tsv", sep="\t")
     row_of_gene = {gene: row for row, gene in enumerate(genes_table["gene_id"])}
     expression = np.load(dataset_dir / "expression.npy", mmap_mode="r")
+    annotation = json.loads((dataset_dir / "gene_annotation.json").read_text())
     covariates = np.load(dataset_dir / "covariates.npy")
     covariate_names = pd.read_csv(dataset_dir / "covariate_names.tsv", sep="\t")["covariate"].tolist()
     splits = json.loads((dataset_dir / "splits.json").read_text())
@@ -200,9 +201,14 @@ def run(results_dirs, dataset_dir, tests_path, methods, designs, panel_dir, pedi
         sv = genotypes[driver]
         record = table.iloc[window[driver]]
         carriers = minor_carriers(sv)
+        body = annotation[gene_id]
+        exons = np.array(body["exons"], dtype=np.int64).reshape(-1, 2)
+        overlaps_body = int(record["end"]) >= int(body["start"]) and int(record["pos"]) <= int(body["end"])
+        overlaps_exon = bool(np.any((exons[:, 1] >= int(record["pos"])) & (exons[:, 0] <= int(record["end"])))) if len(exons) else False
         row = {"method": method, "design": design, "gene_id": gene_id, "chrom": chrom, "sv_id": record["id"], "sv_type": record["sv_type"],
                "sv_start": int(record["pos"]), "sv_end": int(record["end"]), "sv_length": record["sv_length"], "allele_frequency": float(sv.mean() / 2),
-               "abs_corr_with_sv_part": float(scores[driver]), "minor_allele_carriers": int(carriers.sum())}
+               "abs_corr_with_sv_part": float(scores[driver]), "minor_allele_carriers": int(carriers.sum()),
+               "sv_overlaps_gene_body": overlaps_body, "sv_overlaps_exon": overlaps_exon}
         covariate_corr = np.array([correlation(covariates[:, index], sv) for index in range(covariates.shape[1])])
         strongest = int(np.argmax(np.abs(covariate_corr)))
         fitted = sv - residual(sv, covariates)
