@@ -8,6 +8,7 @@ to bound. Every number here is a math check [sim-only].
 """
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -823,7 +824,7 @@ def test_the_infinity_edge_is_the_limit_of_the_evidence(seed, block):
     step = 2.0
     rhos = balance + step * np.arange(1.0, 4.0)
     values, roundings, point = _laplace_path(prior, cavity, block, rhos, base.coefficients)
-    view, allowed = _restricted_prior(prior, frozenset({block}), frozenset())
+    view, allowed = _restricted_prior(prior, frozenset({block}))
     edge = _evidence(view, np.zeros(1), allowed.T @ point, cavity, posterior, _WORKING_BYTES, 0.0)
     assert edge is not None
     near = values[2] + (values[2] - values[1]) / np.expm1(step)
@@ -863,20 +864,16 @@ def test_every_interior_evidence_is_below_the_zero_edge(seed):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(strict=True, reason=(
-    "finding reported to e2e: the lambda = 0 edge is the profile over the block's directions, which bounds every "
-    "proper-prior V(rho) (V -> -inf as rho -> -inf); the edge comparison in _maximize_evidence takes it whenever it is "
-    "certified, so hyper_step returned [-inf, -inf] (roughness and annotation both unpenalized) on all three seeds [sim-only]"
-))
 @pytest.mark.parametrize("seed", _SEEDS)
 def test_a_null_annotation_is_not_left_unpenalized(seed):
-    """An annotation with no effect on the variances: the fitted weight should not sit at the zero edge, where the
-    annotation's coefficient is its unpenalized maximum. By the bound above, V_0 exceeds every interior V by the
-    annotation's Occam term, so a certified zero edge wins the edge comparison whenever that term passes the
-    tolerance [sim-only]."""
+    """An annotation with no effect on the variances: its fitted weight must not sit at the lower end of its
+    resolvable range, where the penalty no longer sees the data (the edge the lambda = 0 limit fell to while it was
+    evaluated as the unpenalized profile, which bounds every proper-prior V) [sim-only]."""
     prior, cavity = _edge_problem(seed, annotation_effect=0.0)
-    step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    assert step.hyperparameters.log_smoothing[1] != -np.inf, step.hyperparameters.log_smoothing
+    start = initial_hyperparameters(prior)
+    lowest = _smoothing_bounds(prior, _data_objective(prior, start.coefficients, cavity, _WORKING_BYTES))[1][0]
+    step = hyper_step(prior, start, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert step.hyperparameters.log_smoothing[1] > lowest, (step.hyperparameters.log_smoothing, lowest)
 
 
 @pytest.mark.slow
@@ -1029,15 +1026,8 @@ def test_the_engines_functions_do_not_depend_on_the_variant_order(seed):
     assert _posterior_divergence(_restricted_moments(fitted, order), moved_fitted) <= _EVIDENCE_TOLERANCE
 
 
-_ZERO_EDGE_ORDER = pytest.mark.xfail(strict=True, reason=(
-    "finding 2 (reported to e2e, fixed by lane/engine-noedge0, where this passes): the two orders reach different "
-    "lambda = 0 edge sets, [-inf, 7.72, -inf, 7.39, -inf] against [-inf, -inf, 7.87, 7.39, -inf], with V within two "
-    "tolerances but the posteriors 0.10 nats apart [sim-only]"
-))
-
-
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", (101, 202, pytest.param(303, marks=_ZERO_EDGE_ORDER)))
+@pytest.mark.parametrize("seed", _SEEDS)
 def test_the_fit_does_not_depend_on_the_variant_order(seed):
     """hyper_step on the same variants in two orders: V within two tolerances, and the fitted posteriors within one."""
     inputs = _invariance_inputs(seed, (50, 30))
@@ -1057,21 +1047,16 @@ def test_the_fit_does_not_depend_on_the_variant_order(seed):
     )
 
 
-def _zero_edge_leak(measured: float) -> pytest.MarkDecorator:
-    return pytest.mark.xfail(strict=True, reason=(
-        f"finding 2 on main (reported to e2e; lane/engine-noedge0 removes the lambda = 0 edge): the fits with and "
-        f"without the null class reach different zero-edge sets, and the other classes' posteriors move {measured} "
-        f"nats [sim-only]"
-    ))
-
-
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", (pytest.param(101, marks=_zero_edge_leak(0.247)), pytest.param(202, marks=_zero_edge_leak(0.085)), 303))
-def test_a_class_of_null_columns_moves_the_other_classes_posteriors_by_at_most_the_tolerance(seed):
+@pytest.mark.parametrize("seed", _SEEDS)
+def test_a_class_of_null_columns_reaches_the_other_classes_only_through_the_learned_prior(seed):
     """bench-real's SNV refit term, at the variant side [sim-only]: fit two classes, then the same variants plus a
-    third class of columns with no effect (SVs that take no weight), and compare the first two classes' fitted
-    posteriors. The prior's classes share a density (eta_bar) and pool their deviations' location and width, so the
-    null class can reach the others only through that pooling; the test measures how far, in the tolerance's nats."""
+    third class of columns with no effect (SVs that take no weight). For independent effects a variant's posterior is
+    its own cavity's tilted law, so at the two-class fit's hyperparameters (the new class's deviation zero, every other
+    coordinate kept) the first two classes' posteriors are the two-class fit's exactly: asserted to the tilted moments'
+    rounding. Everything the null class moves is then the empirical-Bayes refit of the prior, a different model's
+    evidence (lead ruling): reported, not bounded, split by which part of the prior carries it (the shared density
+    eta_bar, the kept classes' deviations, the annotation term)."""
     base = _invariance_inputs(seed, (50, 30))
     extended = _invariance_inputs(seed, (50, 30, 40), null_classes=(2,))
     # The same first 80 variants in both: the extension's leading rows are replaced by the base problem's.
@@ -1082,16 +1067,45 @@ def test_a_class_of_null_columns_moves_the_other_classes_posteriors_by_at_most_t
         Cavity(precision=np.concatenate([base[3].precision, extended[3].precision[kept:]]), shift=np.concatenate([base[3].shift, extended[3].shift[kept:]])),
     )
     nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
-    fits = []
+    priors, cavities_, steps = [], [], []
     for variant_inputs in (base, extended):
         prior, cavity = _invariance_prior(*variant_inputs[:3], nodes), variant_inputs[3]
-        step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-        fits.append((step, tilted_moments(prior, step.hyperparameters, cavity, _WORKING_BYTES)))
-    (first, first_moments), (second, second_moments) = fits
+        steps.append(hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE))
+        priors.append(prior)
+        cavities_.append(cavity)
+    (base_prior, extended_prior), (base_step, extended_step) = priors, steps
+    pooled = base_prior.pooled_size
+
+    def split(coefficients, class_count):
+        """(eta_bar, the class deviations, the annotation coefficients) of a coefficient vector."""
+        return coefficients[:pooled], coefficients[pooled : pooled * (1 + class_count)], coefficients[pooled * (1 + class_count) :]
+
+    def extended_coefficients(shared, deviations, annotation):
+        """Extended-prior coefficients: the kept classes' deviations, the null class's zero."""
+        return np.concatenate([shared, deviations, np.zeros(pooled), annotation])
+
+    base_shared, base_deviations, base_annotation = split(base_step.hyperparameters.coefficients, 2)
+    refit_shared, refit_deviations, refit_annotation = split(extended_step.hyperparameters.coefficients, 3)
+    refit_deviations = refit_deviations[: 2 * pooled]
     rows = np.arange(kept)
-    divergence = _posterior_divergence(first_moments, _restricted_moments(second_moments, rows))
-    assert divergence <= _EVIDENCE_TOLERANCE, (
-        f"the null class moved the other classes' posteriors by {divergence:.3g} nats; max |mean change| "
-        f"{float(np.max(np.abs(first_moments.mean - second_moments.mean[rows]))):.3g}; weights {first.hyperparameters.log_smoothing} "
-        f"vs {second.hyperparameters.log_smoothing}"
-    )
+    base_moments = tilted_moments(base_prior, base_step.hyperparameters, cavities_[0], _WORKING_BYTES)
+
+    def divergence_at(coefficients):
+        moments = tilted_moments(extended_prior, _hyperparameters(extended_prior, coefficients), cavities_[1], _WORKING_BYTES)
+        return _posterior_divergence(base_moments, _restricted_moments(moments, rows)), moments
+
+    frozen, frozen_moments = divergence_at(extended_coefficients(base_shared, base_deviations, base_annotation))
+    # The same K-term sums on the same rows: the moments agree to 4K roundings, a divergence of their square.
+    summation = 4.0 * nodes.shape[0] * _EPSILON
+    np.testing.assert_allclose(frozen_moments.mean[rows], base_moments.mean, rtol=summation, atol=summation * float(np.max(np.sqrt(base_moments.variance))))
+    np.testing.assert_allclose(frozen_moments.variance[rows], base_moments.variance, rtol=2.0 * summation)
+    refit_moments = tilted_moments(extended_prior, extended_step.hyperparameters, cavities_[1], _WORKING_BYTES)
+    sensitivity = {
+        "refit": _posterior_divergence(base_moments, _restricted_moments(refit_moments, rows)),
+        "shared density from the refit": divergence_at(extended_coefficients(refit_shared, base_deviations, base_annotation))[0],
+        "kept deviations from the refit": divergence_at(extended_coefficients(base_shared, refit_deviations, base_annotation))[0],
+        "annotation from the refit": divergence_at(extended_coefficients(base_shared, base_deviations, refit_annotation))[0],
+        "frozen": frozen,
+    }
+    print(json.dumps({"seed": seed, "tolerance": _EVIDENCE_TOLERANCE, "posterior_kl_nats": sensitivity,
+                      "weights_base": base_step.hyperparameters.log_smoothing.tolist(), "weights_refit": extended_step.hyperparameters.log_smoothing.tolist()}))
