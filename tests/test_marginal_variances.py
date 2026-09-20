@@ -8,6 +8,7 @@ variances are wrong and to leave the others alone.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.stats import norm
 from scipy.stats import t as student_t
 
@@ -40,6 +41,8 @@ from sv_pgs.marginal_variances import (
     window_bulk_quadratic,
     window_cross,
 )
+import sv_pgs.marginal_variances as marginal_variances_module
+from sv_pgs.marginal_variances import _heavy_cut
 
 
 def _genotypes(generator, sample_count: int, variant_count: int, correlation: float) -> np.ndarray:
@@ -475,6 +478,47 @@ def test_sandwich_diagonal_equals_the_three_operand_contraction():
     assert np.allclose(sandwich_diagonal(covariance, gram), reference, rtol=1e-12, atol=1e-12 * np.abs(reference).max())
 
 
+def _low_rank_block(generator, size: int, rank: int) -> np.ndarray:
+    """A PSD block whose trace is spread evenly over ``rank`` random orthonormal directions (effective rank ``rank``)."""
+    basis = np.linalg.qr(generator.standard_normal((size, rank)))[0]
+    return basis @ basis.T
+
+
+@pytest.mark.parametrize(("rank", "probe_count"), [(1, 16), (2, 16), (20, 16), (20, 64)])
+def test_certificate_keeps_its_level_on_low_effective_rank_blocks(rank, probe_count):
+    # review-stats: strong LD makes a block's probe values z'Az skewed (close to tr chi2_r / r), and the plain t cut
+    # then missed on the heavy side up to 9.5x its level. With the exact variances the true relative error is zero and
+    # the tolerance is zero, so a block is violated exactly when its interval misses: the family-wise miss rate must
+    # stay within the binomial spread of the level.
+    # 400 families give the test power against the plain t cut, whose family-wise miss rate at rank 1 is ~3x the level.
+    generator = np.random.default_rng(100 + rank + probe_count)
+    size, block_count = 24, 4
+    level = certificate_level(8)
+    blocks = tuple(np.arange(start, start + size) for start in range(0, size * block_count, size))
+    covariance = np.zeros((size * block_count, size * block_count))
+    for members in blocks:
+        covariance[np.ix_(members, members)] = _low_rank_block(generator, size, rank)
+    variances = np.diag(covariance).copy()
+    trials = 400
+    misses = 0
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(size * block_count, probe_count))
+        certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, 0.0, level)
+        assert not certificate.certified.any()
+        misses += int(certificate.violated.any())
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+
+
+def test_heavy_cut_is_the_t_quantile_for_symmetric_values_and_moves_out_with_skewness():
+    side, probe_count = 1e-3, 16
+    quantile = float(student_t.isf(side, probe_count - 1))
+    assert _heavy_cut(0.0, probe_count, side, quantile) == (quantile, True)
+    cut, usable = _heavy_cut(0.05, probe_count, side, quantile)
+    assert cut > quantile and usable
+    # A skewness large enough that the one-term correction is not below the tail it corrects leaves the block undecided.
+    assert not _heavy_cut(10.0, probe_count, side, quantile)[1]
+
+
 def _kernel_factor(columns: np.ndarray, precision: np.ndarray, resolved: np.ndarray) -> KernelFactor:
     bulk = 1.0 / precision
     bulk[resolved] = 0.0
@@ -520,3 +564,48 @@ def test_kernel_factor_inverts_its_core_once():
     factor = _kernel_factor(columns, precision, np.array([3, 7]))
     assert factor.core_inverse is factor.core_inverse
     assert np.allclose(factor.core_inverse @ factor.resolved_core, np.eye(2), atol=1e-12)
+
+
+def _rademacher_skewness(matrix: np.ndarray) -> float:
+    """The exact skewness of z'Az for Rademacher z: variance 2 (||A||_F^2 - sum a_ii^2) and third cumulant
+    8 (tr A^3 - 3 sum_i a_ii (A^2)_ii + 2 sum_i a_ii^3), the triangle terms of the off-diagonal chaos."""
+    diagonal = np.diag(matrix)
+    square = matrix @ matrix
+    variance = 2.0 * (float(np.sum(matrix * matrix)) - float(np.sum(diagonal**2)))
+    third = 8.0 * (float(np.trace(square @ matrix)) - 3.0 * float(np.sum(diagonal * np.diag(square))) + 2.0 * float(np.sum(diagonal**3)))
+    return third / variance**1.5
+
+
+@pytest.mark.parametrize("rank", [2, 20])
+def test_certificate_keeps_its_level_with_structural_skewness(rank):
+    generator = np.random.default_rng(200 + rank)
+    size, block_count, probe_count = 24, 4, 16
+    level = certificate_level(8)
+    blocks = tuple(np.arange(start, start + size) for start in range(0, size * block_count, size))
+    covariance = np.zeros((size * block_count, size * block_count))
+    skewness = np.zeros(block_count)
+    for position, members in enumerate(blocks):
+        block = _low_rank_block(generator, size, rank)
+        covariance[np.ix_(members, members)] = block
+        skewness[position] = _rademacher_skewness(block)
+    variances = np.diag(covariance).copy()
+    trials = 400
+    misses = 0
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(size * block_count, probe_count))
+        certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, 0.0, level, skewness)
+        misses += int(certificate.violated.any())
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+
+
+def test_zero_skewness_reproduces_the_student_t_interval():
+    generator = np.random.default_rng(24)
+    values = [generator.standard_normal(16) + 5.0 for _ in range(3)]
+    estimate = np.array([5.0, 5.0, 5.0])
+    level = certificate_level(64)
+    certificate = marginal_variances_module._certificate(estimate, values, 0.1, level, np.zeros(3))
+    quantile = float(student_t.isf(0.5 * level / 3, 15))
+    spread = np.array([np.std(v, ddof=1) / 4.0 / 5.0 for v in values])
+    relative = np.array([(np.mean(v) - 5.0) / 5.0 for v in values])
+    assert np.allclose(certificate.lower_bound, relative - quantile * spread, rtol=0, atol=1e-15)
+    assert np.allclose(certificate.upper_bound, relative + quantile * spread, rtol=0, atol=1e-15)
