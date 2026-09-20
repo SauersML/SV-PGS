@@ -338,6 +338,15 @@ class BenchRealPredictor:
     scoring: ScoringModel
     columns: np.ndarray
     centering: str
+    input_columns: int
+
+    @property
+    def coefficients(self) -> np.ndarray:
+        """Each input column's effect on the genotype (0/1/2) scale, bench-real's ``sv_coefficients`` contract:
+        127 beta_k / sigma_k summed over the model columns k read from it, and 0 for a column the fit left out."""
+        effects = np.zeros(int(self.input_columns))
+        np.add.at(effects, self.columns, CODES_PER_DOSAGE * self.scoring.coefficients / self.scoring.signed_scales)
+        return effects
 
     def predict(self, genotypes: np.ndarray) -> np.ndarray:
         """The genetic score plus the intercept, in closed form from dosages."""
@@ -401,7 +410,7 @@ def _fit_expression(train: Any, arm: str, centering: str) -> BenchRealPredictor:
         working_bytes=one_core_budget().working_bytes,
         seed=_training_seed(genotypes, train.phenotype),
     )
-    return BenchRealPredictor(scoring=fitted.scoring, columns=fitted.scoring.store_rows, centering=centering)
+    return BenchRealPredictor(scoring=fitted.scoring, columns=fitted.scoring.store_rows, centering=centering, input_columns=genotypes.shape[1])
 
 
 def _training_seed(genotypes: np.ndarray, phenotype: np.ndarray) -> int:

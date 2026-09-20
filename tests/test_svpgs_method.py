@@ -279,3 +279,14 @@ def test_the_ablation_arms_withhold_their_prior_terms_and_nothing_else(small_n: 
             VariantClass.SNV, VariantClass.INSERTION, VariantClass.SNV, VariantClass.SNV, VariantClass.INSERTION, VariantClass.DELETION,
         ]
     np.testing.assert_array_equal(call["codes"], (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))
+
+
+def test_the_coefficients_are_the_genotype_scale_effects_of_the_prediction(small_n: _SmallNStub) -> None:
+    train, test = _bench_real_train(np.random.default_rng(9))
+    predictor = svpgs_method.fit_expression(train)
+    base = predictor.predict(test)
+    for column in range(_COLUMNS):
+        moved = test.copy()
+        moved[:, column] += 1.0
+        change = predictor.predict(moved) - base
+        np.testing.assert_allclose(change, predictor.coefficients[column], rtol=0.0, atol=64 * _EPSILON * (np.abs(base).max() + 1.0))
