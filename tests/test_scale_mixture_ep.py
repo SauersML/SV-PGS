@@ -842,26 +842,39 @@ def _ascended(prior, cavity):
 @pytest.mark.parametrize("seed", (101, 202, 303))
 def test_the_weights_remaining_gain_covers_every_nearby_weight(seed):
     # verify-engine finding 3: the old check's 1/2 (|c| + E)^2 / s used an upper bound on |V''| and so understated the
-    # gain (0.0245 claimed where V rose 0.0645 within one unit of rho, seed 303). The remaining gain must cover the
-    # best certified V over a neighbourhood of the ascent's stop, up to the two sides' certified tolerances.
+    # gain (0.0245 claimed where V rose 0.0645 within one unit of rho, seed 303). At the point hyper_step certifies,
+    # the best certified V over a neighbourhood of its interior weights must stay within the claimed remaining gain,
+    # up to the two sides' certified tolerances. (The claim is a Newton decrement on the local model, so it is tested
+    # where it certifies, not along the way.)
     prior, cavity = _annotated_problem(seed)
-    weights, evidence, interior = _ascended(prior, cavity)
-    if not np.any(interior):
-        pytest.skip("the ascent stopped at the resolvable range's bounds")
-    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    assert check.better is None
+    step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert step.stationarity_gain <= _EVIDENCE_TOLERANCE
+    log_smoothing = step.hyperparameters.log_smoothing
+    infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
+    view, allowed = _restricted_prior(prior, infinite)
+    weights = log_smoothing[np.isfinite(log_smoothing)]
+    coefficients = allowed.T @ step.hyperparameters.coefficients
+    base = _corrected(view, weights, _evidence(view, weights, coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                      cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert base is not None
+    bounds = _smoothing_bounds(prior, _data_objective(prior, step.hyperparameters.coefficients, cavity, _WORKING_BYTES))
+    lower = np.array([bound[0] for bound in bounds])[np.isfinite(log_smoothing)]
+    upper = np.array([bound[1] for bound in bounds])[np.isfinite(log_smoothing)]
+    interior = np.flatnonzero((weights > lower) & (weights < upper))
+    if not interior.shape[0]:
+        pytest.skip("every weight is at an edge or a bound of its range")
     gains = []
-    for position in np.flatnonzero(interior):
+    for position in interior:
         for distance in (-1.0, -0.3, -0.1, 0.1, 0.3, 1.0):
             moved_weights = weights.copy()
             moved_weights[position] += distance
             moved = _corrected(
-                prior, moved_weights, _evidence(prior, moved_weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                view, moved_weights, _evidence(view, moved_weights, base.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
                 cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE,
             )
             if moved is not None:
-                gains.append(moved.value - evidence.value)
-    assert max(gains) <= check.gain + 2.0 * _EVIDENCE_TOLERANCE, (max(gains), check.gain, check.gradient, check.curvature)
+                gains.append(moved.value - base.value)
+    assert max(gains) <= step.stationarity_gain + 2.0 * _EVIDENCE_TOLERANCE, (max(gains), step.stationarity_gain)
 
 
 def test_a_maximum_at_its_basins_fold_is_certified_one_sided(monkeypatch):
