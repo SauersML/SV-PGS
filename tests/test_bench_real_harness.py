@@ -131,11 +131,14 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
     tiny_dataset(tmp_path)
     method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
     (tmp_path / "screened.tsv").write_text("gene_id\tscore\ng1\t3.2\n")
-    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv")
+    (tmp_path / "note.json").write_text(json.dumps({"label": "arm X", "tests": "green"}))
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv",
+                note=tmp_path / "note.json")
     out = tmp_path / "results" / "top_variant" / "loso"
     record = json.loads((out / "chr1.run.json").read_text())
     assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
     assert record["gene_list_sha256"] == hashlib.sha256((tmp_path / "screened.tsv").read_bytes()).hexdigest()
+    assert record["note"] == {"label": "arm X", "tests": "green"}
     truth = np.load(out / "chr1.truth.npy")
     for feature_set in ("snv", "snv_sv"):
         predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")

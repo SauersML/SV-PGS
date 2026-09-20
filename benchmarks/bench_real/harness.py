@@ -520,7 +520,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
@@ -571,7 +571,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "splits": split_names, "overlay": str(overlay_dir) if overlay_dir is not None else None,
+        "genes": len(gene_rows), "contract": contract, "splits": split_names,
+        "note": json.loads(pathlib.Path(note).read_text()) if note is not None else None, "overlay": str(overlay_dir) if overlay_dir is not None else None,
         "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
                            if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
@@ -604,7 +605,8 @@ if __name__ == "__main__":
     parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
     parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
     parser.add_argument("--splits", nargs="+", help="only these splits of the design (e.g. loso/AFR), for per-split checkpoints")
+    parser.add_argument("--note", help="a JSON file recorded verbatim in run.json (arm label, test status, rulings)")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
-        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits)
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note)
