@@ -100,7 +100,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Sequence
 
 import numpy as np
-from scipy.integrate import quad
+from scipy.integrate import quad, quad_vec
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
@@ -1558,6 +1558,113 @@ def _laplace_corrections(
     for index in replaced:
         corrections[index] = _line_log_integral(prior, log_smoothing, evidence.coefficients, directions[:, index], value, cavity, working_bytes, share)
     return corrections, terms, directions
+
+
+def _line_slopes(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, vectors: F64Array, cavity: Cavity, working_bytes: int
+) -> Callable[[float], tuple[float, F64Array]]:
+    """At a step t along x + t b: F - P there and grad F(x + t b) . v for each column v of ``vectors``.
+
+    log Z_j = LSE_k(log pi_ck + L_jk(e_j)) with pi_c normalized, so its slope along v is
+    sum_k w_jk (eta'_ck + dL_jk/de e'_j) - pi_c . eta'_c, with w the node responsibilities, eta' and e' the
+    density and log-scale parts of M v, and dL/de the kernel's own first derivative (``_components``)."""
+    line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
+    density, _scale = _density_and_scale(prior, origin)
+    density_step, scale_step = _density_and_scale(prior, direction)
+    scales = log_scale(prior, origin)
+    scale_slope = prior.scale_design @ scale_step
+    parts = [_density_and_scale(prior, vector) for vector in vectors.T]
+    density_slopes = np.stack([part[0] for part in parts], axis=-1) if parts else np.zeros(density.shape + (0,))
+    scale_slopes = np.column_stack([prior.scale_design @ part[1] for part in parts]) if parts else np.zeros((prior.variant_count, 0))
+
+    def at(step: float) -> tuple[float, F64Array]:
+        log_weights = density + step * density_step
+        log_density = log_weights - _log_sum_exp(log_weights, axis=1, keepdims=True)
+        slopes = np.zeros(vectors.shape[1])
+        for class_position, class_rows in enumerate(prior.class_rows):
+            class_slopes = density_slopes[class_position]
+            mean_slope = np.exp(log_density[class_position]) @ class_slopes
+            for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
+                components = _components(
+                    log_density[class_position], scales[rows] + step * scale_slope[rows], prior.log_variance_grid, prior.kernel_floor,
+                    cavity.precision[rows], cavity.shift[rows],
+                )
+                weights = components.responsibility
+                slopes += np.sum(weights @ class_slopes, axis=0) - rows.shape[0] * mean_slope
+                slopes += np.sum(weights * components.first, axis=1) @ scale_slopes[rows]
+        return float(line(np.array([step]))[0]), slopes
+
+    return at
+
+
+def _correction_gradient(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+) -> tuple[F64Array, F64Array]:
+    """The rho-gradient of V's Tierney-Kadane corrections (``_corrected``) with each replaced direction held, and a
+    bound on its quadrature error: (gradient, error), both per weight.
+
+    A replaced direction b's correction is c = log int exp(l(x + t b) - l(x)) dt - log sqrt(2 pi / kappa), with
+    kappa = b'(-H)b its curvature (one at rho, where b is standardized), so c is the line's own ratio to its Laplace
+    term at every rho. Along rho_i, with x moving by xdot = dx/drho_i and the penalty's explicit part:
+        dc/drho_i = E_p[-lambda_i (t a + t^2 q / 2) + (grad F(x + t b) - grad F(x)) . xdot - t (S b) . xdot] + kappadot / 2,
+    E_p over the line's normalized density, a = (R_i x)'(R_i b), q = ||R_i b||^2, and
+    kappadot = lambda_i q - D^3 F[b, b, xdot] (polarized from ``_directional_derivatives``). In a Gaussian every
+    term cancels. Holding b omits its rotation with rho: the corrections are a product of line integrals, and that
+    term couples a line to the others, the mixed cumulants the product already leaves out (review-stats S2); the
+    corrections' redesign replaces both. The integrals share one adaptive rule (``quad_vec``), each resolved to the
+    share of the tolerance that its correction was.
+    """
+    try:
+        _corrections, terms, directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance)
+    except FloatingPointError:
+        return np.zeros(len(prior.smoothing_blocks)), np.full(len(prior.smoothing_blocks), np.inf)
+    order = np.argsort(-np.abs(terms))
+    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
+    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
+    share = max(0.5 * tolerance / max(replaced.shape[0], 1), _QUADPACK_RELATIVE_FLOOR)
+    weight_count = len(prior.smoothing_blocks)
+    gradient = np.zeros(weight_count)
+    error = np.zeros(weight_count)
+    if not replaced.shape[0]:
+        return gradient, error
+    penalty = _penalty_matrix(prior, log_smoothing)
+    origin = evidence.coefficients
+    moves = evidence.responses
+    data_slope = _data_objective(prior, origin, cavity, working_bytes).gradient
+    origin_slope = (prior.coefficient_map.T @ data_slope) @ moves
+    value = evidence.penalized_value
+    for index in replaced:
+        direction = directions[:, index]
+        slopes = _line_slopes(prior, log_smoothing, origin, direction, moves, cavity, working_bytes)
+
+        def integrand(step: float) -> F64Array:
+            height, slope = slopes(step)
+            density = np.exp(height - value)
+            return density * np.concatenate([[1.0, step, step * step], slope - origin_slope])
+
+        moments, moment_error = quad_vec(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=share, norm="max")
+        mass = float(moments[0])
+        expectations = moments[1:] / mass
+        expectation_error = (moment_error + np.abs(moments[1:]) * moment_error / mass) / mass
+        mean_step, square_step = expectations[0], expectations[1]
+        third = _directional_derivatives(
+            prior, origin, cavity, np.column_stack([direction[:, None] + moves, direction[:, None] - moves, moves]), working_bytes
+        )[0]
+        mixed = (third[:weight_count] - third[weight_count : 2 * weight_count] - 2.0 * third[2 * weight_count :]) / 6.0
+        penalty_move = (penalty @ direction) @ moves
+        for position, (block, log_weight) in enumerate(zip(prior.smoothing_blocks, log_smoothing)):
+            lambda_weight = float(np.exp(log_weight))
+            along = block.factor @ direction[block.coordinates]
+            cross = float((block.factor @ origin[block.coordinates]) @ along)
+            curvature = float(along @ along)
+            gradient[position] += (
+                -lambda_weight * (mean_step * cross + 0.5 * square_step * curvature)
+                + expectations[2 + position]
+                - mean_step * float(penalty_move[position])
+                + 0.5 * (lambda_weight * curvature - float(mixed[position]))
+            )
+            error[position] += lambda_weight * (expectation_error[0] * abs(cross) + 0.5 * expectation_error[1] * curvature) + expectation_error[2 + position] + expectation_error[0] * abs(float(penalty_move[position]))
+    return gradient, error
 
 
 def _corrected(

@@ -777,6 +777,40 @@ def test_the_moment_start_splits_the_phenotypic_variance_and_tracks_the_heritabi
     assert null.resolution <= null.heritability <= 4.0 * null.resolution
 
 
+def test_the_correction_gradient_is_the_held_direction_corrections_derivative():
+    # Each replaced direction b held, its correction is log int exp(l(x_rho + t b) - l(x_rho)) dt + log(kappa) / 2
+    # - log(2 pi) / 2 at every rho: central differences of that sum must match the analytic gradient.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    tolerance = 1e-4
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+    assert evidence is not None
+    gradient, error = engine._correction_gradient(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
+    _corrections, terms, directions = _laplace_corrections(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, tolerance)
+    order = np.argsort(-np.abs(terms))
+    remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
+    replaced = order[: int(np.argmax(remaining <= 0.5 * tolerance))]
+    assert replaced.shape[0] >= 2
+
+    def held(weights):
+        point = _evidence(prior, weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+        penalty = _penalty_matrix(prior, weights)
+        _value, _gradient, hessian = _penalized(prior, _data_objective(prior, point.coefficients, cavity, _WORKING_BYTES), weights, penalty, point.coefficients)
+        total = 0.0
+        for index in replaced:
+            direction = directions[:, index]
+            total += _line_log_integral(prior, weights, point.coefficients, direction, point.penalized_value, cavity, _WORKING_BYTES, 1e-11)
+            total += 0.5 * np.log(float(direction @ (-hessian) @ direction))
+        return total
+
+    step = 1e-4
+    numerical = np.array([
+        (held(hyperparameters.log_smoothing + step * unit) - held(hyperparameters.log_smoothing - step * unit)) / (2.0 * step)
+        for unit in np.eye(hyperparameters.log_smoothing.shape[0])
+    ])
+    np.testing.assert_allclose(gradient, numerical, rtol=1e-4, atol=1e-5 + 2.0 * float(np.max(error)))
+
+
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
     # x = T x' with T orthogonal within each coefficient block: every log-determinant moves by log|det T| = 0,
     # so V and the tilted means must agree to rounding. A normalization or log-determinant error would not.
