@@ -115,9 +115,6 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
-# The degree in t of the Tierney-Kadane expansion of a standardized line integrand's ratio to its Gaussian, through
-# the O(1) term: 1 + k3 t^3 / 6 + k4 t^4 / 24 + k3^2 t^6 / 72.
-_TIERNEY_KADANE_DEGREE = 6
 
 
 @dataclass(frozen=True)
@@ -1221,32 +1218,15 @@ def _line_log_integral(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
 ) -> float:
     """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
-    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
-
-    The integrand is the Laplace term's Gaussian e^(-t^2/2) times h(t) = exp(l(t) + t^2 / 2), so the Gauss-Hermite
-    rules of that weight place their nodes where its mass is. They start at the fewest nodes exact for the
-    Tierney-Kadane expansion of h through its O(1) term (degree 6: k3^2 t^6 / 72), and double while the largest node
-    stays inside the Gaussian's double-precision extent sqrt(2 log(1 / eps)); past it, more nodes only resolve an h
-    that no low-degree polynomial follows. The first two consecutive rules whose logs agree to the share give the
-    larger rule's value. Where none do (a fold or a heavy tail), QUADPACK's adaptive rule over the whole line
-    decides, and its own error estimate must resolve the log to the share, or to half of double precision when
+    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log, by QUADPACK's adaptive rule over the
+    whole line; its own error estimate must resolve the log to the share, or to half of double precision when
     rounding is what stopped it.
+
+    Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
+    on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
+    tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
     line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
-    tolerance = max(share, _HALF_PRECISION)
-    extent = float(np.sqrt(2.0 * np.log(1.0 / _EPSILON)))
-    nodes = (_TIERNEY_KADANE_DEGREE + 2) // 2
-    previous = None
-    while True:
-        steps, weights = np.polynomial.hermite_e.hermegauss(nodes)
-        log_terms = np.log(weights) + line(steps) - value + 0.5 * np.square(steps)
-        estimate = float(_log_sum_exp(log_terms, axis=0)) - 0.5 * np.log(2.0 * np.pi)
-        if previous is not None and abs(estimate - previous) <= tolerance:
-            return estimate
-        if float(steps[-1]) > extent:
-            break
-        previous = estimate
-        nodes *= 2
 
     def integrand(step: float) -> float:
         return float(np.exp(line(np.array([step]))[0] - value))
@@ -1254,7 +1234,7 @@ def _line_log_integral(
     integral, error, _information, *message = quad(
         integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
     )
-    if message and error > tolerance * abs(integral):
+    if message and error > max(share, _HALF_PRECISION) * abs(integral):
         raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
     return float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
 

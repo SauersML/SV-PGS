@@ -639,7 +639,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
         np.testing.assert_allclose(values, expected, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(expected))))
 
 
-def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
+def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
     posterior = normal_means_posterior(cavity, _WORKING_BYTES)
