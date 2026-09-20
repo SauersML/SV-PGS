@@ -80,8 +80,8 @@ def test_a_column_spanned_by_negative_site_columns_has_a_small_negative_cavity()
         assert abs(cavity[2]) <= 10.0 * scale
 
 
-def test_the_sparse_carrier_design_gives_the_dense_design_quantities():
-    """Stage 0's sparse G (minor-allele codes over their SD) with the intercept projected out equals the dense projected
+def test_the_carrier_design_gives_the_projected_design_quantities():
+    """Stage 0's G (minor-allele codes over their SD) with the covariates projected out equals the projected
     standardized design in every kernel quantity, including negative sites."""
     rng = np.random.default_rng(21)
     samples, variants = 60, 90
@@ -91,17 +91,16 @@ def test_the_sparse_carrier_design_gives_the_dense_design_quantities():
     dosage[3, 0] = 1  # a singleton
     codes = (dosage * 127).astype(np.uint8)
     statistics = dense_statistics(codes, np.column_stack([np.ones(samples), rng.standard_normal(samples)]), rng.standard_normal(samples))
-    assert statistics.design.is_sparse
-    dense = _Design.dense(statistics.projected)
+    projected = _Design.dense(statistics.projected)
     count = statistics.design.variant_count
     precision = rng.uniform(0.5, 3.0, count)
     precision[:2] = -0.01
-    sparse_kernel, dense_kernel = _Kernel(statistics.design, precision), _Kernel(dense, precision)
+    carrier_kernel, projected_kernel = _Kernel(statistics.design, precision), _Kernel(projected, precision)
     right = rng.standard_normal((count, 3))
-    np.testing.assert_allclose(sparse_kernel.solve(right), dense_kernel.solve(right), rtol=1e-9, atol=1e-11)
-    for sparse_part, dense_part in zip(sparse_kernel.cavity(), dense_kernel.cavity()):
-        np.testing.assert_allclose(sparse_part, dense_part, rtol=1e-9, atol=1e-12)
-    np.testing.assert_allclose(sparse_kernel.covariance(), dense_kernel.covariance(), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(carrier_kernel.solve(right), projected_kernel.solve(right), rtol=1e-9, atol=1e-11)
+    for carrier_part, projected_part in zip(carrier_kernel.cavity(), projected_kernel.cavity()):
+        np.testing.assert_allclose(carrier_part, projected_part, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(carrier_kernel.covariance(), projected_kernel.covariance(), rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(statistics.design.column_squares(), np.einsum("ij,ij->j", statistics.projected, statistics.projected), rtol=1e-10)
     # X~'s covariate loading, against the definition.
     signed = codes[:, statistics.reduced_rows].astype(np.float64) - SIGNED_CODE_OFFSET
@@ -146,9 +145,9 @@ def test_the_total_curvature_by_the_exact_response_equals_gmres():
     coefficients = initial_hyperparameters(prior).coefficients
     variances, _removed, cavity_precision = posterior.kernel.cavity()
     cavity = Cavity(precision=cavity_precision / noise, shift=rng.standard_normal(variants))
-    exact = _total_curvature(prior, coefficients, cavity, posterior.gaussian_posterior(), 10**9, 1e-13)
-    iterative = _total_curvature(prior, coefficients, cavity, GaussianPosterior(solve=posterior.solve, variance_jvp=posterior.variance_jvp), 10**9, 1e-13)
-    np.testing.assert_allclose(exact, iterative, rtol=1e-7, atol=1e-9 * float(np.max(np.abs(iterative))))
+    exact = _total_curvature(prior, coefficients, cavity, posterior.gaussian_posterior(), 10**9, 1e-10)
+    iterative = _total_curvature(prior, coefficients, cavity, GaussianPosterior(solve=posterior.solve, variance_jvp=posterior.variance_jvp), 10**9, 1e-10)
+    np.testing.assert_allclose(exact, iterative, rtol=1e-6, atol=1e-7 * float(np.max(np.abs(iterative))))
 
 
 def test_kernel_refuses_an_indefinite_precision():

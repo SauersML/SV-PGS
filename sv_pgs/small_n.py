@@ -16,10 +16,9 @@ solve or a probe certificate:
 
 The design is kept as Xp = (I - H_C) G, with H_C = Q Q' and G each reduced column's minor-allele codes over its SD,
 signed so that (I - H_C) G equals (I - H_C) X~ exactly (H_C removes every column's constant, since the intercept is a
-covariate). G is sparse where that is cheaper, by the flop counts (rare variants have few carriers): the kernel's
-P G T^-1 G' P then costs sum_j nnz_j^2 instead of n^2 p, the variances' x_j' K^-1 x_j = g_j' (P K^-1 P) g_j the same,
-and Xp_P' K^-1 Xp_P = G_P' (P K^-1 P) G_P for the formed Sigma costs nnz |P| instead of n |P|^2 (bench-real chr22
-[real]: 13-17x fewer kernel flops).
+covariate). G is dense: its carriers are sparse (13-17x fewer kernel flops as sparse products on bench-real chr22
+[real]), but scipy's sparse products lose to BLAS-3 on every kernel operation there (Gram 0.27 s vs 0.07 s, kernel
+and cavity 0.40 s vs 0.20 s, formed Sigma 2.5 s vs 2.1 s; n = 534, p = 8,916, one core).
 
 The fixed-point iteration and the outer loop are Stage 2's (``full_data_fit._FullDataFixedPoints`` and
 ``scale_mixture_ep.fit_hyperparameters``), with every certified quantity replaced by its exact value: the mean move
@@ -36,10 +35,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from typing import Callable, Sequence
 
 import numpy as np
-from scipy import linalg, sparse
+from scipy import linalg
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.config import TraitType
@@ -77,14 +76,13 @@ _LIVE_FIXED_POINTS = 2
 
 
 class _Design:
-    """Xp = P G with P = I - Q Q' (Q an orthonormal basis of the covariates' columns) and G ``carriers`` (n x p),
-    either a scipy.sparse CSC matrix or a dense Fortran-ordered array."""
+    """Xp = P G with P = I - Q Q' (Q an orthonormal basis of the covariates' columns) and G ``carriers`` (n x p, dense,
+    Fortran-ordered)."""
 
-    def __init__(self, carriers: Any, basis: F64Array) -> None:
-        self.carriers = carriers
+    def __init__(self, carriers: F64Array, basis: F64Array) -> None:
+        self.carriers = np.asfortranarray(carriers, dtype=np.float64)
         self.basis = basis
         self.sample_count, self.variant_count = (int(size) for size in carriers.shape)
-        self.is_sparse = sparse.issparse(carriers)
 
     @classmethod
     def dense(cls, projected: F64Array) -> _Design:
@@ -103,50 +101,36 @@ class _Design:
 
     def image(self, values: F64Array) -> F64Array:
         """Xp v for v (p,) or (p, q)."""
-        return self.project(np.asarray(self.carriers @ values))
+        return self.project(self.carriers @ values)
 
     def back(self, samples: F64Array) -> F64Array:
         """Xp' u for u (n,) or (n, q)."""
-        return np.asarray(self.carriers.T @ self.project(samples))
+        return self.carriers.T @ self.project(samples)
 
     def weighted_gram(self, weights: F64Array) -> F64Array:
-        """Xp diag(w) Xp' (n x n) for w >= 0: sum_j nnz_j^2 flops when sparse."""
-        if self.is_sparse:
-            gram = np.asarray(((self.carriers @ sparse.diags(weights)) @ self.carriers.T).todense())
-        else:
-            scaled = self.carriers * np.sqrt(weights)[None, :]
-            gram = linalg.blas.dsyrk(1.0, scaled)
-            gram = np.triu(gram) + np.triu(gram, 1).T
-        return self.project_both(gram)
+        """Xp diag(w) Xp' (n x n) for w >= 0."""
+        gram = linalg.blas.dsyrk(1.0, self.carriers * np.sqrt(weights)[None, :])
+        return self.project_both(np.triu(gram) + np.triu(gram, 1).T)
 
     def quadratic_diagonal(self, core: F64Array) -> F64Array:
         """x_j' core x_j for every column, core (n x n) symmetric with P core P = core."""
-        # core G = (G' core)', with the sparse factor on the left of every product.
-        product = np.asarray(self.carriers.T @ core).T
-        if self.is_sparse:
-            return np.asarray(self.carriers.multiply(product).sum(axis=0)).ravel()
-        return np.einsum("ij,ij->j", self.carriers, product)
+        return np.einsum("ij,ij->j", self.carriers, core @ self.carriers)
 
     def quadratic(self, core: F64Array, columns: I64Array) -> F64Array:
-        """Xp_c' core Xp_c (|c| x |c|) for core (n x n) with P core P = core: nnz_c |c| flops when sparse."""
+        """Xp_c' core Xp_c (|c| x |c|) for core (n x n) with P core P = core."""
         block = self.carriers[:, columns]
-        return np.asarray(block.T @ np.asarray(block.T @ core).T)
+        return block.T @ (core @ block)
 
     def columns(self, columns: I64Array) -> F64Array:
-        """Xp's columns ``columns``, dense and F-ordered (n x |c|)."""
-        block = self.carriers[:, columns]
-        block = block.toarray() if self.is_sparse else np.asarray(block)
-        return np.asfortranarray(self.project(block))
+        """Xp's columns ``columns`` (n x |c|, F-ordered)."""
+        return np.asfortranarray(self.project(self.carriers[:, columns]))
 
     def column_squares(self) -> F64Array:
         """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
-        if self.is_sparse:
-            squares = np.asarray(self.carriers.multiply(self.carriers).sum(axis=0)).ravel()
-        else:
-            squares = np.einsum("ij,ij->j", self.carriers, self.carriers)
+        squares = np.einsum("ij,ij->j", self.carriers, self.carriers)
         if not self.basis.shape[1]:
             return squares
-        loading = np.asarray(self.carriers.T @ self.basis)
+        loading = self.carriers.T @ self.basis
         return squares - np.einsum("jk,jk->j", loading, loading)
 
 
@@ -246,18 +230,11 @@ def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) 
     minor = np.where(flip[None, :], full - reduced_codes, reduced_codes)
     column_factor = np.where(flip, -1.0, 1.0) / scales[kept]
     offsets = np.where(flip, full, 0.0)
-    carrier_counts = np.count_nonzero(minor, axis=0).astype(np.float64)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    basis = _covariate_basis(covariate_matrix)
-    if float(np.sum(carrier_counts * carrier_counts)) < float(count) * count * kept.shape[0]:
-        rows, columns = np.nonzero(minor)
-        carriers = sparse.csc_matrix((minor[rows, columns] * column_factor[columns], (rows, columns)), shape=minor.shape)
-    else:
-        carriers = np.asfortranarray(minor * column_factor[None, :])
-    design = _Design(carriers, basis)
+    design = _Design(minor * column_factor[None, :], _covariate_basis(covariate_matrix))
     # C' X~_j = C' g_j + C'1 (offset_j - 127 - mean_j) / scale_j.
     constants = (offsets - SIGNED_CODE_OFFSET - means[kept]) / scales[kept]
-    loading = np.asarray(carriers.T @ covariate_matrix).T + np.outer(covariate_matrix.sum(axis=0), constants)
+    loading = (design.carriers.T @ covariate_matrix).T + np.outer(covariate_matrix.sum(axis=0), constants)
     target_values = np.asarray(target, dtype=np.float64)
     return DenseStatistics(
         active_rows=active.astype(np.int64),
@@ -839,7 +816,6 @@ def fit_small_n(
         "samples": statistics.sample_count,
         "active": int(statistics.active_rows.shape[0]),
         "reduced": int(statistics.design.variant_count),
-        "sparse": bool(statistics.design.is_sparse),
         "coefficients": int(prior.coefficient_size),
         "grid": int(prior.grid_size),
         "classes": int(prior.class_count),
