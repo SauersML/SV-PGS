@@ -465,7 +465,7 @@ def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
     if not np.any(undecided):
         return probe_count
     half_width = (certificate.upper_bound - certificate.lower_bound)[undecided] / 2.0
-    margin = np.abs(np.abs(certificate.relative_error[undecided]) - certificate.tolerance)
+    margin = np.abs(np.abs(certificate.relative_error[undecided]) - certificate.tolerance[undecided])
     ratio = float(np.max(half_width / np.maximum(margin, np.finfo(np.float64).tiny)))
     return int(np.ceil(probe_count * ratio * ratio))
 
