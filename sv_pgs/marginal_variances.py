@@ -144,7 +144,9 @@ class BlockCertificate:
     ``certified`` means the whole interval lies within ``tolerance``: the block's error provably does not exceed
     it. ``violated`` means the whole interval lies beyond it. A block that is neither is undecided, and more probes
     decide it (``probes_to_decide``). ``level`` is the family-wise probability that any interval misses its
-    block's true error.
+    block's true error. ``zero_estimate_ratio`` is, for a block whose estimate is zero while its probes see
+    information (an infinite relative error), the probes' half-width for the absolute value over |their mean|: the
+    block is violated once it falls below 1. It is NaN for every other block, and None when no block can be one.
     """
 
     relative_error: NDArray[np.float64]
@@ -155,6 +157,7 @@ class BlockCertificate:
     level: float
     certified: NDArray[np.bool_]
     violated: NDArray[np.bool_]
+    zero_estimate_ratio: "NDArray[np.float64] | None" = None
 
 
 @dataclass(frozen=True)
@@ -669,7 +672,7 @@ def _certificate(
     above = np.full(block_count, quantile)
     unusable = np.zeros(block_count, dtype=bool)
     unresolved_zero = np.zeros(block_count, dtype=bool)
-    excludes_zero = np.zeros(block_count, dtype=bool)
+    zero_ratio = np.full(block_count, np.nan)
     for position, values in enumerate(per_probe):
         computed = float(estimate[position])
         spread = float(np.std(values, ddof=1)) / np.sqrt(probe_count)
@@ -678,7 +681,7 @@ def _certificate(
                 continue
             centre = float(np.mean(values))
             unresolved_zero[position] = True
-            excludes_zero[position] = abs(centre) > quantile * spread
+            zero_ratio[position] = quantile * spread / abs(centre) if centre != 0.0 else np.inf
             relative[position] = np.copysign(np.inf, centre)
             standard[position] = np.inf
             continue
@@ -697,6 +700,7 @@ def _certificate(
         mean_above, mean_below = (heavy, quantile) if block_skewness > 0.0 else (quantile, heavy)
         # The relative error (mean - computed) / computed falls with the mean when the estimate is negative.
         below[position], above[position] = (mean_below, mean_above) if computed > 0.0 else (mean_above, mean_below)
+    excludes_zero = unresolved_zero & (zero_ratio < 1.0)
     with np.errstate(invalid="ignore"):
         lower = np.where(unresolved_zero, np.where(excludes_zero, relative, -np.inf), relative - below * standard)
         upper = np.where(unresolved_zero, np.where(excludes_zero, relative, np.inf), relative + above * standard)
@@ -705,7 +709,7 @@ def _certificate(
     violated = ((lower > bound) | (upper < -bound)) & ~unusable
     return BlockCertificate(
         relative_error=relative, standard_error=standard, lower_bound=lower, upper_bound=upper,
-        tolerance=tolerance, level=level, certified=certified, violated=violated,
+        tolerance=tolerance, level=level, certified=certified, violated=violated, zero_estimate_ratio=zero_ratio,
     )
 
 
@@ -739,10 +743,13 @@ def stage_level(level: float, stage: int) -> float:
     return level * 2.0 ** -(stage + 1)
 
 
-def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
-    """The probe count that would decide every undecided block, if the standard errors fall as 1/sqrt(k).
+def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> float:
+    """The probe count that would decide every undecided block, if the standard errors fall as 1/sqrt(k): a whole
+    number, or inf when some block sits on a boundary (no probe count moves its interval off it).
 
-    The quantile is held at its k-probe value, which is larger than at more probes, so this is conservative.
+    The quantile is held at its k-probe value, which is larger than at more probes, so this is conservative. A block
+    whose estimate is zero while its probes see information has infinite relative bounds; it is decided (violated)
+    once the probes' interval for the absolute value excludes zero, at k * ``zero_estimate_ratio``^2 probes.
     """
     undecided = ~(certificate.certified | certificate.violated)
     if not np.any(undecided):
@@ -750,8 +757,14 @@ def probes_to_decide(certificate: BlockCertificate, probe_count: int) -> int:
     half_width = (certificate.upper_bound - certificate.lower_bound)[undecided] / 2.0
     tolerance = np.broadcast_to(np.asarray(certificate.tolerance, dtype=np.float64), certificate.relative_error.shape)
     margin = np.abs(np.abs(certificate.relative_error[undecided]) - tolerance[undecided])
-    ratio = float(np.max(half_width / np.maximum(margin, np.finfo(np.float64).tiny)))
-    return int(np.ceil(probe_count * ratio * ratio))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = half_width / margin
+    if certificate.zero_estimate_ratio is not None:
+        zero = certificate.zero_estimate_ratio[undecided]
+        ratio = np.where(np.isnan(zero), ratio, zero)
+    worst = float(np.max(ratio))
+    # NaN (an interval of zero width on its boundary) is as undecidable as an infinite ratio.
+    return float(np.inf) if not np.isfinite(worst) else int(np.ceil(probe_count * worst * worst))
 
 
 def information_products(solve: BulkSolve, back_products: NDArray[np.float64]) -> NDArray[np.float64]:
