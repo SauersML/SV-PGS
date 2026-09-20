@@ -975,6 +975,7 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
     """Damped parallel EP on the dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), run to machine precision."""
     site_precision, site_shift = (np.array(part, copy=True) for part in sites)
     hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    previous_change = np.inf
     for _sweep in range(20000):
         covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
         mean = covariance @ (linear_term + site_shift)
@@ -983,11 +984,11 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
         change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
         site_precision += 0.5 * (target_precision - site_precision)
         site_shift += 0.5 * (target_shift - site_shift)
-        # Machine precision: the site update cannot resolve its targets past the inverse's own relative rounding,
-        # eps times the condition number of the posterior precision.
-        rounding = float(np.finfo(np.float64).eps) * float(np.linalg.cond(likelihood_precision + np.diag(site_precision)))
-        if change < max(1e-14, rounding):
+        # Machine precision: the damped map contracts until its targets' rounding, where the change stops falling;
+        # past half of double precision a change that no longer falls is that floor.
+        if change < 1e-14 or (change >= previous_change and change < float(np.finfo(np.float64).eps) ** 0.5):
             return (site_precision, site_shift), covariance, cavity
+        previous_change = change
     raise AssertionError("dense EP did not converge")
 
 
