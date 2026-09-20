@@ -7,8 +7,9 @@ eliminated exactly, so EP is unclipped. Every cavity comes from q's certified ma
 cavity-precision errors reach p99 28-58% at production (speed-floor [semi-real]), and they appear nowhere here.
 The variant side, from tilted moments to the prior's empirical Bayes, is ``scale_mixture_ep``.
 
-The fit starts from the prior itself: moment-matched sites, the start density, and each model's covariate-only
-residual variance. ``scale_mixture_ep.fit_hyperparameters`` then alternates two steps.
+The fit starts from the prior itself (moment-matched sites) at a start that splits each trait's residual variance
+into genetic and noise parts by Haseman-Elston moments of Stage 0's statistics (``moment_starts``), so the start's
+genetic variance never exceeds the phenotypic. ``scale_mixture_ep.fit_hyperparameters`` then alternates two steps.
 1. The EP fixed point at the current hyperparameters (``_FullDataFixedPoints``):
    a. Refresh: solve the mean at the current sites and compute the certified marginal variances z and the
       cavities (P = 1/z - tau). Negative sites are halved while the global precision is not positive definite or a
@@ -67,11 +68,13 @@ from sv_pgs.scale_mixture_ep import (
     FixedPoint,
     GaussianPosterior,
     MixtureHyperparameters,
+    MomentStart,
     ScaleMixturePrior,
     derived_lattice,
     fit_hyperparameters,
     initial_hyperparameters,
     moment_matched_prior_sites,
+    moment_start,
     noise_gain,
     noise_variance,
     prior_second_moment,
@@ -107,6 +110,51 @@ def block_grams(statistics: GenotypeSufficientStatistics, noise: float) -> Block
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
         next_cross.append(np.zeros(shape) if cross is None else np.asarray(cross, dtype=np.float64) / noise)
     return BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross))
+
+
+def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:
+    """Each target's EB start (``scale_mixture_ep.moment_start``) from Stage 0's statistics, with u_j = e^(o_j) the
+    start's relative prior variances. y'y after the covariates comes from the target and covariate Grams; ||X'y||^2
+    from the projected scores; tr G, sum_j u_j G_jj, sum_j u_j ||G e_j||^2 and ||G||_F^2 from the projected Grams,
+    within each block and with its neighbours (the LD Stage 0 keeps; farther pairs enter as zero, which only moves
+    the start)."""
+    ld = statistics.ld
+    weights = np.exp(prior.log_variance_offset)
+    covariate_count = statistics.covariate_gram.shape[0]
+    fitted = statistics.covariate_target.T @ np.linalg.pinv(statistics.covariate_gram) @ statistics.covariate_target
+    target_square = np.diag(statistics.target_gram) - np.diag(fitted)
+    score_square = np.zeros(target_square.shape[0])
+    column_square = np.zeros(prior.variant_count)
+    gram_trace = 0.0
+    gram_square = 0.0
+    weighted_diagonal = 0.0
+    previous_columns = None
+    for block_index in range(ld.block_count):
+        block = ld.block(block_index)
+        columns = np.asarray(block.reduced_columns, dtype=np.int64)
+        gram = np.asarray(block.projected_gram, dtype=np.float64)
+        score_square += np.sum(np.square(np.asarray(block.projected_score, dtype=np.float64)), axis=0)
+        diagonal = np.diag(gram)
+        gram_trace += float(diagonal.sum())
+        weighted_diagonal += float(weights[columns] @ diagonal)
+        squares = np.square(gram)
+        column_square[columns] += squares.sum(axis=0)
+        gram_square += float(squares.sum())
+        cross = ld.adjacent_block(block_index) if block_index else None
+        if cross is not None:
+            cross_squares = np.square(np.asarray(cross, dtype=np.float64))
+            column_square[previous_columns] += cross_squares.sum(axis=1)
+            column_square[columns] += cross_squares.sum(axis=0)
+            gram_square += 2.0 * float(cross_squares.sum())
+        previous_columns = columns
+    return [
+        moment_start(
+            target_square=float(target_square[target]), residual_dimension=float(statistics.sample_count - covariate_count),
+            score_square=float(score_square[target]), gram_trace=gram_trace, weighted_diagonal=weighted_diagonal,
+            weighted_square=float(weights @ column_square), gram_square=gram_square,
+        )
+        for target in range(target_square.shape[0])
+    ]
 
 
 def covariate_residual_variance(targets: F64Array, training: F64Array, covariates: F64Array) -> F64Array:
@@ -248,7 +296,15 @@ class _FullDataFixedPoints:
     hyperparameters, with its noise variance stationary, warm from the previous call (the module docstring's step 1)."""
 
     def __init__(
-        self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int
+        self,
+        gaussian: DualGaussian,
+        statistics: GenotypeSufficientStatistics,
+        prior: ScaleMixturePrior,
+        draw_count: int,
+        working_bytes: int,
+        seed: int,
+        starts: Sequence[MixtureHyperparameters],
+        noise: F64Array,
     ) -> None:
         self.gaussian = gaussian
         self.generator = np.random.default_rng(seed)
@@ -257,10 +313,10 @@ class _FullDataFixedPoints:
         self.draw_count = draw_count
         self.working_bytes = working_bytes
         model_count = gaussian.model_count
-        precision, shift = moment_matched_prior_sites(prior, initial_hyperparameters(prior))
-        self.site_precision = np.repeat(precision[:, None], model_count, axis=1)
-        self.site_shift = np.repeat(shift[:, None], model_count, axis=1)
-        self.noise = covariate_residual_variance(_host(gaussian.targets), _host(gaussian.training), _host(gaussian.covariates))
+        sites = [moment_matched_prior_sites(prior, start) for start in starts]
+        self.site_precision = np.column_stack([precision for precision, _shift in sites])
+        self.site_shift = np.column_stack([shift for _precision, shift in sites])
+        self.noise = np.array(noise, dtype=np.float64, copy=True)
         self.effective = np.full(model_count, float(prior.variant_count))
         self.probe_ratio = _HALF_PRECISION
         self.mean_move = np.full(model_count, np.inf)
@@ -519,8 +575,15 @@ def fit_full_data(
 ) -> FullDataFit:
     """Stage 2 for quantitative models, from the prior (see the module docstring); ``seed`` draws the certificate's
     variant-side probes."""
-    fixed_points = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed)
-    starts = [initial_hyperparameters(prior) for _model in range(gaussian.model_count)]
+    # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
+    # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
+    moments = moment_starts(statistics, prior)
+    if len(moments) != gaussian.model_count:
+        raise ValueError("Stage 0's targets must be the models, in order")
+    starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
+    fixed_points = _FullDataFixedPoints(
+        gaussian, statistics, prior, draw_count, working_bytes, seed, starts, np.array([moment.noise for moment in moments])
+    )
     try:
         fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
     except FloatingPointError as error:
