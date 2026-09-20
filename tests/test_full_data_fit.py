@@ -112,3 +112,34 @@ def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_
     np.testing.assert_allclose(scores.means[training, 0], np.asarray(gaussian.genetic_image)[training, 0], rtol=1e-8, atol=1e-8)
     assert np.corrcoef(scores.means[held_out, 0], genetic[held_out])[0, 1] > 0.5
     assert np.all(scores.variances[held_out, 0] > 0.0)
+
+
+def test_block_grams_share_stage0s_float32_arrays_across_models(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    from sv_pgs.full_data_fit import block_grams
+    from sv_pgs.marginal_variances import window_working_bytes
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 8)
+    training = np.arange(_TRAINING)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)),
+        training,
+        np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        targets[training, None],
+        ModelConfig(),
+        _budget(),
+        _BLOCK_CAP,
+        tmp_path / "ld",
+    )
+    shared = block_grams(statistics)
+    model = replace(shared, scale=1.0 / 0.7)
+    # The same arrays, not copies, and Stage 0's float32 storage.
+    assert all(first is second for first, second in zip(shared.within, model.within))
+    assert all(first is second for first, second in zip(shared.next_cross, model.next_cross))
+    assert all(np.asarray(values).dtype == np.float32 for values in shared.within)
+    ld = statistics.ld
+    for block_index in range(ld.block_count):
+        expected = np.asarray(ld.block(block_index).projected_gram, dtype=np.float64) / 0.7
+        assert np.array_equal(model.within_block(block_index), expected)
+    assert window_working_bytes(model) > 0

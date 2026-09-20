@@ -38,7 +38,7 @@ The fit ends when every model's Newton-B decrement plus its weights' remaining g
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 
 import numpy as np
@@ -63,6 +63,7 @@ from sv_pgs.marginal_variances import (
     information_solve_tolerance,
     marginal_variances,
     variance_jvp,
+    window_working_bytes,
 )
 from sv_pgs.scale_mixture_ep import (
     Cavity,
@@ -100,18 +101,22 @@ def stage0_lattice(
     return derived_lattice(single_precision, single_shift, log_variance_offset, tolerance)
 
 
-def block_grams(statistics: GenotypeSufficientStatistics, noise: float) -> BlockGrams:
-    """Stage 0's projected Grams in the model's metric W = training / sigma^2: R_b within each block and R_{b,b+1}
-    between neighbours, zero across a chromosome's end."""
+def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0) -> BlockGrams:
+    """Stage 0's projected Grams, R_b within each block and R_{b,b+1} between neighbours (zero across a chromosome's
+    end), as the stored float32 arrays themselves: memory-mapped views, no copy. A model's metric W = training /
+    sigma^2 enters as ``scale = 1 / noise``; every model of a fit shares the arrays through
+    ``dataclasses.replace(grams, scale=...)``, and ``marginal_variances`` promotes one window at a time to float64.
+    (Building float64 copies per model and refresh held about 12 GB of each kind per model at p = 466k and ran
+    e2e-scale's chr22 fit out of host memory at 45 GB.)"""
     ld = statistics.ld
     blocks = tuple(np.asarray(ld.block(block_index).reduced_columns, dtype=np.int64) for block_index in range(ld.block_count))
-    within = tuple(np.asarray(ld.block(block_index).projected_gram, dtype=np.float64) / noise for block_index in range(ld.block_count))
+    within = tuple(ld.block(block_index).projected_gram for block_index in range(ld.block_count))
     next_cross = []
     for block_index in range(1, ld.block_count):
         cross = ld.adjacent_block(block_index)
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
-        next_cross.append(np.zeros(shape) if cross is None else np.asarray(cross, dtype=np.float64) / noise)
-    return BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross))
+        next_cross.append(np.zeros(shape, dtype=np.float32) if cross is None else cross)
+    return BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:
@@ -263,7 +268,7 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
             live = live[~done]
         return solution
 
-    return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights).values)
+    return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values)
 
 
 def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array) -> Callable[[F64Array], float]:
@@ -314,6 +319,12 @@ class _FullDataFixedPoints:
         self.prior = prior
         self.draw_count = draw_count
         self.working_bytes = working_bytes
+        # Stage 0's Grams, built once per fit and shared by every model and refresh (``block_grams``); the window
+        # algebra's float64 working set is charged against the fit's budget.
+        self.grams = block_grams(statistics)
+        window_bytes = window_working_bytes(self.grams)
+        if window_bytes > working_bytes:
+            raise MemoryError(f"the leave-block-out windows need {window_bytes} bytes of float64 working set, over the fit's {working_bytes}")
         model_count = gaussian.model_count
         sites = [moment_matched_prior_sites(prior, start) for start in starts]
         self.site_precision = np.column_stack([precision for precision, _shift in sites])
@@ -370,8 +381,10 @@ class _FullDataFixedPoints:
             except np.linalg.LinAlgError:
                 failure = "the full-data precision is not positive definite with non-negative sites"
             else:
-                grams = [block_grams(self.statistics, float(self.noise[model])) for model in range(gaussian.model_count)]
-                variances = np.column_stack([marginal_variances(solve, model_grams) for solve, model_grams in zip(gaussian.bulk_solves, grams)])
+                grams = [replace(self.grams, scale=1.0 / float(self.noise[model])) for model in range(gaussian.model_count)]
+                variances = np.column_stack([
+                    marginal_variances(solve, model_grams, gaussian.array_module) for solve, model_grams in zip(gaussian.bulk_solves, grams)
+                ])
                 # A cavity is proper where the tilted law it makes is: 1 + v P > 0 at every node, v up to u_j e^(t_K) (the
                 # kernel's own test). P = 1/z - tau at or just below zero is a variant the data barely inform, not an
                 # improper one: a site that is an exact sum of negative sites keeps P ~ -eps there however far it halves.
@@ -445,8 +458,11 @@ class _FullDataFixedPoints:
             probes = self.generator.choice(np.array([-1.0, 1.0]), size=(variant_count, probe_count))
             back_products, _coupling, _residual_norm = gaussian.information_solve(probes, model, residual)
             removed = information_products(solve, np.asarray(_host(back_products), dtype=np.float64))
-            control = control_variate(solve, grams, probes)
-            control = ControlVariate(removed_products=control.removed_products, window_information=control.window_information[undecided])
+            control = control_variate(solve, grams, probes, gaussian.array_module)
+            control = ControlVariate(
+                removed_products=control.removed_products, window_information=control.window_information[undecided],
+                resolvable=control.resolvable[undecided],
+            )
             certificate = block_information_certificate(
                 solve, variances, subset, probes, removed, tolerance[undecided], stage_level(level, stage), control
             )
