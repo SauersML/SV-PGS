@@ -15,9 +15,14 @@ standardized effects:
 
 The prediction is the posterior-mean genetic score (plus the fitted intercept for bench-real, whose phenotype is
 already residualized). Covariate effects are left out, as the harnesses adjust for covariates themselves.
-"""
 
-from __future__ import annotations
+``fit_expression_no_sv_terms`` is a bench-real ablation arm only: the same fit with the SV-specific prior terms
+withheld from its store (one variant class for every record, so no class deviations, and no SV-type, source, length
+or length-change columns), leaving the pooled prior.
+
+Both harnesses load this file without registering it as a module, so it has no ``from __future__ import
+annotations``: dataclasses would then look the module up to resolve its string annotations, and fail.
+"""
 
 import tempfile
 from dataclasses import dataclass, replace
@@ -277,18 +282,23 @@ def bench_real_allele_lengths(variants: Any) -> tuple[np.ndarray, np.ndarray]:
     return reference_length, reference_length + np.asarray(variants.allele_length_change, dtype=np.int64)
 
 
-def bench_real_annotations(variants: Any) -> tuple[dict[str, np.ndarray], dict[str, tuple[str, ...]]]:
-    """The store's prior columns; training allele frequencies stay out (Stage 0 computes them itself)."""
+_SV_SPECIFIC_ANNOTATIONS = ("log1p_sv_length", "allele_length_change", "sv_type", "source")
+
+
+def bench_real_annotations(variants: Any, sv_terms: bool) -> tuple[dict[str, np.ndarray], dict[str, tuple[str, ...]]]:
+    """The store's prior columns; training allele frequencies stay out (Stage 0 computes them itself). Without
+    ``sv_terms`` the SV-specific columns are withheld."""
     sv_type, sv_type_legend = _categorical(variants.sv_type)
     source, source_legend = _categorical(variants.source)
+    columns = {
+        "log1p_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
+        "log1p_sv_length": np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))),
+        "allele_length_change": np.asarray(variants.allele_length_change, dtype=np.float64),
+        "sv_type": sv_type,
+        "source": source,
+    }
     annotations = _informative_annotations(
-        {
-            "log1p_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
-            "log1p_sv_length": np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))),
-            "allele_length_change": np.asarray(variants.allele_length_change, dtype=np.float64),
-            "sv_type": sv_type,
-            "source": source,
-        }
+        {name: values for name, values in columns.items() if sv_terms or name not in _SV_SPECIFIC_ANNOTATIONS}
     )
     legends = {name: legend for name, legend in (("sv_type", sv_type_legend), ("source", source_legend)) if name in annotations}
     return annotations, legends
@@ -325,6 +335,15 @@ def one_core_budget() -> ComputeBudget:
 
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
+    return _fit_expression(train, sv_terms=True)
+
+
+def fit_expression_no_sv_terms(train: Any) -> BenchRealPredictor:
+    """bench-real ablation arm: ``fit_expression`` with the SV-specific prior terms withheld (module docstring)."""
+    return _fit_expression(train, sv_terms=False)
+
+
+def _fit_expression(train: Any, sv_terms: bool) -> BenchRealPredictor:
     budget = one_core_budget()
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
@@ -332,7 +351,8 @@ def fit_expression(train: Any) -> BenchRealPredictor:
     variants = train.variants
     order = np.argsort(np.asarray(variants.position), kind="stable")
     reference_length, alternate_length = bench_real_allele_lengths(variants)
-    annotations, legends = bench_real_annotations(variants)
+    annotations, legends = bench_real_annotations(variants, sv_terms)
+    classes = bench_real_classes(variants) if sv_terms else np.full(order.shape[0], _CLASS_CODES[VariantClass.SNV], dtype=np.uint8)
     codes = (np.asarray(genotypes, dtype=np.uint8).T * np.uint8(CODES_PER_DOSAGE))[order]
     with tempfile.TemporaryDirectory(prefix="svpgs-bench-real.") as scratch:
         store = write_store(
@@ -343,7 +363,7 @@ def fit_expression(train: Any) -> BenchRealPredictor:
             genetic_position_cm=np.full(order.shape[0], np.nan),
             reference_length=reference_length[order],
             alternate_length=alternate_length[order],
-            variant_class=bench_real_classes(variants)[order],
+            variant_class=classes[order],
             annotations={name: values[order] for name, values in annotations.items()},
             annotation_legends=legends,
             code_rows=lambda rows: np.ascontiguousarray(codes[rows]),
