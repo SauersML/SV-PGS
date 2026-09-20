@@ -68,6 +68,9 @@ class Variants:
     # Each column's expected genotype concordance where dosages were filled (the share of people whose stored dosage
     # equals the called one; lr-sv's GATK-SV no-call fills). A concordance, not an r^2: 1 where absent.
     concordance: np.ndarray = None
+    # The exact squared correlation of the stored dosage with the CALLED genotype under the fill mixture (lr-sv): an upper
+    # bound on the r^2 with the true genotype, so not the reliability either. 1 where absent.
+    called_r2: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -269,7 +272,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
                         window_row=np.flatnonzero(polymorphic),
                         chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None,
                         reliability=selected["reliability"].to_numpy(dtype=np.float64) if "reliability" in selected else np.ones(len(selected)),
-                        concordance=selected["concordance"].to_numpy(dtype=np.float64) if "concordance" in selected else np.ones(len(selected)))
+                        concordance=selected["concordance"].to_numpy(dtype=np.float64) if "concordance" in selected else np.ones(len(selected)),
+                        called_r2=selected["called_r2"].to_numpy(dtype=np.float64) if "called_r2" in selected else np.ones(len(selected)))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]

@@ -399,7 +399,7 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
     assert joint.variants.reliability[joint.variants.is_sv].tolist() == [0.8, 0.4]
     assert (joint.variants.reliability[~joint.variants.is_sv] == 1.0).all() and (called.variants.reliability == 1.0).all()
-    assert (joint.variants.concordance == 1.0).all()
+    assert (joint.variants.concordance == 1.0).all() and (joint.variants.called_r2 == 1.0).all()
 
 
 def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
