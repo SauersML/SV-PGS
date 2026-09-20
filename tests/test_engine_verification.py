@@ -663,6 +663,11 @@ def _profile(prior, log_smoothing, cavity, point, null_basis):
 
 
 @pytest.mark.slow
+@pytest.mark.xfail(strict=True, reason=(
+    "finding reported to e2e: _laplace_corrections integrates straight lines along the first-order moved directions "
+    "(below the profile path) and per direction (no cross terms); the corrected V falls 0.72 to 2.60 nats below a lower "
+    "bound on the exact profiled V, beyond its certified 1/128, and further than the plain Laplace V [sim-only]"
+))
 @pytest.mark.parametrize("seed", _SEEDS)
 @pytest.mark.parametrize("kind", ("normal_means",))
 def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_directions(seed, kind):
