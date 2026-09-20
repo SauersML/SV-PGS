@@ -241,6 +241,7 @@ def test_the_map_recovers_a_known_leak_from_the_cohort_covariance() -> None:
     block = rng.normal(size=(pairs, 5))
     truth = block[:, [0]] + ((block - block.mean(axis=0)) @ leak)[:, None] + rng.normal(0.0, noise, (pairs, 1))
     leakage = fit_leakage_map(covariance, block, truth, np.array([0]))
+    assert 0.0 < leakage.ridge_ratio < np.inf and not leakage.fits_pairs_exactly
     # Independent unit columns: s_j - c_j has variance (|c|^2 + c_j^2 + noise^2) / n from
     # the pairs' own correlation and noise, and the ridge shrinks by at most the gap.
     standard_errors = np.sqrt((leak @ leak + leak**2 + noise**2) / pairs)
