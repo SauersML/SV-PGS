@@ -31,6 +31,7 @@ from sv_pgs.scale_mixture_ep import (
     _total_curvature,
     _directional_derivatives,
     _corrected,
+    _ascend_evidence,
     _best_certified,
     _laplace_corrections,
     _line_log_integral,
@@ -809,6 +810,97 @@ def test_the_correction_gradient_is_the_held_direction_corrections_derivative():
         for unit in np.eye(hyperparameters.log_smoothing.shape[0])
     ])
     np.testing.assert_allclose(gradient, numerical, rtol=1e-4, atol=1e-5 + 2.0 * float(np.max(error)))
+
+
+def _annotated_problem(seed: int):
+    """One class, ten nodes and one annotation column that scales the effects (verify-engine's finding-3 case)."""
+    generator = np.random.default_rng(seed)
+    variant_count = 80
+    nodes = np.linspace(np.log(1e-5), np.log(1.0), 10)
+    position = generator.uniform(-1.0, 1.0, variant_count)
+    offset = np.log(generator.uniform(0.2, 1.0, variant_count))
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variant_count, np.int64), log_variance_offset=offset, annotation_design=position[:, None],
+        annotation_groups=(AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    precision = generator.uniform(50.0, 400.0, variant_count)
+    effect = np.where(generator.random(variant_count) < 0.4, generator.normal(0.0, 0.25, variant_count), 0.0) * np.exp(0.5 * position)
+    shift = precision * (effect + generator.standard_normal(variant_count) / np.sqrt(precision))
+    return prior, Cavity(precision=precision, shift=shift)
+
+
+def _ascended(prior, cavity):
+    flat = initial_hyperparameters(prior).coefficients
+    start = _corrected(prior, np.zeros(2), _evidence(prior, np.zeros(2), flat, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                       cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    bounds = _smoothing_bounds(prior, _data_objective(prior, start.coefficients, cavity, _WORKING_BYTES))
+    lower, upper = np.array([bound[0] for bound in bounds]), np.array([bound[1] for bound in bounds])
+    weights, evidence = _ascend_evidence(prior, np.zeros(2), start, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, lower, upper, _EVIDENCE_TOLERANCE, flat)
+    return weights, evidence, (weights > lower) & (weights < upper)
+
+
+@pytest.mark.parametrize("seed", (101, 202, 303))
+def test_the_weights_remaining_gain_covers_every_nearby_weight(seed):
+    # verify-engine finding 3: the old check's 1/2 (|c| + E)^2 / s used an upper bound on |V''| and so understated the
+    # gain (0.0245 claimed where V rose 0.0645 within one unit of rho, seed 303). The remaining gain must cover the
+    # best certified V over a neighbourhood of the ascent's stop, up to the two sides' certified tolerances.
+    prior, cavity = _annotated_problem(seed)
+    weights, evidence, interior = _ascended(prior, cavity)
+    if not np.any(interior):
+        pytest.skip("the ascent stopped at the resolvable range's bounds")
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is None
+    gains = []
+    for position in np.flatnonzero(interior):
+        for distance in (-1.0, -0.3, -0.1, 0.1, 0.3, 1.0):
+            moved_weights = weights.copy()
+            moved_weights[position] += distance
+            moved = _corrected(
+                prior, moved_weights, _evidence(prior, moved_weights, evidence.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
+                cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE,
+            )
+            if moved is not None:
+                gains.append(moved.value - evidence.value)
+    assert max(gains) <= check.gain + 2.0 * _EVIDENCE_TOLERANCE, (max(gains), check.gain, check.gradient, check.curvature)
+
+
+def test_a_maximum_at_its_basins_fold_is_certified_one_sided(monkeypatch):
+    # The basin ends just past the stop on the side the gradient climbs: the weight's gain is at most what V can climb
+    # before the fold, and the curvature comes from the other side.
+    prior, cavity = _annotated_problem(101)
+    weights, evidence, interior = _ascended(prior, cavity)
+    position = int(np.flatnonzero(interior)[0])
+    gradient = engine._full_gradient(prior, weights, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)[0]
+    climb = 1.0 if gradient[position] >= 0.0 else -1.0
+    corrected = engine._corrected
+
+    def folded(view, trial_weights, trial, *rest):
+        if climb * (trial_weights[position] - weights[position]) > 0.0:
+            return None
+        return corrected(view, trial_weights, trial, *rest)
+
+    monkeypatch.setattr(engine, "_corrected", folded)
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is None and check.folds[position] > 0.0
+    reach = abs(check.gradient[position]) + check.error[position]
+    assert check.gain >= reach * check.folds[position]
+    assert np.isfinite(check.curvature[position, position])
+
+
+def test_a_certifiably_better_side_is_taken_not_certified(monkeypatch):
+    prior, cavity = _annotated_problem(101)
+    weights, evidence, interior = _ascended(prior, cavity)
+    corrected = engine._corrected
+
+    def lifted(view, trial_weights, trial, *rest):
+        found = corrected(view, trial_weights, trial, *rest)
+        if found is None or np.array_equal(trial_weights, weights):
+            return found
+        return replace(found, value=found.value + 1.0)
+
+    monkeypatch.setattr(engine, "_corrected", lifted)
+    check = engine._stationarity(prior, weights, evidence, interior, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert check.better is not None and check.better[1].value > evidence.value + _EVIDENCE_TOLERANCE
 
 
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
