@@ -446,3 +446,13 @@ def fit_expression_batch(trains: Sequence[Any]) -> list[BenchRealPredictor]:
         BenchRealPredictor(scoring=scoring, columns=scoring.store_rows, centering="training", input_columns=gene.codes.shape[1])
         for scoring, gene in zip(fitted.scoring, genes)
     ]
+
+
+def fit_expression_views(views: Mapping) -> Iterator[tuple[tuple, BenchRealPredictor]]:
+    """bench-real's views contract for the pooled arm: the views grouped by (split, feature set), each group's genes
+    fitted together by ``fit_expression_batch``; yields (key, predictor) for every view exactly once."""
+    groups: dict[tuple, list[tuple]] = {}
+    for key in views:
+        groups.setdefault(tuple(key[1:]), []).append(tuple(key))
+    for keys in groups.values():
+        yield from zip(keys, fit_expression_batch([views[key] for key in keys]))

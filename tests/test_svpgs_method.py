@@ -5,6 +5,7 @@ The engine driver is the stub of tests/test_fit_model.py, so these tests pin the
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -316,3 +317,22 @@ def test_the_batch_arm_fits_every_gene_with_one_pooled_call(monkeypatch: pytest.
         np.testing.assert_array_equal(gene.codes, (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))
         np.testing.assert_array_equal(gene.variant_class, svpgs_method.bench_real_classes(train.variants))
         assert predictor.predict(test).shape == (test.shape[0],)
+
+
+def test_the_views_arm_pools_each_split_and_feature_set_over_its_genes(monkeypatch: pytest.MonkeyPatch) -> None:
+    batches: list[int] = []
+
+    def batch(trains: Any) -> list[Any]:
+        batches.append(len(trains))
+        return [f"predictor of {train.gene_id}" for train in trains]
+
+    monkeypatch.setattr(svpgs_method, "fit_expression_batch", batch)
+    trains = {}
+    for gene in ("a", "b", "c"):
+        for split in ("loso/AFR", "loso/EUR"):
+            for feature_set in ("snv", "snv_sv"):
+                train, _test = _bench_real_train(np.random.default_rng(len(trains)))
+                trains[(gene, split, feature_set)] = dataclasses.replace(train, gene_id=gene)
+    returned = dict(svpgs_method.fit_expression_views(trains))
+    assert sorted(returned) == sorted(trains) and batches == [3, 3, 3, 3]
+    assert all(returned[key] == f"predictor of {key[0]}" for key in trains)
