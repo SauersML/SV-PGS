@@ -661,13 +661,15 @@ def double_loop_sites(
     stationary point of the EP free energy (MODEL.md section 4's fallback; ``tests/ep_eb_reference.double_loop_sites``).
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
-    problem, the minimum of the convex Phi over the sites, is solved by Newton with plain-decrease halving until no
-    representable step along Newton's direction lowers Phi. The loop ends at small_n's own EP check, the undamped
+    problem, the minimum of the convex Phi over the sites, is solved by Newton with sufficient-decrease halving until no
+    representable step along Newton's direction lowers Phi by half its quadratic model's decrease. Each outer step is
+    majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
+    accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
     update's move r' Sigma r at most p_eff / K, or when an outer step leaves the sites unchanged, which is EP's fixed
     point: at an outer step's start (P_s, h_s) are q's own marginals, so Phi's gradient there, (mu - E_r[beta],
     -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
-    means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), lowered Phi
-    at no representable fraction: Phi is stationary there to its rounding, and with it the moment-matching equations,
+    means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), found no
+    representable fraction with sufficient decrease: Phi is stationary there to its rounding, and with it the moment-matching equations,
     whose solutions are EP's fixed points. Sites are never clipped. The start must lie in EP's domain (ValueError
     otherwise: the prior's moment-matched sites always do)."""
     precision = np.array(site_precision, dtype=np.float64, copy=True)
@@ -704,7 +706,12 @@ def double_loop_sites(
                     design, noise, data_score, point.site_precision + fraction * step[size:], point.site_shift + fraction * step[:size],
                     marginal_precision, marginal_shift, tilted, largest_variance,
                 )
-                if candidate is not None and candidate.value < point.value:
+                # Sufficient decrease: at least half of the quadratic model's own decrease along the step, which for a CG
+                # iterate (d'Hd = -g'd = decrement) is fraction (1 - fraction / 2) decrement. Plain decrease can accept
+                # vanishing decreases and stall short of the minimum (theory-ep); this is Armijo with c = 1/4 at
+                # fraction <= 1, and it keeps every exact Newton step on a quadratic.
+                model = fraction * (1.0 - 0.5 * fraction) * decrement
+                if candidate is not None and candidate.value <= point.value - 0.5 * model:
                     accepted = candidate
                     break
                 fraction *= 0.5
