@@ -1180,8 +1180,16 @@ class _DenseFixedPoints:
                 raise NoFixedPoint("the frozen pass's move is not finite")
             if 0.5 * mean_move <= 0.5 / self.draw_count:
                 return
-            if mean_move / previous_move >= 1.0:
-                damping = min(damping, 1.0 / (1.0 + np.sqrt(mean_move / previous_move)))
+            ratio = mean_move / previous_move
+            if ratio >= 1.0:
+                if damping < 1.0:
+                    # A pass damped by 1/(1 + rho), exact for the map's eigenvalue at -rho^2, still does not contract:
+                    # the frozen-cavity map has a mode damping cannot reach (an eigenvalue past +1, or complex), and
+                    # mean-only EP does not converge here. EP falls back to the convergent double loop (MODEL.md
+                    # section 4), as where no damped pass stays positive definite (svpgs-profiler's slow genes 6, 7).
+                    self._double_loop(hyperparameters)
+                    return
+                damping = 1.0 / (1.0 + np.sqrt(ratio))
             previous_move = mean_move
             cavity = Cavity(precision=frozen, shift=self.mean / marginal - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)

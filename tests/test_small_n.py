@@ -575,3 +575,32 @@ def test_a_point_mass_tilted_law_refuses_the_trial_at_once(monkeypatch):
     monkeypatch.setattr(small_n, "tilted_moments", degenerate)
     assert oracle([start]) == [None]
     assert "point masses" in oracle.refusals[-1]
+
+
+def test_frozen_passes_that_do_not_contract_fall_back_to_the_double_loop(monkeypatch):
+    """Where damped mean-only EP does not contract (here every frozen target pushed away from the fixed point: the map's
+    eigenvalues past +1, which damping cannot reach), the frozen passes fall back to the double loop, which reaches
+    EP's fixed point; the check then passes at it (svpgs-profiler's slow genes 6 and 7 [real])."""
+    from sv_pgs.scale_mixture_ep import Cavity
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(97)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    target = (dosage[:, 0] - dosage[:, 0].mean()) + rng.standard_normal(samples)
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), target)
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 64, 10**9)
+    true_targets = oracle._targets
+
+    def repelling(hyperparameters, cavity):
+        precision, shift = true_targets(hyperparameters, cavity)
+        return 2.0 * oracle.site_precision - precision, 2.0 * oracle.site_shift - shift
+
+    monkeypatch.setattr(oracle, "_targets", repelling)
+    (point,) = oracle([start])
+    assert point is not None and oracle.profile["double_loops"] >= 1
+    variances, frozen = oracle._refresh(start)
+    precision, shift = true_targets(start, Cavity(precision=frozen, shift=oracle.mean / variances - oracle.site_shift))
+    np.testing.assert_allclose(precision, oracle.site_precision, rtol=1e-4)
