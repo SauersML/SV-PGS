@@ -1,21 +1,25 @@
-"""Exact marginal posterior variances and sample leverages through the n x n dual, with a rounding certificate.
+"""Exact marginal posterior variances and the bulk kernel's diagonal through the n x n dual, with a rounding certificate.
 
 Model as in marginal_variances: the metric is folded into the columns, Xt = (I - H) W^1/2 X, and the Gaussian
 EP sites give q(beta) with precision A = Xt'Xt + diag(Pi). EP needs diag(A^-1) at every refresh; logistic EP
-also needs the sample leverages h_i = [Xt A^-1 Xt']_ii.
+also needs the bulk kernel's diagonal diag(K^-1) for the sample leverages.
 
 Split the sites into the bulk S (Pi_j > 0, D_j = 1 / Pi_j) and the resolved set L (every Pi_j <= 0, plus any
 sites the caller names). With K = I + Xt_S D_S Xt_S' (n x n, K >= I), U = Xt_L and core = Pi_L + U' K^-1 U,
 
     diag(A^-1)_j = D_j - D_j^2 (q_j - c_j core^-1 c_j'),   q_j = xt_j' K^-1 xt_j,   c_j = xt_j' K^-1 U   (j in S)
-    diag(A^-1)_L = diag(core^-1)
-    h_i = 1 - [K^-1]_ii + d_i core^-1 d_i',   d_i = e_i' K^-1 U.
+    diag(A^-1)_L = diag(core^-1).
 
-These are marginal_variances' identity 1 with K^-1 applied exactly: one Cholesky K = RR' replaces the window
-and its far-field equivalent, so nothing is estimated and no probe certificate is needed. With u = R^-1 x every
-quantity above is an inner product of forward solves. Two passes over the columns (form K and gather U, then
-forward-solve every column) cost n^2 p flops each, the factor n^3/3, and diag(K^-1) another n^3/3 when the
-leverages are asked for. `exact_dual_cost` gives the counts.
+The bulk diagonal [K^-1]_ii is returned alone, in binary-ep's convention: the resolved sites' term and the
+covariate leverage are added once, by dual_solve.SampleDiagonal.predictor_variance, and adding them here too
+would count them twice.
+
+These are marginal_variances' identity 1 with K^-1 applied exactly (its KernelFactor route, here with the
+rounding certified): one Cholesky K = RR' replaces the window and its far-field equivalent, so nothing is
+estimated and no probe certificate is needed. With u = R^-1 x every quantity above is an inner product of
+forward solves, run on the array module's device. Two passes over the columns (form K and gather U, then
+forward-solve every column) cost n^2 p flops each, the factor n^3/3, and diag(K^-1) another n^3/3 when it is
+asked for, in blocks of identity columns, so no second n x n array is held. `exact_dual_cost` gives the counts.
 
 Certificate. The algebra is exact, so the bound covers floating point only. Let u be the unit roundoff and
 gamma_m = m u / (1 - m u) (Higham 2002, Accuracy and Stability of Numerical Algorithms, section 3.1).
@@ -30,7 +34,7 @@ gamma_m = m u / (1 - m u) (Higham 2002, Accuracy and Stability of Numerical Algo
   u_hat = R^-1 x + e with ||e|| <= beta / (1 - beta) ||u_hat||, where
   beta = gamma_n ||R||_F / (sqrt(1 - delta) - gamma_n ||R||_F). Each inner product carries a further relative
   gamma_n.
-That bounds every q, c, core and d entry. The core terms go through the same argument on the small factor of
+That bounds every q, c, core and diag(K^-1) entry. The core terms go through the same argument on the small factor of
 core, with its smallest eigenvalue bounded below from that factor and its computed inverse. A core that isn't
 certifiably positive definite, or any bound that can't be established, raises NotCertified; nothing is guessed.
 """
@@ -64,8 +68,8 @@ class NotCertified(ArithmeticError):
 class ExactMarginals:
     variances: NDArray[np.float64]
     variance_bound: NDArray[np.float64]
-    leverages: NDArray[np.float64] | None
-    leverage_bound: NDArray[np.float64] | None
+    bulk_diagonal: NDArray[np.float64] | None
+    bulk_diagonal_bound: NDArray[np.float64] | None
     resolved: NDArray[np.int64]
     factor_bound: float
 
@@ -123,9 +127,9 @@ def _upper(values: NDArray[np.float64], terms: int) -> NDArray[np.float64]:
 
 
 def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count: int, *,
-                    resolved: NDArray[np.int64] | None = None, leverages: bool = False, array_module: Any = np,
+                    resolved: NDArray[np.int64] | None = None, bulk_diagonal: bool = False, array_module: Any = np,
                     identity_block: int | None = None) -> ExactMarginals:
-    """diag(A^-1) (and, if asked, the sample leverages) with a certified rounding bound.
+    """diag(A^-1) (and, if asked, the bulk diagonal diag(K^-1)) with a certified rounding bound.
 
     blocks() must return a fresh iterable of (column indices, Xt[:, columns]) on every call: the columns are
     read twice. `resolved` names extra sites to eliminate through the core (non-positive sites always are).
@@ -250,10 +254,12 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
         variances[resolved_index] = term
         variance_bound[resolved_index] = term_error
 
-    leverage_values = leverage_bound = None
-    if leverages:
-        leverage_values = np.zeros(sample_count)
-        leverage_bound = np.zeros(sample_count)
+    diagonal_values = diagonal_bound = None
+    if bulk_diagonal:
+        # [K^-1]_ii = ||R^-1 e_i||^2, and R^-1 e_i vanishes above row i, so rows start: of a block of identity
+        # columns come from the trailing sub-factor alone: n^3/3 flops over all blocks, one block resident.
+        diagonal_values = np.zeros(sample_count)
+        diagonal_bound = np.zeros(sample_count)
         width = identity_block or sample_count
         for start in range(0, sample_count, width):
             stop = min(start + width, sample_count)
@@ -263,20 +269,13 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             diagonal = to_host((solved * solved).sum(axis=0))
             solved_norm = np.sqrt(_upper(diagonal, sample_count))
             ones = np.ones(stop - start)
-            error = kernel_bounds.pair(ones, ones, solved_norm, solved_norm)
-            term = np.zeros_like(diagonal)
-            if resolved_count:
-                cross = to_host(solved.T @ solved_resolved[start:])
-                cross_error = kernel_bounds.pair(ones[:, None], resolved_x[None, :], solved_norm[:, None], resolved_u[None, :])
-                term, term_error = through_core(cross, cross_error)
-                error = error + term_error
-            leverage_values[start:stop] = 1 - diagonal + term
-            leverage_bound[start:stop] = error + _gamma(2) * (1 + diagonal + np.abs(term))
-    return ExactMarginals(variances=variances, variance_bound=variance_bound, leverages=leverage_values,
-                          leverage_bound=leverage_bound, resolved=np.sort(resolved_index), factor_bound=delta)
+            diagonal_values[start:stop] = diagonal
+            diagonal_bound[start:stop] = kernel_bounds.pair(ones, ones, solved_norm, solved_norm)
+    return ExactMarginals(variances=variances, variance_bound=variance_bound, bulk_diagonal=diagonal_values,
+                          bulk_diagonal_bound=diagonal_bound, resolved=np.sort(resolved_index), factor_bound=delta)
 
 
-def exact_dual_cost(sample_count: int, variant_count: int, resolved_count: int = 0, *, leverages: bool = False) -> dict[str, float]:
+def exact_dual_cost(sample_count: int, variant_count: int, resolved_count: int = 0, *, bulk_diagonal: bool = False) -> dict[str, float]:
     """Flops, fp64 bytes resident and column passes of one exact refresh (Golub & Van Loan 2013, sections 3.1, 4.2)."""
     n, p = float(sample_count), float(variant_count)
     flops = {
@@ -284,7 +283,7 @@ def exact_dual_cost(sample_count: int, variant_count: int, resolved_count: int =
         "factor": n ** 3 / 3,
         "forward_solves": n * n * p,
         "resolved": n * n * resolved_count + n * p * resolved_count,
-        "diagonal_of_inverse": n ** 3 / 3 if leverages else 0.0,
+        "diagonal_of_inverse": n ** 3 / 3 if bulk_diagonal else 0.0,
     }
     return {**flops, "total_flops": sum(flops.values()), "resident_bytes": np.dtype(np.float64).itemsize * n * n,
             "column_passes": 2.0}

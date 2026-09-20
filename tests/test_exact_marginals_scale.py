@@ -18,9 +18,13 @@ def _extended_inverse(matrix):
 
 
 def _reference(design, precision):
+    """diag(A^-1) and the bulk diagonal diag(K_S^-1), K_S = I + Xt_S D_S Xt_S' over the sites with Pi > 0."""
     extended = design.astype(np.longdouble)
-    inverse = _extended_inverse(extended.T @ extended + np.diag(precision.astype(np.longdouble)))
-    return np.diag(inverse), np.einsum("ij,jk,ik->i", extended, inverse, extended)
+    values = precision.astype(np.longdouble)
+    variances = np.diag(_extended_inverse(extended.T @ extended + np.diag(values)))
+    bulk = values > 0
+    kernel = np.eye(design.shape[0], dtype=np.longdouble) + (extended[:, bulk] / values[bulk]) @ extended[:, bulk].T
+    return variances, np.diag(_extended_inverse(kernel))
 
 
 def _blocks(design, widths):
@@ -45,15 +49,16 @@ def _problem(seed, samples, variants, negative=0, zero=0):
 
 
 @pytest.mark.parametrize("negative,zero", [(0, 0), (3, 2)])
-def test_variances_and_leverages_match_the_extended_precision_inverse_within_the_certificate(negative, zero):
+def test_variances_and_bulk_diagonal_match_the_extended_precision_inverse_within_the_certificate(negative, zero):
     design, precision = _problem(1, 45, 70, negative, zero)
-    result = exact_marginals(_blocks(design, [30, 25, 15]), precision, design.shape[0], leverages=True, identity_block=17)
-    variances, leverages = _reference(design, precision)
+    result = exact_marginals(_blocks(design, [30, 25, 15]), precision, design.shape[0], bulk_diagonal=True, identity_block=17)
+    variances, diagonal = _reference(design, precision)
     variance_error = np.abs(result.variances - variances.astype(np.float64))
-    leverage_error = np.abs(result.leverages - leverages.astype(np.float64))
+    diagonal_error = np.abs(result.bulk_diagonal - diagonal.astype(np.float64))
     assert np.all(variance_error <= result.variance_bound)
-    assert np.all(leverage_error <= result.leverage_bound)
+    assert np.all(diagonal_error <= result.bulk_diagonal_bound)
     assert np.all(result.variance_bound <= np.abs(variances.astype(np.float64)) * 1e-6)
+    assert np.all(result.bulk_diagonal_bound <= diagonal.astype(np.float64) * 1e-6)
     assert np.array_equal(result.resolved, np.flatnonzero(precision <= 0))
 
 
@@ -66,10 +71,10 @@ def test_named_resolved_sites_give_the_same_marginals():
 
 def test_the_block_partition_does_not_change_the_answer_beyond_the_bound():
     design, precision = _problem(3, 50, 90, negative=2)
-    one = exact_marginals(_blocks(design, [90]), precision, design.shape[0], leverages=True)
-    many = exact_marginals(_blocks(design, [7, 40, 1, 42]), precision, design.shape[0], leverages=True)
+    one = exact_marginals(_blocks(design, [90]), precision, design.shape[0], bulk_diagonal=True)
+    many = exact_marginals(_blocks(design, [7, 40, 1, 42]), precision, design.shape[0], bulk_diagonal=True, identity_block=11)
     assert np.all(np.abs(one.variances - many.variances) <= one.variance_bound + many.variance_bound)
-    assert np.all(np.abs(one.leverages - many.leverages) <= one.leverage_bound + many.leverage_bound)
+    assert np.all(np.abs(one.bulk_diagonal - many.bulk_diagonal) <= one.bulk_diagonal_bound + many.bulk_diagonal_bound)
 
 
 def test_a_core_that_is_not_positive_definite_is_refused():
@@ -86,7 +91,7 @@ def test_blocks_must_cover_every_column():
 
 
 def test_cost_model_counts_the_two_passes_and_the_factor():
-    cost = exact_dual_cost(50_000, 500_000, leverages=True)
+    cost = exact_dual_cost(50_000, 500_000, bulk_diagonal=True)
     assert cost["formation"] == cost["forward_solves"] == 50_000.0 ** 2 * 500_000
     assert cost["factor"] == cost["diagonal_of_inverse"] == 50_000.0 ** 3 / 3
     assert cost["resident_bytes"] == 8 * 50_000.0 ** 2
