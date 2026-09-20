@@ -130,7 +130,6 @@ def block_gcro_dr(
     relative_tolerance: float,
     absolute_tolerance: float,
     working_bytes: int,
-    application_limit: int,
     start: F64 | None = None,
     precondition: Callable[[F64], F64] | None = None,
     recycled: RecycledSpace | None = None,
@@ -140,8 +139,10 @@ def block_gcro_dr(
     It iterates until its recurrence residual is at most max(rtol ||right||_F, atol), then measures the true residual
     once and returns it: whether that meets the caller's test (and what to do if not, e.g. tighten the products) is the
     caller's. The Arnoldi cycle is the longest that ``working_bytes`` holds (its bases and search directions, the
-    recycled pair, and the solution, residual and right-hand side). Past ``application_limit`` applications without
-    converging it raises FloatingPointError.
+    recycled pair, and the solution, residual and right-hand side). It stops on its own measured progress, not a count:
+    a cycle whose residual does not fall, from a start that already held the last cycle's harmonic Ritz space, leaves
+    the next cycle the same search space, so it raises FloatingPointError there (a first cycle that does not fall still
+    hands the next one its deflated space, a different one, and that cycle is measured).
     """
     right = np.asarray(right, dtype=np.float64)
     size, width = right.shape
@@ -171,15 +172,13 @@ def block_gcro_dr(
             residual -= image @ coefficients
             residual_is_true = False
     columns_available = int(working_bytes) // (_ITEM_BYTES * size)
-    while float(np.linalg.norm(residual)) > target:
-        if counts["applications"] >= application_limit:
-            raise FloatingPointError(f"the block linear response did not converge within {application_limit} applications")
+    while (before := float(np.linalg.norm(residual))) > target:
         counts["cycles"] += 1
+        kept_at_start = kept
         first, coordinates = _orthonormal(residual)
         block = int(first.shape[1])
         recycle_width = 0 if kept is None else int(kept[1].shape[1])
         steps = max(1, (columns_available - 2 * max(recycle_width, block) - 3 * width - block) // (2 * block))
-        steps = min(steps, application_limit - counts["applications"])
         bases, searches, couplings = [first], [], []
         heights, widths = [block], []
         hessenberg: dict[tuple[int, int], F64] = {}
@@ -233,6 +232,12 @@ def block_gcro_dr(
             coefficients = kept[1].T @ residual
             solution += kept[0] @ coefficients
             residual -= kept[1] @ coefficients
+        after = float(np.linalg.norm(residual))
+        if not after < before and (kept_at_start is not None or deflated is None):
+            raise FloatingPointError(
+                f"the block linear response stagnated: cycle {counts['cycles']} left its residual at {after:.3e} (from {before:.3e}, "
+                f"target {target:.3e}) after {counts['applications']} applications"
+            )
     if recycled is not None and kept is not None:
         recycled.vectors = kept[0]
     true_residual = residual if residual_is_true else right - operator(solution)

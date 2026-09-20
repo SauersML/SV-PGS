@@ -192,9 +192,11 @@ class FitCertificate:
     - ``smoothing_gradient``: the B-evidence's largest |dV/drho| over interior weights, from its analytic gradient,
       with the curvature's difference steps in ``stationarity_steps`` and the gradient's error bounds in
       ``stationarity_errors``;
-    - ``mean_move``: an upper bound on twice the undamped EP update's KL(q || q') at the final refresh (the mean's move
-      in the posterior metric plus half the variances' move, dtau'(Sigma o Sigma) dtau), against ``draw_tolerance`` = 1 / K, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (evidence units,
-      defined as p_eff -> 0; lead ruling via speed-smalln); ``noise_gain``: the noise update's evidence gain there;
+    - ``mean_move``: an upper bound on twice the KL(q || q') still to go to the EP fixed point at the final refresh,
+      KL_k / (1 - rho)^2 with KL_k the undamped update's (the mean's move in the posterior metric plus half the
+      variances' move, dtau'(Sigma o Sigma) dtau, halved) and rho = sqrt(KL_k / KL_(k-1)) the refreshes' measured
+      contraction (theory-ep's ruled form), against ``draw_tolerance`` = 1 / K, i.e. at most 1 / (2K) nats (evidence
+      units, defined as p_eff -> 0); ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
       block's relative error in tr(D - Sigma), and the smallest per-block tolerance it is tested against
@@ -273,9 +275,13 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
         ensure()
         while live.size:
-            solved = np.asarray(_host(gaussian.posterior_solve(values[:, live], model, bound)), dtype=np.float64)
-            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), bound)
-            done = bound <= relative_tolerance * lower
+            solved, certified = gaussian.posterior_solve(values[:, live], model, bound)
+            solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
+            if not np.all(np.isfinite(certified)):
+                raise ValueError("a posterior solve has no certificate at float64's accuracy")
+            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), certified)
+            # A certificate above the bound asked for is float64's floor: no solve certifies the column better.
+            done = (certified <= relative_tolerance * lower) | (certified > bound)
             solution[:, live[done]] = solved[:, done]
             bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
             live = live[~done]
@@ -596,11 +602,15 @@ class _FullDataFixedPoints:
         columns = [site_targets(tilted_moments(self.prior, model, cavity, self.working_bytes), cavity) for model, cavity in zip(hyperparameters, cavities)]
         return np.column_stack([column[0] for column in columns]), np.column_stack([column[1] for column in columns])
 
-    def _move_bounds(self, model: int, right: F64Array, threshold: float) -> float:
-        """An upper bound on ||Sigma right||_A^2 = right' Sigma right over the members that decides it against
-        ``threshold``: Sigma = C_w + W Sigma_groups W' (``_member_posterior``), so the members' within-group part is
-        exact and the groups' part is the solver's, whose bound halves until the two-sided bounds from r'x_hat fall on
-        one side."""
+    def _move_bounds(self, model: int, right: F64Array, threshold: float | None = None) -> tuple[float, float]:
+        """Two-sided bounds on ||Sigma right||_A^2 = right' Sigma right over the members: Sigma = C_w + W Sigma_groups W'
+        (``_member_posterior``), so the members' within-group part is exact and the groups' part is the solver's.
+
+        With no ``threshold`` the norm is resolved to relative accuracy sqrt(1 / K), the accuracy the mean itself is
+        solved to in the posterior metric (``_iterate``), so the refreshes' ratio is measured at the scorer's own
+        resolution; with one, the solve's bound halves until the bounds fall on one side of it. Where float64's floor
+        stops the solve first (its certificate above the bound asked for, speed-krylov cf364bd), the bounds are
+        returned as they are and the caller reads them on the cautious side."""
         precision = self.site_precision[:, model]
         weight = member_weights(self.ties, precision)
         grouped = np.zeros(self.ties.group_count)
@@ -612,21 +622,30 @@ class _FullDataFixedPoints:
             signs = self.ties.sign[members]
             conditional = np.diag(variance) - np.outer(signs * shares, signs * variance)
             within += float(right[members] @ conditional @ right[members])
-        remaining = threshold - within
-        if remaining < 0.0:
-            return within
-        bound = np.array([0.5 * np.sqrt(remaining)])
+        remaining = None if threshold is None else threshold - within
+        if remaining is not None and remaining < 0.0:
+            return within, np.inf
+        relative = np.sqrt(1.0 / self.draw_count)
+        # The first bound's scale: Sigma_groups <= D_groups^-1 (the data only add precision), so r_g' D_g^-1 r_g bounds
+        # the norm from above where the groups' sites are proper; later bounds follow the solve's own lower bound.
+        group_precision = np.abs(np.bincount(self.ties.group, weights=precision, minlength=grouped.size))
+        scale = float(np.sqrt(np.sum(np.square(grouped) / group_precision)))
+        bound = np.array([0.5 * np.sqrt(remaining) if remaining is not None else relative * scale])
         while True:
-            try:
-                solved = np.asarray(_host(self.gaussian.posterior_solve(grouped[:, None], model, bound)), dtype=np.float64)
-            except ValueError as error:
-                # The move cannot be decided against its budget at float64's attainable accuracy: no certified fixed
-                # point here, so the outer loop shortens its step.
-                raise NoFixedPoint(f"model {model}: the EP move cannot be resolved against its budget: {error}") from error
-            lower, upper = _norm_bounds(np.array([float(grouped @ solved[:, 0])]), bound)
-            if upper[0] * upper[0] <= remaining or lower[0] * lower[0] > remaining:
-                return within + float(upper[0] * upper[0])
-            bound = 0.5 * bound
+            solved, certified = self.gaussian.posterior_solve(grouped[:, None], model, bound)
+            solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
+            if not np.all(np.isfinite(certified)):
+                # No certificate at float64's accuracy: the move cannot be decided, so no certified fixed point here and
+                # the outer loop shortens its step.
+                raise NoFixedPoint(f"model {model}: a posterior solve for the EP move has no certificate at float64's accuracy")
+            lower, upper = _norm_bounds(np.array([float(grouped @ solved[:, 0])]), certified)
+            if remaining is None:
+                done = certified[0] <= relative * lower[0]
+            else:
+                done = upper[0] * upper[0] <= remaining or lower[0] * lower[0] > remaining
+            if done or certified[0] > bound[0]:
+                return within + float(lower[0] * lower[0]), within + float(upper[0] * upper[0])
+            bound = 0.5 * bound if remaining is not None or not lower[0] > 0.0 else np.array([relative * float(lower[0])])
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """Each model's certified EP fixed point, or None for every model when EP has none at these hyperparameters
@@ -643,6 +662,9 @@ class _FullDataFixedPoints:
         gaussian = self.gaussian
         model_count = gaussian.model_count
         tolerance = 0.5 / self.draw_count
+        # The last refresh's KL bounds per model, for the contraction rate; None where there is no earlier refresh of
+        # the same map in this call (the first, or after a noise update moved the likelihood under a certified KL).
+        previous: tuple[F64Array, F64Array] | None = None
         while True:
             variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
@@ -655,7 +677,11 @@ class _FullDataFixedPoints:
                 raise NoFixedPoint("a site target is not finite at these hyperparameters")
             # The undamped update's KL(q || q') to second order in the site change (dtau, dnu): 1/2 r'Sigma r +
             # 1/4 dtau'(Sigma o Sigma) dtau with r = dnu - dtau o mu, the Fisher metric of q's statistics (beta, -beta^2/2)
-            # (speed-smalln: the mean part alone left the site variances off). Certified at 1/(2K) nats.
+            # (speed-smalln: the mean part alone left the site variances off). The fixed point is where the refreshes
+            # converge, so the certificate is on the distance to it (theory-ep's ruled form, the lead's ruling): with
+            # rho = sqrt(KL_k / KL_(k-1)) the measured contraction, the remaining steps' KL sums to at most
+            # KL_k / (1 - rho)^2, certified at 1/(2K) nats. For KL_(k-1) = b that is KL_k <= c b / (sqrt b + sqrt c)^2,
+            # c = 1/(2K): a threshold on KL_k, taken at b's lower bound so the rate is never understated.
             snapshot = self._snapshot()
             posteriors = [
                 _member_posterior(
@@ -669,20 +695,42 @@ class _FullDataFixedPoints:
             spread = np.array([
                 max(-float(precision_step[:, model] @ posteriors[model].variance_jvp(precision_step[:, [model]])[:, 0]), 0.0) for model in range(model_count)
             ])
-            budget = 1.0 / self.draw_count
-            self.mean_move = np.array([
-                (self._move_bounds(model, right[:, model], budget - 0.5 * float(spread[model])) if 0.5 * spread[model] < budget else np.inf)
-                + 0.5 * float(spread[model])
-                for model in range(model_count)
-            ])
-            draw_tolerance = np.full(model_count, budget)
+            budget = 0.5 / self.draw_count
+            lower, upper = np.empty(model_count), np.empty(model_count)
+            certified = np.zeros(model_count, dtype=bool)
+            for model in range(model_count):
+                fixed = 0.25 * float(spread[model])
+                mean_lower, mean_upper = self._move_bounds(model, right[:, model])
+                lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
+                if previous is None:
+                    continue
+                last = float(previous[0][model])
+                certified[model] = upper[model] <= budget * last / (np.sqrt(last) + np.sqrt(budget)) ** 2
+                if certified[model] or upper[model] <= last:
+                    continue
+                # Not within the certificate, and not measurably below the last refresh's KL: decided against that
+                # KL's lower bound, a KL not below it is no contraction, and nothing certifies a fixed point the
+                # refreshes do not approach (the outer loop shortens its step instead).
+                if fixed < last:
+                    mean_lower, mean_upper = self._move_bounds(model, right[:, model], 2.0 * (last - fixed))
+                    lower[model], upper[model] = 0.5 * mean_lower + fixed, 0.5 * mean_upper + fixed
+                if not upper[model] <= last:
+                    raise NoFixedPoint(
+                        f"model {model}: the EP refreshes do not contract: the undamped update's KL is {lower[model]:.3e}..{upper[model]:.3e} "
+                        f"nats after {last:.3e}..{float(previous[1][model]):.3e}"
+                    )
+            with np.errstate(divide="ignore", invalid="ignore"):
+                rate = np.sqrt(upper / previous[0]) if previous is not None else np.full(model_count, np.inf)
+                # Twice the certified distance's KL, against 1 / K (the certificate's units).
+                self.mean_move = np.where(rate < 1.0, 2.0 * upper / np.square(1.0 - rate), np.inf)
+            draw_tolerance = np.full(model_count, 2.0 * budget)
             noise = self._noise(variances)
             covariate_count = int(gaussian.covariates.shape[1])
             self.noise_gain = np.array([
                 noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), covariate_count)
                 for model in range(model_count)
             ])
-            if np.all(self.mean_move <= draw_tolerance) and np.all(self.noise_gain <= tolerance):
+            if np.all(certified) and np.all(self.noise_gain <= tolerance):
                 return [
                     FixedPoint(
                         cavity=cavities[model],
@@ -693,6 +741,9 @@ class _FullDataFixedPoints:
                     )
                     for model in range(model_count)
                 ]
+            # A noise update moves the likelihood, so the next refresh is of a new map where the sites had met their
+            # certificate: the rate starts again there.
+            previous = None if np.all(certified) else (lower, upper)
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
             self.noise = self._noise(1.0 / (frozen + self.site_precision))
 

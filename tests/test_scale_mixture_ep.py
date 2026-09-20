@@ -1243,3 +1243,21 @@ def test_a_halved_lattice_does_not_alias_the_fitted_density_on_the_v7_gap_case()
         values.append(fit.step.evidence)
         assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
     assert abs(values[0] - values[1]) <= 2.0 * _EVIDENCE_TOLERANCE, values
+
+
+def test_the_trust_region_step_takes_the_hard_case_exactly():
+    """More and Sorensen's hard case: g = 0 at an indefinite point (and g orthogonal to -H's lowest eigenvector) puts
+    mu at -lambda_min, where the lowest eigenspace's shifted eigenvalue is 0. The step reaches the boundary along the
+    lowest eigenvector, with no division by zero (speed-krylov's -W error run)."""
+    import warnings
+
+    from sv_pgs.scale_mixture_ep import _trust_region_step
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        step = _trust_region_step(np.diag([-1.0, 2.0]), np.zeros(2), 1.0)
+        np.testing.assert_allclose(np.abs(step), [1.0, 0.0], atol=1e-15)
+        # g orthogonal to the lowest eigenvector, its own part inside the radius: the rest at mu = 1, then the boundary.
+        step = _trust_region_step(np.diag([-1.0, 2.0]), np.array([0.0, 1.5]), 1.0)
+        np.testing.assert_allclose(step[1], 0.5, rtol=1e-12)
+        np.testing.assert_allclose(float(np.linalg.norm(step)), 1.0, rtol=1e-12)
