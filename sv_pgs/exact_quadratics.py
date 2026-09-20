@@ -79,13 +79,27 @@ class _Plan:
     dropped: NDArray[np.float64]
 
 
-def _plan(block: int, members: NDArray[np.int64], is_bulk: NDArray[np.bool_], gram: NDArray[np.float64], squares: NDArray[np.float64]) -> _Plan:
-    """The block's directions: its nonzero bulk columns, or R_b's resolvable eigenvectors when fewer."""
+def _storage_unit(stored) -> float:
+    """The unit roundoff of a Gram stored coarser than float64 (zero for float64 storage)."""
+    dtype = np.asarray(stored).dtype
+    return float(np.finfo(dtype).eps) / 2 if np.issubdtype(dtype, np.floating) and np.finfo(dtype).eps > EPS else 0.0
+
+
+def _plan(
+    block: int, members: NDArray[np.int64], is_bulk: NDArray[np.bool_], gram: NDArray[np.float64], squares: NDArray[np.float64], storage_unit: float
+) -> _Plan:
+    """The block's directions: its nonzero bulk columns, or R_b's resolvable eigenvectors when fewer.
+
+    R_b's resolution is the eigensolver's |b| eps lambda_max plus, when the Gram is stored coarser than float64
+    (Stage 0's float32 LdGramStore, unit roundoff ``storage_unit``), its storage error: each entry is rounded once,
+    so the stored Gram is within storage_unit ||R_b||_F of the design's in the 2-norm, and by Weyl so is every
+    eigenvalue, and ||d_j||^2 = (P R_b P)_jj by at most that more than the stored Gram's.
+    """
     bulk = np.flatnonzero(is_bulk[members])
     live = squares[members[bulk]] > 0.0
     bulk_gram = gram[np.ix_(bulk, bulk)]
     eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (bulk_gram + bulk_gram.T)) if bulk.size else (np.zeros(0), np.zeros((0, 0)))
-    cut = bulk.size * EPS * float(eigenvalues[-1]) if bulk.size else 0.0
+    cut = bulk.size * EPS * float(eigenvalues[-1]) + storage_unit * float(np.linalg.norm(bulk_gram)) if bulk.size else 0.0
     kept = eigenvalues > cut
     if int(np.sum(kept)) < int(np.sum(live)):
         dropped = np.sqrt(np.square(eigenvectors[:, ~kept]) @ np.maximum(eigenvalues[~kept], 0.0) + cut)
@@ -99,7 +113,8 @@ def exact_block_quadratics(
     """M_b for each of ``blocks`` of ``model`` at the last iterate's sites, each diagonal entry certified to
     ``relative_error`` of its value when the resolved block allows it (module docstring).
 
-    ``grams`` are the model's metric Grams (marginal_variances.BlockGrams); they choose the directions only.
+    ``grams`` are the model's metric Grams (marginal_variances.BlockGrams, which may be Stage 0's shared float32
+    arrays with the model's ``scale``); they choose the directions and bound the dropped part only.
     The norms come from the solver: ||xt_j||^2 from its column squares and ||u_k|| from the image.
     """
     if not relative_error > 0.0:
@@ -110,7 +125,7 @@ def exact_block_quadratics(
     is_bulk = np.ones(variant_count, dtype=bool)
     is_bulk[solve.resolved] = False
     squares = _host(gaussian.unit_squares)[:, model] / float(gaussian.noise_variance[model])
-    plans = [_plan(block, grams.blocks[block], is_bulk, grams.within[block], squares) for block in blocks]
+    plans = [_plan(block, grams.blocks[block], is_bulk, grams.within_block(block), squares, _storage_unit(grams.within[block])) for block in blocks]
     sites = np.concatenate([plan.members[plan.bulk] for plan in plans]) if plans else np.zeros(0, dtype=np.int64)
     order = np.argsort(sites, kind="stable")
     widths = [int(plan.coefficients.shape[1]) for plan in plans]

@@ -59,14 +59,19 @@ def _grams(design, bounds):
     return BlockGrams(blocks=blocks, within=within, next_cross=cross)
 
 
-def _fit(seed: int, bound: float, duplicated: int = 0):
+def _fit(seed: int, bound: float, duplicated: int = 0, noise_variance: float | None = None):
     genotypes, bounds, covariates, training, noise, precision, shift, response = _problem(seed, duplicated)
     design = _design(genotypes, covariates, training)
     grams = _grams(design, bounds)
+    if noise_variance is not None:
+        # Stage 0's shared float32 Grams with the model's metric 1 / sigma^2 as their scale
+        noise = np.full(1, noise_variance)
+        grams = BlockGrams(blocks=grams.blocks, within=tuple(w.astype(np.float32) for w in grams.within),
+                           next_cross=tuple(c.astype(np.float32) for c in grams.next_cross), scale=1.0 / noise_variance)
     gaussian = dual_solve.DualGaussian(source=dual_solve.DenseDualSource(genotypes, bounds), training=training, targets=response, offsets=np.zeros_like(response),
                                        covariates=covariates, grams=grams, probe_count=2, seed=seed)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(1, bound), probe_residual_ratio=bound)
-    posterior_precision = design.T @ design + np.diag(precision[:, 0])
+    posterior_precision = design.T @ design / float(noise[0]) + np.diag(precision[:, 0])
     return gaussian, grams, posterior_precision
 
 
@@ -105,6 +110,22 @@ def test_a_rank_deficient_block_takes_its_eigenvectors() -> None:
     # Three duplicated column pairs in block 1: its bulk Gram loses one rank per pair left in the bulk, so it
     # takes fewer directions than columns.
     gaussian, grams, posterior_precision = _fit(75, np.sqrt(EPS), duplicated=3)
+    [result] = exact_block_quadratics(gaussian, 0, grams, [1], EPS ** 0.25)
+    resolved = gaussian.bulk_solves[0].resolved
+    bulk = np.setdiff1d(result.sites, resolved)
+    pairs = [(15 + 2 * index, 16 + 2 * index) for index in range(3)]
+    deficiency = sum(first not in resolved and second not in resolved for first, second in pairs)
+    assert deficiency
+    assert result.columns == bulk.size - deficiency
+    positions, exact, rounding = _exact(gaussian, posterior_precision, result.sites)
+    assert np.all(np.abs(result.quadratic[np.ix_(positions, positions)] - exact) <= result.error[np.ix_(positions, positions)] + rounding)
+
+
+def test_shared_float32_grams_with_a_scale_drop_the_same_directions_within_their_bounds() -> None:
+    # The fit's Grams are Stage 0's float32 arrays with scale 1 / sigma^2: the storage rounding lifts a duplicated
+    # pair's null eigenvalue to about u32 lambda_max, which the resolution covers, and the dropped part's bound is
+    # taken in the model's metric.
+    gaussian, grams, posterior_precision = _fit(75, np.sqrt(EPS), duplicated=3, noise_variance=0.7)
     [result] = exact_block_quadratics(gaussian, 0, grams, [1], EPS ** 0.25)
     resolved = gaussian.bulk_solves[0].resolved
     bulk = np.setdiff1d(result.sites, resolved)
