@@ -1,0 +1,12 @@
+{
+ "file": "gap_v7_x1000_r0.npz",
+ "file_sha256": "fd8dcc4ddd9b772d2b7869413910337ccae8813ddaefb3aec027418be69c9349",
+ "label": "semi-real: bench-sim v7 real-1kGP-haplotype chr22 genotypes of simulated people (50,000), simulated effects and phenotype",
+ "cohort_path": "/scratch.global/sauer354/svpgs-team/bench-sim/v7/cohort/chr22 (truth_G.npy)",
+ "cohort_version": "bench-sim v7 (PREREG amendment 7: group weights from the public 1kGP founder composition)",
+ "cohort_generator": "lane/bench-sim-weights 3fa9577",
+ "producer": "oracle lane, /scratch.global/sauer354/svpgs-team/oracle/diag/true_prior_gap.py replicate 0 (sha256 299c621b64befa298d0b9a0bb9a302caf88cbfab594fc6a5040dc45982ab3c95), building with speed-floor's v7_learned_bias.py build() (sha256 fd254c6d9c227cdf2a1fc56187080d523e31365e46f4c7a84a5075f81619f654): 2 windows x 40 variants, 1000 x production signal, rng default_rng(20260923 + 1000)",
+ "contents": "likelihood_precision (block-diagonal X'X, 80 x 80), linear_term X'y (unit noise), offset (log u_j, one class, no annotations), effects (the simulated true effects)",
+ "truth": "t = log variance - offset ~ 0.97 N(0, 1) + 0.03 N(log 100, 1); oracle: truth's log Z_EP 23.81, certified V(infinity) 23.59 (log-normal width 2.6), single-variance boundary 14.53",
+ "not_aou": "no All of Us data or aggregate enters: the cohort is bench-sim v7, built from public 1kGP haplotypes with public founder weights"
+}

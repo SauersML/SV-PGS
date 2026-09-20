@@ -6,6 +6,7 @@ Gaussian-prior regression for the noise update.
 """
 from __future__ import annotations
 
+import pathlib
 from dataclasses import replace
 
 import numpy as np
@@ -657,6 +658,23 @@ def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_d
     assert np.all(np.abs(corrections[tiny]) <= 2.0 * np.abs(terms[tiny]) + 1e-7)
 
 
+def test_a_density_the_lattice_does_not_resolve_is_not_certified(monkeypatch):
+    # The same density on half the spacing: a smooth one moves sum_j log Z_j by far less than the tolerance, one that
+    # alternates between nodes (narrower than the spacing, the aliasing oracle found) by far more.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    smooth = initial_hyperparameters(prior).coefficients
+    assert abs(engine._halved_data_value(prior, smooth, cavity, _WORKING_BYTES) - _data_value(prior, smooth, cavity, _WORKING_BYTES)) <= 1e-2 * _EVIDENCE_TOLERANCE
+    spiky = smooth.copy()
+    alternating = np.where(np.arange(prior.grid_size) % 2 == 0, 8.0, -8.0)
+    spiky[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (alternating - alternating.mean())
+    assert abs(engine._halved_data_value(prior, spiky, cavity, _WORKING_BYTES) - _data_value(prior, spiky, cavity, _WORKING_BYTES)) > _EVIDENCE_TOLERANCE
+    # Where the halved sum moves by more than the tolerance, the corrected V is not certified.
+    hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
+    evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
+    assert _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE) is not None
+    halved = engine._halved_data_value
+    monkeypatch.setattr(engine, "_halved_data_value", lambda *arguments: halved(*arguments) + 2.0 * _EVIDENCE_TOLERANCE)
+    assert _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE) is None
 def test_the_kronrod_rule_is_quadpacks():
     # The embedded Gauss rule is the 7-point Gauss-Legendre rule, and the 15-point Kronrod rule integrates every
     # polynomial of degree 22 exactly (3 n + 1 for n = 7).
@@ -1093,3 +1111,67 @@ def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects()
     mapping = prior.coefficient_map
     fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
     np.testing.assert_allclose(analytic, fixed_cavity, rtol=1e-9, atol=1e-9 * float(np.max(np.abs(fixed_cavity))))
+
+
+_GAP_CASE = pathlib.Path(__file__).resolve().parent / "data" / "gap_v7_x1000_r0.npz"
+
+
+def _dense_fixed_points(prior, likelihood_precision, linear_term):
+    """The exact EP fixed point of a dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), warm between calls."""
+    count = linear_term.shape[0]
+    state = {"sites": None}
+
+    def fixed_points(hyperparameters):
+        points = []
+        for model in hyperparameters:
+            starts = ([state["sites"]] if state["sites"] is not None else []) + [moment_matched_prior_sites(prior, model)]
+            for start in starts:
+                try:
+                    sites, covariance, cavity = _dense_ep(prior, model.coefficients, likelihood_precision, linear_term, start)
+                    break
+                except (AssertionError, FloatingPointError, np.linalg.LinAlgError):
+                    continue
+            else:
+                points.append(None)
+                continue
+            state["sites"] = sites
+            squared = np.square(covariance)
+
+            def linear_response(left, right, diagonal, weight, right_hand, covariance=covariance, squared=squared):
+                matrix = np.eye(count) - (np.eye(count) - weight[:, None] * squared) @ (left[:, None] * covariance * right[None, :] + np.diag(diagonal))
+                return np.linalg.solve(matrix, right_hand)
+
+            precision = likelihood_precision + np.diag(sites[0])
+            points.append(FixedPoint(
+                cavity=cavity,
+                posterior=GaussianPosterior(solve=lambda right, _e, c=covariance: c @ right, variance_jvp=lambda w, s=squared: -(s @ w), linear_response=linear_response),
+                mean=covariance @ (linear_term + sites[1]),
+                precision_norm=lambda direction, a=precision: float(direction @ a @ direction),
+                effective_effects=float(count - np.sum(sites[0] * np.diag(covariance))),
+            ))
+        return points
+
+    return fixed_points
+
+
+@pytest.mark.slow
+def test_a_halved_lattice_does_not_alias_the_fitted_density_on_the_v7_gap_case():
+    # oracle's finding [semi-real, bench-sim v7 x1000, 80 variants]: on the halved lattice its interior search found
+    # densities narrower than one spacing, which alias to a few atoms and lifted the objective from 23.59 to 24.27, above
+    # any continuous density. The engine's certified fit must give the same evidence on the lattice and on its halving
+    # (its V is certified only where the lattice resolves the density, ``_corrected``).
+    data = np.load(_GAP_CASE)
+    likelihood_precision, linear_term = data["likelihood_precision"], data["linear_term"]
+    count = linear_term.shape[0]
+    offset = np.full(count, float(np.asarray(data["offset"]).ravel()[0]))
+    nodes, floor, top = derived_lattice(np.diag(likelihood_precision), linear_term, offset, _EVIDENCE_TOLERANCE)
+    values = []
+    for lattice in (nodes, np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)):
+        prior = scale_mixture_prior(
+            class_index=np.zeros(count, np.int64), log_variance_offset=offset, annotation_design=np.zeros((count, 0)), annotation_groups=(),
+            nodes=lattice, floor=floor, top=top,
+        )
+        (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], _dense_fixed_points(prior, likelihood_precision, linear_term), 1 << 26, _EVIDENCE_TOLERANCE)
+        values.append(fit.step.evidence)
+        assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
+    assert abs(values[0] - values[1]) <= 2.0 * _EVIDENCE_TOLERANCE, values

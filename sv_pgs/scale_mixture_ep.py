@@ -991,7 +991,6 @@ def _maximize_coefficients(
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
 
 
-
 @dataclass(frozen=True)
 class GaussianPosterior:
     """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
@@ -1712,7 +1711,7 @@ def _correction_slopes(
     corrections are smooth there, and no inner maximum is re-solved, so no fold can intervene; x's second-order
     error cancels in the central difference), at the same count of replaced directions. Each correction is resolved
     to a share e / m of its log (m integrals) with e set so the difference errs by about the Laplace gradient's own
-    error, and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
+    error, never below the rounding of the line values (eps times the objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
     V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
     halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
     complement is not positive definite there), the one-sided difference on the other side is used, with its larger
@@ -1732,7 +1731,10 @@ def _correction_slopes(
     for position in np.flatnonzero(interior):
         unit = np.zeros(count_weights)
         unit[position] = 1.0
-        accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), count * _QUADPACK_RELATIVE_FLOOR)
+        # No integral is resolved past the rounding of the line values it integrates: each exponent is known to eps
+        # times the objective's magnitude, and QUADPACK's own floor is 50 eps.
+        floor = count * max(_QUADPACK_RELATIVE_FLOOR, _EPSILON * evidence.magnitude)
+        accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), floor)
         share = accuracy / count
         step = max(float((3.0 * accuracy / scale[position]) ** (1.0 / 3.0)), limit)
         centre = _correction_value(view, weights, evidence.coefficients, cavity, working_bytes, count, share)
@@ -1770,6 +1772,26 @@ def _correction_slopes(
     return slopes, errors, second
 
 
+def _halved_data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
+    """sum_j log Z_j with the same density on the lattice of half the spacing (``halved_lattice``'s: each class's
+    log g the natural spline of least roughness through its nodal values), the same scales and kernel floor."""
+    nodes = prior.log_variance_grid
+    finer = np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1)
+    log_weights, _scale = _density_and_scale(prior, coefficients)
+    natural = [(order, 0.0) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
+    spline = make_interp_spline(nodes, log_weights.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
+    fine_weights = spline(finer).T
+    log_density = fine_weights - _log_sum_exp(fine_weights, axis=1, keepdims=True)
+    scales = log_scale(prior, coefficients)
+    total = 0.0
+    for class_position, class_rows in enumerate(prior.class_rows):
+        for rows in _row_chunks(class_rows, finer.shape[0], working_bytes):
+            total += float(np.sum(_log_normalizers(
+                log_density[class_position], scales[rows], finer, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            )))
+    return total
+
+
 def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
@@ -1780,7 +1802,8 @@ def _corrected(
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None or a line integral cannot be certified.
+    None when the evidence is None, a line integral cannot be certified, or the lattice does not resolve the density
+    (its trapezoid sum moves by more than the tolerance on half the spacing).
     """
     if evidence is None:
         return None
@@ -1794,8 +1817,16 @@ def _corrected(
     replaced = int(np.argmax(remaining <= 0.5 * tolerance))
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
+    # The lattice must resolve the density x_rho puts on it (lead ruling B): the same density on half the spacing
+    # changes sum_j log Z_j by the trapezoid's error at h (the rule converges geometrically in 1/h for these analytic
+    # integrands, so the h/2 sum is exact beside it). A density narrower than the spacing aliases to a few atoms, whose
+    # lattice sum rises above any continuous density's [semi-real, oracle's v7 x1000 windows: 23.59 to 24.27]; its
+    # halved sum falls back. Where the difference exceeds the tolerance, V is not certified there and never steers.
+    quadrature = abs(_halved_data_value(prior, evidence.coefficients, cavity, working_bytes) - _data_value(prior, evidence.coefficients, cavity, working_bytes))
+    if quadrature > tolerance:
+        return None
     return replace(
-        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder + quadrature,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
     )
 
@@ -2131,16 +2162,6 @@ def _same_basin(first: _Evidence, second: _Evidence) -> bool:
     return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
 
 
-def _same_basin(first: _Evidence, second: _Evidence) -> bool:
-    """Whether two certified inner maxima are one: each point lies within sqrt(2 d) of its maximum in the -H metric
-    (d its inner decrement), so one maximum is within the sum of the radii of both points; their V must then agree
-    to within their certified errors."""
-    step = first.coefficients - second.coefficients
-    radius = np.sqrt(2.0 * first.inner_decrement) + np.sqrt(2.0 * second.inner_decrement)
-    distance = np.sqrt(max(float(step @ first.precision @ step), 0.0))
-    return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
-
-
 def _best_certified(
     prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
@@ -2415,6 +2436,9 @@ def _stationarity(
     open_ = np.flatnonzero(interior & ~folded)
     reach = np.abs(gradient) + error
     gain = float(np.sum(reach[folded] * folds[folded]))
+    if not np.all(np.isfinite(reach[interior])):
+        # A slope that could not be resolved leaves the gain unbounded: the weights are not certified here.
+        return _Stationarity(gradient, error, curvature, steps, folds, np.inf, None)
     if open_.shape[0]:
         block = curvature[np.ix_(open_, open_)]
         try:
