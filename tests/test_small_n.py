@@ -548,3 +548,30 @@ def test_a_collapsed_prior_is_a_fixed_point_at_the_first_refresh():
     assert point is not None and not oracle.refusals
     assert oracle.profile["refreshes"] == 1 and oracle.profile["factorizations"] == 1
     assert oracle.effective < 1e-10
+
+
+def test_a_point_mass_tilted_law_refuses_the_trial_at_once(monkeypatch):
+    """review-mathbugs N2: at a far trial some tilted laws are point masses (variance 0), so their site targets are
+    tau = inf, nu = nan. The fixed point refuses at once (NoFixedPoint: the outer loop halves), never loops on NaN."""
+    from sv_pgs import small_n
+    from sv_pgs.scale_mixture_ep import TiltedMoments
+    from sv_pgs.small_n import _DenseFixedPoints, small_n_prior, small_n_start
+
+    rng = np.random.default_rng(96)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    start, start_noise, _moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, 64, 10**9)
+    real = small_n.tilted_moments
+
+    def degenerate(*arguments, **keywords):
+        moments = real(*arguments, **keywords)
+        variance = moments.variance.copy()
+        variance[:5] = 0.0
+        return TiltedMoments(log_normalizer=moments.log_normalizer, mean=np.where(variance > 0, moments.mean, 0.0), variance=variance)
+
+    monkeypatch.setattr(small_n, "tilted_moments", degenerate)
+    assert oracle([start]) == [None]
+    assert "point masses" in oracle.refusals[-1]

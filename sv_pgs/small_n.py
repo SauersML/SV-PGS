@@ -765,7 +765,8 @@ def _loop_point(
     variance = noise * kernel.variances()
     log_normalizer, tilted_mean, tilted_variance, third, fourth = tilted(cavity_precision, marginal_shift - site_shift)
     values = (log_normalizer, tilted_mean, tilted_variance, third, fourth)
-    if not all(np.all(np.isfinite(value)) for value in values):
+    # A point-mass tilted law (variance 0) has no finite site: outside the domain.
+    if not (all(np.all(np.isfinite(value)) for value in values) and np.all(tilted_variance > 0.0)):
         return None
     value = 0.5 * float(scaled_shift @ mean) / noise - 0.5 * kernel.log_determinant() + float(np.sum(log_normalizer))
     tilted_second = tilted_variance + tilted_mean**2
@@ -885,6 +886,8 @@ def double_loop_sites(
         variance = noise * variances
         cavity_precision = cavity_scaled / noise
         log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
+        if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
+            raise NoFixedPoint("a tilted law is a point mass at q's cavities: no finite EP site")
         # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
         target_precision = 1.0 / tilted_variance - cavity_precision
         target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
@@ -892,9 +895,12 @@ def double_loop_sites(
         if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
             return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
-        # In the domain: the start was checked, and every later outer step starts from an accepted inner point.
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
-        assert point is not None
+        if point is None:
+            # The sites are in the domain (the start was checked, and every later outer step starts from an accepted
+            # inner point), so only the tilted law at the new marginals' cavities can fail: a point mass, which no
+            # finite site matches.
+            raise NoFixedPoint("a tilted law is a point mass at q's marginals' cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
@@ -1035,10 +1041,16 @@ class _DenseFixedPoints:
             self.site_precision[negative] *= 0.5
 
     def _targets(self, hyperparameters: MixtureHyperparameters, cavity: Cavity) -> tuple[F64Array, F64Array]:
+        """The mean-matched sites; ``NoFixedPoint`` where a tilted law is a point mass (variance 0: the prior's mass all
+        on flat-kernel nodes at a far trial, review-mathbugs N1/N2), whose site precision is infinite: EP has no finite
+        fixed point there, and the outer loop halves the trial."""
         started = time.perf_counter()
-        targets = site_targets(tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes), cavity)
+        moments = tilted_moments(self.prior, hyperparameters, cavity, self.working_bytes)
         self.profile["tilted_seconds"] += time.perf_counter() - started
-        return targets
+        if not (np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean)) and np.all(np.isfinite(moments.variance))):
+            degenerate = int(np.sum(~(moments.variance > 0.0)))
+            raise NoFixedPoint(f"{degenerate} tilted laws are point masses (variance 0) at these hyperparameters: no finite EP site")
+        return site_targets(moments, cavity)
 
     def _precision_norm(self) -> Callable[[F64Array], float]:
         design, precision, noise = self.design, self.site_precision.copy(), self.noise
@@ -1153,7 +1165,8 @@ class _DenseFixedPoints:
                     break
                 except np.linalg.LinAlgError:
                     fraction *= 0.5
-                if fraction * move <= _EPSILON * scale:
+                # Written so that a non-finite step also ends the halving (review-mathbugs N2).
+                if not fraction * move > _EPSILON * scale:
                     # PD failures halved the damped step to the sites' rounding: no damped EP pass keeps the precision
                     # positive definite from here, so EP falls back to the convergent double loop (MODEL.md section 4).
                     self._double_loop(hyperparameters)
@@ -1161,6 +1174,8 @@ class _DenseFixedPoints:
             self.site_precision, self.site_shift = trial_precision, trial_shift
             marginal = 1.0 / (frozen + self.site_precision)
             mean_move = float(np.sum(np.square(self.mean - mean) / marginal)) / (fraction * fraction)
+            if not np.isfinite(mean_move):
+                raise NoFixedPoint("the frozen pass's move is not finite")
             if 0.5 * mean_move <= 0.5 / self.draw_count:
                 return
             if mean_move / previous_move >= 1.0:
