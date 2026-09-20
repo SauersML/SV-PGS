@@ -1603,6 +1603,84 @@ def transcode_store(source: str | Path, destination: str | Path, *, codec: Codec
                     raise ValueError(f"half{half}/{chromosome}: the stored {name} disagrees with the codes.")
 
 
+CACHE_MARKER = "CACHE_COMPLETE.json"
+"""Written last into a finished local cache: the source store, its digest and the cache's codec."""
+
+
+def store_digest(root: str | Path) -> str:
+    """A sha256 that changes whenever any file of the store is rewritten.
+
+    It covers every file's relative path, size and modification time (a rewrite of any array,
+    column, map or manifest changes one of them), plus the bytes of the MANIFEST, every array's
+    zarr.json and every shard's crc32c-checked index, which holds each inner chunk's offset and
+    size. It reads no code bytes, so it costs one stat per file and a small read per shard.
+    """
+    root = Path(root)
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        status = path.stat()
+        digest.update(f"{relative}\0{status.st_size}\0{status.st_mtime_ns}\0".encode())
+        if path.name in (MANIFEST_FILE, _ZARR_METADATA_FILE):
+            digest.update(path.read_bytes())
+    for directory in sorted(item.parent for item in (root / "dosage").rglob(_ZARR_METADATA_FILE)):
+        layout = _layout_from_metadata(_read_metadata(directory), directory)
+        for shard_index in range(layout.shard_count):
+            with open(_shard_path(directory, shard_index), "rb") as handle:
+                handle.seek(-layout.shard_index_bytes, os.SEEK_END)
+                digest.update(handle.read(layout.shard_index_bytes))
+    return digest.hexdigest()
+
+
+def local_cache(source: str | Path, cache_root: str | Path, *, codec: Codec, budget: ComputeBudget) -> Path:
+    """The local ``codec`` copy of the store at ``source``, rebuilt whenever the store's digest changes.
+
+    A cache lives at ``cache_root/<codec>-<digest>`` and counts as built only once its
+    ``CACHE_MARKER`` names that digest. Otherwise the store is transcoded into a private
+    partial directory, checked against a second digest of the source taken after the copy
+    (so a store rewritten mid-copy is never cached), and renamed into place. Caches of the same
+    source under other digests are then removed, so a stale copy never outlives its store.
+    """
+    source_root, cache_directory = Path(source).resolve(), Path(cache_root)
+    digest = store_digest(source_root)
+    target = cache_directory / f"{codec}-{digest}"
+    marker = {"source": str(source_root), "digest": digest, "codec": codec}
+    if not _cache_is_complete(target, marker):
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        partial = cache_directory / f".{codec}-{digest}.partial-{os.getpid()}-{threading.get_ident()}"
+        shutil.rmtree(partial, ignore_errors=True)
+        transcode_store(source_root, partial, codec=codec, budget=budget)
+        if store_digest(source_root) != digest:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise RuntimeError(f"{source_root} changed while its local cache was being built.")
+        (partial / CACHE_MARKER).write_text(json.dumps(marker))
+        if target.exists() and not _cache_is_complete(target, marker):
+            # only a finished cache is ever renamed into place, so an unmarked one is debris
+            shutil.rmtree(target, ignore_errors=True)
+        try:
+            os.rename(partial, target)
+        except OSError:
+            # another process finished the same cache first; theirs is identical
+            shutil.rmtree(partial, ignore_errors=True)
+            if not _cache_is_complete(target, marker):
+                raise
+    for other in cache_directory.iterdir():
+        if other != target and not other.name.startswith(".") and _cache_marker(other).get("source") == str(source_root):
+            shutil.rmtree(other, ignore_errors=True)
+    return target
+
+
+def _cache_marker(directory: Path) -> dict[str, Any]:
+    try:
+        return json.loads((directory / CACHE_MARKER).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_is_complete(directory: Path, marker: Mapping[str, Any]) -> bool:
+    return _cache_marker(directory) == dict(marker)
+
+
 def _transcode_array(array: CodeArray, directory: Path, codec: Codec, budget: ComputeBudget) -> tuple[I64Array, I64Array]:
     """Re-encode one code array shard by shard, returning the exact code sums it wrote."""
     layout = array.layout

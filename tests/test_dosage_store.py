@@ -28,6 +28,8 @@ from sv_pgs.dosage_store import (
     read_manifest,
     sites_md5,
     statistic_column_directory,
+    local_cache,
+    store_digest,
     transcode_store,
     variant_column_directory,
     write_column,
@@ -461,3 +463,38 @@ def test_stage0_accumulation_bounds_are_exact_and_tight() -> None:
     float_running = np.add.accumulate(float_products, dtype=np.float32)
     assert float(float_running[FLOAT32_EXACT_ROWS - 1]) == worst_product * FLOAT32_EXACT_ROWS
     assert float(float_running[FLOAT32_EXACT_ROWS]) != worst_product * (FLOAT32_EXACT_ROWS + 1)
+
+
+@pytest.mark.parametrize("codec", ["raw", "rowdict"])
+def test_the_local_cache_follows_the_store_digest(tmp_path: Path, codec: str) -> None:
+    milli_by_half = _two_half_dosage()
+    _write_store(tmp_path / "store", milli_by_half, "zstd")
+    expected = _all_codes(milli_by_half)
+    first = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
+    with DosageStore.open(first) as cached:
+        assert cached.codecs == frozenset({codec})
+        np.testing.assert_array_equal(cached.read_codes(0, cached.n_variants, None, np.empty_like(expected)), expected)
+    built = (first / "MANIFEST.json").stat().st_mtime_ns
+    assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
+    assert (first / "MANIFEST.json").stat().st_mtime_ns == built
+    # a rewritten statistic column (same size, later mtime) is a new store
+    column = next((tmp_path / "store" / "stats").rglob("sum_code*"))
+    path = next(item for item in column.rglob("*") if item.is_file() and item.name != "zarr.json")
+    status = path.stat()
+    path.write_bytes(path.read_bytes())
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1))
+    second = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
+    assert second != first and not first.exists()
+    assert [item.name for item in (tmp_path / "cache").iterdir()] == [second.name]
+
+
+def test_an_unfinished_cache_is_never_used(tmp_path: Path) -> None:
+    _write_store(tmp_path / "store", _two_half_dosage(), "zstd")
+    digest = store_digest(tmp_path / "store")
+    stale = tmp_path / "cache" / f"raw-{digest}"
+    stale.mkdir(parents=True)
+    (stale / "MANIFEST.json").write_text("{}")
+    built = local_cache(tmp_path / "store", tmp_path / "cache", codec="raw", budget=_budget())
+    assert built == stale
+    with DosageStore.open(built) as cached:
+        assert cached.n_variants == 450
