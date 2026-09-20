@@ -48,6 +48,7 @@ from sv_pgs.config import TraitType
 from sv_pgs.dual_solve import DualGaussian, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
+from sv_pgs.krylov_recycle import local_response
 from sv_pgs.marginal_variances import (
     BlockCertificate,
     ControlVariate,
@@ -269,7 +270,10 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
             live = live[~done]
         return solution
 
-    return GaussianPosterior(solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values)
+    return GaussianPosterior(
+        solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values,
+        local_response=local_response(solve, grams),
+    )
 
 
 def _precision_norm(gaussian: DualGaussian, model: int, site_precision: F64Array) -> Callable[[F64Array], float]:
