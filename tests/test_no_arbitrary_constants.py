@@ -111,6 +111,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('phenotype_measurement.py', '_level_grid'): ('derived', frozenset({0.25}), 'the relative tolerance split: half to the trapezoid rule, a quarter to each truncated tail'),
     ('phenotype_measurement.py', '_log_prior_sum_bound'): ('derived', frozenset({3.0, 4.0}), 'moments m = 0, 1, 2; |T|^m N(T; 0, tau^2) has four monotone pieces for m > 0 (two for m = 0)'),
     ('progress.py', 'elapsed'): ('unit', frozenset({60}), 'seconds per minute and minutes per hour'),
+    ('krylov_recycle.py', 'block_gcro_dr'): ('derived', frozenset({3}), 'byte accounting: the solution, residual and right-hand side are the three p x r arrays kept beside the cycle'),
     ('scale_mixture_ep.py', 'ROUGHNESS_ORDER'): ('spec', frozenset({3}), 'third-difference roughness (lead ruling 6c9976a): its null space is a normal log-density, the proper lambda = infinity limit'),
     ('scale_mixture_ep.py', '_ROW_INTERMEDIATES'): ('derived', frozenset({20}), "byte accounting: the (rows x K) float64 arrays alive at once in a chunk"),
     ('scale_mixture_ep.py', '_KRONROD_NODES'): ('spec', frozenset({0.20778495500789848, 0.4058451513773972, 0.5860872354676911, 0.7415311855993945, 0.8648644233597691, 0.9491079123427585, 0.9914553711208126}), 'QUADPACK dqk15i (Piessens, de Doncker-Kapenga, Ueberhuber and Kahaner 1983): the 15-point Kronrod rule and its embedded 7-point Gauss rule'),
