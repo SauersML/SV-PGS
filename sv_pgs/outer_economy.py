@@ -147,6 +147,9 @@ class EconomicalDualGaussian(DualGaussian):
         state["_state"] = dict(self._state)
         if "blocks" in state["_state"]:
             state["_state"]["blocks"] = dict(state["_state"]["blocks"])
+        # A refinement replaces a model's block and its kept products together: both are copied, so a restore never
+        # pairs one snapshot's Z_L with another's X~'Z_L.
+        state["_products"] = dict(self._products)
         return state
 
     def load(self, state: dict) -> None:
@@ -155,6 +158,7 @@ class EconomicalDualGaussian(DualGaussian):
         self._state = dict(state["_state"])
         if "blocks" in self._state:
             self._state["blocks"] = dict(self._state["blocks"])
+        self._products = dict(state["_products"])
         self.operator += 1
 
     # -- the fused read (items 1-3) --------------------------------------------------------------------------------

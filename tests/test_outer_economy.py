@@ -170,3 +170,23 @@ def test_a_saved_state_restores_the_solver_without_a_read() -> None:
     scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
     error = economy.posterior_solve(right, model, np.sqrt(EPS) * scale) - exact
     assert np.all(np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error)) <= np.sqrt(EPS) * scale + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
+
+
+def test_a_restore_after_a_refinement_pairs_each_block_with_its_own_products() -> None:
+    _parent, economy, problem = _pair(63, probe_count=2)
+    genotypes, covariates, training, noise, precision, shift, response, offsets = problem
+    keywords = dict(noise_variance=noise, error_bound=np.full(MODEL_COUNT, 1e-2), probe_residual_ratio=1e-2)
+    economy.iterate(site_precision=precision, site_shift=shift, **keywords)
+    saved = economy.save()
+    model = 0
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
+    right = np.random.default_rng(64).standard_normal((genotypes.shape[1], 2))
+    exact = np.linalg.solve(posterior_precision, right)
+    scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+    rounding = np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale
+    # A tight bound after a loose mean solve refines the model's resolved block (and its kept products).
+    economy.posterior_solve(right, model, np.sqrt(EPS) * scale)
+    economy.load(saved)
+    for bound in (1e-6 * scale, np.sqrt(EPS) * scale):
+        error = economy.posterior_solve(right, model, bound) - exact
+        assert np.all(np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error)) <= bound + rounding)
