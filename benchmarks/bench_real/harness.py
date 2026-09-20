@@ -33,6 +33,8 @@ import pandas as pd
 CIS_RADIUS_BP = 1_000_000
 SEALED_GENES = "sealed_confirmation_genes.tsv"
 PARENT_DATASET = "parent_dataset.txt"
+# Per-row measurement-quality columns; a source without one of them gets 1.0 there (a direct call).
+MEASUREMENT_COLUMNS = ("reliability", "concordance", "called_r2")
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
                 "svimp", "snv_svimp", "ctyper", "snv_ctyper", "hprc2", "snv_hprc2")
@@ -93,9 +95,35 @@ class TrainData:
     coding_exons: np.ndarray
 
 
+class _StackedDosage:
+    """Rows of several memory-mapped (variants x samples) int8 arrays, in a merged row order, read by fancy indexing
+    without concatenating the arrays: source_of[i] names the array holding merged row i, and row_of[i] its row there."""
+
+    def __init__(self, parts, source_of, row_of):
+        self.parts, self.source_of, self.row_of = parts, source_of, row_of
+        self.shape = (len(source_of), parts[0].shape[1])
+
+    def __getitem__(self, rows):
+        rows = np.asarray(rows)
+        out = np.empty((len(rows), self.shape[1]), dtype=self.parts[0].dtype)
+        for index, part in enumerate(self.parts):
+            chosen = np.flatnonzero(self.source_of[rows] == index)
+            if len(chosen):
+                out[chosen] = part[self.row_of[rows[chosen]]]
+        return out
+
+
 class Dataset:
-    def __init__(self, dataset_dir, overlay_dir=None):
+    def __init__(self, dataset_dir, overlay_dir=None, rows_dirs=None, sample_subset=None):
         self.directory = pathlib.Path(dataset_dir)
+        # Extra-rows overlays (lr-sv's SV sources, stored beside the parent instead of as full copies): each directory
+        # holds chrN.variants.tsv and chrN.dosage.npy (int8, rows x the parent's samples, in samples.tsv order). Per
+        # chromosome the table is the parent's rows, then each directory's rows in the given order, stably sorted by pos,
+        # exactly as a full derived copy is built, so windows, row order and chromosome_row equal the full copy's.
+        self.rows_dirs = [pathlib.Path(path) for path in (rows_dirs or [])]
+        # A sample subset (e.g. the 260 people with ONT calls): every split's train and test are cut to it, and any
+        # stored genotype read for a subset person must be a real value (the harness refuses negative placeholders).
+        self.sample_subset = pathlib.Path(sample_subset) if sample_subset is not None else None
         # Imputed SV dosages (bench-sim's svimp): per chromosome, <overlay>/<chrom>.svimp.npz with rows (indices into the
         # chromosome's variant table, panel SV rows) and ds (float32 [rows x samples] in samples.tsv order). They enter a
         # gene window as extra columns with source "svimp", beside the called genotypes they impute.
@@ -105,9 +133,18 @@ class Dataset:
         self.expression = np.load(self.directory / "expression.npy")
         self.covariates = np.load(self.directory / "covariates.npy")
         self.splits = {split["name"]: split for split in json.loads((self.directory / "splits.json").read_text())}
+        if self.sample_subset is not None:
+            keep = set(pd.read_csv(self.sample_subset, sep="\t", header=None)[0].astype(str)) - {"sample"}
+            unknown = keep - set(self.samples["sample"])
+            if unknown:
+                raise ValueError(f"{len(unknown)} subset samples are not dataset samples, e.g. {sorted(unknown)[:3]}")
+            restricted = {name: dict(split, train=[s for s in split["train"] if s in keep], test=[s for s in split["test"] if s in keep])
+                          for name, split in self.splits.items()}
+            self.splits = {name: split for name, split in restricted.items() if split["train"] and split["test"]}
         self.gene_annotation = json.loads((self.directory / "gene_annotation.json").read_text())
         self.sample_index = {sample: index for index, sample in enumerate(self.samples["sample"])}
         self._chromosomes = {}
+        self._parent_position = None
 
     def overlay(self, chrom: str):
         """(rows, dosages) of the chromosome's imputed SV overlay, or None."""
@@ -139,8 +176,36 @@ class Dataset:
             if "source" not in table:
                 table["source"] = "panel"
             dosage = np.load(self.directory / f"chr{number}.dosage.npy", mmap_mode="r")
+            self._parent_position = None
+            if self.rows_dirs:
+                table, dosage = self._with_extra_rows(number, table, dosage)
             self._chromosomes[chrom] = (table, dosage)
         return self._chromosomes[chrom]
+
+    def _with_extra_rows(self, number, parent_table, parent_dosage):
+        tables, dosages = [parent_table], [parent_dosage]
+        for directory in self.rows_dirs:
+            path = directory / f"chr{number}.variants.tsv"
+            if not path.exists():
+                continue
+            extra_dosage = np.load(directory / f"chr{number}.dosage.npy", mmap_mode="r")
+            if extra_dosage.shape[1] != parent_dosage.shape[1]:
+                raise ValueError(f"{directory}: {extra_dosage.shape[1]} samples, the parent has {parent_dosage.shape[1]}")
+            extra = pd.read_csv(path, sep="\t")
+            if len(extra) != extra_dosage.shape[0]:
+                raise ValueError(f"{directory} chr{number}: {len(extra)} table rows but {extra_dosage.shape[0]} dosage rows")
+            tables.append(extra)
+            dosages.append(extra_dosage)
+        measured = [column for column in MEASUREMENT_COLUMNS if any(column in part for part in tables)]
+        tables = [part.reindex(columns=list(parent_table.columns) + [column for column in measured if column not in parent_table])
+                  .assign(**{column: part[column] if column in part else 1.0 for column in measured}) for part in tables]
+        source_of = np.concatenate([np.full(len(part), index) for index, part in enumerate(tables)])
+        row_of = np.concatenate([np.arange(len(part)) for part in tables])
+        merged = pd.concat(tables, ignore_index=True)
+        order = np.argsort(merged["pos"].to_numpy(), kind="stable")
+        self._parent_position = np.empty(len(parent_table), dtype=np.int64)
+        self._parent_position[row_of[order][source_of[order] == 0]] = np.flatnonzero(source_of[order] == 0)
+        return merged.iloc[order].reset_index(drop=True), _StackedDosage(dosages, source_of[order], row_of[order])
 
     def sealed_genes(self):
         """The sealed confirmation genes (lead ruling): scored once, only when the lead calls the confirmation.
@@ -218,6 +283,9 @@ def load_gene_window(dataset: Dataset, gene_row: int):
     overlay = dataset.overlay(chrom)
     if overlay is not None:
         imputed_rows, imputed = overlay
+        if dataset._parent_position is not None:
+            # svimp rows index the parent's table; with extra rows merged in, map them to merged positions.
+            imputed_rows = dataset._parent_position[imputed_rows]
         present = np.flatnonzero(np.isin(imputed_rows, rows))
         if len(present):
             imputed_table = table.iloc[imputed_rows[present]].reset_index(drop=True).assign(source="svimp")
@@ -259,6 +327,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     train_index = np.array([dataset.sample_index[sample] for sample in split["train"]])
     test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
     train_genotypes, test_genotypes = window.genotypes[train_index], window.genotypes[test_index]
+    if (train_genotypes < 0).any() or (test_genotypes < 0).any():
+        raise ValueError(f"{window.gene_id}: a negative placeholder genotype was read for a split sample (sample subset missing?)")
     allele_count = train_genotypes.sum(axis=0)
     # A column that is constant in the training samples carries no information and has zero variance, which
     # breaks standardization: that is every sample 0 or 2, but also every sample heterozygous (seen in PanGenie
@@ -375,8 +445,8 @@ def load_method(spec: str):
 _WORKER = {}
 
 
-def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None):
-    _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir)
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None):
+    _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
 
@@ -407,10 +477,10 @@ def _run_gene(arguments):
     return results
 
 
-def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None):
+def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None, rows_dirs=None, sample_subset=None):
     from multiprocessing import get_context
 
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir)) as pool:
+    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset)) as pool:
         yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
 
 
@@ -522,14 +592,14 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None, rows_dirs=None, sample_subset=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
     contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
     with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
-    dataset = Dataset(dataset_dir, overlay_dir)
+    dataset = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
     if split_subset is not None:
         unknown = set(split_subset) - set(split_names)
@@ -550,7 +620,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     elif contract == "views":
         results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
-        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir) for result in chunk)
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset) for result in chunk)
     coefficient_tables = []
     for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients in results:
         if coefficients is not None:
@@ -574,6 +644,10 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
         "genes": len(gene_rows), "contract": contract, "splits": split_names,
+        "rows_dirs": [{"dir": str(path), "provenance_sha256": hashlib.sha256((path / "PROVENANCE.json").read_bytes()).hexdigest()
+                       if (path / "PROVENANCE.json").exists() else None} for path in dataset.rows_dirs],
+        "sample_subset": str(sample_subset) if sample_subset is not None else None,
+        "sample_subset_sha256": hashlib.sha256(pathlib.Path(sample_subset).read_bytes()).hexdigest() if sample_subset is not None else None,
         "note": json.loads(pathlib.Path(note).read_text()) if note is not None else None, "overlay": str(overlay_dir) if overlay_dir is not None else None,
         "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
                            if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
@@ -608,7 +682,10 @@ if __name__ == "__main__":
     parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
     parser.add_argument("--splits", nargs="+", help="only these splits of the design (e.g. loso/AFR), for per-split checkpoints")
     parser.add_argument("--note", help="a JSON file recorded verbatim in run.json (arm label, test status, rulings)")
+    parser.add_argument("--rows", action="append", metavar="NAME=DIR", help="an extra-rows overlay (repeatable; merged in the given order)")
+    parser.add_argument("--sample-subset", help="a file of sample ids, one per line: every split is cut to these people")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
-        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note)
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note,
+        [value.split("=", 1)[1] for value in arguments.rows] if arguments.rows else None, arguments.sample_subset)

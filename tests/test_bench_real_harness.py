@@ -460,3 +460,51 @@ def test_undefined_quality_values_pass_through_as_nan(tmp_path):
     train, _, _, _ = harness.build_gene_task(dataset, harness.load_gene_window(dataset, 0), dataset.splits["loso/AFR"])
     assert np.isnan(train.variants.called_r2[train.variants.is_sv]).all()
     assert (train.variants.called_r2[~train.variants.is_sv] == 1.0).all()
+
+
+def test_extra_rows_overlay_equals_the_full_derived_copy(tmp_path):
+    import shutil
+
+    (tmp_path / "parent").mkdir()
+    parent = tiny_dataset(tmp_path / "parent")
+    generator = np.random.default_rng(8)
+    extra_table = pd.DataFrame({"pos": [100, 103, 106], "end": [100, 160, 106], "id": ["x1", "x2", "x3"], "ref_len": 1, "alt_len": -1, "symbolic": True,
+                                "sv_type": ["DEL", "DUP", "CNV"], "sv_length": [50, 57, 900], "is_sv": True, "source": "gatksv",
+                                "concordance": [0.99, 0.95, 1.0], "called_r2": [0.98, np.nan, 1.0]})
+    extra_dosage = generator.integers(0, 3, size=(3, 24)).astype(np.int8)
+    rows_dir = tmp_path / "rows"
+    rows_dir.mkdir()
+    extra_table.to_csv(rows_dir / "chr1.variants.tsv", sep="\t", index=False)
+    np.save(rows_dir / "chr1.dosage.npy", extra_dosage)
+    # The full copy, built by the stated rule: parent rows then extra rows, measurement columns filled with 1.0, stable sort by pos.
+    full = tmp_path / "full"
+    shutil.copytree(parent, full)
+    parent_table = pd.read_csv(parent / "chr1.variants.tsv", sep="\t")
+    merged = pd.concat([parent_table.assign(concordance=1.0, called_r2=1.0), extra_table], ignore_index=True)
+    order = np.argsort(merged["pos"].to_numpy(), kind="stable")
+    merged.iloc[order].to_csv(full / "chr1.variants.tsv", sep="\t", index=False)
+    np.save(full / "chr1.dosage.npy", np.vstack([np.load(parent / "chr1.dosage.npy"), extra_dosage])[order])
+    overlaid = harness.load_gene_window(harness.Dataset(parent, rows_dirs=[rows_dir]), 0)
+    copied = harness.load_gene_window(harness.Dataset(full), 0)
+    assert np.array_equal(overlaid.genotypes, copied.genotypes) and np.array_equal(overlaid.chromosome_rows, copied.chromosome_rows)
+    pd.testing.assert_frame_equal(overlaid.table, copied.table, check_dtype=False)
+
+
+def test_sample_subset_cuts_every_split_and_refuses_placeholders(tmp_path):
+    tiny_dataset(tmp_path)
+    subset = tmp_path / "subset.txt"
+    subset.write_text("\n".join(f"s{index}" for index in range(12)) + "\n")
+    dataset = harness.Dataset(tmp_path, sample_subset=subset)
+    assert all(set(split["train"]) | set(split["test"]) <= {f"s{index}" for index in range(12)} for split in dataset.splits.values())
+    window = harness.load_gene_window(dataset, 0)
+    train, _, _, _ = harness.build_gene_task(dataset, window, dataset.splits["loso/AFR"])
+    assert len(train.phenotype) == 6
+    dosage = np.load(tmp_path / "chr1.dosage.npy")
+    dosage[:, 0] = -1
+    np.save(tmp_path / "chr1.dosage.npy", dosage)
+    try:
+        harness.build_gene_task(dataset, harness.load_gene_window(harness.Dataset(tmp_path, sample_subset=subset), 0), dataset.splits["loso/AFR"])
+    except ValueError as error:
+        assert "placeholder" in str(error)
+    else:
+        raise AssertionError("a negative placeholder read for a split sample must be refused")

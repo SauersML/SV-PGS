@@ -61,7 +61,9 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
             predictions = np.load(path)
             for superpopulation in SUPERPOPULATIONS:
                 members = np.flatnonzero(samples["Superpopulation"].to_numpy() == superpopulation)
-                scores = [squared_correlation(predictions[row, members].astype(np.float64), truth[row, members].astype(np.float64)) for row in range(len(genes))]
+                # Only the group's people who were held out (a sample subset leaves the others unscored, as NaN).
+                scores = [squared_correlation(predictions[row, tested].astype(np.float64), truth[row, tested].astype(np.float64))
+                          for row in range(len(genes)) for tested in [members[np.isfinite(truth[row, members])]]]
                 frames.append(pd.DataFrame({"gene_id": genes["gene_id"], "chrom": genes["chrom"], "method": method, "feature_set": feature_set,
                                             "design": design, "superpopulation": superpopulation, "r2": scores}))
     return pd.concat(frames, ignore_index=True)
@@ -120,7 +122,8 @@ def sv_credit(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str,
             for superpopulation in SUPERPOPULATIONS:
                 members = np.flatnonzero(samples["Superpopulation"].to_numpy() == superpopulation)
                 for row in range(len(genes)):
-                    observed, predicted, predicted_without = truth[row, members], full[row, members], masked[row, members]
+                    tested = members[np.isfinite(truth[row, members])]
+                    observed, predicted, predicted_without = truth[row, tested], full[row, tested], masked[row, tested]
                     rows.append({"gene_id": genes["gene_id"].iloc[row], "chrom": genes["chrom"].iloc[row], "method": method, "feature_set": feature_set,
                                  "design": design, "superpopulation": superpopulation, "covariance_full": covariance(observed, predicted),
                                  "covariance_sv": covariance(observed, predicted - predicted_without),
