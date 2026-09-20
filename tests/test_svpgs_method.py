@@ -307,7 +307,7 @@ def test_the_batch_arm_fits_every_gene_with_one_pooled_call(monkeypatch: pytest.
 
     def pooled(genes: Any, **arguments: Any) -> Any:
         calls.append((genes, arguments))
-        fits = [single(codes=gene.codes, target=gene.target, seed=index) for index, gene in enumerate(genes)]
+        fits = [single(codes=gene.codes, covariates=gene.covariates, target=gene.target, seed=index) for index, gene in enumerate(genes)]
         return type("PooledFit", (), {"scoring": tuple(fit.scoring for fit in fits)})()
 
     monkeypatch.setattr(svpgs_method, "fit_pooled_small_n", pooled)

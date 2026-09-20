@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from benchmarks import svpgs_method
 from benchmarks.bench_real import harness as bench_real
@@ -25,6 +26,10 @@ def _budget() -> ComputeBudget:
     )
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="the full-data driver refuses this synthetic start (cavity information certificate, e2e); run-only wiring, replaced by e2e's fit_models",
+)
 def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path) -> None:
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
     samples = store.n_samples
