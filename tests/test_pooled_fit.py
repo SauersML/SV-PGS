@@ -100,3 +100,22 @@ def test_several_genes_fit_one_certified_prior():
     for gene, scoring in zip(genes, fit.scoring):
         assert np.all(np.isfinite(scoring.coefficients)) and scoring.posterior_draws.shape[1] == 64
         assert scoring.store_rows.max() < gene.codes.shape[1]
+
+
+def test_a_gene_at_its_frozen_fixed_point_takes_no_step_while_the_others_move():
+    """Regression (bench-real diag2 [real], 3 of 3 groups): a gene whose frozen update was below its sites' rounding was
+    taken for one whose damped passes all failed, and refused the whole pool."""
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+
+    rng = np.random.default_rng(8)
+    genes = [_gene(rng, 80, width, _sparse_effects(rng, width, count)) for width, count in ((40, 2), (30, 1))]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    oracle = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    _variances, frozen = oracle._refresh(start)
+    rows = oracle.rows
+    target_precision, target_shift = oracle.site_precision.copy(), oracle.site_shift.copy()
+    target_precision[rows[1]] *= 1.5  # gene 0's targets are its own sites: its update is exactly zero
+    oracle._frozen_passes(start, frozen, target_precision, target_shift)  # refused before the fix
+    assert np.all(np.isfinite(oracle.site_precision)) and np.all(np.isfinite(oracle.mean))

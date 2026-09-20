@@ -401,9 +401,12 @@ class _PooledFixedPoints:
                 delta_shift = target_shift[rows] - self.site_shift[rows]
                 move = max(float(np.max(np.abs(delta_precision), initial=0.0)), float(np.max(np.abs(delta_shift), initial=0.0)))
                 scale = 1.0 + max(float(np.max(np.abs(self.site_precision[rows]))), float(np.max(np.abs(self.site_shift[rows]))))
+                if fraction * move <= _EPSILON * scale:
+                    # This gene's update is below its sites' rounding: it is at its frozen fixed point while the pooled
+                    # move is not yet below tolerance, so it takes no step this sweep.
+                    moves[gene] = 0.0
+                    continue
                 while True:
-                    if fraction * move <= _EPSILON * scale:
-                        raise NoFixedPoint(f"gene {gene}: no damped EP pass keeps the precision positive definite")
                     trial_precision = self.site_precision[rows] + fraction * delta_precision
                     trial_shift = self.site_shift[rows] + fraction * delta_shift
                     try:
@@ -411,6 +414,8 @@ class _PooledFixedPoints:
                         break
                     except np.linalg.LinAlgError:
                         fraction *= 0.5
+                        if fraction * move <= _EPSILON * scale:
+                            raise NoFixedPoint(f"gene {gene}: no damped EP pass keeps the precision positive definite")
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
