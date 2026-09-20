@@ -138,3 +138,23 @@ def test_the_genes_curvature_blocks_add_up_to_the_pooled_curvature():
     scale = np.max(np.abs(pooled))
     np.testing.assert_allclose(curvature.blocks.sum(axis=0), pooled, rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps) * scale)
     assert curvature.blocks.shape == (2,) + pooled.shape
+
+
+def test_a_genes_double_loop_is_small_ns_on_its_rows():
+    """The pooled fallback (MODEL.md section 4) runs small_n's double loop on the gene's own rows of the pooled prior:
+    for one gene it is small_n's exactly."""
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+    from sv_pgs.small_n import _DenseFixedPoints
+
+    rng = np.random.default_rng(10)
+    gene = _gene(rng, 60, 40, _sparse_effects(rng, 40, 2))
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target)]
+    prior = pooled_prior(statistics, [gene.variant_class], [np.zeros(40)], np.ones(1), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    pooled = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    single = _DenseFixedPoints(statistics[0], prior, start, float(noise[0]), 64, 10**9)
+    pooled._double_loop(0, start)
+    single._double_loop(start)
+    np.testing.assert_array_equal(pooled.site_precision, single.site_precision)
+    np.testing.assert_array_equal(pooled.site_shift, single.site_shift)
+    np.testing.assert_array_equal(pooled.mean, single.mean)

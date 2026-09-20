@@ -49,6 +49,7 @@ from sv_pgs.scale_mixture_ep import (
     prior_second_moment,
     scale_mixture_prior,
     site_targets,
+    tilted_cumulants,
     tilted_moments,
 )
 from sv_pgs.small_n import (
@@ -58,8 +59,10 @@ from sv_pgs.small_n import (
     DenseStatistics,
     _DensePosterior,
     _Kernel,
+    _loop_point,
     _new_profile,
     dense_statistics,
+    double_loop_sites,
 )
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -389,6 +392,37 @@ class _PooledFixedPoints:
             self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
             self.noise = self._noises(1.0 / (frozen + self.site_precision))
 
+    def _double_loop(self, gene: int, hyperparameters: MixtureHyperparameters) -> None:
+        """Gene ``gene``'s EP fixed point by the double loop (``small_n.double_loop_sites``) on its own rows of the pooled
+        prior, from its current sites when they lie in EP's domain, else from the prior's moment-matched sites."""
+        rows = self.rows[gene]
+        prior = _gene_prior(self.prior, rows)
+        noise = float(self.noise[gene])
+        design = self.statistics[gene].design
+        largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
+
+        def tilted(cavity_precision: F64Array, cavity_shift: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array, F64Array]:
+            started = time.perf_counter()
+            cavity = Cavity(precision=cavity_precision, shift=cavity_shift)
+            moments = tilted_moments(prior, hyperparameters, cavity, self.working_bytes)
+            third, fourth = tilted_cumulants(prior, hyperparameters, cavity, self.working_bytes)
+            self.profile["tilted_seconds"] += time.perf_counter() - started
+            return moments.log_normalizer, moments.mean, moments.variance, third, fourth
+
+        self.profile["double_loops"] += 1
+        start_precision, start_shift = self.site_precision[rows].copy(), self.site_shift[rows].copy()
+        kernel = _Kernel(design, noise * start_precision)
+        mean = kernel.solve(self.scores[gene] + noise * start_shift)
+        variance = noise * kernel.variances()
+        if _loop_point(design, noise, self.scores[gene], start_precision, start_shift, 1.0 / variance, mean / variance, tilted, largest) is None:
+            start_precision, start_shift = moment_matched_prior_sites(prior, hyperparameters)
+        precision, shift = double_loop_sites(
+            design, noise, self.scores[gene], start_precision, start_shift, tilted, largest, self.draw_count,
+            self.working_bytes // _LIVE_FIXED_POINTS, self.profile,
+        )
+        self.site_precision[rows], self.site_shift[rows] = precision, shift
+        self._iterate(gene, precision, shift)
+
     def _frozen_passes(self, hyperparameters: MixtureHyperparameters, frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
         """Mean-only EP with the cavity precisions frozen, every gene stepping each sweep with its own damping, until
         the pooled frozen move is below sum_g p_eff,g / K (``small_n._DenseFixedPoints._frozen_passes``)."""
@@ -417,7 +451,13 @@ class _PooledFixedPoints:
                     except np.linalg.LinAlgError:
                         fraction *= 0.5
                         if fraction * move <= _EPSILON * scale:
-                            raise NoFixedPoint(f"gene {gene}: no damped EP pass keeps the precision positive definite")
+                            break
+                if fraction * move <= _EPSILON * scale:
+                    # PD failures halved this gene's damped step to its sites' rounding: its EP falls back to the
+                    # convergent double loop at these hyperparameters and its noise (MODEL.md section 4), per gene.
+                    self._double_loop(gene, hyperparameters)
+                    moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) * (frozen[rows] + self.site_precision[rows])))
+                    continue
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
