@@ -59,7 +59,7 @@ are logged.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 
 import numpy as np
 
@@ -430,10 +430,24 @@ def mapped_gram(gram: NDArray, leakage: LeakageMap) -> F64Array:
 
 @dataclass(frozen=True)
 class LdBlock:
-    """One LD block's records (store row indices) and which of them are mapped targets (indices into ``records``)."""
+    """One block's records (store row indices), its mapped targets and its absorbed records (indices into ``records``).
+
+    An LD block maps its imperfect columns onto the linear predictor of their true
+    genotypes. A fusion block pairs an imputed record (the target) with a direct
+    call of the same event from the same people's reads, e.g. a GATK-SV copy
+    number (absorbed): the target becomes E_lin[G | D*, direct call], and the
+    absorbed column, whose information the target now carries, leaves the fit
+    (offset -inf, prior variance exactly 0) while staying an input of the map.
+    """
 
     records: I64Array
     targets: I64Array
+    absorbed: I64Array = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
+
+    def __post_init__(self) -> None:
+        targets, absorbed = np.asarray(self.targets), np.asarray(self.absorbed)
+        if np.intersect1d(targets, absorbed).size:
+            raise ValueError("a block's absorbed records cannot also be its targets.")
 
 
 @dataclass(frozen=True)
@@ -523,13 +537,23 @@ def calibration_pairs(
     return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
 
 
+def _calibrated_block_covariance(pairs: BlockPairs, scales: NDArray) -> F64Array:
+    block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
+    return block_scales[:, None] * np.asarray(pairs.cohort_covariance, dtype=np.float64) * block_scales[None, :]
+
+
 def fit_block_map(pairs: BlockPairs, scales: NDArray) -> LeakageMap:
     """One block's leakage map, with each column recalibrated by its record's scale, pairs and cohort alike."""
     block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
     dosage = np.asarray(pairs.dosage, dtype=np.float64)
     means = dosage.mean(axis=0)
-    calibrated_covariance = block_scales[:, None] * np.asarray(pairs.cohort_covariance, dtype=np.float64) * block_scales[None, :]
-    return fit_leakage_map(calibrated_covariance, means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+    return fit_leakage_map(_calibrated_block_covariance(pairs, scales), means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
+
+
+def mapped_signal_variances(pairs: BlockPairs, scales: NDArray, leakage: LeakageMap) -> F64Array:
+    """Var(Xtilde_k) = a_k' Sigma_D* a_k in the fitted cohort, for each mapped target k (a_k: column k of A)."""
+    transform = leakage_transform(leakage)[:, leakage.targets]
+    return np.einsum("jk,jl,lk->k", transform, _calibrated_block_covariance(pairs, scales), transform)
 
 
 @dataclass(frozen=True)
@@ -595,6 +619,7 @@ def fit_measurement_model(
         offsets[uncalibrated] = np.log(reported[uncalibrated])
         residual[uncalibrated] = variance[uncalibrated] * (1.0 - reported[uncalibrated]) / reported[uncalibrated]
     maps: list[LeakageMap] = []
+    absorbed = np.zeros(variance.shape, dtype=bool)
     if calibration is not None and np.any(calibrated):
         moments = calibration.moments.subset(calibrated)
         design = np.column_stack([np.ones(int(calibrated.sum())), reported[calibrated], np.log(variance[calibrated])])
@@ -602,13 +627,26 @@ def fit_measurement_model(
         scales[calibrated] = pooled.scales
         residual[calibrated] = residual_variances(variance[calibrated], pooled.scales, pooled.variance_ratios)
         offsets[calibrated] = log_reliability_offsets(variance[calibrated], scales[calibrated], residual[calibrated])
-        maps = [fit_block_map(pairs, scales) for pairs in calibration.blocks]
+        genotype_variance = np.where(calibrated, 0.0, residual + scales**2 * variance)
+        genotype_variance[calibrated] = pooled.variance_ratios * variance[calibrated]
+        for pairs in calibration.blocks:
+            leakage = fit_block_map(pairs, scales)
+            maps.append(leakage)
+            # A mapped target's signal is its mapped column's variance; the genotype variance is unchanged.
+            rows = np.asarray(pairs.block.records, dtype=np.int64)
+            target_rows = rows[np.asarray(pairs.block.targets, dtype=np.int64)]
+            signal = mapped_signal_variances(pairs, scales, leakage)
+            residual[target_rows] = np.maximum(genotype_variance[target_rows] - signal, 0.0)
+            offsets[target_rows] = _log_signal_share(signal, residual[target_rows])
+            absorbed[rows[np.asarray(pairs.block.absorbed, dtype=np.int64)]] = True
+        offsets[absorbed] = -np.inf
     ratios = np.array([leakage.ridge_ratio for leakage in maps])
     certificate: dict[str, object] = {
         "calibration_samples": 0 if calibration is None else len(calibration.sample_ids),
         "calibrated_records": int(calibrated.sum()),
         "uncalibrated_records": int(uncalibrated.sum()),
         "records_without_cohort_variation": int((~varying).sum()),
+        "direct_calls_fused": int(absorbed.sum()),
         "recalibration": (
             f"applied to {int(calibrated.sum())} records: kappa pooled by stratum on [1, reported r^2, log V] "
             f"from the calibration pairs; not applied to {int(uncalibrated.sum())} records with fewer than 3 pairs "
@@ -627,6 +665,6 @@ def fit_measurement_model(
             f"-inf (no cohort variation) for {int((~varying).sum())} records"
         ),
     }
-    for key in ("recalibration", "leakage_correction", "reliability_source"):
+    for key in ("recalibration", "leakage_correction", "reliability_source", "direct_calls_fused"):
         log(f"measurement model: {key}: {certificate[key]}")
     return MeasurementModel(scales, residual, offsets, tuple(maps), certificate)

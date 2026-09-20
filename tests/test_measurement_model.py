@@ -333,3 +333,38 @@ def test_a_copy_number_column_is_calibrated_in_copies() -> None:
     assert abs(float(np.mean(pooled.scales)) - kappa) <= sampling_bound(float(kappa_error))
     ratios = moments.truth_variance / moments.dosage_variance
     assert abs(float(pooled.variance_ratios[0]) - kappa) <= sampling_bound(float(np.std(ratios) / np.sqrt(records)))
+
+
+def test_a_direct_call_is_fused_into_its_imputed_record_and_leaves_the_fit() -> None:
+    rng = np.random.default_rng(53)
+    frequency, keep, pairs, cohort = 0.3, 0.5, 3000, 40000
+
+    def sources(count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        genotype = rng.binomial(2, frequency, size=count).astype(float)
+        imputed = _draw_type_column(genotype[None], np.array([frequency]), keep, rng)[0]
+        # A read-depth call: the true copy change plus independent read-count noise.
+        direct = genotype + rng.normal(0.0, 0.6, count)
+        return genotype, imputed, direct
+
+    genotype, imputed, direct = sources(pairs)
+    cohort_genotype, cohort_imputed, cohort_direct = sources(cohort)
+    cohort_block = np.vstack([cohort_imputed, cohort_direct])
+    block = LdBlock(np.array([0, 1]), np.array([0]), np.array([1]))
+    calibration = calibration_pairs(
+        tuple(ResearchId(str(index)) for index in range(pairs)), np.vstack([imputed, direct]), np.vstack([genotype, genotype]),
+        blocks=(block,), block_covariances=(np.cov(cohort_block, bias=True),),
+    )
+    model = fit_measurement_model(calibration, cohort_block.var(axis=1), np.array([0, 1]), np.array([0.3, 1.0]))
+    assert model.log_reliability[1] == -np.inf and model.certificate["direct_calls_fused"] == 1
+
+    centre = cohort_block.mean(axis=1, keepdims=True)
+    calibrated = (centre + model.scales[:, None] * (cohort_block - centre)).T
+    fused = apply_leakage_map(calibrated, model.leakage_maps[0])[:, 0]
+
+    def r2(column: np.ndarray) -> float:
+        return float(np.corrcoef(column, cohort_genotype)[0, 1] ** 2)
+
+    assert r2(fused) > max(r2(calibrated[:, 0]), r2(cohort_direct))
+    # The offset is the fused column's share of the genotype variance; its error is that of
+    # the variance ratios estimated from the calibration pairs.
+    assert abs(model.log_reliability[0] - np.log(r2(fused))) <= sampling_bound(float(np.sqrt(4 / pairs)))
