@@ -15,7 +15,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - An ALT-count record has 127 and 0, so its value is the dosage above; the reader refuses any other pair for it.
   - A copy_number record (a multi-copy CNV such as PDXDC1, KANSL1 or WASH3P, which fails HWE and Mendelian checks as a 0/1/2 dosage) has ⌊254 / its maximum called copy number⌋ codes per copy and value_origin = −its modal called copy number, so its value is CN − modal CN and every integer copy number is exact.
   - Stage 0, Stage 2 and scoring work on standardized code columns, which are affine-invariant per column, so they need neither number. Anything read in the column's own units (a frequency, the measurement model's moments, a copy change) decodes through them.
-  - Stores written before these columns are refused and must be converted again.
+  - A store written before these columns holds only ALT-count records and reads as 127 and 0; one that holds copy_number records without them is refused and must be converted again.
 - **Encoding:**
   - one shard per array by default, with 64-row inner chunks (derived from the measured read path, `docs/design/math/codec.md` §3). A read costs the same across a shard boundary, and a writer encodes a shard's inner chunks on its worker pool, so shards add only files and descriptors, and they cut zero-copy views. `shard_rows_for` gives the fewest shards that still hold `parallel_writers` whole-shard writers (the synthetic generator's tasks) and fit the process's descriptor hard limit: 2 per shard. Stores written with other shard sizes stay readable, since each array's zarr.json records its own;
   - zstd at libzstd's default level (3), with a crc32c-checked shard index;

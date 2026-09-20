@@ -550,3 +550,26 @@ def test_an_array_is_one_shard_by_default_and_round_trips(tmp_path: Path) -> Non
     out = np.empty_like(codes)
     CodeArray(tmp_path / "array").read_rows_into(0, 203, out)
     np.testing.assert_array_equal(out, codes)
+
+
+def test_a_store_written_before_the_value_decode_reads_as_alt_counts_unless_it_holds_copy_numbers(tmp_path) -> None:
+    import shutil
+
+    milli_by_half = _two_half_dosage()
+    root = tmp_path / "store"
+    _write_store(root, milli_by_half, "raw")
+    chromosomes = list(milli_by_half[0])
+    for chromosome in chromosomes:
+        for name in ("codes_per_unit", "value_origin"):
+            shutil.rmtree(variant_column_directory(root, chromosome, name))
+    with DosageStore.open(root) as store:
+        table = store.variant_table
+        assert np.all(table.codes_per_unit == CODES_PER_DOSAGE) and np.all(table.value_origin == 0)
+    record_count = milli_by_half[0][chromosomes[0]].shape[0]
+    classes = np.zeros(record_count, dtype=np.uint8)
+    classes[0] = VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
+    shutil.rmtree(variant_column_directory(root, chromosomes[0], "variant_class"))
+    write_column(variant_column_directory(root, chromosomes[0], "variant_class"), classes, {"legend": VARIANT_CLASS_LEGEND})
+    with pytest.raises(ValueError, match="copy-number records without their value decode"):
+        with DosageStore.open(root) as store:
+            store.variant_table

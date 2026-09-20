@@ -112,6 +112,8 @@ VARIANT_CLASSES = tuple(VariantClass)
 VARIANT_CLASS_LEGEND = [variant_class.value for variant_class in VARIANT_CLASSES]
 # On-disk variant columns every store carries; any other column is a prior annotation.
 REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first", "codes_per_unit", "value_origin")
+# Written by every current store; a store from before them holds only ALT-count records, decoded as code / 127.
+_VALUE_DECODE_COLUMNS = ("codes_per_unit", "value_origin")
 _COPY_NUMBER_CODE = VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
 Codec = Literal["raw", "zstd", "rowdict"]
 
@@ -1091,7 +1093,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
     for chromosome, record_count in zip(chromosomes, record_counts):
         present = sorted(path.name for path in (root / "variants" / chromosome).iterdir())
         missing = sorted(reserved - set(present))
-        if missing:
+        legacy = sorted(_VALUE_DECODE_COLUMNS) == [name for name in missing if name in _VALUE_DECODE_COLUMNS]
+        if missing and not (legacy and set(missing) <= set(_VALUE_DECODE_COLUMNS)):
             raise ValueError(f"variant table of {chromosome} lacks required columns {missing}.")
         names = [name for name in present if name not in reserved]
         if annotation_names is None:
@@ -1099,7 +1102,7 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
         elif names != annotation_names:
             raise ValueError(f"annotation columns of {chromosome} differ from those of {chromosomes[0]}.")
         columns: dict[str, NDArray] = {}
-        for name in [*REQUIRED_VARIANT_COLUMNS, *names]:
+        for name in [*(column for column in REQUIRED_VARIANT_COLUMNS if column in present), *names]:
             values, attributes = open_column(variant_column_directory(root, chromosome, name))
             if values.shape[0] != record_count:
                 raise ValueError(f"variant column {chromosome}/{name} has {values.shape[0]} rows, not {record_count}.")
@@ -1117,9 +1120,15 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             raise ValueError(f"{chromosome} sites (pos, ref_len, alt_len) do not match the manifest md5.")
         if int(columns["variant_class"].max()) >= len(VARIANT_CLASSES):
             raise ValueError(f"{chromosome} has variant_class codes outside tuple(VariantClass).")
+        copy_number = columns["variant_class"] == _COPY_NUMBER_CODE
+        if legacy:
+            # Written before the value decode: every record must be an ALT count, stored as code / 127.
+            if np.any(copy_number):
+                raise ValueError(f"{chromosome} holds copy-number records without their value decode; convert the store again.")
+            columns["codes_per_unit"] = np.full(record_count, CODES_PER_DOSAGE, dtype=np.uint8)
+            columns["value_origin"] = np.zeros(record_count, dtype=np.int16)
         codes_per_unit = columns["codes_per_unit"].astype(np.uint8)
         value_origin = columns["value_origin"].astype(np.int64)
-        copy_number = columns["variant_class"] == _COPY_NUMBER_CODE
         if np.any(codes_per_unit == 0):
             raise ValueError(f"{chromosome} has a record with codes_per_unit 0.")
         if np.any(~copy_number & ((codes_per_unit != CODES_PER_DOSAGE) | (value_origin != 0))):
