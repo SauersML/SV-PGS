@@ -513,7 +513,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
@@ -522,6 +522,11 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
     dataset = Dataset(dataset_dir, overlay_dir)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
+    if split_subset is not None:
+        unknown = set(split_subset) - set(split_names)
+        if unknown:
+            raise ValueError(f"splits not in design {design}: {sorted(unknown)}")
+        split_names = [name for name in split_names if name in set(split_subset)]
     if gene_ranks is not None and gene_list is None:
         raise ValueError("gene ranks need a gene list")
     gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation, gene_ranks)
@@ -548,7 +553,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
-    tag = "_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
+    tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
+           + ("." + "+".join(name.split("/")[1] for name in split_names) if split_subset is not None else ""))
     method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
     (out / f"{tag}.run.json").write_text(json.dumps({
@@ -558,7 +564,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "overlay": str(overlay_dir) if overlay_dir is not None else None,
+        "genes": len(gene_rows), "contract": contract, "splits": split_names, "overlay": str(overlay_dir) if overlay_dir is not None else None,
         "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
                            if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
@@ -590,7 +596,8 @@ if __name__ == "__main__":
                         help="gene: fit(train); batch: fit_batch(trains) once per split; views: fit_views(views) once over every view")
     parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
     parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
+    parser.add_argument("--splits", nargs="+", help="only these splits of the design (e.g. loso/AFR), for per-split checkpoints")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
-        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay)
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits)

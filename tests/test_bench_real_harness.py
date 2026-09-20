@@ -426,3 +426,17 @@ def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
         assert "sealed" in str(error)
     else:
         raise AssertionError("views containing a sealed gene must be refused")
+
+
+def test_per_split_runs_merge_to_the_full_design_run(tmp_path):
+    from benchmarks.bench_real import merge_splits
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    harness.run(tmp_path, method, "full", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    for split in ("loso/AFR", "loso/EUR"):
+        harness.run(tmp_path, method, "parts", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), split_subset=[split])
+    merge_splits.merge(tmp_path / "results/parts/loso", "chr1")
+    for name in ("snv.predictions", "snv_sv.predictions_without_sv", "truth"):
+        assert np.array_equal(np.load(tmp_path / f"results/full/loso/chr1.{name}.npy"), np.load(tmp_path / f"results/parts/loso/chr1.merged.{name}.npy"),
+                              equal_nan=True)
