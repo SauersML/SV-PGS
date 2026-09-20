@@ -293,7 +293,8 @@ def sharing_cost(
     fold_kernel_shared = n * n * mean_window
     fold_factor_direct = sum(t ** 3 / 3.0 for t in training_sizes)
     fold_factor_shared = n ** 3 / 3.0
-    trailing = n
+    # FoldOrder puts the always-trained samples first, so the rows after block k are the later blocks only.
+    trailing = float(np.sum(held_out_sizes))
     for h in held_out_sizes:
         trailing -= h
         if trailing > 0:

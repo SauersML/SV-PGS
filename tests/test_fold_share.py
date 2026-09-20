@@ -142,3 +142,16 @@ def test_sharing_cost_counts():
     assert cost.fold_factor_direct == 2 * 125 / 3
     assert cost.nested_shared == 100 * 2
     assert cost.ratios()["fold_factors"] < 1
+
+
+def test_sharing_cost_excludes_the_always_trained_prefix_from_trailing_blocks():
+    # n = 10 with 4 always-trained samples ordered first, then blocks of 3 and 3: fold 1's trailing rows are block 2
+    # (a = 3, h = 3), fold 2 has none. Shared = n³/3 + 2·(a + h)·a² − 2a³/3.
+    cost = fold_share.sharing_cost(sample_count=10, held_out_sizes=[3, 3], window_sizes=[1], unique_columns=1,
+                                   segment_window_memberships=0, added_columns=[])
+    assert cost.fold_factor_shared == pytest.approx(1000 / 3 + 2 * 6 * 9 - 2 * 27 / 3)
+    assert cost.fold_factor_direct == pytest.approx(2 * 7 ** 3 / 3)
+    # The count matches the trailing blocks fold_factors actually factors.
+    folds = fold_share.FoldOrder.from_held_out([np.arange(4, 7), np.arange(7, 10)], 10)
+    trailing_rows = [10 - block.stop for block in folds.bounds]
+    assert trailing_rows == [3, 0]
