@@ -704,3 +704,56 @@ def test_a_refresh_outside_eps_domain_is_repaired_by_the_double_loop_not_halved(
     assert oracle.profile["repairs"] == 1 and oracle.profile["repair_rounds"] >= 1
     assert oracle.profile["double_loops"] == oracle.profile["repair_rounds"]
     assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
+
+
+def test_the_double_loop_never_evaluates_an_improper_cavity(monkeypatch):
+    """fit-api rwAMR [real]: an outer step's q-cavity 1/z - tau was improper (1 + v_max P <= 0) and the tilted moments
+    raised on it, uncaught. Here a doubleton column (x2 = x0 + x1) with negative sites on its singletons starts with an
+    improper q-cavity; the double loop reseeds its inner problem instead, never calls the tilted moments on an improper
+    cavity, and returns sites whose every q-cavity is proper and which pass the EP check."""
+    from sv_pgs import small_n
+    from sv_pgs.scale_mixture_ep import Cavity, derived_lattice, initial_hyperparameters, log_scale, scale_mixture_prior, tilted_cumulants, tilted_moments
+    from sv_pgs.small_n import double_loop_sites
+
+    rng = np.random.default_rng(101)
+    samples, variants, noise = 30, 6, 0.8
+    design = _design(rng, samples, variants)
+    design[:, 2] = design[:, 0] + design[:, 1]
+    target = design[:, 3] * 0.8 + np.sqrt(noise) * rng.standard_normal(samples)
+    nodes, floor, top = derived_lattice(np.einsum("ij,ij->j", design, design) / noise, design.T @ target / noise, np.zeros(variants), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(variants, dtype=np.int64), log_variance_offset=np.zeros(variants), annotation_design=np.zeros((variants, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    hyperparameters = initial_hyperparameters(prior)
+    largest = np.exp(log_scale(prior, hyperparameters.coefficients) + prior.log_variance_grid[-1])
+    calls = {"improper": 0}
+
+    def tilted(cavity_precision, cavity_shift):
+        calls["improper"] += int(np.sum(~(1.0 + largest * cavity_precision > 0.0)))
+        cavity = Cavity(precision=cavity_precision, shift=cavity_shift)
+        moments = tilted_moments(prior, hyperparameters, cavity, 10**8)
+        third, fourth = tilted_cumulants(prior, hyperparameters, cavity, 10**8)
+        return moments.log_normalizer, moments.mean, moments.variance, third, fourth
+
+    dense = _Design.dense(design)
+    precision = np.full(variants, 2.0)
+    # Negative singleton sites whose doubleton's cavity is improper, with the precision still definite.
+    for scale in 2.0 ** -np.arange(0, 30):
+        precision[[0, 1]] = -scale * np.min(np.einsum("ij,ij->j", design, design)) / noise
+        try:
+            kernel = _Kernel(dense, noise * precision)
+        except np.linalg.LinAlgError:
+            continue
+        cavity_precision = kernel.cavity()[2] / noise
+        if not (1.0 + largest[2] * cavity_precision[2] > 0.0):
+            break
+    else:
+        pytest.skip("no definite start with an improper doubleton cavity on this draw")
+    shift = np.zeros(variants)
+    profile = _new_profile()
+    got_precision, got_shift = double_loop_sites(dense, noise, design.T @ target, precision, shift, tilted, largest, 64, 10**9, profile)
+    assert calls["improper"] == 0 and profile["double_loop_reseeds"] >= 1
+    kernel = _Kernel(dense, noise * got_precision)
+    cavity_precision = kernel.cavity()[2] / noise
+    assert np.all(1.0 + largest * cavity_precision > 0.0)

@@ -795,6 +795,15 @@ def _loop_point(
     )
 
 
+def _positive_definite(design: _Design, noise: float, site_precision: F64Array) -> bool:
+    """Whether A' = Xp'Xp + sigma^2 diag(tau) is positive definite (the double loop's only condition on its start)."""
+    try:
+        _Kernel(design, noise * site_precision)
+    except np.linalg.LinAlgError:
+        return False
+    return True
+
+
 def _in_domain(
     design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted, largest_variance: F64Array
 ) -> bool:
@@ -889,13 +898,19 @@ def double_loop_sites(
     -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
     means the first Newton step, which takes at least half of Newton's model decrease (``_newton_step``), found no
     representable fraction with sufficient decrease: Phi is stationary there to its rounding, and with it the moment-matching equations,
-    whose solutions are EP's fixed points. Sites are never clipped. The start must lie in EP's domain (ValueError
-    otherwise: the prior's moment-matched sites always do)."""
+    whose solutions are EP's fixed points. Sites are never clipped.
+
+    No tilted law is ever evaluated outside EP's domain, so no FloatingPointError is reachable from it: q's own
+    cavities are evaluated (the fixed-point check) only when every one is proper; the inner problem's start is moved
+    into its domain when they are not (the inner problem is convex, so its minimizer does not depend on the start, and
+    the marginals' own sites, zero cavities with positive sites, are always inside it); every inner step is accepted
+    only at a point ``_loop_point`` finds in the domain (definite precision, proper inner cavities, finite moments).
+    The start's precision must be positive definite (ValueError otherwise: the prior's moment-matched sites are)."""
     precision = np.array(site_precision, dtype=np.float64, copy=True)
     shift = np.array(site_shift, dtype=np.float64, copy=True)
     size = precision.shape[0]
-    if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
-        raise ValueError("the EP double loop's start lies outside EP's domain")
+    if not _positive_definite(design, noise, precision):
+        raise ValueError("the EP double loop's start leaves the precision not positive definite")
     while True:
         profile["double_loop_outer"] += 1
         kernel = _Kernel(design, noise * precision)
@@ -903,22 +918,38 @@ def double_loop_sites(
         variances, _removed, cavity_scaled = kernel.cavity()
         variance = noise * variances
         cavity_precision = cavity_scaled / noise
-        log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
-        if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
-            raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
-        # The EP check (``_DenseFixedPoints._solve``): the undamped update's move in q's posterior metric.
-        target_precision = 1.0 / tilted_variance - cavity_precision
-        target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
-        # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
-        if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
-            return precision, shift
         marginal_precision, marginal_shift = 1.0 / variance, mean / variance
+        proper = 1.0 + largest_variance * cavity_precision > 0.0
+        if np.all(proper):
+            log_normalizer, tilted_mean, tilted_variance, _third, _fourth = tilted(cavity_precision, mean / variance - shift)
+            if not (np.all(tilted_variance > 0.0) and np.all(np.isfinite(tilted_mean))):
+                raise NoFixedPoint("a computed tilted variance is 0 at q's cavities: no finite EP site")
+            # The EP check (``_DenseFixedPoints._solve``): the undamped update's KL in nats.
+            target_precision = 1.0 / tilted_variance - cavity_precision
+            target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
+            if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
+                return precision, shift
+            reseeded = False
+        else:
+            # The outer step sets the frozen marginals to q's (CCCP), and q's own cavity 1/z - tau can then be improper
+            # (a tilted law can be wider than its cavity, so the inner optimum's marginals, the tilted moments at its
+            # proper inner cavities, need not leave 1/z - tau proper; fit-api rwAMR [real]). Such sites are no fixed
+            # point (every fixed point's cavities are proper) and are never evaluated; they only start the inner
+            # problem, whose convex minimizer does not depend on its start. The start is moved into its domain: the
+            # improper sites to the marginals' own (a zero cavity), and every site there if that leaves the precision
+            # not positive definite (all positive then, so it is definite, and every cavity is zero: in the domain).
+            profile["double_loop_reseeds"] += 1
+            precision, shift = precision.copy(), shift.copy()
+            precision[~proper], shift[~proper] = marginal_precision[~proper], marginal_shift[~proper]
+            if not _positive_definite(design, noise, precision):
+                precision, shift = marginal_precision.copy(), marginal_shift.copy()
+            reseeded = True
         point = _loop_point(design, noise, data_score, precision, shift, marginal_precision, marginal_shift, tilted, largest_variance)
         if point is None:
-            # The sites are in the domain (the start was checked, and every later outer step starts from an accepted
-            # inner point), so only the tilted moments at the new marginals' cavities can fail: a computed variance of 0
-            # (the engine's below-floor approximation), which no finite site matches.
-            raise NoFixedPoint("a computed tilted variance is 0 at q's marginals' cavities: no finite EP site")
+            # The start is in the inner domain (the precision is definite, and every inner cavity is either q's proper
+            # cavity or zero), so only a tilted moment can fail: a computed variance of 0 (the engine's below-floor
+            # approximation, N1), which no finite site matches.
+            raise NoFixedPoint("a computed tilted variance is 0 at the double loop's cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
         polish_decrement: float | None = None
         polish_origin = point
@@ -960,8 +991,9 @@ def double_loop_sites(
             point = accepted
             profile["double_loop_newton"] += 1
         precision, shift = point.site_precision, point.site_shift
-        if np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
-            # Phi stationary at q's own marginals to its rounding: EP's fixed point (see the docstring).
+        if not reseeded and np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
+            # Phi stationary at q's own marginals to its rounding, with q's cavities proper: EP's fixed point (see the
+            # docstring). A reseeded start is not q's own marginals, so its outer step is taken and checked afresh.
             profile["double_loop_stationary"] += 1
             return precision, shift
 
@@ -987,11 +1019,12 @@ def _best_double_loop(
     design: _Design, noise: float, data_score: F64Array, starts: Sequence[tuple[F64Array, F64Array]], tilted: Tilted, largest_variance: F64Array,
     draw_count: int, jvp_bytes: int, profile: dict,
 ) -> tuple[F64Array, F64Array]:
-    """The double loop from every start that lies in EP's domain, keeping the fixed point with the highest log Z_EP
-    (lead ruling: EP's fixed point is not unique in general, and the selection is by the evidence)."""
+    """The double loop from every start whose precision is positive definite (its only condition: an improper cavity
+    only reseeds the inner problem), keeping the fixed point with the highest log Z_EP (lead ruling: EP's fixed point
+    is not unique in general, and the selection is by the evidence)."""
     best: tuple[float, F64Array, F64Array] | None = None
     for precision, shift in starts:
-        if not _in_domain(design, noise, data_score, precision, shift, tilted, largest_variance):
+        if not _positive_definite(design, noise, precision):
             continue
         found = double_loop_sites(design, noise, data_score, precision, shift, tilted, largest_variance, draw_count, jvp_bytes, profile)
         evidence = _log_evidence(design, noise, data_score, found[0], found[1], tilted)
@@ -999,7 +1032,7 @@ def _best_double_loop(
         if best is None or evidence > best[0]:
             best = (evidence, found[0], found[1])
     if best is None:
-        raise NoFixedPoint("no start of the double loop lies in EP's domain (the moment-matched sites leave the precision singular)")
+        raise NoFixedPoint("no start of the double loop leaves the precision positive definite (the moment-matched sites leave it singular)")
     return best[1], best[2]
 
 
@@ -1010,7 +1043,7 @@ def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
         "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
-        "repairs", "repair_rounds", "repair_active_max",
+        "double_loop_reseeds", "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
