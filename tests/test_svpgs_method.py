@@ -6,6 +6,7 @@ The engine driver is the stub of tests/test_fit_model.py, so these tests pin the
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -227,15 +228,29 @@ def test_both_harnesses_load_the_method_file_their_own_way() -> None:
     path = Path(svpgs_method.__file__)
     assert callable(bench_real.load_method(f"{path}:fit_expression"))
     assert callable(bench_real.load_method(f"{path}:fit_expression_no_sv_terms"))
+    assert callable(bench_real.load_method(f"{path}:fit_expression_no_annotations"))
     assert callable(bench_sim.load_method(path).fit)
 
 
-def test_the_no_sv_terms_arm_withholds_the_sv_specific_prior_terms(driver: _StubDriver) -> None:
+@pytest.mark.parametrize(
+    ("arm", "annotations"),
+    [(svpgs_method.fit_expression_no_sv_terms, ["log1p_tss_distance"]), (svpgs_method.fit_expression_no_annotations, [])],
+)
+def test_the_ablation_arms_withhold_their_prior_terms_and_nothing_else(driver: _StubDriver, arm: Any, annotations: list[str]) -> None:
     train, test = _bench_real_train(np.random.default_rng(7))
-    predictor = svpgs_method.fit_expression_no_sv_terms(train)
-    table = driver.calls[0]["store"].variant_table
-    assert set(table.variant_class.tolist()) == {_CLASSES.index(VariantClass.SNV)}
-    assert sorted(table.annotations) == ["log1p_tss_distance"]
+    predictor = arm(train)
+    store: DosageStore = driver.calls[0]["store"]
+    table = store.variant_table
     order = np.argsort(train.variants.position, kind="stable")
-    np.testing.assert_array_equal(driver.calls[0]["store"].read_codes(0, _COLUMNS), (train.genotypes.T[order] * CODES_PER_DOSAGE).astype(np.uint8))
+    classes = [_CLASSES[code] for code in table.variant_class]
+    if arm is svpgs_method.fit_expression_no_annotations:
+        assert set(classes) == {VariantClass.SNV}
+    else:
+        # The small-variant rule on allele lengths: SNVs and indels keep their classes, and no SV type is read.
+        reference_length = train.variants.end - train.variants.position + 1
+        alternate_length = reference_length + train.variants.allele_length_change
+        assert classes == [_expected_class(1, ref_len, alt_len) for ref_len, alt_len in zip(reference_length[order], alternate_length[order])]
+        assert VariantClass.DUPLICATION not in classes and {VariantClass.SNV, VariantClass.DELETION, VariantClass.INSERTION} <= set(classes)
+    assert sorted(table.annotations) == annotations
+    np.testing.assert_array_equal(store.read_codes(0, _COLUMNS), (train.genotypes.T[order] * CODES_PER_DOSAGE).astype(np.uint8))
     assert predictor.predict(test).shape == (test.shape[0],)
