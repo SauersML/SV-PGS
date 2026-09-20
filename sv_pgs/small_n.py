@@ -1010,7 +1010,7 @@ def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
         "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
-        "repairs", "repair_active_max",
+        "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
     )}
@@ -1082,7 +1082,8 @@ class _DenseFixedPoints:
     def _refresh(self, hyperparameters: MixtureHyperparameters) -> tuple[F64Array, F64Array]:
         """The mean, the exact marginal variances and the cavity precisions at the current sites. Where the precision
         is not positive definite or a cavity's tilted law is not proper, the offending variants are solved back into
-        EP's domain by the double loop (``_repair``) rather than by halving negative sites: each halving costs a full
+        EP's domain by the double loop (``_repair``, growing the set while the rest's cavities leave it) rather than by
+        halving negative sites: each halving costs a full
         build, erases the step that led there and returns the same targets (theory-ep's fix (2): a cycle of 33
         halvings per refresh on svpgs-profiler's g3 [real]).
 
@@ -1093,7 +1094,8 @@ class _DenseFixedPoints:
         they underflow (bench-real chr22 gene 1 [real]: 7 negative sites halved past 1e-250 over 870 refactorizations
         while one column's cavity stayed at -9e-16, its rounding of 0)."""
         largest = self._largest_variances(hyperparameters)
-        repaired = False
+        members = self.design.members
+        offending = np.zeros(self.prior.variant_count, dtype=bool)
         while True:
             improper = None
             try:
@@ -1115,10 +1117,19 @@ class _DenseFixedPoints:
                 # Every site positive: A' is positive definite and every cavity precision non-negative, so this is
                 # Cholesky's own breakdown, not EP's domain.
                 raise NoFixedPoint(failure)
-            if repaired:
-                raise NoFixedPoint(f"{failure}, after the double loop solved the offending variants back into EP's domain")
-            self._repair(hyperparameters, negative if improper is None else negative | improper)
-            repaired = True
+            # A repaired set's new sites, negative ones included, couple into the rest, so a cavity there can leave the
+            # domain after a correct repair: A grows by it and is solved again (theory-ep). A only grows, so this ends;
+            # at A = every variant it is the whole problem's double loop, which reaches a fixed point in the domain (the
+            # EC existence argument, with the lattice's finite top), so a set that cannot grow is numerics.
+            grown = offending | negative | (improper if improper is not None else False)
+            grown = np.isin(members, np.unique(members[grown]))
+            if np.array_equal(grown, offending):
+                raise NoFixedPoint(f"{failure}, after the double loop solved every offending variant back into EP's domain")
+            if not np.any(offending):
+                self.profile["repairs"] += 1
+            offending = grown
+            self.profile["repair_rounds"] += 1
+            self._repair(hyperparameters, offending)
 
     def _repair(self, hyperparameters: MixtureHyperparameters, offending: F64Array) -> None:
         """Solve the ``offending`` variants (improper cavities, non-positive sites) and their tie groups, A, back into
@@ -1130,7 +1141,6 @@ class _DenseFixedPoints:
         and |A|-scale work, against a full build per halving."""
         members = self.design.members
         active = np.flatnonzero(np.isin(members, np.unique(members[np.flatnonzero(offending)])))
-        self.profile["repairs"] += 1
         self.profile["repair_active_max"] = max(self.profile["repair_active_max"], int(active.size))
         whitened, score = self._conditional_block(active, self.site_precision, self.site_shift)
         design, noise = _Design.dense(whitened), float(self.noise)

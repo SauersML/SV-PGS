@@ -701,5 +701,6 @@ def test_a_refresh_outside_eps_domain_is_repaired_by_the_double_loop_not_halved(
     variances, cavity_precision = oracle._refresh(start)
     largest = oracle._largest_variances(start)
     assert np.all(1.0 + largest * cavity_precision > 0.0)
-    assert oracle.profile["repairs"] == 1 and oracle.profile["double_loops"] == 1
+    assert oracle.profile["repairs"] == 1 and oracle.profile["repair_rounds"] >= 1
+    assert oracle.profile["double_loops"] == oracle.profile["repair_rounds"]
     assert np.all(np.isfinite(variances)) and np.all(variances > 0.0)
