@@ -95,7 +95,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
 | `tr_newton.py`, the binary code in `mixture_inference` (B6) | Logistic EP sites; owner not yet assigned |
 
 **Kept modules with no kept importer yet.** The engine is expected to import them; any still unused when their step comes are dead code and go in that step:
-- `anderson.py`: the EFS + Anderson hyper step. C5 deletes it only if it is still unused.
+- `anderson.py`: the EFS + Anderson hyper step. Deleted: the engine's outer step is Newton-B, and nothing imported it.
 - `prior_design.py`: the d_j design builders `_build_prior_design`, the feature specs, spline, factor and nested encoders, and `collapse_tie_groups`. The E functions above go.
 - `hyperprior_pooling.py`: cross-trait pooling of the level and θ.
 - `numeric.py` (`stable_sigmoid`, for logistic sites): C5 deletes it if still unused.
@@ -193,7 +193,7 @@ The engine lane is building a production variant-side inference module in `sv_pg
   - B6, for the binary files. If B6 is open, split: C5a takes everything except `tr_newton.py` and the binary helpers, and C5b takes those after logistic EP lands. `mixture_inference.py` then shrinks to its binary part in C5a.
 - **Delete:**
   - `mixture_inference.py` (13,147), `linear_solvers.py` (1,451), `tr_newton.py` (800), `elbo.py` (175), `forcing_sequence.py` (136), `precision_policy.py` (93), `inference.py` (35), `gpu_scheduler.py` (216);
-  - `numeric.py` (46) and `anderson.py` (127), only if the engine does not import them.
+  - `numeric.py` (46), only if the engine does not import it; `anderson.py` (127) is deleted (unused).
 - **Edit:**
   - `prior_design.py`: delete the E functions (B7);
   - `config.py`: none yet (C8).

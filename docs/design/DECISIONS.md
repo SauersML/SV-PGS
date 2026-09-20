@@ -18,7 +18,7 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 
 ## Model
 - **One model, one path; approximate stages are warm starts, certified on full data (SPEC).** Block mean field shifted β by 16% on a toy [sim-only]. Block-diagonal LD alone over-predicted 2.7× at p/n = 20 [semi-real: design-credit, 1kGP-based genotypes].
-- **Inference is EP-EB,** with a MacKay/EFS + Anderson hyper step, a trust region, warm-up, and a Newton-decrement + prediction-change certificate. Plain EM is never used.
+- **Inference is EP-EB,** with the outer step Newton on the total curvature B + S (lead ruling, 2026-09-19). Plain EP-EM is never used: its fixed-cavity M-step is not concave wherever A + S is indefinite. (speed-floor's 7-of-16 divergence measurement was withdrawn: its linearization point was not a fixed point.) Anderson acceleration was not adopted (`anderson.py` deleted).
 - **No joint multi-trait effect model.** The user: "we dont need multi-trait tbh". The unwired `pleiotropy_layer.py` (shared per-variant multiplier across traits) is deleted; it is recoverable from tag `archive/2026-09-19/old-path-final`. Cross-trait pooling of the prior's hyperparameters (level_c, θ) stays.
 - **Binary traits use a logistic link.** VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
 - **No hand-chosen priors; the effect prior's mixing density is learned (SPEC 9c57144).**
