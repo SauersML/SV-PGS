@@ -31,8 +31,8 @@ gamma_m = m u / (1 - m u) (Higham 2002, Accuracy and Stability of Numerical Algo
   beta = gamma_n ||R||_F / (sqrt(1 - delta) - gamma_n ||R||_F). Each inner product carries a further relative
   gamma_n.
 That bounds every q, c, core and d entry. The core terms go through the same argument on the small factor of
-core, with core >= its certified smallest eigenvalue. A core that isn't certifiably positive definite, or any
-bound that can't be established, raises NotCertified; nothing is guessed.
+core, with its smallest eigenvalue bounded below from that factor and its computed inverse. A core that isn't
+certifiably positive definite, or any bound that can't be established, raises NotCertified; nothing is guessed.
 """
 
 from __future__ import annotations
@@ -46,11 +46,12 @@ import scipy.linalg
 from numpy.typing import NDArray
 
 UNIT_ROUNDOFF = np.finfo(np.float64).eps / 2
-# Roundings in one product D_j xt_ij xt_kj as formed: sqrt(D_j), two scalings and the product, plus the
-# addition of the block's product into K (Higham 2002 section 3.1).
+# Roundings in one term D_j xt_ij xt_kj beyond the accumulation depth, which already counts the product and every
+# addition: D_j = 1 / Pi_j (its error enters each factor as a square root, so once), sqrt(D_j) (in both factors)
+# and the two scalings (Higham 2002 Lemma 3.1).
 FORMATION_ROUNDINGS = 5
-# Operations in D (1 - D v): the product D v, the difference and the final scaling.
-VARIANCE_OPERATIONS = 3
+# Roundings in D (1 - D v): D = 1 / Pi (which enters twice), the product D v, the difference and the scaling.
+VARIANCE_OPERATIONS = 5
 
 Blocks = Callable[[], Iterable[tuple[NDArray[np.int64], Any]]]
 
@@ -141,11 +142,13 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
 
     kernel = xp.eye(sample_count, dtype=xp.float64)
     column_norm = np.zeros(variant_count)
+    coverage = np.zeros(variant_count, dtype=np.int64)
     load, depth = 0.0, 0
     resolved_columns: list[NDArray[np.int64]] = []
     resolved_values: list[Any] = []
     for columns, block in blocks():
         columns = np.asarray(columns, dtype=np.int64)
+        np.add.at(coverage, columns, 1)
         block = xp.asarray(block, dtype=xp.float64)
         norms = _upper(to_host((block * block).sum(axis=0)), sample_count + 1)
         column_norm[columns] = np.sqrt(norms)
@@ -160,7 +163,7 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             resolved_columns.append(columns[~bulk])
             resolved_values.append(block[:, xp.asarray(np.flatnonzero(~bulk))])
     resolved_index = np.concatenate(resolved_columns) if resolved_columns else np.zeros(0, dtype=np.int64)
-    if not np.array_equal(np.sort(resolved_index), np.flatnonzero(resolved_mask)):
+    if not np.all(coverage == 1):
         raise ValueError("blocks() must cover every column exactly once")
 
     factor = cholesky(kernel)
@@ -179,16 +182,25 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
         core = gram + np.diag(precision[resolved_index])
         core_error = kernel_bounds.pair(resolved_x[:, None], resolved_x[None, :], resolved_u[:, None], resolved_u[None, :])
         core_error = core_error + UNIT_ROUNDOFF * np.abs(core)
-        core_error_norm = float(np.sqrt((core_error * core_error).sum()))
-        eigenvalues = np.linalg.eigvalsh(core)
-        core_frobenius = float(np.sqrt((core * core).sum()))
-        computed_smallest = float(eigenvalues[0]) - _gamma(resolved_count * resolved_count) * core_frobenius
-        true_smallest = computed_smallest - core_error_norm
-        if computed_smallest <= 0 or true_smallest <= 0:
-            raise NotCertified(f"core is not certifiably positive definite (smallest eigenvalue {eigenvalues[0]:.3g}, error {core_error_norm:.3g})")
-        core_factor = np.linalg.cholesky(core)
+        core_error_norm = float(np.sqrt(_upper(np.array([(core_error * core_error).sum()]), resolved_count * resolved_count)[0]))
+        try:
+            core_factor = np.linalg.cholesky(core)
+        except np.linalg.LinAlgError as error:
+            raise NotCertified("core is not positive definite in float64") from error
         core_frobenius_squared = float(_upper(np.array([(core_factor * core_factor).sum()]), resolved_count * resolved_count)[0])
         core_delta = _gamma(resolved_count + 1) * core_frobenius_squared
+        # lambda_min(core) from its own factor, not an eigensolver's unstated error constant: the computed inverse
+        # factor Z has L Z = I - G with ||G||_2 <= gamma_r ||L||_F ||Z||_F (Thm 8.5, column by column), so
+        # sigma_min(L) >= (1 - ||G||) / ||Z||_F, and core >= sigma_min(L)^2 - core_delta (Thm 10.3).
+        inverse_factor = scipy.linalg.solve_triangular(core_factor, np.eye(resolved_count), lower=True, check_finite=False)
+        inverse_frobenius = float(np.sqrt(_upper(np.array([(inverse_factor * inverse_factor).sum()]), resolved_count * resolved_count)[0]))
+        residual = _gamma(resolved_count) * np.sqrt(core_frobenius_squared) * inverse_frobenius
+        if residual >= 1:
+            raise NotCertified("the core's inverse factor cannot be bounded: the core is too ill-conditioned for float64")
+        computed_smallest = ((1 - residual) / inverse_frobenius) ** 2 - core_delta
+        true_smallest = computed_smallest - core_error_norm
+        if computed_smallest <= 0 or true_smallest <= 0:
+            raise NotCertified(f"core is not certifiably positive definite (smallest eigenvalue >= {computed_smallest:.3g}, error {core_error_norm:.3g})")
         core_bounds = _factor_bounds(core_delta, core_frobenius_squared, resolved_count, computed_smallest)
         true_core_inverse_norm = 1 / true_smallest
     else:
@@ -200,7 +212,7 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
         term = (solved * solved).sum(axis=0)
         cross_norm = np.sqrt(_upper((cross * cross).sum(axis=1), resolved_count))
         solved_norm = np.sqrt(_upper(term, resolved_count))
-        error_norm = np.sqrt((cross_error * cross_error).sum(axis=1))
+        error_norm = np.sqrt(_upper((cross_error * cross_error).sum(axis=1), resolved_count))
         rounding = core_bounds.pair(cross_norm, cross_norm, solved_norm, solved_norm)
         exact_norm = cross_norm + error_norm
         propagated = (core_bounds.inverse_norm * (cross_norm + exact_norm) * error_norm
@@ -224,8 +236,8 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             cross = to_host(solved.T @ solved_resolved)
             cross_error = kernel_bounds.pair(chosen_x[:, None], resolved_x[None, :], solved_norm[:, None], resolved_u[None, :])
             term, term_error = through_core(cross, cross_error)
+            quadratic_error = quadratic_error + term_error + UNIT_ROUNDOFF * (np.abs(quadratic) + np.abs(term))
             quadratic = quadratic - term
-            quadratic_error = quadratic_error + term_error
         variance = bulk_variance[chosen]
         values = variance * (1 - variance * quadratic)
         variances[chosen] = values
@@ -252,15 +264,14 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             solved_norm = np.sqrt(_upper(diagonal, sample_count))
             ones = np.ones(stop - start)
             error = kernel_bounds.pair(ones, ones, solved_norm, solved_norm)
-            value = 1 - diagonal
+            term = np.zeros_like(diagonal)
             if resolved_count:
                 cross = to_host(solved.T @ solved_resolved[start:])
                 cross_error = kernel_bounds.pair(ones[:, None], resolved_x[None, :], solved_norm[:, None], resolved_u[None, :])
                 term, term_error = through_core(cross, cross_error)
-                value = value + term
                 error = error + term_error
-            leverage_values[start:stop] = value
-            leverage_bound[start:stop] = error + _gamma(2) * (1 + diagonal + np.abs(value))
+            leverage_values[start:stop] = 1 - diagonal + term
+            leverage_bound[start:stop] = error + _gamma(2) * (1 + diagonal + np.abs(term))
     return ExactMarginals(variances=variances, variance_bound=variance_bound, leverages=leverage_values,
                           leverage_bound=leverage_bound, resolved=np.sort(resolved_index), factor_bound=delta)
 

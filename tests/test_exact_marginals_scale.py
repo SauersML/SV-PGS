@@ -40,7 +40,7 @@ def _problem(seed, samples, variants, negative=0, zero=0):
     chosen = generator.choice(variants, negative + zero, replace=False)
     precision[chosen[:zero]] = 0.0
     gram_diagonal = (design * design).sum(axis=0)
-    precision[chosen[zero:]] = -generator.uniform(0.05, 0.3, negative) * gram_diagonal[chosen[zero:]]
+    precision[chosen[zero:]] = -generator.uniform(0.005, 0.02, negative) * gram_diagonal[chosen[zero:]]
     return design, precision
 
 
