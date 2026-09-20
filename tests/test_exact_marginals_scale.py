@@ -73,6 +73,22 @@ def test_data_dominated_sites_stay_within_the_certificate():
     assert np.all(np.abs(result.bulk_diagonal - diagonal.astype(np.float64)) <= result.bulk_diagonal_bound)
 
 
+def test_the_kept_kernel_is_the_bulk_factor_its_resolved_solves_and_the_core():
+    design, precision = _problem(7, 35, 50, negative=2, zero=1)
+    named = np.array([4, 30])
+    result = exact_marginals(_blocks(design, [30, 20]), precision, design.shape[0], resolved=named, keep_kernel=True)
+    resolved = result.resolved
+    bulk = np.ones(precision.size, dtype=bool)
+    bulk[resolved] = False
+    kernel = np.eye(design.shape[0]) + (design[:, bulk] / precision[bulk]) @ design[:, bulk].T
+    solves = np.linalg.solve(kernel, design[:, resolved])
+    np.testing.assert_allclose(result.kernel.lower @ result.kernel.lower.T, kernel, rtol=0, atol=1e-12 * np.abs(kernel).max())
+    np.testing.assert_allclose(result.kernel.resolved_solves, solves, rtol=0, atol=1e-10 * np.abs(solves).max())
+    core = np.diag(precision[resolved]) + design[:, resolved].T @ solves
+    np.testing.assert_allclose(result.kernel.resolved_core, core, rtol=0, atol=1e-10 * np.abs(core).max())
+    assert not np.triu(result.kernel.lower, 1).any()
+
+
 def test_named_resolved_sites_give_the_same_marginals():
     design, precision = _problem(2, 40, 60)
     plain = exact_marginals(_blocks(design, [60]), precision, design.shape[0])

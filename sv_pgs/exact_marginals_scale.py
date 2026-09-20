@@ -72,6 +72,17 @@ class NotCertified(ArithmeticError):
 
 
 @dataclass(frozen=True)
+class KernelParts:
+    """The factored bulk kernel, for callers that keep it (marginal_variances.KernelFactor's fields): `lower` is R
+    with RR' = K_S, `resolved_solves` is K_S^-1 Xt_L (n x |L|) and `resolved_core` is Pi_L + Xt_L' K_S^-1 Xt_L,
+    both with the resolved sites in ExactMarginals.resolved order. `lower` and `resolved_solves` stay on the array
+    module's device; the core is on the host."""
+    lower: Any
+    resolved_solves: Any
+    resolved_core: NDArray[np.float64]
+
+
+@dataclass(frozen=True)
 class ExactMarginals:
     variances: NDArray[np.float64]
     variance_bound: NDArray[np.float64]
@@ -79,6 +90,7 @@ class ExactMarginals:
     bulk_diagonal_bound: NDArray[np.float64] | None
     resolved: NDArray[np.int64]
     factor_bound: float
+    kernel: KernelParts | None = None
 
 
 def _gamma(count: int) -> float:
@@ -139,6 +151,14 @@ class _Backend:
         import cupyx.scipy.linalg
 
         return cupyx.scipy.linalg.solve_triangular(factor, right, lower=True)
+
+    def backward(self, factor: Any, right: Any) -> Any:
+        """R'^-1 right."""
+        if self.on_host:
+            return scipy.linalg.solve_triangular(factor, right, lower=True, trans="T", check_finite=False)
+        import cupyx.scipy.linalg
+
+        return cupyx.scipy.linalg.solve_triangular(factor, right, lower=True, trans="T")
 
     def to_host(self, values: Any) -> Any:
         return values if self.on_host else self.xp.asnumpy(values)
@@ -202,11 +222,13 @@ def _factor_norm_squared(factor: Any, array_module: Any, to_host: Callable, widt
 
 def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count: int, *,
                     resolved: NDArray[np.int64] | None = None, bulk_diagonal: bool = False, array_module: Any = np,
-                    identity_block: int | None = None) -> ExactMarginals:
+                    identity_block: int | None = None, keep_kernel: bool = False) -> ExactMarginals:
     """diag(A^-1) (and, if asked, the bulk diagonal diag(K^-1)) with a certified rounding bound.
 
     blocks() must return a fresh iterable of (column indices, Xt[:, columns]) on every call: the columns are
     read twice. `resolved` names extra sites to eliminate through the core (non-positive sites always are).
+    `keep_kernel` also returns the factored kernel (KernelParts), at one more triangular solve of the resolved
+    columns (n^2 |L|); the factor then stays alive with the result.
     """
     xp = array_module
     backend = _Backend(xp)
@@ -349,8 +371,17 @@ def exact_marginals(blocks: Blocks, precision: NDArray[np.float64], sample_count
             ones = np.ones(stop - start)
             diagonal_values[start:stop] = diagonal
             diagonal_bound[start:stop] = kernel_bounds.pair(ones, ones, solved_norm, solved_norm)
+    kept = None
+    if keep_kernel:
+        order = np.argsort(resolved_index)
+        if resolved_count:
+            kept = KernelParts(lower=factor, resolved_solves=backend.backward(factor, solved_resolved)[:, xp.asarray(order)],
+                               resolved_core=core[np.ix_(order, order)])
+        else:
+            kept = KernelParts(lower=factor, resolved_solves=xp.zeros((sample_count, 0)), resolved_core=np.zeros((0, 0)))
     return ExactMarginals(variances=variances, variance_bound=variance_bound, bulk_diagonal=diagonal_values,
-                          bulk_diagonal_bound=diagonal_bound, resolved=np.sort(resolved_index), factor_bound=delta)
+                          bulk_diagonal_bound=diagonal_bound, resolved=np.sort(resolved_index), factor_bound=delta,
+                          kernel=kept)
 
 
 def exact_dual_cost(sample_count: int, variant_count: int, resolved_count: int = 0, *, bulk_diagonal: bool = False) -> dict[str, float]:
