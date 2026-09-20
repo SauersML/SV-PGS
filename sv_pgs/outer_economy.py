@@ -23,6 +23,13 @@ the resolved sites' columns. Their algebra lets most of them share reads:
    (read only by the next refresh) are dead weight, and a pass whose only use is the next site update needs its mean
    only to the forcing accuracy ``optimal_forcing`` derives. The exit is decided only on a pass solved to the
    certificate's own bound, so the exit rule, and everything after it, is ``full_data_fit``'s.
+6. **Frozen passes relaxed by their measured mode** (``relaxed_fraction``). With the cavity precisions P frozen, a pass
+   maps the cavity shifts h to h' = mu(h) (P + tau*(h)) - nu*(h), with the tilted targets tau* = 1/s^2 - P and
+   nu* = m/s^2 - h. Since dm/dh = s^2 and ds^2/dh = kappa_3, its Jacobian is
+       J = diag(P + tau) A^-1 diag(a) - diag(a),   a = kappa_3 (mu - m) / s^4,
+   which vanishes at the fixed point, where mu = m. So the undamped pass converges superlinearly there, and a damping
+   that only ever falls (the parent keeps the least fraction it has needed) turns that into a linear rate of 1 - f.
+   Instead each pass's fraction zeroes the dominant mode the last two passes measured, capped at the undamped step.
 
 Everything is exact algebra or a certified bound; no number is set by hand. ``fit_full_data`` is
 ``full_data_fit.fit_full_data`` with these, and returns the same ``FullDataFit``.
@@ -99,6 +106,23 @@ def optimal_forcing(contraction: float, rate: float, fixed_reads: float) -> floa
         else:
             high = middle
     return float(high)
+
+
+def relaxed_fraction(fraction: float, ratio: float, inner: float) -> float:
+    """The next frozen pass's step fraction from the last one's: item 6 of the module docstring.
+
+    Along a mode with eigenvalue lambda of the undamped pass, a pass of fraction f scales the error by 1 - f + f lambda,
+    so two consecutive full steps (each normalized by its fraction) have squared-size ratio ``ratio`` =
+    (1 - f + f lambda)^2, and their inner product ``inner`` has the sign of 1 - f + f lambda. That fixes lambda, and the
+    fraction 1 / (1 - lambda) zeroes the mode: f / (1 + sqrt(ratio)) for an oscillating mode (inner < 0), and
+    f / (1 - sqrt(ratio)) for a monotone contracting one. It is capped at the undamped EP step, the local optimum
+    (J = 0 at the fixed point). A monotone mode that does not contract (sqrt(ratio) >= 1) has no contracting fraction;
+    there the parent's rule, f / (1 + sqrt(ratio)), is kept.
+    """
+    root = float(np.sqrt(ratio))
+    if inner < 0.0 or root >= 1.0:
+        return min(1.0, fraction / (1.0 + root))
+    return min(1.0, fraction / (1.0 - root))
 
 
 @dataclass
@@ -626,12 +650,12 @@ class EconomicalFixedPoints(_FullDataFixedPoints):
         ]
 
     def _frozen_passes(self, hyperparameters: Sequence[MixtureHyperparameters], frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
-        """The parent's mean-only EP (full_data_fit's step 1c) with item 5: no probe columns, and every pass but the
-        ones that decide the exit solved to the forcing accuracy; the exit is tested only on a pass at the
-        certificate's own bound."""
+        """The parent's mean-only EP (full_data_fit's step 1c) with items 5 and 6: no probe columns, every pass but the
+        ones that decide the exit solved to the forcing accuracy, and each pass's fraction from the measured mode; the
+        exit is tested only on a pass at the certificate's own bound, with the parent's rule."""
         gaussian = self.gaussian
         model_count = gaussian.model_count
-        previous_move, damping = np.full(model_count, np.inf), 1.0
+        previous_move, previous_step, previous_fraction, damping = np.full(model_count, np.inf), None, 1.0, 1.0
         forcing = np.zeros(model_count)
         while True:
             mean = np.asarray(_host(gaussian.mean), dtype=np.float64).copy()
@@ -652,15 +676,23 @@ class EconomicalFixedPoints(_FullDataFixedPoints):
                     fraction *= 0.5
             self.site_precision, self.site_shift = trial_precision, trial_shift
             marginal = 1.0 / (frozen + self.site_precision)
-            mean_move = np.sum(np.square(_host(gaussian.mean) - mean) / marginal, axis=0) / (fraction * fraction)
+            # The full step this pass took a fraction of, in the frozen marginal metric.
+            step = (np.asarray(_host(gaussian.mean), dtype=np.float64) - mean) / fraction
+            mean_move = np.sum(np.square(step) / marginal, axis=0)
             exact = bool(np.all(loose <= np.sqrt(self.effective / self.draw_count)))
             if exact and np.all(mean_move <= self.effective / self.draw_count):
                 return
             ratio = mean_move / previous_move
-            if float(np.max(ratio)) >= 1.0:
-                damping = min(damping, 1.0 / (1.0 + np.sqrt(float(np.max(ratio)))))
+            if previous_step is None:
+                damping = fraction
+            else:
+                # The last two full steps straddle the previous pass, so its fraction is the one they measure. The model
+                # the pass contracts least decides the shared fraction (the parent's rule takes the worst too).
+                worst = int(np.argmax(np.where(np.isfinite(ratio), ratio, -np.inf)))
+                inner = float(np.sum(step[:, worst] * previous_step[:, worst] / marginal[:, worst]))
+                damping = relaxed_fraction(previous_fraction, float(ratio[worst]), inner)
             contraction = np.sqrt(np.where(np.isfinite(ratio), ratio, np.nan))
-            previous_move = mean_move
+            previous_move, previous_step, previous_fraction = mean_move, step, fraction
             # The next pass decides the exit when the move it predicts (rho^2 times this one) is below the threshold:
             # it is then solved to the certificate's bound; otherwise to the forcing accuracy.
             predicted = np.where(np.isfinite(contraction), contraction * contraction * mean_move, np.inf)

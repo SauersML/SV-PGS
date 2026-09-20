@@ -170,3 +170,67 @@ def test_a_saved_state_restores_the_solver_without_a_read() -> None:
     scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
     error = economy.posterior_solve(right, model, np.sqrt(EPS) * scale) - exact
     assert np.all(np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error)) <= np.sqrt(EPS) * scale + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
+
+
+def test_the_relaxed_fraction_zeroes_the_measured_mode() -> None:
+    for eigenvalue, fraction in ((-0.8, 1.0), (-3.0, 0.6), (0.3, 0.5), (0.9, 0.2)):
+        error = 1.7
+        step = (eigenvalue - 1.0) * error
+        error_next = (1.0 - fraction + fraction * eigenvalue) * error
+        step_next = (eigenvalue - 1.0) * error_next
+        relaxed = outer_economy.relaxed_fraction(fraction, step_next**2 / step**2, step * step_next)
+        optimum = 1.0 / (1.0 - eigenvalue)
+        assert abs(relaxed - min(1.0, optimum)) <= 8 * EPS
+        # The undamped step is the cap; below it the relaxed pass removes the mode exactly.
+        if optimum <= 1.0:
+            assert abs(1.0 - relaxed + relaxed * eigenvalue) <= 8 * EPS
+    # A monotone mode that does not contract keeps the parent's damping.
+    assert outer_economy.relaxed_fraction(0.5, 4.0, 1.0) == 0.5 / 3.0
+
+
+def test_the_frozen_cavity_pass_has_a_vanishing_jacobian_at_the_ep_fixed_point() -> None:
+    from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, initial_hyperparameters, moment_matched_prior_sites, scale_mixture_prior, site_targets, tilted_cumulants, tilted_moments
+    from tests.test_scale_mixture_ep import _WORKING_BYTES, _data, _dense_ep, _hyperparameters
+
+    generator = np.random.default_rng(45)
+    variant_count, sample_count = 30, 400
+    latent = generator.standard_normal((sample_count, variant_count))
+    for column in range(1, variant_count):
+        latent[:, column] = 0.6 * latent[:, column - 1] + 0.8 * latent[:, column]
+    genotypes = (latent - latent.mean(axis=0)) / latent.std(axis=0)
+    effects = np.where(generator.random(variant_count) < 0.3, generator.normal(0.0, 0.15, variant_count), 0.0)
+    targets = genotypes @ effects + generator.standard_normal(sample_count)
+    likelihood, linear = genotypes.T @ genotypes, genotypes.T @ targets
+    class_index, offset, design, groups, _cavity = _data(variant_count, 46)
+    nodes = np.linspace(np.log(1e-4), np.log(0.2), 8)
+    prior = scale_mixture_prior(class_index=class_index, log_variance_offset=offset, annotation_design=design, annotation_groups=groups, nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1])
+    coefficients = _hyperparameters(prior, 47).coefficients * 0.3 + initial_hyperparameters(prior).coefficients
+    hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    _sites, _covariance, cavity = _dense_ep(prior, coefficients, likelihood, linear, moment_matched_prior_sites(prior, hyperparameters))
+    frozen = cavity.precision
+
+    def parts(shift):
+        point = Cavity(precision=frozen, shift=shift)
+        moments = tilted_moments(prior, hyperparameters, point, _WORKING_BYTES)
+        precision, site_shift = site_targets(moments, point)
+        operator = likelihood + np.diag(precision)
+        mean = np.linalg.solve(operator, linear + site_shift)
+        return mean * (frozen + precision) - site_shift, moments, precision, operator, mean, point
+
+    def jacobian(shift, step):
+        return np.column_stack([(parts(shift + step * unit)[0] - parts(shift - step * unit)[0]) / (2 * step) for unit in np.eye(variant_count)])
+
+    fixed = cavity.shift
+    np.testing.assert_allclose(parts(fixed)[0], fixed, rtol=1e-9, atol=1e-9 * np.abs(fixed).max())
+    step = 1e-4 * max(1.0, float(np.abs(fixed).max()))
+    away = fixed + 0.5 * np.abs(fixed).max() * generator.standard_normal(variant_count)
+    at_fixed, at_away = jacobian(fixed, step), jacobian(away, step)
+    # The analytic Jacobian away from the fixed point, from the tilted third cumulant (outer_economy item 6).
+    _image, moments, precision, operator, mean, point = parts(away)
+    third, _fourth = tilted_cumulants(prior, hyperparameters, point, _WORKING_BYTES)
+    weight = third * (mean - moments.mean) / np.square(moments.variance)
+    analytic = (frozen + precision)[:, None] * np.linalg.solve(operator, np.diag(weight)) - np.diag(weight)
+    scale = float(np.abs(at_away).max())
+    assert scale > 1e-3
+    np.testing.assert_allclose(at_away, analytic, rtol=0.0, atol=1e-5 * scale)
+    assert float(np.abs(at_fixed).max()) <= 1e-5 * scale
