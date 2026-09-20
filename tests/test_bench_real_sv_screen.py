@@ -170,7 +170,7 @@ def test_ranking_orders_by_panel_sum_and_breaks_ties_by_the_sealed_gene_order():
     assert ranked["rank"].tolist() == [1, 2, 3, 4]
 
 
-def test_confirmation_genes_follow_the_sealed_hash_and_exclude_the_development_set():
+def test_confirmation_genes_follow_the_sealed_hash_and_exclude_every_scored_gene():
     genes = [f"ENSG{index:011d}.1" for index in range(4_000)]
     development = genes[:1_000]
     confirm = sv_screen.confirmation_genes(genes, development)

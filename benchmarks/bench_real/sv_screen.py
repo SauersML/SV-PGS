@@ -15,7 +15,9 @@ the leading SVs. Genes are ranked by the panel sum, ties broken by the sealed ge
 Outputs: screen_<version>.tsv (every column, one row per gene in rank order, with a `confirm` flag),
 sv_ranked_<version>.tsv (a `gene_id` column only, in rank order, without the confirmation genes, for the harness's
 gene-list option), confirm_genes_<version>.tsv (the sealed confirmation genes, used exactly once for the final
-confirmation), sv_proxies_<version>.tsv.gz (per SV), and SEALED.txt with the sha256 of all four.
+confirmation; also written to the dataset's sealed_confirmation_genes.tsv, which the harness enforces and which is
+never replaced), sv_proxies_<version>.tsv.gz (per SV), and SEALED.txt with the sha256 of each and of the
+already-scored gene list the confirmation set was drawn against.
 """
 import argparse
 import concurrent.futures
@@ -197,12 +199,13 @@ def gene_scores(genes, annotation, structural, radius=CIS_RADIUS_BP):
 
 
 CONFIRM_SALT = "bench-real/confirm/"
-CONFIRM_MODULUS = 4  # lead ruling: a quarter of the genes outside the fitted mr.ash prefix are sealed for confirmation
+CONFIRM_MODULUS = 4  # lead ruling: a quarter of the genes bench-real has never scored are sealed for confirmation
+SEALED_GENES = "sealed_confirmation_genes.tsv"  # the file bench-real's harness enforces (harness.SEALED_GENES)
 
 
-def confirmation_genes(gene_ids, development_genes):
-    """The sealed confirmation genes: outside the development set, int(sha256(salt + gene_id), 16) % modulus == 0."""
-    development = set(development_genes)
+def confirmation_genes(gene_ids, scored_genes):
+    """The sealed confirmation genes: never scored by any bench-real run, and int(sha256(salt + gene_id), 16) % modulus == 0."""
+    development = set(scored_genes)
     return np.array([gene not in development and int(hashlib.sha256((CONFIRM_SALT + gene).encode()).hexdigest(), 16) % CONFIRM_MODULUS == 0
                      for gene in gene_ids])
 
@@ -245,6 +248,7 @@ def main():
     parser.add_argument("--out", required=True)
     parser.add_argument("--workers", type=int, default=os.cpu_count())
     parser.add_argument("--version", default="v1")
+    parser.add_argument("--scored-genes", required=True, help="bench-real's reports/genes_already_scored.tsv (a gene_id column)")
     arguments = parser.parse_args()
     dataset_dir, out_dir = pathlib.Path(arguments.dataset), pathlib.Path(arguments.out)
     proxies_dir = out_dir / f"sv_proxies_{arguments.version}"
@@ -263,7 +267,9 @@ def main():
     ranked = rank_genes(gene_scores(genes, annotation, structural), gene_order)
     for prefix in FITTED_PREFIXES:
         ranked[f"in_prefix_{prefix}"] = ranked["gene_order_index"] < prefix
-    ranked["confirm"] = confirmation_genes(ranked["gene_id"], gene_order[:min(FITTED_PREFIXES)])
+    scored = pd.read_csv(arguments.scored_genes, sep="\t")["gene_id"]
+    ranked["already_scored"] = ranked["gene_id"].isin(set(scored))
+    ranked["confirm"] = confirmation_genes(ranked["gene_id"], scored)
     screen = out_dir / f"screen_{arguments.version}.tsv"
     ranked_list = out_dir / f"sv_ranked_{arguments.version}.tsv"
     table = out_dir / f"sv_proxies_{arguments.version}.tsv.gz"
@@ -271,8 +277,17 @@ def main():
     confirm_list = out_dir / f"confirm_genes_{arguments.version}.tsv"
     ranked.loc[~ranked["confirm"], ["gene_id"]].to_csv(ranked_list, sep="\t", index=False)
     ranked.loc[ranked["confirm"], ["gene_id"]].sort_values("gene_id").to_csv(confirm_list, sep="\t", index=False)
+    sealed = dataset_dir / SEALED_GENES
+    if sealed.exists() and sealed.read_bytes() != confirm_list.read_bytes():
+        raise RuntimeError(f"{sealed} already holds a different confirmation set; it is never replaced")
+    if not sealed.exists():
+        partial = sealed.with_name(f".{sealed.name}.partial")
+        partial.write_bytes(confirm_list.read_bytes())
+        partial.replace(sealed)
     structural.to_csv(table, sep="\t", index=False)
-    (out_dir / "SEALED.txt").write_text("".join(f"{_sha256(path)}  {path.name}\n" for path in (screen, ranked_list, confirm_list, table)))
+    (out_dir / "SEALED.txt").write_text("".join(f"{_sha256(path)}  {path.name}\n" for path in (screen, ranked_list, confirm_list, table))
+                                        + f"{_sha256(sealed)}  {sealed} (the harness copy of {confirm_list.name})\n"
+                                        + f"{_sha256(pathlib.Path(arguments.scored_genes))}  {arguments.scored_genes} (input: genes already scored)\n")
     print((out_dir / "SEALED.txt").read_text(), flush=True)
 
 
