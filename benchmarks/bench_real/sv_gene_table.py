@@ -117,7 +117,13 @@ def gene_row(gene_id):
     for split_name, split_effects in effects.groupby("split"):
         test_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["test"]])
         columns = split_effects["window_row"].to_numpy()
-        contributions = (window.genotypes[np.ix_(test_index, columns)].astype(np.float64) - split_effects["train_mean"].to_numpy()) * split_effects["effect"].to_numpy()
+        # SV j's part of the score as the harness scores it (predict_for_truth): effect_j times the test genotype minus its
+        # training OLS fit on [1, covariates], applied to the test covariates.
+        train_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["train"]])
+        design_train = np.column_stack([np.ones(len(train_index)), dataset.covariates[train_index]])
+        design_test = np.column_stack([np.ones(len(test_index)), dataset.covariates[test_index]])
+        fitted, *_ = np.linalg.lstsq(design_train, window.genotypes[np.ix_(train_index, columns)].astype(np.float64), rcond=None)
+        contributions = (window.genotypes[np.ix_(test_index, columns)].astype(np.float64) - design_test @ fitted) * split_effects["effect"].to_numpy()
         full = np.zeros((len(test_index), len(rows)))
         full[:, [position_of[row] for row in columns]] = contributions
         full -= full.mean(axis=0)

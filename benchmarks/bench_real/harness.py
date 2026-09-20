@@ -12,6 +12,11 @@ passes only test genotypes to ``predict``. Test phenotypes are read only when sc
 
 Phenotype: MAGE inverse-normal TMM expression, residualized on the MAGE eQTL covariates (sex, 5 genotype PCs,
 60 PEER factors) by OLS fitted on the training samples only; test phenotypes are adjusted with the training fit.
+Covariates are fixed effects for every method: TrainData.covariates carries the training rows (a predictor whose
+predict accepts ``covariates`` receives the test rows), and every method's score is compared with the truth by one
+rule, predict_for_truth: the score is residualized on [1, covariates] with training OLS coefficients, as the truth is.
+MAGE computed the PEER factors from all 731 samples' expression, held-out samples included. That is unsupervised,
+shared by every method, and not a per-method leak, but the held-out expression did shape one covariate set.
 Target gene: GENCODE v38 gene body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 Genotypes: alternate-allele counts 0/1/2 from the 1kGP phased panel; variants monomorphic in the training samples
 are dropped. Window: the variant interval overlaps TSS +/- 1 Mb, the cis window of MAGE's own mapping and of
@@ -20,6 +25,7 @@ GTEx (GTEx Consortium 2020, Science 369:1318).
 import dataclasses
 import hashlib
 import importlib.util
+import inspect
 import json
 import subprocess
 import os
@@ -35,6 +41,8 @@ SEALED_GENES = "sealed_confirmation_genes.tsv"
 PARENT_DATASET = "parent_dataset.txt"
 # Per-row measurement-quality columns; a source without one of them gets 1.0 there (a direct call).
 MEASUREMENT_COLUMNS = ("reliability", "concordance", "called_r2")
+# Recorded in run.json: how a score is compared with the truth (predict_for_truth). Results without it are "pre-C2".
+PREDICTION_RULE = "C2: score residualized on [1, covariates] by training OLS, as the truth is"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
                 "svimp", "snv_svimp", "ctyper", "snv_ctyper", "hprc2", "snv_hprc2")
@@ -93,6 +101,9 @@ class TrainData:
     strand: str
     exons: np.ndarray
     coding_exons: np.ndarray
+    # The training rows of the covariates the phenotype was residualized on (sex, 5 genotype PCs, 60 PEER factors;
+    # dataset/covariate_names.tsv), without the intercept. phenotype is already orthogonal to [1, covariates].
+    covariates: np.ndarray = None
 
 
 class _StackedDosage:
@@ -353,7 +364,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     train = TrainData(gene_id=window.gene_id, chrom=window.chrom, tss=window.tss, genotypes=train_genotypes, phenotype=train_phenotype, variants=variants,
                       superpopulation=samples["Superpopulation"].to_numpy()[train_index], population=samples["Population"].to_numpy()[train_index],
                       gene_start=gene["start"], gene_end=gene["end"], strand=gene["strand"],
-                      exons=np.array(gene["exons"], dtype=np.int64).reshape(-1, 2), coding_exons=np.array(gene["coding_exons"], dtype=np.int64).reshape(-1, 2))
+                      exons=np.array(gene["exons"], dtype=np.int64).reshape(-1, 2), coding_exons=np.array(gene["coding_exons"], dtype=np.int64).reshape(-1, 2),
+                      covariates=np.asarray(dataset.covariates[train_index], dtype=np.float64))
     return train, test_genotypes, test_phenotype, test_index
 
 
@@ -458,6 +470,36 @@ def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
     return masked
 
 
+def _call_predict(predictor, genotypes, covariates):
+    """predictor.predict(genotypes), passing the samples' covariates too when the predictor accepts them."""
+    if "covariates" in inspect.signature(predictor.predict).parameters:
+        return np.asarray(predictor.predict(genotypes, covariates=covariates), dtype=np.float64)
+    return np.asarray(predictor.predict(genotypes), dtype=np.float64)
+
+
+def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, test_covariates: np.ndarray):
+    """The held-out predictions scored against the truth, full and with the SV columns held at their training means.
+
+    The truth is the test expression minus [1, C_test] a, with a the training OLS coefficients of expression on
+    [1, C] (residualize). Under the fixed-effects model y = [1, C] g + X b + e, a estimates g + B b, where B is the
+    training OLS of the genotypes on [1, C], so the truth's genetic part is (X_test - [1, C_test] B) b. The harness
+    therefore treats every method's score the way it treats the truth: it fits the score on [1, C] over the training
+    samples and removes [1, C_test] times those coefficients from the test score. For a linear score X b this gives
+    exactly (X_test - [1, C_test] B) b, whatever b is; for a score already orthogonal to [1, C] in training it changes
+    nothing. One rule for every method (review-mathbugs C2)."""
+    design_train = np.column_stack([np.ones(train.genotypes.shape[0]), train.covariates])
+    design_test = np.column_stack([np.ones(test_genotypes.shape[0]), test_covariates])
+
+    def adjusted(train_genotypes, genotypes):
+        coefficients, *_ = np.linalg.lstsq(design_train, _call_predict(predictor, train_genotypes, train.covariates), rcond=None)
+        return _call_predict(predictor, genotypes, test_covariates) - design_test @ coefficients
+
+    prediction = adjusted(train.genotypes, test_genotypes)
+    if not train.variants.is_sv.any():
+        return prediction, prediction
+    return prediction, adjusted(_without_structural_variants(train, train.genotypes), _without_structural_variants(train, test_genotypes))
+
+
 def _run_gene(arguments):
     gene_row, split_names = arguments
     dataset, fit = _WORKER["dataset"], _WORKER["fit"]
@@ -469,9 +511,8 @@ def _run_gene(arguments):
             train, test_genotypes = subset(train_all, test_all, feature_set, split_name)
             started = time.process_time()
             predictor = fit(train)
-            prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
             seconds = time.process_time() - started
-            without_sv = np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64) if train.variants.is_sv.any() else prediction
+            prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
             results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds,
                             sv_coefficients(train, predictor, window.gene_id, split_name, feature_set)))
     return results
@@ -564,9 +605,7 @@ def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
         seen.add(key)
         seconds = (time.process_time() - started) / len(views)
         train, test_genotypes, test_phenotype, test_index = views._task(key)
-        prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
-        without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
-                      if train.variants.is_sv.any() else prediction)
+        prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
         yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
                int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]))
     if len(seen) != len(views):
@@ -584,9 +623,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 raise ValueError(f"fit_batch returned {len(predictors)} predictors for {len(gene_rows)} genes")
             for index, (gene_row, predictor) in enumerate(zip(gene_rows, predictors)):
                 train, test_genotypes, test_phenotype, test_index = trains._task(index)
-                prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
-                without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
-                              if train.variants.is_sv.any() else prediction)
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index])
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
                        int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set))
 
@@ -643,7 +680,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "splits": split_names,
+        "genes": len(gene_rows), "contract": contract, "splits": split_names, "prediction_rule": PREDICTION_RULE,
         "rows_dirs": [{"dir": str(path), "provenance_sha256": hashlib.sha256((path / "PROVENANCE.json").read_bytes()).hexdigest()
                        if (path / "PROVENANCE.json").exists() else None} for path in dataset.rows_dirs],
         "sample_subset": str(sample_subset) if sample_subset is not None else None,

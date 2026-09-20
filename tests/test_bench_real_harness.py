@@ -508,3 +508,49 @@ def test_sample_subset_cuts_every_split_and_refuses_placeholders(tmp_path):
         assert "placeholder" in str(error)
     else:
         raise AssertionError("a negative placeholder read for a split sample must be refused")
+
+
+def test_scores_are_residualized_on_the_covariates_like_the_truth():
+    generator = np.random.default_rng(9)
+    train_count, test_count, variant_count, covariate_count = 80, 30, 6, 3
+    covariates = generator.normal(size=(train_count + test_count, covariate_count))
+    genotypes = (generator.binomial(2, 0.4, size=(train_count + test_count, variant_count)) + covariates[:, :1] > 1).astype(np.float64)
+    effects = generator.normal(size=variant_count)
+    is_sv = np.array([False, True, False, False, True, False])
+    train = harness.TrainData(gene_id="g", chrom="chr1", tss=0, genotypes=genotypes[:train_count], phenotype=np.zeros(train_count),
+                              variants=synthetic_variants(is_sv, ["panel"] * variant_count), superpopulation=np.array(["EUR"] * train_count),
+                              population=np.array(["CEU"] * train_count), gene_start=0, gene_end=0, strand="+", exons=np.zeros((0, 2), dtype=np.int64),
+                              coding_exons=np.zeros((0, 2), dtype=np.int64), covariates=covariates[:train_count])
+    prediction, without_sv = harness.predict_for_truth(baselines.LinearPredictor(0.7, effects), train, genotypes[train_count:], covariates[train_count:])
+    design_train = np.column_stack([np.ones(train_count), covariates[:train_count]])
+    design_test = np.column_stack([np.ones(test_count), covariates[train_count:]])
+    fitted, *_ = np.linalg.lstsq(design_train, genotypes[:train_count], rcond=None)
+    expected = (genotypes[train_count:] - design_test @ fitted) @ effects
+    tolerance = 1e3 * EPSILON * np.abs(genotypes).max() * np.abs(effects).sum()
+    assert np.allclose(prediction, expected, rtol=0, atol=tolerance)
+    assert np.allclose(prediction - without_sv, (genotypes[train_count:, is_sv] - design_test @ fitted[:, is_sv]) @ effects[is_sv], rtol=0, atol=tolerance)
+
+    class Projected:
+        """A predictor that already projects its genotypes on the covariates: the harness rule leaves it unchanged."""
+
+        def predict(self, genotypes, covariates):
+            design = np.column_stack([np.ones(len(genotypes)), covariates])
+            return (genotypes - design @ fitted) @ effects
+
+    again, _ = harness.predict_for_truth(Projected(), train, genotypes[train_count:], covariates[train_count:])
+    assert np.allclose(again, expected, rtol=0, atol=tolerance)
+
+
+def test_covariate_projected_genotypes_are_orthogonal_to_the_covariates():
+    generator = np.random.default_rng(10)
+    covariates = generator.normal(size=(50, 4))
+    genotypes = generator.binomial(2, 0.3, size=(50, 7)).astype(np.float64)
+
+    class Train:
+        pass
+
+    train = Train()
+    train.covariates = covariates
+    projected = baselines.covariate_projected(train, genotypes)
+    design = np.column_stack([np.ones(50), covariates])
+    assert np.abs(design.T @ projected).max() <= 1e3 * EPSILON * np.abs(genotypes).sum()

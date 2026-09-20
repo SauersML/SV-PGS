@@ -38,17 +38,28 @@ class ZeroPredictor:
         return np.full(genotypes.shape[0], self.level)
 
 
+def covariate_projected(train, genotypes):
+    """The training genotypes with [1, covariates] projected out (Frisch-Waugh-Lovell): fitting effects on these and
+    the phenotype (already orthogonal to [1, covariates]) is least squares with the covariates as fixed effects. Without
+    covariates it is centring. The harness applies the matching test-side projection to every score (predict_for_truth)."""
+    covariates = getattr(train, "covariates", None)
+    design = np.ones((genotypes.shape[0], 1)) if covariates is None else np.column_stack([np.ones(genotypes.shape[0]), covariates])
+    coefficients, *_ = np.linalg.lstsq(design, genotypes, rcond=None)
+    return genotypes - design @ coefficients
+
+
 def top_variant(train):
     genotypes = np.asarray(train.genotypes, dtype=np.float64)
     phenotype = train.phenotype
     if genotypes.shape[1] == 0:
         return ZeroPredictor(phenotype.mean())
-    centered = genotypes - genotypes.mean(axis=0)
+    if not np.all(genotypes.var(axis=0) > 0):
+        raise ValueError("top_variant needs every column to vary in the training samples")
+    centered = covariate_projected(train, genotypes)
     centered_phenotype = phenotype - phenotype.mean()
     squared_norms = (centered ** 2).sum(axis=0)
-    if not np.all(squared_norms > 0):
-        raise ValueError("top_variant needs every column to vary in the training samples")
-    correlation = (centered.T @ centered_phenotype) / np.sqrt(squared_norms * (centered_phenotype ** 2).sum())
+    correlation = np.divide(centered.T @ centered_phenotype, np.sqrt(squared_norms * (centered_phenotype ** 2).sum()),
+                            out=np.zeros(genotypes.shape[1]), where=squared_norms > 0)
     best = int(np.argmax(np.abs(correlation)))
     slope = (centered[:, best] @ centered_phenotype) / (centered[:, best] @ centered[:, best])
     coefficients = np.zeros(genotypes.shape[1])
@@ -196,7 +207,8 @@ def mr_ash(train):
     if variant_count == 0:
         return ZeroPredictor(phenotype.mean())
     center = genotypes.mean(axis=0)
-    design = np.ascontiguousarray(genotypes - center)
+    # Covariates as in mr.ash.alpha's remove_covariate for a multi-column Z: X and y projected on [1, Z] (y already is).
+    design = np.ascontiguousarray(covariate_projected(train, genotypes))
     response = phenotype - phenotype.mean()
     squared_norms = (design ** 2).sum(axis=0)
     prior_variances = (2.0 ** (np.arange(MR_ASH_GRID_SIZE) / MR_ASH_GRID_SIZE) - 1.0) ** 2 / np.median(squared_norms) * sample_count
