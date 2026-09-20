@@ -229,7 +229,7 @@ def _chromosome_proxies(arguments):
             table["source"] = "panel"
         dosage = np.load(dataset_dir / f"chr{number}.dosage.npy", mmap_mode="r")
         partial = target.with_name(f".{target.name}.partial")
-        sv_proxies(chrom, table, dosage, worker_bytes=worker_bytes).to_csv(partial, sep="\t", index=False)
+        sv_proxies(chrom, table, dosage, worker_bytes=worker_bytes).to_csv(partial, sep="\t", index=False, compression="gzip")
         partial.replace(target)
     return chrom
 
