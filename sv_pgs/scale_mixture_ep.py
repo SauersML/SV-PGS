@@ -103,6 +103,7 @@ import numpy as np
 from scipy.integrate import quad
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
+from scipy.optimize import brentq
 from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import erfcx
 
@@ -121,9 +122,6 @@ ROUGHNESS_ORDER = 3
 _ROW_INTERMEDIATES = 20
 # QUADPACK's relative accuracy is bounded below by 50 eps (scipy.integrate.quad raises under it).
 _QUADPACK_RELATIVE_FLOOR = 50.0 * _EPSILON
-# The degree in t of the Tierney-Kadane expansion of a standardized line integrand's ratio to its Gaussian, through
-# the O(1) term: 1 + k3 t^3 / 6 + k4 t^4 / 24 + k3^2 t^6 / 72.
-_TIERNEY_KADANE_DEGREE = 6
 
 
 @dataclass(frozen=True)
@@ -297,7 +295,9 @@ def derived_lattice(single_precision: F64Array, single_shift: F64Array, log_scal
     floor = kernel_floor(single_precision, single_shift, log_scale_values, tolerance)
     top = kernel_top(single_precision, single_shift, log_scale_values, floor)
     spacing = spacing_bound(float(np.asarray(single_precision).shape[0]), tolerance)
-    width = max(top - floor, spacing)
+    # Where no effect clears the noise the kernel range is empty (floor = top), and the lattice still needs more
+    # nodes than the roughness order to carry a density: half the order in spacings on each side gives order + 1.
+    width = max(top - floor, 0.5 * ROUGHNESS_ORDER * spacing)
     return np.arange(floor - width, top + width + spacing, spacing), floor, top
 
 
@@ -436,12 +436,33 @@ def scale_mixture_prior(
     )
 
 
-def initial_hyperparameters(prior: ScaleMixturePrior) -> MixtureHyperparameters:
-    """A start, not a prior: every class at the log-normal centred on the lattice whose density at the lattice's
-    ends is eps of its peak; no deviation or annotation effect; unit penalty weights."""
+def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | None = None) -> MixtureHyperparameters:
+    """A start, not a prior: every class at one log-normal on the lattice, of the width whose density at the lattice's
+    ends is eps of its peak when it is centred; no deviation or annotation effect; unit penalty weights.
+
+    It is centred on the lattice unless ``mean_variance`` is given: the start's mean of e^t over the lattice, so that
+    every prior variance E[beta_j^2] starts at mean_variance u_j (``moment_start``). The centre then moves along the
+    lattice until the lattice mean equals it (the mean rises with the centre), or stops at the lattice's end nearer a
+    target beyond its reach. The start only moves the fit's first iterate, never its certified answer.
+    """
     nodes = prior.log_variance_grid
-    centre = 0.5 * (nodes[0] + nodes[-1])
     width = 0.5 * (nodes[-1] - nodes[0]) / np.sqrt(2.0 * np.log(1.0 / _EPSILON))
+
+    def log_mean(centre: float) -> float:
+        quadratic = -0.5 * np.square((nodes - centre) / width)
+        return float(_log_sum_exp(quadratic + nodes, axis=0) - _log_sum_exp(quadratic, axis=0))
+
+    centre = 0.5 * (nodes[0] + nodes[-1])
+    if mean_variance is not None:
+        if not mean_variance > 0.0:
+            raise ValueError("mean_variance must be positive")
+        target = float(np.log(mean_variance))
+        if log_mean(float(nodes[0])) >= target:
+            centre = float(nodes[0])
+        elif log_mean(float(nodes[-1])) <= target:
+            centre = float(nodes[-1])
+        else:
+            centre = float(brentq(lambda value: log_mean(value) - target, float(nodes[0]), float(nodes[-1])))
     quadratic = -0.5 * np.square((nodes - centre) / width)
     coefficients = np.zeros(prior.coefficient_size)
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
@@ -459,6 +480,56 @@ def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Arra
     with np.errstate(divide="ignore"):
         total = np.log(np.sum(shifted, axis=axis, keepdims=True)) + shift
     return total if keepdims else np.squeeze(total, axis=axis)
+
+
+@dataclass(frozen=True)
+class MomentStart:
+    """Where EB starts on a trait: its phenotypic variance split into genetic and noise parts.
+
+    ``heritability`` is the share of y's residual variance (after the covariates) the start gives the genotypes,
+    ``genetic_variance`` and ``noise`` its two parts per sample, and ``mean_variance`` the start's mean of e^t, so
+    that every E[beta_j^2] starts at mean_variance u_j (``initial_hyperparameters``); ``resolution`` is the moment
+    estimate's standard error under no signal.
+    """
+
+    heritability: float
+    genetic_variance: float
+    noise: float
+    mean_variance: float
+    resolution: float
+
+
+def moment_start(
+    *, target_square: float, residual_dimension: float, score_square: float, gram_trace: float, weighted_diagonal: float, weighted_square: float, gram_square: float
+) -> MomentStart:
+    """The EB start from Haseman-Elston moments: the genetic variance can never exceed the phenotypic.
+
+    With y (after the covariates, in r = n - k dimensions) = X beta + e, beta_j independent with variance c u_j and
+    e ~ N(0, sigma^2 I), and G = X'X, the two moments are exact for a fixed design:
+        E[y'y]       = sigma^2 r      + c sum_j u_j G_jj           (``target_square``, ``weighted_diagonal``)
+        E[||X'y||^2] = sigma^2 tr G   + c sum_j u_j ||G e_j||^2    (``score_square``, ``gram_trace``, ``weighted_square``).
+    The first is held exactly, V_y = y'y / r = sigma^2 + c sum_j u_j G_jj / r, so the split always satisfies the
+    variance bound; the second then gives the heritability h^2 = c sum_j u_j G_jj / y'y. Under no signal ||X'y||^2
+    has variance 2 sigma^4 ||G||_F^2 (``gram_square``), which makes h^2's standard error the resolution s: the start
+    stays inside [s, 1 - s], at one resolution from either end the data cannot tell apart from it. Where the moments
+    cannot place h^2 at all (s >= 1/2, or no curvature between the two moments), it is 1/2: the minimax point of the
+    feasible interval [0, 1], the start whose largest distance to any heritability the data allow is least.
+    """
+    total = target_square / residual_dimension
+    denominator = target_square * weighted_square / weighted_diagonal - total * gram_trace
+    if denominator > 0.0:
+        resolution = float(np.sqrt(2.0 * gram_square) * total / denominator)
+        estimate = (score_square - total * gram_trace) / denominator
+    else:
+        resolution, estimate = np.inf, 0.5
+    heritability = 0.5 if resolution >= 0.5 else float(np.clip(estimate, resolution, 1.0 - resolution))
+    return MomentStart(
+        heritability=heritability,
+        genetic_variance=heritability * total,
+        noise=(1.0 - heritability) * total,
+        mean_variance=heritability * target_square / weighted_diagonal,
+        resolution=resolution,
+    )
 
 
 def _density_and_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[F64Array, F64Array]:
@@ -910,14 +981,18 @@ class GaussianPosterior:
 
     ``linear_response(left, right, diagonal, weight, B)``, when a posterior can give it, is the exact solution X of
     (I - (I - diag(weight) (Sigma o Sigma)) (diag(left) Sigma diag(right) + diag(diagonal))) X = B: the linear response
-    ``_total_curvature`` otherwise finds by GMRES (the small-n route factors this p x p matrix once)."""
+    ``_total_curvature`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once)."""
 
     solve: Callable[[F64Array, float], F64Array]
     variance_jvp: Callable[[F64Array], F64Array]
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
 
 
-@dataclass(frozen=True)
+class LinearResponseError(RuntimeError):
+    """B's linear response could not be solved to its tolerance. Not a FloatingPointError: the outer loop reads those
+    as "no certified maximum here" and steps on; without B the fit cannot be certified at all."""
+
+
 class CurvatureCorrection:
     """C = B - A at an EP fixed point: the total curvature's EP-response part, in the full prior's x coordinates.
 
@@ -926,17 +1001,69 @@ class CurvatureCorrection:
     exactly, which is where the certificate is taken; elsewhere it is B to first order in x_rho - x_k, as A is. A
     view's coordinates are x = K x_view with M_view = M K, so the correction there is K' C K. For independent effects
     (normal means) the cavities do not move with the prior, so C = 0 (``INDEPENDENT_EFFECTS``).
+
+    Either given whole (``coefficient_map`` and ``matrix``), or formed only where it is asked (``columns``, from
+    ``curvature_correction``): B's linear response is solved for the directions of the views asked for, starting
+    with the free coefficients of the current edges, and extended by the new directions when a view releases an
+    edge (lead ruling: the response on d_free directions, not all D).
     """
 
-    coefficient_map: F64Array | None = None
-    matrix: F64Array | None = None
+    def __init__(
+        self,
+        coefficient_map: F64Array | None = None,
+        matrix: F64Array | None = None,
+        *,
+        mapping: F64Array | None = None,
+        columns: Callable[[F64Array], F64Array] | None = None,
+        fixed_curvature: F64Array | None = None,
+    ) -> None:
+        self.coefficient_map = coefficient_map
+        self.matrix = matrix
+        self._mapping = mapping
+        self._columns = columns
+        self._fixed = fixed_curvature
+        # An orthonormal basis Q (x coordinates) of the directions solved so far, and B_z M Q.
+        self._basis: F64Array | None = None
+        self._total: F64Array | None = None
+
+    @property
+    def solved_directions(self) -> int:
+        """How many directions B's linear response has been solved for (lazy corrections only)."""
+        return 0 if self._basis is None else int(self._basis.shape[1])
 
     def on(self, coefficient_map: F64Array) -> F64Array:
         size = int(coefficient_map.shape[1])
+        if self._columns is not None:
+            return self._lazy(coefficient_map)
         if self.matrix is None or self.coefficient_map is None:
             return np.zeros((size, size))
         basis = np.linalg.lstsq(self.coefficient_map, coefficient_map, rcond=None)[0]
         return basis.T @ self.matrix @ basis
+
+    def _lazy(self, coefficient_map: F64Array) -> F64Array:
+        mapping, columns, fixed = self._mapping, self._columns, self._fixed
+        assert mapping is not None and columns is not None and fixed is not None
+        view = np.linalg.lstsq(mapping, coefficient_map, rcond=None)[0]
+        if view.shape[1] == 0:
+            return np.zeros((0, 0))
+        if self._basis is None:
+            missing = view
+        else:
+            missing = view - self._basis @ (self._basis.T @ view)
+        # A direction is new when the view has a part outside the solved span beyond the span's own rounding.
+        values, vectors = np.linalg.eigh(missing.T @ missing)
+        new = values > _EPSILON * view.shape[0] * max(float(np.max(np.linalg.eigvalsh(view.T @ view))), np.finfo(np.float64).tiny)
+        if np.any(new):
+            added = missing @ vectors[:, new] / np.sqrt(values[new])
+            if self._basis is not None:
+                added -= self._basis @ (self._basis.T @ added)
+            added = np.linalg.qr(added)[0]
+            total = columns(mapping @ added)
+            self._basis = added if self._basis is None else np.column_stack([self._basis, added])
+            self._total = total if self._total is None else np.column_stack([self._total, total])
+        assert self._basis is not None and self._total is not None
+        total = coefficient_map.T @ (self._total @ (self._basis.T @ view))
+        return 0.5 * (total + total.T) - coefficient_map.T @ fixed @ coefficient_map
 
 
 INDEPENDENT_EFFECTS = CurvatureCorrection()
@@ -945,14 +1072,19 @@ INDEPENDENT_EFFECTS = CurvatureCorrection()
 def curvature_correction(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, tolerance: float
 ) -> CurvatureCorrection:
-    """C = B - A at the EP fixed point with q's responses ``posterior``: one linear-response solve per outer step.
+    """C = B - A at the EP fixed point with q's responses ``posterior``, solved lazily for the directions asked
+    (``CurvatureCorrection``): one linear-response solve per outer step on the free coefficients, and one more per
+    released edge.
 
     B to the tolerance over the dimension (a relative error e in B moves log|B + S| by at most D e for well-scaled
     B + S), never past what double precision resolves."""
-    total = _total_curvature(prior, coefficients, cavity, posterior, working_bytes, max(tolerance / coefficients.shape[0], _EPSILON))
-    mapping = prior.coefficient_map
-    fixed = -(mapping.T @ _data_objective(prior, coefficients, cavity, working_bytes).hessian @ mapping)
-    return CurvatureCorrection(coefficient_map=mapping, matrix=total - 0.5 * (fixed + fixed.T))
+    relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
+    fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    return CurvatureCorrection(
+        mapping=prior.coefficient_map,
+        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions),
+        fixed_curvature=0.5 * (fixed + fixed.T),
+    )
 
 
 def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
@@ -1050,7 +1182,23 @@ def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log
 def _total_curvature(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, relative_tolerance: float
 ) -> F64Array:
-    """B = -d2 log Z_EP / dx2 with EP re-solved, in x: M' B_z M (speed-ep, B_PRODUCTS.md), without re-solving EP.
+    """B in x: M' B_z M (``_total_curvature_columns`` on every direction)."""
+    directions = prior.coefficient_map
+    total = directions.T @ _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions)
+    return 0.5 * (total + total.T)
+
+
+def _total_curvature_columns(
+    prior: ScaleMixturePrior,
+    coefficients: F64Array,
+    cavity: Cavity,
+    posterior: GaussianPosterior,
+    working_bytes: int,
+    relative_tolerance: float,
+    directions: F64Array,
+) -> F64Array:
+    """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
+    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
 
     B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
     B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
@@ -1062,40 +1210,36 @@ def _total_curvature(
     the restart length that fits ``working_bytes``.
     """
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
-    directions = prior.coefficient_map
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     # A variant whose tilted law is a point mass at zero (all its prior mass on flat-kernel nodes: v = 0) does not
     # respond: its mean and every derivative are zero for every cavity, so dh = dP = 0 exactly (the limit of the map,
-    # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset.
+    # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset (speed-smalln).
     live = derivatives.variance > 0.0
     inverse = np.where(live, 1.0 / np.where(live, derivatives.variance, 1.0), 0.0)
     inverse_column = inverse[:, None]
     live_column = live[:, None].astype(np.float64)
 
-    def through(precision_step: F64Array) -> tuple[F64Array, F64Array]:
+    def through(precision_step: F64Array, inner: float, affine: bool = True) -> tuple[F64Array, F64Array, F64Array]:
+        # The map is affine in dP. With ``affine`` False its constant (the E terms) is dropped, which leaves its linear
+        # part exactly: GMRES applies that, so each solve inside is accurate relative to what it applies, not to the
+        # constant, as a difference of two solves would be (speed-recycle a7752ae).
+        mean_constant = mean_by_z if affine else np.zeros_like(mean_by_z)
         mean_step = posterior.solve(
-            (derivatives.mean + derivatives.mean_by_precision * inverse)[:, None] * precision_step + mean_by_z * inverse_column, relative_tolerance
+            (derivatives.mean + derivatives.mean_by_precision * inverse)[:, None] * precision_step + mean_constant * inverse_column, inner
         )
-        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_by_z) * inverse_column
-        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step + variance_by_z
+        shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_constant) * inverse_column
+        variance_step = derivatives.variance_by_shift[:, None] * shift_step + derivatives.variance_by_precision[:, None] * precision_step
+        if affine:
+            variance_step = variance_step + variance_by_z
         response = variance_step * inverse_column**2 + live_column * precision_step
         return shift_step, response + posterior.variance_jvp(response) * inverse_column**2, response
 
     shape = mean_by_z.shape
-    _shift, offset, start_response = through(np.zeros(shape))
-    # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times the
-    # terms that cancel, which is where GMRES's residual can stop.
-    rounding = _EPSILON * float(np.linalg.norm(start_response))
-
-    def linear_part(vector: F64Array) -> F64Array:
-        precision_step = vector.reshape(shape)
-        return (precision_step - (through(precision_step)[1] - offset)).ravel()
-
     if posterior.linear_response is not None:
-        # through is affine with linear part (I - diag(1/v^2) (Sigma o Sigma)) R, R = diag(v_h / v^3) Sigma diag(m + m_P / v)
-        # + diag(1 + v_P / v^2 - v_h m_P / v^3) (1/v read as 0, and the 1 as 0, on point-mass rows): the posterior solves
-        # the fixed point exactly.
+        # ``through`` is affine in dP, with linear part (I - diag(1/v^2) (Sigma o Sigma)) R and R = diag(v_h / v^3) Sigma
+        # diag(m + m_P / v) + diag(1 + v_P / v^2 - v_h m_P / v^3): the posterior solves its fixed point exactly.
+        _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
         precision_step = posterior.linear_response(
             derivatives.variance_by_shift * inverse**3,
             derivatives.mean + derivatives.mean_by_precision * inverse,
@@ -1103,32 +1247,62 @@ def _total_curvature(
             inverse**2,
             offset,
         )
-        return _total_from_response(prior, coefficients, cavity, derivatives, directions, precision_step, through, working_bytes)
+        return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
     size = int(np.prod(shape))
-    operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
     # GMRES(r) keeps r + 1 basis vectors of ``size`` and an (r + 1) x r Hessenberg matrix, at most 2 (r + 1) size
     # float64 values: r is the longest restart that fits ``working_bytes``. The cycles are capped so the total Krylov
     # dimension is ``size``, where unrestarted GMRES is exact; a restarted one that has not converged by then raises.
     restart = max(1, min(size, int(working_bytes) // (2 * np.dtype(np.float64).itemsize * size) - 1))
-    solution, information = gmres(operator, offset.ravel(), rtol=relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart))
-    if information != 0:
-        raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+    # Each product solves the posterior only to ``inner``, so the operator itself errs, and GMRES's own residual
+    # estimate can sit far below the true one (inexact Krylov: Simoncini and Szyld, SIAM J. Sci. Comput. 25, 2003):
+    # half the tolerance goes to GMRES, half to the products. The true residual is measured once GMRES stops; while
+    # it exceeds the tolerance, the inner solves tighten by the measured excess (the operator's own amplification of
+    # their error) and GMRES continues from where it stopped.
+    inner = relative_tolerance
+    solution = np.zeros(size)
+    previous = np.inf
+    while True:
+        try:
+            _shift, offset, start_response = through(np.zeros(shape), inner)
+        except ValueError as error:
+            if inner >= relative_tolerance:
+                raise
+            # The solver cannot reach the tightened accuracy in float64: the response is not resolvable here.
+            raise LinearResponseError(f"the EP fixed point's linear response cannot be resolved: {error}") from error
+        # The map's last step cancels the diagonal of Sigma o Sigma against v^2: its value is known only to eps times
+        # the terms that cancel, which is where GMRES's residual can stop.
+        rounding = _EPSILON * float(np.linalg.norm(start_response))
+
+        def linear_part(vector: F64Array, inner: float = inner) -> F64Array:
+            precision_step = vector.reshape(shape)
+            return (precision_step - through(precision_step, inner, affine=False)[1]).ravel()
+
+        operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
+        right = offset.ravel()
+        solution, information = gmres(
+            operator, right, x0=solution, rtol=0.5 * relative_tolerance, atol=rounding, restart=restart, maxiter=-(-size // restart)
+        )
+        target = max(relative_tolerance * float(np.linalg.norm(right)), rounding)
+        residual = float(np.linalg.norm(right - linear_part(solution)))
+        if residual <= target:
+            break
+        if residual >= previous:
+            raise LinearResponseError(f"the EP fixed point's linear response did not converge (gmres information {information})")
+        previous = residual
+        inner *= 0.5 * target / residual
     precision_step = solution.reshape(shape)
-    return _total_from_response(prior, coefficients, cavity, derivatives, directions, precision_step, through, working_bytes)
+    return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, inner)[0], precision_step, working_bytes)
 
 
 def _total_from_response(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, derivatives: _VariantDerivatives, directions: F64Array,
-    precision_step: F64Array, through: Callable[[F64Array], tuple[F64Array, F64Array, F64Array]], working_bytes: int,
+    shift_step: F64Array, precision_step: F64Array, working_bytes: int,
 ) -> F64Array:
-    """B in x from the cavity precision response dP (``_total_curvature``)."""
-    shift_step, _next, _response = through(precision_step)
+    """B_z E from the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
-    total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
+    return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
     )
-    total = directions.T @ total_z
-    return 0.5 * (total + total.T)
 
 
 # ------------------------------------------------------- the Laplace evidence for the weights
@@ -1320,32 +1494,15 @@ def _line_log_integral(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
 ) -> float:
     """log of the line integral of exp(F - P - value) along a standardized direction b (unit curvature at the
-    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log.
-
-    The integrand is the Laplace term's Gaussian e^(-t^2/2) times h(t) = exp(l(t) + t^2 / 2), so the Gauss-Hermite
-    rules of that weight place their nodes where its mass is. They start at the fewest nodes exact for the
-    Tierney-Kadane expansion of h through its O(1) term (degree 6: k3^2 t^6 / 72), and double while the largest node
-    stays inside the Gaussian's double-precision extent sqrt(2 log(1 / eps)); past it, more nodes only resolve an h
-    that no low-degree polynomial follows. The first two consecutive rules whose logs agree to the share give the
-    larger rule's value. Where none do (a fold or a heavy tail), QUADPACK's adaptive rule over the whole line
-    decides, and its own error estimate must resolve the log to the share, or to half of double precision when
+    maximum x), over its Laplace term sqrt(2 pi), to ``share`` in its log, by QUADPACK's adaptive rule over the
+    whole line; its own error estimate must resolve the log to the share, or to half of double precision when
     rounding is what stopped it.
+
+    Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
+    on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
+    tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
     line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
-    tolerance = max(share, _HALF_PRECISION)
-    extent = float(np.sqrt(2.0 * np.log(1.0 / _EPSILON)))
-    nodes = (_TIERNEY_KADANE_DEGREE + 2) // 2
-    previous = None
-    while True:
-        steps, weights = np.polynomial.hermite_e.hermegauss(nodes)
-        log_terms = np.log(weights) + line(steps) - value + 0.5 * np.square(steps)
-        estimate = float(_log_sum_exp(log_terms, axis=0)) - 0.5 * np.log(2.0 * np.pi)
-        if previous is not None and abs(estimate - previous) <= tolerance:
-            return estimate
-        if float(steps[-1]) > extent:
-            break
-        previous = estimate
-        nodes *= 2
 
     def integrand(step: float) -> float:
         return float(np.exp(line(np.array([step]))[0] - value))
@@ -1353,7 +1510,7 @@ def _line_log_integral(
     integral, error, _information, *message = quad(
         integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True
     )
-    if message and error > tolerance * abs(integral):
+    if message and error > max(share, _HALF_PRECISION) * abs(integral):
         raise FloatingPointError(f"the exact integral along a direction did not converge: {message[0]}")
     return float(np.log(integral) - 0.5 * np.log(2.0 * np.pi))
 
@@ -1743,6 +1900,16 @@ def _certified_evidence(
     warm = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
     chosen = warm if warm is not None else _evidence(prior, log_smoothing, flat_start, cavity, correction, working_bytes, tolerance)
     return _corrected(prior, log_smoothing, chosen, cavity, correction, working_bytes, tolerance)
+
+
+def _same_basin(first: _Evidence, second: _Evidence) -> bool:
+    """Whether two certified inner maxima are one: each point lies within sqrt(2 d) of its maximum in the -H metric
+    (d its inner decrement), so one maximum is within the sum of the radii of both points; their V must then agree
+    to within their certified errors."""
+    step = first.coefficients - second.coefficients
+    radius = np.sqrt(2.0 * first.inner_decrement) + np.sqrt(2.0 * second.inner_decrement)
+    distance = np.sqrt(max(float(step @ first.precision @ step), 0.0))
+    return distance <= radius and abs(first.laplace_value - second.laplace_value) <= first.error + second.error
 
 
 def _same_basin(first: _Evidence, second: _Evidence) -> bool:

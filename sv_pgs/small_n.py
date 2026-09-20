@@ -57,6 +57,7 @@ from sv_pgs.scale_mixture_ep import (
     initial_hyperparameters,
     log_scale,
     moment_matched_prior_sites,
+    moment_start,
     noise_gain,
     noise_variance,
     prior_second_moment,
@@ -522,7 +523,9 @@ class _DenseFixedPoints:
     """``scale_mixture_ep.FixedPoints`` for one model on a dense training matrix: ``full_data_fit``'s fixed-point
     iteration (refresh, the check, mean-only EP with frozen cavity precisions, the noise update), each quantity exact."""
 
-    def __init__(self, statistics: DenseStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int) -> None:
+    def __init__(
+        self, statistics: DenseStatistics, prior: ScaleMixturePrior, start: MixtureHyperparameters, start_noise: float, draw_count: int, working_bytes: int
+    ) -> None:
         self.statistics = statistics
         self.prior = prior
         self.draw_count = int(draw_count)
@@ -531,11 +534,10 @@ class _DenseFixedPoints:
         self.data_score = self.design.back(statistics.target)
         self.sample_count = statistics.sample_count
         self.covariate_count = int(statistics.covariates.shape[1])
-        precision, shift = moment_matched_prior_sites(prior, initial_hyperparameters(prior))
+        precision, shift = moment_matched_prior_sites(prior, start)
         self.site_precision = precision.copy()
         self.site_shift = shift.copy()
-        residual = statistics.projected_target
-        self.noise = float(residual @ residual) / (self.sample_count - self.covariate_count)
+        self.noise = float(start_noise)
         self.effective = float(prior.variant_count)
         self.mean_move = np.inf
         self.noise_gain = np.inf
@@ -740,6 +742,27 @@ def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_va
     )
 
 
+def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tuple[MixtureHyperparameters, float, object]:
+    """The EB start from Haseman-Elston moments (``scale_mixture_ep.moment_start``), exact from the n x n kernel
+    K0 = Xp Xp': tr G = tr K0, sum_j u_j ||G e_j||^2 = sum_j u_j x_j' K0 x_j and ||G||_F^2 = tr(K0^2), one n^2 p pass."""
+    design = statistics.design
+    residual = statistics.projected_target
+    weights = np.exp(prior.log_variance_offset)
+    kernel = design.weighted_gram(np.ones(design.variant_count))
+    squares = design.column_squares()
+    score = design.back(statistics.target)
+    moment = moment_start(
+        target_square=float(residual @ residual),
+        residual_dimension=float(statistics.sample_count - statistics.covariates.shape[1]),
+        score_square=float(score @ score),
+        gram_trace=float(np.trace(kernel)),
+        weighted_diagonal=float(weights @ squares),
+        weighted_square=float(weights @ design.quadratic_diagonal(kernel)),
+        gram_square=float(np.sum(kernel * kernel)),
+    )
+    return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
+
+
 def fit_small_n(
     *,
     codes: np.ndarray,
@@ -762,10 +785,11 @@ def fit_small_n(
     offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
     prior = small_n_prior(statistics, variant_class, offsets, draw_count)
     stage0_seconds = time.perf_counter() - started
-    oracle = _DenseFixedPoints(statistics, prior, draw_count, working_bytes)
+    start, start_noise, moment = small_n_start(statistics, prior)
+    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
     tolerance = 0.5 / draw_count
     try:
-        (outer,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], oracle, working_bytes // 2, tolerance)
+        (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; EP refusals: {oracle.refusals}") from error
     # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
@@ -820,6 +844,8 @@ def fit_small_n(
         "grid": int(prior.grid_size),
         "classes": int(prior.class_count),
         "outer_iterations": int(outer.iterations),
+        "start_heritability": float(moment.heritability),
+        "start_resolution": float(moment.resolution),
     }
     return SmallNFit(
         scoring=scoring, noise_variance=float(oracle.noise), hyperparameters=outer.hyperparameters, certificate=certificate, prior=prior,
