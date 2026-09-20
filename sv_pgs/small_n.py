@@ -863,8 +863,8 @@ def double_loop_sites(
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
     problem, the minimum of the convex Phi over the sites, is solved by Newton with sufficient-decrease halving until no
-    representable step along Newton's direction lowers Phi by half its quadratic model's decrease, or Newton's decrement
-    falls below Phi's rounding. Each outer step is
+    representable step along Newton's direction lowers Phi by half its quadratic model's decrease; below Phi's rounding,
+    where values cannot tell a decrease, full Newton steps continue while Newton's decrement (from the gradient) falls. Each outer step is
     majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
     accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
     update's KL 1/2 r' Sigma r at most 1/(2K) nats, or when an outer step leaves the sites unchanged, which is EP's fixed
@@ -903,11 +903,27 @@ def double_loop_sites(
             # (the engine's below-floor approximation), which no finite site matches.
             raise NoFixedPoint("a computed tilted variance is 0 at q's marginals' cavities: no finite EP site")
         start_precision, start_shift = precision.copy(), shift.copy()
+        polish_decrement: float | None = None
         while True:
             step, decrement = _newton_step(point, noise, jvp_bytes, profile)
-            # A decrease below Phi's own rounding cannot be told from it.
-            if not decrement > _EPSILON * abs(point.value):
+            if not decrement > 0.0:
                 break
+            if not decrement > _EPSILON * abs(point.value):
+                # Below Phi's rounding the line search cannot tell a decrease from it, and a value-based stop resolves
+                # the minimum only to sqrt(eps). Newton's decrement comes from the gradient, not from differences of
+                # Phi: in this quadratic regime the full step is taken while that decrement keeps falling.
+                if polish_decrement is not None and not decrement < polish_decrement:
+                    break
+                candidate = _loop_point(
+                    design, noise, data_score, point.site_precision + step[size:], point.site_shift + step[:size],
+                    marginal_precision, marginal_shift, tilted, largest_variance,
+                )
+                if candidate is None:
+                    break
+                polish_decrement = decrement
+                point = candidate
+                profile["double_loop_newton"] += 1
+                continue
             fraction = 1.0
             accepted = None
             while fraction * float(np.max(np.abs(step))) > _EPSILON * (1.0 + max(float(np.max(np.abs(point.site_precision))), float(np.max(np.abs(point.site_shift))))):
