@@ -90,7 +90,8 @@ def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path)
     columns = np.arange(samples, dtype=np.int64)
     everything = np.arange(records, dtype=np.int64)
     candidates = stage0_candidates(store, columns, np.zeros(records), ModelConfig(minimum_minor_allele_frequency=0.0))
-    assert candidates.shape[0] == records - 10  # only the monomorphic records go
+    polymorphic = int(np.sum(np.ptp(milli, axis=1) > 0))
+    assert candidates.shape[0] == polymorphic  # only the monomorphic records go
     candidates = stage0_candidates(store, columns, np.zeros(records), ModelConfig())
     statistics = compute_genotype_statistics(
         DosageStoreTileSource(store, everything), columns, np.ones((samples, 1)), generator.normal(size=(samples, 1)), ModelConfig(), _budget(), 256, tmp_path / "ld"

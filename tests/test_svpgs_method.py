@@ -16,7 +16,7 @@ from benchmarks.bench_real import harness as bench_real
 from benchmarks.bench_sim import harness as bench_sim
 from sv_pgs import fit_model
 from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.config import VariantClass
+from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE, DosageStore
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from tests.test_fit_model import _StubDriver
