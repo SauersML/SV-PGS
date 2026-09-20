@@ -100,7 +100,6 @@ from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Sequence
 
 import numpy as np
-from scipy.integrate import quad_vec
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
@@ -1421,7 +1420,7 @@ class _Evidence:
     # newton_decrement is 1/2 g'(B + S)^-1 g: what the fit's certificate records (math-epeb: the fixed-cavity form
     # understates the remaining gain by up to 100x).
     # After ``_corrected``: the standardized directions whose Laplace terms it replaced by line integrals, and the
-    # share of the tolerance each was resolved to (their gradient reuses them, ``_correction_gradient``).
+    # share of the tolerance each was resolved to (their slopes keep the count, ``_correction_slopes``).
     replaced_directions: F64Array | None = None
     replaced_share: float = 0.0
 
@@ -1637,25 +1636,10 @@ def _laplace_corrections(
     tolerance / (2 m) in its log, m of them). A replaced direction's correction is the log of the exact line
     integral's ratio to the Laplace term (its limit covers a density collapsing to a point); elsewhere it is 0.
     """
-    penalty = _penalty_matrix(prior, log_smoothing)
-    objective = _data_objective(prior, evidence.coefficients, cavity, working_bytes)
-    value, _gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, evidence.coefficients)
-    negative = -hessian
-    null_basis = prior.null_basis
-    complement = np.linalg.svd(np.eye(negative.shape[0]) - null_basis @ null_basis.T)[0][:, : negative.shape[0] - null_basis.shape[1]]
-    response = np.eye(negative.shape[0])
-    if null_basis.shape[1]:
-        response = response - null_basis @ np.linalg.solve(null_basis.T @ negative @ null_basis, null_basis.T @ negative)
-    moved = response @ complement
-    schur = moved.T @ negative @ moved
-    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
-    # -H passed its Cholesky test, so the Schur complement is positive definite; an eigenvalue below eps times the
-    # largest is rounding, raised to that floor as in ``_ascent_direction``.
-    if eigenvalues.size:
-        eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
-    directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
-    third, fourth = _directional_derivatives(prior, evidence.coefficients, cavity, directions, working_bytes)
-    terms = fourth / 8.0 + 5.0 * third**2 / 24.0
+    standardized = _standardized(prior, log_smoothing, evidence.coefficients, cavity, working_bytes)
+    if standardized is None:
+        raise FloatingPointError("the Schur complement of -H is not positive definite at x")
+    value, terms, directions = standardized
     corrections = np.zeros(directions.shape[1])
     order = np.argsort(-np.abs(terms))
     # Remaining sums from the smallest term up: the replaced set is the shortest prefix of ``order`` whose
@@ -1668,119 +1652,122 @@ def _laplace_corrections(
     return corrections, terms, directions
 
 
-def _line_slopes(
-    prior: ScaleMixturePrior, origin: F64Array, direction: F64Array, vectors: F64Array, cavity: Cavity, working_bytes: int
-) -> Callable[[float], F64Array]:
-    """At a step t along x + t b: grad F(x + t b) . v for each column v of ``vectors``.
-
-    log Z_j = LSE_k(log pi_ck + L_jk(e_j)) with pi_c normalized, so its slope along v is
-    sum_k w_jk (eta'_ck + dL_jk/de e'_j) - pi_c . eta'_c, with w the node responsibilities, eta' and e' the
-    density and log-scale parts of M v, and dL/de the kernel's own first derivative (``_components``)."""
-    density, _scale = _density_and_scale(prior, origin)
-    density_step, scale_step = _density_and_scale(prior, direction)
-    scales = log_scale(prior, origin)
-    scale_slope = prior.scale_design @ scale_step
-    parts = [_density_and_scale(prior, vector) for vector in vectors.T]
-    density_slopes = np.stack([part[0] for part in parts], axis=-1) if parts else np.zeros(density.shape + (0,))
-    scale_slopes = np.column_stack([prior.scale_design @ part[1] for part in parts]) if parts else np.zeros((prior.variant_count, 0))
-
-    def at(step: float) -> F64Array:
-        log_weights = density + step * density_step
-        log_density = log_weights - _log_sum_exp(log_weights, axis=1, keepdims=True)
-        slopes = np.zeros(vectors.shape[1])
-        for class_position, class_rows in enumerate(prior.class_rows):
-            class_slopes = density_slopes[class_position]
-            mean_slope = np.exp(log_density[class_position]) @ class_slopes
-            for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
-                components = _components(
-                    log_density[class_position], scales[rows] + step * scale_slope[rows], prior.log_variance_grid, prior.kernel_floor,
-                    cavity.precision[rows], cavity.shift[rows],
-                )
-                weights = components.responsibility
-                slopes += np.sum(weights @ class_slopes, axis=0) - rows.shape[0] * mean_slope
-                slopes += np.sum(weights * components.first, axis=1) @ scale_slopes[rows]
-        return slopes
-
-    return at
-
-
-def _correction_gradient(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
-) -> tuple[F64Array, F64Array]:
-    """The rho-gradient of V's Tierney-Kadane corrections (``_corrected``) with each replaced direction held, and a
-    bound on its quadrature error: (gradient, error), both per weight.
-
-    A replaced direction b's correction is c = log int exp(l(x + t b) - l(x)) dt - log sqrt(2 pi / kappa), with
-    kappa = b'(-H)b its curvature (one at rho, where b is standardized), so c is the line's own ratio to its Laplace
-    term at every rho. Along rho_i, with x moving by xdot = dx/drho_i and the penalty's explicit part:
-        dc/drho_i = E_p[-lambda_i (t a + t^2 q / 2) + (grad F(x + t b) - grad F(x)) . xdot - t (S b) . xdot] + kappadot / 2,
-    E_p over the line's normalized density, a = (R_i x)'(R_i b), q = ||R_i b||^2, and
-    kappadot = lambda_i q - D^3 F[b, b, xdot] (polarized from ``_directional_derivatives``). In a Gaussian every
-    term cancels. Holding b omits its rotation with rho: the corrections are a product of line integrals, and that
-    term couples a line to the others, the mixed cumulants the product already leaves out (review-stats S2); the
-    corrections' redesign replaces both. The integrals share one adaptive rule (``quad_vec``), each resolved to the
-    share of the tolerance that its correction was.
-    """
-    if evidence.replaced_directions is not None:
-        directions, share = evidence.replaced_directions, evidence.replaced_share
-    else:
-        try:
-            _corrections, terms, all_directions = _laplace_corrections(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance)
-        except FloatingPointError:
-            return np.zeros(len(prior.smoothing_blocks)), np.full(len(prior.smoothing_blocks), np.inf)
-        order = np.argsort(-np.abs(terms))
-        remaining = np.concatenate([np.cumsum(np.abs(terms[order])[::-1])[::-1], [0.0]])
-        directions = all_directions[:, order[: int(np.argmax(remaining <= 0.5 * tolerance))]]
-        share = 0.5 * tolerance / max(directions.shape[1], 1)
-    replaced = np.arange(directions.shape[1])
-    share = max(share, _QUADPACK_RELATIVE_FLOOR)
-    weight_count = len(prior.smoothing_blocks)
-    gradient = np.zeros(weight_count)
-    error = np.zeros(weight_count)
-    if not replaced.shape[0]:
-        return gradient, error
+def _standardized(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, cavity: Cavity, working_bytes: int
+) -> tuple[float, F64Array, F64Array] | None:
+    """(penalized value, Tierney-Kadane terms, standardized directions) at x: the eigenvectors of -H's Schur
+    complement on the complement of the profiled null space, each moved with the null coordinates' first-order
+    response and scaled to unit curvature, and each one's O(1) term k4/8 + 5 k3^2/24 from exact third and fourth
+    derivatives. None where the Schur complement is not positive definite (x is not inside a basin)."""
     penalty = _penalty_matrix(prior, log_smoothing)
-    origin = evidence.coefficients
-    moves = evidence.responses
-    data_slope = _data_objective(prior, origin, cavity, working_bytes).gradient
-    origin_slope = (prior.coefficient_map.T @ data_slope) @ moves
-    value = evidence.penalized_value
-    for index in replaced:
-        direction = directions[:, index]
-        line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
-        slopes = _line_slopes(prior, origin, direction, moves, cavity, working_bytes)
+    objective = _data_objective(prior, coefficients, cavity, working_bytes)
+    value, _gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+    negative = -hessian
+    null_basis = prior.null_basis
+    complement = np.linalg.svd(np.eye(negative.shape[0]) - null_basis @ null_basis.T)[0][:, : negative.shape[0] - null_basis.shape[1]]
+    response = np.eye(negative.shape[0])
+    if null_basis.shape[1]:
+        response = response - null_basis @ np.linalg.solve(null_basis.T @ negative @ null_basis, null_basis.T @ negative)
+    moved = response @ complement
+    schur = moved.T @ negative @ moved
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (schur + schur.T))
+    if eigenvalues.size and eigenvalues[0] <= 0.0:
+        return None
+    # An eigenvalue below eps times the largest is rounding, raised to that floor as in ``_ascent_direction``.
+    if eigenvalues.size:
+        eigenvalues = np.maximum(eigenvalues, _EPSILON * float(np.max(np.abs(eigenvalues))))
+    directions = moved @ eigenvectors / np.sqrt(eigenvalues)[None, :]
+    third, fourth = _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+    return value, fourth / 8.0 + 5.0 * third**2 / 24.0, directions
 
-        def integrand(step: float) -> F64Array:
-            # Far out the integrand is zero to double precision (where every node's kernel has overflowed): its
-            # slopes, whose responsibilities are 0/0 there, are not needed.
-            density = float(np.exp(line(np.array([step]))[0] - value))
-            if density == 0.0:
-                return np.zeros(3 + moves.shape[1])
-            return density * np.concatenate([[1.0, step, step * step], slopes(step) - origin_slope])
 
-        moments, moment_error = quad_vec(integrand, -np.inf, np.inf, epsabs=0.0, epsrel=share, norm="max")
-        mass = float(moments[0])
-        expectations = moments[1:] / mass
-        expectation_error = (moment_error + np.abs(moments[1:]) * moment_error / mass) / mass
-        mean_step, square_step = expectations[0], expectations[1]
-        third = _directional_derivatives(
-            prior, origin, cavity, np.column_stack([direction[:, None] + moves, direction[:, None] - moves, moves]), working_bytes
-        )[0]
-        mixed = (third[:weight_count] - third[weight_count : 2 * weight_count] - 2.0 * third[2 * weight_count :]) / 6.0
-        penalty_move = (penalty @ direction) @ moves
-        for position, (block, log_weight) in enumerate(zip(prior.smoothing_blocks, log_smoothing)):
-            lambda_weight = float(np.exp(log_weight))
-            along = block.factor @ direction[block.coordinates]
-            cross = float((block.factor @ origin[block.coordinates]) @ along)
-            curvature = float(along @ along)
-            gradient[position] += (
-                -lambda_weight * (mean_step * cross + 0.5 * square_step * curvature)
-                + expectations[2 + position]
-                - mean_step * float(penalty_move[position])
-                + 0.5 * (lambda_weight * curvature - float(mixed[position]))
-            )
-            error[position] += lambda_weight * (expectation_error[0] * abs(cross) + 0.5 * expectation_error[1] * curvature) + expectation_error[2 + position] + expectation_error[0] * abs(float(penalty_move[position]))
-    return gradient, error
+def _correction_value(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, cavity: Cavity, working_bytes: int, count: int, share: float
+) -> float | None:
+    """The corrections' sum at x with the ``count`` largest terms replaced (``_corrected``'s rule at a fixed count),
+    each line integral resolved to ``share`` in its log; None where x is not inside a basin or an integral fails."""
+    standardized = _standardized(prior, log_smoothing, coefficients, cavity, working_bytes)
+    if standardized is None:
+        return None
+    value, terms, directions = standardized
+    if count == 0:
+        return 0.0
+    chosen = np.argsort(-np.abs(terms))[:count]
+    try:
+        return float(np.sum(_line_log_integrals(prior, log_smoothing, coefficients, directions[:, chosen], value, cavity, working_bytes, share)))
+    except FloatingPointError:
+        return None
+
+
+def _correction_slopes(
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+) -> tuple[F64Array, F64Array, F64Array]:
+    """The rho-slopes of V's corrections at a corrected evidence, their error estimates, and their second
+    differences, per interior weight (zero elsewhere).
+
+    The corrections are the sum of the replaced directions' line-integral ratios to their Laplace terms, along the
+    Schur complement's standardized eigenvectors, which rotate with rho: holding them fixed gave the slope's wrong
+    sign where V was then climbing the other way [sim-only, e2e: +0.25 held against +0.04 V's own]. So the slope is
+    V's corrections' own, by central differences in rho_i with x on its first-order path x + h dx/drho_i (the
+    corrections are smooth there, and no inner maximum is re-solved, so no fold can intervene; x's second-order
+    error cancels in the central difference), at the same count of replaced directions. Each correction is resolved
+    to a share e / m of its log (m integrals) with e set so the difference errs by about the Laplace gradient's own
+    error, and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
+    V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
+    halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
+    complement is not positive definite there), the one-sided difference on the other side is used, with its larger
+    truncation h s / 2. The error estimate is a posteriori (the h / h/2 agreement); it is not a bound.
+    """
+    count_weights = weights.shape[0]
+    slopes = np.zeros(count_weights)
+    errors = np.zeros(count_weights)
+    second = np.zeros(count_weights)
+    count = 0 if evidence.replaced_directions is None else int(evidence.replaced_directions.shape[1])
+    if count == 0:
+        return slopes, errors, second
+    radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
+    scale = np.maximum(0.5 * (evidence.effective_degrees + evidence.penalty_sizes), _EPSILON * evidence.magnitude)
+    target = scale * radius + _EPSILON * evidence.magnitude
+    limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
+    for position in np.flatnonzero(interior):
+        unit = np.zeros(count_weights)
+        unit[position] = 1.0
+        accuracy = max(float((2.0 * target[position] / 3.0 ** (2.0 / 3.0)) ** 1.5 / scale[position] ** 0.5), count * _QUADPACK_RELATIVE_FLOOR)
+        share = accuracy / count
+        step = max(float((3.0 * accuracy / scale[position]) ** (1.0 / 3.0)), limit)
+        centre = _correction_value(view, weights, evidence.coefficients, cavity, working_bytes, count, share)
+        if centre is None:
+            slopes[position], errors[position] = 0.0, np.inf
+            continue
+        while True:
+            values = {}
+            for multiple in (-1.0, -0.5, 0.5, 1.0):
+                length = multiple * step
+                values[multiple] = _correction_value(
+                    view, weights + length * unit, evidence.coefficients + length * evidence.responses[:, position], cavity, working_bytes, count, share
+                )
+            if all(values[multiple] is not None for multiple in values):
+                differences = [(values[1.0] - values[-1.0]) / (2.0 * step), (values[0.5] - values[-0.5]) / step]
+                bounds = [step**2 * scale[position] / 6.0 + accuracy / step, (0.5 * step) ** 2 * scale[position] / 6.0 + 2.0 * accuracy / step]
+                curvature = (values[1.0] - 2.0 * centre + values[-1.0]) / step**2
+            else:
+                side = 1.0 if values[1.0] is not None and values[0.5] is not None else -1.0
+                if values[side] is None or values[0.5 * side] is None:
+                    differences = None
+                else:
+                    differences = [(values[side] - centre) / (side * step), (values[0.5 * side] - centre) / (0.5 * side * step)]
+                    bounds = [step * scale[position] / 2.0 + 2.0 * accuracy / step, 0.25 * step * scale[position] + 4.0 * accuracy / step]
+                    curvature = (values[side] - 2.0 * values[0.5 * side] + centre) / (0.5 * step) ** 2
+            if differences is not None and abs(differences[0] - differences[1]) <= bounds[0] + bounds[1]:
+                slopes[position] = differences[1]
+                errors[position] = bounds[1] + abs(differences[0] - differences[1])
+                second[position] = curvature
+                break
+            if step <= limit:
+                slopes[position], errors[position] = 0.0, np.inf
+                break
+            step = max(0.5 * step, limit)
+    return slopes, errors, second
 
 
 def _corrected(
@@ -2077,7 +2064,7 @@ def _ascend_evidence(
 ) -> tuple[F64Array, _Evidence]:
     """Trust-region quasi-Newton ascent of V(rho) inside [lower, upper], from a certified evidence ``start``.
 
-    The model is the certified V's gradient (``_full_gradient``) with a BFGS approximation of -V's Hessian; each trial maximizes it inside a
+    The model is the Laplace V's gradient with a BFGS approximation of -V's Hessian; each trial maximizes it inside a
     radius, projected onto the bounds, and the radius follows the ratio of actual to predicted gain
     (Nocedal and Wright, Algorithm 4.1). A trial's x starts from the first-order predictor
     x_rho + (dx/drho) delta; a trial whose inner answer is not a certified maximum counts as V = -infinity.
@@ -2086,9 +2073,9 @@ def _ascend_evidence(
     """
     weights = np.clip(start_weights, lower, upper)
     current = start
-    # The certified V's own gradient, corrections included (lead ruling A): the Laplace V is biased up at small lambda,
-    # so its gradient would steer toward densities the corrections reject.
-    gradient = _full_gradient(prior, weights, current, cavity, correction, working_bytes, tolerance)[0]
+    # The Laplace gradient proposes the steps; every acceptance is on the certified V (lead ruling A), and the final
+    # stationarity check takes V's own gradient, corrections included (``_stationarity``).
+    gradient = current.gradient
     hessian = np.eye(weights.shape[0])
     radius = float(np.linalg.norm(gradient))
     while True:
@@ -2115,7 +2102,7 @@ def _ascend_evidence(
             radius = 2.0 * radius
         if trial is None or actual <= 0.0:
             continue
-        trial_gradient = _full_gradient(prior, trial_weights, trial, cavity, correction, working_bytes, tolerance)[0]
+        trial_gradient = trial.gradient
         gradient_change = gradient - trial_gradient
         curvature = float(step @ gradient_change)
         if curvature > 0.0:
@@ -2322,8 +2309,9 @@ def _maximize_evidence(
 class _Stationarity:
     """The B-evidence's stationarity in the weights at a certified maximum x_rho (``_stationarity``).
 
-    ``gradient`` is V's analytic rho-gradient (the Laplace part's and the corrections', ``_correction_gradient``) with
-    its error bound ``error``; ``curvature`` the matrix -d2V/drho2 from forward differences of that gradient, of steps
+    ``gradient`` is V's rho-gradient (the Laplace part's, exact, and the corrections' own slopes,
+    ``_correction_slopes``) with its error ``error``; ``curvature`` the matrix -d2V/drho2 (forward differences of the
+    Laplace gradient plus the corrections' second differences on the diagonal), of steps
     ``steps``; ``folds`` is, per weight, the distance within which its basin ends on the side its gradient climbs to
     (zero where it does not end); ``gain`` the remaining gain; ``better`` a side whose certified V is above the base's
     by more than the tolerance, both at their certified bounds (weights and evidence), when one was found.
@@ -2339,15 +2327,16 @@ class _Stationarity:
 
 
 def _full_gradient(
-    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
-) -> tuple[F64Array, F64Array]:
-    """The certified V's rho-gradient and its error bound: the Laplace part's (exact at x_rho) and the corrections'."""
-    correction_gradient, correction_error = _correction_gradient(view, weights, evidence, cavity, correction, working_bytes, tolerance)
+    view: ScaleMixturePrior, weights: F64Array, evidence: _Evidence, interior: F64Array, cavity: Cavity, working_bytes: int
+) -> tuple[F64Array, F64Array, F64Array]:
+    """The certified V's rho-gradient, its error, and the corrections' second differences: the Laplace part's
+    gradient (exact at x_rho) plus the corrections' own slopes (``_correction_slopes``)."""
+    correction_slopes, correction_errors, correction_second = _correction_slopes(view, weights, evidence, interior, cavity, working_bytes)
     # x_rho's own error moves the Laplace gradient by its x-slope over x's error, sqrt(2 d) in the -H metric: bounded
     # by the gradient's scale s_i times that radius (the same logistic bound as V's derivatives).
     radius = float(np.sqrt(2.0 * max(evidence.inner_decrement, 0.0)))
     scale = 0.5 * (evidence.effective_degrees + evidence.penalty_sizes)
-    return evidence.gradient + correction_gradient, correction_error + scale * radius + _EPSILON * evidence.magnitude
+    return evidence.gradient + correction_slopes, correction_errors + scale * radius + _EPSILON * evidence.magnitude, correction_second
 
 
 def _stationarity(
@@ -2363,10 +2352,12 @@ def _stationarity(
     """The weights' Newton decrement at a certified maximum, from V's analytic gradient (lead ruling: in place of
     central differences of V, which cannot certify where the base's inner basin ends within their step).
 
-    The curvature is -dg/drho by one forward difference of the analytic gradient per interior weight, taken on the
-    side the gradient climbs (where a fold would be). With g's error E and V's third derivative in rho_i bounded by
-    s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of step h errs by
-    h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
+    The gradient is the Laplace part's (exact) plus the corrections' own slopes (``_correction_slopes``). The curvature
+    is -dg/drho of the Laplace part by one forward difference per interior weight, taken on the side the gradient
+    climbs (where a fold would be), plus the corrections' second differences on the diagonal (their mixed second
+    differences are left out of the local model). With the Laplace gradient's error E and V's third derivative in
+    rho_i bounded by s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of
+    step h errs by h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
     there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
     most V can climb before the fold. Elsewhere the gain is the Newton decrement 1/2 r K^-1 r with r = |g| + E on the
     other interior weights and K the symmetrized difference matrix; an indefinite K has no decrement (infinite gain),
@@ -2381,8 +2372,9 @@ def _stationarity(
     # The gradient is taken at x_rho resolved to double precision, so x's own error barely enters it.
     refined = _corrected(view, weights, _evidence(view, weights, evidence.coefficients, cavity, correction, working_bytes, 0.0), cavity, correction, working_bytes, tolerance)
     base = evidence if refined is None else refined
-    gradient, error = _full_gradient(view, weights, base, cavity, correction, working_bytes, tolerance)
+    gradient, error, correction_second = _full_gradient(view, weights, base, interior, cavity, working_bytes)
     scale = np.maximum(0.5 * (base.effective_degrees + base.penalty_sizes), _EPSILON * base.magnitude)
+    laplace_error = scale * float(np.sqrt(2.0 * max(base.inner_decrement, 0.0))) + _EPSILON * base.magnitude
     limit = _HALF_PRECISION * (1.0 + float(np.max(np.abs(weights), initial=0.0)))
     curvature = np.zeros((count, count))
     steps = np.zeros(count)
@@ -2391,7 +2383,7 @@ def _stationarity(
         unit = np.zeros(count)
         unit[position] = 1.0
         climb = 1.0 if gradient[position] >= 0.0 else -1.0
-        step = max(2.0 * float(np.sqrt(error[position] / scale[position])), limit)
+        step = max(2.0 * float(np.sqrt(laplace_error[position] / scale[position])), limit)
         column = None
         while column is None:
             for side in (climb, -climb):
@@ -2407,8 +2399,7 @@ def _stationarity(
                     if side == climb:
                         folds[position] = step
                     continue
-                trial_gradient, _trial_error = _full_gradient(view, trial_weights, trial, cavity, correction, working_bytes, tolerance)
-                column = -(trial_gradient - gradient) / (side * step)
+                column = -(trial.gradient - base.gradient) / (side * step)
                 break
             if column is None:
                 if step <= limit:
@@ -2416,6 +2407,7 @@ def _stationarity(
                 folds[position] = 0.0
                 step = max(0.5 * step, limit)
         curvature[:, position] = column
+        curvature[position, position] -= correction_second[position]
         steps[position] = step
     inside = np.flatnonzero(interior)
     curvature[np.ix_(inside, inside)] = 0.5 * (curvature[np.ix_(inside, inside)] + curvature[np.ix_(inside, inside)].T)
