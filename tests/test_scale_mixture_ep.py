@@ -45,6 +45,7 @@ from sv_pgs.scale_mixture_ep import (
     _restricted_prior,
     _smoothing_bounds,
     cavities,
+    curvature_correction,
     class_log_density,
     derived_lattice,
     diagonal_posterior,
@@ -52,6 +53,7 @@ from sv_pgs.scale_mixture_ep import (
     relattice,
     hyper_step,
     initial_hyperparameters,
+    moment_start,
     kernel_floor,
     kernel_top,
     log_scale,
@@ -676,7 +678,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
         np.testing.assert_allclose(values, expected, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(expected))))
 
 
-def test_the_gauss_hermite_line_integral_matches_quadpack_to_its_share():
+def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
     posterior = INDEPENDENT_EFFECTS
@@ -711,6 +713,64 @@ def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
         prior, hyperparameters.log_smoothing, [hyperparameters.coefficients, nearby], cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE
     )
     assert best is not None and len(calls) == 1
+
+
+def test_a_trait_with_no_effect_above_the_noise_still_gets_a_lattice_and_a_fit_start():
+    # prior-terms' case: every single-variant likelihood is flat to the tolerance, so the kernel range is empty.
+    generator = np.random.default_rng(71)
+    count = 400
+    precision = np.full(count, 4.0)
+    shift = 4.0 * 0.1 * generator.standard_normal(count)
+    frequency = generator.uniform(0.01, 0.5, count)
+    offset = np.log(generator.uniform(0.3, 1.0, count)) + np.log(2.0 * frequency * (1.0 - frequency))
+    nodes, floor, top = derived_lattice(precision, shift, offset, _LATTICE_TOLERANCE)
+    assert nodes.shape[0] > engine.ROUGHNESS_ORDER
+    prior = scale_mixture_prior(
+        class_index=np.zeros(count, dtype=np.int64), log_variance_offset=offset, annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    moments = tilted_moments(prior, initial_hyperparameters(prior), Cavity(precision=precision, shift=shift), _WORKING_BYTES)
+    assert np.all(np.isfinite(moments.mean)) and np.all(moments.variance > 0.0)
+
+
+def test_the_variance_matched_start_has_the_asked_prior_variances():
+    prior, _cavity = _problem(variant_count=60, seed=39, node_count=12)
+    nodes = prior.log_variance_grid
+    offsets = np.exp(log_scale(prior, initial_hyperparameters(prior).coefficients))
+    for mean_variance in (float(np.exp(nodes[2])), float(np.exp(0.5 * (nodes[0] + nodes[-1]))), float(np.exp(nodes[-3]))):
+        start = initial_hyperparameters(prior, mean_variance)
+        np.testing.assert_allclose(prior_second_moment(prior, start), mean_variance * offsets, rtol=1e-10)
+    # Beyond the lattice's reach the centre stops at the nearer end.
+    below = initial_hyperparameters(prior, float(np.exp(nodes[0] - 1.0)))
+    assert np.all(prior_second_moment(prior, below) < np.exp(nodes[2]) * offsets)
+
+
+def _moments(genotypes, target, weights):
+    gram = genotypes.T @ genotypes
+    return dict(
+        target_square=float(target @ target), residual_dimension=float(genotypes.shape[0]), score_square=float(np.sum(np.square(genotypes.T @ target))),
+        gram_trace=float(np.trace(gram)), weighted_diagonal=float(weights @ np.diag(gram)),
+        weighted_square=float(weights @ np.sum(np.square(gram), axis=0)), gram_square=float(np.sum(np.square(gram))),
+    )
+
+
+def test_the_moment_start_splits_the_phenotypic_variance_and_tracks_the_heritability():
+    generator = np.random.default_rng(61)
+    samples, variants = 2000, 300
+    genotypes = generator.standard_normal((samples, variants))
+    weights = generator.uniform(0.5, 2.0, variants)
+    for heritability in (0.2, 0.6):
+        effects = generator.standard_normal(variants) * np.sqrt(weights)
+        signal = genotypes @ effects
+        noise = generator.standard_normal(samples) * np.sqrt(np.var(signal) * (1.0 - heritability) / heritability)
+        start = moment_start(**_moments(genotypes, signal + noise, weights))
+        total = float((signal + noise) @ (signal + noise)) / samples
+        # The split is exact: the genetic variance never exceeds the phenotypic.
+        np.testing.assert_allclose(start.genetic_variance + start.noise, total, rtol=1e-12)
+        assert abs(start.heritability - heritability) <= 0.15
+    # Under no signal the start stays within a few resolutions of zero, and never at it.
+    null = moment_start(**_moments(genotypes, generator.standard_normal(samples), weights))
+    assert null.resolution <= null.heritability <= 4.0 * null.resolution
 
 
 def test_an_orthogonal_reparametrization_of_every_block_leaves_the_evidence_and_the_posterior_unchanged():
@@ -802,6 +862,27 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     np.testing.assert_allclose(analytic, numerical, rtol=1e-5, atol=1e-5 * float(np.max(np.abs(numerical))))
     fixed_cavity = -(mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping)
     assert np.max(np.abs(analytic - fixed_cavity)) > 1e-3 * float(np.max(np.abs(fixed_cavity)))
+
+    # A posterior that solves the linear response exactly gives the same B as GMRES.
+    squared = np.square(covariance)
+
+    def linear_response(left, right, diagonal, weight, right_hand):
+        matrix = np.eye(variant_count) - (np.eye(variant_count) - weight[:, None] * squared) @ (left[:, None] * covariance * right[None, :] + np.diag(diagonal))
+        return np.linalg.solve(matrix, right_hand)
+
+    exact = _total_curvature(prior, coefficients, cavity, replace(posterior, linear_response=linear_response), _WORKING_BYTES, 1e-13)
+    np.testing.assert_allclose(exact, analytic, rtol=1e-9, atol=1e-9 * float(np.max(np.abs(analytic))))
+
+    # The correction is solved only on the directions a view asks for: first an edge's free coefficients, then the
+    # released ones; on each it is the whole correction's restriction.
+    whole = analytic + mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).hessian @ mapping
+    lazy = curvature_correction(prior, coefficients, cavity, posterior, _WORKING_BYTES, 1e-13 * coefficients.shape[0])
+    view, allowed = _restricted_prior(prior, frozenset({0}))
+    scale = float(np.max(np.abs(whole)))
+    np.testing.assert_allclose(lazy.on(view.coefficient_map), allowed.T @ whole @ allowed, rtol=1e-8, atol=1e-8 * scale)
+    assert lazy.solved_directions == allowed.shape[1] < coefficients.shape[0]
+    np.testing.assert_allclose(lazy.on(mapping), whole, rtol=1e-8, atol=1e-8 * scale)
+    assert lazy.solved_directions == coefficients.shape[0]
 
 
 def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():

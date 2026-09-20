@@ -6,7 +6,7 @@ import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
-from sv_pgs.small_n import _DensePosterior, _Kernel, _new_profile, dense_statistics, fit_small_n
+from sv_pgs.small_n import _DensePosterior, _Design, _Kernel, _new_profile, dense_statistics, fit_small_n
 
 _ROUNDING = 1e-9
 
@@ -28,7 +28,7 @@ def test_kernel_solve_variances_and_jvp_match_the_dense_inverse(negative):
     precision[:negative] = -0.05
     inverse = _dense_inverse(design, precision)
     assert np.all(np.linalg.eigvalsh(design.T @ design + np.diag(precision)) > 0.0)
-    kernel = _Kernel(design, precision)
+    kernel = _Kernel(_Design.dense(design), precision)
     right = rng.standard_normal((30, 4))
     np.testing.assert_allclose(kernel.solve(right), inverse @ right, rtol=_ROUNDING, atol=_ROUNDING)
     np.testing.assert_allclose(kernel.variances(), np.diag(inverse), rtol=_ROUNDING, atol=_ROUNDING)
@@ -47,7 +47,7 @@ def test_the_cavity_precision_keeps_its_digits_where_the_data_barely_inform_a_co
     design[:, 0] *= 1e-7  # a column whose data information q ~ 1e-14 of its site precision
     precision = rng.uniform(0.5, 2.0, 6)
     precision[0] = 1e3
-    _variances, removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+    _variances, removed, cavity = _Kernel(_Design.dense(design), precision).cavity()
     # Reference, no cancellation: the cavity precision of column j is x_j' (I + X_-j T_-j^-1 X_-j')^-1 x_j.
     for column in range(6):
         others = np.delete(np.arange(6), column)
@@ -56,7 +56,7 @@ def test_the_cavity_precision_keeps_its_digits_where_the_data_barely_inform_a_co
         np.testing.assert_allclose(cavity[column], expected, rtol=1e-9)
         np.testing.assert_allclose(removed[column], expected / (expected + precision[column]), rtol=1e-9)
     # The naive 1/z - t has no digits left for column 0.
-    naive = 1.0 / _Kernel(np.asfortranarray(design), precision).variances()[0] - precision[0]
+    naive = 1.0 / _Kernel(_Design.dense(design), precision).variances()[0] - precision[0]
     assert abs(naive - cavity[0]) > 1e-6 * abs(cavity[0])
 
 
@@ -70,7 +70,7 @@ def test_a_column_spanned_by_negative_site_columns_has_a_small_negative_cavity()
     for scale in (1e-3, 1e-6, 1e-9):
         precision = rng.uniform(0.5, 2.0, 6)
         precision[[0, 1]] = -scale
-        _variances, _removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+        _variances, _removed, cavity = _Kernel(_Design.dense(design), precision).cavity()
         others = np.array([0, 1, 3, 4, 5])
         # Reference (T invertible here): x3' (I + X_-3 T_-3^-1 X_-3')^-1 x3.
         kernel = np.eye(15) + design[:, others] @ np.diag(1.0 / precision[others]) @ design[:, others].T
@@ -80,13 +80,83 @@ def test_a_column_spanned_by_negative_site_columns_has_a_small_negative_cavity()
         assert abs(cavity[2]) <= 10.0 * scale
 
 
+def test_the_carrier_design_gives_the_projected_design_quantities():
+    """Stage 0's G (minor-allele codes over their SD) with the covariates projected out equals the projected
+    standardized design in every kernel quantity, including negative sites."""
+    rng = np.random.default_rng(21)
+    samples, variants = 60, 90
+    frequency = rng.uniform(0.005, 0.6, variants)
+    dosage = rng.binomial(2, frequency, size=(samples, variants))
+    dosage[:, 0] = 0
+    dosage[3, 0] = 1  # a singleton
+    codes = (dosage * 127).astype(np.uint8)
+    statistics = dense_statistics(codes, np.column_stack([np.ones(samples), rng.standard_normal(samples)]), rng.standard_normal(samples))
+    projected = _Design.dense(statistics.projected)
+    count = statistics.design.variant_count
+    precision = rng.uniform(0.5, 3.0, count)
+    precision[:2] = -0.01
+    carrier_kernel, projected_kernel = _Kernel(statistics.design, precision), _Kernel(projected, precision)
+    right = rng.standard_normal((count, 3))
+    np.testing.assert_allclose(carrier_kernel.solve(right), projected_kernel.solve(right), rtol=1e-9, atol=1e-11)
+    for carrier_part, projected_part in zip(carrier_kernel.cavity(), projected_kernel.cavity()):
+        np.testing.assert_allclose(carrier_part, projected_part, rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(carrier_kernel.covariance(), projected_kernel.covariance(), rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(statistics.design.column_squares(), np.einsum("ij,ij->j", statistics.projected, statistics.projected), rtol=1e-10)
+    # X~'s covariate loading, against the definition.
+    signed = codes[:, statistics.reduced_rows].astype(np.float64) - SIGNED_CODE_OFFSET
+    kept = np.asarray(statistics.tie_map.kept_indices)
+    standardized = (signed - statistics.means[kept]) / statistics.scales[kept]
+    np.testing.assert_allclose(statistics.loading, statistics.covariates.T @ standardized, rtol=1e-9, atol=1e-9)
+
+
+@pytest.mark.parametrize("negative", [0, 2])
+def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
+    rng = np.random.default_rng(31 + negative)
+    design = _design(rng, 10, 25)
+    precision = rng.uniform(0.5, 2.0, 25)
+    precision[:negative] = -0.05
+    noise = 0.8
+    sigma = noise * _dense_inverse(design, precision)
+    left, right, diagonal, weight = (rng.standard_normal(25) for _ in range(4))
+    weight = np.abs(weight)
+    rhs = rng.standard_normal((25, 4))
+    matrix = np.eye(25) - (np.eye(25) - weight[:, None] * (sigma * sigma)) @ (left[:, None] * sigma * right[None, :] + np.diag(diagonal))
+    posterior = _DensePosterior(_Kernel(_Design.dense(design), precision), noise, 10**9, _new_profile())
+    np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, rhs), np.linalg.solve(matrix, rhs), rtol=1e-8, atol=1e-10)
+
+
+def test_the_total_curvature_by_the_exact_response_equals_gmres():
+    from sv_pgs.scale_mixture_ep import Cavity, GaussianPosterior, _total_curvature, derived_lattice, initial_hyperparameters, scale_mixture_prior
+
+    rng = np.random.default_rng(41)
+    samples, variants = 30, 40
+    design = _design(rng, samples, variants)
+    precision = rng.uniform(0.5, 2.0, variants)
+    precision[0] = -0.02
+    noise = 1.3
+    posterior = _DensePosterior(_Kernel(_Design.dense(design), precision), noise, 10**9, _new_profile())
+    single_precision = np.einsum("ij,ij->j", design, design) / noise
+    single_shift = rng.standard_normal(variants) * 2.0
+    nodes, floor, top = derived_lattice(single_precision, single_shift, np.zeros(variants), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=np.arange(variants) % 2, log_variance_offset=np.zeros(variants), annotation_design=np.zeros((variants, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    coefficients = initial_hyperparameters(prior).coefficients
+    variances, _removed, cavity_precision = posterior.kernel.cavity()
+    cavity = Cavity(precision=cavity_precision / noise, shift=rng.standard_normal(variants))
+    exact = _total_curvature(prior, coefficients, cavity, posterior.gaussian_posterior(), 10**9, 1e-10)
+    iterative = _total_curvature(prior, coefficients, cavity, GaussianPosterior(solve=posterior.solve, variance_jvp=posterior.variance_jvp), 10**9, 1e-10)
+    np.testing.assert_allclose(exact, iterative, rtol=1e-6, atol=1e-7 * float(np.max(np.abs(iterative))))
+
+
 def test_kernel_refuses_an_indefinite_precision():
     rng = np.random.default_rng(7)
     design = _design(rng, 5, 20)
     precision = np.ones(20)
     precision[0] = -50.0
     with pytest.raises(np.linalg.LinAlgError):
-        _Kernel(design, precision)
+        _Kernel(_Design.dense(design), precision)
 
 
 def test_draws_have_the_posterior_covariance():
@@ -95,7 +165,7 @@ def test_draws_have_the_posterior_covariance():
     precision = rng.uniform(0.5, 2.0, 8)
     precision[0] = -0.1
     inverse = _dense_inverse(design, precision)
-    draws = _Kernel(design, precision).draws(np.random.default_rng(11), 200_000)
+    draws = _Kernel(_Design.dense(design), precision).draws(np.random.default_rng(11), 200_000)
     empirical = draws @ draws.T / draws.shape[1]
     # Monte Carlo error of a covariance entry: sqrt((S_ii S_jj + S_ij^2) / K) <= sqrt(2 / K) max S_ii.
     bound = 5.0 * np.sqrt(2.0 / draws.shape[1]) * float(np.max(np.diag(inverse)))
