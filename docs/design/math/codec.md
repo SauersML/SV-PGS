@@ -90,3 +90,19 @@ The sweep agrees. R = 64 has the fastest host share at L = 64 and is within 3% o
 - **The remaining gap:** the host share is about 67–75 GB/s decoded per process against 266 GB/s for the kernels. It does not scale with threads: the per-chunk crc32c and the numpy frame location hold the GIL (1 thread: 66.6 GB/s; 8 threads: 74.6 GB/s).
   - The next steps are a device crc32c and device-side frame location from the size tables. Either one leaves the host a single preadv per request.
 - **Wiring:** Stage 0/2 consumers still take host codes. `DosageStore.read_codes_to_device` is the entry point for a rowdict cache; moving `StoreBlockSource` onto it is the consumer-side change.
+
+## 5. Reading only a fit's active rows (layer A)
+A Stage 2 read needs the reduced model's rows, not the whole span between a block's first and last rows. A rowdict frame depends only on its record's codes and n, not on where it sits. So `read_rows_to_device(start, stop, out, decoder, rows=)` works like this:
+- it reads only the inner chunks that hold a wanted row, with one read per run of consecutive chunks;
+- it checks their crc32c and locates only the wanted frames;
+- it decodes them, in order, into a compact target of `len(rows)` rows.
+
+The host still reads the unwanted frames that share a chunk with a wanted one. With R = 64 and the fraction f of rows wanted spread at random, a chunk is skipped with probability (1 − f)^64. So the host reads essentially the whole span unless the wanted rows cluster. The device work and memory follow the wanted rows only.
+
+**Staging.** Chunks move in windows of whole chunks, through one pinned buffer and one device buffer of max(largest chunk, min(encoded bytes, decoded bytes of `rows`)). Staging therefore never exceeds the decoded rows it serves, and a whole-chromosome read no longer pins the chromosome's encoded bytes at once.
+
+**A fit-local copy of the reduced rows (layer B)** would also remove the host's unwanted bytes. It is built only when the fit's own numbers say it pays. There are P Stage 2 passes; the span's encoded bytes are E_s and the reduced rows' E_r (so E_r ≤ E_s); reading costs τ_r per byte and writing τ_w. The copy pays when
+
+  P·(E_s − E_r)·τ_r > E_s·τ_r + E_r·τ_w,
+
+since it is built by copying frames (a read of the span plus a write of the rows, with nothing re-encoded). With every record active, E_s − E_r is the tied records alone. That is to be measured on an all-active fit before B is built.
