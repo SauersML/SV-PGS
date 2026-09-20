@@ -114,3 +114,13 @@ This replaces §4's bench-real design wherever a decision is made.
 - **The competitor:** `mr_ashr_init` is mr-ash-workflow's mr.ash.init through mr.ashr 0.1-90 (3d65ce3), as `benchmarks/compete` specifies. That's on lane/compete-harness, not yet on main.
 - **The level:** H is its own family of one per version, at α_v. It is a separate claim from the term decisions of §6, so it's outside their Holm family.
 - **Everything else is secondary** and reported without a claim: mr_ashr_both and the other competitors, random5, other feature sets, results per group, and bench-sim.
+
+## Amendment 3 (2026-09-20, before any SV-PGS portability or headline result exists): the portability family P, gated on H
+The lead ratified this by SendMessage on 2026-09-20. It adds critic-real's portability pre-registration, docs/design/prereg/PORTABILITY.md (lane/critic-real-prereg 879f6d5), to this plan's α accounting. That file defines P, its metric, its comparator (mr_ashr_init) and its genes, and this amendment doesn't restate them.
+- **Version:** P shares H's version v, the same frozen (F sha, adapter sha) pair. It takes no separate place in the Amendment 2 spending sequence.
+- **Level, by fixed sequence** (Maurer, Hothorn & Lehmacher 1995): within version v, H is tested first at α_v = 0.05 · 2^−(v+1). P's two-sided (1 − α_v) interval supports a claim only if H rejects at α_v in that version.
+  - If H doesn't reject, P is reported with its interval and no claim.
+  - The fixed sequence keeps FWER over {H, P} ≤ α_v under any dependence between the two tests.
+  - H's level is unchanged, and no α is split.
+- **Timing:** P's confirmatory value is computed only at version v's confirmation run, alongside H, on the genes PORTABILITY.md names. It is never computed at any other time.
+- **PORTABILITY.md's other secondaries** are descriptive and spend no α.
