@@ -313,14 +313,34 @@ def _fit_measurement_model(calibration, cohort_dosage_variance, strata, design=N
     return SimpleNamespace(scales=scales, residual_variance=np.zeros_like(scales), log_reliability=np.zeros_like(scales), certificate=certificate)
 
 
-def _pooled_log_reliability(scales, residual_variance, cohort_dosage_mean, cohort_dosage_variance, group_counts):
+@dataclasses.dataclass(frozen=True)
+class _MeasurementModel:
+    """A stand-in for measurement_model.MeasurementModel's arrays and its npz save and load."""
+
+    scales: np.ndarray
+    residual_variance: np.ndarray
+    log_reliability: np.ndarray
+
+    def save(self, path: Path) -> None:
+        np.savez(path, **dataclasses.asdict(self))
+
+    @classmethod
+    def load(cls, path: Path) -> _MeasurementModel:
+        with np.load(path) as archive:
+            return cls(**{name: archive[name] for name in archive.files})
+
+
+def _pooled_measurement_model(models, cohort_dosage_mean, cohort_dosage_variance, group_counts) -> _MeasurementModel:
     """A stand-in with the production signature: log Var(D*) / (Var(D*) + v) of the stacked groups, -inf without variance."""
+    scales = np.column_stack([model.scales for model in models])
+    residual = np.column_stack([model.residual_variance for model in models])
     weights = group_counts / group_counts.sum()
     mean = cohort_dosage_mean @ weights
     variance = (scales**2 * cohort_dosage_variance + (cohort_dosage_mean - mean[:, None]) ** 2) @ weights
-    total = variance + residual_variance @ weights
+    total = variance + residual @ weights
     with np.errstate(divide="ignore", invalid="ignore"):
-        return np.where(total > 0.0, np.log(variance / total), -np.inf)
+        log_reliability = np.where(total > 0.0, np.log(variance / total), -np.inf)
+    return _MeasurementModel(np.ones_like(mean), residual @ weights, log_reliability)
 
 
 @dataclasses.dataclass
@@ -337,14 +357,15 @@ class _Recorder:
         self.fit_calls: list[dict] = []
         self.failing_fit = failing_fit
 
-    def fit(self, *, store, store_columns, covariates, covariate_names, covariate_columns, targets, training, model_names,
-            trait_types, research_ids, log_variance_offset, budget, work_dir, seed) -> _Fitted:
+    def fit(self, *, store, store_columns, covariates, covariate_names, covariate_columns, targets, target_variance, training,
+            model_names, trait_types, research_ids, measurement, budget, work_dir, seed) -> _Fitted:
         """A stand-in with fit_model.fit's keywords: each model's own covariates by least squares, then marginal
         effects of the standardized codes on the training rows."""
         if self.failing_fit:
             raise RuntimeError("preempted")
         self.fit_calls.append(dict(locals()))
-        assert log_variance_offset.shape == (store.n_variants,) and np.all(log_variance_offset <= 0.0) and work_dir.is_dir()
+        offset = measurement.log_reliability
+        assert offset.shape == (store.n_variants,) and np.all(offset <= 0.0) and target_variance is None and work_dir.is_dir()
         codes = store.read_codes(0, store.n_variants, np.asarray(store_columns)).astype(np.float64) - 127.0
         models = []
         for model, trait_type in enumerate(trait_types):
@@ -405,7 +426,8 @@ def _bindings(recorder: _Recorder, client: _FakeBigQuery) -> WorkspaceBindings:
         ),
         calibration_pairs=lambda sample_ids, moments, blocks=(): SimpleNamespace(sample_ids=sample_ids, moments=moments, blocks=blocks),
         fit_measurement_model=_fit_measurement_model,
-        pooled_log_reliability=_pooled_log_reliability,
+        pooled_measurement_model=_pooled_measurement_model,
+        load_measurement_model=_MeasurementModel.load,
         fit=recorder.fit,
         save_model=_save_model,
         load_model=_load_model,
@@ -517,7 +539,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     untabled = list(cohort["research_ids"]).index("5049")
     assert np.all(np.isnan(cohort["targets"][untabled])) and not fitted_rows[untabled] and "7099" in cohort["research_ids"]
     assert len(call["research_ids"]) == len(call["store_columns"])
-    np.testing.assert_array_equal(call["log_variance_offset"], measurement["log_variance_offset"])
+    saved = _MeasurementModel.load(run / "measurement" / "measurement_model.npz")
+    np.testing.assert_array_equal(call["measurement"].log_reliability, saved.log_reliability)
 
     # Scores: every observed target has its own fold's held-out prediction.
     held_out = np.load(run / "score" / "predictions.npz")["held_out"]

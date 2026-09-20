@@ -168,16 +168,18 @@ FIT_KEYWORDS = (
     "covariate_names",
     "covariate_columns",
     "targets",
+    "target_variance",
     "training",
     "model_names",
     "trait_types",
     "research_ids",
-    "log_variance_offset",
+    "measurement",
     "budget",
     "work_dir",
     "seed",
 )
 """The keywords the fit step passes to fit_model.fit; a fit that lacks one is refused before any step runs."""
+MEASUREMENT_MODEL_FILE = "measurement_model.npz"
 _INT64_BYTES = np.dtype(np.int64).itemsize
 _FLOAT64_BYTES = np.dtype(np.float64).itemsize
 
@@ -315,7 +317,8 @@ class WorkspaceBindings:
     concatenate_calibration_moments: Callable[..., Any]
     calibration_pairs: Callable[..., Any]
     fit_measurement_model: Callable[..., Any]
-    pooled_log_reliability: Callable[..., Any]
+    pooled_measurement_model: Callable[..., Any]
+    load_measurement_model: Callable[..., Any]
     fit: Callable[..., Any]
     save_model: Callable[..., None]
     load_model: Callable[..., Any]
@@ -342,7 +345,8 @@ def workspace_bindings() -> WorkspaceBindings:
         concatenate_calibration_moments=measurement_model.concatenate_calibration_moments,
         calibration_pairs=measurement_model.CalibrationPairs,
         fit_measurement_model=measurement_model.fit_measurement_model,
-        pooled_log_reliability=measurement_model.pooled_log_reliability,
+        pooled_measurement_model=measurement_model.pooled_measurement_model,
+        load_measurement_model=measurement_model.MeasurementModel.load,
         fit=fit_model.fit,
         save_model=artifact.save_model,
         load_model=artifact.load_model,
@@ -1411,14 +1415,11 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         scales=scales,
         residual_variance=residual_variance,
         log_reliability=np.column_stack([np.asarray(result.log_reliability, dtype=np.float64) for result in results]),
-        # The fit's prior offset until it takes one per ancestry group: log r^2 of the stacked D* over the fit rows.
-        log_variance_offset=np.asarray(
-            run.bindings.pooled_log_reliability(
-                scales, residual_variance, np.column_stack(group_means), np.column_stack(group_variances), counts
-            ),
-            dtype=np.float64,
-        ),
     )
+    # The fit takes one model over the store's records until it takes one per ancestry group: the groups' models
+    # pooled over the fit rows (its log reliability is the stacked D*'s r^2), as measurement_model defines it.
+    pooled = run.bindings.pooled_measurement_model(results, np.column_stack(group_means), np.column_stack(group_variances), counts)
+    pooled.save(directory / MEASUREMENT_MODEL_FILE)
     _write_json(directory / "certificate.json", certificates)
     if calibrated:
         rewrite_recalibrated_store(source_root, directory / "store", scales, samples.groups, store_directory / "fill", run.config.codec, run.budget)
@@ -1445,7 +1446,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     targets = np.where(cohort.training, cohort.targets[:, cohort.model_traits], np.nan)[rows]
     work = directory / "work"
     work.mkdir(exist_ok=True)
-    offset = np.load(run.output("measurement") / "measurement.npz")["log_variance_offset"]
+    measurement = run.bindings.load_measurement_model(run.output("measurement") / MEASUREMENT_MODEL_FILE)
     with DosageStore.open(_final_store(run)) as store:
         arguments = {
             "store": store,
@@ -1455,11 +1456,13 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
             # Each model projects out its own trait's columns and the structure columns, never another trait's.
             "covariate_columns": cohort.covariate_columns[cohort.model_traits][:, 1:],
             "targets": targets,
+            # Every target measured exactly until the per-person target variances exist (review-stats section 7).
+            "target_variance": None,
             "training": cohort.training[rows],
             "model_names": cohort.model_names,
             "trait_types": tuple(cohort.trait_types[trait] for trait in cohort.model_traits.tolist()),
             "research_ids": tuple(research_id for research_id, fitted_row in zip(cohort.research_ids, rows) if fitted_row),
-            "log_variance_offset": offset,
+            "measurement": measurement,
             "budget": run.budget,
             "work_dir": work,
             "seed": run.config.seed,
@@ -1475,8 +1478,8 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
         "models": list(fitted.model_names),
         "refusals": [str(refusal) for refusal in getattr(fitted, "refusals", ())],
         "measurement_terms": (
-            "log_variance_offset: the measurement model's reliability pooled over the fit rows' ancestry groups; "
-            "residual variances and each person's target_reliability are recorded, not yet fit inputs"
+            "measurement: the groups' measurement models pooled over the fit rows' ancestry groups; "
+            "target_variance: none yet, so every target is taken as measured exactly"
         ),
     }
 

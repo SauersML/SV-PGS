@@ -39,7 +39,7 @@ These are formats; the paths come from a run config supplied inside the workspac
 | phenotypes | the CDR | one sample table per disease and trait (`all_of_us`) | step |
 | cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |
 | store | samples, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes | each batch's decode; each chromosome |
-| measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the fit's prior offset, pooled over the fit rows' ancestry groups (`pooled_log_reliability`); the store rewritten with D* where pairs exist | step |
+| measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the one model the fit reads, pooled over the fit rows' ancestry groups (`pooled_measurement_model`); the store rewritten with D* where pairs exist | step |
 | fit | cohort, measurement, final store | every (trait, fold) model in one `fit_model.fit` call, each projecting out its own trait's columns (`covariate_columns`), saved by `artifact.save_model` | step |
 | score | fit, cohort | every model's predictions of the cohort from one store read (`artifact.predict`), and each person's own-fold held-out prediction | step |
 | report | score, cohort | held-out accuracy per trait by fold, ancestry and half; counts of 1 to 20 suppressed | step |
@@ -73,10 +73,11 @@ The derivation starts from COMPUTE.md's floor at its design workload (n = 10⁵,
 ## Open items, stated in the step summaries
 
 1. **The disease target is `target`.** pheno-disease's latent-onset model replaces the 0/1 rule path with a reliability-weighted target, and its tables will list every EHR participant.
-2. **The fit's prior offset is pooled** over the fit rows' ancestry groups until the fit takes one per group. It is measure-path's `pooled_log_reliability`, log r² of the stacked D*: Var(D*) = Σ_g w_g (κ_g² V_g + (μ_g − μ)²) over Var(D*) + Σ_g w_g v_g. The per-group residual variances also feed scoring later. No LD-block pairs are passed, so the A-map is not built.3. **The fit needs `covariate_columns`** (fit-api), and the engine a per-model F on each model's own columns. A run whose `fit_model.fit` lacks any keyword in `FIT_KEYWORDS` is refused before its first step.
+2. **The fit gets one measurement model, pooled** over the fit rows' ancestry groups, until it takes one per group. This is measure-path's `pooled_measurement_model`, saved as `measurement/measurement_model.npz` and read back with `MeasurementModel.load`. Its log reliability is the stacked D*'s r²: Var(D*) = Σ_g w_g (κ_g² V_g + (μ_g − μ)²), over Var(D*) + Σ_g w_g v_g. No LD-block pairs are passed yet, so the A-map is not built.
+3. **Every model projects out its own columns (`covariate_columns`, fit-api).** The engine still needs a per-model F on each model's own columns (e2e). A run whose `fit_model.fit` lacks any keyword in `FIT_KEYWORDS` is refused before its first step.
 4. **The store lacks** the SV-context features (STORE.md: the storage plan is not yet written by the converter), and `tr_motif_len` and `r2_locus` in the loci table. A non-SNV record whose core overlaps a GIAB repeat interval is `str_vntr_repeat`.
 5. **Batch `SECURED.ok` files are not read.** The lockstep gate checks every record of every batch.
-6. **Each person's `target_reliability`** (their precision) is not passed to the fit until it takes `target_weights`.
+6. **`target_variance` is None,** so every target is taken as measured exactly. Each person's Gaussian-site variance comes once deslop-hygiene exports it and e2e's heteroscedastic noise exists (review-stats §7). A (target, target_reliability) pair is never passed as an outcome.
 
 ## Covariates (lead ruling, 2026-09-19: each trait its own)
 
@@ -159,7 +160,7 @@ The fusion is measure-path's `measurement_model` (lane/measure-path-model f043b2
   - **A hard-call ALT-count row** takes reported r² = 1: the call set's own claim of exactness, with no genotype likelihoods to give a better number.
 - **The third source C** (RD_CN, or a separate read-depth call set) stays gated. measure-path hasn't validated the three-source identity (MODEL.md §2), and it isn't on their queue.
 - **Moments in value units.** Every moment the measurement model sees, calibration and fitted-cohort alike, is computed on decoded values (code / codes_per_unit + value_origin). A CN row is in copies and an ALT-count row in dosage.
-- **Offsets and scoring.** The fit's `log_variance_offset` covers the merged store's rows. `pooled_log_reliability` must keep a direct row's −inf, since it is −inf in every group. Scoring, Stage 0 and Stage 2 are otherwise affine-invariant per column and need no change (`copy_number` module docstring).
+- **Offsets and scoring.** The measurement model the fit reads covers the merged store's rows. Its pooling must keep a direct row's −inf, since that row is −inf in every group. Scoring, Stage 0 and Stage 2 are otherwise affine-invariant per column and need no change (`copy_number` module docstring).
 - **Measured** [semi-real: bench-sim v7, simulated read-depth DEL/DUP channel, reported by measure-path]: fused r² 0.77–0.80, against 0.69–0.73 for D* alone and 0.41–0.48 for the direct call alone. That is 98–99% of the in-sample linear oracle.
 
 **Restart.** The step's key covers the call-set files by size, the crosswalk, the measurement step's key and its code. Each chromosome is a sub-checkpoint, as in the store step.
