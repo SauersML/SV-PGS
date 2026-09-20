@@ -16,6 +16,7 @@ from scipy.optimize import minimize_scalar
 
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
+    _sum_to_zero_basis,
     INDEPENDENT_EFFECTS,
     CurvatureCorrection,
     FixedPoint,
@@ -103,8 +104,9 @@ def _data(variant_count: int, seed: int):
     return class_index, offset, design, groups, Cavity(precision=precision, shift=shift)
 
 
-def _problem(*, variant_count: int, seed: int, node_count: int = 0):
-    """With ``node_count`` a fixed lattice whose kernels are all active; otherwise the derived floor, top and spacing."""
+def _problem(*, variant_count: int, seed: int, node_count: int = 0, offset_group_count: int = 0):
+    """With ``node_count`` a fixed lattice whose kernels are all active; otherwise the derived floor, top and spacing.
+    With ``offset_group_count`` the variants are dealt round-robin into that many offset groups with learned levels."""
     class_index, offset, design, groups, cavity = _data(variant_count, seed)
     if node_count:
         nodes = np.linspace(np.log(1e-5), np.log(0.5), node_count)
@@ -122,6 +124,7 @@ def _problem(*, variant_count: int, seed: int, node_count: int = 0):
         nodes=nodes,
         floor=floor,
         top=top,
+        offset_groups=np.arange(variant_count) % offset_group_count if offset_group_count else None,
     )
     return prior, cavity
 
@@ -193,8 +196,9 @@ def test_moment_matched_prior_sites_carry_the_prior_second_moment():
     np.testing.assert_array_equal(shift, 0.0)
 
 
-def test_penalized_gradient_and_hessian_match_finite_differences():
-    prior, cavity = _problem(variant_count=25, seed=9, node_count=8)
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_penalized_gradient_and_hessian_match_finite_differences(offset_group_count):
+    prior, cavity = _problem(variant_count=25, seed=9, node_count=8, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 10)
     penalty = _penalty_matrix(prior, hyperparameters.log_smoothing)
     coefficients = hyperparameters.coefficients
@@ -225,7 +229,6 @@ def test_component_derivatives_in_log_scale_match_finite_differences():
             log_density[prior.class_index[variant]],
             scales[variant : variant + 1] + shift_in_log_scale,
             prior.log_variance_grid,
-            prior.kernel_floor,
             cavity.precision[variant : variant + 1],
             cavity.shift[variant : variant + 1],
         )
@@ -309,8 +312,9 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
     ]
 
 
-def test_curvature_trace_gradient_matches_finite_differences():
-    prior, cavity = _problem(variant_count=30, seed=15, node_count=12)
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_curvature_trace_gradient_matches_finite_differences(offset_group_count):
+    prior, cavity = _problem(variant_count=30, seed=15, node_count=12, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 16)
     coefficients = hyperparameters.coefficients
     mapping = prior.coefficient_map
@@ -327,10 +331,11 @@ def test_curvature_trace_gradient_matches_finite_differences():
     np.testing.assert_allclose(analytic, numerical, rtol=1e-6, atol=1e-6)
 
 
-def test_evidence_gradient_in_the_log_weights_matches_finite_differences():
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_evidence_gradient_in_the_log_weights_matches_finite_differences(offset_group_count):
     # Also with a correction C = B - A that is not zero (a PSD one of the form M'(B_z - A_z)M): the gradient is the
     # B-evidence's own, with W_B in its trace terms, not the fixed-cavity form's.
-    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12, offset_group_count=offset_group_count)
     hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
     mapping = prior.coefficient_map
     for correction in (INDEPENDENT_EFFECTS, CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (0.3 * np.eye(mapping.shape[0])) @ mapping)):
@@ -1091,6 +1096,61 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
     assert fit.prediction_move <= fit.prediction_tolerance
 
 
+def test_the_prediction_check_holds_each_block_to_its_own_budget():
+    # Two independently scored blocks share x: a move within the summed budget but over one block's own must not
+    # certify (fit-api P1). Normal means, as in the refusal test; block 0 gets a vanishing budget.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    halves = (slice(0, 30), slice(30, 60))
+
+    def fixed_points(hyperparameters, starve):
+        points = []
+        for model in hyperparameters:
+            moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
+            variance = moments.variance
+
+            def norm(direction, variance=variance):
+                return np.array([float(np.sum(np.square(direction[part]) / variance[part])) for part in halves])
+
+            effective = np.array([float(np.sum(cavity.precision[part] * variance[part])) for part in halves])
+            if starve:
+                effective[0] = 0.0
+            points.append(FixedPoint(cavity=cavity, posterior=diagonal_posterior(variance), mean=moments.mean, precision_norm=norm, effective_effects=effective))
+        return points
+
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, False), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    assert fit.certified and fit.prediction_move <= fit.prediction_tolerance
+    (starved,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], lambda h: fixed_points(h, True), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    # Block 0 has no budget: no step that moves its mean can certify, so the fit is returned uncertified.
+    assert not starved.certified or starved.prediction_move == 0.0
+
+
+def test_a_density_below_the_kernel_floor_is_a_near_zero_effect_not_a_point_mass():
+    # review-mathbugs N1 [real: gene 3 snv_sv's first outer trial]: with every node below the floor given v = 0, a
+    # class whose density sits there had tilted variance exactly 0, so the site targets were tau = inf, nu = nan.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    nodes = prior.log_variance_grid
+    below = initial_hyperparameters(prior, float(np.exp(nodes[0])))
+    moments = tilted_moments(prior, below, cavity, _WORKING_BYTES)
+    assert np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean))
+    precision, shift = site_targets(moments, cavity)
+    assert np.all(np.isfinite(precision)) and np.all(np.isfinite(shift))
+
+
+def test_the_first_outer_trial_is_bounded_by_the_cauchy_step():
+    # The first trust radius is the Cauchy step's length on |B + S|: a direction the data barely curve cannot send the
+    # first trial off to the rounding floor's 1 / eps (review-mathbugs: |x| 1.3e4 on a real gene).
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
+    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+    point = FixedPoint(cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                       precision_norm=lambda d: float(np.sum(np.square(d) / moments.variance)), effective_effects=1.0)
+    newton = engine._newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, INDEPENDENT_EFFECTS, _WORKING_BYTES)
+    radius = engine._cauchy_radius(newton)
+    gradient_norm = float(np.linalg.norm(newton.gradient))
+    assert 0.0 < radius <= gradient_norm / float(np.min(np.abs(newton.eigenvalues)))
+    assert float(np.linalg.norm(engine._proposal(newton, radius))) <= radius * (1.0 + 1e-12)
+
+
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
     prior, cavity = _problem(variant_count=40, seed=48, node_count=10)
     coefficients = _hyperparameters(prior, 49).coefficients
@@ -1162,3 +1222,34 @@ def test_a_halved_lattice_does_not_alias_the_fitted_density_on_the_v7_gap_case()
         values.append(fit.step.evidence)
         assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
     assert abs(values[0] - values[1]) <= 2.0 * _EVIDENCE_TOLERANCE, values
+
+
+def test_offset_group_levels_shift_every_variant_of_a_group_by_its_level_whatever_its_class():
+    """review-mathbugs P2 (lead ruling): levels are gene-owned offsets, sum-to-zero over groups, never class-centred."""
+    class_index = np.array([0, 1, 0, 1, 1, 0, 0, 1])
+    groups = np.array([0, 0, 0, 1, 1, 1, 1, 0])
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 8)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=np.zeros(8), annotation_design=np.zeros((8, 0)), annotation_groups=(),
+        nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=groups,
+    )
+    assert prior.level_size == 1 and prior.smoothing_blocks[-1].name == "offset group levels"
+    levels = np.array([0.7, -0.7])
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[-1:] = _sum_to_zero_basis(2).T @ levels
+    shift = log_scale(prior, coefficients) - log_scale(prior, np.zeros(prior.coefficient_size))
+    np.testing.assert_allclose(shift, levels[groups], rtol=0.0, atol=8 * np.finfo(np.float64).eps)
+    hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+    moved, moved_hyperparameters = relattice(prior, hyperparameters, np.linspace(nodes[0], nodes[-1], 12), nodes[0] - 1.0, nodes[-1])
+    np.testing.assert_array_equal(moved.offset_groups, groups)
+    moved_shift = log_scale(moved, moved_hyperparameters.coefficients) - log_scale(moved, np.zeros(moved.coefficient_size))
+    np.testing.assert_allclose(moved_shift, levels[groups], rtol=0.0, atol=np.sqrt(np.finfo(np.float64).eps))
+
+
+def test_offset_groups_that_do_not_connect_the_classes_are_refused():
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 8)
+    with pytest.raises(ValueError, match="connect the classes"):
+        scale_mixture_prior(
+            class_index=np.array([0, 0, 1, 1]), log_variance_offset=np.zeros(4), annotation_design=np.zeros((4, 0)), annotation_groups=(),
+            nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=np.array([0, 0, 1, 1]),
+        )
