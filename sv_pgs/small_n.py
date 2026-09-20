@@ -246,6 +246,21 @@ class _Kernel:
         delta, phi, psi = self.factors()
         return delta - np.einsum("ij,ij->j", phi, phi) + np.einsum("ij,ij->j", psi, psi)
 
+    def cavity_precisions(self, variances: F64Array) -> F64Array:
+        """1/z - t for the scaled variances z = diag A'^-1, without forming it as that difference.
+
+        On the bulk z = 1/t - a + b (a = |phi_j|^2 = |U^-T x_j|^2 / t^2, b = |psi_j|^2), so 1 - t z = t (a - b) and
+        1/z - t = t (a - b) / z exactly. The difference 1/z - t cancels to rounding where the data's information on a
+        column is small against its site precision (a rare column under a narrow start); this form keeps it to
+        relative rounding, and it is positive whenever the sites are (b = 0 and a > 0). Where t <= 0 both terms of
+        1/z - t are non-negative, so it has no cancellation there."""
+        _delta, phi, psi = self.factors()
+        cavity = 1.0 / variances - self.precision
+        bulk = self.bulk
+        gap = np.einsum("ij,ij->j", phi[:, bulk], phi[:, bulk]) - np.einsum("ij,ij->j", psi[:, bulk], psi[:, bulk])
+        cavity[bulk] = self.precision[bulk] * gap / variances[bulk]
+        return cavity
+
     def draws(self, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x draws) exact draws of N(0, A'^-1): beta_N from its marginal N(0, S^-1), then beta_P | beta_N with
         precision A'_PP (Bhattacharya et al. 2016: u ~ N(0, T^-1), e ~ N(0, I_n), u - T^-1 Xp_P' K^-1 (Xp_P u + e))."""
@@ -400,6 +415,10 @@ class _DenseFixedPoints:
         self.profile["variance_seconds"] += time.perf_counter() - started
         return variances
 
+    def _cavity_precisions(self, variances: F64Array) -> F64Array:
+        """1/z - tau in the model's units: the kernel's scaled form, divided by sigma^2 (A = A' / sigma^2)."""
+        return self.kernel.cavity_precisions(variances / self.noise) / self.noise
+
     def _residual_sum_of_squares(self) -> float:
         residual = self.statistics.projected_target - self.design @ self.mean
         return float(residual @ residual)
@@ -420,7 +439,7 @@ class _DenseFixedPoints:
                 failure = "the precision is not positive definite with non-negative sites"
             else:
                 variances = self._variances()
-                if not np.any(1.0 / variances - self.site_precision <= 0.0):
+                if not np.any(self._cavity_precisions(variances) <= 0.0):
                     self.profile["refreshes"] += 1
                     count = self.prior.variant_count
                     self.effective = max(count - float(np.sum(self.site_precision * variances)), _EPSILON * count)
@@ -473,7 +492,7 @@ class _DenseFixedPoints:
         tolerance = 0.5 / self.draw_count
         while True:
             variances = self._refresh()
-            frozen = 1.0 / variances - self.site_precision
+            frozen = self._cavity_precisions(variances)
             mean = self.mean.copy()
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)

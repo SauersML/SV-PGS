@@ -117,3 +117,20 @@ def test_the_small_n_fit_runs_and_recovers_a_sparse_signal():
     assert set(np.argsort(-np.abs(coefficients))[:3].tolist()) == {10, 50, 90}
     assert fit.scoring.posterior_draws.shape == (variants, 64)
     assert 0.5 < fit.noise_variance < 2.0
+
+
+def test_cavity_precisions_are_positive_and_exact_where_the_difference_cancels():
+    from sv_pgs.small_n import _Kernel
+
+    generator = np.random.default_rng(21)
+    samples, columns = 30, 200
+    design = generator.normal(size=(samples, columns))
+    design[:, :100] *= 1e-7  # little data on these columns against their sites: 1/z - t cancels to rounding
+    precision = generator.uniform(0.5, 2.0, size=columns)
+    kernel = _Kernel(design, precision)
+    variances = kernel.variances()
+    exact = np.array([design[:, j] @ np.linalg.solve(np.eye(samples) + (design * (1.0 / precision)) @ design.T
+                      - np.outer(design[:, j], design[:, j]) / precision[j], design[:, j]) for j in range(columns)])
+    cavity = kernel.cavity_precisions(variances)
+    assert np.all(cavity > 0.0)
+    np.testing.assert_allclose(cavity, exact, rtol=np.sqrt(np.finfo(np.float64).eps))
