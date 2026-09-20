@@ -15,6 +15,8 @@ Phenotype: MAGE inverse-normal TMM expression, residualized on the MAGE eQTL cov
 Covariates are fixed effects for every method: TrainData.covariates carries the training rows (a predictor whose
 predict accepts ``covariates`` receives the test rows), and every method's score is compared with the truth by one
 rule, predict_for_truth: the score is residualized on [1, covariates] with training OLS coefficients, as the truth is.
+That saved truth is the fit's target, not the held-out metric: report.py scores expression and score both residualized
+on [1, covariates] within each held-out group (the within-group partial r^2, lead ruling).
 MAGE computed the PEER factors from all 731 samples' expression, held-out samples included. That is unsupervised,
 shared by every method, and not a per-method leak, but the held-out expression did shape one covariate set.
 Target gene: GENCODE v38 gene body, strand, merged exons and merged CDS (1-based closed, like POS/END).
@@ -498,6 +500,10 @@ def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, t
         train_score, test_score = _call_predict(predictor, train_genotypes, train.covariates), _call_predict(predictor, genotypes, test_covariates)
         if raw is not None:
             raw[label] = (train_score, test_score)
+        if np.ptp(train_score) == 0:
+            # A constant's fit on [1, C] is the constant on the intercept alone; lstsq would leave float rounding noise,
+            # which scores as a random direction instead of as no prediction.
+            return test_score - train_score[0]
         coefficients, *_ = np.linalg.lstsq(design_train, train_score, rcond=None)
         return test_score - design_test @ coefficients
 
