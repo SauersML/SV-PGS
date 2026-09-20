@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.measurement_model import (
+    BlockPairs,
     LdBlock,
     MeasurementModel,
     apply_leakage_map,
@@ -19,6 +20,7 @@ from sv_pgs.measurement_model import (
     mapped_gram,
     pooled_calibration,
     pooled_log_reliability,
+    pooled_measurement_model,
     residual_variances,
 )
 from sv_pgs.sample_ids import ResearchId
@@ -403,3 +405,32 @@ def test_engine_blocks_fold_fused_pairs_into_their_block_and_refuse_a_split_pair
     assert blocks[2].targets.tolist() == [5] and blocks[2].absorbed.tolist() == [6]
     with pytest.raises(ValueError, match="straddles"):
         engine_blocks(starts, stops, np.array([9]), np.array([10]), np.array([9]))
+
+
+def test_the_pooled_model_pools_the_groups_and_fits_the_maps_once() -> None:
+    rng = np.random.default_rng(61)
+    models, means, variances, counts = [], [], [], np.array([1500, 500])
+    for size in counts:
+        sv, snp = _two_locus(rng, int(size), 0.3, 0.9)
+        draw = _draw_type_column(sv[None], np.array([0.3]), 0.5, rng)[0]
+        pairs = calibration_pairs(tuple(ResearchId(str(index)) for index in range(size)), np.vstack([draw, snp]), np.vstack([sv, snp]))
+        stored = np.vstack([draw, snp])
+        models.append(fit_measurement_model(pairs, stored.var(axis=1), np.array([0, 1]), np.array([0.3, 1.0])))
+        means.append(stored.mean(axis=1))
+        variances.append(stored.var(axis=1))
+    means, variances = np.column_stack(means), np.column_stack(variances)
+    unmapped = pooled_measurement_model(models, means, variances, counts)
+    scales = np.column_stack([model.scales for model in models])
+    residuals = np.column_stack([model.residual_variance for model in models])
+    np.testing.assert_array_equal(unmapped.log_reliability, pooled_log_reliability(scales, residuals, means, variances, counts))
+    np.testing.assert_array_equal(unmapped.scales, np.ones(2))
+    np.testing.assert_allclose(unmapped.residual_variance, residuals @ (counts / counts.sum()), rtol=rounding_gamma(4))
+
+    sv, snp = _two_locus(rng, 3000, 0.3, 0.9)
+    draw = 0.5 * _draw_type_column(sv[None], np.array([0.3]), 0.5, rng)[0]
+    cohort = np.vstack([draw, snp])
+    block = BlockPairs(LdBlock(np.array([0, 1]), np.array([0]), np.array([1])), cohort.T[:2000], sv[:2000, None], np.cov(cohort, bias=True))
+    mapped = pooled_measurement_model(models, means, variances, counts, blocks=(block,))
+    assert mapped.log_reliability[1] == -np.inf and mapped.certificate["direct_calls_fused"] == 1
+    assert mapped.leakage_maps[0].ridge_ratio > 0.0
+    assert mapped.log_reliability[0] > unmapped.log_reliability[0]

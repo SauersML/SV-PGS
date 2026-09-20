@@ -767,3 +767,77 @@ def fit_measurement_model(
     for key in ("recalibration", "leakage_correction", "reliability_source", "direct_calls_fused"):
         log(f"measurement model: {key}: {certificate[key]}")
     return MeasurementModel(scales, residual, offsets, tuple(maps), certificate)
+
+
+def pooled_measurement_model(
+    models: Sequence[MeasurementModel],
+    cohort_dosage_mean: NDArray,
+    cohort_dosage_variance: NDArray,
+    group_counts: NDArray,
+    blocks: Sequence[BlockPairs] = (),
+) -> MeasurementModel:
+    """The one model the fit uses over store records, from one model per ancestry group.
+
+    Each group's kappa is applied in the store, so the fit's columns are D* and the
+    pooled ``scales`` are 1. ``cohort_dosage_mean`` and ``cohort_dosage_variance``
+    are [records, groups], the stored (uncalibrated) columns' moments in each
+    group's fitted samples, and ``group_counts`` the fitted samples per group. Each
+    recalibration keeps its group's mean, so D*'s cohort variance is
+    sum_g w_g (kappa_g^2 V_g + (mu_g - mu)^2) and its residual variance
+    sum_g w_g v_g (w_g = n_g / n); the offsets are ``pooled_log_reliability``.
+    The maps are fitted here, once over the pooled cohort, not per group: a linear
+    predictor is not an average of per-group predictors. Each of ``blocks`` holds
+    the truth pairs of every group with their stored D* columns (already
+    recalibrated, so the map applies no scale) and the pooled cohort's covariance
+    of those D* columns. A mapped target's offset is its mapped column's share of
+    the pooled genotype variance; an absorbed direct call gets -inf.
+    """
+    if not models:
+        raise ValueError("pooled_measurement_model needs one model per ancestry group.")
+    scales = np.column_stack([model.scales for model in models])
+    residuals = np.column_stack([model.residual_variance for model in models])
+    means = np.asarray(cohort_dosage_mean, dtype=np.float64)
+    variances = np.asarray(cohort_dosage_variance, dtype=np.float64)
+    counts = np.asarray(group_counts, dtype=np.float64)
+    if means.shape != scales.shape or variances.shape != scales.shape or counts.shape != (scales.shape[1],):
+        raise ValueError("pooled_measurement_model needs [records, groups] moments and one count per model.")
+    offsets = pooled_log_reliability(scales, residuals, means, variances, counts)
+    weights = counts / counts.sum()
+    fitted = weights > 0.0
+
+    def weighted(values: F64Array) -> F64Array:
+        return (np.where(fitted, values, 0.0) * weights).sum(axis=1)
+
+    centre = weighted(means)
+    signal = weighted(scales**2 * variances + (means - centre[:, None]) ** 2)
+    residual = weighted(residuals)
+    genotype_variance = signal + residual
+    ones = np.ones(scales.shape[0])
+    maps: list[LeakageMap] = []
+    absorbed = np.zeros(scales.shape[0], dtype=bool)
+    for pairs in blocks:
+        leakage = fit_block_map(pairs, ones)
+        maps.append(leakage)
+        rows = np.asarray(pairs.block.records, dtype=np.int64)
+        target_rows = rows[np.asarray(pairs.block.targets, dtype=np.int64)]
+        mapped = mapped_signal_variances(pairs, ones, leakage)
+        residual[target_rows] = np.maximum(genotype_variance[target_rows] - mapped, 0.0)
+        offsets[target_rows] = _log_signal_share(mapped, residual[target_rows])
+        absorbed[rows[np.asarray(pairs.block.absorbed, dtype=np.int64)]] = True
+    offsets[absorbed] = -np.inf
+    ratios = np.array([leakage.ridge_ratio for leakage in maps])
+    certificate: dict[str, object] = {
+        "groups": [model.certificate for model in models],
+        "group_counts": [int(count) for count in counts],
+        "scales": "kappa applied per ancestry group in the store; the fit's columns are D*",
+        "reliability_source": "each group's model, pooled over the fitted cohort's groups",
+        "leakage_correction": (
+            f"applied to {len(maps)} blocks over the pooled cohort: no leakage found in {int(np.sum(ratios == 0.0))}"
+            if maps
+            else "not applied: no block has calibration pairs"
+        ),
+        "direct_calls_fused": int(absorbed.sum()),
+    }
+    for key in ("leakage_correction", "direct_calls_fused"):
+        log(f"pooled measurement model: {key}: {certificate[key]}")
+    return MeasurementModel(ones, residual, offsets, tuple(maps), certificate)
