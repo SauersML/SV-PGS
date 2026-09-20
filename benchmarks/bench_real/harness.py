@@ -12,6 +12,13 @@ passes only test genotypes to ``predict``. Test phenotypes are read only when sc
 
 Phenotype: MAGE inverse-normal TMM expression, residualized on the MAGE eQTL covariates (sex, 5 genotype PCs,
 60 PEER factors) by OLS fitted on the training samples only; test phenotypes are adjusted with the training fit.
+Covariates are fixed effects for every method: TrainData.covariates carries the training rows (a predictor whose
+predict accepts ``covariates`` receives the test rows), and every method's score is compared with the truth by one
+rule, predict_for_truth: the score is residualized on [1, covariates] with training OLS coefficients, as the truth is.
+That saved truth is the fit's target, not the held-out metric: report.py scores expression and score both residualized
+on [1, covariates] within each held-out group (the within-group partial r^2, lead ruling).
+MAGE computed the PEER factors from all 731 samples' expression, held-out samples included. That is unsupervised,
+shared by every method, and not a per-method leak, but the held-out expression did shape one covariate set.
 Target gene: GENCODE v38 gene body, strand, merged exons and merged CDS (1-based closed, like POS/END).
 Genotypes: alternate-allele counts 0/1/2 from the 1kGP phased panel; variants monomorphic in the training samples
 are dropped. Window: the variant interval overlaps TSS +/- 1 Mb, the cis window of MAGE's own mapping and of
@@ -20,6 +27,7 @@ GTEx (GTEx Consortium 2020, Science 369:1318).
 import dataclasses
 import hashlib
 import importlib.util
+import inspect
 import json
 import subprocess
 import os
@@ -33,14 +41,19 @@ import pandas as pd
 CIS_RADIUS_BP = 1_000_000
 SEALED_GENES = "sealed_confirmation_genes.tsv"
 PARENT_DATASET = "parent_dataset.txt"
+# Per-row measurement-quality columns; a source without one of them gets 1.0 there (a direct call).
+MEASUREMENT_COLUMNS = ("reliability", "concordance", "called_r2")
+# Recorded in run.json: how a score is compared with the truth (predict_for_truth). Results without it are "pre-C2".
+PREDICTION_RULE = "C2: score residualized on [1, covariates] by training OLS, as the truth is"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
-                "svimp", "snv_svimp")
+                "svimp", "snv_svimp", "ctyper", "snv_ctyper", "hprc2", "snv_hprc2")
 # Rows of these sources are SVs; each set is its source alone, or panel SNVs/indels plus it (lr-sv's derived datasets).
 SOURCE_SETS = {"hgsvc3": "hgsvc3", "ont": "ont", "sv_merged": "panel_merged", "pgsv_merged": "pangenie_merged", "hgsvc3_merged": "hgsvc3_merged",
-               "gatksv": "gatksv", "svimp": "svimp"}
+               "gatksv": "gatksv", "svimp": "svimp", "ctyper": "ctyper", "hprc2": "hprc2"}
 JOINT_SOURCE_SETS = {"snv_hgsvc3": "hgsvc3", "snv_ont": "ont", "snv_sv_merged": "panel_merged", "snv_pgsv_merged": "pangenie_merged",
-                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv", "snv_svimp": "svimp"}
+                     "snv_hgsvc3_merged": "hgsvc3_merged", "snv_sv_cn": "gatksv", "snv_svimp": "svimp", "snv_ctyper": "ctyper",
+                     "snv_hprc2": "hprc2"}
 MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
 
@@ -60,6 +73,19 @@ class Variants:
     # Row of each variant in its chromosome's variant table: with source, it identifies one column across overlapping
     # gene windows, so a method can share work between genes (fit_views).
     chromosome_row: np.ndarray = None
+    # Each column's measurement reliability: the expected squared correlation of the stored dosage with the true genotype.
+    # 1 for direct calls; a derived dataset supplies it (a variants.tsv "reliability" column) where dosages were filled
+    # or imputed, and an imputed overlay supplies its imputation r^2 estimate (svimp.npz "dr2"). A method that cannot
+    # use it simply sees the dosages.
+    reliability: np.ndarray = None
+    # Each column's expected genotype concordance where dosages were filled (the share of people whose stored dosage
+    # equals the called one; lr-sv's GATK-SV no-call fills). A concordance, not an r^2: 1 where absent.
+    concordance: np.ndarray = None
+    # The exact squared correlation of the stored dosage with the CALLED genotype under the fill mixture (lr-sv): an upper
+    # bound on the r^2 with the true genotype, so not the reliability either. 1 where absent.
+    # In reliability, concordance and called_r2 alike, NaN means "undefined" (e.g. called_r2 on a row whose called people
+    # are all homozygous reference, where every carrier is a fill): no reported value, never a value of 0 or 1.
+    called_r2: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,11 +103,40 @@ class TrainData:
     strand: str
     exons: np.ndarray
     coding_exons: np.ndarray
+    # The training rows of the covariates the phenotype was residualized on (sex, 5 genotype PCs, 60 PEER factors;
+    # dataset/covariate_names.tsv), without the intercept. phenotype is already orthogonal to [1, covariates].
+    covariates: np.ndarray = None
+
+
+class _StackedDosage:
+    """Rows of several memory-mapped (variants x samples) int8 arrays, in a merged row order, read by fancy indexing
+    without concatenating the arrays: source_of[i] names the array holding merged row i, and row_of[i] its row there."""
+
+    def __init__(self, parts, source_of, row_of):
+        self.parts, self.source_of, self.row_of = parts, source_of, row_of
+        self.shape = (len(source_of), parts[0].shape[1])
+
+    def __getitem__(self, rows):
+        rows = np.asarray(rows)
+        out = np.empty((len(rows), self.shape[1]), dtype=self.parts[0].dtype)
+        for index, part in enumerate(self.parts):
+            chosen = np.flatnonzero(self.source_of[rows] == index)
+            if len(chosen):
+                out[chosen] = part[self.row_of[rows[chosen]]]
+        return out
 
 
 class Dataset:
-    def __init__(self, dataset_dir, overlay_dir=None):
+    def __init__(self, dataset_dir, overlay_dir=None, rows_dirs=None, sample_subset=None):
         self.directory = pathlib.Path(dataset_dir)
+        # Extra-rows overlays (lr-sv's SV sources, stored beside the parent instead of as full copies): each directory
+        # holds chrN.variants.tsv and chrN.dosage.npy (int8, rows x the parent's samples, in samples.tsv order). Per
+        # chromosome the table is the parent's rows, then each directory's rows in the given order, stably sorted by pos,
+        # exactly as a full derived copy is built, so windows, row order and chromosome_row equal the full copy's.
+        self.rows_dirs = [pathlib.Path(path) for path in (rows_dirs or [])]
+        # A sample subset (e.g. the 260 people with ONT calls): every split's train and test are cut to it, and any
+        # stored genotype read for a subset person must be a real value (the harness refuses negative placeholders).
+        self.sample_subset = pathlib.Path(sample_subset) if sample_subset is not None else None
         # Imputed SV dosages (bench-sim's svimp): per chromosome, <overlay>/<chrom>.svimp.npz with rows (indices into the
         # chromosome's variant table, panel SV rows) and ds (float32 [rows x samples] in samples.tsv order). They enter a
         # gene window as extra columns with source "svimp", beside the called genotypes they impute.
@@ -91,9 +146,18 @@ class Dataset:
         self.expression = np.load(self.directory / "expression.npy")
         self.covariates = np.load(self.directory / "covariates.npy")
         self.splits = {split["name"]: split for split in json.loads((self.directory / "splits.json").read_text())}
+        if self.sample_subset is not None:
+            keep = set(pd.read_csv(self.sample_subset, sep="\t", header=None)[0].astype(str)) - {"sample"}
+            unknown = keep - set(self.samples["sample"])
+            if unknown:
+                raise ValueError(f"{len(unknown)} subset samples are not dataset samples, e.g. {sorted(unknown)[:3]}")
+            restricted = {name: dict(split, train=[s for s in split["train"] if s in keep], test=[s for s in split["test"] if s in keep])
+                          for name, split in self.splits.items()}
+            self.splits = {name: split for name, split in restricted.items() if split["train"] and split["test"]}
         self.gene_annotation = json.loads((self.directory / "gene_annotation.json").read_text())
         self.sample_index = {sample: index for index, sample in enumerate(self.samples["sample"])}
         self._chromosomes = {}
+        self._parent_position = None
 
     def overlay(self, chrom: str):
         """(rows, dosages) of the chromosome's imputed SV overlay, or None."""
@@ -109,7 +173,12 @@ class Dataset:
             if "samples" in data and list(data["samples"]) != list(self.samples["sample"]):
                 raise ValueError(f"{path}: sample order differs from samples.tsv")
             self._overlay_chrom, self._overlay = chrom, (data["rows"].astype(np.int64), data["ds"])
+            self._overlay_dr2 = data["dr2"].astype(np.float64) if "dr2" in data else None
         return self._overlay
+
+    def overlay_reliability(self, chrom: str):
+        """The overlay's per-row imputation r^2 estimate (Beagle DR2), or None."""
+        return self._overlay_dr2 if self.overlay(chrom) is not None else None
 
     def chromosome(self, chrom: str):
         """The variant table and memory-mapped dosages of one chromosome; only the latest one stays cached."""
@@ -120,8 +189,36 @@ class Dataset:
             if "source" not in table:
                 table["source"] = "panel"
             dosage = np.load(self.directory / f"chr{number}.dosage.npy", mmap_mode="r")
+            self._parent_position = None
+            if self.rows_dirs:
+                table, dosage = self._with_extra_rows(number, table, dosage)
             self._chromosomes[chrom] = (table, dosage)
         return self._chromosomes[chrom]
+
+    def _with_extra_rows(self, number, parent_table, parent_dosage):
+        tables, dosages = [parent_table], [parent_dosage]
+        for directory in self.rows_dirs:
+            path = directory / f"chr{number}.variants.tsv"
+            if not path.exists():
+                continue
+            extra_dosage = np.load(directory / f"chr{number}.dosage.npy", mmap_mode="r")
+            if extra_dosage.shape[1] != parent_dosage.shape[1]:
+                raise ValueError(f"{directory}: {extra_dosage.shape[1]} samples, the parent has {parent_dosage.shape[1]}")
+            extra = pd.read_csv(path, sep="\t")
+            if len(extra) != extra_dosage.shape[0]:
+                raise ValueError(f"{directory} chr{number}: {len(extra)} table rows but {extra_dosage.shape[0]} dosage rows")
+            tables.append(extra)
+            dosages.append(extra_dosage)
+        measured = [column for column in MEASUREMENT_COLUMNS if any(column in part for part in tables)]
+        tables = [part.reindex(columns=list(parent_table.columns) + [column for column in measured if column not in parent_table])
+                  .assign(**{column: part[column] if column in part else 1.0 for column in measured}) for part in tables]
+        source_of = np.concatenate([np.full(len(part), index) for index, part in enumerate(tables)])
+        row_of = np.concatenate([np.arange(len(part)) for part in tables])
+        merged = pd.concat(tables, ignore_index=True)
+        order = np.argsort(merged["pos"].to_numpy(), kind="stable")
+        self._parent_position = np.empty(len(parent_table), dtype=np.int64)
+        self._parent_position[row_of[order][source_of[order] == 0]] = np.flatnonzero(source_of[order] == 0)
+        return merged.iloc[order].reset_index(drop=True), _StackedDosage(dosages, source_of[order], row_of[order])
 
     def sealed_genes(self):
         """The sealed confirmation genes (lead ruling): scored once, only when the lead calls the confirmation.
@@ -199,9 +296,16 @@ def load_gene_window(dataset: Dataset, gene_row: int):
     overlay = dataset.overlay(chrom)
     if overlay is not None:
         imputed_rows, imputed = overlay
+        if dataset._parent_position is not None:
+            # svimp rows index the parent's table; with extra rows merged in, map them to merged positions.
+            imputed_rows = dataset._parent_position[imputed_rows]
         present = np.flatnonzero(np.isin(imputed_rows, rows))
         if len(present):
             imputed_table = table.iloc[imputed_rows[present]].reset_index(drop=True).assign(source="svimp")
+            if dataset.overlay_reliability(chrom) is not None:
+                imputed_table["reliability"] = dataset.overlay_reliability(chrom)[present]
+            if "reliability" in imputed_table and "reliability" not in window_table:
+                window_table = window_table.assign(reliability=1.0)
             genotypes = np.hstack([genotypes, imputed[present].T.astype(np.float32)])
             window_table = pd.concat([window_table, imputed_table], ignore_index=True)
             chromosome_rows = np.concatenate([chromosome_rows, imputed_rows[present]])
@@ -236,6 +340,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
     train_index = np.array([dataset.sample_index[sample] for sample in split["train"]])
     test_index = np.array([dataset.sample_index[sample] for sample in split["test"]])
     train_genotypes, test_genotypes = window.genotypes[train_index], window.genotypes[test_index]
+    if (train_genotypes < 0).any() or (test_genotypes < 0).any():
+        raise ValueError(f"{window.gene_id}: a negative placeholder genotype was read for a split sample (sample subset missing?)")
     allele_count = train_genotypes.sum(axis=0)
     # A column that is constant in the training samples carries no information and has zero variance, which
     # breaks standardization: that is every sample 0 or 2, but also every sample heterozygous (seen in PanGenie
@@ -250,14 +356,18 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
                         sv_type=selected["sv_type"].to_numpy(dtype=str), sv_length=length, allele_length_change=length_change,
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
                         window_row=np.flatnonzero(polymorphic),
-                        chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None)
+                        chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None,
+                        reliability=selected["reliability"].to_numpy(dtype=np.float64) if "reliability" in selected else np.ones(len(selected)),
+                        concordance=selected["concordance"].to_numpy(dtype=np.float64) if "concordance" in selected else np.ones(len(selected)),
+                        called_r2=selected["called_r2"].to_numpy(dtype=np.float64) if "called_r2" in selected else np.ones(len(selected)))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]
     train = TrainData(gene_id=window.gene_id, chrom=window.chrom, tss=window.tss, genotypes=train_genotypes, phenotype=train_phenotype, variants=variants,
                       superpopulation=samples["Superpopulation"].to_numpy()[train_index], population=samples["Population"].to_numpy()[train_index],
                       gene_start=gene["start"], gene_end=gene["end"], strand=gene["strand"],
-                      exons=np.array(gene["exons"], dtype=np.int64).reshape(-1, 2), coding_exons=np.array(gene["coding_exons"], dtype=np.int64).reshape(-1, 2))
+                      exons=np.array(gene["exons"], dtype=np.int64).reshape(-1, 2), coding_exons=np.array(gene["coding_exons"], dtype=np.int64).reshape(-1, 2),
+                      covariates=np.asarray(dataset.covariates[train_index], dtype=np.float64))
     return train, test_genotypes, test_phenotype, test_index
 
 
@@ -299,7 +409,9 @@ def feature_mask(variants: Variants, feature_set: str, draw_key: str):
     panel SNVs/indels plus those SVs. The long-read rows exist only in the derived datasets that carry them.
     *_merged: the same SV sources after truvari collapse, one row per collapsed site; gatksv / snv_sv_cn: the GATK-SV 1kGP
     callset, whose multi-allelic CNV rows carry copies above the lowest copy number (so train_allele_frequency on them
-    is half a mean copy offset, not an allele frequency). See SOURCE_SETS and JOINT_SOURCE_SETS."""
+    is half a mean copy offset, not an allele frequency); ctyper / snv_ctyper: Ctyper paralog-specific copy numbers (one row per
+    gene-family copy, placed at its locus); hprc2 / snv_hprc2: HPRC release-2 pangenome SV genotypes. See SOURCE_SETS and
+    JOINT_SOURCE_SETS."""
     panel = variants.source == "panel"
     small = panel & ~variants.is_sv
     pangenie_sv = (variants.source == "pangenie") & variants.is_sv
@@ -347,10 +459,11 @@ def load_method(spec: str):
 _WORKER = {}
 
 
-def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None):
-    _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir)
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False):
+    _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
+    _WORKER["record_failures"] = record_failures
 
 
 def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
@@ -358,6 +471,52 @@ def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
     masked = test_genotypes.copy()
     masked[:, train.variants.is_sv] = train.genotypes[:, train.variants.is_sv].mean(axis=0)
     return masked
+
+
+def _call_predict(predictor, genotypes, covariates):
+    """predictor.predict(genotypes), passing the samples' covariates too when the predictor accepts them."""
+    if "covariates" in inspect.signature(predictor.predict).parameters:
+        return np.asarray(predictor.predict(genotypes, covariates=covariates), dtype=np.float64)
+    return np.asarray(predictor.predict(genotypes), dtype=np.float64)
+
+
+def predict_for_truth(predictor, train: TrainData, test_genotypes: np.ndarray, test_covariates: np.ndarray, raw=None):
+    """The held-out predictions scored against the truth, full and with the SV columns held at their training means.
+
+    The truth is the test expression minus [1, C_test] a, with a the training OLS coefficients of expression on
+    [1, C] (residualize). Under the fixed-effects model y = [1, C] g + X b + e, a estimates g + B b, where B is the
+    training OLS of the genotypes on [1, C], so the truth's genetic part is (X_test - [1, C_test] B) b. The harness
+    therefore treats every method's score the way it treats the truth: it fits the score on [1, C] over the training
+    samples and removes [1, C_test] times those coefficients from the test score. For a linear score X b this gives
+    exactly (X_test - [1, C_test] B) b, whatever b is; for a score already orthogonal to [1, C] in training it changes
+    nothing. One rule for every method (review-mathbugs C2).
+
+    With raw a dict, the method's unadjusted scores are also returned in it (train, test, and both with the SV columns
+    held at their training means), so a fit can be re-scored under any other truth definition without refitting."""
+    design_train = np.column_stack([np.ones(train.genotypes.shape[0]), train.covariates])
+    design_test = np.column_stack([np.ones(test_genotypes.shape[0]), test_covariates])
+
+    def adjusted(train_genotypes, genotypes, label):
+        train_score, test_score = _call_predict(predictor, train_genotypes, train.covariates), _call_predict(predictor, genotypes, test_covariates)
+        if raw is not None:
+            raw[label] = (train_score, test_score)
+        if np.ptp(train_score) == 0:
+            # A constant's fit on [1, C] is the constant on the intercept alone; lstsq would leave float rounding noise,
+            # which scores as a random direction instead of as no prediction.
+            return test_score - train_score[0]
+        coefficients, *_ = np.linalg.lstsq(design_train, train_score, rcond=None)
+        return test_score - design_test @ coefficients
+
+    prediction = adjusted(train.genotypes, test_genotypes, "full")
+    if not train.variants.is_sv.any():
+        if raw is not None:
+            raw["without_sv"] = raw["full"]
+        return prediction, prediction
+    return prediction, adjusted(_without_structural_variants(train, train.genotypes), _without_structural_variants(train, test_genotypes), "without_sv")
+
+
+def _train_index(dataset, split_name):
+    return np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["train"]])
 
 
 def _run_gene(arguments):
@@ -370,19 +529,30 @@ def _run_gene(arguments):
         for feature_set in _WORKER["feature_sets"]:
             train, test_genotypes = subset(train_all, test_all, feature_set, split_name)
             started = time.process_time()
-            predictor = fit(train)
-            prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
+            try:
+                predictor = fit(train)
+                raw = {}
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
+                coefficients, status = sv_coefficients(train, predictor, window.gene_id, split_name, feature_set), "ok"
+            except Exception as error:
+                # A failed fit is never replaced by a stand-in predictor. By default it stops the run; with
+                # --record-failures it is kept as a failure: NaN predictions (unscored) and the error in the log.
+                if not _WORKER["record_failures"]:
+                    raise
+                prediction = without_sv = np.full(len(test_index), np.nan)
+                raw = None
+                coefficients, status = None, f"failed: {type(error).__name__}: {str(error)[:300]}"
             seconds = time.process_time() - started
-            without_sv = np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64) if train.variants.is_sv.any() else prediction
-            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1], int(train.variants.is_sv.sum()), seconds,
-                            sv_coefficients(train, predictor, window.gene_id, split_name, feature_set)))
+            results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
+                            int(train.variants.is_sv.sum()), seconds, coefficients, status, raw, _train_index(dataset, split_name)))
     return results
 
 
-def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None):
+def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None, rows_dirs=None, sample_subset=None,
+                      record_failures=False):
     from multiprocessing import get_context
 
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir)) as pool:
+    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures)) as pool:
         yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
 
 
@@ -466,11 +636,10 @@ def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
         seen.add(key)
         seconds = (time.process_time() - started) / len(views)
         train, test_genotypes, test_phenotype, test_index = views._task(key)
-        prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
-        without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
-                      if train.variants.is_sv.any() else prediction)
+        raw = {}
+        prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
         yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]))
+               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok", raw, _train_index(dataset, key[1]))
     if len(seen) != len(views):
         raise ValueError(f"fit_views returned {len(seen)} of {len(views)} requested views")
 
@@ -486,29 +655,40 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 raise ValueError(f"fit_batch returned {len(predictors)} predictors for {len(gene_rows)} genes")
             for index, (gene_row, predictor) in enumerate(zip(gene_rows, predictors)):
                 train, test_genotypes, test_phenotype, test_index = trains._task(index)
-                prediction = np.asarray(predictor.predict(test_genotypes), dtype=np.float64)
-                without_sv = (np.asarray(predictor.predict(_without_structural_variants(train, test_genotypes)), dtype=np.float64)
-                              if train.variants.is_sv.any() else prediction)
+                raw = {}
+                prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set))
+                       int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set), "ok", raw,
+                       _train_index(dataset, split_name))
 
 
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
-        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None):
+        confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None, rows_dirs=None, sample_subset=None,
+        record_failures=False):
     """Out-of-fold predictions of one method for every gene on the chromosomes, under one split design.
 
     contract "gene": the method is fit(train) -> predictor, called per gene, split and feature set in worker processes.
     contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
     with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
-    dataset = Dataset(dataset_dir, overlay_dir)
+    dataset = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
+    if split_subset is not None:
+        unknown = set(split_subset) - set(split_names)
+        if unknown:
+            raise ValueError(f"splits not in design {design}: {sorted(unknown)}")
+        split_names = [name for name in split_names if name in set(split_subset)]
     if gene_ranks is not None and gene_list is None:
         raise ValueError("gene ranks need a gene list")
     gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation, gene_ranks)
     sample_count = len(dataset.samples)
     predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
     predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
+    # The raw (unadjusted) scores of every sample, per split: genes x splits x samples, so a fit can be re-scored under
+    # another truth definition without refitting. NaN where a sample was not scored in that split (or the fit failed).
+    raw_scores = {(feature_set, kind): np.full((len(gene_rows), len(split_names), sample_count), np.nan, dtype=np.float32)
+                  for feature_set in feature_sets for kind in ("full", "without_sv")}
+    split_position = {name: position for position, name in enumerate(split_names)}
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
     log = []
     position_of_row = {row: position for position, row in enumerate(gene_rows)}
@@ -517,19 +697,27 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     elif contract == "views":
         results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
     else:
-        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir) for result in chunk)
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset,
+                                                            record_failures) for result in chunk)
     coefficient_tables = []
-    for gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients in results:
+    for (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status,
+         raw, train_index) in results:
         if coefficients is not None:
             coefficient_tables.append(coefficients)
         position = position_of_row[gene_row]
         predictions[feature_set][position, test_index] = prediction
         predictions_without_sv[feature_set][position, test_index] = without_sv
+        if raw is not None:
+            for kind, (train_score, test_score) in raw.items():
+                raw_scores[(feature_set, kind)][position, split_position[split_name], train_index] = train_score
+                raw_scores[(feature_set, kind)][position, split_position[split_name], test_index] = test_score
         truth[position, test_index] = test_phenotype
-        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds))
+        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds, status,
+                    bool(np.isfinite(prediction).all() and np.ptp(prediction) == 0)))
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
-    tag = "_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
+    tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
+           + ("." + "+".join(name.split("/")[1] for name in split_names) if split_subset is not None else ""))
     method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
     (out / f"{tag}.run.json").write_text(json.dumps({
@@ -539,17 +727,28 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "overlay": str(overlay_dir) if overlay_dir is not None else None,
+        "genes": len(gene_rows), "contract": contract, "splits": split_names, "prediction_rule": PREDICTION_RULE,
+        "record_failures": record_failures, "failed_fits": sum(entry[6] != "ok" for entry in log),
+        "constant_predictions": sum(bool(entry[7]) for entry in log),
+        "rows_dirs": [{"dir": str(path), "provenance_sha256": hashlib.sha256((path / "PROVENANCE.json").read_bytes()).hexdigest()
+                       if (path / "PROVENANCE.json").exists() else None} for path in dataset.rows_dirs],
+        "sample_subset": str(sample_subset) if sample_subset is not None else None,
+        "sample_subset_sha256": hashlib.sha256(pathlib.Path(sample_subset).read_bytes()).hexdigest() if sample_subset is not None else None,
+        "note": json.loads(pathlib.Path(note).read_text()) if note is not None else None, "overlay": str(overlay_dir) if overlay_dir is not None else None,
         "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
                            if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
     for feature_set in feature_sets:
         np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
         np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
+        np.save(out / f"{tag}.{feature_set}.raw_scores.npy", raw_scores[(feature_set, "full")])
+        np.save(out / f"{tag}.{feature_set}.raw_scores_without_sv.npy", raw_scores[(feature_set, "without_sv")])
+    (out / f"{tag}.raw_splits.json").write_text(json.dumps(split_names))
     np.save(out / f"{tag}.truth.npy", truth)
     if coefficient_tables:
         pd.concat(coefficient_tables, ignore_index=True).to_csv(out / f"{tag}.sv_coefficients.tsv.gz", sep="\t", index=False)
     dataset.genes.iloc[gene_rows].to_csv(out / f"{tag}.genes.tsv", sep="\t", index=False)
-    pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds"]).to_csv(out / f"{tag}.log.tsv", sep="\t", index=False)
+    pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds", "status", "constant_prediction"]).to_csv(
+        out / f"{tag}.log.tsv", sep="\t", index=False)
 
 
 if __name__ == "__main__":
@@ -571,7 +770,13 @@ if __name__ == "__main__":
                         help="gene: fit(train); batch: fit_batch(trains) once per split; views: fit_views(views) once over every view")
     parser.add_argument("--gene-ranks", nargs=2, type=int, metavar=("START", "STOP"), help="with --genes, only the list's rows START..STOP-1")
     parser.add_argument("--overlay", help="directory of <chrom>.svimp.npz imputed SV dosages (feature sets svimp, snv_svimp)")
+    parser.add_argument("--splits", nargs="+", help="only these splits of the design (e.g. loso/AFR), for per-split checkpoints")
+    parser.add_argument("--note", help="a JSON file recorded verbatim in run.json (arm label, test status, rulings)")
+    parser.add_argument("--rows", action="append", metavar="NAME=DIR", help="an extra-rows overlay (repeatable; merged in the given order)")
+    parser.add_argument("--sample-subset", help="a file of sample ids, one per line: every split is cut to these people")
+    parser.add_argument("--record-failures", action="store_true", help="keep going when a fit raises: the fit is recorded as failed (NaN, never a stand-in)")
     arguments = parser.parse_args()
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
-        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay)
+        tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note,
+        [value.split("=", 1)[1] for value in arguments.rows] if arguments.rows else None, arguments.sample_subset, arguments.record_failures)

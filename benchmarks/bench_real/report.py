@@ -1,9 +1,25 @@
 """Score out-of-fold predictions from the harness.
 
-Per gene and superpopulation, r^2 = squared Pearson correlation between prediction and the covariate-adjusted
-held-out expression (0 when the prediction is constant). Paired differences between two arms are averaged over
-genes; their standard error is the delete-one-chromosome jackknife (genes on one chromosome share variants and
-trans structure, chromosomes do not), and a gene-level SE is shown when only one chromosome is scored.
+The held-out metric is the within-group partial r^2 (lead ruling, review-stats STATS_REVIEW.md §0). Within one held-out
+superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted over T's own held-out people. Per gene:
+  r2       corr(R_T s, R_T y)^2, with y the dataset's expression and s the saved prediction (0 when R_T s = 0): the
+           incremental R^2 of the score given the covariates inside the target ancestry. The harness's saved truth (y
+           minus a training-OLS covariate fit) is not scored: in a held-out ancestry that fit is an extrapolation whose
+           within-group spread dominated the truth, and every score shared it. The saved truth only marks who was held
+           out, and it is checked against y (HeldOut.expression_for), so a mismatched --dataset stops the report.
+  oos_r2   1 - |R_T (y - s)|^2 / |R_T y|^2: it also charges the score's scale, which r2 ignores.
+  null_r2  1 / (n_T - rank[1, C_T]), the exact expectation of r2 for a score unrelated to expression.
+  mismatched_r2  the standing negative control: gene i's expression against the score of the next gene of its chunk on
+           another chromosome (review-stats). Its mean must sit at null_r2; above it is signal no gene owns.
+R_T s is the same for any two scores that differ by one covariate combination, so raw and covariate-adjusted scores
+score alike, and fits made before the harness adjusted scores (C2) re-score from their saved predictions. Under loso
+that is exact. Under random5 a group's people come from five training fits, so a score adjusted fold by fold keeps a
+small fold-to-fold covariate term; the saved (adjusted) prediction is scored as it is.
+
+Paired differences between two arms are averaged over genes; their standard error is the delete-one-chromosome jackknife
+(genes on one chromosome share variants and trans structure, chromosomes do not), and a gene-level SE is shown when only
+one chromosome is scored. They hold the people fixed; robust.py's family x chromosome bootstrap, which re-fits R_T in
+every replicate, covers the sampling of people too.
 
 Headline: both designs hold every person out exactly once, so the five superpopulations are pooled into one test.
 Per gene, r^2 and paired differences are averaged over the groups and covariances are summed over them; the result
@@ -12,11 +28,13 @@ per-group rows follow as secondary detail (the African-ancestry drop under loso 
 
 SV credit, per method and feature set with SV columns: the harness also predicts with every SV column held at its
 training mean, so the SV part of a prediction is prediction - prediction_without_sv. The credit is that part's
-share of the held-out covariance with expression, summed over genes (an exact additive split for linear
+share of the within-group covariance <R_T y, R_T s>, summed over genes (an exact additive split for linear
 predictors), and the r^2 lost when SVs are held at their means.
 """
 import argparse
+import functools
 import itertools
+import json
 import pathlib
 
 import numpy as np
@@ -26,8 +44,9 @@ SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 POOLED = "pooled"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
-                "svimp", "snv_svimp")
-JOINT_SETS = ("snv_sv", "snv_pgsv", "snv_hgsvc3", "snv_ont", "snv_sv_merged", "snv_pgsv_merged", "snv_hgsvc3_merged", "snv_sv_cn", "snv_svimp")
+                "svimp", "snv_svimp", "ctyper", "snv_ctyper", "hprc2", "snv_hprc2")
+JOINT_SETS = ("snv_sv", "snv_pgsv", "snv_hgsvc3", "snv_ont", "snv_sv_merged", "snv_pgsv_merged", "snv_hgsvc3_merged", "snv_sv_cn", "snv_svimp",
+              "snv_ctyper", "snv_hprc2")
 # Within a method: adding each SV source to SNVs; each other source, and each collapsed source, against the panel SVs or its
 # uncollapsed self; and SVs alone against an equal number of matched SNVs (and against each other). HGSVC3 is the PanGenie
 # arm of record; HGSVC2 PanGenie (pgsv) stays as a labelled legacy comparison.
@@ -35,34 +54,170 @@ WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("snv_hgsvc
                              ("snv_pgsv_merged", "snv"), ("snv_hgsvc3_merged", "snv"), ("snv_sv_cn", "snv"),
                              ("snv_hgsvc3", "snv_sv"), ("snv_ont", "snv_sv"), ("snv_sv_cn", "snv_sv"),
                              ("snv_sv_merged", "snv_sv"), ("snv_pgsv_merged", "snv_pgsv"), ("snv_hgsvc3_merged", "snv_hgsvc3"),
-                             ("snv_svimp", "snv"), ("snv_svimp", "snv_sv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
+                             ("snv_svimp", "snv"), ("snv_svimp", "snv_sv"), ("snv_ctyper", "snv"), ("snv_ctyper", "snv_sv"), ("snv_hprc2", "snv"),
+                             ("snv_hprc2", "snv_sv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
 
 
-def squared_correlation(prediction, truth):
-    prediction = prediction - prediction.mean()
-    truth = truth - truth.mean()
-    denominator = np.sqrt((prediction ** 2).sum() * (truth ** 2).sum())
-    return 0.0 if denominator == 0 else float((prediction @ truth / denominator) ** 2)
+def group_basis(covariates, weights=None):
+    """An orthonormal basis of span[1, covariates] over one group's people (the rows of covariates), and its rank. With
+    weights (one per person), of that design with each row scaled by sqrt(weight): the weighted within-group fit."""
+    design = np.column_stack([np.ones(covariates.shape[0]), covariates])
+    if weights is not None:
+        design = design * np.sqrt(weights)[:, None]
+    left, singular, _ = np.linalg.svd(design, full_matrices=False)
+    # numpy.linalg.matrix_rank's default: a singular value counts when it exceeds the largest one times the larger
+    # dimension times the float64 machine epsilon.
+    rank = int(np.sum(singular > singular.max() * max(design.shape) * np.finfo(np.float64).eps))
+    return left[:, :rank], rank
+
+
+def residual_on(basis, values, weights=None):
+    """Each row of values (rows x the group's people) minus its projection on the basis. A row in the span (a constant,
+    or any covariate combination) has residual 0, and it is set so rather than left as float rounding noise, which would
+    score as a random direction. A row is in the span when it is constant, or when its residual is within what rounding
+    leaves of a row in the span: its storage precision (half an ulp per entry of a float32 prediction moves the row by at
+    most eps32 / 2 of its norm) plus group_basis's rank tolerance for the float64 projection. With weights, the residual
+    of the sqrt(weight)-scaled rows, so plain sums of products of two residuals are the weighted sums."""
+    values = np.asarray(values)
+    storage = np.finfo(values.dtype).eps if np.issubdtype(values.dtype, np.floating) else 0.0
+    values = values.astype(np.float64)
+    constant = np.ptp(values, axis=1) == 0
+    if weights is not None:
+        values = values * np.sqrt(weights)
+    residual = values - (values @ basis) @ basis.T
+    tolerance = storage + max(basis.shape) * np.finfo(np.float64).eps
+    residual[constant | (np.linalg.norm(residual, axis=1) <= tolerance * np.linalg.norm(values, axis=1))] = 0.0
+    return residual
+
+
+def within_group_residual(values, covariates, weights=None):
+    """R_T values: each row of values (rows x one group's people) minus its least-squares fit on [1, covariates] within
+    the group, and the rank of [1, covariates]."""
+    basis, rank = group_basis(covariates, weights)
+    return residual_on(basis, values, weights), rank
+
+
+def partial_scores(score, truth):
+    """Per row of within-group residuals: r2 = corr(R s, R y)^2 (0 when R s = 0) and oos_r2 = 1 - |R y - R s|^2 / |R y|^2."""
+    product = np.sum(score * truth, axis=1)
+    score_norm, truth_norm = np.sum(score ** 2, axis=1), np.sum(truth ** 2, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r2 = np.where(score_norm == 0, 0.0, product ** 2 / (score_norm * truth_norm))
+        return r2, 1.0 - np.sum((truth - score) ** 2, axis=1) / truth_norm
+
+
+class HeldOut:
+    """The dataset side of the within-group rule: expression, covariates, superpopulations and each split's test people."""
+
+    def __init__(self, dataset_dir):
+        dataset_dir = pathlib.Path(dataset_dir)
+        samples = pd.read_csv(dataset_dir / "samples.tsv", sep="\t")
+        self.covariates = np.load(dataset_dir / "covariates.npy").astype(np.float64)
+        self.expression = np.load(dataset_dir / "expression.npy", mmap_mode="r")
+        self.gene_row = {gene: row for row, gene in enumerate(pd.read_csv(dataset_dir / "genes.tsv", sep="\t")["gene_id"])}
+        index = {sample: position for position, sample in enumerate(samples["sample"])}
+        self.tests = {split["name"]: np.array([index[sample] for sample in split["test"]], dtype=int)
+                      for split in json.loads((dataset_dir / "splits.json").read_text())}
+        self.groups = {group: np.flatnonzero(samples["Superpopulation"].to_numpy() == group) for group in SUPERPOPULATIONS}
+        # (design, group, people, rank) of groups left unscored: [1, C_T] leaves their people no residual dimension.
+        self.unscorable = set()
+
+    def expression_for(self, genes: pd.DataFrame, truth: np.ndarray, design: str):
+        """Each gene's expression y, NaN where the saved truth t is NaN (not held out), checked against t. Within every
+        split's test people t is y minus a covariate combination, so R(t - y) = 0 up to rounding: t is stored in float32
+        (at most half an ulp per entry, so |R(t - y)| <= eps32 |t| / 2) and both covariate fits are float64, far below
+        that, so eps32 (|t| + |y|) bounds it."""
+        missing = sorted(set(genes["gene_id"]) - set(self.gene_row))
+        if missing:
+            raise ValueError(f"{len(missing)} scored genes are not in the dataset, e.g. {missing[:3]}")
+        expression = np.asarray(self.expression[[self.gene_row[gene] for gene in genes["gene_id"]]], dtype=np.float64)
+        expression[~np.isfinite(truth)] = np.nan
+        for name, test in self.tests.items():
+            held = test[np.isfinite(truth[:, test]).all(axis=0)] if name.startswith(f"{design}/") else test[:0]
+            if held.size == 0:
+                continue
+            gap, _ = within_group_residual(truth[:, held] - expression[:, held], self.covariates[held])
+            bound = np.finfo(np.float32).eps * (np.linalg.norm(truth[:, held], axis=1) + np.linalg.norm(expression[:, held], axis=1))
+            if (np.linalg.norm(gap, axis=1) > bound).any():
+                raise ValueError(f"the saved truth of split {name} is not the dataset's expression minus a covariate fit: is --dataset this run's dataset?")
+        return expression
+
+    def predictions(self, directory: pathlib.Path, tag: str, feature_set: str, masked: bool):
+        """A saved prediction (with the SV columns held at their training means when masked). A fit whose raw score is
+        constant over its split's people, train and test, predicts no differences, so its covariate-adjusted score is
+        exactly 0; the harness's adjustment left float rounding noise there, which is set back to 0. Needs the raw
+        scores (saved since e448b16); an earlier unadjusted prediction of such a fit is exactly constant already."""
+        suffix = "_without_sv" if masked else ""
+        predictions = np.load(directory / f"{tag}.{feature_set}.predictions{suffix}.npy")
+        raw_path = directory / f"{tag}.{feature_set}.raw_scores{suffix}.npy"
+        if raw_path.exists():
+            raw = np.load(raw_path)
+            for position, name in enumerate(json.loads((directory / f"{tag}.raw_splits.json").read_text())):
+                block = raw[:, position]
+                finite = np.isfinite(block)
+                constant = finite.any(axis=1) & (np.where(finite, block, np.inf).min(axis=1) == np.where(finite, block, -np.inf).max(axis=1))
+                cells = np.ix_(constant, self.tests[name])
+                predictions[cells] = np.where(np.isfinite(predictions[cells]), 0.0, np.nan)
+        return predictions
+
+    def within_groups(self, design: str, expression: np.ndarray, *scores):
+        """Per held-out group, and per set of genes held out on the same people: the gene rows, the people count, the
+        rank of [1, C_T], R_T of the expression and R_T of each score."""
+        for group, members in self.groups.items():
+            held = np.isfinite(expression[:, members])
+            for pattern in np.unique(held, axis=0):
+                rows = np.flatnonzero((held == pattern).all(axis=1))
+                people = members[pattern]
+                if people.size == 0:
+                    continue
+                basis, rank = group_basis(self.covariates[people])
+                if people.size <= rank:
+                    self.unscorable.add((design, group, int(people.size), rank))
+                    continue
+                yield (group, rows, int(people.size), rank, residual_on(basis, expression[np.ix_(rows, people)]),
+                       [residual_on(basis, score[np.ix_(rows, people)]) for score in scores])
+
+
+@functools.lru_cache(maxsize=None)
+def held_out(dataset_dir: pathlib.Path) -> HeldOut:
+    return HeldOut(dataset_dir)
 
 
 def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str, design: str):
-    samples = pd.read_csv(dataset_dir / "samples.tsv", sep="\t")
-    frames = []
-    for genes_file in sorted((results_dir / method / design).glob("*.genes.tsv")):
+    """Per gene, feature set and held-out group: r2, oos_r2 and null_r2 under the within-group rule, and the group's
+    held-out people count."""
+    data, directory, frames = held_out(pathlib.Path(dataset_dir)), results_dir / method / design, []
+    for genes_file in sorted(directory.glob("*.genes.tsv")):
         tag = genes_file.name.removesuffix(".genes.tsv")
         genes = pd.read_csv(genes_file, sep="\t")
-        truth = np.load(results_dir / method / design / f"{tag}.truth.npy")
+        expression = data.expression_for(genes, np.load(directory / f"{tag}.truth.npy").astype(np.float64), design)
         for feature_set in FEATURE_SETS:
-            path = results_dir / method / design / f"{tag}.{feature_set}.predictions.npy"
-            if not path.exists():
+            if not (directory / f"{tag}.{feature_set}.predictions.npy").exists():
                 continue
-            predictions = np.load(path)
-            for superpopulation in SUPERPOPULATIONS:
-                members = np.flatnonzero(samples["Superpopulation"].to_numpy() == superpopulation)
-                scores = [squared_correlation(predictions[row, members].astype(np.float64), truth[row, members].astype(np.float64)) for row in range(len(genes))]
-                frames.append(pd.DataFrame({"gene_id": genes["gene_id"], "chrom": genes["chrom"], "method": method, "feature_set": feature_set,
-                                            "design": design, "superpopulation": superpopulation, "r2": scores}))
+            predictions = data.predictions(directory, tag, feature_set, masked=False)
+            for group, rows, people, rank, truth, (score,) in data.within_groups(design, expression, predictions):
+                r2, oos_r2 = partial_scores(score, truth)
+                partner = mismatched_partners(genes["chrom"].to_numpy()[rows])
+                mismatched = np.where(partner >= 0, partial_scores(score[partner], truth)[0], np.nan)
+                frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
+                                            "feature_set": feature_set, "design": design, "superpopulation": group, "r2": r2, "oos_r2": oos_r2,
+                                            "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
     return pd.concat(frames, ignore_index=True)
+
+
+def mismatched_partners(chromosomes: np.ndarray) -> np.ndarray:
+    """The negative control's pairing (review-stats): each gene's partner is the next gene of its chunk, cyclically, on
+    another chromosome (-1 when every gene shares one). The r2 of gene i's expression against its partner's score is
+    signal that no gene owns, such as shared covariate or ancestry structure; under the within-group rule its mean sits
+    at null_r2."""
+    count = len(chromosomes)
+    doubled = np.concatenate([chromosomes, chromosomes])
+    # next_other[j]: the first position after j whose chromosome differs from j's, i.e. the end of j's run.
+    next_other = np.full(2 * count, 2 * count)
+    for position in range(2 * count - 2, -1, -1):
+        next_other[position] = position + 1 if doubled[position + 1] != doubled[position] else next_other[position + 1]
+    first = next_other[:count]
+    return np.where(first < np.arange(count) + count, first % max(count, 1), -1)
 
 
 def jackknife(differences: pd.Series, blocks: pd.Series):
@@ -75,58 +230,81 @@ def jackknife(differences: pd.Series, blocks: pd.Series):
 
 
 def paired(scores: pd.DataFrame, arm_a, arm_b):
+    """Paired differences between two arms, reported two ways when fits failed (--record-failures):
+    complete-case (difference, se): only genes every compared arm completed, with failed_genes counted;
+    intention-to-treat (itt_difference, itt_se): every gene, a failed group scored as the training-mean prediction
+    (r^2 = 0), so an arm cannot gain by failing on hard genes. Without failures the two coincide."""
     rows = []
     key = ["gene_id", "chrom", "design", "superpopulation"]
     left = scores[(scores["method"] == arm_a[0]) & (scores["feature_set"] == arm_a[1])][key + ["r2"]]
     right = scores[(scores["method"] == arm_b[0]) & (scores["feature_set"] == arm_b[1])][key + ["r2"]]
     merged = left.merge(right, on=key, suffixes=("_a", "_b"))
-    pooled = merged.groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].mean().assign(superpopulation=POOLED)
+    pooled = merged.groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].agg(lambda values: values.mean(skipna=False)).assign(
+        superpopulation=POOLED)
+    pooled_itt = merged.fillna({"r2_a": 0.0, "r2_b": 0.0}).groupby(["gene_id", "chrom", "design"], as_index=False)[["r2_a", "r2_b"]].mean()
+    itt = pd.concat([pooled_itt.assign(superpopulation=POOLED), merged.fillna({"r2_a": 0.0, "r2_b": 0.0})], ignore_index=True)
+    itt_groups = dict(list(itt.groupby(["design", "superpopulation"], sort=False)))
     for (design, superpopulation), group in pd.concat([pooled, merged], ignore_index=True).groupby(["design", "superpopulation"], sort=False):
-        mean, error, kind = jackknife(group["r2_a"] - group["r2_b"], group["chrom"])
-        rows.append({"arm_a": "/".join(arm_a), "arm_b": "/".join(arm_b), "design": design, "superpopulation": superpopulation, "genes": len(group),
-                     "mean_r2_a": group["r2_a"].mean(), "mean_r2_b": group["r2_b"].mean(), "difference": mean, "se": error, "se_kind": kind})
+        failed = int(group[["r2_a", "r2_b"]].isna().any(axis=1).sum())
+        complete = group.dropna(subset=["r2_a", "r2_b"])
+        mean, error, kind = jackknife(complete["r2_a"] - complete["r2_b"], complete["chrom"])
+        whole = itt_groups[(design, superpopulation)]
+        itt_mean, itt_error, _ = jackknife(whole["r2_a"] - whole["r2_b"], whole["chrom"])
+        rows.append({"arm_a": "/".join(arm_a), "arm_b": "/".join(arm_b), "design": design, "superpopulation": superpopulation, "genes": len(complete),
+                     "mean_r2_a": complete["r2_a"].mean(), "mean_r2_b": complete["r2_b"].mean(), "difference": mean, "se": error, "se_kind": kind,
+                     "failed_genes": failed, "itt_genes": len(whole), "itt_mean_r2_a": whole["r2_a"].mean(), "itt_mean_r2_b": whole["r2_b"].mean(),
+                     "itt_difference": itt_mean, "itt_se": itt_error})
     return rows
 
 
 def pooled_r2(scores: pd.DataFrame):
-    """Per method, feature set and design: the mean over genes of each gene's r^2 averaged over the held-out groups."""
-    per_gene = scores.groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False)["r2"].mean()
+    """Per method, feature set and design: the mean over genes of each gene's r^2 (and oos_r2, and the null r^2)
+    averaged over the held-out groups, complete-case (failed genes dropped and counted) and intention-to-treat (a failed
+    group scored as the training-mean prediction: r^2 = oos_r2 = 0)."""
+    key = ["method", "feature_set", "design", "gene_id", "chrom"]
+    per_gene = scores.groupby(key, as_index=False)[["r2", "oos_r2", "null_r2", "mismatched_r2"]].agg(lambda values: values.mean(skipna=False))
+    per_gene_itt = scores.fillna({"r2": 0.0}).groupby(key, as_index=False)["r2"].mean()
+    itt_groups = dict(list(per_gene_itt.groupby(["method", "feature_set", "design"])))
     rows = []
-    for key, group in per_gene.groupby(["method", "feature_set", "design"]):
-        mean, error, kind = jackknife(group["r2"], group["chrom"])
-        rows.append(dict(zip(["method", "feature_set", "design"], key), superpopulation=POOLED, genes=len(group), mean_r2=mean, se=error, se_kind=kind))
+    for arm, group in per_gene.groupby(["method", "feature_set", "design"]):
+        failed = int(group["r2"].isna().sum())
+        complete = group.dropna(subset=["r2"])
+        mean, error, kind = jackknife(complete["r2"], complete["chrom"])
+        oos_mean, oos_error, _ = jackknife(complete["oos_r2"], complete["chrom"])
+        whole = itt_groups[arm]
+        itt_mean, itt_error, _ = jackknife(whole["r2"], whole["chrom"])
+        rows.append(dict(zip(["method", "feature_set", "design"], arm), superpopulation=POOLED, genes=len(complete), mean_r2=mean, se=error, se_kind=kind,
+                         null_r2=complete["null_r2"].mean(), mismatched_r2=complete["mismatched_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error, failed_genes=failed, itt_genes=len(whole),
+                         itt_mean_r2=itt_mean, itt_se=itt_error))
     return pd.DataFrame(rows)
-
-
-def covariance(first, second):
-    return float(((first - first.mean()) * (second - second.mean())).sum())
 
 
 def sv_credit(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str, design: str):
-    samples = pd.read_csv(dataset_dir / "samples.tsv", sep="\t")
-    rows = []
-    for genes_file in sorted((results_dir / method / design).glob("*.genes.tsv")):
+    """Per gene, joint feature set and held-out group, under the within-group rule: the covariances <R_T y, R_T s> of the
+    full prediction and of its SV part s - m (m: the SV columns held at their training means), and the r2 lost to m."""
+    data, directory, frames = held_out(pathlib.Path(dataset_dir)), results_dir / method / design, []
+    for genes_file in sorted(directory.glob("*.genes.tsv")):
         tag = genes_file.name.removesuffix(".genes.tsv")
         genes = pd.read_csv(genes_file, sep="\t")
-        truth = np.load(results_dir / method / design / f"{tag}.truth.npy").astype(np.float64)
+        expression = data.expression_for(genes, np.load(directory / f"{tag}.truth.npy").astype(np.float64), design)
         for feature_set in JOINT_SETS:
-            full_path = results_dir / method / design / f"{tag}.{feature_set}.predictions.npy"
-            masked_path = results_dir / method / design / f"{tag}.{feature_set}.predictions_without_sv.npy"
-            if not (full_path.exists() and masked_path.exists()):
+            if not all((directory / f"{tag}.{feature_set}.{kind}.npy").exists() for kind in ("predictions", "predictions_without_sv")):
                 continue
-            full, masked = np.load(full_path).astype(np.float64), np.load(masked_path).astype(np.float64)
-            for superpopulation in SUPERPOPULATIONS:
-                members = np.flatnonzero(samples["Superpopulation"].to_numpy() == superpopulation)
-                for row in range(len(genes)):
-                    observed, predicted, predicted_without = truth[row, members], full[row, members], masked[row, members]
-                    rows.append({"gene_id": genes["gene_id"].iloc[row], "chrom": genes["chrom"].iloc[row], "method": method, "feature_set": feature_set,
-                                 "design": design, "superpopulation": superpopulation, "covariance_full": covariance(observed, predicted),
-                                 "covariance_sv": covariance(observed, predicted - predicted_without),
-                                 "r2_drop": squared_correlation(predicted, observed) - squared_correlation(predicted_without, observed)})
-    return pd.DataFrame(rows)
+            full = data.predictions(directory, tag, feature_set, masked=False)
+            masked = data.predictions(directory, tag, feature_set, masked=True)
+            for group, rows, _, _, truth, (score, score_without, sv_part) in data.within_groups(design, expression, full, masked, full - masked):
+                frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
+                                            "feature_set": feature_set, "design": design, "superpopulation": group,
+                                            "covariance_full": np.sum(truth * score, axis=1), "covariance_sv": np.sum(truth * sv_part, axis=1),
+                                            "r2_drop": partial_scores(score, truth)[0] - partial_scores(score_without, truth)[0]}))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def summarize_sv_credit(credit: pd.DataFrame):
+    # Genes with a failed fit in any group are dropped whole: a NaN covariance must not enter a sum as 0.
+    failed = credit[["covariance_full", "covariance_sv"]].isna().any(axis=1)
+    bad = set(map(tuple, credit.loc[failed, ["method", "feature_set", "design", "gene_id"]].to_numpy()))
+    credit = credit[[tuple(row) not in bad for row in credit[["method", "feature_set", "design", "gene_id"]].to_numpy()]]
     pooled = credit.groupby(["method", "feature_set", "design", "gene_id", "chrom"], as_index=False).agg(
         covariance_full=("covariance_full", "sum"), covariance_sv=("covariance_sv", "sum"), r2_drop=("r2_drop", "mean")).assign(superpopulation=POOLED)
     rows = []
@@ -176,11 +354,16 @@ def main():
     credit = pd.concat([sv_credit(results_dir, dataset_dir, method, design) for results_dir, method, design in runs], ignore_index=True)
     if len(credit):
         summarize_sv_credit(credit).to_csv(pathlib.Path(arguments.out) / "sv_credit.tsv", sep="\t", index=False)
-    summary = scores.groupby(["design", "superpopulation", "method", "feature_set"])["r2"].agg(["mean", "count"]).reset_index()
+    summary = scores.groupby(["design", "superpopulation", "method", "feature_set"]).agg(mean=("r2", "mean"), count=("r2", "count"), null_r2=("null_r2", "mean"),
+                                                                                       mismatched_r2=("mismatched_r2", "mean"),
+                                                                                       mean_oos_r2=("oos_r2", "mean"), people=("people", "max")).reset_index()
     summary.to_csv(pathlib.Path(arguments.out) / "mean_r2.tsv", sep="\t", index=False)
     headline = pooled_r2(scores)
     headline.to_csv(pathlib.Path(arguments.out) / "pooled_r2.tsv", sep="\t", index=False)
     with pd.option_context("display.width", 250, "display.max_rows", 500, "display.float_format", "{:.5f}".format):
+        print("within-group partial r^2 given the covariates (R_T y, R_T s; STATS_REVIEW.md §0)")
+        for design, group, people, rank in sorted(held_out(dataset_dir).unscorable):
+            print(f"unscored: {design} {group}: {people} held-out people, [1, C] rank {rank}, no residual dimension")
         print("pooled held-out r^2 (headline)")
         print(headline.to_string(index=False))
         print("pooled paired differences (headline)")
