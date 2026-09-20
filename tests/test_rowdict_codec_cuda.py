@@ -133,3 +133,64 @@ def test_store_selective_reads_span_chromosomes_and_halves(tmp_path: Path) -> No
             store.read_codes_to_device(0, 10, cupy.empty((2, store.n_samples), dtype=cupy.uint8), decoder, np.array([5, 3]))
         with pytest.raises(ValueError, match="ascending"):
             store.read_codes_to_device(0, 10, cupy.empty((1, store.n_samples), dtype=cupy.uint8), decoder, np.array([10]))
+
+
+def _array_of_every_depth(tmp_path: Path, samples: int) -> tuple[CodeArray, np.ndarray]:
+    rng = np.random.default_rng(samples + 3)
+    codes = np.vstack([_rows_of_every_depth(rng, samples) for _ in range(2)])
+    layout = create_code_array(tmp_path, codes.shape[0], samples, codec="rowdict", shard_rows=16, inner_rows=4)
+    for shard_index in range(layout.shard_count):
+        with CodeShardWriter(tmp_path, layout, shard_index) as writer:
+            writer.write_rows(codes[shard_index * 16 : (shard_index + 1) * 16])
+    return CodeArray(tmp_path), codes
+
+
+def test_the_device_checks_refuse_a_corrupted_chunk(tmp_path: Path) -> None:
+    import google_crc32c
+
+    array, codes = _array_of_every_depth(tmp_path, 4099)
+    decoder = rowdict_codec.GpuRowDecoder(cupy)
+    shard = array._shard(0)
+    offset, size = int(shard.chunk_offsets[1]), int(shard.chunk_sizes[1]) - 4
+    array.close()
+    path = tmp_path / "c" / "0" / "0"
+    original = bytearray(path.read_bytes())
+
+    def read(start: int, stop: int) -> None:
+        fresh = CodeArray(tmp_path)
+        try:
+            fresh.read_rows_to_device(start, stop, cupy.empty((stop - start, 4099), dtype=cupy.uint8), decoder)
+        finally:
+            fresh.close()
+
+    corrupted = bytearray(original)
+    corrupted[offset + size // 2] ^= 0x10
+    path.write_bytes(bytes(corrupted))
+    with pytest.raises(ValueError, match="inner chunk 1 fails its crc32c"):
+        read(0, 16)
+    read(0, 4)  # chunk 0 alone is intact
+    # a size table that no longer covers the payload, under a matching crc32c
+    corrupted = bytearray(original)
+    corrupted[offset] ^= 0x01
+    corrupted[offset + size : offset + size + 4] = google_crc32c.value(bytes(corrupted[offset : offset + size])).to_bytes(4, "little")
+    path.write_bytes(bytes(corrupted))
+    with pytest.raises(ValueError, match="row size table"):
+        read(4, 8)
+    path.write_bytes(bytes(original))
+    out = cupy.empty((16, 4099), dtype=cupy.uint8)
+    fresh = CodeArray(tmp_path)
+    fresh.read_rows_to_device(0, 16, out, decoder)
+    fresh.close()
+    assert np.array_equal(cupy.asnumpy(out), codes[:16])
+
+
+def test_the_device_decode_runs_on_a_non_blocking_stream(tmp_path: Path) -> None:
+    array, codes = _array_of_every_depth(tmp_path, (1 << 16) + 5)
+    decoder = rowdict_codec.GpuRowDecoder(cupy)
+    stream = cupy.cuda.Stream(non_blocking=True)
+    out = cupy.zeros(codes.shape, dtype=cupy.uint8)
+    with stream:
+        array.read_rows_to_device(0, codes.shape[0], out, decoder)
+    stream.synchronize()
+    array.close()
+    assert np.array_equal(cupy.asnumpy(out), codes)

@@ -148,3 +148,20 @@ def test_the_crc32c_table_and_combine_match_google_crc32c() -> None:
             first, second = data[:cut], data[cut:]
             combined = rowdict_codec._multiply_mod_polynomial(rowdict_codec.byte_shift(len(second)), google_crc32c.value(first))
             assert combined ^ google_crc32c.value(second) == google_crc32c.value(data)
+
+
+def test_the_crc32c_table_and_combine_match_google_crc32c() -> None:
+    import google_crc32c
+
+    table = rowdict_codec._crc32c_table()
+    rng = np.random.default_rng(31)
+    for length in (0, 1, 7, 1000, 4097):
+        data = rng.integers(0, 256, length, dtype=np.uint8).tobytes()
+        crc = 0xFFFFFFFF
+        for byte in data:
+            crc = int(table[(crc ^ byte) & 0xFF]) ^ (crc >> 8)
+        assert crc ^ 0xFFFFFFFF == google_crc32c.value(data)
+        for cut in (0, length // 3, length):
+            first, second = data[:cut], data[cut:]
+            combined = rowdict_codec._multiply_mod_polynomial(rowdict_codec.byte_shift(len(second)), google_crc32c.value(first))
+            assert combined ^ google_crc32c.value(second) == google_crc32c.value(data)
