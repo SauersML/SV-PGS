@@ -906,10 +906,15 @@ def _maximize_coefficients(
 class GaussianPosterior:
     """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
     to relative error e in the posterior metric, and ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2
-    answers them with extra right-hand sides of its solve and with ``marginal_variances.variance_jvp``."""
+    answers them with extra right-hand sides of its solve and with ``marginal_variances.variance_jvp``.
+
+    ``linear_response(left, right, diagonal, weight, B)``, when a posterior can give it, is the exact solution X of
+    (I - (I - diag(weight) (Sigma o Sigma)) (diag(left) Sigma diag(right) + diag(diagonal))) X = B: the linear response
+    ``_total_curvature`` otherwise finds by GMRES (the small-n route factors this p x p matrix once)."""
 
     solve: Callable[[F64Array, float], F64Array]
     variance_jvp: Callable[[F64Array], F64Array]
+    linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
 
 
 @dataclass(frozen=True)
@@ -1081,6 +1086,18 @@ def _total_curvature(
         precision_step = vector.reshape(shape)
         return (precision_step - (through(precision_step)[1] - offset)).ravel()
 
+    if posterior.linear_response is not None:
+        # through is affine with linear part (I - diag(1/v^2) (Sigma o Sigma)) R, R = diag(v_h / v^3) Sigma diag(m + m_P / v)
+        # + diag(1 + v_P / v^2 - v_h m_P / v^3): the posterior solves the fixed point exactly.
+        tilted = derivatives.variance
+        precision_step = posterior.linear_response(
+            derivatives.variance_by_shift / tilted**3,
+            derivatives.mean + derivatives.mean_by_precision / tilted,
+            1.0 + derivatives.variance_by_precision / tilted**2 - derivatives.variance_by_shift * derivatives.mean_by_precision / tilted**3,
+            1.0 / tilted**2,
+            offset,
+        )
+        return _total_from_response(prior, coefficients, cavity, derivatives, directions, precision_step, through, working_bytes)
     size = int(np.prod(shape))
     operator = LinearOperator((size, size), matvec=linear_part, dtype=np.float64)
     # GMRES(r) keeps r + 1 basis vectors of ``size`` and an (r + 1) x r Hessenberg matrix, at most 2 (r + 1) size
@@ -1091,6 +1108,14 @@ def _total_curvature(
     if information != 0:
         raise FloatingPointError(f"the EP fixed point's linear response did not converge (gmres information {information})")
     precision_step = solution.reshape(shape)
+    return _total_from_response(prior, coefficients, cavity, derivatives, directions, precision_step, through, working_bytes)
+
+
+def _total_from_response(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, derivatives: _VariantDerivatives, directions: F64Array,
+    precision_step: F64Array, through: Callable[[F64Array], tuple[F64Array, F64Array, F64Array]], working_bytes: int,
+) -> F64Array:
+    """B in x from the cavity precision response dP (``_total_curvature``)."""
     shift_step, _next, _response = through(precision_step)
     fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     total_z = fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (

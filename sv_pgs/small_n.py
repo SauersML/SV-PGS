@@ -492,8 +492,42 @@ class _DensePosterior:
         self.profile["jvp_columns"] += int(values.shape[1])
         return result[:, 0] if column else result
 
+    def linear_response(self, left: F64Array, right: F64Array, diagonal: F64Array, weight: F64Array, rhs: F64Array) -> F64Array:
+        """The exact X of (I - (I - diag(w) S2) M) X = B, S2 = Sigma o Sigma and M = diag(left) Sigma diag(right) +
+        diag(diagonal) (``scale_mixture_ep.GaussianPosterior``), by one LU of that p x p matrix.
+
+        Sigma = sigma^2 (diag(delta) - Phi'Phi + Psi'Psi) makes M = diag(d0) + U V' with rank r = n + |N|, so the matrix
+        diag(1 - d0) - U V' + diag(w) (S2 diag(d0) + (S2 U) V') is formed in 3 p^2 r flops, and the LU costs 2 p^3 / 3,
+        whatever the number of directions."""
+        started = time.perf_counter()
+        squared = self._explicit()
+        delta, phi, psi = self.kernel.factors()
+        noise = self.noise
+        d0 = diagonal + noise * left * delta * right
+        factor_rows = np.vstack([phi, psi]) if psi.shape[0] else phi
+        signs = np.concatenate([-np.ones(phi.shape[0]), np.ones(psi.shape[0])])
+        low = (noise * left)[:, None] * (factor_rows.T * signs[None, :])  # U (p x r)
+        high = factor_rows * right[None, :]  # V' (r x p)
+        squared_low = squared @ low
+        matrix = squared * d0[None, :]
+        # Row panels of r rows keep every temporary the size of the factors.
+        step = max(1, high.shape[0])
+        for start in range(0, matrix.shape[0], step):
+            rows = slice(start, min(start + step, matrix.shape[0]))
+            matrix[rows] += squared_low[rows] @ high
+            matrix[rows] *= weight[rows, None]
+            matrix[rows] -= low[rows] @ high
+        matrix[np.diag_indices_from(matrix)] += 1.0 - d0
+        solution = linalg.solve(matrix, np.asarray(rhs, dtype=np.float64), overwrite_a=True, check_finite=False)
+        self.profile["response_seconds"] += time.perf_counter() - started
+        self.profile["responses"] += 1
+        return solution
+
     def gaussian_posterior(self) -> GaussianPosterior:
-        return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp)
+        """The responses; the exact linear response when S2 and the response matrix (two p x p) fit the memory share."""
+        p = self.kernel.variant_count
+        exact = 2 * _FLOAT_BYTES * p * p <= self.jvp_bytes
+        return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if exact else None)
 
 
 # ------------------------------------------------------------------ the EP fixed points (Stage 2's, exact)
@@ -501,8 +535,10 @@ class _DensePosterior:
 
 def _new_profile() -> dict:
     return {name: 0 for name in (
-        "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns",
-    )} | {name: 0.0 for name in ("factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds")}
+        "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses",
+    )} | {name: 0.0 for name in (
+        "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
+    )}
 
 
 class _DenseFixedPoints:

@@ -110,6 +110,47 @@ def test_the_sparse_carrier_design_gives_the_dense_design_quantities():
     np.testing.assert_allclose(statistics.loading, statistics.covariates.T @ standardized, rtol=1e-9, atol=1e-9)
 
 
+@pytest.mark.parametrize("negative", [0, 2])
+def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
+    rng = np.random.default_rng(31 + negative)
+    design = _design(rng, 10, 25)
+    precision = rng.uniform(0.5, 2.0, 25)
+    precision[:negative] = -0.05
+    noise = 0.8
+    sigma = noise * _dense_inverse(design, precision)
+    left, right, diagonal, weight = (rng.standard_normal(25) for _ in range(4))
+    weight = np.abs(weight)
+    rhs = rng.standard_normal((25, 4))
+    matrix = np.eye(25) - (np.eye(25) - weight[:, None] * (sigma * sigma)) @ (left[:, None] * sigma * right[None, :] + np.diag(diagonal))
+    posterior = _DensePosterior(_Kernel(_Design.dense(design), precision), noise, 10**9, _new_profile())
+    np.testing.assert_allclose(posterior.linear_response(left, right, diagonal, weight, rhs), np.linalg.solve(matrix, rhs), rtol=1e-8, atol=1e-10)
+
+
+def test_the_total_curvature_by_the_exact_response_equals_gmres():
+    from sv_pgs.scale_mixture_ep import Cavity, GaussianPosterior, _total_curvature, derived_lattice, initial_hyperparameters, scale_mixture_prior
+
+    rng = np.random.default_rng(41)
+    samples, variants = 30, 40
+    design = _design(rng, samples, variants)
+    precision = rng.uniform(0.5, 2.0, variants)
+    precision[0] = -0.02
+    noise = 1.3
+    posterior = _DensePosterior(_Kernel(_Design.dense(design), precision), noise, 10**9, _new_profile())
+    single_precision = np.einsum("ij,ij->j", design, design) / noise
+    single_shift = rng.standard_normal(variants) * 2.0
+    nodes, floor, top = derived_lattice(single_precision, single_shift, np.zeros(variants), 1.0 / 128)
+    prior = scale_mixture_prior(
+        class_index=np.arange(variants) % 2, log_variance_offset=np.zeros(variants), annotation_design=np.zeros((variants, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    coefficients = initial_hyperparameters(prior).coefficients
+    variances, _removed, cavity_precision = posterior.kernel.cavity()
+    cavity = Cavity(precision=cavity_precision / noise, shift=rng.standard_normal(variants))
+    exact = _total_curvature(prior, coefficients, cavity, posterior.gaussian_posterior(), 10**9, 1e-13)
+    iterative = _total_curvature(prior, coefficients, cavity, GaussianPosterior(solve=posterior.solve, variance_jvp=posterior.variance_jvp), 10**9, 1e-13)
+    np.testing.assert_allclose(exact, iterative, rtol=1e-7, atol=1e-9 * float(np.max(np.abs(iterative))))
+
+
 def test_kernel_refuses_an_indefinite_precision():
     rng = np.random.default_rng(7)
     design = _design(rng, 5, 20)
