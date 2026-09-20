@@ -68,7 +68,7 @@ def test_the_pooled_posterior_is_the_direct_sum_of_the_genes_at_any_residency(sh
     weight = rng.uniform(0.0, 1.0, 29)
     system = np.eye(29) - (np.eye(29) - np.diag(weight) @ squared) @ (np.diag(left) @ covariance @ np.diag(response_right) + np.diag(diagonal))
     posterior = pooled.gaussian_posterior()
-    assert posterior.linear_response is not None
+    assert posterior.linear_response is not None and posterior.exact
     for _call in range(2):  # a resident gene answers from its kept factor the second time
         np.testing.assert_allclose(
             posterior.linear_response(left, response_right, diagonal, weight, right), np.linalg.solve(system, right), rtol=rounding, atol=rounding
@@ -77,7 +77,8 @@ def test_the_pooled_posterior_is_the_direct_sum_of_the_genes_at_any_residency(sh
 
 def test_the_exact_response_needs_room_for_the_largest_gene():
     kernels, noises, rows, _covariance = _two_genes(np.random.default_rng(5))
-    assert _PooledPosterior(kernels, noises, rows, 2 * 8 * 20**2 - 1, _new_profile()).gaussian_posterior().linear_response is None
+    posterior = _PooledPosterior(kernels, noises, rows, 2 * 8 * 20**2 - 1, _new_profile()).gaussian_posterior()
+    assert posterior.linear_response is None and not posterior.exact
 
 
 def test_the_pooled_prior_stacks_the_genes_with_their_levels_as_offset_groups():

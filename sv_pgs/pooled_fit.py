@@ -185,7 +185,10 @@ class _PooledPosterior:
         return result
 
     def gaussian_posterior(self) -> GaussianPosterior:
-        return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if self.exact else None)
+        # Every gene's response is its own dense LU, exact to rounding; the engine reads ``exact`` only where it has one.
+        return GaussianPosterior(
+            solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if self.exact else None, exact=self.exact,
+        )
 
 
 class _PooledFixedPoints:
