@@ -1141,6 +1141,37 @@ def test_the_prediction_check_holds_each_block_to_its_own_budget():
     assert not starved.certified
 
 
+def test_a_density_below_the_kernel_floor_is_a_near_zero_effect_not_a_point_mass():
+    # review-mathbugs N1 [real: gene 3 snv_sv's first outer trial]: with every node below the floor given v = 0, a
+    # class whose density sits there had tilted variance exactly 0, so the site targets were tau = inf, nu = nan.
+    prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
+    nodes = prior.log_variance_grid
+    below = initial_hyperparameters(prior, float(np.exp(nodes[0])))
+    moments = tilted_moments(prior, below, cavity, _WORKING_BYTES)
+    assert np.all(moments.variance > 0.0) and np.all(np.isfinite(moments.mean))
+    precision, shift = site_targets(moments, cavity)
+    assert np.all(np.isfinite(precision)) and np.all(np.isfinite(shift))
+
+
+def test_the_first_trust_region_trial_is_bounded_by_the_cauchy_step():
+    # The first trust radius is the Cauchy step's length on |B + S|: a direction the data barely curve cannot send the
+    # first trial off to the rounding floor's 1 / eps (review-mathbugs: |x| 1.3e4 on a real gene). An indefinite model
+    # (the saddle correction of the outer-step test) steps inside it.
+    prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
+    hyperparameters = _hyperparameters(prior, 18, log_smoothing=2.0)
+    objective = _data_objective(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    mapping = prior.coefficient_map
+    saddle = CurvatureCorrection(coefficient_map=mapping, matrix=mapping.T @ (2.0 * objective.hessian - np.eye(mapping.shape[0])) @ mapping)
+    moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES)
+    point = FixedPoint(cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                       precision_norm=lambda d: float(np.sum(np.square(d) / moments.variance)), effective_effects=1.0)
+    newton = engine._newton_b(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, point, saddle, _WORKING_BYTES)
+    assert not newton.definite
+    radius = engine._cauchy_radius(newton)
+    assert 0.0 < radius <= float(np.linalg.norm(newton.gradient)) / float(np.min(np.abs(newton.eigenvalues)))
+    assert float(np.linalg.norm(engine._proposal(newton, radius))) <= radius * (1.0 + 1e-9)
+
+
 def test_total_curvature_is_the_fixed_cavity_curvature_for_independent_effects():
     prior, cavity = _problem(variant_count=40, seed=48, node_count=10)
     coefficients = _hyperparameters(prior, 49).coefficients
