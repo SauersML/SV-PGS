@@ -60,7 +60,10 @@ def test_null_r2_moments_match_simulation():
 def test_locus_power_is_monotone_and_the_detectable_share_attains_it():
     shares = np.linspace(0.001, 0.2, 50)
     values = power.locus_power(793, shares, 5e-8)
-    assert np.all(np.diff(values) > 0)
+    # Non-decreasing everywhere; strictly increasing until the power rounds to 1 in float64.
+    assert np.all(np.diff(values) >= 0)
+    below_one = values < 1.0
+    assert np.all(np.diff(values[below_one]) > 0)
     share = power.detectable_share(793, 5e-8, 0.8)
     assert power.locus_power(793, share, 5e-8) == pytest.approx(0.8, abs=1e-9)
 
