@@ -1397,16 +1397,16 @@ class _Evidence:
     # maximum it approximates in that metric, which is how two starts are recognized as one basin.
     precision: F64Array
     inner_decrement: float
-    # After ``_corrected``: the standardized directions whose Laplace terms it replaced by line integrals, and the
-    # share of the tolerance each was resolved to (their gradient reuses them, ``_correction_gradient``).
-    replaced_directions: F64Array | None = None
-    replaced_share: float = 0.0
     # Per weight, the two rho-dependent parts of dV/drho_i: the effective degrees of freedom
     # lambda_i tr((B + S)^-1 S_i) and the penalty's size lambda_i ||R_i x||^2.
     effective_degrees: F64Array
     penalty_sizes: F64Array
     # newton_decrement is 1/2 g'(B + S)^-1 g: what the fit's certificate records (math-epeb: the fixed-cavity form
     # understates the remaining gain by up to 100x).
+    # After ``_corrected``: the standardized directions whose Laplace terms it replaced by line integrals, and the
+    # share of the tolerance each was resolved to (their gradient reuses them, ``_correction_gradient``).
+    replaced_directions: F64Array | None = None
+    replaced_share: float = 0.0
 
 
 def _directional_derivatives(
