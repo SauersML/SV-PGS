@@ -107,8 +107,12 @@ pheno-disease's disease model (docs/design/math/disease_measurement.md) replaces
   - The exact ℓ_i is used, never the site's quadratic, since a negative R makes the quadratic unbounded.
   - `onset_probability` is display-only and enters no score.
 - **Needed from other lanes before this lands:**
-  - pheno-disease: a fold-strict entry point. Given the fold of each person, it runs one query and K training-fold fits, and writes per-fold tables, per-fold parameters and knots, and the records.
-  - fit-api: a covariate-only fit f_0 with the same likelihood.
+  - pheno-disease (agreed, being built): `prepare_all_of_us_disease_folds(disease, output_dir, fold_of_person, *, client=None)`, with loaders `load_disease_fold(output_dir, k) -> (knots, parameters)` and `load_disease_records(output_dir)`.
+    - It runs the queries once and fits once per training fold, writing each fold's sites TSV, metadata and parameters, and every person's records.
+    - EHR persons without genotypes enter every training-fold fit (pheno-disease's call: θ_M is phenotype-only). Fold k's fit never sees a record of a fold-k person.
+    - The K fits are independent, so the driver runs them in parallel within the step's budget. The per-fit time is to be measured on a synthetic 10⁵ cohort [sim-only].
+  - fit-api (agreed, pending e2e): f_0 as `predict`'s `linear_predictor_0` = [1, C] `null_alpha`. That is the covariate-only optimum under the same likelihood, zero off each model's covariate_columns, stored in the FittedModel.
+    - **Interim,** while the target is the unweighted Gaussian one: the driver computes f_0 as least squares of the target on [1, C_t] over each model's training rows. That is exactly what the engine would return, and the report labels it as the interim form.
   - novel-inference: the disease pair term. Until then the variance is conservative (EVALUATION.md, Pending).
 
 ## Direct read-based SV/CNV channel (specified; not yet built)
