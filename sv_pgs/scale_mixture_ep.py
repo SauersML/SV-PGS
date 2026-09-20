@@ -1009,6 +1009,22 @@ class GaussianPosterior:
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
 
 
+class LatticeUnresolved(RuntimeError):
+    """A V the search needed is not resolved by the lattice (its trapezoid sum moves by more than the tolerance on half
+    the spacing, ``_corrected``). The lattice is only quadrature, so the answer is to refine it and resume
+    (``fit_on_resolved_lattice``), never to let an unresolved V steer (lead ruling B). ``hyperparameters`` are the
+    fit's iterates when it stopped, for the warm restart."""
+
+    def __init__(self, message: str, hyperparameters: list[MixtureHyperparameters] | None = None) -> None:
+        super().__init__(message)
+        self.hyperparameters = hyperparameters
+
+
+class NoCertifiedProgress(FloatingPointError):
+    """The outer loop's step shrank to double precision with every trial refused, where no uncertified fit can be
+    returned honestly (the weights have no evaluated step, or B + S is indefinite there)."""
+
+
 class LinearResponseError(RuntimeError):
     """B's linear response could not be solved to its tolerance. Not a FloatingPointError: the outer loop reads those
     as "no certified maximum here" and steps on; without B the fit cannot be certified at all."""
@@ -1267,7 +1283,11 @@ def _total_curvature_columns(
     if posterior.linear_response is not None:
         # The posterior solves its fixed point exactly.
         _shift, offset, _start = through(np.zeros(shape), relative_tolerance)
-        precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+        try:
+            precision_step = posterior.linear_response(left, gain, diagonal, weight, offset)
+        except np.linalg.LinAlgError as error:
+            # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
+            raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
         return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
     size = int(np.prod(shape))
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
@@ -1802,8 +1822,8 @@ def _corrected(
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None, a line integral cannot be certified, or the lattice does not resolve the density
-    (its trapezoid sum moves by more than the tolerance on half the spacing).
+    None when the evidence is None or a line integral cannot be certified; ``LatticeUnresolved`` when the lattice does
+    not resolve the density (its trapezoid sum moves by more than the tolerance on half the spacing).
     """
     if evidence is None:
         return None
@@ -1824,7 +1844,7 @@ def _corrected(
     # halved sum falls back. Where the difference exceeds the tolerance, V is not certified there and never steers.
     quadrature = abs(_halved_data_value(prior, evidence.coefficients, cavity, working_bytes) - _data_value(prior, evidence.coefficients, cavity, working_bytes))
     if quadrature > tolerance:
-        return None
+        raise LatticeUnresolved(f"the lattice does not resolve the density at these weights: its trapezoid sum moves by {quadrature:.3g} nats on half the spacing")
     return replace(
         evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder + quadrature,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
@@ -2598,6 +2618,9 @@ class OuterFit:
     unresolved: int
     # The decrement plus the weights' remaining gain at every outer evaluation, in order: the outer rate.
     history: tuple[float, ...]
+    # False when the loop stopped at double precision without certifying (``remaining_gain`` over the tolerance, or the
+    # prediction move unchecked): an honest fit, which callers count and report as uncertified, never as certified.
+    certified: bool = True
 
 
 @dataclass(frozen=True)
@@ -2722,6 +2745,8 @@ def fit_hyperparameters(
             correction = curvature_correction(prior, hyperparameters[model].coefficients, point.cavity, point.posterior, working_bytes, tolerance)
             try:
                 step = hyper_step(prior, hyperparameters[model], point.cavity, correction, working_bytes, tolerance)
+            except LatticeUnresolved as error:
+                raise LatticeUnresolved(str(error), list(hyperparameters)) from error
             except FloatingPointError:
                 # B + S has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
                 step = None
@@ -2758,6 +2783,10 @@ def fit_hyperparameters(
                 allowed_move = 2.0 * tolerance * current.effective_effects
                 if move <= allowed_move:
                     certified_step, remaining = steps_taken[model]
+                    # The oracle's state is the trial's certified fixed point: the fit returns the trial, so its
+                    # hyperparameters and its fixed point are one model (review-mathbugs E1). The certificate covers the
+                    # move: the decrement at x, and q's mean moved by at most p_eff / K.
+                    hyperparameters[model], points[model] = trials[model], trial_point
                     fits[model] = OuterFit(
                         hyperparameters=hyperparameters[model], step=certified_step, newton_decrement=newton.decrement, remaining_gain=remaining,
                         prediction_move=move, prediction_tolerance=allowed_move, iterations=iterations[model], halvings=halvings[model],
@@ -2786,7 +2815,24 @@ def fit_hyperparameters(
                 continue
             halvings[model] += 1
             if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
-                raise FloatingPointError("the Newton-B step makes no certified progress at the EP fixed point")
+                if newton.definite and step is not None:
+                    # x is at its maximum to double precision (no trial can lower a decrement at its rounding), and what
+                    # stops the certificate is the weights' remaining gain or the prediction check: the fit is returned
+                    # with its measured remaining gain, uncertified, at the point the oracle last solved.
+                    if trial_point is not None:
+                        hyperparameters[model], points[model] = trials[model], trial_point
+                    fits[model] = OuterFit(
+                        hyperparameters=hyperparameters[model], step=step, newton_decrement=newton.decrement,
+                        remaining_gain=newton.decrement + step.evidence_gain + step.stationarity_gain, prediction_move=np.inf,
+                        prediction_tolerance=2.0 * tolerance * points[model].effective_effects, iterations=iterations[model],
+                        halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]), certified=False,
+                    )
+                    pending[model] = None
+                    continue
+                raise NoCertifiedProgress(
+                    "the Newton-B step makes no certified progress at the EP fixed point "
+                    + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
+                )
             # A certifying step refused for having no fixed point stays certifying at half the length; one whose
             # move was too large, or an ordinary one, becomes an ordinary shorter trial.
             keep = certifying and trial_point is None
@@ -2796,3 +2842,24 @@ def fit_hyperparameters(
                 radius = 0.5 * length
                 radii[model] = radius
                 pending[model] = (newton, step, _proposal(newton, radius), radius, keep, 0.5 * fraction)
+
+
+def fit_on_resolved_lattice(
+    prior: ScaleMixturePrior,
+    starts: Sequence[MixtureHyperparameters],
+    fixed_points_for: Callable[[ScaleMixturePrior], FixedPoints],
+    working_bytes: int,
+    tolerance: float,
+) -> tuple[ScaleMixturePrior, list[OuterFit]]:
+    """``fit_hyperparameters`` on the prior's lattice, halved and refit from the stopped iterates while a V the search
+    needs is not resolved by it (``LatticeUnresolved``; lead ruling B: the lattice is only quadrature, so refining it
+    is the answer). ``fixed_points_for`` builds the EP oracle on a lattice. Returns the lattice fitted on and the fits.
+    """
+    current = list(starts)
+    while True:
+        try:
+            return prior, fit_hyperparameters(prior, current, fixed_points_for(prior), working_bytes, tolerance)
+        except LatticeUnresolved as error:
+            stopped = error.hyperparameters if error.hyperparameters is not None else current
+            moved = [halved_lattice(prior, hyperparameters) for hyperparameters in stopped]
+            prior, current = moved[0][0], [hyperparameters for _finer, hyperparameters in moved]

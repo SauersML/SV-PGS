@@ -668,13 +668,14 @@ def test_a_density_the_lattice_does_not_resolve_is_not_certified(monkeypatch):
     alternating = np.where(np.arange(prior.grid_size) % 2 == 0, 8.0, -8.0)
     spiky[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (alternating - alternating.mean())
     assert abs(engine._halved_data_value(prior, spiky, cavity, _WORKING_BYTES) - _data_value(prior, spiky, cavity, _WORKING_BYTES)) > _EVIDENCE_TOLERANCE
-    # Where the halved sum moves by more than the tolerance, the corrected V is not certified.
+    # Where the halved sum moves by more than the tolerance, the corrected V is not certified: the lattice must refine.
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
     evidence = _evidence(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
     assert _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE) is not None
     halved = engine._halved_data_value
     monkeypatch.setattr(engine, "_halved_data_value", lambda *arguments: halved(*arguments) + 2.0 * _EVIDENCE_TOLERANCE)
-    assert _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE) is None
+    with pytest.raises(engine.LatticeUnresolved):
+        _corrected(prior, hyperparameters.log_smoothing, evidence, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
 def test_the_kronrod_rule_is_quadpacks():
     # The embedded Gauss rule is the 7-point Gauss-Legendre rule, and the 15-point Kronrod rule integrates every
     # polynomial of degree 22 exactly (3 n + 1 for n = 7).
@@ -1083,10 +1084,13 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
     prior, cavity = _problem(variant_count=60, seed=17, node_count=12)
     calls = []
 
+    solved = []
+
     def fixed_points(hyperparameters):
         calls.append(len(calls))
         if len(calls) == 2:
             return [None] * len(hyperparameters)
+        solved.append(np.array(hyperparameters[0].coefficients, copy=True))
         points = []
         for model in hyperparameters:
             moments = tilted_moments(prior, model, cavity, _WORKING_BYTES)
@@ -1098,7 +1102,9 @@ def test_the_outer_loop_refuses_a_trial_without_a_fixed_point_and_still_certifie
         return points
 
     (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], fixed_points, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    assert fit.unresolved >= 1 and len(calls) > 2
+    assert fit.unresolved >= 1 and len(calls) > 2 and fit.certified
+    # The oracle's last fixed point is the returned model's own (review-mathbugs E1).
+    np.testing.assert_array_equal(solved[-1], fit.hyperparameters.coefficients)
     assert fit.remaining_gain <= _EVIDENCE_TOLERANCE
     assert fit.prediction_move <= fit.prediction_tolerance
 
