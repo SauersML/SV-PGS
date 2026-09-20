@@ -30,7 +30,9 @@ from sv_pgs.marginal_variances import (
     exact_block_information,
     exact_route_is_cheaper,
     exact_bulk_diagonal,
+    block_covariance,
     block_trace_certificate,
+    prepare_windows,
     cavity_tolerance,
     certificate_level,
     probes_to_decide,
@@ -673,3 +675,26 @@ def test_shared_float32_grams_with_a_scale_give_the_float64_answer():
     bound = np.finfo(np.float32).eps * window * (1.0 + solve.bulk_trace * float(np.linalg.eigvalsh(columns.T @ columns)[-1]) * np.max(1.0 / precision))
     assert np.all(np.abs(shared - reference) <= bound * np.abs(reference))
     assert marginal_variances_module.window_working_bytes(stored) == marginal_variances_module.window_working_bytes(grams)
+
+
+def test_block_covariance_is_the_window_maps_own_block_and_shares_its_preparation():
+    generator = np.random.default_rng(31)
+    sample_count, variant_count, heritability = 1500, 600, 0.5
+    columns = _genotypes(generator, sample_count, variant_count, 0.97) / np.sqrt(1.0 - heritability)
+    precision = variant_count / heritability * np.exp(generator.normal(0.0, 1.0, variant_count))
+    blocks = tuple(np.arange(start, start + 100) for start in range(0, variant_count, 100))
+    solve = _solve(columns, precision, _resolved(1.0 / precision, sample_count))
+    assert solve.resolved.shape[0] == 0  # no far-resolved term: the marginals are the blocks' own diagonals
+    grams = _grams(columns, blocks)
+    prepared = prepare_windows(solve, grams)
+    variances = marginal_variances(solve, grams)
+    exact = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    for block, members in enumerate(blocks):
+        covariance = block_covariance(solve, grams, block, prepared=prepared)
+        assert covariance.shape == (members.shape[0], members.shape[0]) and covariance.dtype == np.float64
+        assert np.array_equal(covariance, covariance.T)
+        assert np.array_equal(covariance, block_covariance(solve, grams, block))
+        assert np.allclose(np.diag(covariance), variances[members], rtol=1e-12)
+        # Off the diagonal too, the block's covariance tracks the exact one to the equivalent's scale.
+        error = np.linalg.norm(covariance - exact[np.ix_(members, members)]) / np.linalg.norm(exact[np.ix_(members, members)])
+        assert error <= approximation_scale(solve)
