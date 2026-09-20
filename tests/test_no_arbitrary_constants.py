@@ -109,6 +109,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('held_out_comparison.py', 'null_cost_gate(alpha=)'): ('spec', frozenset({0.05}), 'pre-registered test level (EVALUATION.md G13)'),
     ('imputation_reliability.py', 'triad_squared_correlation'): ('definitional', frozenset({3}), 'a correlation needs at least three observations'),
     ('ld_partition.py', '_UNREACHABLE'): ('definitional', frozenset({61}), 'a quarter of the int64 range: a sum of two reachable costs stays representable'),
+    ('marginal_variances.py', '_edgeworth_correction'): ('math', frozenset({6.0}), 'one-term Edgeworth polynomial of the studentized mean, q1(x) = g (2 x^2 + 1) / 6 (Hall 1992, The Bootstrap and Edgeworth Expansion, section 2.6)'),
     ('phenotype_measurement.py', 'FIT_TOLERANCE'): ('derived', frozenset({4}), 'searches compare spans of four evidence values to EVIDENCE_TOLERANCE; fits short of their maxima by a quarter of it move a span by at most half'),
     ('phenotype_measurement.py', 'level_posterior'): ('math', frozenset({0.25}), 'Var_k(e^2 / (2 s_k)) = e^4 Var_k(1 / s_k) / 4, the noise score variance of the split information'),
     ('phenotype_measurement.py', '_SPLIT_OPERATIONS_PER_TERM'): ('derived', frozenset({8}), "the rounded operations behind each (node, occasion, component) term of the split information, counted in its comment"),

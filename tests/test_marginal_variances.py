@@ -8,6 +8,7 @@ variances are wrong and to leave the others alone.
 from __future__ import annotations
 
 import numpy as np
+import pytest
 from scipy.stats import norm
 from scipy.stats import t as student_t
 
@@ -40,6 +41,7 @@ from sv_pgs.marginal_variances import (
     window_bulk_quadratic,
     window_cross,
 )
+from sv_pgs.marginal_variances import _heavy_cut
 
 
 def _genotypes(generator, sample_count: int, variant_count: int, correlation: float) -> np.ndarray:
@@ -473,6 +475,46 @@ def test_sandwich_diagonal_equals_the_three_operand_contraction():
     gram = generator.standard_normal((40, 40))
     reference = np.einsum("ij,jk,ki->i", covariance, gram, covariance)
     assert np.allclose(sandwich_diagonal(covariance, gram), reference, rtol=1e-12, atol=1e-12 * np.abs(reference).max())
+
+
+def _low_rank_block(generator, size: int, rank: int) -> np.ndarray:
+    """A PSD block whose trace is spread evenly over ``rank`` random orthonormal directions (effective rank ``rank``)."""
+    basis = np.linalg.qr(generator.standard_normal((size, rank)))[0]
+    return basis @ basis.T
+
+
+@pytest.mark.parametrize("rank", [1, 2, 20])
+def test_certificate_keeps_its_level_on_low_effective_rank_blocks(rank):
+    # review-stats: strong LD makes a block's probe values z'Az skewed (close to tr chi2_r / r), and the plain t cut
+    # then missed on the heavy side up to 9.5x its level. With the exact variances the true relative error is zero and
+    # the tolerance is zero, so a block is violated exactly when its interval misses: the family-wise miss rate must
+    # stay within the binomial spread of the level.
+    generator = np.random.default_rng(100 + rank)
+    size, block_count, probe_count = 24, 4, 16
+    level = certificate_level(8)
+    blocks = tuple(np.arange(start, start + size) for start in range(0, size * block_count, size))
+    covariance = np.zeros((size * block_count, size * block_count))
+    for members in blocks:
+        covariance[np.ix_(members, members)] = _low_rank_block(generator, size, rank)
+    variances = np.diag(covariance).copy()
+    trials = int(np.ceil(300 / level))
+    misses = 0
+    for _trial in range(trials):
+        probes = generator.choice([-1.0, 1.0], size=(size * block_count, probe_count))
+        certificate = block_trace_certificate(variances, blocks, probes, covariance @ probes, 0.0, level)
+        assert not certificate.certified.any()
+        misses += int(certificate.violated.any())
+    assert misses <= level * trials + 3 * np.sqrt(level * trials)
+
+
+def test_heavy_cut_is_the_t_quantile_for_symmetric_values_and_moves_out_with_skewness():
+    side, probe_count = 1e-3, 16
+    quantile = float(student_t.isf(side, probe_count - 1))
+    assert _heavy_cut(0.0, probe_count, side, quantile) == (quantile, True)
+    cut, usable = _heavy_cut(0.5, probe_count, side, quantile)
+    assert cut > quantile and usable
+    # A skewness large enough that the one-term correction is not below the tail it corrects leaves the block undecided.
+    assert not _heavy_cut(10.0, probe_count, side, quantile)[1]
 
 
 def _kernel_factor(columns: np.ndarray, precision: np.ndarray, resolved: np.ndarray) -> KernelFactor:
