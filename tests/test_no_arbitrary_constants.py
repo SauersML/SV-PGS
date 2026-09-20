@@ -90,6 +90,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('external_annotations.py', 'TIER_COORDINATE'): ('definitional', frozenset({3}), 'enum code; (chromosome << 32 | position) site key'),
     ('external_annotations.py', 'MOTIF_MULTIPLES'): ('spec', frozenset({3}), 'TRF reports a period, or twice or three times it'),
     ('external_annotations.py', '_SITE_STRIDE'): ('definitional', frozenset({32}), 'enum code; (chromosome << 32 | position) site key'),
+    ('fold_share.py', 'sharing_cost'): ('math', frozenset({3.0}), 'Cholesky n^3/3 and Householder QR 2mn^2 - 2n^3/3 flop counts (Golub and Van Loan, Matrix Computations, 4th ed., sections 4.2.5 and 5.2.2)'),
     ('fast_scoring.py', 'SIGNED_CODE_OFFSET'): ('spec', frozenset({127.0}), '8-bit store code offset (STORE.md)'),
     ('fast_scoring.py', '_FLOAT64_BYTES'): ('definitional', frozenset({8}), 'float64 itemsize'),
     ('fast_scoring.py', 'predictive_intercept_shift.xtol'): ('derived', frozenset({4.0}), "rtol = 4 eps is scipy's minimum; xtol = 4 eps min(p, 1 - p) since the logistic slope is at most 1/4"),
