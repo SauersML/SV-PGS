@@ -163,11 +163,31 @@ def test_body_and_exon_overlap_flags():
     assert scores.loc["outside", "n_sv_panel"] == 0 and scores.loc["outside", "U_panel"] == 0
 
 
-def test_ranking_orders_by_panel_sum_and_breaks_ties_by_the_sealed_gene_order():
-    scores = pd.DataFrame({"gene_id": ["a", "b", "c", "d"], "U_panel": [0.1, 0.5, 0.1, 0.0]})
+def test_ranking_orders_by_the_key_and_breaks_ties_by_the_sealed_gene_order():
+    scores = pd.DataFrame({"gene_id": ["a", "b", "c", "d"], "U_panel": [0.1, 0.5, 0.1, 0.0], "max_u_panel": [0.3, 0.1, 0.2, 0.3]})
     ranked = sv_screen.rank_genes(scores, ["d", "c", "b", "a"])
     assert ranked["gene_id"].tolist() == ["b", "c", "a", "d"]
     assert ranked["rank"].tolist() == [1, 2, 3, 4]
+    assert sv_screen.rank_genes(ranked, ["d", "c", "b", "a"], key="max_u_panel")["gene_id"].tolist() == ["d", "a", "c", "b"]
+
+
+def test_reorder_keeps_the_genes_marks_dev_refuses_a_changed_source_and_never_replaces(tmp_path):
+    import pytest
+    screen = pd.DataFrame({"rank": [1, 2, 3, 4], "gene_id": ["a", "b", "c", "d"], "U_panel": [0.5, 0.4, 0.3, 0.2],
+                           "max_u_panel": [0.1, 0.4, 0.3, 0.2], "gene_order_index": [3, 2, 1, 0],
+                           "already_scored": [True, False, False, True], "confirm": [False, False, True, False]})
+    screen.to_csv(tmp_path / "screen_v1.tsv", sep="\t", index=False)
+    (tmp_path / "SEALED.txt").write_text(f"{sv_screen._sha256(tmp_path / 'screen_v1.tsv')}  screen_v1.tsv\n")
+    ranked = sv_screen.reorder(tmp_path, "v1", "v2", "max_u_panel")
+    assert ranked["gene_id"].tolist() == ["b", "c", "d", "a"]
+    assert ranked["dev"].tolist() == [False, False, True, True]
+    assert pd.read_csv(tmp_path / "sv_ranked_v2.tsv", sep="\t")["gene_id"].tolist() == ["b", "d", "a"]
+    assert "sv_ranked_v2.tsv" in (tmp_path / "SEALED.txt").read_text()
+    with pytest.raises(RuntimeError):
+        sv_screen.reorder(tmp_path, "v1", "v2", "max_u_panel")
+    (tmp_path / "screen_v1.tsv").write_text("changed")
+    with pytest.raises(RuntimeError):
+        sv_screen.reorder(tmp_path, "v1", "v3", "max_u_panel")
 
 
 def test_confirmation_genes_follow_the_sealed_hash_and_exclude_every_scored_gene():
