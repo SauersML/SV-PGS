@@ -284,9 +284,15 @@ def test_the_ablation_arms_withhold_their_prior_terms_and_nothing_else(small_n: 
 def test_the_coefficients_are_the_genotype_scale_effects_of_the_prediction(small_n: _SmallNStub) -> None:
     train, test = _bench_real_train(np.random.default_rng(9))
     predictor = svpgs_method.fit_expression(train)
+    scoring = predictor.scoring
+
+    def rounding(genotypes: np.ndarray) -> float:
+        signed = genotypes[:, scoring.store_rows].astype(np.float64).T * CODES_PER_DOSAGE - SIGNED_CODE_OFFSET
+        return _scores(scoring, signed)[1] + _EPSILON * abs(float(scoring.alpha[0]))
+
     base = predictor.predict(test)
     for column in range(_COLUMNS):
-        moved = test.copy()
+        moved = test.astype(np.float64)
         moved[:, column] += 1.0
         change = predictor.predict(moved) - base
-        np.testing.assert_allclose(change, predictor.coefficients[column], rtol=0.0, atol=64 * _EPSILON * (np.abs(base).max() + 1.0))
+        np.testing.assert_allclose(change, predictor.coefficients[column], rtol=0.0, atol=rounding(test) + rounding(moved))
