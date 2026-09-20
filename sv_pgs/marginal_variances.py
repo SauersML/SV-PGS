@@ -50,6 +50,7 @@ beyond its window, shows up as a block whose measured trace error provably excee
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 from numpy.typing import NDArray
@@ -822,6 +823,11 @@ class KernelFactor:
     resolved_solves: NDArray[np.float64]
     resolved_core: NDArray[np.float64]
 
+    @cached_property
+    def core_inverse(self) -> NDArray[np.float64]:
+        """core^-1, formed once per factor and shared by every block's call (speed-krylov)."""
+        return np.linalg.inv(self.resolved_core) if self.resolved_core.shape[0] else np.zeros((0, 0))
+
 
 def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.float64], columns: NDArray[np.float64]) -> NDArray[np.float64]:
     """D_j - Sigma_jj for one block's variants, exactly: D_j^2 (xt_j' K_S^-1 xt_j - c_j core^-1 c_j').
@@ -832,7 +838,7 @@ def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.floa
     whitened = solve_triangular(factor.lower, columns, lower=True)
     quadratic = np.sum(np.square(whitened), axis=0)
     cross = columns.T @ factor.resolved_solves
-    spikes = np.sum((cross @ np.linalg.inv(factor.resolved_core)) * cross, axis=1) if cross.shape[1] else 0.0
+    spikes = np.sum((cross @ factor.core_inverse) * cross, axis=1) if cross.shape[1] else 0.0
     return np.square(bulk_variance) * (quadratic - spikes)
 
 

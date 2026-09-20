@@ -511,3 +511,12 @@ def test_exact_route_rule_prefers_the_dual_when_samples_are_few():
     grams = BlockGrams(blocks=blocks, within=(np.eye(4430),), next_cross=())
     assert exact_route_is_cheaper(580, grams, 2**30)
     assert not exact_route_is_cheaper(50_000, grams, 2**30)
+
+
+def test_kernel_factor_inverts_its_core_once():
+    generator = np.random.default_rng(25)
+    columns = generator.standard_normal((40, 60))
+    precision = generator.uniform(1.0, 30.0, 60)
+    factor = _kernel_factor(columns, precision, np.array([3, 7]))
+    assert factor.core_inverse is factor.core_inverse
+    assert np.allclose(factor.core_inverse @ factor.resolved_core, np.eye(2), atol=1e-12)
