@@ -56,10 +56,8 @@ def brute_force_proxies(table, dosage, radius):
     return result
 
 
-def test_proxies_match_a_direct_computation_across_batches_and_window_slides():
-    table, dosage = synthetic_chromosome(seed=1)
-    radius = 1_500
-    frame = sv_screen.sv_proxies("chr1", table, dosage, radius=radius)
+def check_against_brute_force(table, dosage, radius, **options):
+    frame = sv_screen.sv_proxies("chr1", table, dosage, radius=radius, **options)
     expected = brute_force_proxies(table, dosage, radius)
     tolerance = dosage.shape[1] * EPSILON
     assert sorted(frame["row"]) == sorted(expected)
@@ -70,9 +68,31 @@ def test_proxies_match_a_direct_computation_across_batches_and_window_slides():
         assert abs(row.untagged_variance - untagged) <= tolerance
 
 
+def test_proxies_match_a_direct_computation_in_one_chunk_and_in_many():
+    table, dosage = synthetic_chromosome(seed=1)
+    check_against_brute_force(table, dosage, radius=1_500, chunk_rows=len(table))
+    check_against_brute_force(table, dosage, radius=1_500, chunk_rows=7)
+
+
+def test_an_sv_longer_than_the_radius_is_its_own_group_and_still_exact():
+    table, dosage = synthetic_chromosome(seed=5)
+    longest = int(np.flatnonzero(table["is_sv"].to_numpy())[3])
+    table.loc[longest, "end"] = int(table["pos"].max())
+    groups = list(sv_screen._batches(np.array([0, 10, 20, 30]), np.array([5, 5_000, 25, 35]), radius=100))
+    assert [group.tolist() for group in groups] == [[0], [1], [2, 3]]
+    check_against_brute_force(table, dosage, radius=800, chunk_rows=11)
+
+
+def test_the_memory_sized_chunks_give_the_same_answer():
+    table, dosage = synthetic_chromosome(seed=6)
+    exact = sv_screen.sv_proxies("chr1", table, dosage, radius=1_000, chunk_rows=len(table))
+    sized = sv_screen.sv_proxies("chr1", table, dosage, radius=1_000, worker_bytes=sv_screen.resident_bytes() + (8 << 20))
+    pd.testing.assert_frame_equal(exact, sized)
+
+
 def test_constant_svs_carry_no_untagged_variance_and_constant_proxies_never_tag():
     table, dosage = synthetic_chromosome(seed=2)
-    frame = sv_screen.sv_proxies("chr1", table, dosage, radius=2_000)
+    frame = sv_screen.sv_proxies("chr1", table, dosage, radius=2_000, chunk_rows=len(table))
     constant = frame[frame["genotype_variance"] == 0]
     assert len(constant) >= 2
     assert (constant["untagged_variance"] == 0).all() and (constant["max_r2"] == 0).all()
@@ -80,14 +100,15 @@ def test_constant_svs_carry_no_untagged_variance_and_constant_proxies_never_tag(
     assert constant_proxy not in set(frame["proxy_id"])
 
 
-def test_sliding_window_equals_direct_standardization():
+def test_standardization_matches_numpy():
     generator = np.random.default_rng(3)
     dosage = generator.integers(0, 3, size=(200, 50)).astype(np.int8)
+    dosage[7] = 1
     rows = np.sort(generator.choice(200, 120, replace=False))
-    window = sv_screen.SmallVariantWindow(dosage, rows)
-    for start, stop in [(0, 30), (5, 60), (5, 40), (20, 110), (90, 120), (100, 101)]:
-        np.testing.assert_allclose(window.window(start, stop), sv_screen.standardized(dosage[rows[start:stop]]), rtol=0,
-                                   atol=dosage.shape[1] * EPSILON)
+    values = dosage[rows].astype(np.float64)
+    spread = values.std(axis=1)
+    expected = np.where(spread[:, None] > 0, (values - values.mean(axis=1, keepdims=True)) / np.where(spread > 0, spread, 1)[:, None], 0.0)
+    np.testing.assert_allclose(sv_screen.read_standardized(dosage, rows), expected, rtol=0, atol=dosage.shape[1] * EPSILON)
 
 
 def write_dataset(directory, table, dosage, genes, annotation):
@@ -113,7 +134,7 @@ def test_gene_windows_match_the_harness_and_sums_match_the_proxies(tmp_path):
                          "coding_exons": []} for gene, start in zip(genes["gene_id"], tss)}
     write_dataset(tmp_path, scaled, dosage, genes, annotation)
     dataset = harness.Dataset(tmp_path)
-    frame = sv_screen.sv_proxies("chr1", scaled, dosage, radius=radius)
+    frame = sv_screen.sv_proxies("chr1", scaled, dosage, radius=radius, chunk_rows=5)
     scores = sv_screen.gene_scores(genes, annotation, frame, radius=radius).set_index("gene_id")
     for gene in genes.itertuples():
         cis = dataset.cis_rows("chr1", int(gene.tss))

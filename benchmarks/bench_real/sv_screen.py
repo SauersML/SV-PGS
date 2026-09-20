@@ -30,50 +30,73 @@ from benchmarks.bench_real.harness import CIS_RADIUS_BP
 
 SV_COLUMNS = ["chrom", "row", "id", "source", "pos", "end", "sv_type", "sv_length", "allele_frequency", "genotype_variance",
               "max_r2", "proxy_id", "proxies", "untagged_variance"]
+TABLE_COLUMNS = {"pos", "end", "id", "is_sv", "source", "sv_type", "sv_length"}
 LEADING_SVS = 3  # how many SVs each gene row lists; display only
 FITTED_PREFIXES = (2000, 5000)  # the --gene-prefix values of bench-real's v2 runs (mr.ash; lead variant and GBLUP)
 
 
 def standardized(block):
-    """Rows centred and scaled to unit variance over the samples; constant rows become zero."""
-    values = np.asarray(block, dtype=np.float64)
-    centered = values - values.mean(axis=1, keepdims=True)
-    scale = np.sqrt((centered ** 2).mean(axis=1))
+    """Rows centred and scaled to unit variance over the samples, as float64; constant rows become zero."""
+    values = np.array(block, dtype=np.float64)
+    values -= values.mean(axis=1, keepdims=True)
+    scale = np.sqrt((values ** 2).mean(axis=1))
     varying = scale > 0
-    centered[varying] /= scale[varying, None]
-    centered[~varying] = 0.0
-    return centered
+    values[varying] /= scale[varying, None]
+    values[~varying] = 0.0
+    return values
 
 
-class SmallVariantWindow:
-    """Standardized small-variant rows over a sliding index range, each row read from disk once as the range advances."""
-
-    def __init__(self, dosage, rows):
-        self.dosage, self.rows = dosage, rows
-        self.start = self.stop = 0
-        self.values = np.empty((0, dosage.shape[1]))
-
-    def _read(self, start, stop):
-        rows = self.rows[start:stop]
-        if len(rows) == 0:
-            return np.empty((0, self.dosage.shape[1]))
-        first = int(rows.min())
-        span = np.asarray(self.dosage[first:int(rows.max()) + 1])
-        return standardized(span[rows - first])
-
-    def window(self, start, stop):
-        if start >= self.stop or stop <= self.start or start < self.start:
-            self.values, self.start, self.stop = self._read(start, stop), start, stop
-        else:
-            self.values, self.start = self.values[start - self.start:], start
-            if stop > self.stop:
-                self.values = np.concatenate([self.values, self._read(self.stop, stop)])
-                self.stop = stop
-        return self.values[:stop - self.start]
+def read_standardized(dosage, rows):
+    """Standardized dosage rows; ``rows`` ascending, read as one contiguous span."""
+    if len(rows) == 0:
+        return np.empty((0, dosage.shape[1]))
+    first = int(rows[0])
+    return standardized(np.asarray(dosage[first:int(rows[-1]) + 1])[rows - first])
 
 
-def sv_proxies(chrom, table, dosage, radius=CIS_RADIUS_BP):
-    """Per SV of one chromosome: frequency, genotype variance, best small-variant proxy and untagged variance."""
+def resident_bytes():
+    """This process's anonymous resident memory (Linux /proc/self/status RssAnon, in kB). File-backed pages of the
+    memory-mapped dosages are reclaimable and not counted, as the kernel's OOM accounting does not charge them."""
+    for line in pathlib.Path("/proc/self/status").read_text().splitlines():
+        if line.startswith("RssAnon:"):
+            return int(line.split()[1]) * 1024
+    raise RuntimeError("/proc/self/status has no RssAnon")
+
+
+def worker_memory_bytes(workers):
+    """One worker's memory: the runner's per-task allotment when it sets one, otherwise the task's cores-proportional
+    share of the host's usable memory (the runners' default rule), split evenly over the workers."""
+    from sv_pgs.compute_budget import RUNQ_MEMORY_VARIABLE, _usable_host_bytes
+    usable = _usable_host_bytes()
+    share = usable if RUNQ_MEMORY_VARIABLE in os.environ else usable * workers // os.cpu_count()
+    return share // workers
+
+
+def _batches(positions, ends, radius):
+    """SVs (sorted by position) in groups whose proxy windows are read together: consecutive SVs starting within
+    ``radius`` of the group's first, each SV longer than ``radius`` in a group of its own."""
+    long = (ends - positions) > radius
+    start = 0
+    while start < len(positions):
+        if long[start]:
+            yield np.array([start])
+            start += 1
+            continue
+        stop = start + 1
+        while stop < len(positions) and not long[stop] and positions[stop] < positions[start] + radius:
+            stop += 1
+        yield np.arange(start, stop)
+        start = stop
+
+
+def sv_proxies(chrom, table, dosage, radius=CIS_RADIUS_BP, chunk_rows=None, worker_bytes=None):
+    """Per SV of one chromosome: frequency, genotype variance, best small-variant proxy and untagged variance.
+
+    Small variants are streamed in chunks; without ``chunk_rows``, each chunk is sized so that its live arrays fit in
+    ``worker_bytes`` less this process's resident set.
+    """
+    if (chunk_rows is None) == (worker_bytes is None):
+        raise ValueError("give exactly one of chunk_rows and worker_bytes")
     sample_count = dosage.shape[1]
     positions, ends = table["pos"].to_numpy(), table["end"].to_numpy()
     small = np.flatnonzero((table["source"].to_numpy() == "panel") & ~table["is_sv"].to_numpy(dtype=bool))
@@ -86,37 +109,43 @@ def sv_proxies(chrom, table, dosage, radius=CIS_RADIUS_BP):
     frequency = genotypes.mean(axis=1) / 2
     variance = genotypes.var(axis=1)
     scaled = standardized(genotypes)
+    del genotypes
     best = np.zeros(len(structural))
     proxy = np.full(len(structural), -1)
     proxies = np.zeros(len(structural), dtype=np.int64)
-    window = SmallVariantWindow(dosage, small)
-    batch_start = 0
-    while batch_start < len(structural):
-        batch_stop = int(np.searchsorted(positions[structural], positions[structural[batch_start]] + radius, side="left"))
-        batch_stop = max(batch_stop, batch_start + 1)
-        batch = np.arange(batch_start, batch_stop)
+    # Live bytes per streamed small-variant row: the int8 span and its selection, the float64 standardized row, and
+    # one float64 correlation per SV of the group.
+    row_bytes = lambda group: sample_count * (2 * np.dtype(np.int8).itemsize + np.dtype(np.float64).itemsize) + group * np.dtype(np.float64).itemsize
+    for batch in _batches(positions[structural], ends[structural], radius):
         lows = positions[structural[batch]] - radius
         highs = ends[structural[batch]] + radius
         first = np.searchsorted(small_positions, lows - slack, side="left")
         last = np.searchsorted(small_positions, highs, side="right")
-        block_start, block_stop = int(first.min()), int(last.max())
-        block = window.window(block_start, block_stop)
-        correlation = scaled[batch] @ block.T / sample_count
-        for offset, index in enumerate(batch):
-            begin, finish = int(first[offset]), int(last[offset])
-            covered = np.flatnonzero(small_ends[begin:finish] >= lows[offset])
-            proxies[index] = len(covered)
-            if len(covered) == 0 or variance[index] == 0:
-                continue
-            squared = correlation[offset, begin - block_start + covered] ** 2
-            top = int(np.argmax(squared))
-            if squared[top] > 0:
-                best[index], proxy[index] = squared[top], small[begin + covered[top]]
-        batch_start = batch_stop
-    identifiers = table["id"].to_numpy(dtype=str)
+        step = chunk_rows
+        if step is None:
+            headroom = worker_bytes - resident_bytes()
+            if headroom < row_bytes(len(batch)):
+                raise MemoryError(f"{chrom}: {headroom} bytes of headroom cannot hold one small-variant row")
+            step = headroom // row_bytes(len(batch))
+        for chunk_start in range(int(first.min()), int(last.max()), step):
+            chunk_stop = min(chunk_start + step, int(last.max()))
+            correlation = scaled[batch] @ read_standardized(dosage, small[chunk_start:chunk_stop]).T / sample_count
+            for offset, index in enumerate(batch):
+                begin, finish = max(int(first[offset]), chunk_start), min(int(last[offset]), chunk_stop)
+                if begin >= finish:
+                    continue
+                covered = np.flatnonzero(small_ends[begin:finish] >= lows[offset])
+                proxies[index] += len(covered)
+                if len(covered) == 0 or variance[index] == 0:
+                    continue
+                squared = correlation[offset, begin - chunk_start + covered] ** 2
+                top = int(np.argmax(squared))
+                if squared[top] > best[index]:
+                    best[index], proxy[index] = squared[top], small[begin + covered[top]]
+    identifiers = table["id"].to_numpy()
     frame = pd.DataFrame({"chrom": chrom, "row": structural, "id": identifiers[structural],
-                          "source": table["source"].to_numpy(dtype=str)[structural], "pos": positions[structural],
-                          "end": ends[structural], "sv_type": table["sv_type"].to_numpy(dtype=str)[structural],
+                          "source": table["source"].to_numpy()[structural], "pos": positions[structural],
+                          "end": ends[structural], "sv_type": table["sv_type"].to_numpy()[structural],
                           "sv_length": table["sv_length"].to_numpy()[structural], "allele_frequency": frequency,
                           "genotype_variance": variance, "max_r2": np.minimum(best, 1.0),
                           "proxy_id": np.where(proxy >= 0, identifiers[np.maximum(proxy, 0)], ""), "proxies": proxies})
@@ -172,16 +201,16 @@ def rank_genes(scores, gene_order):
 
 
 def _chromosome_proxies(arguments):
-    dataset_dir, chrom, out_dir = arguments
+    dataset_dir, chrom, out_dir, worker_bytes = arguments
     target = out_dir / f"{chrom}.sv_proxies.tsv.gz"
     if not target.exists():
         number = chrom.removeprefix("chr")
-        table = pd.read_csv(dataset_dir / f"chr{number}.variants.tsv", sep="\t")
+        table = pd.read_csv(dataset_dir / f"chr{number}.variants.tsv", sep="\t", usecols=lambda column: column in TABLE_COLUMNS)
         if "source" not in table:
             table["source"] = "panel"
         dosage = np.load(dataset_dir / f"chr{number}.dosage.npy", mmap_mode="r")
         partial = target.with_name(f".{target.name}.partial")
-        sv_proxies(chrom, table, dosage).to_csv(partial, sep="\t", index=False)
+        sv_proxies(chrom, table, dosage, worker_bytes=worker_bytes).to_csv(partial, sep="\t", index=False)
         partial.replace(target)
     return chrom
 
@@ -206,8 +235,10 @@ def main():
     proxies_dir.mkdir(parents=True, exist_ok=True)
     genes = pd.read_csv(dataset_dir / "genes.tsv", sep="\t")
     chromosomes = sorted(genes["chrom"].unique(), key=lambda chrom: -(dataset_dir / f"chr{chrom.removeprefix('chr')}.dosage.npy").stat().st_size)
+    worker_bytes = worker_memory_bytes(arguments.workers)
+    print("worker memory bytes", worker_bytes, flush=True)
     with concurrent.futures.ProcessPoolExecutor(max_workers=arguments.workers) as pool:
-        for chrom in pool.map(_chromosome_proxies, [(dataset_dir, chrom, proxies_dir) for chrom in chromosomes]):
+        for chrom in pool.map(_chromosome_proxies, [(dataset_dir, chrom, proxies_dir, worker_bytes) for chrom in chromosomes]):
             print("proxies done", chrom, flush=True)
     structural = pd.concat([pd.read_csv(proxies_dir / f"{chrom}.sv_proxies.tsv.gz", sep="\t", keep_default_na=False)
                             for chrom in chromosomes], ignore_index=True)
