@@ -65,6 +65,9 @@ class Variants:
     # or imputed, and an imputed overlay supplies its imputation r^2 estimate (svimp.npz "dr2"). A method that cannot
     # use it simply sees the dosages.
     reliability: np.ndarray = None
+    # Each column's expected genotype concordance where dosages were filled (the share of people whose stored dosage
+    # equals the called one; lr-sv's GATK-SV no-call fills). A concordance, not an r^2: 1 where absent.
+    concordance: np.ndarray = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -265,7 +268,8 @@ def build_gene_task(dataset: Dataset, window: GeneWindow, split: dict):
                         train_allele_frequency=allele_count[polymorphic] / (2 * len(train_index)), source=selected["source"].to_numpy(dtype=str),
                         window_row=np.flatnonzero(polymorphic),
                         chromosome_row=window.chromosome_rows[polymorphic] if window.chromosome_rows is not None else None,
-                        reliability=selected["reliability"].to_numpy(dtype=np.float64) if "reliability" in selected else np.ones(len(selected)))
+                        reliability=selected["reliability"].to_numpy(dtype=np.float64) if "reliability" in selected else np.ones(len(selected)),
+                        concordance=selected["concordance"].to_numpy(dtype=np.float64) if "concordance" in selected else np.ones(len(selected)))
     train_phenotype, test_phenotype = residualize(dataset.expression[window.gene_row], dataset.covariates, train_index, test_index)
     samples = dataset.samples
     gene = dataset.gene_annotation[window.gene_id]
