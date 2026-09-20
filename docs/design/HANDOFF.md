@@ -61,6 +61,7 @@ Working:
 ## The user's pending decisions
 Agents never act on these and never contact anyone about them; the user decides and acts.
 1. **Git history.** AoU-derived values remain in the public git history and in the `archive/2026-09-19/*` tags. Whether to rewrite history, delete tags, or leave them is the user's decision. A purge of the orphaned commit `ba1b71e` (blob `0b20f6b750f8b7899a860045a5fe6a4d5e2f20c0`) from GitHub's caches is also the user's call.
+   - Also in main's history: the message of commit `302419a` (block_information_certificate, novel-inference) cites chr22 variance and cavity numbers measured on bench-sim's first chr22 cohort. That cohort was withdrawn for its AoU-derived group weights. The results were deleted locally and on MSI and reported to aou-audit; the message itself is left alone, as the lead ruled.
 2. **Attach the All of Us Controlled Tier data collection (v9)** to the SV-PGS workspace. It holds the phenotypes, person tables, GATK-SV VCFs, and the only DRAGEN-to-research-ID crosswalk.
 3. **Approve the store pull:** build the 8-bit stores inside the imputation workspace and copy only the stores into the SV-PGS workspace, in-perimeter. Agents never move data between workspaces without this approval.
 4. **The MSI Slurm counter reset** (COMPUTE.md): whether to pursue it.
