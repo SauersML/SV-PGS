@@ -375,9 +375,10 @@ def scale_mixture_prior(
     """Validate and centre the prior's inputs and lay out x; every class in 0..C-1 must have a member.
 
     ``offset_groups`` (one group index per variant, e.g. its gene) gives each group a learned level: a shift l_g of every
-    one of its variants' log prior variance, the same whatever their class. The levels sum to zero over the groups (the
-    class densities carry the common location) and have a Gaussian prior with one learned precision (ridge I on
-    sum-to-zero coordinates); they enter log u_j uncentred, as the last G - 1 scale coefficients. They are identified
+    one of its variants' log prior variance, the same whatever their class. The levels sum to zero over the groups,
+    unweighted (the class densities' locations carry the common location, and each class's location absorbs its own
+    composition-weighted mean level, which is identified: do not re-centre the levels by weight), and have a Gaussian
+    prior with one learned precision (ridge I on sum-to-zero coordinates); they enter log u_j uncentred, as the last G - 1 scale coefficients. They are identified
     against the classes' locations when the groups and classes connect: a common shift of the levels is the only
     direction they share, and sum-to-zero removes it.
 
