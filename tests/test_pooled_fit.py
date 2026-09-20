@@ -6,7 +6,7 @@ import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.pooled_fit import GeneData, _PooledPosterior, fit_pooled_small_n, pooled_prior
-from sv_pgs.small_n import _DensePosterior, _Design, _Kernel, _new_profile, dense_statistics, fit_small_n
+from sv_pgs.small_n import _Design, _Kernel, _new_profile, dense_statistics, fit_small_n
 
 _SNV = list(VariantClass).index(VariantClass.SNV)
 _DELETION = list(VariantClass).index(VariantClass.DELETION)
@@ -42,24 +42,42 @@ def test_one_gene_is_exactly_the_small_n_fit():
     assert float(pooled.noise_variance[0]) == single.noise_variance
 
 
-def test_the_pooled_posterior_is_the_direct_sum_of_the_genes():
-    rng = np.random.default_rng(4)
+def _two_genes(rng):
     designs = [np.asfortranarray(rng.standard_normal((12, width))) for width in (20, 9)]
     precisions = [rng.uniform(0.5, 2.0, design.shape[1]) for design in designs]
-    noises = [1.3, 0.7]
-    posteriors = [
-        _DensePosterior(_Kernel(_Design.dense(design), noise * precision), noise, 10**9, _new_profile())
-        for design, precision, noise in zip(designs, precisions, noises)
-    ]
+    noises = np.array([1.3, 0.7])
+    kernels = [_Kernel(_Design.dense(design), noise * precision) for design, precision, noise in zip(designs, precisions, noises)]
     rows = (slice(0, 20), slice(20, 29))
-    pooled = _PooledPosterior(posteriors, rows)
     covariance = np.zeros((29, 29))
     for design, precision, noise, gene_rows in zip(designs, precisions, noises, rows):
         covariance[gene_rows, gene_rows] = np.linalg.inv(design.T @ design / noise + np.diag(precision))
+    return kernels, noises, rows, covariance
+
+
+@pytest.mark.parametrize("share", [10**9, 2 * 8 * 20**2, 2 * 8 * 20**2 + 2 * 8 * 9**2])
+def test_the_pooled_posterior_is_the_direct_sum_of_the_genes_at_any_residency(share):
+    rng = np.random.default_rng(4)
+    kernels, noises, rows, covariance = _two_genes(rng)
+    pooled = _PooledPosterior(kernels, noises, rows, share, _new_profile())
     right = rng.standard_normal((29, 3))
     rounding = np.sqrt(np.finfo(np.float64).eps)
     np.testing.assert_allclose(pooled.solve(right, 0.0), covariance @ right, rtol=rounding, atol=rounding)
-    np.testing.assert_allclose(pooled.variance_jvp(right), -(covariance * covariance) @ right, rtol=rounding, atol=rounding)
+    squared = covariance * covariance
+    np.testing.assert_allclose(pooled.variance_jvp(right), -squared @ right, rtol=rounding, atol=rounding)
+    left, response_right, diagonal = rng.uniform(0.1, 0.5, 29), rng.uniform(0.1, 0.5, 29), rng.uniform(-0.2, 0.2, 29)
+    weight = rng.uniform(0.0, 1.0, 29)
+    system = np.eye(29) - (np.eye(29) - np.diag(weight) @ squared) @ (np.diag(left) @ covariance @ np.diag(response_right) + np.diag(diagonal))
+    posterior = pooled.gaussian_posterior()
+    assert posterior.linear_response is not None
+    for _call in range(2):  # a resident gene answers from its kept factor the second time
+        np.testing.assert_allclose(
+            posterior.linear_response(left, response_right, diagonal, weight, right), np.linalg.solve(system, right), rtol=rounding, atol=rounding
+        )
+
+
+def test_the_exact_response_needs_room_for_the_largest_gene():
+    kernels, noises, rows, _covariance = _two_genes(np.random.default_rng(5))
+    assert _PooledPosterior(kernels, noises, rows, 2 * 8 * 20**2 - 1, _new_profile()).gaussian_posterior().linear_response is None
 
 
 def test_the_pooled_prior_stacks_the_genes_with_one_level_group():

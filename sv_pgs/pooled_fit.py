@@ -50,6 +50,8 @@ from sv_pgs.scale_mixture_ep import (
     tilted_moments,
 )
 from sv_pgs.small_n import (
+    _EXACT_RESPONSE_MATRICES,
+    _FLOAT_BYTES,
     _LIVE_FIXED_POINTS,
     DenseStatistics,
     _DensePosterior,
@@ -123,16 +125,40 @@ def pooled_prior(
 
 
 class _PooledPosterior:
-    """The joint posterior's responses as the direct sum of the genes' (``small_n._DensePosterior`` each)."""
+    """The joint posterior's responses as the direct sum of the genes' (``small_n._DensePosterior`` each).
 
-    def __init__(self, posteriors: Sequence[_DensePosterior], rows: Sequence[slice]) -> None:
-        self.posteriors = tuple(posteriors)
+    Every response is block diagonal by gene, so each gene answers its own rows, one gene at a time. A gene's exact
+    response holds two p_g x p_g matrices (Sigma o Sigma and the response's LU); the genes' together rarely fit, so
+    the largest genes (whose matrices cost the most to form again, p^3 against p^2 bytes) stay resident within
+    ``share`` less the room one other gene needs, and every other gene forms its matrices for the call and frees them.
+    The responses are exact either way; residency only saves recomputation. Where one gene alone cannot hold its
+    matrices, the exact response is unavailable and the total curvature uses GMRES on the direct sum."""
+
+    def __init__(self, kernels: Sequence[_Kernel], noises: F64Array, rows: Sequence[slice], share: int, profile: dict) -> None:
+        self.kernels = tuple(kernels)
+        self.noises = np.asarray(noises, dtype=np.float64)
         self.rows = tuple(rows)
+        self.share = int(share)
+        self.profile = profile
+        need = np.array([_EXACT_RESPONSE_MATRICES * _FLOAT_BYTES * (gene_rows.stop - gene_rows.start) ** 2 for gene_rows in self.rows])
+        self.exact = bool(need.max(initial=0) <= self.share)
+        room = self.share - int(need.max(initial=0))
+        self.resident: dict[int, _DensePosterior] = {}
+        spent = 0
+        for gene in np.argsort(-need, kind="stable").tolist():
+            if spent + int(need[gene]) <= room:
+                self.resident[gene] = self._new(gene)
+                spent += int(need[gene])
+
+    def _new(self, gene: int) -> _DensePosterior:
+        # Each posterior may form its exact matrices whenever one gene's fit the share (``gaussian_posterior``).
+        return _DensePosterior(self.kernels[gene], float(self.noises[gene]), self.share, self.profile)
 
     def _each(self, values: F64Array, apply: Callable[[_DensePosterior, F64Array, slice], F64Array]) -> F64Array:
         array = np.asarray(values, dtype=np.float64)
         result = np.empty_like(array)
-        for posterior, rows in zip(self.posteriors, self.rows):
+        for gene, rows in enumerate(self.rows):
+            posterior = self.resident.get(gene) or self._new(gene)
             result[rows] = apply(posterior, array[rows], rows)
         return result
 
@@ -149,8 +175,7 @@ class _PooledPosterior:
         )
 
     def gaussian_posterior(self) -> GaussianPosterior:
-        exact = all(posterior.gaussian_posterior().linear_response is not None for posterior in self.posteriors)
-        return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if exact else None)
+        return GaussianPosterior(solve=self.solve, variance_jvp=self.variance_jvp, linear_response=self.linear_response if self.exact else None)
 
 
 class _PooledFixedPoints:
@@ -269,14 +294,8 @@ class _PooledFixedPoints:
         return norm
 
     def _posterior(self) -> GaussianPosterior:
-        # The live fixed points share the working memory; within one, each gene's p x p matrices get their share.
-        share = self.working_bytes // _LIVE_FIXED_POINTS
-        squares = np.array([float((rows.stop - rows.start) ** 2) for rows in self.rows])
-        posteriors = [
-            _DensePosterior(kernel, float(noise), int(share * square / squares.sum()), self.profile)
-            for kernel, noise, square in zip(self.kernels, self.noise, squares)
-        ]
-        return _PooledPosterior(posteriors, self.rows).gaussian_posterior()
+        # The live fixed points (the current one and a trial) share the working memory equally.
+        return _PooledPosterior(self.kernels, self.noise.copy(), self.rows, self.working_bytes // _LIVE_FIXED_POINTS, self.profile).gaussian_posterior()
 
     def _snapshot(self) -> dict:
         return {
