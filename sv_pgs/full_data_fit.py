@@ -193,7 +193,8 @@ class FitCertificate:
       with the curvature's difference steps in ``stationarity_steps`` and the gradient's error bounds in
       ``stationarity_errors``;
     - ``mean_move``: an upper bound on the undamped EP update's squared move of the mean in the posterior metric at
-      the final refresh, against ``draw_tolerance`` = p_eff / K; ``noise_gain``: the noise update's evidence gain there;
+      the final refresh, against ``draw_tolerance`` = 1 / K, i.e. KL(q || q') = move / 2 <= 1 / (2K) nats (evidence units,
+      defined as p_eff -> 0; lead ruling via speed-smalln); ``noise_gain``: the noise update's evidence gain there;
     - ``mean_error``: the certified ||mu_hat - mu||_A of the final solve;
     - ``information_bound`` and ``information_tolerance``: the final refresh's largest family-wise upper bound on a
       block's relative error in tr(D - Sigma), and the smallest per-block tolerance it is tested against
@@ -429,7 +430,8 @@ class _FullDataFixedPoints:
         group_precision, group_shift = group_sites(self.ties, site_precision, site_shift)
         certificate = self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=self.noise,
-            error_bound=np.sqrt(self.effective / self.draw_count), probe_residual_ratio=self.probe_ratio,
+            # The mean's own error in q's metric, ||mu_hat - mu||_A^2 / 2 <= 1 / (2K) nats, as every EP certificate here.
+            error_bound=np.full(self.gaussian.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=self.probe_ratio,
         )
         self.mean_error = np.asarray(_host(certificate.error_bound), dtype=np.float64)
         self.passes += 1
@@ -615,7 +617,12 @@ class _FullDataFixedPoints:
             return within
         bound = np.array([0.5 * np.sqrt(remaining)])
         while True:
-            solved = np.asarray(_host(self.gaussian.posterior_solve(grouped[:, None], model, bound)), dtype=np.float64)
+            try:
+                solved = np.asarray(_host(self.gaussian.posterior_solve(grouped[:, None], model, bound)), dtype=np.float64)
+            except ValueError as error:
+                # The move cannot be decided against its budget at float64's attainable accuracy: no certified fixed
+                # point here, so the outer loop shortens its step.
+                raise NoFixedPoint(f"model {model}: the EP move cannot be resolved against its budget: {error}") from error
             lower, upper = _norm_bounds(np.array([float(grouped @ solved[:, 0])]), bound)
             if upper[0] * upper[0] <= remaining or lower[0] * lower[0] > remaining:
                 return within + float(upper[0] * upper[0])
@@ -648,7 +655,7 @@ class _FullDataFixedPoints:
                 raise NoFixedPoint("a site target is not finite at these hyperparameters")
             # The undamped update moves the mean by Sigma (delta nu - delta tau o mu), to first order in the site change.
             right = (target_shift - self.site_shift) - (target_precision - self.site_precision) * mean
-            draw_tolerance = self.effective / self.draw_count
+            draw_tolerance = np.full(model_count, 1.0 / self.draw_count)
             self.mean_move = np.array([self._move_bounds(model, right[:, model], float(draw_tolerance[model])) for model in range(model_count)])
             noise = self._noise(variances)
             covariate_count = int(gaussian.covariates.shape[1])
@@ -707,7 +714,7 @@ class _FullDataFixedPoints:
             mean_move = np.sum(np.square(new_mean - mean) / marginal, axis=0) / (fraction * fraction)
             if not np.all(np.isfinite(mean_move)):
                 raise NoFixedPoint("a frozen pass's mean move is not finite")
-            if np.all(mean_move <= self.effective / self.draw_count):
+            if np.all(mean_move <= 1.0 / self.draw_count):
                 return
             ratio = float(np.max(mean_move / previous_move))
             if ratio >= 1.0:
@@ -751,7 +758,7 @@ def fit_full_data(
             stationarity_steps=tuple(fit.step.stationarity_steps for fit in fits),
             stationarity_errors=tuple(fit.step.stationarity_errors for fit in fits),
             mean_move=fixed_points.mean_move,
-            draw_tolerance=fixed_points.effective / draw_count,
+            draw_tolerance=np.full(gaussian.model_count, 1.0 / draw_count),
             noise_gain=fixed_points.noise_gain,
             mean_error=fixed_points.mean_error,
             information_bound=np.array([float(np.max(certificate.upper_bound)) for certificate in fixed_points.information]),
@@ -781,7 +788,7 @@ def scoring_models(
     and the covariate coefficients. Tied members are equal on the training samples only, so each keeps its effect."""
     gaussian = fit.gaussian
     ties = TieGroups.from_tie_map(statistics.tie_map)
-    error_bound = np.sqrt(fit.certificate.effective_effects / draw_count)
+    error_bound = np.full(len(trait_types), np.sqrt(1.0 / draw_count))
     group_draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
     alpha = np.asarray(_host(gaussian.alpha), dtype=np.float64)
     group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
