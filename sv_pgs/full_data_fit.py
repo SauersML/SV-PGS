@@ -560,7 +560,14 @@ class _FullDataFixedPoints:
                     level=stage_level(level, stage), certified=np.ones(undecided.shape[0], dtype=bool), violated=np.zeros(undecided.shape[0], dtype=bool),
                 )
             probes = self.generator.choice(np.array([-1.0, 1.0]), size=(variant_count, probe_count))
-            back_products, _coupling, _residual_norm = gaussian.information_solve(probes, model, residual)
+            back_products, _coupling, residual_norm = gaussian.information_solve(probes, model, residual)
+            reached = float(np.max(np.asarray(_host(residual_norm), dtype=np.float64)))
+            if not reached <= residual:
+                # float64 stopped the solve above the residual the certificate's products need (it returns the residual
+                # reached rather than raise, speed-krylov cf364bd; speed-recycle's note): nothing certifies the block.
+                raise NoFixedPoint(
+                    f"model {model}: the information solve stops at relative residual {reached:.3e}, above the {residual:.3e} its certificate needs"
+                )
             removed = information_products(solve, np.asarray(_host(back_products), dtype=np.float64))
             control = control_variate(solve, grams, probes, gaussian.array_module)
             control = ControlVariate(
