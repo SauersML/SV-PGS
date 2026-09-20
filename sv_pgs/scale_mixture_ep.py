@@ -1182,32 +1182,38 @@ def _directional_derivatives(
     return third, fourth
 
 
-def _line_values(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, steps: F64Array, cavity: Cavity, working_bytes: int
-) -> F64Array:
-    """The penalized objective F(x + t b) - P(x + t b) at every step t, in one pass over the variants.
+def _line(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int
+) -> Callable[[F64Array], F64Array]:
+    """The penalized objective F(x + t b) - P(x + t b) as a function of the steps t, each call one pass over the
+    variants for all its steps.
 
     z = M x is affine in t, so every step's class log densities and log scales follow from those of x and b, and P
     is exactly quadratic in t: only the log normalizers are evaluated per step."""
-    count = steps.shape[0]
     density, _scale = _density_and_scale(prior, origin)
     density_step, scale_step = _density_and_scale(prior, direction)
-    log_weights = density[None] + steps[:, None, None] * density_step[None]
-    log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
     scales = log_scale(prior, origin)
     scale_slope = prior.scale_design @ scale_step
     penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
-    curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
-    values = -(penalty + steps * float(penalty_gradient @ direction) + 0.5 * np.square(steps) * curvature)
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
-            size = rows.shape[0] * count
-            normalizers = _log_normalizers(
-                np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
-                (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
-                prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
-            )
-            values += normalizers.reshape(rows.shape[0], count).sum(axis=0)
+    penalty_slope = float(penalty_gradient @ direction)
+    penalty_curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+
+    def values(steps: F64Array) -> F64Array:
+        count = steps.shape[0]
+        log_weights = density[None] + steps[:, None, None] * density_step[None]
+        log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
+        total = -(penalty + steps * penalty_slope + 0.5 * np.square(steps) * penalty_curvature)
+        for class_position, class_rows in enumerate(prior.class_rows):
+            for rows in _row_chunks(class_rows, prior.grid_size * count, working_bytes):
+                size = rows.shape[0] * count
+                normalizers = _log_normalizers(
+                    np.broadcast_to(log_density[None, :, class_position], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
+                    (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
+                    prior.log_variance_grid, prior.kernel_floor, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
+                )
+                total += normalizers.reshape(rows.shape[0], count).sum(axis=0)
+        return total
+
     return values
 
 
@@ -1226,13 +1232,14 @@ def _line_log_integral(
     decides, and its own error estimate must resolve the log to the share, or to half of double precision when
     rounding is what stopped it.
     """
+    line = _line(prior, log_smoothing, origin, direction, cavity, working_bytes)
     tolerance = max(share, _HALF_PRECISION)
     extent = float(np.sqrt(2.0 * np.log(1.0 / _EPSILON)))
     nodes = (_TIERNEY_KADANE_DEGREE + 2) // 2
     previous = None
     while True:
         steps, weights = np.polynomial.hermite_e.hermegauss(nodes)
-        log_terms = np.log(weights) + _line_values(prior, log_smoothing, origin, direction, steps, cavity, working_bytes) - value + 0.5 * np.square(steps)
+        log_terms = np.log(weights) + line(steps) - value + 0.5 * np.square(steps)
         estimate = float(_log_sum_exp(log_terms, axis=0)) - 0.5 * np.log(2.0 * np.pi)
         if previous is not None and abs(estimate - previous) <= tolerance:
             return estimate
@@ -1242,7 +1249,7 @@ def _line_log_integral(
         nodes *= 2
 
     def integrand(step: float) -> float:
-        return float(np.exp(_line_values(prior, log_smoothing, origin, direction, np.array([step]), cavity, working_bytes)[0] - value))
+        return float(np.exp(line(np.array([step]))[0] - value))
 
     integral, error, _information, *message = quad(
         integrand, -np.inf, np.inf, epsabs=0.0, epsrel=max(share, _QUADPACK_RELATIVE_FLOOR), full_output=True

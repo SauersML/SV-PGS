@@ -30,7 +30,7 @@ from sv_pgs.scale_mixture_ep import (
     _best_certified,
     _laplace_corrections,
     _line_log_integral,
-    _line_values,
+    _line,
     _log_normal_start,
     _maximize_coefficients,
     _penalized,
@@ -630,7 +630,7 @@ def test_the_line_values_are_the_penalized_objective_at_each_step():
     direction = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
     steps = np.array([-3.0, -0.4, 0.0, 0.9, 2.5])
     for working_bytes in (_WORKING_BYTES, 1 << 12):
-        values = _line_values(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, steps, cavity, working_bytes)
+        values = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, working_bytes)(steps)
         expected = np.array([
             _data_value(prior, hyperparameters.coefficients + step * direction, cavity, _WORKING_BYTES)
             - _penalty_value(prior, hyperparameters.log_smoothing, hyperparameters.coefficients + step * direction)[0]
