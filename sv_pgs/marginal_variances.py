@@ -53,6 +53,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.linalg import solve_triangular
 from scipy.stats import t as student_t
 
 
@@ -803,3 +804,63 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_part[solve.resolved] = resolved_bulk_near
     return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
 
+
+
+
+# --------------------------------------------------------------------------- the exact dual route (small n)
+
+
+@dataclass(frozen=True)
+class KernelFactor:
+    """The bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely: for shapes whose n x n fits in memory.
+
+    ``lower`` is its Cholesky factor, ``resolved_solves`` Z_L = K_S^-1 Xt_L, and ``resolved_core``
+    core = Pi_L + Xt_L' Z_L. Then Q = K^-1 = K_S^-1 - Z_L core^-1 Z_L' (Woodbury, valid for any core > 0).
+    """
+
+    lower: NDArray[np.float64]
+    resolved_solves: NDArray[np.float64]
+    resolved_core: NDArray[np.float64]
+
+
+def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.float64], columns: NDArray[np.float64]) -> NDArray[np.float64]:
+    """D_j - Sigma_jj for one block's variants, exactly: D_j^2 (xt_j' K_S^-1 xt_j - c_j core^-1 c_j').
+
+    ``columns`` is the block's Xt_b (n x |b|) and ``bulk_variance`` its D_b (zero on resolved sites, whose rows
+    the caller takes from core^-1). The cost is n^2 |b| for the triangular solve plus n |b| |L|.
+    """
+    whitened = solve_triangular(factor.lower, columns, lower=True)
+    quadratic = np.sum(np.square(whitened), axis=0)
+    cross = columns.T @ factor.resolved_solves
+    spikes = np.sum((cross @ np.linalg.inv(factor.resolved_core)) * cross, axis=1) if cross.shape[1] else 0.0
+    return np.square(bulk_variance) * (quadratic - spikes)
+
+
+def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
+    """diag(K_S^-1), exactly: the column sums of squares of L^-1, with K_S = L L'. The cost is n^3 / 3.
+
+    This is the bulk diagonal only. The resolved sites' correction (Z_L core^-1 Z_L')_ii and the covariate
+    leverage are added once, by ``dual_solve.SampleDiagonal.predictor_variance``, the single assembler for the
+    exact and the windowed routes alike (binary-ep). Subtracting them here too would count them twice.
+    """
+    inverse_lower = solve_triangular(factor.lower, np.eye(factor.lower.shape[0]), lower=True)
+    return np.sum(np.square(inverse_lower), axis=0)
+
+
+def exact_route_is_cheaper(sample_count: int, grams: BlockGrams, working_bytes: int) -> bool:
+    """Whether the exact dual route costs fewer flops than the window route and its n x n factor fits.
+
+    Leading-order counts (Golub and Van Loan, Matrix Computations, 4th ed.: Cholesky n^3 / 3; a triangular solve
+    n^2 per column; the symmetric eigendecomposition with vectors about 9 n^3):
+    - exact: n^2 p (forming K_S) + n^3 / 3 (its factor) + n^2 p (the triangular solves);
+    - window: the sum over blocks of 9 |W_b|^3, with |W_b| the block's window size.
+    The exact route needs n^2 float64 for the factor and n^2 for its inverse (the leverages).
+    """
+    variant_count = sum(members.shape[0] for members in grams.blocks)
+    exact = 2.0 * sample_count**2 * variant_count + sample_count**3 / 3.0
+    window = 0.0
+    for block in range(len(grams.blocks)):
+        size = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
+        window += 9.0 * float(size) ** 3
+    fits = 2 * sample_count * sample_count * np.dtype(np.float64).itemsize <= working_bytes
+    return bool(fits and exact < window)

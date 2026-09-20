@@ -23,6 +23,10 @@ from sv_pgs.marginal_variances import (
     information_solve_tolerance,
     resolvable_blocks,
     sandwich_diagonal,
+    KernelFactor,
+    exact_block_information,
+    exact_route_is_cheaper,
+    exact_bulk_diagonal,
     block_trace_certificate,
     cavity_tolerance,
     certificate_level,
@@ -469,3 +473,41 @@ def test_sandwich_diagonal_equals_the_three_operand_contraction():
     gram = generator.standard_normal((40, 40))
     reference = np.einsum("ij,jk,ki->i", covariance, gram, covariance)
     assert np.allclose(sandwich_diagonal(covariance, gram), reference, rtol=1e-12, atol=1e-12 * np.abs(reference).max())
+
+
+def _kernel_factor(columns: np.ndarray, precision: np.ndarray, resolved: np.ndarray) -> KernelFactor:
+    bulk = 1.0 / precision
+    bulk[resolved] = 0.0
+    kernel = np.eye(columns.shape[0]) + (columns * bulk) @ columns.T
+    solves = np.linalg.solve(kernel, columns[:, resolved])
+    return KernelFactor(lower=np.linalg.cholesky(kernel), resolved_solves=solves,
+                        resolved_core=np.diag(precision[resolved]) + columns[:, resolved].T @ solves)
+
+
+def test_exact_dual_route_matches_the_dense_inverse_with_a_non_positive_site():
+    generator = np.random.default_rng(24)
+    columns = generator.standard_normal((60, 150))
+    precision = generator.uniform(1.0, 30.0, 150)
+    precision[[4, 90]] = [-0.5 * float(np.linalg.eigvalsh(columns.T @ columns)[0]), 0.01]
+    resolved = np.array([4, 90])
+    factor = _kernel_factor(columns, precision, resolved)
+    covariance = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    bulk = 1.0 / precision
+    bulk[resolved] = 0.0
+    block = np.arange(30, 80)
+    removed = exact_block_information(factor, bulk[block], columns[:, block])
+    expected = np.where(np.isin(block, resolved), 0.0, bulk[block] - np.diag(covariance)[block])
+    assert np.allclose(np.where(np.isin(block, resolved), 0.0, removed), expected, rtol=1e-8, atol=1e-14)
+    kernel = np.eye(columns.shape[0]) + (columns * bulk) @ columns.T
+    assert np.allclose(exact_bulk_diagonal(factor), np.diag(np.linalg.inv(kernel)), rtol=1e-8)
+    # With the resolved correction added once, 1 - Q_ii is the exact leverage h_i = xt_i' Sigma xt_i.
+    resolved_term = np.sum((factor.resolved_solves @ np.linalg.inv(factor.resolved_core)) * factor.resolved_solves, axis=1)
+    leverage = 1.0 - (exact_bulk_diagonal(factor) - resolved_term)
+    assert np.allclose(leverage, np.einsum("ij,jk,ik->i", columns, covariance, columns), rtol=1e-8)
+
+
+def test_exact_route_rule_prefers_the_dual_when_samples_are_few():
+    blocks = (np.arange(4430),)
+    grams = BlockGrams(blocks=blocks, within=(np.eye(4430),), next_cross=())
+    assert exact_route_is_cheaper(580, grams, 2**30)
+    assert not exact_route_is_cheaper(50_000, grams, 2**30)

@@ -81,6 +81,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('dosage_store.py', '_column_metadata'): ('spec', frozenset({3}), 'Zarr format version 3'),
     ('dosage_store.py', 'open_column'): ('spec', frozenset({3}), 'Zarr format version 3'),
     ('dosage_store.py', 'chromosome_number'): ('spec', frozenset({22}), 'human autosomes chr1-chr22'),
+    ('marginal_variances.py', 'exact_route_is_cheaper'): ('spec', frozenset({9.0, 3.0}), 'leading-order flop counts: symmetric eigendecomposition with vectors about 9 n^3, Cholesky n^3 / 3 (Golub and Van Loan, Matrix Computations, 4th ed., Table 8.3.1 and Section 4.2)'),
     ('dual_solve.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('external_annotations.py', 'TIER_COORDINATE'): ('definitional', frozenset({3}), 'enum code; (chromosome << 32 | position) site key'),
     ('external_annotations.py', 'MOTIF_MULTIPLES'): ('spec', frozenset({3}), 'TRF reports a period, or twice or three times it'),
