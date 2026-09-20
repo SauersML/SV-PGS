@@ -886,7 +886,7 @@ def test_total_curvature_matches_ep_resolved_differences_of_the_evidence_gradien
     np.testing.assert_allclose(lazy.on(view.coefficient_map), allowed.T @ whole @ allowed, rtol=1e-8, atol=1e-8 * scale)
     assert lazy.solved_directions == allowed.shape[1] < coefficients.shape[0]
     np.testing.assert_allclose(lazy.on(mapping), whole, rtol=1e-8, atol=1e-8 * scale)
-    assert lazy.solved_directions == coefficients.shape[0]
+    assert lazy.solved_directions == np.linalg.matrix_rank(mapping)
 
 
 def test_the_outer_step_never_certifies_where_the_total_curvature_is_indefinite():
