@@ -12,7 +12,9 @@ import pytest
 from scipy.stats import norm
 from scipy.stats import t as student_t
 
+from sv_pgs import marginal_variances as marginal_variances_module
 from sv_pgs.marginal_variances import (
+    BlockCertificate,
     BlockGrams,
     BulkSolve,
     approximation_scale,
@@ -609,3 +611,65 @@ def test_zero_skewness_reproduces_the_student_t_interval():
     relative = np.array([(np.mean(v) - 5.0) / 5.0 for v in values])
     assert np.allclose(certificate.lower_bound, relative - quantile * spread, rtol=0, atol=1e-15)
     assert np.allclose(certificate.upper_bound, relative + quantile * spread, rtol=0, atol=1e-15)
+
+
+def test_an_inconsistent_window_gram_is_refused():
+    generator, columns, precision, blocks, solve = _strong_case(27)
+    grams = _grams(columns, blocks)
+    # Cross-block Grams from another design: the assembled window is no longer a Gram matrix.
+    other = generator.standard_normal(columns.shape)
+    wrong = BlockGrams(blocks=grams.blocks, within=grams.within,
+                       next_cross=tuple(3.0 * (other[:, blocks[i]].T @ other[:, blocks[i + 1]]) for i in range(len(blocks) - 1)))
+    with pytest.raises(ValueError, match="not positive semidefinite"):
+        marginal_variances(solve, wrong)
+
+
+def test_a_thin_middle_block_leaves_the_window_positive_semidefinite():
+    # Strong LD across a 5-variant middle block: the zero corner would make the three-block window indefinite.
+    generator = np.random.default_rng(28)
+    columns = _genotypes(generator, 2000, 205, 0.99)
+    blocks = (np.arange(0, 100), np.arange(100, 105), np.arange(105, 205))
+    grams = _grams(columns, blocks)
+    gram, _columns, _own = marginal_variances_module._window(grams, 1)
+    zero_corner = gram.copy()
+    zero_corner[:100, 105:] = 0.0
+    zero_corner[105:, :100] = 0.0
+    assert np.linalg.eigvalsh(zero_corner)[0] < 0.0
+    assert np.linalg.eigvalsh(gram)[0] >= -np.finfo(np.float64).eps * gram.shape[0] * np.linalg.norm(gram)
+
+
+def test_probes_to_decide_takes_a_per_block_tolerance_with_mixed_decisions():
+    # speed-recycle's case: a per-block tolerance array and a stage with certified and undecided blocks.
+    # Dyadic values, so the expected probe count is exact in floating point.
+    relative = np.array([0.0, 0.0, 0.5, 0.5])
+    standard = np.full(4, 0.125)
+    tolerance = np.array([2.0, 2.0, 0.75, 0.75])
+    width = 3.0 * standard
+    certificate = BlockCertificate(
+        relative_error=relative, standard_error=standard, lower_bound=relative - width, upper_bound=relative + width,
+        tolerance=tolerance, level=certificate_level(64),
+        certified=(relative - width >= -tolerance) & (relative + width <= tolerance),
+        violated=(relative - width > tolerance) | (relative + width < -tolerance),
+    )
+    assert certificate.certified.tolist() == [True, True, False, False]
+    # The undecided blocks sit 0.25 inside their tolerance with half-width 0.375: (0.375 / 0.25)^2 = 2.25 times the probes.
+    assert probes_to_decide(certificate, 16) == 36
+
+
+
+def test_shared_float32_grams_with_a_scale_give_the_float64_answer():
+    _generator, columns, precision, blocks, solve = _strong_case(30)
+    grams = _grams(columns, blocks)
+    noise = 0.8
+    scaled = BlockGrams(blocks=grams.blocks, within=tuple(w * noise for w in grams.within),
+                        next_cross=tuple(c * noise for c in grams.next_cross))
+    stored = BlockGrams(blocks=scaled.blocks, within=tuple(w.astype(np.float32) for w in scaled.within),
+                        next_cross=tuple(c.astype(np.float32) for c in scaled.next_cross), scale=1.0 / noise)
+    reference = marginal_variances(solve, grams)
+    shared = marginal_variances(solve, stored)
+    # float32 storage rounds each Gram entry by u32; the variances move by at most that times the window's
+    # conditioning, which the tolerance bounds (I + omega_F B has eigenvalues >= 1).
+    window = max(sum(grams.blocks[m].shape[0] for m in marginal_variances_module._window_blocks(grams, b)) for b in range(len(blocks)))
+    bound = np.finfo(np.float32).eps * window * (1.0 + solve.bulk_trace * float(np.linalg.eigvalsh(columns.T @ columns)[-1]) * np.max(1.0 / precision))
+    assert np.all(np.abs(shared - reference) <= bound * np.abs(reference))
+    assert marginal_variances_module.window_working_bytes(stored) == marginal_variances_module.window_working_bytes(grams)
