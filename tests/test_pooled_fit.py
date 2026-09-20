@@ -80,13 +80,14 @@ def test_the_exact_response_needs_room_for_the_largest_gene():
     assert _PooledPosterior(kernels, noises, rows, 2 * 8 * 20**2 - 1, _new_profile()).gaussian_posterior().linear_response is None
 
 
-def test_the_pooled_prior_stacks_the_genes_with_one_level_group():
+def test_the_pooled_prior_stacks_the_genes_with_their_levels_as_offset_groups():
     rng = np.random.default_rng(6)
     genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (30, 25, 40)]
     statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
     prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(3), 64)
     assert prior.variant_count == sum(int(gene.projected.shape[1]) for gene in statistics)
-    assert prior.class_count == 2 and len(prior.annotation_groups) == 1 and prior.scale_size == 2
+    # The genes' levels are offset groups (review-mathbugs P2): no annotation group, G - 1 level coordinates.
+    assert prior.class_count == 2 and len(prior.annotation_groups) == 0 and prior.level_size == 2 and prior.scale_size == 2
 
 
 @pytest.mark.slow
