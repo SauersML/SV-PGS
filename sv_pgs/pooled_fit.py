@@ -352,6 +352,8 @@ class _PooledFixedPoints:
             mean = self.mean.copy()
             cavity = Cavity(precision=frozen, shift=mean / variances - self.site_shift)
             target_precision, target_shift = self._targets(hyperparameters, cavity)
+            if not (np.all(np.isfinite(target_precision)) and np.all(np.isfinite(target_shift))):
+                raise NoFixedPoint("non-finite EP site targets at these hyperparameters (review-mathbugs N2)")
             # Every gene is scored as its own model, so each is certified on its own (review-mathbugs P1), in evidence
             # units as small_n's fixed point is: its undamped update moves its q by KL(q || q') nats
             # (``_Kernel.update_divergence``, the mean and variance parts to second order) and its noise update gains
@@ -435,6 +437,10 @@ class _PooledFixedPoints:
                 fraction = float(damping[gene])
                 delta_precision = target_precision[rows] - self.site_precision[rows]
                 delta_shift = target_shift[rows] - self.site_shift[rows]
+                if not (np.all(np.isfinite(delta_precision)) and np.all(np.isfinite(delta_shift))):
+                    # A non-finite target (a trial density with no mass where this gene's tilted laws live: review-mathbugs
+                    # N1/N2) has no damped step to take; the trial has no fixed point here, and the outer loop halves it.
+                    raise NoFixedPoint(f"gene {gene}: non-finite EP site targets at these hyperparameters")
                 move = max(float(np.max(np.abs(delta_precision), initial=0.0)), float(np.max(np.abs(delta_shift), initial=0.0)))
                 scale = 1.0 + max(float(np.max(np.abs(self.site_precision[rows]))), float(np.max(np.abs(self.site_shift[rows]))))
                 if fraction * move <= _EPSILON * scale:
@@ -461,6 +467,8 @@ class _PooledFixedPoints:
                 self.site_precision[rows], self.site_shift[rows] = trial_precision, trial_shift
                 marginal = 1.0 / (frozen[rows] + self.site_precision[rows])
                 moves[gene] = float(np.sum(np.square(self.mean[rows] - mean) / marginal)) / (fraction * fraction)
+                if not np.isfinite(moves[gene]):
+                    raise NoFixedPoint(f"gene {gene}: a non-finite EP move at these hyperparameters")
                 if previous[gene] > 0.0 and moves[gene] / previous[gene] >= 1.0:
                     damping[gene] = min(float(damping[gene]), 1.0 / (1.0 + np.sqrt(moves[gene] / previous[gene])))
             # A gene is done once its own frozen move, in nats (half its squared move in the posterior metric), is at

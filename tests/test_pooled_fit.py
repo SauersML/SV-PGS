@@ -158,3 +158,21 @@ def test_a_genes_double_loop_is_small_ns_on_its_rows():
     np.testing.assert_array_equal(pooled.site_precision, single.site_precision)
     np.testing.assert_array_equal(pooled.site_shift, single.site_shift)
     np.testing.assert_array_equal(pooled.mean, single.mean)
+
+
+def test_non_finite_site_targets_refuse_the_trial_instead_of_looping():
+    """review-mathbugs N2: a NaN target made the damped halving and the sweep loop run forever."""
+    from sv_pgs.full_data_fit import NoFixedPoint
+    from sv_pgs.pooled_fit import _PooledFixedPoints, _gene_rows, _pooled_start
+
+    rng = np.random.default_rng(11)
+    genes = [_gene(rng, 60, width, _sparse_effects(rng, width, 1)) for width in (30, 20)]
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
+    prior = pooled_prior(statistics, [gene.variant_class for gene in genes], [np.zeros(gene.codes.shape[1]) for gene in genes], np.ones(2), 64)
+    start, noise = _pooled_start(statistics, prior, _gene_rows(statistics))
+    oracle = _PooledFixedPoints(statistics, prior, start, noise, 64, 10**9)
+    _variances, frozen = oracle._refresh(start)
+    target_precision, target_shift = oracle.site_precision.copy(), oracle.site_shift.copy()
+    target_precision[3] = np.nan
+    with pytest.raises(NoFixedPoint, match="non-finite"):
+        oracle._frozen_passes(start, frozen, target_precision, target_shift)

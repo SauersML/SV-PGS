@@ -31,11 +31,15 @@ class SmallNPredictor:
     scoring: ScoringModel
     profile: dict
 
-    def predict(self, genotypes: np.ndarray) -> np.ndarray:
-        """The genetic score plus the intercept, in closed form from dosages: x_j = (127 d_j - 127 - mu_j) / sigma_j."""
+    def predict(self, genotypes: np.ndarray, covariates: np.ndarray | None = None) -> np.ndarray:
+        """The genetic score plus the intercept, in closed form from dosages: x_j = (127 d_j - 127 - mu_j) / sigma_j, and
+        the fixed covariate effects when the harness passes the scored samples' covariates."""
         dosages = np.asarray(genotypes, dtype=np.float64)[:, self.scoring.store_rows]
         standardized = (CODES_PER_DOSAGE * dosages - SIGNED_CODE_OFFSET - self.scoring.signed_means) / self.scoring.signed_scales
-        return standardized @ self.scoring.coefficients + self.scoring.alpha[0]
+        score = standardized @ self.scoring.coefficients + self.scoring.alpha[0]
+        if covariates is not None and self.scoring.alpha.shape[0] > 1:
+            score = score + np.asarray(covariates, dtype=np.float64) @ self.scoring.alpha[1:]
+        return score
 
 
 _CLASS_CODES = {variant_class: index for index, variant_class in enumerate(VariantClass)}
@@ -75,7 +79,8 @@ def _fit(train: Any, arm: str) -> SmallNPredictor:
     samples = genotypes.shape[0]
     fit = fit_small_n(
         codes=codes,
-        covariates=np.ones((samples, 1)),
+        # bench-real's fixed-effect covariates [1, C] (review-mathbugs C2), as svpgs_method's arms pass them.
+        covariates=_METHOD.bench_real_covariates(train),
         target=np.asarray(train.phenotype, dtype=np.float64),
         variant_class=classes_for_arm(train.variants, arm),
         log_variance_offset=None,
