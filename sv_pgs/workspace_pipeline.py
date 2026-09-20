@@ -577,10 +577,12 @@ def _samples_step(run: _Run, directory: Path) -> dict[str, Any]:
     folds = kinship_folds(components, strata, config.fold_count, config.seed)
     with (directory / "rows.tsv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(("research_id", "genotype_source", "half", "store_column", "ancestry", "fold"))
+        writer.writerow(("research_id", "genotype_source", "half", "store_column", "ancestry", "fold", "family"))
         for row, research_id in enumerate(research_ids):
             store_column = int(half_starts[rows.store_half[row]]) + rows.store_column[row]
-            writer.writerow((research_id, rows.genotype_source[row], row_labels[row], store_column, ancestry[research_id], int(folds[row])))
+            writer.writerow(
+                (research_id, rows.genotype_source[row], row_labels[row], store_column, ancestry[research_id], int(folds[row]), int(components[row]))
+            )
     pairs = _calibration_pairs(halves, crosswalk)
     _write_json(
         directory / "samples.json",
@@ -692,6 +694,8 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         traits=tables,
     )
     folds = np.array([int(row["fold"]) for row in kept], dtype=np.int64)
+    # The kinship components as family clusters 0..C-1, the resampling unit of the held-out tests.
+    families = np.unique(np.array([int(row["family"]) for row in kept], dtype=np.int64), return_inverse=True)[1].astype(np.int64)
     model_traits = np.repeat(np.arange(len(trait_names)), config.fold_count)
     model_folds = np.tile(np.arange(config.fold_count), len(trait_names))
     observed = cohort.observed[:, model_traits]
@@ -705,6 +709,7 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         covariate_columns=cohort.covariate_columns,
         targets=cohort.targets,
         folds=folds,
+        families=families,
         training=training,
         held_out=held_out,
         model_traits=model_traits,

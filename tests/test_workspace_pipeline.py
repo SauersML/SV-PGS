@@ -439,6 +439,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     rows = {row.split("\t")[0]: row.split("\t") for row in (run / "samples" / "rows.tsv").read_text().splitlines()[1:]}
     assert {person for person, row in rows.items() if row[1] == "long_read"} == set(TRUTH)
     assert "5010" not in rows and rows["5020"][5] == rows["5021"][5]
+    # Second-degree relatives form one family; a pair below the KING second-degree bound does not.
+    assert rows["5020"][6] == rows["5021"][6] and rows["5030"][6] != rows["5031"][6]
     assert summaries["samples"]["calibration_pairs"] == len(TRUTH_OF_SEQUENCING)
 
     # The store: typed half manifests, background-corrected imputed codes, long-read hard calls.
@@ -504,6 +506,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     # A trait's own columns are 0 on the rows it does not observe.
     bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
     assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)
+    families = cohort["families"]
+    assert np.array_equal(np.unique(families), np.arange(families.max() + 1)) and len(set(families.tolist())) == len(families) - 1
     fitted_rows = cohort["training"].any(axis=1)
     folds = cohort["folds"][fitted_rows]
     for model in range(4):
