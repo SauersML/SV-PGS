@@ -145,12 +145,16 @@ A new step, `direct_sv`, sits between `measurement` and `fit`. It needs the impu
 ### How the channel enters the measurement model
 
 The fusion is measure-path's `measurement_model` (lane/measure-path-model f043b26): a map fitted on the long-read truth pairs, not a truth-free calibration.
-- **Pairs fold into the engine's LD blocks.** `engine_blocks(block_starts, block_stops, target_rows, absorbed_rows, absorbing_rows)` gives one `LdBlock` per engine block, with targets = the imputed rows and absorbed = their fused direct rows. It refuses a pair split across a block boundary. Each is passed in `CalibrationPairs.blocks` as a `BlockPairs`:
-  - `dosage`: the truth pairs' decoded values of all the block's records (`copy_number.decode_values`);
+- **Pairs fold into the engine's LD blocks.** `engine_blocks(block_starts, block_stops, target_rows, absorbed_rows, absorbing_rows)` gives one `LdBlock` per engine block, with targets = the imputed rows and absorbed = their fused direct rows. It refuses a pair split across a block boundary.
+- **The maps are fitted once, on the pooled model, never per group,** because a linear predictor is not an average of per-group predictors. The per-group `fit_measurement_model` calls take no blocks. Each block goes to `pooled_measurement_model(models, means, variances, counts, blocks)` (lane/measure-path-model 2b5d463) as a `BlockPairs`:
+  - `dosage`: every group's truth pairs' decoded D* values of all the block's records, each recalibrated by its own group's κ (`copy_number.decode_values`);
   - `truth`: the targets' truth ALT counts, or truth CN − modal CN for a CN target;
-  - `cohort_covariance`: from the fitted cohort's sums over the block's records.
+  - `cohort_covariance`: the pooled fitted cohort's covariance of those D* columns.
   The truth pairs are the long-read panel members, with B already no-call-free.
-- **What the model returns.** It fits E_lin[G | D*, B] for the imputed row. It sets the direct row's offset to −inf, so the fit drops that column exactly while the map still reads it. The fused target gets its own offset and residual variance, and the certificate counts `direct_calls_fused`.
+- **What the model returns.** It fits E_lin[G | D*, B] for the imputed row, and sets the direct row's offset to −inf, so the fit drops that column exactly while the map still reads it.
+  - A fused target's offset is its mapped column's share of the pooled genotype variance, and it gets its own residual variance.
+  - The pooled model's scales are 1, because κ is already applied per group in the store.
+  - Its certificate lists each group's certificate, with `direct_calls_fused`.
 - **Persisted.** The measurement model, fusion maps included, is written by `MeasurementModel.save` and read back by `load`; its `digest` enters the fit step's key. e2e applies each map A in Stage 0, Stage 2 and scoring.
   - **Open (fit-api/e2e):** `fit_model.fit` takes no map argument yet, so the step can't land before it does.
 - **No truth pairs: no fusion.** Both rows stay separate columns, the step summary and the certificate say so, and the run continues. The truth-free path (`sv_fusion.calibrate_two_sources`, anchor error models, false-positive rates) assumes classical error on DS, which draw-type DS violates, so the driver never uses it.
