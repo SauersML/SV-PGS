@@ -6,9 +6,12 @@ covariance (replica.predicted_r2 with a one-component prior). This is exact for 
 realized r^2 on real expression tests the model's own account of accuracy, including the portability loss that LD
 and allele-frequency differences alone predict when a held-out ancestry has a different Sigma_t.
 
-usage: validate_real.py DATASET CHROM SPLITS(comma) WORKERS OUT.json
+Rows are appended per gene to a JSONL checkpoint; a resumed run skips the genes already written.
+
+usage: validate_real.py DATASET CHROM SPLITS(comma) WORKERS OUT.jsonl
 """
 import json
+import os
 import sys
 from multiprocessing import Pool
 
@@ -55,13 +58,16 @@ def main():
     dataset_dir, chrom, split_names, workers, out_path = sys.argv[1], sys.argv[2], sys.argv[3].split(","), int(sys.argv[4]), sys.argv[5]
     dataset = harness.Dataset(dataset_dir)
     gene_rows = list(dataset.gene_rows([chrom]))
-    results = []
-    with Pool(workers, initializer=_init, initargs=(dataset_dir,)) as pool:
-        for rows in pool.imap_unordered(_gene, [(gene_row, split_names) for gene_row in gene_rows]):
-            results.extend(rows)
-    with open(out_path, "w") as handle:
-        json.dump(results, handle)
-    print("genes", len(gene_rows), "rows", len(results))
+    done = set()
+    if os.path.exists(out_path):
+        with open(out_path) as handle:
+            done = {json.loads(line)["gene_row"] for line in handle if line.strip()}
+    remaining = [gene_row for gene_row in gene_rows if gene_row not in done]
+    with Pool(workers, initializer=_init, initargs=(dataset_dir,)) as pool, open(out_path, "a") as handle:
+        for rows in pool.imap_unordered(_gene, [(gene_row, split_names) for gene_row in remaining]):
+            handle.writelines(json.dumps(row) + "\n" for row in rows)
+            handle.flush()
+    print("genes", len(gene_rows), "already done", len(done), "run", len(remaining))
 
 
 if __name__ == "__main__":

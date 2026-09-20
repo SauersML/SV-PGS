@@ -1,6 +1,6 @@
 """Summarize validate_real.py output: predicted vs realized GBLUP r^2 per split, and the LD-only portability prediction.
 
-usage: summarize_real.py REAL.json
+usage: summarize_real.py REAL.jsonl
 """
 import json
 import sys
@@ -10,7 +10,8 @@ import pandas as pd
 
 
 def main():
-    frame = pd.DataFrame(json.load(open(sys.argv[1])))
+    with open(sys.argv[1]) as handle:
+        frame = pd.DataFrame([json.loads(line) for line in handle if line.strip()])
     frame = frame[frame["reml_h2"] > 0]
     rows = []
     for split, group in frame.groupby("split"):

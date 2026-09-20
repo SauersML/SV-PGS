@@ -66,3 +66,25 @@ def test_expected_sample_r2_limits():
 
 def test_polygenic_limit_matches_daetwyler_small_signal():
     assert np.isclose(replica.polygenic_r2(100, 0.5, 1e6), 0.5 ** 2 * 100 / 1e6, rtol=1e-3)
+
+
+def test_single_effect_susie_is_the_exact_single_effect_posterior_mean():
+    from benchmarks.closed_form.susie_oracle import susie
+
+    generator = np.random.default_rng(11)
+    count, dimension, slab, noise = 40, 30, 0.3, 0.7
+    raw = generator.standard_normal((count, dimension))
+    design = (raw - raw.mean(axis=0)) / raw.std(axis=0)
+    response = design[:, 4] * 0.8 + generator.standard_normal(count) * np.sqrt(noise)
+    log_evidence, means = np.empty(dimension), np.empty(dimension)
+    for column in range(dimension):
+        covariance = noise * np.eye(count) + slab * np.outer(design[:, column], design[:, column])
+        _, log_determinant = np.linalg.slogdet(covariance)
+        solved = np.linalg.solve(covariance, response)
+        log_evidence[column] = -0.5 * (log_determinant + response @ solved)
+        means[column] = slab * design[:, column] @ solved
+    posterior = np.exp(log_evidence - log_evidence.max())
+    posterior /= posterior.sum()
+    expected = np.zeros(dimension)
+    expected[:] = posterior * means
+    assert np.allclose(susie(design, response, 1, slab, noise), expected, rtol=1e-10, atol=1e-12)
