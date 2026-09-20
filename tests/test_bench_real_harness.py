@@ -131,11 +131,14 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
     tiny_dataset(tmp_path)
     method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
     (tmp_path / "screened.tsv").write_text("gene_id\tscore\ng1\t3.2\n")
-    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv")
+    (tmp_path / "note.json").write_text(json.dumps({"label": "arm X", "tests": "green"}))
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), gene_list=tmp_path / "screened.tsv",
+                note=tmp_path / "note.json")
     out = tmp_path / "results" / "top_variant" / "loso"
     record = json.loads((out / "chr1.run.json").read_text())
     assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
     assert record["gene_list_sha256"] == hashlib.sha256((tmp_path / "screened.tsv").read_bytes()).hexdigest()
+    assert record["note"] == {"label": "arm X", "tests": "green"}
     truth = np.load(out / "chr1.truth.npy")
     for feature_set in ("snv", "snv_sv"):
         predictions = np.load(out / f"chr1.{feature_set}.predictions.npy")
@@ -387,7 +390,7 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     overlay.mkdir()
     dosage = np.load(tmp_path / "chr1.dosage.npy")
     imputed = (dosage[[3, 7]] * 0.9 + 0.05).astype(np.float32)
-    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed)
+    np.savez(overlay / "chr1.svimp.npz", rows=np.array([3, 7]), ds=imputed, dr2=np.array([0.8, 0.4]))
     dataset = harness.Dataset(tmp_path, overlay)
     window = harness.load_gene_window(dataset, 0)
     assert window.genotypes.shape[1] == dosage.shape[0] + 2 and list(window.table["source"].iloc[-2:]) == ["svimp", "svimp"]
@@ -397,6 +400,9 @@ def test_imputed_sv_overlay_adds_columns_beside_the_called_ones(tmp_path):
     called, _ = harness.subset(train, test, "snv_sv", "loso/AFR")
     assert joint.variants.is_sv.sum() == called.variants.is_sv.sum() == 2
     assert (joint.variants.source[joint.variants.is_sv] == "svimp").all()
+    assert joint.variants.reliability[joint.variants.is_sv].tolist() == [0.8, 0.4]
+    assert (joint.variants.reliability[~joint.variants.is_sv] == 1.0).all() and (called.variants.reliability == 1.0).all()
+    assert (joint.variants.concordance == 1.0).all() and (joint.variants.called_r2 == 1.0).all()
 
 
 def test_views_refuse_sealed_genes_and_missing_or_extra_views(tmp_path):
@@ -452,3 +458,307 @@ def test_horvitz_thompson_census_of_the_signal_has_no_design_error():
     totals, errors = _every_sample(values, {1, 4}, 3)
     assert np.allclose(totals, values.sum(), rtol=0, atol=64 * EPSILON)
     assert np.allclose(errors, 0.0, rtol=0, atol=64 * EPSILON)
+
+
+def test_per_split_runs_merge_to_the_full_design_run(tmp_path):
+    from benchmarks.bench_real import merge_splits
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    harness.run(tmp_path, method, "full", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    for split in ("loso/AFR", "loso/EUR"):
+        harness.run(tmp_path, method, "parts", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), split_subset=[split])
+    merge_splits.merge(tmp_path / "results/parts/loso", "chr1")
+    for name in ("snv.predictions", "snv_sv.predictions_without_sv", "truth"):
+        assert np.array_equal(np.load(tmp_path / f"results/full/loso/chr1.{name}.npy"), np.load(tmp_path / f"results/parts/loso/chr1.merged.{name}.npy"),
+                              equal_nan=True)
+
+
+def test_ctyper_and_hprc2_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True], ["panel", "panel", "ctyper", "hprc2"])
+    assert list(harness.feature_mask(variants, "snv_ctyper", "g/s")) == [True, False, True, False]
+    assert list(harness.feature_mask(variants, "snv_hprc2", "g/s")) == [True, False, False, True]
+
+
+def test_undefined_quality_values_pass_through_as_nan(tmp_path):
+    tiny_dataset(tmp_path)
+    table = pd.read_csv(tmp_path / "chr1.variants.tsv", sep="\t")
+    table["called_r2"] = np.where(table["is_sv"], np.nan, 1.0)
+    table.to_csv(tmp_path / "chr1.variants.tsv", sep="\t", index=False)
+    dataset = harness.Dataset(tmp_path)
+    train, _, _, _ = harness.build_gene_task(dataset, harness.load_gene_window(dataset, 0), dataset.splits["loso/AFR"])
+    assert np.isnan(train.variants.called_r2[train.variants.is_sv]).all()
+    assert (train.variants.called_r2[~train.variants.is_sv] == 1.0).all()
+
+
+def test_extra_rows_overlay_equals_the_full_derived_copy(tmp_path):
+    import shutil
+
+    (tmp_path / "parent").mkdir()
+    parent = tiny_dataset(tmp_path / "parent")
+    generator = np.random.default_rng(8)
+    extra_table = pd.DataFrame({"pos": [100, 103, 106], "end": [100, 160, 106], "id": ["x1", "x2", "x3"], "ref_len": 1, "alt_len": -1, "symbolic": True,
+                                "sv_type": ["DEL", "DUP", "CNV"], "sv_length": [50, 57, 900], "is_sv": True, "source": "gatksv",
+                                "concordance": [0.99, 0.95, 1.0], "called_r2": [0.98, np.nan, 1.0]})
+    extra_dosage = generator.integers(0, 3, size=(3, 24)).astype(np.int8)
+    rows_dir = tmp_path / "rows"
+    rows_dir.mkdir()
+    extra_table.to_csv(rows_dir / "chr1.variants.tsv", sep="\t", index=False)
+    np.save(rows_dir / "chr1.dosage.npy", extra_dosage)
+    # The full copy, built by the stated rule: parent rows then extra rows, measurement columns filled with 1.0, stable sort by pos.
+    full = tmp_path / "full"
+    shutil.copytree(parent, full)
+    parent_table = pd.read_csv(parent / "chr1.variants.tsv", sep="\t")
+    merged = pd.concat([parent_table.assign(concordance=1.0, called_r2=1.0), extra_table], ignore_index=True)
+    order = np.argsort(merged["pos"].to_numpy(), kind="stable")
+    merged.iloc[order].to_csv(full / "chr1.variants.tsv", sep="\t", index=False)
+    np.save(full / "chr1.dosage.npy", np.vstack([np.load(parent / "chr1.dosage.npy"), extra_dosage])[order])
+    overlaid = harness.load_gene_window(harness.Dataset(parent, rows_dirs=[rows_dir]), 0)
+    copied = harness.load_gene_window(harness.Dataset(full), 0)
+    assert np.array_equal(overlaid.genotypes, copied.genotypes) and np.array_equal(overlaid.chromosome_rows, copied.chromosome_rows)
+    pd.testing.assert_frame_equal(overlaid.table, copied.table, check_dtype=False)
+
+
+def test_sample_subset_cuts_every_split_and_refuses_placeholders(tmp_path):
+    tiny_dataset(tmp_path)
+    subset = tmp_path / "subset.txt"
+    subset.write_text("\n".join(f"s{index}" for index in range(12)) + "\n")
+    dataset = harness.Dataset(tmp_path, sample_subset=subset)
+    assert all(set(split["train"]) | set(split["test"]) <= {f"s{index}" for index in range(12)} for split in dataset.splits.values())
+    window = harness.load_gene_window(dataset, 0)
+    train, _, _, _ = harness.build_gene_task(dataset, window, dataset.splits["loso/AFR"])
+    assert len(train.phenotype) == 6
+    dosage = np.load(tmp_path / "chr1.dosage.npy")
+    dosage[:, 0] = -1
+    np.save(tmp_path / "chr1.dosage.npy", dosage)
+    try:
+        harness.build_gene_task(dataset, harness.load_gene_window(harness.Dataset(tmp_path, sample_subset=subset), 0), dataset.splits["loso/AFR"])
+    except ValueError as error:
+        assert "placeholder" in str(error)
+    else:
+        raise AssertionError("a negative placeholder read for a split sample must be refused")
+
+
+def test_scores_are_residualized_on_the_covariates_like_the_truth():
+    generator = np.random.default_rng(9)
+    train_count, test_count, variant_count, covariate_count = 80, 30, 6, 3
+    covariates = generator.normal(size=(train_count + test_count, covariate_count))
+    genotypes = (generator.binomial(2, 0.4, size=(train_count + test_count, variant_count)) + covariates[:, :1] > 1).astype(np.float64)
+    effects = generator.normal(size=variant_count)
+    is_sv = np.array([False, True, False, False, True, False])
+    train = harness.TrainData(gene_id="g", chrom="chr1", tss=0, genotypes=genotypes[:train_count], phenotype=np.zeros(train_count),
+                              variants=synthetic_variants(is_sv, ["panel"] * variant_count), superpopulation=np.array(["EUR"] * train_count),
+                              population=np.array(["CEU"] * train_count), gene_start=0, gene_end=0, strand="+", exons=np.zeros((0, 2), dtype=np.int64),
+                              coding_exons=np.zeros((0, 2), dtype=np.int64), covariates=covariates[:train_count])
+    prediction, without_sv = harness.predict_for_truth(baselines.LinearPredictor(0.7, effects), train, genotypes[train_count:], covariates[train_count:])
+    design_train = np.column_stack([np.ones(train_count), covariates[:train_count]])
+    design_test = np.column_stack([np.ones(test_count), covariates[train_count:]])
+    fitted, *_ = np.linalg.lstsq(design_train, genotypes[:train_count], rcond=None)
+    expected = (genotypes[train_count:] - design_test @ fitted) @ effects
+    tolerance = 1e3 * EPSILON * np.abs(genotypes).max() * np.abs(effects).sum()
+    assert np.allclose(prediction, expected, rtol=0, atol=tolerance)
+    assert np.allclose(prediction - without_sv, (genotypes[train_count:, is_sv] - design_test @ fitted[:, is_sv]) @ effects[is_sv], rtol=0, atol=tolerance)
+
+    class Projected:
+        """A predictor that already projects its genotypes on the covariates: the harness rule leaves it unchanged."""
+
+        def predict(self, genotypes, covariates):
+            design = np.column_stack([np.ones(len(genotypes)), covariates])
+            return (genotypes - design @ fitted) @ effects
+
+    again, _ = harness.predict_for_truth(Projected(), train, genotypes[train_count:], covariates[train_count:])
+    assert np.allclose(again, expected, rtol=0, atol=tolerance)
+
+
+def test_covariate_projected_genotypes_are_orthogonal_to_the_covariates():
+    generator = np.random.default_rng(10)
+    covariates = generator.normal(size=(50, 4))
+    genotypes = generator.binomial(2, 0.3, size=(50, 7)).astype(np.float64)
+
+    class Train:
+        pass
+
+    train = Train()
+    train.covariates = covariates
+    projected = baselines.covariate_projected(train, genotypes)
+    design = np.column_stack([np.ones(50), covariates])
+    assert np.abs(design.T @ projected).max() <= 1e3 * EPSILON * np.abs(genotypes).sum()
+
+
+FAILING_METHOD = (
+    "def fit(train):\n"
+    "    if train.variants.is_sv.any():\n"
+    "        raise RuntimeError('kernel failed to compile')\n"
+    "    import numpy as np\n"
+    "    class Predictor:\n"
+    "        def predict(self, genotypes):\n"
+    "            return genotypes[:, 0].astype(float)\n"
+    "    return Predictor()\n")
+
+
+def test_a_fit_failure_raises_by_default(tmp_path):
+    tiny_dataset(tmp_path)
+    (tmp_path / "failing.py").write_text(FAILING_METHOD)
+    try:
+        harness.run(tmp_path, f"{tmp_path}/failing.py:fit", "failing", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    except RuntimeError as error:
+        assert "compile" in str(error)
+    else:
+        raise AssertionError("a fit that raises must stop the run, never be replaced by a stand-in predictor")
+
+
+def test_recorded_failures_are_nan_logged_and_never_scored(tmp_path):
+    import json
+
+    from benchmarks.bench_real import report
+
+    tiny_dataset(tmp_path)
+    (tmp_path / "failing.py").write_text(FAILING_METHOD)
+    harness.run(tmp_path, f"{tmp_path}/failing.py:fit", "failing", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"), record_failures=True)
+    out = tmp_path / "results/failing/loso"
+    assert np.isnan(np.load(out / "chr1.snv_sv.predictions.npy")).all()
+    assert np.isfinite(np.load(out / "chr1.snv.predictions.npy")).all()
+    log = pd.read_csv(out / "chr1.log.tsv", sep="\t")
+    assert (log.loc[log["feature_set"] == "snv_sv", "status"].str.startswith("failed: RuntimeError")).all()
+    assert (log.loc[log["feature_set"] == "snv", "status"] == "ok").all()
+    assert json.loads((out / "chr1.run.json").read_text())["failed_fits"] == 2
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "failing", "loso")
+    table = pd.DataFrame(report.paired(scores, ("failing", "snv_sv"), ("failing", "snv")))
+    pooled = table[table["superpopulation"] == report.POOLED].iloc[0]
+    assert pooled["genes"] == 0 and pooled["failed_genes"] == 1
+    # Intention-to-treat scores the failed arm as the training-mean prediction (r^2 = 0) on every gene.
+    assert pooled["itt_genes"] == 1 and pooled["itt_mean_r2_a"] == 0.0 and np.isclose(pooled["itt_difference"], -pooled["itt_mean_r2_b"])
+
+
+def test_raw_scores_reproduce_the_scored_predictions_and_merge_along_splits(tmp_path):
+    import json
+
+    from benchmarks.bench_real import merge_splits
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    harness.run(tmp_path, method, "full", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    out = tmp_path / "results/full/loso"
+    raw = np.load(out / "chr1.snv_sv.raw_scores.npy").astype(np.float64)
+    splits_order = json.loads((out / "chr1.raw_splits.json").read_text())
+    predictions = np.load(out / "chr1.snv_sv.predictions.npy").astype(np.float64)
+    dataset = harness.Dataset(tmp_path)
+    for position, split_name in enumerate(splits_order):
+        train_index = np.array([dataset.sample_index[s] for s in dataset.splits[split_name]["train"]])
+        test_index = np.array([dataset.sample_index[s] for s in dataset.splits[split_name]["test"]])
+        design = np.column_stack([np.ones(len(dataset.samples)), dataset.covariates])
+        coefficients, *_ = np.linalg.lstsq(design[train_index], raw[0, position, train_index], rcond=None)
+        rescored = raw[0, position, test_index] - design[test_index] @ coefficients
+        assert np.allclose(rescored, predictions[0, test_index], rtol=0, atol=64 * np.finfo(np.float32).eps * max(np.abs(raw).max(), 1.0))
+    for split in ("loso/AFR", "loso/EUR"):
+        harness.run(tmp_path, method, "parts", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",), split_subset=[split])
+    merge_splits.merge(tmp_path / "results/parts/loso", "chr1")
+    merged = np.load(tmp_path / "results/parts/loso/chr1.merged.snv_sv.raw_scores.npy")
+    assert merged.shape[1] == 2 and json.loads((tmp_path / "results/parts/loso/chr1.merged.raw_splits.json").read_text()) == ["loso/AFR", "loso/EUR"]
+
+
+def within_group_fixture(tmp_path, per_group=40, covariate_count=3, gene_count=3):
+    """A loso results directory written the way the harness writes it: the truth is y minus the training OLS fit on
+    [1, C], stored in float32; the predictions are a genetic score plus a different covariate combination per split."""
+    import json
+
+    generator = np.random.default_rng(11)
+    groups = np.repeat(["AFR", "EUR"], per_group)
+    count = len(groups)
+    samples = pd.DataFrame({"sample": [f"s{index}" for index in range(count)], "Superpopulation": groups})
+    samples.to_csv(tmp_path / "samples.tsv", sep="\t", index=False)
+    covariates = generator.normal(size=(count, covariate_count)) + (groups == "AFR")[:, None] * 3.0
+    genetic = generator.normal(size=(gene_count, count))
+    expression = genetic + (covariates @ generator.normal(size=(covariate_count, gene_count))).T * 2 + generator.normal(size=(gene_count, count))
+    np.save(tmp_path / "covariates.npy", covariates)
+    np.save(tmp_path / "expression.npy", expression)
+    genes = pd.DataFrame({"chrom": ["chr1", "chr2", "chr3"][:gene_count], "gene_id": [f"g{index}" for index in range(gene_count)]})
+    genes.to_csv(tmp_path / "genes.tsv", sep="\t", index=False)
+    split_list = [{"name": f"loso/{group}", "test": list(samples["sample"][groups == group]), "train": list(samples["sample"][groups != group])}
+                  for group in ("AFR", "EUR")]
+    (tmp_path / "splits.json").write_text(json.dumps(split_list))
+    out = tmp_path / "results/m/loso"
+    out.mkdir(parents=True)
+    truth, predictions = np.full((gene_count, count), np.nan, dtype=np.float32), np.full((gene_count, count), np.nan)
+    design = np.column_stack([np.ones(count), covariates])
+    for group in ("AFR", "EUR"):
+        test, train = np.flatnonzero(groups == group), np.flatnonzero(groups != group)
+        for gene in range(gene_count):
+            truth[gene, test] = harness.residualize(expression[gene], covariates, train, test)[1]
+            predictions[gene, test] = genetic[gene, test] + generator.normal(size=count)[test] + design[test] @ generator.normal(size=covariate_count + 1) * 5
+    genes.to_csv(out / "chr.genes.tsv", sep="\t", index=False)
+    np.save(out / "chr.truth.npy", truth)
+    np.save(out / "chr.snv.predictions.npy", predictions)
+    return samples, covariates, expression, predictions
+
+
+def closed_form_partial_r2(prediction, expression, covariates):
+    design = np.column_stack([np.ones(len(prediction)), covariates])
+    residual = lambda values: values - design @ np.linalg.lstsq(design, values, rcond=None)[0]
+    return np.corrcoef(residual(prediction), residual(expression))[0, 1] ** 2
+
+
+def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_terms(tmp_path):
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    samples, covariates, expression, predictions = within_group_fixture(tmp_path)
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    assert len(scores) == 6 and set(scores["superpopulation"]) == {"AFR", "EUR"}
+    for row in scores.itertuples():
+        members = np.flatnonzero(samples["Superpopulation"].to_numpy() == row.superpopulation)
+        gene = int(row.gene_id[1:])
+        expected = closed_form_partial_r2(predictions[gene, members], expression[gene, members], covariates[members])
+        assert np.isclose(row.r2, expected, rtol=0, atol=1e3 * EPSILON)
+        # The exact null expectation: people minus the rank of [1, C_T].
+        assert row.null_r2 == 1.0 / (40 - 4) and row.people == 40
+        assert np.isfinite(row.mismatched_r2)
+    # Any covariate combination added to the score, or taken from the truth, leaves the metric unchanged.
+    shifted = predictions + (np.column_stack([np.ones(len(covariates)), covariates]) @ np.arange(1.0, 5.0))[None, :]
+    np.save(tmp_path / "results/m/loso/chr.snv.predictions.npy", shifted)
+    again = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
+
+
+def test_a_covariate_only_score_scores_zero_and_a_foreign_dataset_is_refused(tmp_path):
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    _, covariates, expression, predictions = within_group_fixture(tmp_path)
+    covariate_only = np.where(np.isfinite(predictions), (np.column_stack([np.ones(len(covariates)), covariates]) @ np.array([0.3, 1.0, -2.0, 0.5]))[None, :], np.nan)
+    np.save(tmp_path / "results/m/loso/chr.snv.predictions.npy", covariate_only)
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    assert (scores["r2"] == 0.0).all() and (scores["oos_r2"] == 0.0).all()
+    report.held_out.cache_clear()
+    np.save(tmp_path / "expression.npy", expression[::-1])
+    try:
+        report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    except ValueError as error:
+        assert "not the dataset's expression" in str(error)
+    else:
+        raise AssertionError("a truth that is not the dataset's expression minus a covariate fit must stop the report")
+
+
+def test_a_constant_fit_is_scored_as_no_prediction():
+    from benchmarks.bench_real import report
+
+    generator = np.random.default_rng(12)
+    train_count, test_count = 60, 25
+    covariates = generator.normal(size=(train_count + test_count, 4))
+    genotypes = generator.binomial(2, 0.4, size=(train_count + test_count, 3)).astype(np.float64)
+    train = harness.TrainData(gene_id="g", chrom="chr1", tss=0, genotypes=genotypes[:train_count], phenotype=np.zeros(train_count),
+                              variants=synthetic_variants([False, True, False], ["panel"] * 3), superpopulation=np.array(["EUR"] * train_count),
+                              population=np.array(["CEU"] * train_count), gene_start=0, gene_end=0, strand="+", exons=np.zeros((0, 2), dtype=np.int64),
+                              coding_exons=np.zeros((0, 2), dtype=np.int64), covariates=covariates[:train_count])
+    prediction, without_sv = harness.predict_for_truth(baselines.ZeroPredictor(0.37), train, genotypes[train_count:], covariates[train_count:])
+    # Exactly zero: least squares of a constant on [1, C] leaves rounding noise, which would score as a random direction.
+    assert (prediction == 0).all() and (without_sv == 0).all()
+    residual, rank = report.within_group_residual(np.full((1, test_count), 0.37), covariates[train_count:])
+    assert rank == 5 and (residual == 0).all()
+
+
+def test_mismatched_partners_pair_each_gene_with_the_next_gene_on_another_chromosome():
+    from benchmarks.bench_real import report
+
+    assert list(report.mismatched_partners(np.array(["chr1", "chr1", "chr2", "chr3", "chr3"]))) == [2, 2, 3, 0, 0]
+    assert list(report.mismatched_partners(np.array(["chr1", "chr1"]))) == [-1, -1]

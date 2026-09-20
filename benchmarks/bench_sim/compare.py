@@ -4,6 +4,8 @@
         --reference ridge_inf_simple [--methods a b ...]
 
 For each scenario the primary metric is the incremental R2 (quantitative) or the liability-scale R2 (binary).
+In-family (dev/, sealed/) and out-of-family (dev_out/, sealed_out/) scenario sets are compared in separate runs and
+reported separately (PREREG amendment 9); the "family" breakdown splits the out-of-family set by family.
 Every scenario is reported, losses included; the summary is the mean paired difference with its SE across
 scenarios, then descriptive breakdowns by the scenario's truth parameters.
 """
@@ -18,7 +20,9 @@ import numpy as np
 
 from benchmarks.bench_sim.harness import ARMS, score
 
-BREAKDOWNS = ("shape", "sv_mode", "tr_mode", "annotation_mode", "binary", "frequency_source")
+BREAKDOWNS = ("family", "shape", "sv_mode", "tr_mode", "annotation_mode", "binary", "frequency_source")
+# In-family scenarios (PREREG section 3) carry no "family" key; out-of-family ones (amendment 9) do.
+IN_FAMILY = "in-family"
 
 
 def primary(metrics: dict) -> float:
@@ -71,7 +75,9 @@ def main() -> None:
             groups: dict = {}
             for name, value in zip(shared, differences):
                 params = json.loads((scenarios / name / "scenario.json").read_text())["params"]
-                groups.setdefault(str(params[key]), []).append(float(value))
+                level = params.get(key, IN_FAMILY if key == "family" else None)
+                if level is not None:
+                    groups.setdefault(str(level), []).append(float(value))
             breakdown[key] = {level: {"n": len(values), "mean": float(np.mean(values))} for level, values in groups.items()}
         entry["breakdown"] = breakdown
         report["methods"][method] = entry

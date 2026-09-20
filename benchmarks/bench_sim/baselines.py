@@ -17,7 +17,7 @@ import numpy as np
 from scipy.linalg import cho_factor, cho_solve
 
 from benchmarks.bench_sim.harness import ARMS, covariate_matrix
-from benchmarks.bench_sim.measurement import measured_records
+from benchmarks.bench_sim.records import measured_records
 
 CODES_PER_DOSAGE = 127
 

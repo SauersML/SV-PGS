@@ -8,7 +8,8 @@ Inputs:
   - the dataset, for genotypes, gene structure and the segmental-duplication track.
 
 Per gene, over the held-out groups of the design (each person held out once under loso and random5): SV j contributes
-c_j = effect_j (x_j - training mean_j) to each held-out person's score, and the SV part is s = sum_j c_j. SVs that are one
+c_j = R_T (effect_j x_j) to each held-out person's score, R_T the residual on [1, covariates] within the person's held-out
+group (as report.py scores), and the SV part is s = sum_j c_j. SVs that are one
 event called more than once (genotype r^2 above DUPLICATE_R2 over all samples, or the same span by 50% reciprocal overlap,
 the SV-callset matching criterion of Collins et al. 2020, Nature 581:444) are merged: an event's contribution is the sum
 of its SVs'. Reported per gene:
@@ -35,7 +36,7 @@ from multiprocessing import get_context
 import numpy as np
 import pandas as pd
 
-from benchmarks.bench_real import harness
+from benchmarks.bench_real import harness, report
 
 DUPLICATE_R2 = 0.8
 RECIPROCAL_OVERLAP = 0.5
@@ -111,20 +112,32 @@ def gene_row(gene_id):
     table = window.table
     rows = np.unique(effects["window_row"].to_numpy())
     position_of = {row: index for index, row in enumerate(rows)}
-    contribution_var, contribution_cov = {}, {}
-    leaders = []
-    per_split = []
+    contributions = np.full((len(dataset.samples), len(rows)), np.nan)
+    split_people = []
     for split_name, split_effects in effects.groupby("split"):
         test_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[split_name]["test"]])
         columns = split_effects["window_row"].to_numpy()
-        contributions = (window.genotypes[np.ix_(test_index, columns)].astype(np.float64) - split_effects["train_mean"].to_numpy()) * split_effects["effect"].to_numpy()
-        full = np.zeros((len(test_index), len(rows)))
-        full[:, [position_of[row] for row in columns]] = contributions
-        full -= full.mean(axis=0)
-        per_split.append(full)
-        sv_part = full.sum(axis=1)
-        leaders.append(rows[int(np.argmax(full.T @ sv_part))])
-    stacked = np.vstack(per_split)
+        contributions[test_index] = 0.0
+        contributions[np.ix_(test_index, [position_of[row] for row in columns])] = (
+            window.genotypes[np.ix_(test_index, columns)].astype(np.float64) * split_effects["effect"].to_numpy())
+        split_people.append(test_index)
+    # SV j's part of the score as report.py scores it: effect_j times the held-out genotype, residualized on [1, covariates]
+    # fitted within the held-out group (R_T), which removes every covariate combination, the harness's C2 adjustment included.
+    residual = np.full_like(contributions, np.nan)
+    superpopulation = dataset.samples["Superpopulation"].to_numpy()
+    for group in report.SUPERPOPULATIONS:
+        people = np.flatnonzero((superpopulation == group) & np.isfinite(contributions).all(axis=1))
+        if people.size == 0:
+            continue
+        basis, rank = report.group_basis(dataset.covariates[people].astype(np.float64))
+        if people.size > rank:
+            residual[people] = report.residual_on(basis, contributions[people].T).T
+    leaders = []
+    for people in split_people:
+        split_residual = residual[people[np.isfinite(residual[people]).all(axis=1)]]
+        if len(split_residual):
+            leaders.append(rows[int(np.argmax(split_residual.T @ split_residual.sum(axis=1)))])
+    stacked = residual[np.isfinite(residual).all(axis=1)]
     sv_part = stacked.sum(axis=1)
     sv_variance = float(sv_part @ sv_part)
     record = {"gene_id": gene_id, "chrom": window.chrom, "svs": len(rows), "sv_part_variance": sv_variance / len(sv_part)}

@@ -165,3 +165,55 @@ The cohort's group weights no longer come from any All of Us source. They are de
 - The group-weight table in section 1 is superseded.
 - The cohort, annotations, dev and sealed truths, Beagle arm and kernels are rebuilt under these weights in `bench-sim/v7/`, with new commitments in COMMITMENTS.txt. The sealed master seed is unchanged.
 - Results from the earlier cohort, including the GLIMPSE2 calibration tables, are labelled "built under withdrawn weights".
+
+## Amendment 8 (2026-09-19, before any submission): the true-genotype training half
+- **Arm "beagle_truthhalf"** (label: Beagle-imputed with a true-genotype training half) is the Beagle arm in which a flagged subset of the training samples is observed at its true genotypes (code = 127·G) on every measured record, as a long-read truth half would be.
+- **The subset:** 20% of each group's training samples, chosen with the public seed (measurement_truthhalf.truth_half). Test samples are never in it.
+- **The 20% is a benchmark design choice, fixed here;** it isn't taken from any production cohort. Methods see the flags as `train.truth_half`; every other arm reports them all False.
+- **Purpose:** it lets the ablation plan (benchmarks/ABLATION_PLAN.md, term t7) test measurement-model terms that learn from a truth subset.
+
+## Amendment 9 (2026-09-20, before any sealed run): out-of-family truths
+critic-method (critique/CRITIQUE_METHOD.md, item 3) found that section 3 mostly sits inside SV-PGS's own model class:
+- six of its eight effect shapes are Gaussian scale mixtures;
+- its frequency law, LD power, annotation splines and SV enrichment modes mirror SV-PGS's prior terms.
+
+A second, sealed set of truths is added, each outside that class (benchmarks/bench_sim/truth_out.py). Heritability, covariates, noise and trait type are still drawn as in section 3; none of section 3's effect terms apply.
+
+| family | the architecture | the assumption it breaks |
+|---|---|---|
+| fixed_count | exactly K ~ LogUniform(10, 300) causal records, one per-SD magnitude, random signs | Bernoulli causals under a continuous prior |
+| nonscale_heavy | causal probability π ~ LogUniform(1e-4, 3e-2); per-SD magnitudes Pareto with tail index ~ U(1.2, 2.5) above a floor, random signs | Gaussian scale-mixture shapes (this density is zero near 0) |
+| hidden_annotation | K ~ LogUniform(20, 500) causal records, all inside UCSC CpG islands plus 2 kb shores (Irizarry et al. 2009), N(0, 1) per SD; the annotation is never given to methods | the given annotations explaining the enrichment |
+| clustered_loci | loci are equal genetic-length segments of LogUniform(0.05, 0.5) cM; LogUniform(5, 100) causal loci; a U(0.01, 0.2) fraction of each locus's records share one per-allele effect (same sign and size) | independent effects across variants |
+| epistasis | products of standardized genotype pairs (LogUniform(5, 100) pairs of records with cohort MAF ≥ 5%, random signs) carry a U(0.3, 1) share of the genetic variance; a fixed_count additive background carries the rest | additivity |
+| panel_absent | K ~ LogUniform(20, 500) causal records, a U(0.5, 0.9) share of them outside the measured set (panel MAC < 2), random-sign unit per-SD effects | the causal variants being measured at all |
+| sv_gene_dosage | for LogUniform(3, 60) RefSeq genes touched by SVs, a gene effect N(0, 1); an SV's per-allele effect is the gene effect times its copy change; a fixed_count background on the other classes carries a U(0.2, 0.8)-complement share | SV effects set by a class scale |
+
+The sv_gene_dosage copy-change rule, summed over genes:
+- a deletion: minus the fraction of the gene's exonic bases it removes;
+- a duplication containing the whole gene: +1; a partial duplication: minus its exonic fraction;
+- any other SV that touches an exon: −1.
+
+**Sets:**
+- dev_out/: 14 public scenarios, 2 per family, seeds 1000–1013.
+- sealed_out/: 56 sealed scenarios, 8 per family. Seeds are sha256("<master>:out:<i>"), a hash domain disjoint from section 4's. Their parameter hash goes into COMMITMENTS.txt before any sealed run.
+
+**Reporting:** every result is reported separately for in-family (sealed/) and out-of-family (sealed_out/) scenarios. The out-of-family report also breaks down by family.
+- The epistasis family's oracle_observed uses the additive part only.
+- In panel_absent, most causal effect is unmeasurable by design.
+
+**Reference arms:** MegaPRS and SBayesRC are added alongside ridge_inf and oracle_observed, because they also model frequency, LD and annotations. They're built by the compete lane at package defaults, frozen before the sealed run.
+
+## Amendment 10 (2026-09-20, before any sealed run): a read-depth copy-number channel
+- **Arm "beagle_readcn"** (label: Beagle-imputed + read-depth CN likelihoods) is the Beagle arm plus per-sample read-depth genotype likelihoods on every measured DEL and DUP record, simulated from the truth (benchmarks/bench_sim/measurement_readcn.py). It lets methods test fusing imputed DS with direct read evidence.
+- **Generating model:**
+  - The copy number is c = 2 − g for a DEL and 2 + g for a DUP.
+  - Reads over the span follow R ~ NB(mean s_i·30·L/150·(c + 2P)/(2 + 2P), size 1/φ), for 30× depth and 150 bp reads.
+  - The sample depth scale is s_i ~ LogNormal(0, σ_s).
+  - P counts the segmental-duplication partners (UCSC hg38 genomicSuperDups) overlapping the span with fracMatch ≥ identity. Their reads dilute the signal.
+- **The caller** assumes unique sequence (P = 0) and a depth scale with error exp(N(0, τ²)). It emits PL for g = 0, 1, 2, as `train.reads` / `test.reads`.
+- **Parameter ranges:** σ_s ~ U(0.05, 0.25), φ ~ LogUniform(0.01, 0.2), identity ~ U(0.97, 0.995), τ ~ U(0, 0.1).
+- **Two draws:**
+  - a public dev draw (seed 20260919·10) serves dev scenarios;
+  - a sealed draw, sha256("<master>:readcn"), stored under sealed/, serves sealed scenarios.
+  - The sealed parameter file's hash goes into COMMITMENTS.txt.
