@@ -60,6 +60,26 @@ def test_the_cavity_precision_keeps_its_digits_where_the_data_barely_inform_a_co
     assert abs(naive - cavity[0]) > 1e-6 * abs(cavity[0])
 
 
+def test_a_column_spanned_by_negative_site_columns_has_a_small_negative_cavity():
+    """x3 = x1 + x2 (a doubleton, the sum of two singleton columns) with slightly negative sites on x1 and x2: x3's
+    cavity precision is negative and proportional to those sites, never positive however small they get. The refresh
+    must therefore accept it whenever the tilted law is proper (1 + v_max P > 0), not ask P > 0."""
+    rng = np.random.default_rng(12)
+    design = _design(rng, 15, 6)
+    design[:, 2] = design[:, 0] + design[:, 1]
+    for scale in (1e-3, 1e-6, 1e-9):
+        precision = rng.uniform(0.5, 2.0, 6)
+        precision[[0, 1]] = -scale
+        _variances, _removed, cavity = _Kernel(np.asfortranarray(design), precision).cavity()
+        others = np.array([0, 1, 3, 4, 5])
+        # Reference (T invertible here): x3' (I + X_-3 T_-3^-1 X_-3')^-1 x3.
+        kernel = np.eye(15) + design[:, others] @ np.diag(1.0 / precision[others]) @ design[:, others].T
+        expected = float(design[:, 2] @ np.linalg.solve(kernel, design[:, 2]))
+        assert expected < 0.0 and cavity[2] < 0.0
+        np.testing.assert_allclose(cavity[2], expected, rtol=1e-6, atol=10 * _ROUNDING * scale)
+        assert abs(cavity[2]) <= 10.0 * scale
+
+
 def test_kernel_refuses_an_indefinite_precision():
     rng = np.random.default_rng(7)
     design = _design(rng, 5, 20)
