@@ -26,7 +26,8 @@ import pandas as pd
 
 CIS_RADIUS_BP = 1_000_000
 SEALED_GENES = "sealed_confirmation_genes.tsv"
-FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched")
+PARENT_DATASET = "parent_dataset.txt"
+FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont")
 MATCHED_SEED = hashlib.sha256(b"bench-real/snv_matched").digest()
 
 
@@ -85,8 +86,16 @@ class Dataset:
         return self._chromosomes[chrom]
 
     def sealed_genes(self):
-        """The sealed confirmation genes (lead ruling): scored once, only when the lead calls the confirmation."""
+        """The sealed confirmation genes (lead ruling): scored once, only when the lead calls the confirmation.
+
+        A derived dataset (a sample subset, or one with extra SV sources) names its parent in parent_dataset.txt and
+        must carry the parent's sealed list byte for byte, so no derived copy can score a sealed gene."""
         path = self.directory / SEALED_GENES
+        parent_file = self.directory / PARENT_DATASET
+        if parent_file.exists():
+            parent_sealed = pathlib.Path(parent_file.read_text().strip()) / SEALED_GENES
+            if parent_sealed.exists() and (not path.exists() or path.read_bytes() != parent_sealed.read_bytes()):
+                raise ValueError(f"{self.directory} does not carry its parent's sealed confirmation genes")
         return set(pd.read_csv(path, sep="\t")["gene_id"]) if path.exists() else set()
 
     def gene_rows(self, chromosomes, gene_prefix=None, gene_list=None, confirmation=False):
@@ -205,13 +214,18 @@ def matched_small_variants(variants: Variants, draw_key: str):
 
 def feature_mask(variants: Variants, feature_set: str, draw_key: str):
     """snv: panel SNVs/indels; snv_sv: all panel rows; snv_pgsv: panel SNVs/indels plus PanGenie SVs; sv: panel SVs;
-    pgsv: PanGenie SVs; snv_matched: as many panel SNVs/indels as panel SVs, matched to them (matched_small_variants)."""
+    pgsv: PanGenie SVs; snv_matched: as many panel SNVs/indels as panel SVs, matched to them (matched_small_variants);
+    hgsvc3 / ont: long-read SVs only (HGSVC3 PanGenie lifted to GRCh38; 1KG-ONT SVIM-asm), and snv_hgsvc3 / snv_ont:
+    panel SNVs/indels plus those SVs. The long-read rows exist only in the derived datasets that carry them."""
     panel = variants.source == "panel"
     small = panel & ~variants.is_sv
     pangenie_sv = (variants.source == "pangenie") & variants.is_sv
+    hgsvc3_sv = (variants.source == "hgsvc3") & variants.is_sv
+    ont_sv = (variants.source == "ont") & variants.is_sv
     if feature_set == "snv_matched":
         return matched_small_variants(variants, draw_key)
-    return {"snv": small, "snv_sv": panel, "snv_pgsv": small | pangenie_sv, "sv": panel & variants.is_sv, "pgsv": pangenie_sv}[feature_set]
+    return {"snv": small, "snv_sv": panel, "snv_pgsv": small | pangenie_sv, "sv": panel & variants.is_sv, "pgsv": pangenie_sv,
+            "hgsvc3": hgsvc3_sv, "snv_hgsvc3": small | hgsvc3_sv, "ont": ont_sv, "snv_ont": small | ont_sv}[feature_set]
 
 
 def subset(train: TrainData, test_genotypes: np.ndarray, feature_set: str, split_name: str):

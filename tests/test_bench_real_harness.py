@@ -205,3 +205,28 @@ def test_sealed_confirmation_genes_are_never_scored_outside_the_confirmation(tmp
         assert "sealed" in str(error)
     else:
         raise AssertionError("a gene list naming a sealed gene must be refused")
+
+
+def test_long_read_feature_sets_select_their_source():
+    variants = synthetic_variants([False, True, True, True, False], ["panel", "panel", "hgsvc3", "ont", "ont"])
+    assert list(harness.feature_mask(variants, "hgsvc3", "g/s")) == [False, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_hgsvc3", "g/s")) == [True, False, True, False, False]
+    assert list(harness.feature_mask(variants, "snv_ont", "g/s")) == [True, False, False, True, False]
+
+
+def test_a_derived_dataset_must_carry_its_parents_sealed_genes(tmp_path):
+    parent, child = tmp_path / "parent", tmp_path / "child"
+    parent.mkdir()
+    child.mkdir()
+    pd.DataFrame({"gene_id": ["g2"]}).to_csv(parent / harness.SEALED_GENES, sep="\t", index=False)
+    (child / harness.PARENT_DATASET).write_text(str(parent) + "\n")
+    dataset = harness.Dataset.__new__(harness.Dataset)
+    dataset.directory = child
+    try:
+        dataset.sealed_genes()
+    except ValueError as error:
+        assert "sealed" in str(error)
+    else:
+        raise AssertionError("a derived dataset without the parent's sealed list must be refused")
+    (child / harness.SEALED_GENES).write_bytes((parent / harness.SEALED_GENES).read_bytes())
+    assert dataset.sealed_genes() == {"g2"}

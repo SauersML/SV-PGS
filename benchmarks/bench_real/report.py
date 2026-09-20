@@ -24,9 +24,12 @@ import pandas as pd
 
 SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 POOLED = "pooled"
-FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched")
-# Within a method: adding SVs to SNVs, and SVs alone against an equal number of matched SNVs (and against each other).
-WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
+FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont")
+JOINT_SETS = ("snv_sv", "snv_pgsv", "snv_hgsvc3", "snv_ont")
+# Within a method: adding each SV source to SNVs, each long-read source against the panel SVs, and SVs alone against an
+# equal number of matched SNVs (and against each other).
+WITHIN_METHOD_COMPARISONS = (("snv_sv", "snv"), ("snv_pgsv", "snv"), ("snv_hgsvc3", "snv"), ("snv_ont", "snv"), ("snv_hgsvc3", "snv_sv"),
+                             ("snv_ont", "snv_sv"), ("sv", "snv_matched"), ("pgsv", "snv_matched"), ("sv", "pgsv"))
 
 
 def squared_correlation(prediction, truth):
@@ -100,7 +103,7 @@ def sv_credit(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str,
         tag = genes_file.name.removesuffix(".genes.tsv")
         genes = pd.read_csv(genes_file, sep="\t")
         truth = np.load(results_dir / method / design / f"{tag}.truth.npy").astype(np.float64)
-        for feature_set in ("snv_sv", "snv_pgsv"):
+        for feature_set in JOINT_SETS:
             full_path = results_dir / method / design / f"{tag}.{feature_set}.predictions.npy"
             masked_path = results_dir / method / design / f"{tag}.{feature_set}.predictions_without_sv.npy"
             if not (full_path.exists() and masked_path.exists()):
