@@ -114,7 +114,7 @@ MR_ASH_CONVERGENCE_TOLERANCE = 1e-8
 MR_ASH_EPSILON_TOLERANCE = 1e-12
 
 
-@numba.njit(cache=True)
+@numba.njit
 def _mr_ash_sweeps(design, squared_norms, prior_variances, mixture, coefficients, residual, noise_variance,
                    max_iterations, convergence_tolerance, epsilon_tolerance):
     sample_count, variant_count = design.shape
