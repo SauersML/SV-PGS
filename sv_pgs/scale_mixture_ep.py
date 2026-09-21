@@ -2710,8 +2710,8 @@ def _best_certified(
     by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing.
 
     Two starts found one basin when their points are within the inner maximizer's own radii of each other,
-    sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the one with the
-    smaller error stands for the basin, which is then corrected once.
+    sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the first
+    start's candidate stands for the basin, which is then corrected once.
 
     With ``screen``, the corrections are taken only where some basin's Laplace V is above it, and None is returned
     otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate."""
@@ -2720,10 +2720,12 @@ def _best_certified(
         candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
         if candidate is None:
             continue
-        for position, other in enumerate(certified):
+        for other in certified:
             if _same_basin(candidate, other):
-                if candidate.error < other.error:
-                    certified[position] = candidate
+                # The first start's candidate stands for the basin: the starts are ordered warm, flat, log-normal,
+                # and the warm one is the closest to the state the outer loop moves from (on gene 1 [real] a
+                # profile approaching its supremum along a ray, the log-normal start's candidate lay far along it,
+                # and the joint trial to it had no certified state at its own fixed point).
                 break
         else:
             certified.append(candidate)
@@ -3401,7 +3403,11 @@ class _State:
     W_j - F_j(x_j), and E's change between two states is the path integral of ``gradient`` (the EP evidence's
     x-gradient, the fixed-cavity one at a fixed point), corrected by B's change along the step (``fixed_curvature``
     A_j and ``correction`` C_j, in full x). ``decrement`` is x's own Newton decrement delta_j; ``polished`` marks a
-    state whose x inner steps have taken to its maximum at rho_j to double precision."""
+    state whose x inner steps have taken to its maximum at rho_j to the certificate's resolution; ``tail`` is the
+    remaining gain the inner steps' own geometric contraction bounds where they end (``fit_hyperparameters``:
+    a profile that approaches its supremum along a ray, E_inf - c e^{-t/tau}, gives Newton steps of one length
+    with gains falling by a fixed ratio r, and its remaining gain is the last gain times r / (1 - r), twice the
+    Newton decrement there; zero where the decrement is the bound)."""
 
     value: float
     rest: float
@@ -3411,6 +3417,7 @@ class _State:
     error: float
     decrement: float
     polished: bool = False
+    tail: float = 0.0
 
 
 def _outer_state(
@@ -3564,6 +3571,23 @@ def fit_hyperparameters(
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
     # Each model's last evaluated hyper step: the certificate an uncertified return at the family's boundary reports.
     last_steps: list[HyperStep | None] = [None] * count
+    # The realized gains of each model's consecutive accepted inner steps at its current weights (``_State.tail``).
+    inner_gains: list[list[float]] = [[] for _model in range(count)]
+
+    def tail_of(model: int) -> float:
+        """The remaining gain the last two inner gains' contraction bounds: g r / (1 - r) with r their ratio, where
+        two gains are measured and the ratio is below one (the geometric tail of a profile approaching its
+        supremum along a ray); infinite where the gains do not contract, zero where none is measured yet."""
+        gains = inner_gains[model]
+        if len(gains) < 2:
+            return 0.0
+        previous, last = gains[-2], gains[-1]
+        if last <= 0.0:
+            return 0.0
+        if previous <= 0.0:
+            return np.inf
+        rate = last / previous
+        return last * rate / (1.0 - rate) if rate < 1.0 else np.inf
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
     # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
     weight_tolerances = [tolerance] * count
@@ -3594,11 +3618,14 @@ def fit_hyperparameters(
 
     def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
-        if polishes and newton.definite and newton.decrement <= tolerance and states[model] is not None:
+        tail = tail_of(model)
+        if polishes and newton.definite and max(newton.decrement, tail) <= tolerance and states[model] is not None:
             # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
-            # tolerance, so the state is planned once more (a release in flight is settled here). A polish that only
-            # ends on a step below x's own resolution walks a flat ray to the family's boundary: on gene 1 [real] the
-            # width -> 0 ray, 2.8 units a step with 1e-4 to 1e-7 nats each, until the density collapsed.
+            # tolerance, and so does the inner steps' own contraction (``_State.tail``), so the state is planned
+            # once more (a release in flight is settled here). A polish that only ends on a step below x's own
+            # resolution walks a flat ray to the family's boundary: on gene 1 [real] the width -> 0 ray, 2.8 units
+            # a step with 1e-4 to 1e-7 nats each, until the density collapsed.
+            states[model] = replace(states[model], tail=tail)
             if anchors[model] is not None:
                 settle_release(model)
             else:
@@ -3622,7 +3649,7 @@ def fit_hyperparameters(
         error (``_outer_state`` and ``HyperStep.resolve``: more directions integrated exactly) and the weights' bound
         is tightened to theta times their gain (``HyperStep.tighten``), and the certificate is read again. A piece
         that cannot reach its share stays as measured, so a decision fails only on what no resolution removes."""
-        fixed = remainders[model]
+        fixed = remainders[model] + state.tail
         predicted = step.evidence - state.value
         pieces = (state.error, step.evidence_error, step.stationarity_gain)
         resolvable = float(sum(pieces))
@@ -3633,7 +3660,7 @@ def fit_hyperparameters(
         if state.error > 0.0:
             resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, theta * state.error)
             if resolved_state is not None:
-                state = replace(resolved_state, polished=state.polished)
+                state = replace(resolved_state, polished=state.polished, tail=state.tail)
         if step.evidence_error > 0.0 and step.resolve is not None:
             resolved_step = step.resolve(theta * step.evidence_error)
             if resolved_step is not None:
@@ -3653,6 +3680,8 @@ def fit_hyperparameters(
     def plan(model: int) -> _OuterTrial | None:
         state = states[model]
         planned = weight_tolerances[model]
+        # A polish's geometric sequence of gains belongs to one plan.
+        inner_gains[model] = []
         # A release is judged from a polished state (below), so an unpolished state's hyper step holds every edge:
         # its release trials (three maximizations per block at the range's centre) would be discarded.
         held = frozenset().union(*refused_releases[model])
@@ -3862,6 +3891,12 @@ def fit_hyperparameters(
                 accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
+                previous_state = states[model]
+                if previous_state is not None and trial_state is not None:
+                    inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+                    inner_gains[model].append(float(inner_gain))
+                else:
+                    inner_gains[model] = []
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
@@ -3871,6 +3906,7 @@ def fit_hyperparameters(
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
             halvings[model] += 1
+            inner_gains[model] = []
             if not resolved:
                 if entry.polishes and anchors[model] is not None:
                     settle_release(model)
