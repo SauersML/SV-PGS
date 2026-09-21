@@ -33,7 +33,7 @@ built from.
 for a scorer with K posterior draws: the remaining gain is bounded by the last sweep's gain g_t times
 rho / (1 - rho), rho = g_t / g_(t-1) the measured contraction (the same extrapolation the EP oracles use for their
 distance to the fixed point), so a call sweeps at least until two gains are measured; a gain below the ELBO's own
-rounding (eps times the sum of its terms' sizes) is resolved. Nothing is clipped, damped or capped.
+rounding (``_elbo``: a forward-error bound from the pieces' sizes) is resolved. Nothing is clipped, damped or capped.
 
 **The outer loop's view.** The pseudo-likelihoods are the ``Cavity`` the hyper step maximizes over: at the fixed
 point q_j = t_j(x), so by the envelope theorem d ELBO*/dx = sum_j d log Z_j(x; omega_j, h_j)/dx at fixed cavities,
@@ -77,7 +77,8 @@ _EPSILON = float(np.finfo(np.float64).eps)
 def _sweep(design, squares, members, class_index, log_density, log_scale_rows, grid, noise, mean, residual, variance, shift):
     """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
-    (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2) at the sweep's end, so the ELBO is exact there.
+    (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
+    and its rounding bound are exact there.
 
     ``design`` is Xp over the groups (n x groups, Fortran order), ``squares`` their ||x_g||^2, ``members[j]`` member
     j's group; ``log_density`` is (classes x nodes), ``log_scale_rows`` per member, ``grid`` the nodes' log
@@ -88,6 +89,7 @@ def _sweep(design, squares, members, class_index, log_density, log_scale_rows, g
     node_count = grid.shape[0]
     divergence = 0.0
     weighted_variance = 0.0
+    sizes = 0.0
     log_weights = np.empty(node_count)
     conditional = np.empty(node_count)
     for member in range(member_count):
@@ -132,12 +134,15 @@ def _sweep(design, squares, members, class_index, log_density, log_scale_rows, g
         mean[member] = new_mean
         variance[member] = new_variance
         shift[member] = h
-        divergence += h * new_mean - 0.5 * omega * (new_mean * new_mean + new_variance) - log_normalizer
+        pull = h * new_mean
+        shrink = 0.5 * omega * (new_mean * new_mean + new_variance)
+        divergence += pull - shrink - log_normalizer
+        sizes += abs(pull) + shrink + abs(log_normalizer)
         weighted_variance += squares[group] * new_variance
     residual_square = 0.0
     for sample in range(sample_count):
         residual_square += residual[sample] * residual[sample]
-    return divergence, weighted_variance, residual_square
+    return divergence, weighted_variance, residual_square, sizes
 
 
 class _Response:
@@ -229,11 +234,20 @@ class MeanFieldFixedPoints:
 
     # the ELBO and its pieces
 
-    def _elbo(self, divergence: float, weighted_variance: float, residual_square: float) -> float:
+    def _elbo(self, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
+        """(the ELBO at this q and noise, a bound on its rounding). The bound: each of the N = 2p + n summands (p KL
+        terms, p weighted variances, n residual squares) is formed from pieces whose sizes sum to S, with at most
+        K + 1 rounded operations on each (its log-sum-exp over the K nodes and its combination), and recursive
+        summation of N terms adds at most N eps of their sizes (Higham, Accuracy and Stability of Numerical
+        Algorithms, 2nd ed., Lemma 3.1 with gamma_N <= N eps at N eps << 1): |rounding| <= (K + 1 + N) eps S."""
         noise = self.noise
-        return -0.5 * self.residual_dimension * float(np.log(2.0 * np.pi * noise)) - (residual_square + weighted_variance) / (2.0 * noise) - divergence
+        residual_term = 0.5 * self.residual_dimension * float(np.log(2.0 * np.pi * noise))
+        fit_term = (residual_square + weighted_variance) / (2.0 * noise)
+        value = -residual_term - fit_term - divergence
+        summands = 2 * self.prior.variant_count + self.sample_count
+        return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
-    def _sweep(self, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float]:
+    def _sweep(self, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
         started = time.perf_counter()
         prior = self.prior
         values = _sweep(
@@ -282,17 +296,14 @@ class MeanFieldFixedPoints:
             if pending_noise is not None:
                 elbo = elbo + self.noise_gain if elbo is not None else None
                 self.noise = pending_noise
-            divergence, weighted_variance, residual_square = self._sweep(hyperparameters)
+            divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
                 raise FloatingPointError("a mean-field sweep is not finite")
-            value = self._elbo(divergence, weighted_variance, residual_square)
+            value, rounding = self._elbo(divergence, weighted_variance, residual_square, sizes)
             # The noise's stationary value at this q, and the gain it would bring (both exact); applied before the
             # next sweep, if there is one.
             pending_noise = (residual_square + weighted_variance) / self.residual_dimension
             self.noise_gain = noise_gain(pending_noise, self.noise, self.sample_count, self.covariate_count)
-            # The ELBO's rounding: the sum of its terms' sizes times eps. A gain below it is not resolved.
-            magnitude = 0.5 * self.residual_dimension * abs(float(np.log(2.0 * np.pi * self.noise))) + (residual_square + weighted_variance) / (2.0 * self.noise) + abs(divergence)
-            rounding = _EPSILON * magnitude
             gain = (value - elbo) if elbo is not None else None
             elbo = value
             self.profile["elbo"] = value

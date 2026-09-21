@@ -84,8 +84,8 @@ def test_every_sweep_raises_the_elbo_and_the_fixed_point_is_the_tilted_moments(t
     statistics, prior, start, oracle = _oracle(3, tied=tied)
     values = []
     for _sweep in range(6):
-        divergence, weighted_variance, residual_square = oracle._sweep(start)
-        values.append(oracle._elbo(divergence, weighted_variance, residual_square))
+        divergence, weighted_variance, residual_square, sizes = oracle._sweep(start)
+        values.append(oracle._elbo(divergence, weighted_variance, residual_square, sizes)[0])
     gains = np.diff(values)
     assert np.all(gains >= -1e-9 * np.abs(values[1:]))
     (point,) = oracle([start])
