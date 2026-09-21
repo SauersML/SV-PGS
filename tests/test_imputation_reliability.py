@@ -42,6 +42,25 @@ def test_triad_drops_missing_samples_and_rejects_unrelated_truths():
         triad_squared_correlation(dosage, unrelated - 10 * genotype, genotype)
 
 
+def test_the_triad_refuses_a_ratio_that_is_not_a_squared_correlation():
+    generator = np.random.default_rng(15)
+    genotype = _genotypes(generator, 2_000)
+    truth_a = genotype + generator.normal(0.0, 0.4, genotype.size)
+    truth_b = genotype + generator.normal(0.0, 0.4, genotype.size)
+    with pytest.raises(ValueError, match="the dosage is constant"):
+        triad_squared_correlation(np.full(genotype.size, 1.5), truth_a, truth_b)
+    with pytest.raises(ValueError, match="the second truth is constant"):
+        triad_squared_correlation(genotype, truth_a, np.zeros(genotype.size))
+    # Three samples cannot resolve the ratio, which comes out at 1.5.
+    with pytest.raises(ValueError, match="not a squared correlation"):
+        triad_squared_correlation([0.0, 1.0, 2.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0])
+    # A dosage driven by the truths' errors breaks the identity's independence: it correlates
+    # positively with one truth and negatively with the other, so the ratio is negative.
+    shared, error_a, error_b = generator.normal(size=(3, 5_000))
+    with pytest.raises(ValueError, match="not a squared correlation"):
+        triad_squared_correlation(error_a - error_b, shared + error_a, shared + error_b)
+
+
 def test_calibration_shape_is_monotone_and_the_identity_for_a_calibrated_dosage():
     generator = np.random.default_rng(13)
     dosage = np.round(generator.uniform(0.0, 2.0, 200_000), 1)

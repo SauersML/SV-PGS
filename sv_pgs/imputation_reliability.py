@@ -43,18 +43,41 @@ from sv_pgs._typing import F64Array, NDArray
 def triad_squared_correlation(dosage: NDArray, truth_a: NDArray, truth_b: NDArray) -> float:
     """r^2 = corr^2(D, G) from two truths whose errors are mutually independent.
 
-    Samples missing in any of the three arrays are dropped. Fails loudly when
-    the two truths do not share signal, since the identity then has no value.
+    Samples missing in any of the three arrays are dropped. Every way the
+    identity can return something that is not a squared correlation raises
+    instead, because the caller's use of the value is a prior variance factor
+    and its logarithm is the prior's offset:
+
+    - a constant column over the shared samples has no correlation, and the
+      ratio is NaN, not a reliability of nan;
+    - two truths that do not share signal make the ratio a quotient of noise;
+    - a ratio outside [0, 1] is not a squared correlation. It says this sample
+      contradicts the identity's assumption of independent truth errors, or is
+      too small to resolve the ratio. Clipping it would hand the prior a
+      reliability of exactly 1 or 0, which the record has not earned; it is for
+      the caller to pool the record or drop it.
     """
     values = np.vstack([np.asarray(dosage, float), np.asarray(truth_a, float), np.asarray(truth_b, float)])
     observed = np.isfinite(values).all(axis=0)
-    if observed.sum() < 3:
+    shared = int(observed.sum())
+    if shared < 3:
         raise ValueError("the triad needs at least 3 samples observed in all three columns")
-    correlation = np.corrcoef(values[:, observed])
+    present = values[:, observed]
+    for name, spread in zip(("the dosage", "the first truth", "the second truth"), present.var(axis=1)):
+        if not spread > 0.0:
+            raise ValueError(f"{name} is constant over the {shared} shared samples, so it has no correlation")
+    correlation = np.corrcoef(present)
     truth_truth = correlation[1, 2]
     if not truth_truth > 0.0:
         raise ValueError(f"the two truths are not positively correlated (r = {truth_truth:.4f})")
-    return float(correlation[0, 1] * correlation[0, 2] / truth_truth)
+    squared = float(correlation[0, 1] * correlation[0, 2] / truth_truth)
+    if not 0.0 <= squared <= 1.0:
+        raise ValueError(
+            f"the triad gives r^2 = {squared:.4f}, which is not a squared correlation: r(D,T1) = "
+            f"{correlation[0, 1]:.4f}, r(D,T2) = {correlation[0, 2]:.4f} and r(T1,T2) = {truth_truth:.4f} "
+            f"over {shared} shared samples contradict the identity's independent truth errors"
+        )
+    return squared
 
 
 def _pool_adjacent_violators(values: F64Array, weights: F64Array) -> F64Array:
