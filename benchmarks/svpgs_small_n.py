@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from benchmarks.seeds import seed_from_name
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
@@ -76,7 +77,6 @@ def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
     if not np.all(np.isin(genotypes, (0, 1, 2))):
         raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
     codes = genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE)
-    samples = genotypes.shape[0]
     fit = fit_small_n(
         codes=codes,
         # bench-real's fixed-effect covariates [1, C] (review-mathbugs C2), as svpgs_method's arms pass them.
@@ -86,7 +86,7 @@ def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
         log_variance_offset=None,
         draw_count=DRAW_COUNT,
         working_bytes=_METHOD.one_core_budget().working_bytes,
-        seed=int.from_bytes(str(train.gene_id).encode()[:8].ljust(8, b"\0"), "big"),
+        seed=seed_from_name(str(train.gene_id)),
         inference=inference,
     )
     return SmallNPredictor(scoring=fit.scoring, profile=fit.profile)

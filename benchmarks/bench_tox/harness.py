@@ -34,6 +34,7 @@ from scipy import stats
 from benchmarks import svpgs_small_n as bench
 from benchmarks.bench_real import baselines, harness as real_harness
 from benchmarks.bench_tox import dataset, genotypes, splits
+from benchmarks.seeds import seed_from_name
 from sv_pgs.fit_model import DRAW_COUNT
 from sv_pgs.small_n import fit_small_n
 
@@ -272,7 +273,7 @@ def _one(job):
     train.raw_phenotype = y[train_rows]
     test_genotypes = dosage[test_rows].astype(np.float64)
     record = {"compound": compound, "arm": arm, "screened": int(chrom_rows.shape[0]), "screened_sv": int(np.sum(variants.is_sv)) if chrom_rows.shape[0] else 0}
-    seed = int.from_bytes(compound.encode()[:8].ljust(8, b"\0"), "big")
+    seed = seed_from_name(compound)
     for name, method in (("top_variant", baselines.top_variant), ("gblup_reml", baselines.gblup_reml), ("svpgs_mean_field", lambda t: _svpgs(t, seed))):
         started = time.perf_counter()
         try:
