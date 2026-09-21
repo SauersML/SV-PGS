@@ -2,7 +2,7 @@
 
 top_variant   the single variant with the largest training |correlation|, fitted by OLS (the "lead eQTL" predictor).
 gblup_reml    GBLUP on the standardized cis genotypes, with h^2 chosen by REML (spectral form: Kang et al. 2008,
-              Genetics 178:1709), and the GLS intercept.
+              Genetics 178:1709) and the GLS fixed effects, both under the harness's fixed-effect design [1, covariates].
 mr.ash        is not ported here: the published R package (mr.ash.alpha) is run as itself for the comparison; a Python
               port gave identical SNV and SNV+SV predictions on bench-real chr22 (lead, 2026-09-21) and was deleted.
 """
@@ -78,17 +78,33 @@ def top_variant(train):
 
 
 class GblupPredictor:
-    def __init__(self, standardized_train, dual_weights, intercept, center, scale, heritability):
+    """The GLS fit: intercept + (x - center) / scale @ (standardized_train.T @ dual_weights), plus the covariate
+    effects when the caller passes the covariates (the harness does; predict_for_truth then removes the whole
+    covariate combination from the score, so they change no score of this benchmark)."""
+
+    def __init__(self, standardized_train, dual_weights, fixed_effects, center, scale, heritability):
         self.heritability = heritability
         self.standardized_train = standardized_train
         self.dual_weights = dual_weights
-        self.intercept = intercept
+        self.fixed_effects = fixed_effects
+        self.intercept = float(fixed_effects[0])
         self.center = center
         self.scale = scale
 
-    def predict(self, genotypes):
+    def predict(self, genotypes, covariates=None):
         standardized = (np.asarray(genotypes, dtype=np.float64) - self.center) / self.scale
-        return self.intercept + standardized @ (self.standardized_train.T @ self.dual_weights)
+        score = self.intercept + standardized @ (self.standardized_train.T @ self.dual_weights)
+        if covariates is None or len(self.fixed_effects) == 1:
+            return score
+        return score + np.asarray(covariates, dtype=np.float64) @ self.fixed_effects[1:]
+
+
+def fixed_effect_design(train, sample_count):
+    """[1, covariates]: the fixed-effect design every method of the benchmark fits under (harness.predict_for_truth)."""
+    covariates = getattr(train, "covariates", None)
+    if covariates is None:
+        return np.ones((sample_count, 1))
+    return np.column_stack([np.ones(sample_count), covariates])
 
 
 def gblup_reml(train):
@@ -103,12 +119,16 @@ def gblup_reml(train):
         raise ValueError("gblup_reml needs every column to vary in the training samples")
     standardized = (genotypes - center) / scale / np.sqrt(variant_count)
     kernel = standardized @ standardized.T
-    # REML with the intercept as the only fixed effect: work in an orthonormal basis of the complement of 1.
-    complement = linalg.null_space(np.ones((1, sample_count)))
+    # REML under the harness's own fixed-effect design [1, covariates], not the intercept alone: the restricted
+    # likelihood is the likelihood of the data in the complement of the design's column span, and the covariance
+    # K enters it through that complement, so removing a different design changes h^2 itself, not just the fitted
+    # mean. null_space's rank-revealing SVD handles a rank-deficient design; the complement's width is n - rank.
+    design = fixed_effect_design(train, sample_count)
+    complement = linalg.null_space(design.T)
     eigenvalues, eigenvectors = np.linalg.eigh(complement.T @ kernel @ complement)
     eigenvalues = np.clip(eigenvalues, 0.0, None)
     rotated_squared = (eigenvectors.T @ (complement.T @ phenotype)) ** 2
-    degrees = sample_count - 1
+    degrees = complement.shape[1]
 
     def negative_reml(heritability):
         # V = h K + (1-h) I up to the total variance, which is profiled out.
@@ -122,10 +142,12 @@ def gblup_reml(train):
         return ZeroPredictor(phenotype.mean())
     variance = heritability * kernel + (1.0 - heritability) * np.eye(sample_count)
     factor = np.linalg.cholesky(variance)
-    solve = lambda vector: np.linalg.solve(factor.T, np.linalg.solve(factor, vector))
-    inverse_ones, inverse_phenotype = solve(np.ones(sample_count)), solve(phenotype)
-    intercept = inverse_phenotype.sum() / inverse_ones.sum()
-    dual_weights = heritability * (inverse_phenotype - intercept * inverse_ones)
-    return GblupPredictor(standardized, dual_weights, intercept, center, scale * np.sqrt(variant_count), heritability)
+    solve = lambda values: np.linalg.solve(factor.T, np.linalg.solve(factor, values))
+    inverse_design, inverse_phenotype = solve(design), solve(phenotype)
+    # The generalized least squares fixed effects of the whole design, under the fitted covariance; lstsq because a
+    # rank-deficient design has no unique solution, only a unique fit.
+    fixed_effects, *_ = np.linalg.lstsq(design.T @ inverse_design, design.T @ inverse_phenotype, rcond=None)
+    dual_weights = heritability * (inverse_phenotype - inverse_design @ fixed_effects)
+    return GblupPredictor(standardized, dual_weights, fixed_effects, center, scale * np.sqrt(variant_count), heritability)
 
 
