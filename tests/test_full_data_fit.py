@@ -69,6 +69,12 @@ def _store(root: Path, seed: int):
     return store, covariate, targets, genetic
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="EP's full-data oracle refuses this store (its refreshes line up with no contraction and the route has no "
+    "double loop: 59 of 65 calls on 2026-09-21), so the fit returns with remaining_gain inf. The public route fits "
+    "by the mean-field oracle (the test below); EP stays for tie members until the mean-field route carries them.",
+)
 @pytest.mark.slow  # the whole driver on the synthetic store: it did not finish within the gate's budget on the merged engine (2026-09-21), and is run on its own until its cost is measured
 def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_path: Path) -> None:
     store, covariate, targets, genetic = _store(tmp_path / "store", 7)

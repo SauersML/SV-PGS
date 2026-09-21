@@ -30,10 +30,13 @@ built from.
 ``scale_mixture_ep.noise_gain``.
 
 **The fixed point.** Sweeps end when the gain they can still find is at most the fit's resolution, 1/(2K) nats
-for a scorer with K posterior draws: the remaining gain is bounded by the last sweep's gain g_t times
+for a scorer with K posterior draws: the remaining gain is estimated as the last sweep's gain g_t times
 rho / (1 - rho), rho = g_t / g_(t-1) the measured contraction (the same extrapolation the EP oracles use for their
 distance to the fixed point), so a call sweeps at least until two gains are measured; a gain below the ELBO's own
-rounding (``_elbo``: a forward-error bound from the pieces' sizes) is resolved. Nothing is clipped, damped or capped.
+rounding (``_elbo``: a forward-error bound from the pieces' sizes) is resolved. The extrapolation is a geometric
+estimate from two gains, not a bound: a slow mode that has not yet shown its rate is missed by it (the audit's
+M12), which is why the Newton corrections through the response and their fresh decrement, not the extrapolation,
+decide the certificate wherever a response exists. Nothing is clipped, damped or capped.
 
 **The outer loop's view.** The pseudo-likelihoods are the ``Cavity`` the hyper step maximizes over: at the fixed
 point q_j = t_j(x), so by the envelope theorem d ELBO*/dx = sum_j d log Z_j(x; omega_j, h_j)/dx at fixed cavities,
@@ -96,7 +99,7 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(cache=True)
-def _sweep(design, squares, members, class_index, log_density, node_variance, noise, mean, residual, variance, shift, third, fourth):
+def _sweep(design, squares, members, class_index, log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth):
     """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
     (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
@@ -104,7 +107,7 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
 
     ``design`` is Xp over the groups (n x groups, Fortran order), ``squares`` their ||x_g||^2, ``members[j]`` member
     j's group; ``log_density`` is (classes x nodes), ``node_variance`` (members x nodes) each member's variance at
-    each node, u_j e^{t_k}, formed once per hyperparameters (``MeanFieldFixedPoints._node_variance``: the sweep's
+    each node, u_j e^{t_k}, and ``log_node_variance`` its log (read only where the variance overflowed), formed once per hyperparameters (``MeanFieldFixedPoints._node_variance``: the sweep's
     exponentials are its cost, and this one does not move between sweeps). The node terms are
     ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node whose variance overflows
     contributes conditional variance 1 / omega and weight 0. ``third`` and ``fourth`` receive each q_j's third and
@@ -132,8 +135,10 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
             variance_node = node_variance[member, node]
             ratio = variance_node * omega
             if ratio == np.inf:
+                # The kernel's own limit (``scale_mixture_ep._kernel_terms``): log(1 + v omega) = log v + log omega
+                # to rounding, so the weight is small and finite, never -inf.
                 conditional[node] = 1.0 / omega
-                log_weights[node] = -np.inf
+                log_weights[node] = log_density[row, node] - 0.5 * (log_node_variance[member, node] + np.log(omega)) + 0.5 * h * h * conditional[node]
             else:
                 conditional[node] = 1.0 / (1.0 / variance_node + omega) if variance_node > 0.0 else 0.0
                 log_weights[node] = log_density[row, node] - 0.5 * np.log1p(ratio) + 0.5 * h * h * conditional[node]
@@ -300,7 +305,7 @@ class MeanFieldFixedPoints:
         self.refusals: list[str] = []
         self.profile = _new_profile() | {"sweeps": 0, "sweep_seconds": 0.0, "elbo": -np.inf}
         self._node_variance_key: bytes | None = None
-        self._node_variance_table = np.zeros((0, 0))
+        self._node_variance_table = (np.zeros((0, 0)), np.zeros((0, 0)))
         # The last fixed point's response factorization and its noise: the metric of the corrections between sweeps.
         self._response: _Response | None = None
         self._response_noise = float(start_noise)
@@ -322,12 +327,13 @@ class MeanFieldFixedPoints:
         summands = 2 * self.prior.variant_count + self.sample_count
         return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
-    def _node_variance(self, hyperparameters: MixtureHyperparameters) -> F64Array:
-        """(members x nodes) u_j e^{t_k} at these hyperparameters, held for the next sweep at the same ones."""
+    def _node_variance(self, hyperparameters: MixtureHyperparameters) -> tuple[F64Array, F64Array]:
+        """(members x nodes) u_j e^{t_k} at these hyperparameters and its log, held for the next sweep at the same ones."""
         key = hyperparameters.coefficients.tobytes()
         if self._node_variance_key != key:
+            log_table = log_scale(self.prior, hyperparameters.coefficients)[:, None] + self.prior.log_variance_grid[None, :]
             with np.errstate(over="ignore"):
-                self._node_variance_table = np.exp(log_scale(self.prior, hyperparameters.coefficients)[:, None] + self.prior.log_variance_grid[None, :])
+                self._node_variance_table = (np.exp(log_table), log_table)
             self._node_variance_key = key
         return self._node_variance_table
 
@@ -336,7 +342,7 @@ class MeanFieldFixedPoints:
         prior = self.prior
         values = _sweep(
             self.projected, self.group_squares, self.members, self.class_index,
-            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), self._node_variance(hyperparameters),
+            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), *self._node_variance(hyperparameters),
             self.noise, self.mean, self.residual, self.variance, self.shift, self.third, self.fourth,
         )
         self.profile["sweeps"] += 1

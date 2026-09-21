@@ -1031,12 +1031,13 @@ class _FullDataMeanField:
                 local = np.arange(piece_start, piece_stop, dtype=np.int64)
                 rows = start + local
                 projected = self._projected(tile, local, model)
+                log_node_variance = scales[rows][:, None] + prior.log_variance_grid[None, :]
                 with np.errstate(over="ignore"):
-                    node_variance = np.exp(scales[rows][:, None] + prior.log_variance_grid[None, :])
+                    node_variance = np.exp(log_node_variance)
                 mean, variance, shift, third, fourth = (np.ascontiguousarray(values[rows, model]) for values in (self.mean, self.variance, self.shift, self.third, self.fourth))
                 part = mean_field_sweep(
                     projected, np.ascontiguousarray(self.member_squares[rows, model]), local - piece_start, self.class_index[rows], log_density,
-                    node_variance, noise, mean, residual, variance, shift, third, fourth,
+                    node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth,
                 )
                 for values, piece in ((self.mean, mean), (self.variance, variance), (self.shift, shift), (self.third, third), (self.fourth, fourth)):
                     values[rows, model] = piece

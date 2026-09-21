@@ -1360,3 +1360,15 @@ def test_offset_groups_that_do_not_connect_the_classes_are_refused():
             class_index=np.array([0, 0, 1, 1]), log_variance_offset=np.zeros(4), annotation_design=np.zeros((4, 0)), annotation_groups=(),
             nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=np.array([0, 0, 1, 1]),
         )
+
+
+def test_a_finite_log_variance_past_double_precision_keeps_its_finite_normalizer():
+    # The audit's M18: at log v = 1000, P = 1, h = 0 the log normalizer is -1/2 log(1 + v P) = -500, not -inf.
+    conditional, retained, ratio_retained, log_component, _signal = engine._kernel_terms(
+        np.zeros((1, 1)), np.zeros(1), np.array([1000.0]), np.array([1.0]), np.array([0.0])
+    )
+    assert np.isfinite(log_component[0, 0]) and np.isclose(log_component[0, 0], -500.0, rtol=0.0, atol=1e-9)
+    assert conditional[0, 0] == 1.0 and retained[0, 0] == 0.0 and ratio_retained[0, 0] == 1.0
+    # With a shift the h^2 / (2P) term stays too.
+    log_component = engine._kernel_terms(np.zeros((1, 1)), np.zeros(1), np.array([1000.0]), np.array([2.0]), np.array([3.0]))[3]
+    assert np.isclose(log_component[0, 0], -0.5 * (1000.0 + np.log(2.0)) + 0.5 * 9.0 / 2.0, rtol=0.0, atol=1e-9)

@@ -762,10 +762,13 @@ def _kernel_terms(
     """(v r = v/(1 + vP), r = 1/(1 + vP), qr = vP/(1 + vP), log pi_k + log Z_jk, h^2 v r) at every node, with the
     node's own variance v = u e^t (below the kernel floor too: the floor only bounds log Z's error there, and a flat
     kernel's v = 0 would make those nodes a point mass at zero, which the model does not have; review-mathbugs N1).
-    Written so that an overflowing v (a node far past every effect's scale) gives its limits v r = 1/P, r = 0,
-    qr = 1 and a component of weight zero, not inf * 0; an underflowing v gives v r = 0 and r = 1 exactly."""
+    Written so that an overflowing v (a node far past every effect's scale, at a finite log v) gives its limits
+    v r = 1/P, r = 0, qr = 1 and the log component's own limit, -1/2 (log v + log P) + h^2 / (2P): finite, as the
+    mathematical value is (log v = 1000 at P = 1 and h = 0 is -500, not -inf; the audit's M18), and never inf * 0;
+    an underflowing v gives v r = 0 and r = 1 exactly."""
     with np.errstate(over="ignore", divide="ignore"):
-        variance = np.exp(log_scale_rows[:, None] + grid[None, :])
+        log_variance = log_scale_rows[:, None] + grid[None, :]
+        variance = np.exp(log_variance)
         column_precision = precision[:, None]
         ratio = variance * column_precision
         if np.any(ratio <= -1.0):
@@ -773,8 +776,14 @@ def _kernel_terms(
         retained = 1.0 / (1.0 + ratio)
         ratio_retained = 1.0 / (1.0 + 1.0 / ratio)
         conditional = 1.0 / (1.0 / variance + column_precision)
+        log_one_plus = np.log1p(ratio)
+    overflowed = ~np.isfinite(variance) & (column_precision > 0.0)
+    if np.any(overflowed):
+        # log(1 + v P) = log v + log P to rounding where v P overflowed double precision.
+        rows, nodes = np.nonzero(overflowed)
+        log_one_plus[rows, nodes] = log_variance[rows, nodes] + np.log(precision[rows])
     signal = np.square(shift)[:, None] * conditional
-    log_component = log_density - 0.5 * np.log1p(ratio) + 0.5 * signal
+    log_component = log_density - 0.5 * log_one_plus + 0.5 * signal
     return conditional, retained, ratio_retained, log_component, signal
 
 
@@ -2301,11 +2310,15 @@ def _laplace_corrections_once(
 
     The integrated directions are the eigenvectors of -H's Schur complement on the complement of the profiled null
     space, each moved with the null coordinates' first-order response and scaled to unit curvature. Along a
-    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24. V is certified to ``tolerance`` in
-    total: half of it bounds the directions left to the Laplace term (the largest terms are replaced until the
-    remaining ones sum to at most tolerance / 2), and half bounds the quadratures of the replaced ones (each to
-    tolerance / (2 m) in its log, m of them). A replaced direction's correction is the log of the exact line
-    integral's ratio to the Laplace term (its limit covers a density collapsing to a point); elsewhere it is 0.
+    standardized direction the Tierney-Kadane O(1) term is k4/8 + 5 k3^2/24: the estimate that decides which
+    directions are integrated (the largest terms are replaced until the remaining ones sum to at most
+    tolerance / 2), and the quadratures of the replaced ones are each certified to tolerance / (2 m) in its log
+    (m of them). What is not certified: the terms are the expansion's leading ones, not a remainder bound (a log
+    integrand -x^2/2 - x^6 has both zero and a correction of -0.45: the audit's M08), and the integrals are
+    one-dimensional along each direction, so the mixed cumulants between directions are not represented
+    (-x^2/2 - y^2 - x^2 y^2 has exact Gaussian slices and a joint correction of -0.24: M07). A replaced
+    direction's correction is the log of the exact line integral's ratio to the Laplace term (its limit covers a
+    density collapsing to a point); elsewhere it is 0.
     """
     standardized = _standardized(prior, log_smoothing, evidence.coefficients, cavity, working_bytes)
     if standardized is None:
@@ -2642,8 +2655,10 @@ def _evidence_once(
         curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
         sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
         rounding = objective.rounding + _EPSILON * abs(value)
-        # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
-        # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
+        # x-hat's error moves the determinant terms by this much at first order, and F itself by the decrement (the
+        # quadratic model's own gain); together, the inner maximizer's share of V's error. Both are the local
+        # quadratic model's estimates, not bounds: they hold to the order the model holds, and the certificate's
+        # reader knows them as that (the audit's M03; ``OuterFit.fixed_point_term_measured``).
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
         if not maximize or 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
@@ -2656,8 +2671,11 @@ def _evidence_once(
         inner_tolerance = max(2.0 * tolerance * tolerance / sensitivity, rounding)
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; a relative residual
-    # e of that response moves 1/2 log|B + S| by at most D e / 2, charged below at the residual the solve reached
+    # e of that response moves 1/2 log|B + S| by about D e / 2, charged below at the residual the solve reached
     # (``CurvatureCorrection.resolution``: its rounding where the posterior is exact, 0 for a correction given whole).
+    # That charge is first order in e and blind to conditioning: near a singular B + S the log-determinant moves
+    # more than D e / 2 for the same residual (a whitened bound, d (-log(1 - eta)) for eta the whitened
+    # perturbation's norm, is the audit's M13 and is not formed here).
     if prior.anchor is not None:
         # With the local model's anchor, -H is already A + C + S (``_Anchor``): C enters once, and x_rho's own factor
         # is the determinant's.
@@ -3059,10 +3077,13 @@ def _maximize_evidence(
             # penalty swamps the data there past half precision, so V is the edge's to the tolerance by
             # construction and its slope is O(e^-rho) (on the mean-field test problem V's interior maximum sits
             # mid-range, 2.7 nats above the edge on one class, with a slope of -0.0004 +- 0.06 at the upper end).
-            # The Laplace form screens the centre (``_best_certified``): the Tierney-Kadane terms lowered V on every
-            # problem measured (gene 1's flat interior by 1-66 nats, the test problem's optimum by 0.4), so the
-            # corrections are taken only where the Laplace V is itself above the edge. The ascent from the centre
-            # then searches the interior.
+            # The Laplace form screens the centre (``_best_certified``): the corrections are taken only where the
+            # Laplace V is itself above the edge, and the ascent from the centre then searches the interior. The
+            # screen is a heuristic on the search, not a certificate: a correction can be positive (measured on
+            # bench-real chr22 [real]: 2 of 89 on ENSG00000254709.8, the larger +0.55 nats, against 1-66 nats of
+            # lowering elsewhere; the audit's M05), so a trial whose Laplace V sits within such a correction below
+            # the edge is missed, and the fit ends at the edge with its certificate as a local one. What the screen
+            # buys: on ENSG00000274602.5 [real] the corrections are 59% of a 412 s fit.
             for position in sorted(edges):
                 if position in released_once:
                     continue
@@ -3683,11 +3704,14 @@ def _outer_state(
 
 def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Array) -> tuple[float, float]:
     """(G, eps): V's realized gain from ``start`` to ``end`` over the step ``move`` = x_end - x_start, and its
-    resolution (theory-ep (b)). E's change is the trapezoid rule of its path integral with its Euler-Maclaurin end
-    correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is quartic along s), whose plain
-    rule's error |s'(B_end - B_start)s| / 12 bounds the corrected one's; the penalty and the determinant terms
-    change in closed form (the states' ``rest``), and eps adds both states' own errors. The fixed points' gradient
-    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``).
+    resolution (theory-ep (b)). On the EP route E's change is estimated by the trapezoid rule of its path integral
+    with its Euler-Maclaurin end correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is
+    quartic along s), and the end correction's size |s'(B_end - B_start)s| / 12 is charged as the rule's resolution.
+    That charge is the next term's size, not a bound on the omitted ones: an E whose end derivatives vanish to
+    second order while it rises along s (10t^3 - 15t^4 + 6t^5 on [0, 1]: the audit's M10) has estimate 0 and
+    charge 0 against a gain of 1. The penalty and the determinant terms change in closed form (the states'
+    ``rest``), and eps adds both states' own errors. The fixed points' gradient error along s (their perturbation
+    probes) is not charged yet (``OuterFit.fixed_point_term_measured``).
 
     Where both fixed points carry E's offset (``FixedPoint.evidence_offset``: the mean-field oracle's), the gain is
     exact, (value + offset)_end - (value + offset)_start, with both states' errors as its resolution: no path
@@ -4261,6 +4285,12 @@ def fit_hyperparameters(
                     # x is at its maximum to double precision (no trial can lower a decrement at its rounding) and what
                     # stops the certificate is not x: the fit is returned uncertified with its measured remaining gain.
                     uncertified(model, entry, entry.step, newton.decrement)
+                    continue
+                if newton.definite and last_steps[model] is not None:
+                    # The same, at a state whose own plan had no certified hyper step (a saddle of V's model): the
+                    # last evaluated step is the fit's, and the remaining gain is unmeasured. Raising here threw
+                    # away a 945 s fit whose x was at its maximum (ENSG00000124596.17 [real], snv_sv).
+                    uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement)
                     continue
                 raise NoCertifiedProgress(
                     "the Newton-B step makes no certified progress at the EP fixed point "
