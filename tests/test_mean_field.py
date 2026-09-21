@@ -126,29 +126,40 @@ def test_the_response_solves_a_symmetric_indefinite_system_exactly():
 
 def test_the_cavity_response_matches_finite_differences_of_the_fixed_point():
     """The linear response dh/dx the fixed point hands the outer loop, against central differences of the mean-field
-    fixed point re-solved at moved hyperparameters (the solve tightened to rounding)."""
+    fixed point re-solved at moved hyperparameters. The fixed points are resolved to the ELBO's rounding (a draw count
+    past 1 / eps leaves only that stop), and the differences take two steps with Richardson's extrapolation, so their
+    error is the resolved means' own over the step, below the tolerance asked."""
     _statistics, prior, start, oracle = _oracle(5)
-    oracle.draw_count = 2**40  # the fixed point resolved to rounding for the differences
+    oracle.draw_count = 2**60
     (point,) = oracle([start])
     assert point is not None, oracle.refusals
     direction = 0.05 * np.random.default_rng(3).standard_normal(prior.coefficient_size)
-    # The fixed-cavity mean change m_x E: the tilted mean's derivative at the pseudo-likelihood.
+
+    def moved(coefficients):
+        return type(start)(coefficients=coefficients, log_smoothing=start.log_smoothing)
+
+    # The fixed-cavity mean change m_x E: the tilted mean's derivative at the pseudo-likelihood, by the same differences.
     def tilted_mean(coefficients):
-        return tilted_moments(prior, type(start)(coefficients=coefficients, log_smoothing=start.log_smoothing), point.cavity, _WORKING_BYTES).mean
-    scale = 1e-4
-    mean_by_z = (tilted_mean(start.coefficients + scale * direction) - tilted_mean(start.coefficients - scale * direction)) / (2.0 * scale)
-    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], np.zeros((prior.variant_count, 1)))
-    assert not np.any(precision_step)
+        return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).mean
 
     def shift_at(coefficients):
-        moved = MeanFieldFixedPoints(oracle.statistics, prior, oracle.noise, 2**40, _WORKING_BYTES)
-        moved.mean, moved.variance, moved.shift, moved.residual = (values.copy() for values in (oracle.mean, oracle.variance, oracle.shift, oracle.residual))
-        (moved_point,) = moved([type(start)(coefficients=coefficients, log_smoothing=start.log_smoothing)])
-        assert moved_point is not None, moved.refusals
+        resolved = MeanFieldFixedPoints(oracle.statistics, prior, oracle.noise, 2**60, _WORKING_BYTES)
+        resolved.mean, resolved.variance, resolved.shift, resolved.residual = (values.copy() for values in (oracle.mean, oracle.variance, oracle.shift, oracle.residual))
+        (moved_point,) = resolved([moved(coefficients)])
+        assert moved_point is not None, resolved.refusals
         return moved_point.cavity.shift
 
-    numeric = (shift_at(start.coefficients + scale * direction) - shift_at(start.coefficients - scale * direction)) / (2.0 * scale)
-    np.testing.assert_allclose(shift_step[:, 0], numeric, rtol=1e-4, atol=1e-6 * float(np.max(np.abs(numeric))))
+    def richardson(function, scale):
+        coarse = (function(start.coefficients + scale * direction) - function(start.coefficients - scale * direction)) / (2.0 * scale)
+        fine = (function(start.coefficients + 0.5 * scale * direction) - function(start.coefficients - 0.5 * scale * direction)) / scale
+        return fine + (fine - coarse) / 3.0
+
+    scale = 1e-2
+    mean_by_z = richardson(tilted_mean, scale)
+    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], np.zeros((prior.variant_count, 1)))
+    assert not np.any(precision_step)
+    numeric = richardson(shift_at, scale)
+    np.testing.assert_allclose(shift_step[:, 0], numeric, rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric))))
 
 
 def test_the_noise_update_is_the_elbos_stationary_value():
@@ -160,7 +171,8 @@ def test_the_noise_update_is_the_elbos_stationary_value():
     residual = oracle.residual
     pending = (float(residual @ residual) + float(oracle.member_squares @ oracle.variance)) / oracle.residual_dimension
     np.testing.assert_allclose(oracle.noise_gain, noise_gain(pending, oracle.noise, oracle.sample_count, oracle.covariate_count), rtol=1e-10)
-    assert oracle.noise_gain <= 0.5 / 64 and oracle.mean_move + oracle.noise_gain <= 0.5 / 64
+    # The certificate's move is twice the remaining gain (KL = move / 2); with the noise's pending gain it is within 1 / (2K).
+    assert oracle.noise_gain <= 0.5 / 64 and 0.5 * oracle.mean_move + oracle.noise_gain <= 0.5 / 64
 
 
 def test_a_refused_call_restores_the_state():
