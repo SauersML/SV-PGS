@@ -38,6 +38,7 @@ from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.full_data_fit import FitCertificate
+from sv_pgs.imputation_reliability import checked_log_reliability
 # RUN-ONLY (run/svpgs-bench-1): e2e's full_data_fit.fit_models replaces this wiring.
 from sv_pgs.stage2_wiring import fit_models
 
@@ -175,12 +176,10 @@ class FitRequest:
             raise ValueError("every training target must be finite.")
         if self.log_variance_offset is not None:
             offset = np.asarray(self.log_variance_offset)
-            if offset.ndim != 1 or offset.dtype.kind not in "fiu":
-                raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
-            offset = offset.astype(np.float64)
-            if offset.shape != (self.store.n_variants,) or np.any(np.isnan(offset)) or np.any(offset > 0.0):
-                raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
-            set_field(self, "log_variance_offset", offset)
+            if offset.ndim != 1 or offset.dtype.kind not in "fiu" or offset.shape != (self.store.n_variants,):
+                raise ValueError("log_variance_offset must be one log reliability per store record.")
+            # The values are a reliability, which every source of one meets by the same contract, checked in one place.
+            set_field(self, "log_variance_offset", checked_log_reliability(offset, "the request's log_variance_offset"))
         for model, trait_type in enumerate(self.trait_types):
             if trait_type == TraitType.BINARY and not np.all(np.isin(target_matrix[training_mask[:, model], model], (0.0, 1.0))):
                 raise ValueError(f"binary model {self.model_names[model]!r} has training targets other than 0 and 1.")

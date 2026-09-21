@@ -318,6 +318,18 @@ def test_fit_refuses_a_cohort_that_does_not_line_up(tmp_path: Path, store_root: 
     assert driver.calls == []
 
 
+def test_a_refused_offset_is_refused_by_the_one_reliability_contract(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    """The request's offsets meet ``imputation_reliability.checked_log_reliability``, the contract every source of a
+    record's reliability meets, so the refusal names the first offending record and how many there are rather than
+    repeating the rule in a second place that could drift from it."""
+    cohort = _cohort(np.random.default_rng(4))
+    offset = np.zeros(_VARIANTS)
+    offset[2] = 0.25
+    with pytest.raises(ValueError, match=r"log_variance_offset: .*record 2 has 0\.25 \(1 of "):
+        _request(store_root, cohort.arguments() | {"log_variance_offset": offset}, tmp_path, 5)
+    assert driver.calls == []
+
+
 def test_fit_refuses_a_seed_that_is_not_an_integer(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
     """A float seed would be truncated by the conversion, so a different run would be reported as the same one."""
     cohort = _cohort(np.random.default_rng(4))
