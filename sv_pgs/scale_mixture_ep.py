@@ -2119,16 +2119,15 @@ def _prior_digest(prior: ScaleMixturePrior) -> tuple[object, ...]:
 
 
 def _repeated(name: str, cavity: Cavity, inputs: tuple[object, ...], compute: Callable[[], object], held: object | None = None) -> object:
-    """compute() once per distinct ``inputs`` at this cavity within a hyper step (and, when given, this ``held``
-    object: compared by identity); outside a hyper step, compute() every time."""
+    """compute() once per distinct ``inputs`` at this cavity within the open cache (a hyper step's, or the outer
+    loop's; and, when given, this ``held`` object: compared by identity); outside one, compute() every time."""
     cache = _STEP_CACHE.get()
     if cache is None:
         return compute()
-    repeats = cache.setdefault("repeats", {})
-    scope = _digest(cavity.precision, cavity.shift)
-    if repeats.get("cavity") != scope:
-        repeats.clear()
-        repeats["cavity"] = scope
+    # One memo per cavity: the outer loop's trials visit other fixed points between two hyper steps at one state (the
+    # halved joint trials' own), and a single-cavity memo forgot the state's repeats each time (gene 1 [real]: the
+    # certifying replan repeated the polished state's five release trials, 10 s of 40).
+    repeats = cache.setdefault("repeats", {}).setdefault(_digest(cavity.precision, cavity.shift), {})
     if held is not None and repeats.get(("held", name)) is not held:
         for key in [key for key in repeats if isinstance(key, tuple) and key[0] == name]:
             del repeats[key]
