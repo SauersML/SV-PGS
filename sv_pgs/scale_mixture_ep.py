@@ -1211,8 +1211,11 @@ def _maximize_coefficients(
         if predicted <= rounding:
             # The value cannot resolve this step; the gradient can. It is judged as the outer loop judges its inner
             # steps: taken where the decrement in the current metric falls (a strict maximum), or where the trapezoid
-            # gain of the two gradients is positive (a saddle), and the maximization ends otherwise. (A value-only
-            # trial here would compare two values at their rounding; a step below x's own resolution ends above.)
+            # gain of the two gradients is positive (a saddle), and the maximization ends otherwise. A step below x's
+            # own resolution cannot be told from the point it leaves (the decrements of both sit at their rounding),
+            # so it ends the maximization too.
+            if float(np.linalg.norm(step)) <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
+                return coefficients, objective
             candidate = coefficients + step
             candidate_objective = _data_objective(prior, candidate, cavity, working_bytes)
             candidate_value, candidate_gradient, candidate_hessian = _penalized(prior, candidate_objective, log_smoothing, penalty, candidate)
