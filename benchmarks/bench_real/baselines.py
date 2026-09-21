@@ -54,10 +54,24 @@ def top_variant(train):
     centered = covariate_projected(train, genotypes)
     centered_phenotype = phenotype - phenotype.mean()
     squared_norms = (centered ** 2).sum(axis=0)
+    # A column that varies in training can still lie in the span of [1, covariates]: it adds nothing to the covariates
+    # and has no slope. Its projection is then rounding error, not zero, so "positive norm" is not the test; the test is
+    # the numerical rank of the projection. Computing g - design @ coefficients leaves a residual of order
+    # max(design.shape) * eps * ||g|| (Golub and Van Loan 2013, §5.3), which is the same criterion numpy's own lstsq
+    # uses for rank (its rcond default). Below it a column is in the span: its correlation is a ratio of two rounding
+    # errors, which reaches +-1 as readily as a real association, and its slope is that error divided by its square.
+    covariates = getattr(train, "covariates", None)
+    design_columns = 1 if covariates is None else 1 + np.asarray(covariates).shape[1]
+    span_level = max(genotypes.shape[0], design_columns) * DOUBLE_EPSILON * np.linalg.norm(genotypes, axis=0)
+    outside_span = squared_norms > span_level ** 2
+    usable = np.flatnonzero(outside_span)
+    if usable.size == 0:
+        # No variant adds anything to [1, covariates], so the covariates are the whole fit.
+        return ZeroPredictor(phenotype.mean())
     correlation = np.divide(centered.T @ centered_phenotype, np.sqrt(squared_norms * (centered_phenotype ** 2).sum()),
-                            out=np.zeros(genotypes.shape[1]), where=squared_norms > 0)
-    best = int(np.argmax(np.abs(correlation)))
-    slope = (centered[:, best] @ centered_phenotype) / (centered[:, best] @ centered[:, best])
+                            out=np.zeros(genotypes.shape[1]), where=outside_span)
+    best = int(usable[np.argmax(np.abs(correlation[usable]))])
+    slope = (centered[:, best] @ centered_phenotype) / squared_norms[best]
     coefficients = np.zeros(genotypes.shape[1])
     coefficients[best] = slope
     return LinearPredictor(phenotype.mean() - genotypes[:, best].mean() * slope, coefficients)

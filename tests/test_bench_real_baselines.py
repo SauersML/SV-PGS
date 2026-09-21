@@ -12,6 +12,7 @@ EPSILON = np.finfo(np.float64).eps
 class FakeTrain:
     genotypes: np.ndarray
     phenotype: np.ndarray
+    covariates: np.ndarray = None
 
 
 def simulated(seed, samples=300, variants=200, causal=3):
@@ -60,3 +61,22 @@ def test_top_variant_picks_the_causal_variant():
     genotypes, phenotype, effects = simulated(4, causal=1)
     predictor = baselines.top_variant(FakeTrain(genotypes, phenotype))
     assert np.flatnonzero(predictor.coefficients)[0] == np.flatnonzero(effects)[0]
+
+
+def test_top_variant_is_the_covariate_only_fit_when_every_column_is_in_the_covariate_span():
+    """Columns that vary in training but lie in the span of [1, covariates] project to rounding error, not to zero."""
+    genotypes, phenotype, _ = simulated(11, samples=40, variants=6)
+    predictor = baselines.top_variant(FakeTrain(genotypes, phenotype, covariates=genotypes))
+    assert (genotypes.var(axis=0) > 0).all()
+    assert isinstance(predictor, baselines.ZeroPredictor)
+    assert np.allclose(predictor.predict(genotypes), phenotype.mean())
+
+
+def test_top_variant_picks_a_column_that_survives_the_projection():
+    """Every column but the first is a covariate, so only the first can carry a slope; the rest are rounding error,
+    whose correlation reaches +-1 as readily as a real association."""
+    genotypes, phenotype, _ = simulated(12, samples=40, variants=6)
+    predictor = baselines.top_variant(FakeTrain(genotypes, phenotype, covariates=genotypes[:, 1:]))
+    assert np.flatnonzero(predictor.coefficients).tolist() == [0]
+    assert np.isfinite(predictor.coefficients).all() and np.isfinite(predictor.intercept)
+    assert np.isfinite(predictor.predict(genotypes)).all()
