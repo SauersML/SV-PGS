@@ -143,11 +143,21 @@ def test_the_cavity_response_matches_finite_differences_of_the_fixed_point():
         return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).mean
 
     def shift_at(coefficients):
+        # The fixed point at the moved x with the noise held at the base point's, as B holds it (the noise's own
+        # response is not part of B in either inference; its stationarity is certified separately): sweeps until
+        # the means stop moving at double precision, which resolves h far below the differences' step (an ELBO stop
+        # resolves the means only to the square root of its rounding).
         resolved = MeanFieldFixedPoints(oracle.statistics, prior, oracle.noise, 2**60, _WORKING_BYTES)
         resolved.mean, resolved.variance, resolved.shift, resolved.residual = (values.copy() for values in (oracle.mean, oracle.variance, oracle.shift, oracle.residual))
-        (moved_point,) = resolved([moved(coefficients)])
-        assert moved_point is not None, resolved.refusals
-        return moved_point.cavity.shift
+        hyperparameters = moved(coefficients)
+        for _sweep in range(10_000):
+            before = resolved.mean.copy()
+            resolved._sweep(hyperparameters)
+            if np.max(np.abs(resolved.mean - before)) <= np.finfo(np.float64).eps * (1.0 + np.max(np.abs(resolved.mean))):
+                break
+        else:
+            raise AssertionError("the moved fixed point did not settle to double precision")
+        return resolved._fixed_point(hyperparameters).cavity.shift
 
     def richardson(function, scale):
         coarse = (function(start.coefficients + scale * direction) - function(start.coefficients - scale * direction)) / (2.0 * scale)
