@@ -2291,13 +2291,13 @@ def _evidence(
 ) -> _Evidence | None:
     """``_evidence_once``, each distinct input once per cavity (and per correction, held by identity: one per hyper step)."""
     return _repeated(
-        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance),
-        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance), held=correction,
+        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance, maximize),
+        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, maximize), held=correction,
     )
 
 
 def _evidence_once(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, maximize: bool = True
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
