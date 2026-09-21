@@ -80,6 +80,7 @@ from sv_pgs.scale_mixture_ep import (
     GaussianPosterior,
     MixtureHyperparameters,
     ScaleMixturePrior,
+    _class_terms,
     _components,
     class_log_density,
     log_scale,
@@ -421,14 +422,10 @@ class MeanFieldFixedPoints:
         conditional normals N(h c_k, c_k) (``scale_mixture_ep._components``): mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and
         mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2) with d_k = h c_k - m."""
         prior = self.prior
-        log_density = class_log_density(prior, hyperparameters.coefficients)
-        scales = log_scale(prior, hyperparameters.coefficients)
         third, fourth = np.zeros(prior.variant_count), np.zeros(prior.variant_count)
-        for class_position in range(log_density.shape[0]):
-            rows = np.flatnonzero(self.class_index == class_position)
-            if rows.size == 0:
-                continue
-            terms = _components(log_density[class_position], scales[rows], prior.log_variance_grid, omega[rows], self.shift[rows])
+        # The components at the state's own cavity, through the kernel rows the outer loop holds for it.
+        cavity = Cavity(precision=omega, shift=self.shift.copy())
+        for _class_position, rows, terms in _class_terms(prior, hyperparameters.coefficients, cavity, self.working_bytes):
             conditional = terms.conditional_variance
             deviation = self.shift[rows][:, None] * conditional - self.mean[rows][:, None]
             third[rows] = np.sum(terms.responsibility * (deviation**3 + 3.0 * conditional * deviation), axis=1)
