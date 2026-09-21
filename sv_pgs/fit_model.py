@@ -1,9 +1,10 @@
 """The public entry point: a dosage store and a cohort in, a fitted model out.
 
 Every column of ``targets`` and ``training`` is one model: a trait on one training set (a fold's training rows, or all
-of a trait's observed rows). ``full_data_fit.fit_models`` runs Stage 0 once over the union of the training rows and
-fits every model by EP-EB from its learned prior; this module checks the cohort, adds the provenance, and splits the
-certificate into per-model terms, whole-fit counts and refusals for ``artifact.FittedModel``.
+of a trait's observed rows). ``stage2_wiring.fit_models`` runs Stage 0 once per model, on that model's own training
+rows and covariate columns, and fits it by EP-EB from its learned prior; the models are fitted separately, so nothing
+is shared between them. This module checks the cohort, adds the provenance, and splits the certificate into per-model
+terms, whole-fit counts and refusals for ``artifact.FittedModel``.
 
 ``FitRequest`` is the whole input of one fit, checked and normalized by its own constructor. ``fit`` takes nothing
 else, so a caller that builds a request (``workspace_pipeline``'s fit step) either builds this exact object or fails
