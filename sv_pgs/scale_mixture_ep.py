@@ -834,10 +834,14 @@ _STEP_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("scale
 
 
 def _step_scoped(function: Callable) -> Callable:
-    """``function`` with its own ``_STEP_CACHE`` for the call's duration."""
+    """``function`` with a ``_STEP_CACHE`` for the call's duration: its own where none is open, the open one otherwise
+    (a hyper step inside the outer loop shares the loop's, so its exact repeats at an unchanged fixed point, the
+    release trials of one polished state's successive hyper steps among them, are answered once)."""
 
     @functools.wraps(function)
     def scoped(*arguments, **keywords):
+        if _STEP_CACHE.get() is not None:
+            return function(*arguments, **keywords)
         token = _STEP_CACHE.set({})
         try:
             return function(*arguments, **keywords)
@@ -849,8 +853,8 @@ def _step_scoped(function: Callable) -> Callable:
 
 # Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed. The outer
 # loop holds its own cache across its iterations (``fit_hyperparameters`` is step-scoped too): every evaluation at one
-# fixed point's cavity (its state, its Newton model, the gradient at a trial that becomes the next state) shares the
-# kernel rows, which the cavity key keeps exact; a hyper step's cache nests inside it and ends with the step.
+# fixed point's cavity (its state, its Newton model, the gradient at a trial that becomes the next state, its hyper
+# steps) shares the kernel rows and the exact repeats, which the cavity key keeps exact.
 _HELD_ARRAYS_PER_ROW_SET = 10
 
 
