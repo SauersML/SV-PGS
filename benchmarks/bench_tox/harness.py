@@ -217,6 +217,19 @@ class _Train:
         self.genotypes, self.phenotype, self.covariates, self.variants, self.gene_id = genotypes_, phenotype, covariates, variants, gene_id
 
 
+def _working_bytes() -> int:
+    """This worker's share of the task's memory: the runq allotment over the task's workers (``one_core_budget`` divides
+    by the machine's threads, 48 on the runner against the task's 8, and refused every fit on a screen past 100,000
+    records), less what the forked worker already holds."""
+    allotment = os.environ.get("RUNQ_MEM_BYTES")
+    if allotment is None:
+        return bench._METHOD.one_core_budget().working_bytes
+    share = int(allotment) // max(int(os.environ.get("RUNQ_CORES", "1")), 1) - bench._METHOD._resident_bytes()
+    if share <= 0:
+        raise MemoryError("a worker's share of the task's memory allotment is already spent by what it holds.")
+    return share
+
+
 def _svpgs(train: _Train, seed: int):
     genotypes_ = np.asarray(train.genotypes)
     if genotypes_.shape[1] == 0:
@@ -224,7 +237,7 @@ def _svpgs(train: _Train, seed: int):
     fit = fit_small_n(
         codes=genotypes_.astype(np.uint8) * np.uint8(bench.CODES_PER_DOSAGE), covariates=bench._METHOD.bench_real_covariates(train),
         target=np.asarray(train.raw_phenotype, dtype=np.float64), variant_class=bench.classes_for_arm(train.variants, "full"), log_variance_offset=None,
-        draw_count=DRAW_COUNT, working_bytes=bench._METHOD.one_core_budget().working_bytes, seed=seed, inference="mean_field",
+        draw_count=DRAW_COUNT, working_bytes=_working_bytes(), seed=seed, inference="mean_field",
     )
     return bench.SmallNPredictor(scoring=fit.scoring, profile=fit.profile)
 
