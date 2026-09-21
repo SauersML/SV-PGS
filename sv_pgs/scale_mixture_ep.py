@@ -3083,10 +3083,12 @@ def hyper_step(
         return checked(tightened) if tightened.better is None and np.isfinite(tightened.gain) else None
 
     def resolve(budget: float) -> HyperStep | None:
-        """This step with V at its returned weights certified to ``budget`` (more of the Tierney-Kadane directions
-        integrated exactly, the integrals resolved further), the stationarity check as it stands; None where V has no
+        """This step with V at its returned weights certified to ``budget``: x re-maximized to the inner tolerance
+        that budget asks (the determinant's first-order move under x's remaining decrement), then more of the
+        Tierney-Kadane directions integrated exactly; the stationarity check as it stands. None where V has no
         certified value there."""
-        resolved = _corrected(final_view, weights, evidence, cavity, correction, working_bytes, budget)
+        refined = _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, budget)
+        resolved = _corrected(final_view, weights, refined, cavity, correction, working_bytes, budget)
         return None if resolved is None else checked(check, resolved)
 
     return checked(check)
