@@ -142,6 +142,31 @@ class HeldOut:
                 raise ValueError(f"the saved truth of split {name} is not the dataset's expression minus a covariate fit: is --dataset this run's dataset?")
         return expression
 
+    def raw_split_order(self, directory: pathlib.Path, tag: str, columns: int):
+        """Which split each column of a raw-score array is, from the run's own record.
+
+        The harness writes <tag>.raw_splits.json beside the arrays (since e448b16). A run from before that file
+        records the same list in its <tag>.run.json ("splits"), and a merged run records its parts' lists in the
+        order merge_splits stacked them. A layout with neither is refused by name, and so is one whose list does not
+        have one entry per column: an array's split order is never guessed from a file name or a sort."""
+        order = None
+        raw_splits = directory / f"{tag}.raw_splits.json"
+        record_path = directory / f"{tag}.run.json"
+        if raw_splits.exists():
+            order = json.loads(raw_splits.read_text())
+        elif record_path.exists():
+            record = json.loads(record_path.read_text())
+            order = record.get("splits") or ([name for part in record["parts"] for name in part["splits"]] if "parts" in record else None)
+        if order is None:
+            raise ValueError(f"{directory}: {tag}'s raw scores have no split order. Write the splits, in the array's column order, "
+                             f"to {raw_splits.name}; the run's own {record_path.name} lists them under 'splits'.")
+        if len(order) != columns:
+            raise ValueError(f"{directory}: {tag}'s split order names {len(order)} splits for {columns} raw-score columns")
+        unknown = [name for name in order if name not in self.tests]
+        if unknown:
+            raise ValueError(f"{directory}: {tag}'s split order names splits the dataset does not have, e.g. {unknown[:3]}")
+        return order
+
     def predictions(self, directory: pathlib.Path, tag: str, feature_set: str, masked: bool):
         """A saved prediction (with the SV columns held at their training means when masked). A fit whose raw score is
         constant over its split's people, train and test, predicts no differences, so its covariate-adjusted score is
@@ -152,7 +177,7 @@ class HeldOut:
         raw_path = directory / f"{tag}.{feature_set}.raw_scores{suffix}.npy"
         if raw_path.exists():
             raw = np.load(raw_path)
-            for position, name in enumerate(json.loads((directory / f"{tag}.raw_splits.json").read_text())):
+            for position, name in enumerate(self.raw_split_order(directory, tag, raw.shape[1])):
                 block = raw[:, position]
                 finite = np.isfinite(block)
                 constant = finite.any(axis=1) & (np.where(finite, block, np.inf).min(axis=1) == np.where(finite, block, -np.inf).max(axis=1))

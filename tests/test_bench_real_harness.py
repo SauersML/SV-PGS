@@ -731,6 +731,37 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
     assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
 
 
+def test_raw_scores_score_from_the_run_record_when_the_split_file_is_missing(tmp_path):
+    """An older results layout kept its raw scores without a <tag>.raw_splits.json. The run's own record lists the
+    same splits in the same order, so the same command scores the old and the current layout alike; a layout with
+    neither is refused by name, and a column count that does not match the list is refused too."""
+    import json
+
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    within_group_fixture(tmp_path)
+    out = tmp_path / "results/m/loso"
+    order = ["loso/AFR", "loso/EUR"]
+    raw = np.arange(3 * 2 * 80, dtype=np.float32).reshape(3, 2, 80)
+    raw[0] = 2.5  # gene 0's fit is constant over its people, train and test: it predicts no differences at all
+    np.save(out / "chr.snv.raw_scores.npy", raw)
+    (out / "chr.raw_splits.json").write_text(json.dumps(order))
+    data = report.held_out(tmp_path)
+    expected = data.predictions(out, "chr", "snv", masked=False)
+    assert (expected[0] == 0.0).all()
+    (out / "chr.raw_splits.json").unlink()
+    for record in ({"splits": order}, {"merged_from": ["a", "b"], "parts": [{"splits": order[:1]}, {"splits": order[1:]}]}):
+        (out / "chr.run.json").write_text(json.dumps(record))
+        assert np.array_equal(data.predictions(out, "chr", "snv", masked=False), expected, equal_nan=True)
+    (out / "chr.run.json").write_text(json.dumps({"splits": order[:1]}))
+    with pytest.raises(ValueError, match="names 1 splits for 2 raw-score columns"):
+        data.predictions(out, "chr", "snv", masked=False)
+    (out / "chr.run.json").unlink()
+    with pytest.raises(ValueError, match="raw scores have no split order"):
+        data.predictions(out, "chr", "snv", masked=False)
+
+
 def test_a_covariate_only_score_scores_zero_and_a_foreign_dataset_is_refused(tmp_path):
     from benchmarks.bench_real import report
 
