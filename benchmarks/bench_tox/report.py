@@ -1,6 +1,6 @@
 """bench-tox's report from the harness's per-fold JSON lines (aggregates only): per design, method and arm, the mean
 held-out r² over folds and development compounds, the SV gain (snv_sv minus snv, paired by compound and fold), the
-screen's size, the fits' wall seconds, and how many fits certified or failed. Standard errors are a bootstrap over
+screen's size, the fits' wall seconds, and how many fits met the outer criterion or failed. Standard errors are a bootstrap over
 compounds of the fold-averaged r² (the compounds are correlated: PREREG.md gives their effective number, 13.2, so a
 compound bootstrap is the honest unit)."""
 from __future__ import annotations
@@ -29,7 +29,7 @@ def load(results: pathlib.Path) -> tuple[pd.DataFrame, list[dict]]:
                     rows.append({
                         "design": record["split"].split("/")[0], "split": record["split"], "compound": record["compound"], "arm": record["arm"],
                         "screened": record["screened"], "screened_sv": record["screened_sv"], "method": method, "r2": record[method]["r2"],
-                        "seconds": record[method]["seconds"], "status": record[method]["status"], "certified": record[method].get("certified"),
+                        "seconds": record[method]["seconds"], "status": record[method]["status"], "outer_criterion_met": record[method].get("outer_criterion_met"),
                     })
     return pd.DataFrame(rows), headers
 
@@ -46,7 +46,7 @@ def summarize(table: pd.DataFrame, seed: int = 0) -> pd.DataFrame:
             "mean_r2": float(values.mean()), "se_bootstrap_compounds": float(values[draws].mean(axis=1).std(ddof=1)),
             "median_screened": float(part["screened"].median()), "max_screened": int(part["screened"].max()),
             "empty_screens": int((part["screened"] == 0).sum()), "median_seconds": float(part["seconds"].median()), "max_seconds": float(part["seconds"].max()),
-            "failed": int((part["status"] != "ok").sum()), "certified": int(part["certified"].fillna(False).sum()) if method == "svpgs_mean_field" else None,
+            "failed": int((part["status"] != "ok").sum()), "outer_criterion_met": int(part["outer_criterion_met"].fillna(False).sum()) if method == "svpgs_mean_field" else None,
         })
     return pd.DataFrame(out)
 

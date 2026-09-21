@@ -390,6 +390,7 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
             predictive_intercept_shift=0.0,
         ))
     certificate = FitCertificate(
+        outer_criterion_met=np.array([outer.certified], dtype=bool),
         remaining_gain=np.array([outer.remaining_gain]),
         newton_decrement=np.array([outer.newton_decrement]),
         smoothing_gradient=np.array([outer.step.smoothing_gradient]),
