@@ -71,7 +71,7 @@ def classes_for_arm(variants: Any, arm: str) -> np.ndarray:
     return _METHOD._length_class(reference_length, reference_length + signed_length_change(variants))
 
 
-def _fit(train: Any, arm: str) -> SmallNPredictor:
+def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
         raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
@@ -87,6 +87,7 @@ def _fit(train: Any, arm: str) -> SmallNPredictor:
         draw_count=DRAW_COUNT,
         working_bytes=_METHOD.one_core_budget().working_bytes,
         seed=int.from_bytes(str(train.gene_id).encode()[:8].ljust(8, b"\0"), "big"),
+        inference=inference,
     )
     return SmallNPredictor(scoring=fit.scoring, profile=fit.profile)
 
@@ -104,3 +105,9 @@ def fit_expression_no_sv_terms(train: Any) -> SmallNPredictor:
 def fit_expression_no_annotations(train: Any) -> SmallNPredictor:
     """bench-real ablation arm: the genotypes alone, every annotation withheld (``svpgs_method``)."""
     return _fit(train, "no_annotations")
+
+
+def fit_expression_mean_field(train: Any) -> SmallNPredictor:
+    """bench-real: the full model with the small-n route's mean-field inference (``sv_pgs.mean_field``), the VB side
+    of the definition of done's inference measurement against ``fit_expression``'s EP."""
+    return _fit(train, "full", inference="mean_field")

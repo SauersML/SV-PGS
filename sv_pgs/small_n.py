@@ -40,7 +40,7 @@ from __future__ import annotations
 import time
 import weakref
 from dataclasses import dataclass, field
-from typing import Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
 import numpy as np
 from scipy import linalg, sparse
@@ -75,6 +75,10 @@ from sv_pgs.scale_mixture_ep import (
 )
 from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
 from sv_pgs.tie_members import TieGroups
+
+if TYPE_CHECKING:
+    from sv_pgs.mean_field import MeanFieldFixedPoints
+
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
@@ -1644,26 +1648,41 @@ def fit_small_n(
     working_bytes: int,
     seed: int,
     trait_type: TraitType = TraitType.QUANTITATIVE,
+    inference: str = "ep",
 ) -> SmallNFit:
     """Fit one quantitative model on the dense training codes (n x records, store codes) with ``covariates`` (n x k,
-    intercept first) and ``target`` (n,): Stage 0 dense, the prior, Stage 2's EP-EB with exact dense algebra, and
-    ``draw_count`` exact posterior draws (``seed``)."""
+    intercept first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of
+    ``fit_hyperparameters`` at the fixed points of ``inference`` ("ep": Stage 2's EP with exact dense algebra;
+    "mean_field": coordinate-ascent VB, ``mean_field.MeanFieldFixedPoints``), and ``draw_count`` posterior draws
+    (``seed``). The two inferences exist for the definition of done's measurement (item 3: the one that predicts
+    better under the same prior on bench-real is kept, the other deleted)."""
     if trait_type != TraitType.QUANTITATIVE:
         raise NotImplementedError("the small-n route fits quantitative traits (Stage 2 has no binary likelihood yet).")
+    if inference not in ("ep", "mean_field"):
+        raise ValueError("inference must be 'ep' or 'mean_field'.")
     started = time.perf_counter()
     statistics = dense_statistics(codes, covariates, target)
     offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
     prior = small_n_prior(statistics, variant_class, offsets, draw_count)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(statistics, prior)
-    oracle = _DenseFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
+    if inference == "ep":
+        oracle: _DenseFixedPoints | MeanFieldFixedPoints = _DenseFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
+    else:
+        from sv_pgs.mean_field import MeanFieldFixedPoints
+
+        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes)
     tolerance = 0.5 / draw_count
     try:
         (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
-        raise FloatingPointError(f"{error}; EP refusals: {oracle.refusals}") from error
-    # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
-    draws = oracle.mean[:, None] + np.sqrt(oracle.noise) * oracle.kernel.draws(np.random.default_rng(seed), draw_count)
+        raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
+    generator = np.random.default_rng(seed)
+    if inference == "ep":
+        # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
+        draws = oracle.mean[:, None] + np.sqrt(oracle.noise) * oracle.kernel.draws(generator, draw_count)
+    else:
+        draws = oracle.draws(outer.hyperparameters, generator, draw_count)
     alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ oracle.mean)
     # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
