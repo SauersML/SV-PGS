@@ -697,19 +697,35 @@ def _row_chunks(rows: I64Array, grid_size: int, working_bytes: int) -> Iterator[
 # ------------------------------------------------------------------ the tilted moments
 
 
-@dataclass(frozen=True)
 class _Components:
-    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j;
-    ``rounding`` bounds each log Z_j's rounding (``_KernelRows.components``)."""
+    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j
+    (``first`` to ``fourth``, formed by the kernel rows on first use: a pass without a scale design never asks for
+    them); ``rounding`` bounds each log Z_j's rounding (``_KernelRows.components``)."""
 
-    log_normalizer: F64Array
-    responsibility: F64Array
-    conditional_variance: F64Array
-    first: F64Array
-    second: F64Array
-    third: F64Array
-    fourth: F64Array
-    rounding: F64Array
+    __slots__ = ("log_normalizer", "responsibility", "conditional_variance", "rounding", "_rows")
+
+    def __init__(
+        self, log_normalizer: F64Array, responsibility: F64Array, conditional_variance: F64Array, rounding: F64Array, rows: "_KernelRows"
+    ) -> None:
+        self.log_normalizer, self.responsibility, self.conditional_variance, self.rounding, self._rows = (
+            log_normalizer, responsibility, conditional_variance, rounding, rows
+        )
+
+    @property
+    def first(self) -> F64Array:
+        return self._rows.derivatives()[0]
+
+    @property
+    def second(self) -> F64Array:
+        return self._rows.derivatives()[1]
+
+    @property
+    def third(self) -> F64Array:
+        return self._rows.derivatives()[2]
+
+    @property
+    def fourth(self) -> F64Array:
+        return self._rows.derivatives()[3]
 
 
 def _kernel_terms(
@@ -808,7 +824,6 @@ class _KernelRows:
         responsibility = self.exponentials * scaled[None, :] / np.where(lost, 1.0, products)[:, None]
         if np.any(lost):
             responsibility[lost] = np.exp(self.kernel[lost] + log_density[None, :] - log_normalizer[lost, None])
-        first, second, third, fourth = self.derivatives()
         # log Z_j's rounding (the verification harness's bound, tests/test_engine_verification._objective_rounding):
         # each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 rounds by about four ulps of its pieces' sizes,
         # the log-sum-exp adds eps times sum_k w_k (1 + |x_k - max|) relative to its sum, and its maximum's own ulp.
@@ -819,10 +834,7 @@ class _KernelRows:
         density_range = float(np.max(finite_density) - np.min(finite_density)) if finite_density.size else 0.0
         density_size = float(np.max(np.abs(finite_density))) if finite_density.size else 0.0
         rounding = _EPSILON * (np.abs(log_normalizer) + 1.0 + self._kernel_range + density_range + 4.0 * (density_size + self._pieces_max))
-        return _Components(
-            log_normalizer=log_normalizer, responsibility=responsibility, conditional_variance=self.conditional,
-            first=first, second=second, third=third, fourth=fourth, rounding=rounding,
-        )
+        return _Components(log_normalizer, responsibility, self.conditional, rounding, self)
 
 
 def _components(
@@ -1578,8 +1590,12 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         fields["variance_by_shift"][rows] = expectation(deviation**3) + 3.0 * expectation(conditional * deviation)
         fields["mean_by_precision"][rows] = mean_by_precision
         fields["variance_by_precision"][rows] = second_by_precision - 2.0 * mean * mean_by_precision
-        fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
-        fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
+        if prior.scale_size:
+            fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
+            fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
+        else:
+            # No scale design: nothing moves log u, and the kernel's derivatives are never formed.
+            fields["mean_by_log_scale"][rows] = fields["second_by_log_scale"][rows] = 0.0
         mean_by_density[rows] = weights * deviation
         second_by_density[rows] = weights * (raw_second - second[:, None])
     return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
@@ -1589,9 +1605,13 @@ def _through_z(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64
     """(p x r): each variant's derivative in z applied to the directions (C K + L) x r."""
     grid_size = prior.grid_size
     density_part = directions_z[: prior.density_size].reshape(prior.class_count, grid_size, -1)
-    return np.einsum("jk,jkr->jr", by_density, density_part[prior.class_index]) + by_log_scale[:, None] * (
-        prior.scale_design @ directions_z[prior.density_size :]
-    )
+    # One GEMM per class (the same sums; gathering the class directions per variant would hold p x K x r at once).
+    result = np.empty((prior.variant_count, directions_z.shape[1]))
+    for class_position, rows in enumerate(prior.class_rows):
+        result[rows] = by_density[rows] @ density_part[class_position]
+    if prior.scale_size:
+        result += by_log_scale[:, None] * (prior.scale_design @ directions_z[prior.density_size :])
+    return result
 
 
 def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, values: F64Array) -> F64Array:
@@ -1786,8 +1806,14 @@ def _curvature_trace_gradient(
     for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         density_density = covariance_z[span, span]
-        density_scale = covariance_z[span, scale_span]
         weights = terms.responsibility
+        if not prior.scale_size:
+            # Without a scale design every scale term is zero: the eta gradient is Q [diag N - 2 N w] alone, with
+            # N = Sigma_eta, and the kernel's derivatives are never formed.
+            inner = np.diag(density_density)[None, :] - 2.0 * (weights @ density_density)
+            density_gradient[class_position] -= np.sum(weights * (inner - np.sum(weights * inner, axis=1)[:, None]), axis=0)
+            continue
+        density_scale = covariance_z[span, scale_span]
         first, second, third = terms.first, terms.second, terms.third
         design = prior.scale_design[rows]
         scale_scale = np.sum((design @ scale_covariance) * design, axis=1)
