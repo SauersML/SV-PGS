@@ -125,7 +125,7 @@ def _objective_rounding(prior, coefficients: np.ndarray, cavity: Cavity) -> floa
     total = 0.0
     for class_position, rows in enumerate(prior.class_rows):
         _conditional, retained, _ratio, log_component, signal = _kernel_terms(
-            log_density[class_position], scales[rows], prior.log_variance_grid, prior.kernel_floor, cavity.precision[rows], cavity.shift[rows]
+            log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
         )
         peak = np.max(log_component, axis=1)
         weights = np.exp(log_component - logsumexp(log_component, axis=1)[:, None])
@@ -140,14 +140,27 @@ def _objective_rounding(prior, coefficients: np.ndarray, cavity: Cavity) -> floa
 _DENSE_CONDITIONS: list[float] = []
 
 
-def _dense_gmres(operator, right, **_options):
-    """GMRES's stand-in for the harness: the linear response solved exactly by a dense factorization of the
-    operator (materialized column by column), so B is tested apart from its Krylov solver's convergence. Each
-    operator's condition number is recorded for the failure messages."""
-    size = right.shape[0]
-    matrix = np.column_stack([operator.matvec(column) for column in np.eye(size)])
-    _DENSE_CONDITIONS.append(float(np.linalg.cond(matrix)))
-    return np.linalg.solve(matrix, right), 0
+def _dense_posterior(covariance: np.ndarray, exact_response: bool) -> GaussianPosterior:
+    """q's responses from a dense covariance: ``solve`` and ``variance_jvp`` exactly, and, with ``exact_response``,
+    the linear response solved by a dense factorization of (I - (I - diag(w) S2) M), S2 = Sigma o Sigma and
+    M = diag(left) Sigma diag(right) + diag(diagonal) (``GaussianPosterior.linear_response``'s contract), so B is
+    tested apart from its Krylov solver's convergence. Each operator's condition number is recorded for the failure
+    messages. Without it the engine solves the response by its block Krylov route."""
+    squared = covariance * covariance
+
+    def linear_response(left, right, diagonal, weight, rhs):
+        size = covariance.shape[0]
+        moved = left[:, None] * covariance * right[None, :] + np.diag(diagonal)
+        matrix = np.eye(size) - (np.eye(size) - weight[:, None] * squared) @ moved
+        _DENSE_CONDITIONS.append(float(np.linalg.cond(matrix)))
+        return np.linalg.solve(matrix, rhs)
+
+    return GaussianPosterior(
+        solve=lambda right, _relative_tolerance: covariance @ right,
+        variance_jvp=lambda weights: -squared @ weights,
+        linear_response=linear_response if exact_response else None,
+        exact=exact_response,
+    )
 
 
 # ---------------------------------------------------------------- 1. tilted moments against direct quadrature
@@ -441,9 +454,9 @@ def _log_ep_evidence(likelihood_precision, linear_term, site_precision, site_shi
     return gaussian + float(np.sum(moments.log_normalizer - site_normalizers))
 
 
-def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np.ndarray, monkeypatch) -> None:
+def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np.ndarray) -> None:
     """The fixed-cavity gradient and the total curvature B against differences of log Z_EP, EP re-solved at every
-    point, along random directions. B's linear response is solved densely (``_dense_gmres``)."""
+    point, along random directions. B's linear response is solved densely (``_dense_posterior``)."""
     variant_count = genotypes.shape[1]
     likelihood_precision, linear_term = _gaussian_likelihood(generator, genotypes)
     nodes = np.linspace(np.log(1e-4), np.log(0.3), 8)
@@ -452,13 +465,8 @@ def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np
     site_precision, site_shift, covariance, cavity, moments = _expectation_propagation(prior, coefficients, likelihood_precision, linear_term)
     mapping = prior.coefficient_map
     fixed_cavity_gradient = mapping.T @ _data_objective(prior, coefficients, cavity, _WORKING_BYTES).gradient
-    posterior = GaussianPosterior(
-        solve=lambda right: covariance @ right,
-        variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance),
-    )
-    with monkeypatch.context() as patch:
-        patch.setattr(scale_mixture_ep, "gmres", _dense_gmres)
-        total_curvature = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, _EPSILON)
+    posterior = _dense_posterior(covariance, exact_response=True)
+    total_curvature = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, _EPSILON)
 
     def evidence(point):
         solved = _expectation_propagation(prior, point, likelihood_precision, linear_term, (site_precision, site_shift))
@@ -490,8 +498,8 @@ def _check_ep_evidence_derivatives(generator: np.random.Generator, genotypes: np
 
 @pytest.mark.parametrize("seed", _SEEDS)
 @pytest.mark.parametrize("correlation", (0.0, 0.7, 0.95))
-def test_the_total_curvatures_krylov_solve_matches_the_dense_one(seed, correlation, monkeypatch):
-    """``_total_curvature``'s GMRES against the dense solve at the relative tolerance ``_evidence`` passes for the
+def test_the_total_curvatures_krylov_solve_matches_the_dense_one(seed, correlation):
+    """``_total_curvature``'s block Krylov solve against the dense response at the relative tolerance ``_evidence`` passes for the
     fit's evidence tolerance, max(tolerance / D, eps): a relative error e in B is what that tolerance allows."""
     generator = np.random.default_rng(seed)
     likelihood_precision, linear_term = _gaussian_likelihood(generator, _ar1_genotypes(generator, 10, 300, correlation))
@@ -499,27 +507,21 @@ def test_the_total_curvatures_krylov_solve_matches_the_dense_one(seed, correlati
     prior = _prior(generator, 10, nodes, nodes[0] - 1.0, nodes[-1], class_count=1 + int(generator.integers(2)), annotated=False)
     coefficients = initial_hyperparameters(prior).coefficients + 0.3 * generator.standard_normal(prior.coefficient_size)
     _precision, _shift, covariance, cavity, _moments = _expectation_propagation(prior, coefficients, likelihood_precision, linear_term)
-    posterior = GaussianPosterior(
-        solve=lambda right: covariance @ right,
-        variance_jvp=lambda weights: -np.einsum("jk,kr,kj->jr", covariance, weights, covariance),
-    )
     relative = max(_EVIDENCE_TOLERANCE / coefficients.shape[0], _EPSILON)
-    krylov = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, relative)
-    with monkeypatch.context() as patch:
-        patch.setattr(scale_mixture_ep, "gmres", _dense_gmres)
-        dense = _total_curvature(prior, coefficients, cavity, posterior, _WORKING_BYTES, relative)
+    krylov = _total_curvature(prior, coefficients, cavity, _dense_posterior(covariance, exact_response=False), _WORKING_BYTES, relative)
+    dense = _total_curvature(prior, coefficients, cavity, _dense_posterior(covariance, exact_response=True), _WORKING_BYTES, relative)
     error = float(np.linalg.norm(krylov - dense, 2) / np.linalg.norm(dense, 2))
     assert error <= relative, (error, relative, _DENSE_CONDITIONS[-1])
 
 
 @pytest.mark.parametrize("seed", _SEEDS)
 @pytest.mark.parametrize("correlation", (0.0, 0.7, 0.95))
-def test_the_fixed_cavity_gradient_and_the_total_curvature_are_the_ep_evidence_derivatives(seed, correlation, monkeypatch):
+def test_the_fixed_cavity_gradient_and_the_total_curvature_are_the_ep_evidence_derivatives(seed, correlation):
     generator = np.random.default_rng(seed)
-    _check_ep_evidence_derivatives(generator, _ar1_genotypes(generator, 10, 300, correlation), monkeypatch)
+    _check_ep_evidence_derivatives(generator, _ar1_genotypes(generator, 10, 300, correlation))
 
 
-def test_the_ep_evidence_derivatives_on_public_1kgp_windows(monkeypatch):
+def test_the_ep_evidence_derivatives_on_public_1kgp_windows():
     """Real LD: windows of consecutive common biallelic SNVs from the public 1kGP high-coverage phased panel (EBI),
     as an .npz of dosage matrices named by ``SV_PGS_PUBLIC_WINDOWS``; skipped where no such file is given
     (``scripts`` in the verify-engine lane builds it on MSI). The traits are simulated [semi-real]."""
@@ -530,7 +532,7 @@ def test_the_ep_evidence_derivatives_on_public_1kgp_windows(monkeypatch):
         pytest.skip("no public 1kGP windows given (SV_PGS_PUBLIC_WINDOWS)")
     with np.load(path) as windows:
         for position, name in enumerate(sorted(windows.files)):
-            _check_ep_evidence_derivatives(np.random.default_rng(position), np.asarray(windows[name], dtype=np.float64), monkeypatch)
+            _check_ep_evidence_derivatives(np.random.default_rng(position), np.asarray(windows[name], dtype=np.float64))
 
 
 # ---------------------------------------------------------------- 5. V's formula, recomputed independently

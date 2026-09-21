@@ -43,6 +43,7 @@ import numpy as np
 
 from sv_pgs import fit_model
 from sv_pgs.compute_budget import RUNQ_MEMORY_VARIABLE, ComputeBudget, detect_compute_budget
+from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -117,6 +118,9 @@ def write_store(
     identifiers = "".join(f"{chromosome}-{row}" for row in range(count)).encode()
     lengths = np.array([len(f"{chromosome}-{row}") for row in range(count)], dtype=np.int64)
     table = VariantTable(
+        # bench-sim's harness codes are ALT dosages x 127: every record decodes as an ALT count (DS = code / 127).
+        codes_per_unit=allele_count_decode(count)[0],
+        value_origin=allele_count_decode(count)[1],
         chromosome=np.full(count, chromosome_number(chromosome), dtype=np.int8),
         position=np.asarray(position, dtype=np.int64),
         genetic_position_cm=np.asarray(genetic_position_cm, dtype=np.float64),

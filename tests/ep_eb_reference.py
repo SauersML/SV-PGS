@@ -839,25 +839,22 @@ def _sequential_sweep(prior, vector, likelihood_precision, linear_term, state: S
     fixed point). Sequential updates settle strongly coupled (LD-tied) sites where a
     parallel sweep or a Newton step on all sites at once is only valid in a tiny region. None if
     the swept sites leave the domain."""
-    mixing_coefficients, annotation_coefficients = _unpack(prior, vector)
-    log_scale = prior.log_variance_offset + prior.centred_design @ annotation_coefficients
-    log_density = log_mixing_density(prior, mixing_coefficients)[prior.class_index]
+    count = linear_term.shape[0]
     site_precision = state.site_precision.copy()
     site_shift = state.site_shift.copy()
     covariance = state.covariance.copy()
     mean = state.posterior_mean.copy()
-    for variant in range(linear_term.shape[0]):
+    for variant in range(count):
         marginal = covariance[variant, variant]
         cavity_precision = 1.0 / marginal - site_precision[variant]
         cavity_shift = mean[variant] / marginal - site_shift[variant]
         if not cavity_precision > 0.0:
             return None
-        variance = np.exp(log_scale[variant] + prior.mixing.nodes)
-        conditional = variance / (1.0 + variance * cavity_precision)
-        log_component = log_density[variant] + _log_component_normalizer(variance, cavity_precision, cavity_shift**2)
-        weights = np.exp(log_component - logsumexp(log_component))
-        tilted_mean = cavity_shift * float(weights @ conditional)
-        tilted_variance = float(weights @ (conditional + (cavity_shift * conditional) ** 2)) - tilted_mean**2
+        # The variant's tilted moments through ``tilted_power_moments`` itself (the one place the tilted law is
+        # written, and what a test may stand in for): every row at this variant's cavity, its own row read.
+        moments = tilted_power_moments(prior, vector, np.full(count, cavity_precision), np.full(count, cavity_shift))
+        tilted_mean = float(moments["first"][variant])
+        tilted_variance = float(moments["second"][variant]) - tilted_mean**2
         precision_step = 1.0 / tilted_variance - cavity_precision - site_precision[variant]
         shift_step = tilted_mean / tilted_variance - cavity_shift - site_shift[variant]
         column = covariance[:, variant].copy()
