@@ -3571,8 +3571,15 @@ def fit_hyperparameters(
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
 
-    def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial:
+    def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        if polishes and newton.definite and newton.decrement <= tolerance and states[model] is not None:
+            # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
+            # tolerance, so the state is planned once more. (A polish that only ends on a step below x's own
+            # resolution walks a flat ray to the family's boundary: on gene 1 [real] the width -> 0 ray, 2.8 units
+            # a step with 1e-4 to 1e-7 nats each, until the density collapsed.)
+            states[model] = replace(states[model], polished=True)
+            return None
         radius = radii[model]
         if radius is None:
             radius = _cauchy_radius(newton)
