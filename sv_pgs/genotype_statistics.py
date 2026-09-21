@@ -691,7 +691,10 @@ class _LdGramWriter:
                 entry: dict[str, Any] = {"chromosome": chromosome}
                 for name, values in arrays.items():
                     entry[f"{name}_offset"] = self._offsets[name]
-                    self._files[name].write(memoryview(np.ascontiguousarray(values, dtype=_LD_ARRAYS[name][1])).cast("B"))
+                    # The array is written through its own buffer, not a byte-cast memoryview: a block with no active
+                    # row has a zero in its shape, which memoryview.cast refuses, and an empty block is a valid block
+                    # (every candidate of that block monomorphic on these training rows). Both write the same bytes.
+                    self._files[name].write(np.ascontiguousarray(values, dtype=_LD_ARRAYS[name][1]))
                     self._offsets[name] += int(values.size)
                 self.entries[(chromosome, start)] = entry
             except BaseException as error:

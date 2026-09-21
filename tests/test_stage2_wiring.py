@@ -151,16 +151,7 @@ def _fit_one_model(root: Path, milli: np.ndarray, training: np.ndarray, targets:
     ("case", "reason"),
     [
         ("monomorphic_store", "no store record carries signal"),
-        pytest.param(
-            "monomorphic_on_training",
-            "monomorphic on these training rows",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="Stage 0 cannot write an LD block with no active row: genotype_statistics.py:694 raises "
-                "TypeError('memoryview: cannot cast view with zeros in shape or strides') before the wiring sees the "
-                "empty active set. The wiring's own handling of it is there; the store pass has to survive it first.",
-            ),
-        ),
+        ("monomorphic_on_training", "monomorphic on these training rows"),
         ("covariates_explain_the_target", "explain every training target to working precision"),
     ],
 )
