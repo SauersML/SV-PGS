@@ -698,7 +698,8 @@ def _row_chunks(rows: I64Array, grid_size: int, working_bytes: int) -> Iterator[
 
 @dataclass(frozen=True)
 class _Components:
-    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j."""
+    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j;
+    ``rounding`` bounds each log Z_j's rounding (``_KernelRows.components``)."""
 
     log_normalizer: F64Array
     responsibility: F64Array
@@ -707,6 +708,7 @@ class _Components:
     second: F64Array
     third: F64Array
     fourth: F64Array
+    rounding: F64Array
 
 
 def _kernel_terms(
@@ -798,9 +800,19 @@ class _KernelRows:
         if np.any(lost):
             responsibility[lost] = np.exp(self.kernel[lost] + log_density[None, :] - log_normalizer[lost, None])
         first, second, third, fourth = self.derivatives()
+        # log Z_j's rounding (the verification harness's bound, tests/test_engine_verification._objective_rounding):
+        # each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 rounds by about four ulps of its pieces' sizes,
+        # the log-sum-exp adds eps times sum_k w_k (1 + |x_k - max|) relative to its sum, and its maximum's own ulp.
+        # |log Z_j| alone understates this wherever the terms are large and cancel.
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            pieces = np.abs(log_density)[None, :] - 0.5 * np.log(self.retained) + 0.5 * self._signal
+            spread = np.abs(self.kernel + log_density[None, :] - (self.peak + np.max(log_density))[:, None])
+            # A node of weight zero (its kernel at the overflow limit) contributes nothing, whatever its pieces.
+            per_node = np.where(responsibility > 0.0, responsibility * (1.0 + spread + 4.0 * pieces), 0.0)
+        rounding = _EPSILON * (np.abs(log_normalizer) + np.sum(per_node, axis=1))
         return _Components(
             log_normalizer=log_normalizer, responsibility=responsibility, conditional_variance=self.conditional,
-            first=first, second=second, third=third, fourth=fourth,
+            first=first, second=second, third=third, fourth=fourth, rounding=rounding,
         )
 
 
@@ -1002,12 +1014,16 @@ def noise_gain(new_noise: float, old_noise: float, sample_count: int, covariate_
 
 @dataclass(frozen=True)
 class _Objective:
-    """sum_j log Z_j at fixed cavities, its gradient and Hessian in z, and the sum of |log Z_j| (its rounding scale)."""
+    """sum_j log Z_j at fixed cavities, its gradient and Hessian in z, the sum of |log Z_j| (its scale), and ``rounding``,
+    a bound on |value - sum_j log Z_j| in double precision: each term's own (``_Components.rounding``) plus the
+    recursive summation's, at most (p - 1) eps of the terms' sizes (Higham, Accuracy and Stability of Numerical
+    Algorithms, 2nd ed., Lemma 3.1)."""
 
     value: float
     gradient: F64Array
     hessian: F64Array
     magnitude: float
+    rounding: float
 
 
 def _data_objective(
@@ -1022,13 +1038,18 @@ def _data_objective(
             array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
             prior.log_variance_grid, cavity.precision, cavity.shift, prior.scale_design, working_bytes,
         )
-        return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
+        # The device kernel returns the terms' sizes, not their pieces: the bound is the summation lemma's on K-term
+        # log-sum-exps and p terms, (K + 1 + p) eps of the sizes.
+        return _Objective(
+            value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
+            rounding=(prior.grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
+        )
     grid_size = prior.grid_size
     scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
     dimension = prior.density_size + prior.scale_size
     gradient = np.zeros(dimension)
     hessian = np.zeros((dimension, dimension))
-    value = magnitude = 0.0
+    value = magnitude = rounding = 0.0
     density = np.exp(class_log_density(prior, coefficients))
     responsibility_sum = np.zeros((prior.class_count, grid_size))
     responsibility_outer = np.zeros((prior.class_count, grid_size, grid_size))
@@ -1037,6 +1058,7 @@ def _data_objective(
         responsibility = terms.responsibility
         value += float(np.sum(terms.log_normalizer))
         magnitude += float(np.sum(np.abs(terms.log_normalizer)))
+        rounding += float(np.sum(terms.rounding))
         responsibility_sum[class_position] += responsibility.sum(axis=0)
         responsibility_outer[class_position] += responsibility.T @ responsibility
         if prior.scale_size:
@@ -1060,7 +1082,10 @@ def _data_objective(
         )
         hessian[span, scale_span] = cross[class_position]
         hessian[scale_span, span] = cross[class_position].T
-    return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
+    return _Objective(
+        value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
+        rounding=rounding + max(prior.variant_count - 1, 0) * _EPSILON * magnitude,
+    )
 
 
 def _data_value(
@@ -1200,7 +1225,8 @@ def _maximize_coefficients(
     ascent = _ascent_direction(-hessian, gradient, spectrum)
     radius = float(np.linalg.norm(ascent))
     while True:
-        rounding = _EPSILON * (objective.magnitude + abs(value))
+        # The objective's own rounding (its terms' and their summation's) plus the penalized value's arithmetic.
+        rounding = objective.rounding + _EPSILON * abs(value)
         definite = float(spectrum[0][0]) > 0.0
         if definite and 0.5 * float(gradient @ ascent) <= max(tolerance, rounding):
             return coefficients, objective
@@ -2412,7 +2438,7 @@ def _evidence_once(
         newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
         curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
         sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
-        rounding = _EPSILON * (objective.magnitude + abs(value))
+        rounding = objective.rounding + _EPSILON * abs(value)
         # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
         # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
