@@ -642,11 +642,14 @@ def relattice(
     """The same model on new nodes and a new kernel range.
 
     The model holds each lattice function (the pooled log g and every class deviation) by its nodal values, and its
-    roughness is the integral of the m-th derivative squared (m = ``ROUGHNESS_ORDER``); the continuous function it
-    implies between the nodes is the one of least roughness through them, the natural spline of degree 2m - 1,
+    roughness is the integral of the m-th derivative squared (m = ``ROUGHNESS_ORDER``) in its finite-difference
+    form (``roughness_factor``: h^-(2m-1) ||D_m eta||^2, the integral's discretization on the lattice). The
+    continuous function of least integrated roughness through the nodes is the natural spline of degree 2m - 1,
     whose derivatives m to 2m - 2 vanish at both ends (Schoenberg; Wahba 1990, Section 1.3), and beyond the ends
-    that function continues as the polynomial of degree m - 1 its end derivatives set: the continuation of no
-    roughness at all. So a finer or wider lattice holds the same density, and only the quadrature changes.
+    it continues as the polynomial of degree m - 1 its end derivatives set: the continuation of no roughness at
+    all. The two roughnesses agree to the discretization's order in the spacing, not exactly (nine nodes over four
+    units of sin t + 0.1 t^4: 14.1 by differences against 19.1 integrated; the audit's M22), so a finer or wider
+    lattice holds the same density to that order, and ``halved_lattice`` is what refines it.
 
     Each part moves on its own: the pooled shape and the deviations are one decomposition of the class densities
     (a common shift of every deviation is a pooled shift), and a least-squares fit of the class densities alone
@@ -2996,7 +2999,10 @@ def _maximize_evidence(
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
     at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
     (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight is released to the
-    centre of its resolvable range when the certified V is higher there. There is no lambda = 0 edge (see the module
+    centre of its resolvable range when the certified V is higher there. That is one probe of the interior per
+    block, not a proof over its range: a V below the edge at the centre and above it elsewhere in the range keeps
+    the block at its edge (the audit's M06), and what the fit then certifies is the stationarity it reached, as
+    ``OuterFit`` says. There is no lambda = 0 edge (see the module
     docstring), so a start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
     global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
     the start.
