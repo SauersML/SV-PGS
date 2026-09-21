@@ -133,6 +133,37 @@ def test_the_scale_calibrates_at_every_dosage_where_a_linear_map_only_matches_co
     assert linear.min() < 0.0
 
 
+def test_the_reliability_survives_an_affine_map_of_the_column_but_not_the_shape():
+    """The offset is log of a squared correlation, so units and centring do not move it.
+
+    Rescaling and shifting the stored column leaves the reliability, the fitted shape and the
+    calibrated column where they were, which is what lets the codec's scale, the engine's centring
+    and this recalibration all happen without the prior's offset following them. The monotone shape
+    is not an affine map, so the reliability has to be measured on the shaped column
+    (docs/design/math/scale_model.md section 1).
+    """
+    generator = np.random.default_rng(16)
+    genotype = _genotypes(generator, 100_000, frequency=0.2)
+    dosage = np.round(2.0 * np.sqrt(genotype / 2.0) + generator.normal(0.0, 0.3, genotype.size), 2)
+    truth_a = genotype + generator.normal(0.0, 0.4, genotype.size)
+    truth_b = genotype + generator.normal(0.0, 0.3, genotype.size)
+    rescaled = 0.5 * dosage - 3.0
+
+    stored = triad_squared_correlation(dosage, truth_a, truth_b)
+    assert triad_squared_correlation(rescaled, truth_a, truth_b) == pytest.approx(stored, rel=1e-9)
+
+    curve = fit_calibration_shape(dosage, truth_a, stratum="stored", version="test")
+    affine = fit_calibration_shape(rescaled, truth_a, stratum="rescaled", version="test")
+    np.testing.assert_array_equal(affine.shape(rescaled), curve.shape(dosage))
+
+    shaped = triad_squared_correlation(curve.shape(dosage), truth_a, truth_b)
+    assert abs(shaped - stored) > 0.01
+    curve = replace(curve, scale=calibrated_scale(
+        float(np.sqrt(shaped)), float(np.std(genotype)), float(np.std(curve.shape(dosage)))
+    ))
+    assert triad_squared_correlation(curve.apply(dosage), truth_a, truth_b) == pytest.approx(shaped, rel=1e-9)
+
+
 def test_calibration_curve_round_trips_and_rejects_a_constant_dosage():
     curve = CalibrationCurve("VNTR", "v1", np.array([0.0, 1.0, 2.0]), np.array([0.1, 0.8, 1.7]), 0.9)
     restored = CalibrationCurve.from_dict(curve.to_dict())

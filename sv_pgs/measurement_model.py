@@ -19,7 +19,15 @@ truth samples, and on public benchmarks from their truth.
    caller-given design, over all the stratum's pairs, and each record's own
    slope is shrunk toward it by a normal-normal empirical Bayes whose
    between-record variance is the energy-weighted moment estimate (0 when the
-   records agree).
+   records agree). This is the linear calibration; its monotone counterpart, for
+   a column whose E[G | D] is curved, is imputation_reliability's isotonic shape.
+   Both regress a truth on D, which the truth's own error does not attenuate: it
+   attenuates the correlation of D with the truth, not the regression on D. Both
+   also give Cov(G, D*) = Var(D*), which is one orthogonality condition and not
+   calibration at every dosage; only the monotone map delivers E[G | D*] = D*.
+   mu_j is the column's own mean, so D* carries the dosage's mean rather than the
+   genotype's; every column is centred before it is fitted, so only kappa_j
+   reaches the fit.
 2. Conditional moments. With D* calibrated, the residual variance
    v_j = E[(G - D*_j)^2] = Var(G_j) - Var(D*_j) = V_j (lambda_j - kappa_j^2),
    with lambda = Var(G) / Var(D) fitted like kappa(x), enters the predictive
