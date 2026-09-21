@@ -37,6 +37,7 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 import pandas as pd
+import threadpoolctl
 
 CIS_RADIUS_BP = 1_000_000
 SEALED_GENES = "sealed_confirmation_genes.tsv"
@@ -480,8 +481,42 @@ def load_method(spec: str):
 
 _WORKER = {}
 
+# The thread counts a worker's own libraries read. A fit is one process's share of the task, so each of these is its
+# share of the task's cores, not the node's.
+_THREAD_VARIABLES = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "NUMBA_NUM_THREADS")
 
-def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False, finished=()):
+
+def _worker_threads(workers):
+    """Threads for one worker: the task's cores over its workers, at least one. None when the environment states one.
+
+    Without this the pool oversubscribes by the worker count: the parent opens a BLAS pool sized to the node it sees
+    (OpenBLAS takes min(cores, 64)), every forked worker inherits it, and W workers of an eight-core task run
+    W x 64 threads on eight cores. The task's cores are RUNQ_CORES where the runner names them, and otherwise this
+    process's CPU affinity, which is the slice it may use; neither is a constant. An environment that already names
+    any of the thread variables has stated its own budget, and the harness leaves it alone."""
+    if any(name in os.environ for name in _THREAD_VARIABLES):
+        return None
+    cores = int(os.environ["RUNQ_CORES"]) if "RUNQ_CORES" in os.environ else len(os.sched_getaffinity(0))
+    return max(cores // max(int(workers), 1), 1)
+
+
+def _limit_worker_threads(threads):
+    """Hold this process's BLAS, OpenMP and numba threads at ``threads`` (None: the environment's own budget stands).
+
+    Both halves are needed after a fork. The variables reach the runtimes this worker loads itself, which is most of
+    them: the method module is imported below, in the worker. The limiter reaches the ones the fork inherited already
+    open, which no variable can change, by calling each loaded runtime's own setter. It is kept for the worker's life
+    rather than used as a context manager, so nothing restores the parent's pool size."""
+    if threads is None:
+        return
+    for name in _THREAD_VARIABLES:
+        os.environ[name] = str(threads)
+    _WORKER["thread_limits"] = threadpoolctl.threadpool_limits(limits=threads)
+
+
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False, finished=(),
+                 threads=None):
+    _limit_worker_threads(threads)
     _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
@@ -584,7 +619,8 @@ def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_n
     if not todo:
         return
     with get_context("fork").Pool(workers, initializer=_init_worker,
-                                  initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures, finished)) as pool:
+                                  initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures, finished,
+                                            _worker_threads(workers))) as pool:
         yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in todo], chunksize=1)
 
 

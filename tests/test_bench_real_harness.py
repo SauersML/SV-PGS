@@ -1,5 +1,6 @@
 """Leakage and bookkeeping checks of the bench-real harness on synthetic inputs (no MAGE or 1kGP data)."""
 
+import os
 import pathlib
 
 import pytest
@@ -153,6 +154,50 @@ def tiny_dataset(tmp_path):
     (tmp_path / "splits.sha256").write_text("synthetic\n")
     (tmp_path / "gene_annotation.json").write_text(json.dumps({"g1": {"start": 90, "end": 110, "strand": "+", "exons": [[95, 105]], "coding_exons": []}}))
     return tmp_path
+
+
+def _reported_thread_limits():
+    import threadpoolctl
+
+    return [entry["num_threads"] for entry in threadpoolctl.threadpool_info()]
+
+
+def _reported_thread_variables():
+    return {name: os.environ.get(name) for name in harness._THREAD_VARIABLES}
+
+
+def test_a_worker_gets_its_share_of_the_tasks_cores(monkeypatch):
+    """A worker's thread budget is the task's cores over its workers, at least one, and the environment's own budget
+    wins where it states one. A pool without this oversubscribes by the worker count."""
+    for name in harness._THREAD_VARIABLES:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("RUNQ_CORES", "8")
+    assert harness._worker_threads(1) == 8
+    assert harness._worker_threads(4) == 2
+    # More workers than cores: a worker still gets a thread, never zero.
+    assert harness._worker_threads(16) == 1
+    monkeypatch.delenv("RUNQ_CORES")
+    assert harness._worker_threads(2) == max(len(os.sched_getaffinity(0)) // 2, 1)
+    monkeypatch.setenv("OMP_NUM_THREADS", "3")
+    assert harness._worker_threads(4) is None
+
+
+def test_a_forked_worker_runs_at_its_own_thread_budget():
+    """The fork inherits the parent's open BLAS pool, which no environment variable reaches, so the initializer holds
+    the worker's runtimes down by their own setters."""
+    from multiprocessing import get_context
+
+    generator = np.random.default_rng(0)
+    # Open the parent's BLAS pool before the fork, as a run does, so the worker has something to inherit.
+    np.linalg.svd(generator.standard_normal((128, 128)))
+    parent = _reported_thread_limits()
+    if not parent:
+        pytest.skip("no threaded runtime here for threadpoolctl to report")
+    with get_context("fork").Pool(1, initializer=harness._limit_worker_threads, initargs=(1,)) as pool:
+        limits = pool.apply(_reported_thread_limits)
+        variables = pool.apply(_reported_thread_variables)
+    assert limits and all(count == 1 for count in limits), f"parent {parent}, worker {limits}"
+    assert set(variables.values()) == {"1"}
 
 
 def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
