@@ -4,6 +4,10 @@ Every column of ``targets`` and ``training`` is one model: a trait on one traini
 of a trait's observed rows). ``full_data_fit.fit_models`` runs Stage 0 once over the union of the training rows and
 fits every model by EP-EB from its learned prior; this module checks the cohort, adds the provenance, and splits the
 certificate into per-model terms, whole-fit counts and refusals for ``artifact.FittedModel``.
+
+``FitRequest`` is the whole input of one fit, checked and normalized by its own constructor. ``fit`` takes nothing
+else, so a caller that builds a request (``workspace_pipeline``'s fit step) either builds this exact object or fails
+where it builds it: there is no keyword list to drift from the fitter's signature.
 """
 
 from __future__ import annotations
@@ -75,79 +79,108 @@ def certificate_parts(certificate: FitCertificate, model_count: int) -> Certific
     return CertificateParts(terms=terms, counts=counts, refusals=refusals)
 
 
-def fit(
-    *,
-    store: DosageStore,
-    store_columns: I64Array,
-    covariates: F64Array,
-    covariate_names: Sequence[str],
-    covariate_columns: BoolArray,
-    targets: F64Array,
-    training: BoolArray,
-    model_names: Sequence[str],
-    trait_types: Sequence[TraitType],
-    research_ids: Sequence[str],
-    log_variance_offset: F64Array | None,
-    budget: ComputeBudget,
-    work_dir: str | Path,
-    seed: int,
-) -> FittedModel:
-    """Fit every model on its training rows and return the artifact.
+@dataclasses.dataclass(frozen=True)
+class FitRequest:
+    """One fit's whole input, checked and normalized here, so ``fit`` never validates a second time.
 
     Cohort row i is the store sample ``store_columns[i]`` with id ``research_ids[i]``; ``covariates`` [n, k] holds the
     named covariates of every model without the intercept, as ``artifact.predict`` takes them, and
     ``covariate_columns`` [models, k] the ones each model adjusts for besides the intercept; ``targets`` and
-    ``training`` are [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store records] is each
-    record's log measurement reliability, log r^2 <= 0, the prior's variance offset (-inf: the record carries no
-    signal); None takes r^2 from the store's ``quality`` column. Stage 0 keeps its LD blocks under ``work_dir``.
+    ``training`` are [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store
+    records] is each record's log measurement reliability, log r^2 <= 0, the prior's variance offset (-inf: the record
+    carries no signal); None takes r^2 from the store's ``quality`` column. Stage 0 keeps its LD blocks under
+    ``work_dir``.
+
+    The fit has no measurement-object and no target-variance term: the measurement model enters as the records'
+    ``log_variance_offset`` (and as the store's own recalibrated dosages), and every target is taken as measured
+    exactly. A caller with a term this request has no field for cannot pass it, so nothing is dropped in silence.
     """
-    columns = np.asarray(store_columns, dtype=np.int64)
-    covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    target_matrix = np.asarray(targets, dtype=np.float64)
-    training_mask = np.asarray(training, dtype=bool)
-    row_count, model_count = columns.shape[0], len(model_names)
-    if columns.ndim != 1 or np.unique(columns).shape[0] != row_count or np.any(columns < 0) or np.any(columns >= store.n_samples):
-        raise ValueError("store_columns must name distinct store samples.")
-    if len(research_ids) != row_count or len(set(research_ids)) != row_count:
-        raise ValueError("research_ids needs one distinct id per cohort row.")
-    if covariate_matrix.shape != (row_count, len(covariate_names)) or not np.all(np.isfinite(covariate_matrix)):
-        raise ValueError("covariates must be finite [cohort rows, named covariates].")
-    adjusted = np.asarray(covariate_columns)
-    if adjusted.shape != (model_count, len(covariate_names)) or adjusted.dtype != np.bool_:
-        raise ValueError("covariate_columns must be bool [models, named covariates].")
-    if target_matrix.shape != (row_count, model_count) or training_mask.shape != target_matrix.shape:
-        raise ValueError("targets and training must be [cohort rows, models].")
-    if len(trait_types) != model_count:
-        raise ValueError("trait_types needs one entry per model.")
-    if not np.all(np.isfinite(target_matrix[training_mask])):
-        raise ValueError("every training target must be finite.")
-    if log_variance_offset is not None:
-        offset = np.asarray(log_variance_offset, dtype=np.float64)
-        if offset.shape != (store.n_variants,) or np.any(np.isnan(offset)) or np.any(offset > 0.0):
-            raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
-    for model, trait_type in enumerate(trait_types):
-        if trait_type == TraitType.BINARY and not np.all(np.isin(target_matrix[training_mask[:, model], model], (0.0, 1.0))):
-            raise ValueError(f"binary model {model_names[model]!r} has training targets other than 0 and 1.")
+
+    store: DosageStore
+    store_columns: I64Array
+    covariates: F64Array
+    covariate_names: tuple[str, ...]
+    covariate_columns: BoolArray
+    targets: F64Array
+    training: BoolArray
+    model_names: tuple[str, ...]
+    trait_types: tuple[TraitType, ...]
+    research_ids: tuple[str, ...]
+    log_variance_offset: F64Array | None
+    budget: ComputeBudget
+    work_dir: Path
+    seed: int
+
+    def __post_init__(self) -> None:
+        set_field = object.__setattr__
+        set_field(self, "covariate_names", tuple(str(name) for name in self.covariate_names))
+        set_field(self, "model_names", tuple(str(name) for name in self.model_names))
+        set_field(self, "trait_types", tuple(self.trait_types))
+        set_field(self, "research_ids", tuple(str(research_id) for research_id in self.research_ids))
+        set_field(self, "work_dir", Path(self.work_dir))
+        set_field(self, "seed", int(self.seed))
+        columns = np.asarray(self.store_columns, dtype=np.int64)
+        covariate_matrix = np.asarray(self.covariates, dtype=np.float64)
+        target_matrix = np.asarray(self.targets, dtype=np.float64)
+        training_mask = np.asarray(self.training, dtype=bool)
+        adjusted = np.asarray(self.covariate_columns)
+        row_count, model_count = columns.shape[0], len(self.model_names)
+        if columns.ndim != 1 or np.unique(columns).shape[0] != row_count or np.any(columns < 0) or np.any(columns >= self.store.n_samples):
+            raise ValueError("store_columns must name distinct store samples.")
+        if len(self.research_ids) != row_count or len(set(self.research_ids)) != row_count:
+            raise ValueError("research_ids needs one distinct id per cohort row.")
+        if covariate_matrix.shape != (row_count, len(self.covariate_names)) or not np.all(np.isfinite(covariate_matrix)):
+            raise ValueError("covariates must be finite [cohort rows, named covariates].")
+        if adjusted.shape != (model_count, len(self.covariate_names)) or adjusted.dtype != np.bool_:
+            raise ValueError("covariate_columns must be bool [models, named covariates].")
+        if target_matrix.shape != (row_count, model_count) or training_mask.shape != target_matrix.shape:
+            raise ValueError("targets and training must be [cohort rows, models].")
+        if len(self.trait_types) != model_count:
+            raise ValueError("trait_types needs one entry per model.")
+        if not np.all(np.isfinite(target_matrix[training_mask])):
+            raise ValueError("every training target must be finite.")
+        if self.log_variance_offset is not None:
+            offset = np.asarray(self.log_variance_offset, dtype=np.float64)
+            if offset.shape != (self.store.n_variants,) or np.any(np.isnan(offset)) or np.any(offset > 0.0):
+                raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
+            set_field(self, "log_variance_offset", offset)
+        for model, trait_type in enumerate(self.trait_types):
+            if trait_type == TraitType.BINARY and not np.all(np.isin(target_matrix[training_mask[:, model], model], (0.0, 1.0))):
+                raise ValueError(f"binary model {self.model_names[model]!r} has training targets other than 0 and 1.")
+        set_field(self, "store_columns", columns)
+        set_field(self, "covariates", covariate_matrix)
+        set_field(self, "targets", target_matrix)
+        set_field(self, "training", training_mask)
+        set_field(self, "covariate_columns", adjusted)
+
+    @property
+    def model_count(self) -> int:
+        return len(self.model_names)
+
+
+def fit(request: FitRequest) -> FittedModel:
+    """Fit every model of ``request`` on its training rows and return the artifact."""
+    row_count, model_count = request.store_columns.shape[0], request.model_count
     fitted = fit_models(
-        store=store,
-        store_columns=columns,
-        covariates=np.column_stack([np.ones(row_count), covariate_matrix]),
-        covariate_columns=np.column_stack([np.ones(model_count, dtype=bool), adjusted]),
-        targets=np.where(training_mask, target_matrix, 0.0),
-        training=training_mask,
-        trait_types=tuple(trait_types),
-        log_variance_offset=None if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64),
-        budget=budget,
-        work_dir=Path(work_dir),
-        seed=seed,
+        store=request.store,
+        store_columns=request.store_columns,
+        covariates=np.column_stack([np.ones(row_count), request.covariates]),
+        covariate_columns=np.column_stack([np.ones(model_count, dtype=bool), request.covariate_columns]),
+        targets=np.where(request.training, request.targets, 0.0),
+        training=request.training,
+        trait_types=request.trait_types,
+        log_variance_offset=request.log_variance_offset,
+        budget=request.budget,
+        work_dir=request.work_dir,
+        seed=request.seed,
         draw_count=DRAW_COUNT,
     )
     parts = certificate_parts(fitted.certificate, model_count)
-    trained = training_mask.any(axis=1)
+    trained = request.training.any(axis=1)
     return FittedModel(
-        model_names=tuple(model_names),
-        covariate_names=tuple(covariate_names),
-        covariate_columns=adjusted,
+        model_names=request.model_names,
+        covariate_names=request.covariate_names,
+        covariate_columns=request.covariate_columns,
         scoring=tuple(fitted.scoring),
         noise_variance=np.asarray(fitted.noise_variance, dtype=np.float64),
         hyperparameters=tuple(fitted.hyperparameters),
@@ -156,10 +189,10 @@ def fit(
         refusals=parts.refusals,
         provenance=Provenance(
             code_digest=code_digest(),
-            store_digest=store_digest(store.root),
-            sites_digest=sites_digest(store.root),
-            cohort_digest=cohort_digest([research_id for research_id, kept in zip(research_ids, trained) if kept]),
-            offset_digest=offset_digest(log_variance_offset),
+            store_digest=store_digest(request.store.root),
+            sites_digest=sites_digest(request.store.root),
+            cohort_digest=cohort_digest([research_id for research_id, kept in zip(request.research_ids, trained) if kept]),
+            offset_digest=offset_digest(request.log_variance_offset),
         ),
     )
 
@@ -200,20 +233,22 @@ def write_model(store_path: str | Path, cohort_path: str | Path, model_path: str
     work_dir = Path(tempfile.mkdtemp(prefix=f".{target.name}.work.", dir=target.parent))
     try:
         model = fit(
-            store=store,
-            store_columns=arrays["store_columns"],
-            covariates=arrays["covariates"],
-            covariate_names=[str(name) for name in arrays["covariate_names"]],
-            covariate_columns=arrays["covariate_columns"],
-            targets=arrays["targets"],
-            training=arrays["training"],
-            model_names=[str(name) for name in arrays["model_names"]],
-            trait_types=[TraitType(str(value)) for value in arrays["trait_types"]],
-            research_ids=research_ids,
-            log_variance_offset=None,
-            budget=budget,
-            work_dir=work_dir,
-            seed=cohort_seed(store_path, research_ids),
+            FitRequest(
+                store=store,
+                store_columns=arrays["store_columns"],
+                covariates=arrays["covariates"],
+                covariate_names=tuple(str(name) for name in arrays["covariate_names"]),
+                covariate_columns=arrays["covariate_columns"],
+                targets=arrays["targets"],
+                training=arrays["training"],
+                model_names=tuple(str(name) for name in arrays["model_names"]),
+                trait_types=tuple(TraitType(str(value)) for value in arrays["trait_types"]),
+                research_ids=research_ids,
+                log_variance_offset=None,
+                budget=budget,
+                work_dir=work_dir,
+                seed=cohort_seed(store_path, research_ids),
+            )
         )
     finally:
         shutil.rmtree(work_dir)

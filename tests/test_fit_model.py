@@ -36,6 +36,10 @@ def _budget() -> ComputeBudget:
     )
 
 
+def _request(store_root: Path, arguments: dict[str, Any], work_dir: Path, seed: int) -> fit_model.FitRequest:
+    return fit_model.FitRequest(store=DosageStore.open(store_root), **arguments, budget=_budget(), work_dir=work_dir, seed=seed)
+
+
 def _certificate(model_count: int, generator: np.random.Generator) -> FitCertificate:
     """A certificate with every field filled by its annotated kind, so a new driver field needs no test change."""
     values: dict[str, Any] = {}
@@ -166,7 +170,7 @@ def driver(monkeypatch: pytest.MonkeyPatch) -> _StubDriver:
 
 def test_the_driver_gets_the_intercept_the_training_targets_and_the_draw_count(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
     cohort = _cohort(np.random.default_rng(1))
-    fit_model.fit(store=DosageStore.open(store_root), **cohort.arguments(), budget=_budget(), work_dir=tmp_path, seed=11)
+    fit_model.fit(_request(store_root, cohort.arguments(), tmp_path, 11))
     (call,) = driver.calls
     np.testing.assert_array_equal(call["covariates"], np.column_stack([np.ones(_COHORT), cohort.covariates]))
     np.testing.assert_array_equal(call["covariate_columns"], np.column_stack([np.ones(3, dtype=bool), cohort.covariate_columns]))
@@ -183,14 +187,14 @@ def test_the_driver_gets_the_records_log_reliabilities(tmp_path: Path, store_roo
     offset = np.log(np.random.default_rng(12).uniform(size=_VARIANTS))
     offset[4] = -np.inf
     arguments = _cohort(np.random.default_rng(1)).arguments() | {"log_variance_offset": offset}
-    model = fit_model.fit(store=DosageStore.open(store_root), **arguments, budget=_budget(), work_dir=tmp_path, seed=11)
+    model = fit_model.fit(_request(store_root, arguments, tmp_path, 11))
     np.testing.assert_array_equal(driver.calls[0]["log_variance_offset"], offset)
     assert model.provenance.offset_digest == offset_digest(offset) != offset_digest(None)
 
 
 def test_the_artifact_carries_the_whole_certificate_and_the_provenance(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
     cohort = _cohort(np.random.default_rng(2))
-    model = fit_model.fit(store=DosageStore.open(store_root), **cohort.arguments(), budget=_budget(), work_dir=tmp_path, seed=5)
+    model = fit_model.fit(_request(store_root, cohort.arguments(), tmp_path, 5))
     fitted = driver.results[0].certificate
     assert model.model_names == cohort.model_names and model.trait_types == cohort.trait_types
     np.testing.assert_array_equal(model.covariate_columns, cohort.covariate_columns)
@@ -220,7 +224,7 @@ def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_r
     training = cohort.training.copy()
     training[0] = False
     arguments = cohort.arguments() | {"training": training}
-    model = fit_model.fit(store=DosageStore.open(store_root), **arguments, budget=_budget(), work_dir=tmp_path, seed=5)
+    model = fit_model.fit(_request(store_root, arguments, tmp_path, 5))
     assert model.provenance.cohort_digest == cohort_digest(cohort.research_ids[1:])
 
 
@@ -246,7 +250,7 @@ def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_r
 def test_fit_refuses_a_cohort_that_does_not_line_up(tmp_path: Path, store_root: Path, driver: _StubDriver, change: Any, message: str) -> None:
     cohort = _cohort(np.random.default_rng(4))
     with pytest.raises(ValueError, match=message):
-        fit_model.fit(store=DosageStore.open(store_root), **(cohort.arguments() | change(cohort)), budget=_budget(), work_dir=tmp_path, seed=5)
+        _request(store_root, cohort.arguments() | change(cohort), tmp_path, 5)
     assert driver.calls == []
 
 

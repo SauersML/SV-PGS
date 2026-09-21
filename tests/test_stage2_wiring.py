@@ -35,20 +35,22 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
     samples = store.n_samples
     training = np.arange(samples) < samples * 4 // 5
     model = fit_model.fit(
-        store=store,
-        store_columns=np.arange(samples, dtype=np.int64),
-        covariates=covariate[:, None],
-        covariate_names=("covariate",),
-        covariate_columns=np.ones((1, 1), dtype=bool),
-        targets=np.where(training, targets, np.nan)[:, None],
-        training=training[:, None],
-        model_names=("trait/fold0",),
-        trait_types=(TraitType.QUANTITATIVE,),
-        research_ids=[f"person{index}" for index in range(samples)],
-        log_variance_offset=None,
-        budget=_budget(),
-        work_dir=tmp_path,
-        seed=3,
+        fit_model.FitRequest(
+            store=store,
+            store_columns=np.arange(samples, dtype=np.int64),
+            covariates=covariate[:, None],
+            covariate_names=("covariate",),
+            covariate_columns=np.ones((1, 1), dtype=bool),
+            targets=np.where(training, targets, np.nan)[:, None],
+            training=training[:, None],
+            model_names=("trait/fold0",),
+            trait_types=(TraitType.QUANTITATIVE,),
+            research_ids=tuple(f"person{index}" for index in range(samples)),
+            log_variance_offset=None,
+            budget=_budget(),
+            work_dir=tmp_path,
+            seed=3,
+        )
     )
     assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
     save_model(tmp_path / "model", model)

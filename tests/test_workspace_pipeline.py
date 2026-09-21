@@ -13,6 +13,7 @@ import dataclasses
 import datetime
 import gzip
 import hashlib
+import inspect
 import json
 import pickle
 import re
@@ -34,8 +35,10 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
+from sv_pgs.fit_model import FitRequest
 from sv_pgs.phenotype_measurement import fit_at_exponent
 from sv_pgs.store_converter import linear_recalibration, refalt_digest, value_matched_background
+from sv_pgs import workspace_pipeline
 from sv_pgs.workspace_pipeline import (
     STEP_NAMES,
     StrataSites,
@@ -354,18 +357,21 @@ class _Fitted:
 
 class _Recorder:
     def __init__(self, failing_fit: bool = False) -> None:
-        self.fit_calls: list[dict] = []
+        self.fit_calls: list[FitRequest] = []
         self.failing_fit = failing_fit
 
-    def fit(self, *, store, store_columns, covariates, covariate_names, covariate_columns, targets, target_variance, training,
-            model_names, trait_types, research_ids, measurement, budget, work_dir, seed) -> _Fitted:
-        """A stand-in with fit_model.fit's keywords: each model's own covariates by least squares, then marginal
-        effects of the standardized codes on the training rows."""
+    def fit(self, request: FitRequest) -> _Fitted:
+        """A stand-in for the engine behind the real ``fit_model.FitRequest``: each model's own covariates by least
+        squares, then marginal effects of the standardized codes on the training rows."""
         if self.failing_fit:
             raise RuntimeError("preempted")
-        self.fit_calls.append(dict(locals()))
-        offset = measurement.log_reliability
-        assert offset.shape == (store.n_variants,) and np.all(offset <= 0.0) and target_variance is None and work_dir.is_dir()
+        assert isinstance(request, FitRequest)
+        self.fit_calls.append(request)
+        store, store_columns, covariates = request.store, request.store_columns, request.covariates
+        covariate_columns, targets, training = request.covariate_columns, request.targets, request.training
+        model_names, trait_types, work_dir = request.model_names, request.trait_types, request.work_dir
+        offset = request.log_variance_offset
+        assert offset.shape == (store.n_variants,) and np.all(offset <= 0.0) and work_dir.is_dir()
         codes = store.read_codes(0, store.n_variants, np.asarray(store_columns)).astype(np.float64) - 127.0
         models = []
         for model, trait_type in enumerate(trait_types):
@@ -383,7 +389,7 @@ class _Recorder:
             if trait_type != TraitType.BINARY:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0))
-        return _Fitted(tuple(model_names), tuple(covariate_names), tuple(models), np.ones(len(models)))
+        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)))
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -446,6 +452,22 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 def _completed_at(run: Path, step: str) -> float:
     return (run / step / "_COMPLETE.json").stat().st_mtime_ns
+
+
+def test_the_production_bindings_hand_the_fit_step_s_request_to_the_real_fitter() -> None:
+    """No stand-in: the modules the run imports are the real ones, and ``fit`` takes the ``FitRequest`` the fit step
+    builds, so the step's call cannot drift from the fitter's input."""
+    from sv_pgs import artifact, fit_model, measurement_model
+    from sv_pgs.workspace_pipeline import workspace_bindings
+
+    bindings = workspace_bindings()
+    assert bindings.fit is fit_model.fit and bindings.save_model is artifact.save_model
+    assert bindings.load_model is artifact.load_model and bindings.predict is artifact.predict
+    assert bindings.load_measurement_model == measurement_model.MeasurementModel.load
+    (parameter,) = inspect.signature(fit_model.fit).parameters.values()
+    assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD and parameter.default is inspect.Parameter.empty
+    # The request the fit step builds is the fitter's own class, not a copy of its fields.
+    assert workspace_pipeline.FitRequest is fit_model.FitRequest is FitRequest
 
 
 def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
@@ -522,9 +544,9 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     }
     assert set(names) == structure | own["atrial_fibrillation"] | own["total_bilirubin"]
     assert summaries["cohort"]["covariates"] == {trait: [name for name in names if name in structure | columns] for trait, columns in own.items()}
-    assert call["covariates"].shape[1] == len(call["covariate_names"]) == len(names) - 1
+    assert call.covariates.shape[1] == len(call.covariate_names) == len(names) - 1
     for model, trait in enumerate(["atrial_fibrillation"] * 2 + ["total_bilirubin"] * 2):
-        assert {name for name, used in zip(names[1:], call["covariate_columns"][model]) if used} == (structure | own[trait]) - {"intercept"}
+        assert {name for name, used in zip(names[1:], call.covariate_columns[model]) if used} == (structure | own[trait]) - {"intercept"}
     # A trait's own columns are 0 on the rows it does not observe.
     bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
     assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)
@@ -533,14 +555,14 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     fitted_rows = cohort["training"].any(axis=1)
     folds = cohort["folds"][fitted_rows]
     for model in range(4):
-        assert not np.any(call["training"][:, model] & (folds == model % 2))
-        assert np.all(np.isnan(call["targets"][~call["training"][:, model], model]))
+        assert not np.any(call.training[:, model] & (folds == model % 2))
+        assert np.all(np.isnan(call.targets[~call.training[:, model], model]))
     # 5049 is genotyped but in no table: a cohort row with no target and no fit row.
     untabled = list(cohort["research_ids"]).index("5049")
     assert np.all(np.isnan(cohort["targets"][untabled])) and not fitted_rows[untabled] and "7099" in cohort["research_ids"]
-    assert len(call["research_ids"]) == len(call["store_columns"])
+    assert len(call.research_ids) == len(call.store_columns)
     saved = _MeasurementModel.load(run / "measurement" / "measurement_model.npz")
-    np.testing.assert_array_equal(call["measurement"].log_reliability, saved.log_reliability)
+    np.testing.assert_array_equal(call.log_variance_offset, saved.log_reliability)
 
     # Scores: every observed target has its own fold's held-out prediction.
     held_out = np.load(run / "score" / "predictions.npz")["held_out"]

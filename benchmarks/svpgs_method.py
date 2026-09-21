@@ -143,20 +143,22 @@ def _fit_one(store: DosageStore, covariates: np.ndarray, covariate_names: Sequen
     sample_count = phenotype.shape[0]
     research_ids = [f"train{sample}" for sample in range(sample_count)]
     model = fit_model.fit(
-        store=store,
-        store_columns=np.arange(sample_count, dtype=np.int64),
-        covariates=covariates,
-        covariate_names=covariate_names,
-        covariate_columns=np.ones((1, len(covariate_names)), dtype=bool),
-        targets=np.asarray(phenotype, dtype=np.float64)[:, None],
-        training=np.ones((sample_count, 1), dtype=bool),
-        model_names=("trait",),
-        trait_types=(trait_type,),
-        research_ids=research_ids,
-        log_variance_offset=None,
-        budget=budget,
-        work_dir=work_dir,
-        seed=fit_model.cohort_seed(store.root, research_ids),
+        fit_model.FitRequest(
+            store=store,
+            store_columns=np.arange(sample_count, dtype=np.int64),
+            covariates=covariates,
+            covariate_names=tuple(covariate_names),
+            covariate_columns=np.ones((1, len(covariate_names)), dtype=bool),
+            targets=np.asarray(phenotype, dtype=np.float64)[:, None],
+            training=np.ones((sample_count, 1), dtype=bool),
+            model_names=("trait",),
+            trait_types=(trait_type,),
+            research_ids=research_ids,
+            log_variance_offset=None,
+            budget=budget,
+            work_dir=work_dir,
+            seed=fit_model.cohort_seed(store.root, research_ids),
+        )
     )
     return model.scoring[0]
 

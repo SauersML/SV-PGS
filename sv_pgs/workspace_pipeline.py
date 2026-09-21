@@ -93,6 +93,7 @@ from sv_pgs.cohort import (
 )
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.fit_model import FitRequest
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -162,24 +163,6 @@ STRATA_COLUMNS = ("idx", "pos", "id", "refalt_md5", "ref_len", "alt_len", "n_pat
 SEX_COLUMN = "sex_at_birth_concept_id"
 """The categorical covariate the sample tables write one-hot, as ``sex_at_birth_concept_id_<concept>``."""
 UNRECORDED_SEX = "unrecorded"
-FIT_KEYWORDS = (
-    "store",
-    "store_columns",
-    "covariates",
-    "covariate_names",
-    "covariate_columns",
-    "targets",
-    "target_variance",
-    "training",
-    "model_names",
-    "trait_types",
-    "research_ids",
-    "measurement",
-    "budget",
-    "work_dir",
-    "seed",
-)
-"""The keywords the fit step passes to fit_model.fit; a fit that lacks one is refused before any step runs."""
 MEASUREMENT_MODEL_FILE = "measurement_model.npz"
 _INT64_BYTES = np.dtype(np.int64).itemsize
 _FLOAT64_BYTES = np.dtype(np.float64).itemsize
@@ -310,7 +293,8 @@ class WorkspaceConfig:
 class WorkspaceBindings:
     """The entry points of the steps that other modules own.
 
-    ``workspace_bindings`` binds the production ones. A test binds doubles of the same signatures.
+    ``workspace_bindings`` binds the production ones. A test binds doubles of the same signatures; ``fit`` is called
+    with a real ``fit_model.FitRequest`` either way, so a double cannot stand in for the fitter's own input.
     """
 
     bigquery_client: Callable[[], Any]
@@ -330,16 +314,12 @@ def workspace_bindings() -> WorkspaceBindings:
     """The production entry points: the measurement model (``measurement_model``) and the fit, model files and
     prediction (``fit_model``, ``artifact``).
 
-    They are imported, and fit's keywords checked against FIT_KEYWORDS, when the run starts, so a checkout
-    without them fails before any step runs. BigQuery gets None, from which all_of_us builds the workspace's
-    own client (GOOGLE_PROJECT).
+    They are imported when the run starts, so a checkout without them fails before any step runs. BigQuery gets
+    None, from which all_of_us builds the workspace's own client (GOOGLE_PROJECT).
     """
     measurement_model = importlib.import_module("sv_pgs.measurement_model")
     fit_model = importlib.import_module("sv_pgs.fit_model")
     artifact = importlib.import_module("sv_pgs.artifact")
-    missing = [keyword for keyword in FIT_KEYWORDS if keyword not in inspect.signature(fit_model.fit).parameters]
-    if missing:
-        raise RuntimeError(f"fit_model.fit takes no {missing}; the pipeline needs every trait's own covariates and the offsets.")
     return WorkspaceBindings(
         bigquery_client=lambda: None,
         calibration_moments=measurement_model.calibration_moments,
@@ -1452,28 +1432,28 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     work.mkdir(exist_ok=True)
     measurement = run.bindings.load_measurement_model(run.output("measurement") / MEASUREMENT_MODEL_FILE)
     with DosageStore.open(_final_store(run)) as store:
-        arguments = {
-            "store": store,
-            "store_columns": cohort.store_columns[rows],
-            "covariates": cohort.covariates[rows][:, 1:],
-            "covariate_names": cohort.covariate_names[1:],
-            # Each model projects out its own trait's columns and the structure columns, never another trait's.
-            "covariate_columns": cohort.covariate_columns[cohort.model_traits][:, 1:],
-            "targets": targets,
-            # Every target measured exactly until the per-person target variances exist (review-stats section 7).
-            "target_variance": None,
-            "training": cohort.training[rows],
-            "model_names": cohort.model_names,
-            "trait_types": tuple(cohort.trait_types[trait] for trait in cohort.model_traits.tolist()),
-            "research_ids": tuple(research_id for research_id, fitted_row in zip(cohort.research_ids, rows) if fitted_row),
-            "measurement": measurement,
-            "budget": run.budget,
-            "work_dir": work,
-            "seed": run.config.seed,
-        }
-        if tuple(arguments) != FIT_KEYWORDS:
-            raise AssertionError("the fit step's keywords drifted from FIT_KEYWORDS, which the run checks at its start.")
-        fitted = run.bindings.fit(**arguments)
+        fitted = run.bindings.fit(
+            FitRequest(
+                store=store,
+                store_columns=cohort.store_columns[rows],
+                covariates=cohort.covariates[rows][:, 1:],
+                covariate_names=cohort.covariate_names[1:],
+                # Each model projects out its own trait's columns and the structure columns, never another trait's.
+                covariate_columns=cohort.covariate_columns[cohort.model_traits][:, 1:],
+                targets=targets,
+                training=cohort.training[rows],
+                model_names=cohort.model_names,
+                trait_types=tuple(cohort.trait_types[trait] for trait in cohort.model_traits.tolist()),
+                research_ids=tuple(research_id for research_id, fitted_row in zip(cohort.research_ids, rows) if fitted_row),
+                # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote
+                # the store's dosages in the measurement step). The fit has no term for its residual variances or its
+                # leakage maps, and none for a target variance, so it is not handed either.
+                log_variance_offset=measurement.log_reliability,
+                budget=run.budget,
+                work_dir=work,
+                seed=run.config.seed,
+            )
+        )
     if tuple(fitted.model_names) != cohort.model_names:
         raise ValueError("the fit returned other models than the cohort's (trait, fold) training sets.")
     run.bindings.save_model(directory / "model", fitted)
@@ -1482,8 +1462,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
         "models": list(fitted.model_names),
         "refusals": [str(refusal) for refusal in getattr(fitted, "refusals", ())],
         "measurement_terms": (
-            "measurement: the groups' measurement models pooled over the fit rows' ancestry groups; "
-            "target_variance: none yet, so every target is taken as measured exactly"
+            "log_variance_offset: the log reliability of the groups' measurement models pooled over the fit rows' "
+            "ancestry groups; the fit has no target-variance term, so every target is taken as measured exactly, "
+            "and none for the measurement model's residual variances or leakage maps"
         ),
     }
 
