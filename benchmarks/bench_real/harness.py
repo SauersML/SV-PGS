@@ -459,11 +459,13 @@ def load_method(spec: str):
 _WORKER = {}
 
 
-def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False):
+def _init_worker(dataset_dir, method_spec, feature_sets, overlay_dir=None, rows_dirs=None, sample_subset=None, record_failures=False, finished=()):
     _WORKER["dataset"] = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     _WORKER["fit"] = load_method(method_spec)
     _WORKER["feature_sets"] = feature_sets
     _WORKER["record_failures"] = record_failures
+    # (gene row, split, feature set) already written to the run's durable store by an earlier attempt at this run.
+    _WORKER["finished"] = set(finished)
 
 
 def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
@@ -525,8 +527,11 @@ def _run_gene(arguments):
     window = load_gene_window(dataset, gene_row)
     results = []
     for split_name in split_names:
+        wanted = [name for name in _WORKER["feature_sets"] if (gene_row, split_name, name) not in _WORKER["finished"]]
+        if not wanted:
+            continue
         train_all, test_all, test_phenotype, test_index = build_gene_task(dataset, window, dataset.splits[split_name])
-        for feature_set in _WORKER["feature_sets"]:
+        for feature_set in wanted:
             train, test_genotypes = subset(train_all, test_all, feature_set, split_name)
             started = time.process_time()
             try:
@@ -549,11 +554,16 @@ def _run_gene(arguments):
 
 
 def _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir=None, rows_dirs=None, sample_subset=None,
-                      record_failures=False):
+                      record_failures=False, finished=()):
     from multiprocessing import get_context
 
-    with get_context("fork").Pool(workers, initializer=_init_worker, initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures)) as pool:
-        yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in gene_rows], chunksize=1)
+    finished = set(finished)
+    todo = [row for row in gene_rows if any((row, split, feature_set) not in finished for split in split_names for feature_set in feature_sets)]
+    if not todo:
+        return
+    with get_context("fork").Pool(workers, initializer=_init_worker,
+                                  initargs=(dataset_dir, method_spec, feature_sets, overlay_dir, rows_dirs, sample_subset, record_failures, finished)) as pool:
+        yield from pool.imap_unordered(_run_gene, [(row, split_names) for row in todo], chunksize=1)
 
 
 class _LazyTrains(Sequence):
@@ -662,6 +672,103 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                        _train_index(dataset, split_name))
 
 
+FIT_FIELDS = ("gene_row", "split_name", "feature_set", "test_index", "prediction", "without_sv", "test_phenotype", "variant_count", "sv_count",
+              "seconds", "coefficients", "status", "raw", "train_index")
+
+
+def _atomic(path: pathlib.Path, write):
+    """write(temporary path), then rename it into place: a file that exists under its own name is complete, and a
+    reader never sees a half-written one (os.replace is atomic within a directory)."""
+    # The temporary keeps the suffix, because np.save and to_csv read the extension to pick their format.
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp{path.suffix}")
+    try:
+        write(temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _store_frame(arrays: dict, prefix: str, frame):
+    """A DataFrame's columns as npz arrays, without pickling: object columns are stored as text."""
+    if frame is None:
+        return
+    arrays[f"{prefix}columns"] = np.asarray(list(frame.columns), dtype=str)
+    for name in frame.columns:
+        values = frame[name].to_numpy()
+        arrays[f"{prefix}{name}"] = values.astype(str) if values.dtype == object else values
+
+
+def _load_frame(archive, prefix: str):
+    key = f"{prefix}columns"
+    return pd.DataFrame({name: archive[f"{prefix}{name}"] for name in archive[key]}) if key in archive.files else None
+
+
+class FitStore:
+    """Every finished fit of one run, written to its own file as it lands and read back afterwards to build the
+    run's arrays.
+
+    A fit costs minutes, a run holds thousands of them, and they used to exist only in the parent process's memory
+    until the last one arrived: a worker dying, a wall clock, a kill or a failure on the way to the arrays threw
+    away every finished fit. Each fit is now written under <tag>.parts/ by a temporary name that is renamed into
+    place, so a file present under its own name is a complete fit, and the same run started again reads them and
+    fits only what is missing. The store holds the run's identity, so parts of a different run are never read as
+    this one's, and a part's name is built from the gene's position, the split and the feature set rather than
+    parsed back out of it."""
+
+    def __init__(self, directory, run_id: str, gene_rows, split_names, feature_sets):
+        self.directory = pathlib.Path(directory)
+        self.directory.mkdir(parents=True, exist_ok=True)
+        stamp = self.directory / "run_id.txt"
+        if stamp.exists() and stamp.read_text().strip() != run_id:
+            raise ValueError(f"{self.directory} holds the finished fits of run {stamp.read_text().strip()[:12]}, not of this run "
+                             f"({run_id[:12]}). Use another --out, or remove that directory if those fits are not wanted.")
+        _atomic(stamp, lambda target: target.write_text(run_id + "\n"))
+        self.position_of_row = {row: position for position, row in enumerate(gene_rows)}
+        self.split_position = {name: position for position, name in enumerate(split_names)}
+        self.feature_sets = list(feature_sets)
+        self.keys = [(row, split, feature_set) for row in gene_rows for split in split_names for feature_set in self.feature_sets]
+
+    def path(self, gene_row, split_name, feature_set) -> pathlib.Path:
+        return self.directory / f"{self.position_of_row[gene_row]:06d}.{self.split_position[split_name]}.{feature_set}.npz"
+
+    def finished(self):
+        """The keys whose fit is already stored, from one listing of the directory."""
+        names = set(os.listdir(self.directory))
+        return {key for key in self.keys if self.path(*key).name in names}
+
+    def write(self, fit: dict):
+        arrays = {"gene_row": np.int64(fit["gene_row"]), "split": np.asarray(fit["split_name"]), "feature_set": np.asarray(fit["feature_set"]),
+                  "status": np.asarray(fit["status"]), "test_index": np.asarray(fit["test_index"], dtype=np.int64),
+                  "train_index": np.asarray(fit["train_index"], dtype=np.int64), "prediction": np.asarray(fit["prediction"], dtype=np.float32),
+                  "without_sv": np.asarray(fit["without_sv"], dtype=np.float32), "truth": np.asarray(fit["test_phenotype"], dtype=np.float32),
+                  "variant_count": np.int64(fit["variant_count"]), "sv_count": np.int64(fit["sv_count"]), "seconds": np.float64(fit["seconds"])}
+        for kind, (train_score, test_score) in (fit["raw"] or {}).items():
+            arrays[f"raw_{kind}_train"] = np.asarray(train_score, dtype=np.float32)
+            arrays[f"raw_{kind}_test"] = np.asarray(test_score, dtype=np.float32)
+        _store_frame(arrays, "coefficients_", fit["coefficients"])
+        _atomic(self.path(fit["gene_row"], fit["split_name"], fit["feature_set"]), lambda target: np.savez(target, **arrays))
+
+    def read(self, key):
+        return np.load(self.path(*key), allow_pickle=False)
+
+    def discard(self):
+        """Drop the parts once the run's own outputs are written; the directory goes with them when it is empty."""
+        for key in self.keys:
+            self.path(*key).unlink(missing_ok=True)
+        (self.directory / "run_id.txt").unlink(missing_ok=True)
+        if not any(self.directory.iterdir()):
+            self.directory.rmdir()
+
+
+def run_identity(record: dict) -> str:
+    """A digest of what a run's results depend on: the method and its source, the harness source, the dataset and
+    its splits, the selected genes, the feature sets, the extra genotype sources and the failure policy. Not the
+    worker count, the note or the outcome, none of which change a prediction. Two runs with the same identity
+    compute the same thing, so one may continue the other's stored fits; two with different identities may not
+    share an output directory, however alike their --out and their tag look."""
+    return hashlib.sha256(json.dumps(record, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 def source_provenance():
     """What source this run is: the git commit of the checkout the harness lives in, or, when there is no checkout, a
     digest of the source files themselves.
@@ -693,7 +800,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
     with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
-    # Before the fits: a provenance failure must never cost a finished run its results.
+    # Before the fits: a provenance failure must never cost a finished run its results, and the run's identity and
+    # its manifest are written before the first fit, not after the last.
     provenance = source_provenance()
     method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
     method_sha256 = hashlib.sha256(method_file.read_bytes()).hexdigest()
@@ -708,80 +816,119 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         raise ValueError("gene ranks need a gene list")
     gene_rows = dataset.gene_rows(chromosomes, gene_prefix, gene_list, confirmation, gene_ranks)
     sample_count = len(dataset.samples)
-    predictions = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
-    predictions_without_sv = {feature_set: np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32) for feature_set in feature_sets}
-    # The raw (unadjusted) scores of every sample, per split: genes x splits x samples, so a fit can be re-scored under
-    # another truth definition without refitting. NaN where a sample was not scored in that split (or the fit failed).
-    raw_scores = {(feature_set, kind): np.full((len(gene_rows), len(split_names), sample_count), np.nan, dtype=np.float32)
-                  for feature_set in feature_sets for kind in ("full", "without_sv")}
-    split_position = {name: position for position, name in enumerate(split_names)}
-    truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
-    log = []
-    position_of_row = {row: position for position, row in enumerate(gene_rows)}
-    if contract == "batch":
-        results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
-    elif contract == "views":
-        results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
-    else:
-        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset,
-                                                            record_failures) for result in chunk)
-    coefficient_tables = []
     out = pathlib.Path(out_dir) / method_name / design
     out.mkdir(parents=True, exist_ok=True)
     tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
            + ("." + "+".join(name.split("/")[1] for name in split_names) if split_subset is not None else ""))
-    # One line per fit as it lands (the tables below are written once every fit is in): a run's progress and each
-    # fit's CPU time are readable while it runs, and a run that dies leaves its finished fits' record.
-    progress = (out / f"{tag}.progress.jsonl").open("w")
-    for (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status,
-         raw, train_index) in results:
-        if coefficients is not None:
-            coefficient_tables.append(coefficients)
-        position = position_of_row[gene_row]
-        predictions[feature_set][position, test_index] = prediction
-        predictions_without_sv[feature_set][position, test_index] = without_sv
-        if raw is not None:
-            for kind, (train_score, test_score) in raw.items():
-                raw_scores[(feature_set, kind)][position, split_position[split_name], train_index] = train_score
-                raw_scores[(feature_set, kind)][position, split_position[split_name], test_index] = test_score
-        truth[position, test_index] = test_phenotype
-        log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds, status,
-                    bool(np.isfinite(prediction).all() and np.ptp(prediction) == 0)))
-        progress.write(json.dumps({
-            "gene_id": log[-1][0], "split": split_name, "feature_set": feature_set, "variants": int(variant_count), "sv_variants": int(sv_count),
-            "cpu_seconds": float(seconds), "status": status, "finished": len(log),
-        }) + "\n")
-        progress.flush()
-    progress.close()
-    (out / f"{tag}.run.json").write_text(json.dumps({
+    record = {
         "method": method_spec, "method_sha256": method_sha256, **provenance,
-        "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets), "gene_prefix": gene_prefix,
+        "dataset": str(dataset.directory), "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets),
+        "gene_prefix": gene_prefix,
         "gene_list": str(gene_list) if gene_list is not None else None, "gene_ranks": list(gene_ranks) if gene_ranks is not None else None,
         "confirmation": confirmation,
         "sealed_genes_sha256": hashlib.sha256((dataset.directory / SEALED_GENES).read_bytes()).hexdigest() if (dataset.directory / SEALED_GENES).exists() else None,
         "gene_list_sha256": hashlib.sha256(pathlib.Path(gene_list).read_bytes()).hexdigest() if gene_list is not None else None,
-        "genes": len(gene_rows), "contract": contract, "splits": split_names, "prediction_rule": PREDICTION_RULE,
-        "record_failures": record_failures, "failed_fits": sum(entry[6] != "ok" for entry in log),
-        "constant_predictions": sum(bool(entry[7]) for entry in log),
+        "genes": len(gene_rows),
+        # The gene set itself, not only its size: the stored fits are keyed by a gene's position in it.
+        "gene_ids_sha256": hashlib.sha256("\n".join(dataset.genes.iloc[gene_rows]["gene_id"]).encode()).hexdigest(),
+        "contract": contract, "splits": split_names, "prediction_rule": PREDICTION_RULE, "record_failures": record_failures,
         "rows_dirs": [{"dir": str(path), "provenance_sha256": hashlib.sha256((path / "PROVENANCE.json").read_bytes()).hexdigest()
                        if (path / "PROVENANCE.json").exists() else None} for path in dataset.rows_dirs],
         "sample_subset": str(sample_subset) if sample_subset is not None else None,
         "sample_subset_sha256": hashlib.sha256(pathlib.Path(sample_subset).read_bytes()).hexdigest() if sample_subset is not None else None,
-        "note": json.loads(pathlib.Path(note).read_text()) if note is not None else None, "overlay": str(overlay_dir) if overlay_dir is not None else None,
+        "overlay": str(overlay_dir) if overlay_dir is not None else None,
         "overlay_sha256": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(pathlib.Path(overlay_dir).glob("*.svimp.npz"))
-                           if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None, "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}, indent=1))
-    for feature_set in feature_sets:
-        np.save(out / f"{tag}.{feature_set}.predictions.npy", predictions[feature_set])
-        np.save(out / f"{tag}.{feature_set}.predictions_without_sv.npy", predictions_without_sv[feature_set])
-        np.save(out / f"{tag}.{feature_set}.raw_scores.npy", raw_scores[(feature_set, "full")])
-        np.save(out / f"{tag}.{feature_set}.raw_scores_without_sv.npy", raw_scores[(feature_set, "without_sv")])
-    (out / f"{tag}.raw_splits.json").write_text(json.dumps(split_names))
-    np.save(out / f"{tag}.truth.npy", truth)
+                           if path.name.split(".")[0] in chromosomes} if overlay_dir is not None else None,
+        "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}
+    record["run_id"] = run_identity(record)
+    record["note"] = json.loads(pathlib.Path(note).read_text()) if note is not None else None
+    manifest = out / f"{tag}.run.json"
+    if manifest.exists():
+        previous = json.loads(manifest.read_text()).get("run_id")
+        if previous != record["run_id"]:
+            raise ValueError(f"{manifest} is the record of {'run ' + previous[:12] if previous else 'a run that recorded no identity'}, not of this run "
+                             f"({record['run_id'][:12]}). Its outputs would be overwritten by a different run's: use another --out.")
+    # Nothing in the output directory is written until both it and the store agree that this is the run they hold.
+    store = FitStore(out / f"{tag}.parts", record["run_id"], gene_rows, split_names, feature_sets)
+    carried = store.finished()
+    _atomic(manifest, lambda target: target.write_text(json.dumps(record, indent=1)))
+    if contract == "batch":
+        # A pooled method is called with every gene at once, so a part of its work cannot be carried over without
+        # changing the fit: these contracts refit and overwrite their parts, which stay durable against a crash.
+        results = _run_batch(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
+    elif contract == "views":
+        results = _run_views(dataset, load_method(method_spec), gene_rows, split_names, feature_sets)
+    else:
+        results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs,
+                                                         sample_subset, record_failures, carried) for result in chunk)
+    # One line per fit as it lands, beside the fit's own stored file: a run's progress and each fit's CPU time are
+    # readable while it runs, and the line points at work that is already on disk rather than only in this process.
+    with (out / f"{tag}.progress.jsonl").open("a" if carried else "w") as progress:
+        for position, fit in enumerate(dict(zip(FIT_FIELDS, values)) for values in results):
+            store.write(fit)
+            progress.write(json.dumps({
+                "gene_id": dataset.genes.iloc[fit["gene_row"]]["gene_id"], "split": fit["split_name"], "feature_set": fit["feature_set"],
+                "variants": int(fit["variant_count"]), "sv_variants": int(fit["sv_count"]), "cpu_seconds": float(fit["seconds"]),
+                "status": fit["status"], "finished": len(carried) + position + 1,
+            }) + "\n")
+            progress.flush()
+    log, coefficient_tables = _consolidate(store, out, tag, dataset, gene_rows, split_names, feature_sets, sample_count)
+    record["failed_fits"] = sum(entry[6] != "ok" for entry in log)
+    record["constant_predictions"] = sum(bool(entry[7]) for entry in log)
+    _atomic(manifest, lambda target: target.write_text(json.dumps(record, indent=1)))
+    _atomic(out / f"{tag}.raw_splits.json", lambda target: target.write_text(json.dumps(split_names)))
     if coefficient_tables:
-        pd.concat(coefficient_tables, ignore_index=True).to_csv(out / f"{tag}.sv_coefficients.tsv.gz", sep="\t", index=False)
-    dataset.genes.iloc[gene_rows].to_csv(out / f"{tag}.genes.tsv", sep="\t", index=False)
-    pd.DataFrame(log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds", "status", "constant_prediction"]).to_csv(
-        out / f"{tag}.log.tsv", sep="\t", index=False)
+        _atomic(out / f"{tag}.sv_coefficients.tsv.gz", lambda target: pd.concat(coefficient_tables, ignore_index=True).to_csv(target, sep="\t", index=False))
+    _atomic(out / f"{tag}.genes.tsv", lambda target: dataset.genes.iloc[gene_rows].to_csv(target, sep="\t", index=False))
+    _atomic(out / f"{tag}.log.tsv", lambda target: pd.DataFrame(
+        log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds", "status", "constant_prediction"]).to_csv(
+        target, sep="\t", index=False))
+    store.discard()
+
+
+def _consolidate(store: FitStore, out: pathlib.Path, tag: str, dataset, gene_rows, split_names, feature_sets, sample_count: int):
+    """The stored fits, gathered into the run's arrays: one feature set at a time, so a run holds one feature set's
+    predictions and raw scores rather than every feature set's at once. Returns the log rows, in gene, split and
+    feature-set order, and the saved SV effect tables."""
+    position_of_row = {row: position for position, row in enumerate(gene_rows)}
+    split_position = {name: position for position, name in enumerate(split_names)}
+    truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
+    available = store.finished()
+    entries, coefficient_tables = {}, {}
+    for feature_set in feature_sets:
+        predictions = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
+        without_sv = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
+        # The raw (unadjusted) scores of every sample, per split: genes x splits x samples, so a fit can be re-scored
+        # under another truth definition without refitting. NaN where a sample was not scored in that split.
+        raw_scores = {kind: np.full((len(gene_rows), len(split_names), sample_count), np.nan, dtype=np.float32) for kind in ("full", "without_sv")}
+        for gene_row in gene_rows:
+            for split_name in split_names:
+                key = (gene_row, split_name, feature_set)
+                if key not in available:
+                    continue
+                with store.read(key) as part:
+                    position, test_index = position_of_row[gene_row], part["test_index"]
+                    predictions[position, test_index] = part["prediction"]
+                    without_sv[position, test_index] = part["without_sv"]
+                    truth[position, test_index] = part["truth"]
+                    for kind, array in raw_scores.items():
+                        if f"raw_{kind}_train" in part.files:
+                            array[position, split_position[split_name], part["train_index"]] = part[f"raw_{kind}_train"]
+                            array[position, split_position[split_name], test_index] = part[f"raw_{kind}_test"]
+                    table = _load_frame(part, "coefficients_")
+                    if table is not None:
+                        coefficient_tables[key] = table
+                    entries[key] = (dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, int(part["variant_count"]), int(part["sv_count"]),
+                                    float(part["seconds"]), str(part["status"]),
+                                    bool(np.isfinite(part["prediction"]).all() and np.ptp(part["prediction"]) == 0))
+        _atomic(out / f"{tag}.{feature_set}.predictions.npy", lambda target, values=predictions: np.save(target, values))
+        _atomic(out / f"{tag}.{feature_set}.predictions_without_sv.npy", lambda target, values=without_sv: np.save(target, values))
+        for kind, array in raw_scores.items():
+            suffix = "" if kind == "full" else "_without_sv"
+            _atomic(out / f"{tag}.{feature_set}.raw_scores{suffix}.npy", lambda target, values=array: np.save(target, values))
+    _atomic(out / f"{tag}.truth.npy", lambda target: np.save(target, truth))
+    order = [key for key in store.keys if key in entries]
+    return [entries[key] for key in order], [coefficient_tables[key] for key in order if key in coefficient_tables]
 
 
 if __name__ == "__main__":

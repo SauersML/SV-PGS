@@ -733,6 +733,88 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
     assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
 
 
+def flaky_top_variant(train):
+    """A method that records every gene it fits and refuses g2 while a sentinel file is there, so a run can be made
+    to die after some fits have finished. Its own file's digest, which the run identity uses, never changes."""
+    import os
+
+    root = pathlib.Path(os.environ["BENCH_REAL_TEST_ROOT"])
+    with (root / "fitted.log").open("a") as log:
+        log.write(train.gene_id + "\n")
+    if (root / "fail").exists() and train.gene_id == "g2":
+        raise RuntimeError("the worker died")
+    return baselines.top_variant(train)
+
+
+def two_gene_dataset(tmp_path):
+    import json
+
+    tiny_dataset(tmp_path)
+    genes = pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    pd.concat([genes, genes.assign(gene_id="g2", tss=104)], ignore_index=True).to_csv(tmp_path / "genes.tsv", sep="\t", index=False)
+    expression = np.load(tmp_path / "expression.npy")
+    np.save(tmp_path / "expression.npy", np.vstack([expression, np.roll(expression, 5, axis=1)]))
+    annotation = json.loads((tmp_path / "gene_annotation.json").read_text())
+    annotation["g2"] = annotation["g1"]
+    (tmp_path / "gene_annotation.json").write_text(json.dumps(annotation))
+
+
+def test_a_run_that_dies_keeps_its_finished_fits_and_the_same_run_again_fits_only_what_is_missing(tmp_path, monkeypatch):
+    """Fits used to live in the parent process's memory until the last one arrived, so anything that stopped a run
+    threw away every finished fit. Each one is now a file of its own, and the same run started again carries them."""
+    import json
+
+    two_gene_dataset(tmp_path)
+    monkeypatch.setenv("BENCH_REAL_TEST_ROOT", str(tmp_path))
+    (tmp_path / "fail").touch()
+    method = f"{__file__}:flaky_top_variant"
+    arguments = (tmp_path, method, "m", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    with pytest.raises(RuntimeError, match="the worker died"):
+        harness.run(*arguments)
+    out = tmp_path / "results/m/loso"
+    parts = out / "chr1.parts"
+    # g1 finished: two splits by two feature sets. g2 died on its first fit and left none.
+    assert sorted(path.name.split(".", 1)[1] for path in parts.glob("*.npz")) == ["0.snv.npz", "0.snv_sv.npz", "1.snv.npz", "1.snv_sv.npz"]
+    assert len((out / "chr1.progress.jsonl").read_text().splitlines()) == 4
+    assert (tmp_path / "fitted.log").read_text().split() == ["g1"] * 4 + ["g2"]
+    # A different run may not take over this one's output directory, whichever of the two records it by itself.
+    (out / "chr1.run.json").unlink()
+    with pytest.raises(ValueError, match="holds the finished fits of run"):
+        harness.run(tmp_path, method, "m", "loso", ["chr1"], tmp_path / "results", 1, ("snv",))
+    (tmp_path / "fail").unlink()
+    (tmp_path / "fitted.log").unlink()
+    harness.run(*arguments)
+    assert (tmp_path / "fitted.log").read_text().split() == ["g2"] * 4
+    assert not parts.exists()
+    assert len((out / "chr1.progress.jsonl").read_text().splitlines()) == 8
+    assert len(pd.read_csv(out / "chr1.log.tsv", sep="\t")) == 8
+    assert json.loads((out / "chr1.run.json").read_text())["failed_fits"] == 0
+    # What the run wrote is what a run that never died writes.
+    harness.run(tmp_path, method, "clean", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    clean = tmp_path / "results/clean/loso"
+    for name in ("snv.predictions", "snv_sv.predictions", "snv_sv.predictions_without_sv", "snv_sv.raw_scores", "truth"):
+        assert np.array_equal(np.load(out / f"chr1.{name}.npy"), np.load(clean / f"chr1.{name}.npy"), equal_nan=True)
+    assert (pd.read_csv(out / "chr1.sv_coefficients.tsv.gz", sep="\t") == pd.read_csv(clean / "chr1.sv_coefficients.tsv.gz", sep="\t")).all().all()
+
+
+def test_a_run_of_a_different_identity_may_not_overwrite_an_existing_run(tmp_path):
+    """The output path and tag name a chromosome, not a run: the same tag serves a different method file, inference,
+    dataset, gene set or feature sets. The run's own identity is written before the first fit and checked against it."""
+    import json
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    harness.run(tmp_path, method, "m", "loso", ["chr1"], tmp_path / "results", 1, ("snv",))
+    record = json.loads((tmp_path / "results/m/loso/chr1.run.json").read_text())
+    assert len(record["run_id"]) == 64 and len(record["gene_ids_sha256"]) == 64
+    # The same run again is the same identity, and writes the same outputs.
+    harness.run(tmp_path, method, "m", "loso", ["chr1"], tmp_path / "results", 1, ("snv",))
+    assert json.loads((tmp_path / "results/m/loso/chr1.run.json").read_text())["run_id"] == record["run_id"]
+    for different in (dict(feature_sets=("snv", "snv_sv")), dict(record_failures=True)):
+        with pytest.raises(ValueError, match="is the record of run"):
+            harness.run(tmp_path, method, "m", "loso", ["chr1"], tmp_path / "results", 1, **different)
+
+
 def test_the_report_reads_several_results_roots_with_different_genes_and_refuses_a_gene_scored_twice(tmp_path, monkeypatch):
     """One method in gene-range chunks, one directory each, beside a comparator that scored other genes: the roots
     score different gene sets, and one root may hold no genes of a method at all. A gene scored twice for one arm is
