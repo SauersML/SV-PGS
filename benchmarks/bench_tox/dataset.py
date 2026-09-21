@@ -45,7 +45,7 @@ def load_values() -> pd.DataFrame:
 def load_lines() -> pd.DataFrame:
     """One row per analysis line, in the genotype files' order: line, sex, population, batch, continent, family."""
     covariates = pd.read_csv(RESTRICTED / "ToxChallenge_Covariates.txt", sep="\t", dtype=str).set_index("ID")
-    pedigree = pd.read_csv(PEDIGREE, sep=r"\s+", dtype=str).set_index("sample")
+    pedigree = pd.read_csv(PEDIGREE, sep=r"\s+", dtype=str).set_index("SampleID")
     order = genotypes.samples()
     analysis = set(line.strip() for line in (RESTRICTED / "derived/analysis_lines.txt").read_text().split())
     rows = []
