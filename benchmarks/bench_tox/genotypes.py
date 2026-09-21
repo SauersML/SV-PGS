@@ -12,6 +12,7 @@ autosomal SNVs, and ``related_pairs`` the pairs at third degree or closer (kinsh
 """
 from __future__ import annotations
 
+import os
 import pathlib
 
 import numpy as np
@@ -53,18 +54,39 @@ def variant_table(chrom: int) -> pd.DataFrame:
     })
 
 
-def read_bed(chrom: int, rows: np.ndarray | None, sample_count: int) -> np.ndarray:
-    """ALT dosages (rows x samples) as int8, -1 where missing, for the given variant rows (all rows when None)."""
-    path = GENO / f"chr{chrom}.bed"
-    bytes_per_variant = (sample_count + 3) // 4
+def _read_rows(path: pathlib.Path, rows: np.ndarray | None, bytes_per_variant: int) -> np.ndarray:
+    """The packed bytes of the given variant rows (all when None), by plain reads: a memory map's touched pages are
+    charged to the task's memory budget (a runq task reading the genome's beds was killed at 16 GB of page cache), and
+    the pages read here are released to the kernel at once (posix_fadvise DONTNEED)."""
     with open(path, "rb") as handle:
         if handle.read(3) != _MAGIC:
             raise ValueError(f"{path} is not a SNP-major plink bed")
-    raw = np.memmap(path, dtype=np.uint8, mode="r", offset=3)
-    total = raw.shape[0] // bytes_per_variant
-    raw = raw[: total * bytes_per_variant].reshape(total, bytes_per_variant)
-    chosen = raw if rows is None else raw[np.asarray(rows, dtype=np.int64)]
-    chosen = np.ascontiguousarray(chosen)
+        if rows is None:
+            chosen = np.frombuffer(handle.read(), dtype=np.uint8)
+            chosen = chosen[: (chosen.shape[0] // bytes_per_variant) * bytes_per_variant].reshape(-1, bytes_per_variant).copy()
+        else:
+            rows = np.asarray(rows, dtype=np.int64)
+            chosen = np.empty((rows.shape[0], bytes_per_variant), dtype=np.uint8)
+            # Runs of consecutive rows are one read each.
+            start = 0
+            while start < rows.shape[0]:
+                end = start + 1
+                while end < rows.shape[0] and rows[end] == rows[end - 1] + 1:
+                    end += 1
+                handle.seek(3 + int(rows[start]) * bytes_per_variant)
+                chosen[start:end] = np.frombuffer(handle.read((end - start) * bytes_per_variant), dtype=np.uint8).reshape(end - start, bytes_per_variant)
+                start = end
+        try:
+            os.posix_fadvise(handle.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        except (AttributeError, OSError):
+            pass
+    return chosen
+
+
+def read_bed(chrom: int, rows: np.ndarray | None, sample_count: int) -> np.ndarray:
+    """ALT dosages (rows x samples) as int8, -1 where missing, for the given variant rows (all rows when None)."""
+    bytes_per_variant = (sample_count + 3) // 4
+    chosen = _read_rows(GENO / f"chr{chrom}.bed", rows, bytes_per_variant)
     # Two bits per line, the first line in the low bits.
     codes = np.stack([(chosen >> shift) & 0b11 for shift in (0, 2, 4, 6)], axis=2).reshape(chosen.shape[0], -1)[:, :sample_count]
     dosage = np.empty(codes.shape, dtype=np.int8)
