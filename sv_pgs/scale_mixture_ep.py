@@ -2900,9 +2900,13 @@ def _maximize_evidence(
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
-    # A start weight past its range's resolvable upper end (a fit on another lattice, whose range differs) is the
-    # lambda = infinity edge itself: V is not resolved there, and the edge is its limit.
-    infinite = frozenset(int(position) for position in np.flatnonzero((start_weights == np.inf) | (start_weights > upper)))
+    # A finite start weight past its range's resolvable end (the range moves with the data curvature at x: on
+    # ENSG00000274602.5 [real] a block's weight of 2.27, found by an earlier search, lay past the range's upper end
+    # at a later state) is clipped to the range, never remapped to the lambda = infinity edge: the edge's view
+    # projects x onto the block's null space, where the outer state's certified maximum (with the block finite) is
+    # no maximum, so every start failed and the search fell back to releasing every block at once, whose
+    # maximizations collapsed; at the range's end V is the edge's to the tolerance by construction, with x kept.
+    infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
     weights = np.where(np.isin(np.arange(start_weights.shape[0]), list(infinite)), upper, np.clip(start_weights, lower, upper))
     flat = initial_hyperparameters(prior).coefficients
     log_normal = _log_normal_start(prior, start_coefficients, cavity, working_bytes)
@@ -3693,6 +3697,10 @@ def fit_hyperparameters(
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
     # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
     weight_tolerances = [tolerance] * count
+    # The decrement each model's x is polished to: the fit's tolerance, until a decision finds the state's own error
+    # (whose floor is x's decrement there) is what stops the certificate and no re-certification lowers it to the
+    # share the rest leaves (``decide``): x then polishes further, to that share.
+    polish_tolerances = [tolerance] * count
     # Whether the oracle's last solve for the model was elsewhere than the point it returns.
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
@@ -3739,7 +3747,7 @@ def fit_hyperparameters(
     def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
         tail = tail_of(model)
-        if polishes and newton.definite and max(newton.decrement, tail) <= tolerance and states[model] is not None:
+        if polishes and newton.definite and max(newton.decrement, tail) <= polish_tolerances[model] and states[model] is not None:
             # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
             # tolerance, and so does the inner steps' own contraction (``_State.tail``), so the state is planned
             # once more (a release in flight is settled here). A polish that only ends on a step below x's own
@@ -3778,9 +3786,16 @@ def fit_hyperparameters(
             return state, step, predicted, remaining
         theta = (tolerance - predicted - fixed) / resolvable
         if state.error > 0.0:
-            resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, theta * state.error)
+            share = theta * state.error
+            resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, share)
             if resolved_state is not None:
                 state = replace(resolved_state, polished=state.polished, tail=state.tail)
+            if state.error > share and state.decrement > share:
+                # The state's error cannot reach its share by re-certification alone: its floor is x's own decrement
+                # there (on ENSG00000254709.8 [real] a polished state's error 0.0029 was its decrement, and the
+                # certificate, needing it twice with the step's, stood at 0.0096 against the tolerance 0.0078).
+                # x polishes further, to the share (the refused-trial chain below re-opens the polish).
+                polish_tolerances[model] = min(polish_tolerances[model], share)
         if step.evidence_error > 0.0 and step.resolve is not None:
             resolved_step = step.resolve(theta * step.evidence_error)
             if resolved_step is not None:
@@ -3999,6 +4014,12 @@ def fit_hyperparameters(
                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
                     # more, with the weights searched to what their share asks.
                     pending[model] = None
+                elif state.polished and state.decrement > polish_tolerances[model] and (reopened := inner(model, entry.step, entry.remaining, True)) is not None:
+                    # The decision asked a smaller decrement of x than the polish reached (``polish_tolerances``): the
+                    # polish continues to it, and the state is planned again from there (where the B-model's decrement
+                    # is already within it, ``inner`` proposes nothing and the state stands as measured).
+                    states[model] = replace(states[model], polished=False)
+                    pending[model] = reopened
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
                     uncertified(model, entry, entry.step, state.decrement)
