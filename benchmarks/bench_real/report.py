@@ -18,18 +18,30 @@ superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted ov
            score worse than that fit, and is never clipped. Its nuisance fit is made inside the target group, so it
            is a target-residualized statistic, not the R^2 of a deployable predictor whose covariate model was
            fitted in training: this benchmark measures conditional association, not prospective skill (see E03).
-  null_r2  1 / (n_T - rank[1, C_T]), the expectation of r2 under the null model below.
+  null_r2  1 / d with d = n_T - rank[1, C_T], the mean of r2 under one explicit null: R_T s fixed and nonzero, and
+           R_T y uniform in direction over the d-dimensional residual subspace, independent of the score. r2 is then
+           the squared cosine between a fixed direction and a uniform one, Beta(1/2, (d-1)/2), whose mean is 1/d.
+           "A score unrelated to the expression" does not on its own give that: related people, heteroskedastic
+           residuals, a covariate fit made on the same people, and a score learned on the training people each break
+           the rotational symmetry, and the floor is then an approximation. It is the scale to read r2 against, not
+           a p-value; the permutation and bootstrap machinery (perm_null.py, robust.py) is what tests a null.
   mismatched_r2  the standing negative control: gene i's expression against the score of the next gene of its chunk on
-           another chromosome (review-stats). Its mean must sit at null_r2; above it is signal no gene owns.
+           another chromosome (review-stats). Under that null its mean sits at null_r2, so a mean above it is
+           structure no gene owns (shared covariates, ancestry, relatedness). It is a diagnostic of that structure,
+           not an identity a biological null has to satisfy.
 R_T s is the same for any two scores that differ by one covariate combination, so raw and covariate-adjusted scores
 score alike, and fits made before the harness adjusted scores (C2) re-score from their saved predictions. Under loso
 that is exact. Under random5 a group's people come from five training fits, so a score adjusted fold by fold keeps a
 small fold-to-fold covariate term; the saved (adjusted) prediction is scored as it is.
 
-Paired differences between two arms are averaged over genes; their standard error is the delete-one-chromosome jackknife
-(genes on one chromosome share variants and trans structure, chromosomes do not), and a gene-level SE is shown when only
-one chromosome is scored. They hold the people fixed; robust.py's family x chromosome bootstrap, which re-fits R_T in
-every replicate, covers the sampling of people too.
+Paired differences between two arms are averaged over genes; their standard error is the delete-one-chromosome
+jackknife, which treats chromosomes as exchangeable blocks of genes. It covers what genes of one chromosome share
+through their own variants and their local trans structure; it does not cover what every gene shares through the same
+people, their relatedness, their ancestry and the one covariate fit, so two chromosomes are not independent, only far
+less dependent than two genes of one chromosome. With one chromosome scored the SE is gene-level and labelled so: it
+describes the genes that were scored and generalizes to no others. The jackknife holds the people fixed; robust.py's
+family x chromosome bootstrap, which re-fits R_T in every replicate and keeps each replicate's arms paired, covers the
+sampling of people too.
 
 Headline: both designs hold every person out exactly once, so the five superpopulations are pooled into one test.
 Per gene, r^2 and paired differences are averaged over the groups and covariances are summed over them; the result

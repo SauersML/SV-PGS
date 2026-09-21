@@ -731,6 +731,24 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
     assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
 
 
+def test_the_analytic_null_floor_is_the_mean_r2_of_a_score_uniform_in_the_residual_subspace():
+    """The null the floor 1 / (n_T - rank[1, C_T]) belongs to, checked where it holds: a score whose within-group
+    residual points uniformly in the residual subspace, independent of the expression. r2 is then the squared cosine
+    of two uniform directions, Beta(1/2, (d-1)/2), with mean 1/d and variance 2(d-1) / (d^2 (d+2)). Math only."""
+    from benchmarks.bench_real import report
+
+    generator = np.random.default_rng(21)
+    people, covariate_count, draws = 40, 3, 20_000
+    basis, rank = report.group_basis(generator.normal(size=(people, covariate_count)))
+    dimension = people - rank
+    truth = report.residual_on(basis, generator.normal(size=(1, people)))
+    scores = report.residual_on(basis, generator.normal(size=(draws, people)))
+    _, r2, _ = report.partial_scores(scores, np.repeat(truth, draws, axis=0))
+    error = np.sqrt(2 * (dimension - 1) / (dimension ** 2 * (dimension + 2)) / draws)
+    assert abs(r2.mean() - 1.0 / dimension) < 4 * error
+    assert np.isclose(r2.var(), 2 * (dimension - 1) / (dimension ** 2 * (dimension + 2)), rtol=0.1)
+
+
 def test_the_signed_partial_correlation_and_the_squared_error_skill_sit_beside_the_squared_one(tmp_path):
     """r2 is the square of a partial correlation: it charges a score neither its sign nor its scale. The report
     names and writes all three, so a table cannot be read as if one were the other."""
