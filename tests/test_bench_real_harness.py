@@ -762,6 +762,29 @@ def test_raw_scores_score_from_the_run_record_when_the_split_file_is_missing(tmp
         data.predictions(out, "chr", "snv", masked=False)
 
 
+def test_a_foreign_dataset_is_refused_when_no_person_is_held_out_for_every_gene(tmp_path):
+    """The truth is checked against the dataset's expression gene group by gene group, on each group's own people.
+    Checking only the people every gene row has a finite truth for left the rest unchecked, and when missingness
+    differs enough from gene to gene that intersection is empty, which passed as "verified"."""
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    _, _, expression, _ = within_group_fixture(tmp_path)
+    out = tmp_path / "results/m/loso"
+    truth = np.load(out / "chr.truth.npy")
+    for group_start in (0, 40):
+        for gene, people in enumerate(np.array_split(np.arange(group_start, group_start + 40), 3)):
+            truth[gene, people] = np.nan
+    np.save(out / "chr.truth.npy", truth)
+    assert not np.isfinite(truth).all(axis=0).any()
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    assert np.isfinite(scores["r2"]).all()
+    report.held_out.cache_clear()
+    np.save(tmp_path / "expression.npy", expression[::-1])
+    with pytest.raises(ValueError, match="not the dataset's expression"):
+        report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+
+
 def test_a_covariate_only_score_scores_zero_and_a_foreign_dataset_is_refused(tmp_path):
     from benchmarks.bench_real import report
 

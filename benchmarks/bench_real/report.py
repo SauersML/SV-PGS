@@ -133,13 +133,21 @@ class HeldOut:
         expression = np.asarray(self.expression[[self.gene_row[gene] for gene in genes["gene_id"]]], dtype=np.float64)
         expression[~np.isfinite(truth)] = np.nan
         for name, test in self.tests.items():
-            held = test[np.isfinite(truth[:, test]).all(axis=0)] if name.startswith(f"{design}/") else test[:0]
-            if held.size == 0:
+            if not name.startswith(f"{design}/"):
                 continue
-            gap, _ = within_group_residual(truth[:, held] - expression[:, held], self.covariates[held])
-            bound = np.finfo(np.float32).eps * (np.linalg.norm(truth[:, held], axis=1) + np.linalg.norm(expression[:, held], axis=1))
-            if (np.linalg.norm(gap, axis=1) > bound).any():
-                raise ValueError(f"the saved truth of split {name} is not the dataset's expression minus a covariate fit: is --dataset this run's dataset?")
+            # Gene rows are checked in groups of equal missingness, each on its own held-out people. Checking only the
+            # people every gene row has a finite truth for left every other cell unchecked, and under heterogeneous
+            # missingness that intersection can be empty, which passed for "verified".
+            finite = np.isfinite(truth[:, test])
+            for pattern in np.unique(finite, axis=0):
+                held, rows = test[pattern], np.flatnonzero((finite == pattern).all(axis=1))
+                if held.size == 0 or rows.size == 0:
+                    continue
+                cells = np.ix_(rows, held)
+                gap, _ = within_group_residual(truth[cells] - expression[cells], self.covariates[held])
+                bound = np.finfo(np.float32).eps * (np.linalg.norm(truth[cells], axis=1) + np.linalg.norm(expression[cells], axis=1))
+                if (np.linalg.norm(gap, axis=1) > bound).any():
+                    raise ValueError(f"the saved truth of split {name} is not the dataset's expression minus a covariate fit: is --dataset this run's dataset?")
         return expression
 
     def raw_split_order(self, directory: pathlib.Path, tag: str, columns: int):
