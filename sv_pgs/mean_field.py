@@ -92,19 +92,21 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(cache=True)
-def _sweep(design, squares, members, class_index, log_density, log_scale_rows, grid, noise, mean, residual, variance, shift):
+def _sweep(design, squares, members, class_index, log_density, node_variance, noise, mean, residual, variance, shift):
     """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
     (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
     and its rounding bound are exact there.
 
     ``design`` is Xp over the groups (n x groups, Fortran order), ``squares`` their ||x_g||^2, ``members[j]`` member
-    j's group; ``log_density`` is (classes x nodes), ``log_scale_rows`` per member, ``grid`` the nodes' log
-    variances. The node terms are ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node
-    whose variance overflows contributes conditional variance 1 / omega and weight 0."""
+    j's group; ``log_density`` is (classes x nodes), ``node_variance`` (members x nodes) each member's variance at
+    each node, u_j e^{t_k}, formed once per hyperparameters (``MeanFieldFixedPoints._node_variance``: the sweep's
+    exponentials are its cost, and this one does not move between sweeps). The node terms are
+    ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node whose variance overflows
+    contributes conditional variance 1 / omega and weight 0."""
     sample_count = design.shape[0]
     member_count = members.shape[0]
-    node_count = grid.shape[0]
+    node_count = node_variance.shape[1]
     divergence = 0.0
     weighted_variance = 0.0
     sizes = 0.0
@@ -121,8 +123,7 @@ def _sweep(design, squares, members, class_index, log_density, log_scale_rows, g
         row = class_index[member]
         peak = -np.inf
         for node in range(node_count):
-            log_variance = log_scale_rows[member] + grid[node]
-            variance_node = np.exp(log_variance)
+            variance_node = node_variance[member, node]
             ratio = variance_node * omega
             if ratio == np.inf:
                 conditional[node] = 1.0 / omega
@@ -249,6 +250,8 @@ class MeanFieldFixedPoints:
         self.noise_gain = np.inf
         self.refusals: list[str] = []
         self.profile = _new_profile() | {"sweeps": 0, "sweep_seconds": 0.0, "elbo": -np.inf}
+        self._node_variance_key: bytes | None = None
+        self._node_variance_table = np.zeros((0, 0))
 
     # the ELBO and its pieces
 
@@ -265,13 +268,21 @@ class MeanFieldFixedPoints:
         summands = 2 * self.prior.variant_count + self.sample_count
         return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
+    def _node_variance(self, hyperparameters: MixtureHyperparameters) -> F64Array:
+        """(members x nodes) u_j e^{t_k} at these hyperparameters, held for the next sweep at the same ones."""
+        key = hyperparameters.coefficients.tobytes()
+        if self._node_variance_key != key:
+            with np.errstate(over="ignore"):
+                self._node_variance_table = np.exp(log_scale(self.prior, hyperparameters.coefficients)[:, None] + self.prior.log_variance_grid[None, :])
+            self._node_variance_key = key
+        return self._node_variance_table
+
     def _sweep(self, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
         started = time.perf_counter()
         prior = self.prior
         values = _sweep(
             self.projected, self.group_squares, self.members, self.class_index,
-            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)),
-            np.ascontiguousarray(log_scale(prior, hyperparameters.coefficients)), np.ascontiguousarray(prior.log_variance_grid),
+            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), self._node_variance(hyperparameters),
             self.noise, self.mean, self.residual, self.variance, self.shift,
         )
         self.profile["sweeps"] += 1
