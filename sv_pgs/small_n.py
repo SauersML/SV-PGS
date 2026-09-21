@@ -54,6 +54,8 @@ from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
 from sv_pgs.scale_mixture_ep import (
+    _DEVICE,
+    _host,
     device_scope,
     Cavity,
     FixedPoint,
@@ -130,6 +132,19 @@ class _Design:
         """A u: each member's group's value."""
         return group_values[self.members] if self.tied else group_values
 
+    def _device(self):
+        """(array module, carriers, basis) on the fit's device (``scale_mixture_ep.device_scope``): the design's
+        products are its sample-side cost (Xp diag(w) Xp' at n^2 p was 7.8 s of a 73 s device fit on
+        ENSG00000254709.8 [real]), so they run where the fit runs, on one held copy, and hand back host arrays."""
+        xp = _DEVICE.get()
+        if xp is np:
+            return np, self.carriers, self.basis
+        held = getattr(self, "_held_device", None)
+        if held is None or held[0] is not xp:
+            held = (xp, xp.asarray(self.carriers), xp.asarray(self.basis))
+            self._held_device = held
+        return held
+
     def project(self, samples: F64Array) -> F64Array:
         return samples - self.basis @ (self.basis.T @ samples) if self.basis.shape[1] else samples
 
@@ -142,11 +157,20 @@ class _Design:
 
     def image(self, values: F64Array) -> F64Array:
         """Xp v for v (p,) or (p, q)."""
-        return self.project(self.carriers @ self.group_sum(values))
+        xp, carriers, basis = self._device()
+        if xp is np:
+            return self.project(carriers @ self.group_sum(values))
+        product = carriers @ xp.asarray(self.group_sum(values))
+        return _host(product - basis @ (basis.T @ product) if basis.shape[1] else product)
 
     def back(self, samples: F64Array) -> F64Array:
         """Xp' u for u (n,) or (n, q)."""
-        return self.spread(self.carriers.T @ self.project(samples))
+        xp, carriers, basis = self._device()
+        if xp is np:
+            return self.spread(carriers.T @ self.project(samples))
+        values = xp.asarray(samples)
+        projected = values - basis @ (basis.T @ values) if basis.shape[1] else values
+        return self.spread(_host(carriers.T @ projected))
 
     def _chunks(self) -> Iterator[slice]:
         """Column panels n wide: every design pass below keeps its temporaries at n x n."""
@@ -157,6 +181,10 @@ class _Design:
     def weighted_gram(self, weights: F64Array) -> F64Array:
         """Xp diag(w) Xp' (n x n) for w >= 0: G diag(A' w) G', the members' weights summed within their group."""
         roots = np.sqrt(self.group_sum(weights))
+        xp, carriers, _basis = self._device()
+        if xp is not np:
+            scaled = carriers * xp.asarray(roots)[None, :]
+            return self.project_both(_host(scaled @ scaled.T))
         gram = np.zeros((self.sample_count, self.sample_count), order="F")
         for panel in self._chunks():
             gram = linalg.blas.dsyrk(1.0, self.carriers[:, panel] * roots[None, panel], beta=1.0, c=gram, overwrite_c=True)

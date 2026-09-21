@@ -330,6 +330,7 @@ def objective_statistics(
     improper = cupy.zeros(1, dtype=cupy.int32)
     density = np.exp(log_density)
     for class_position, all_rows in enumerate(class_rows):
+        all_rows = cupy.asarray(all_rows)
         class_log_density = _column(cupy, log_density[class_position], cupy.float64)
         class_density = _column(cupy, density[class_position], cupy.float64)
         deviation_sum = cupy.zeros(node_count, dtype=cupy.float64)
@@ -354,7 +355,7 @@ def objective_statistics(
                 deviations, centred, log_normalizer, curvature, improper,
             ))
             padded = cupy.zeros((padded_rows, scale_size), dtype=cupy.float64)
-            padded[:count] = cupy.asarray(scale_design[rows], dtype=cupy.float64)
+            padded[:count] = cupy.asarray(scale_design)[rows] if scale_size else cupy.zeros((count, 0))
             design = padded[:count]
             value += log_normalizer.sum()
             magnitude += cupy.abs(log_normalizer).sum()
@@ -373,7 +374,10 @@ def objective_statistics(
         hessian[span, span] = np.diag(summed) - outer - np.outer(summed, mass) - np.outer(mass, summed)
         hessian[span, scale_span] = cupy.asnumpy(cross)
         hessian[scale_span, span] = hessian[span, scale_span].T
-    _raise_if_improper(improper)
+    # One transfer for the scalars and the improper flag: each ``float`` or flag read is a device sync (~0.7 ms), and
+    # this call is made thousands of times per fit.
+    totals = cupy.asnumpy(cupy.stack([value, magnitude, improper[0].astype(cupy.float64)]))
+    _raise_if_improper(totals[2:])
     gradient[scale_span] = cupy.asnumpy(scale_gradient)
     hessian[scale_span, scale_span] = cupy.asnumpy(scale_hessian)
-    return float(value), gradient, hessian, float(magnitude)
+    return float(totals[0]), gradient, hessian, float(totals[1])

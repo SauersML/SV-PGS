@@ -922,6 +922,21 @@ def device_scope(array_module: ModuleType | None) -> Iterator[None]:
         _DEVICE.reset(token)
 
 
+def _device_inputs(prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity) -> tuple[list, F64Array, F64Array, F64Array]:
+    """(class rows, log scales, cavity precision, cavity shift) on the fit's device for the fused kernels, held for
+    the hyper step while they are the ones they were formed for: the kernels took a host copy of each per call, and
+    on ENSG00000254709.8 [real] those uploads were 3.5 s of a 73 s device fit (69,643 of them)."""
+    xp = _DEVICE.get()
+    cache = _STEP_CACHE.get()
+    held = None if cache is None else cache.get("device_inputs")
+    if held is not None and held[0] is prior.class_rows and np.array_equal(held[1], scales) and held[2] is cavity:
+        return held[3]
+    formed = ([xp.asarray(rows) for rows in prior.class_rows], xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift))
+    if cache is not None:
+        cache["device_inputs"] = (prior.class_rows, scales.copy(), cavity, formed)
+    return formed
+
+
 def _step_scoped(function: Callable) -> Callable:
     """``function`` with a ``_STEP_CACHE`` for the call's duration: its own where none is open, the open one otherwise
     (a hyper step inside the outer loop shares the loop's, so its exact repeats at an unchanged fixed point, the
@@ -1141,9 +1156,10 @@ def _data_objective(
     if array_module is None:
         array_module = _DEVICE.get()
     if array_module is not np:
+        class_rows, scales, precision, shift = _device_inputs(prior, log_scale(prior, coefficients), cavity)
         value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
-            array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
-            prior.log_variance_grid, cavity.precision, cavity.shift, prior.scale_design, working_bytes,
+            array_module, class_rows, class_log_density(prior, coefficients), scales, prior.log_variance_grid, precision, shift,
+            prior.scale_design, working_bytes,
         )
         # The device kernel returns the terms' sizes, not their pieces: the bound is the summation lemma's on K-term
         # log-sum-exps and p terms, (K + 1 + p) eps of the sizes.
@@ -1208,8 +1224,9 @@ def _data_value(
     if array_module is None:
         array_module = _DEVICE.get()
     if array_module is not np:
+        _rows, device_scales, precision, shift = _device_inputs(prior, scales, cavity)
         log_normalizer, _mean, _variance = engine_kernels.tilted_moments(
-            array_module, prior.class_index, log_density, scales, prior.log_variance_grid, cavity.precision, cavity.shift, working_bytes,
+            array_module, prior.class_index, log_density, device_scales, prior.log_variance_grid, precision, shift, working_bytes,
         )
         return float(log_normalizer.sum())
     total = 0.0
