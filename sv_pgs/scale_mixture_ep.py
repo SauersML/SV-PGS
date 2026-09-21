@@ -3230,18 +3230,15 @@ def _trial(newton: _NewtonB, step: F64Array) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + step), log_smoothing=newton.log_smoothing)
 
 
-def _newton_step(newton: _NewtonB) -> F64Array:
-    return newton.eigenvectors @ ((newton.eigenvectors.T @ newton.gradient) / newton.eigenvalues)
-
-
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by halving a refused step, not by a
-    radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
-    the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
-    curvature out of a saddle."""
-    if newton.definite:
-        return _newton_step(newton)
-    return _trust_region_step(newton.total, newton.gradient, radius)
+    """The step: the maximizer of the quadratic model inside ``radius`` (More and Sorensen): Newton's (B + S)^-1 g
+    where B + S is positive definite and that step fits, the boundary maximizer otherwise, which follows B + S's
+    negative curvature out of a saddle. The radius binds the definite case too: Newton's step divides each
+    direction's gradient by its own curvature, and on a direction the data barely curve (the log-normal family at
+    the lambda = infinity edge, curvature 3e-5 against a gradient of 0.02 on the mean-field test problem) it is
+    hundreds of units long, which the acceptance test cannot refuse: it lands where the density has collapsed onto
+    one lattice node, every derivative is at rounding, and the vanished gradient reads as a maximum."""
+    return _trust_region_step(newton.total, newton.gradient, radius, spectrum=(newton.eigenvalues, newton.eigenvectors))
 
 
 def _cauchy_radius(newton: _NewtonB) -> float:
@@ -3613,8 +3610,8 @@ def fit_hyperparameters(
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
-                if not newton.definite:
-                    radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
+                # A step that reached the radius widens it; one that stopped short (Newton's, fitting) keeps it.
+                radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
@@ -3634,11 +3631,7 @@ def fit_hyperparameters(
                     "the Newton-B step makes no certified progress at the EP fixed point "
                     + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
                 )
-            if newton.definite:
-                shorter = 0.5 * proposal
-                radius = entry.radius
-            else:
-                radius = 0.5 * length
-                radii[model] = radius
-                shorter = _proposal(newton, radius)
+            radius = 0.5 * length
+            radii[model] = radius
+            shorter = _proposal(newton, radius)
             pending[model] = replace(entry, hyperparameters=_trial(newton, shorter), proposal=shorter, radius=radius, fraction=0.5 * entry.fraction)
