@@ -1537,12 +1537,18 @@ def curvature_correction(
     relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
     fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     achieved: list[float] = []
-    return CurvatureCorrection(
-        mapping=prior.coefficient_map,
-        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved),
-        fixed_curvature=0.5 * (fixed + fixed.T),
-        resolutions=achieved,
-    )
+    # The variants' derivatives at this fixed point serve every direction the correction is asked for.
+    formed: dict[str, _VariantDerivatives] = {}
+
+    def columns(directions: F64Array) -> F64Array:
+        if "derivatives" not in formed:
+            formed["derivatives"] = _variant_derivatives(prior, coefficients, cavity, working_bytes)
+        return _total_curvature_columns(
+            prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved,
+            derivatives=formed["derivatives"], fixed_cavity=fixed,
+        )
+
+    return CurvatureCorrection(mapping=prior.coefficient_map, columns=columns, fixed_curvature=0.5 * (fixed + fixed.T), resolutions=achieved)
 
 
 def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
@@ -1663,9 +1669,13 @@ def _total_curvature_columns(
     relative_tolerance: float,
     directions: F64Array,
     achieved: list[float] | None = None,
+    derivatives: _VariantDerivatives | None = None,
+    fixed_cavity: F64Array | None = None,
 ) -> F64Array:
     """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
-    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
+    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K). ``derivatives`` and
+    ``fixed_cavity`` (the variants' derivatives and A at this x and cavity) are formed here when not given: a lazy
+    correction (``curvature_correction``) forms them once and hands them to every call at its fixed point.
 
     B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
     B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
@@ -1677,7 +1687,10 @@ def _total_curvature_columns(
     the restart length that fits ``working_bytes``. ``achieved``, when given, receives the relative residual the
     solve reached (its rounding where the posterior is ``exact``).
     """
-    derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
+    if derivatives is None:
+        derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
+    if fixed_cavity is None:
+        fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     if posterior.cavity_response is not None:
@@ -1685,7 +1698,7 @@ def _total_curvature_columns(
         shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z)
         if achieved is not None:
             achieved.append(_EPSILON if posterior.exact else relative_tolerance)
-        return _total_from_response(prior, coefficients, cavity, derivatives, directions, shift_step, precision_step, working_bytes)
+        return _total_from_response(prior, fixed_cavity, derivatives, directions, shift_step, precision_step)
     solve, variance_jvp = posterior.solve, posterior.variance_jvp
     assert solve is not None and variance_jvp is not None
     # A variant whose tilted law is a point mass at zero (all its prior mass where v = u e^t underflows to 0) does not
@@ -1729,7 +1742,7 @@ def _total_curvature_columns(
         except np.linalg.LinAlgError as error:
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
-        return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
+        return _total_from_response(prior, fixed_cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step)
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
     # columns (``krylov_recycle.block_gcro_dr``, speed-recycle): each application serves them all, restarts keep the
     # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it; it stops where a cycle no longer
@@ -1786,15 +1799,13 @@ def _total_curvature_columns(
                 )
             floor_residual, tightened = residual, _EPSILON
         inner = tightened
-    return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
+    return _total_from_response(prior, fixed_cavity, derivatives, directions, through(solution, inner)[0], solution)
 
 
 def _total_from_response(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, derivatives: _VariantDerivatives, directions: F64Array,
-    shift_step: F64Array, precision_step: F64Array, working_bytes: int,
+    prior: ScaleMixturePrior, fixed_cavity: F64Array, derivatives: _VariantDerivatives, directions: F64Array, shift_step: F64Array, precision_step: F64Array
 ) -> F64Array:
-    """B_z E from the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
-    fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    """B_z E from A (``fixed_cavity``) and the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
     return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
     )
