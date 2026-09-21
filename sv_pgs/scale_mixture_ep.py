@@ -1470,7 +1470,6 @@ class CurvatureCorrection:
 INDEPENDENT_EFFECTS = CurvatureCorrection()
 
 
-@dataclass(frozen=True)
 class _Anchor:
     """The EP evidence's local model about the fixed point x_k where ``correction`` (C = B - A) was solved: EP
     stationarity makes E and the fixed-cavity F_k share their gradient at x_k, with Hessians -B and -A, so
@@ -1478,21 +1477,43 @@ class _Anchor:
     that model minus the penalty, whose curvature A + C + S is the one V's determinant takes: its maximizer, its
     responses and its line integrals then belong to the same integrand. ``center`` is z_k = M x_k, the same in every
     view; ``matrix``, ``linear`` and ``constant`` are this prior's K'CK, K'C x_k and x_k'C x_k (x = K x_view), so the
-    term is -(1/2 x'(K'CK)x - (K'C x_k)'x + 1/2 x_k'C x_k)."""
+    term is -(1/2 x'(K'CK)x - (K'C x_k)'x + 1/2 x_k'C x_k).
 
-    correction: CurvatureCorrection
-    center: F64Array
-    matrix: F64Array
-    linear: F64Array
-    constant: float
+    They are formed on first use, from the correction's own lazy solve on this prior's directions: the hyper step
+    anchors the full prior, whose local model only its views evaluate (each on its own directions, the free
+    coefficients of its edges), so the full lattice's directions are solved only where a view asks for them all."""
+
+    __slots__ = ("correction", "center", "_coefficient_map", "_blocks")
+
+    def __init__(self, correction: CurvatureCorrection, center: F64Array, coefficient_map: F64Array) -> None:
+        self.correction, self.center, self._coefficient_map = correction, center, coefficient_map
+        self._blocks: F64Array | None = None
+
+    def _solved(self) -> F64Array:
+        if self._blocks is None:
+            self._blocks = self.correction.on(np.column_stack([self._coefficient_map, self.center]))
+        return self._blocks
+
+    @property
+    def matrix(self) -> F64Array:
+        size = self._coefficient_map.shape[1]
+        return self._solved()[:size, :size]
+
+    @property
+    def linear(self) -> F64Array:
+        size = self._coefficient_map.shape[1]
+        return self._solved()[:size, size]
+
+    @property
+    def constant(self) -> float:
+        size = self._coefficient_map.shape[1]
+        return float(self._solved()[size, size])
 
 
 def _anchored(prior: ScaleMixturePrior, correction: CurvatureCorrection, center: F64Array) -> ScaleMixturePrior:
     """``prior`` with the local model about z_k = ``center`` in its own coordinates (``_Anchor``): C on the prior's
-    directions and on x_k's, from the correction's own lazy solve."""
-    size = prior.coefficient_size
-    blocks = correction.on(np.column_stack([prior.coefficient_map, center]))
-    return replace(prior, anchor=_Anchor(correction, center, blocks[:size, :size], blocks[:size, size], float(blocks[size, size])))
+    directions and on x_k's, from the correction's own lazy solve, formed when first used."""
+    return replace(prior, anchor=_Anchor(correction, center, prior.coefficient_map))
 
 
 def _anchor_value(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[float, F64Array]:
@@ -2474,22 +2495,29 @@ def _evidence(
     working_bytes: int,
     tolerance: float,
     maximize: bool = True,
+    screen: float | None = None,
 ) -> _Evidence | None:
     """``_evidence_once``, each distinct input once per cavity (and per correction, held by identity: one per hyper step)."""
     return _repeated(
-        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance, maximize),
-        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, maximize), held=correction,
+        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance, maximize, screen),
+        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, maximize, screen), held=correction,
     )
 
 
 def _evidence_once(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, maximize: bool = True
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, maximize: bool = True,
+    screen: float | None = None,
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
 
     With ``maximize`` false, V's formula is taken at ``start`` itself (an outer state's own x, ``_outer_state``): its
     error then carries x's own decrement there, as the inner maximizer's share does.
+
+    With ``screen`` (a release trial's, ``_best_certified``), None as soon as the Laplace V at an iterate plus the
+    inner maximizer's error bound is at or below it: x is then resolved no further, since tightening it can only
+    move V within that bound, and the trial has failed. Taken where the prior is anchored (every view of a hyper
+    step), where the determinant V takes is the iterate's own.
 
     V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved, the
     second-order approximation of the actual marginal likelihood, taken as A + ``correction`` (``CurvatureCorrection``);
@@ -2525,6 +2553,10 @@ def _evidence_once(
         # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
         # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
+        if screen is not None and prior.anchor is not None:
+            penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
+            if value + 0.5 * penalty_log_determinant - 0.5 * fixed.schur_log_determinant + inner_error <= screen:
+                return None
         if not maximize or 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
         if previous is not None and np.array_equal(coefficients, previous):
@@ -2756,10 +2788,13 @@ def _best_certified(
     start's candidate stands for the basin, which is then corrected once.
 
     With ``screen``, the corrections are taken only where some basin's Laplace V is above it, and None is returned
-    otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate."""
+    otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate. A start whose
+    Laplace V falls at or below the screen by more than its inner error stops at its first iterate
+    (``_evidence_once``): on real genes every release trial of an all-edge state fails, at two maximizations and
+    three trace-gradient passes per start."""
     certified: list[_Evidence] = []
     for start in starts:
-        candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
+        candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, screen=screen)
         if candidate is None:
             continue
         for other in certified:
