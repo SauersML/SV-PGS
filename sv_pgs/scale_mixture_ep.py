@@ -1144,6 +1144,16 @@ def _penalized(
     return objective.value - penalty_value - anchor_value, mapping.T @ objective.gradient - penalty_gradient - anchor_gradient, hessian
 
 
+def _resolved_spectrum(spectrum: tuple[F64Array, F64Array]) -> tuple[F64Array, F64Array]:
+    """The spectrum with every eigenvalue within the eigendecomposition's rounding of zero (eps times the dimension
+    times the largest magnitude) raised to that floor: such a direction is flat to double precision, neither an
+    ascent to follow nor a negative curvature to leave by (on a weak-data verification case the smallest eigenvalue
+    of -H sat at +-1e-14 and flipped sign between iterates, and the trust-region step walked 2-10 units along it)."""
+    eigenvalues, eigenvectors = spectrum
+    floor = _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny)
+    return np.where(np.abs(eigenvalues) <= floor, floor, eigenvalues), eigenvectors
+
+
 def _spectrum(negative_hessian: F64Array) -> tuple[F64Array, F64Array]:
     """-H's eigendecomposition (of its symmetric part), shared by every step taken at one point."""
     return np.linalg.eigh(0.5 * (negative_hessian + negative_hessian.T))
@@ -1226,8 +1236,8 @@ def _maximize_coefficients(
     objective = _data_objective(prior, coefficients, cavity, working_bytes)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
     # -H changes only when a step is accepted: its one eigendecomposition serves the test, the ascent direction and
-    # every trust-region trial at that point.
-    spectrum = _spectrum(-hessian)
+    # every trust-region trial at that point; a direction flat to rounding counts as flat (``_resolved_spectrum``).
+    spectrum = _resolved_spectrum(_spectrum(-hessian))
     ascent = _ascent_direction(-hessian, gradient, spectrum)
     radius = float(np.linalg.norm(ascent))
     while True:
@@ -1259,7 +1269,7 @@ def _maximize_coefficients(
                 return coefficients, objective
             coefficients, objective = candidate, candidate_objective
             value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
-            spectrum = _spectrum(-hessian)
+            spectrum = _resolved_spectrum(_spectrum(-hessian))
             ascent = _ascent_direction(-hessian, gradient, spectrum)
             continue
         candidate = coefficients + step
@@ -1287,7 +1297,7 @@ def _maximize_coefficients(
                 # here; the point certifies nothing (``_evidence_once``).
                 return coefficients, objective
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
-            spectrum = _spectrum(-hessian)
+            spectrum = _resolved_spectrum(_spectrum(-hessian))
             ascent = _ascent_direction(-hessian, gradient, spectrum)
 
 
@@ -2357,10 +2367,22 @@ def _null_complement(null_basis: F64Array) -> F64Array:
 
 
 def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Array) -> _Profiled:
-    """``_Profiled`` for M; raises LinAlgError when M is not positive definite."""
+    """``_Profiled`` for M; raises LinAlgError when M is not positive definite. An eigenvalue negative within the
+    eigendecomposition's rounding of zero is not resolved as negative: M is then factored with it at the rounding
+    floor (``_resolved_spectrum``), a flat direction whose determinant the returned ``rounding`` reports as
+    unresolved, so the point certifies nothing at a positive tolerance and a tolerance of zero gets the value."""
     basis = np.hstack([null_basis, complement])
     rotated = basis.T @ matrix @ basis
-    factor = np.linalg.cholesky(0.5 * (rotated + rotated.T))
+    symmetric = 0.5 * (rotated + rotated.T)
+    try:
+        factor = np.linalg.cholesky(symmetric)
+    except np.linalg.LinAlgError:
+        eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
+        resolved, _vectors = _resolved_spectrum((eigenvalues, eigenvectors))
+        if not np.all(resolved > 0.0):
+            raise
+        rotated = eigenvectors @ (resolved[:, None] * eigenvectors.T)
+        factor = np.linalg.cholesky(0.5 * (rotated + rotated.T))
     inverse_factor = solve_triangular(factor, np.eye(factor.shape[0]), lower=True)
     profiled = null_basis.shape[1]
     trailing = inverse_factor[profiled:]
