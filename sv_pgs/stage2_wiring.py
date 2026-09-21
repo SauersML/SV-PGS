@@ -32,6 +32,8 @@ from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
+_EPSILON = float(np.finfo(np.float64).eps)
+
 
 @dataclass(frozen=True)
 class FittedModels:
@@ -86,7 +88,9 @@ def stage0_candidates(store: DosageStore, training_columns: I64Array, log_reliab
 
 def _block_cap(store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget) -> int:
     """The memory's largest cap, but no larger than a chromosome's candidate count (in cap steps): Stage 0's buffers
-    grow with the cap, and a block never holds more than its chromosome's candidates."""
+    grow with the cap, and a block never holds more than its chromosome's candidates.
+
+    There is at least one candidate: ``_fit_one`` returns the null genetic model before Stage 0 when there is none."""
     sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
     sample_groups[training_columns] = 0
     memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
@@ -112,6 +116,92 @@ def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificat
     return FitCertificate(**values)
 
 
+_ModelFit = tuple[ScoringModel, float, MixtureHyperparameters, FitCertificate]
+
+
+@dataclass(frozen=True)
+class _CovariateFit:
+    """The covariates' own least squares on one model's training rows.
+
+    ``degrees`` is n - rank(C), by the rank of the covariates themselves rather than their column count, and
+    ``noise`` the residual sum of squares over it. ``explained`` is whether the residual is zero to the covariates'
+    own numerical rank tolerance, max(n, k) eps ||y||, the rule Stage 0 uses for the covariate span
+    (``small_n._covariate_basis``): the targets then lie in the covariates' span to working precision, so the data
+    say nothing about a residual for a genetic model to explain.
+    """
+
+    alpha: F64Array
+    noise: float
+    degrees: int
+    explained: bool
+
+
+def _covariate_least_squares(covariates: F64Array, targets: F64Array) -> _CovariateFit:
+    alpha, _sums, rank, _singular = np.linalg.lstsq(covariates, targets, rcond=None)
+    residual = targets - covariates @ alpha
+    residual_sum = float(residual @ residual)
+    degrees = int(targets.shape[0] - rank)
+    resolution = max(covariates.shape) * _EPSILON * float(np.linalg.norm(targets))
+    return _CovariateFit(
+        alpha=alpha,
+        noise=residual_sum / degrees if degrees > 0 else np.inf,
+        degrees=degrees,
+        explained=residual_sum <= resolution * resolution,
+    )
+
+
+def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: str) -> _ModelFit:
+    """The model of a training set with no genetic column to fit: the covariates alone, and no variant.
+
+    This is the fit's answer, not a failure. A training set can legitimately have no genetic column: every record's
+    reliability can be zero, every candidate can be monomorphic on its own rows, or the covariates can already
+    explain its targets to working precision. The predictor is then the covariate part alone, the prior is empty,
+    and there is nothing approximated and nothing to search, so every certificate term is 0 and ``reason`` says
+    which case it was. The noise variance is the covariates' own residual variance as computed, never a floor and
+    never rounded up: where the covariates span the targets it can be 0, and the predictive variance is 0 with it.
+    """
+    log(f"stage2 wiring: null genetic model ({reason}); the covariates alone, noise {covariate_fit.noise:.6g}")
+    scoring = ScoringModel(
+        store_rows=np.zeros(0, dtype=np.int64),
+        signed_means=np.zeros(0),
+        signed_scales=np.zeros(0),
+        coefficients=np.zeros(0),
+        posterior_draws=np.zeros((0, draw_count)),
+        alpha=covariate_fit.alpha,
+        trait_type=TraitType.QUANTITATIVE,
+        predictive_intercept_shift=0.0,
+    )
+    certificate = FitCertificate(
+        remaining_gain=np.zeros(1),
+        newton_decrement=np.zeros(1),
+        smoothing_gradient=np.zeros(1),
+        stationarity_steps=(np.zeros(0),),
+        stationarity_errors=(np.zeros(0),),
+        mean_move=np.zeros(1),
+        draw_tolerance=np.full(1, 1.0 / draw_count),
+        noise_gain=np.zeros(1),
+        mean_error=np.zeros(1),
+        information_bound=np.zeros(1),
+        information_tolerance=np.zeros(1),
+        undecided_blocks=0,
+        negative_sites=np.zeros(1, dtype=np.int64),
+        # p_eff = 0: there are no effects, so the prediction tolerance p_eff / K is 0 and the move is 0 with it.
+        effective_effects=np.zeros(1),
+        outer_iterations=np.zeros(1, dtype=np.int64),
+        halvings=np.zeros(1, dtype=np.int64),
+        prediction_move=np.zeros(1),
+        prediction_tolerance=np.zeros(1),
+        unresolved=np.zeros(1, dtype=np.int64),
+        refusals=(reason,),
+        outer_history=((),),
+        refreshes=0,
+        passes=0,
+        # There is no outer loop to stop and no fixed point to perturb: the covariate least squares is exact.
+        outer_criterion_met=np.ones(1, dtype=bool),
+    )
+    return scoring, covariate_fit.noise, MixtureHyperparameters(coefficients=np.zeros(0), log_smoothing=np.zeros(0)), certificate
+
+
 def _fit_one(
     store: DosageStore,
     training_columns: I64Array,
@@ -122,16 +212,29 @@ def _fit_one(
     work_dir: Path,
     seed: int,
     draw_count: int,
-) -> tuple[ScoringModel, float, MixtureHyperparameters, FitCertificate]:
+) -> _ModelFit:
     """One quantitative model on the sorted store columns ``training_columns``, whose covariates (intercept first) and
-    targets follow them."""
+    targets follow them; the null genetic model where the training set has no genetic column to fit."""
     # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
+    # Before the store is read: what the covariates alone leave, which decides whether there is anything to fit.
+    covariate_fit = _covariate_least_squares(covariates, targets)
+    if covariate_fit.degrees <= 0:
+        raise ValueError(
+            f"{targets.shape[0]} training rows against covariates of rank {targets.shape[0] - covariate_fit.degrees} leave no "
+            "residual degrees of freedom, so the noise variance is not identified."
+        )
+    if covariate_fit.explained:
+        return _null_genetic_model(covariate_fit, draw_count, "the covariates explain every training target to working precision")
     candidates = stage0_candidates(store, training_columns, log_reliability, config)
+    if candidates.shape[0] == 0:
+        return _null_genetic_model(covariate_fit, draw_count, "no store record carries signal on these training rows")
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
     statistics = compute_genotype_statistics(
         DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
     )
+    if np.asarray(statistics.active_rows).shape[0] == 0:
+        return _null_genetic_model(covariate_fit, draw_count, "every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)

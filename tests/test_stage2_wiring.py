@@ -122,6 +122,103 @@ def test_both_reliability_sources_meet_one_contract(tmp_path: Path, capsys: pyte
         )
 
 
+def _made(path: Path) -> Path:
+    path.mkdir(parents=True)
+    return path
+
+
+def _fit_one_model(root: Path, milli: np.ndarray, training: np.ndarray, targets: np.ndarray, work_dir: Path):
+    from sv_pgs.dosage_store import DosageStore
+    from sv_pgs.stage2_wiring import fit_models
+    from tests.test_dosage_store import _write_store
+
+    _write_store(root, [{"chr22": milli}])
+    store = DosageStore.open(root)
+    work_dir.mkdir(parents=True)
+    return store, fit_models(
+        store=store,
+        store_columns=np.arange(store.n_samples, dtype=np.int64),
+        covariates=np.ones((store.n_samples, 1)),
+        covariate_columns=np.ones((1, 1), dtype=bool),
+        targets=targets[:, None],
+        training=training[:, None],
+        trait_types=(TraitType.QUANTITATIVE,),
+        log_variance_offset=None,
+        budget=_budget(),
+        work_dir=work_dir,
+        seed=1,
+        draw_count=4,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "reason"),
+    [
+        ("monomorphic_store", "no store record carries signal"),
+        pytest.param(
+            "monomorphic_on_training",
+            "monomorphic on these training rows",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason="Stage 0 cannot write an LD block with no active row: genotype_statistics.py:694 raises "
+                "TypeError('memoryview: cannot cast view with zeros in shape or strides') before the wiring sees the "
+                "empty active set. The wiring's own handling of it is there; the store pass has to survive it first.",
+            ),
+        ),
+        ("covariates_explain_the_target", "explain every training target to working precision"),
+    ],
+)
+def test_a_training_set_with_no_genetic_column_fits_the_covariates_alone(tmp_path: Path, case: str, reason: str) -> None:
+    """I07: no candidate record, every candidate monomorphic on the training rows, and a phenotype the covariates
+    explain to working precision are covariate-only outcomes of the model, not crashes. They raised ValueError from
+    .max() on an empty bincount and from arange in the start lattice at a zero residual variance."""
+    generator = np.random.default_rng(6)
+    samples, records = 40, 12
+    training = np.ones(samples, dtype=bool)
+    targets = generator.normal(size=samples)
+    if case == "monomorphic_store":
+        milli = np.zeros((records, samples), dtype=np.int64)
+    elif case == "monomorphic_on_training":
+        training = np.arange(samples) < samples // 2
+        milli = (generator.binomial(2, 0.3, size=(records, samples)) * 1000).astype(np.int64)
+        milli[:, training] = 0
+    else:
+        milli = (generator.binomial(2, 0.3, size=(records, samples)) * 1000).astype(np.int64)
+        targets = np.full(samples, 3.5)
+    store, fitted = _fit_one_model(tmp_path / "store", milli, training, targets, tmp_path / "work")
+    (scoring,) = fitted.scoring
+    expected = float(np.mean(targets[training]))
+    assert scoring.store_rows.shape == (0,) and scoring.coefficients.shape == (0,)
+    np.testing.assert_allclose(scoring.alpha, [expected], rtol=0.0, atol=1e-12)
+    (refusal,) = fitted.certificate.refusals
+    assert refusal.startswith("model 0: ") and reason in refusal
+    assert fitted.certificate.outer_criterion_met.tolist() == [True]
+    rows = int(training.sum())
+    if case == "covariates_explain_the_target":
+        # The residual is zero to the covariates' own rank tolerance, so the reported variance is below it, not a floor.
+        resolution = max(rows, 1) * np.finfo(np.float64).eps * float(np.linalg.norm(targets[training]))
+        expected_noise = 0.0
+        assert 0.0 <= fitted.noise_variance[0] <= resolution * resolution / (rows - 1)
+    else:
+        expected_noise = float(np.sum((targets[training] - expected) ** 2) / (rows - 1))
+        np.testing.assert_allclose(fitted.noise_variance, [expected_noise], rtol=1e-12, atol=1e-12)
+    # The covariate-only model saves, loads and scores like any other: every person gets the covariate prediction.
+    model = fit_model.fit(
+        fit_model.FitRequest(
+            store=store, store_columns=np.arange(samples, dtype=np.int64), covariates=np.zeros((samples, 0)),
+            covariate_names=(), covariate_columns=np.zeros((1, 0), dtype=bool), targets=targets[:, None],
+            training=training[:, None], model_names=("trait/fold0",), trait_types=(TraitType.QUANTITATIVE,),
+            research_ids=tuple(f"person{index}" for index in range(samples)), log_variance_offset=None,
+            budget=_budget(), work_dir=_made(tmp_path / "fit"), seed=2,
+        )
+    )
+    save_model(tmp_path / "model", model)
+    prediction = predict(load_model(tmp_path / "model"), store, np.arange(samples), np.zeros((samples, 0)), _budget())
+    np.testing.assert_allclose(prediction.predictive_mean[:, 0], expected, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(prediction.predictive_variance[:, 0], model.noise_variance[0], rtol=0.0, atol=0.0)
+    assert expected_noise == 0.0 or abs(model.noise_variance[0] - expected_noise) <= 1e-12
+
+
 def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path) -> None:
     from sv_pgs.config import ModelConfig
     from sv_pgs.dosage_store import DosageStore

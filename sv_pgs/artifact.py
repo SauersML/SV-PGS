@@ -113,8 +113,9 @@ class FittedModel:
     ``covariate_names`` are the union of every model's covariates, and ``covariate_columns`` [models, covariates] the
     ones each model adjusted for (with the intercept, always); a model's alpha is exactly 0 on the others.
     ``certificate`` holds every per-model term of the fit's certificate as an array with one leading entry per model,
-    ``fit_counts`` its whole-fit counts, and ``refusals`` the reasons the fit refused trial steps, across all models;
-    ``noise_variance`` is each quantitative model's residual variance, used in its predictive variance.
+    ``fit_counts`` its whole-fit counts, and ``refusals`` the reasons the fit refused trial steps (and the reason a
+    model is the null genetic model), across all models; ``noise_variance`` is each quantitative model's residual
+    variance, used in its predictive variance. A model with no genetic column has no store row in its ``scoring``.
     """
 
     model_names: tuple[str, ...]
@@ -135,8 +136,11 @@ class FittedModel:
         if len(self.scoring) != model_count or len(self.hyperparameters) != model_count:
             raise ValueError("scoring and hyperparameters need one entry per model.")
         noise = np.asarray(self.noise_variance)
-        if noise.shape != (model_count,) or noise.dtype != np.float64 or not np.all(np.isfinite(noise)) or np.any(noise <= 0.0):
-            raise ValueError("noise_variance must be positive float64 with one entry per model.")
+        # 0 is admissible and is an estimate, never a floor: a model whose covariates explain its training targets
+        # exactly has no residual variance, and its predictive variance is 0 with it (``stage2_wiring``'s null
+        # genetic model). A negative variance is not an estimate of anything.
+        if noise.shape != (model_count,) or noise.dtype != np.float64 or not np.all(np.isfinite(noise)) or np.any(noise < 0.0):
+            raise ValueError("noise_variance must be a finite non-negative float64 with one entry per model.")
         columns = np.asarray(self.covariate_columns)
         if columns.shape != (model_count, len(self.covariate_names)) or columns.dtype != np.bool_:
             raise ValueError("covariate_columns must be bool [models, covariates].")
