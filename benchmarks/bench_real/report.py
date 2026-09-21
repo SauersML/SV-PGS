@@ -2,13 +2,23 @@
 
 The held-out metric is the within-group partial r^2 (lead ruling, review-stats STATS_REVIEW.md §0). Within one held-out
 superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted over T's own held-out people. Per gene:
-  r2       corr(R_T s, R_T y)^2, with y the dataset's expression and s the saved prediction (0 when R_T s = 0): the
-           incremental R^2 of the score given the covariates inside the target ancestry. The harness's saved truth (y
-           minus a training-OLS covariate fit) is not scored: in a held-out ancestry that fit is an extrapolation whose
-           within-group spread dominated the truth, and every score shared it. The saved truth only marks who was held
-           out, and it is checked against y (HeldOut.expression_for), so a mismatched --dataset stops the report.
-  oos_r2   1 - |R_T (y - s)|^2 / |R_T y|^2: it also charges the score's scale, which r2 ignores.
-  null_r2  1 / (n_T - rank[1, C_T]), the exact expectation of r2 for a score unrelated to expression.
+  partial_correlation  corr(R_T s, R_T y), with y the dataset's expression and s the saved prediction (0 when
+           R_T s = 0): the partial correlation of the score with the expression given [1, C_T], inside the target
+           ancestry, with its sign. The harness's saved truth (y minus a training-OLS covariate fit) is not scored: in
+           a held-out ancestry that fit is an extrapolation whose within-group spread dominated the truth, and every
+           score shared it. The saved truth only marks who was held out, and it is checked against y
+           (HeldOut.expression_for), so a mismatched --dataset stops the report.
+  r2       its square, the squared partial correlation. It is the share of the expression's WITHIN-GROUP RESIDUAL
+           variance the score explains, not the rise in the total-response R^2: that rise is r2 times the share of
+           the variance [1, C_T] leaves, so r2 is an upper bound on it. It charges neither the score's sign (a score
+           that is the exact negative of the expression scores 1) nor its scale (any multiple of a score scores
+           alike). The headline is r2; the other two say what it leaves out.
+  oos_r2   1 - |R_T (y - s)|^2 / |R_T y|^2: the squared-error skill of the score as it stands against the target
+           group's own covariate fit, so it charges the sign and the scale that r2 ignores. It is negative for a
+           score worse than that fit, and is never clipped. Its nuisance fit is made inside the target group, so it
+           is a target-residualized statistic, not the R^2 of a deployable predictor whose covariate model was
+           fitted in training: this benchmark measures conditional association, not prospective skill (see E03).
+  null_r2  1 / (n_T - rank[1, C_T]), the expectation of r2 under the null model below.
   mismatched_r2  the standing negative control: gene i's expression against the score of the next gene of its chunk on
            another chromosome (review-stats). Its mean must sit at null_r2; above it is signal no gene owns.
 R_T s is the same for any two scores that differ by one covariate combination, so raw and covariate-adjusted scores
@@ -98,12 +108,13 @@ def within_group_residual(values, covariates, weights=None):
 
 
 def partial_scores(score, truth):
-    """Per row of within-group residuals: r2 = corr(R s, R y)^2 (0 when R s = 0) and oos_r2 = 1 - |R y - R s|^2 / |R y|^2."""
+    """Per row of within-group residuals: the signed partial correlation corr(R s, R y) (0 when R s = 0), its square
+    r2, and oos_r2 = 1 - |R y - R s|^2 / |R y|^2. Three estimands, not one: see this module's docstring."""
     product = np.sum(score * truth, axis=1)
     score_norm, truth_norm = np.sum(score ** 2, axis=1), np.sum(truth ** 2, axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        r2 = np.where(score_norm == 0, 0.0, product ** 2 / (score_norm * truth_norm))
-        return r2, 1.0 - np.sum((truth - score) ** 2, axis=1) / truth_norm
+        correlation = np.where(score_norm == 0, 0.0, product / np.sqrt(score_norm * truth_norm))
+        return correlation, correlation ** 2, 1.0 - np.sum((truth - score) ** 2, axis=1) / truth_norm
 
 
 class HeldOut:
@@ -229,11 +240,12 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
                 continue
             predictions = data.predictions(directory, tag, feature_set, masked=False)
             for group, rows, people, rank, truth, (score,) in data.within_groups(design, expression, predictions):
-                r2, oos_r2 = partial_scores(score, truth)
+                correlation, r2, oos_r2 = partial_scores(score, truth)
                 partner = mismatched_partners(genes["chrom"].to_numpy()[rows])
-                mismatched = np.where(partner >= 0, partial_scores(score[partner], truth)[0], np.nan)
+                mismatched = np.where(partner >= 0, partial_scores(score[partner], truth)[1], np.nan)
                 frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
-                                            "feature_set": feature_set, "design": design, "superpopulation": group, "r2": r2, "oos_r2": oos_r2,
+                                            "feature_set": feature_set, "design": design, "superpopulation": group,
+                                            "partial_correlation": correlation, "r2": r2, "oos_r2": oos_r2,
                                             "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
     return pd.concat(frames, ignore_index=True)
 
@@ -291,11 +303,12 @@ def paired(scores: pd.DataFrame, arm_a, arm_b):
 
 
 def pooled_r2(scores: pd.DataFrame):
-    """Per method, feature set and design: the mean over genes of each gene's r^2 (and oos_r2, and the null r^2)
-    averaged over the held-out groups, complete-case (failed genes dropped and counted) and intention-to-treat (a failed
-    group scored as the training-mean prediction: r^2 = oos_r2 = 0)."""
+    """Per method, feature set and design: the mean over genes of each gene's r^2 (and its signed partial correlation,
+    oos_r2, and the null r^2) averaged over the held-out groups, complete-case (failed genes dropped and counted) and
+    intention-to-treat (a failed group scored as the training-mean prediction: r^2 = oos_r2 = 0)."""
     key = ["method", "feature_set", "design", "gene_id", "chrom"]
-    per_gene = scores.groupby(key, as_index=False)[["r2", "oos_r2", "null_r2", "mismatched_r2"]].agg(lambda values: values.mean(skipna=False))
+    per_gene = scores.groupby(key, as_index=False)[["partial_correlation", "r2", "oos_r2", "null_r2", "mismatched_r2"]].agg(
+        lambda values: values.mean(skipna=False))
     per_gene_itt = scores.fillna({"r2": 0.0}).groupby(key, as_index=False)["r2"].mean()
     itt_groups = dict(list(per_gene_itt.groupby(["method", "feature_set", "design"])))
     rows = []
@@ -304,10 +317,12 @@ def pooled_r2(scores: pd.DataFrame):
         complete = group.dropna(subset=["r2"])
         mean, error, kind = jackknife(complete["r2"], complete["chrom"])
         oos_mean, oos_error, _ = jackknife(complete["oos_r2"], complete["chrom"])
+        correlation_mean, correlation_error, _ = jackknife(complete["partial_correlation"], complete["chrom"])
         whole = itt_groups[arm]
         itt_mean, itt_error, _ = jackknife(whole["r2"], whole["chrom"])
         rows.append(dict(zip(["method", "feature_set", "design"], arm), superpopulation=POOLED, genes=len(complete), mean_r2=mean, se=error, se_kind=kind,
-                         null_r2=complete["null_r2"].mean(), mismatched_r2=complete["mismatched_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error, failed_genes=failed, itt_genes=len(whole),
+                         null_r2=complete["null_r2"].mean(), mismatched_r2=complete["mismatched_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error,
+                         mean_partial_correlation=correlation_mean, partial_correlation_se=correlation_error, failed_genes=failed, itt_genes=len(whole),
                          itt_mean_r2=itt_mean, itt_se=itt_error))
     return pd.DataFrame(rows)
 
@@ -329,7 +344,7 @@ def sv_credit(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method: str,
                 frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
                                             "feature_set": feature_set, "design": design, "superpopulation": group,
                                             "covariance_full": np.sum(truth * score, axis=1), "covariance_sv": np.sum(truth * sv_part, axis=1),
-                                            "r2_drop": partial_scores(score, truth)[0] - partial_scores(score_without, truth)[0]}))
+                                            "r2_drop": partial_scores(score, truth)[1] - partial_scores(score_without, truth)[1]}))
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
@@ -389,7 +404,8 @@ def main():
         summarize_sv_credit(credit).to_csv(pathlib.Path(arguments.out) / "sv_credit.tsv", sep="\t", index=False)
     summary = scores.groupby(["design", "superpopulation", "method", "feature_set"]).agg(mean=("r2", "mean"), count=("r2", "count"), null_r2=("null_r2", "mean"),
                                                                                        mismatched_r2=("mismatched_r2", "mean"),
-                                                                                       mean_oos_r2=("oos_r2", "mean"), people=("people", "max")).reset_index()
+                                                                                       mean_oos_r2=("oos_r2", "mean"), people=("people", "max"),
+                                                                                       mean_partial_correlation=("partial_correlation", "mean")).reset_index()
     summary.to_csv(pathlib.Path(arguments.out) / "mean_r2.tsv", sep="\t", index=False)
     headline = pooled_r2(scores)
     headline.to_csv(pathlib.Path(arguments.out) / "pooled_r2.tsv", sep="\t", index=False)

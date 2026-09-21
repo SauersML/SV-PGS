@@ -731,6 +731,26 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
     assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
 
 
+def test_the_signed_partial_correlation_and_the_squared_error_skill_sit_beside_the_squared_one(tmp_path):
+    """r2 is the square of a partial correlation: it charges a score neither its sign nor its scale. The report
+    names and writes all three, so a table cannot be read as if one were the other."""
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    _, _, _, predictions = within_group_fixture(tmp_path)
+    scores = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+    assert np.allclose(scores["partial_correlation"] ** 2, scores["r2"], rtol=0, atol=16 * EPSILON)
+    for multiple, flips in ((-1.0, True), (3.0, False)):
+        np.save(tmp_path / "results/m/loso/chr.snv.predictions.npy", predictions * multiple)
+        again = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
+        assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
+        assert np.allclose(again["partial_correlation"], scores["partial_correlation"] * (-1 if flips else 1), rtol=0, atol=1e3 * EPSILON)
+        # The squared-error skill does charge both, and is never clipped at zero.
+        assert not np.allclose(again["oos_r2"], scores["oos_r2"]) and (again["oos_r2"] < 0).any()
+    pooled = report.pooled_r2(again)
+    assert np.isclose(pooled["mean_partial_correlation"].iloc[0], again.groupby("gene_id")["partial_correlation"].mean().mean(), rtol=0, atol=1e3 * EPSILON)
+
+
 def test_raw_scores_score_from_the_run_record_when_the_split_file_is_missing(tmp_path):
     """An older results layout kept its raw scores without a <tag>.raw_splits.json. The run's own record lists the
     same splits in the same order, so the same command scores the old and the current layout alike; a layout with
