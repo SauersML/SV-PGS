@@ -9,7 +9,6 @@ import pytest
 from sv_pgs.config import VariantClass
 from sv_pgs.mean_field import MeanFieldFixedPoints, _Response
 from sv_pgs.scale_mixture_ep import (
-    Cavity,
     _components,
     class_log_density,
     initial_hyperparameters,

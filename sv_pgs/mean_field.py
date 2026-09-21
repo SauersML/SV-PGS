@@ -73,7 +73,7 @@ import numba
 import numpy as np
 from scipy import linalg
 
-from sv_pgs._typing import F64Array, I64Array
+from sv_pgs._typing import F64Array
 from sv_pgs.scale_mixture_ep import (
     Cavity,
     FixedPoint,

@@ -887,8 +887,8 @@ def _ascended(prior, cavity):
     return weights, evidence, (weights > lower) & (weights < upper)
 
 
-@pytest.mark.xfail(strict=True, reason=_FLAT_REASON)
-@pytest.mark.parametrize("seed", (101, 202, 303))
+# Seeds 101 and 303 certify since the lambda = infinity start with releases at the range's centre (lead, 2026-09-21).
+@pytest.mark.parametrize("seed", (101, pytest.param(202, marks=pytest.mark.xfail(strict=True, reason=_FLAT_REASON)), 303))
 def test_the_weights_remaining_gain_covers_every_nearby_weight(seed):
     # verify-engine finding 3: the old check's 1/2 (|c| + E)^2 / s used an upper bound on |V''| and so understated the
     # gain (0.0245 claimed where V rose 0.0645 within one unit of rho, seed 303). At the point hyper_step certifies,

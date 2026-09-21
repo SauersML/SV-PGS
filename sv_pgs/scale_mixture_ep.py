@@ -1183,10 +1183,12 @@ def _maximize_coefficients(
     definite and the Newton step's predicted gain is below ``tolerance`` nats (the resolution the caller
     certifies, and at least the objective's rounding level); a saddle's negative curvature is followed by
     the trust-region step instead. It also stops when no step longer than half of double precision raises
-    the objective, and when the model predicts no gain above the objective's rounding inside the radius: a
-    trial there compares two values at their rounding, and a gain at rounding is not a gain (on gene 1's release
-    trials, whose penalized directions carry a data curvature 1e-9 of the penalty's scale, the loop otherwise
-    accepts rounding-level gains and doubles its radius without end).
+    the objective. Where the model predicts no gain above the objective's rounding inside the radius, a value-only
+    trial would compare two values at their rounding (on gene 1's release trials, whose penalized directions carry
+    a data curvature 1e-9 of the penalty's scale, the loop once accepted rounding-level gains and doubled its
+    radius without end): such a step is judged on the gradient instead, taken where its decrement in the current
+    metric falls, as the outer loop judges its inner steps, so x still reaches a stationary point to the gradient's
+    resolution when the tolerance asks for it (the engine's verification harness asks with tolerance 0).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     coefficients = np.array(start, dtype=np.float64, copy=True)
@@ -1207,7 +1209,24 @@ def _maximize_coefficients(
         step = _trust_region_step(-hessian, gradient, radius, spectrum)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
         if predicted <= rounding:
-            return coefficients, objective
+            # The value cannot resolve this step; the gradient can. It is judged as the outer loop judges its inner
+            # steps: taken where the decrement in the current metric falls (a strict maximum), or where the trapezoid
+            # gain of the two gradients is positive (a saddle), and the maximization ends otherwise. (A value-only
+            # trial here would compare two values at their rounding; a step below x's own resolution ends above.)
+            candidate = coefficients + step
+            candidate_objective = _data_objective(prior, candidate, cavity, working_bytes)
+            candidate_value, candidate_gradient, candidate_hessian = _penalized(prior, candidate_objective, log_smoothing, penalty, candidate)
+            if definite:
+                resolved = 0.5 * float(candidate_gradient @ _ascent_direction(-hessian, candidate_gradient, spectrum)) < 0.5 * float(gradient @ ascent)
+            else:
+                resolved = 0.5 * float((gradient + candidate_gradient) @ step) > 0.0
+            if not (resolved and np.isfinite(candidate_value)):
+                return coefficients, objective
+            coefficients, objective = candidate, candidate_objective
+            value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
+            spectrum = _spectrum(-hessian)
+            ascent = _ascent_direction(-hessian, gradient, spectrum)
+            continue
         candidate = coefficients + step
         candidate_value = (
             _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0] - _anchor_value(prior, candidate)[0]
