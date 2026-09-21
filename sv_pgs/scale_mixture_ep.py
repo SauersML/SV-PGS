@@ -2580,7 +2580,9 @@ def _evidence_once(
             # The maximizer resolves x no further (its own rounding stop): V is as accurate as double precision gives.
             break
         previous = coefficients
-        inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
+        # Never below the objective's rounding: a decrement under it is unresolvable, and the maximizer asked for one
+        # ran 425 iterations to a tolerance of 4e-14 on ENSG00000274602.5 [real] (6.7 s a start) before its own stops.
+        inner_tolerance = max(2.0 * tolerance * tolerance / sensitivity, rounding)
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; a relative residual
     # e of that response moves 1/2 log|B + S| by at most D e / 2, charged below at the residual the solve reached
