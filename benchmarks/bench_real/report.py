@@ -40,8 +40,9 @@ through their own variants and their local trans structure; it does not cover wh
 people, their relatedness, their ancestry and the one covariate fit, so two chromosomes are not independent, only far
 less dependent than two genes of one chromosome. With one chromosome scored the SE is gene-level and labelled so: it
 describes the genes that were scored and generalizes to no others. The jackknife holds the people fixed; robust.py's
-family x chromosome bootstrap, which re-fits R_T in every replicate and keeps each replicate's arms paired, covers the
-sampling of people too.
+family x chromosome bootstrap resamples them, but it scores the weighted squared correlation of the saved prediction
+with the saved truth inside each group, with no within-group covariate projection, so its interval belongs to that
+estimand and not to this one.
 
 Headline: both designs hold every person out exactly once, so the five superpopulations are pooled into one test.
 Per gene, r^2 and paired differences are averaged over the groups and covariances are summed over them; the result
