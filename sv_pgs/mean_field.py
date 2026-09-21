@@ -59,7 +59,9 @@ dh_0 = -(Xp'Xp - diag ||x_j||^2) dm_0 / sigma^2 and dh_1 = (Xp'Xp - diag ||x_j||
 does from EP's response; the solve is ``_Response`` (the matrix is symmetric, not always positive definite). With
 the noise's response left out (as it was), the outer loop's Newton steps in x converged linearly (a rate of 0.1 on
 the test problem and 0.37 on gene 1 [real]: sixteen extra outer states), the signature of a model curvature that
-misses the fixed point's own motion. The prediction check moves q's means in q's own metric, sum_j d_j^2 / v_j,
+misses the fixed point's own motion. The prediction check moves q's means in q's own local metric, the tilted
+family's Fisher information in its mean coordinate, sum_j d_j^2 / v_j (``_fixed_point``'s ``norm``: half of it is
+KL(q || q moved)'s leading term, exact only where q_j is Gaussian, not a finite-step KL),
 and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). The draws are q's own, so they are
 conditional variational draws of the product approximation at the fitted hyperparameters and not of the posterior
 it approximates (``draws``): each member's node from its responsibilities, then its conditional normal.
@@ -502,8 +504,9 @@ class MeanFieldFixedPoints:
                 corrections = True
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
-        """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own metric
-        for the prediction check, p_eff = sum_j omega_j v_j, and the linear response through ``_Response``."""
+        """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own local
+        metric for the prediction check (``norm``), p_eff = sum_j omega_j v_j, and the linear response through
+        ``_Response``."""
         omega = self.member_squares / self.noise
         live = self.variance > 0.0
         with np.errstate(divide="ignore"):
@@ -562,8 +565,14 @@ class MeanFieldFixedPoints:
             return shift_step, precision_step
 
         def norm(direction: F64Array) -> float:
-            # q's own metric for a shift of its means: KL(q || q shifted) = sum_j d_j^2 / (2 v_j) for a product of
-            # laws that shift as a location family, so the move is sum_j d_j^2 / v_j; a dead row moves nowhere.
+            # The squared length of a shift of q's means in q's own LOCAL metric. Member j's law is the prior tilted
+            # by exp(h_j b - omega_j b^2 / 2); at fixed omega_j that is an exponential family in h_j with
+            # d log Z_j / dh_j = m_j and d2 log Z_j / dh_j^2 = v_j, so its Fisher information in the mean coordinate
+            # m_j is 1 / v_j and a product's is diag(1 / v). The move is sum_j d_j^2 / v_j, whose half is the leading
+            # term of KL(q || q moved) and not that KL: the expansion's remainder is O(d^3), and the identity holds
+            # exactly only where q_j is Gaussian. A non-Gaussian scale mixture's location Fisher information is not
+            # its inverse variance (0.9 N(0, 0.01) + 0.1 N(0, 10) has 86.7 against 1 / 1.009), so this metric is the
+            # tilted family's own, in its mean coordinate, not a location family's. A dead row moves nowhere.
             values = np.asarray(direction, dtype=np.float64)
             moving = values != 0.0
             if np.any(moving & ~live):
