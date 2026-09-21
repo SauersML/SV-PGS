@@ -284,6 +284,8 @@ class HyperStep:
     stationarity_decrement: float = np.inf
     stationarity_fold: float = np.inf
     tighten: Callable[[float], "HyperStep | None"] | None = None
+    # ``resolve(budget)``: this step with V at its returned weights certified to ``budget``, where a decision needs it.
+    resolve: Callable[[float], "HyperStep | None"] | None = None
     # The certified error of ``evidence`` (``_Evidence.error``): the outer loop's predicted gain carries it.
     evidence_error: float = 0.0
 
@@ -1736,6 +1738,9 @@ class _Evidence:
     # share of the tolerance each was resolved to (their slopes keep the count, ``_correction_slopes``).
     replaced_directions: F64Array | None = None
     replaced_share: float = 0.0
+    # The corrections' own part of ``error`` (``_corrected``: the directions left to the Laplace term and the
+    # integrals' resolution), so a later ``_corrected`` at another tolerance starts from the Laplace error.
+    correction_remainder: float = 0.0
 
 
 def _directional_derivatives(
@@ -2206,7 +2211,8 @@ def _corrected(
     share = 0.5 * tolerance / max(replaced, 1)
     remainder = float(remaining[replaced]) + replaced * max(share, _HALF_PRECISION)
     return replace(
-        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error + remainder,
+        evidence, value=evidence.laplace_value + float(np.sum(corrections)), error=evidence.error - evidence.correction_remainder + remainder,
+        correction_remainder=remainder,
         replaced_directions=_directions[:, order[:replaced]], replaced_share=share,
     )
 
@@ -3050,7 +3056,7 @@ def hyper_step(
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
 
-    def checked(check: _Stationarity) -> HyperStep:
+    def checked(check: _Stationarity, evidence: _Evidence = evidence) -> HyperStep:
         return HyperStep(
             hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
             penalized_objective=evidence.penalized_value,
@@ -3066,6 +3072,7 @@ def hyper_step(
             stationarity_decrement=check.decrement,
             stationarity_fold=check.fold,
             tighten=tighten,
+            resolve=resolve,
             evidence_error=evidence.error,
         )
 
@@ -3074,6 +3081,13 @@ def hyper_step(
         then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
         tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
         return checked(tightened) if tightened.better is None and np.isfinite(tightened.gain) else None
+
+    def resolve(budget: float) -> HyperStep | None:
+        """This step with V at its returned weights certified to ``budget`` (more of the Tierney-Kadane directions
+        integrated exactly, the integrals resolved further), the stationarity check as it stands; None where V has no
+        certified value there."""
+        resolved = _corrected(final_view, weights, evidence, cavity, correction, working_bytes, budget)
+        return None if resolved is None else checked(check, resolved)
 
     return checked(check)
 
@@ -3378,6 +3392,9 @@ def fit_hyperparameters(
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     # |G - pi| at the model's last whole joint trial: the local model's measured error (unknown before the first).
     remainders = [np.inf] * count
+    # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
+    # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
+    weight_tolerances = [tolerance] * count
     # Whether the oracle's last solve for the model was elsewhere than the point it returns.
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
@@ -3391,10 +3408,49 @@ def fit_hyperparameters(
         proposal = _proposal(newton, radius)
         return _OuterTrial(_trial(newton, proposal), step, remaining, False, newton=newton, proposal=proposal, radius=radius, polishes=polishes)
 
+    def decide(model: int, state: _State, step: HyperStep) -> tuple[_State, HyperStep, float, float]:
+        """The certificate at the state and its step: (state, step, predicted, remaining), each resolvable piece
+        tightened where they, not the decision's fixed part, stop it.
+
+        remaining = predicted + fixed + S, with fixed the model's measured remainder at its last whole joint trial
+        and S the resolvable pieces: the state's certified V error, the step's, and the weights' remaining gain. Where
+        predicted + fixed < tolerance < remaining, every piece is scaled by theta = M / S, M = tolerance - predicted -
+        fixed (theory-ep's per-decision tightening: no fixed shares): each V is re-certified to theta times its
+        error (``_outer_state`` and ``HyperStep.resolve``: more directions integrated exactly) and the weights' bound
+        is tightened to theta times their gain (``HyperStep.tighten``), and the certificate is read again. A piece
+        that cannot reach its share stays as measured, so a decision fails only on what no resolution removes."""
+        fixed = remainders[model]
+        predicted = step.evidence - state.value
+        pieces = (state.error, step.evidence_error, step.stationarity_gain)
+        resolvable = float(sum(pieces))
+        remaining = predicted + fixed + resolvable
+        if not (predicted + fixed < tolerance < remaining) or resolvable <= 0.0:
+            return state, step, predicted, remaining
+        theta = (tolerance - predicted - fixed) / resolvable
+        if state.error > 0.0:
+            resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, theta * state.error)
+            if resolved_state is not None:
+                state = replace(resolved_state, polished=state.polished)
+        if step.evidence_error > 0.0 and step.resolve is not None:
+            resolved_step = step.resolve(theta * step.evidence_error)
+            if resolved_step is not None:
+                step = resolved_step
+        if step.stationarity_gain > 0.0 and step.tighten is not None:
+            share = theta * step.stationarity_gain
+            tightened = step.tighten(share)
+            if tightened is not None:
+                step = tightened
+            if step.stationarity_gain > share:
+                # The weights' bound cannot be tightened to their share at these weights: the next search moves them
+                # further, to the resolution their share asks (a continued search, warm from these weights).
+                weight_tolerances[model] = min(weight_tolerances[model], share)
+        predicted = step.evidence - state.value
+        return state, step, predicted, predicted + fixed + state.error + step.evidence_error + step.stationarity_gain
+
     def plan(model: int) -> _OuterTrial:
         state = states[model]
         try:
-            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, tolerance)
+            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, weight_tolerances[model])
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
@@ -3404,15 +3460,8 @@ def fit_hyperparameters(
         if state is None:
             histories[model].append(np.inf)
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
-        predicted = step.evidence - state.value
-        error = remainders[model] + step.evidence_error + state.error
-        remaining = predicted + step.stationarity_gain + error
-        if step.tighten is not None and predicted + error <= tolerance < remaining:
-            # What stops the certificate is the weights' bound: it is tightened to the share the rest leaves it, at the
-            # same weights (theory-ep), so the trial below may certify.
-            tightened = step.tighten(tolerance - predicted - error)
-            if tightened is not None:
-                step, remaining = tightened, predicted + tightened.stationarity_gain + error
+        state, step, predicted, remaining = decide(model, state, step)
+        states[model] = state
         histories[model].append(float(remaining))
         return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted)
 
