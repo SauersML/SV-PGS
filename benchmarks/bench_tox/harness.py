@@ -271,7 +271,7 @@ def _one(job):
             prediction, status = np.full(test_rows.shape[0], np.nan), f"failed: {type(error).__name__}: {str(error)[:200]}"
         record[name] = {"r2": _r2(prediction, truth), "seconds": time.perf_counter() - started, "status": status}
         if name == "svpgs_mean_field" and status == "ok":
-            record[name]["certified"] = bool(predictor.profile.get("certified"))
+            record[name]["certified"] = bool(getattr(predictor, "profile", {}).get("certified"))
     return record
 
 
