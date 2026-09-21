@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -62,9 +64,12 @@ def test_shape_and_triad_scale_restore_calibration_of_an_overconfident_dosage():
     shape_truth_r = np.sqrt(triad_squared_correlation(shaped, truth_a, truth_b))
     genotype_sd = np.sqrt(np.cov(truth_a, truth_b)[0, 1])
     curve = CalibrationCurve(
-        curve.stratum, curve.version, curve.knots_dosage, curve.knots_expectation, curve.centre,
+        curve.stratum, curve.version, curve.knots_dosage, curve.knots_expectation,
         calibrated_scale(shape_truth_r, genotype_sd, float(np.std(shaped))),
     )
+    # These truths are on the genotype's own scale, so the shape is the whole map: their noise
+    # attenuates corr(D, T), not E[T | D]. The scale is 1 up to its sampling error.
+    assert curve.scale == pytest.approx(1.0, abs=0.02)
     recalibrated = curve.apply(dosage)
     covariance = np.cov(genotype, recalibrated)
     assert covariance[0, 1] / covariance[1, 1] == pytest.approx(1.0, abs=0.03)
@@ -72,8 +77,45 @@ def test_shape_and_triad_scale_restore_calibration_of_an_overconfident_dosage():
     assert abs(raw_covariance[0, 1] / raw_covariance[1, 1] - 1.0) > 0.2
 
 
+def test_a_doubled_truth_calibrates_the_genotype_back_to_itself():
+    """The audit's scaled-truth case: D = G and T = 2G must leave [0, 1, 2] where it is."""
+    genotype = np.tile(np.arange(3, dtype=float), 10)
+    curve = fit_calibration_shape(genotype, 2.0 * genotype, stratum="doubled", version="test")
+    shape = curve.shape(genotype)
+    curve = replace(curve, scale=calibrated_scale(1.0, float(np.std(genotype)), float(np.std(shape))))
+    # Doubling scales every deviation by an exact power of two, so the scale is exactly 1/2.
+    assert curve.scale == 0.5
+    np.testing.assert_array_equal(curve.apply(np.arange(3, dtype=float)), np.arange(3, dtype=float))
+
+
+def test_the_scale_calibrates_at_every_dosage_where_a_linear_map_only_matches_covariance():
+    """A curved E[G | D] measured by a tripled truth: the shape's map is exact, the linear one is not."""
+    genotype = np.concatenate([
+        np.zeros(100),                                          # dosage 0: E[G | D] = 0.0
+        np.repeat([0.0, 1.0], [90, 10]),                        # dosage 1: E[G | D] = 0.1
+        np.repeat([0.0, 1.0], [60, 40]),                        # dosage 2: E[G | D] = 0.4
+        np.full(100, 2.0),                                      # dosage 3: E[G | D] = 2.0
+    ])
+    dosage = np.repeat([0.0, 1.0, 2.0, 3.0], 100)
+    conditional_mean = np.repeat([0.0, 0.1, 0.4, 2.0], 100)
+    curve = fit_calibration_shape(dosage, 3.0 * genotype, stratum="tripled", version="test")
+    shape = curve.shape(dosage)
+    correlation = float(np.corrcoef(shape, genotype)[0, 1])
+    curve = replace(curve, scale=calibrated_scale(correlation, float(np.std(genotype)), float(np.std(shape))))
+    calibrated = curve.apply(dosage)
+    assert curve.scale == pytest.approx(1.0 / 3.0, rel=1e-12)
+    np.testing.assert_allclose(calibrated, conditional_mean, atol=1e-12)
+    # The best linear recalibration of the same column matches the covariance and still misses
+    # E[G | D] by 0.3 or more, and predicts a negative genotype at the lowest dosage.
+    slope = float(np.cov(genotype, dosage)[0, 1] / np.var(dosage, ddof=1))
+    linear = genotype.mean() + slope * (dosage - dosage.mean())
+    assert np.cov(genotype, linear)[0, 1] / np.var(linear, ddof=1) == pytest.approx(1.0, rel=1e-12)
+    assert np.max(np.abs(linear - conditional_mean)) > 0.3
+    assert linear.min() < 0.0
+
+
 def test_calibration_curve_round_trips_and_rejects_a_constant_dosage():
-    curve = CalibrationCurve("VNTR", "v1", np.array([0.0, 1.0, 2.0]), np.array([0.1, 0.8, 1.7]), 0.6, 0.9)
+    curve = CalibrationCurve("VNTR", "v1", np.array([0.0, 1.0, 2.0]), np.array([0.1, 0.8, 1.7]), 0.9)
     restored = CalibrationCurve.from_dict(curve.to_dict())
     np.testing.assert_allclose(restored.apply([0.0, 0.5, 2.0]), curve.apply([0.0, 0.5, 2.0]))
     assert restored.stratum == "VNTR" and restored.version == "v1"

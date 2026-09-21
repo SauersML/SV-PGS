@@ -2,20 +2,32 @@
 
 SPEC scales each variant's prior variance by r^2 = corr^2(D, G) between its
 stored column D and the true genotype G, with r^2 fixed from long-read truth
-outside the fit. Three pieces live here:
+outside the fit. The prior it offsets is the one on the coefficient per SD of
+the stored column, so log r^2 enters log u_j with coefficient exactly 1
+(docs/design/math/scale_model.md section 1), and r^2, a squared correlation, is
+invariant to affine maps of D: the codec's scale, centring and the recalibration
+below leave the offset alone. A non-affine map does change it, so the shape
+below is part of the column the reliability is measured on, never applied after
+it. Three pieces live here:
 
-- The triad estimator. A long-read truth T = G + e carries its own error, so
-  corr^2(D, T) understates r^2. Two truths with errors independent of each
-  other and of D identify it exactly: r^2 = r(D,T1) r(D,T2) / r(T1,T2).
+- The triad estimator. A long-read truth T = G + e carries its own error, which
+  attenuates corr(D, T) below corr(D, G), so corr^2(D, T) understates r^2. Two
+  truths with errors independent of each other and of D identify it exactly:
+  r^2 = r(D,T1) r(D,T2) / r(T1,T2).
 - The per-record reliability model. It predicts r^2 from sites-only features
   on the logit scale and is fitted once on truth; the fit supplies the prior
   offset log r^2, whose coefficient is exactly 1 by derivation (the prior on the
   true-genotype effect maps to the stored column through r^2).
 - The monotone calibration curve. Where the imputed dosage is not a calibrated
   posterior mean (confident-draw SV/TR dosages, deflated multi-path alleles),
-  D* = centre + scale (h(D) - centre) restores E[G | D*] = D*. Its shape h is
-  fitted on truth by isotonic regression; its scale comes from the triad r,
-  because a noisy truth identifies the shape of E[G | D] but not its scale.
+  E[G | D] is not D, and D* = scale h(D) restores it. The shape h is the
+  isotonic regression of a truth on D, which estimates the regression function
+  E[T | D]; a truth's own error attenuates its correlation with D, never that
+  regression function, so a truth on the genotype's scale identifies E[G | D]
+  outright and the scale is 1 (measurement_model.py's linear kappa is the same
+  statement for the linear map). The scale is there for a truth on an unknown
+  scale, E[T | G] = lambda G: then E[T | D] = lambda E[G | D] and the scale is
+  1 / lambda, which the triad correlation identifies without knowing lambda.
 """
 
 from __future__ import annotations
@@ -65,20 +77,26 @@ def _pool_adjacent_violators(values: F64Array, weights: F64Array) -> F64Array:
 
 @dataclass(frozen=True)
 class CalibrationCurve:
-    """Monotone recalibration D* = centre + scale (h(D) - centre) for one stratum."""
+    """Monotone recalibration D* = scale h(D) for one stratum.
+
+    The shape h is a free monotone function of the stored column, so a shift of
+    the column is already in h and the map needs no centre of its own. A centre
+    would be a second one: the shape's own mean is the truth's, lambda E[G], not
+    the genotype's, and using it for both sends the genotype [0, 1, 2] measured
+    by a doubled truth to [1, 2, 3] instead of back to [0, 1, 2].
+    """
 
     stratum: str
     version: str
     knots_dosage: F64Array
     knots_expectation: F64Array
-    centre: float
     scale: float
 
     def shape(self, dosage: NDArray) -> F64Array:
         return np.interp(np.asarray(dosage, float), self.knots_dosage, self.knots_expectation)
 
     def apply(self, dosage: NDArray) -> F64Array:
-        return self.centre + self.scale * (self.shape(dosage) - self.centre)
+        return self.scale * self.shape(dosage)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,7 +104,6 @@ class CalibrationCurve:
             "version": self.version,
             "knots_dosage": self.knots_dosage.tolist(),
             "knots_expectation": self.knots_expectation.tolist(),
-            "centre": self.centre,
             "scale": self.scale,
         }
 
@@ -97,7 +114,6 @@ class CalibrationCurve:
             version=str(record["version"]),
             knots_dosage=np.asarray(record["knots_dosage"], float),
             knots_expectation=np.asarray(record["knots_expectation"], float),
-            centre=float(record["centre"]),
             scale=float(record["scale"]),
         )
 
@@ -105,8 +121,10 @@ class CalibrationCurve:
 def fit_calibration_shape(dosage: NDArray, truth: NDArray, stratum: str, version: str) -> CalibrationCurve:
     """Isotonic E[T | D] on the distinct dosage values, with unit scale.
 
-    The scale is left at 1 here: with a noisy truth T = lambda G + e the shape is
-    identified but lambda is not. Set it with calibrated_scale before applying.
+    Unit scale is the whole map for a truth on the genotype's scale, where
+    E[T | D] is E[G | D] already: the truth's error attenuates corr(D, T), not
+    E[T | D]. With E[T | G] = lambda G the shape carries lambda; set the scale
+    with calibrated_scale before applying.
     """
     dosage_values = np.asarray(dosage, float).ravel()
     truth_values = np.asarray(truth, float).ravel()
@@ -116,16 +134,25 @@ def fit_calibration_shape(dosage: NDArray, truth: NDArray, stratum: str, version
         raise ValueError(f"stratum {stratum}: the calibration shape needs at least 2 distinct dosage values")
     truth_sums = np.bincount(inverse, weights=truth_values[observed], minlength=knots.size)
     expectation = _pool_adjacent_violators(truth_sums / counts, counts.astype(float))
-    centre = float(np.sum(expectation * counts) / counts.sum())
-    return CalibrationCurve(stratum, version, knots, expectation, centre, 1.0)
+    return CalibrationCurve(stratum, version, knots, expectation, 1.0)
 
 
 def calibrated_scale(shape_truth_correlation: float, genotype_sd: float, shape_sd: float) -> float:
-    """Scale b with Cov(G, D*) = Var(D*) for D* = centre + b (h - centre).
+    """Scale b = r(h, G) sd(G) / sd(h) for D* = b h(D).
 
-    b = r(h, G) sd(G) / sd(h), where r(h, G) is the triad correlation of the
-    shaped column with the true genotype, never a regression slope on one noisy
-    truth, which is attenuated by that truth's error.
+    b is the least-squares slope of G on the shaped column, Cov(G, h) / Var(h),
+    so D* satisfies the linear identity Cov(G, D*) = Var(D*) for any shape. That
+    identity is one orthogonality condition, not calibration at every dosage:
+    the linear recalibration of a column whose E[G | D] is curved satisfies it
+    and still misses E[G | D] by O(1) in the tails. Calibration at every dosage,
+    E[G | D*] = D*, follows when h is the conditional mean E[T | D] of a truth
+    with E[T | G] = lambda G, since then h = lambda E[G | D] and b = 1 / lambda.
+
+    r(h, G) is the triad correlation of the shaped column with the true
+    genotype, which is free of lambda, never the slope of one truth on h: that
+    slope is lambda b, carrying the very scale b has to remove. A truth's noise
+    does not enter either estimate, because it attenuates a correlation of D
+    with the truth, not a regression on D.
     """
     if not (0.0 < shape_truth_correlation <= 1.0 and genotype_sd > 0.0 and shape_sd > 0.0):
         raise ValueError("calibrated_scale needs 0 < r <= 1 and positive standard deviations")
