@@ -1916,6 +1916,7 @@ dependencies = [
     { name = "cyvcf2" },
     { name = "google-cloud-bigquery" },
     { name = "google-crc32c" },
+    { name = "numba" },
     { name = "numpy" },
     { name = "pandas" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1940,7 +1941,6 @@ gpu = [
 dev = [
     { name = "duckdb" },
     { name = "mypy" },
-    { name = "numba" },
     { name = "pytest" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scikit-learn", version = "1.8.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -1957,6 +1957,7 @@ requires-dist = [
     { name = "cyvcf2", specifier = ">=0.31.4" },
     { name = "google-cloud-bigquery", specifier = ">=3.40.1" },
     { name = "google-crc32c", specifier = ">=1.5" },
+    { name = "numba", specifier = ">=0.60" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "nvidia-cublas-cu12", marker = "extra == 'gpu'" },
     { name = "nvidia-cuda-nvrtc-cu12", marker = "extra == 'gpu'" },
@@ -1976,7 +1977,6 @@ provides-extras = ["gpu"]
 dev = [
     { name = "duckdb", specifier = ">=1.1" },
     { name = "mypy", specifier = ">=1.20.0" },
-    { name = "numba", specifier = ">=0.60" },
     { name = "pytest", specifier = ">=8" },
     { name = "scikit-learn", specifier = ">=1.3" },
     { name = "sqlglot", specifier = ">=30" },

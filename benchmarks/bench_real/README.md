@@ -112,7 +112,7 @@ The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML opt
 - **Other caveats:** reference-LD mismatch, and the estimator's bias under that mismatch.
 
 ## Running it
-The baselines need numba, which is in the repository's dev dependency group. bcftools must be on PATH. From the repository root:
+bcftools must be on PATH. From the repository root:
 
     python benchmarks/bench_real/fetch_mage.py <root>/data/mage
     benchmarks/bench_real/fetch_genotypes.sh <root> <public-dir> <threads>

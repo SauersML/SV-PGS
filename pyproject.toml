@@ -21,6 +21,9 @@ dependencies = [
     "pandas>=1.5",
     # Stage 0's CPU backend runs single-threaded BLAS inside its own worker pool.
     "threadpoolctl>=3.1",
+    # sv_pgs/mean_field.py imports numba at module level: its kernels are the small-n route's inference, so an
+    # install without numba cannot fit anything.
+    "numba>=0.60",
 ]
 
 [project.optional-dependencies]
@@ -85,9 +88,6 @@ dev = [
     # on synthetic OMOP tables: sqlglot transpiles it to DuckDB.
     "duckdb>=1.1",
     "sqlglot>=30",
-    # benchmarks/bench_real/baselines.py runs the mr.ash coordinate-ascent
-    # kernel under numba; its math tests import it.
-    "numba>=0.60",
 ]
 # Coalescent simulation for the team's accuracy and power studies on public data.
 # Never imported by sv_pgs; install with `uv sync --group sim`.
