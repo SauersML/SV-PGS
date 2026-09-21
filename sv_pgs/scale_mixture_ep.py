@@ -3961,10 +3961,13 @@ def fit_hyperparameters(
         planned = weight_tolerances[model]
         # A polish's geometric sequence of gains belongs to one plan.
         inner_gains[model] = []
-        # A release is judged from a polished state (below), so an unpolished state's hyper step holds every edge:
-        # its release trials (three maximizations per block at the range's centre) would be discarded.
+        # A release is judged from a polished state (below), so every other state's hyper step holds every edge: its
+        # release trials (three maximizations per block at the range's centre) would be discarded. That includes a
+        # state with no certified value yet (the fit's first plans, and every plan after a joint trial left the
+        # basin): on ENSG00000254709.8 [real] three such plans spent 60 of the fit's 206 s on trials whose one
+        # release was undone two states later.
         held = frozenset().union(*refused_releases[model])
-        if state is not None and not state.polished:
+        if state is None or not state.polished:
             held = held | frozenset(int(position) for position in np.flatnonzero(hyperparameters[model].log_smoothing == np.inf))
         try:
             step = hyper_step(
