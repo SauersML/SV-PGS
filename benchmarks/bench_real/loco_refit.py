@@ -2,31 +2,40 @@
 
 sv_artifacts.py's influence check removes a carrier from the test set only. Here each minor-allele carrier of a gene's
 driving SV is removed from every loso training set that holds them. The snv and snv_sv arms are refitted with the
-harness's own code, and the gene's pooled r2 gain over the five held-out groups is recomputed; the test sets don't
-change. Genes run in increasing order of carrier count, where one person can matter most, until the deadline.
+harness's own code and scored the way the benchmark scores them (harness.predict_for_truth, then report.py's
+within-group partial r^2), and the gene's pooled gain over the five held-out groups is recomputed; the test sets
+don't change. Genes run in increasing order of carrier count, where one person can matter most, until the deadline.
 """
 import argparse
 import datetime
-import json
 import pathlib
 import time
 
 import numpy as np
 import pandas as pd
 
-from benchmarks.bench_real import harness, robust
+from benchmarks.bench_real import harness, report
 
 
 def split_gains(dataset, window, fit, splits: dict):
-    """Per loso split: r2 of snv_sv minus r2 of snv on that split's held-out group."""
+    """Per loso split: r2 of snv_sv minus r2 of snv on that split's held-out group, under the benchmark's own rule.
+
+    A refit is only comparable with the run it re-examines if it is scored like it: the score is the one
+    harness.predict_for_truth compares with the truth, and the metric report.py's within-group partial r^2 against
+    [1, C_T] over the group's people. A group [1, C_T] leaves no residual dimension in is left out, as the report
+    leaves it out."""
     gains = {}
     for name, split in splits.items():
         train_all, test_all, test_phenotype, test_index = harness.build_gene_task(dataset, window, split)
+        basis, rank = report.group_basis(dataset.covariates[test_index])
+        if len(test_index) <= rank:
+            continue
+        truth = report.residual_on(basis, np.asarray(test_phenotype, dtype=np.float64)[None])
         values = {}
         for feature_set in ("snv", "snv_sv"):
             train, test = harness.subset(train_all, test_all, feature_set, name)
-            prediction = np.asarray(fit(train).predict(test), dtype=np.float64)
-            values[feature_set] = robust.group_metrics(np.ones((1, len(test_index))), prediction[None], test_phenotype[None])["r2"][0, 0]
+            score, _ = harness.predict_for_truth(fit(train), train, test, dataset.covariates[test_index])
+            values[feature_set] = float(report.partial_scores(report.residual_on(basis, score[None]), truth)[1][0])
         gains[name] = values["snv_sv"] - values["snv"]
     return gains
 
