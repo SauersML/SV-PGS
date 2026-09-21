@@ -123,39 +123,64 @@ def _projector(design: np.ndarray):
     return lambda values: values - design @ (pseudo @ values)
 
 
-def screen_fold(values: pd.DataFrame, train_rows: np.ndarray, design: np.ndarray, level: float, sample_count: int) -> dict:
+def _screen_chromosome(chrom: int, phenotypes: np.ndarray, phenotype_norm: np.ndarray, project, train_rows: np.ndarray, degrees: int, level: float, sample_count: int, compound_count: int):
+    """One chromosome's part of ``screen_fold``: the records at or below ``level`` per compound, and the counts tested."""
+    is_small = ~genotypes.variant_table(chrom)["is_sv"].to_numpy()
+    held = [[] for _compound in range(compound_count)]
+    tested = np.zeros(2, dtype=np.int64)
+    for start, block in genotypes.read_chromosome_chunks(chrom, sample_count, _CHUNK):
+        block = block[:, train_rows].T.astype(np.float64)
+        if np.any(block < 0):
+            raise ValueError("a missing call in the panel")
+        projected = project(block)
+        norms = np.sqrt(np.sum(np.square(projected), axis=0))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            correlation = (projected.T @ phenotypes) / (norms[:, None] * phenotype_norm[None, :])
+        correlation = np.where(np.isfinite(correlation), correlation, 0.0)
+        correlation = np.clip(correlation, -1.0 + np.finfo(np.float64).eps, 1.0 - np.finfo(np.float64).eps)
+        t_values = correlation * np.sqrt(degrees / (1.0 - np.square(correlation)))
+        p_values = 2.0 * stats.t.sf(np.abs(t_values), degrees)
+        small_block = is_small[start : start + block.shape[1]]
+        tested += (int(np.sum(small_block)), block.shape[1])
+        rows, columns = np.nonzero(p_values <= level)
+        for column in np.unique(columns):
+            chosen = rows[columns == column]
+            held[column].append(np.column_stack([
+                np.full(chosen.shape[0], chrom), start + chosen, small_block[chosen].astype(np.int64), np.round(p_values[chosen, column] * 2.0**52).astype(np.int64),
+            ]))
+    return chrom, [np.concatenate(parts) if parts else np.zeros((0, 4), dtype=np.int64) for parts in held], tested
+
+
+_SCREEN: dict = {}
+
+
+def _screen_worker(chrom: int):
+    return _screen_chromosome(chrom, **_SCREEN)
+
+
+def screen_fold(values: pd.DataFrame, train_rows: np.ndarray, design: np.ndarray, level: float, sample_count: int, workers: int = 1) -> dict:
     """Per compound and arm, the rows (chromosome, bim row) BH keeps at ``level`` on the training lines: the t test of
-    each record's correlation with the phenotype, both projected on ``design``, with n - k - 2 degrees of freedom."""
+    each record's correlation with the phenotype, both projected on ``design``, with n - k - 2 degrees of freedom.
+    Only a p-value at or below the level can pass BH (its cutoff i q / m never exceeds q), so those alone are held.
+    The chromosomes are screened in parallel over ``workers`` forked processes."""
     project = _projector(design)
     phenotypes = project(values.to_numpy(dtype=np.float64)[train_rows])
     phenotype_norm = np.sqrt(np.sum(np.square(phenotypes), axis=0))
     degrees = train_rows.shape[0] - design.shape[1] - 1
-    # Only a p-value at or below the level can pass BH (its cutoff i q / m never exceeds q), so those alone are held:
-    # per compound the (chromosome, row, is_small, p) of every record at or below it.
+    _SCREEN.update(phenotypes=phenotypes, phenotype_norm=phenotype_norm, project=project, train_rows=train_rows, degrees=degrees, level=level,
+                   sample_count=sample_count, compound_count=values.shape[1])
     held = {compound: [] for compound in values.columns}
-    tested = np.zeros(2, dtype=np.int64)  # records tested: small variants, every record
-    for chrom in genotypes.AUTOSOMES:
-        is_small = ~genotypes.variant_table(chrom)["is_sv"].to_numpy()
-        for start, block in genotypes.read_chromosome_chunks(chrom, sample_count, _CHUNK):
-            block = block[:, train_rows].T.astype(np.float64)
-            if np.any(block < 0):
-                raise ValueError("a missing call in the panel")
-            projected = project(block)
-            norms = np.sqrt(np.sum(np.square(projected), axis=0))
-            with np.errstate(divide="ignore", invalid="ignore"):
-                correlation = (projected.T @ phenotypes) / (norms[:, None] * phenotype_norm[None, :])
-            correlation = np.where(np.isfinite(correlation), correlation, 0.0)
-            correlation = np.clip(correlation, -1.0 + np.finfo(np.float64).eps, 1.0 - np.finfo(np.float64).eps)
-            t_values = correlation * np.sqrt(degrees / (1.0 - np.square(correlation)))
-            p_values = 2.0 * stats.t.sf(np.abs(t_values), degrees)
-            small_block = is_small[start : start + block.shape[1]]
-            tested += (int(np.sum(small_block)), block.shape[1])
-            rows, columns = np.nonzero(p_values <= level)
-            for column in np.unique(columns):
-                chosen = rows[columns == column]
-                held[values.columns[column]].append(np.column_stack([
-                    np.full(chosen.shape[0], chrom), start + chosen, small_block[chosen].astype(np.int64), np.round(p_values[chosen, column] * 2.0**52).astype(np.int64),
-                ]))
+    tested = np.zeros(2, dtype=np.int64)
+    if workers > 1:
+        with get_context("fork").Pool(workers) as pool:
+            results = list(pool.imap_unordered(_screen_worker, list(genotypes.AUTOSOMES)))
+    else:
+        results = [_screen_worker(chrom) for chrom in genotypes.AUTOSOMES]
+    _SCREEN.clear()
+    for _chrom, parts, counted in sorted(results, key=lambda item: item[0]):
+        tested += counted
+        for compound, part in zip(values.columns, parts):
+            held[compound].append(part)
     kept = {}
     for compound in values.columns:
         table = np.concatenate(held[compound]) if held[compound] else np.zeros((0, 4), dtype=np.int64)
@@ -259,7 +284,7 @@ def run_fold(split: dict, workers: int, out_dir: pathlib.Path, level: float) -> 
     grm = genome_grm(len(lines))
     design_train, design_test, components = fold_covariates(lines, train_rows, test_rows, grm, 1.0 / DRAW_COUNT)
     started = time.perf_counter()
-    kept = screen_fold(values, train_rows, np.column_stack([np.ones(train_rows.shape[0]), design_train]), level, len(lines))
+    kept = screen_fold(values, train_rows, np.column_stack([np.ones(train_rows.shape[0]), design_train]), level, len(lines), workers)
     screen_seconds = time.perf_counter() - started
     tables = {chrom: genotypes.variant_table(chrom) for chrom in genotypes.AUTOSOMES}
     state = {"values": values, "lines": lines, "train_rows": train_rows, "test_rows": test_rows, "design_train": design_train, "design_test": design_test, "kept": kept, "tables": tables}
