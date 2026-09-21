@@ -3767,19 +3767,20 @@ def fit_hyperparameters(
                 fraction = 0.5 * entry.fraction
                 same_edges = np.array_equal(target.log_smoothing == np.inf, hyperparameters[model].log_smoothing == np.inf)
                 longer = fraction * float(np.linalg.norm(segment)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(hyperparameters[model].coefficients))))
-                if same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
+                if state.polished and remainders[model] < previous_remainder:
+                    # This whole trial re-measured the model's remainder below the one the plan's certificate carried
+                    # (on the mean-field test problem the first whole trial, from the uncertified start, left 0.106
+                    # nats of remainder that the polished state's own zero-length trial measured at 1e-6; on gene 1
+                    # a 0.0247 the certifying trial measured at 2e-7): the certificate is read again with the fresh
+                    # remainder, before any halving. A remainder that did not fall leaves the certificate as it was,
+                    # so this replans at most once per measured decrease.
+                    pending[model] = None
+                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
                     # more, with the weights searched to what their share asks.
-                    pending[model] = None
-                elif state.polished and remainders[model] < previous_remainder:
-                    # This whole trial re-measured the model's remainder below the one the plan's certificate carried
-                    # (on the mean-field test problem the first whole trial, from the uncertified start, left 0.106
-                    # nats of remainder that the polished state's own zero-length trial measured at 1e-6): the
-                    # certificate is read again with the fresh remainder. A remainder that did not fall leaves the
-                    # certificate as it was, so this replans at most once per measured decrease.
                     pending[model] = None
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
