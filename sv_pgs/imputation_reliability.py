@@ -40,6 +40,33 @@ import numpy as np
 from sv_pgs._typing import F64Array, NDArray
 
 
+def checked_log_reliability(values: NDArray, source: str) -> F64Array:
+    """The records' prior log-variance offsets log r^2, against the one contract they all meet.
+
+    Every source of a record's reliability ends here: this module's fitted model,
+    ``measurement_model.log_reliability_offsets`` on truth pairs, a store's reported
+    imputation r^2, and a caller's explicit offsets. The contract is r^2 in [0, 1],
+    so the offset is at most 0, and -inf is the record whose stored column carries
+    no information about its genotype: its prior variance is r^2 x (its class's) = 0,
+    its effect is exactly zero, and the fit leaves it out.
+
+    Anything else is corrupt metadata rather than a measurement, and raises here
+    instead of reaching the prior. An offset above 0 would inflate a record's prior
+    variance above its class's, which no reliability can do; a nan would be dropped
+    by candidate selection, which tests offsets for finiteness, so a record with
+    unreadable metadata would pass for one that was measured and found empty.
+    """
+    offsets = np.asarray(values, dtype=np.float64)
+    invalid = ~(offsets <= 0.0)
+    if invalid.any():
+        first = int(np.flatnonzero(invalid)[0])
+        raise ValueError(
+            f"{source}: every record's log reliability must be <= 0, a log r^2 with r^2 in [0, 1]; "
+            f"record {first} has {offsets[first]} ({int(invalid.sum())} of {offsets.size} records)"
+        )
+    return offsets
+
+
 def triad_squared_correlation(dosage: NDArray, truth_a: NDArray, truth_b: NDArray) -> float:
     """r^2 = corr^2(D, G) from two truths whose errors are mutually independent.
 

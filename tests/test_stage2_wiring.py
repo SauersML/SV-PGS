@@ -79,6 +79,47 @@ def test_the_bench_real_adapter_fits_a_synthetic_gene_with_the_engine() -> None:
     assert prediction.shape == (40,) and np.all(np.isfinite(prediction))
 
 
+def test_both_reliability_sources_meet_one_contract(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A store's quality column and a caller's offsets are validated by the same function."""
+    from sv_pgs.dosage_store import DosageStore
+    from sv_pgs.stage2_wiring import fit_models, store_log_reliability
+    from tests.test_dosage_store import _write_store
+
+    generator = np.random.default_rng(6)
+    samples, records = 12, 5
+    milli = (generator.binomial(2, 0.3, size=(records, samples)) * 1000).astype(np.int64)
+    _write_store(tmp_path / "store", [{"chr22": milli}])
+    store = DosageStore.open(tmp_path / "store")
+
+    # No quality column: perfect measurement, said out loud rather than assumed in silence.
+    np.testing.assert_array_equal(store_log_reliability(store), np.zeros(records))
+    assert "measured exactly" in capsys.readouterr().err
+
+    store.variant_table.annotations["quality"] = np.array([1.0, 0.5, 0.0, 0.25, 0.75])
+    np.testing.assert_allclose(store_log_reliability(store), [0.0, np.log(0.5), -np.inf, np.log(0.25), np.log(0.75)])
+
+    for corrupt in ([1.0, 1.4, 0.5, 0.25, 0.75], [1.0, -0.3, 0.5, 0.25, 0.75], [1.0, np.nan, 0.5, 0.25, 0.75]):
+        store.variant_table.annotations["quality"] = np.array(corrupt)
+        with pytest.raises(ValueError, match="the store's quality column: every record's log reliability"):
+            store_log_reliability(store)
+
+    with pytest.raises(ValueError, match="the caller's log_variance_offset: every record's log reliability"):
+        fit_models(
+            store=store,
+            store_columns=np.arange(samples, dtype=np.int64),
+            covariates=np.ones((samples, 1)),
+            covariate_columns=np.ones((1, 1), dtype=bool),
+            targets=np.zeros((samples, 1)),
+            training=np.ones((samples, 1), dtype=bool),
+            trait_types=(TraitType.QUANTITATIVE,),
+            log_variance_offset=np.array([0.0, 0.0, 0.3, 0.0, 0.0]),
+            budget=_budget(),
+            work_dir=tmp_path / "fit",
+            seed=1,
+            draw_count=8,
+        )
+
+
 def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path) -> None:
     from sv_pgs.config import ModelConfig
     from sv_pgs.dosage_store import DosageStore

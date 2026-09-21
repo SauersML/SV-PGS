@@ -27,6 +27,7 @@ from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
+from sv_pgs.imputation_reliability import checked_log_reliability
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -45,12 +46,21 @@ def _seed(seed: int, *keys: int) -> int:
 
 
 def store_log_reliability(store: DosageStore) -> F64Array:
-    """Each record's log r^2 from the store's ``quality`` column (1 where the store has none)."""
+    """Each record's log r^2 from the store's ``quality`` column, its reported imputation r^2.
+
+    A store without the column carries no measurement, and the only model that lets its records be
+    fitted at all is perfect measurement, r^2 = 1. A hard-called benchmark store means exactly that;
+    a store that has lost its column does not, and the two are told apart by reading the line this
+    logs, not by the prior. A quality the column does hold must be a reliability
+    (``checked_log_reliability``): a value above 1, below 0 or missing is corrupt metadata.
+    """
     quality = store.variant_table.annotations.get("quality")
     if quality is None:
+        log(f"stage2 wiring: no quality column, so all {store.n_variants:,} records are taken as measured exactly (r^2 = 1)")
         return np.zeros(store.n_variants)
-    with np.errstate(divide="ignore"):
-        return np.log(np.asarray(quality, dtype=np.float64))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        offsets = np.log(np.asarray(quality, dtype=np.float64))
+    return checked_log_reliability(offsets, "the store's quality column")
 
 
 def stage0_candidates(store: DosageStore, training_columns: I64Array, log_reliability: F64Array, config: ModelConfig) -> I64Array:
@@ -182,7 +192,11 @@ def fit_models(
     """Every model of ``fit_model.fit``, one at a time (see the module docstring)."""
     if any(trait_type != TraitType.QUANTITATIVE for trait_type in trait_types):
         raise NotImplementedError("run/svpgs-bench-1 fits quantitative traits only: fit_full_data has no binary likelihood yet.")
-    log_reliability = store_log_reliability(store) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
+    log_reliability = (
+        store_log_reliability(store)
+        if log_variance_offset is None
+        else checked_log_reliability(log_variance_offset, "the caller's log_variance_offset")
+    )
     scoring, noise, hyperparameters, certificates = [], [], [], []
     for model in range(training.shape[1]):
         rows = np.flatnonzero(training[:, model])
