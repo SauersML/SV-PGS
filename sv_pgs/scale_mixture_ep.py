@@ -1027,12 +1027,14 @@ class _Objective:
 
 
 def _data_objective(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np, hessian_too: bool = True
 ) -> _Objective:
     """For variant j of class c, with responsibilities w_j, component derivatives g_jk and their mean gbar_j, in z:
     d/deta_c = w_j - pi_c and d/d(scale) = gbar_j d_j (d_j the variant's scale-design row);
     d2/deta_c2 = diag(w_j) - w_j w_j' - (diag pi_c - pi_c pi_c'), d2/deta_ck d(scale) = w_jk (g_jk - gbar_j) d_j,
-    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel."""
+    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel.
+    With ``hessian_too`` false the Hessian is left zero (a gradient's pass: the p x K^2 responsibility products are the
+    pass's bulk), on the host path."""
     if array_module is not np:
         value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
             array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
@@ -1060,21 +1062,25 @@ def _data_objective(
         magnitude += float(np.sum(np.abs(terms.log_normalizer)))
         rounding += float(np.sum(terms.rounding))
         responsibility_sum[class_position] += responsibility.sum(axis=0)
-        responsibility_outer[class_position] += responsibility.T @ responsibility
+        if hessian_too:
+            responsibility_outer[class_position] += responsibility.T @ responsibility
         if prior.scale_size:
             # Without an annotation design the scale terms are empty products.
             design = prior.scale_design[rows]
             mean_first = np.sum(responsibility * terms.first, axis=1)
-            centred_first = terms.first - mean_first[:, None]
-            curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
-            cross[class_position] += (responsibility * centred_first).T @ design
             gradient[scale_span] += design.T @ mean_first
-            hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
+            if hessian_too:
+                centred_first = terms.first - mean_first[:, None]
+                curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
+                cross[class_position] += (responsibility * centred_first).T @ design
+                hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
     for class_position, class_rows in enumerate(prior.class_rows):
         size = float(class_rows.shape[0])
         class_density = density[class_position]
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         gradient[span] = responsibility_sum[class_position] - size * class_density
+        if not hessian_too:
+            continue
         hessian[span, span] = (
             np.diag(responsibility_sum[class_position])
             - responsibility_outer[class_position]
@@ -3294,7 +3300,7 @@ class _NewtonB:
 
 def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:
     """The fixed-cavity gradient of the penalized objective in x: at an EP fixed point, the EP evidence's."""
-    objective = _data_objective(prior, coefficients, cavity, working_bytes)
+    objective = _data_objective(prior, coefficients, cavity, working_bytes, hessian_too=False)
     return _penalized(prior, objective, weights, _penalty_matrix(prior, weights), coefficients)[1]
 
 
