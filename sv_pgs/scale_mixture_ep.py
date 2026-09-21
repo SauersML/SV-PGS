@@ -3571,14 +3571,38 @@ def fit_hyperparameters(
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
 
+    def settle_release(model: int) -> None:
+        """x polished at the freed weights: the release stands where its certified V is above the state's it left by
+        more than the tolerance and both errors (its realized gain measured against the step's prediction);
+        otherwise the model returns to that state and this release is not planned again."""
+        anchor = anchors[model]
+        assert anchor is not None
+        anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchor
+        polished_state = states[model]
+        realized = -np.inf if polished_state is None else polished_state.value - anchor_state.value
+        resolution = np.inf if polished_state is None else polished_state.error + anchor_state.error
+        remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
+        anchors[model] = None
+        if polished_state is not None and realized - resolution > tolerance:
+            states[model] = replace(polished_state, polished=True)
+            return
+        refused_releases[model].add(frozenset(
+            int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
+        ))
+        hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
+        displaced[model], radii[model] = True, None
+
     def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
         if polishes and newton.definite and newton.decrement <= tolerance and states[model] is not None:
             # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
-            # tolerance, so the state is planned once more. (A polish that only ends on a step below x's own
-            # resolution walks a flat ray to the family's boundary: on gene 1 [real] the width -> 0 ray, 2.8 units
-            # a step with 1e-4 to 1e-7 nats each, until the density collapsed.)
-            states[model] = replace(states[model], polished=True)
+            # tolerance, so the state is planned once more (a release in flight is settled here). A polish that only
+            # ends on a step below x's own resolution walks a flat ray to the family's boundary: on gene 1 [real] the
+            # width -> 0 ray, 2.8 units a step with 1e-4 to 1e-7 nats each, until the density collapsed.
+            if anchors[model] is not None:
+                settle_release(model)
+            else:
+                states[model] = replace(states[model], polished=True)
             return None
         radius = radii[model]
         if radius is None:
@@ -3849,25 +3873,7 @@ def fit_hyperparameters(
             halvings[model] += 1
             if not resolved:
                 if entry.polishes and anchors[model] is not None:
-                    # x is at its maximum at the freed weights: the release stands where its certified V is above
-                    # the state's it left by more than the tolerance and both errors (its realized gain measured
-                    # against the step's prediction); otherwise the model returns to that state and this release
-                    # is not planned again.
-                    anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchors[model]
-                    polished_state = states[model]
-                    realized = -np.inf if polished_state is None else polished_state.value - anchor_state.value
-                    resolution = np.inf if polished_state is None else polished_state.error + anchor_state.error
-                    remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
-                    anchors[model] = None
-                    if polished_state is not None and realized - resolution > tolerance:
-                        states[model] = replace(polished_state, polished=True)
-                        pending[model] = None
-                        continue
-                    refused_releases[model].add(frozenset(
-                        int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
-                    ))
-                    hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
-                    displaced[model], radii[model] = True, None
+                    settle_release(model)
                     pending[model] = None
                     continue
                 if entry.polishes and states[model] is not None:
