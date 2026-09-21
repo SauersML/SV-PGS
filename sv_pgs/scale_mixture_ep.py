@@ -3339,12 +3339,6 @@ def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficient
     return _penalized(prior, objective, weights, _penalty_matrix(prior, weights), coefficients)[1]
 
 
-def _metric_decrement(newton: _NewtonB, gradient: F64Array) -> float:
-    """1/2 g'(B + S)^-1 g in the step's own metric (B + S positive definite)."""
-    components = newton.eigenvectors.T @ gradient
-    return 0.5 * float(np.sum(components * components / newton.eigenvalues))
-
-
 def _newton_b(
     prior: ScaleMixturePrior, log_smoothing: F64Array, coefficients: F64Array, point: FixedPoint, correction: CurvatureCorrection, working_bytes: int
 ) -> _NewtonB:
@@ -3809,10 +3803,13 @@ def fit_hyperparameters(
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
                 )
-                if newton.definite:
-                    accepted = _metric_decrement(newton, gradient) < newton.decrement
-                else:
-                    accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+                # The step is an ascent where the trapezoid rule of the two fixed points' gradients along it is
+                # positive (the path integral of E's gradient to first order). A decrement test in the origin's
+                # metric refused every step inside the radius on the mean-field test problem: with B + S's
+                # eigenvalues 2e-5 and 1e-2 the decrement is the weak direction's g^2 / lambda, which no step shorter
+                # than Newton's thousand units lowers, so the loop halved to x's resolution and read a maximum where
+                # the state's own error was 9.6 nats.
+                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
