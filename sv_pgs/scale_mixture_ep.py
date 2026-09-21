@@ -3703,8 +3703,8 @@ def fit_hyperparameters(
         gain at ``fraction``: infinite where the realized gain is positive or unmeasured (a halving may still resolve
         it), 0 where the segment is no ascent at the state, and s^2 / (4 |c|) otherwise (the model's maximum over the
         segment). A halving sequence whose gains are negative and rising toward zero as the fraction shrinks halved
-        forty times on ENSG00000285707.1 [real] (a fixed point and an outer state each, 40 of its 75 s) before the
-        fraction fell below x's resolution."""
+        thirty-one times from an unpolished state on ENSG00000285707.1 [real] (a fixed point and an outer state each,
+        31 of its 75 s) before the fraction fell below x's resolution, and x polished only then."""
         if not np.isfinite(gain) or gain > 0.0:
             return np.inf
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
@@ -3987,7 +3987,12 @@ def fit_hyperparameters(
                     # remainder, before any halving. A remainder that did not fall leaves the certificate as it was,
                     # so this replans at most once per measured decrease.
                     pending[model] = None
-                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and segment_reach(model, segment, entry.fraction, gain) > tolerance:
+                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and (
+                    # A polished state whose whole step has no certified end halves toward the fraction-certified
+                    # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
+                    # and ends where the segment's quadratic model reaches none.
+                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) > tolerance
+                ):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
