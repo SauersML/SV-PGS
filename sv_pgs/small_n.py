@@ -201,11 +201,19 @@ class _Design:
         return self._squares
 
     def column_squares(self) -> F64Array:
-        """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2."""
-        squares = np.einsum("ij,ij->j", self.carriers, self.carriers)
+        """||x_j||^2 = ||g_j||^2 - ||Q' g_j||^2, and where that difference is within its own rounding of zero (a column
+        in or near the covariates' span: two nearly equal squares leave eps ||g_j||^2 per term, of either sign; a
+        constant code of 127 over 534 samples gave -3.7e-9) the projected column's own square, which is never
+        negative."""
+        raw = np.einsum("ij,ij->j", self.carriers, self.carriers)
+        squares = raw
         if self.basis.shape[1]:
             loading = self.carriers.T @ self.basis
-            squares = squares - np.einsum("jk,jk->j", loading, loading)
+            squares = raw - np.einsum("jk,jk->j", loading, loading)
+            unresolved = np.flatnonzero(squares <= _EPSILON * (self.sample_count + self.basis.shape[1]) * raw)
+            if unresolved.size:
+                projected = self.group_columns(unresolved)
+                squares[unresolved] = np.einsum("ij,ij->j", projected, projected)
         return self.spread(squares)
 
 
@@ -234,6 +242,13 @@ class DenseStatistics:
     covariate_pseudo_inverse: F64Array
     target: F64Array
     projected_target: F64Array
+
+    @property
+    def covariate_rank(self) -> int:
+        """k: the covariates' numerical rank, the dimension the projection removes (the basis's columns). Dependent
+        covariate columns remove nothing more, so n - k, not n minus the column count, is the residual dimension of the
+        likelihood, the noise and its gain."""
+        return int(self.design.basis.shape[1])
 
     @property
     def sample_count(self) -> int:
@@ -1250,7 +1265,7 @@ class _DenseFixedPoints:
         self.design = statistics.design
         self.data_score = self.design.back(statistics.target)
         self.sample_count = statistics.sample_count
-        self.covariate_count = int(statistics.covariates.shape[1])
+        self.covariate_count = statistics.covariate_rank
         precision, shift = moment_matched_prior_sites(prior, start)
         self.site_precision = precision.copy()
         self.site_shift = shift.copy()
@@ -1606,7 +1621,7 @@ def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_va
     _classes, class_index = np.unique(np.asarray(variant_class)[members], return_inverse=True)
     offsets = np.asarray(log_variance_offset, dtype=np.float64)[members]
     residual = statistics.projected_target
-    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariates.shape[1])
+    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
     single_precision = statistics.design.column_squares() / start_noise
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
@@ -1627,7 +1642,7 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     score = design.back(statistics.target)
     moment = moment_start(
         target_square=float(residual @ residual),
-        residual_dimension=float(statistics.sample_count - statistics.covariates.shape[1]),
+        residual_dimension=float(statistics.sample_count - statistics.covariate_rank),
         score_square=float(score @ score),
         gram_trace=float(np.trace(kernel)),
         weighted_diagonal=float(weights @ squares),

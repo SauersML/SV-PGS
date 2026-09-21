@@ -238,7 +238,7 @@ class MeanFieldFixedPoints:
         self.working_bytes = int(working_bytes)
         self.design = statistics.design
         self.sample_count = statistics.sample_count
-        self.covariate_count = int(statistics.covariates.shape[1])
+        self.covariate_count = statistics.covariate_rank
         self.residual_dimension = self.sample_count - self.covariate_count
         # Xp over the groups, dense, once: every sweep is a pass over it.
         self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
@@ -266,6 +266,8 @@ class MeanFieldFixedPoints:
         # The last fixed point's response factorization and its noise: the metric of the corrections between sweeps.
         self._response: _Response | None = None
         self._response_noise = float(start_noise)
+        # The start's state, from which every call is also solved cold (``__call__``).
+        self._cold: dict | None = self._snapshot()
 
     # the ELBO and its pieces
 
@@ -309,6 +311,10 @@ class MeanFieldFixedPoints:
             "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "residual": self.residual.copy(),
             "third": self.third.copy(), "fourth": self.fourth.copy(),
             "noise": self.noise, "site_precision": self.site_precision.copy(), "effective": self.effective,
+            # The response factor belongs to the state it was built at: a rejected trial's must not steer the next
+            # solve from the restored state (the factor is immutable, so the reference is the state).
+            "response": self._response, "response_noise": self._response_noise,
+            "mean_move": self.mean_move, "noise_gain": self.noise_gain, "elbo": self.profile["elbo"],
         }
 
     def _restore(self, snapshot: dict) -> None:
@@ -316,17 +322,36 @@ class MeanFieldFixedPoints:
             snapshot[name].copy() for name in ("mean", "variance", "shift", "residual", "third", "fourth")
         )
         self.noise, self.site_precision, self.effective = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"]
+        self._response, self._response_noise = snapshot["response"], snapshot["response_noise"]
+        self.mean_move, self.noise_gain, self.profile["elbo"] = snapshot["mean_move"], snapshot["noise_gain"], snapshot["elbo"]
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
+        """The fixed point of the higher ELBO between the solve from the carried state and the solve from the start.
+
+        Coordinate ascent has several fixed points at one x, and neither start finds the better one always: on
+        bench-real chr22 [real, loso/AFR, snv] the cold solve's ELBO was above the carried state's by up to 24 nats
+        at 11 of 13 calls on ENSG00000075234.17 (19 at the fit's end, where the held-out r^2 was 0.457 cold against
+        0.388 carried), below it by 0.6 on ENSG00000100385.14, and equal to 0.01 nats on two other genes. The ELBO
+        is a lower bound on the evidence at this x, so the higher one is the better approximation, and the oracle
+        is then nearer a function of x than of the path that reached it. The first call's two starts are one."""
         (model_hyperparameters,) = hyperparameters
         self.profile["fixed_point_calls"] += 1
-        snapshot = self._snapshot()
-        try:
-            return [self._solve(model_hyperparameters)]
-        except (FloatingPointError, np.linalg.LinAlgError) as error:
-            self._restore(snapshot)
-            self.refusals.append(str(error))
+        entry = self._snapshot()
+        solved: list[tuple[float, FixedPoint, dict]] = []
+        for start in (entry, self._cold) if self.profile["fixed_point_calls"] > 1 else (entry,):
+            self._restore(start)
+            try:
+                point = self._solve(model_hyperparameters)
+            except (FloatingPointError, np.linalg.LinAlgError) as error:
+                self.refusals.append(str(error))
+                continue
+            solved.append((float(self.profile["elbo"]), point, self._snapshot()))
+        if not solved:
+            self._restore(entry)
             return [None]
+        _value, point, state = max(solved, key=lambda item: item[0])
+        self._restore(state)
+        return [point]
 
     def _stale_gap(self) -> F64Array:
         """h'_j - h_j on the live rows: each pseudo-likelihood's location recomputed from the sweep's final residual
@@ -340,9 +365,13 @@ class MeanFieldFixedPoints:
         """(the Newton decrement of the fixed-point equation in the means, its step): the map h -> T(h) whose fixed
         point q is has Jacobian -(Xp'Xp - diag ||x_j||^2) diag(v) / sigma^2, so Newton's step in the means is
         dm = R^-1 (h' - h) with R = diag(tau) + Xp'Xp / sigma^2 the response matrix (module docstring), and the
-        decrement (h' - h)' dm / 2 bounds the ELBO's own quadratic model's gain (its curvature is R plus the diagonal
-        ||x_j||^2 / sigma^2, so its inverse is smaller). With a response held from an earlier fixed point the
-        decrement is that metric's estimate; the fresh one at the returned fixed point is the certificate's."""
+        decrement (h' - h)' dm / 2 is the gain of the ELBO's own quadratic model in the means at fixed noise: in the
+        means the ELBO is -||y_P - Xp m||^2 / (2 sigma^2) - sum_j [J_j(m_j) - omega_j m_j^2 / 2] (the likelihood's
+        variance term cancels the KL's), J_j the Legendre transform of log Z_j with J_j'' = 1 / v_j, so its negative
+        Hessian is R itself. R need not be positive definite (``_Response``): where the form is negative the model
+        has no maximum along the gap and the decrement is no bound at all (``_solve`` then neither steps nor
+        certifies by it). With a response held from an earlier fixed point the decrement is that metric's estimate;
+        the fresh one at the returned fixed point is the certificate's."""
         step = response_noise * response.solve(gap[:, None])[:, 0]
         return 0.5 * float(gap @ step), step
 
@@ -399,15 +428,21 @@ class MeanFieldFixedPoints:
                     raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
             self.profile["elbo"] = value
             gap = self._stale_gap()
+            newton: float | None = None
             if corrections and self._response is not None:
-                remaining, step = self._decrement(gap, self._response, self._response_noise)
-                if remaining > tolerance:
+                newton, step = self._decrement(gap, self._response, self._response_noise)
+                if newton < 0.0:
+                    # R is indefinite along the gap: no step and no bound from it; the sweeps' extrapolation governs.
+                    newton, corrections = None, False
+                elif newton > tolerance:
                     # Newton's step in the means; the next sweep re-tilts every site at the moved residual.
                     correction = (self._snapshot(), value)
                     self.mean = self.mean + step
                     self.residual = self.residual - self.design.image(step)
                     self.profile["passes"] += 1
                     continue
+            if newton is not None:
+                remaining = newton
             else:
                 # Without a response yet (the fit's first fixed point), or after an unconfirmed correction: the
                 # sweeps' geometric extrapolation from the last two gains.
@@ -429,7 +464,10 @@ class MeanFieldFixedPoints:
                 # The certificate reads the decrement with the fresh factorization; where it is not within the
                 # tolerance the corrections continue in that metric.
                 assert self._response is not None
-                remaining, _step = self._decrement(gap, self._response, self._response_noise)
+                fresh, _step = self._decrement(gap, self._response, self._response_noise)
+                if fresh >= 0.0:
+                    # A negative form is no bound (R indefinite along the gap): the measured remainder stands.
+                    remaining = fresh
                 self.mean_move = 2.0 * remaining
                 if remaining + self.noise_gain <= tolerance:
                     return point

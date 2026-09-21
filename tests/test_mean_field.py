@@ -271,3 +271,47 @@ def test_the_mean_field_and_ep_fits_agree_on_the_resolved_effects():
     for name, each in fits.items():
         assert set(np.argsort(np.abs(each.scoring.coefficients))[-3:].tolist()) == set(strong), name
     np.testing.assert_allclose(fits["mean_field"].scoring.coefficients[strong], fits["ep"].scoring.coefficients[strong], rtol=0.25)
+
+
+def test_a_rejected_trial_leaves_no_response_factor_behind():
+    # The snapshot is the whole state: the response factor of a rejected trial must not steer the next solve.
+    codes, covariates, target, classes = _problem(5, samples=160, variants=50)
+    from sv_pgs import small_n
+    from sv_pgs.mean_field import MeanFieldFixedPoints
+
+    statistics = small_n.dense_statistics(codes, covariates, target)
+    prior = small_n.small_n_prior(statistics, classes, np.zeros(codes.shape[1]), 64)
+    start, start_noise, _moment = small_n.small_n_start(statistics, prior)
+    oracle = MeanFieldFixedPoints(statistics, prior, start_noise, 64, _WORKING_BYTES)
+    (point,) = oracle([start])
+    assert point is not None
+    accepted, accepted_noise = oracle._response, oracle._response_noise
+    snapshot = oracle._snapshot()
+    oracle._response, oracle._response_noise = "rejected", 9.0
+    oracle._restore(snapshot)
+    assert oracle._response is accepted and oracle._response_noise == accepted_noise
+
+
+def test_the_residual_dimension_is_the_covariate_rank_not_the_column_count():
+    # A duplicated covariate column removes nothing more: the statistics, the start noise and the oracle's residual
+    # dimension are those of the unduplicated design.
+    codes, covariates, target, classes = _problem(6, samples=160, variants=50)
+    from sv_pgs import small_n
+
+    doubled = np.column_stack([covariates, covariates[:, :1]])
+    plain, twice = small_n.dense_statistics(codes, covariates, target), small_n.dense_statistics(codes, doubled, target)
+    assert plain.covariate_rank == twice.covariate_rank == np.linalg.matrix_rank(covariates)
+    prior = small_n.small_n_prior(plain, classes, np.zeros(codes.shape[1]), 64)
+    _start, noise_plain, _m = small_n.small_n_start(plain, prior)
+    _start, noise_twice, _m = small_n.small_n_start(twice, small_n.small_n_prior(twice, classes, np.zeros(codes.shape[1]), 64))
+    assert np.isclose(noise_plain, noise_twice, rtol=1e-12, atol=0.0)
+
+
+def test_a_column_in_the_covariate_span_has_a_nonnegative_square():
+    from sv_pgs.small_n import _Design
+
+    samples = 534
+    basis = np.ones((samples, 1)) / np.sqrt(samples)
+    design = _Design(np.full((samples, 1), 127.0), basis)
+    # eps^2 of the column's own square, n terms: the projected column's entries are rounding-sized.
+    assert 0.0 <= design.squares[0] <= (np.finfo(np.float64).eps * samples) ** 2 * samples * 127.0 ** 2
