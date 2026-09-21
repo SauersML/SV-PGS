@@ -1306,6 +1306,15 @@ def _maximize_coefficients(
                 resolved = 0.5 * float((gradient + candidate_gradient) @ step) > 0.0
             if not (resolved and np.isfinite(candidate_value)):
                 return coefficients, objective
+            # The radius follows the same rule as the value's branch, with the trapezoid gain of the two gradients
+            # as the step's realized gain: a full-length step that realized three quarters of its model's gain
+            # doubles it. Held fixed, a saddle's negative curvature was followed at one radius for ever (on
+            # ENSG00000211673.2 [real] steps of 0.0012 along a curvature of -2e-3, each gaining 1e-7 nats, for an
+            # hour: the model's gain was below the value's rounding, so the value's branch, whose radius grows,
+            # never judged them).
+            trapezoid = 0.5 * float((gradient + candidate_gradient) @ step)
+            if float(np.linalg.norm(step)) >= radius * (1.0 - _HALF_PRECISION) and trapezoid > 0.75 * predicted:
+                radius = 2.0 * radius
             coefficients, objective = candidate, candidate_objective
             value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
             spectrum = _resolved_spectrum(_spectrum(-hessian))
