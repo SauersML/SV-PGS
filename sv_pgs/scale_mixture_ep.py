@@ -3559,6 +3559,8 @@ class _State:
     tail: float = 0.0
     # The fixed point's ``FixedPoint.evidence_offset``: ``value`` + ``offset`` is E's units across fixed points.
     offset: float = np.nan
+    # Whether an inner step below x's resolution ended the polish here: no further polish lowers the decrement.
+    at_resolution: bool = False
 
 
 def _outer_state(
@@ -4079,7 +4081,10 @@ def fit_hyperparameters(
                     pending[model] = None
                 elif newly_refused_edge:
                     pending[model] = None
-                elif state.polished and state.decrement > polish_tolerances[model] and (reopened := inner(model, entry.step, entry.remaining, True)) is not None:
+                elif (
+                    state.polished and not state.at_resolution and state.decrement > polish_tolerances[model]
+                    and (reopened := inner(model, entry.step, entry.remaining, True)) is not None
+                ):
                     # The decision asked a smaller decrement of x than the polish reached (``polish_tolerances``): the
                     # polish continues to it, and the state is planned again from there (where the B-model's decrement
                     # is already within it, ``inner`` proposes nothing and the state stands as measured).
@@ -4155,8 +4160,9 @@ def fit_hyperparameters(
                     pending[model] = None
                     continue
                 if entry.polishes and states[model] is not None:
-                    # x is at its maximum at rho_k to double precision: the state is planned once more.
-                    states[model] = replace(states[model], polished=True)
+                    # x is at its maximum at rho_k to double precision: the state is planned once more, and no
+                    # tighter polish is asked of it (``polish_tolerances``: the share the certificate wanted).
+                    states[model] = replace(states[model], polished=True, at_resolution=True)
                     pending[model] = None
                     continue
                 if newton.definite and entry.step is not None:
