@@ -11,8 +11,8 @@ small variants only and ``snv_sv`` among every record. A compound whose screen k
 methods return the training mean, scored as r² = 0 and counted.
 
 Covariates, fitted on the training lines only: sex, the cytotoxicity batch (indicators), and the genotype principal
-components of the training lines' genome-wide GRM (GCTA's, from every record) that Patterson's Tracy-Widom test
-keeps at level 1/K (Patterson, Price and Reich 2006, PLoS Genet 2:e190).
+components of the training lines' GRM of random near-unlinked autosomal SNVs (``structure_grm``) that Patterson's
+sequential Tracy-Widom test keeps at level 1/K (Patterson, Price and Reich 2006, PLoS Genet 2:e190).
 
 Methods: ``top_variant`` and numba ``mr_ash`` from bench-real's baselines, and SV-PGS by the small-n route with
 mean-field fixed points (``fit_small_n``); each fit's wall time is recorded. Held-out r² is the squared correlation
@@ -33,7 +33,7 @@ from scipy import stats
 
 from benchmarks import svpgs_small_n as bench
 from benchmarks.bench_real import baselines, harness as real_harness
-from benchmarks.bench_tox import dataset, genotypes
+from benchmarks.bench_tox import dataset, genotypes, splits
 from sv_pgs.fit_model import DRAW_COUNT
 from sv_pgs.small_n import fit_small_n
 
@@ -51,28 +51,27 @@ def _tracy_widom_quantile(level: float) -> float:
     return float(np.interp(np.log(level), logs[::-1], values[::-1]))
 
 
-def _read_grm(path_stem: pathlib.Path, count: int) -> tuple[np.ndarray, np.ndarray]:
-    """GCTA's binary GRM (lower triangle, float32) and its marker counts, as full matrices."""
-    values = np.fromfile(str(path_stem) + ".grm.bin", dtype=np.float32)
-    markers = np.fromfile(str(path_stem) + ".grm.N.bin", dtype=np.float32)
-    lower = np.tril_indices(count)
-    grm = np.zeros((count, count))
-    grm[lower] = values
-    grm = grm + np.tril(grm, -1).T
-    used = np.zeros((count, count))
-    used[lower] = markers
-    used = used + np.tril(used, -1).T
-    return grm, used
+def structure_grm(train_rows: np.ndarray, sample_count: int) -> np.ndarray:
+    """The GRM the PCs come from: the KING draw of random autosomal SNVs (``dataset.KING_MARKERS_PER_CHROMOSOME`` per
+    chromosome, one per 65 kb on average: near-unlinked, as Patterson's test assumes), each standardized by its
+    training-fold frequency, without the training fold's singletons (a singleton carries no information on any pair)
+    or its monomorphic sites; over every line, so the test lines' scores project onto the training eigenvectors.
 
-
-def genome_grm(count: int) -> np.ndarray:
-    """The genome-wide GRM as the marker-count-weighted mean of the chromosome GRMs."""
-    total, weight = np.zeros((count, count)), np.zeros((count, count))
+    Not GCTA's all-record GRM: on lococ/AFR its spectrum is nowhere near Wishart (25 million records, most rare, the
+    diagonal 0.47 with LD everywhere), and Patterson's sequential test kept every axis (598 of 599)."""
+    generator = np.random.default_rng(splits.seed_from_name("bench-tox/king"))
+    blocks = []
     for chrom in genotypes.AUTOSOMES:
-        grm, used = _read_grm(genotypes.GENO / f"grm_chr{chrom}", count)
-        total += grm * used
-        weight += used
-    return total / weight
+        table = genotypes.variant_table(chrom)
+        snv_rows = np.flatnonzero(table["is_snv"].to_numpy())
+        chosen = np.sort(generator.permutation(snv_rows)[: dataset.KING_MARKERS_PER_CHROMOSOME])
+        blocks.append(genotypes.read_bed(chrom, chosen, sample_count).T)
+    calls = np.concatenate(blocks, axis=1).astype(np.float64)
+    count = calls[train_rows].sum(axis=0)
+    kept = (count >= 2.0) & (count <= 2.0 * train_rows.shape[0] - 2.0)
+    frequency = count[kept] / (2.0 * train_rows.shape[0])
+    standardized = (calls[:, kept] - 2.0 * frequency) / np.sqrt(2.0 * frequency * (1.0 - frequency))
+    return standardized @ standardized.T / kept.sum()
 
 
 def significant_components(grm: np.ndarray, level: float) -> np.ndarray:
@@ -281,7 +280,7 @@ def run_fold(split: dict, workers: int, out_dir: pathlib.Path, level: float) -> 
     index = {line: row for row, line in enumerate(lines["line"])}
     train_rows = np.array(sorted(index[line] for line in split["train"]))
     test_rows = np.array(sorted(index[line] for line in split["test"]))
-    grm = genome_grm(len(lines))
+    grm = structure_grm(train_rows, len(lines))
     design_train, design_test, components = fold_covariates(lines, train_rows, test_rows, grm, 1.0 / DRAW_COUNT)
     started = time.perf_counter()
     kept = screen_fold(values, train_rows, np.column_stack([np.ones(train_rows.shape[0]), design_train]), level, len(lines), workers)
