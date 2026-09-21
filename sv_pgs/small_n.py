@@ -300,11 +300,15 @@ def _covariate_basis(covariates: F64Array) -> F64Array:
 
 def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) -> DenseStatistics:
     """Stage 0 of ``codes`` (n x records, store codes 0..254 = dosage x 127) with ``covariates`` (n x k, intercept
-    included) and ``target`` (n,)."""
+    included) and ``target`` (n,).
+
+    The codes are an integer array, as the store holds them. A float array is refused rather than truncated: the pass
+    reads them as integers (the tie test's exact gcd arithmetic, the minor-end flip), so a dosage handed over unscaled
+    would be read as a code of 0, 1 or 2, and every record would come out monomorphic or nearly so with no error."""
     values = np.asarray(codes)
     full = int(2 * SIGNED_CODE_OFFSET)
-    if values.ndim != 2 or values.min(initial=0) < 0 or values.max(initial=0) > full:
-        raise ValueError("codes must be store codes 0..254 of shape [samples, records].")
+    if values.ndim != 2 or values.dtype.kind not in "iu" or values.min(initial=0) < 0 or values.max(initial=0) > full:
+        raise ValueError(f"codes must be integer store codes 0..{full} of shape [samples, records].")
     count = int(values.shape[0])
     signed = values.astype(np.int64) - int(SIGNED_CODE_OFFSET)
     sums = signed.sum(axis=0)

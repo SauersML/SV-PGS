@@ -178,6 +178,19 @@ def test_draws_have_the_posterior_covariance():
     assert float(np.max(np.abs(empirical - inverse))) <= bound
 
 
+def test_stage0_refuses_codes_that_are_not_integers():
+    """Stage 0 reads the codes as integers, so a float array is refused rather than truncated: dosages handed over
+    unscaled would each become a code of 0, 1 or 2, and every record would come out monomorphic with no error."""
+    rng = np.random.default_rng(31)
+    samples, variants = 40, 6
+    dosage = rng.integers(0, 3, size=(samples, variants))
+    covariates, target = np.ones((samples, 1)), rng.standard_normal(samples)
+    dense_statistics((dosage * 127).astype(np.uint8), covariates, target)
+    for refused in (dosage.astype(np.float64), (dosage * 127.0), (dosage * 127.0) + 0.5):
+        with pytest.raises(ValueError, match="integer store codes"):
+            dense_statistics(refused, covariates, target)
+
+
 def test_stage0_standardizes_and_merges_exact_ties():
     rng = np.random.default_rng(5)
     samples = 40
