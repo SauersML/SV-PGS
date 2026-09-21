@@ -1217,23 +1217,33 @@ def _maximize_coefficients(
 
 @dataclass(frozen=True)
 class GaussianPosterior:
-    """q's linear responses at the EP fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
+    """q's linear responses at the fixed point, for the total curvature B: ``solve(R, e)`` is Sigma R, each column
     to relative error e in the posterior metric, and ``variance_jvp(W)`` is -(Sigma o Sigma) W, both (p x r). Stage 2
     answers them with extra right-hand sides of its solve and with ``marginal_variances.variance_jvp``.
 
     ``linear_response(left, right, diagonal, weight, B)``, when a posterior can give it, is the exact solution X of
     (I - (I - diag(weight) (Sigma o Sigma)) (diag(left) Sigma diag(right) + diag(diagonal))) X = B: the linear response
-    ``_total_curvature`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once)."""
+    ``_total_curvature`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once).
 
-    solve: Callable[[F64Array, float], F64Array]
-    variance_jvp: Callable[[F64Array], F64Array]
+    ``cavity_response(m_x E, s2_x E)``, for a fixed point that is not EP's (the mean-field fixed point, whose cavity
+    is the pseudo-likelihood: ``mean_field``), is that fixed point's own response (dh, dP) of every variant's cavity
+    to the directions' fixed-cavity moment changes (both p x r); ``_total_curvature_columns`` then takes B from it
+    directly and never asks ``solve`` or ``variance_jvp``, which such a posterior leaves None."""
+
+    solve: Callable[[F64Array, float], F64Array] | None = None
+    variance_jvp: Callable[[F64Array], F64Array] | None = None
     linear_response: Callable[[F64Array, F64Array, F64Array, F64Array, F64Array], F64Array] | None = None
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
     # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
-    # Whether ``solve``, ``variance_jvp`` and ``linear_response`` are exact to rounding whatever tolerance they are
-    # asked for (a dense factor, or independent effects): B's response is then charged its rounding, not the request.
+    cavity_response: Callable[[F64Array, F64Array], tuple[F64Array, F64Array]] | None = None
+    # Whether the responses are exact to rounding whatever tolerance they are asked for (a dense factor, or
+    # independent effects): B's response is then charged its rounding, not the request.
     exact: bool = False
+
+    def __post_init__(self) -> None:
+        if self.cavity_response is None and (self.solve is None or self.variance_jvp is None):
+            raise ValueError("a GaussianPosterior answers by solve and variance_jvp, or by cavity_response.")
 
 
 class NoCertifiedProgress(FloatingPointError):
@@ -1511,6 +1521,14 @@ def _total_curvature_columns(
     derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
+    if posterior.cavity_response is not None:
+        # The fixed point's own cavity response (a mean-field fixed point: ``mean_field``), exact by construction.
+        shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z)
+        if achieved is not None:
+            achieved.append(_EPSILON if posterior.exact else relative_tolerance)
+        return _total_from_response(prior, coefficients, cavity, derivatives, directions, shift_step, precision_step, working_bytes)
+    solve, variance_jvp = posterior.solve, posterior.variance_jvp
+    assert solve is not None and variance_jvp is not None
     # A variant whose tilted law is a point mass at zero (all its prior mass where v = u e^t underflows to 0) does not
     # respond: its mean and every derivative are zero for every cavity, so dh = dP = 0 exactly (the limit of the map,
     # whose 1/v factors are 0/0 there). Its rows are identity rows of the fixed point, with zero offset (speed-smalln).
@@ -1525,7 +1543,7 @@ def _total_curvature_columns(
         # constant, as a difference of two solves would be (speed-recycle a7752ae).
         # A scalar zero, so the linear part applies to any number of columns (a block Krylov step's).
         mean_constant = mean_by_z if affine else 0.0
-        mean_step = posterior.solve(
+        mean_step = solve(
             (derivatives.mean + derivatives.mean_by_precision * inverse)[:, None] * precision_step + mean_constant * inverse_column, inner
         )
         shift_step = (mean_step - derivatives.mean_by_precision[:, None] * precision_step - mean_constant) * inverse_column
@@ -1533,7 +1551,7 @@ def _total_curvature_columns(
         if affine:
             variance_step = variance_step + variance_by_z
         response = variance_step * inverse_column**2 + live_column * precision_step
-        return shift_step, response + posterior.variance_jvp(response) * inverse_column**2, response
+        return shift_step, response + variance_jvp(response) * inverse_column**2, response
 
     shape = mean_by_z.shape
     # ``through`` is affine in dP, with linear part (I - diag(1/v^2) (Sigma o Sigma)) R and R = diag(v_h / v^3) Sigma

@@ -36,13 +36,15 @@ distance to the fixed point), so a call sweeps at least until two gains are meas
 rounding (eps times the sum of its terms' sizes) is resolved. Nothing is clipped, damped or capped.
 
 **The outer loop's view.** The pseudo-likelihoods are the ``Cavity`` the hyper step maximizes over: at the fixed
-point q_j = t_j(x), so ELBO = sum_j log Z_j(x; omega, h) + terms free of x, and sum_j log Z_j is exactly what
-``hyper_step`` maximizes at a cavity. The total curvature's linear response comes from the mean-field fixed point's
-own: m_j = f_j(h_j(m_-j); x) gives dm/dx = (I - J)^-1 df/dx with J_ji = v_j (-x_j' x_i / sigma^2) for i != j, i.e.
-(I - J) = diag(v) [diag(1 / v_j - omega_j) + Xp'Xp / sigma^2], the Gaussian posterior with sites
-tau_j = 1 / v_j - omega_j (the tilted precision less the pseudo-likelihood's). That is ``small_n._Kernel`` at
-sigma^2 tau, so ``small_n._DensePosterior`` answers the outer loop's solves and variance products exactly, as for EP.
-Posterior draws are q's own: each member's node from its responsibilities, then its conditional normal.
+point q_j = t_j(x), so by the envelope theorem d ELBO*/dx = sum_j d log Z_j(x; omega_j, h_j)/dx at fixed cavities,
+exactly the fixed-cavity gradient EP's outer loop uses. The total curvature B = -d2 ELBO*/dx2 needs the cavity's
+response to x: only h moves (omega is fixed), through the means, dh = -(Xp'Xp - diag ||x_j||^2) dm / sigma^2 with
+dm = f_h dh + f_x E, f_h = v (the tilted variance) and f_x E = m_x E the fixed-cavity mean change, so
+(diag(1 / v - omega) + Xp'Xp / sigma^2) dm = diag(1 / v) m_x E. ``GaussianPosterior.cavity_response`` hands (dh, 0)
+to ``_total_curvature_columns``, which forms B from it as it does from EP's response; the solve is ``_Response``
+(the matrix is symmetric, not always positive definite). The prediction check moves q's means in q's own metric,
+sum_j d_j^2 / v_j, and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws
+are q's own: each member's node from its responsibilities, then its conditional normal.
 """
 
 from __future__ import annotations
@@ -52,11 +54,13 @@ from typing import Sequence
 
 import numba
 import numpy as np
+from scipy import linalg
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.scale_mixture_ep import (
     Cavity,
     FixedPoint,
+    GaussianPosterior,
     MixtureHyperparameters,
     ScaleMixturePrior,
     _components,
@@ -64,7 +68,7 @@ from sv_pgs.scale_mixture_ep import (
     log_scale,
     noise_gain,
 )
-from sv_pgs.small_n import _LIVE_FIXED_POINTS, DenseStatistics, _DensePosterior, _Kernel, _new_profile
+from sv_pgs.small_n import DenseStatistics, _Design, _new_profile
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -136,6 +140,57 @@ def _sweep(design, squares, members, class_index, log_density, log_scale_rows, g
     return divergence, weighted_variance, residual_square
 
 
+class _Response:
+    """(Xp'Xp + diag t)^-1 applied to columns, for sites t of either sign: the mean-field fixed point's response
+    matrix diag(tau) + Xp'Xp / sigma^2 (t = sigma^2 tau, module docstring) is symmetric but need not be positive
+    definite. A member whose tilted variance exceeds its pseudo-likelihood's, v_j > 1 / omega_j, has tau_j < 0, and
+    two tied members with such sites make it indefinite along their difference; it is still nonsingular wherever the
+    fixed point has a linear response.
+
+    The bulk P (t_j >= ||x_j||^2, where Woodbury keeps every digit: ``small_n._Kernel``) enters through the kernel
+    K = I + Xp_P T_P^-1 Xp_P' (positive definite), and the rest N exactly through its Schur complement
+    S = T_N + Xp_N' K^-1 Xp_N (|N| x |N|, symmetric, any sign), factored by LU. A dead row (a point-mass tilted law,
+    t = infinity) has no response: it is a bulk row with T^-1 = 0."""
+
+    def __init__(self, design: _Design, scaled_sites: F64Array, live: np.ndarray) -> None:
+        self.design = design
+        squares = design.squares
+        bulk = ~live | (scaled_sites >= squares)
+        with np.errstate(divide="ignore"):
+            self.bulk_inverse = np.where(bulk & live, 1.0 / np.where(bulk & live, scaled_sites, 1.0), 0.0)
+        kernel = design.weighted_gram(self.bulk_inverse)
+        kernel[np.diag_indices_from(kernel)] += 1.0
+        self.upper = linalg.cholesky(kernel, lower=False, check_finite=False, overwrite_a=True)
+        self.rest = np.flatnonzero(~bulk)
+        if self.rest.size:
+            self.rest_columns = design.columns(self.rest)
+            whitened = linalg.solve_triangular(self.upper, self.rest_columns, trans="T", lower=False, check_finite=False)
+            schur = whitened.T @ whitened
+            schur[np.diag_indices_from(schur)] += scaled_sites[self.rest]
+            self.schur = linalg.lu_factor(schur, check_finite=False)
+            if not np.all(np.isfinite(self.schur[0])) or np.any(np.diag(self.schur[0]) == 0.0):
+                raise np.linalg.LinAlgError("the mean-field fixed point's response matrix is singular on its Schur block")
+
+    def _bulk_solve(self, right: F64Array) -> F64Array:
+        """(T_P + Xp_P'Xp_P)^-1 on the bulk rows of ``right`` (zero elsewhere), by Woodbury."""
+        scaled = self.bulk_inverse[:, None] * right
+        image = self.design.image(scaled)
+        back = self.design.back(linalg.cho_solve((self.upper, False), image, check_finite=False))
+        return scaled - self.bulk_inverse[:, None] * back
+
+    def solve(self, right: F64Array) -> F64Array:
+        """(Xp'Xp + diag t)^-1 right for right (p x r)."""
+        values = np.asarray(right, dtype=np.float64)
+        solution = self._bulk_solve(values)
+        if not self.rest.size:
+            return solution
+        rest_right = values[self.rest] - self.rest_columns.T @ self.design.image(solution)
+        rest_solution = linalg.lu_solve(self.schur, rest_right, check_finite=False)
+        solution = solution - self._bulk_solve(self.design.back(self.rest_columns @ rest_solution))
+        solution[self.rest] = rest_solution
+        return solution
+
+
 class MeanFieldFixedPoints:
     """``scale_mixture_ep.FixedPoints`` for one model on a dense training matrix by mean-field coordinate ascent
     (module docstring). The state (q's moments, the residual, the noise) is warm across calls; a call that ends
@@ -154,9 +209,11 @@ class MeanFieldFixedPoints:
         self.residual_dimension = self.sample_count - self.covariate_count
         # Xp over the groups, dense, once: every sweep is a pass over it.
         self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
-        self.group_squares = np.einsum("ij,ij->j", self.projected, self.projected)
         self.members = np.asarray(self.design.members, dtype=np.int64)
-        self.member_squares = self.group_squares[self.members]
+        # ||x_g||^2 as the design defines it (``_Design.squares``: the same numbers the response and the tests use).
+        self.member_squares = np.asarray(self.design.squares, dtype=np.float64)
+        self.group_squares = np.zeros(self.design.group_count)
+        self.group_squares[self.members] = self.member_squares
         self.class_index = np.asarray(prior.class_index, dtype=np.int64)
         self.noise = float(start_noise)
         self.mean = np.zeros(prior.variant_count)
@@ -169,7 +226,6 @@ class MeanFieldFixedPoints:
         self.noise_gain = np.inf
         self.refusals: list[str] = []
         self.profile = _new_profile() | {"sweeps": 0, "sweep_seconds": 0.0, "elbo": -np.inf}
-        self.kernel: _Kernel | None = None
 
     # the ELBO and its pieces
 
@@ -194,12 +250,12 @@ class MeanFieldFixedPoints:
     def _snapshot(self) -> dict:
         return {
             "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "residual": self.residual.copy(),
-            "noise": self.noise, "site_precision": self.site_precision.copy(), "effective": self.effective, "kernel": self.kernel,
+            "noise": self.noise, "site_precision": self.site_precision.copy(), "effective": self.effective,
         }
 
     def _restore(self, snapshot: dict) -> None:
         self.mean, self.variance, self.shift, self.residual = (snapshot[name].copy() for name in ("mean", "variance", "shift", "residual"))
-        self.noise, self.site_precision, self.effective, self.kernel = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"], snapshot["kernel"]
+        self.noise, self.site_precision, self.effective = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"]
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         (model_hyperparameters,) = hyperparameters
@@ -253,37 +309,50 @@ class MeanFieldFixedPoints:
             else:
                 remaining = np.inf
             previous_gain = gain
-            self.mean_move = remaining
+            # The remainder in the certificate's units: KL(q || q') = move / 2, so the move is twice the remaining gain.
+            self.mean_move = 2.0 * remaining
             if remaining + self.noise_gain <= tolerance:
                 return self._fixed_point(hyperparameters)
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
-        """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, the linear
-        response's Gaussian (sites 1 / v_j - omega_j) as the posterior."""
+        """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own metric
+        for the prediction check, p_eff = sum_j omega_j v_j, and the linear response through ``_Response``."""
         omega = self.member_squares / self.noise
+        live = self.variance > 0.0
         with np.errstate(divide="ignore"):
-            tau = np.where(self.variance > 0.0, 1.0 / self.variance, np.inf) - omega
-        if not np.all(np.isfinite(tau)):
-            raise FloatingPointError("a member's mean-field variance is 0: its linear response has no finite site")
+            tau = np.where(live, 1.0 / np.where(live, self.variance, 1.0), np.inf) - omega
+        self.site_precision = tau
+        self.effective = max(float(np.sum(omega * self.variance)), _EPSILON * tau.shape[0])
         started = time.perf_counter()
-        kernel = _Kernel(self.design, self.noise * tau)
+        response = _Response(self.design, self.noise * tau, live)
         self.profile["factorizations"] += 1
         self.profile["factor_seconds"] += time.perf_counter() - started
-        variances, removed, _cavity_precision = kernel.cavity()
-        self.kernel = kernel
-        self.site_precision = tau
-        self.effective = max(float(np.sum(removed)), _EPSILON * tau.shape[0])
         self.profile["refreshes"] += 1
-        posterior = _DensePosterior(kernel, self.noise, self.working_bytes // _LIVE_FIXED_POINTS, self.profile)
-        design, noise, precision = self.design, self.noise, tau.copy()
+        design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
+
+        def cavity_response(mean_by_z: F64Array, _variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
+            # dm = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest; then
+            # dh = -(Xp'Xp - diag(||x_j||^2)) dm / sigma^2 and dP = 0 (module docstring).
+            started = time.perf_counter()
+            scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
+            mean_step = noise * response.solve(scaled)
+            shift_step = -(design.back(design.image(mean_step)) - squares[:, None] * mean_step) / noise
+            self.profile["response_seconds"] += time.perf_counter() - started
+            self.profile["responses"] += 1
+            return shift_step, np.zeros_like(shift_step)
 
         def norm(direction: F64Array) -> float:
+            # q's own metric for a shift of its means: KL(q || q shifted) = sum_j d_j^2 / (2 v_j) for a product of
+            # laws that shift as a location family, so the move is sum_j d_j^2 / v_j; a dead row moves nowhere.
             values = np.asarray(direction, dtype=np.float64)
-            image = design.image(values)
-            return float(image @ image) / noise + float(np.sum(precision * values * values))
+            moving = values != 0.0
+            if np.any(moving & ~live):
+                return np.inf
+            return float(np.sum(np.square(values[live]) / variance[live]))
 
+        posterior = GaussianPosterior(cavity_response=cavity_response, exact=True)
         return FixedPoint(
-            cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior.gaussian_posterior(), mean=self.mean.copy(),
+            cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
             precision_norm=norm, effective_effects=float(self.effective),
         )
 
