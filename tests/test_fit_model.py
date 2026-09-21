@@ -291,7 +291,11 @@ def test_a_store_goes_through_fit_and_score_to_the_held_out_predictions(tmp_path
             np.testing.assert_allclose(scores["linear_predictor"][:, index], linear, rtol=0.0, atol=float(np.max(rounding)))
     expected = predict(model, DosageStore.open(store_root), cohort.store_columns[held_out], cohort.covariates[held_out], _budget())
     with np.load(tmp_path / "scores.npz") as scores:
-        np.testing.assert_array_equal(scores["predictive_mean"], expected.predictive_mean)
+        # The command and this call reduce the same sums in whatever order their thread counts give them (the command
+        # took 128 threads on a compute node where this call takes the budget's 1), so they agree to the reduction's
+        # rounding, not bit for bit: eps per variant of the size the sum reaches.
+        rounding = np.finfo(np.float64).eps * _VARIANTS * np.maximum(np.abs(expected.predictive_mean), 1.0)
+        np.testing.assert_allclose(scores["predictive_mean"], expected.predictive_mean, rtol=0.0, atol=float(np.max(rounding)))
     with pytest.raises(FileExistsError):
         main(["fit", str(store_root), str(tmp_path / "cohort.npz"), str(tmp_path / "model")])
     assert len(driver.calls) == 1
