@@ -846,7 +846,6 @@ def test_the_report_reads_several_results_roots_with_different_genes_and_refuses
     """One method in gene-range chunks, one directory each, beside a comparator that scored other genes: the roots
     score different gene sets, and one root may hold no genes of a method at all. A gene scored twice for one arm is
     refused, whichever root or tag holds the copy."""
-    import json
     import sys
 
     from benchmarks.bench_real import report

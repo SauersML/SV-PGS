@@ -1,11 +1,16 @@
-"""The permutation null's identity replicate reproduces the harness's own top_variant fit, on a synthetic dataset."""
+"""The permutation null runs the benchmark's own fit and score, on a synthetic dataset.
 
+The identity replicate must reproduce baselines.top_variant plus harness.predict_for_truth plus report.py's
+within-group partial r^2; so must a permuted replicate, against the same pipeline fed the permuted SV columns.
+"""
+
+import dataclasses
 import json
 
 import numpy as np
 import pandas as pd
 
-from benchmarks.bench_real import baselines, harness, perm_null, robust, splits
+from benchmarks.bench_real import baselines, harness, perm_null, report, splits
 
 EPSILON = np.finfo(np.float64).eps
 
@@ -42,17 +47,36 @@ def synthetic_dataset(root):
     return samples
 
 
-def direct_gain(dataset, gene_row):
+def permuted_rows(values, local_inverse_row):
+    """The rows of `values` under the permutation sigma that `local_inverse_row` inverts: x[sigma]."""
+    forward = np.empty_like(local_inverse_row)
+    forward[local_inverse_row] = np.arange(len(local_inverse_row))
+    return values[forward]
+
+
+def direct_gain(dataset, gene_row, replicate=None, inverse=None):
+    """The gain the benchmark itself computes: top_variant fitted on the training data, scored by
+    harness.predict_for_truth, and read by report.py's within-group partial r^2. With a replicate, every SV column
+    of both arms is first permuted by that replicate's own permutation of the split's people."""
     window = harness.load_gene_window(dataset, gene_row)
-    groups = dataset.samples["Superpopulation"].to_numpy()
     gains = []
     for name in sorted(split for split in dataset.splits if split.startswith("loso/")):
         train_all, test_all, test_phenotype, test_index = harness.build_gene_task(dataset, window, dataset.splits[name])
+        train_index = np.array([dataset.sample_index[sample] for sample in dataset.splits[name]["train"]])
+        basis, _ = report.group_basis(dataset.covariates[test_index])
+        truth = report.residual_on(basis, np.asarray(test_phenotype, dtype=np.float64)[None])
         values = {}
         for feature_set in ("snv", "snv_sv"):
             train, test = harness.subset(train_all, test_all, feature_set, name)
-            prediction = baselines.top_variant(train).predict(test)
-            values[feature_set] = robust.group_metrics(np.ones((1, len(test_index))), prediction[None], test_phenotype[None])["r2"][0, 0]
+            if replicate is not None:
+                is_sv = train.variants.is_sv
+                genotypes, test_genotypes = train.genotypes.copy(), np.asarray(test, dtype=np.float64).copy()
+                genotypes[:, is_sv] = permuted_rows(genotypes, perm_null.local_permutations(inverse, train_index, len(dataset.samples))[replicate])[:, is_sv]
+                test_genotypes[:, is_sv] = permuted_rows(test_genotypes, perm_null.local_permutations(inverse, test_index, len(dataset.samples))[replicate])[:, is_sv]
+                train, test = dataclasses.replace(train, genotypes=genotypes), test_genotypes
+            predictor = baselines.top_variant(train)
+            score, _ = harness.predict_for_truth(predictor, train, test, dataset.covariates[test_index])
+            values[feature_set] = report.partial_scores(report.residual_on(basis, score[None]), truth)[1][0]
         gains.append(values["snv_sv"] - values["snv"])
     return float(np.mean(gains))
 
@@ -69,3 +93,18 @@ def test_identity_replicate_matches_the_harness_and_null_permutations_stay_withi
         _, _, gains, _ = perm_null.gene_null(dataset, gene_row, inverse)
         assert abs(gains[0] - direct_gain(dataset, gene_row)) < 1e4 * EPSILON
         assert gains.shape == (21,)
+
+
+def test_a_permuted_replicate_is_the_pipeline_fed_the_permuted_sv_columns(tmp_path):
+    """The null's whole speed rests on reading a permutation through permuted responses and permuted basis rows
+    instead of permuting and re-projecting the columns. Each replicate must still be the fit and the score the
+    benchmark would produce from the permuted genotypes themselves."""
+    synthetic_dataset(tmp_path)
+    dataset = harness.Dataset(tmp_path)
+    inverse = perm_null.within_group_permutations(dataset.samples["Superpopulation"].to_numpy(), 6, np.random.default_rng(2))
+    for gene_row in (0, 1):
+        _, _, gains, wins = perm_null.gene_null(dataset, gene_row, inverse)
+        for replicate in range(inverse.shape[0]):
+            expected = direct_gain(dataset, gene_row, replicate=replicate, inverse=inverse)
+            assert abs(gains[replicate] - expected) < 1e4 * EPSILON, (gene_row, replicate, gains[replicate], expected)
+        assert wins.max() <= 5 and wins.shape == (7,)
