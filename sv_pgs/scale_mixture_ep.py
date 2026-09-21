@@ -2394,7 +2394,11 @@ def _evidence_once(
     # V's own rho-gradient: W_B = (B + S)^-1 - N (N'(B + S)N)^-1 N' carries both determinants' dependence on rho,
     # through S directly and through x_rho in A(x_rho) (C is held), with dx/drho_i = -(-H)^-1 lambda_i S_i x.
     total_weight = profiled_total.weight
-    total_curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, total_weight, working_bytes)
+    # The gradient's trace term is one pass over the sites' third derivatives; a view with no finite weight (every
+    # block at its edge) has no rho-gradient to take.
+    total_curvature_gradient = (
+        _curvature_trace_gradient(prior, coefficients, cavity, total_weight, working_bytes) if prior.smoothing_blocks else np.zeros(coefficients.shape[0])
+    )
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
     effective_degrees = np.empty(len(prior.smoothing_blocks))
     penalty_sizes = np.empty(len(prior.smoothing_blocks))
@@ -3285,7 +3289,12 @@ def _outer_state(
     lowest = np.array([bound[0] for bound in _smoothing_bounds(prior, data)])
     log_smoothing = np.where(hyperparameters.log_smoothing == -np.inf, lowest, hyperparameters.log_smoothing)
     infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
-    view, allowed = _restricted_prior(_anchored(prior, correction, prior.coefficient_map @ hyperparameters.coefficients), infinite)
+    # Restricted first, anchored second: the anchor asks C on the view's own directions (at an all-edge state two per
+    # class, not the lattice's K per class), and the correction's lazy solve keeps them for the hyper step's full
+    # anchor. The order is exact: z_k is the same in every view, and ``_restricted_prior`` re-anchors a restricted
+    # view with the same correction and center.
+    view, allowed = _restricted_prior(prior, infinite)
+    view = _anchored(view, correction, prior.coefficient_map @ hyperparameters.coefficients)
     weights = log_smoothing[np.isfinite(log_smoothing)]
     evidence = _evidence(view, weights, allowed.T @ hyperparameters.coefficients, point.cavity, correction, working_bytes, tolerance, maximize=False)
     corrected = None if evidence is None else _corrected(view, weights, evidence, point.cavity, correction, working_bytes, tolerance)
