@@ -60,8 +60,9 @@ does from EP's response; the solve is ``_Response`` (the matrix is symmetric, no
 the noise's response left out (as it was), the outer loop's Newton steps in x converged linearly (a rate of 0.1 on
 the test problem and 0.37 on gene 1 [real]: sixteen extra outer states), the signature of a model curvature that
 misses the fixed point's own motion. The prediction check moves q's means in q's own metric, sum_j d_j^2 / v_j,
-and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws are q's own: each
-member's node from its responsibilities, then its conditional normal.
+and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). The draws are q's own, so they are
+conditional variational draws of the product approximation at the fitted hyperparameters and not of the posterior
+it approximates (``draws``): each member's node from its responsibilities, then its conditional normal.
 """
 
 from __future__ import annotations
@@ -583,6 +584,13 @@ class MeanFieldFixedPoints:
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x K) draws from q itself, member by member: each member's node from its responsibilities at its
         pseudo-likelihood, then its conditional normal N(h c_k, c_k) (``scale_mixture_ep._components``).
+
+        These are conditional variational draws of the product approximation q = prod_j q_j at the fitted
+        hyperparameters, not draws of the posterior q approximates. A direction that mixes members in LD has a
+        variance under the product that is neither an upper nor a lower bound on the posterior's (for a two-effect
+        Gaussian posterior with unit diagonal precision and off-diagonal 0.9 the product gives 2 against the
+        posterior's 20 along [1, -1] and 1.05 along [1, 1]), and the hyperparameters are held fixed, so the draws
+        carry the posterior's marginal spread per member and no joint-posterior or predictive-interval coverage.
 
         The rows are taken in pieces whose per-row intermediates fit ``working_bytes``
         (``scale_mixture_ep._row_chunks``): the widest of them are the kernel's node-wide forms and the sampler's

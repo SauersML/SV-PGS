@@ -22,22 +22,36 @@ column is owned by one worker that adds the blocks in store order with
 single-threaded BLAS; thread and device counts change a score only at fp64
 rounding (BLAS kernels may order a panel's sums by its width).
 
-Posterior draws. A model carries K exact draws beta^(k) from its Gaussian
-posterior q; Stage 2 draws them by perturb-and-solve on its own genotype
-passes. Each draw is one more weight column, so the same single read gives
-the draw scores g_i^(k). The posterior mean score g_i is known exactly, so
+Posterior draws. A model carries K draws beta^(k) of its effects from the law
+its fitting route represents the posterior by, which is not the same law for
+every route. Stage 2's full-data route draws exactly from its Gaussian
+posterior q by perturb-and-solve on its own genotype passes. The small-n
+mean-field route (``mean_field.MeanFieldFixedPoints.draws``) draws instead
+from the fitted product approximation prod_j q_j, conditional on the fitted
+hyperparameters: a direction that mixes members in LD has a variance under
+the product that is neither an upper nor a lower bound on the posterior's,
+and hyperparameter uncertainty is left out. Everything below is a statement
+about the law the draws come from, so it is a posterior statement exactly
+where that law is the posterior.
+
+Each draw is one more weight column, so the same single read gives
+the draw scores g_i^(k). The mean score g_i is known exactly, so
 
     v_i = (1 / K) sum_k (g_i^(k) - g_i)^2
 
-is an unbiased estimate of the posterior variance of the genetic score, with
-relative standard error sqrt(2 / K). That moves a damped probability by at
+is an unbiased estimate of the variance of the genetic score under that law,
+with relative standard error sqrt(2 / K). That moves a damped probability by at
 most |sigmoid''| / 2 * sqrt(2 / K) * v_i <= 0.068 v_i / sqrt(K). One draw
-already makes it unbiased. An interval needs more care: K v_i is v times a
-chi-square with K degrees of freedom, independent of the genetic value, so
-(G_i - g_i) / sqrt(v_i) is exactly Student-t with K degrees of freedom and
-``GeneticScores.credible_interval`` uses t_K quantiles. Normal quantiles would
-under-cover at small K. The covariate coefficients have a flat prior and an
-O(1/n) posterior variance, which the predictive ignores.
+already makes it unbiased. An interval needs more care: where the drawing law
+is Gaussian, K v_i is v times a chi-square with K degrees of freedom,
+independent of the genetic value, so (G_i - g_i) / sqrt(v_i) is exactly
+Student-t with K degrees of freedom and ``GeneticScores.credible_interval``
+uses t_K quantiles. Normal quantiles would under-cover at small K. Under a
+non-Gaussian drawing law (the mean-field product's score is a sum of
+independent scale mixtures) the t_K interval is an approximation, not an
+exact coverage statement, for that law or for the posterior. The covariate
+coefficients have a flat prior and an O(1/n) posterior variance, which the
+predictive ignores.
 
 Binary models. The posterior predictive is
 
@@ -101,8 +115,11 @@ class ScoringModel:
     """One fitted model in store rows and signed-code units (see the module docstring).
 
     ``coefficients`` are the posterior-mean effects of the standardized columns at
-    ``store_rows`` and ``posterior_draws`` [rows, K] are K exact posterior draws of
-    the same effects, both tie-expanded. ``alpha`` are the covariate coefficients
+    ``store_rows`` and ``posterior_draws`` [rows, K] are K draws of the same effects
+    from the law the fitting route represents the posterior by (the module docstring:
+    the full-data route's exact posterior draws, or the mean-field route's conditional
+    variational draws of its product approximation), both tie-expanded.
+    ``alpha`` are the covariate coefficients
     with the intercept first. ``predictive_intercept_shift`` calibrates the damped
     binary predictive (0.0 for quantitative models).
     """
@@ -259,10 +276,11 @@ class ScoringPlan:
 
 @dataclass(frozen=True)
 class GeneticScores:
-    """Scores [samples, models]: posterior-mean genetic scores and their posterior variances.
+    """Scores [samples, models]: posterior-mean genetic scores and their variances under each model's drawing law.
 
     ``variances`` are the K-draw estimates v_i (NaN for a model without posterior draws) and
-    ``draw_counts`` holds each model's K.
+    ``draw_counts`` holds each model's K. The drawing law is the posterior only on the full-data
+    route; on the mean-field route it is that fit's product approximation (the module docstring).
     """
 
     means: F64Array
@@ -270,11 +288,15 @@ class GeneticScores:
     draw_counts: tuple[int, ...]
 
     def credible_interval(self, coverage: float) -> tuple[F64Array, F64Array]:
-        """Central ``coverage`` interval of every sample's genetic value, exact for any K.
+        """Central ``coverage`` interval of every sample's genetic value under the model's drawing law,
+        exact for any K where that law is Gaussian.
 
-        The mean score is exact and the K draws are independent posterior draws, so K v_i / v is
+        The mean score is exact and the K draws are independent draws of it, so K v_i / v is
         chi-square with K degrees of freedom and independent of G ~ N(g, v); (G - g) / sqrt(v_i) is
-        then Student-t with K degrees of freedom, and the interval uses its quantiles.
+        then Student-t with K degrees of freedom, and the interval uses its quantiles. Under a
+        non-Gaussian drawing law (the mean-field product's) G is not normal and the interval is an
+        approximation; it covers the posterior only where the drawing law is the posterior
+        (the module docstring).
         """
         if not 0.0 < coverage < 1.0:
             raise ValueError("coverage must lie strictly between 0 and 1.")

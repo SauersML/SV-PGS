@@ -282,7 +282,9 @@ class StoreCodeBlocks:
 class Prediction:
     """Predictions [samples, models] for the scored samples.
 
-    ``genetic`` holds the posterior-mean genetic scores and their K-draw posterior variances;
+    ``genetic`` holds the posterior-mean genetic scores and their K-draw variances under each model's drawing law
+    (``fast_scoring``: the posterior's on the full-data route, the fitted product approximation's on the mean-field
+    route, so a spread reported here is the posterior's only in the first case);
     ``linear_predictor`` adds the intercept and covariate effects. ``predictive_mean`` is the linear predictor for a
     quantitative trait and P(y = 1) for a binary one; ``predictive_variance`` is the genetic variance plus the noise
     variance for a quantitative trait and p(1 - p) for a binary one.
