@@ -504,9 +504,11 @@ class MeanFieldFixedPoints:
             return float(np.sum(np.square(values[live]) / variance[live]))
 
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=True)
+        # The solver's state at this point, so the outer loop can put it back before a trial (``FixedPoint.restore``).
+        snapshot = self._snapshot()
         return FixedPoint(
             cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
-            precision_norm=norm, effective_effects=float(self.effective),
+            precision_norm=norm, effective_effects=float(self.effective), restore=lambda: self._restore(snapshot),
         )
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:

@@ -3363,11 +3363,17 @@ class FixedPoint:
     mean: F64Array
     precision_norm: Callable[[F64Array], float | F64Array]
     effective_effects: float | F64Array
+    # Puts the oracle back at this fixed point, where it offers that: the outer loop restores its state's point before
+    # every trial, so a trial's fixed point is a function of its hyperparameters and the state, warm from the state,
+    # never of the refused trials before it (a mean-field solve warm from a refused trial's q reached another fixed
+    # point at the state's own hyperparameters on ENSG00000274602.5 [real]: V 867.7 against the state's 819.7, which
+    # the path gain along x cannot see, so the trial was refused and the fit ended uncertified).
+    restore: Callable[[], None] | None = None
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
-"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call; None for a model where
-none exists (EP reaches no proper cavities there)."""
+"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call (from the state's point
+where the points offer ``restore``); None for a model where none exists (EP reaches no proper cavities there)."""
 
 
 @dataclass(frozen=True)
@@ -3685,6 +3691,24 @@ def fit_hyperparameters(
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
 
+    def segment_reach(model: int, segment: F64Array, fraction: float, gain: float) -> float:
+        """The largest gain any shorter fraction of a refused joint step can reach, under the quadratic model of the
+        gain along the segment through the state's slope (the B-model's gradient at rho_k along it) and the realized
+        gain at ``fraction``: infinite where the realized gain is positive or unmeasured (a halving may still resolve
+        it), 0 where the segment is no ascent at the state, and s^2 / (4 |c|) otherwise (the model's maximum over the
+        segment). A halving sequence whose gains are negative and rising toward zero as the fraction shrinks halved
+        forty times on ENSG00000285707.1 [real] (a fixed point and an outer state each, 40 of its 75 s) before the
+        fraction fell below x's resolution."""
+        if not np.isfinite(gain) or gain > 0.0:
+            return np.inf
+        newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        slope = float(newton.gradient @ (newton.allowed.T @ segment))
+        if slope <= 0.0:
+            return 0.0
+        # gain = slope f + c f^2 with gain <= 0 < slope f: c < 0, and the model peaks at slope^2 / (4 |c|).
+        curvature = (gain - slope * fraction) / (fraction * fraction)
+        return slope * slope / (4.0 * -curvature)
+
     def settle_release(model: int) -> None:
         """x polished at the freed weights: the release stands where its certified V is above the state's it left by
         more than the tolerance and both errors (its realized gain measured against the step's prediction);
@@ -3820,15 +3844,23 @@ def fit_hyperparameters(
         )
         pending[model] = None
 
+    def warm_from_states() -> None:
+        """The oracle back at the states' points (``FixedPoint.restore``), so the next solve is warm from them."""
+        for point in points:
+            if point is not None and point.restore is not None:
+                point.restore()
+
     while True:
         for model in range(count):
             if fits[model] is None and pending[model] is None:
                 pending[model] = plan(model)
         if all(fit is not None for fit in fits):
             if any(displaced):
+                warm_from_states()
                 points = list(fixed_points(hyperparameters))
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else entry.hyperparameters for model, entry in enumerate(pending)]
+        warm_from_states()
         trial_points = list(fixed_points(trials))
         for model, entry in enumerate(pending):
             if entry is None:
@@ -3949,7 +3981,7 @@ def fit_hyperparameters(
                     # remainder, before any halving. A remainder that did not fall leaves the certificate as it was,
                     # so this replans at most once per measured decrease.
                     pending[model] = None
-                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
+                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and segment_reach(model, segment, entry.fraction, gain) > tolerance:
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
