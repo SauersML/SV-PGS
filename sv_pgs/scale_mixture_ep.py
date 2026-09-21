@@ -2590,14 +2590,18 @@ def _same_basin(first: _Evidence, second: _Evidence) -> bool:
 
 
 def _best_certified(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
+    screen: float | None = None,
 ) -> _Evidence | None:
     """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
     by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing.
 
     Two starts found one basin when their points are within the inner maximizer's own radii of each other,
     sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the one with the
-    smaller error stands for the basin, which is then corrected once."""
+    smaller error stands for the basin, which is then corrected once.
+
+    With ``screen``, the corrections are taken only where some basin's Laplace V is above it, and None is returned
+    otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate."""
     certified: list[_Evidence] = []
     for start in starts:
         candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
@@ -2610,6 +2614,8 @@ def _best_certified(
                 break
         else:
             certified.append(candidate)
+    if screen is not None and not any(candidate.value > screen for candidate in certified):
+        return None
     corrected = [
         evidence
         for evidence in (_corrected(prior, log_smoothing, candidate, cavity, correction, working_bytes, tolerance) for candidate in certified)
@@ -2654,12 +2660,13 @@ def _edge_evidence(
     cavity: Cavity, correction: CurvatureCorrection,
     working_bytes: int,
     tolerance: float,
+    screen: float | None = None,
 ) -> tuple[F64Array, _Evidence] | None:
     """The best certified evidence of the model with ``infinite`` at lambda = infinity, the other weights at
-    ``weights``; with its restriction basis."""
+    ``weights``; with its restriction basis. ``screen`` as in ``_best_certified``."""
     view, allowed = _restricted_prior(prior, infinite)
     finite = [position for position in range(weights.shape[0]) if position not in infinite]
-    evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, correction, working_bytes, tolerance)
+    evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, correction, working_bytes, tolerance, screen)
     return None if evidence is None else (allowed, evidence)
 
 
@@ -2675,9 +2682,9 @@ def _maximize_evidence(
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
     at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
-    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight moves back to the
-    upper end of its range when V is higher there. There is no lambda = 0 edge (see the module docstring), so a
-    start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
+    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight is released to the
+    centre of its resolvable range when the certified V is higher there. There is no lambda = 0 edge (see the module
+    docstring), so a start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
     global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
     the start.
     """
@@ -2695,14 +2702,14 @@ def _maximize_evidence(
         # The warm weights (a fit on another lattice, or at a fold of their basin) can have no certified maximum:
         # the search then starts from the canonical start's weights, every edge released.
         infinite = frozenset()
-        weights = np.clip(initial_hyperparameters(prior).log_smoothing, lower, upper)
+        weights = 0.5 * (lower + upper)
         first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
     best_corrected = -np.inf
-    # Blocks released from their edge by the inward rule below, once each per search: a block the ascent then
-    # leaves at its range's end is not released again (the edge and the end are one value to the tolerance).
+    # Blocks released from their edge below, once each per search: a block the ascent then returns to its edge is
+    # not tried again.
     released_once: set[int] = set()
     while True:
         edges = infinite
@@ -2741,20 +2748,28 @@ def _maximize_evidence(
             infinite, moved = frozenset(best_edge[0]), True
             coefficients = best_edge[1][0] @ best_edge[1][1].coefficients
         if not moved:
-            # An edge weight moves back to the upper end of its range when V is higher there, or when V is level with
-            # the edge to the tolerance and rises inward (its Laplace slope in rho negative at the upper end): from
-            # the edge, V at the range's end is the edge's own to rounding, so a raise alone would never release a
-            # block, and the ascent below is what searches the interior.
+            # An edge weight is released where the certified V at the centre of its resolvable range is above the
+            # edge's by more than the tolerance. The centre is the weight at which the penalty's geometric-mean
+            # eigenvalue matches the data's curvature (the log-midpoint of the two half-precision ends): the one
+            # scale-free point where the two are commensurate. The range's upper end cannot release anything: the
+            # penalty swamps the data there past half precision, so V is the edge's to the tolerance by
+            # construction and its slope is O(e^-rho) (on the mean-field test problem V's interior maximum sits
+            # mid-range, 2.7 nats above the edge on one class, with a slope of -0.0004 +- 0.06 at the upper end).
+            # The Laplace form screens the centre (``_best_certified``): the Tierney-Kadane terms lowered V on every
+            # problem measured (gene 1's flat interior by 1-66 nats, the test problem's optimum by 0.4), so the
+            # corrections are taken only where the Laplace V is itself above the edge. The ascent from the centre
+            # then searches the interior.
             for position in sorted(edges):
+                if position in released_once:
+                    continue
                 trial_infinite = infinite - {position}
                 trial_weights = weights.copy()
-                trial_weights[position] = upper[position]
-                trial = _edge_evidence(prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
-                if trial is None:
-                    continue
-                released = sorted(index for index in range(len(bounds)) if index not in trial_infinite).index(position)
-                inward = position not in released_once and trial[1].value >= current_value - tolerance and trial[1].gradient[released] < -_laplace_gradient_error(trial[1])[released]
-                if trial[1].value > current_value + tolerance or inward:
+                trial_weights[position] = 0.5 * (lower[position] + upper[position])
+                trial = _edge_evidence(
+                    prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance,
+                    screen=current_value + tolerance,
+                )
+                if trial is not None and trial[1].value > current_value + tolerance:
                     released_once.add(position)
                     infinite, weights, moved = frozenset(trial_infinite), trial_weights, True
                     coefficients = trial[0] @ trial[1].coefficients
