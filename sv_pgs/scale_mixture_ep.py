@@ -3244,9 +3244,17 @@ def hyper_step(
     lower = np.array([bound[0] for bound in bounds])[finite_final]
     upper = np.array([bound[1] for bound in bounds])[finite_final]
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
+    interior = (weights > lower) & (weights < upper)
+    # A search that released a block from its edge is provisional: the outer loop takes it at its own fixed point,
+    # polishes x there, and its next hyper step at that state searches the weights afresh, so the released
+    # weights' polish and stationarity certificate here would be discarded (on ENSG00000254709.8 [real] a release's
+    # hyper step spent 67 s, most of it in the weights' certified moves and difference slopes, before the release
+    # was refused at its fixed point). The step returns with an infinite stationarity gain, as a release's certificate
+    # is never read.
+    released = bool(np.any(finite_final & ~np.isfinite(hyperparameters.log_smoothing)))
     # The weights, evidence and check before a band move (below), until the check after it has judged it.
     band: tuple[F64Array, _Evidence, _Stationarity] | None = None
-    while True:
+    while not released:
         interior = (weights > lower) & (weights < upper)
         check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
         if band is not None:
@@ -3315,6 +3323,12 @@ def hyper_step(
             evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
+    if released:
+        count = weights.shape[0]
+        check = _Stationarity(
+            gradient=np.zeros(count), error=np.zeros(count), curvature=np.zeros((count, count)), steps=np.zeros(count), folds=np.zeros(count),
+            gain=np.inf, better=None,
+        )
 
     def checked(check: _Stationarity, evidence: _Evidence = evidence) -> HyperStep:
         """The step at ``evidence`` (V at the returned weights, as resolved so far) with the stationarity ``check``;
