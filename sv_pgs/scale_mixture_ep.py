@@ -1215,11 +1215,14 @@ def _maximize_coefficients(
         actual = candidate_value - value
         ratio = actual / predicted if predicted > 0.0 else -np.inf
         step_norm = float(np.linalg.norm(step))
-        if not np.isfinite(ratio) or ratio < 0.25:
+        # A gain at the objective's rounding is not a gain: the step is refused, and a refused step shrinks the radius
+        # whatever its ratio (a step refused at an unchanged radius would be proposed again without end).
+        accepted = bool(np.isfinite(candidate_value)) and actual > rounding
+        if not accepted or ratio < 0.25:
             radius = 0.25 * step_norm
         elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
             radius = 2.0 * radius
-        if np.isfinite(candidate_value) and actual > rounding:
+        if accepted:
             coefficients = candidate
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
             if not np.any(np.abs(objective.gradient) > _EPSILON * objective.magnitude):
