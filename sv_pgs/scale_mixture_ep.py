@@ -1212,14 +1212,14 @@ def _maximize_coefficients(
     (More-Sorensen); a trial costs one value-only pass, and the radius follows the ratio of actual to
     predicted gain (Nocedal and Wright, Algorithm 4.1). It stops at a strict maximum, where -H is positive
     definite and the Newton step's predicted gain is below ``tolerance`` nats (the resolution the caller
-    certifies, and at least the objective's rounding level); a saddle's negative curvature is followed by
-    the trust-region step instead. It also stops when no step longer than half of double precision raises
-    the objective. Where the model predicts no gain above the objective's rounding inside the radius, a value-only
-    trial would compare two values at their rounding (on gene 1's release trials, whose penalized directions carry
-    a data curvature 1e-9 of the penalty's scale, the loop once accepted rounding-level gains and doubled its
-    radius without end): such a step is judged on the gradient instead, taken where its decrement in the current
-    metric falls, as the outer loop judges its inner steps, so x still reaches a stationary point to the gradient's
-    resolution when the tolerance asks for it (the engine's verification harness asks with tolerance 0).
+    certifies); a saddle's negative curvature is followed by the trust-region step instead. It also stops when no
+    step longer than half of double precision raises the objective. Where the model predicts no gain above the
+    objective's rounding inside the radius, a value-only trial would compare two values at their rounding (on
+    gene 1's release trials, whose penalized directions carry a data curvature 1e-9 of the penalty's scale, the
+    loop once accepted rounding-level gains and doubled its radius without end): such a step is judged on the
+    gradient instead, taken where its decrement in the current metric falls, as the outer loop judges its inner
+    steps, so x reaches a stationary point to the gradient's resolution when the tolerance asks for it (the
+    engine's verification harness asks with tolerance 0: the value's rounding is not the gradient's).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     coefficients = np.array(start, dtype=np.float64, copy=True)
@@ -1234,7 +1234,7 @@ def _maximize_coefficients(
         # The objective's own rounding (its terms' and their summation's) plus the penalized value's arithmetic.
         rounding = objective.rounding + _EPSILON * abs(value)
         definite = float(spectrum[0][0]) > 0.0
-        if definite and 0.5 * float(gradient @ ascent) <= max(tolerance, rounding):
+        if definite and 0.5 * float(gradient @ ascent) <= tolerance:
             return coefficients, objective
         if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
