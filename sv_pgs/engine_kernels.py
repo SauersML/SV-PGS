@@ -41,7 +41,7 @@ _SOURCE = r"""
 __device__ __forceinline__ void node_terms(
     const double log_scale_value, const double scale_exp, const double node, const double node_exp,
     const double precision, const double shift_square, const double tiny, const double huge,
-    double* retained, double* ratio_retained, double* conditional, double* signal, int* improper)
+    double* retained, double* ratio_retained, double* conditional, double* signal, double* log_root, int* improper)
 {
     double variance = scale_exp * node_exp;
     if (!(scale_exp >= tiny && scale_exp <= huge && node_exp >= tiny && node_exp <= huge && variance >= tiny && variance <= huge))
@@ -57,6 +57,9 @@ __device__ __forceinline__ void node_terms(
         *conditional = 1.0 / (1.0 / variance + precision);
     }
     *signal = shift_square * *conditional;
+    // log sqrt(r) = -1/2 log(1 + q); where q overflowed at a finite log v it is -1/2 (log v + log P), the host's
+    // limit (scale_mixture_ep._kernel_terms): a finite weight, never zero.
+    *log_root = (isinf(variance) && precision > 0.0) ? -0.5 * (log_scale_value + node + log(precision)) : -0.5 * log1p(ratio);
 }
 
 // The running log-sum-exp over e^(exponent) sqrt(r): the node's weight relative to the largest exponent so far (a
@@ -92,12 +95,12 @@ extern "C" __global__ void tilted_rows(
     int bad = 0;
     double peak = log_zero, total = 0.0, running_mean = 0.0, running_square = 0.0;
     for (int node = 0; node < node_count; ++node) {
-        double retained, ratio_retained, conditional, signal;
+        double retained, ratio_retained, conditional, signal, log_root;
         node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
-                   &retained, &ratio_retained, &conditional, &signal, &bad);
-        const double exponent = mass[node] + 0.5 * signal, root = sqrt(retained);
-        if (exponent == log_zero || root == 0.0) continue;
-        const double weight = running_weight(exponent, &peak, &total, &running_square) * root;
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = mass[node] + 0.5 * signal + log_root;
+        if (exponent == log_zero || isinf(exponent)) continue;
+        const double weight = running_weight(exponent, &peak, &total, &running_square);
         const double updated = total + weight;
         const double deviation = conditional - running_mean;
         const double step = deviation * (weight / updated);
@@ -139,16 +142,16 @@ extern "C" __global__ void objective_rows(
     const double scale_value = log_scale[row], scale_exp = exp(scale_value), cavity_precision = precision[row];
     const double shift_square = shift[row] * shift[row];
     int bad = 0;
-    double retained, ratio_retained, conditional, signal;
+    double retained, ratio_retained, conditional, signal, log_root;
     double peak = log_zero, total = 0.0, first_mean = 0.0, first_square = 0.0, second_mean = 0.0;
     for (int node = 0; node < node_count; ++node) {
         node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
-                   &retained, &ratio_retained, &conditional, &signal, &bad);
-        const double exponent = class_log_density[node] + 0.5 * signal, root = sqrt(retained);
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = class_log_density[node] + 0.5 * signal + log_root;
         const double first = 0.5 * (retained * signal - ratio_retained);
         const double second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained;
-        if (exponent == log_zero || root == 0.0) continue;
-        const double weight = running_weight(exponent, &peak, &total, &first_square) * root;
+        if (exponent == log_zero || isinf(exponent)) continue;
+        const double weight = running_weight(exponent, &peak, &total, &first_square);
         const double updated = total + weight;
         const double share = weight / updated;
         const double deviation = first - first_mean;
@@ -162,10 +165,10 @@ extern "C" __global__ void objective_rows(
     const double inverse_total = 1.0 / total;
     for (int node = 0; node < node_count; ++node) {
         node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
-                   &retained, &ratio_retained, &conditional, &signal, &bad);
-        const double exponent = class_log_density[node] + 0.5 * signal, root = sqrt(retained);
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = class_log_density[node] + 0.5 * signal + log_root;
         const double first = 0.5 * (retained * signal - ratio_retained);
-        const double responsibility = exponent == log_zero || root == 0.0 ? 0.0 : exp(exponent - peak) * root * inverse_total;
+        const double responsibility = exponent == log_zero || isinf(exponent) ? 0.0 : exp(exponent - peak) * inverse_total;
         const long long at = base + node * width;
         deviations[at] = responsibility - class_density[node];
         centred[at] = responsibility * (first - first_mean);

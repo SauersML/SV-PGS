@@ -3875,19 +3875,29 @@ def fit_hyperparameters(
     def segment_reach(model: int, segment: F64Array, fraction: float, gain: float) -> float:
         """The largest gain any shorter fraction of a refused joint step can reach, under the quadratic model of the
         gain along the segment through the state's slope (the B-model's gradient at rho_k along it) and the realized
-        gain at ``fraction``: infinite where the realized gain is positive or unmeasured (a halving may still resolve
-        it), 0 where the segment is no ascent at the state, and s^2 / (4 |c|) otherwise (the model's maximum over the
-        segment). A halving sequence whose gains are negative and rising toward zero as the fraction shrinks halved
-        thirty-one times from an unpolished state on ENSG00000285707.1 [real] (a fixed point and an outer state each,
-        31 of its 75 s) before the fraction fell below x's resolution, and x polished only then."""
-        if not np.isfinite(gain) or gain > 0.0:
+        gain at ``fraction``: infinite where the realized gain is unmeasured, the measured gain where the segment is
+        no ascent at the state or the model still rises at ``fraction``, and s^2 / (4 |c|) where the model has
+        peaked before it. A halving sequence whose gains are negative and rising toward zero as the fraction shrinks
+        halved thirty-one times from an unpolished state on ENSG00000285707.1 [real] (a fixed point and an outer
+        state each, 31 of its 75 s) before the fraction fell below x's resolution, and x polished only then. The
+        caller compares the reach less the state's own error with the tolerance: a trial's resolution is at least
+        that error, so below it no halving can be accepted."""
+        if not np.isfinite(gain):
             return np.inf
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
         slope = float(newton.gradient @ (newton.allowed.T @ segment))
         if slope <= 0.0:
-            return 0.0
-        # gain = slope f + c f^2 with gain <= 0 < slope f: c < 0, and the model peaks at slope^2 / (4 |c|).
+            # No ascent at the state along the segment: a positive gain here is past what the model reads, so the
+            # bound is that gain itself (a shorter fraction climbs no higher on a segment that starts downhill).
+            return max(gain, 0.0)
+        # gain = slope f + c f^2. With c >= 0 the model rises with f (a longer fraction was refused for another
+        # reason): the bound is the gain measured. With c < 0 it peaks at f* = slope / (2 |c|): a shorter fraction
+        # reaches at most the gain at f where f <= f*, else slope^2 / (4 |c|) (on ENSG00000254709.8's chunk of the
+        # 500-gene run [real] eight fits halved for two hours each with positive gains of 0.002 against a resolution
+        # of 0.014, which no fraction can exceed).
         curvature = (gain - slope * fraction) / (fraction * fraction)
+        if curvature >= 0.0 or fraction <= slope / (2.0 * -curvature):
+            return max(gain, 0.0)
         return slope * slope / (4.0 * -curvature)
 
     def settle_release(model: int) -> None:
@@ -4193,7 +4203,7 @@ def fit_hyperparameters(
                     # A polished state whose whole step has no certified end halves toward the fraction-certified
                     # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
                     # and ends where the segment's quadratic model reaches none.
-                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) > tolerance
+                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) - state.error > tolerance
                 ):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
