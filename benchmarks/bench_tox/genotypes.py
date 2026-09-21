@@ -38,13 +38,13 @@ def variant_table(chrom: int) -> pd.DataFrame:
     which ``bench_real_signed_change`` then reads from the token), sv_length (the SVLEN the id carries: 0 here, the
     panel's symbolic records give none through plink)."""
     bim = pd.read_csv(GENO / f"chr{chrom}.bim", sep=r"\s+", header=None, names=["chrom", "id", "cm", "position", "a1", "a2"], dtype={"a1": str, "a2": str})
-    alt = bim["a1"].to_numpy(dtype=str)
-    ref = bim["a2"].to_numpy(dtype=str)
-    symbolic = np.char.startswith(alt, "<")
-    ref_length = np.char.str_len(ref)
-    alt_length = np.where(symbolic, ref_length, np.char.str_len(alt))
+    # Lengths and the symbolic token from the object columns: a fixed-width numpy string array of a million alleles,
+    # as wide as the longest insertion, is tens of gigabytes.
+    symbolic = bim["a1"].str.startswith("<").to_numpy()
+    ref_length = bim["a2"].str.len().to_numpy(dtype=np.int64)
+    alt_length = np.where(symbolic, ref_length, bim["a1"].str.len().to_numpy(dtype=np.int64))
     is_sv = symbolic | (np.maximum(ref_length, alt_length) >= SV_LENGTH)
-    sv_type = np.where(symbolic, alt, ".")
+    sv_type = np.where(symbolic, bim["a1"].to_numpy(dtype=object), ".")
     change = np.where(symbolic, 0, alt_length - ref_length).astype(np.int64)
     # Compact: no allele strings (25 million records genome-wide), the token as a category.
     return pd.DataFrame({
