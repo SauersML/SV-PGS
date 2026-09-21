@@ -252,6 +252,9 @@ class MeanFieldFixedPoints:
         self.profile = _new_profile() | {"sweeps": 0, "sweep_seconds": 0.0, "elbo": -np.inf}
         self._node_variance_key: bytes | None = None
         self._node_variance_table = np.zeros((0, 0))
+        # The last fixed point's response factorization and its noise: the metric of the corrections between sweeps.
+        self._response: _Response | None = None
+        self._response_noise = float(start_noise)
 
     # the ELBO and its pieces
 
@@ -311,16 +314,48 @@ class MeanFieldFixedPoints:
             self.refusals.append(str(error))
             return [None]
 
+    def _stale_gap(self) -> F64Array:
+        """h'_j - h_j on the live rows: each pseudo-likelihood's location recomputed from the sweep's final residual
+        against the one its site was built from, the ELBO's gradient in q's means at the sweep's end (a site updated
+        early in the sweep is stale by the later sites' moves). Zero where q_j is a point mass."""
+        live = self.variance > 0.0
+        located = (self.design.back(self.residual) + self.member_squares * self.mean) / self.noise
+        return np.where(live, located - self.shift, 0.0)
+
+    def _decrement(self, gap: F64Array, response: _Response, response_noise: float) -> tuple[float, F64Array]:
+        """(the Newton decrement of the fixed-point equation in the means, its step): the map h -> T(h) whose fixed
+        point q is has Jacobian -(Xp'Xp - diag ||x_j||^2) diag(v) / sigma^2, so Newton's step in the means is
+        dm = R^-1 (h' - h) with R = diag(tau) + Xp'Xp / sigma^2 the response matrix (module docstring), and the
+        decrement (h' - h)' dm / 2 bounds the ELBO's own quadratic model's gain (its curvature is R plus the diagonal
+        ||x_j||^2 / sigma^2, so its inverse is smaller). With a response held from an earlier fixed point the
+        decrement is that metric's estimate; the fresh one at the returned fixed point is the certificate's."""
+        step = response_noise * response.solve(gap[:, None])[:, 0]
+        return 0.5 * float(gap @ step), step
+
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
-        """Sweeps at the current noise until the remaining gain (module docstring) is within the tolerance. The noise
-        moves to its stationary value only between sweeps, so the returned state (q, sigma^2) is the one the last
-        sweep built: its pseudo-likelihoods are the cavity, exactly. The noise's pending gain counts as remaining."""
+        """Sweeps at the current noise, with Newton corrections in the means between them, until the remaining gain
+        (module docstring) is within the tolerance. The noise moves to its stationary value only between sweeps, so
+        the returned state (q, sigma^2) is the one the last sweep built: its pseudo-likelihoods are the cavity,
+        exactly. The noise's pending gain counts as remaining.
+
+        Coordinate ascent alone crawls along the design's correlated directions (gene 1 [real]: sweeps stopped by
+        the geometric extrapolation of their ELBO gains left q's means where the held-out r^2 was 0.0339, and
+        sweeping until the means settled gave 0.0385: the two-gain extrapolation understates the remaining gain
+        where the slow modes have not yet shown their rate). So after each sweep the stale gap h' - h (the ELBO's
+        gradient in the means) is taken through the last fixed point's response factorization as Newton's step in
+        the means, the next sweep re-tilts every site at the moved residual, and the remaining gain is the Newton
+        decrement, read with the fresh factorization at the returned fixed point before it is returned. A correction
+        the next sweep does not confirm (its ELBO below the pre-correction sweep's) is undone, and the call sweeps
+        on without corrections."""
         tolerance = 0.5 / self.draw_count
-        previous_gain: float | None = None
         # The hyperparameters changed since the last call, so the state's ELBO is unknown until a sweep measures it:
-        # the first sweep's gain is not a gain, and the bound starts at the second.
+        # the first sweep's gain is not a gain, and the extrapolation starts at the second.
         elbo: float | None = None
+        gain: float | None = None
+        previous_gain: float | None = None
         pending_noise: float | None = None
+        corrections = self._response is not None
+        correction: tuple[dict, float] | None = None
         while True:
             if pending_noise is not None:
                 elbo = elbo + self.noise_gain if elbo is not None else None
@@ -333,26 +368,58 @@ class MeanFieldFixedPoints:
             # next sweep, if there is one.
             pending_noise = (residual_square + weighted_variance) / self.residual_dimension
             self.noise_gain = noise_gain(pending_noise, self.noise, self.sample_count, self.covariate_count)
-            gain = (value - elbo) if elbo is not None else None
-            elbo = value
-            self.profile["elbo"] = value
-            if gain is None:
-                continue
-            if gain < -rounding:
-                raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
-            gain = max(float(gain), 0.0)
-            if gain <= rounding:
-                remaining = 0.0
-            elif previous_gain is not None and previous_gain > 0.0:
-                rate = gain / previous_gain
-                remaining = gain * rate / (1.0 - rate) if rate < 1.0 else np.inf
+            if correction is not None:
+                # The sweep after a correction: confirmed where the ELBO is at or above the pre-correction sweep's.
+                snapshot, before = correction
+                correction = None
+                if value < before - rounding:
+                    self._restore(snapshot)
+                    corrections = False
+                    elbo, gain, previous_gain, pending_noise = before, None, None, None
+                    continue
+                elbo, gain, previous_gain = value, None, None
             else:
-                remaining = np.inf
-            previous_gain = gain
+                gain = (value - elbo) if elbo is not None else None
+                elbo = value
+                if gain is not None and gain < -rounding:
+                    raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
+            self.profile["elbo"] = value
+            gap = self._stale_gap()
+            if corrections and self._response is not None:
+                remaining, step = self._decrement(gap, self._response, self._response_noise)
+                if remaining > tolerance:
+                    # Newton's step in the means; the next sweep re-tilts every site at the moved residual.
+                    correction = (self._snapshot(), value)
+                    self.mean = self.mean + step
+                    self.residual = self.residual - self.design.image(step)
+                    self.profile["passes"] += 1
+                    continue
+            else:
+                # Without a response yet (the fit's first fixed point), or after an unconfirmed correction: the
+                # sweeps' geometric extrapolation from the last two gains.
+                if gain is None:
+                    remaining = np.inf
+                elif gain <= rounding:
+                    remaining = 0.0
+                elif previous_gain is not None and previous_gain > 0.0:
+                    rate = gain / previous_gain
+                    remaining = gain * rate / (1.0 - rate) if rate < 1.0 else np.inf
+                else:
+                    remaining = np.inf
+                if gain is not None:
+                    previous_gain = max(float(gain), 0.0)
             # The remainder in the certificate's units: KL(q || q') = move / 2, so the move is twice the remaining gain.
             self.mean_move = 2.0 * remaining
             if remaining + self.noise_gain <= tolerance:
-                return self._fixed_point(hyperparameters)
+                point = self._fixed_point(hyperparameters)
+                # The certificate reads the decrement with the fresh factorization; where it is not within the
+                # tolerance the corrections continue in that metric.
+                assert self._response is not None
+                remaining, _step = self._decrement(gap, self._response, self._response_noise)
+                self.mean_move = 2.0 * remaining
+                if remaining + self.noise_gain <= tolerance:
+                    return point
+                corrections = True
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own metric
@@ -368,6 +435,7 @@ class MeanFieldFixedPoints:
         self.profile["factorizations"] += 1
         self.profile["factor_seconds"] += time.perf_counter() - started
         self.profile["refreshes"] += 1
+        self._response, self._response_noise = response, self.noise
         design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
         mean, shift, residual = self.mean.copy(), self.shift.copy(), self.residual.copy()
         third, fourth = self._central_moments(hyperparameters, omega)
