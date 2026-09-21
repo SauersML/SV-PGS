@@ -2525,10 +2525,11 @@ def _evidence_once(
     With ``maximize`` false, V's formula is taken at ``start`` itself (an outer state's own x, ``_outer_state``): its
     error then carries x's own decrement there, as the inner maximizer's share does.
 
-    With ``screen`` (a release trial's, ``_best_certified``), None as soon as the Laplace V at an iterate plus the
-    inner maximizer's error bound is at or below it: x is then resolved no further, since tightening it can only
-    move V within that bound, and the trial has failed. Taken where the prior is anchored (every view of a hyper
-    step), where the determinant V takes is the iterate's own.
+    With ``screen`` (a release trial's, ``_best_certified``), None where the Laplace V at x_rho is at or below it,
+    before its rho-gradient is formed (a failing trial never reads it). The screen is read at x_rho itself, never
+    at an earlier iterate through the inner error bound: that bound is first order in x's remaining move, and on
+    ENSG00000274602.5 [real] the tightened iterate's V lay 0.45 nats above a first iterate's V plus its bound (the
+    determinant's change along a near-flat direction is not first order), which would have discarded the basin.
 
     V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved, the
     second-order approximation of the actual marginal likelihood, taken as A + ``correction`` (``CurvatureCorrection``);
@@ -2564,10 +2565,6 @@ def _evidence_once(
         # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
         # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
-        if screen is not None and prior.anchor is not None:
-            penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
-            if value + 0.5 * penalty_log_determinant - 0.5 * fixed.schur_log_determinant + inner_error <= screen:
-                return None
         if not maximize or 0.5 * np.sqrt(sensitivity * 2.0 * newton_decrement) <= tolerance or newton_decrement <= rounding:
             break
         if previous is not None and np.array_equal(coefficients, previous):
@@ -2594,6 +2591,8 @@ def _evidence_once(
         return None
     total_covariance = profiled_total.inverse
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * profiled_total.schur_log_determinant
+    if screen is not None and evidence_value <= screen:
+        return None
     # V's own rho-gradient: W_B = (B + S)^-1 - N (N'(B + S)N)^-1 N' carries both determinants' dependence on rho,
     # through S directly and through x_rho in A(x_rho) (C is held), with dx/drho_i = -(-H)^-1 lambda_i S_i x.
     total_weight = profiled_total.weight
@@ -2800,9 +2799,7 @@ def _best_certified(
 
     With ``screen``, the corrections are taken only where some basin's Laplace V is above it, and None is returned
     otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate. A start whose
-    Laplace V falls at or below the screen by more than its inner error stops at its first iterate
-    (``_evidence_once``): on real genes every release trial of an all-edge state fails, at two maximizations and
-    three trace-gradient passes per start."""
+    Laplace V is at or below the screen is left before its rho-gradient is formed (``_evidence_once``)."""
     certified: list[_Evidence] = []
     for start in starts:
         candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, screen=screen)
