@@ -14,7 +14,7 @@ Covariates, fitted on the training lines only: sex, the cytotoxicity batch (indi
 components of the training lines' GRM of random near-unlinked autosomal SNVs (``structure_grm``) that Patterson's
 sequential Tracy-Widom test keeps at level 1/K (Patterson, Price and Reich 2006, PLoS Genet 2:e190).
 
-Methods: ``top_variant`` and numba ``mr_ash`` from bench-real's baselines, and SV-PGS by the small-n route with
+Methods: ``top_variant`` and ``gblup_reml`` from bench-real's baselines, and SV-PGS by the small-n route with
 mean-field fixed points (``fit_small_n``); each fit's wall time is recorded. Held-out r² is the squared correlation
 of the genetic score with the test lines' phenotype residualized on the training-fitted covariate effects.
 """
@@ -273,7 +273,7 @@ def _one(job):
     test_genotypes = dosage[test_rows].astype(np.float64)
     record = {"compound": compound, "arm": arm, "screened": int(chrom_rows.shape[0]), "screened_sv": int(np.sum(variants.is_sv)) if chrom_rows.shape[0] else 0}
     seed = int.from_bytes(compound.encode()[:8].ljust(8, b"\0"), "big")
-    for name, method in (("top_variant", baselines.top_variant), ("mr_ash_numba", baselines.mr_ash), ("svpgs_mean_field", lambda t: _svpgs(t, seed))):
+    for name, method in (("top_variant", baselines.top_variant), ("gblup_reml", baselines.gblup_reml), ("svpgs_mean_field", lambda t: _svpgs(t, seed))):
         started = time.perf_counter()
         try:
             predictor = method(train)

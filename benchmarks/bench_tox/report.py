@@ -12,7 +12,7 @@ import pathlib
 import numpy as np
 import pandas as pd
 
-METHODS = ("top_variant", "mr_ash_numba", "svpgs_mean_field")
+METHODS = ("top_variant", "gblup_reml", "svpgs_mean_field")
 BOOTSTRAP = 2_000
 
 

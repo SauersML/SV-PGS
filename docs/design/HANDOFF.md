@@ -24,7 +24,7 @@ This is the single entry point for the project's state. The model is in [MODEL.m
 | SV-PGS, mean-field fixed points, main `ccfb72c`, SNV + SV arm (46 SVs, their own class) | 141 | 0.0334 | certified (remaining 0.0057), at the λ = ∞ edge |
 | SV-PGS, mean-field fixed points, main `eef5f00` (the unit-weight start), SNV arm | 1,825 | 0.0291 | certified, at the λ = ∞ edge |
 | SV-PGS, mean-field fixed points, main `eef5f00`, SNV + SV arm | 1,931 | 0.0334 | certified, at the λ = ∞ edge |
-| numba mr.ash (`bench_real/baselines.py`), SNV arm | 6 | 0.0308 | |
+| numba mr.ash port (deleted 2026-09-21; gave identical SNV and SNV+SV predictions), SNV arm | 6 | 0.0308 | |
 | numba mr.ash, SNV + SV arm | 6 | 0.0307 | |
 | SV-PGS, EP fixed points (`fit_small_n(inference="ep")`, branch `2f783c3`, the unit-weight start), SNV arm | 4,368 | 0.0335 | uncertified (remaining ∞, 81 halvings), at the λ = ∞ edge |
 | SV-PGS, EP fixed points, branch `2f783c3`, SNV + SV arm | (refused after 38 min) | — | `NoCertifiedProgress` (B + S indefinite at the EP fixed point; the branch predates the trust radius on the definite step) |

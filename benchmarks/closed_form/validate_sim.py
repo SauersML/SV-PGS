@@ -5,7 +5,6 @@ scale-mixture prior. For each architecture it compares:
 - the Bayes-optimal replica prediction `replica.predicted_r2`;
 - the posterior mean under a Gaussian prior at the true h^2 (ridge, exact kernel form);
 - oracle SuSiE with the true number of effects, slab variance and noise (sparse architectures only);
-- mr.ash (bench-real's port of mr.ash.alpha, learning its own mixture).
 VAMP itself is not run here: on real cis-LD its iterates overflow (the design is far from right-rotationally
 invariant), which the first run recorded.
 The realized accuracy is the population rho^2 over the test sample's genotype covariance, so no test-noise sampling
@@ -17,11 +16,10 @@ usage: validate_sim.py DATASET GENE_ROWS(comma) SPLIT REPLICATES OUT.jsonl
 import json
 import os
 import sys
-import types
 
 import numpy as np
 
-from benchmarks.bench_real import baselines, harness
+from benchmarks.bench_real import harness
 from benchmarks.closed_form import replica
 from benchmarks.closed_form.susie_oracle import susie
 
@@ -89,15 +87,14 @@ def main():
             # Ridge is linear, so its pooled r^2 depends on the prior only through E[beta beta^T] = (h^2 / p) I: the
             # Gaussian-prior formula at the same h^2 is exact for it under every architecture.
             predicted_ridge, _ = replica.predicted_r2(x_train, x_test, heritability, [1.0], [1.0])
-            methods = ["ridge", "mr_ash"] + ([] if spec["causal"] is None else ["susie_oracle"])
+            methods = ["ridge"] + ([] if spec["causal"] is None else ["susie_oracle"])
             realized = {method: [] for method in methods}
             pooled = {method: [] for method in methods}
             for _ in range(replicates):
                 component = generator.choice(len(weights), size=dimension, p=weights)
                 beta = generator.standard_normal(dimension) * np.sqrt(variances[component])
                 response = x_train @ beta + generator.standard_normal(count) * np.sqrt(noise)
-                estimates = {"ridge": ridge(x_train, kernel, response, noise, heritability / dimension),
-                             "mr_ash": np.asarray(baselines.mr_ash(types.SimpleNamespace(genotypes=x_train, phenotype=response)).coefficients, dtype=np.float64)}
+                estimates = {"ridge": ridge(x_train, kernel, response, noise, heritability / dimension)}
                 if spec["causal"] is not None:
                     estimates["susie_oracle"] = susie(x_train, response, spec["causal"], variances[1], noise)
                 for method, estimate in estimates.items():

@@ -311,9 +311,9 @@ def test_horvitz_thompson_total_is_exactly_unbiased_over_every_random_sample():
 
 def test_saved_sv_effects_reproduce_the_sv_part_of_the_prediction(tmp_path):
     tiny_dataset(tmp_path)
-    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
-    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
-    out = tmp_path / "results" / "mr_ash" / "loso"
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    out = tmp_path / "results" / "top_variant" / "loso"
     effects = pd.read_csv(out / "chr1.sv_coefficients.tsv.gz", sep="\t")
     dataset = harness.Dataset(tmp_path)
     window = harness.load_gene_window(dataset, 0)
@@ -338,13 +338,24 @@ def test_duplicate_sv_calls_merge_into_one_event():
     assert labels[0] == labels[2] == labels[3] != labels[1]
 
 
+def dense_least_squares(train):
+    """A linear predictor with an effect on every column (the minimum-norm least-squares fit): the gene-row test
+    needs nonzero SV effects, which the lead-variant baseline does not give."""
+    from benchmarks.bench_real import baselines
+
+    genotypes = np.asarray(train.genotypes, dtype=np.float64)
+    center = genotypes.mean(axis=0)
+    coefficients = np.linalg.lstsq(genotypes - center, train.phenotype - train.phenotype.mean(), rcond=None)[0]
+    return baselines.LinearPredictor(train.phenotype.mean(), coefficients, center=center, scale=np.ones(genotypes.shape[1]))
+
+
 def test_gene_row_decomposes_the_sv_part_of_a_real_harness_run(tmp_path):
     from benchmarks.bench_real import sv_gene_table
 
     tiny_dataset(tmp_path)
-    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
-    harness.run(tmp_path, method, "mr_ash", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
-    effects = pd.read_csv(tmp_path / "results/mr_ash/loso/chr1.sv_coefficients.tsv.gz", sep="\t")
+    method = f"{__file__}:dense_least_squares"
+    harness.run(tmp_path, method, "dense", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
+    effects = pd.read_csv(tmp_path / "results/dense/loso/chr1.sv_coefficients.tsv.gz", sep="\t")
     superdups = tmp_path / "superdups.txt.gz"
     pd.DataFrame([[0, "chr1", 50, 150]]).to_csv(superdups, sep="\t", header=False, index=False)
     sv_gene_table.initialize(tmp_path, superdups, effects.groupby("gene_id"))
@@ -636,7 +647,7 @@ def test_raw_scores_reproduce_the_scored_predictions_and_merge_along_splits(tmp_
     from benchmarks.bench_real import merge_splits
 
     tiny_dataset(tmp_path)
-    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:mr_ash"
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
     harness.run(tmp_path, method, "full", "loso", ["chr1"], tmp_path / "results", 1, ("snv_sv",))
     out = tmp_path / "results/full/loso"
     raw = np.load(out / "chr1.snv_sv.raw_scores.npy").astype(np.float64)

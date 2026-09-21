@@ -2,7 +2,7 @@
 
 Inputs:
   - a results directory written by the harness with saved SV effects (<tag>.sv_coefficients.tsv.gz), for one method,
-    design and joint feature set (e.g. mr_ash / loso / snv_sv);
+    design and joint feature set (e.g. top_variant / loso / snv_sv);
   - robust.py's sv_gene_tests.tsv.gz for the same arm: each gene's SV gain, its split into the SV part and the SNV
     refit, and their family-bootstrap SEs, one-sided p values and Benjamini-Hochberg q values;
   - the dataset, for genotypes, gene structure and the segmental-duplication track.

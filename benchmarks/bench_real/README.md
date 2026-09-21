@@ -65,7 +65,7 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 ## Baselines
 - **top_variant:** the lead marginal variant, fitted by OLS.
 - **gblup_reml:** REML h², with the GLS intercept.
-- **mr_ash:** a faithful port of mr.ash.alpha 8e257fd with its published defaults, cited in `baselines.py`.
+- **mr.ash:** the published R package (mr.ash.alpha) run as itself; the former Python port was deleted (identical SNV and SNV+SV predictions).
 - **The engine's current design** is added when it lands on main.
 
 The baselines' math checks are in `tests/test_bench_real_baselines.py`: REML optimality against direct REML, dual/primal BLUP identity, sparse recovery, and lead-variant choice.
@@ -120,7 +120,7 @@ The baselines need numba, which is in the repository's dev dependency group. bcf
     python benchmarks/bench_real/build_dataset.py --root <root> --chromosomes <c>   # one per autosome, in parallel
     python benchmarks/bench_real/splits.py <root>/dataset
     python benchmarks/bench_real/harness.py --dataset <root>/dataset --method benchmarks/bench_real/baselines.py:gblup_reml         --name gblup_reml --design loso --chromosomes chr22 --out <root>/results --workers <n>
-    python benchmarks/bench_real/report.py --results <root>/results --dataset <root>/dataset --methods gblup_reml mr_ash --out <report dir>
+    python benchmarks/bench_real/report.py --results <root>/results --dataset <root>/dataset --methods gblup_reml top_variant --out <report dir>
 
 Set OMP_NUM_THREADS=1 (and the OpenBLAS, MKL and numba equivalents) when running several workers.
 

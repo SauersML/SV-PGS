@@ -3,7 +3,7 @@
 critic-real, 2026-09-20. Written before any SV-PGS portability result exists: fit-api's `fit_expression` had not been delivered, and no SV-PGS prediction had been scored.
 
 **Ratified by the lead** on 2026-09-20, with two edits, both applied below:
-1. The comparator is compete's `mr_ashr_init` arm, the lasso-started mr-ash-workflow arm and the primary competitor. bench-real's numba mr.ash port is secondary.
+1. The comparator is compete's `mr_ashr_init` arm, the lasso-started mr-ash-workflow arm and the primary competitor. bench-real's numba mr.ash port was deleted on 2026-09-21 (it gave identical SNV and SNV+SV predictions); nothing replaces it as a secondary comparator.
 2. This is a SECONDARY family, next to ablate's Amendment 2 headline H: the pooled Δr² of SV-PGS − mr_ashr_init, loso, on the confirmation genes. It takes its own α from the same alpha-spending scheme, set with ablate.
 
 Changes need a dated amendment that says why, and nobody may read an SV-PGS portability number before the amendment is made.

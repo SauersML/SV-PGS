@@ -56,16 +56,6 @@ def test_gblup_dual_prediction_equals_primal_ridge():
     assert np.max(np.abs(primal - dual)) <= condition * EPSILON * np.abs(primal).max() * genotypes.shape[1]
 
 
-def test_mr_ash_recovers_sparse_effects():
-    genotypes, phenotype, effects = simulated(3, samples=600, variants=300, causal=3)
-    predictor = baselines.mr_ash(FakeTrain(genotypes, phenotype))
-    causal = np.flatnonzero(effects)
-    standard_errors = 1.0 / np.sqrt(((genotypes[:, causal] - genotypes[:, causal].mean(0)) ** 2).sum(0))
-    assert np.all(np.abs(predictor.coefficients[causal] - effects[causal]) < 4 * standard_errors)
-    null = np.setdiff1d(np.arange(300), causal)
-    assert np.abs(predictor.coefficients[null]).max() < np.abs(effects[causal]).min()
-
-
 def test_top_variant_picks_the_causal_variant():
     genotypes, phenotype, effects = simulated(4, causal=1)
     predictor = baselines.top_variant(FakeTrain(genotypes, phenotype))
