@@ -1,5 +1,8 @@
 # SV-PGS
 
+These are binding requirements, not a description of what is written. Where the shipped code does not yet meet one,
+[docs/design/CAPABILITIES.md](docs/design/CAPABILITIES.md) says what it does instead and names the test that pins that behaviour.
+
 - Each type of variant will have a different prior on its effect size.
 - No variant is filtered by rarity or by any threshold. Rare variants enter the one model, and the prior shrinks what the data can't support. A variant is left out of computation only when a derived bound shows its posterior contribution to every score is below the certificate tolerance, e.g. a column that is monomorphic in the training fold.
 - Single letter variable names are not allowed anywhere for any reason.

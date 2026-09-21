@@ -5,6 +5,7 @@ These documents describe SV-PGS: the one model, its dosage store, its phenotypes
 | Document | What it holds |
 |---|---|
 | [HANDOFF.md](HANDOFF.md) | The current-state entry point: what's on main, what's in flight, what's next, and the decisions waiting on the user |
+| [CAPABILITIES.md](CAPABILITIES.md) | The requirements of SPEC.md and MODEL.md the public routes do not meet yet, what they do instead, and the test that pins each behaviour |
 | [MODEL.md](MODEL.md) | The one generative model, its prior, its inference and certificate, the Stage 0 → Stage 2 pipeline, and the evidence tags |
 | [STORE.md](STORE.md) | The 8-bit dosage store: arrays, halves, sidecar, loci, external annotations, gates |
 | [EVALUATION.md](EVALUATION.md) | How an SV gain is claimed: arms, tests, the trait panel, simulation gates, red-team checks |
