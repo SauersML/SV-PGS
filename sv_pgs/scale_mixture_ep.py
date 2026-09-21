@@ -100,6 +100,9 @@ removing k. Its fixed point is the MacKay form RSS / (n - k - gamma), which is u
 
 from __future__ import annotations
 
+import contextvars
+import functools
+import hashlib
 from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Callable, Iterator, Sequence
@@ -730,6 +733,73 @@ def _log_normalizers(
     return _log_sum_exp(_kernel_terms(log_density, log_scale_rows, grid, precision, shift)[3], axis=1)
 
 
+class _KernelRows:
+    """One chunk's kernel at a cavity and its log scales: every per-node quantity of ``_components`` except the class
+    density's part, which enters log Z_jk = log pi_ck + L_jk additively (L the kernel's log with a flat density).
+
+    So log Z_j = LSE_k(L_jk + log pi_ck) is one product of exp(L - max_k L) with exp(log pi - max log pi) over the
+    nodes (a GEMV of positive terms: exact to K eps in relative terms), with a row whose product falls to where
+    subnormal terms could matter taken exactly, as ``_line`` takes its fixed rows. The derivatives in eta = log u are
+    formed on first use."""
+
+    def __init__(self, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array) -> None:
+        self.conditional, self.retained, self._ratio_retained, self.kernel, self._signal = _kernel_terms(
+            np.zeros(grid.shape[0]), log_scale_rows, grid, precision, shift
+        )
+        # Shifted by each row's largest term, as ``_log_sum_exp`` shifts (by 0 where that term is not finite).
+        peak = np.max(self.kernel, axis=1)
+        self.peak = np.where(np.isfinite(peak), peak, 0.0)
+        with np.errstate(invalid="ignore"):
+            self.exponentials = np.exp(self.kernel - self.peak[:, None])
+        self._derivatives: tuple[F64Array, F64Array, F64Array, F64Array] | None = None
+        # Held from one pass to the next (``_kernel_chunks``): read-only, so no caller can change a later pass's rows.
+        for held in (self.conditional, self.retained, self.kernel, self.exponentials):
+            held.setflags(write=False)
+
+    def derivatives(self) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+        """(first, second, third, fourth): see ``_components``."""
+        if self._derivatives is None:
+            retained, ratio_retained, signal = self.retained, self._ratio_retained, self._signal
+            self._derivatives = (
+                0.5 * (retained * signal - ratio_retained),
+                0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained,
+                0.5 * signal * retained * (6.0 * retained * retained - 6.0 * retained + 1.0)
+                - 0.5 * ratio_retained * retained * (2.0 * retained - 1.0),
+                signal * (
+                    retained * (3.0 * retained**3 - 3.0 * retained**2 + 0.5 * retained)
+                    - retained * (1.0 - retained) * (9.0 * retained**2 - 6.0 * retained + 0.5)
+                )
+                + retained * (1.0 - retained) * (-3.0 * retained**2 + 3.0 * retained - 0.5),
+            )
+            for held in self._derivatives:
+                held.setflags(write=False)
+        return self._derivatives
+
+    def normalizers(self, log_density: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+        """(log Z_j, exp(log pi - max log pi), the products, the rows taken exactly)."""
+        density_peak = float(np.max(log_density))
+        scaled = np.exp(log_density - density_peak)
+        products = self.exponentials @ scaled
+        # Rows at subnormal level, and rows with a non-finite term (a kernel at its overflow limit), are taken exactly.
+        lost = ~np.isfinite(products) | (products < np.finfo(np.float64).tiny / _EPSILON)
+        with np.errstate(divide="ignore"):
+            log_normalizer = np.log(products) + self.peak + density_peak
+        if np.any(lost):
+            log_normalizer[lost] = _log_sum_exp(self.kernel[lost] + log_density[None, :], axis=1)
+        return log_normalizer, scaled, products, lost
+
+    def components(self, log_density: F64Array) -> _Components:
+        log_normalizer, scaled, products, lost = self.normalizers(log_density)
+        responsibility = self.exponentials * scaled[None, :] / np.where(lost, 1.0, products)[:, None]
+        if np.any(lost):
+            responsibility[lost] = np.exp(self.kernel[lost] + log_density[None, :] - log_normalizer[lost, None])
+        first, second, third, fourth = self.derivatives()
+        return _Components(
+            log_normalizer=log_normalizer, responsibility=responsibility, conditional_variance=self.conditional,
+            first=first, second=second, third=third, fourth=fourth,
+        )
+
+
 def _components(
     log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array
 ) -> _Components:
@@ -738,23 +808,64 @@ def _components(
     B_(n+1) = -r(1 - r) B_n', giving A_2 = r^2 - r/2, B_2 = r(1 - r)/2, A_3 = 3r^3 - 3r^2 + r/2,
     B_3 = r(1 - r)(2r - 1)/2, and A_4 = r A_3 - r(1 - r)(9r^2 - 6r + 1/2), B_4 = -r(1 - r)(-3r^2 + 3r - 1/2).
     Every node takes its own variance v = u e^t (``_kernel_terms``)."""
-    conditional, retained, ratio_retained, log_component, signal = _kernel_terms(log_density, log_scale_rows, grid, precision, shift)
-    log_normalizer = _log_sum_exp(log_component, axis=1)
-    responsibility = np.exp(log_component - log_normalizer[:, None])
-    return _Components(
-        log_normalizer=log_normalizer,
-        responsibility=responsibility,
-        conditional_variance=conditional,
-        first=0.5 * (retained * signal - ratio_retained),
-        second=0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained,
-        third=0.5 * signal * retained * (6.0 * retained * retained - 6.0 * retained + 1.0)
-        - 0.5 * ratio_retained * retained * (2.0 * retained - 1.0),
-        fourth=signal * (
-            retained * (3.0 * retained**3 - 3.0 * retained**2 + 0.5 * retained)
-            - retained * (1.0 - retained) * (9.0 * retained**2 - 6.0 * retained + 0.5)
-        )
-        + retained * (1.0 - retained) * (-3.0 * retained**2 + 3.0 * retained - 0.5),
-    )
+    return _KernelRows(log_scale_rows, grid, precision, shift).components(log_density)
+
+
+# One hyper step's caches, opened by ``hyper_step`` and ended with it (context-local, so no two calls share one): the
+# kernel rows held between its passes (``_kernel_chunks``) and its exact repeats (``_repeated``). Outside a hyper step
+# nothing is held.
+_STEP_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("scale_mixture_ep_step_cache", default=None)
+
+
+def _step_scoped(function: Callable) -> Callable:
+    """``function`` with its own ``_STEP_CACHE`` for the call's duration."""
+
+    @functools.wraps(function)
+    def scoped(*arguments, **keywords):
+        token = _STEP_CACHE.set({})
+        try:
+            return function(*arguments, **keywords)
+        finally:
+            _STEP_CACHE.reset(token)
+
+    return scoped
+
+
+# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed.
+_HELD_ARRAYS_PER_ROW_SET = 10
+
+
+def _kernel_chunks(
+    prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity, working_bytes: int
+) -> Iterator[tuple[int, I64Array, _KernelRows]]:
+    """(class, rows, kernel rows) over every chunk of every class. Within a hyper step, while the cavity, the log scales,
+    the lattice and the chunks are the ones they were formed for (a hyper step holds its cavity, and without an
+    annotation design the log scales too), later passes reuse the rows: held only where each class is one chunk and the
+    held rows fit in ``working_bytes`` beside a pass's own (twice their size), so holding them stays inside the budget."""
+    cache = _STEP_CACHE.get()
+    held = None if cache is None else cache.get("rows")
+    if (
+        held is not None and held[0] is prior.class_rows and held[1] is prior.log_variance_grid and held[2] == working_bytes
+        and np.array_equal(held[3], scales) and np.array_equal(held[4], cavity.precision) and np.array_equal(held[5], cavity.shift)
+    ):
+        yield from held[6]
+        return
+    chunks = [list(_row_chunks(class_rows, prior.grid_size, working_bytes)) for class_rows in prior.class_rows]
+    if all(len(pieces) <= 1 for pieces in chunks):
+        formed = [
+            (class_position, rows, _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]))
+            for class_position, pieces in enumerate(chunks) for rows in pieces
+        ]
+        held_bytes = _HELD_ARRAYS_PER_ROW_SET * sum(kernel_rows.kernel.nbytes for _class, _rows, kernel_rows in formed)
+        if cache is not None and 2 * held_bytes <= working_bytes:
+            cache["rows"] = (
+                prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
+            )
+        yield from formed
+        return
+    for class_position, pieces in enumerate(chunks):
+        for rows in pieces:
+            yield class_position, rows, _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows])
 
 
 def _class_terms(
@@ -763,11 +874,8 @@ def _class_terms(
     """(class, rows, components) over every chunk of every class."""
     log_density = class_log_density(prior, coefficients)
     scales = log_scale(prior, coefficients)
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
-            yield class_position, rows, _components(
-                log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
-            )
+    for class_position, rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
+        yield class_position, rows, kernel_rows.components(log_density[class_position])
 
 
 def tilted_moments(
@@ -920,17 +1028,19 @@ def _data_objective(
     cross = np.zeros((prior.class_count, grid_size, prior.scale_size))
     for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
         responsibility = terms.responsibility
-        design = prior.scale_design[rows]
-        mean_first = np.sum(responsibility * terms.first, axis=1)
-        centred_first = terms.first - mean_first[:, None]
-        curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
         value += float(np.sum(terms.log_normalizer))
         magnitude += float(np.sum(np.abs(terms.log_normalizer)))
         responsibility_sum[class_position] += responsibility.sum(axis=0)
         responsibility_outer[class_position] += responsibility.T @ responsibility
-        cross[class_position] += (responsibility * centred_first).T @ design
-        gradient[scale_span] += design.T @ mean_first
-        hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
+        if prior.scale_size:
+            # Without an annotation design the scale terms are empty products.
+            design = prior.scale_design[rows]
+            mean_first = np.sum(responsibility * terms.first, axis=1)
+            centred_first = terms.first - mean_first[:, None]
+            curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
+            cross[class_position] += (responsibility * centred_first).T @ design
+            gradient[scale_span] += design.T @ mean_first
+            hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
     for class_position, class_rows in enumerate(prior.class_rows):
         size = float(class_rows.shape[0])
         class_density = density[class_position]
@@ -958,11 +1068,8 @@ def _data_value(
         )
         return float(log_normalizer.sum())
     total = 0.0
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
-            total += float(np.sum(_log_normalizers(
-                log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
-            )))
+    for class_position, _rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
+        total += float(np.sum(kernel_rows.normalizers(log_density[class_position])[0]))
     return total
 
 
@@ -999,24 +1106,31 @@ def _penalized(
     return objective.value - penalty_value - anchor_value, mapping.T @ objective.gradient - penalty_gradient - anchor_gradient, hessian
 
 
-def _ascent_direction(negative_hessian: F64Array, gradient: F64Array) -> F64Array:
+def _spectrum(negative_hessian: F64Array) -> tuple[F64Array, F64Array]:
+    """-H's eigendecomposition (of its symmetric part), shared by every step taken at one point."""
+    return np.linalg.eigh(0.5 * (negative_hessian + negative_hessian.T))
+
+
+def _ascent_direction(negative_hessian: F64Array, gradient: F64Array, spectrum: tuple[F64Array, F64Array] | None = None) -> F64Array:
     """The Newton direction on -H with every eigenvalue replaced by its magnitude (an ascent direction where -H is indefinite).
 
     Eigenvalues below eps times the largest are raised to that floor, the rounding level of the spectrum.
     """
-    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (negative_hessian + negative_hessian.T))
+    eigenvalues, eigenvectors = _spectrum(negative_hessian) if spectrum is None else spectrum
     magnitudes = np.maximum(np.abs(eigenvalues), _EPSILON * float(np.max(np.abs(eigenvalues))))
     return eigenvectors @ ((eigenvectors.T @ gradient) / magnitudes)
 
 
-def _trust_region_step(negative_hessian: F64Array, gradient: F64Array, radius: float) -> F64Array:
+def _trust_region_step(
+    negative_hessian: F64Array, gradient: F64Array, radius: float, spectrum: tuple[F64Array, F64Array] | None = None
+) -> F64Array:
     """The maximizer of g's - s'(-H)s/2 over ||s|| <= radius (More and Sorensen), from -H's eigendecomposition.
 
     s(mu) = (-H + mu I)^-1 g with mu >= max(0, -lambda_min) and ||s(mu)|| = radius unless the Newton
     step of a positive definite -H already fits; ||s(mu)|| falls monotonically in mu, so mu is bisected
     to double precision between its bounds.
     """
-    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (negative_hessian + negative_hessian.T))
+    eigenvalues, eigenvectors = _spectrum(negative_hessian) if spectrum is None else spectrum
     components = eigenvectors.T @ gradient
     if eigenvalues[0] > 0.0:
         newton = components / eigenvalues
@@ -1068,15 +1182,19 @@ def _maximize_coefficients(
     coefficients = np.array(start, dtype=np.float64, copy=True)
     objective = _data_objective(prior, coefficients, cavity, working_bytes)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
-    radius = float(np.linalg.norm(_ascent_direction(-hessian, gradient)))
+    # -H changes only when a step is accepted: its one eigendecomposition serves the test, the ascent direction and
+    # every trust-region trial at that point.
+    spectrum = _spectrum(-hessian)
+    ascent = _ascent_direction(-hessian, gradient, spectrum)
+    radius = float(np.linalg.norm(ascent))
     while True:
         rounding = _EPSILON * (objective.magnitude + abs(value))
-        definite = float(np.linalg.eigvalsh(0.5 * (hessian + hessian.T))[-1]) < 0.0
-        if definite and 0.5 * float(gradient @ _ascent_direction(-hessian, gradient)) <= max(tolerance, rounding):
+        definite = float(spectrum[0][0]) > 0.0
+        if definite and 0.5 * float(gradient @ ascent) <= max(tolerance, rounding):
             return coefficients, objective
         if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
-        step = _trust_region_step(-hessian, gradient, radius)
+        step = _trust_region_step(-hessian, gradient, radius, spectrum)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
         candidate = coefficients + step
         candidate_value = (
@@ -1093,6 +1211,8 @@ def _maximize_coefficients(
             coefficients = candidate
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
+            spectrum = _spectrum(-hessian)
+            ascent = _ascent_direction(-hessian, gradient, spectrum)
 
 
 @dataclass(frozen=True)
@@ -1303,12 +1423,12 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
     mean_by_density = np.empty((variant_count, grid_size))
     second_by_density = np.empty((variant_count, grid_size))
     scales = log_scale(prior, coefficients)
-    for _class, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+    log_density = class_log_density(prior, coefficients)
+    for _class, rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
+        terms = kernel_rows.components(log_density[_class])
         weights = terms.responsibility
         conditional = terms.conditional_variance
-        retained = _kernel_terms(
-            class_log_density(prior, coefficients)[_class], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
-        )[1]
+        retained = kernel_rows.retained
         centre = cavity.shift[rows][:, None] * conditional
 
         def expectation(values: F64Array) -> F64Array:
@@ -1612,6 +1732,10 @@ def _directional_derivatives(
         d3 = k3(theta') + 3 cov(theta', theta'') + E theta''',
         d4 = k4(theta') + 6 k(theta', theta', theta'') + 3 var(theta'') + 4 cov(theta', theta''') + E theta''''.
     The -LSE(eta_c) term subtracts k3 and k4 of b_c under pi_c, once per variant of the class.
+
+    Without an annotation design b_e = 0, so theta' = b_c and d3, d4 are the third cumulant and the fourth cumulant
+    of b_c under w_j: every direction at once from the raw moments R_r = w_j' (b_c - b_c[m])^r (one GEMM per power),
+    taken about each variant's modal node m, where they do not cancel (the variants grouped by that node).
     """
     mapping = prior.coefficient_map
     directions_z = mapping @ directions
@@ -1620,7 +1744,23 @@ def _directional_derivatives(
     third = np.zeros(directions.shape[1])
     fourth = np.zeros(directions.shape[1])
     density = np.exp(class_log_density(prior, coefficients))
-    for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+    if not prior.scale_size:
+        for class_position, _rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
+            steps = directions_z[class_position * grid_size : (class_position + 1) * grid_size]
+            weights = terms.responsibility
+            modes = np.argmax(weights, axis=1)
+            for node in np.unique(modes):
+                offset = steps - steps[node][None, :]
+                node_weights = weights[modes == node]
+                mean = node_weights @ offset
+                second = node_weights @ np.square(offset)
+                cubed = node_weights @ offset**3
+                central_second = second - mean * mean
+                third += np.sum(cubed - 3.0 * mean * second + 2.0 * mean**3, axis=0)
+                fourth += np.sum(
+                    node_weights @ offset**4 - 4.0 * mean * cubed + 6.0 * mean * mean * second - 3.0 * mean**4 - 3.0 * central_second**2, axis=0
+                )
+    for class_position, rows, terms in (() if not prior.scale_size else _class_terms(prior, coefficients, cavity, working_bytes)):
         weights = terms.responsibility
         design = prior.scale_design[rows]
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
@@ -1803,7 +1943,67 @@ def _line_log_integral(
     return float(_line_log_integrals(prior, log_smoothing, origin, direction[:, None], value, cavity, working_bytes, share)[0])
 
 
+# One hyper step's exact repeats are answered once: the structural starts of each basin search land in one basin, and
+# the edge comparisons re-evaluate the models they came from (gene 1: 9 of 31 corrections repeated an earlier one bit
+# for bit [real, tk-closedform]). Keyed by the bytes of every input; held in the step's ``_STEP_CACHE``, so they end
+# with the step, and dropped when the cavity changes within it.
+
+
+def _digest(*values: object) -> bytes:
+    hasher = hashlib.blake2b()
+    for value in values:
+        if isinstance(value, np.ndarray):
+            hasher.update(repr((value.dtype.str, value.shape)).encode())
+            hasher.update(np.ascontiguousarray(value).tobytes())
+        else:
+            hasher.update(repr(value).encode())
+    return hasher.digest()
+
+
+def _prior_digest(prior: ScaleMixturePrior) -> tuple[object, ...]:
+    """What a view's evidence depends on besides x and rho: its map, blocks, null space and lattice."""
+    blocks = tuple(value for block in prior.smoothing_blocks for value in (block.coordinates, block.factor))
+    return (
+        prior.coefficient_map, prior.null_basis, prior.log_variance_grid, prior.kernel_floor, prior.class_index, prior.log_variance_offset, prior.scale_design,
+        prior.pooled_size, prior.offset_groups, *blocks,
+    )
+
+
+def _repeated(name: str, cavity: Cavity, inputs: tuple[object, ...], compute: Callable[[], object], held: object | None = None) -> object:
+    """compute() once per distinct ``inputs`` at this cavity within a hyper step (and, when given, this ``held``
+    object: compared by identity); outside a hyper step, compute() every time."""
+    cache = _STEP_CACHE.get()
+    if cache is None:
+        return compute()
+    repeats = cache.setdefault("repeats", {})
+    scope = _digest(cavity.precision, cavity.shift)
+    if repeats.get("cavity") != scope:
+        repeats.clear()
+        repeats["cavity"] = scope
+    if held is not None and repeats.get(("held", name)) is not held:
+        for key in [key for key in repeats if isinstance(key, tuple) and key[0] == name]:
+            del repeats[key]
+        repeats[("held", name)] = held
+    key = (name, _digest(*inputs))
+    if key not in repeats:
+        repeats[key] = compute()
+    return repeats[key]
+
+
 def _laplace_corrections(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+) -> tuple[F64Array, F64Array, F64Array]:
+    """``_laplace_corrections_once``, each distinct input once per cavity (and per correction, held by identity). The
+    corrections depend on the evidence's -H and responses, which come from the correction, so those are keyed too:
+    equal coefficients can come with a different -H once a lazy correction has grown (e2e review)."""
+    return _repeated(
+        "corrections", cavity,
+        (*_prior_digest(prior), log_smoothing, evidence.coefficients, evidence.precision, evidence.responses, working_bytes, tolerance),
+        lambda: _laplace_corrections_once(prior, log_smoothing, evidence, cavity, correction, working_bytes, tolerance), held=correction,
+    )
+
+
+def _laplace_corrections_once(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> tuple[F64Array, F64Array, F64Array]:
     """Per integrated direction, the correction from the Laplace term to the exact one-dimensional integral, the
@@ -2088,6 +2288,16 @@ def _evidence(
     working_bytes: int,
     tolerance: float,
     maximize: bool = True,
+) -> _Evidence | None:
+    """``_evidence_once``, each distinct input once per cavity (and per correction, held by identity: one per hyper step)."""
+    return _repeated(
+        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance),
+        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance), held=correction,
+    )
+
+
+def _evidence_once(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
@@ -2700,6 +2910,7 @@ def _stationarity(
     return _Stationarity(gradient, error, curvature, steps, folds, gain, None, floor=alpha, decrement=decrement, fold=fold)
 
 
+@_step_scoped
 def hyper_step(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> HyperStep:
