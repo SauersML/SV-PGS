@@ -1258,6 +1258,7 @@ def _maximize_coefficients(
     components = spectrum[1].T @ gradient
     curvature = float(np.sum(np.abs(spectrum[0]) * np.square(components)))
     radius = float(np.linalg.norm(gradient)) ** 3 / curvature if curvature > 0.0 else 0.0
+    last_contraction: float | None = None
     while True:
         # The objective's own rounding (its terms' and their summation's) plus the penalized value's arithmetic.
         rounding = objective.rounding + _EPSILON * abs(value)
@@ -1273,15 +1274,22 @@ def _maximize_coefficients(
             # steps: taken where the decrement in the current metric falls (a strict maximum), or where the trapezoid
             # gain of the two gradients is positive (a saddle), and the maximization ends otherwise. A step below x's
             # own resolution cannot be told from the point it leaves (the decrements of both sit at their rounding),
-            # so it ends the maximization too.
+            # so it ends the maximization too; and so does a decrement whose ratio to the last one does not fall:
+            # Newton approaches a strict maximum quadratically (each ratio smaller than the last), while an objective
+            # whose supremum lies at infinity along a direction gives one ratio for ever (the width -> 0 ray on the
+            # bench-real genes: steps of one length with the decrement falling by a fixed factor, and a maximization
+            # that ran for minutes per start at every release trial).
             if float(np.linalg.norm(step)) <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
                 return coefficients, objective
             candidate = coefficients + step
             candidate_objective = _data_objective(prior, candidate, cavity, working_bytes)
             candidate_value, candidate_gradient, candidate_hessian = _penalized(prior, candidate_objective, log_smoothing, penalty, candidate)
+            decrement = 0.5 * float(gradient @ ascent)
             if definite:
-                resolved = 0.5 * float(candidate_gradient @ _ascent_direction(-hessian, candidate_gradient, spectrum)) < 0.5 * float(gradient @ ascent)
+                candidate_decrement = 0.5 * float(candidate_gradient @ _ascent_direction(-hessian, candidate_gradient, spectrum))
+                resolved = candidate_decrement < decrement
             else:
+                candidate_decrement = np.nan
                 resolved = 0.5 * float((gradient + candidate_gradient) @ step) > 0.0
             if not (resolved and np.isfinite(candidate_value)):
                 return coefficients, objective
@@ -1289,6 +1297,11 @@ def _maximize_coefficients(
             value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
             spectrum = _resolved_spectrum(_spectrum(-hessian))
             ascent = _ascent_direction(-hessian, gradient, spectrum)
+            if definite and decrement > 0.0:
+                contraction = candidate_decrement / decrement
+                if last_contraction is not None and contraction >= last_contraction:
+                    return coefficients, objective
+                last_contraction = contraction
             continue
         candidate = coefficients + step
         candidate_value = (
