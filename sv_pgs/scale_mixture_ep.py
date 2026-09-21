@@ -1219,6 +1219,13 @@ def _maximize_coefficients(
         if np.isfinite(candidate_value) and actual > rounding:
             coefficients = candidate
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
+            if not np.any(np.abs(objective.gradient) > _EPSILON * objective.magnitude):
+                # The data no longer see x: every tilted moment has saturated (the density is a point mass on the
+                # lattice to rounding). What the model still gains beyond here is the anchor's quadratic alone, a
+                # local model of the fixed point's response taken out of its range (at a released weight of e^-22
+                # on gene 1 its indefinite C sent x to 1e153 over 6,600 accepted steps), so the maximization ends
+                # here; the point certifies nothing (``_evidence_once``).
+                return coefficients, objective
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
             spectrum = _spectrum(-hessian)
             ascent = _ascent_direction(-hessian, gradient, spectrum)
@@ -3439,6 +3446,13 @@ def fit_hyperparameters(
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     # |G - pi| at the model's last whole joint trial: the local model's measured error (unknown before the first).
     remainders = [np.inf] * count
+    # A release (the step frees an edge weight) is taken as its weights' move first, at x_k and its fixed point
+    # (the fixed point does not depend on the weights), and x then follows by inner steps at the freed weights; the
+    # joint step stands where x's certified V at the freed weights, once polished, is above the state's it left by
+    # more than the tolerance and both errors. ``anchors`` holds that state (and the step's predicted gain) until
+    # then, and ``refused_releases`` the edge sets a model was returned to, which its next steps do not free again.
+    anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
+    refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
     # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
     weight_tolerances = [tolerance] * count
@@ -3494,7 +3508,7 @@ def fit_hyperparameters(
         predicted = step.evidence - state.value
         return state, step, predicted, predicted + fixed + state.error + step.evidence_error + step.stationarity_gain
 
-    def plan(model: int) -> _OuterTrial:
+    def plan(model: int) -> _OuterTrial | None:
         state = states[model]
         planned = weight_tolerances[model]
         try:
@@ -3511,7 +3525,29 @@ def fit_hyperparameters(
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
         histories[model].append(float(remaining))
-        return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
+        entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
+        released = frozenset(
+            int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
+        )
+        if not released or entry.certifying:
+            return entry
+        if released in refused_releases[model]:
+            # This release was taken and returned once: x polished at the freed weights below the state it left.
+            uncertified(model, entry, step, state.decrement)
+            return None
+        # The joint step to a freed edge cannot be tested as one move: its x-part is the whole distance from the
+        # edge's density to the interior's (|move| 43 on the mean-field test problem), where the path integral's
+        # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the weights move
+        # first, at x_k and its fixed point, and x follows by inner steps at the freed weights, each accepted on the
+        # model as always; the certified V once x is polished there decides the release (``anchors``).
+        moved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients, log_smoothing=step.hyperparameters.log_smoothing)
+        moved_state = _outer_state(prior, moved, points[model], corrections[model], working_bytes, tolerance)
+        if moved_state is None:
+            return entry
+        anchors[model] = (hyperparameters[model], points[model], corrections[model], state, predicted)
+        hyperparameters[model], states[model] = moved, moved_state
+        radii[model] = None
+        return inner(model, step, remaining, True)
 
     def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
         fits[model] = OuterFit(
@@ -3654,6 +3690,29 @@ def fit_hyperparameters(
                 continue
             halvings[model] += 1
             if not resolved:
+                if entry.polishes and anchors[model] is not None:
+                    # x is at its maximum at the freed weights: the release stands where its certified V is above
+                    # the state's it left by more than the tolerance and both errors (its realized gain measured
+                    # against the step's prediction); otherwise the model returns to that state and this release
+                    # is not planned again.
+                    anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchors[model]
+                    polished_state = states[model]
+                    realized = -np.inf if polished_state is None else polished_state.value - anchor_state.value
+                    resolution = np.inf if polished_state is None else polished_state.error + anchor_state.error
+                    remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
+                    anchors[model] = None
+                    if polished_state is not None and realized - resolution > tolerance:
+                        states[model] = replace(polished_state, polished=True)
+                        pending[model] = None
+                        continue
+                    refused_releases[model].add(frozenset(
+                        int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
+                    ))
+                    hyperparameters[model], points[model], corrections[model] = anchor_hyperparameters, anchor_point, anchor_correction
+                    states[model] = replace(anchor_state, polished=True)
+                    displaced[model], radii[model] = True, None
+                    pending[model] = None
+                    continue
                 if entry.polishes and states[model] is not None:
                     # x is at its maximum at rho_k to double precision: the state is planned once more.
                     states[model] = replace(states[model], polished=True)
