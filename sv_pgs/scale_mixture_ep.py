@@ -3573,6 +3573,8 @@ def fit_hyperparameters(
     last_steps: list[HyperStep | None] = [None] * count
     # The realized gains of each model's consecutive accepted inner steps at its current weights (``_State.tail``).
     inner_gains: list[list[float]] = [[] for _model in range(count)]
+    # Whether the model's last whole joint trial had no certified state at its own fixed point.
+    whole_uncertifiable: list[bool] = [False] * count
 
     def tail_of(model: int) -> float:
         """The remaining gain the last two inner gains' contraction bounds: g r / (1 - r) with r their ratio, where
@@ -3813,6 +3815,8 @@ def fit_hyperparameters(
                     unresolved[model] += 1
                 else:
                     trial_correction, trial_state = solve_state(trial, trial_point)
+                    if entry.fraction == 1.0:
+                        whole_uncertifiable[model] = trial_state is None
                     if trial_state is not None:
                         gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                         if entry.fraction == 1.0:
@@ -3822,6 +3826,27 @@ def fit_hyperparameters(
                             displaced[model], pending[model] = False, None
                             iterations[model] += 1
                             continue
+                        if state.polished and whole_uncertifiable[model] and gain + resolution + state.tail <= tolerance:
+                            # The whole step's end has no certified value (on gene 1 [real] it lies along the width
+                            # -> 0 ray where the curvature has saturated), so the model's prediction beyond this
+                            # fraction is void and its remainder cannot be measured; the fraction's own certified
+                            # gain bound, G + its resolution (both states' errors and the end correction), with
+                            # the polish's tail, is the remaining gain to any certifiable point along the step,
+                            # and the fit certifies where it is within the tolerance and the fraction's trial
+                            # moves q's mean within the certificate's budget.
+                            current = points[model]
+                            moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
+                            allowed = np.full(moves.shape[0], 2.0 * tolerance)
+                            if bool(np.all(moves <= allowed)):
+                                worst = int(np.argmax(np.where(allowed > 0.0, moves / allowed, 0.0)))
+                                fits[model] = OuterFit(
+                                    hyperparameters=hyperparameters[model], step=entry.step, newton_decrement=state.decrement,
+                                    remaining_gain=gain + resolution + state.tail, prediction_move=float(moves[worst]),
+                                    prediction_tolerance=float(allowed[worst]), iterations=iterations[model], halvings=halvings[model],
+                                    unresolved=unresolved[model], history=tuple(histories[model]),
+                                )
+                                pending[model] = None
+                                continue
                 halvings[model] += 1
                 target = entry.step.hyperparameters
                 segment = target.coefficients - hyperparameters[model].coefficients
