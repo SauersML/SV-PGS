@@ -100,6 +100,7 @@ removing k. Its fixed point is the MacKay form RSS / (n - k - gamma), which is u
 
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import functools
 import hashlib
@@ -806,8 +807,9 @@ class _KernelRows:
     formed on first use."""
 
     def __init__(self, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array) -> None:
+        # A flat density on the grid's own device (a device grid takes a device zero: no host array meets it).
         self.conditional, self.retained, self._ratio_retained, self.kernel, self._signal = _kernel_terms(
-            np.zeros(grid.shape[0]), log_scale_rows, grid, precision, shift
+            np.zeros_like(grid), log_scale_rows, grid, precision, shift
         )
         # For the rounding bound of ``components``, per row: the largest size of a node term's kernel pieces,
         # log(1 + vP)/2 + h^2 c/2 (both non-negative), and the kernel's range over the nodes, both over the nodes
@@ -825,7 +827,8 @@ class _KernelRows:
         self._derivatives: tuple[F64Array, F64Array, F64Array, F64Array] | None = None
         # Held from one pass to the next (``_kernel_chunks``): read-only, so no caller can change a later pass's rows.
         for held in (self.conditional, self.retained, self.kernel, self.exponentials, self._pieces_max, self._kernel_range):
-            held.setflags(write=False)
+            if hasattr(held, "setflags"):
+                held.setflags(write=False)
 
     def derivatives(self) -> tuple[F64Array, F64Array, F64Array, F64Array]:
         """(first, second, third, fourth): see ``_components``."""
@@ -843,11 +846,14 @@ class _KernelRows:
                 + retained * (1.0 - retained) * (-3.0 * retained**2 + 3.0 * retained - 0.5),
             )
             for held in self._derivatives:
-                held.setflags(write=False)
+                if hasattr(held, "setflags"):
+                    held.setflags(write=False)
         return self._derivatives
 
     def normalizers(self, log_density: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array]:
         """(log Z_j, exp(log pi - max log pi), the products, the rows taken exactly)."""
+        if hasattr(self.kernel, "get") and not hasattr(log_density, "get"):
+            log_density = _DEVICE.get().asarray(log_density)
         density_peak = float(np.max(log_density))
         scaled = np.exp(log_density - density_peak)
         products = self.exponentials @ scaled
@@ -893,6 +899,28 @@ def _components(
 # nothing is held.
 _STEP_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("scale_mixture_ep_step_cache", default=None)
 
+# The array module every data objective and tilted-moment evaluation runs on (numpy, or CuPy for the fused device
+# kernels of ``engine_kernels``), set for a fit's duration by ``device_scope``: the objective is the fit's most
+# repeated call (3,337 of them on ENSG00000254709.8 [real, 37,106 members, 88 nodes]), at 196 ms on one core and
+# 7 ms on the device for the same values (to 5e-13), so the route that chose the device sets it once here rather
+# than threading it through every caller.
+_DEVICE: contextvars.ContextVar[ModuleType] = contextvars.ContextVar("scale_mixture_ep_device", default=np)
+
+
+def _host(values):
+    """A host array for ``values`` (a device array's copy, a host array itself)."""
+    return values.get() if hasattr(values, "get") else values
+
+
+@contextlib.contextmanager
+def device_scope(array_module: ModuleType | None) -> Iterator[None]:
+    """Every objective and moment evaluation inside runs on ``array_module`` (None: numpy)."""
+    token = _DEVICE.set(np if array_module is None else array_module)
+    try:
+        yield
+    finally:
+        _DEVICE.reset(token)
+
 
 def _step_scoped(function: Callable) -> Callable:
     """``function`` with a ``_STEP_CACHE`` for the call's duration: its own where none is open, the open one otherwise
@@ -936,11 +964,17 @@ def _kernel_chunks(
         yield from held[6]
         return
     chunks = [list(_row_chunks(class_rows, prior.grid_size, working_bytes)) for class_rows in prior.class_rows]
+    xp = _DEVICE.get()
+
+    def form(rows: I64Array) -> _KernelRows:
+        # On the fit's device (``device_scope``): the rows' kernel and every per-node quantity live there, and each
+        # consumer takes host copies of its row-wise results at its own boundary (``_host``).
+        return _KernelRows(
+            xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]), xp.asarray(cavity.shift[rows])
+        )
+
     if all(len(pieces) <= 1 for pieces in chunks):
-        formed = [
-            (class_position, rows, _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]))
-            for class_position, pieces in enumerate(chunks) for rows in pieces
-        ]
+        formed = [(class_position, rows, form(rows)) for class_position, pieces in enumerate(chunks) for rows in pieces]
         held_bytes = _HELD_ARRAYS_PER_ROW_SET * sum(kernel_rows.kernel.nbytes for _class, _rows, kernel_rows in formed)
         if cache is not None and 2 * held_bytes <= working_bytes:
             cache["rows"] = (
@@ -950,7 +984,7 @@ def _kernel_chunks(
         return
     for class_position, pieces in enumerate(chunks):
         for rows in pieces:
-            yield class_position, rows, _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows])
+            yield class_position, rows, form(rows)
 
 
 def _class_terms(
@@ -965,10 +999,12 @@ def _class_terms(
 
 def tilted_moments(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int,
-    array_module: ModuleType = np,
+    array_module: ModuleType | None = None,
 ) -> TiltedMoments:
     """log Z_j and the exact tilted mean and variance of every effect; with ``array_module`` CuPy, by the fused
-    device kernel (``engine_kernels``) within ``working_bytes`` of device memory."""
+    device kernel (``engine_kernels``) within ``working_bytes`` of device memory; None takes the fit's device."""
+    if array_module is None:
+        array_module = _DEVICE.get()
     if array_module is not np:
         on_device = engine_kernels.tilted_moments(
             array_module, prior.class_index, class_log_density(prior, hyperparameters.coefficients),
@@ -1002,16 +1038,17 @@ def tilted_cumulants(
     """
     third = np.empty(prior.variant_count)
     fourth = np.empty(prior.variant_count)
+    xp = _DEVICE.get()
     for _class, rows, terms in _class_terms(prior, hyperparameters.coefficients, cavity, working_bytes):
-        shift = cavity.shift[rows][:, None]
+        shift = xp.asarray(cavity.shift[rows])[:, None]
         conditional = terms.conditional_variance
         weights = terms.responsibility
         component_mean = shift * conditional
         mean = np.sum(weights * component_mean, axis=1)[:, None]
         offset = component_mean - mean
         second = np.sum(weights * (np.square(offset) + conditional), axis=1)
-        third[rows] = np.sum(weights * (offset ** 3 + 3.0 * offset * conditional), axis=1)
-        fourth[rows] = np.sum(weights * (offset ** 4 + 6.0 * np.square(offset) * conditional + 3.0 * np.square(conditional)), axis=1) - 3.0 * np.square(second)
+        third[rows] = _host(np.sum(weights * (offset ** 3 + 3.0 * offset * conditional), axis=1))
+        fourth[rows] = _host(np.sum(weights * (offset ** 4 + 6.0 * np.square(offset) * conditional + 3.0 * np.square(conditional)), axis=1) - 3.0 * np.square(second))
     return third, fourth
 
 
@@ -1093,14 +1130,16 @@ class _Objective:
 
 
 def _data_objective(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np, hessian_too: bool = True
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType | None = None, hessian_too: bool = True
 ) -> _Objective:
     """For variant j of class c, with responsibilities w_j, component derivatives g_jk and their mean gbar_j, in z:
     d/deta_c = w_j - pi_c and d/d(scale) = gbar_j d_j (d_j the variant's scale-design row);
     d2/deta_c2 = diag(w_j) - w_j w_j' - (diag pi_c - pi_c pi_c'), d2/deta_ck d(scale) = w_jk (g_jk - gbar_j) d_j,
     and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel.
     With ``hessian_too`` false the Hessian is left zero (a gradient's pass: the p x K^2 responsibility products are the
-    pass's bulk), on the host path."""
+    pass's bulk), on the host path. ``array_module`` None takes the fit's device (``device_scope``)."""
+    if array_module is None:
+        array_module = _DEVICE.get()
     if array_module is not np:
         value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
             array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
@@ -1161,11 +1200,13 @@ def _data_objective(
 
 
 def _data_value(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType | None = None
 ) -> float:
-    """sum_j log Z_j alone: a trial point's evaluation."""
+    """sum_j log Z_j alone: a trial point's evaluation; ``array_module`` None takes the fit's device."""
     log_density = class_log_density(prior, coefficients)
     scales = log_scale(prior, coefficients)
+    if array_module is None:
+        array_module = _DEVICE.get()
     if array_module is not np:
         log_normalizer, _mean, _variance = engine_kernels.tilted_moments(
             array_module, prior.class_index, log_density, scales, prior.log_variance_grid, cavity.precision, cavity.shift, working_bytes,
@@ -1688,7 +1729,8 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         weights = terms.responsibility
         conditional = terms.conditional_variance
         retained = kernel_rows.retained
-        centre = cavity.shift[rows][:, None] * conditional
+        xp = _DEVICE.get()
+        centre = xp.asarray(cavity.shift[rows])[:, None] * conditional
 
         def expectation(values: F64Array) -> F64Array:
             return np.sum(weights * values, axis=1)
@@ -1703,20 +1745,20 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         slope = -0.5 * raw_second
         mean_by_precision = covariance(slope, centre) - expectation(centre * conditional)
         second_by_precision = covariance(slope, raw_second) - expectation(conditional * conditional + 2.0 * centre * centre * conditional)
-        fields["mean"][rows] = mean
-        fields["second"][rows] = second
-        fields["variance"][rows] = second - mean * mean
-        fields["variance_by_shift"][rows] = expectation(deviation**3) + 3.0 * expectation(conditional * deviation)
-        fields["mean_by_precision"][rows] = mean_by_precision
-        fields["variance_by_precision"][rows] = second_by_precision - 2.0 * mean * mean_by_precision
+        fields["mean"][rows] = _host(mean)
+        fields["second"][rows] = _host(second)
+        fields["variance"][rows] = _host(second - mean * mean)
+        fields["variance_by_shift"][rows] = _host(expectation(deviation**3) + 3.0 * expectation(conditional * deviation))
+        fields["mean_by_precision"][rows] = _host(mean_by_precision)
+        fields["variance_by_precision"][rows] = _host(second_by_precision - 2.0 * mean * mean_by_precision)
         if prior.scale_size:
-            fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
-            fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
+            fields["mean_by_log_scale"][rows] = _host(covariance(terms.first, centre) + expectation(centre * retained))
+            fields["second_by_log_scale"][rows] = _host(covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained))
         else:
             # No scale design: nothing moves log u, and the kernel's derivatives are never formed.
             fields["mean_by_log_scale"][rows] = fields["second_by_log_scale"][rows] = 0.0
-        mean_by_density[rows] = weights * deviation
-        second_by_density[rows] = weights * (raw_second - second[:, None])
+        mean_by_density[rows] = _host(weights * deviation)
+        second_by_density[rows] = _host(weights * (raw_second - second[:, None]))
     return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
 
 
@@ -1927,20 +1969,21 @@ def _curvature_trace_gradient(
     scale_covariance = covariance_z[scale_span, scale_span]
     gradient_z = np.zeros(covariance_z.shape[0])
     density_gradient = np.zeros((prior.class_count, grid_size))
+    xp = _DEVICE.get()
     for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
-        density_density = covariance_z[span, span]
+        density_density = xp.asarray(covariance_z[span, span])
         weights = terms.responsibility
         if not prior.scale_size:
             # Without a scale design every scale term is zero: the eta gradient is Q [diag N - 2 N w] alone, with
             # N = Sigma_eta, and the kernel's derivatives are never formed.
             inner = np.diag(density_density)[None, :] - 2.0 * (weights @ density_density)
-            density_gradient[class_position] -= np.sum(weights * (inner - np.sum(weights * inner, axis=1)[:, None]), axis=0)
+            density_gradient[class_position] -= _host(np.sum(weights * (inner - np.sum(weights * inner, axis=1)[:, None]), axis=0))
             continue
-        density_scale = covariance_z[span, scale_span]
+        density_scale = xp.asarray(covariance_z[span, scale_span])
         first, second, third = terms.first, terms.second, terms.third
-        design = prior.scale_design[rows]
-        scale_scale = np.sum((design @ scale_covariance) * design, axis=1)
+        design = xp.asarray(prior.scale_design[rows])
+        scale_scale = np.sum((design @ xp.asarray(scale_covariance)) * design, axis=1)
         density_row = design @ density_scale.T
         first_dot_weights = np.sum(first * weights, axis=1)
         density_row_dot_weights = np.sum(density_row * weights, axis=1)
@@ -1959,8 +2002,8 @@ def _curvature_trace_gradient(
             + 2.0 * np.sum((density_row + first * scale_scale[:, None]) * weighted_second, axis=1)
             + scale_scale * np.sum(weights * third, axis=1)
         )
-        density_gradient[class_position] -= weighted_inner.sum(axis=0)
-        gradient_z[scale_span] -= design.T @ scale_gradient
+        density_gradient[class_position] -= _host(weighted_inner.sum(axis=0))
+        gradient_z[scale_span] -= _host(design.T @ scale_gradient)
     density = np.exp(class_log_density(prior, coefficients))
     for class_position, class_rows in enumerate(prior.class_rows):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
@@ -2034,28 +2077,30 @@ def _directional_derivatives(
     fourth = np.zeros(directions.shape[1])
     density = np.exp(class_log_density(prior, coefficients))
     if not prior.scale_size:
+        xp = _DEVICE.get()
         for class_position, _rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
-            steps = directions_z[class_position * grid_size : (class_position + 1) * grid_size]
+            steps = xp.asarray(directions_z[class_position * grid_size : (class_position + 1) * grid_size])
             weights = terms.responsibility
             modes = np.argmax(weights, axis=1)
-            for node in np.unique(modes):
+            for node in _host(np.unique(modes)).tolist():
                 offset = steps - steps[node][None, :]
                 node_weights = weights[modes == node]
                 mean = node_weights @ offset
                 second = node_weights @ np.square(offset)
                 cubed = node_weights @ offset**3
                 central_second = second - mean * mean
-                third += np.sum(cubed - 3.0 * mean * second + 2.0 * mean**3, axis=0)
-                fourth += np.sum(
+                third += _host(np.sum(cubed - 3.0 * mean * second + 2.0 * mean**3, axis=0))
+                fourth += _host(np.sum(
                     node_weights @ offset**4 - 4.0 * mean * cubed + 6.0 * mean * mean * second - 3.0 * mean**4 - 3.0 * central_second**2, axis=0
-                )
+                ))
     for class_position, rows, terms in (() if not prior.scale_size else _class_terms(prior, coefficients, cavity, working_bytes)):
         weights = terms.responsibility
-        design = prior.scale_design[rows]
+        xp = _DEVICE.get()
+        design = xp.asarray(prior.scale_design[rows])
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         for column in range(directions.shape[1]):
-            density_step = directions_z[span, column][None, :]
-            scale_step = (design @ directions_z[scale_span, column])[:, None]
+            density_step = xp.asarray(directions_z[span, column])[None, :]
+            scale_step = (design @ xp.asarray(directions_z[scale_span, column]))[:, None]
             first = density_step + terms.first * scale_step
             second = terms.second * scale_step**2
             third_term = terms.third * scale_step**3
@@ -2116,10 +2161,12 @@ def _line(
         fixed_rows.append(still)
         moving_rows.append(class_rows[scale_slope[class_rows] != 0.0])
         rows_kernels = []
+        xp = _DEVICE.get()
         for rows in _row_chunks(still, prior.grid_size, working_bytes):
-            # L_jk: the kernel's log with a flat class density (its log pi part enters per step).
+            # L_jk: the kernel's log with a flat class density (its log pi part enters per step), on the fit's device.
             row_kernel = _kernel_terms(
-                np.zeros(prior.grid_size), scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]
+                xp.zeros(prior.grid_size), xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]),
+                xp.asarray(cavity.shift[rows]),
             )[3]
             peak = np.max(row_kernel, axis=1)
             rows_kernels.append((rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel))
@@ -2130,20 +2177,22 @@ def _line(
         log_weights = density[None] + steps[:, None, None] * density_step[None]
         log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
         total = -(penalty + steps * penalty_slope + 0.5 * np.square(steps) * penalty_curvature)
+        xp = _DEVICE.get()
         for class_position in range(prior.class_count):
             class_density = log_density[:, class_position]
             density_peak = np.max(class_density, axis=1)
-            scaled = np.exp(class_density - density_peak[:, None]).T
+            scaled = xp.asarray(np.exp(class_density - density_peak[:, None]).T)
+            device_density = xp.asarray(class_density)
             for rows, peak, exponentials, row_kernel in kernels[class_position]:
                 products = exponentials @ scaled
                 # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
                 lost = products < np.finfo(np.float64).tiny / _EPSILON
                 with np.errstate(divide="ignore"):
-                    normalizers = np.log(products) + peak[:, None] + density_peak[None, :]
+                    normalizers = np.log(products) + peak[:, None] + xp.asarray(density_peak)[None, :]
                 if np.any(lost):
                     row_index, step_index = np.nonzero(lost)
-                    normalizers[row_index, step_index] = _log_sum_exp(row_kernel[row_index] + class_density[step_index], axis=1)
-                total += normalizers.sum(axis=0)
+                    normalizers[row_index, step_index] = _log_sum_exp(row_kernel[row_index] + device_density[step_index], axis=1)
+                total += _host(normalizers.sum(axis=0))
             moving = moving_rows[class_position]
             for rows in _row_chunks(moving, prior.grid_size * count, working_bytes):
                 size = rows.shape[0] * count

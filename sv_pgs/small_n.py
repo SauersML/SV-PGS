@@ -42,6 +42,8 @@ import weakref
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable, Iterator, Sequence
 
+from types import ModuleType
+
 import numpy as np
 from scipy import linalg, sparse
 
@@ -52,6 +54,7 @@ from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
 from sv_pgs.scale_mixture_ep import (
+    device_scope,
     Cavity,
     FixedPoint,
     GaussianPosterior,
@@ -1668,6 +1671,7 @@ def fit_small_n(
     seed: int,
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "ep",
+    array_module: ModuleType | None = None,
 ) -> SmallNFit:
     """Fit one quantitative model on the dense training codes (n x records, store codes) with ``covariates`` (n x k,
     intercept first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of
@@ -1693,7 +1697,10 @@ def fit_small_n(
         oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes)
     tolerance = 0.5 / draw_count
     try:
-        (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
+        # The variant side's objective and moments on ``array_module`` (``scale_mixture_ep.device_scope``); the
+        # fixed points' dense sample-side algebra stays on the host.
+        with device_scope(array_module):
+            (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
     generator = np.random.default_rng(seed)
