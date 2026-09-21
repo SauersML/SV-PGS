@@ -108,6 +108,20 @@ def test_gblup_dual_prediction_equals_primal_ridge():
     assert np.max(np.abs(primal - dual)) <= condition * EPSILON * np.abs(primal).max() * genotypes.shape[1]
 
 
+def test_gblup_coefficients_decompose_its_score_column_by_column():
+    """The fit carries the primal coefficients, so one column's contribution to the score is effect (x - train mean):
+    the contract harness.sv_coefficients reads a linear predictor under, and what makes SV credit decomposable."""
+    genotypes, phenotype, _ = simulated(13, samples=80, variants=50)
+    predictor = baselines.gblup_reml(FakeTrain(genotypes, phenotype))
+    assert predictor.heritability > 0
+    effects = predictor.coefficients / predictor.scale
+    muted = genotypes.copy()
+    muted[:, 7] = genotypes[:, 7].mean()
+    contribution = predictor.predict(genotypes) - predictor.predict(muted)
+    expected = effects[7] * (genotypes[:, 7] - genotypes[:, 7].mean())
+    assert np.allclose(contribution, expected, rtol=0, atol=64 * EPSILON * max(np.abs(predictor.predict(genotypes)).max(), 1.0))
+
+
 def test_top_variant_picks_the_causal_variant():
     genotypes, phenotype, effects = simulated(4, causal=1)
     predictor = baselines.top_variant(FakeTrain(genotypes, phenotype))

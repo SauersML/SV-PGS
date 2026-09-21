@@ -77,23 +77,22 @@ def top_variant(train):
     return LinearPredictor(phenotype.mean() - genotypes[:, best].mean() * slope, coefficients)
 
 
-class GblupPredictor:
-    """The GLS fit: intercept + (x - center) / scale @ (standardized_train.T @ dual_weights), plus the covariate
-    effects when the caller passes the covariates (the harness does; predict_for_truth then removes the whole
-    covariate combination from the score, so they change no score of this benchmark)."""
+class GblupPredictor(LinearPredictor):
+    """The GLS fit: intercept + (x - center) / scale @ coefficients, plus the covariate effects when the caller
+    passes the covariates (the harness does; predict_for_truth then removes the whole covariate combination from the
+    score, so they change no score of this benchmark).
 
-    def __init__(self, standardized_train, dual_weights, fixed_effects, center, scale, heritability):
+    The dual weights are turned into those primal coefficients once, in the fit: the dual form recomputed
+    standardized_train.T @ dual_weights on every predict, and the harness predicts four times per fit (train and test,
+    full and SV-muted), each time multiplying the whole training matrix again and holding it alive until then."""
+
+    def __init__(self, coefficients, fixed_effects, center, scale, heritability):
+        super().__init__(fixed_effects[0], coefficients, center, scale)
         self.heritability = heritability
-        self.standardized_train = standardized_train
-        self.dual_weights = dual_weights
         self.fixed_effects = fixed_effects
-        self.intercept = float(fixed_effects[0])
-        self.center = center
-        self.scale = scale
 
     def predict(self, genotypes, covariates=None):
-        standardized = (np.asarray(genotypes, dtype=np.float64) - self.center) / self.scale
-        score = self.intercept + standardized @ (self.standardized_train.T @ self.dual_weights)
+        score = super().predict(genotypes)
         if covariates is None or len(self.fixed_effects) == 1:
             return score
         return score + np.asarray(covariates, dtype=np.float64) @ self.fixed_effects[1:]
@@ -141,13 +140,15 @@ def gblup_reml(train):
     if heritability == 0.0:
         return ZeroPredictor(phenotype.mean())
     variance = heritability * kernel + (1.0 - heritability) * np.eye(sample_count)
-    factor = np.linalg.cholesky(variance)
-    solve = lambda values: np.linalg.solve(factor.T, np.linalg.solve(factor, values))
-    inverse_design, inverse_phenotype = solve(design), solve(phenotype)
+    # One Cholesky and one triangular solve of the design and the phenotype together: cho_solve tells LAPACK the factor
+    # is triangular, which np.linalg.solve (an LU of a triangular matrix, twice) does not.
+    factor = linalg.cho_factor(variance, lower=True)
+    inverse = linalg.cho_solve(factor, np.column_stack([design, phenotype]))
+    inverse_design, inverse_phenotype = inverse[:, :-1], inverse[:, -1]
     # The generalized least squares fixed effects of the whole design, under the fitted covariance; lstsq because a
     # rank-deficient design has no unique solution, only a unique fit.
     fixed_effects, *_ = np.linalg.lstsq(design.T @ inverse_design, design.T @ inverse_phenotype, rcond=None)
     dual_weights = heritability * (inverse_phenotype - inverse_design @ fixed_effects)
-    return GblupPredictor(standardized, dual_weights, fixed_effects, center, scale * np.sqrt(variant_count), heritability)
+    return GblupPredictor(standardized.T @ dual_weights, fixed_effects, center, scale * np.sqrt(variant_count), heritability)
 
 
