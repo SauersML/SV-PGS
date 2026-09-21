@@ -3591,11 +3591,13 @@ def fit_hyperparameters(
     def plan(model: int) -> _OuterTrial | None:
         state = states[model]
         planned = weight_tolerances[model]
+        # A release is judged from a polished state (below), so an unpolished state's hyper step holds every edge:
+        # its release trials (three maximizations per block at the range's centre) would be discarded.
+        held = frozenset().union(*refused_releases[model])
+        if state is not None and not state.polished:
+            held = held | frozenset(int(position) for position in np.flatnonzero(hyperparameters[model].log_smoothing == np.inf))
         try:
-            step = hyper_step(
-                prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned,
-                held_edges=frozenset().union(*refused_releases[model]),
-            )
+            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held)
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
