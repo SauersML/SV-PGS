@@ -3512,12 +3512,19 @@ def fit_hyperparameters(
                 else:
                     pending[model] = inner(model, entry.step, entry.remaining, True)
                 continue
-            # An inner step at the state's weights.
+            # An inner step at the state's weights. A proposal below double precision's resolution of x cannot be told
+            # from the point it leaves: the decrements of both sit at their rounding, where the monotonicity test is a
+            # coin toss (a polish that accepted 3,000 such steps on the mean-field test problem), so it is never
+            # accepted, and x counts as at its maximum to double precision.
             newton, proposal = entry.newton, entry.proposal
             assert proposal is not None
+            length = float(np.linalg.norm(proposal))
+            resolved = length > _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin))))
             if trial_point is None:
                 accepted = False
                 unresolved[model] += 1
+            elif not resolved:
+                accepted = False
             else:
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
@@ -3526,7 +3533,6 @@ def fit_hyperparameters(
                     accepted = _metric_decrement(newton, gradient) < newton.decrement
                 else:
                     accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
-            length = float(np.linalg.norm(proposal))
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
@@ -3538,7 +3544,7 @@ def fit_hyperparameters(
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
             halvings[model] += 1
-            if length <= _HALF_PRECISION * (1.0 + float(np.max(np.abs(newton.origin)))):
+            if not resolved:
                 if entry.polishes and states[model] is not None:
                     # x is at its maximum at rho_k to double precision: the state is planned once more.
                     states[model] = replace(states[model], polished=True)
