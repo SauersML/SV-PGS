@@ -35,7 +35,7 @@ from sv_pgs.scale_mixture_ep import (
     _penalty_value,
     _restricted_prior,
     _smoothing_bounds,
-    _stationarity_check,
+    _stationarity,
     _total_curvature,
     cavities,
     class_log_density,
@@ -44,7 +44,7 @@ from sv_pgs.scale_mixture_ep import (
     kernel_floor,
     kernel_top,
     log_scale,
-    normal_means_posterior,
+    INDEPENDENT_EFFECTS,
     quadrature_majorant_ratio,
     scale_mixture_prior,
     site_targets,
@@ -551,7 +551,7 @@ def test_the_evidence_is_the_profiled_laplace_value_at_a_stationary_point(seed, 
     prior = _prior(generator, variant_count, nodes, nodes[0] - 1.0, nodes[-1], class_count=1 + seed % 2, annotated=True)
     cavity = _cavity(generator, kind, variant_count)
     log_smoothing = generator.uniform(-1.0, 2.0, len(prior.smoothing_blocks))
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     evidence = _evidence(prior, log_smoothing, initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     if evidence is None:
         pytest.skip("no certified maximum at these weights: the engine refuses V there, which is its contract")
@@ -592,7 +592,7 @@ def test_the_evidence_gradient_in_the_weights_matches_differences_of_v(seed, kin
     prior = _prior(generator, variant_count, nodes, nodes[0] - 1.0, nodes[-1], class_count=1 + seed % 2, annotated=True)
     cavity = _cavity(generator, kind, variant_count)
     log_smoothing = generator.uniform(-1.0, 2.0, len(prior.smoothing_blocks))
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     evidence = _evidence(prior, log_smoothing, initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     if evidence is None:
         pytest.skip("no certified maximum at these weights: the engine refuses V there, which is its contract")
@@ -684,7 +684,7 @@ def test_the_corrected_evidence_matches_the_exact_integral_over_the_penalized_di
     cavity = _cavity(generator, kind, variant_count)
     # Weights from near-singular B + S (small lambda over weak data) to a stiff penalty.
     log_smoothing = np.array([generator.uniform(-4.0, 2.0)])
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     laplace = _evidence(prior, log_smoothing, initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     if laplace is None:
         pytest.skip("no certified maximum at this weight")
@@ -792,7 +792,7 @@ def _laplace_path(prior, cavity, block: int, rhos: np.ndarray, start: np.ndarray
     """The Laplace V (tolerance 0: at the stationary point) along rho_block, the other weight at 0, each fit warm
     started from the previous one; with each value's rounding bound (dimension times eps times the condition number
     of B + S, relative)."""
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     values, roundings, point = [], [], start
     for rho in rhos:
         weights = np.zeros(len(prior.smoothing_blocks))
@@ -814,7 +814,7 @@ def test_the_infinity_edge_is_the_limit_of_the_evidence(seed, block):
     1/lambda there): Richardson's extrapolation from rho and rho + 2 lands on the edge's V to within its difference
     from the extrapolation one step earlier (whose remainder is e^4 times larger)."""
     prior, cavity = _edge_problem(seed)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     base = _evidence(prior, np.zeros(2), initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     assert base is not None
     upper = _smoothing_bounds(prior, _data_objective(prior, base.coefficients, cavity, _WORKING_BYTES))[block][1]
@@ -852,7 +852,7 @@ def test_every_interior_evidence_is_below_the_zero_edge(seed):
     terms <= 0 (B~ the profiled data curvature there). So V falls without bound toward rho = -infinity (slope
     r_i / 2) while V_0 stays above every interior value [sim-only]."""
     prior, cavity = _edge_problem(seed)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     base = _evidence(prior, np.zeros(2), initial_hyperparameters(prior).coefficients, cavity, posterior, _WORKING_BYTES, 0.0)
     assert base is not None
     lower, upper = _smoothing_bounds(prior, _data_objective(prior, base.coefficients, cavity, _WORKING_BYTES))[1]
@@ -872,24 +872,26 @@ def test_a_null_annotation_is_not_left_unpenalized(seed):
     prior, cavity = _edge_problem(seed, annotation_effect=0.0)
     start = initial_hyperparameters(prior)
     lowest = _smoothing_bounds(prior, _data_objective(prior, start.coefficients, cavity, _WORKING_BYTES))[1][0]
-    step = hyper_step(prior, start, cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    step = hyper_step(prior, start, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert step.hyperparameters.log_smoothing[1] > lowest, (step.hyperparameters.log_smoothing, lowest)
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("seed", (101, 202, pytest.param(303, marks=pytest.mark.xfail(strict=True, reason=(
-    "finding reported to e2e: s = (edf + penalty size) / 2 bounds |V''| from above, so 1/2 (|c| + E)^2 / s bounds the "
-    "Newton gain from below; here V rises 0.0645 nats within one unit of rho against a claimed 0.0245 [sim-only]"
+@pytest.mark.parametrize("seed", (101, 202, pytest.param(303, marks=pytest.mark.xfail(strict=False, reason=(
+    "finding reported to e2e against the earlier check: s = (edf + penalty size) / 2 bounded |V''| from above, so "
+    "1/2 (|c| + E)^2 / s bounded the Newton gain from below; there V rose 0.0645 nats within one unit of rho against "
+    "a claimed 0.0245 [sim-only]. The redesigned check (``_stationarity``: V's analytic gradient, forward-difference "
+    "curvature, the gain over the gradient's error box) is measured here on the same seed; not strict until it is."
 )))))
 def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
-    """The stationarity check's gain 1/2 sum (|c| + E)^2 / s is claimed to bound the gain a Newton step on the
-    weights could still find (``HyperStep.stationarity_gain``). At the interior ascent's stop (both weights finite:
+    """The stationarity check's remaining gain (``_Stationarity.gain``) is claimed to bound the gain a Newton step on
+    the weights could still find (``HyperStep.stationarity_gain``). At the interior ascent's stop (both weights finite:
     the edges are not what is tested here), scan each weight over a neighbourhood in rho (0.1, 0.3 and 1 either side:
     a Newton step's reach where V is flat in rho) and compare the best certified V with V there. Each V is certified to
-    the tolerance, so the gain may exceed the claimed bound by at most two tolerances. s bounds |V''| from above, so
-    1/2 c^2 / s is at most the Newton gain 1/2 c^2 / |V''|, not at least it: the scan measures by how much."""
+    the tolerance, so the gain may exceed the claimed bound by at most two tolerances. The check's curvature is a
+    forward difference of the Laplace gradient, not an upper bound on |V''|: the scan measures what the claim misses."""
     prior, cavity = _edge_problem(seed, annotation_effect=1.0)
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     flat = initial_hyperparameters(prior).coefficients
     start = _corrected(prior, np.zeros(2), _evidence(prior, np.zeros(2), flat, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE),
                        cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
@@ -900,10 +902,11 @@ def test_the_stationarity_certificate_bounds_the_gain_of_nearby_weights(seed):
     interior = (weights > lower) & (weights < upper)
     if not np.any(interior):
         pytest.skip("the ascent stopped at the resolvable range's bounds: no interior weight to check")
-    check, curvature, _steps, errors, better = _stationarity_check(prior, weights, evidence, interior, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
-    if better is not None:
+    stationarity = _stationarity(prior, weights, evidence, interior, cavity, posterior, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+    if stationarity.better is not None:
         pytest.skip("the check found a certifiably better side: the engine claims no stationarity here, so there is no claimed bound to cover")
-    claimed = 0.5 * float(np.sum(np.square(np.abs(check) + errors) / curvature))
+    check, curvature, errors = stationarity.gradient, stationarity.curvature, stationarity.error
+    claimed = float(stationarity.gain)
     gains = {}
     for position in np.flatnonzero(interior):
         for distance in (-1.0, -0.3, -0.1, 0.1, 0.3, 1.0):
@@ -1010,10 +1013,10 @@ def test_the_engines_functions_do_not_depend_on_the_variant_order(seed):
     assert abs(moved_value - objective.value) <= rounding
     mapping = prior.coefficient_map
     log_smoothing = np.zeros(len(prior.smoothing_blocks))
-    posterior = normal_means_posterior(cavity, _WORKING_BYTES)
+    posterior = INDEPENDENT_EFFECTS
     start = initial_hyperparameters(prior).coefficients
     evidence = _evidence(prior, log_smoothing, start, cavity, posterior, _WORKING_BYTES, 0.0)
-    moved_evidence = _evidence(moved_prior, log_smoothing, start, moved_cavity, normal_means_posterior(moved_cavity, _WORKING_BYTES), _WORKING_BYTES, 0.0)
+    moved_evidence = _evidence(moved_prior, log_smoothing, start, moved_cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, 0.0)
     if evidence is None or moved_evidence is None:
         assert evidence is None and moved_evidence is None, "V certified in one order and refused in the other"
         pytest.skip("no certified maximum at these weights in either order: the engine refuses V there")
@@ -1036,7 +1039,7 @@ def test_the_fit_does_not_depend_on_the_variant_order(seed):
     fits = []
     for variant_inputs in (inputs, _permuted(inputs, order)):
         prior, cavity = _invariance_prior(*variant_inputs[:3], nodes), variant_inputs[3]
-        step = hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE)
+        step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
         fits.append((step, tilted_moments(prior, step.hyperparameters, cavity, _WORKING_BYTES)))
     (first, first_moments), (second, second_moments) = fits
     divergence = _posterior_divergence(_restricted_moments(first_moments, order), second_moments)
@@ -1070,7 +1073,7 @@ def test_a_class_of_null_columns_reaches_the_other_classes_only_through_the_lear
     priors, cavities_, steps = [], [], []
     for variant_inputs in (base, extended):
         prior, cavity = _invariance_prior(*variant_inputs[:3], nodes), variant_inputs[3]
-        steps.append(hyper_step(prior, initial_hyperparameters(prior), cavity, normal_means_posterior(cavity, _WORKING_BYTES), _WORKING_BYTES, _EVIDENCE_TOLERANCE))
+        steps.append(hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE))
         priors.append(prior)
         cavities_.append(cavity)
     (base_prior, extended_prior), (base_step, extended_step) = priors, steps
