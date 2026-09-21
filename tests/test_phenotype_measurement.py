@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import warnings
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from sv_pgs.phenotype_measurement import (
     PieceTooLarge,
     OccasionModelFit,
     Occasions,
+    _Model,
     _density_prior,
     _log_modulus_bound,
     box_cox,
@@ -377,6 +379,17 @@ def _simulated(persons: int, level_variance: float, noise: float, seed: int, gro
     factor = np.where(generator.random(values.shape[0]) < 0.5, 10.0, 1.0 / 18.016)
     design = np.column_stack([np.ones_like(ages), ages - ages.mean()])
     return person_index, values, np.where(gross, np.round(values * factor, 1), values), design, gross
+
+
+def test_the_start_scales_the_deviations_of_the_repeated_occasions_only():
+    """A singleton's J / (J - 1) is a division by zero, warning over a value the start never uses."""
+    person_index, values, _gross, design, _mask = _simulated(60, 4.0, 1.0, 15)
+    assert np.any(np.bincount(person_index) == 1)
+    model = _Model(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        state = model.start()
+    assert np.all(np.isfinite(state.hyperparameters.coefficients))
 
 
 def test_the_fit_recovers_gaussian_data_within_sampling_error():

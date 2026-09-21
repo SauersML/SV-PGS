@@ -829,7 +829,9 @@ class _Model:
         nodes = np.arange(floor, extent + spacing, spacing)
         _check_lattice(nodes.shape[0], self.working_bytes)
         prior = _density_prior(nodes, top, occasions.values.shape[0])
-        scaled = np.square(deviations[repeated]) * (counts / (counts - 1.0))[occasions.person_index[repeated]]
+        # J / (J - 1) over the repeated occasions only: a singleton's J - 1 is 0, and it has no deviation to scale.
+        repeated_counts = counts[occasions.person_index[repeated]]
+        scaled = np.square(deviations[repeated]) * repeated_counts / (repeated_counts - 1.0)
         return _State(fixed_effects, level_variance, prior, _moment_hyperparameters(prior, scaled, spacing))
 
     def residuals(self, state: _State) -> F64Array:
