@@ -2685,6 +2685,7 @@ def _maximize_evidence(
     working_bytes: int,
     bounds: list[tuple[float, float]],
     tolerance: float,
+    held_edges: frozenset[int] = frozenset(),
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
@@ -2716,8 +2717,8 @@ def _maximize_evidence(
     start = first[1]
     best_corrected = -np.inf
     # Blocks released from their edge below, once each per search: a block the ascent then returns to its edge is
-    # not tried again.
-    released_once: set[int] = set()
+    # not tried again; ``held_edges`` (``hyper_step``) are never released.
+    released_once: set[int] = set(held_edges)
     while True:
         edges = infinite
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
@@ -2981,7 +2982,8 @@ def _stationarity(
 
 @_step_scoped
 def hyper_step(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
+    held_edges: frozenset[int] = frozenset(),
 ) -> HyperStep:
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
@@ -2997,6 +2999,11 @@ def hyper_step(
 
     The returned step's ``tighten`` re-checks its stationarity at the final weights with the bound tightened to a
     budget (``_stationarity``), with no new search.
+
+    ``held_edges`` are blocks the search leaves at their lambda = infinity edge: those the outer loop released on
+    this model's proposal and returned (``fit_hyperparameters``: x polished at the freed weights certified below
+    the state it left), so the local model's account of that interior was measured and refuted at its own fixed
+    point, which stands above what the model predicts here.
 
     The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
     ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
@@ -3020,7 +3027,7 @@ def hyper_step(
     )
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
-        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance
+        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges
     )
     final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
     final_view, final_allowed = _restricted_prior(prior, final_infinite)
@@ -3088,7 +3095,7 @@ def hyper_step(
         # pass and the loop ends.
         resumed_smoothing = log_smoothing.copy()
         resumed_smoothing[finite_final] = weights
-        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance)
+        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges)
         if resumed[2].value > evidence.value:
             log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
             final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
@@ -3450,7 +3457,8 @@ def fit_hyperparameters(
     # (the fixed point does not depend on the weights), and x then follows by inner steps at the freed weights; the
     # joint step stands where x's certified V at the freed weights, once polished, is above the state's it left by
     # more than the tolerance and both errors. ``anchors`` holds that state (and the step's predicted gain) until
-    # then, and ``refused_releases`` the edge sets a model was returned to, which its next steps do not free again.
+    # then, and ``refused_releases`` the blocks a model was returned from, which its next hyper steps hold at their
+    # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
     anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
@@ -3512,7 +3520,10 @@ def fit_hyperparameters(
         state = states[model]
         planned = weight_tolerances[model]
         try:
-            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned)
+            step = hyper_step(
+                prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned,
+                held_edges=frozenset().union(*refused_releases[model]),
+            )
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
@@ -3531,10 +3542,7 @@ def fit_hyperparameters(
         )
         if not released or entry.certifying:
             return entry
-        if released in refused_releases[model]:
-            # This release was taken and returned once: x polished at the freed weights below the state it left.
-            uncertified(model, entry, step, state.decrement)
-            return None
+        assert not (released & frozenset().union(*refused_releases[model]))
         # The joint step to a freed edge cannot be tested as one move: its x-part is the whole distance from the
         # edge's density to the interior's (|move| 43 on the mean-field test problem), where the path integral's
         # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the trial is
