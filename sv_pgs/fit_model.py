@@ -55,12 +55,18 @@ def certificate_parts(certificate: FitCertificate, model_count: int) -> Certific
 
     A per-model sequence of varying length (one entry per interior weight) is padded with NaN to the longest and
     stored with ``<name>_count``, the number of valid entries of each model, so a pad is never read as a value.
+
+    A term the fit did not record is None, which is refused here by name: an artifact says what the fit established,
+    so a missing term is never written as a number (a scalar-like None reached ``int(None)`` before) and never left
+    out in silence.
     """
     terms: dict[str, np.ndarray] = {}
     counts: dict[str, int] = {}
     refusals: tuple[str, ...] = ()
     for field in dataclasses.fields(certificate):
         value = getattr(certificate, field.name)
+        if value is None:
+            raise ValueError(f"certificate term {field.name!r} was not recorded by this fit; an artifact never invents one.")
         if isinstance(value, tuple) and all(isinstance(entry, str) for entry in value):
             refusals = value
         elif isinstance(value, tuple):

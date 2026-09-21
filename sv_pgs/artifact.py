@@ -41,6 +41,10 @@ MODEL_FORMAT = "svpgs-model v1"
 _METADATA = "model.json"
 _ARRAYS = "arrays.npz"
 _SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha")
+CERTIFICATE_STATUS = "outer_criterion_met"
+"""The certificate term every fit records (``full_data_fit.FitCertificate``): per model, whether the outer loop's own
+stopping criterion was met. It is not certification (M04), and a model whose certificate lacks it says nothing at all
+about how its fit ended, so it is not a model this package wrote."""
 
 
 @dataclass(frozen=True)
@@ -141,9 +145,15 @@ class FittedModel:
                 raise ValueError("each model's alpha must hold the intercept and one entry per covariate.")
             if np.any(model.alpha[1:][~adjusted] != 0.0):
                 raise ValueError("a model's alpha must be 0 on the covariates it did not adjust for.")
+        if CERTIFICATE_STATUS not in self.certificate:
+            raise ValueError(f"the certificate must carry {CERTIFICATE_STATUS!r}; a model that says nothing about its fit is not one.")
         for name, values in self.certificate.items():
-            if np.asarray(values).shape[:1] != (model_count,):
+            term = np.asarray(values)
+            if term.shape[:1] != (model_count,):
                 raise ValueError(f"certificate term {name!r} needs one entry per model.")
+            # A padded term carries NaN past each model's count, so only the kind is checked, never finiteness.
+            if term.dtype.kind not in "fiub":
+                raise ValueError(f"certificate term {name!r} must be a numeric or boolean array.")
 
     @property
     def trait_types(self) -> tuple[TraitType, ...]:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.artifact import (
+    CERTIFICATE_STATUS,
     FittedModel,
     Provenance,
     cohort_digest,
@@ -27,8 +29,11 @@ from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.fast_scoring import ScoringModel, posterior_predictive_probability
+from sv_pgs.fit_model import certificate_parts
+from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 from tests.test_dosage_store import _write_store
+from tests.test_fit_model import _certificate
 
 _SAMPLES = 40
 _VARIANTS = 30
@@ -71,7 +76,12 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
         hyperparameters=tuple(
             MixtureHyperparameters(coefficients=generator.normal(size=9), log_smoothing=generator.normal(size=3)) for _model in range(2)
         ),
-        certificate={"remaining_gain": np.array([0.01, 0.02]), "negative_sites": np.array([0, 3]), "outer_iterations": np.array([4, 6])},
+        certificate={
+            "remaining_gain": np.array([0.01, 0.02]),
+            "negative_sites": np.array([0, 3]),
+            "outer_iterations": np.array([4, 6]),
+            "outer_criterion_met": np.array([True, False]),
+        },
         fit_counts={"refreshes": 3, "passes": 41},
         refusals=("model 1: no damped EP pass keeps the full-data precision positive definite",),
         provenance=Provenance(
@@ -114,6 +124,31 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     assert sorted(loaded.certificate) == sorted(model.certificate)
     for name, values in model.certificate.items():
         np.testing.assert_array_equal(loaded.certificate[name], values)
+
+
+def test_a_model_needs_a_well_formed_certificate_with_its_fit_status(tmp_path: Path, store_root: Path) -> None:
+    """I12: the leading dimension alone let an empty mapping, a mapping without the fit's status, and an object array
+    all pass. The status term is the one ``full_data_fit.FitCertificate`` records for every route."""
+    model = _model(np.random.default_rng(9), store_root)
+    assert CERTIFICATE_STATUS in {field.name for field in dataclasses.fields(FitCertificate)}
+    with pytest.raises(ValueError, match=CERTIFICATE_STATUS):
+        replace(model, certificate={})
+    with pytest.raises(ValueError, match=CERTIFICATE_STATUS):
+        replace(model, certificate={name: values for name, values in model.certificate.items() if name != CERTIFICATE_STATUS})
+    with pytest.raises(ValueError, match="numeric or boolean"):
+        replace(model, certificate=model.certificate | {"remaining_gain": np.array(["a", "b"])})
+    # A padded per-model term keeps its NaN pads: only the kind is checked.
+    padded = replace(model, certificate=model.certificate | {"stationarity_steps": np.array([[0.5, np.nan], [0.25, 0.125]])})
+    save_model(tmp_path / "model", padded)
+    assert np.isnan(load_model(tmp_path / "model").certificate["stationarity_steps"][0, 1])
+
+
+def test_an_artifact_is_never_written_from_a_certificate_term_the_fit_did_not_record() -> None:
+    """I12: ``certified`` defaulted to None and reached ``int(None)``; a term a route leaves unrecorded is now named."""
+    certificate = _certificate(2, np.random.default_rng(11))
+    assert certificate_parts(certificate, 2).terms[CERTIFICATE_STATUS].shape == (2,)
+    with pytest.raises(ValueError, match=CERTIFICATE_STATUS):
+        certificate_parts(replace(certificate, **{CERTIFICATE_STATUS: None}), 2)
 
 
 def test_a_model_is_never_overwritten(tmp_path: Path, store_root: Path) -> None:
