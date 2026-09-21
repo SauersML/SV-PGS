@@ -1180,7 +1180,10 @@ def _maximize_coefficients(
     definite and the Newton step's predicted gain is below ``tolerance`` nats (the resolution the caller
     certifies, and at least the objective's rounding level); a saddle's negative curvature is followed by
     the trust-region step instead. It also stops when no step longer than half of double precision raises
-    the objective.
+    the objective, and when the model predicts no gain above the objective's rounding inside the radius: a
+    trial there compares two values at their rounding, and a gain at rounding is not a gain (on gene 1's release
+    trials, whose penalized directions carry a data curvature 1e-9 of the penalty's scale, the loop otherwise
+    accepts rounding-level gains and doubles its radius without end).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
     coefficients = np.array(start, dtype=np.float64, copy=True)
@@ -1200,6 +1203,8 @@ def _maximize_coefficients(
             return coefficients, objective
         step = _trust_region_step(-hessian, gradient, radius, spectrum)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
+        if predicted <= rounding:
+            return coefficients, objective
         candidate = coefficients + step
         candidate_value = (
             _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0] - _anchor_value(prior, candidate)[0]
@@ -1211,7 +1216,7 @@ def _maximize_coefficients(
             radius = 0.25 * step_norm
         elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
             radius = 2.0 * radius
-        if np.isfinite(candidate_value) and actual > 0.0:
+        if np.isfinite(candidate_value) and actual > rounding:
             coefficients = candidate
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
