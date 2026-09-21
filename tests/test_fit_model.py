@@ -245,12 +245,33 @@ def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_r
         (lambda cohort: {"log_variance_offset": np.zeros(_VARIANTS - 1)}, "log reliability"),
         (lambda cohort: {"log_variance_offset": np.full(_VARIANTS, 0.1)}, "log reliability"),
         (lambda cohort: {"log_variance_offset": np.full(_VARIANTS, np.nan)}, "log reliability"),
+        # Validated before conversion: a coercion that would silently change what the input means is refused.
+        (lambda cohort: {"training": cohort.training.astype(np.int64)}, "not a training flag"),
+        (lambda cohort: {"training": cohort.training.astype(np.float64)}, "not a training flag"),
+        (lambda cohort: {"store_columns": cohort.store_columns.astype(np.float64) + 0.5}, "1-D integer array"),
+        (lambda cohort: {"store_columns": cohort.store_columns[0]}, "1-D integer array"),
+        (lambda cohort: {"store_columns": cohort.store_columns.astype(str)}, "1-D integer array"),
+        (lambda cohort: {"covariates": cohort.covariates.astype(str)}, "covariates"),
+        (lambda cohort: {"covariates": cohort.covariates[:, 0]}, "covariates"),
+        (lambda cohort: {"targets": cohort.targets.astype(str)}, "targets and training"),
+        (lambda cohort: {"log_variance_offset": np.zeros(_VARIANTS).astype(str)}, "log reliability"),
+        # Refused before Stage 0 reads the store, not after the fit.
+        (lambda cohort: {"model_names": (cohort.model_names[0], *cohort.model_names[1:-1], cohort.model_names[0])}, "distinct model names"),
+        (lambda cohort: {"training": np.column_stack([np.zeros(_COHORT, bool), cohort.training[:, 1:]])}, "no training rows"),
     ],
 )
 def test_fit_refuses_a_cohort_that_does_not_line_up(tmp_path: Path, store_root: Path, driver: _StubDriver, change: Any, message: str) -> None:
     cohort = _cohort(np.random.default_rng(4))
     with pytest.raises(ValueError, match=message):
         _request(store_root, cohort.arguments() | change(cohort), tmp_path, 5)
+    assert driver.calls == []
+
+
+def test_fit_refuses_a_seed_that_is_not_an_integer(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    """A float seed would be truncated by the conversion, so a different run would be reported as the same one."""
+    cohort = _cohort(np.random.default_rng(4))
+    with pytest.raises(ValueError, match="seed must be an integer"):
+        _request(store_root, cohort.arguments(), tmp_path, 5.5)  # type: ignore[arg-type]
     assert driver.calls == []
 
 

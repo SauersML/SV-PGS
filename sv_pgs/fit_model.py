@@ -112,35 +112,64 @@ class FitRequest:
     seed: int
 
     def __post_init__(self) -> None:
+        """Check every field's rank, kind, values and agreement, and only then convert.
+
+        Nothing is converted before it is checked, so an input never changes meaning on the way in: a float array of
+        store columns or a seed is refused rather than truncated, a mask of codes is refused rather than read as
+        "train on every nonzero row", and a wrong rank is named rather than raising where a shape is indexed.
+        """
         set_field = object.__setattr__
         set_field(self, "covariate_names", tuple(str(name) for name in self.covariate_names))
         set_field(self, "model_names", tuple(str(name) for name in self.model_names))
         set_field(self, "trait_types", tuple(self.trait_types))
         set_field(self, "research_ids", tuple(str(research_id) for research_id in self.research_ids))
         set_field(self, "work_dir", Path(self.work_dir))
+        if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
+            raise ValueError("seed must be an integer.")
         set_field(self, "seed", int(self.seed))
-        columns = np.asarray(self.store_columns, dtype=np.int64)
-        covariate_matrix = np.asarray(self.covariates, dtype=np.float64)
-        target_matrix = np.asarray(self.targets, dtype=np.float64)
-        training_mask = np.asarray(self.training, dtype=bool)
-        adjusted = np.asarray(self.covariate_columns)
-        row_count, model_count = columns.shape[0], len(self.model_names)
-        if columns.ndim != 1 or np.unique(columns).shape[0] != row_count or np.any(columns < 0) or np.any(columns >= self.store.n_samples):
+        model_count = len(self.model_names)
+        if model_count == 0 or len(set(self.model_names)) != model_count:
+            raise ValueError("a fit needs at least one model, with distinct model names.")
+        columns = np.asarray(self.store_columns)
+        if columns.ndim != 1 or columns.dtype.kind not in "iu":
+            raise ValueError("store_columns must be a 1-D integer array of distinct store samples.")
+        columns = columns.astype(np.int64)
+        row_count = columns.shape[0]
+        if np.unique(columns).shape[0] != row_count or np.any(columns < 0) or np.any(columns >= self.store.n_samples):
             raise ValueError("store_columns must name distinct store samples.")
         if len(self.research_ids) != row_count or len(set(self.research_ids)) != row_count:
             raise ValueError("research_ids needs one distinct id per cohort row.")
+        covariate_matrix = np.asarray(self.covariates)
+        if covariate_matrix.ndim != 2 or covariate_matrix.dtype.kind not in "fiu":
+            raise ValueError("covariates must be finite [cohort rows, named covariates].")
+        covariate_matrix = covariate_matrix.astype(np.float64)
         if covariate_matrix.shape != (row_count, len(self.covariate_names)) or not np.all(np.isfinite(covariate_matrix)):
             raise ValueError("covariates must be finite [cohort rows, named covariates].")
+        adjusted = np.asarray(self.covariate_columns)
         if adjusted.shape != (model_count, len(self.covariate_names)) or adjusted.dtype != np.bool_:
             raise ValueError("covariate_columns must be bool [models, named covariates].")
+        training_mask = np.asarray(self.training)
+        if training_mask.dtype != np.bool_:
+            raise ValueError("training must be a bool mask; a count or a code is not a training flag.")
+        target_matrix = np.asarray(self.targets)
+        if target_matrix.ndim != 2 or target_matrix.dtype.kind not in "fiu":
+            raise ValueError("targets and training must be [cohort rows, models].")
+        target_matrix = target_matrix.astype(np.float64)
         if target_matrix.shape != (row_count, model_count) or training_mask.shape != target_matrix.shape:
             raise ValueError("targets and training must be [cohort rows, models].")
         if len(self.trait_types) != model_count:
             raise ValueError("trait_types needs one entry per model.")
+        # Before Stage 0 reads the store: a model with no training row has nothing to fit and nothing to predict.
+        untrained = [name for name, count in zip(self.model_names, training_mask.sum(axis=0)) if count == 0]
+        if untrained:
+            raise ValueError(f"models {untrained} have no training rows.")
         if not np.all(np.isfinite(target_matrix[training_mask])):
             raise ValueError("every training target must be finite.")
         if self.log_variance_offset is not None:
-            offset = np.asarray(self.log_variance_offset, dtype=np.float64)
+            offset = np.asarray(self.log_variance_offset)
+            if offset.ndim != 1 or offset.dtype.kind not in "fiu":
+                raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
+            offset = offset.astype(np.float64)
             if offset.shape != (self.store.n_variants,) or np.any(np.isnan(offset)) or np.any(offset > 0.0):
                 raise ValueError("log_variance_offset must be a log reliability <= 0 for every store record.")
             set_field(self, "log_variance_offset", offset)
