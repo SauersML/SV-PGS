@@ -3537,17 +3537,11 @@ def fit_hyperparameters(
             return None
         # The joint step to a freed edge cannot be tested as one move: its x-part is the whole distance from the
         # edge's density to the interior's (|move| 43 on the mean-field test problem), where the path integral's
-        # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the weights move
-        # first, at x_k and its fixed point, and x follows by inner steps at the freed weights, each accepted on the
-        # model as always; the certified V once x is polished there decides the release (``anchors``).
-        moved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients, log_smoothing=step.hyperparameters.log_smoothing)
-        moved_state = _outer_state(prior, moved, points[model], corrections[model], working_bytes, tolerance)
-        if moved_state is None:
-            return entry
+        # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the trial is
+        # taken at its own fixed point without a gain test, x is polished there by inner steps (accepted on the
+        # model as always), and the polished certified V against the state's here decides the release (``anchors``).
         anchors[model] = (hyperparameters[model], points[model], corrections[model], state, predicted)
-        hyperparameters[model], states[model] = moved, moved_state
-        radii[model] = None
-        return inner(model, step, remaining, True)
+        return entry
 
     def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
         fits[model] = OuterFit(
@@ -3590,6 +3584,25 @@ def fit_hyperparameters(
                         continue
                 halvings[model] += 1
                 pending[model] = inner(model, entry.step, entry.remaining, False)
+                continue
+            if entry.newton is None and anchors[model] is not None:
+                # A release in flight: the trial stands provisionally at its own fixed point, and x polishes there.
+                assert entry.step is not None
+                if trial_point is None:
+                    unresolved[model] += 1
+                    anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, _predicted = anchors[model]
+                    refused_releases[model].add(frozenset(
+                        int(position) for position in np.flatnonzero(np.isfinite(trial.log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
+                    ))
+                    hyperparameters[model], points[model], corrections[model] = anchor_hyperparameters, anchor_point, anchor_correction
+                    states[model] = replace(anchor_state, polished=True)
+                    anchors[model], radii[model], pending[model] = None, None, None
+                    continue
+                trial_correction, trial_state = solve_state(trial, trial_point)
+                hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
+                displaced[model], radii[model] = False, None
+                iterations[model] += 1
+                pending[model] = inner(model, entry.step, entry.remaining, True)
                 continue
             if entry.newton is None:
                 # The joint trial.
