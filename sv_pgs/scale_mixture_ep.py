@@ -103,6 +103,7 @@ from __future__ import annotations
 import contextvars
 import functools
 import hashlib
+import weakref
 from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Callable, Iterator, Sequence
@@ -2128,10 +2129,13 @@ def _repeated(name: str, cavity: Cavity, inputs: tuple[object, ...], compute: Ca
     # halved joint trials' own), and a single-cavity memo forgot the state's repeats each time (gene 1 [real]: the
     # certifying replan repeated the polished state's five release trials, 10 s of 40).
     repeats = cache.setdefault("repeats", {}).setdefault(_digest(cavity.precision, cavity.shift), {})
-    if held is not None and repeats.get(("held", name)) is not held:
+    holder = repeats.get(("held", name))
+    if held is not None and (holder is None or holder() is not held):
+        # Held by a weak reference: the memo neither keeps a correction's solved directions alive (p x K arrays)
+        # nor can mistake a new object at a freed one's address for it.
         for key in [key for key in repeats if isinstance(key, tuple) and key[0] == name]:
             del repeats[key]
-        repeats[("held", name)] = held
+        repeats[("held", name)] = weakref.ref(held)
     key = (name, _digest(*inputs))
     if key not in repeats:
         repeats[key] = compute()
