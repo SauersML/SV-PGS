@@ -1739,6 +1739,14 @@ def fit_small_n(
         "outer_iterations": int(outer.iterations),
         "start_heritability": float(moment.heritability),
         "start_resolution": float(moment.resolution),
+        # The certificate's decisive numbers, so every recorded fit says whether and how it certified.
+        "certified": bool(outer.certified and outer.remaining_gain <= tolerance and outer.prediction_move <= outer.prediction_tolerance),
+        "remaining_gain": float(outer.remaining_gain),
+        "prediction_move": float(outer.prediction_move),
+        "prediction_tolerance": float(outer.prediction_tolerance),
+        "halvings": int(outer.halvings),
+        "unresolved": int(outer.unresolved),
+        "final_log_smoothing": [float(value) for value in np.atleast_1d(outer.hyperparameters.log_smoothing)],
     }
     return SmallNFit(
         scoring=scoring, noise_variance=float(oracle.noise), hyperparameters=outer.hyperparameters, certificate=certificate, prior=prior,
