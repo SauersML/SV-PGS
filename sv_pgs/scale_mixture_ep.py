@@ -3551,6 +3551,7 @@ def fit_hyperparameters(
                         pending[model] = None
                         continue
                 gain = -np.inf
+                previous_remainder = remainders[model]
                 if trial_point is None:
                     # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                     unresolved[model] += 1
@@ -3577,6 +3578,13 @@ def fit_hyperparameters(
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
                     # more, with the weights searched to what their share asks.
+                    pending[model] = None
+                elif state.polished and remainders[model] < previous_remainder:
+                    # This whole trial re-measured the model's remainder below the one the plan's certificate carried
+                    # (on the mean-field test problem the first whole trial, from the uncertified start, left 0.106
+                    # nats of remainder that the polished state's own zero-length trial measured at 1e-6): the
+                    # certificate is read again with the fresh remainder. A remainder that did not fall leaves the
+                    # certificate as it was, so this replans at most once per measured decrease.
                     pending[model] = None
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
