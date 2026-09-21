@@ -3431,7 +3431,7 @@ def fit_hyperparameters(
         pieces = (state.error, step.evidence_error, step.stationarity_gain)
         resolvable = float(sum(pieces))
         remaining = predicted + fixed + resolvable
-        if not (predicted + fixed < tolerance < remaining) or resolvable <= 0.0:
+        if not (predicted + fixed < tolerance < remaining) or not 0.0 < resolvable < np.inf:
             return state, step, predicted, remaining
         theta = (tolerance - predicted - fixed) / resolvable
         if state.error > 0.0:
