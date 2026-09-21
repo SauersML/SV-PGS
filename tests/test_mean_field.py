@@ -3,17 +3,21 @@ of the engine's own components, each sweep raises the exact ELBO, the fixed poin
 its linear response matches finite differences of the fixed point, and the whole fit certifies and scores.
 Synthetic data only: machinery checks, never accuracy evidence."""
 
+import tracemalloc
+
 import numpy as np
 import pytest
 
 from sv_pgs.config import VariantClass
-from sv_pgs.mean_field import MeanFieldFixedPoints, _Response
+from sv_pgs.mean_field import MeanFieldFixedPoints, _Response, _sample_nodes
 from sv_pgs.scale_mixture_ep import (
     _components,
     class_log_density,
+    derived_lattice,
     initial_hyperparameters,
     log_scale,
     noise_gain,
+    scale_mixture_prior,
     tilted_moments,
 )
 from sv_pgs.small_n import dense_statistics, fit_small_n, small_n_prior, small_n_start
@@ -315,3 +319,79 @@ def test_a_column_in_the_covariate_span_has_a_nonnegative_square():
     design = _Design(np.full((samples, 1), 127.0), basis)
     # eps^2 of the column's own square, n terms: the projected column's entries are rounding-sized.
     assert 0.0 <= design.squares[0] <= (np.finfo(np.float64).eps * samples) ** 2 * samples * 127.0 ** 2
+
+
+def test_the_node_sampler_is_the_inverse_cdf_of_the_responsibilities():
+    """P03: ``_sample_nodes`` returns, per row and draw, the number of that row's cumulative responsibilities strictly
+    below the draw's uniform, capped at the last node -- exactly what the (rows x nodes x draws) boolean counted --
+    and its node frequencies are the responsibilities."""
+    rng = np.random.default_rng(5)
+    weights = rng.random((7, 11))
+    responsibility = weights / weights.sum(axis=1, keepdims=True)
+    uniform = rng.random((7, 100_000))
+    nodes = np.empty(uniform.shape, dtype=np.int64)
+    _sample_nodes(responsibility, uniform, nodes)
+    cumulative = np.cumsum(responsibility, axis=1)
+    np.testing.assert_array_equal(
+        nodes, np.minimum(np.sum(cumulative[:, :, None] < uniform[:, None, :], axis=1), responsibility.shape[1] - 1)
+    )
+    frequency = np.stack([np.bincount(row, minlength=responsibility.shape[1]) for row in nodes]) / uniform.shape[1]
+    # Five standard errors of a binomial frequency, at its widest: 77 cells, so no seed of this size fails by chance.
+    assert np.max(np.abs(frequency - responsibility)) <= 5.0 * np.sqrt(0.25 / uniform.shape[1])
+
+
+def test_the_draws_are_one_law_however_the_budget_splits_them():
+    """P03: ``working_bytes`` sets how many rows a piece of ``draws`` holds, and the smallest budget takes one row per
+    piece. A piece boundary changes which value of the generator's stream lands where, so the two runs are NOT
+    bit-for-bit equal; what must hold is that both are draws of q. Checked on each member's first two moments."""
+    _statistics, prior, start, oracle = _oracle(13)
+    (point,) = oracle([start])
+    assert point is not None
+    count = 20_000
+    whole = oracle.draws(start, np.random.default_rng(2), count)
+    oracle.working_bytes = 1  # every piece is one row
+    pieces = oracle.draws(start, np.random.default_rng(2), count)
+    assert whole.shape == pieces.shape == (prior.variant_count, count)
+    assert not np.array_equal(whole, pieces)
+    for values in (whole, pieces):
+        assert np.all(np.isfinite(values))
+        error = 5.0 * np.sqrt(oracle.variance / count) + 1e-12
+        assert np.all(np.abs(values.mean(axis=1) - oracle.mean) <= error + 1e-6 * np.abs(oracle.mean))
+        assert np.all(np.abs(values.var(axis=1) - oracle.variance) <= 0.2 * oracle.variance + 1e-12)
+
+
+def test_the_draws_stay_inside_their_working_budget():
+    """P03: a draw's working memory is the pieces' budget, not (rows x nodes x draws). On a case whose old boolean
+    tensor alone was 24 times the budget, the peak beyond the returned array stays inside ``working_bytes``."""
+    samples, variants, count, budget = 60, 2_000, 64, 1 << 20
+    rng = np.random.default_rng(31)
+    dosage = rng.binomial(2, rng.uniform(0.05, 0.5, variants), size=(samples, variants))
+    codes = (dosage * 127).astype(np.uint8)
+    covariates = np.column_stack([np.ones(samples), rng.standard_normal(samples)])
+    target = dosage[:, :10] @ rng.standard_normal(10) * 0.1 + rng.standard_normal(samples)
+    statistics = dense_statistics(codes, covariates, target)
+    members = statistics.active_rows
+    offsets = np.zeros(members.shape[0])
+    residual = statistics.projected_target
+    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
+    nodes, floor, top = derived_lattice(
+        statistics.design.column_squares() / start_noise, statistics.design.back(statistics.target) / start_noise,
+        offsets, 0.5 / count,
+    )
+    prior = scale_mixture_prior(
+        class_index=np.zeros(members.shape[0], dtype=np.int64), log_variance_offset=offsets,
+        annotation_design=np.zeros((members.shape[0], 0)), annotation_groups=(), nodes=np.linspace(float(nodes[0]), float(nodes[-1]), 200),
+        floor=floor, top=top,
+    )
+    hyperparameters = initial_hyperparameters(prior, 0.01)
+    oracle = MeanFieldFixedPoints(statistics, prior, start_noise, count, budget)
+    oracle._sweep(hyperparameters)
+    # One byte per entry of the boolean the old body formed per class, against the budget it was outside of.
+    assert prior.variant_count * prior.grid_size * count >= 24 * budget
+    oracle.draws(hyperparameters, np.random.default_rng(3), count)  # the sampler's compilation is not the measurement
+    tracemalloc.start()
+    values = oracle.draws(hyperparameters, np.random.default_rng(3), count)
+    _current, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert values.shape == (prior.variant_count, count) and np.all(np.isfinite(values))
+    assert peak <= values.nbytes + budget

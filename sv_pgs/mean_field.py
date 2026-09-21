@@ -82,6 +82,7 @@ from sv_pgs.scale_mixture_ep import (
     ScaleMixturePrior,
     _components,
     _data_value,
+    _row_chunks,
     class_log_density,
     log_scale,
     noise_gain,
@@ -171,6 +172,32 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
     for sample in range(sample_count):
         residual_square += residual[sample] * residual[sample]
     return divergence, weighted_variance, residual_square, sizes
+
+
+@numba.njit(cache=True)
+def _sample_nodes(responsibility, uniform, nodes):
+    """``nodes[j, k]`` is the number of row j's cumulative responsibilities strictly below ``uniform[j, k]``, capped at
+    the last node: the inverse CDF of the row's node law (``MeanFieldFixedPoints.draws``), by bisection. One row's
+    cumulative sums live at a time, so nothing of the size (rows x nodes x draws) is formed."""
+    row_count, node_count = responsibility.shape
+    draw_count = uniform.shape[1]
+    cumulative = np.empty(node_count)
+    for row in range(row_count):
+        total = 0.0
+        for node in range(node_count):
+            total += responsibility[row, node]
+            cumulative[node] = total
+        for draw in range(draw_count):
+            value = uniform[row, draw]
+            low = 0
+            high = node_count
+            while low < high:
+                middle = (low + high) // 2
+                if cumulative[middle] < value:
+                    low = middle + 1
+                else:
+                    high = middle
+            nodes[row, draw] = min(low, node_count - 1)
 
 
 class _Response:
@@ -554,21 +581,29 @@ class MeanFieldFixedPoints:
         )
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:
-        """(p x K) draws from q itself: each member's node from its responsibilities at its pseudo-likelihood, then its
-        conditional normal N(h c_k, c_k) (``scale_mixture_ep._components``)."""
+        """(p x K) draws from q itself, member by member: each member's node from its responsibilities at its
+        pseudo-likelihood, then its conditional normal N(h c_k, c_k) (``scale_mixture_ep._components``).
+
+        The rows are taken in pieces whose per-row intermediates fit ``working_bytes``
+        (``scale_mixture_ep._row_chunks``): the widest of them are the kernel's node-wide forms and the sampler's
+        draw-wide arrays, so the width to budget is their sum. ``_sample_nodes`` samples by inverse CDF inside a
+        piece, so nothing of the size (rows x nodes x draws) is ever formed. A piece boundary moves which value of
+        the generator's stream lands where, so the law is preserved and the numbers are not."""
         prior = self.prior
+        count = int(draw_count)
         log_density = class_log_density(prior, hyperparameters.coefficients)
         scales = log_scale(prior, hyperparameters.coefficients)
         omega = self.member_squares / self.noise
-        draws = np.empty((prior.variant_count, int(draw_count)))
+        draws = np.empty((prior.variant_count, count))
         for class_position in range(log_density.shape[0]):
             rows = np.flatnonzero(self.class_index == class_position)
             if rows.size == 0:
                 continue
-            terms = _components(log_density[class_position], scales[rows], prior.log_variance_grid, omega[rows], self.shift[rows])
-            cumulative = np.cumsum(terms.responsibility, axis=1)
-            uniform = generator.random((rows.shape[0], int(draw_count)))
-            nodes = np.minimum(np.sum(cumulative[:, :, None] < uniform[:, None, :], axis=1), prior.grid_size - 1)
-            conditional = np.take_along_axis(terms.conditional_variance, nodes, axis=1)
-            draws[rows] = self.shift[rows][:, None] * conditional + np.sqrt(conditional) * generator.standard_normal(conditional.shape)
+            for piece in _row_chunks(rows, prior.grid_size + count, self.working_bytes):
+                terms = _components(log_density[class_position], scales[piece], prior.log_variance_grid, omega[piece], self.shift[piece])
+                uniform = generator.random((piece.shape[0], count))
+                nodes = np.empty((piece.shape[0], count), dtype=np.int64)
+                _sample_nodes(np.ascontiguousarray(terms.responsibility), uniform, nodes)
+                conditional = np.take_along_axis(terms.conditional_variance, nodes, axis=1)
+                draws[piece] = self.shift[piece][:, None] * conditional + np.sqrt(conditional) * generator.standard_normal(conditional.shape)
         return draws
