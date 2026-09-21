@@ -56,6 +56,23 @@ def _dense_operator(genotypes, covariates, weights, variances, model):
     return _dense(genotypes, covariates, weights, variances, model)[3]
 
 
+def test_cuda_exact_marginals_match_the_host() -> None:
+    from tests.test_dual_solve import _gaussian_problem
+
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(82)
+    outputs = []
+    for array_module in (np, cupy):
+        source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
+        gaussian = dual_solve.DualGaussian(
+            source=source, training=array_module.asarray(training), targets=array_module.asarray(response), offsets=array_module.asarray(offsets),
+            covariates=array_module.asarray(covariates), grams=_grams(bounds, True), probe_count=2, seed=14,
+        )
+        gaussian.iterate(site_precision=array_module.asarray(precision), site_shift=array_module.asarray(shift), noise_variance=noise,
+                         error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+        outputs.append(gaussian.exact_marginals(0, gaussian.kernel_factor(0)))
+    np.testing.assert_allclose(outputs[1], outputs[0], rtol=genotypes.shape[0] * np.sqrt(EPS), atol=0.0)
+
+
 def test_cuda_dual_gaussian_matches_the_host() -> None:
     from tests.test_dual_solve import _gaussian_problem
 
@@ -104,3 +121,26 @@ def test_cuda_posterior_and_information_solves_match_the_host() -> None:
         scale = max(float(np.abs(host).max()), np.finfo(np.float64).tiny)
         # Both runs are certified to sqrt(eps); their difference is at most twice that, times the conditioning seen.
         assert float(np.abs(host - device).max()) <= np.sqrt(EPS) * scale * genotypes.shape[0]
+
+
+def test_cuda_rank_losing_covariates_and_tied_spikes_match_the_host() -> None:
+    from tests.test_dual_solve import _rank_losing_problem
+
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _rank_losing_problem(33)
+    results = []
+    for array_module in (np, cupy):
+        source = dual_solve.DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
+        models = dual_solve.DualModels(array_module.asarray(weights), array_module.asarray(variances), array_module.asarray(covariates), array_module)
+        right = dual_solve.mean_right_hand_side(models, array_module.asarray(response), array_module.asarray(genotypes @ prior_mean))
+        count = dual_solve.PassCount()
+        deflation, resolved = dual_solve.spike_deflation(source, models, count)
+        assert resolved[1] >= 2
+        host_right = np.asarray(right.get() if hasattr(right, "get") else right)
+        assert np.all(np.isfinite(host_right))
+        bound = array_module.asarray(_solve_bound(host_right))
+        result = dual_solve.certified_block_cg(source, models, right, array_module.zeros_like(right), array_module.arange(MODEL_COUNT), bound, count, deflation=deflation)
+        solution = np.asarray(result.solution.get() if hasattr(result.solution, "get") else result.solution)
+        assert np.all(np.isfinite(solution))
+        results.append((solution, np.asarray(bound.get() if hasattr(bound, "get") else bound)))
+    (host, host_bound), (device, _device_bound) = results
+    assert np.all(np.linalg.norm(host - device, axis=0) <= 2.0 * host_bound * (1.0 + genotypes.shape[0] * EPS))

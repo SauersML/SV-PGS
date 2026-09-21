@@ -2,6 +2,11 @@
 the evidence, and gross errors. The simulations check the algebra ([sim-only])."""
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 from scipy import integrate
@@ -9,7 +14,10 @@ from scipy.special import logsumexp
 from scipy.stats import multivariate_normal, norm
 
 from sv_pgs.phenotype_measurement import (
+    LatticeTooLarge,
     LevelGrid,
+    PieceTooLarge,
+    OccasionModelFit,
     Occasions,
     _density_prior,
     _log_modulus_bound,
@@ -234,6 +242,128 @@ def test_louis_information_is_the_curvature_of_the_exact_log_likelihood():
     np.testing.assert_array_less(np.abs(-louis - fine), estimate + 2.0 * rounding_gamma(16) * np.abs(louis))
 
 
+def test_the_split_information_is_the_curvature_of_the_exact_log_likelihood():
+    # Louis' 2 x 2 information for (log tau^2, a), a scaling every noise variance by e^a, against central
+    # differences of one fixed trapezoid rule (a finite mixture, for which Louis' identity is exact).
+    generator = np.random.default_rng(12)
+    residuals = generator.normal(0.0, 2.0, (40, 1)) + generator.normal(0.0, 1.0, (40, 3))
+    prior = _lattice(0.05, 400.0, 12, 120)
+    hyperparameters = _density(prior, {_node(prior, 1.0): 0.8, _node(prior, 4.0): 0.15, _node(prior, 100.0): 0.05})
+    log_masses = class_log_density(prior, hyperparameters.coefficients)[0]
+    variances = np.exp(prior.log_variance_grid)
+    tolerance, level_variance = person_tolerance(40), 4.0
+    first = level_posterior(residuals, level_variance, log_masses, variances, tolerance, None, True, WORKING_BYTES)
+    grid = first.grid
+    fixed = LevelGrid(0.5 * first.admissible_step, first.level_mean, 2.0 * grid.lower_reach, 2.0 * grid.upper_reach, grid.half_width)
+    posterior = level_posterior(residuals, level_variance, log_masses, variances, tolerance, fixed, True, WORKING_BYTES)
+
+    def log_likelihood(shift: np.ndarray) -> float:
+        return float(level_posterior(residuals, level_variance * np.exp(shift[0]), log_masses, variances * np.exp(shift[1]), tolerance, fixed,
+                                     False, WORKING_BYTES).log_likelihood.sum())
+
+    def central(step: float) -> np.ndarray:
+        hessian = np.empty((2, 2))
+        for row in range(2):
+            for column in range(2):
+                shift_row, shift_column = np.eye(2)[row] * step, np.eye(2)[column] * step
+                hessian[row, column] = (
+                    log_likelihood(shift_row + shift_column) - log_likelihood(shift_row - shift_column)
+                    - log_likelihood(-shift_row + shift_column) + log_likelihood(-shift_row - shift_column)
+                ) / (4.0 * step * step)
+        return hessian
+
+    step = float(np.finfo(np.float64).eps ** 0.25)
+    coarse, fine = central(step), central(0.5 * step)
+    rounding = rounding_gamma(4 * (prior.grid_size + residuals.shape[1])) * float(np.abs(posterior.log_likelihood).sum())
+    estimate = 4.0 / 3.0 * np.abs(coarse - fine) + 4.0 * rounding / (4.0 * (0.5 * step) ** 2)
+    np.testing.assert_array_less(np.abs(-posterior.split_information - fine), estimate + 2.0 * rounding_gamma(16) * np.abs(posterior.split_information))
+
+
+def test_the_split_certificate_needs_a_positive_definite_margin_above_rounding():
+    base = dict(exponent=1.0, fixed_effects=np.zeros(1), level_variance=1.0, prior=None, hyperparameters=None, level_mean=np.zeros(1),
+                level_posterior_variance=np.zeros(1), log_likelihood=0.0, log_evidence=0.0)
+    certified = OccasionModelFit(**base, split_information=np.array([[2.0, 1.0], [1.0, 2.0]]), split_magnitude=np.full((2, 2), 4.0), split_operations=1000)
+    singular = OccasionModelFit(**base, split_information=np.array([[1.0, 1.0], [1.0, 1.0]]), split_magnitude=np.full((2, 2), 4.0), split_operations=1000)
+    # The smallest eigenvalue, 1e-14, is below the entries' rounding bound gamma_(10^6) * 8, about 9e-10.
+    marginal = OccasionModelFit(**base, split_information=np.array([[1.0, 1.0], [1.0, 1.0 + 2e-14]]), split_magnitude=np.full((2, 2), 4.0), split_operations=10**6)
+    assert certified.split_identified
+    assert not singular.split_identified
+    assert not marginal.split_identified
+
+
+def test_a_lattice_past_the_memory_budget_raises_instead_of_allocating():
+    person_index, values, _gross_values, design, _gross = _simulated(60, 4.0, 1.0, seed=15)
+    # Four kibibytes cannot hold the noise lattice's matrices, however few its nodes.
+    with pytest.raises(LatticeTooLarge):
+        fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, 1 << 12)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS caps the address space on Linux")
+def test_the_profile_fit_stays_within_its_memory_budget():
+    # The Box-Cox profile fit in a process whose address space is capped at what it maps after its imports plus
+    # three working budgets. The E-step's pieces and the lattice's matrices each stay within one budget, and the
+    # third covers the rest at this size. So an allocation past the plan fails the test as a MemoryError. The
+    # data are the MCV-like occasions whose profile once reached an exponent needing a 19.5 GiB lattice.
+    script = textwrap.dedent("""
+        import resource
+        import numpy as np
+        from sv_pgs.phenotype_measurement import Occasions, fit_occasion_model
+        budget = 1 << 27
+        with open("/proc/self/status") as status:
+            mapped = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
+        resource.setrlimit(resource.RLIMIT_AS, (mapped + 3 * budget, mapped + 3 * budget))
+        generator = np.random.default_rng(7)
+        counts = generator.integers(1, 7, 150)
+        person_index = np.repeat(np.arange(150), counts)
+        ages = generator.uniform(25.0, 80.0, person_index.shape[0])
+        levels = generator.normal(0.0, 1.0, 150)
+        values = np.round(90.0 + 0.03 * (ages - 50.0) + levels[person_index] + generator.normal(0.0, np.sqrt(2.0), person_index.shape[0]), 1)
+        design = np.column_stack([np.ones_like(ages), ages - ages.mean()])
+        fit = fit_occasion_model(Occasions(person_index=person_index, values=values, design=design), budget)
+        print(fit.exponent, fit.prior.grid_size)
+    """)
+    threads = {name: "1" for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")}
+    result = subprocess.run([sys.executable, "-c", script], env={**os.environ, **threads}, capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_a_certified_rule_past_the_memory_budget_raises_before_allocating():
+    # One reading, a narrow noise component and one 10^14 times wider, and a wide prior: the integrand is a sharp
+    # peak on a plateau as wide as the wide component, and a uniform certified rule needs the peak's step across
+    # all of it (the case that once asked for a 28 x 93.6M node grid). It must raise before building the grid.
+    prior = _lattice(1e-4, 1e10, 20, 1)
+    hyperparameters = _density(prior, {0: 0.5, prior.grid_size - 1: 0.5})
+    log_masses = class_log_density(prior, hyperparameters.coefficients)[0]
+    variances = np.exp(prior.log_variance_grid)
+    script = textwrap.dedent(f"""
+        import resource
+        import numpy as np
+        from sv_pgs.phenotype_measurement import PieceTooLarge, level_posterior
+        budget = 1 << 24
+        with open("/proc/self/status") as status:
+            mapped = next(int(line.split()[1]) * 1024 for line in status if line.startswith("VmSize:"))
+        resource.setrlimit(resource.RLIMIT_AS, (mapped + 3 * budget, mapped + 3 * budget))
+        try:
+            level_posterior(np.array([[0.0]]), 1e10, np.array({log_masses.tolist()}), np.array({variances.tolist()}), 1e-6, None, False, budget)
+        except PieceTooLarge:
+            print("raised")
+    """)
+    if not sys.platform.startswith("linux"):
+        with pytest.raises(PieceTooLarge):
+            level_posterior(np.array([[0.0]]), 1e10, log_masses, variances, 1e-6, None, False, 1 << 24)
+        return
+    threads = {name: "1" for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")}
+    result = subprocess.run([sys.executable, "-c", script], env={**os.environ, **threads}, capture_output=True, text=True, check=False)
+    assert result.returncode == 0 and result.stdout.strip() == "raised", result.stderr[-4000:]
+
+
+def test_the_fit_needs_repeated_occasions():
+    person_index = np.arange(50)
+    values = np.round(50.0 + np.random.default_rng(14).normal(0.0, 2.0, 50), 1)
+    with pytest.raises(ValueError, match="repeated occasion"):
+        fit_at_exponent(Occasions(person_index=person_index, values=values, design=np.ones((50, 1))), 1.0, WORKING_BYTES)
+
+
 def _simulated(persons: int, level_variance: float, noise: float, seed: int, gross_share: float = 0.0):
     """Readings at 0.1 resolution around an age trend, and a copy with a share of them grossly wrong: half with
     an extra digit (x 10), half in mmol/L recorded as mg/dL (/ 18.016, glucose's molar mass over 10)."""
@@ -253,6 +383,8 @@ def test_the_fit_recovers_gaussian_data_within_sampling_error():
     level_variance, noise = 4.0, 1.0
     person_index, values, _gross_values, design, _gross = _simulated(300, level_variance, noise, seed=3)
     fit = fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
+    # One to five occasions per person: the replicates certify the level/noise split.
+    assert fit.split_identified
     # Maximum likelihood is efficient, so the Henderson III moment estimators' standard errors bound its own.
     between_error, within_error = variance_component_standard_errors(np.bincount(person_index), level_variance, noise)
     assert abs(fit.level_variance - level_variance) < sampling_bound(between_error)

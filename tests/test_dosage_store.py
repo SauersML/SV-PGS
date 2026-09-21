@@ -12,6 +12,7 @@ import pytest
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
+    CODES_PER_DOSAGE,
     MANIFEST_FILE,
     MAXIMUM_CODE,
     VARIANT_CLASS_LEGEND,
@@ -26,8 +27,11 @@ from sv_pgs.dosage_store import (
     encode_dosage_milli,
     open_column,
     read_manifest,
+    shard_rows_for,
     sites_md5,
     statistic_column_directory,
+    local_cache,
+    store_digest,
     transcode_store,
     variant_column_directory,
     write_column,
@@ -75,6 +79,8 @@ def _write_store(root: Path, milli_by_half: list[dict[str, np.ndarray]], codec: 
             "alt_len": (lengths, {}),
             "cm": (positions / 1e6, {}),
             "variant_class": (np.zeros(record_count, dtype=np.uint8), {"legend": VARIANT_CLASS_LEGEND}),
+            "codes_per_unit": (np.full(record_count, CODES_PER_DOSAGE, dtype=np.uint8), {}),
+            "value_origin": (np.zeros(record_count, dtype=np.int16), {}),
             "group_first": (np.arange(record_count, dtype=np.int64), {}),
             "class": (np.zeros(record_count, dtype=np.uint8), {"legend": ["SNV", "INDEL", "SV"]}),
             "has_pl": (np.arange(record_count) % 3 == 0, {}),
@@ -118,7 +124,7 @@ def _two_half_dosage() -> list[dict[str, np.ndarray]]:
     ]
 
 
-@pytest.fixture(params=["raw", "zstd"])
+@pytest.fixture(params=["raw", "zstd", "rowdict"])
 def two_half_store(request: pytest.FixtureRequest, tmp_path: Path) -> tuple[Path, list[dict[str, np.ndarray]]]:
     milli_by_half = _two_half_dosage()
     _write_store(tmp_path / "store", milli_by_half, request.param)
@@ -209,7 +215,7 @@ def test_raw_single_half_ranges_inside_a_shard_are_zero_copy_views(tmp_path: Pat
 
 def test_corrupted_shards_and_missing_codes_fail_loudly(tmp_path: Path) -> None:
     milli_by_half = _two_half_dosage()
-    for codec, flipped_byte in (("raw", -6), ("zstd", 40)):
+    for codec, flipped_byte in (("raw", -6), ("zstd", 40), ("rowdict", 40)):
         root = tmp_path / codec
         _write_store(root, milli_by_half, codec)
         shard_path = dosage_array_directory(root, 0, "chr21") / "c" / "0" / "0"
@@ -253,7 +259,7 @@ def test_code_array_metadata_is_zarr_v3_sharded(two_half_store: tuple[Path, list
     assert sharding["name"] == "sharding_indexed"
     assert sharding["configuration"]["chunk_shape"] == [INNER_ROWS, 37]
     inner_codecs = [codec["name"] for codec in sharding["configuration"]["codecs"]]
-    assert inner_codecs in (["bytes"], ["bytes", "zstd", "crc32c"])
+    assert inner_codecs in (["bytes"], ["bytes", "zstd", "crc32c"], ["bytes", "svpgs_rowdict", "crc32c"])
     shard_bytes = (dosage_array_directory(root, 0, "chr22") / "c" / "1" / "0").read_bytes()
     index_entries = SHARD_ROWS // INNER_ROWS
     index = np.frombuffer(shard_bytes[-(16 * index_entries + 4) : -4], dtype="<u8").reshape(index_entries, 2)
@@ -262,7 +268,7 @@ def test_code_array_metadata_is_zarr_v3_sharded(two_half_store: tuple[Path, list
     assert np.all(index[written:] == np.uint64(2**64 - 1))
 
 
-@pytest.mark.parametrize("codec", ["raw", "zstd"])
+@pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
 def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: str) -> None:
     rng = np.random.default_rng(7)
     counts = (90, 41)
@@ -271,13 +277,17 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
     chromosome = np.repeat(np.array([2, 5], dtype=np.int8), counts)
     variant_count = sum(counts)
     ids = b"".join(f"v{row}".encode() for row in range(variant_count))
+    variant_class = rng.integers(0, len(VARIANT_CLASSES), variant_count).astype(np.uint8)
+    copy_number = variant_class == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
     table = VariantTable(
         chromosome=chromosome,
         position=np.concatenate([np.arange(counts[0]) * 7 + 3, np.arange(counts[1]) * 5 + 1]).astype(np.int64),
         genetic_position_cm=np.linspace(0.0, 3.0, variant_count),
         ref_length=rng.integers(1, 4, variant_count).astype(np.int32),
         alt_length=rng.integers(1, 60, variant_count).astype(np.int32),
-        variant_class=rng.integers(0, len(VARIANT_CLASSES), variant_count).astype(np.uint8),
+        variant_class=variant_class,
+        codes_per_unit=np.where(copy_number, 50, CODES_PER_DOSAGE).astype(np.uint8),
+        value_origin=np.where(copy_number, -2, 0).astype(np.int64),
         group_first=np.concatenate([np.arange(counts[0]) // 3 * 3, counts[0] + np.arange(counts[1]) // 2 * 2]).astype(np.int64),
         sum_code=wide.sum(axis=1),
         sum_code2=(wide * wide).sum(axis=1),
@@ -292,7 +302,10 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
         assert store.chromosomes == ("chr2", "chr5")
         assert np.array_equal(store.read_codes(0, variant_count), codes)
         read_table = store.variant_table
-        for field_name in ("chromosome", "position", "ref_length", "alt_length", "variant_class", "group_first", "sum_code", "sum_code2"):
+        for field_name in (
+            "chromosome", "position", "ref_length", "alt_length", "variant_class", "codes_per_unit", "value_origin",
+            "group_first", "sum_code", "sum_code2",
+        ):
             assert np.array_equal(getattr(read_table, field_name), getattr(table, field_name)), field_name
         assert np.allclose(read_table.genetic_position_cm, table.genetic_position_cm)
         assert np.array_equal(read_table.annotations["n_paths_total"], table.annotations["n_paths_total"])
@@ -461,3 +474,102 @@ def test_stage0_accumulation_bounds_are_exact_and_tight() -> None:
     float_running = np.add.accumulate(float_products, dtype=np.float32)
     assert float(float_running[FLOAT32_EXACT_ROWS - 1]) == worst_product * FLOAT32_EXACT_ROWS
     assert float(float_running[FLOAT32_EXACT_ROWS]) != worst_product * (FLOAT32_EXACT_ROWS + 1)
+
+
+@pytest.mark.parametrize("codec", ["raw", "rowdict"])
+def test_the_local_cache_follows_the_store_digest(tmp_path: Path, codec: str) -> None:
+    milli_by_half = _two_half_dosage()
+    _write_store(tmp_path / "store", milli_by_half, "zstd")
+    expected = _all_codes(milli_by_half)
+    first = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
+    with DosageStore.open(first) as cached:
+        assert cached.codecs == frozenset({codec})
+        np.testing.assert_array_equal(cached.read_codes(0, cached.n_variants, None, np.empty_like(expected)), expected)
+    built = (first / "MANIFEST.json").stat().st_mtime_ns
+    assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
+    assert (first / "MANIFEST.json").stat().st_mtime_ns == built
+    # a rewritten statistic column (same size, later mtime) is a new store
+    column = next((tmp_path / "store" / "stats").rglob("sum_code*"))
+    path = next(item for item in column.rglob("*") if item.is_file() and item.name != "zarr.json")
+    status = path.stat()
+    path.write_bytes(path.read_bytes())
+    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1))
+    second = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
+    assert second != first and not first.exists()
+    assert [item.name for item in (tmp_path / "cache").iterdir()] == [second.name]
+
+
+def test_an_unfinished_cache_is_never_used(tmp_path: Path) -> None:
+    _write_store(tmp_path / "store", _two_half_dosage(), "zstd")
+    digest = store_digest(tmp_path / "store")
+    stale = tmp_path / "cache" / f"raw-{digest}"
+    stale.mkdir(parents=True)
+    (stale / "MANIFEST.json").write_text("{}")
+    built = local_cache(tmp_path / "store", tmp_path / "cache", codec="raw", budget=_budget())
+    assert built == stale
+    with DosageStore.open(built) as cached:
+        assert cached.n_variants == 450
+
+
+def test_shard_rows_are_the_fewest_shards_that_keep_every_writer_busy() -> None:
+    counts = [1000, 300, 17]
+    assert shard_rows_for(counts, inner_rows=16, parallel_writers=1, arrays_per_count=2) == 1008
+    for writers in (2, 3, 5, 9, 40):
+        rows = shard_rows_for(counts, inner_rows=16, parallel_writers=writers, arrays_per_count=2)
+        assert rows % 16 == 0
+
+        def shards(size: int) -> int:
+            return sum(-(-count // size) for count in counts)
+
+        # enough shards for every writer, and one more inner chunk per shard would leave a writer idle
+        # (unless the rows are already the smallest, one chunk, or the largest, the whole longest array)
+        assert shards(rows) >= writers or rows == 16
+        assert shards(rows + 16) < writers or rows == 1008
+
+
+def test_shard_rows_grow_to_fit_the_descriptor_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    import resource
+
+    monkeypatch.setattr(resource, "getrlimit", lambda _: (64, 64))
+    monkeypatch.setattr(os, "listdir", lambda _: [])
+    monkeypatch.setattr(os.path, "isdir", lambda _: True)
+    # 64 writers would need 64 shards of 16 rows, 2 descriptors each over 2 arrays per count: 256 > 64
+    rows = shard_rows_for([1024], inner_rows=16, parallel_writers=64, arrays_per_count=2)
+    assert rows == 64 and 2 * 2 * (1024 // rows) <= 64
+    with pytest.raises(RuntimeError, match="descriptors"):
+        shard_rows_for([10] * 17, inner_rows=16, parallel_writers=1, arrays_per_count=2)
+
+
+def test_an_array_is_one_shard_by_default_and_round_trips(tmp_path: Path) -> None:
+    rng = np.random.default_rng(12)
+    codes = encode_dosage_milli(_random_dosage_milli(rng, 203, 11))
+    layout = create_code_array(tmp_path / "array", 203, 11, codec="zstd", inner_rows=INNER_ROWS)
+    assert layout.shard_count == 1 and layout.shard_rows == 208
+    with CodeShardWriter(tmp_path / "array", layout, 0) as writer:
+        writer.write_rows(codes)
+    out = np.empty_like(codes)
+    CodeArray(tmp_path / "array").read_rows_into(0, 203, out)
+    np.testing.assert_array_equal(out, codes)
+
+
+def test_a_store_written_before_the_value_decode_reads_as_alt_counts_unless_it_holds_copy_numbers(tmp_path) -> None:
+    import shutil
+
+    milli_by_half = _two_half_dosage()
+    root = tmp_path / "store"
+    _write_store(root, milli_by_half, "raw")
+    chromosomes = list(milli_by_half[0])
+    for chromosome in chromosomes:
+        for name in ("codes_per_unit", "value_origin"):
+            shutil.rmtree(variant_column_directory(root, chromosome, name))
+    with DosageStore.open(root) as store:
+        table = store.variant_table
+        assert np.all(table.codes_per_unit == CODES_PER_DOSAGE) and np.all(table.value_origin == 0)
+    record_count = milli_by_half[0][chromosomes[0]].shape[0]
+    classes = np.zeros(record_count, dtype=np.uint8)
+    classes[0] = VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
+    shutil.rmtree(variant_column_directory(root, chromosomes[0], "variant_class"))
+    write_column(variant_column_directory(root, chromosomes[0], "variant_class"), classes, {"legend": VARIANT_CLASS_LEGEND})
+    with pytest.raises(ValueError, match="copy-number records without their value decode"):
+        with DosageStore.open(root) as store:
+            store.variant_table

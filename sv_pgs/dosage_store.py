@@ -10,14 +10,22 @@ Layout ("svpgs-store v1", target-format REPORT §2 with addenda A1/A2)::
 
 Encoding: ``code = (DS_milli * 127 + 500) // 1000`` in [0, 254] and DS = code / 127, so 0, 1
 and 2 are exact and the error is at most 1/254.  Code 255 is the Zarr fill value and is never
-written.  Dosages count the ALT allele.  The Stage 0 kernels (``genotype_buffers``) work on
+written.  Dosages count the ALT allele.  Every record's value is ``code / codes_per_unit +
+value_origin`` (two variant columns): an ALT-count record has 127 and 0, a copy-number record
+(``VariantClass.COPY_NUMBER``) floor(254 / its maximum copy number) and minus its modal copy
+number, so its value is CN - modal CN and every integer copy number is exact (``copy_number``).  The Stage 0 kernels (``genotype_buffers``) work on
 ``s = code - 127`` in [-127, 127]; standardization is affine in s, so (DS - mean_DS) / sd_DS =
 (s - mean_s) / sd_s exactly.
 
-Two inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
+Three inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
 
 - ``[bytes, zstd(3), crc32c]``, the bucket store.  Each 64-record chunk is an independent zstd
   frame whose crc32c is verified whenever it is decoded.
+- ``[bytes, svpgs_rowdict, crc32c]``, the GPU-decoded cache (``rowdict_codec``).  An inner chunk
+  holds one frame per record (a dictionary of the record's most frequent codes, bit-packed slots
+  and exceptions), which a GPU decodes at memory speed; the host reads the bytes and checks the
+  chunk's crc32c.  ``CodeArray.read_rows_to_device`` is that path; the CPU decoder is the
+  reference.
 - ``[bytes]``, the local NVMe/RAM cache.  A shard's records are one contiguous byte range, so a
   range inside a shard is a zero-copy view of the page cache.  Any range can also be read with
   ``preadv`` straight into a caller buffer, such as pinned host memory for GPU staging.
@@ -39,12 +47,13 @@ from pathlib import Path
 import resource
 import shutil
 import threading
-from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence, get_args
 
 import google_crc32c
 import numpy as np
 import zstandard
 
+from sv_pgs import rowdict_codec
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
@@ -93,7 +102,8 @@ CODES_PER_DOSAGE = 127
 MAXIMUM_CODE = 254
 MISSING_CODE = 255
 MAXIMUM_DOSAGE_MILLI = 2000
-DEFAULT_SHARD_ROWS = 65536
+# Minimizes the worst relative read-time regret over request runs of at least one Stage 0 tile,
+# given the measured per-byte, per-chunk and per-request costs (docs/design/math/codec.md §3).
 DEFAULT_INNER_CHUNK_ROWS = 64
 # libzstd's ZSTD_CLEVEL_DEFAULT; decoding does not depend on the level.
 ZSTD_LEVEL = 3
@@ -101,8 +111,11 @@ VARIANT_CLASSES = tuple(VariantClass)
 # Stored with every variant_class column; a store whose legend differs is refused, never decoded.
 VARIANT_CLASS_LEGEND = [variant_class.value for variant_class in VARIANT_CLASSES]
 # On-disk variant columns every store carries; any other column is a prior annotation.
-REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first")
-Codec = Literal["raw", "zstd"]
+REQUIRED_VARIANT_COLUMNS = ("pos", "ref_len", "alt_len", "cm", "variant_class", "group_first", "codes_per_unit", "value_origin")
+# Written by every current store; a store from before them holds only ALT-count records, decoded as code / 127.
+_VALUE_DECODE_COLUMNS = ("codes_per_unit", "value_origin")
+_COPY_NUMBER_CODE = VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
+Codec = Literal["raw", "zstd", "rowdict"]
 
 _ZARR_METADATA_FILE = "zarr.json"
 _UNWRITTEN_CHUNK = np.uint64(2**64 - 1)
@@ -131,7 +144,10 @@ _CRC32C_CODEC = {"name": "crc32c"}
 _INNER_CODECS: dict[str, list[dict[str, Any]]] = {
     "raw": [_BYTES_CODEC],
     "zstd": [_BYTES_CODEC, {"name": "zstd", "configuration": {"level": ZSTD_LEVEL, "checksum": False}}, _CRC32C_CODEC],
+    "rowdict": [_BYTES_CODEC, {"name": "svpgs_rowdict"}, _CRC32C_CODEC],
 }
+# Chains whose inner chunks are variable-size frames stored back to back, each crc32c-checked.
+_FRAMED_CODECS = frozenset({"zstd", "rowdict"})
 
 
 def encode_dosage_milli(dosage_milli: NDArray) -> U8Array:
@@ -272,8 +288,60 @@ def _layout_from_metadata(metadata: Mapping[str, Any], directory: Path) -> CodeA
         sample_count=int(shape[1]),
         shard_rows=int(shard_shape[0]),
         inner_rows=int(inner_shape[0]),
-        codec="raw" if matching[0] == "raw" else "zstd",
+        codec=next(codec for codec in get_args(Codec) if codec == matching[0]),
     )
+
+
+def shard_rows_for(record_counts: Sequence[int], *, inner_rows: int, parallel_writers: int, arrays_per_count: int) -> int:
+    """Rows per shard (a multiple of ``inner_rows``) for arrays of ``record_counts`` rows.
+
+    Nothing a read costs depends on the shard size: a range decodes by inner chunk and costs the
+    same across a shard boundary (docs/design/math/codec.md §3), except that a zero-copy view of
+    the page cache must lie inside one shard. A writer fills a shard sequentially and encodes its
+    inner chunks on the worker pool, so shards add parallelism only where whole shards are written
+    in parallel (the synthetic store's generator). Every shard costs the reader one descriptor
+    and one mapping. So the fewest shards serve best, within two bounds: at least
+    ``parallel_writers`` shards over ``record_counts`` (one writer per shard), and descriptors for
+    ``arrays_per_count`` arrays of each count within this process's hard limit. It is the largest
+    multiple of ``inner_rows`` that gives ``parallel_writers`` shards, raised if the limit needs it.
+    """
+    counts = [int(count) for count in record_counts]
+    if not counts or min(counts) < 0 or inner_rows < 1 or parallel_writers < 1 or arrays_per_count < 1:
+        raise ValueError("shard_rows_for needs record counts, positive inner rows, writers and arrays per count.")
+
+    def shards(rows: int) -> int:
+        return sum(max(1, -(-count // rows)) for count in counts)
+
+    def largest_chunks(enough: Any) -> int:
+        """The largest chunk count m in [1, whole] with enough(m * inner_rows); shards() only grows as m shrinks."""
+        low, high = 1, whole_chunks
+        while low < high:
+            middle = (low + high + 1) // 2
+            low, high = (middle, high) if enough(middle * inner_rows) else (low, middle - 1)
+        return low
+
+    def smallest_chunks(fits: Any) -> int:
+        """The smallest chunk count m in [1, whole] with fits(m * inner_rows)."""
+        low, high = 1, whole_chunks
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (low, middle) if fits(middle * inner_rows) else (middle + 1, high)
+        return low
+
+    whole_chunks = max(1, -(-max(counts) // inner_rows))
+    rows = largest_chunks(lambda rows: shards(rows) >= parallel_writers) * inner_rows
+    _, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard_limit != resource.RLIM_INFINITY:
+        # the store's reader holds a descriptor and a mapping per shard beside what is open now
+        open_now = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else 0
+
+        def fits(rows: int) -> bool:
+            return 2 * arrays_per_count * shards(rows) + open_now <= hard_limit
+
+        if not fits(whole_chunks * inner_rows):
+            raise RuntimeError(f"{arrays_per_count * len(counts)} arrays need more descriptors than the hard limit {hard_limit} allows.")
+        rows = max(rows, smallest_chunks(fits) * inner_rows)
+    return rows
 
 
 def create_code_array(
@@ -282,10 +350,15 @@ def create_code_array(
     sample_count: int,
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> CodeArrayLayout:
-    """Write the Zarr v3 metadata of an empty code array and return its layout."""
+    """Write the Zarr v3 metadata of an empty code array and return its layout.
+
+    ``shard_rows`` defaults to ``shard_rows_for`` with one writer: the whole array is one shard.
+    """
+    if shard_rows is None:
+        shard_rows = shard_rows_for([row_count], inner_rows=inner_rows, parallel_writers=1, arrays_per_count=1)
     layout = CodeArrayLayout(
         row_count=row_count, sample_count=sample_count, shard_rows=shard_rows, inner_rows=inner_rows, codec=codec
     )
@@ -314,17 +387,24 @@ def _compression_pool() -> ThreadPoolExecutor:
         return _COMPRESSION_POOL[0]
 
 
-def _compressed_chunk(payload: bytes) -> bytes:
-    frame = zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(payload)
+def _checksummed(frame: bytes) -> bytes:
     return frame + google_crc32c.value(frame).to_bytes(_CRC32C_BYTES, "little")
+
+
+def _compressed_chunk(payload: bytes) -> bytes:
+    return _checksummed(zstandard.ZstdCompressor(level=ZSTD_LEVEL).compress(payload))
+
+
+def _rowdict_chunk(codes: U8Array) -> bytes:
+    return _checksummed(rowdict_codec.encode_chunk(codes))
 
 
 class CodeShardWriter:
     """Stream the rows of one shard of a code array into its shard file.
 
     Rows arrive in order and are cut into inner chunks; the last one is padded with the fill
-    value.  zstd chunks are compressed on the process's worker threads, a bounded number in
-    flight, and written in order.  The file is written under a temporary name and renamed into
+    value.  zstd and rowdict chunks are encoded on the process's worker threads, a bounded number
+    in flight, and written in order.  The file is written under a temporary name and renamed into
     place by ``close`` only after every chunk and the checksummed index are on disk.  Shards are
     independent files, so separate processes may write separate shards of one array concurrently.
     """
@@ -356,11 +436,14 @@ class CodeShardWriter:
         self._chunks_written += 1
 
     def _emit_chunk(self) -> None:
-        payload = self._chunk.tobytes()
         if self._layout.codec == "raw":
-            self._write_payload(payload)
+            self._write_payload(self._chunk.tobytes())
         else:
-            self._compressing.append(_compression_pool().submit(_compressed_chunk, payload))
+            if self._layout.codec == "zstd":
+                encoded = _compression_pool().submit(_compressed_chunk, self._chunk.tobytes())
+            else:
+                encoded = _compression_pool().submit(_rowdict_chunk, self._chunk.copy())
+            self._compressing.append(encoded)
             while len(self._compressing) > self._compressing_limit:
                 self._write_payload(self._compressing.popleft().result())
         self._chunk.fill(MISSING_CODE)
@@ -443,6 +526,18 @@ def _row_buffers(target: U8Array) -> list[memoryview]:
     return [memoryview(target.reshape(-1))] if target.flags.c_contiguous else [memoryview(row) for row in target]
 
 
+def _selected_rows(row_start: int, row_stop: int, rows: NDArray | None) -> I64Array:
+    """Rows [row_start, row_stop), or ``rows`` checked to be ascending, distinct and inside that range."""
+    if row_start < 0 or row_stop < row_start:
+        raise IndexError(f"rows [{row_start}, {row_stop}) are not a range of rows.")
+    if rows is None:
+        return np.arange(row_start, row_stop, dtype=np.int64)
+    wanted = np.asarray(rows, dtype=np.int64)
+    if wanted.ndim != 1 or np.any(np.diff(wanted) <= 0) or (wanted.size and (wanted[0] < row_start or wanted[-1] >= row_stop)):
+        raise ValueError(f"rows must be ascending, distinct and inside [{row_start}, {row_stop}).")
+    return wanted
+
+
 _THREAD_STATE = threading.local()
 
 
@@ -494,12 +589,13 @@ class CodeArray:
                 and data_bytes == written * layout.inner_chunk_bytes
             ):
                 raise ValueError(f"{path}: raw inner chunks are not whole and in row order.")
-            if layout.codec == "zstd" and not (
+            if layout.codec in _FRAMED_CODECS and not (
                 int(offsets[0]) == 0
                 and np.array_equal(offsets[1:], offsets[:-1] + sizes[:-1])
                 and data_bytes == int(offsets[-1] + sizes[-1])
+                and bool(np.all(sizes > _CRC32C_BYTES))
             ):
-                raise ValueError(f"{path}: zstd inner chunks are not stored back to back in row order.")
+                raise ValueError(f"{path}: {layout.codec} inner chunks are not stored back to back in row order.")
         except BaseException:
             os.close(descriptor)
             raise
@@ -602,6 +698,40 @@ class CodeArray:
             self._decode_frame(frame, memoryview(decoded), chunk)
             rows[...] = decoded.reshape(layout.inner_rows, layout.sample_count)[first - chunk_start : last - chunk_start]
 
+    def _stage_rowdict(
+        self, shard: _OpenShard, local_rows: I64Array, chunks: I64Array, buffer: U8Array
+    ) -> rowdict_codec.RowFrames:
+        """Read rowdict ``chunks`` (ascending local chunk indices) of one shard into ``buffer``, back to back.
+
+        Each run of consecutive chunks is one read, every chunk's crc32c is checked, and the frames
+        of the ``local_rows`` (ascending shard rows) that fall in these chunks are located.
+        """
+        layout = self.layout
+        positions, payload_sizes = self._read_chunks(shard, chunks, buffer)
+        for chunk, offset, size in zip(chunks.tolist(), positions.tolist(), payload_sizes.tolist()):
+            # google_crc32c takes read-only bytes only, so the chunk is copied once.
+            stored = int.from_bytes(buffer[offset + size : offset + size + _CRC32C_BYTES].tobytes(), "little")
+            if google_crc32c.value(buffer[offset : offset + size].tobytes()) != stored:
+                raise ValueError(f"{self.directory}: inner chunk {chunk} fails its crc32c check.")
+        lower, upper = np.searchsorted(local_rows, [int(chunks[0]) * layout.inner_rows, (int(chunks[-1]) + 1) * layout.inner_rows])
+        rows = local_rows[lower:upper]
+        chunk_rows = np.searchsorted(chunks, rows // layout.inner_rows) * layout.inner_rows + rows % layout.inner_rows
+        try:
+            return rowdict_codec.row_frames(buffer, positions, payload_sizes, layout.inner_rows, layout.sample_count, chunk_rows)
+        except ValueError as error:
+            raise ValueError(f"{self.directory}: {error}") from error
+
+    def _read_chunks(self, shard: _OpenShard, chunks: I64Array, buffer: U8Array) -> tuple[I64Array, I64Array]:
+        """Read ``chunks`` (ascending local chunk indices) of one shard into ``buffer``, back to back,
+        one read per run of consecutive chunks; return each chunk's position there and its payload size."""
+        sizes = shard.chunk_sizes[chunks]
+        positions = np.cumsum(sizes) - sizes
+        breaks = np.flatnonzero(np.diff(chunks) != 1) + 1
+        for first, last in zip([0, *breaks.tolist()], [*breaks.tolist(), chunks.shape[0]]):
+            begin, end = int(positions[first]), int(positions[last - 1] + sizes[last - 1])
+            _pread_exact(shard.descriptor, [memoryview(buffer[begin:end])], int(shard.chunk_offsets[chunks[first]]))
+        return positions, sizes - _CRC32C_BYTES
+
     def read_rows_into(self, row_start: int, row_stop: int, out: U8Array) -> None:
         """Fill ``out`` [rows, samples] (each row contiguous, e.g. a column slice of a wider array)."""
         layout = self.layout
@@ -610,12 +740,101 @@ class CodeArray:
         out_row = 0
         for shard_index, local_start, local_stop in self.shard_pieces(row_start, row_stop):
             shard = self._shard(shard_index)
+            target = out[out_row : out_row + local_stop - local_start]
             if layout.codec == "raw":
-                target = out[out_row : out_row + local_stop - local_start]
                 _pread_exact(shard.descriptor, _row_buffers(target), local_start * layout.sample_count)
+            elif layout.codec == "zstd":
+                self._decode_rows_into(shard, local_start, local_stop, target)
             else:
-                self._decode_rows_into(shard, local_start, local_stop, out[out_row : out_row + local_stop - local_start])
+                chunks = np.arange(local_start // layout.inner_rows, -(-local_stop // layout.inner_rows), dtype=np.int64)
+                encoded = _scratch("encoded_frames", int(shard.chunk_sizes[chunks].sum()))
+                frames = self._stage_rowdict(shard, np.arange(local_start, local_stop, dtype=np.int64), chunks, encoded)
+                rowdict_codec.decode_rows(encoded, frames, layout.sample_count, target)
             out_row += local_stop - local_start
+
+    def read_rows_to_device(
+        self, row_start: int, row_stop: int, out: Any, decoder: rowdict_codec.GpuRowDecoder, rows: NDArray | None = None
+    ) -> None:
+        """Decode rows [row_start, row_stop) of a rowdict array, or only ``rows`` of them, into the
+        CuPy array ``out`` [rows, samples] (contiguous rows) on the device.
+
+        ``rows`` are ascending, distinct and inside the range; ``out`` holds just those rows, in
+        order.  Only the inner chunks that hold a wanted row are read.  They move host -> device
+        still encoded, in windows of whole chunks through one pinned buffer and one device buffer
+        of min(the chunks' encoded bytes, ``out``'s bytes), and at least the largest chunk: the
+        staging never exceeds the decoded rows it serves.  The host only reads the bytes; on the
+        current stream, ``decoder`` checks each chunk's crc32c and size table, locates the wanted
+        frames and decodes only those (``GpuRowDecoder.decode_chunks``).  The call returns once
+        the stream has run the checks, and raises as the host path does if a chunk fails.
+        """
+        layout = self.layout
+        if layout.codec != "rowdict":
+            raise ValueError(f"{self.directory}: only a rowdict array decodes on the device; this one is {layout.codec}.")
+        wanted = _selected_rows(row_start, row_stop, rows)
+        if not row_stop <= layout.row_count:
+            raise IndexError(f"rows [{row_start}, {row_stop}) fall outside [0, {layout.row_count}).")
+        cupy = decoder.cupy
+        if out.shape != (wanted.shape[0], layout.sample_count) or out.dtype != cupy.uint8 or out.strides[1] != 1:
+            raise ValueError(f"out must be uint8 [{wanted.shape[0]}, {layout.sample_count}] with contiguous rows.")
+        if wanted.shape[0] == 0:
+            return
+        shard_of_row = wanted // layout.shard_rows
+        plans = []
+        for shard_index in np.unique(shard_of_row).tolist():
+            local = wanted[shard_of_row == shard_index] - shard_index * layout.shard_rows
+            plans.append((self._shard(shard_index), local, np.unique(local // layout.inner_rows)))
+        largest = max(int(shard.chunk_sizes[chunks].max()) for shard, _, chunks in plans)
+        encoded = sum(int(shard.chunk_sizes[chunks].sum()) for shard, _, chunks in plans)
+        window_bytes = max(largest, min(encoded, wanted.shape[0] * layout.sample_count))
+        stream = cupy.cuda.get_current_stream()
+        owner, pinned = _PINNED_POOL.acquire(cupy, window_bytes)
+        copied = None
+        checks = []
+        try:
+            window = cupy.empty(window_bytes, dtype=cupy.uint8)
+            out_row = 0
+            for shard, local, chunks in plans:
+                sizes = shard.chunk_sizes[chunks].tolist()
+                first = 0
+                while first < len(sizes):
+                    last, filled = first + 1, sizes[first]
+                    while last < len(sizes) and filled + sizes[last] <= window_bytes:
+                        filled += sizes[last]
+                        last += 1
+                    if copied is not None:
+                        # The pinned buffer is refilled only once the device has its last window.
+                        copied.synchronize()
+                    window_chunks = chunks[first:last]
+                    positions, payload_sizes = self._read_chunks(shard, window_chunks, pinned)
+                    window[:filled].set(pinned[:filled], stream=stream)
+                    copied = cupy.cuda.Event()
+                    copied.record(stream)
+                    lower, upper = np.searchsorted(
+                        local, [int(window_chunks[0]) * layout.inner_rows, (int(window_chunks[-1]) + 1) * layout.inner_rows]
+                    )
+                    wanted_rows = local[lower:upper]
+                    chunk_rows = np.searchsorted(window_chunks, wanted_rows // layout.inner_rows) * layout.inner_rows
+                    chunk_rows += wanted_rows % layout.inner_rows
+                    # The next window's copy is queued behind this decode on the same stream.
+                    count = int(wanted_rows.shape[0])
+                    with stream:
+                        error, first_bad = decoder.decode_chunks(
+                            window, positions, payload_sizes, layout.inner_rows, chunk_rows, layout.sample_count,
+                            out[out_row : out_row + count],
+                        )
+                    checks.append((error, first_bad, window_chunks))
+                    out_row += count
+                    first = last
+        finally:
+            if copied is not None:
+                copied.synchronize()
+            _PINNED_POOL.release(owner)
+        for error, first_bad, window_chunks in checks:
+            failure = int(error.get(stream=stream)[0])
+            if failure:
+                reasons = "; ".join(text for bit, text in rowdict_codec.CHUNK_FAILURES.items() if failure & bit)
+                where = f"inner chunk {int(window_chunks[int(first_bad.get(stream=stream)[0])])}" if failure & rowdict_codec.CHUNK_LEVEL_FAILURES else "a row"
+                raise ValueError(f"{self.directory}: {where} {reasons}.")
 
     @property
     def shard_count(self) -> int:
@@ -828,8 +1047,9 @@ class VariantTable:
     ``variant_class`` indexes ``VARIANT_CLASSES`` (``tuple(VariantClass)``).  ``group_first`` is
     the first row of the record's unbreakable group (its bubble, same-POS set, duplicate group
     or TR locus; its own row if none).  ``sum_code``/``sum_code2`` are the sidecar's all-sample
-    code sums over the store's halves, for pre-filtering only.  ``annotations`` holds every
-    other sidecar column: categorical and boolean ones as int32 codes whose names are in
+    code sums over the store's halves, for pre-filtering only.  A record's value is
+    ``code / codes_per_unit + value_origin`` (see the module docstring).  ``annotations`` holds
+    every other sidecar column: categorical and boolean ones as int32 codes whose names are in
     ``annotation_legends``, the rest as float64.
     """
 
@@ -839,6 +1059,8 @@ class VariantTable:
     ref_length: NDArray
     alt_length: NDArray
     variant_class: U8Array
+    codes_per_unit: U8Array
+    value_origin: I64Array
     group_first: I64Array
     sum_code: NDArray
     sum_code2: NDArray
@@ -871,7 +1093,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
     for chromosome, record_count in zip(chromosomes, record_counts):
         present = sorted(path.name for path in (root / "variants" / chromosome).iterdir())
         missing = sorted(reserved - set(present))
-        if missing:
+        legacy = sorted(_VALUE_DECODE_COLUMNS) == [name for name in missing if name in _VALUE_DECODE_COLUMNS]
+        if missing and not (legacy and set(missing) <= set(_VALUE_DECODE_COLUMNS)):
             raise ValueError(f"variant table of {chromosome} lacks required columns {missing}.")
         names = [name for name in present if name not in reserved]
         if annotation_names is None:
@@ -879,7 +1102,7 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
         elif names != annotation_names:
             raise ValueError(f"annotation columns of {chromosome} differ from those of {chromosomes[0]}.")
         columns: dict[str, NDArray] = {}
-        for name in [*REQUIRED_VARIANT_COLUMNS, *names]:
+        for name in [*(column for column in REQUIRED_VARIANT_COLUMNS if column in present), *names]:
             values, attributes = open_column(variant_column_directory(root, chromosome, name))
             if values.shape[0] != record_count:
                 raise ValueError(f"variant column {chromosome}/{name} has {values.shape[0]} rows, not {record_count}.")
@@ -897,6 +1120,19 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             raise ValueError(f"{chromosome} sites (pos, ref_len, alt_len) do not match the manifest md5.")
         if int(columns["variant_class"].max()) >= len(VARIANT_CLASSES):
             raise ValueError(f"{chromosome} has variant_class codes outside tuple(VariantClass).")
+        copy_number = columns["variant_class"] == _COPY_NUMBER_CODE
+        if legacy:
+            # Written before the value decode: every record must be an ALT count, stored as code / 127.
+            if np.any(copy_number):
+                raise ValueError(f"{chromosome} holds copy-number records without their value decode; convert the store again.")
+            columns["codes_per_unit"] = np.full(record_count, CODES_PER_DOSAGE, dtype=np.uint8)
+            columns["value_origin"] = np.zeros(record_count, dtype=np.int16)
+        codes_per_unit = columns["codes_per_unit"].astype(np.uint8)
+        value_origin = columns["value_origin"].astype(np.int64)
+        if np.any(codes_per_unit == 0):
+            raise ValueError(f"{chromosome} has a record with codes_per_unit 0.")
+        if np.any(~copy_number & ((codes_per_unit != CODES_PER_DOSAGE) | (value_origin != 0))):
+            raise ValueError(f"{chromosome} has an ALT-count record not decoded as code / {CODES_PER_DOSAGE}.")
         group_first = columns["group_first"].astype(np.int64)
         if np.any(group_first > np.arange(record_count)) or np.any(group_first < 0):
             raise ValueError(f"{chromosome} group_first must point at or before each row.")
@@ -920,6 +1156,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
             "ref_length": columns["ref_len"].astype(np.int32),
             "alt_length": columns["alt_len"].astype(np.int32),
             "variant_class": columns["variant_class"].astype(np.uint8),
+            "codes_per_unit": codes_per_unit,
+            "value_origin": value_origin,
             "group_first": group_first + chromosome_start,
             "sum_code": half_totals[0],
             "sum_code2": half_totals[1],
@@ -943,6 +1181,8 @@ def _read_variant_table(root: Path, manifest: Mapping[str, Any], half_indices: S
         ref_length=merged["ref_length"],
         alt_length=merged["alt_length"],
         variant_class=merged["variant_class"],
+        codes_per_unit=merged["codes_per_unit"],
+        value_origin=merged["value_origin"],
         group_first=merged["group_first"],
         sum_code=merged["sum_code"],
         sum_code2=merged["sum_code2"],
@@ -1058,6 +1298,11 @@ class DosageStore:
     def n_samples(self) -> int:
         return int(self.half_sample_starts[-1])
 
+    @property
+    def codecs(self) -> frozenset[str]:
+        """The inner-chunk codecs of the selected halves' arrays."""
+        return frozenset(array.layout.codec for arrays in self._arrays for array in arrays)
+
     def statistic(self, name: str) -> I64Array:
         """A per-record integer sidecar statistic summed over the store's halves, in store order."""
         per_chromosome = []
@@ -1161,6 +1406,30 @@ class DosageStore:
         if out.dtype != np.uint8 or out.shape != (rows, selection.indices.size) or not out.flags.c_contiguous:
             raise ValueError(f"out must be C-contiguous uint8 [{rows}, {selection.indices.size}].")
         self._read_into(start, stop, selection, out)
+        return out
+
+    def read_codes_to_device(
+        self, start: int, stop: int, out: Any, decoder: rowdict_codec.GpuRowDecoder, rows: NDArray | None = None
+    ) -> Any:
+        """Codes of rows [start, stop), or of only ``rows`` (ascending, distinct, inside the range),
+        decoded on the device into the CuPy array ``out`` [rows, all samples].
+
+        Every half must be rowdict-encoded; each half's rows land in its columns of ``out``, and
+        only the inner chunks holding a wanted row are read (``CodeArray.read_rows_to_device``).
+        """
+        cupy = decoder.cupy
+        wanted = _selected_rows(start, stop, rows)
+        if out.dtype != cupy.uint8 or out.shape != (wanted.shape[0], self.n_samples) or not out.flags.c_contiguous:
+            raise ValueError(f"out must be C-contiguous uint8 [{wanted.shape[0]}, {self.n_samples}].")
+        for half_position, arrays in enumerate(self._arrays):
+            columns = slice(int(self.half_sample_starts[half_position]), int(self.half_sample_starts[half_position + 1]))
+            for chromosome, local_start, local_stop, _ in self._chromosome_pieces(start, stop):
+                offset = int(self.chromosome_starts[chromosome])
+                lower, upper = np.searchsorted(wanted, [offset + local_start, offset + local_stop])
+                if lower < upper:
+                    arrays[chromosome].read_rows_to_device(
+                        local_start, local_stop, out[lower:upper, columns], decoder, wanted[lower:upper] - offset
+                    )
         return out
 
     def advise(self, start: int, stop: int) -> None:
@@ -1281,6 +1550,8 @@ def write_variant_columns(root: Path, chromosome: str, table: VariantTable, rows
         ("alt_len", table.alt_length[rows].astype(np.int32), {}),
         ("cm", table.genetic_position_cm[rows], {}),
         ("variant_class", table.variant_class[rows], {"legend": VARIANT_CLASS_LEGEND}),
+        ("codes_per_unit", table.codes_per_unit[rows].astype(np.uint8), {}),
+        ("value_origin", table.value_origin[rows].astype(np.int16), {}),
         ("group_first", table.group_first[rows] - chromosome_start, {}),
     ):
         write_column(variant_column_directory(root, chromosome, name), values, attributes)
@@ -1299,7 +1570,7 @@ def write_half_codes(
     code_blocks: Iterable[U8Array],
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> tuple[I64Array, I64Array]:
     """Write one half's codes [records, samples] of one chromosome from row blocks in store order.
@@ -1372,7 +1643,7 @@ def write_dosage_store(
     code_blocks: Iterable[U8Array],
     *,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
 ) -> None:
     """Write a one-half store from code blocks [rows, n_samples] that arrive in store order.
@@ -1441,19 +1712,95 @@ def transcode_store(source: str | Path, destination: str | Path, *, codec: Codec
                     raise ValueError(f"half{half}/{chromosome}: the stored {name} disagrees with the codes.")
 
 
+CACHE_MARKER = "CACHE_COMPLETE.json"
+"""Written last into a finished local cache: the source store, its digest and the cache's codec."""
+
+
+def store_digest(root: str | Path) -> str:
+    """A sha256 that changes whenever any file of the store is rewritten.
+
+    It covers every file's relative path, size and modification time (a rewrite of any array,
+    column, map or manifest changes one of them), plus the bytes of the MANIFEST, every array's
+    zarr.json and every shard's crc32c-checked index, which holds each inner chunk's offset and
+    size. It reads no code bytes, so it costs one stat per file and a small read per shard.
+    """
+    root = Path(root)
+    digest = hashlib.sha256()
+    for path in sorted(item for item in root.rglob("*") if item.is_file()):
+        relative = path.relative_to(root).as_posix()
+        status = path.stat()
+        digest.update(f"{relative}\0{status.st_size}\0{status.st_mtime_ns}\0".encode())
+        if path.name in (MANIFEST_FILE, _ZARR_METADATA_FILE):
+            digest.update(path.read_bytes())
+    for directory in sorted(item.parent for item in (root / "dosage").rglob(_ZARR_METADATA_FILE)):
+        layout = _layout_from_metadata(_read_metadata(directory), directory)
+        for shard_index in range(layout.shard_count):
+            with open(_shard_path(directory, shard_index), "rb") as handle:
+                handle.seek(-layout.shard_index_bytes, os.SEEK_END)
+                digest.update(handle.read(layout.shard_index_bytes))
+    return digest.hexdigest()
+
+
+def local_cache(source: str | Path, cache_root: str | Path, *, codec: Codec, budget: ComputeBudget) -> Path:
+    """The local ``codec`` copy of the store at ``source``, rebuilt whenever the store's digest changes.
+
+    A cache lives at ``cache_root/<codec>-<digest>`` and counts as built only once its
+    ``CACHE_MARKER`` names that digest. Otherwise the store is transcoded into a private
+    partial directory, checked against a second digest of the source taken after the copy
+    (so a store rewritten mid-copy is never cached), and renamed into place. Caches of the same
+    source under other digests are then removed, so a stale copy never outlives its store.
+    """
+    source_root, cache_directory = Path(source).resolve(), Path(cache_root)
+    digest = store_digest(source_root)
+    target = cache_directory / f"{codec}-{digest}"
+    marker = {"source": str(source_root), "digest": digest, "codec": codec}
+    if not _cache_is_complete(target, marker):
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        partial = cache_directory / f".{codec}-{digest}.partial-{os.getpid()}-{threading.get_ident()}"
+        shutil.rmtree(partial, ignore_errors=True)
+        transcode_store(source_root, partial, codec=codec, budget=budget)
+        if store_digest(source_root) != digest:
+            shutil.rmtree(partial, ignore_errors=True)
+            raise RuntimeError(f"{source_root} changed while its local cache was being built.")
+        (partial / CACHE_MARKER).write_text(json.dumps(marker))
+        if target.exists() and not _cache_is_complete(target, marker):
+            # only a finished cache is ever renamed into place, so an unmarked one is debris
+            shutil.rmtree(target, ignore_errors=True)
+        try:
+            os.rename(partial, target)
+        except OSError:
+            # another process finished the same cache first; theirs is identical
+            shutil.rmtree(partial, ignore_errors=True)
+            if not _cache_is_complete(target, marker):
+                raise
+    for other in cache_directory.iterdir():
+        if other != target and not other.name.startswith(".") and _cache_marker(other).get("source") == str(source_root):
+            shutil.rmtree(other, ignore_errors=True)
+    return target
+
+
+def _cache_marker(directory: Path) -> dict[str, Any]:
+    try:
+        return json.loads((directory / CACHE_MARKER).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_is_complete(directory: Path, marker: Mapping[str, Any]) -> bool:
+    return _cache_marker(directory) == dict(marker)
+
+
 def _transcode_array(array: CodeArray, directory: Path, codec: Codec, budget: ComputeBudget) -> tuple[I64Array, I64Array]:
     """Re-encode one code array shard by shard, returning the exact code sums it wrote."""
     layout = array.layout
-    target = create_code_array(
-        directory, layout.row_count, layout.sample_count, codec=codec, shard_rows=layout.shard_rows, inner_rows=layout.inner_rows
-    )
+    target = create_code_array(directory, layout.row_count, layout.sample_count, codec=codec, inner_rows=layout.inner_rows)
     sums = np.zeros(layout.row_count, dtype=np.int64)
     squares = np.zeros(layout.row_count, dtype=np.int64)
     buffer = np.empty(0, dtype=np.uint8)
-    for shard_index in range(layout.shard_count):
-        shard_start = shard_index * layout.shard_rows
+    for shard_index in range(target.shard_count):
+        shard_start = shard_index * target.shard_rows
         with CodeShardWriter(directory, target, shard_index) as writer:
-            for start, stop in _block_ranges(shard_start, shard_start + layout.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
+            for start, stop in _block_ranges(shard_start, shard_start + target.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
                 if buffer.size < (stop - start) * layout.sample_count:
                     buffer = np.empty((stop - start) * layout.sample_count, dtype=np.uint8)
                 piece = buffer[: (stop - start) * layout.sample_count].reshape(stop - start, layout.sample_count)

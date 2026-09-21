@@ -5,7 +5,10 @@ One Stage 2 read visits every LD block once. Three stages of it overlap:
 1. the host: ``DosageStore.iter_codes`` reads and decodes the next blocks' row spans ahead, on
    its reader threads, into a ring of (pinned, on CUDA) host buffers;
 2. the copy engine: the next block's span goes host -> device on its own stream while the
-   current block computes;
+   current block computes. A rowdict store skips the host decode: only the chunks holding the
+   block's rows go to the device, and ``DosageStore.read_codes_to_device`` checks and decodes
+   just those rows there, on the copy stream, into a compact [block rows, n] buffer; the host
+   only reads bytes;
 3. the device: one kernel picks the block's rows out of its span and writes them as signed codes
    ``s = code - 127`` into an aligned buffer, which a ``CodeBlockTile`` wraps without copying.
 
@@ -20,6 +23,7 @@ from typing import Any, Iterator, Sequence
 import numpy as np
 from numpy.typing import NDArray
 
+from sv_pgs import rowdict_codec
 from sv_pgs.code_products import INT8_GEMM_ALIGNMENT, CodeBlockTile
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore
@@ -45,6 +49,25 @@ void gather_signed_codes(const unsigned char* __restrict__ span, const long long
 
 def _aligned(count: int) -> int:
     return -(-count // INT8_GEMM_ALIGNMENT) * INT8_GEMM_ALIGNMENT
+
+
+def reduced_block_layout(
+    statistics: GenotypeSufficientStatistics,
+) -> tuple[list[NDArray[np.int64]], list[NDArray[np.int64]], list[NDArray[np.float64]], list[NDArray[np.float64]]]:
+    """Per LD block of one Stage 0 pass: its store rows, its reduced columns, and their means and
+    scales. Each reduced column is its tie group's representative, whose store row, mean and scale
+    Stage 0 recorded."""
+    kept = np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)
+    boundaries = statistics.ld.block_boundaries
+    block_rows, block_indices, means, scales = [], [], [], []
+    for block_index in range(statistics.ld.block_count):
+        reduced = np.arange(int(boundaries[block_index]), int(boundaries[block_index + 1]), dtype=np.int64)
+        representatives = kept[reduced]
+        block_rows.append(statistics.active_rows[representatives])
+        block_indices.append(reduced)
+        means.append(statistics.means[representatives])
+        scales.append(statistics.scales[representatives])
+    return block_rows, block_indices, means, scales
 
 
 class StoreGenotypeBlockSource:
@@ -98,8 +121,14 @@ class StoreGenotypeBlockSource:
         self.resident_bytes = sum(int(slot.nbytes) for slot in self._signed) + int(self._means.nbytes) + int(self._scales.nbytes)
         if self._cupy is not None:
             cupy = self._cupy
-            self._spans_on_device = [cupy.empty((widest_span, self._samples), dtype=cupy.uint8) for _ in range(2)]
-            self._rows_in_span = [cupy.asarray(rows - rows[0]) for rows in self._block_rows]
+            self._decoder = rowdict_codec.GpuRowDecoder(cupy) if store.codecs == frozenset({"rowdict"}) else None
+            # a rowdict read lands the block's rows compactly, so the gather is the identity there
+            staged_rows = widest_block if self._decoder is not None else widest_span
+            self._spans_on_device = [cupy.empty((staged_rows, self._samples), dtype=cupy.uint8) for _ in range(2)]
+            self._rows_in_span = [
+                cupy.arange(rows.shape[0], dtype=cupy.int64) if self._decoder is not None else cupy.asarray(rows - rows[0])
+                for rows in self._block_rows
+            ]
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
@@ -110,15 +139,8 @@ class StoreGenotypeBlockSource:
     ) -> StoreGenotypeBlockSource:
         """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
         group's representative, whose store row, mean and scale Stage 0 recorded."""
-        kept = np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)
-        boundaries = statistics.ld.block_boundaries
-        block_rows, block_indices = [], []
-        for block_index in range(statistics.ld.block_count):
-            reduced = np.arange(int(boundaries[block_index]), int(boundaries[block_index + 1]), dtype=np.int64)
-            block_rows.append(statistics.active_rows[kept[reduced]])
-            block_indices.append(reduced)
-        order = np.concatenate([kept[indices] for indices in block_indices])
-        return cls(store, block_rows, block_indices, statistics.means[order], statistics.scales[order], budget, workspace_bytes)
+        block_rows, block_indices, means, scales = reduced_block_layout(statistics)
+        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes)
 
     @property
     def sample_count(self) -> int:
@@ -142,6 +164,9 @@ class StoreGenotypeBlockSource:
 
     def iter_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
         """Yield (block_index, tile) in block order; a tile is valid until the next is requested."""
+        if self._cupy is not None and self._decoder is not None:
+            yield from self._iter_decoded_tiles()
+            return
         spans = self._store.iter_codes(self._spans, None, self._budget)
         if self._cupy is None:
             for block_index, (start, _stop, codes) in enumerate(spans):
@@ -171,10 +196,6 @@ class StoreGenotypeBlockSource:
         count = len(self._spans)
         _start, _stop, first = next(spans)
         upload(0, first)
-        attributes = cupy.cuda.Device().attributes
-        threads = int(attributes["MaxThreadsPerBlock"])
-        # a grid-stride loop needs no more blocks than the device keeps resident at once
-        resident_blocks = int(attributes["MultiProcessorCount"]) * (int(attributes["MaxThreadsPerMultiProcessor"]) // threads)
         for block_index in range(count):
             slot = block_index % 2
             # iter_codes reuses the host buffer of this span once the next span is requested.
@@ -182,16 +203,58 @@ class StoreGenotypeBlockSource:
             if block_index + 1 < count:
                 _start, _stop, following = next(spans)
                 upload(block_index + 1, following)
-            rows = int(self._block_rows[block_index].shape[0])
             compute.wait_event(copied[slot])
-            padded_rows = _aligned(rows)
-            elements = padded_rows * self._padded_samples
-            self._gather(
-                (min(-(-elements // threads), resident_blocks),), (threads,),
-                (
-                    self._spans_on_device[slot], self._rows_in_span[block_index], self._signed[slot],
-                    np.int64(rows), np.int64(self._samples), np.int64(padded_rows), np.int64(self._padded_samples),
-                ),
-            )
+            self._gather_block(block_index, slot)
             yield block_index, self._tile(block_index, slot)
             computed[slot].record(compute)
+
+    def _gather_block(self, block_index: int, slot: int) -> None:
+        """Queue, on the current stream, block ``block_index``'s rows of its span as signed codes."""
+        cupy = self._cupy
+        attributes = cupy.cuda.Device().attributes
+        threads = int(attributes["MaxThreadsPerBlock"])
+        # a grid-stride loop needs no more blocks than the device keeps resident at once
+        resident_blocks = int(attributes["MultiProcessorCount"]) * (int(attributes["MaxThreadsPerMultiProcessor"]) // threads)
+        rows = int(self._block_rows[block_index].shape[0])
+        padded_rows = _aligned(rows)
+        self._gather(
+            (min(-(-padded_rows * self._padded_samples // threads), resident_blocks),), (threads,),
+            (
+                self._spans_on_device[slot], self._rows_in_span[block_index], self._signed[slot],
+                np.int64(rows), np.int64(self._samples), np.int64(padded_rows), np.int64(self._padded_samples),
+            ),
+        )
+
+    def _iter_decoded_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The rowdict path: each block's rows decode on the device, on the copy stream.
+
+        Block b + 1's span is fetched after block b is yielded, so its host work (read, crc32c,
+        frame location, the host -> device copy) overlaps the products the caller queued for b.
+        """
+        cupy = self._cupy
+        compute = cupy.cuda.get_current_stream()
+        decoded = [cupy.cuda.Event() for _ in range(2)]
+        gathered = [cupy.cuda.Event() for _ in range(2)]
+        for event in gathered:
+            event.record(compute)
+
+        def fetch(position: int) -> None:
+            slot = position % 2
+            start, stop = self._spans[position]
+            rows = self._block_rows[position]
+            # the staging buffer is free once the gather of the block that last used it has run
+            self._copy_stream.wait_event(gathered[slot])
+            with self._copy_stream:
+                self._store.read_codes_to_device(start, stop, self._spans_on_device[slot][: rows.shape[0]], self._decoder, rows=rows)
+            decoded[slot].record(self._copy_stream)
+
+        fetch(0)
+        for block_index in range(len(self._spans)):
+            slot = block_index % 2
+            compute.wait_event(decoded[slot])
+            self._gather_block(block_index, slot)
+            gathered[slot].record(compute)
+            yield block_index, self._tile(block_index, slot)
+            if block_index + 1 < len(self._spans):
+                fetch(block_index + 1)
+

@@ -2,7 +2,7 @@
 
 Each entry gives the ruling and the measurement or identity behind it. Simulations ran on MSI with public 1kGP/HPRC data or synthetic data. No AoU participant data was used outside the AoU workspace. Results measured inside it are tagged [in-workspace], and their values are not reproduced here (user rule, 2026-09-19).
 
-Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-real]`, `[real]` and `[provenance unknown]`. Under the evidence rule, a `[sim-only]` result checks the math and the code, but it is not evidence of an accuracy gain. Rulings resting on it stand until the neutral benchmarks (bench-real, bench-sim) re-measure them.
+Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-real]`, `[real]`, `[machinery]`, `[est]`, `[in-workspace]` and `[provenance unknown]`. Under the evidence rule, a `[sim-only]` result checks the math and the code, but it is not evidence of an accuracy gain. Rulings resting on it stand until the neutral benchmarks (bench-real, bench-sim) re-measure them.
 
 ## Why the old fit failed
 - **The inference, not the prior family.**
@@ -18,7 +18,7 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 
 ## Model
 - **One model, one path; approximate stages are warm starts, certified on full data (SPEC).** Block mean field shifted β by 16% on a toy [sim-only]. Block-diagonal LD alone over-predicted 2.7× at p/n = 20 [semi-real: design-credit, 1kGP-based genotypes].
-- **Inference is EP-EB,** with a MacKay/EFS + Anderson hyper step, a trust region, warm-up, and a Newton-decrement + prediction-change certificate. Plain EM is never used.
+- **Inference is EP-EB,** with the outer step Newton on the total curvature B + S (lead ruling, 2026-09-19). Plain EP-EM is never used: its fixed-cavity M-step is not concave wherever A + S is indefinite. (speed-floor's 7-of-16 divergence measurement was withdrawn: its linearization point was not a fixed point.) Anderson acceleration was not adopted (`anderson.py` deleted).
 - **No joint multi-trait effect model.** The user: "we dont need multi-trait tbh". The unwired `pleiotropy_layer.py` (shared per-variant multiplier across traits) is deleted; it is recoverable from tag `archive/2026-09-19/old-path-final`. Cross-trait pooling of the prior's hyperparameters (level_c, θ) stays.
 - **Binary traits use a logistic link.** VB-probit lost 0.012–0.020 AUC, and EP-probit only tied logistic [sim-only: theory-inference].
 - **No hand-chosen priors; the effect prior's mixing density is learned (SPEC 9c57144).**
@@ -78,7 +78,20 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 
 ## Engineering
 - **The new path replaces the old one, and superseded code is deleted.** About 74% of sv_pgs (48,616 of 65,304 lines at `c2a9443`) is slated for removal, in ordered commits C0–C8 ([CUTOVER.md](CUTOVER.md)).
-- **Continuous integration:** every validated increment lands on main through full-suite CI, sharded three ways.
+- **Landing:** every increment lands through the merge queue. The gate is the full suite on MSI (runq `cpu-node`) on the exact tip, under a memory ulimit, plus GPU tests when CUDA code changes. GitHub CI runs on main pushes as a secondary signal only (lead, 2026-09-19, after the user asked why GitHub CI was used when MSI is available).
 - **Compute:** development runs on MSI with public or synthetic data. Training runs in the dedicated AoU workspace through its in-perimeter launch path.
 - **All agents run on one model; helper subagents on other models are not used.**
-- **No external contact** (email, support tickets, forums) is made without an explicit, per-message approval.
+- **No external contact, ever** (user order): no agent contacts anything outside this machine or sends anything to a human, for any reason. That bans email, web forms, tickets, posts, relays and file drops, gists, webhooks, notification services, third-party uploads, GitHub mentions, review requests, issues and PRs, and any repo other than SauersML's own. Pushing lane branches to SauersML/SV-PGS for the merge queue is the only outward write. Any step that would need outside contact is the user's: the user decides and acts.
+
+## Later rulings, 2026-09-19
+- **Stage 1 is dropped, provisionally, on cost** (compute_floor.md §3): one Stage 1 sweep costs 75–600 Stage 2 pass-equivalents [est]. The outer-convergence measurement first cited for it was withdrawn (compute_floor.md §10.1–10.3). The pipeline is Stage 0, Stage 2 from the prior, scoring.
+- **The outer step is Newton on the total curvature B, with a trust region** (superseding the MacKay/EFS + Anderson hyper step; `anderson.py` is being deleted). Plain EP-EM is never used: its fixed-cavity M-step is ill-posed wherever A + S is indefinite, as it was at the true prior on chr22 LD [semi-real: public 1kGP-haplotype LD with simulated effects]. The certificate requires B + S positive definite, a Newton decrement within 1/(2K), and a bounded prediction change (MODEL.md §4).
+- **Stage 2 uses certified marginal variances only** (`marginal_variances.py`), never block-Jacobi inverses and never stochastic variances in site updates. Block-Jacobi cavities were off by p99 25–54% on real chr22 LD [semi-real: bench-sim v7].
+- **The mixing density is a continuous function; any grid is a converged quadrature; the range is data-derived** (SPEC 131b205), with D3 roughness (above).
+- **No hard bins of continuous quantities.** DEL/DUP short/long classes and the small-indel class are merged; length enters as a learned smooth of log length, and 50 bp survives only as a reporting label. The SV-context window and K-nearest features became one learned distance kernel.
+- **No variant is filtered by rarity** (SPEC); a column leaves computation only under a derived bound on its contribution. **Accelerator routes are CuPy, CPU routes NumPy/SciPy; JAX is not used** (SPEC).
+- **No arbitrary constants** (user rule): each is derived, learned, measured at runtime, or its feature is deleted. `tests/test_no_arbitrary_constants.py` guards the package, with a registry of justified values and a strict list of pending ones.
+- **Draw-like imputed SV/TR dosages are the measurement model** [semi-real: bench-sim v7, Beagle 5.5]: per-stratum D* recalibration, the A-map leakage correction (scale_model.md §3), and predictive variance from the calibrated Var(G|D) are all required.
+- **Quantitative traits use an exact per-occasion measurement model** (`phenotype_measurement.py`): a learned heavy-tailed noise density and a learned Box–Cox transform replace the plausible-range and log-scale constants. It gained +0.110 ± 0.022 nats per reading for SBP and +0.191 ± 0.022 for pulse on held-out NHANES 2017–2020 [real, NHANES replicates: 60-second within-exam replicates, predictive density, not genetic signal]. Traits with no replicates use the transformed reading with reliability 1; lab-criterion disease rules keep their ranges until the disease model lands.
+- **The AoU rule** (user, 2026-09-19): no AoU-related data outside the permitted environment, aggregates included; no download from any Google or AoU bucket; the AoU long-read panel is never used outside it. Public 1kGP/HGSVC panels are allowed for the benchmarks. bench-sim's cohort weights were rebuilt from the public 1kGP founder composition (PREREG amendment 7); results on the earlier cohort are labelled "withdrawn weights".
+- **Evidence rule:** a lane's own simulation checks math only; accuracy claims come from bench-real, bench-sim, or in-workspace held-out data.

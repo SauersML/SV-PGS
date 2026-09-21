@@ -5,7 +5,7 @@ for a quantitative trait; the logistic curvature or EP likelihood-site precision
 the logistic likelihood is log-concave, for a binary one), Gaussian site variances D = 1/Pi (p,)
 >= 0, and the covariates C profiled out in its own weighted metric:
 
-    H  = W^1/2 C (C'WC)^-1 C' W^1/2,   Xt = (I - H) W^1/2 X,
+    H  = W^1/2 C (C'WC)^+ C' W^1/2,   Xt = (I - H) W^1/2 X,
     A  = Xt'Xt + diag(1/D)            (the posterior precision)
     S  = I + Xt D Xt'                 (n x n, every eigenvalue >= 1)
 
@@ -17,6 +17,8 @@ identity A^-1 Xt' = D Xt' S^-1. For any iterate with residual r = b - S z_hat,
 (e = -D Xt' S^-1 r and Xt (D A D) Xt' = G S with G = S - I), so a column's exact residual norm is
 its certificate against ep_eb.md's target ||e||_A^2 <= p_eff / K. Rows outside the training metric
 (held-out folds, target people) satisfy ||X_out e||^2 <= lambda_max(X_out D X_out') ||r||^2 / 4.
+H is the projector onto the column space of W^1/2 C, which can lose rank on a model's rows while C
+has full rank on the cohort (`covariate_whitener`).
 
 One pass reads each tile once and serves every column of every model:
 
@@ -39,7 +41,7 @@ from typing import Any, Callable, Iterator, Protocol
 
 import numpy as np
 
-from sv_pgs.marginal_variances import BlockGrams, BulkSolve, WindowCross
+from sv_pgs.marginal_variances import BlockGrams, BulkSolve, KernelFactor, WindowCross, exact_block_information
 
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
@@ -86,6 +88,15 @@ class DualTileSource(Protocol):
 
     def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
         """(start, stop, tile) for every block, in variant order, covering 0..p-1."""
+        ...
+
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        """sum over blocks of what work(start, stop, tile, shared, rows_b, image) adds into a zero image.
+
+        `shared` holds sample-side arrays every block reads (work may cache per-device state in it),
+        `rows` variant-side arrays of which each block gets its rows. A source over several devices
+        runs its blocks on all of them at once and sums the devices' images in a fixed order.
+        """
         ...
 
 
@@ -150,6 +161,9 @@ class DenseDualSource:
         for start, stop in self.block_bounds:
             yield start, stop, DenseDualTile(self.genotypes[:, start:stop], self.array_module)
 
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        return sequential_map_reduce(self, work, shared, rows, image_shape)
+
 
 def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> list[tuple[int, int]]:
     bounds = [(int(start), int(stop)) for start, stop in block_bounds]
@@ -158,6 +172,15 @@ def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> 
     ):
         raise ValueError("blocks must cover every variant once, in order.")
     return bounds
+
+
+def sequential_map_reduce(source: DualTileSource, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+    """map_reduce on one device: every block in order into one image."""
+    image = source.array_module.zeros(image_shape)
+    device_shared = dict(shared)
+    for start, stop, tile in source.blocks():
+        work(start, stop, tile, device_shared, {name: values[start:stop] for name, values in rows.items()}, image)
+    return image
 
 
 class StreamedDualSource:
@@ -182,13 +205,39 @@ class StreamedDualSource:
             start, stop = self.block_bounds[block_index]
             yield start, stop, tile
 
+    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
+        return sequential_map_reduce(self, work, shared, rows, image_shape)
+
 
 def _host(values: Any) -> np.ndarray:
     return np.asarray(values.get() if hasattr(values, "get") else values)
 
 
+def covariate_whitener(array_module: Any, weighted_covariates: Any) -> Any:
+    """F (k x k) with F F' = (A'A)^+ on the numerical column space of A = W^1/2 C (n x k).
+
+    The covariates are shared by every trait, so a model's rows can take their rank away: a
+    sex-restricted disease (prostate cancer: men only) makes the sex indicator equal the intercept and
+    age x female zero, and a fold can hold no member of a rare level. Singular values of A at or below
+    the numerical-rank tolerance max(n, k) eps s_max (Golub and Van Loan 5.4.1) span no direction of
+    its column space; the others give F = V diag(1/s) from A's own SVD, zero columns for the rest, so
+    the Gram's squared condition number never enters. A F has orthonormal (or zero) columns, so
+    H = A F F' A' is the projector onto A's column space and F F' A'y the minimum-norm coefficients.
+    The SVD is taken of R in A = QR (Householder, backward stable), which has A's singular values and
+    right vectors without forming the n x k left ones.
+    """
+    triangle = array_module.linalg.qr(weighted_covariates, mode="r")
+    _, singular_values, right_vectors = array_module.linalg.svd(triangle, full_matrices=False)
+    kept = singular_values > max(weighted_covariates.shape) * np.finfo(np.float64).eps * singular_values[0]
+    inverse = array_module.where(kept, 1.0 / array_module.where(kept, singular_values, 1.0), 0.0)
+    return right_vectors.T * inverse[None, :]
+
+
 class DualModels:
-    """Weights (n, M), site variances (p, M) and shared covariates (n, k) of every model."""
+    """Weights (n, M), site variances (p, M) and shared covariates (n, k) of every model.
+
+    `covariate_factor` (M, k, k) holds each model's `covariate_whitener`: F_m F_m' = (C'W_m C)^+.
+    """
 
     def __init__(self, weights: Any, variances: Any, covariates: Any, array_module: Any = np) -> None:
         self.array_module = array_module
@@ -198,21 +247,24 @@ class DualModels:
         if bool(array_module.any(self.variances < 0.0)):
             raise ValueError("site variances must be non-negative; negative sites need the exact split.")
         self.root_weights = array_module.sqrt(self.weights)
-        normal = array_module.einsum("na,nm,nb->mab", self.covariates, self.weights, self.covariates)
-        self.covariate_factor = array_module.linalg.cholesky(normal)
+        self.covariate_factor = array_module.stack(
+            [covariate_whitener(array_module, self.root_weights[:, model : model + 1] * self.covariates) for model in range(self.model_count)]
+        )
 
     @property
     def model_count(self) -> int:
         return int(self.weights.shape[1])
 
+    def covariate_solve(self, right: Any, column_models: Any) -> Any:
+        """(C'W_m C)^+ r for each column r of `right` (k x columns), with m the column's model."""
+        factor = self.covariate_factor[column_models]
+        whitened = self.array_module.einsum("cab,ac->cb", factor, right)
+        return self.array_module.einsum("cab,cb->ac", factor, whitened)
+
     def complement(self, values: Any, column_models: Any) -> Any:
         """(I - H_m) v per column, with H_m the weighted covariate projector of the column's model."""
-        array_module = self.array_module
         root = self.root_weights[:, column_models]
-        projected = (self.covariates.T @ (root * values)).T[:, :, None]
-        factor = self.covariate_factor[column_models]
-        solved = array_module.linalg.solve(array_module.swapaxes(factor, 1, 2), array_module.linalg.solve(factor, projected))[:, :, 0].T
-        return values - root * (self.covariates @ solved)
+        return values - root * (self.covariates @ self.covariate_solve(self.covariates.T @ (root * values), column_models))
 
     def sample_to_design(self, values: Any, column_models: Any) -> Any:
         """The sample-side operand of X_b': Xt'v = X' [W^1/2 (I - H) v]."""
@@ -237,15 +289,6 @@ class PassCount:
         self.records.append((label, columns, relative_error))
 
 
-def _read_products(tile: DualTile, operand: Any, left: Any, relative_error: float) -> tuple[Any, Any]:
-    """X_b' L for one block of a read, preparing the read's operand at its first block."""
-    if relative_error <= 0.0:
-        return tile.rmatmat(left), operand
-    if operand is None:
-        operand = tile.sample_operand(left, relative_error)
-    return tile.rmatmat(operand), operand
-
-
 def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -> None:
     if relative_error <= 0.0:
         image += tile.matmat(right)
@@ -253,15 +296,28 @@ def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -
         tile.accumulate_matmat(right, image, relative_error)
 
 
+def _operator_block(relative_error: float) -> Callable[..., None]:
+    """One block of S V's read: X_b' L, scaled by D_b per column, back through X_b into the image.
+
+    With a relaxed error the read's sample operand is prepared at a device's first block and reused
+    by its other blocks (code_products.CodeBlockTile.sample_operand)."""
+
+    def work(_start: int, _stop: int, tile: DualTile, shared: dict, rows: dict, image: Any) -> None:
+        if relative_error > 0.0 and "operand" not in shared:
+            shared["operand"] = tile.sample_operand(shared["left"], relative_error)
+        products = tile.rmatmat(shared["operand"] if relative_error > 0.0 else shared["left"])
+        scaled = rows["variances"][:, shared["column_models"]] * products
+        _accumulate(tile, scaled if scaled.flags.c_contiguous else scaled.copy(order="C"), image, relative_error)
+
+    return work
+
+
 def apply_operator(source: DualTileSource, models: DualModels, values: Any, column_models: Any, relative_error: float, count: PassCount, label: str) -> Any:
-    """S V for every column, one read; the sample operand is prepared once for the read."""
-    array_module = source.array_module
+    """S V for every column, one read over every device of the source."""
     left = models.sample_to_design(values, column_models)
-    image = array_module.zeros_like(values)
-    operand = None
-    for start, stop, tile in source.blocks():
-        products, operand = _read_products(tile, operand, left, relative_error)
-        _accumulate(tile, array_module.ascontiguousarray(models.variances[start:stop][:, column_models] * products), image, relative_error)
+    image = source.map_reduce(
+        _operator_block(relative_error), {"left": left, "column_models": column_models}, {"variances": models.variances}, tuple(values.shape)
+    )
     count.note(int(values.shape[1]), relative_error, label)
     return values + models.design_to_sample(image, column_models)
 
@@ -288,7 +344,7 @@ def _cholesky_solve(array_module: Any, factor: Any, right: Any) -> Any:
 
 
 def column_squares(source: DualTileSource, models: DualModels, count: PassCount) -> Any:
-    """||xt_k||^2 for every variant and model, one read: x_k'W x_k - (x_k'WC)(C'WC)^-1(C'Wx_k)."""
+    """||xt_k||^2 for every variant and model, one read: x_k'W x_k - ||F'(C'Wx_k)||^2, F F' = (C'WC)^+."""
     array_module = source.array_module
     squares = array_module.zeros((source.variant_count, models.model_count))
     covariate_count = int(models.covariates.shape[1])
@@ -297,9 +353,8 @@ def column_squares(source: DualTileSource, models: DualModels, count: PassCount)
     )
     for start, stop, tile in source.blocks():
         cross = tile.rmatmat(weighted_covariates).reshape(stop - start, models.model_count, covariate_count)
-        factor = array_module.broadcast_to(models.covariate_factor[None], (stop - start,) + tuple(models.covariate_factor.shape))
-        solved = array_module.linalg.solve(array_module.swapaxes(factor, 2, 3), array_module.linalg.solve(factor, cross[..., None]))[..., 0]
-        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(cross * solved, axis=2)
+        whitened = array_module.einsum("vma,mab->vmb", cross, models.covariate_factor)
+        squares[start:stop] = tile.weighted_column_squares(models.weights) - array_module.sum(whitened * whitened, axis=2)
     count.note(models.model_count * (1 + covariate_count), 0.0, "column-squares")
     return squares
 
@@ -315,9 +370,29 @@ def resolved_spikes(spikes: Any, sample_count: int, array_module: Any) -> np.nda
         chosen = updated
 
 
+def deflation_factor(array_module: Any, basis: Any, image: Any) -> Any:
+    """F with F F' = (W'SW)^+ on the numerical column space of a spike basis W (n x k), from S W = `image`.
+
+    Spikes tied on a model's rows (variants that differ only off them) give W equal columns, and
+    W'SW, whose null space is W's since S >= I, is singular: a Cholesky factorization fails, or passes
+    only on a pivot that rounding left positive. The computed Gram W'(SW) is within
+    gamma_n |W|'|SW| of the exact one (Higham 2002, 3.5; gamma_n = n u / (1 - n u) <= n eps for
+    u = eps / 2), so its error is below n eps ||W||_F ||SW||_F in norm and, by Weyl, an eigenvalue
+    at or below that spans no direction.
+    The others give F = V diag(lambda^-1/2): W F F' W' S is the S-orthogonal projector onto span(W),
+    so the deflated iteration is the one on the independent spike directions.
+    """
+    gram = basis.T @ image
+    eigenvalues, eigenvectors = array_module.linalg.eigh(0.5 * (gram + gram.T))
+    rounding = basis.shape[0] * np.finfo(np.float64).eps * array_module.linalg.norm(basis) * array_module.linalg.norm(image)
+    kept = eigenvalues > rounding
+    return eigenvectors * array_module.where(kept, 1.0 / array_module.sqrt(array_module.where(kept, eigenvalues, 1.0)), 0.0)[None, :]
+
+
 @dataclass
 class Deflation:
-    """Per model, a basis W (n x k) of its spike directions, S W, the factor of W'SW, and the variants W holds.
+    """Per model, a basis W (n x k) of its spike directions, S W, F with F F' = (W'SW)^+
+    (`deflation_factor`), and the variants W holds.
 
     Deflated CG (Saad, Yeung, Erhel & Guyomarc'h 2000) keeps every residual orthogonal to W and
     every direction S-orthogonal to it: the spikes W spans are solved exactly in the k x k system
@@ -330,11 +405,13 @@ class Deflation:
     indices: dict
 
     def project_start(self, array_module: Any, model: int, solution: Any, residual: Any) -> tuple[Any, Any]:
-        coefficients = _cholesky_solve(array_module, self.factors[model], self.bases[model].T @ residual)
+        factor = self.factors[model]
+        coefficients = factor @ (factor.T @ (self.bases[model].T @ residual))
         return solution + self.bases[model] @ coefficients, residual - self.images[model] @ coefficients
 
     def project_direction(self, array_module: Any, model: int, values: Any) -> Any:
-        return values - self.bases[model] @ _cholesky_solve(array_module, self.factors[model], self.images[model].T @ values)
+        factor = self.factors[model]
+        return values - self.bases[model] @ (factor @ (factor.T @ (self.images[model].T @ values)))
 
 
 def spike_deflation(
@@ -384,8 +461,7 @@ def spike_deflation(
             width = int(bases[model].shape[1])
             images[model] = image[:, offset : offset + width]
             offset += width
-            gram = bases[model].T @ images[model]
-            factors[model] = array_module.linalg.cholesky(0.5 * (gram + gram.T))
+            factors[model] = deflation_factor(array_module, bases[model], images[model])
     return Deflation(bases, images, factors, resolved), {model: int(indices.size) for model, indices in resolved.items()}
 
 
@@ -428,7 +504,8 @@ def recursive_share(log_ratio: float, rate: float, operator_scale: float, sample
     def excess(share: float) -> float:
         iterations = (log_ratio + np.log(1.0 / share)) / rate
         inverse_error = 2 * operator_scale * iterations * np.sqrt(np.exp(log_ratio) * share) / (1.0 - share)
-        scaled_digits = max(0.0, float(np.log(np.sqrt(sample_count) * inverse_error)))
+        # an identity operator (rate = inf, no iterations) needs no operand digits
+        scaled_digits = max(0.0, float(np.log(np.sqrt(sample_count) * inverse_error))) if inverse_error > 0.0 else 0.0
         return (1.0 + share) * (log_ratio + np.log(1.0 / share)) - 2 * (1.0 - share) * (scaled_digits + 1.0)
 
     low, high = np.finfo(np.float64).tiny, 1.0 - np.finfo(np.float64).epsneg
@@ -480,7 +557,8 @@ def certified_block_cg(
     largest Ritz value seen), so a column's bound below that estimate is raised to it at each restart, and a
     column whose exact residual did not fall across a restart has reached what float64 attains for it
     and stops at that residual. ``residual_bound`` reports the bound each column met, the one asked for
-    or the one float64 set, so the caller sees which.
+    or the one float64 set, so the caller sees which. A residual that is not finite fails loudly: NaN
+    compares false against every bound, so it would otherwise pass as certified.
     """
     array_module = source.array_module
     host_models = _host(column_models)
@@ -501,6 +579,8 @@ def certified_block_cg(
         else:
             residual = right_hand_side - apply_operator(source, models, solution, column_models, 0.0, count, f"{label}:exact")
         norms = array_module.linalg.norm(residual, axis=0)
+        if not bool(array_module.all(array_module.isfinite(norms))):
+            raise FloatingPointError("an exact residual is not finite: the right-hand side or the operator holds NaN or inf.")
         floor = np.finfo(np.float64).eps * (right_norms + (source.sample_count + source.variant_count) * operator_scale * array_module.linalg.norm(solution, axis=0))
         bound = array_module.maximum(requested, floor)
         open_mask = _host(norms > bound)
@@ -592,8 +672,9 @@ def certified_block_cg(
                     share = recursive_share(float(np.log(cycle_start_worst)), rate, operator_scale, source.sample_count)
                     drift_budget = (1.0 - share) * bound
             worst = float(array_module.max(array_module.linalg.norm(residual[:, open_columns], axis=0) / bound[open_columns]))
-            if worst < cycle_start_worst:
+            if 0.0 < worst < cycle_start_worst:
                 # The measured average contraction replaces the worst-case one once the cycle has made progress.
+                # A cycle that solved every open column exactly (an identity bulk operator) has none to measure.
                 rate = float(np.log(cycle_start_worst / worst)) / cycle_iterations
             directions = next_directions
 
@@ -785,6 +866,43 @@ def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, r
     return ResolvedBlock(design, precision, duals, residual, core, factor)
 
 
+def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, float]:
+    """(lambda_min(core_hat), ||R_L||_2, delta) for a resolved block, delta bounding ||L^-1 (core - core_hat) L^-T||_2.
+
+    With E = Z_L - Z_hat = S_S^-1 R_L, core - core_hat = sym(Z_hat'R_L) + R_L'S_S^-1 R_L, so
+    delta = ||L^-1 sym(Z_hat'R_L) L^-T|| + ||R_L||^2 / lambda_min(core_hat) (S_S >= I); all norms spectral.
+    """
+    lowest = float(array_module.linalg.eigvalsh(block.core)[0])
+    residual_gram = block.residual.T @ block.residual
+    residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
+    coupling = block.duals.T @ block.residual
+    whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
+    delta = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
+    return lowest, residual_norm, delta
+
+
+def resolved_correction_error(array_module: Any, block: ResolvedBlock, correction: Any, shifted: Any, image_norms: Any) -> Any:
+    """Per column, a bound on ||Z_hat c - Z_L c*|| for c = core_hat^-1 s_hat and c* = core^-1 s, s = Z_L'u - v_L.
+
+    `correction` is c, `shifted` is s_hat = Z_hat'u - v_L and `image_norms` is ||u||. With E = Z_L - Z_hat =
+    S_S^-1 R_L (||E|| <= ||R_L||, S_S >= I), s_hat - s = -E'u and L'core^-1 L within kappa = delta / (1 - delta)
+    of I (core_bounds):
+        ||Z_hat c - Z_L c*|| <= ||R_L|| ||c|| + (||Z_hat|| + ||R_L||) ||c - c*||,
+        ||c - c*|| <= ||R_L|| ||u|| / lambda_min + kappa (||L^-1 s_hat|| + ||R_L|| ||u|| / sqrt(lambda_min)) / sqrt(lambda_min).
+    Infinite when delta is not below 1. All norms spectral.
+    """
+    lowest, residual_norm, delta = core_bounds(array_module, block)
+    if not delta < 1.0:
+        return array_module.full(image_norms.shape, np.inf)
+    kappa = delta / (1.0 - delta)
+    root = float(np.sqrt(lowest))
+    gram = block.duals.T @ block.duals
+    duals_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (gram + gram.T))[-1]), 0.0)))
+    whitened = array_module.linalg.norm(array_module.linalg.solve(block.factor, shifted), axis=0)
+    offset = residual_norm * image_norms / lowest + kappa * (whitened + residual_norm * image_norms / root) / root
+    return residual_norm * array_module.linalg.norm(correction, axis=0) + (duals_norm + residual_norm) * offset
+
+
 def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: Any, residual: Any) -> tuple[Any, Any, Any]:
     """Columns sharing one model's split: their resolved block, their mean duals and their A-norm certificate.
 
@@ -804,14 +922,9 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     mean_duals = duals - block.duals @ resolved_mean
     bulk_residual = residual - block.residual @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
-    lowest = float(array_module.linalg.eigvalsh(block.core)[0])
+    lowest, residual_norm, core_error = core_bounds(array_module, block)
     # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
     inverse_factor_norm = float(np.sqrt(1.0 / lowest))
-    residual_gram = block.residual.T @ block.residual
-    residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
-    coupling = block.duals.T @ block.residual
-    whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
-    core_error = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
     bulk_norms = array_module.linalg.norm(bulk_residual, axis=0)
     if core_error >= 1.0:
         return resolved_mean, mean_duals, array_module.full(bulk_norms.shape, np.inf)
@@ -832,6 +945,44 @@ def exact_resolved_certificate(array_module: Any, block: ResolvedBlock, shift: A
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
     projected = array_module.linalg.solve(block.factor, stationarity + block.duals.T @ residual)
     return array_module.sqrt(array_module.sum(residual * residual, axis=0) + array_module.sum(projected * projected, axis=0))
+
+
+@dataclass(frozen=True)
+class SampleDiagonal:
+    """The exact parts of one model's per-sample posterior variance of the linear predictor.
+
+    Var(eta_i) = (1 - [(I - H) S^-1 (I - H)]_ii) / w_i on the training rows, with S the model's full
+    dual operator. Two identities make every part but one exact:
+    - S H = H (Xt'H = 0), so S^-1 = H + (I - H) S^-1 (I - H) and
+      [(I - H) S^-1 (I - H)]_ii = [S^-1]_ii - H_ii, with H_ii = `covariate_leverage`;
+    - with the resolved sites eliminated, I - Xt A^-1 Xt' = S_S^-1 - Z_L core^-1 Z_L' (Woodbury on L,
+      valid for any-sign Pi_L while core > 0), so [S^-1]_ii = [S_S^-1]_ii - resolved_i with
+      resolved_i = z_L,i' core^-1 z_L,i.
+    The one convention: the bulk diagonal [S_S^-1]_ii is of the spike-free bulk operator only, the
+    deterministic-equivalent map's to supply; `predictor_variance` is the one place that adds the
+    resolved term and H_ii to it.
+
+    `resolved_term` is resolved_i from the computed Z_L and core; `resolved_lower` and
+    `resolved_upper` bound the exact value row by row. With a_i = ||L^-1 z_hat_L,i|| (core_hat = L L')
+    and E = S_S^-1 R_L the error of Z_L (R_L its exact residuals), row i of E is e_i' S_S^-1 R_L, so
+    ||E_i|| <= ||S_S^-1 e_i|| ||R_L||_2 <= ||R_L||_2 (S_S >= I), and ||L^-1 E_i|| <= b = ||R_L||_2 /
+    sqrt(lambda_min(core_hat)). The core satisfies (1 - delta) core_hat <= core <= (1 + delta) core_hat
+    (core_bounds), so resolved_i lies in [max(a_i - b, 0)^2 / (1 + delta), (a_i + b)^2 / (1 - delta)];
+    the bounds are infinite when delta is not below 1.
+    """
+
+    weights: Any
+    covariate_leverage: Any
+    resolved_term: Any
+    resolved_lower: Any
+    resolved_upper: Any
+
+    def predictor_variance(self, bulk_diagonal: Any, array_module: Any) -> tuple[Any, Any, Any]:
+        """(training rows, lower, upper) of Var(eta_i) = (1 - [S_S^-1]_ii + resolved_i + H_ii) / w_i, given
+        the bulk diagonal [S_S^-1]_ii (n,); the interval carries only the resolved term's bound."""
+        rows = array_module.flatnonzero(self.weights > 0.0)
+        base = 1.0 - bulk_diagonal[rows] + self.covariate_leverage[rows]
+        return rows, (base + self.resolved_lower[rows]) / self.weights[rows], (base + self.resolved_upper[rows]) / self.weights[rows]
 
 
 @dataclass(frozen=True)
@@ -927,7 +1078,8 @@ class DualGaussian:
     quantities for the leave-block-out marginal variances, the covariates and posterior draws.
 
     A model is a quantitative trait on a training set: `training` (n, M) is 1 on its training rows,
-    `targets` and `offsets` are (n, M), and the covariates are profiled out in its metric
+    `targets` and `offsets` are (n, M) (a target off its model's rows is never read, so it may be
+    missing: NaN, as in cohort.Cohort.targets), and the covariates are profiled out in its metric
     W = training / sigma^2. The sites (tau, nu) of `iterate` give D = 1/tau and m = nu / tau on the
     bulk; the resolved set L of each model, its non-positive sites and its spikes (resolved_spikes),
     is eliminated exactly, and the bulk probes (Rademacher on the training rows) give
@@ -944,7 +1096,11 @@ class DualGaussian:
         self.windows = _WindowLayout(grams, source)
         self.array_module = array_module
         self.training = array_module.asarray(training, dtype=array_module.float64)
-        self.targets = array_module.asarray(targets, dtype=array_module.float64)
+        targets = array_module.asarray(targets, dtype=array_module.float64)
+        if not bool(array_module.all(array_module.isfinite(targets) | (self.training == 0.0))):
+            raise ValueError("every target on a model's training rows must be finite.")
+        # Zero weight times a missing target is NaN, not zero: the rows off the mask take target 0.
+        self.targets = array_module.where(self.training == 0.0, 0.0, targets)
         self.offsets = array_module.asarray(offsets, dtype=array_module.float64)
         self.covariates = array_module.asarray(covariates, dtype=array_module.float64)
         self.model_count = int(self.training.shape[1])
@@ -1104,10 +1260,8 @@ class DualGaussian:
         self.count.note(int(duals.shape[1]), 0.0, "finish")
         self.mean = mean
         self.genetic_image = image
-        weights = models.weights
         remainder = self.targets - self.offsets - image
-        normal = array_module.einsum("na,nm,nb->mab", self.covariates, weights, self.covariates)
-        self.alpha = array_module.linalg.solve(normal, (self.covariates.T @ (weights * remainder)).T[:, :, None])[:, :, 0].T
+        self.alpha = models.covariate_solve(self.covariates.T @ (models.weights * remainder), array_module.arange(self.model_count))
         self.linear_predictor = self.offsets + image + self.covariates @ self.alpha
         probe_solutions = result.solution[:, int(state["offsets"][-2]) :]
         self.bulk_solves = []
@@ -1157,33 +1311,109 @@ class DualGaussian:
         """The products the cavity certificate needs for variant-side probes v (p x k), at the last iterate's sites.
 
         With u = Xt D_S v, t = Z_L'u and w = K_S^-1 u - Z_L core^-1 (t - v_L) (K_S = S_S, the bulk
-        operator), returns (Xt'w (p x k), t (|L| x k), the exact relative residuals ||u - K_S y|| / ||u||
-        of the bulk solve (k,)). The solve runs to `residual_tolerance`, a relative bound on that
-        residual (marginal_variances' information_solve_tolerance), applied to each column's own u.
-        w is minus the dual posterior_solve forms for the shift v, before D_S v_S is added. Two reads
-        plus the CG passes.
+        operator), returns (Xt'w (p x k), t (|L| x k), bounds on ||w_hat - w|| / ||u|| (k,)). Each bound is
+        at most `residual_tolerance` (marginal_variances' information_solve_tolerance), whose
+        |a'(w_hat - w)| <= |a| ||w_hat - w|| is what the certificate needs. The bound adds, to the K_S
+        solve's exact residual, the resolved correction's error from the refresh's Z_hat and core_hat
+        (resolved_correction_error). A column that misses tightens its solve and Z_L by the measured
+        shortfall, as posterior_solve does. w is minus the dual posterior_solve forms for the shift v,
+        before D_S v_S is added. Two reads plus the CG passes.
         """
         array_module = self.array_module
+        source = self.source
         state = self._state
         models = state["models"]
         values, _bulk_values, resolved, column_models, image = self._bulk_image(probes, model)
         columns = int(values.shape[1])
         image_norms = array_module.linalg.norm(image, axis=0)
-        bound = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,)) * image_norms
+        # A column with no image is solved by the zero start, so its bound is 0 (never inf * 0).
+        tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (columns,))
+        target = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
+        bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)
-        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="information")
-        block = state["blocks"].get(model)
-        duals = result.solution
-        coupling = array_module.zeros((0, columns))
-        if block is not None:
-            coupling = block.duals.T @ image
-            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling - values[resolved])
+        start = array_module.zeros_like(image)
+        while True:
+            result = certified_block_cg(source, models, image, start, column_models, bound, self.count, deflation=spike_free, label="information")
+            block = state["blocks"].get(model)
+            duals = result.solution
+            coupling = array_module.zeros((0, columns))
+            error = result.residual_norm
+            if block is not None:
+                coupling = block.duals.T @ image
+                shifted = coupling - values[resolved]
+                correction = _cholesky_solve(array_module, block.factor, shifted)
+                duals = duals - block.duals @ correction
+                error = error + resolved_correction_error(array_module, block, correction, shifted, image_norms)
+            # the certificate's bound scales with ||u||, so a column with no bulk image asks nothing of it
+            open_mask = _host((error > target) & (image_norms > 0.0))
+            if not open_mask.any():
+                break
+            finite = array_module.isfinite(error)
+            shortfall = array_module.where(finite, target / array_module.where(finite & (error > 0.0), error, 1.0), tolerance)
+            open_columns = array_module.asarray(np.flatnonzero(open_mask))
+            bound[open_columns] *= shortfall[open_columns]
+            if block is not None:
+                tightening = float(array_module.min(shortfall[open_columns]))
+                resolved_columns = array_module.full(int(block.design.shape[1]), model)
+                resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
+                refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="information-resolved")
+                state["blocks"][model] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+            start = result.solution
         left = models.sample_to_design(duals, column_models)
         back_products = array_module.empty((self.source.variant_count, columns))
-        for start, stop, tile in self.source.blocks():
-            back_products[start:stop] = tile.rmatmat(left)
+        for start_row, stop_row, tile in self.source.blocks():
+            back_products[start_row:stop_row] = tile.rmatmat(left)
         self.count.note(columns, 0.0, "information-products")
-        return back_products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
+        return back_products, coupling, error / array_module.maximum(image_norms, np.finfo(np.float64).tiny)
+
+    def resolved_block(self, model: int) -> "ResolvedBlock | None":
+        """The last iterate's resolved block of `model` (Xt_L, Z_hat, R_L, core_hat and its factor), or None."""
+        return self._state["blocks"].get(model)
+
+    def block_products(self, model: int, columns: np.ndarray, coefficients: Any, rows: np.ndarray, residual_tolerance: float) -> tuple[Any, Any, Any, Any]:
+        """Xt_rows' w for directions u = Xt_columns C of a few bulk columns, at the last iterate's sites.
+
+        `columns` are sorted bulk variants, `coefficients` C is (|columns|, r) and `rows` are sorted variants.
+        With w = K_S^-1 u - Z_L core^-1 Z_L'u (Q u, every resolved site eliminated), the K_S solve runs to the
+        relative residual `residual_tolerance` of each u. Returns (Xt_rows' w (|rows|, r), t = Z_L'u (|L|, r),
+        the exact relative residuals (r,), ||u|| (r,)). Unlike information_solve it holds no p x r array: the
+        image reads only the columns' tiles and the back product keeps only the rows' tiles. One read for the
+        image, the CG passes, one read for the back product.
+        """
+        array_module = self.array_module
+        state = self._state
+        models = state["models"]
+        columns = np.asarray(columns, dtype=np.int64)
+        rows = np.asarray(rows, dtype=np.int64)
+        values = array_module.asarray(coefficients, dtype=array_module.float64)
+        width = int(values.shape[1])
+        column_models = array_module.full(width, model)
+        image = array_module.zeros((self.source.sample_count, width))
+        for start, stop, tile in self.source.blocks():
+            inside = np.flatnonzero((columns >= start) & (columns < stop))
+            if inside.size:
+                image += tile.columns(columns[inside] - start) @ values[array_module.asarray(inside)]
+        self.count.note(width, 0.0, "block-image")
+        image = models.design_to_sample(image, column_models)
+        image_norms = array_module.linalg.norm(image, axis=0)
+        tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (width,))
+        bound = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
+        spike_free = Deflation({}, {}, {}, self._resolved)
+        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="block-products")
+        duals = result.solution
+        block = state["blocks"].get(model)
+        coupling = array_module.zeros((0, width))
+        if block is not None:
+            coupling = block.duals.T @ image
+            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling)
+        left = models.sample_to_design(duals, column_models)
+        products = array_module.zeros((rows.size, width))
+        for start, stop, tile in self.source.blocks():
+            inside = np.flatnonzero((rows >= start) & (rows < stop))
+            if inside.size:
+                products[array_module.asarray(inside)] = tile.rmatmat(left)[array_module.asarray(rows[inside] - start)]
+        self.count.note(width, 0.0, "block-products")
+        return products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny), image_norms
 
     def posterior_solve(self, right: Any, model: int, error_bound: Any) -> tuple[Any, Any]:
         """A_m^-1 right (p x r) at the last iterate's sites, and each column's certified ||x_hat - x||_A.
@@ -1264,6 +1494,30 @@ class DualGaussian:
             solution[resolved] = resolved_values
         return solution, certificate
 
+    def sample_diagonal(self, model: int) -> SampleDiagonal:
+        """The exact parts of model m's per-sample predictor variance at the last iterate (SampleDiagonal); no read."""
+        array_module = self.array_module
+        state = self._state
+        models = state["models"]
+        weights = models.weights[:, model]
+        # H_ii = w_i c_i'(C'WC)^+ c_i = w_i ||F'c_i||^2 with F F' = (C'WC)^+ (covariate_whitener).
+        whitened_covariates = self.covariates @ models.covariate_factor[model]
+        covariate_leverage = weights * array_module.sum(whitened_covariates * whitened_covariates, axis=1)
+        block = state["blocks"].get(model)
+        if block is None:
+            zeros = array_module.zeros(self.source.sample_count)
+            return SampleDiagonal(weights, covariate_leverage, zeros, zeros, zeros)
+        whitened = array_module.linalg.solve(block.factor, block.duals.T)
+        resolved_term = array_module.sum(whitened * whitened, axis=0)
+        lowest, residual_norm, core_error = core_bounds(array_module, block)
+        if core_error >= 1.0:
+            return SampleDiagonal(weights, covariate_leverage, resolved_term, array_module.zeros_like(resolved_term), array_module.full_like(resolved_term, np.inf))
+        root = array_module.sqrt(resolved_term)
+        reach = residual_norm / float(np.sqrt(lowest))
+        lower = array_module.maximum(root - reach, 0.0) ** 2 / (1.0 + core_error)
+        upper = (root + reach) ** 2 / (1.0 - core_error)
+        return SampleDiagonal(weights, covariate_leverage, resolved_term, lower, upper)
+
     def residual_sum_of_squares(self) -> np.ndarray:
         """(M,): each model's training sum of (y - linear predictor)^2 at the current mean."""
         residual = self.targets - self.linear_predictor
@@ -1273,20 +1527,74 @@ class DualGaussian:
         """Posterior draws for given noise: the bulk by Matheron on S_S, L from its marginal (split_draw_duals).
 
         prior_noise (p, K) and sample_noise (n, K) are e1 and e2 of each draw column, resolved_noise[m]
-        is eps_L (|L_m| x the model's draws); each draw's dual is certified to error_bound (K,).
-        Returns (draws (p, K), exact bulk dual residual norms (K,)).
+        is eps_L (|L_m| x the model's draws). Each draw's perturbation, the draw minus the mean, is certified
+        to error_bound (K,) in A-norm against an exact draw from the same noise.
+
+        The exact draw may take beta_L* - mu_L = F eps_L for any F with F F' = core^-1 (each gives the joint
+        posterior), so take F = core^-1/2 U, with U the orthogonal factor nearest core^1/2 L^-T for the
+        computed core_hat = L L'. By Schur's complement of A's bulk block, the error e has
+        ||e||_A^2 = ||e_S + A_SS^-1 A_SL e_L||_A_SS^2 + ||e_L||_core^2.
+        - The first part is D_S Xt_S' S_S^-1 (R_L d_L - r), for the draw's resolved offset d_L = L^-T eps_L,
+          the Z_L residuals R_L and the draw dual's exact residual r, so it is at most ||R_L d_L - r||
+          (DualCertificate's identity).
+        - e_L = (core^1/2 L^-T - U) eps_L in the core norm. The singular values of core^1/2 L^-T are
+          sqrt(1 + lambda) over the eigenvalues lambda of L^-1 (core - core_hat) L^-T, which lie in
+          [-delta, delta] (core_bounds), so ||e_L||_core <= (1 - sqrt(1 - delta)) ||eps_L||.
+        A draw that misses its bound tightens its dual and its model's Z_L by the measured shortfall, as
+        posterior_solve does. Returns (draws (p, K), the certificates (K,)).
         """
         array_module = self.array_module
         source = self.source
         state = self._state
         models = state["models"]
+        host_models = np.asarray(draw_models)
         device_models = array_module.asarray(draw_models)
         rhs = draw_right_hand_side(source, models, device_models, prior_noise, sample_noise, self.count)
-        result = certified_block_cg(source, models, rhs, array_module.zeros_like(rhs), device_models, array_module.asarray(error_bound), self.count, label="draws")
-        draw_duals, resolved_draws = split_draw_duals(
-            {model: block.factor for model, block in state["blocks"].items()}, state["resolved_mean"],
-            {model: block.duals for model, block in state["blocks"].items()}, draw_models, result.solution, resolved_noise, array_module,
-        )
+        target = array_module.broadcast_to(array_module.asarray(error_bound, dtype=array_module.float64), (int(rhs.shape[1]),)).copy()
+        bound = target.copy()
+        spike_free = Deflation({}, {}, {}, self._resolved)
+        start = array_module.zeros_like(rhs)
+        while True:
+            # the split made S_S spike-free, so the relaxed operand error applies (an empty deflation says so)
+            result = certified_block_cg(source, models, rhs, start, device_models, bound, self.count, deflation=spike_free, label="draws")
+            draw_duals, resolved_draws = split_draw_duals(
+                {model: block.factor for model, block in state["blocks"].items()}, state["resolved_mean"],
+                {model: block.duals for model, block in state["blocks"].items()}, draw_models, result.solution, resolved_noise, array_module,
+            )
+            certificate = result.residual_norm.copy()
+            for model, block in state["blocks"].items():
+                columns = np.flatnonzero(host_models == model)
+                if columns.size == 0:
+                    continue
+                device_columns = array_module.asarray(columns)
+                _lowest, _residual_norm, delta = core_bounds(array_module, block)
+                if not delta < 1.0:
+                    certificate[device_columns] = np.inf
+                    continue
+                offset = resolved_draws[model] - state["resolved_mean"][model][:, None]
+                bulk = array_module.linalg.norm(block.residual @ offset - result.residual[:, device_columns], axis=0)
+                # 1 - sqrt(1 - delta), written without the cancellation
+                spread = delta / (1.0 + np.sqrt(1.0 - delta)) * array_module.linalg.norm(array_module.asarray(resolved_noise[model]), axis=0)
+                certificate[device_columns] = array_module.sqrt(bulk * bulk + spread * spread)
+            open_mask = _host(certificate > target)
+            if not open_mask.any():
+                break
+            finite = array_module.isfinite(certificate)
+            fallback = target / array_module.maximum(array_module.linalg.norm(rhs, axis=0), np.finfo(np.float64).tiny)
+            # an open column's certificate exceeds its positive target, so it is positive
+            shortfall = array_module.where(finite, target / array_module.where(finite & (certificate > 0.0), certificate, 1.0), fallback)
+            open_columns = array_module.asarray(np.flatnonzero(open_mask))
+            bound[open_columns] *= shortfall[open_columns]
+            for model in np.unique(host_models[open_mask]):
+                block = state["blocks"].get(int(model))
+                if block is None:
+                    continue
+                tightening = float(array_module.min(shortfall[array_module.asarray(np.flatnonzero(open_mask & (host_models == model)))]))
+                resolved_columns = array_module.full(int(block.design.shape[1]), int(model))
+                resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
+                refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="draws-resolved")
+                state["blocks"][int(model)] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+            start = result.solution
         left = models.sample_to_design(draw_duals, device_models)
         bulk_variances = state["bulk_variances"][:, device_models]
         draws = self.mean[:, device_models] + array_module.sqrt(bulk_variances) * prior_noise
@@ -1294,9 +1602,9 @@ class DualGaussian:
             draws[start:stop] += bulk_variances[start:stop] * tile.rmatmat(left)
         self.count.note(int(draw_duals.shape[1]), 0.0, "draws")
         for model, values in resolved_draws.items():
-            columns = np.flatnonzero(draw_models == model)
+            columns = np.flatnonzero(host_models == model)
             draws[array_module.asarray(self._resolved[model])[:, None], array_module.asarray(columns)[None, :]] = values
-        return draws, result.residual_norm
+        return draws, certificate
 
     def draws(self, *, draw_count: int, error_bound: Any, seed: int) -> Any:
         """(p, M, draw_count) exact posterior draws of every model, each certified to its model's error_bound."""
@@ -1312,3 +1620,54 @@ class DualGaussian:
         bound = array_module.asarray(error_bound, dtype=array_module.float64)[array_module.asarray(draw_models)]
         draws, _norms = self.draws_from_noise(prior_noise=prior_noise, sample_noise=sample_noise, resolved_noise=resolved_noise, draw_models=draw_models, error_bound=bound)
         return draws.reshape(self.source.variant_count, self.model_count, draw_count)
+
+    def _design_block(self, model: int, start: int, stop: int, tile: DualTile) -> Any:
+        """Xt_b = (I - H) W^1/2 X_b of one block for model m, dense (n x p_b)."""
+        return self._state["models"].design_to_sample(tile.columns(np.arange(stop - start)), self.array_module.full(stop - start, model))
+
+    def kernel_factor(self, model: int) -> KernelFactor:
+        """Model m's bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely at the last iterate's sites (host).
+
+        For shapes whose n x n kernel fits (marginal_variances.exact_route_is_cheaper): one read forms K_S
+        (n^2 p flops), its Cholesky factor gives Z_L = K_S^-1 Xt_L and core = Pi_L + Xt_L'Z_L (Pi_L of any
+        sign). Raises LinAlgError when the core, hence A, is not positive definite.
+        """
+        array_module = self.array_module
+        state = self._state
+        variances = state["models"].variances[:, model]
+        kernel = array_module.eye(self.source.sample_count)
+        for start, stop, tile in self.source.blocks():
+            block = self._design_block(model, start, stop, tile)
+            kernel += (block * variances[start:stop][None, :]) @ block.T
+        # The read multiplies every block by n sample-side columns.
+        self.count.note(self.source.sample_count, 0.0, "kernel-factor")
+        kernel = _host(kernel)
+        lower = np.linalg.cholesky(0.5 * (kernel + kernel.T))
+        block = state["blocks"].get(model)
+        if block is None:
+            return KernelFactor(lower=lower, resolved_solves=np.zeros((lower.shape[0], 0)), resolved_core=np.zeros((0, 0)))
+        design = _host(block.design)
+        resolved_solves = np.linalg.solve(lower.T, np.linalg.solve(lower, design))
+        core = np.diag(_host(block.precision)) + design.T @ resolved_solves
+        core = 0.5 * (core + core.T)
+        np.linalg.cholesky(core)
+        return KernelFactor(lower=lower, resolved_solves=resolved_solves, resolved_core=core)
+
+    def exact_marginals(self, model: int, factor: KernelFactor) -> np.ndarray:
+        """diag(A_m^-1) at the last iterate's sites (host, (p,)), exactly, from `kernel_factor`'s factor: one read.
+
+        Bulk sites take D_j - marginal_variances.exact_block_information, resolved sites diag(core^-1)
+        (A^-1_LL = core^-1, Schur's complement of A's bulk block). No probes and no certificate: the
+        only error is float64 rounding.
+        """
+        variances = _host(self._state["models"].variances[:, model])
+        marginals = np.empty(self.source.variant_count)
+        for start, stop, tile in self.source.blocks():
+            block_variances = variances[start:stop]
+            information = exact_block_information(factor, block_variances, _host(self._design_block(model, start, stop, tile)))
+            marginals[start:stop] = block_variances - information
+        self.count.note(self.source.sample_count, 0.0, "exact-marginals")
+        resolved = self._resolved[model]
+        if resolved.size:
+            marginals[resolved] = np.diag(np.linalg.inv(factor.resolved_core))
+        return marginals

@@ -22,8 +22,7 @@ The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings b
 
 ## Status
 [docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps.
-- **On main:** the dosage store, Stage 0, the Stage 2 E-step, scoring, the reliability and fusion models, the prior design, the phenotypes and the evaluation tests.
-- **Not yet on main:** the end-to-end fit (Stage 2's driver, `full_data_fit.py`).
+- **On main:** the dosage store and its streamed reader, Stage 0, the EP-EB engine (`scale_mixture_ep.py`, with its certified outer loop), the Stage 2 solves (`dual_solve.py`) and certified marginal variances (`marginal_variances.py`), the Stage 2 driver (`full_data_fit.py`), the small-n dense route (`small_n.py`) and the pooled fit (`pooled_fit.py`), the fit/score API and its model artifact (`fit_model.py`, `artifact.py`, `cli.py`), scoring, the reliability and fusion models, the prior design, the cohort builder with typed sample IDs, the phenotypes and their measurement model, the evaluation tests, and two neutral benchmarks (`benchmarks/bench_real`, `benchmarks/bench_sim`) with SV-PGS's own method entry (`benchmarks/svpgs_method.py`).
 - **Deleted:** the old fitting path, in cutover steps C2–C8 ([CUTOVER.md](docs/design/CUTOVER.md)); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## Install

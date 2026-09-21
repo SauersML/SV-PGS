@@ -1,4 +1,4 @@
-"""GATK-SV store rows: fused rows, no-call fills, copy-number codes, dropped records."""
+"""GATK-SV store rows: every called record a row, no-call fills, copy-number codes, fusion pairs, dropped records."""
 from __future__ import annotations
 
 import numpy as np
@@ -7,22 +7,10 @@ import pytest
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.gatksv_source import GatksvBlock
-from sv_pgs.gatksv_store_rows import (
-    FalsePositiveRates,
-    ImputedSvRecords,
-    gatksv_sites,
-    gatksv_store_rows,
-)
-from sv_pgs.sv_fusion import AnchorErrorModel, SvSites, calibrate_two_sources
+from sv_pgs.gatksv_store_rows import ImputedSvRecords, gatksv_sites, gatksv_store_rows
+from sv_pgs.sv_fusion import MINIMUM_PAIRING_Z, SvSites
 
 _SAMPLE_COUNT = 20_000
-# Stratum 0 trusts its anchors; stratum 1's anchor error swamps them, so its
-# records keep the reliability model's prediction.
-_ERROR_MODELS = (
-    AnchorErrorModel(bias=0.0, excess_variance=0.01, berkson=False),
-    AnchorErrorModel(bias=0.0, excess_variance=1e6, berkson=False),
-)
-_CONTRADICTED_RELIABILITY = 0.02
 
 
 def _draw_and_calls(
@@ -84,17 +72,9 @@ def _scenario() -> tuple[GatksvBlock, ImputedSvRecords, dict[str, np.ndarray]]:
             duplications_are_insertions=True,
         ),
         codes=_codes(np.stack([dosage, unrelated_dosage, sharp_dosage]), CODES_PER_DOSAGE),
-        prior_log_reliabilities=np.log(np.array([0.64, 0.64, _CONTRADICTED_RELIABILITY])),
-        strata=np.array([0, 0, 1], dtype=np.int64),
     )
     return gatksv, imputed, {"genotype": genotype}
 
-
-_NO_FALSE_POSITIVES = FalsePositiveRates(means=np.zeros(5), variances=np.zeros(5))
-
-
-def _squared_correlation(first: np.ndarray, second: np.ndarray) -> float:
-    return float(np.corrcoef(first, second)[0, 1] ** 2)
 
 
 def test_gatksv_sites_use_the_first_affected_base_and_an_exclusive_end() -> None:
@@ -108,74 +88,53 @@ def test_gatksv_sites_use_the_first_affected_base_and_an_exclusive_end() -> None
     assert not sites.duplications_are_insertions
 
 
-def test_store_rows_fuse_the_accepted_pair_and_fill_every_other_no_call() -> None:
+def _best_linear_prediction(gatksv: GatksvBlock, imputed: ImputedSvRecords, record: int, imputed_record: int) -> np.ndarray:
+    dosage = imputed.codes[imputed_record] / CODES_PER_DOSAGE
+    called = ~gatksv.no_call[record]
+    covariance = np.cov(dosage[called], gatksv.values[record][called].astype(np.float64), bias=True)
+    slope = covariance[0, 1] / covariance[0, 0]
+    return gatksv.values[record][called].mean() + slope * (dosage - dosage[called].mean())
+
+
+def test_every_called_record_is_a_row_and_the_strong_pairs_are_left_to_the_measurement_model() -> None:
     gatksv, imputed, truth = _scenario()
     observed = ~gatksv.no_call
 
-    fused, rows = gatksv_store_rows(gatksv, imputed, _ERROR_MODELS, _NO_FALSE_POSITIVES)
+    rows, fusion = gatksv_store_rows(gatksv, imputed)
 
-    # Only the first DEL fuses; its row replaces imputed record 0.
-    assert fused.imputed_records.tolist() == [0]
-    assert fused.gatksv_records.tolist() == [0]
-    calibration = fused.calibrations[0]
-    assert calibration.accepted
-    fused_dosage = fused.codes[0] / CODES_PER_DOSAGE
-    imputed_dosage = imputed.codes[0] / CODES_PER_DOSAGE
-    assert _squared_correlation(fused_dosage, truth["genotype"]) > _squared_correlation(imputed_dosage, truth["genotype"]) + 0.05
-    # A GATK-SV no-call takes the recalibrated imputed dosage.
-    recalibrated = calibration.missing_genotype_mean + calibration.missing_slope * (imputed_dosage - calibration.missing_first_mean)
-    expected = np.floor(np.clip(recalibrated, 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
-    np.testing.assert_array_equal(fused.codes[0][gatksv.no_call[0]], expected[gatksv.no_call[0]])
-
-    # The rest stay rows; the all-no-call DUP is dropped.
-    assert rows.gatksv_records.tolist() == [1, 2, 3]
+    # The two DELs pair strongly with their imputed records; the unrelated INS does not.
+    assert fusion.imputed_records.tolist() == [0, 2] and fusion.gatksv_rows.tolist() == [0, 2]
+    assert np.all(fusion.pairing_z >= MINIMUM_PAIRING_Z)
+    # Every called record stays a row, the all-no-call DUP is dropped, nothing is fused here.
+    assert rows.gatksv_records.tolist() == [0, 1, 2, 3]
     assert rows.unobserved_records.tolist() == [4]
-    np.testing.assert_array_equal(rows.lengths, gatksv.lengths[[1, 2, 3]])
-    assert rows.filled_from_imputed.tolist() == [True, True, False]
-    np.testing.assert_allclose(rows.observed_fractions, observed[[1, 2, 3]].mean(axis=1))
-    # Observed calls are stored exactly: 127 per allele, a copy number as itself.
-    for row, record in enumerate([1, 2]):
-        np.testing.assert_array_equal(rows.codes[row][observed[record]], gatksv.values[record][observed[record]] * 127)
-    np.testing.assert_array_equal(rows.codes[2][observed[3]], gatksv.values[3][observed[3]])
-
-    # Every other record with a candidate fills its no-calls with E[B | DS] from that
-    # candidate's imputed DS: the unrelated INS (a slope near 0, so near its observed mean)
-    # and the contradicted DEL (a rejected calibration, but a strong pairing).
-    def best_linear_prediction(record: int, imputed_record: int) -> np.ndarray:
-        dosage = imputed.codes[imputed_record] / CODES_PER_DOSAGE
-        called = observed[record]
-        covariance = np.cov(dosage[called], gatksv.values[record][called].astype(np.float64), bias=True)
-        slope = covariance[0, 1] / covariance[0, 0]
-        return gatksv.values[record][called].mean() + slope * (dosage - dosage[called].mean())
-
-    unrelated = best_linear_prediction(1, 1)
-    expected = np.floor(np.clip(unrelated, 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
-    np.testing.assert_array_equal(rows.codes[0][gatksv.no_call[1]], expected[gatksv.no_call[1]])
-    contradicted = calibrate_two_sources(
-        imputed.codes[2] / CODES_PER_DOSAGE, gatksv.values[2], observed[2], _CONTRADICTED_RELIABILITY
-    )
-    assert not contradicted.accepted and contradicted.pairing_z >= 5
-    prediction = best_linear_prediction(2, 2)
-    expected = np.floor(np.clip(prediction, 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
-    np.testing.assert_array_equal(rows.codes[1][gatksv.no_call[2]], expected[gatksv.no_call[2]])
-    # Copy numbers never pair; their no-calls take the rounded observed mean.
+    np.testing.assert_array_equal(rows.lengths, gatksv.lengths[[0, 1, 2, 3]])
+    assert rows.filled_from_imputed.tolist() == [True, True, True, False]
+    np.testing.assert_allclose(rows.observed_fractions, observed[[0, 1, 2, 3]].mean(axis=1))
+    # Observed calls are stored exactly: 127 per allele, and floor(254 / 3) = 84 per copy for
+    # the copy-number record, whose calls reach 3 copies and whose modal call is 2.
+    for record in (0, 1, 2):
+        np.testing.assert_array_equal(rows.codes[record][observed[record]], gatksv.values[record][observed[record]] * 127)
+    assert gatksv.values[3][observed[3]].max() == 3
+    assert rows.codes_per_unit.tolist() == [127, 127, 127, 84]
+    assert rows.value_origin.tolist() == [0, 0, 0, -2]
+    np.testing.assert_array_equal(rows.codes[3][observed[3]], gatksv.values[3][observed[3]].astype(np.int64) * 84)
+    # No-calls take E[B | DS] from the paired imputed DS, or the observed mean for a copy number.
+    for record in (0, 1, 2):
+        expected = np.floor(np.clip(_best_linear_prediction(gatksv, imputed, record, record), 0.0, 2.0) * 127 + 0.5).astype(np.uint8)
+        np.testing.assert_array_equal(rows.codes[record][gatksv.no_call[record]], expected[gatksv.no_call[record]])
     copy_number_mean = gatksv.values[3][observed[3]].mean()
-    assert set(rows.codes[2][gatksv.no_call[3]].tolist()) == {int(np.floor(copy_number_mean + 0.5))}
-    predicted = prediction[gatksv.no_call[2]]
+    assert set(rows.codes[3][gatksv.no_call[3]].tolist()) == {int(np.floor(copy_number_mean * 84 + 0.5))}
     half_code = 0.5 / 127
-    assert rows.clipped_counts.tolist() == [0, int(np.count_nonzero((predicted < -half_code) | (predicted >= 2 + half_code))), 0]
+    for record in (0, 1, 2):
+        predicted = _best_linear_prediction(gatksv, imputed, record, record)[gatksv.no_call[record]]
+        assert rows.clipped_counts[record] == int(np.count_nonzero((predicted < -half_code) | (predicted >= 2 + half_code)))
+    assert rows.clipped_counts[3] == 0
+    assert truth["genotype"].shape == (gatksv.values.shape[1],)
 
 
-def test_store_rows_need_the_reliability_predictions_and_false_positive_rates() -> None:
+def test_store_rows_need_the_store_samples() -> None:
     gatksv, imputed, _ = _scenario()
-    missing_prediction = ImputedSvRecords(
-        sites=imputed.sites,
-        codes=imputed.codes,
-        prior_log_reliabilities=np.array([np.nan, 0.0, 0.0]),
-        strata=imputed.strata,
-    )
-
-    with pytest.raises(ValueError, match="reliability-model prediction"):
-        gatksv_store_rows(gatksv, missing_prediction, _ERROR_MODELS, _NO_FALSE_POSITIVES)
-    with pytest.raises(ValueError, match="one false-positive rate per GATK-SV record"):
-        gatksv_store_rows(gatksv, imputed, _ERROR_MODELS, FalsePositiveRates(means=np.zeros(4), variances=np.zeros(4)))
+    narrow = ImputedSvRecords(sites=imputed.sites, codes=imputed.codes[:, :-1])
+    with pytest.raises(ValueError, match="store's samples"):
+        gatksv_store_rows(gatksv, narrow)

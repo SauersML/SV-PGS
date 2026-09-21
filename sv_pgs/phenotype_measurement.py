@@ -18,7 +18,9 @@ The lattice starts at the recording resolution's variance. Readings are rounded 
 smallest gap between distinct readings, §3.2), so the rounded-data likelihood convolves the noise with the
 rounding error, of variance (y^(lambda - 1) delta)^2 / 12 on the transformed scale: no smaller noise variance
 is resolvable. The lattice reaches the largest squared within-person deviation, past it by its own width,
-and its spacing is halved until its quadrature in t meets the evidence tolerance.
+and its spacing is halved until its quadrature in t meets the evidence tolerance. PENDING (lead ruling): the
+extent past the largest deviation is generous, not derived; math-density's R2 rule (the fitted mass beyond the
+last node, mixing_density.md section 2) replaces it.
 
 Inference is exact in T_i, which is one-dimensional (the lead's ruling): EM over the complete data
 (T_i, each occasion's lattice component), with the density's step on the exact likelihood.
@@ -81,6 +83,9 @@ _GOLDEN = 0.5 * (3.0 - np.sqrt(5.0))
 # product, or one logsumexp temporary; and one more while a grown grid's components replace the last.
 _FLOAT64_BYTES = 8
 _ENTRY_BYTES = 4 * _FLOAT64_BYTES
+# Rounded operations behind each (node, occasion, component) term of the split information: the product with the
+# responsibility and the division by s (R1, R2), a square, two scalings, a subtraction and the accumulation.
+_SPLIT_OPERATIONS_PER_TERM = 8
 
 
 def _logsumexp(values: F64Array, axis: int) -> F64Array:
@@ -144,10 +149,31 @@ class OccasionModelFit:
     level_posterior_variance: F64Array
     log_likelihood: float
     log_evidence: float
+    # Louis' observed information for (log tau^2, a), a scaling every noise variance by e^a, the magnitudes of
+    # its terms, and how many rounded operations accumulated them (``split_identified``).
+    split_information: F64Array
+    split_magnitude: F64Array
+    split_operations: int
 
     @property
     def reliability(self) -> F64Array:
         return 1.0 - self.level_posterior_variance / self.level_variance
+
+    @property
+    def split_identified(self) -> bool:
+        """Whether the data separate the level variance from the noise (the lead's ruling on traits with few
+        within-person replicates): the observed information for (log tau^2, a) is positive definite beyond its
+        rounding. Each entry, a sum of m rounded terms, errs by at most gamma_m times the sum of their magnitudes
+        (Higham 2002, section 4.2), so by Weyl's inequality the matrix is certified positive definite when its
+        smallest eigenvalue exceeds the Frobenius norm of those bounds. Without replicates only the sum
+        tau^2 + E[s] is identified and the smallest eigenvalue is zero up to rounding."""
+        unit_roundoff = 0.5 * _EPSILON
+        if self.split_operations * unit_roundoff >= 1.0:
+            return False
+        gamma = self.split_operations * unit_roundoff / (1.0 - self.split_operations * unit_roundoff)
+        if _log_determinant(self.split_information) is None:
+            return False
+        return bool(np.linalg.eigvalsh(0.5 * (self.split_information + self.split_information.T))[0] > gamma * np.linalg.norm(self.split_magnitude))
 
     @property
     def noise_second_moment(self) -> float:
@@ -199,6 +225,9 @@ class LevelPosterior:
     occasion_precision: F64Array
     occasion_shift: F64Array
     missing_information: F64Array
+    split_information: F64Array
+    split_magnitude: F64Array
+    split_operations: int
     admissible_step: F64Array
     grid: LevelGrid
 
@@ -332,6 +361,21 @@ def _log_modulus_bound(
     return _logsumexp(np.stack([interior, below, above], axis=2), axis=2)
 
 
+class LatticeTooLarge(MemoryError):
+    """A noise-density lattice whose K x K matrices exceed the memory budget."""
+
+
+# The lattice's K x K float64 matrices live at once, at most: in the engine's prior (the sum-to-zero basis, the
+# roughness factor, the coefficient map, the penalty and its eigenvectors) and, beside it, a least-squares refit
+# of its coefficients (the matrix's copy and its two singular-vector factors).
+_LATTICE_MATRICES = 8
+
+
+def _check_lattice(node_count: int, working_bytes: int) -> None:
+    if node_count * node_count * _LATTICE_MATRICES * _FLOAT64_BYTES > working_bytes:
+        raise LatticeTooLarge(f"a noise-density lattice of {node_count} nodes exceeds the {working_bytes} byte budget")
+
+
 class PieceTooLarge(MemoryError):
     """An E-step piece whose persons x nodes x J x K working arrays exceed the memory budget."""
 
@@ -381,12 +425,16 @@ def _level_grid(
     lower = -np.maximum(np.ceil(lower_reach / steps), 1.0)
     upper = np.maximum(np.ceil(upper_reach / steps), 1.0)
     while True:
+        # Checked in floating point before any persons x nodes array exists (or an integer count overflows): the
+        # grid's own index, mask and nodes are smaller than the components per entry the budget counts.
+        widest = float(np.max(upper - lower)) + 1.0
+        if not residuals.shape[0] * widest * residuals.shape[1] * variances.shape[0] * _ENTRY_BYTES <= working_bytes:
+            raise PieceTooLarge(f"{residuals.shape[0]} persons need {widest:.3g} level nodes each")
         counts = (upper - lower).astype(np.int64) + 1
-        offsets = np.arange(int(counts.max()))[None, :]
+        width = int(counts.max())
+        offsets = np.arange(width)[None, :]
         valid = offsets < counts[:, None]
         levels = centres[:, None] + (lower[:, None] + np.minimum(offsets, counts[:, None] - 1)) * steps[:, None]
-        if levels.size * residuals.shape[1] * variances.shape[0] * _ENTRY_BYTES > working_bytes:
-            raise PieceTooLarge(f"{levels.shape[0]} persons need {levels.shape[1]} level nodes each")
         log_components = _log_components(residuals, levels, log_masses, variances)
         per_occasion = _logsumexp(log_components, axis=3)
         log_integrand = np.where(valid, _log_prior(levels, level_variance) + per_occasion.sum(axis=2), -np.inf)
@@ -453,6 +501,7 @@ def level_posterior(
     occasion_precision, occasion_shift = np.empty((persons, occasion_count)), np.empty((persons, occasion_count))
     admissible = np.empty(persons)
     counts, missing = np.zeros(grid_size), np.zeros((grid_size, grid_size))
+    split, magnitude, operations = np.zeros((2, 2)), np.zeros((2, 2)), 0
     # Only the persons whose step is not yet certified are integrated again.
     pending = np.arange(persons)
     while pending.size:
@@ -513,6 +562,37 @@ def level_posterior(
                 + (flat_sums * weights.reshape(-1, 1)).T @ flat_sums
                 - mean_sums.T @ mean_sums
             )
+            # The level/noise split: Louis' identity for (log tau^2, a), a scaling every noise variance by e^a.
+            # The complete-data scores are t = T^2 / (2 tau^2) - 1/2 and sum_j (e_j^2 / (2 s) - 1/2), e_j = r_j - T;
+            # given T each occasion's component is independent, so E and Var of the noise score at a node are
+            # sums over occasions of e^2 R1 / 2 - 1/2 and e^4 (R2 - R1^2) / 4, R_p = sum_k rho_k / s_k^p.
+            squares = np.square(residuals[rows][:, None, :] - node_levels[:, :, None])
+            first = responsibility @ (1.0 / variances)
+            second = responsibility @ (1.0 / np.square(variances))
+            noise_score = np.sum(0.5 * squares * first - 0.5, axis=2)
+            noise_variance = 0.25 * np.sum(np.square(squares) * (second - np.square(first)), axis=2)
+            level_score = 0.5 * np.square(node_levels) / level_variance - 0.5
+            complete = np.stack([
+                np.sum(weights * (level_score + 0.5), axis=1),
+                np.sum(weights * 0.5 * np.sum(squares * first, axis=2), axis=1),
+            ])
+            means = np.stack([np.sum(weights * level_score, axis=1), np.sum(weights * noise_score, axis=1)])
+            raw = np.stack([
+                np.sum(weights * np.square(level_score), axis=1),
+                np.sum(weights * (noise_variance + np.square(noise_score)), axis=1),
+            ])
+            cross = np.sum(weights * level_score * noise_score, axis=1)
+            split += np.array([
+                [np.sum(complete[0] - raw[0] + np.square(means[0])), -np.sum(cross - means[0] * means[1])],
+                [-np.sum(cross - means[0] * means[1]), np.sum(complete[1] - raw[1] + np.square(means[1]))],
+            ])
+            off_diagonal = np.sum(np.sum(weights * np.abs(level_score * noise_score), axis=1) + np.abs(means[0] * means[1]))
+            magnitude += np.array([
+                [np.sum(complete[0] + raw[0] + np.square(means[0])), off_diagonal],
+                [off_diagonal, np.sum(complete[1] + raw[1] + np.square(means[1]))],
+            ])
+            # Per (node, occasion, component) term: a product with rho, a square, two scalings and the sums.
+            operations += responsibility.size * _SPLIT_OPERATIONS_PER_TERM
         node_precision = weighted @ (1.0 / variances)
         occasion_precision[rows] = node_precision.sum(axis=1)
         occasion_shift[rows] = np.sum(node_precision * node_levels[:, :, None], axis=1)
@@ -529,6 +609,9 @@ def level_posterior(
         occasion_precision=occasion_precision,
         occasion_shift=occasion_shift,
         missing_information=missing,
+        split_information=split,
+        split_magnitude=magnitude,
+        split_operations=operations,
         admissible_step=admissible,
         # The next step starts halfway in log between the certified one and the largest admissible here, so it
         # grows while the certificate allows and falls back by one re-integration when it does not.
@@ -607,6 +690,12 @@ def laplace_evidence(
     -H = M' I M + S in x, with I the observed information in the density's log values (Louis) and N the
     profiled null space. At an infinite weight x lies in the null space; at an infinite or zero weight every
     allowed direction is profiled, so V is the log-likelihood there.
+
+    The inner problem (the penalized marginal likelihood in x) is not concave in general: the observed
+    information of a scale mixture can be indefinite. So a strict maximum is required, and the Laplace V is not
+    corrected toward the exact integral here (the engine's Tierney-Kadane certification is not applied). PENDING:
+    the engine's rounding test (Demmel's componentwise bound, computed on its profiled factor in the [N, C]
+    basis) once that factor is public; the same bound on the full -H here is too conservative to use.
     """
     if not np.all(np.isfinite(log_smoothing)):
         return log_likelihood
@@ -616,16 +705,16 @@ def laplace_evidence(
     kept = eigenvalues > _EPSILON * penalty.shape[0] * max(float(eigenvalues[-1]), np.finfo(np.float64).tiny)
     negative_hessian = mapping.T @ observed_information @ mapping + penalty
     null = prior.null_basis
-    log_determinant, null_log_determinant = _log_determinant(negative_hessian), _log_determinant(null.T @ negative_hessian @ null)
-    if log_determinant is None or null_log_determinant is None:
+    full, profiled = _log_determinant(negative_hessian), _log_determinant(null.T @ negative_hessian @ null)
+    if full is None or profiled is None:
         # Not a strict maximum: the Laplace evidence is undefined, and the search counts it as the lowest value.
         return -np.inf
     return (
         log_likelihood
         - 0.5 * float(coefficients @ penalty @ coefficients)
         + 0.5 * float(np.sum(np.log(eigenvalues[kept])))
-        - 0.5 * float(log_determinant)
-        + 0.5 * float(null_log_determinant)
+        - 0.5 * full
+        + 0.5 * profiled
     )
 
 
@@ -649,6 +738,9 @@ class _Expectation:
     occasion_precision: F64Array
     occasion_shift: F64Array
     missing_information: F64Array
+    split_information: F64Array
+    split_magnitude: F64Array
+    split_operations: int
     # Every person's trapezoid rule at this E-step, the start of the next.
     grid: LevelGrid
 
@@ -720,7 +812,10 @@ class _Model:
         person_mean = np.bincount(occasions.person_index, weights=residuals) / counts
         deviations = residuals - person_mean[occasions.person_index]
         repeated = counts[occasions.person_index] > 1
-        largest = float(np.max(np.square(deviations[repeated]))) if np.any(repeated) else float(np.max(np.square(residuals)))
+        if not np.any(repeated):
+            # Only tau^2 + E[s] is identified: the target is then the transformed reading (``marginal_transform``).
+            raise ValueError("no person has a repeated occasion, so the level and the noise are not separable")
+        largest = float(np.max(np.square(deviations[repeated])))
         # The person means' variance by their median absolute deviation, which gross errors barely move: it
         # overstates tau^2 by the noise of a mean, which the EM removes.
         level_variance = float(np.median(np.square(person_mean - np.median(person_mean)))) / float(chi2.median(1))
@@ -730,8 +825,10 @@ class _Model:
         top = float(np.log(max(largest, self.resolution_variance)))
         spacing = spacing_bound(float(occasions.values.shape[0]), EVIDENCE_TOLERANCE)
         extent = max(top + (top - floor), floor + (ROUGHNESS_ORDER + 1) * spacing)
-        prior = _density_prior(np.arange(floor, extent + spacing, spacing), top, occasions.values.shape[0])
-        scaled = np.square(deviations[repeated]) * (counts / (counts - 1.0))[occasions.person_index[repeated]] if np.any(repeated) else np.square(residuals)
+        nodes = np.arange(floor, extent + spacing, spacing)
+        _check_lattice(nodes.shape[0], self.working_bytes)
+        prior = _density_prior(nodes, top, occasions.values.shape[0])
+        scaled = np.square(deviations[repeated]) * (counts / (counts - 1.0))[occasions.person_index[repeated]]
         return _State(fixed_effects, level_variance, prior, _moment_hyperparameters(prior, scaled, spacing))
 
     def residuals(self, state: _State) -> F64Array:
@@ -748,6 +845,7 @@ class _Model:
         precision, shift = np.empty(residuals.shape[0]), np.empty(residuals.shape[0])
         counts = np.zeros(variances.shape[0])
         missing = np.zeros((variances.shape[0], variances.shape[0]))
+        split, magnitude, operations = np.zeros((2, 2)), np.zeros((2, 2)), 0
         log_likelihood = self.log_jacobian
         # A piece's arrays are as wide as its widest grid, so persons are pieced by their last node count to within
         # a factor of 2 (none yet: one piece per occasion count).
@@ -778,11 +876,14 @@ class _Model:
             shift[piece] = posterior.occasion_shift
             counts += posterior.counts
             missing += posterior.missing_information
+            split += posterior.split_information
+            magnitude += posterior.split_magnitude
+            operations += posterior.split_operations
             for name in ("step", "centre", "lower_reach", "upper_reach", "half_width"):
                 getattr(grid, name)[persons] = getattr(posterior.grid, name)
         if adopt:
             self.grid = grid
-        return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing, grid)
+        return _Expectation(log_likelihood, level_mean, level_second, counts, precision, shift, missing, split, magnitude, operations, grid)
 
     def trial(self, state: _State, louis: bool, start: LevelGrid) -> _Expectation | None:
         """The E-step at a speculative point (an extrapolation or a Newton step), or None where its level integrals
@@ -933,21 +1034,32 @@ class _Model:
             previous = increment
 
     def _refined(self, state: _State, expectation: _Expectation) -> _State:
-        """Halve the lattice's spacing until its trapezoid in t meets ``spacing_bound`` for these occasions.
+        """Halve the lattice's spacing until its trapezoid in t meets the engine's spacing bound for these
+        occasions, h <= pi^2 / ln(1 + 2 sum_j M_j / Z_j / tol) (``spacing_bound``), taken in logs: an occasion far
+        outside the density's mass has a majorant ratio past double precision's range.
 
         At t + i pi/2 a node's kernel N(e; 0, i e^t) has modulus (2 pi e^t)^(-1/2), so each occasion's majorant
-        ratio is sum_k pi_k (2 pi s_k)^(-1/2) / f(e), taken at its posterior mean level.
+        ratio is sum_k pi_k (2 pi s_k)^(-1/2) / f(e), taken at its posterior mean level. A lattice whose matrices
+        exceed the memory budget raises ``LatticeTooLarge``.
         """
+        residuals = self.residuals(state) - expectation.level_mean[self.occasions.person_index]
         while True:
             log_masses = class_log_density(state.prior, state.hyperparameters.coefficients)[0]
             log_heights = log_masses - 0.5 * (_LOG_TWO_PI + state.prior.log_variance_grid)
             variances = np.exp(state.prior.log_variance_grid)
-            residuals = self.residuals(state) - expectation.level_mean[self.occasions.person_index]
-            log_density = logsumexp(log_heights[None, :] - 0.5 * np.square(residuals)[:, None] / variances[None, :], axis=1)
-            ratio_sum = float(np.sum(np.exp(np.maximum(float(logsumexp(log_heights)) - log_density, 0.0))))
+            peak = float(_logsumexp(log_heights, axis=0))
+            # The occasions x nodes kernel values, a chunk of occasions at a time within the budget.
+            chunk = max(1, self.working_bytes // (_ENTRY_BYTES * variances.shape[0]))
+            log_ratios = np.concatenate([
+                np.maximum(peak - _logsumexp(log_heights[None, :] - 0.5 * np.square(part)[:, None] / variances[None, :], axis=1), 0.0)
+                for part in np.array_split(residuals, -(-residuals.shape[0] // chunk))
+            ])
+            log_ratio_sum = float(_logsumexp(log_ratios, axis=0))
+            bound = np.pi**2 / np.logaddexp(0.0, np.log(2.0) + log_ratio_sum - np.log(EVIDENCE_TOLERANCE))
             nodes = state.prior.log_variance_grid
-            if nodes[1] - nodes[0] <= spacing_bound(ratio_sum, EVIDENCE_TOLERANCE):
+            if nodes[1] - nodes[0] <= bound:
                 return state
+            _check_lattice(2 * nodes.shape[0] - 1, self.working_bytes)
             prior, hyperparameters = halved_lattice(state.prior, state.hyperparameters)
             state = _State(state.fixed_effects, state.level_variance, prior, hyperparameters)
 
@@ -978,18 +1090,29 @@ class _Model:
         if len(start.prior.smoothing_blocks) != 1:
             raise ValueError("the occasion noise density has one class and one roughness penalty")
         fits: dict[float, tuple[_State, _Expectation, float]] = {}
+        unevaluated: set[float] = set()
 
         def at(log_weight: float) -> float:
+            if log_weight in unevaluated:
+                return -np.inf
             if log_weight not in fits:
                 nearest = min(fits, key=lambda known: abs(known - log_weight)) if fits else None
                 origin = start if nearest is None else fits[nearest][0]
-                state, expectation, certified = self.converge(origin, np.array([log_weight]))
+                try:
+                    state, expectation, certified = self.converge(origin, np.array([log_weight]))
+                except (MemoryError, FloatingPointError):
+                    # Not evaluable within the memory budget, or with finite integrals: never approximated, it
+                    # counts as an uncertified maximum.
+                    unevaluated.add(log_weight)
+                    return -np.inf
                 # An uncertified maximum counts as the lowest evidence (the engine's rule).
                 fits[log_weight] = (state, expectation, self.evidence(state, expectation) if certified else -np.inf)
             return fits[log_weight][2]
 
         initial = float(start.hyperparameters.log_smoothing[0])
         at(initial)
+        if initial not in fits:
+            raise FloatingPointError("the start weight's fit is not evaluable within the memory budget")
         lower, upper = self.smoothing_range(*fits[initial][:2])
         bracketed_maximum(at, initial, lower, upper)
         # The best weight the search evaluated (an uncertified fit anywhere breaks unimodality).
@@ -997,9 +1120,14 @@ class _Model:
         if fits[best][2] == -np.inf:
             raise FloatingPointError("no penalty weight in the resolvable range reaches a certified maximum")
         if best in (lower, upper):
-            # The ascent reached an end of the resolvable range: the weight moves to that edge exactly.
-            best = np.inf if best == upper else -np.inf
-            at(best)
+            # The ascent reached an end of the resolvable range: the weight moves to that edge exactly. The
+            # engine (engine-tk) also compares V(infinity) with an interior maximum; that needs the global
+            # null-space fit of mixing_density.md B4 (a grid over the log-normal's location and width, then a
+            # polish), which this model does not have yet: a local EM there is neither global nor cheap.
+            edge = np.inf if best == upper else -np.inf
+            at(edge)
+            if edge in fits:
+                best = edge
         return fits[best]
 
 
@@ -1060,6 +1188,9 @@ def _result(model: _Model, state: _State, expectation: _Expectation, evidence: f
         level_posterior_variance=expectation.level_second_moment - np.square(expectation.level_mean),
         log_likelihood=expectation.log_likelihood,
         log_evidence=evidence,
+        split_information=expectation.split_information,
+        split_magnitude=expectation.split_magnitude,
+        split_operations=expectation.split_operations,
     )
 
 
@@ -1089,16 +1220,17 @@ def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionMode
         if exponent not in fits:
             model = _Model(occasions, exponent, working_bytes)
             fitted = [known for known in fits if fits[known][1] is not None]
-            if fitted:
-                nearest = min(fitted, key=lambda known: abs(known - exponent))
-                previous_model, (previous_state, _expectation, _evidence) = fits[nearest]
-                start = _carried(previous_state, model, previous_model)
-            else:
-                start = model.start()
             try:
+                if fitted:
+                    nearest = min(fitted, key=lambda known: abs(known - exponent))
+                    previous_model, (previous_state, _expectation, _evidence) = fits[nearest]
+                    start = _carried(previous_state, model, previous_model)
+                else:
+                    start = model.start()
                 fits[exponent] = (model, model.fit(start))
-            except FloatingPointError:
-                # No certified maximum at this exponent: it counts as the lowest evidence.
+            except (FloatingPointError, MemoryError):
+                # No certified maximum at this exponent, or none evaluable within the memory budget: it counts as
+                # the lowest evidence.
                 fits[exponent] = (model, None)
         fit = fits[exponent][1]
         return -np.inf if fit is None else fit[2]
@@ -1109,6 +1241,27 @@ def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionMode
         raise FloatingPointError("no Box-Cox exponent reaches a certified maximum")
     model, (state, expectation, evidence_value) = fits[middle]
     return _result(model, state, expectation, evidence_value)
+
+
+def marginal_transform(values: F64Array, design: F64Array) -> tuple[float, F64Array]:
+    """The Box-Cox exponent learned from the readings' marginal, and the transformed readings: the target of a
+    trait whose level and noise are not separable (no within-person replicates, or a split the data do not
+    certify; the lead's ruling), with reliability 1. The noise then stays in the genetic model's residual, where
+    it belongs when it cannot be separated.
+
+    The exponent maximizes the Gaussian marginal profile log-likelihood of the readings given the design,
+    -(n / 2) log(RSS / n) + (lambda - 1) sum log y (Box and Cox 1964), by ``bracketed_maximum`` from the identity.
+    """
+    log_values = np.log(values)
+
+    def profile(exponent: float) -> float:
+        transformed, _log_jacobian = box_cox(values, exponent)
+        coefficients = np.linalg.lstsq(design, transformed, rcond=None)[0]
+        residual_sum = float(np.sum(np.square(transformed - design @ coefficients)))
+        return -0.5 * values.shape[0] * np.log(residual_sum / values.shape[0]) + (exponent - 1.0) * float(log_values.sum())
+
+    exponent = bracketed_maximum(profile, 1.0, -np.inf, np.inf)
+    return exponent, box_cox(values, exponent)[0]
 
 
 def level_posterior_at(

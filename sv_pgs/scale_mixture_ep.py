@@ -101,6 +101,7 @@ removing k. Its fixed point is the MacKay form RSS / (n - k - gamma), which is u
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from types import ModuleType
 from typing import Callable, Iterator, Sequence
 
 import numpy as np
@@ -109,6 +110,7 @@ from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
 from scipy.special import erfcx
 
+from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.krylov_recycle import block_gcro_dr
 
@@ -769,9 +771,18 @@ def _class_terms(
 
 
 def tilted_moments(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int,
+    array_module: ModuleType = np,
 ) -> TiltedMoments:
-    """log Z_j and the exact tilted mean and variance of every effect."""
+    """log Z_j and the exact tilted mean and variance of every effect; with ``array_module`` CuPy, by the fused
+    device kernel (``engine_kernels``) within ``working_bytes`` of device memory."""
+    if array_module is not np:
+        on_device = engine_kernels.tilted_moments(
+            array_module, prior.class_index, class_log_density(prior, hyperparameters.coefficients),
+            log_scale(prior, hyperparameters.coefficients), prior.log_variance_grid, cavity.precision, cavity.shift, working_bytes,
+        )
+        log_normalizer, mean, variance = (array_module.asnumpy(values) for values in on_device)
+        return TiltedMoments(log_normalizer=log_normalizer, mean=mean, variance=variance)
     log_normalizer = np.empty(prior.variant_count)
     mean = np.empty(prior.variant_count)
     variance = np.empty(prior.variant_count)
@@ -884,11 +895,19 @@ class _Objective:
     magnitude: float
 
 
-def _data_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _Objective:
+def _data_objective(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np
+) -> _Objective:
     """For variant j of class c, with responsibilities w_j, component derivatives g_jk and their mean gbar_j, in z:
     d/deta_c = w_j - pi_c and d/d(scale) = gbar_j d_j (d_j the variant's scale-design row);
     d2/deta_c2 = diag(w_j) - w_j w_j' - (diag pi_c - pi_c pi_c'), d2/deta_ck d(scale) = w_jk (g_jk - gbar_j) d_j,
-    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'."""
+    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel."""
+    if array_module is not np:
+        value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
+            array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
+            prior.log_variance_grid, cavity.precision, cavity.shift, prior.scale_design, working_bytes,
+        )
+        return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
     grid_size = prior.grid_size
     scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
     dimension = prior.density_size + prior.scale_size
@@ -927,10 +946,17 @@ def _data_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Ca
     return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
 
 
-def _data_value(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> float:
+def _data_value(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np
+) -> float:
     """sum_j log Z_j alone: a trial point's evaluation."""
     log_density = class_log_density(prior, coefficients)
     scales = log_scale(prior, coefficients)
+    if array_module is not np:
+        log_normalizer, _mean, _variance = engine_kernels.tilted_moments(
+            array_module, prior.class_index, log_density, scales, prior.log_variance_grid, cavity.precision, cavity.shift, working_bytes,
+        )
+        return float(log_normalizer.sum())
     total = 0.0
     for class_position, class_rows in enumerate(prior.class_rows):
         for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):

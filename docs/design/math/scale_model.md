@@ -54,7 +54,7 @@ the D-space coefficients are $b=A\gamma$.
 
 **Claim.** $A=\mathrm{diag}(r)$ exactly, so the independent prior $\mathrm{Var}(b_j)=r_j^2\mathrm{Var}(\gamma_j)$ is exact, **iff** every column's error is uncorrelated with every other column. That holds when all columns are posterior means of their genotypes given one common data set: $D_j=\mathbb E[G_j\mid\mathcal F]$ with all $D_k$ $\mathcal F$-measurable. Then $G_j-D_j\perp D_k$ for all $k$ (tower property), so $\Sigma_{DG}=\Sigma_D$ in per-allele units.
 
-The same result, in its general non-linear form, is novel-measure's Result 2 in `scratchpad/team/novel-measure/THEORY.md`: the joint regression on $X=\mathbb E[G\mid M]$ is conditionally unbiased for the true effects. Those numbers and these agree.
+The same result, in its general non-linear form, is novel-measure's Result 2 ([novel-measure.md](novel-measure.md)): the joint regression on $X=\mathbb E[G\mid M]$ is conditionally unbiased for the true effects. Those numbers and these agree.
 
 **Leakage otherwise.** For a draw-type SV column with a clean tag SNP (haplotype correlation ρ), the tag carries information about $G_{SV}$ that $D^*_{SV}$ lacks:
 - $\mathrm{Cov}(D_{SNP},G_{SV}) > \mathrm{Cov}(D_{SNP},D^*_{SV})$;
@@ -145,7 +145,7 @@ The offset uses $\log\hat r^2_j$ from the reliability model.
 - median $S$ of −0.37 (BayesS 2018) and −0.58 (SBayesS 2021);
 - LDAK uses −0.25.
 
-(These are from lit-pgs, `scratchpad/team/lit-pgs/REPORT.md`; not re-read here.)
+(These are from the lit-pgs literature review, whose report is not kept in the repo; not re-read here.)
 
 **Model (novel-pleio / novel-evoprior candidate; verified below).**
 - Mutations have per-allele effect vectors $a\in\mathbb R^n$ on the $n$ trait axes under selection, with $a\mid s\sim N(0,sI_n)$ and $s\sim g$.

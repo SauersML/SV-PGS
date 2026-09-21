@@ -1,0 +1,88 @@
+{
+ "cohort_path": "/scratch.global/sauer354/svpgs-team/bench-sim/v7/cohort/chr22",
+ "cohort_version": "bench-sim v7 (PREREG amendment 7: group weights from the public 1kGP founder composition)",
+ "cohort_generator": "lane/bench-sim-weights 3fa9577",
+ "cohort_built": "2026-09-19T15:58Z (bench-sim STATUS)",
+ "reference_commit": "00ae5c3f0a245041fb50e1086182345f375d0252",
+ "script_sha256": {
+  "v7_pooled_fixed_point3.py": "08ae26865d9081df8c27a313589e3b8e0491457fd0ae487bc5154eaa66a7cb2f",
+  "v7_fixture_plain_c1.py": "aa1b702717013d4229ce7be785597a32720f146f7f95b72151652ed65c0cf102",
+  "rho_core_v7.py": "ad8ed78121523bdfa63e564e6475d6bb72153146010591d5adb74e0a04b5a5cb",
+  "diverge_search4.py": "f2f34d2eeecc4654400c397d6745fd887cde926d8f8599e6f24d6fcc840a0a5b"
+ },
+ "fixture_built": "2026-09-19T23:00:27+00:00",
+ "label": "semi-real: real 1kGP-haplotype LD, simulated effects",
+ "file": "pooled_chr22_w150_r12_v7_x100.npz",
+ "file_sha256": "d2f1185d775dff958a97fc052f5468148857a879c6618ff219af322dd7eea491",
+ "source_file": "/scratch.global/sauer354/svpgs-team/speed-floor/v7_pooled_c1_fixture_w150_r12_m100_w1_complete.npz (MSI)",
+ "producer": "speed-floor lane",
+ "statement": "c = 1, penalty weights 1, 100x production signal: the 12 windows' union is one block-diagonal model; the reference's prior (one class, no annotations)",
+ "summary_at_c1": {
+  "truth": {
+   "evidence_c1": -7.445695567310848,
+   "evidence_genome": -7.445695567310848,
+   "newton_decrement_genome": null,
+   "gradient_norm_genome": 52.188357787229606,
+   "fixed_negative": 1,
+   "total_negative": 1
+  },
+  "plain_last": {
+   "evidence_c1": 7.993225047403809,
+   "evidence_genome": 7.993225047403809,
+   "newton_decrement_genome": null,
+   "gradient_norm_genome": 12.488734881722255,
+   "fixed_negative": 2,
+   "total_negative": 2
+  },
+  "certified": {
+   "evidence_c1": 9.643293427266467,
+   "evidence_genome": 9.643293427266467,
+   "newton_decrement_genome": 3.364050723575908e-20,
+   "gradient_norm_genome": 2.2115381991850743e-09,
+   "fixed_negative": 0,
+   "total_negative": 0
+  },
+  "plain_iterates": [
+   {
+    "evidence_c1": -7.445695567310848,
+    "evidence_genome": -7.445695567310848,
+    "newton_decrement_genome": null,
+    "gradient_norm_genome": 52.188357787229606,
+    "fixed_negative": 1,
+    "total_negative": 1
+   },
+   {
+    "evidence_c1": 9.052551679371096,
+    "evidence_genome": 9.052551679371096,
+    "newton_decrement_genome": null,
+    "gradient_norm_genome": 7.222017234468619,
+    "fixed_negative": 1,
+    "total_negative": 1
+   },
+   {
+    "evidence_c1": 7.993225047403809,
+    "evidence_genome": 7.993225047403809,
+    "newton_decrement_genome": null,
+    "gradient_norm_genome": 12.488734881722255,
+    "fixed_negative": 2,
+    "total_negative": 2
+   }
+  ],
+  "plain_history_genome": [
+   -7.445695567310848,
+   9.052551679371096,
+   7.993225047403809
+  ],
+  "genome_scale": 1.0,
+  "weights_genome": [
+   1.0,
+   1.0,
+   1.0
+  ],
+  "weights_c1": [
+   1.0,
+   1.0,
+   1.0
+  ]
+ }
+}

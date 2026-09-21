@@ -1,0 +1,30 @@
+{
+  "run_directory": "/mnt/disks/run/svpgs",
+  "marker_directory": "/mnt/disks/ops/svpgs/${RUN_ID}/markers",
+  "chromosomes": ["chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10", "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20", "chr21", "chr22"],
+  "imputed_halves": [
+    {"label": "${HALF_A_LABEL}", "batches": ["${HALF_A_FIRST_BATCH}"], "batch_path": "${HALF_A_ROOT}/{chromosome}/{batch}.bcf"},
+    {"label": "${HALF_B_LABEL}", "batches": ["${HALF_B_FIRST_BATCH}"], "batch_path": "${HALF_B_ROOT}/{chromosome}/{batch}.bcf"}
+  ],
+  "truth_calls": null,
+  "strata_directory": "${STRATA_ROOT}",
+  "bubble_split": "${BUBBLE_ROOT}/{chromosome}.bubble.split.bcf",
+  "tandem_repeats": "${REFERENCE_ROOT}/GRCh38_AllTandemRepeatsandHomopolymers_slop5.bed.gz",
+  "crosswalk": "${CDR_COPY}/crosswalk.tsv",
+  "crosswalk_columns": ["${CROSSWALK_RESEARCH_COLUMN}", "${CROSSWALK_SEQUENCING_COLUMN}"],
+  "ancestry": "${CDR_COPY}/ancestry_preds.tsv",
+  "relatedness": "${CDR_COPY}/relatedness.tsv",
+  "relatedness_columns": ["i.s", "j.s", "kin"],
+  "diseases": [
+    "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression",
+    "gout", "cataract", "chronic_kidney_disease", "psoriasis", "prostate_cancer"
+  ],
+  "traits": [
+    "height", "body_mass_index", "systolic_blood_pressure", "heart_rate", "mean_corpuscular_volume", "platelet_count",
+    "white_blood_cell_count", "egfr_ckd_epi_2021", "total_bilirubin", "ldl_cholesterol", "hemoglobin_a1c"
+  ],
+  "fold_count": 5,
+  "seed": ${FOLD_SEED},
+  "codec": "zstd",
+  "export": []
+}

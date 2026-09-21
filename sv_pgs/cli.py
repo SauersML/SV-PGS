@@ -17,6 +17,7 @@ from sv_pgs.all_of_us import (
 from sv_pgs.artifact import write_predictions
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.fit_model import write_model
+from sv_pgs.workspace_pipeline import STEP_NAMES, WorkspaceConfig, run_pipeline, workspace_bindings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -95,6 +96,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     score_parser.add_argument("output", help="Output NPZ of model_names and the prediction arrays [n, models]; never overwritten.")
 
+    workspace_parser = subparsers.add_parser(
+        "workspace-run",
+        help=(
+            "Run the in-workspace pipeline (docs/design/WORKSPACE_PIPELINE.md) from its JSON config, resuming "
+            "from the run directory's checkpoints. Nothing is sent anywhere; outputs stay in the run directory."
+        ),
+    )
+    workspace_parser.add_argument("--config", required=True, help="The run config JSON supplied inside the workspace.")
+    workspace_parser.add_argument("--through", choices=STEP_NAMES, default=None, help="Stop after this step.")
+
     subparsers.add_parser(
         "version",
         help="Print sv-pgs package version and git commit sha.",
@@ -153,6 +164,14 @@ def _main_impl(argv: list[str] | None = None) -> int:
     if args.command == "list-all-of-us-traits":
         for trait_name in available_measurement_names():
             print(trait_name)
+        return 0
+
+    if args.command == "workspace-run":
+        summaries = run_pipeline(
+            WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through
+        )
+        for step in summaries:
+            print(f"{step}\tcomplete")
         return 0
 
     if args.command == "census-all-of-us-traits":

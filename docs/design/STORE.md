@@ -11,17 +11,24 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - `samples/half{h}` is the half's sample manifest: the header names in column order, each once, tagged with their namespace. The imputed halves use `dragen_sample` (DRAGEN sequencing names) and the long-read half `research_id` (AoU person IDs). `DosageStore.half_samples()` returns one `HalfSamples` per half, never a list merged across halves.
   - Names of the two namespaces collide by chance (different people), so they are never compared across namespaces. Only a `dragen_sample` half goes through the CDR crosswalk (`sample_crosswalk` refuses any other), and cross-half identity comes only from that map or from genotype (KING). A name repeated within a half fails conversion.
 - **Code:** `(DS_milli·127 + 500) // 1000`, where DS_milli is the corrected dosage below. 255 is never written.
+- **Value:** every record decodes as `code / codes_per_unit + value_origin`, from two required sidecar columns (`copy_number.py`).
+  - An ALT-count record has 127 and 0, so its value is the dosage above; the reader refuses any other pair for it.
+  - A copy_number record (a multi-copy CNV such as PDXDC1, KANSL1 or WASH3P, which fails HWE and Mendelian checks as a 0/1/2 dosage) has ⌊254 / its maximum called copy number⌋ codes per copy and value_origin = −its modal called copy number, so its value is CN − modal CN and every integer copy number is exact.
+  - Stage 0, Stage 2 and scoring work on standardized code columns, which are affine-invariant per column, so they need neither number. Anything read in the column's own units (a frequency, the measurement model's moments, a copy change) decodes through them.
+  - A store written before these columns holds only ALT-count records and reads as 127 and 0; one that holds copy_number records without them is refused and must be converted again.
 - **Encoding:**
-  - shards of 65,536 rows with 64-row inner chunks;
-  - zstd level 3, with a crc32c-checked shard index;
-  - a `transcode_store` step builds an uncompressed local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded raw and its code sums re-checked.
+  - one shard per array by default, with 64-row inner chunks (derived from the measured read path, `docs/design/math/codec.md` §3). A read costs the same across a shard boundary, and a writer encodes a shard's inner chunks on its worker pool, so shards add only files and descriptors, and they cut zero-copy views. `shard_rows_for` gives the fewest shards that still hold `parallel_writers` whole-shard writers (the synthetic generator's tasks) and fit the process's descriptor hard limit: 2 per shard. Stores written with other shard sizes stay readable, since each array's zarr.json records its own;
+  - zstd at libzstd's default level (3), with a crc32c-checked shard index;
+  - `local_cache` keeps one local copy per store digest (`store_digest`: every file's path, size and mtime, plus the manifest, zarr.json and shard indexes; no code bytes read). A fit calls it before Stage 2 and gets `cache_root/<codec>-<digest>`. That copy is rebuilt whenever the digest changes; a copy counts only once its completion marker names the digest; a source rewritten mid-copy is refused; and caches of older digests are removed. The bucket store stays zstd at rest and in transfer, and a GPU host caches it as rowdict, so every Stage 2 pass reads warm and decodes on the device;
+  - a `transcode_store` step builds a local cache: the same store (halves, sidecar, statistics, external maps, loci, MANIFEST), with every code array re-encoded (raw, or rowdict for a GPU host) and its code sums re-checked;
+  - **rowdict** (`[bytes, svpgs_rowdict, crc32c]`, `rowdict_codec.py`): one frame per record, a dictionary of its 2^k most frequent codes with k the exact size minimizer, k-bit slots and exceptions. The host reads the bytes and checks the chunk crc32c; `read_rows_to_device` decodes on the GPU; the CPU decoder is the reference. Which tier takes which codec comes from the cost model in `docs/design/math/codec.md` §2: the bucket stays zstd.
 - **Kernels** read codes as signed `code − 127` and accumulate in int32, exactly.
 - **Background removal ("value matched"),** applied before quantization and before any sums:
   - Per record, K_v = min(10, N_PATHS_TOTAL); m_v = the number of kept paths carrying the record's ID; w = ε/(1−ε) with the imputation error ε = 0.001.
   - The background values are q_v = m_v·w/(1 + K_v·w) and 2q_v. DS is set to 0 wherever its 3-dp value equals 0, q_v or 2q_v; every other value is left untouched.
   - In simulation this leaves zero background residual in every record type, and the only error is ≤ 2q_v, on carriers.
   - It is exact where a per-variant modal floor or a global 2ε is not, since the latter mishandle multi-path and PL-bearing records.
-- **Recalibration:** where a validated per-stratum κ exists (from truth), the stored value is D* = μ + κ(DS − μ). It is linear only. Until the truth-derived κ table arrives, the field stays empty; there is no default.
+- **Recalibration:** where a validated per-stratum κ exists (from truth), the stored value is D* = μ + κ(DS − μ). It is linear only. κ is fitted by the pipeline inside the AoU workspace from the long-read truth rows; until then the field stays empty, and there is no default.
 
 ## Halves: one verified site list, several measurements
 - Every half shares the chromosome's site list and its sites md5. The fit gives each half its own covariate.
@@ -60,7 +67,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
     - each feature is quantized to the store's 1/254 step with its own scale, which is within the prior's tolerance because features enter log u linearly;
     - near bases are sparse;
     - a class-specific block is kept where n · Var(feature) · τ̂² clears the certificate tolerance (τ̂² from hyperprior_pooling), and the class-summed block otherwise.
-  - Pairs are exact, about 2e10 on chr1. The derived far-basis binning width b/d ≤ (8/3)·(1/254)·h is barely cheaper.
+  - Pairs are exact, about 2e10 on chr1 [est]. The derived far-basis binning width b/d ≤ (8/3)·(1/254)·h is barely cheaper.
 - **Per-half sums:** sum_code, sum_code2 and no_calls. They give AF, variance and rsq_ds.
 
 ## Loci `loci/chrK`
@@ -83,7 +90,7 @@ tr_start, tr_end, n_intervals, n_records, n_dlen_nonzero, tr_motif_len (the majo
 - **G8:** excess co-carriage over independence within a TR locus, tested only where the rarer record has ≥ 21 carrier haplotypes. It detects the same length change recorded twice.
 - **Floor QC:** zeroed fractions by class × cx × has_pl.
 - **Service-half gates, which must pass before its data is pooled:**
-  - **S0, image identity: PASS.** GLIMPSE2 1.2.0-8671138 vs 1.0.0-2cee597. At one thread all 433,383 records of a public 50-sample chr22 shard are identical. At four threads, genotype discordance is 1.01–1.02× the same-image replicate floor. So one r² curve serves both halves.
+  - **S0, image identity: PASS.** GLIMPSE2 1.2.0-8671138 vs 1.0.0-2cee597. At one thread all 433,383 records of a public 50-sample chr22 shard are identical [real: public shard]. At four threads, genotype discordance is 1.01–1.02× the same-image replicate floor. So one r² curve serves both halves.
   - **S1 sites, S2 FORMAT, S3 floor:** pending until that half's data arrives.
 
 ## MANIFEST

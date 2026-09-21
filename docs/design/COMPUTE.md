@@ -2,7 +2,7 @@
 
 ## Cost model
 - **Workload:** n = 100k, p = 17M, 105 models (21 traits × 5 folds).
-- **Where it comes from:** measured on MSI unless marked; COST_MODEL numbers from the speed lane.
+- **Where it comes from:** measured on MSI unless marked [machinery]; the derivations and the per-stage gap are in [math/compute_floor.md](math/compute_floor.md).
 - **What dominates:** passes over the store. One uint8 pass is about 1.7 TB uncompressed.
 
 **Kernels (measured, exact).** The exact int8 path's achieved rate on the A40 is in compute_floor.md §9.3: the raw GEMM runs at 68–73% of spec in the pass shape.
@@ -17,11 +17,11 @@
 - Host → GPU pinned: 24 GB/s per GPU.
 - Parallel `preadv` is used; mmap page faults ran at ~51 MB/s.
 
-**Codec (design):**
-- Quantization levels are chosen per variant by rate–distortion, for ≤ 0.1% r² loss.
-- rANS for MAF < 5%, fixed-rate bitpacking above that.
-- Expected 1–2 bits per code, i.e. 0.21–0.43 TB at 100k × 17M. That fits 8×H200 HBM, and 8×A100-40 at ≤ 1.5 bits per code.
-- Rare columns are sparse in storage only: sparse arithmetic loses to dense tensor cores at ~1,800 right-hand sides.
+**Codec (status):**
+- The store is zstd today. Host-side zstd decode runs at about 0.65 GB/s per core, about 2,600 core-seconds per full read at N·P = 1.7e12, so no host-decoded format reaches the floor [machinery].
+- A lossless GPU-decodable prototype (a per-row dictionary, fixed-rate slots and exceptions, with k chosen by exact byte count) gave 2.22 bits per code against zstd's 1.62 and decoded at 186 GB/s on an A40, on the synthetic s1M_100k store [machinery: synthetic store]. Real imputed DS may differ; its size is not measured, and an AoU-side aggregate of it was withdrawn under the AoU rule.
+- The earlier design target of 1–2 bits per code (rate–distortion levels, rANS below 5% MAF) is [est].
+- Rare columns are sparse in storage only: sparse arithmetic loses to dense tensor cores at ~1,800 right-hand sides [sim-only: synthetic store; timing].
 
 **The floor and the gap** (derived and measured in [math/compute_floor.md](math/compute_floor.md)). All 105 models, n = 10⁵, p = 1.7·10⁷:
 - **Floor:** ~47 store passes after the one cold staging read.
@@ -51,9 +51,10 @@ End to end: about 1,000× with the old Stage 1, and 10–40× without it.
 **Stage 1 is dropped, provisionally (lead's decision, 2026-09-19), on the cost argument alone.** One Stage 1 sweep's variance refresh costs 75–600 Stage 2 pass-equivalents (compute_floor.md §3).
 - The outer-convergence measurement first cited for this decision ("no slow direction", 1–3 outer steps) was withdrawn: it linearized at the true prior, which is a saddle of the genome-scaled penalized evidence (compute_floor.md §10.1–10.3).
 - The decision is revisited only if the corrected measurement at the pooled fixed point shows production needs more outer steps × passes per step than a Stage 1 sweep costs.
-- The outer step is Newton with the total curvature B and a trust region. The fixed-cavity curvature A + S is indefinite in every measured configuration, so plain EP-EM is ill-posed.
-- Stage 2 uses only certified marginals. Block-Jacobi variances put the top ~1% of cavity precisions 28–58% off, so they need cross-block correction (compute_floor.md §10.4).
+- The outer step is Newton with the total curvature B and a trust region; Anderson acceleration was not adopted (`anderson.py` deleted). The fixed-cavity curvature A + S is indefinite in every measured configuration, so plain EP-EM is ill-posed.
+- Stage 2 uses only certified marginals. Block-Jacobi variances put the top ~1% of cavity precisions 25–54% off, so they need cross-block correction (compute_floor.md §10.4).
 - The variance refreshes still need e2854ca's fp64-vs-fp32 Cholesky policy (Jacobi-scaled fp32 factors with fp64 refinement; archive tags `build-stage1` and `wip-wt-build-store`) and its multi-GPU block dispatch.
+- Evidence for the two bullets above: at the true prior of the pooled chr22 problem, A + S was indefinite in every measured configuration [semi-real: public 1kGP-haplotype chr22 LD with simulated effects]. On bench-sim's v7 chr22 LD, block-Jacobi variances put the top 1% of cavity precisions 54% off at block cap 1024 and 25% at cap 4096, and 1.5% at cap 4096 with the second-order term [semi-real: compute_floor.md §10.4].
 
 ## Cloud: the dedicated SV-PGS workspace
 - **Platform:** a Verily Workbench (AoU Researcher Workbench 2.0) workspace in us-central1.
@@ -84,22 +85,26 @@ End to end: about 1,000× with the old Stage 1, and 10–40× without it.
   - At most 2 concurrent jobs per agent.
   - Keep account-wide pending jobs under 90: backfill considers only the top 100 pending per user, so more starves every session's new jobs.
   - **Never mass-hold or mass-cancel array tasks.**
-- **Status at handoff:** the account's default Slurm association submit counter underflowed. It reads MaxSubmitJobs=5000(4294967036), that is −260 wrapped to uint32, so every normal `sbatch` fails with AssocMaxSubmitJobLimit.
+- **Slurm status:** the account's default Slurm association submit counter underflowed. It reads MaxSubmitJobs=5000(4294967036), that is −260 wrapped to uint32, so every normal `sbatch` fails with AssocMaxSubmitJobLimit.
   - **Root cause, from Slurm source:** a bug in Slurm 25.05.9 (MSI agate).
     - In `src/slurmctld/acct_policy.c` `_adjust_limit_usage()`, the association `ACCT_POLICY_REM_SUBMIT` branch checks only `if (used_submit_jobs)`, not `>= job_cnt`. For a pending array job_cnt is the whole task count, so one over-removal wraps the counter. The QOS branch clamps correctly.
     - Upstream fix: SchedMD commit c9f89343b143 (ticket 24379), first released in 25.11.3 and not backported to 25.05.
   - **Why it stays stuck:** new submits are refused while every finishing job decrements further. It went −201 → −260 over the session.
   - **Our trigger:** mass hold and cancel of about 1,000 pending array tasks, plus about 40 `scontrol update partition=` calls on pending arrays. The single over-removing call needs root-only slurmctld debug2 logs to identify.
-  - **Reset:** only an administrator can do it. A slurmctld restart or reconfigure runs `_restore_job_accounting()` in read_config.c, which clears and recounts usage. The permanent fix is Slurm ≥ 25.11.3. A support request was filed; any follow-up is sent by the user, never by an agent.
+  - **Reset:** only an administrator can do it. A slurmctld restart or reconfigure runs `_restore_job_accounting()` in read_config.c, which clears and recounts usage. The permanent fix is Slurm ≥ 25.11.3. Whether to pursue a reset is the user's decision: the user decides and acts, and no agent contacts MSI or anyone else about it.
   - Until the reset, the `interactive` and `interactive-gpu` partitions still accept jobs, at most one running job per user each, shared across all sessions of the account.
-- **Task runner (runq), the workaround while the counter is wrapped:**
-  - one long `interactive-gpu` allocation (2×A40, 48 cores, 24 h, which submits its own successor) runs small tasks from file queues;
-  - tasks go to `/scratch.global/<user>/svpgs-team/runq/{gpu,cpu}/pending/` as `<lane>__<name>__c<cores>[__g<gpus>].sh`, at most 16 cores each and at most 2 queued per lane;
-  - the runner pins each task (`taskset`, `nice 10`), sets the thread counts, `CUDA_VISIBLE_DEVICES` and a private TMPDIR, and records each exit in `logs/records.jsonl`;
-  - `touch <queue>/STOP` drains it;
-  - the sources are `svpgs-team/runq_bin/` (runner.py and the two sbatch launchers);
-  - a watcher (`runq_bin/slurm_watch.sh`, one core, nice 19) writes `runq/SLURM_RESTORED` once the counter is reset;
-  - no task may call `sbatch` itself.
+- **Task runners (runq), the workaround while the counter is wrapped.** Two long allocations run small tasks from file queues under `/scratch.global/<user>/svpgs-team/runq/`:
+  - the GPU runner, one `interactive-gpu` job (2×A40, 48 cores), serves `gpu/` and `cpu/`;
+  - the CPU runner, one `interactive` job on a 124-core node, serves `cpu-node/`, with node-local ext4 TMPDIR;
+  - each submits its own successor before its walltime ends.
+  - **Task names:** `<lane>__<name>__c<cores>[__m<GB>][__g<gpus>].sh`, written as `.tmp` then moved in; at most 16 cores each, at most 2 queued per lane, and one GPU task per lane while others wait. Only a task whose name has `__g<n>` gets a GPU.
+  - **Memory budgets** (`__m<GB>`, or a cores-proportional default, exported as `RUNQ_MEM_BYTES`) take effect only on successor runners. The live runners reject names with `__m`.
+  - **Cancel** only by `touch <queue>/cancel/<task>`, never by deleting from `pending/`. Successor runners kill a cancelled task's whole session and never assign a busy GPU. Until the CPU runner's successor is live, never cancel a RUNNING task there: the old code can crash on that path and take every task with it.
+  - Inside tasks use `timeout --foreground`, never a plain `timeout`, which escapes the cancel.
+  - The runner pins each task (`taskset`, `nice 10`), sets the thread counts, `CUDA_VISIBLE_DEVICES` and a private TMPDIR, and records each exit in `logs/records.jsonl`; `touch <queue>/STOP` drains it.
+  - Sources: `svpgs-team/runq_bin/` (runner.py and the sbatch launchers). A watcher (`runq_bin/slurm_watch.sh`, one core, nice 19) writes `runq/SLURM_RESTORED` once the counter is reset. No task may call `sbatch` or `srun` itself.
+- **Landing gate:** the full suite on MSI (runq `cpu-node`) on the exact tip that lands, under a memory ulimit so allocation bugs fail, plus the GPU tests on runq `gpu` when CUDA code changes. The merge-queue lane stacks the ready branches and fast-forwards main only on green. GitHub CI runs on pushes to main as a secondary signal; a failure there blocks nothing unless it reproduces on MSI.
+- **Data sources on MSI:** public data only, and never from a Google Cloud Storage or AoU bucket (user rule, 2026-09-19): EBI/IGSR, Zenodo, NCBI, UCSC, AWS open data and tool authors' sites.
 - **Environments** (uv, Python 3.12, synced `--locked` from `svpgs-team/env-src`, a detached checkout of origin/main):
   - `svpgs-team/venv-cpu`: the dev and sim groups (msprime included);
   - `svpgs-team/venv-gpu`: the same plus the `gpu` extra (cupy-cuda12x and the CUDA 12 library wheels it loads). Export `LD_LIBRARY_PATH` from `venv-gpu/lib/python3.12/site-packages/nvidia/*/lib` before importing cupy.

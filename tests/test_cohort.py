@@ -1,4 +1,4 @@
-"""The shared cohort: covariates with full rank, NaN-masked multi-trait targets, kinship-grouped folds."""
+"""The cohort: each trait's own covariates over shared genotype rows, NaN-masked targets, kinship-grouped folds."""
 from __future__ import annotations
 
 import json
@@ -11,6 +11,7 @@ from sv_pgs.cohort import (
     DUPLICATE_KINSHIP,
     SECOND_DEGREE_KINSHIP,
     AncestryPcs,
+    TraitTable,
     build_cohort,
     indicator_columns,
     kinship_components,
@@ -145,52 +146,77 @@ def _ancestry(research_ids: list[ResearchId], rng: np.random.Generator) -> Ances
     )
 
 
-def test_build_cohort_assembles_full_rank_covariates_and_masked_targets() -> None:
+def test_build_cohort_gives_each_trait_its_own_covariates_and_masked_targets() -> None:
     rng = np.random.default_rng(5)
     research_ids = [ResearchId(f"R{index}") for index in range(8)]
-    ages = rng.uniform(20, 80, 8)
+    ages = {research_id.value: float(age) for research_id, age in zip(research_ids, rng.uniform(20, 80, 8))}
 
     cohort = build_cohort(
         research_ids,
-        person_covariates={"age": ages, "age_squared": ages**2},
-        categorical_covariates={"sex_at_birth": ["F", "M"] * 4},
         ancestry=_ancestry(research_ids[::-1], rng),
         pipeline_half=["h0", "h0", "h1", "h1", "h0", "h1", "h0", "h1"],
         genotype_source=["imputed"] * 6 + ["long_read"] * 2,
-        trait_targets={"ldl": {"R0": 1.5, "R3": -0.5}, "t2d": {research_id.value: 1.0 for research_id in research_ids}},
+        traits={
+            "ldl": TraitTable(
+                targets={"R0": 1.5, "R3": -0.5, "R5": 0.2},
+                numeric={"mean_age": {"R0": 50.0, "R3": 61.0, "R5": 40.0}},
+                categorical={"sex": {"R0": "F", "R3": "M", "R5": "F"}},
+            ),
+            "t2d": TraitTable(targets={person: 1.0 for person in ages}, numeric={"age": ages}, categorical={}),
+        },
     )
 
     assert cohort.covariate_names == (
-        "intercept", "age", "age_squared", "sex_at_birth=M", "pipeline_half=h1", "genotype_source=long_read",
-        "PC1", "PC2",
+        "intercept", "pipeline_half=h1", "genotype_source=long_read", "PC1", "PC2", "ldl:mean_age", "ldl:sex=M", "t2d:age",
     )
-    assert cohort.covariates.shape == (8, 8)
+    structure = [True] * 5
+    np.testing.assert_array_equal(cohort.covariate_columns, [structure + [True, True, False], structure + [False, False, True]])
+    # A trait's own columns are its table's values on its rows and 0 elsewhere.
+    np.testing.assert_array_equal(cohort.covariates[:, 5], [50.0, 0, 0, 61.0, 0, 40.0, 0, 0])
+    np.testing.assert_array_equal(cohort.covariates[:, 6], [0, 0, 0, 1, 0, 0, 0, 0])
+    np.testing.assert_array_equal(cohort.covariates[:, 7], list(ages.values()))
     assert cohort.trait_names == ("ldl", "t2d")
-    np.testing.assert_array_equal(cohort.observed[:, 0], [True, False, False, True, False, False, False, False])
+    np.testing.assert_array_equal(cohort.observed[:, 0], [True, False, False, True, False, True, False, False])
     assert cohort.observed[:, 1].all()
     assert cohort.targets[3, 0] == -0.5
 
 
-def test_build_cohort_rejects_collinear_covariates_and_missing_values() -> None:
-    rng = np.random.default_rng(9)
-    research_ids = [ResearchId(f"R{index}") for index in range(6)]
-    ages = rng.uniform(20, 80, 6)
-    common = dict(
-        categorical_covariates={},
+def test_a_trait_whose_rows_take_a_column_s_rank_away_is_kept() -> None:
+    # A sex-restricted disease: one level on its rows gives no indicator, and a zero column is left to
+    # each model's projection onto its own columns' span.
+    rng = np.random.default_rng(8)
+    research_ids = [ResearchId(f"R{index}") for index in range(4)]
+    cohort = build_cohort(
+        research_ids,
         ancestry=_ancestry(research_ids, rng),
-        pipeline_half=["h0"] * 6,
-        genotype_source=["imputed"] * 6,
-        trait_targets={"ldl": {"R0": 1.0}},
+        pipeline_half=["h0"] * 4,
+        genotype_source=["imputed"] * 4,
+        traits={
+            "prostate_cancer": TraitTable(
+                targets={"R0": 1.0, "R1": 0.0, "R2": 0.0},
+                numeric={"age_x_female": {"R0": 0.0, "R1": 0.0, "R2": 0.0}},
+                categorical={"sex": {"R0": "M", "R1": "M", "R2": "M"}},
+            )
+        },
     )
 
-    with pytest.raises(ValueError, match="rank-deficient"):
-        build_cohort(research_ids, person_covariates={"age": ages, "age_again": 2 * ages}, **common)
-    with pytest.raises(ValueError, match="missing values"):
-        build_cohort(research_ids, person_covariates={"age": np.where(ages > 50, np.nan, ages)}, **common)
+    assert cohort.covariate_names[-1] == "prostate_cancer:age_x_female"
+    assert not np.any(cohort.covariates[:, -1])
+
+
+def test_build_cohort_rejects_missing_covariates_and_non_finite_targets() -> None:
+    rng = np.random.default_rng(9)
+    research_ids = [ResearchId(f"R{index}") for index in range(6)]
+    common = dict(ancestry=_ancestry(research_ids, rng), pipeline_half=["h0"] * 6, genotype_source=["imputed"] * 6)
+
+    with pytest.raises(ValueError, match="ldl:age has missing values"):
+        build_cohort(research_ids, traits={"ldl": TraitTable({"R0": 1.0, "R1": 2.0}, {"age": {"R0": 50.0}}, {})}, **common)
+    with pytest.raises(ValueError, match="ldl:age has missing values"):
+        build_cohort(research_ids, traits={"ldl": TraitTable({"R0": 1.0}, {"age": {"R0": np.nan}}, {})}, **common)
+    with pytest.raises(ValueError, match="ldl:sex has no level"):
+        build_cohort(research_ids, traits={"ldl": TraitTable({"R0": 1.0, "R1": 2.0}, {}, {"sex": {"R0": "F"}})}, **common)
     with pytest.raises(ValueError, match="non-finite target"):
-        build_cohort(
-            research_ids, person_covariates={"age": ages}, **{**common, "trait_targets": {"ldl": {"R0": np.nan}}}
-        )
+        build_cohort(research_ids, traits={"ldl": TraitTable({"R0": np.nan}, {}, {})}, **common)
 
 
 def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
@@ -200,12 +226,10 @@ def test_build_cohort_rejects_a_trait_keyed_by_ids_outside_the_cohort() -> None:
     with pytest.raises(ValueError, match="'ldl' has no target for any cohort sample"):
         build_cohort(
             research_ids,
-            person_covariates={"age": rng.uniform(20, 80, 6)},
-            categorical_covariates={},
             ancestry=_ancestry(research_ids, rng),
             pipeline_half=["h0"] * 6,
             genotype_source=["imputed"] * 6,
-            trait_targets={"ldl": {1000 + index: 1.0 for index in range(6)}},
+            traits={"ldl": TraitTable({1000 + index: 1.0 for index in range(6)}, {}, {})},
         )
 
 
@@ -349,12 +373,10 @@ def test_relatives_across_the_two_halves_share_a_fold() -> None:
 def test_build_cohort_rejects_a_participant_listed_twice_or_an_untyped_id() -> None:
     rng = np.random.default_rng(4)
     common = dict(
-        person_covariates={"age": rng.uniform(20, 80, 4)},
-        categorical_covariates={},
         ancestry=_ancestry(_research("R0", "R1", "R2"), rng),
         pipeline_half=["h0"] * 4,
         genotype_source=["long_read", "long_read", "imputed", "imputed"],
-        trait_targets={"ldl": {"R0": 1.0}},
+        traits={"ldl": TraitTable({"R0": 1.0}, {}, {})},
     )
 
     with pytest.raises(ValueError, match="repeats a participant"):

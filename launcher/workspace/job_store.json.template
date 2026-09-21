@@ -1,0 +1,42 @@
+{
+  "taskGroups": [
+    {
+      "taskCount": 1,
+      "taskSpec": {
+        "runnables": [{"script": {"path": "/mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
+        "maxRetryCount": ${MAX_RETRIES},
+        "lifecyclePolicies": [
+          {"action": "RETRY_TASK", "actionCondition": {"exitCodes": [50001, 75]}},
+          {"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}
+        ],
+        "volumes": [
+          {"gcs": {"remotePath": "${OPS_BUCKET}"}, "mountPath": "/mnt/disks/ops"},
+          {"deviceName": "run", "mountPath": "/mnt/disks/run", "mountOptions": "rw,async"}
+        ]
+      }
+    }
+  ],
+  "allocationPolicy": {
+    "instances": [
+      {
+        "policy": {
+          "machineType": "${MACHINE_TYPE}",
+          "provisioningModel": "SPOT",
+          "disks": [{"deviceName": "run", "existingDisk": "projects/${PROJECT_ID}/zones/${ZONE}/disks/${RUN_DISK}"}]
+        }
+      }
+    ],
+    "location": {"allowedLocations": ["zones/${ZONE}"]},
+    "network": {
+      "networkInterfaces": [
+        {
+          "network": "projects/${PROJECT_ID}/global/networks/${NETWORK}",
+          "subnetwork": "projects/${PROJECT_ID}/regions/${REGION}/subnetworks/${SUBNETWORK}",
+          "noExternalIpAddress": true
+        }
+      ]
+    },
+    "serviceAccount": {"email": "${SERVICE_ACCOUNT}"}
+  },
+  "logsPolicy": {"destination": "PATH", "logsPath": "/mnt/disks/run/logs"}
+}

@@ -6,9 +6,13 @@ kappa in float64 carries relative error <= dimension * kappa * eps.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
+import pytest
 
 from sv_pgs import dual_solve
+from tests.memory_budget import run_within_budget
 
 EPS = np.finfo(np.float64).eps
 MODEL_COUNT = 4
@@ -79,6 +83,40 @@ def test_the_dual_mean_is_the_posterior_mean_of_every_model() -> None:
         assert np.sqrt(float(error @ precision @ error)) <= float(result.residual_norm[model]) * (1.0 + np.linalg.cond(precision) * EPS * genotypes.shape[1])
 
 
+class _TwoPartSource(dual_solve.DenseDualSource):
+    """A source whose map_reduce runs its blocks as two parts with their own images, summed in order."""
+
+    def __init__(self, genotypes, bounds):
+        super().__init__(genotypes, bounds)
+        self.map_reduce_calls = 0
+
+    def map_reduce(self, work, shared, rows, image_shape):
+        self.map_reduce_calls += 1
+        blocks = list(self.blocks())
+        images = []
+        for part in (blocks[: len(blocks) // 2], blocks[len(blocks) // 2 :]):
+            image = np.zeros(image_shape)
+            part_shared = dict(shared)
+            for start, stop, tile in part:
+                work(start, stop, tile, part_shared, {name: values[start:stop] for name, values in rows.items()}, image)
+            images.append(image)
+        return images[0] + images[1]
+
+
+def test_the_operator_runs_through_the_sources_map_reduce() -> None:
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(19)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    split_source = _TwoPartSource(genotypes, bounds)
+    count = dual_solve.PassCount()
+    split = dual_solve.certified_block_cg(split_source, models, right, np.zeros_like(right), np.arange(MODEL_COUNT), _solve_bound(right), count)
+    assert split_source.map_reduce_calls == count.passes
+    single = dual_solve.certified_block_cg(dual_solve.DenseDualSource(genotypes, bounds), models, right, np.zeros_like(right), np.arange(MODEL_COUNT), _solve_bound(right), dual_solve.PassCount())
+    assert np.all(split.residual_norm <= _solve_bound(right))
+    # Both solutions are certified to the bound, so they agree within twice it.
+    assert np.all(np.linalg.norm(split.solution - single.solution, axis=0) <= 2.0 * _solve_bound(right) * (1.0 + genotypes.shape[0] * EPS))
+
+
 def test_the_energy_error_equals_the_dual_residual_identity() -> None:
     genotypes, _source, _models, covariates, weights, variances, prior_mean, response = _setup(2)
     rng = np.random.default_rng(7)
@@ -129,6 +167,45 @@ def test_a_fold_mask_is_the_posterior_of_its_training_rows() -> None:
     assert np.sqrt(float(error @ precision @ error)) <= float(result.residual_norm[1]) * (1.0 + np.linalg.cond(precision) * EPS * genotypes.shape[1])
 
 
+def budgeted_solve(genotypes, bounds, weights, variances, covariates, right, column_models, bound):
+    """A certified solve with the relaxed operand error, built and run inside the budget."""
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    spike_free = dual_solve.Deflation({}, {}, {}, {})
+    result = dual_solve.certified_block_cg(source, models, right, np.zeros_like(right), column_models, bound, dual_solve.PassCount(), deflation=spike_free)
+    return result.residual_norm, result.iterations
+
+
+def reserve(rows: int, columns: int) -> int:
+    """Reserve, without writing, the float64 block a p-side Krylov state would hold."""
+    return int(np.empty((rows, columns)).shape[0])
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the budget reads /proc/self/status")
+def test_the_certified_solve_holds_only_sample_side_state() -> None:
+    """The solve keeps O(n C) sample-side state and O(p_b C) per block, never a p x C array.
+
+    The budget is a tenth of one p x C float64 block (the primal plan's Krylov state), which the
+    problem makes 400 times its n x C one, so the solve fits only if nothing p-side is allocated;
+    the same budget refuses a p x C reservation.
+    """
+    genotypes, bounds, covariates, weights, variances, _prior_mean, _response = _problem(71, sample_count=100, variant_count=40000, block=100)
+    columns_per_model = 16
+    column_models = np.repeat(np.arange(MODEL_COUNT), columns_per_model)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    right = models.complement(np.random.default_rng(72).standard_normal((genotypes.shape[0], column_models.size)), column_models)
+    bound = _solve_bound(right)
+    primal_block = genotypes.shape[1] * column_models.size * np.dtype(np.float64).itemsize
+    budget = primal_block // 10
+    residual_norm, iterations = run_within_budget(
+        budgeted_solve, genotypes, bounds, weights, variances, covariates, right, column_models, bound, working_bytes=budget
+    )
+    assert np.all(residual_norm <= bound)
+    assert iterations > 0
+    with pytest.raises(AssertionError, match="past its working_bytes budget"):
+        run_within_budget(reserve, genotypes.shape[1], column_models.size, working_bytes=budget)
+
+
 def test_matheron_draws_have_the_posterior_covariance_exactly() -> None:
     genotypes, _source, _models, covariates, weights, variances, _prior_mean, _response = _setup(4)
     for model in range(MODEL_COUNT):
@@ -141,6 +218,28 @@ def test_matheron_draws_have_the_posterior_covariance_exactly() -> None:
         target = np.linalg.inv(precision)
         tolerance = np.linalg.cond(precision) * np.linalg.cond(operator) * genotypes.shape[1] * EPS * np.linalg.norm(target)
         assert np.linalg.norm(covariance - target) <= tolerance
+
+
+def test_exact_marginals_are_the_dense_posterior_diagonal_with_negative_sites() -> None:
+    from sv_pgs.marginal_variances import exact_bulk_diagonal
+
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, negative = _gaussian_problem(81)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=13)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    assert set(negative) <= set(gaussian.bulk_solves[0].resolved)
+    for model in range(MODEL_COUNT):
+        posterior_precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+        factor = gaussian.kernel_factor(model)
+        marginals = gaussian.exact_marginals(model, factor)
+        assert np.all(marginals > 0.0)
+        rounding = np.linalg.cond(posterior_precision) * genotypes.shape[0] * EPS
+        np.testing.assert_allclose(marginals, np.diag(np.linalg.inv(posterior_precision)), rtol=rounding, atol=0.0)
+        # The same factor gives each sample's leverage xt_i' Sigma xt_i = 1 - Q_ii exactly, with
+        # Q = K_S^-1 - Z_L core^-1 Z_L': the bulk diagonal minus the resolved term, added once.
+        leverage = np.einsum("ij,ji->i", design, np.linalg.solve(posterior_precision, design.T))
+        resolved_term = np.einsum("ij,ji->i", factor.resolved_solves, np.linalg.solve(factor.resolved_core, factor.resolved_solves.T)) if factor.resolved_solves.shape[1] else 0.0
+        np.testing.assert_allclose(1.0 - (exact_bulk_diagonal(factor) - resolved_term), leverage, rtol=0.0, atol=rounding)
 
 
 def test_the_fused_final_pass_gives_weights_scores_certificates_and_design_products() -> None:
@@ -606,3 +705,303 @@ def test_information_solve_gives_the_bulk_back_products_and_coupling() -> None:
         np.testing.assert_allclose(back_products, expected, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(expected).max() * genotypes.shape[0])
         if resolved.size:
             np.testing.assert_allclose(resolved_coupling, coupling, rtol=0.0, atol=conditioning * np.sqrt(EPS) * np.abs(coupling).max() * genotypes.shape[0])
+
+
+def _rank_losing_problem(seed: int):
+    """Covariates of full rank on the cohort that lose it on a model's rows: model 1 is sex-restricted
+    (its sex indicator equals the intercept there, age x female is zero), and model 2's training rows
+    miss every member of a rare level. Model 1 also holds two strong variants that differ only off its
+    rows, so both are spikes with one direction between them."""
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(seed)
+    rng = np.random.default_rng(seed + 200)
+    sample_count = genotypes.shape[0]
+    sex = (rng.random(sample_count) < 0.5).astype(np.float64)
+    age = rng.normal(0.0, 1.0, sample_count)
+    rare = np.zeros(sample_count)
+    rare[rng.choice(np.flatnonzero(weights[:, 2] == 0), 3, replace=False)] = 1.0
+    covariates = np.column_stack([covariates, sex, age * (1.0 - sex), rare])
+    assert np.linalg.matrix_rank(covariates) == covariates.shape[1]
+    weights[:, 1] *= sex
+    first, second = 10, 70
+    rows = weights[:, 1] > 0
+    genotypes[rows, second] = genotypes[rows, first]
+    genotypes[~rows, second] = rng.standard_normal(int((~rows).sum()))
+    variances[[first, second], 1] = 0.05
+    return genotypes, bounds, covariates, weights, variances, prior_mean, response
+
+
+def test_covariates_that_lose_rank_on_a_models_rows_are_projected_on_their_column_space() -> None:
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _rank_losing_problem(21)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    count = dual_solve.PassCount()
+    squares = dual_solve.column_squares(source, models, count)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    deflation, resolved = dual_solve.spike_deflation(source, models, count)
+    assert resolved[1] >= 2
+    result = _exact_solve(source, models, right, count, deflation)
+    mean = dual_solve.mean_from_dual(source, models, prior_mean, result.solution, count)
+    for model in range(MODEL_COUNT):
+        projector, design, precision, _operator = _dense(genotypes, covariates, weights, variances, model)
+        expected_squares = np.sum(design * design, axis=0)
+        np.testing.assert_allclose(squares[:, model], expected_squares, rtol=0.0, atol=genotypes.shape[0] * np.sqrt(EPS) * expected_squares.max())
+        root = np.sqrt(weights[:, model])
+        exact = np.linalg.solve(precision, design.T @ (projector @ (root * response[:, model])) + prior_mean[:, model] / variances[:, model])
+        error = mean[:, model] - exact
+        assert np.sqrt(float(error @ precision @ error)) <= float(result.residual_norm[model]) * (1.0 + np.linalg.cond(precision) * EPS * genotypes.shape[1])
+
+
+def test_the_dual_gaussian_takes_rank_losing_covariates_and_missing_targets_off_its_rows() -> None:
+    genotypes, bounds, covariates, weights, variances, _prior_mean, response = _rank_losing_problem(22)
+    rng = np.random.default_rng(23)
+    training = (weights > 0).astype(np.float64)
+    noise = np.array([0.7, 0.9, 1.3, 1.1])
+    precision = 1.0 / variances
+    shift = rng.standard_normal(precision.shape) * np.sqrt(precision)
+    offsets = rng.standard_normal(response.shape) * 0.1
+    targets = np.where(training > 0, response, np.nan)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=targets, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=9)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    rss = gaussian.residual_sum_of_squares()
+    for model in range(MODEL_COUNT):
+        rows = training[:, model] > 0
+        weights_model = training[:, model] / noise[model]
+        root = np.sqrt(weights_model)
+        weighted_covariates = root[:, None] * covariates
+        projector = np.eye(genotypes.shape[0]) - weighted_covariates @ np.linalg.pinv(weighted_covariates)
+        design = projector @ (root[:, None] * genotypes)
+        posterior_precision = design.T @ design + np.diag(precision[:, model])
+        mean = np.linalg.solve(posterior_precision, design.T @ (projector @ (root * (response[:, model] - offsets[:, model]))) + shift[:, model])
+        remainder = response[:, model] - offsets[:, model] - genotypes @ mean
+        alpha = np.linalg.pinv(weighted_covariates) @ (root * remainder)
+        residual = remainder - covariates @ alpha
+        conditioning = np.linalg.cond(posterior_precision)
+        scale = np.sqrt(float(mean @ posterior_precision @ mean))
+        error = gaussian.mean[:, model] - mean
+        assert np.all(np.isfinite(gaussian.mean[:, model]))
+        assert np.sqrt(float(error @ posterior_precision @ error)) <= np.sqrt(EPS) + conditioning * genotypes.shape[1] * EPS * scale
+        # The coefficients are the minimum-norm ones: unique on the covariates' column space of the model's rows.
+        np.testing.assert_allclose(gaussian.alpha[:, model], alpha, rtol=0.0, atol=np.sqrt(EPS) * np.abs(alpha).max() * conditioning)
+        fitted = covariates[rows] @ alpha
+        np.testing.assert_allclose((covariates @ gaussian.alpha[:, model])[rows], fitted, rtol=0.0, atol=np.sqrt(EPS) * np.abs(fitted).max() * conditioning)
+        residual_sum = float(np.sum(training[:, model] * residual * residual))
+        assert abs(rss[model] - residual_sum) <= np.sqrt(EPS) * residual_sum * conditioning
+
+
+def test_spikes_tied_on_a_models_rows_deflate_their_one_direction() -> None:
+    genotypes, bounds, covariates, weights, variances, prior_mean, response = _problem(24)
+    rng = np.random.default_rng(25)
+    first, second = 10, 70
+    rows = weights[:, 1] > 0
+    genotypes[rows, second] = genotypes[rows, first]
+    genotypes[~rows, second] = rng.standard_normal(int((~rows).sum()))
+    variances[[first, second], 1] = 0.05
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    count = dual_solve.PassCount()
+    deflation, _resolved = dual_solve.spike_deflation(source, models, count)
+    assert {first, second} <= set(deflation.indices[1].tolist())
+    result = _exact_solve(source, models, right, count, deflation)
+    for model in range(MODEL_COUNT):
+        _projector, _design, _precision, operator = _dense(genotypes, covariates, weights, variances, model)
+        error = result.solution[:, model] - np.linalg.solve(operator, right[:, model])
+        assert float(error @ operator @ error) <= float(result.residual_norm[model]) ** 2 * (1.0 + np.linalg.cond(operator) * genotypes.shape[0] * EPS)
+
+
+def test_missing_targets_off_a_models_rows_are_never_read() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(61)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    fits = []
+    for targets in (np.where(training > 0, response, 0.0), np.where(training > 0, response, np.nan)):
+        gaussian = dual_solve.DualGaussian(source=source, training=training, targets=targets, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=10)
+        gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+        fits.append((gaussian.mean, gaussian.alpha, gaussian.residual_sum_of_squares()))
+    for filled, missing in zip(*fits):
+        np.testing.assert_array_equal(missing, filled)
+    with np.testing.assert_raises(ValueError):
+        dual_solve.DualGaussian(source=source, training=training, targets=np.where(training > 0, np.nan, response), offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=10)
+
+
+def test_a_residual_that_is_not_finite_is_never_certified() -> None:
+    genotypes, source, models, _covariates, _weights, _variances, prior_mean, response = _setup(26)
+    right = dual_solve.mean_right_hand_side(models, response, genotypes @ prior_mean)
+    right[5, 1] = np.nan
+    with np.testing.assert_raises(FloatingPointError):
+        _exact_solve(source, models, right, dual_solve.PassCount())
+
+
+def test_the_sample_diagonal_parts_match_the_dense_posterior() -> None:
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(65)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    # Loose tolerances leave Z_L inexact, so the per-row bounds are exercised, not only rounding.
+    for error_scale, ratio in ((np.sqrt(EPS), np.sqrt(EPS)), (1e-2, 1e-3)):
+        gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=11)
+        gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, error_scale), probe_residual_ratio=ratio)
+        for model in (0, 1, 3):
+            parts = gaussian.sample_diagonal(model)
+            posterior_precision, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+            weights = training[:, model] / noise[model]
+            root = np.sqrt(weights)
+            weighted_covariates = root[:, None] * covariates
+            projector = weighted_covariates @ np.linalg.pinv(weighted_covariates)
+            np.testing.assert_allclose(parts.covariate_leverage, np.diag(projector), rtol=0.0, atol=np.sqrt(EPS))
+            resolved = gaussian.bulk_solves[model].resolved
+            bulk = np.setdiff1d(np.arange(genotypes.shape[1]), resolved)
+            bulk_operator = np.eye(genotypes.shape[0]) + design[:, bulk] @ (design[:, bulk] / precision[bulk, model][None, :]).T
+            bulk_diagonal = np.diag(np.linalg.inv(bulk_operator))
+            full = np.eye(genotypes.shape[0]) - design @ np.linalg.solve(posterior_precision, design.T)
+            exact_resolved = bulk_diagonal - np.diag(full)
+            rounding = np.linalg.cond(posterior_precision) * np.linalg.cond(bulk_operator) * genotypes.shape[0] * EPS
+            assert np.all(np.isfinite(parts.resolved_upper))
+            assert np.all(parts.resolved_lower - rounding <= exact_resolved)
+            assert np.all(exact_resolved <= parts.resolved_upper + rounding)
+            # The one assembler, fed the exact bulk diagonal, brackets the dense predictor variance.
+            complement = np.eye(genotypes.shape[0]) - projector
+            dense_variance = (1.0 - np.diag(complement @ full @ complement)) / np.where(weights > 0.0, weights, 1.0)
+            rows, lower, upper = parts.predictor_variance(bulk_diagonal, np)
+            np.testing.assert_array_equal(rows, np.flatnonzero(weights > 0.0))
+            slack = rounding / weights[rows]
+            assert np.all(lower - slack <= dense_variance[rows])
+            assert np.all(dense_variance[rows] <= upper + slack)
+
+
+def test_the_covariate_leverage_is_the_projectors_diagonal_when_the_covariates_lose_rank() -> None:
+    genotypes, bounds, covariates, weights, variances, _prior_mean, response = _rank_losing_problem(24)
+    training = (weights > 0).astype(np.float64)
+    noise = np.array([0.7, 0.9, 1.3, 1.1])
+    precision = 1.0 / variances
+    shift = np.zeros_like(precision)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=np.where(training > 0, response, np.nan), offsets=np.zeros_like(response),
+                                       covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=12)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    for model in (1, 2):
+        root = np.sqrt(training[:, model] / noise[model])
+        weighted_covariates = root[:, None] * covariates
+        assert np.linalg.matrix_rank(weighted_covariates) < covariates.shape[1]
+        projector = weighted_covariates @ np.linalg.pinv(weighted_covariates)
+        np.testing.assert_allclose(gaussian.sample_diagonal(model).covariate_leverage, np.diag(projector), rtol=0.0, atol=np.sqrt(EPS))
+
+
+def _identity_draws(gaussian, model, variant_count, sample_count):
+    """Unit noise columns, so the draws minus the mean are the draw map M itself."""
+    resolved_count = gaussian.bulk_solves[model].resolved.size
+    draw_count = resolved_count + variant_count + sample_count
+    resolved_noise = {other: np.zeros((solve.resolved.size, 0)) for other, solve in enumerate(gaussian.bulk_solves) if other != model and solve.resolved.size}
+    if resolved_count:
+        resolved_noise[model] = np.hstack([np.eye(resolved_count), np.zeros((resolved_count, variant_count + sample_count))])
+    prior_noise = np.hstack([np.zeros((variant_count, resolved_count)), np.eye(variant_count), np.zeros((variant_count, sample_count))])
+    sample_noise = np.hstack([np.zeros((sample_count, resolved_count + variant_count)), np.eye(sample_count)])
+    return prior_noise, sample_noise, resolved_noise, np.full(draw_count, model, dtype=np.int64)
+
+
+def _draw_map_deviation(draw_map, posterior_precision):
+    """||A^1/2 (M M' - A^-1) A^1/2||_2, the largest |eigenvalue| of M M' A - I (similar to the symmetric form)."""
+    return float(np.max(np.abs(np.linalg.eigvals(draw_map @ (draw_map.T @ posterior_precision) - np.eye(posterior_precision.shape[0])))))
+
+
+def test_the_draws_certificate_covers_the_resolved_sites_after_a_loose_refresh() -> None:
+    # A refresh at a quarter of float64's digits leaves Z_L and the core that far from exact; draws asked for
+    # sqrt(eps) must still meet it. With an exact map M (A^1/2 M M' A^1/2 = I) and columns off by at most their
+    # A-norm certificates c, ||A^1/2 (M_hat M_hat' - A^-1) A^1/2|| <= 2 s + s^2 with s^2 = sum c^2.
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(53)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=5)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, EPS**0.25), probe_residual_ratio=EPS**0.25)
+    model = 0
+    assert gaussian.bulk_solves[model].resolved.size
+    sample_count, variant_count = genotypes.shape
+    prior_noise, sample_noise, resolved_noise, draw_models = _identity_draws(gaussian, model, variant_count, sample_count)
+    bound = np.full(draw_models.size, np.sqrt(EPS))
+    draws, certificates = gaussian.draws_from_noise(prior_noise=prior_noise, sample_noise=sample_noise, resolved_noise=resolved_noise, draw_models=draw_models, error_bound=bound)
+    assert np.all(certificates <= bound)
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
+    spread = float(np.sqrt(np.sum(np.square(certificates))))
+    rounding = draw_models.size * np.linalg.cond(posterior_precision) * EPS
+    assert _draw_map_deviation(draws - gaussian.mean[:, [model]], posterior_precision) <= 2.0 * spread + spread * spread + rounding
+
+
+def _all_resolved_problem(seed: int):
+    """p < n with every spike D ||xt||^2 far above 1: resolved_spikes takes every site, so S_S = I exactly."""
+    rng = np.random.default_rng(seed)
+    sample_count, variant_count, block = 40, 12, 6
+    raw = rng.standard_normal((sample_count, variant_count))
+    genotypes = (raw - raw.mean(0)) / raw.std(0)
+    bounds = [(start, start + block) for start in range(0, variant_count, block)]
+    covariates = np.column_stack([np.ones(sample_count), rng.standard_normal((sample_count, 2))])
+    training = np.ones((sample_count, 1))
+    noise = np.ones(1)
+    precision = np.ones((variant_count, 1))
+    shift = rng.standard_normal((variant_count, 1))
+    response = rng.standard_normal((sample_count, 1))
+    offsets = np.zeros((sample_count, 1))
+    return genotypes, bounds, covariates, training, noise, precision, shift, response, offsets
+
+
+def test_an_identity_bulk_operator_solves_unit_draws_in_one_exact_step() -> None:
+    # Every site resolved: S_S = I, and unit sample-noise columns are solved exactly by the first block step,
+    # leaving a zero worst residual ratio (which the cycle's contraction estimate must not divide by).
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets = _all_resolved_problem(61)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=9)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(1, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    sample_count, variant_count = genotypes.shape
+    assert gaussian.bulk_solves[0].resolved.size == variant_count
+    prior_noise, sample_noise, resolved_noise, draw_models = _identity_draws(gaussian, 0, variant_count, sample_count)
+    bound = np.full(draw_models.size, np.sqrt(EPS))
+    draws, certificates = gaussian.draws_from_noise(prior_noise=prior_noise, sample_noise=sample_noise, resolved_noise=resolved_noise, draw_models=draw_models, error_bound=bound)
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, 0)[0]
+    spread = float(np.sqrt(np.sum(np.square(certificates))))
+    rounding = draw_models.size * np.linalg.cond(posterior_precision) * EPS
+    assert _draw_map_deviation(draws - gaussian.mean[:, [0]], posterior_precision) <= 2.0 * spread + spread * spread + rounding
+
+
+def test_an_infinite_information_tolerance_needs_no_solve() -> None:
+    # information_solve_tolerance is +inf when every site is resolved; the bulk image is then zero, and its bound
+    # must be 0, not inf * 0.
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets = _all_resolved_problem(63)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=10)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(1, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    probes = np.random.default_rng(64).choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
+    with np.errstate(invalid="raise", over="raise"):
+        back_products, coupling, _residual_norm = gaussian.information_solve(probes, 0, np.inf)
+    from sv_pgs.marginal_variances import covariance_products
+
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, 0)[0]
+    expected = np.linalg.solve(posterior_precision, probes)
+    covariance = covariance_products(gaussian.bulk_solves[0], probes, back_products, coupling)
+    np.testing.assert_allclose(covariance, expected, rtol=0.0, atol=np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * np.abs(expected).max())
+
+
+def test_information_products_stay_within_their_bound_after_a_loose_refresh() -> None:
+    # A refresh at a quarter of float64's digits leaves Z_L that far off, and model 0's negative sites make its
+    # core nearly singular; the returned bound on ||w_hat - w|| / ||u|| must cover the resolved correction too.
+    # Xt'(w_hat - w) is then at most ||Xt||_2 times that bound times ||u|| per column.
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(59)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=8)
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, EPS**0.25), probe_residual_ratio=EPS**0.25)
+    model = 0
+    resolved = gaussian.bulk_solves[model].resolved
+    assert np.any(precision[resolved, model] < 0.0)
+    probes = np.random.default_rng(60).choice(np.array([-1.0, 1.0]), size=(genotypes.shape[1], 3))
+    _posterior, _mean, _alpha, _rss, design = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)
+    bulk = np.setdiff1d(np.arange(genotypes.shape[1]), resolved)
+    variances = np.zeros(genotypes.shape[1])
+    variances[bulk] = 1.0 / precision[bulk, model]
+    kernel = np.eye(genotypes.shape[0]) + (design * variances[None, :]) @ design.T
+    image = design @ (variances[:, None] * probes)
+    resolved_duals = np.linalg.solve(kernel, design[:, resolved])
+    core = np.diag(precision[resolved, model]) + design[:, resolved].T @ resolved_duals
+    w = np.linalg.solve(kernel, image) - resolved_duals @ np.linalg.solve(core, resolved_duals.T @ image - probes[resolved])
+    expected = design.T @ w
+    tolerance = np.sqrt(EPS)
+    back_products, _coupling, relative = gaussian.information_solve(probes, model, tolerance)
+    assert np.all(relative <= tolerance)
+    conditioning = np.linalg.cond(kernel) * np.linalg.cond(core)
+    rounding = genotypes.shape[0] * conditioning * EPS * np.abs(expected).max()
+    allowed = np.linalg.norm(design, 2) * relative * np.linalg.norm(image, axis=0) + rounding
+    assert np.all(np.linalg.norm(back_products - expected, axis=0) <= allowed)

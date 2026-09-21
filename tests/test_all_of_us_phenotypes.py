@@ -62,7 +62,7 @@ from sv_pgs.all_of_us import (
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
-from sv_pgs.phenotype_measurement import Occasions, fit_at_exponent
+from sv_pgs.phenotype_measurement import Occasions, box_cox, fit_at_exponent, marginal_transform
 from tests.phenotype_bounds import (
     rounding_gamma,
     sampling_bound,
@@ -303,7 +303,7 @@ def _captured_occasions(monkeypatch, definition: MeasurementDefinition, rows) ->
         captured["occasions"] = occasions
         persons = occasions.person_count
         return type("Fit", (), {
-            "exponent": 1.0, "level_variance": 1.0, "noise_second_moment": 1.0, "log_evidence": 0.0,
+            "exponent": 1.0, "level_variance": 1.0, "noise_second_moment": 1.0, "log_evidence": 0.0, "split_identified": True,
             "level_mean": np.arange(persons, dtype=np.float64), "reliability": np.full(persons, 0.5),
         })()
 
@@ -983,6 +983,61 @@ def test_the_model_target_tracks_the_true_level_better_than_the_raw_mean():
     true_levels = levels[[int(row["person_id"]) for row in training_rows]]
     assert np.corrcoef(targets, true_levels)[0, 1] > np.corrcoef(raw_means, true_levels)[0, 1]
     assert 0.0 < summary["repeatability"] < 1.0
+
+
+def _replicate_rows(person_count: int, repeated: int, seed: int) -> list[dict[str, object]]:
+    """Person-days of a trait with one occasion per person except the first ``repeated`` persons, who have three,
+    simulated from the per-occasion model (level variance 4, noise variance 1) at 0.1 resolution."""
+    generator = np.random.default_rng(seed)
+    rows: list[dict[str, object]] = []
+    for person in range(person_count):
+        level = generator.normal(0.0, 2.0)
+        ages = generator.uniform(25.0, 80.0, 3 if person < repeated else 1)
+        values = np.round(90.0 + level + generator.normal(0.0, 1.0, ages.shape[0]), 1)
+        rows += _person_days(person, [(float(age), float(value)) for age, value in zip(ages, values, strict=True)],
+                             sex_at_birth_concept_id=45878463 if person % 2 else 45880669)
+    return rows
+
+
+def test_single_readings_give_the_transformed_reading_with_reliability_one(caplog):
+    # Without replicates only tau^2 + E[s] is identified: the target is the transformed reading (lead ruling).
+    rows = _replicate_rows(120, 0, seed=8)
+    definition = resolve_measurement_definition("mean_corpuscular_volume")
+    with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
+        training_rows, _columns, summary = build_all_of_us_measurement_targets(definition, rows, 1 << 28)
+    assert summary["measurement_model"] == "transformed reading: no person has a repeated occasion"
+    assert "no person has a repeated occasion" in caplog.text
+    assert summary["level_variance"] is None and summary["repeatability"] is None
+    people = {person.person_id: person for person in person_occasions(rows)}
+    values = np.array([people[row["person_id"]].values[0] for row in training_rows])
+    ages = np.array([people[row["person_id"]].ages[0] for row in training_rows])
+    female = np.array([people[row["person_id"]].sex_at_birth_name == "female" for row in training_rows], dtype=np.float64)
+    sexes = [str(people[row["person_id"]].sex_at_birth_concept_id) for row in training_rows]
+    exponent, transformed = marginal_transform(values, _occasion_design(ages, female, sexes))
+    assert summary["box_cox_exponent"] == exponent
+    np.testing.assert_array_equal([row["target"] for row in training_rows], transformed)
+    np.testing.assert_array_equal(transformed, box_cox(values, exponent)[0])
+    assert all(row["target_reliability"] == 1.0 for row in training_rows)
+
+
+def test_sparse_replicates_give_a_certified_split_or_the_logged_fallback(caplog, monkeypatch):
+    _identity_transform_fit(monkeypatch)
+    definition = resolve_measurement_definition("mean_corpuscular_volume")
+    for repeated in (3, 60):
+        caplog.clear()
+        with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
+            training_rows, _columns, summary = build_all_of_us_measurement_targets(definition, _replicate_rows(120, repeated, seed=9), 1 << 28)
+        reliabilities = np.array([row["target_reliability"] for row in training_rows])
+        if summary["measurement_model"] == "per-occasion model":
+            # The model's targets: every level shrunk (reliability below 1), and the split's variances reported.
+            assert np.all(reliabilities < 1.0) and summary["level_variance"] > 0.0
+        else:
+            # Never a silent pooling: the fallback is the transformed reading, logged.
+            assert summary["measurement_model"] == "transformed reading: the data do not certify the level/noise split"
+            assert "do not certify the level/noise split" in caplog.text
+            assert np.all(reliabilities == 1.0) and summary["level_variance"] is None
+    # With half the persons replicated three times the split is identified.
+    assert summary["measurement_model"] == "per-occasion model"
 
 
 def test_no_statistic_of_the_occasions_is_a_trait_covariate(monkeypatch):

@@ -405,6 +405,31 @@ def test_marginals_respect_the_exact_bounds():
     assert np.all(variances[bulk] <= upper[bulk]) and np.all(variances[bulk] >= lower[bulk])
 
 
+def test_exact_quadratics_make_a_blocks_bulk_marginals_and_covariance_exact():
+    # verify-stage2's exact_block_quadratics hands a flagged block's M_b = Xt_b' Q Xt_b; identity 1 is then exact.
+    _generator, columns, precision, blocks, solve = _strong_case(33)
+    grams = _grams(columns, blocks)
+    bulk = 1.0 / precision
+    bulk[solve.resolved] = 0.0
+    kernel_inverse = np.linalg.inv(np.eye(columns.shape[0]) + (columns * bulk) @ columns.T)
+    z_resolved = kernel_inverse @ columns[:, solve.resolved]
+    coupling = kernel_inverse - z_resolved @ np.linalg.solve(solve.resolved_core, z_resolved.T)
+    members = blocks[2]
+    quadratic = columns[:, members].T @ coupling @ columns[:, members]
+    resolved_here = np.isin(members, solve.resolved)
+    quadratic[resolved_here, :] = 0.0
+    quadratic[:, resolved_here] = 0.0
+    exact = np.linalg.inv(columns.T @ columns + np.diag(precision))
+    variances = marginal_variances(solve, grams, exact_quadratics={2: quadratic})
+    assert np.allclose(variances[members], np.diag(exact)[members], rtol=1e-10)
+    covariance = block_covariance(solve, grams, 2, exact_quadratic=quadratic)
+    bulk_rows = np.flatnonzero(~resolved_here)
+    assert np.allclose(covariance[np.ix_(bulk_rows, bulk_rows)], exact[np.ix_(members[bulk_rows], members[bulk_rows])], rtol=1e-10, atol=1e-14)
+    # Without the override the block keeps the window map's error, which the override removes.
+    plain = marginal_variances(solve, grams)
+    assert np.max(np.abs(plain[members] / np.diag(exact)[members] - 1.0)) > 1e-6
+
+
 def test_no_upper_clamp_when_a_resolved_site_is_non_positive():
     # verify-stage2's counterexample: with Pi = (2, -1/2) the bulk site's exact marginal exceeds 1/Pi_1.
     columns = np.array([[1.0, 1.0]])

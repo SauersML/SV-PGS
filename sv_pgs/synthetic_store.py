@@ -52,15 +52,15 @@ import multiprocessing
 import os
 from pathlib import Path
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Sequence, get_args
 
 import numpy as np
 
 from sv_pgs._typing import F32Array, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.config import VariantClass
+from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.dosage_store import (
     DEFAULT_INNER_CHUNK_ROWS,
-    DEFAULT_SHARD_ROWS,
     MAXIMUM_DOSAGE_MILLI,
     VARIANT_CLASS_LEGEND,
     Codec,
@@ -72,6 +72,7 @@ from sv_pgs.dosage_store import (
     dosage_array_directory,
     encode_dosage_milli,
     open_column,
+    shard_rows_for,
     sites_md5,
     statistic_column_directory,
     variant_column_directory,
@@ -121,7 +122,9 @@ SINGLE_PATH_R2 = {
     "SV_outTR": (0.0022485654501617743, 0.1738066716577618, 0.6865351451998423, 0.868419151645502),
     "SV_TR": (0.06496154204265829, 0.30317890563719757, 0.6548260520832868, 0.9006202645418034),
 }
-PIPELINE_R2_LOSS = {"A": {"SNV": 0.0, "INDEL": 0.0, "SV": 0.0}, "B": {"SNV": 0.005, "INDEL": 0.02, "SV": 0.03}}
+# Half B is a second imputation pipeline whose r2 target sits this far below half A's for every class: a
+# stated design input with no measured source, so the store carries two reliability classes.
+PIPELINE_R2_LOSS = {"A": 0.0, "B": 0.01}
 R2_BETA_CONCENTRATION = 20.0
 COMPLEXITY_BIN_PATHS = ((1, 1), (2, 5), (6, 10), (11, 20), (21, 60))
 RECORD_SINGLE = 0
@@ -487,9 +490,8 @@ def noise_parameters(
     noise_class = layout.noise_class
     target_mean = np.array([SINGLE_PATH_R2[name] for name in NOISE_CLASSES])[noise_class, maf_bin]
     target = rng.beta(target_mean * R2_BETA_CONCENTRATION, (1 - target_mean) * R2_BETA_CONCENTRATION)
-    loss_table = np.array([PIPELINE_R2_LOSS[pipeline]["SV" if name.startswith("SV") else name] for name in NOISE_CLASSES])
     # r2 is a squared correlation: the pipeline loss can only take it down to 0.
-    target = np.clip(target - loss_table[noise_class], 0.0, 1.0)
+    target = np.clip(target - PIPELINE_R2_LOSS[pipeline], 0.0, 1.0)
     uninformed = np.where(layout.has_read_evidence, 0.0, 0.5 * (1 - target))
     soft = np.minimum(SOFT_POSTERIOR_FRACTION * np.minimum(1.0, 10 * np.minimum(frequency, 1 - frequency)), 1 - uninformed)
     error_rate = solve_error_rate(target, uninformed, soft, frequency)
@@ -899,14 +901,24 @@ def plan_store(
     seed: int,
     block_records: int,
     codec: Codec,
-    shard_rows: int = DEFAULT_SHARD_ROWS,
+    shard_rows: int | None = None,
     inner_rows: int = DEFAULT_INNER_CHUNK_ROWS,
+    parallel_writers: int = 1,
 ) -> GenerationPlan:
-    """Draw the cohort, lay out every chromosome, solve noise parameters and write all metadata."""
+    """Draw the cohort, lay out every chromosome, solve noise parameters and write all metadata.
+
+    Each (chromosome, shard) is one generation task, and a bubble a shard boundary cuts becomes
+    single-path records, so ``shard_rows`` defaults to ``dosage_store.shard_rows_for``: the fewest
+    shards that still give ``parallel_writers`` tasks.
+    """
     if len(half_sample_counts) != len(half_pipelines) or not set(half_pipelines) <= set(PIPELINE_R2_LOSS):
         raise ValueError(f"each half needs a pipeline in {sorted(PIPELINE_R2_LOSS)}.")
     chromosomes = tuple(f"chr{index + 1}" for index in range(chromosome_count))
     record_counts = _record_counts(total_records, chromosome_count)
+    if shard_rows is None:
+        shard_rows = shard_rows_for(
+            record_counts, inner_rows=inner_rows, parallel_writers=parallel_writers, arrays_per_count=len(half_sample_counts)
+        )
     cohort = draw_cohort(int(sum(half_sample_counts)), source, _generator(seed, 0))
     layouts = []
     noise = []
@@ -992,12 +1004,16 @@ def _write_variant_table(root: Path, chromosome: str, layout: ChromosomeLayout, 
     carried_paths = np.where(layout.record_kind == RECORD_NESTED, _popcount(layout.nested_path_mask), 1)
     reference_lengths = source.reference_lengths[source_index].astype(np.int32)
     alternate_lengths = source.alternate_lengths[source_index].astype(np.int32)
+    # Every synthetic record is an ALT count: its value is code / 127.
+    codes_per_unit, value_origin = allele_count_decode(positions.shape[0])
     columns: dict[str, tuple[NDArray, dict[str, Any]]] = {
         "pos": (positions.astype(np.int32), {}),
         "ref_len": (reference_lengths, {}),
         "alt_len": (alternate_lengths, {}),
         "cm": (genetic_map, {}),
         "variant_class": (source.variant_classes[source_index], {"legend": VARIANT_CLASS_LEGEND}),
+        "codes_per_unit": (codes_per_unit, {}),
+        "value_origin": (value_origin.astype(np.int16), {}),
         "group_first": (layout.bubble_start, {}),
         "class": (source.class_codes[source_index], {"legend": list(CLASS_LEGEND)}),
         "sv_ctx": (context, {"legend": list(SV_CONTEXT_LEGEND)}),
@@ -1047,7 +1063,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--chromosomes", type=int, default=len(HG38_AUTOSOME_MEGABASES))
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--block-records", type=int, required=True)
-    parser.add_argument("--codec", choices=("raw", "zstd"), required=True)
+    parser.add_argument("--codec", choices=get_args(Codec), required=True)
     parser.add_argument("--workers", type=int, default=len(os.sched_getaffinity(0)))
     arguments = parser.parse_args(argv)
     started = time.perf_counter()
@@ -1062,6 +1078,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=arguments.seed,
         block_records=arguments.block_records,
         codec=arguments.codec,
+        parallel_writers=arguments.workers,
     )
     planned = time.perf_counter()
     timings = generate_store(plan, workers=arguments.workers)
