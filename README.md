@@ -31,6 +31,9 @@ uv sync                 # CPU
 uv sync --extra gpu     # plus the CUDA 12 GPU libraries
 ```
 
+## Supported platform
+Linux on CPython 3.12: the MSI suite runs 3.12.13 and the CI workflow runs 3.12, and nothing else has ever been run. `sv_pgs` reads `/proc` and `os.sched_getaffinity` for its memory and thread budgets (`compute_budget`, `dosage_store`, `progress`), which no other operating system provides, so an older Python or another platform is not a claim this project can make. `pyproject.toml` says the same.
+
 ## All of Us phenotypes
 The 21-trait panel, 11 quantitative traits and 10 diseases, is built from the workspace's OMOP CDR by BigQuery. It runs inside the workspace, and only counts of at least 21 participants may leave it. [docs/design/PHENOTYPES.md](docs/design/PHENOTYPES.md) has the definitions.
 

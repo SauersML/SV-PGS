@@ -8,7 +8,15 @@ version = "0.1.0"
 description = "Bayesian polygenic scores with structural variants, tandem repeats and SNVs in one model"
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+# The supported platform, stated once here and in the README: Linux on CPython 3.12, which is what the MSI suite
+# (3.12.13) and the CI workflow run. sv_pgs reads /proc and os.sched_getaffinity (compute_budget, dosage_store,
+# progress) and has never been run below 3.12, so neither a wider Python floor nor another operating system is a
+# claim this project can make.
+requires-python = ">=3.12"
+classifiers = [
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.15,<2",
