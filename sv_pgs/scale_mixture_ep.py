@@ -3057,6 +3057,24 @@ def hyper_step(
     log_smoothing[finite_final] = weights
 
     def checked(check: _Stationarity, evidence: _Evidence = evidence) -> HyperStep:
+        """The step at ``evidence`` (V at the returned weights, as resolved so far) with the stationarity ``check``;
+        its ``tighten`` and ``resolve`` compose, each keeping what the other resolved."""
+
+        def tighten(budget: float) -> HyperStep | None:
+            """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the
+            check then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
+            tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
+            return checked(tightened, evidence) if tightened.better is None and np.isfinite(tightened.gain) else None
+
+        def resolve(budget: float) -> HyperStep | None:
+            """This step with V at its returned weights certified to ``budget``: x re-maximized to the inner tolerance
+            that budget asks (the determinant's first-order move under x's remaining decrement), then more of the
+            Tierney-Kadane directions integrated exactly; the stationarity check as it stands. None where V has no
+            certified value there."""
+            refined = _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, budget)
+            resolved = _corrected(final_view, weights, refined, cavity, correction, working_bytes, budget)
+            return None if resolved is None else checked(check, resolved)
+
         return HyperStep(
             hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
             penalized_objective=evidence.penalized_value,
@@ -3075,21 +3093,6 @@ def hyper_step(
             resolve=resolve,
             evidence_error=evidence.error,
         )
-
-    def tighten(budget: float) -> HyperStep | None:
-        """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the check
-        then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
-        tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
-        return checked(tightened) if tightened.better is None and np.isfinite(tightened.gain) else None
-
-    def resolve(budget: float) -> HyperStep | None:
-        """This step with V at its returned weights certified to ``budget``: x re-maximized to the inner tolerance
-        that budget asks (the determinant's first-order move under x's remaining decrement), then more of the
-        Tierney-Kadane directions integrated exactly; the stationarity check as it stands. None where V has no
-        certified value there."""
-        refined = _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, budget)
-        resolved = _corrected(final_view, weights, refined, cavity, correction, working_bytes, budget)
-        return None if resolved is None else checked(check, resolved)
 
     return checked(check)
 
@@ -3326,6 +3329,8 @@ class _OuterTrial:
     # A joint trial from a state where V's formula has no certified value (x_k outside every basin of its integrand at
     # rho_k): it enters one, accepted where the trial's state is certified, and uncounted (V at x_k is unmeasured).
     enters: bool = False
+    # The tolerance the weights were searched to when this trial was planned (``weight_tolerances``).
+    weights_tolerance: float = np.nan
 
 
 def fit_hyperparameters(
@@ -3451,8 +3456,9 @@ def fit_hyperparameters(
 
     def plan(model: int) -> _OuterTrial:
         state = states[model]
+        planned = weight_tolerances[model]
         try:
-            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, weight_tolerances[model])
+            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned)
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
@@ -3465,7 +3471,7 @@ def fit_hyperparameters(
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
         histories[model].append(float(remaining))
-        return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted)
+        return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
 
     def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
         fits[model] = OuterFit(
@@ -3557,6 +3563,10 @@ def fit_hyperparameters(
                 if same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
+                elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
+                    # The decision tightened the weights' tolerance since this plan: the polished state is planned once
+                    # more, with the weights searched to what their share asks.
+                    pending[model] = None
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
                     uncertified(model, entry, entry.step, state.decrement)
