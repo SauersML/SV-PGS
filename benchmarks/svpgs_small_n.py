@@ -4,6 +4,12 @@ fitted from the training genotypes in memory with exact dense algebra (no dosage
 The arms are ``svpgs_method``'s: the full model, ``fit_expression_no_sv_terms`` and ``fit_expression_no_annotations``
 (the variant classes each arm's prior sees). The prediction is the posterior-mean genetic score plus the intercept.
 
+Every arm here passes ``log_variance_offset=None``, so the fit takes every record as measured exactly: its prior
+log-variance offset is log r^2 = 0. That is what bench-real's genotypes are, the panel's hard calls, and it is a
+statement about this benchmark, not about the model. A number from these arms measures the prior and the inference,
+never the measurement model, and none of them may be cited as evidence that the r^2-scaled prior helps or does not
+(``svpgs_method``'s module docstring says the same of its own bench-real arms).
+
 Both harnesses load this file without registering it as a module, so it has no ``from __future__ import
 annotations`` and loads its sibling ``svpgs_method.py`` by path.
 """

@@ -11,10 +11,18 @@ straight from the harness's code view.
 
 bench-real's cis windows have far fewer samples than columns, so they go by the small-n route
 (``sv_pgs.small_n.fit_small_n``: Stage 0 dense and Stage 2's EP-EB with exact algebra in the n x n kernel form) on
-the training calls as codes, which 0/1/2 map onto exactly. The small-n prior reads each record's variant class and
-reliability (1 for called genotypes) only: annotation columns wait for e2e's prior design builder. Test genotypes
-are dosages (the SV-credit arm sets SV columns to their training means), so they are scored in closed form from the
-fitted ``ScoringModel``, with no rounding to codes.
+the training calls as codes, which 0/1/2 map onto exactly. The small-n prior reads each record's variant class only:
+annotation columns wait for e2e's prior design builder. Test genotypes are dosages (the SV-credit arm sets SV columns
+to their training means), so they are scored in closed form from the fitted ``ScoringModel``, with no rounding to
+codes.
+
+Every bench-real arm here passes ``log_variance_offset=None`` to the small-n route, which takes every record as
+measured exactly: its prior log-variance offset is log r^2 = 0. That is what the panel's hard calls are, and it is a
+statement about this benchmark, not about the model. A bench-real number therefore measures the prior and the
+inference, never the measurement model, and none of these arms may be cited as evidence that the r^2-scaled prior
+helps or does not. The measurement-aware path is bench-sim's, whose store carries the arm's imputation r^2 as its
+``quality`` column (``bench_sim_annotations``); ``log_variance_offset=None`` in ``_fit_one`` means that column, not
+perfect measurement.
 
 The prediction is the posterior-mean genetic score (plus the fitted intercept for bench-real, whose phenotype is
 already residualized). Covariate effects are left out, as the harnesses adjust for covariates themselves.
