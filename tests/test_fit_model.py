@@ -7,6 +7,7 @@ around ``full_data_fit.fit_models``; the driver's own accuracy is tested with it
 from __future__ import annotations
 
 import dataclasses
+import json
 from pathlib import Path
 from typing import Any
 
@@ -14,14 +15,14 @@ import numpy as np
 import pytest
 
 from sv_pgs import fit_model
-from sv_pgs.artifact import cohort_digest, load_model, offset_digest, predict, sites_digest, store_digest
+from sv_pgs.artifact import cohort_digest, load_model, offset_digest, predict, save_model, sites_digest, store_digest
 from sv_pgs.cli import main
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import CODES_PER_DOSAGE, DosageStore
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.full_data_fit import FitCertificate
-from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+from sv_pgs.scale_mixture_ep import MixtureHyperparameters, OuterFit
 from tests.test_dosage_store import _write_store
 
 _SAMPLES = 60
@@ -51,8 +52,10 @@ def _certificate(model_count: int, generator: np.random.Generator) -> FitCertifi
             values[field.name] = tuple(generator.normal(size=model + 1) for model in range(model_count))
         elif kind == "int":
             values[field.name] = int(generator.integers(1, 50))
-        elif kind == "I64Array":
+        elif kind.startswith("I64Array"):
             values[field.name] = generator.integers(0, 9, size=model_count)
+        elif kind.startswith("BoolArray"):
+            values[field.name] = generator.uniform(size=model_count) < 0.5
         else:
             values[field.name] = generator.uniform(size=model_count)
     return FitCertificate(**values)
@@ -217,6 +220,21 @@ def test_the_artifact_carries_the_whole_certificate_and_the_provenance(tmp_path:
     assert model.provenance.sites_digest == sites_digest(store_root)
     assert model.provenance.cohort_digest == cohort_digest(cohort.research_ids)
     assert model.provenance.offset_digest == offset_digest(None)
+
+
+def test_the_artifact_reports_the_outer_criterion_and_never_certification(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    """M04: ``OuterFit.fixed_point_term_measured`` is False for every fit this package produces, and its docstring
+    says a caller must then treat the fit as uncertified. So the status the artifact carries is named for what the
+    outer loop did establish, and no public surface carries a ``certified`` flag to be misread."""
+    assert OuterFit.fixed_point_term_measured is False
+    names = {field.name for field in dataclasses.fields(FitCertificate)}
+    assert "certified" not in names and "outer_criterion_met" in names
+    cohort = _cohort(np.random.default_rng(7))
+    model = fit_model.fit(_request(store_root, cohort.arguments(), tmp_path, 7))
+    assert "certified" not in model.certificate and "certified" not in model.fit_counts
+    np.testing.assert_array_equal(model.certificate["outer_criterion_met"], driver.results[0].certificate.outer_criterion_met)
+    save_model(tmp_path / "model", model)
+    assert "certified" not in json.loads((tmp_path / "model" / "model.json").read_text())["certificate_terms"]
 
 
 def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:

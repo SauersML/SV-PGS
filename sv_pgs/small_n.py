@@ -1740,6 +1740,7 @@ def fit_small_n(
         outer_history=(outer.history,),
         refreshes=int(oracle.profile["refreshes"]),
         passes=int(oracle.profile["passes"]),
+        outer_criterion_met=np.array([outer.certified], dtype=bool),
     )
     profile = dict(oracle.profile) | {
         "stage0_seconds": stage0_seconds,
@@ -1754,8 +1755,11 @@ def fit_small_n(
         "outer_iterations": int(outer.iterations),
         "start_heritability": float(moment.heritability),
         "start_resolution": float(moment.resolution),
-        # The certificate's decisive numbers, so every recorded fit says whether and how it certified.
-        "certified": bool(outer.certified and outer.remaining_gain <= tolerance and outer.prediction_move <= outer.prediction_tolerance),
+        # The certificate's decisive numbers, so every recorded fit says what its outer loop established: its
+        # remaining gain and its prediction move are both within their tolerances. That is not certification of the
+        # fit, and no reader may report it as such (``full_data_fit.FitCertificate.outer_criterion_met``): while
+        # ``OuterFit.fixed_point_term_measured`` is False the outer steps charge the fixed points' own error as zero.
+        "outer_criterion_met": bool(outer.certified and outer.remaining_gain <= tolerance and outer.prediction_move <= outer.prediction_tolerance),
         "remaining_gain": float(outer.remaining_gain),
         "prediction_move": float(outer.prediction_move),
         "prediction_tolerance": float(outer.prediction_tolerance),

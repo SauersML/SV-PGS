@@ -43,7 +43,7 @@ from typing import Callable, Sequence
 
 import numpy as np
 
-from sv_pgs._typing import F64Array, I64Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
 from sv_pgs.dual_solve import DualGaussian, _host
 from sv_pgs.fast_scoring import ScoringModel
@@ -234,9 +234,15 @@ class FitCertificate:
     outer_history: tuple[tuple[float, ...], ...]
     refreshes: int
     passes: int
-    # Per model: whether the outer loop certified it (``OuterFit.certified``); an uncertified fit is reported, never
-    # passed as certified.
-    certified: F64Array | None = None
+    # Per model, the outer loop's own stopping criterion (``OuterFit.certified``): its remaining gain is within the
+    # tolerance and its certifying step's prediction move within its own.
+    #
+    # This is NOT certification of the fit, and nothing may report it as such. ``OuterFit.fixed_point_term_measured``
+    # is False for every fit this package can produce, so the outer steps' decisions charge the fixed points' own
+    # error along them as zero (theory-ep: the oracles' perturbation probes are not wired yet); its docstring says a
+    # caller must then treat the result as uncertified. The name says what the outer loop did establish, so no reader
+    # has to know that rule to avoid overclaiming. None where a route does not record it.
+    outer_criterion_met: BoolArray | None = None
 
 
 @dataclass(frozen=True)
@@ -905,7 +911,7 @@ def fit_full_data(
             outer_history=tuple(fit.history for fit in fits),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
-            certified=np.array([fit.certified for fit in fits], dtype=bool),
+            outer_criterion_met=np.array([fit.certified for fit in fits], dtype=bool),
         ),
     )
 
