@@ -1239,6 +1239,35 @@ def _trust_region_step(
     return eigenvectors @ rest
 
 
+def _objective_ceiling(prior: ScaleMixturePrior, penalty: F64Array, cavity: Cavity) -> float:
+    """An upper bound on the penalized objective F - P - A over every x: Z_j = int l_j p_j <= sup_beta l_j(beta) =
+    exp(h_j^2 / (2 P_j)) for every prior (P_j > 0; no bound where a cavity precision is not positive), and the
+    quadratic P + A = 1/2 x'(S + C)x - b'x + c has a minimum c - 1/2 b'(S + C)^+ b where S + C is positive
+    semidefinite with b in its range (none otherwise: the local model is then unbounded, and the maximizer's other
+    stops end it). Infinite where either part has no bound."""
+    precision, shift = cavity.precision, cavity.shift
+    if np.any(precision <= 0.0):
+        return np.inf
+    data_bound = float(np.sum(0.5 * np.square(shift) / precision))
+    quadratic = penalty.copy()
+    linear = np.zeros(penalty.shape[0])
+    constant = 0.0
+    if prior.anchor is not None:
+        quadratic = quadratic + prior.anchor.matrix
+        linear = prior.anchor.linear
+        constant = 0.5 * prior.anchor.constant
+    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (quadratic + quadratic.T))
+    floor = _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny)
+    if eigenvalues.size and float(eigenvalues[0]) < -floor:
+        return np.inf
+    components = eigenvectors.T @ linear
+    positive = eigenvalues > floor
+    if np.any(np.abs(components[~positive]) > floor * max(float(np.max(np.abs(components), initial=0.0)), 1.0)):
+        return np.inf
+    minimum = constant - 0.5 * float(np.sum(np.square(components[positive]) / eigenvalues[positive]))
+    return data_bound - minimum
+
+
 def _maximize_coefficients(
     prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float
 ) -> tuple[F64Array, _Objective]:
@@ -1258,6 +1287,7 @@ def _maximize_coefficients(
     engine's verification harness asks with tolerance 0: the value's rounding is not the gradient's).
     """
     penalty = _penalty_matrix(prior, log_smoothing)
+    ceiling = _objective_ceiling(prior, penalty, cavity)
     coefficients = np.array(start, dtype=np.float64, copy=True)
     objective = _data_objective(prior, coefficients, cavity, working_bytes)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
@@ -1277,6 +1307,12 @@ def _maximize_coefficients(
         rounding = objective.rounding + _EPSILON * abs(value)
         definite = float(spectrum[0][0]) > 0.0
         if definite and 0.5 * float(gradient @ ascent) <= tolerance:
+            return coefficients, objective
+        if ceiling - value <= tolerance:
+            # No x gains the tolerance over this one: the objective's ceiling (``_objective_ceiling``) is within it.
+            # On a gene the data do not see (ENSG00000100385.14 [real]: every |log Z_j| below 1e-9) the objective is
+            # flat at its rounding, -H indefinite there at rounding, and the trust region followed that curvature
+            # for over an hour at gains of 1e-8.
             return coefficients, objective
         if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
