@@ -56,8 +56,10 @@ def _class_bounds(log_density, scales, grid, class_rows, precision, shift):
     With q = vP, r = 1/(1 + q), qr = q r, c = v r and a = h^2 c, the relative errors are those of v (the argument's
     rounding amplified by exp, or the product of two exponentials, or a subnormal's spacing), of q, of 1 + q
     (u (1 + |q|) |r| from the sum, which a negative P amplifies, and q's), and of each product or reciprocal form.
-    A node of log weight -inf is dropped exactly on both sides (an overflowing v), so its errors are zero. Every node
-    takes its own variance v = u e^t (review-mathbugs N1: no flat kernel below the floor).
+    A node whose v overflowed at a finite log v takes both sides' limit, log sqrt(r) = -1/2 (log v + log P), c = 1/P
+    and q r = 1 (``scale_mixture_ep._kernel_terms``, the audit's M18): its q and r are the limits 0 and 1 in the
+    error terms below (no inf * 0), and its log(1 + q) error is the log-domain sum's. Every node takes its own
+    variance v = u e^t (review-mathbugs N1: no flat kernel below the floor).
     """
     u, t = _UNIT, _TRANSCENDENTAL
     node_count = grid.shape[0]
@@ -68,9 +70,11 @@ def _class_bounds(log_density, scales, grid, class_rows, precision, shift):
         with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
             exponent = scales[rows][:, None] + grid[None, :]
             variance = np.exp(exponent)
-            q = np.abs(variance * precision[rows][:, None])
+            overflowed = ~np.isfinite(variance) & (precision[rows][:, None] > 0.0)
+            q = np.where(overflowed, 0.0, np.abs(variance * precision[rows][:, None]))
             r, qr, a = np.abs(retained), np.abs(ratio_retained), np.abs(signal)
-            log1p_ratio = np.abs(np.log1p(variance * precision[rows][:, None]))
+            log1p_signed = np.where(overflowed, exponent + np.log(precision[rows])[:, None], np.log1p(variance * precision[rows][:, None]))
+            log1p_ratio = np.abs(log1p_signed)
             spacing = np.where(variance > 0.0, np.minimum(1.0, 4.0 * _SUBNORMAL / variance), 1.0)
             v_error = u * np.abs(exponent) + 2.0 * t + u + spacing
             q_error = v_error + u
@@ -101,11 +105,14 @@ def _class_bounds(log_density, scales, grid, class_rows, precision, shift):
             conditional_error = np.where(finite, np.abs(conditional) * c_error + c_lost, 0.0)
             log_normalizer = terms.log_normalizer
             responsibility = terms.responsibility
-            # The device's exponent log pi + a/2 (its peak taken over these) and its factor sqrt(r): a correctly rounded
-            # sqrt of r, and the product.
-            device_exponent = np.where(finite, log_density[class_position][None, :] + 0.5 * signal, -np.inf)
-            exponent_error = 0.5 * a * a_error + u * (np.abs(log_density[class_position])[None, :] + 0.5 * a)
-            root_error = 0.5 * r_error + 2.0 * u
+            # The device's exponent log pi + a/2 + log sqrt(r) (its peak taken over these): the log(1 + q) term's own
+            # error (its argument's, or the log-domain sum's where v overflowed) and the sum's rounding.
+            device_exponent = np.where(finite, log_density[class_position][None, :] + 0.5 * signal - 0.5 * log1p_signed, -np.inf)
+            exponent_error = (
+                0.5 * a * a_error + 0.5 * (qr * q_error + t * log1p_ratio)
+                + u * (np.abs(log_density[class_position])[None, :] + 0.5 * a + 0.5 * log1p_ratio)
+            )
+            root_error = 0.0
             peak, device_peak = log_component.max(axis=1), device_exponent.max(axis=1)
             # A weight's error beyond the part common to a row, on either side: its log's, the subtraction of the peak, its
             # exp, and the device's rescales as the peak moves (an exp and a product each, at most one per node).
