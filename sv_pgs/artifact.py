@@ -37,7 +37,7 @@ from sv_pgs.fast_scoring import (
 )
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
-MODEL_FORMAT = "svpgs-model v1"
+MODEL_FORMAT = "svpgs-model v2"
 _METADATA = "model.json"
 _ARRAYS = "arrays.npz"
 _SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha")
@@ -49,13 +49,21 @@ about how its fit ended, so it is not a model this package wrote."""
 
 @dataclass(frozen=True)
 class Provenance:
-    """What produced a model: the exact code, the exact store, its variant layout and the exact training cohort.
+    """What produced a model: the exact code, the exact store, its variant layout, the exact training cohort, the
+    exact problem each model was fitted on, and the prior schema its hyperparameters are written on.
 
     ``code_digest`` is the SHA-256 of the ``sv_pgs`` sources, ``store_digest`` that of the training store's
     ``MANIFEST.json``, ``sites_digest`` that of its chromosomes, record counts and site digests (the layout the
     scoring models' store rows index; any store scored with the model must have the same one),
     ``cohort_digest`` that of the training research IDs, and ``offset_digest`` that of the records' log reliabilities
-    the prior was given (``offset_digest(None)`` when it read the store's own ``quality`` column). Digests only, no
+    the prior was given (``offset_digest(None)`` when it read the store's own ``quality`` column).
+
+    ``cohort_digest`` sorts, because the same people in any order are the same cohort and draw the same seed
+    (``fit_model.cohort_seed``); it therefore says nothing about which store column each person was read from, nor
+    about any model's own training set. ``problem_digest`` says both: the ordered (research ID, store column) pairs,
+    and every model's name, trait type, covariate columns, training mask, training targets and covariate values.
+    ``prior_digest`` identifies each model's prior schema, the lattice, variant classes and record offsets its
+    hyperparameters are written on, without which the saved coefficients name no density. Digests only, no
     identifiers.
     """
 
@@ -64,6 +72,8 @@ class Provenance:
     sites_digest: str
     cohort_digest: str
     offset_digest: str
+    problem_digest: str
+    prior_digest: str
 
 
 def code_digest() -> str:
@@ -104,6 +114,60 @@ def offset_digest(log_variance_offset: np.ndarray | None) -> str:
     """SHA-256 of the records' little-endian float64 log reliabilities; of no bytes when the store's own were used."""
     values = b"" if log_variance_offset is None else np.asarray(log_variance_offset, dtype="<f8").tobytes()
     return hashlib.sha256(values).hexdigest()
+
+
+def named_digest(parts: Mapping[str, Any]) -> str:
+    """SHA-256 over named parts in name order: each name, then either a string's bytes or an array's dtype, shape and
+    contiguous bytes. Naming the dtype and shape keeps two different arrays with the same bytes apart."""
+    hasher = hashlib.sha256()
+    for name in sorted(parts):
+        value = parts[name]
+        hasher.update(name.encode())
+        if isinstance(value, str):
+            hasher.update(value.encode())
+            continue
+        array = np.ascontiguousarray(value)
+        hasher.update(f"{array.dtype.str}{array.shape}".encode())
+        hasher.update(array.tobytes())
+    return hasher.hexdigest()
+
+
+def problem_digest(
+    *,
+    research_ids: Sequence[str],
+    store_columns: np.ndarray,
+    model_names: Sequence[str],
+    trait_types: Sequence[TraitType],
+    covariate_names: Sequence[str],
+    covariate_columns: np.ndarray,
+    covariates: np.ndarray,
+    targets: np.ndarray,
+    training: np.ndarray,
+    draw_count: int,
+    seed: int,
+) -> str:
+    """SHA-256 of the whole fitting problem beyond the code, the store and the store's layout.
+
+    Cohort row i's own (research ID, store column) pair, in row order, so a cohort permuted or bound to other store
+    columns is a different problem even though ``cohort_digest`` is the same. Then every model's name, trait type,
+    covariate columns, training mask and training targets, and the covariate values. Non-training targets are zeroed
+    first, exactly as ``fit_model.fit`` passes them, because no model reads its own.
+    """
+    mask = np.asarray(training, dtype=bool)
+    return named_digest(
+        {
+            "binding": np.array([f"{research_id}\t{column}" for research_id, column in zip(research_ids, np.asarray(store_columns).tolist())]),
+            "model_names": np.array(list(model_names)),
+            "trait_types": np.array([trait_type.value for trait_type in trait_types]),
+            "covariate_names": np.array(list(covariate_names)),
+            "covariate_columns": np.asarray(covariate_columns, dtype=bool),
+            "covariates": np.asarray(covariates, dtype="<f8"),
+            "training": mask,
+            "targets": np.where(mask, np.asarray(targets, dtype="<f8"), 0.0),
+            "draw_count": str(int(draw_count)),
+            "seed": str(int(seed)),
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -193,6 +257,8 @@ def save_model(path: str | Path, model: FittedModel) -> None:
             "sites_digest": model.provenance.sites_digest,
             "cohort_digest": model.provenance.cohort_digest,
             "offset_digest": model.provenance.offset_digest,
+            "problem_digest": model.provenance.problem_digest,
+            "prior_digest": model.provenance.prior_digest,
         },
         "arrays": sorted(arrays),
     }
@@ -273,6 +339,8 @@ def load_model(path: str | Path) -> FittedModel:
             sites_digest=str(provenance["sites_digest"]),
             cohort_digest=str(provenance["cohort_digest"]),
             offset_digest=str(provenance["offset_digest"]),
+            problem_digest=str(provenance["problem_digest"]),
+            prior_digest=str(provenance["prior_digest"]),
         ),
     )
 

@@ -38,6 +38,7 @@ def _budget() -> ComputeBudget:
 
 
 def _request(store_root: Path, arguments: dict[str, Any], work_dir: Path, seed: int) -> fit_model.FitRequest:
+    work_dir.mkdir(parents=True, exist_ok=True)
     return fit_model.FitRequest(store=DosageStore.open(store_root), **arguments, budget=_budget(), work_dir=work_dir, seed=seed)
 
 
@@ -67,6 +68,7 @@ class _StubFit:
     noise_variance: np.ndarray
     hyperparameters: tuple[MixtureHyperparameters, ...]
     certificate: FitCertificate
+    prior_digests: tuple[str, ...]
 
 
 class _StubDriver:
@@ -115,6 +117,7 @@ class _StubDriver:
                 MixtureHyperparameters(coefficients=generator.normal(size=7), log_smoothing=generator.normal(size=2)) for _ in scoring
             ),
             certificate=_certificate(len(scoring), generator),
+            prior_digests=tuple(f"prior-schema-of-model-{index}" for index in range(len(scoring))),
         )
         self.results.append(result)
         return result
@@ -235,6 +238,36 @@ def test_the_artifact_reports_the_outer_criterion_and_never_certification(tmp_pa
     np.testing.assert_array_equal(model.certificate["outer_criterion_met"], driver.results[0].certificate.outer_criterion_met)
     save_model(tmp_path / "model", model)
     assert "certified" not in json.loads((tmp_path / "model" / "model.json").read_text())["certificate_terms"]
+
+
+def test_the_provenance_identifies_the_whole_fitting_problem(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    """I11: the cohort digest sorts, so it is blind to which store column each person was read from and to every
+    model's own training set. The problem digest is not, and the prior digest identifies the schema the saved
+    hyperparameters are written on."""
+    cohort = _cohort(np.random.default_rng(8))
+    base = fit_model.fit(_request(store_root, cohort.arguments(), tmp_path / "a", 5)).provenance
+    order = np.argsort(cohort.research_ids)
+
+    def reordered(**change: Any) -> Any:
+        rows = {name: getattr(cohort, name) for name in ("research_ids", "store_columns", "covariates", "targets", "training")}
+        moved = {name: [values[index] for index in order] if name == "research_ids" else values[order] for name, values in rows.items()}
+        return dataclasses.replace(cohort, **(moved | change))
+
+    # The same people, the same store columns, the same models: one cohort, a different fitting problem.
+    permuted = fit_model.fit(_request(store_root, reordered().arguments(), tmp_path / "b", 5)).provenance
+    assert permuted.cohort_digest == base.cohort_digest and permuted.problem_digest != base.problem_digest
+    # The same people in the same order, re-bound to other store columns.
+    rebound = reordered(store_columns=cohort.store_columns[order][::-1])
+    other = fit_model.fit(_request(store_root, rebound.arguments(), tmp_path / "c", 5)).provenance
+    assert other.cohort_digest == base.cohort_digest and other.problem_digest != permuted.problem_digest
+    # One model's training set moved, with every other input the same.
+    moved = cohort.training.copy()
+    moved[np.flatnonzero(moved[:, 1])[0], 1] = False
+    held = fit_model.fit(_request(store_root, cohort.arguments() | {"training": moved}, tmp_path / "d", 5)).provenance
+    assert held.problem_digest != base.problem_digest
+    # The prior schema is the driver's, and the same problem twice gives the same provenance.
+    assert base.prior_digest == fit_model.fit(_request(store_root, cohort.arguments(), tmp_path / "e", 5)).provenance.prior_digest
+    assert base.problem_digest == fit_model.fit(_request(store_root, cohort.arguments(), tmp_path / "f", 5)).provenance.problem_digest
 
 
 def test_the_cohort_digest_covers_only_the_training_rows(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:

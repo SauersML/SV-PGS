@@ -28,6 +28,7 @@ from sv_pgs.artifact import (
     code_digest,
     cohort_digest,
     offset_digest,
+    problem_digest,
     save_model,
     sites_digest,
     store_digest,
@@ -228,6 +229,21 @@ def fit(request: FitRequest) -> FittedModel:
             sites_digest=sites_digest(request.store.root),
             cohort_digest=cohort_digest([research_id for research_id, kept in zip(request.research_ids, trained) if kept]),
             offset_digest=offset_digest(request.log_variance_offset),
+            problem_digest=problem_digest(
+                research_ids=request.research_ids,
+                store_columns=request.store_columns,
+                model_names=request.model_names,
+                trait_types=request.trait_types,
+                covariate_names=request.covariate_names,
+                covariate_columns=request.covariate_columns,
+                covariates=request.covariates,
+                targets=request.targets,
+                training=request.training,
+                draw_count=DRAW_COUNT,
+                seed=request.seed,
+            ),
+            # One digest over the models' own prior schemas, in model order.
+            prior_digest=hashlib.sha256("\n".join(fitted.prior_digests).encode()).hexdigest(),
         ),
     )
 

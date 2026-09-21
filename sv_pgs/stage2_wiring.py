@@ -18,6 +18,7 @@ from typing import Sequence
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
+from sv_pgs.artifact import named_digest
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.dosage_store import DosageStore
@@ -41,6 +42,8 @@ class FittedModels:
     noise_variance: F64Array
     hyperparameters: tuple[MixtureHyperparameters, ...]
     certificate: FitCertificate
+    # Each model's prior schema (``_prior_schema_digest``), which its fitted hyperparameters alone do not identify.
+    prior_digests: tuple[str, ...]
 
 
 def _seed(seed: int, *keys: int) -> int:
@@ -116,7 +119,23 @@ def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificat
     return FitCertificate(**values)
 
 
-_ModelFit = tuple[ScoringModel, float, MixtureHyperparameters, FitCertificate]
+@dataclass(frozen=True)
+class _ModelFit:
+    """One model's fit: what ``fit_models`` collects per model."""
+
+    scoring: ScoringModel
+    noise: float
+    hyperparameters: MixtureHyperparameters
+    certificate: FitCertificate
+    prior_digest: str
+
+
+def _prior_schema_digest(*, nodes: F64Array, floor: F64Array, top: F64Array, class_index: I64Array, offsets: F64Array, rows: I64Array) -> str:
+    """The prior's schema, which its fitted coefficients do not carry: the lattice its density is written on, the
+    variant class of each row the prior covers, those rows in the store, and the offset each one was given. Without
+    it the saved hyperparameters name no density (``artifact.Provenance.prior_digest``). Empty arrays for a model
+    with no prior at all (the null genetic model)."""
+    return named_digest({"nodes": nodes, "floor": floor, "top": top, "class_index": class_index, "offsets": offsets, "rows": rows})
 
 
 @dataclass(frozen=True)
@@ -199,7 +218,16 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
         # There is no outer loop to stop and no fixed point to perturb: the covariate least squares is exact.
         outer_criterion_met=np.ones(1, dtype=bool),
     )
-    return scoring, covariate_fit.noise, MixtureHyperparameters(coefficients=np.zeros(0), log_smoothing=np.zeros(0)), certificate
+    return _ModelFit(
+        scoring=scoring,
+        noise=covariate_fit.noise,
+        hyperparameters=MixtureHyperparameters(coefficients=np.zeros(0), log_smoothing=np.zeros(0)),
+        certificate=certificate,
+        prior_digest=_prior_schema_digest(
+            nodes=np.zeros(0), floor=np.zeros(0), top=np.zeros(0), class_index=np.zeros(0, np.int64),
+            offsets=np.zeros(0), rows=np.zeros(0, np.int64),
+        ),
+    )
 
 
 def _fit_one(
@@ -274,7 +302,16 @@ def _fit_one(
     fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1))
     (scoring,) = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], draw_count, seed=_seed(seed, 2))
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
-    return scoring, float(np.asarray(fit.noise_variance)[0]), fit.hyperparameters[0], fit.certificate
+    return _ModelFit(
+        scoring=scoring,
+        noise=float(np.asarray(fit.noise_variance)[0]),
+        hyperparameters=fit.hyperparameters[0],
+        certificate=fit.certificate,
+        prior_digest=_prior_schema_digest(
+            nodes=nodes, floor=np.array([floor]), top=np.array([top]), class_index=class_index.astype(np.int64),
+            offsets=offsets, rows=member_rows,
+        ),
+    )
 
 
 def fit_models(
@@ -300,7 +337,7 @@ def fit_models(
         if log_variance_offset is None
         else checked_log_reliability(log_variance_offset, "the caller's log_variance_offset")
     )
-    scoring, noise, hyperparameters, certificates = [], [], [], []
+    scoring, noise, hyperparameters, certificates, prior_digests = [], [], [], [], []
     for model in range(training.shape[1]):
         rows = np.flatnonzero(training[:, model])
         order = np.argsort(store_columns[rows], kind="stable")
@@ -308,7 +345,7 @@ def fit_models(
         adjusted = np.asarray(covariate_columns[model], dtype=bool)
         model_dir = Path(work_dir) / f"model{model}"
         model_dir.mkdir()
-        fitted, model_noise, model_hyperparameters, certificate = _fit_one(
+        fit = _fit_one(
             store,
             np.asarray(store_columns[rows], dtype=np.int64),
             np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
@@ -320,11 +357,16 @@ def fit_models(
             draw_count,
         )
         alpha = np.zeros(adjusted.shape[0])
-        alpha[adjusted] = fitted.alpha
-        scoring.append(dataclasses.replace(fitted, alpha=alpha))
-        noise.append(model_noise)
-        hyperparameters.append(model_hyperparameters)
-        certificates.append(certificate)
+        alpha[adjusted] = fit.scoring.alpha
+        scoring.append(dataclasses.replace(fit.scoring, alpha=alpha))
+        noise.append(fit.noise)
+        hyperparameters.append(fit.hyperparameters)
+        certificates.append(fit.certificate)
+        prior_digests.append(fit.prior_digest)
     return FittedModels(
-        scoring=scoring, noise_variance=np.array(noise), hyperparameters=tuple(hyperparameters), certificate=_merged_certificate(certificates)
+        scoring=scoring,
+        noise_variance=np.array(noise),
+        hyperparameters=tuple(hyperparameters),
+        certificate=_merged_certificate(certificates),
+        prior_digests=tuple(prior_digests),
     )

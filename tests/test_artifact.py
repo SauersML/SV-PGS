@@ -12,11 +12,13 @@ import pytest
 
 from sv_pgs.artifact import (
     CERTIFICATE_STATUS,
+    MODEL_FORMAT,
     FittedModel,
     Provenance,
     cohort_digest,
     code_digest,
     load_model,
+    named_digest,
     offset_digest,
     predict,
     save_model,
@@ -90,6 +92,8 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
             sites_digest=sites_digest(store_root),
             cohort_digest=cohort_digest(["b", "a"]),
             offset_digest=offset_digest(np.log(generator.uniform(size=_VARIANTS))),
+            problem_digest=named_digest({"cohort": np.array(["a", "b"]), "seed": "5"}),
+            prior_digest=named_digest({"nodes": np.linspace(-9.0, 1.0, 11)}),
         ),
     )
 
@@ -167,7 +171,7 @@ def test_loading_refuses_a_model_that_is_not_exactly_what_was_written(tmp_path: 
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="is not a"):
         load_model(tmp_path / "model")
-    metadata["format"] = "svpgs-model v1"
+    metadata["format"] = MODEL_FORMAT
     metadata["arrays"] = metadata["arrays"][1:]
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="exactly the arrays"):
