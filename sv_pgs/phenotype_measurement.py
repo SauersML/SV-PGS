@@ -63,7 +63,6 @@ from sv_pgs.scale_mixture_ep import (
     ScaleMixturePrior,
     class_log_density,
     halved_lattice,
-    initial_hyperparameters,
     relattice,
     scale_mixture_prior,
     spacing_bound,
@@ -775,7 +774,9 @@ def _moment_hyperparameters(prior: ScaleMixturePrior, squared_deviations: F64Arr
     log_density = -0.5 * np.square(prior.log_variance_grid - mean) / variance
     mapping = prior.coefficient_map[: prior.grid_size]
     coefficients = np.linalg.lstsq(mapping, log_density - log_density.mean(), rcond=None)[0]
-    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=initial_hyperparameters(prior).log_smoothing)
+    # The weight starts at unit: this model's own bracketed search below covers its whole resolvable range, so the
+    # start sets only the EM's cost (the engine's start at the lambda = infinity edge is not a bracket point).
+    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
 
 
 class _Model:

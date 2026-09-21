@@ -519,7 +519,9 @@ def scale_mixture_prior(
 
 def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | None = None) -> MixtureHyperparameters:
     """A start, not a prior: every class at one log-normal on the lattice, of the width whose density at the lattice's
-    ends is eps of its peak when it is centred; no deviation or annotation effect; unit penalty weights.
+    ends is eps of its peak when it is centred; no deviation or annotation effect; every penalty weight at its
+    lambda = infinity edge, where that log-normal is the certified fit itself (the search releases a block inward
+    where V rises; a unit weight was an arbitrary start, deep in the near-collapse regime on real genes).
 
     It is centred on the lattice unless ``mean_variance`` is given: the start's mean of e^t over the lattice, so that
     every prior variance E[beta_j^2] starts at mean_variance u_j (``moment_start``). The centre then moves along the
@@ -547,7 +549,7 @@ def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | Non
     quadratic = -0.5 * np.square((nodes - centre) / width)
     coefficients = np.zeros(prior.coefficient_size)
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
-    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.full(len(prior.smoothing_blocks), np.inf))
 
 
 def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Array:
@@ -2690,6 +2692,9 @@ def _maximize_evidence(
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
     best_corrected = -np.inf
+    # Blocks released from their edge by the inward rule below, once each per search: a block the ascent then
+    # leaves at its range's end is not released again (the edge and the end are one value to the tolerance).
+    released_once: set[int] = set()
     while True:
         edges = infinite
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
@@ -2727,12 +2732,21 @@ def _maximize_evidence(
             infinite, moved = frozenset(best_edge[0]), True
             coefficients = best_edge[1][0] @ best_edge[1][1].coefficients
         if not moved:
+            # An edge weight moves back to the upper end of its range when V is higher there, or when V is level with
+            # the edge to the tolerance and rises inward (its Laplace slope in rho negative at the upper end): from
+            # the edge, V at the range's end is the edge's own to rounding, so a raise alone would never release a
+            # block, and the ascent below is what searches the interior.
             for position in sorted(edges):
                 trial_infinite = infinite - {position}
                 trial_weights = weights.copy()
                 trial_weights[position] = upper[position]
                 trial = _edge_evidence(prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
-                if trial is not None and trial[1].value > current_value + tolerance:
+                if trial is None:
+                    continue
+                released = sorted(index for index in range(len(bounds)) if index not in trial_infinite).index(position)
+                inward = position not in released_once and trial[1].value >= current_value - tolerance and trial[1].gradient[released] < -_laplace_gradient_error(trial[1])[released]
+                if trial[1].value > current_value + tolerance or inward:
+                    released_once.add(position)
                     infinite, weights, moved = frozenset(trial_infinite), trial_weights, True
                     coefficients = trial[0] @ trial[1].coefficients
                     break
