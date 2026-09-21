@@ -108,6 +108,8 @@ from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Callable, Iterator, Sequence
 
+import math
+
 import numpy as np
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
@@ -637,25 +639,25 @@ def log_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Array:
 def relattice(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, nodes: F64Array, floor: float, top: float
 ) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
-    """The same model on new nodes and a new kernel range: each class's eta from the model's own continuous log g
-    inside the old lattice, and along its end slopes outside it, so the log-tails stay linear (which the
-    third-order penalty leaves free) rather than following a polynomial's extrapolation.
+    """The same model on new nodes and a new kernel range.
 
-    The model holds log g by its nodal values, and its roughness is the integral of the m-th derivative squared
-    (m = ``ROUGHNESS_ORDER``); the continuous function it implies between the nodes is the one of least roughness
-    through them, the natural spline of degree 2m - 1, whose derivatives m to 2m - 2 vanish at both ends
-    (Schoenberg; Wahba 1990, Section 1.3). So a finer lattice holds the same density, and only the quadrature
-    changes.
+    The model holds each lattice function (the pooled log g and every class deviation) by its nodal values, and its
+    roughness is the integral of the m-th derivative squared (m = ``ROUGHNESS_ORDER``); the continuous function it
+    implies between the nodes is the one of least roughness through them, the natural spline of degree 2m - 1,
+    whose derivatives m to 2m - 2 vanish at both ends (Schoenberg; Wahba 1990, Section 1.3), and beyond the ends
+    that function continues as the polynomial of degree m - 1 its end derivatives set: the continuation of no
+    roughness at all. So a finer or wider lattice holds the same density, and only the quadrature changes.
+
+    Each part moves on its own: the pooled shape and the deviations are one decomposition of the class densities
+    (a common shift of every deviation is a pooled shift), and a least-squares fit of the class densities alone
+    chose another (it split a shared quadratic two thirds pooled, one third per deviation, which the deviation
+    functionals then penalized at 3 nats [sim-only, lead 2026-09-21]). A block at lambda = infinity keeps its
+    constraint: the roughness blocks exactly (a polynomial of degree below m stays one), the deviation
+    functionals to their quadrature, whose residual the least change in x removes here rather than silently in
+    the edge view's projection.
     """
     old_nodes = prior.log_variance_grid
-    log_density, scale_coefficients = _density_and_scale(prior, hyperparameters.coefficients)
-    # One end condition per class: the spline is vector-valued over the classes (review-mathbugs L-0).
-    natural = [(order, np.zeros(log_density.shape[0])) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
-    spline = make_interp_spline(old_nodes, log_density.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
     new_nodes = np.asarray(nodes, dtype=np.float64)
-    inside = np.clip(new_nodes, old_nodes[0], old_nodes[-1])
-    slopes = np.where(new_nodes < old_nodes[0], spline(old_nodes[0], nu=1)[:, None], spline(old_nodes[-1], nu=1)[:, None])
-    new_density = spline(inside).T + slopes * (new_nodes - inside)[None, :]
     moved = scale_mixture_prior(
         class_index=prior.class_index,
         log_variance_offset=prior.log_variance_offset,
@@ -666,10 +668,36 @@ def relattice(
         floor=floor,
         top=top,
     )
-    normalized = new_density - new_density.mean(axis=1, keepdims=True)
-    target = np.concatenate([normalized.ravel(), scale_coefficients])
-    coefficients = np.linalg.lstsq(moved.coefficient_map, target, rcond=None)[0]
-    return moved, MixtureHyperparameters(coefficients=coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
+    old_basis = prior.coefficient_map[: prior.grid_size, : prior.pooled_size]
+    new_basis = moved.coefficient_map[: moved.grid_size, : moved.pooled_size]
+    coefficients = np.asarray(hyperparameters.coefficients, dtype=np.float64)
+    deviation_count = prior.class_count if prior.class_count > 1 else 0
+    part_count = 1 + deviation_count
+    parts = coefficients[: part_count * prior.pooled_size].reshape(part_count, prior.pooled_size)
+    functions = parts @ old_basis.T
+    # One end condition per part: the spline is vector-valued over the parts (review-mathbugs L-0).
+    natural = [(order, np.zeros(part_count)) for order in range(ROUGHNESS_ORDER, 2 * ROUGHNESS_ORDER - 1)]
+    spline = make_interp_spline(old_nodes, functions.T, k=2 * ROUGHNESS_ORDER - 1, bc_type=(natural, natural), axis=0)
+    values = spline(np.clip(new_nodes, old_nodes[0], old_nodes[-1])).T
+    for end, outside in ((old_nodes[0], new_nodes < old_nodes[0]), (old_nodes[-1], new_nodes > old_nodes[-1])):
+        if np.any(outside):
+            distance = new_nodes[outside] - end
+            values[:, outside] = sum(
+                spline(end, nu=order)[:, None] * distance[None, :] ** order / math.factorial(order) for order in range(ROUGHNESS_ORDER)
+            )
+    values -= values.mean(axis=1, keepdims=True)
+    moved_coefficients = np.concatenate([(values @ new_basis).ravel(), coefficients[part_count * prior.pooled_size :]])
+    infinite = [position for position in range(len(moved.smoothing_blocks)) if hyperparameters.log_smoothing[position] == np.inf]
+    if infinite:
+        constraints = []
+        for position in infinite:
+            block = moved.smoothing_blocks[position]
+            embedded = np.zeros((block.factor.shape[0], moved.coefficient_size))
+            embedded[:, block.coordinates] = block.factor
+            constraints.append(embedded)
+        constraint = np.vstack(constraints)
+        moved_coefficients -= np.linalg.lstsq(constraint, constraint @ moved_coefficients, rcond=None)[0]
+    return moved, MixtureHyperparameters(coefficients=moved_coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
 
 
 def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
@@ -2971,9 +2999,11 @@ def _maximize_evidence(
     first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
         # The warm weights (a fit on another lattice, or at a fold of their basin) can have no certified maximum:
-        # the search then starts from the canonical start's weights, every edge released.
-        infinite = frozenset()
-        weights = 0.5 * (lower + upper)
+        # the search then starts from the canonical start's weights, every edge released except the held ones (the
+        # outer loop's refused releases; releasing them here tripped its invariant on the mean-field test problem,
+        # seed 23 [sim-only]).
+        infinite = frozenset(held_edges)
+        weights = np.where(np.isin(np.arange(start_weights.shape[0]), list(infinite)), upper, 0.5 * (lower + upper))
         first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")

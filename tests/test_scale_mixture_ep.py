@@ -567,10 +567,47 @@ def test_relattice_extends_the_log_tails_linearly_and_keeps_the_density_inside()
     # Inside the old lattice the density per unit t is unchanged, up to the constant normalization shifts.
     difference = new_log_density[:, inside] - old_log_density[:, np.searchsorted(nodes, wider[inside] - 1e-9)]
     np.testing.assert_allclose(difference - difference[:, :1], 0.0, atol=1e-6)
-    # Outside it the log density continues along the end slopes: its second differences vanish there.
+    # Outside it the log density continues as the polynomial of degree ROUGHNESS_ORDER - 1 the end derivatives set
+    # (the natural spline's own continuation, of no roughness): its differences of the roughness order vanish there.
     outside = np.flatnonzero(wider > nodes[-1] + 0.2)
-    np.testing.assert_allclose(np.diff(new_log_density[:, outside], n=2, axis=1), 0.0, atol=1e-8)
+    np.testing.assert_allclose(np.diff(new_log_density[:, outside], n=engine.ROUGHNESS_ORDER, axis=1), 0.0, atol=1e-8)
     assert moved.kernel_floor == -9.0 and moved.kernel_top == 4.0
+
+
+def _block_residuals(prior, coefficients):
+    return np.array([float(np.linalg.norm(block.factor @ coefficients[block.coordinates])) for block in prior.smoothing_blocks])
+
+
+@pytest.mark.parametrize("curvature", [-0.3, 0.3])
+def test_relattice_keeps_every_block_at_lambda_infinity_in_its_null_space(curvature):
+    # A D3 block at lambda = infinity holds a quadratic log g; the transfer to a halved, a wider and a shifted lattice
+    # must keep it one exactly, keep zero deviations zero (the least-squares transfer split a shared quadratic two
+    # thirds pooled and one third per deviation, and the deviation functionals then penalized it), and leave the
+    # density inside the old lattice unchanged.
+    class_index, offset, design, groups, _cavity = _data(30, 29)
+    nodes = np.arange(-8.0, 3.0, 0.25)
+    prior = scale_mixture_prior(
+        class_index=class_index, log_variance_offset=offset, annotation_design=design, annotation_groups=groups,
+        nodes=nodes, floor=nodes[0], top=nodes[-1],
+    )
+    quadratic = curvature * np.square(nodes + 2.5) + 0.4 * nodes
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
+    hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.full(len(prior.smoothing_blocks), np.inf))
+    scale = float(np.linalg.norm(coefficients))
+    for moved, transferred in (
+        halved_lattice(prior, hyperparameters),
+        relattice(prior, hyperparameters, np.arange(-12.0, 7.0, 0.25), -12.0, 6.75),
+        relattice(prior, hyperparameters, nodes + 2.0, nodes[0] + 2.0, nodes[-1] + 2.0),
+    ):
+        residuals = _block_residuals(moved, transferred.coefficients)
+        assert np.all(residuals <= 64 * engine._EPSILON * moved.coefficient_size * scale * max(float(np.linalg.norm(block.factor)) for block in moved.smoothing_blocks))
+        assert np.all(transferred.coefficients[moved.pooled_size : moved.pooled_size * (1 + moved.class_count)] == 0.0)
+        new_nodes = moved.log_variance_grid
+        inside = (new_nodes >= nodes[0] - 1e-9) & (new_nodes <= nodes[-1] + 1e-9)
+        expected = curvature * np.square(new_nodes[inside] + 2.5) + 0.4 * new_nodes[inside]
+        got = engine._density_and_scale(moved, transferred.coefficients)[0][0, inside]
+        np.testing.assert_allclose(got - got.mean(), expected - expected.mean(), atol=1e-8)
 
 
 def _log_normal_problem(seed: int):
