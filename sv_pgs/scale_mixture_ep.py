@@ -835,7 +835,10 @@ def _step_scoped(function: Callable) -> Callable:
     return scoped
 
 
-# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed.
+# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed. The outer
+# loop holds its own cache across its iterations (``fit_hyperparameters`` is step-scoped too): every evaluation at one
+# fixed point's cavity (its state, its Newton model, the gradient at a trial that becomes the next state) shares the
+# kernel rows, which the cavity key keeps exact; a hyper step's cache nests inside it and ends with the step.
 _HELD_ARRAYS_PER_ROW_SET = 10
 
 
@@ -1943,7 +1946,13 @@ def _line_log_integrals(
             points = centres[:, None] + halves[:, None] * nodes[None, :]
             steps = (1.0 - points) / points
             both = lines[column](np.concatenate([steps.ravel(), -steps.ravel()])) - value
-            folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
+            with np.errstate(over="ignore", invalid="ignore"):
+                folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
+            if not np.all(np.isfinite(folded)):
+                # The objective along this line rises past the maximum's value by more than double precision holds:
+                # x is not its maximum along it (an anchored model's indefinite C at a freed weight), and every error
+                # estimate below would be nan, which bisection would take for "unsettled" without end.
+                raise FloatingPointError("the exact integral along a direction is not finite: the objective rises past its value at x")
             kronrod_value = folded @ kronrod
             gauss_value = folded @ gauss
             # QUADPACK's error estimate (dqk15i): |K - G| scaled against the integrand's mean absolute deviation.
@@ -1968,6 +1977,11 @@ def _line_log_integrals(
                 raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
             middles = 0.5 * (lows + highs)
             intervals[column] = (np.concatenate([lows, middles]), np.concatenate([middles, highs]))
+            if 2 * 2 * lows.shape[0] * nodes.shape[0] * prior.variant_count * np.dtype(np.float64).itemsize > working_bytes:
+                # The next round's pass (its normalizers, one per variant and step, for both half-lines) would not
+                # fit the working budget: the integrand is not resolved to the share within what the budget can
+                # evaluate, and bisection alone would grow the open intervals without end.
+                raise FloatingPointError("the exact integral along a direction did not converge within the working budget")
             still_open.append(column)
         open_ = still_open
     return logs
@@ -3387,6 +3401,7 @@ class _OuterTrial:
     weights_tolerance: float = np.nan
 
 
+@_step_scoped
 def fit_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
 ) -> list[OuterFit]:
