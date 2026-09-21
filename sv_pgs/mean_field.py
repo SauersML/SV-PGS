@@ -213,7 +213,15 @@ class _Response:
     The bulk P (t_j >= ||x_j||^2, where Woodbury keeps every digit: ``small_n._Kernel``) enters through the kernel
     K = I + Xp_P T_P^-1 Xp_P' (positive definite), and the rest N exactly through its Schur complement
     S = T_N + Xp_N' K^-1 Xp_N (|N| x |N|, symmetric, any sign), factored by LU. A dead row (a point-mass tilted law,
-    t = infinity) has no response: it is a bulk row with T^-1 = 0."""
+    t = infinity) has no response: it is a bulk row with T^-1 = 0.
+
+    |N| is what the split costs, and nothing in the split bounds it a priori, so it was measured on bench-real
+    genes [real], loso/AFR snv: over the first 40 responses of ENSG00000254709.8 (p 37,106 members, n 534) |N| ran
+    0 to 5, median 4, and over the first 25 of ENSG00000100385.14 (p 28,920) 1 to 6, median 4. Every member was
+    live in both, and the bulk was never empty (at worst 5 of 37,106 and 6 of 28,920 rows outside it), so S is a
+    handful of rows and the K = I case never arose. The cost is the kernel's own n x n dsyrk over the p columns,
+    0.18 s and 0.10 s median per response, which is that product's floor. Should a fit ever reach a large N,
+    |N|^2 memory and |N|^3 time are what it pays."""
 
     def __init__(self, design: _Design, scaled_sites: F64Array, live: np.ndarray) -> None:
         self.design = design
