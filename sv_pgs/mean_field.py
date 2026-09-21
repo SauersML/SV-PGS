@@ -38,13 +38,30 @@ rounding (``_elbo``: a forward-error bound from the pieces' sizes) is resolved. 
 **The outer loop's view.** The pseudo-likelihoods are the ``Cavity`` the hyper step maximizes over: at the fixed
 point q_j = t_j(x), so by the envelope theorem d ELBO*/dx = sum_j d log Z_j(x; omega_j, h_j)/dx at fixed cavities,
 exactly the fixed-cavity gradient EP's outer loop uses. The total curvature B = -d2 ELBO*/dx2 needs the cavity's
-response to x: only h moves (omega is fixed), through the means, dh = -(Xp'Xp - diag ||x_j||^2) dm / sigma^2 with
-dm = f_h dh + f_x E, f_h = v (the tilted variance) and f_x E = m_x E the fixed-cavity mean change, so
-(diag(1 / v - omega) + Xp'Xp / sigma^2) dm = diag(1 / v) m_x E. ``GaussianPosterior.cavity_response`` hands (dh, 0)
-to ``_total_curvature_columns``, which forms B from it as it does from EP's response; the solve is ``_Response``
-(the matrix is symmetric, not always positive definite). The prediction check moves q's means in q's own metric,
-sum_j d_j^2 / v_j, and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws
-are q's own: each member's node from its responsibilities, then its conditional normal.
+response to x, with the noise re-solved as the fixed point re-solves it (sigma^2 is profiled, so B is the
+profile's curvature): dh = -(Xp'Xp - diag ||x_j||^2) dm / sigma^2 - h dsigma^2 / sigma^2 and
+domega = -omega dsigma^2 / sigma^2, with dm = f_h dh + f_omega domega + f_x E, f_h = v (the tilted variance),
+f_omega = -(mu_3 + 2 m v) / 2 (the tilted mean's response to its precision, mu_3 the third central moment) and
+f_x E = m_x E the fixed-cavity mean change, so
+
+    (diag(1 / v - omega) + Xp'Xp / sigma^2) dm = diag(1 / v) m_x E - (dsigma^2 / sigma^2) c,
+    c = h + f_omega omega / v,
+
+dm = dm_0 - (dsigma^2 / sigma^2) dm_1 with one solve for dm_1 = R^-1 c per fixed point; and the noise's
+stationarity (n - k) sigma^2 = ||r||^2 + sum_j ||x_j||^2 v_j gives the scalar, with dr = -Xp dm and
+dv = v_x E + g dh + kappa domega (g = mu_3, kappa = -(mu_4 - v^2) / 2 - m mu_3, the tilted variance's responses),
+
+    dsigma^2 [(n - k) - (2 r'Xp dm_1 + sum_j ||x_j||^2 (g_j dh_1j - kappa_j omega_j)) / sigma^2]
+        = -2 r'Xp dm_0 + sum_j ||x_j||^2 (v_x E_j + g_j dh_0j),
+
+dh_0 = -(Xp'Xp - diag ||x_j||^2) dm_0 / sigma^2 and dh_1 = (Xp'Xp - diag ||x_j||^2) dm_1 / sigma^2 - h.
+``GaussianPosterior.cavity_response`` hands (dh, domega) to ``_total_curvature_columns``, which forms B from it as it
+does from EP's response; the solve is ``_Response`` (the matrix is symmetric, not always positive definite). With
+the noise's response left out (as it was), the outer loop's Newton steps in x converged linearly (a rate of 0.1 on
+the test problem and 0.37 on gene 1 [real]: sixteen extra outer states), the signature of a model curvature that
+misses the fixed point's own motion. The prediction check moves q's means in q's own metric, sum_j d_j^2 / v_j,
+and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws are q's own: each
+member's node from its responsibilities, then its conditional normal.
 """
 
 from __future__ import annotations
@@ -340,17 +357,49 @@ class MeanFieldFixedPoints:
         self.profile["factor_seconds"] += time.perf_counter() - started
         self.profile["refreshes"] += 1
         design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
+        mean, shift, residual = self.mean.copy(), self.shift.copy(), self.residual.copy()
+        third, fourth = self._central_moments(hyperparameters, omega)
+        # The tilted moments' responses to the pseudo-likelihood's precision (module docstring), zero on a dead row.
+        mean_by_omega = np.where(live, -0.5 * (third + 2.0 * mean * variance), 0.0)
+        variance_by_shift = np.where(live, third, 0.0)
+        variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
+        residual_dimension = float(self.residual_dimension)
+        noise_solve: dict[str, object] = {}
 
-        def cavity_response(mean_by_z: F64Array, _variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
-            # dm = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest; then
-            # dh = -(Xp'Xp - diag(||x_j||^2)) dm / sigma^2 and dP = 0 (module docstring).
+        def off_diagonal_gram(columns: F64Array) -> F64Array:
+            return design.back(design.image(columns)) - squares[:, None] * columns
+
+        def noise_terms() -> tuple[F64Array, F64Array, float]:
+            # dm_1 = R^-1 c, dh_1 and the scalar on dsigma^2 (module docstring): once per fixed point.
+            if not noise_solve:
+                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
+                mean_one = noise * response.solve(coupling[:, None])
+                shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
+                scalar = residual_dimension - (
+                    2.0 * float(residual @ design.image(mean_one)[:, 0])
+                    + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
+                ) / noise
+                noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
+            return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
+
+        def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
+            # dm_0 = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest, then the
+            # noise's own response and through it every pseudo-likelihood's (module docstring).
             started = time.perf_counter()
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = noise * response.solve(scaled)
-            shift_step = -(design.back(design.image(mean_step)) - squares[:, None] * mean_step) / noise
+            shift_step = -off_diagonal_gram(mean_step) / noise
+            _mean_one, shift_one, scalar = noise_terms()
+            right = -2.0 * (residual @ design.image(mean_step)) + squares @ (
+                np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
+            )
+            noise_step = right / scalar
+            relative = (noise_step / noise)[None, :]
+            shift_step = shift_step + shift_one * relative
+            precision_step = -omega[:, None] * relative
             self.profile["response_seconds"] += time.perf_counter() - started
             self.profile["responses"] += 1
-            return shift_step, np.zeros_like(shift_step)
+            return shift_step, precision_step
 
         def norm(direction: F64Array) -> float:
             # q's own metric for a shift of its means: KL(q || q shifted) = sum_j d_j^2 / (2 v_j) for a product of
@@ -366,6 +415,25 @@ class MeanFieldFixedPoints:
             cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
             precision_norm=norm, effective_effects=float(self.effective),
         )
+
+    def _central_moments(self, hyperparameters: MixtureHyperparameters, omega: F64Array) -> tuple[F64Array, F64Array]:
+        """Each member's tilted third and fourth central moments at the state, from its node responsibilities and
+        conditional normals N(h c_k, c_k) (``scale_mixture_ep._components``): mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and
+        mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2) with d_k = h c_k - m."""
+        prior = self.prior
+        log_density = class_log_density(prior, hyperparameters.coefficients)
+        scales = log_scale(prior, hyperparameters.coefficients)
+        third, fourth = np.zeros(prior.variant_count), np.zeros(prior.variant_count)
+        for class_position in range(log_density.shape[0]):
+            rows = np.flatnonzero(self.class_index == class_position)
+            if rows.size == 0:
+                continue
+            terms = _components(log_density[class_position], scales[rows], prior.log_variance_grid, omega[rows], self.shift[rows])
+            conditional = terms.conditional_variance
+            deviation = self.shift[rows][:, None] * conditional - self.mean[rows][:, None]
+            third[rows] = np.sum(terms.responsibility * (deviation**3 + 3.0 * conditional * deviation), axis=1)
+            fourth[rows] = np.sum(terms.responsibility * (deviation**4 + 6.0 * conditional * deviation**2 + 3.0 * conditional**2), axis=1)
+        return third, fourth
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x K) draws from q itself: each member's node from its responsibilities at its pseudo-likelihood, then its

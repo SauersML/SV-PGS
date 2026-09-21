@@ -142,34 +142,46 @@ def test_the_cavity_response_matches_finite_differences_of_the_fixed_point():
     def tilted_mean(coefficients):
         return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).mean
 
-    def shift_at(coefficients):
-        # The fixed point at the moved x with the noise held at the base point's, as B holds it (the noise's own
-        # response is not part of B in either inference; its stationarity is certified separately): sweeps until
-        # the means stop moving at double precision, which resolves h far below the differences' step (an ELBO stop
+    def cavity_at(coefficients):
+        # The fixed point at the moved x with the noise re-solved between sweeps, as the fixed point re-solves it
+        # (the noise is profiled, and B is the profile's curvature): sweeps until the means and the noise stop
+        # moving at double precision, which resolves the cavity far below the differences' step (an ELBO stop
         # resolves the means only to the square root of its rounding).
         resolved = MeanFieldFixedPoints(oracle.statistics, prior, oracle.noise, 2**60, _WORKING_BYTES)
         resolved.mean, resolved.variance, resolved.shift, resolved.residual = (values.copy() for values in (oracle.mean, oracle.variance, oracle.shift, oracle.residual))
         hyperparameters = moved(coefficients)
         for _sweep in range(10_000):
-            before = resolved.mean.copy()
-            resolved._sweep(hyperparameters)
-            if np.max(np.abs(resolved.mean - before)) <= np.finfo(np.float64).eps * (1.0 + np.max(np.abs(resolved.mean))):
+            before, noise_before = resolved.mean.copy(), resolved.noise
+            _divergence, weighted_variance, residual_square, _sizes = resolved._sweep(hyperparameters)
+            resolved.noise = (residual_square + weighted_variance) / resolved.residual_dimension
+            settled_means = np.max(np.abs(resolved.mean - before)) <= np.finfo(np.float64).eps * (1.0 + np.max(np.abs(resolved.mean)))
+            if settled_means and abs(resolved.noise - noise_before) <= np.finfo(np.float64).eps * resolved.noise:
                 break
         else:
             raise AssertionError("the moved fixed point did not settle to double precision")
-        return resolved._fixed_point(hyperparameters).cavity.shift
+        # One more sweep at the settled noise, so the cavity is the one that noise built (as ``_solve`` returns it).
+        resolved._sweep(hyperparameters)
+        cavity = resolved._fixed_point(hyperparameters).cavity
+        return np.concatenate([cavity.shift, cavity.precision])
 
     def richardson(function, scale):
         coarse = (function(start.coefficients + scale * direction) - function(start.coefficients - scale * direction)) / (2.0 * scale)
         fine = (function(start.coefficients + 0.5 * scale * direction) - function(start.coefficients - 0.5 * scale * direction)) / scale
         return fine + (fine - coarse) / 3.0
 
+    def tilted_variance(coefficients):
+        return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).variance
+
     scale = 1e-2
     mean_by_z = richardson(tilted_mean, scale)
-    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], np.zeros((prior.variant_count, 1)))
-    assert not np.any(precision_step)
-    numeric = richardson(shift_at, scale)
-    np.testing.assert_allclose(shift_step[:, 0], numeric, rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric))))
+    variance_by_z = richardson(tilted_variance, scale)
+    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], variance_by_z[:, None])
+    numeric = richardson(cavity_at, scale)
+    count = prior.variant_count
+    np.testing.assert_allclose(shift_step[:, 0], numeric[:count], rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric[:count]))))
+    # The precisions move together, through the noise alone: -omega dsigma^2 / sigma^2.
+    assert np.any(precision_step)
+    np.testing.assert_allclose(precision_step[:, 0], numeric[count:], rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric[count:]))))
 
 
 def test_the_noise_update_is_the_elbos_stationary_value():
