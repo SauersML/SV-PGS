@@ -3561,6 +3561,11 @@ def fit_hyperparameters(
         if not released or entry.certifying:
             return entry
         assert not (released & frozenset().union(*refused_releases[model]))
+        if not state.polished:
+            # A release is judged against a polished state (x at its maximum at these weights, the model's own
+            # account of them reliable there), so x polishes here first; the hyper step from the polished state
+            # proposes the release again where it still holds.
+            return inner(model, step, remaining, True)
         # The joint step to a freed edge cannot be tested as one move: its x-part is the whole distance from the
         # edge's density to the interior's (|move| 43 on the mean-field test problem), where the path integral's
         # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the trial is
@@ -3620,8 +3625,7 @@ def fit_hyperparameters(
                     refused_releases[model].add(frozenset(
                         int(position) for position in np.flatnonzero(np.isfinite(trial.log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
                     ))
-                    hyperparameters[model], points[model], corrections[model] = anchor_hyperparameters, anchor_point, anchor_correction
-                    states[model] = replace(anchor_state, polished=True)
+                    hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
                     anchors[model], radii[model], pending[model] = None, None, None
                     continue
                 trial_correction, trial_state = solve_state(trial, trial_point)
@@ -3747,8 +3751,7 @@ def fit_hyperparameters(
                     refused_releases[model].add(frozenset(
                         int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
                     ))
-                    hyperparameters[model], points[model], corrections[model] = anchor_hyperparameters, anchor_point, anchor_correction
-                    states[model] = replace(anchor_state, polished=True)
+                    hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
                     displaced[model], radii[model] = True, None
                     pending[model] = None
                     continue
