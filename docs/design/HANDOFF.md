@@ -1,4 +1,4 @@
-# Handoff: current state (2026-09-21)
+# Handoff: current state (2026-09-21, main `eef5f00`)
 
 This is the single entry point for the project's state. The model is in [MODEL.md](MODEL.md), the rulings in [DECISIONS.md](DECISIONS.md), compute and the landing gate in [COMPUTE.md](COMPUTE.md), and evaluation and benchmark results in [EVALUATION.md](EVALUATION.md). Evidence tags are defined in MODEL.md.
 
@@ -15,9 +15,16 @@ This is the single entry point for the project's state. The model is in [MODEL.m
 - **Benchmarks:** `benchmarks/bench_real` (MAGE/1kGP expression; the within-group partial r² metric) and `benchmarks/bench_sim` (v7 cohort), plus the closed-form, tox, yeast and mouse designs.
 - **Guards:** `tests/ep_eb_reference.py` (the EP-EB oracle), `tests/test_engine_verification.py` (the independent engine harness) and `tests/test_no_arbitrary_constants.py`.
 
-## Where SV-PGS stands against mr.ash [real, bench-real chr22, one gene, loso/AFR, n = 534, p ≈ 23.6k, 1 thread]
-Measured on the run branch at `1c888d9` (before the merge), the small-n route certified a fit at 3,296 CPU-s for held-out r² 0.0129 (SNV) and 2,285 CPU-s for 0.0151 (SNV + SV); numba mr.ash took 6 CPU-s for 0.0332. The pooled arm's 20-gene runs never produced a fit record (the outer loop's non-terminating cycle, fixed on the engine lane at `73038b7`; the runs were cancelled on 2026-09-21). The definition of done (TEAM_RULES) is: never refuses, exact where it claims exactness, the inference chosen by measurement, pooled loso r² at least mr.ash's, CPU per gene at most numba mr.ash's, one code path. None of these is met yet.
+## Where SV-PGS stands against mr.ash [real, bench-real chr22 gene 1 ENSG00000172404.5, loso/AFR, n = 534, p = 23,635 SNVs, 1 thread]
+| arm | CPU-s | held-out r² | fit |
+|---|---|---|---|
+| SV-PGS, mean-field fixed points (`fit_small_n(inference="mean_field")`, main `eef5f00`) | 1,825 | 0.0291 | certified |
+| numba mr.ash (`bench_real/baselines.py`) | 6 | 0.0308 | |
+| SV-PGS, EP fixed points (run branch `1c888d9`, before the merge) | 3,296 | 0.0129 | certified |
 
+Accuracy under SV-PGS's own learned prior is within 6% of mr.ash with the mean-field fixed points (EP was at 42%); the inference decision (definition of done, item 3) waits on the 20-gene loso/AFR run (`svpgs_mean_field` through the harness, within-group partial r² beside `mr_ashr_init`) and the EP arm of the same gene on the merged engine. The mean-field inference itself costs 26 CPU-s of the 1,825 (124 sweeps 13.5 s, 29 linear responses 8.4 s); **the hyper step is 94% (3 calls, 1,715 s)**: each certified-V evaluation is `_standardized` (the Tierney–Kadane cumulants of D ≈ 314 directions, 0.66 s) plus ~18 replaced line integrals at 0.21 s each (QAGI on the folded range, 60–120 kernel evaluations of p × K per line, the direction's scale part moving every kernel row), and the search makes 60–150 such evaluations per step (three starts at every stage, edges, the stationarity slopes' four extra evaluations per interior weight). That is the speed gap to the definition of done (item 5: CPU per gene at most numba mr.ash's): the floor for a weights search on a handful of penalty weights is tens of evidence evaluations, and each evaluation's floor is one p × K pass plus the integrals of the few directions whose Tierney–Kadane term exceeds their share (the terms: maximum ~10³, median 10⁻¹³ on this gene). The levers, in order: a cheap bound that skips the cumulants of directions that cannot exceed their share; fewer evaluations in the search; a quadrature that spends its points where the integrand is not Gaussian.
+
+The 20-gene pooled runs of the run branch never produced a fit record (the outer loop's non-terminating cycle and its uncertifiable certificate, both fixed on main at `eef5f00`: an unresolved inner step is never accepted, and the certificate's resolvable pieces are tightened per decision). The definition of done (TEAM_RULES) is: never refuses, exact where it claims exactness, the inference chosen by measurement, pooled loso r² at least mr.ash's, CPU per gene at most numba mr.ash's, one code path. Items 1–3 are in reach; 4 waits on the 20-gene measurement; 5 is the hyper step above.
 ## Process
 - **Landing:** lane branch → READY line in LANDQ → the full MSI suite on the exact tip (runq, `-m "not slow"` under a memory share, plus the GPU tests if CUDA code changed) → fast-forward of main. GitHub CI runs on main pushes only, as a secondary signal (COMPUTE.md).
 - **Coordination** lives outside the repo, in the team folder (`~/svpgs-team/`): TEAM_RULES.md (binding), LANDQ.md, FIXLOG.md, and each lane's STATUS.md.
@@ -25,9 +32,9 @@ Measured on the run branch at `1c888d9` (before the merge), the small-n route ce
 - **Evidence:** accuracy claims come only from bench-real, bench-sim, or later AoU held-out data inside the workspace. A lane's own simulations check math only.
 
 ## Next, in order
-1. The single-gene and 20-gene bench-real runs on main's tip, against mr.ash: CPU per gene and held-out r², both feature sets. Every refusal becomes a regression test with that gene's inputs.
-2. The engine's remaining certificate work (theory-ep's single V: the fixed-point term δ_fp, the C-variation slope, the pooled oracle on `lane/fit-api-pooled-targets` 0227198, which waits on those interfaces).
-3. Speed to the floor: the per-gene cost split (fixed points, hyper_step, corrections, response) from the profiler's phases, then the removals.
+1. The 20-gene loso/AFR mean-field run and the EP arm of gene 1 on main, both against mr.ash: the inference decision, then the loser is deleted (definition of done, items 3 and 6).
+2. The hyper step to its floor (above), then the 20-gene pooled run against mr_ashr_init.
+3. The engine's remaining certificate work: the fixed-point term δ_fp and the C-variation slope (theory-ep), the five normal-means cases where a block's weight ends far down its range at a near-flat direction of −H (strict expected failures in tests/test_scale_mixture_ep.py), the pooled oracle on `lane/fit-api-pooled-targets` 0227198.
 4. Score SV-PGS on bench-sim's sealed test and the pre-registered ablations.
 5. The in-workspace pipeline, which needs the user's decisions below.
 
