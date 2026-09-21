@@ -157,6 +157,7 @@ class Dataset:
         self.gene_annotation = json.loads((self.directory / "gene_annotation.json").read_text())
         self.sample_index = {sample: index for index, sample in enumerate(self.samples["sample"])}
         self._chromosomes = {}
+        self._cis_indexes = {}
         self._parent_position = None
 
     def overlay(self, chrom: str):
@@ -261,10 +262,31 @@ class Dataset:
             on_chromosomes &= self.genes["gene_id"].isin(named)
         return [int(index) for index in self.genes.index[on_chromosomes]]
 
+    def cis_index(self, chrom: str):
+        """(positions in order, their rows, every row's end, the longest record's span) of one chromosome, built
+        once; only the latest chromosome's is kept, as its table is."""
+        if chrom not in self._cis_indexes:
+            self._cis_indexes.clear()
+            table, _ = self.chromosome(chrom)
+            position, end = table["pos"].to_numpy(), table["end"].to_numpy()
+            order = np.argsort(position, kind="stable")
+            span = int(max(np.max(end - position), 0)) if len(position) else 0
+            self._cis_indexes[chrom] = (position[order], order, end, span)
+        return self._cis_indexes[chrom]
+
     def cis_rows(self, chrom: str, tss: int):
-        table, _ = self.chromosome(chrom)
-        start, end = table["pos"].to_numpy(), table["end"].to_numpy()
-        return np.flatnonzero((end >= tss - CIS_RADIUS_BP) & (start <= tss + CIS_RADIUS_BP))
+        """The rows whose interval overlaps the cis window, in table order.
+
+        A record overlaps [low, high] when its end is at least low and its start at most high. Every such record
+        starts at least at low - span, with span the longest record of the chromosome, so all of them lie in one
+        range of the position order: the window's, widened by span. A binary search on the start position alone
+        would omit the long SVs that span the whole window, which are the records this benchmark is about. The
+        alternative, reading the chromosome's two position columns for every gene, costs the chromosome's length
+        per gene."""
+        positions, order, end, span = self.cis_index(chrom)
+        low, high = tss - CIS_RADIUS_BP, tss + CIS_RADIUS_BP
+        candidates = order[np.searchsorted(positions, low - span, side="left"):np.searchsorted(positions, high, side="right")]
+        return np.sort(candidates[end[candidates] >= low])
 
 
 def residualize(phenotype, covariates, train_index, test_index):

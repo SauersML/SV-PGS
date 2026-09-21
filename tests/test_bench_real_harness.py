@@ -80,6 +80,33 @@ def test_merged_intervals_are_the_disjoint_union():
     assert build_dataset.merged([(10, 20), (5, 12), (22, 30), (21, 21), (40, 41)]) == [[5, 30], [40, 41]]
 
 
+def test_the_cis_index_returns_exactly_the_overlapping_rows_including_the_spanning_ones(tmp_path):
+    """The window's rows, against the definition read straight off the two columns, on a table with records long
+    enough to span a whole window and with positions out of order."""
+    generator = np.random.default_rng(31)
+    count = 400
+    position = generator.integers(1, 6_000_000, size=count)
+    length = np.where(generator.random(count) < 0.1, generator.integers(1, 4_000_000, size=count), generator.integers(0, 300, size=count))
+    table = pd.DataFrame({"pos": position, "end": position + length, "is_sv": length >= 50, "sv_type": ".", "sv_length": length,
+                          "alt_len": 1, "ref_len": 1, "source": "panel"})
+    table.to_csv(tmp_path / "chr7.variants.tsv", sep="\t", index=False)
+    np.save(tmp_path / "chr7.dosage.npy", np.zeros((count, 2), dtype=np.int8))
+
+    class FakeDataset(harness.Dataset):
+        def __init__(self):
+            self.directory, self.rows_dirs, self.overlay_dir = tmp_path, [], None
+            self._chromosomes, self._cis_indexes, self._parent_position = {}, {}, None
+
+    dataset = FakeDataset()
+    for tss in (0, 500_000, 3_000_000, 5_999_999, *generator.integers(1, 6_000_000, size=20)):
+        rows = dataset.cis_rows("chr7", int(tss))
+        expected = np.flatnonzero((table["end"].to_numpy() >= tss - harness.CIS_RADIUS_BP) & (table["pos"].to_numpy() <= tss + harness.CIS_RADIUS_BP))
+        assert np.array_equal(rows, expected)
+    # A record that spans the window entirely is in it, and a start-position search alone would have missed it.
+    spanning = np.flatnonzero((table["pos"].to_numpy() < 2_000_000 - harness.CIS_RADIUS_BP) & (table["end"].to_numpy() > 2_000_000 + harness.CIS_RADIUS_BP))
+    assert len(spanning) and set(spanning) <= set(dataset.cis_rows("chr7", 2_000_000).tolist())
+
+
 def test_training_constant_columns_are_dropped_even_when_heterozygous():
     samples = pd.DataFrame({"sample": ["a", "b", "c", "d"], "Superpopulation": ["EUR"] * 4, "Population": ["CEU"] * 4})
     table = pd.DataFrame({"pos": [1, 2, 3], "end": [1, 2, 3], "is_sv": [False, True, False], "sv_type": ["."] * 3, "sv_length": [0, 60, 0],
