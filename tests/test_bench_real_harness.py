@@ -1,5 +1,7 @@
 """Leakage and bookkeeping checks of the bench-real harness on synthetic inputs (no MAGE or 1kGP data)."""
 
+import pathlib
+
 import numpy as np
 import pandas as pd
 
@@ -729,6 +731,53 @@ def test_within_group_partial_r2_matches_its_closed_form_and_ignores_covariate_t
     np.save(tmp_path / "results/m/loso/chr.snv.predictions.npy", shifted)
     again = report.per_gene_scores(tmp_path / "results", tmp_path, "m", "loso")
     assert np.allclose(again["r2"], scores["r2"], rtol=0, atol=1e3 * EPSILON)
+
+
+def test_the_report_reads_several_results_roots_with_different_genes_and_refuses_a_gene_scored_twice(tmp_path, monkeypatch):
+    """One method in gene-range chunks, one directory each, beside a comparator that scored other genes: the roots
+    score different gene sets, and one root may hold no genes of a method at all. A gene scored twice for one arm is
+    refused, whichever root or tag holds the copy."""
+    import json
+    import sys
+
+    from benchmarks.bench_real import report
+
+    report.held_out.cache_clear()
+    within_group_fixture(tmp_path, gene_count=3)
+    source = tmp_path / "results/m/loso"
+    genes = pd.read_csv(source / "chr.genes.tsv", sep="\t")
+    truth, predictions = np.load(source / "chr.truth.npy"), np.load(source / "chr.snv.predictions.npy")
+    roots = []
+    for chunk, rows in enumerate(([0, 1], [2])):
+        root = tmp_path / f"chunk{chunk}"
+        out = root / "m/loso"
+        out.mkdir(parents=True)
+        genes.iloc[rows].to_csv(out / "chr.genes.tsv", sep="\t", index=False)
+        np.save(out / "chr.truth.npy", truth[rows])
+        np.save(out / "chr.snv.predictions.npy", predictions[rows])
+        (root / "other/loso").mkdir(parents=True)  # a method this root holds no genes of
+        roots.append(str(root))
+    out = pathlib.Path(roots[0]) / "other/loso"
+    genes.iloc[[0]].to_csv(out / "chr.genes.tsv", sep="\t", index=False)
+    np.save(out / "chr.truth.npy", truth[[0]])
+    np.save(out / "chr.snv.predictions.npy", predictions[[0]])
+    empty = report.per_gene_scores(pathlib.Path(roots[1]), tmp_path, "other", "loso")
+    assert list(empty.columns) == list(report.SCORE_COLUMNS) and len(empty) == 0
+    destination = tmp_path / "report"
+    destination.mkdir()
+    arguments = ["report.py", "--results", *roots, "--dataset", str(tmp_path), "--methods", "m", "other", "--out", str(destination)]
+    monkeypatch.setattr(sys, "argv", arguments)
+    report.main()
+    scored = pd.read_csv(destination / "per_gene_r2.tsv.gz", sep="\t")
+    assert sorted(scored.loc[scored["method"] == "m", "gene_id"].unique()) == ["g0", "g1", "g2"]
+    assert sorted(scored.loc[scored["method"] == "other", "gene_id"].unique()) == ["g0"]
+    # The same gene in a second root for the same arm is the double count that must stop the report.
+    duplicate = tmp_path / "chunk1/m/loso"
+    genes.iloc[[0]].to_csv(duplicate / "chr2.genes.tsv", sep="\t", index=False)
+    np.save(duplicate / "chr2.truth.npy", truth[[0]])
+    np.save(duplicate / "chr2.snv.predictions.npy", predictions[[0]])
+    with pytest.raises(ValueError, match="scored more than once"):
+        report.main()
 
 
 def test_the_analytic_null_floor_is_the_mean_r2_of_a_score_uniform_in_the_residual_subspace():

@@ -63,6 +63,9 @@ import numpy as np
 import pandas as pd
 
 SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
+# The columns of the per-gene table, so a results directory that scored nothing still concatenates with one that did.
+SCORE_COLUMNS = ("gene_id", "chrom", "method", "feature_set", "design", "superpopulation", "partial_correlation", "r2", "oos_r2", "null_r2",
+                 "mismatched_r2", "people")
 POOLED = "pooled"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
                 "sv_merged", "snv_sv_merged", "pgsv_merged", "snv_pgsv_merged", "hgsvc3_merged", "snv_hgsvc3_merged", "gatksv", "snv_sv_cn",
@@ -259,7 +262,12 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
                                             "feature_set": feature_set, "design": design, "superpopulation": group,
                                             "partial_correlation": correlation, "r2": r2, "oos_r2": oos_r2,
                                             "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
-    return pd.concat(frames, ignore_index=True)
+    if not frames:
+        # The directory exists but scored nothing of this method and design (another results root holds those genes).
+        return pd.DataFrame({column: [] for column in SCORE_COLUMNS})
+    scored = pd.concat(frames, ignore_index=True)
+    assert list(scored.columns) == list(SCORE_COLUMNS)
+    return scored
 
 
 def mismatched_partners(chromosomes: np.ndarray) -> np.ndarray:
@@ -384,7 +392,8 @@ def summarize_sv_credit(credit: pd.DataFrame):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--results", nargs="+", required=True, help="one or more results directories; each (method, design, feature set) must come from one")
+    parser.add_argument("--results", nargs="+", required=True,
+                        help="one or more results directories, which may score different genes; no gene may be scored twice for one arm")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--methods", nargs="+", required=True)
     parser.add_argument("--out", required=True)
@@ -394,9 +403,16 @@ def main():
             if (results_dir / method / design).exists()]
     scores = pd.concat([per_gene_scores(results_dir, dataset_dir, method, design).assign(results=str(results_dir)) for results_dir, method, design in runs],
                        ignore_index=True)
-    sources = scores.groupby(["method", "design", "feature_set"])["results"].nunique()
-    if (sources > 1).any():
-        raise ValueError(f"an arm appears in more than one results directory: {list(sources[sources > 1].index)}")
+    # Several roots scoring different genes of one arm is the normal case: one method runs in gene-range chunks, one
+    # directory each, while a comparator runs whole. What must not happen is one arm scoring a gene twice, which puts
+    # it into the mean twice: two roots holding it, a merged tag beside the parts it was merged from, or overlapping
+    # gene-rank chunks in one directory.
+    identity = ["method", "design", "feature_set", "superpopulation", "gene_id"]
+    repeated = scores[scores.duplicated(identity, keep=False)]
+    if len(repeated):
+        arm, group = next(iter(repeated.groupby(identity, sort=False)))
+        raise ValueError(f"{repeated.groupby(identity).ngroups} (arm, gene, held-out group) triples are scored more than once, e.g. "
+                         f"{' '.join(map(str, arm))} in {sorted(set(group['results']))}: every gene must be scored once per arm.")
     scores = scores.drop(columns="results")
     scores.to_csv(pathlib.Path(arguments.out) / "per_gene_r2.tsv.gz", sep="\t", index=False)
     present = set(zip(scores["method"], scores["feature_set"]))
