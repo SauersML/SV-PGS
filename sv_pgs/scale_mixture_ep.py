@@ -3562,6 +3562,8 @@ def fit_hyperparameters(
     # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
     anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
+    # Each model's last evaluated hyper step: the certificate an uncertified return at the family's boundary reports.
+    last_steps: list[HyperStep | None] = [None] * count
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
     # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
     weight_tolerances = [tolerance] * count
@@ -3633,6 +3635,7 @@ def fit_hyperparameters(
         if step is None:
             histories[model].append(np.inf)
             return inner(model, step, np.inf, False)
+        last_steps[model] = step
         if state is None:
             histories[model].append(np.inf)
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
@@ -3803,6 +3806,22 @@ def fit_hyperparameters(
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
                 )
+                if not np.any(gradient):
+                    # The data no longer see x at the trial: every derivative is at rounding, the density has collapsed
+                    # onto a lattice node (the mixing density's width -> 0 boundary: on gene 1 [real] with the
+                    # mean-field fixed point solved to its Newton decrement, V's supremum lies there, Newton's steps
+                    # along the ray being 2.8 units each with the gradient and the curvature falling by the same
+                    # factor). x is at its maximum to double precision from here on, and V has no Laplace value there
+                    # (the fixed-cavity curvature is singular), so the trial is the fit's state and the fit returns
+                    # uncertified with its last evaluated step; the boundary model is the open work (MODEL.md).
+                    hyperparameters[model], points[model] = trial, trial_point
+                    displaced[model] = False
+                    iterations[model] += 1
+                    last_step = last_steps[model]
+                    if last_step is None:
+                        raise NoCertifiedProgress("the Newton-B step reaches the mixing density's boundary before any hyper step certified a value")
+                    uncertified(model, replace(entry, remaining=np.inf), last_step, newton.decrement)
+                    continue
                 # The step is an ascent where the trapezoid rule of the two fixed points' gradients along it is
                 # positive (the path integral of E's gradient to first order). A decrement test in the origin's
                 # metric refused every step inside the radius on the mean-field test problem: with B + S's
