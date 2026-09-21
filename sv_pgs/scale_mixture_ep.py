@@ -3233,6 +3233,7 @@ def hyper_step(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
     held_edges: frozenset[int] = frozenset(),
     held_finite: frozenset[int] = frozenset(),
+    release_provisional: bool = False,
 ) -> HyperStep:
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
@@ -3255,7 +3256,11 @@ def hyper_step(
     point, which stands above what the model predicts here. ``held_finite`` are blocks the search never moves to
     their edge: those whose edge the outer loop took on this model's proposal and refused at its own fixed point
     (the same measurement, the other way: on the mean-field test problem the model put a block back at its edge
-    from the interior state whose E stood 2.9 nats above the edge's, and the edge lost there by 0.14).
+    from the interior state whose E stood 2.9 nats above the edge's, and the edge lost there by 0.14). With
+    ``release_provisional`` (the outer loop's call), a search that released a block returns at once with an infinite
+    stationarity gain: the outer loop takes the release at its own fixed point and its next hyper step there searches
+    the weights afresh, so the released weights' polish and certificate here would be discarded; a standalone call
+    keeps the full certificate.
 
     The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
     ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
@@ -3295,7 +3300,7 @@ def hyper_step(
     # hyper step spent 67 s, most of it in the weights' certified moves and difference slopes, before the release
     # was refused at its fixed point). The step returns with an infinite stationarity gain, as a release's certificate
     # is never read.
-    released = bool(np.any(finite_final & ~np.isfinite(hyperparameters.log_smoothing)))
+    released = release_provisional and bool(np.any(finite_final & ~np.isfinite(hyperparameters.log_smoothing)))
     # The weights, evidence and check before a band move (below), until the check after it has judged it.
     band: tuple[F64Array, _Evidence, _Stationarity] | None = None
     while not released:
@@ -3916,7 +3921,7 @@ def fit_hyperparameters(
         try:
             step = hyper_step(
                 prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held,
-                held_finite=frozenset(refused_edges[model]),
+                held_finite=frozenset(refused_edges[model]), release_provisional=True,
             )
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
