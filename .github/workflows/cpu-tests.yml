@@ -1,11 +1,47 @@
 name: cpu-tests
 
+# The landing gate is the MSI suite run on each tip before it reaches main (docs/design/COMPUTE.md). This workflow
+# is a secondary signal on main: the project has no branches other than main, so a pull_request trigger would never
+# fire, and nothing here blocks a landing.
 on:
   push:
     branches: [main]
 
 jobs:
-  cpu-full-suite:
+  runtime-install:
+    # The one check the MSI venvs cannot make: that the declared runtime dependencies alone are enough. They have
+    # every dev and benchmark package installed, so a module sv_pgs imports at module scope can sit in the dev
+    # group unnoticed, as numba did. Here the package is installed without that group and every module is imported.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: uv sync (runtime dependencies only; no dev group, no GPU extra)
+        run: uv sync --no-dev
+
+      - name: Import every sv_pgs module
+        run: |
+          uv run --no-dev python - <<'IMPORT_EVERY_MODULE'
+          import importlib
+          import pkgutil
+
+          import sv_pgs
+
+          for module in pkgutil.walk_packages(sv_pgs.__path__, "sv_pgs."):
+              importlib.import_module(module.name)
+              print(module.name, flush=True)
+          IMPORT_EVERY_MODULE
+
+  cpu-fast-tests:
+    # Every test file, sharded, less the slow ones (-m "not slow"); those run on MSI.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
