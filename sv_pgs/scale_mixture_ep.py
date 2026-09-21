@@ -2890,6 +2890,7 @@ def _maximize_evidence(
     bounds: list[tuple[float, float]],
     tolerance: float,
     held_edges: frozenset[int] = frozenset(),
+    held_finite: frozenset[int] = frozenset(),
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
@@ -2956,6 +2957,9 @@ def _maximize_evidence(
         # can prefer an edge the Laplace gradient does not see. The best edge that raises V past the tolerance is taken.
         best_edge = None
         for position in (int(index) for index in finite):
+            if position in held_finite:
+                # The outer loop measured this block's move to its edge at its own fixed point and it lost.
+                continue
             trial_infinite = infinite | {position}
             trial = _edge_evidence(prior, weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
             if trial is not None and trial[1].value > current_value + tolerance and (best_edge is None or trial[1].value > best_edge[1][1].value):
@@ -3192,6 +3196,7 @@ def _stationarity(
 def hyper_step(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
     held_edges: frozenset[int] = frozenset(),
+    held_finite: frozenset[int] = frozenset(),
 ) -> HyperStep:
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
@@ -3211,7 +3216,10 @@ def hyper_step(
     ``held_edges`` are blocks the search leaves at their lambda = infinity edge: those the outer loop released on
     this model's proposal and returned (``fit_hyperparameters``: x polished at the freed weights certified below
     the state it left), so the local model's account of that interior was measured and refuted at its own fixed
-    point, which stands above what the model predicts here.
+    point, which stands above what the model predicts here. ``held_finite`` are blocks the search never moves to
+    their edge: those whose edge the outer loop took on this model's proposal and refused at its own fixed point
+    (the same measurement, the other way: on the mean-field test problem the model put a block back at its edge
+    from the interior state whose E stood 2.9 nats above the edge's, and the edge lost there by 0.14).
 
     The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
     ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
@@ -3235,7 +3243,7 @@ def hyper_step(
     )
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
-        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges
+        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
     )
     final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
     final_view, final_allowed = _restricted_prior(prior, final_infinite)
@@ -3311,7 +3319,9 @@ def hyper_step(
         # pass and the loop ends.
         resumed_smoothing = log_smoothing.copy()
         resumed_smoothing[finite_final] = weights
-        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges)
+        resumed = _maximize_evidence(
+            prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
+        )
         if resumed[2].value > evidence.value:
             log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
             final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
@@ -3706,6 +3716,9 @@ def fit_hyperparameters(
     # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
     anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
+    # The blocks a model's hyper step moved to their edge and the joint trial refused at its own fixed point: its
+    # next hyper steps keep them finite (``hyper_step``'s ``held_finite``).
+    refused_edges: list[set[int]] = [set() for _model in range(count)]
     # Each model's last evaluated hyper step: the certificate an uncertified return at the family's boundary reports.
     last_steps: list[HyperStep | None] = [None] * count
     # The realized gains of each model's consecutive accepted inner steps at its current weights (``_State.tail``).
@@ -3863,7 +3876,10 @@ def fit_hyperparameters(
         if state is not None and not state.polished:
             held = held | frozenset(int(position) for position in np.flatnonzero(hyperparameters[model].log_smoothing == np.inf))
         try:
-            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held)
+            step = hyper_step(
+                prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held,
+                held_finite=frozenset(refused_edges[model]),
+            )
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
@@ -4033,6 +4049,13 @@ def fit_hyperparameters(
                 segment = target.coefficients - hyperparameters[model].coefficients
                 fraction = 0.5 * entry.fraction
                 same_edges = np.array_equal(target.log_smoothing == np.inf, hyperparameters[model].log_smoothing == np.inf)
+                # A block the step moved to its edge: the move lost at its own fixed point, so the next hyper step
+                # keeps it finite (``refused_edges``); a first such refusal replans from the state.
+                edged = {
+                    int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(target.log_smoothing))
+                }
+                newly_refused_edge = bool(edged - refused_edges[model])
+                refused_edges[model] |= edged
                 longer = fraction * float(np.linalg.norm(segment)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(hyperparameters[model].coefficients))))
                 if state.polished and remainders[model] < previous_remainder:
                     # This whole trial re-measured the model's remainder below the one the plan's certificate carried
@@ -4053,6 +4076,8 @@ def fit_hyperparameters(
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
                     # more, with the weights searched to what their share asks.
+                    pending[model] = None
+                elif newly_refused_edge:
                     pending[model] = None
                 elif state.polished and state.decrement > polish_tolerances[model] and (reopened := inner(model, entry.step, entry.remaining, True)) is not None:
                     # The decision asked a smaller decrement of x than the polish reached (``polish_tolerances``): the
