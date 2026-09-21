@@ -752,10 +752,14 @@ class _KernelRows:
         self.conditional, self.retained, self._ratio_retained, self.kernel, self._signal = _kernel_terms(
             np.zeros(grid.shape[0]), log_scale_rows, grid, precision, shift
         )
-        # The sizes of each node term's kernel pieces, log(1 + vP)/2 + h^2 c/2 (both non-negative), for the rounding
-        # bound of ``components``; a node past the overflow limit (retained 0) has an infinite piece and weight zero.
-        with np.errstate(divide="ignore"):
-            self._pieces = -0.5 * np.log(self.retained) + 0.5 * self._signal
+        # For the rounding bound of ``components``, per row: the largest size of a node term's kernel pieces,
+        # log(1 + vP)/2 + h^2 c/2 (both non-negative), and the kernel's range over the nodes, both over the nodes
+        # of weight above zero (a node past the overflow limit, retained 0, has an infinite piece and weight zero).
+        with np.errstate(divide="ignore", invalid="ignore"):
+            pieces = -0.5 * np.log(self.retained) + 0.5 * self._signal
+            finite = np.isfinite(self.kernel)
+            self._pieces_max = np.max(np.where(finite, pieces, -np.inf), axis=1)
+            self._kernel_range = np.max(np.where(finite, self.kernel, -np.inf), axis=1) - np.min(np.where(finite, self.kernel, np.inf), axis=1)
         # Shifted by each row's largest term, as ``_log_sum_exp`` shifts (by 0 where that term is not finite).
         peak = np.max(self.kernel, axis=1)
         self.peak = np.where(np.isfinite(peak), peak, 0.0)
@@ -763,7 +767,7 @@ class _KernelRows:
             self.exponentials = np.exp(self.kernel - self.peak[:, None])
         self._derivatives: tuple[F64Array, F64Array, F64Array, F64Array] | None = None
         # Held from one pass to the next (``_kernel_chunks``): read-only, so no caller can change a later pass's rows.
-        for held in (self.conditional, self.retained, self.kernel, self.exponentials, self._pieces):
+        for held in (self.conditional, self.retained, self.kernel, self.exponentials, self._pieces_max, self._kernel_range):
             held.setflags(write=False)
 
     def derivatives(self) -> tuple[F64Array, F64Array, F64Array, F64Array]:
@@ -807,14 +811,13 @@ class _KernelRows:
         # log Z_j's rounding (the verification harness's bound, tests/test_engine_verification._objective_rounding):
         # each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 rounds by about four ulps of its pieces' sizes,
         # the log-sum-exp adds eps times sum_k w_k (1 + |x_k - max|) relative to its sum, and its maximum's own ulp.
-        # |log Z_j| alone understates this wherever the terms are large and cancel.
-        # A node of weight zero (its kernel at the overflow limit, an infinite piece) contributes nothing.
-        weighted = np.where(responsibility > 0.0, responsibility, 0.0)
-        terms = self.kernel + log_density[None, :]
-        with np.errstate(invalid="ignore"):
-            spread = np.abs(terms - np.max(terms, axis=1)[:, None])
-        pieces = weighted @ np.abs(log_density) + np.einsum("jk,jk->j", weighted, np.where(np.isfinite(self._pieces), self._pieces, 0.0))
-        rounding = _EPSILON * (np.abs(log_normalizer) + 1.0 + np.einsum("jk,jk->j", weighted, np.where(np.isfinite(spread), spread, 0.0)) + 4.0 * pieces)
+        # |log Z_j| alone understates this wherever the terms are large and cancel. Each responsibility-weighted
+        # mean is bounded by its largest term (the weights sum to one), which the kernel rows hold per row, so the
+        # bound costs a pass over the rows, not the nodes: |x_k - max| <= the kernel's range plus the density's.
+        finite_density = log_density[np.isfinite(log_density)]
+        density_range = float(np.max(finite_density) - np.min(finite_density)) if finite_density.size else 0.0
+        density_size = float(np.max(np.abs(finite_density))) if finite_density.size else 0.0
+        rounding = _EPSILON * (np.abs(log_normalizer) + 1.0 + self._kernel_range + density_range + 4.0 * (density_size + self._pieces_max))
         return _Components(
             log_normalizer=log_normalizer, responsibility=responsibility, conditional_variance=self.conditional,
             first=first, second=second, third=third, fourth=fourth, rounding=rounding,
@@ -856,11 +859,12 @@ def _step_scoped(function: Callable) -> Callable:
     return scoped
 
 
-# Each held row set is eleven p x K arrays: the seven ``_KernelRows`` forms and the four derivatives once formed. The outer
+# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed (its two
+# rounding-bound rows are p-vectors). The outer
 # loop holds its own cache across its iterations (``fit_hyperparameters`` is step-scoped too): every evaluation at one
 # fixed point's cavity (its state, its Newton model, the gradient at a trial that becomes the next state, its hyper
 # steps) shares the kernel rows and the exact repeats, which the cavity key keeps exact.
-_HELD_ARRAYS_PER_ROW_SET = 11
+_HELD_ARRAYS_PER_ROW_SET = 10
 
 
 def _kernel_chunks(

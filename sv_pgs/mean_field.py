@@ -80,7 +80,6 @@ from sv_pgs.scale_mixture_ep import (
     GaussianPosterior,
     MixtureHyperparameters,
     ScaleMixturePrior,
-    _class_terms,
     _components,
     class_log_density,
     log_scale,
@@ -92,7 +91,7 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(cache=True)
-def _sweep(design, squares, members, class_index, log_density, node_variance, noise, mean, residual, variance, shift):
+def _sweep(design, squares, members, class_index, log_density, node_variance, noise, mean, residual, variance, shift, third, fourth):
     """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
     (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
@@ -103,7 +102,9 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
     each node, u_j e^{t_k}, formed once per hyperparameters (``MeanFieldFixedPoints._node_variance``: the sweep's
     exponentials are its cost, and this one does not move between sweeps). The node terms are
     ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node whose variance overflows
-    contributes conditional variance 1 / omega and weight 0."""
+    contributes conditional variance 1 / omega and weight 0. ``third`` and ``fourth`` receive each q_j's third and
+    fourth central moments (the noise's response, ``MeanFieldFixedPoints._fixed_point``): with d_k = h c_k - m,
+    mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2)."""
     sample_count = design.shape[0]
     member_count = members.shape[0]
     node_count = node_variance.shape[1]
@@ -143,15 +144,22 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
             new_mean += log_weights[node] / total * h * conditional[node]
         # Var = E_w[c] + Var_w(h c): both terms non-negative, so nothing cancels.
         new_variance = 0.0
+        new_third = 0.0
+        new_fourth = 0.0
         for node in range(node_count):
             offset = h * conditional[node] - new_mean
-            new_variance += log_weights[node] / total * (conditional[node] + offset * offset)
+            weight = log_weights[node] / total
+            new_variance += weight * (conditional[node] + offset * offset)
+            new_third += weight * (offset * offset * offset + 3.0 * conditional[node] * offset)
+            new_fourth += weight * (offset**4 + 6.0 * conditional[node] * offset * offset + 3.0 * conditional[node] * conditional[node])
         step = new_mean - old_mean
         if step != 0.0:
             for sample in range(sample_count):
                 residual[sample] -= design[sample, group] * step
         mean[member] = new_mean
         variance[member] = new_variance
+        third[member] = new_third
+        fourth[member] = new_fourth
         shift[member] = h
         pull = h * new_mean
         shrink = 0.5 * omega * (new_mean * new_mean + new_variance)
@@ -242,6 +250,8 @@ class MeanFieldFixedPoints:
         self.noise = float(start_noise)
         self.mean = np.zeros(prior.variant_count)
         self.variance = np.zeros(prior.variant_count)
+        self.third = np.zeros(prior.variant_count)
+        self.fourth = np.zeros(prior.variant_count)
         self.shift = np.zeros(prior.variant_count)
         self.residual = np.array(statistics.projected_target, dtype=np.float64, copy=True)
         self.site_precision = np.zeros(prior.variant_count)
@@ -286,7 +296,7 @@ class MeanFieldFixedPoints:
         values = _sweep(
             self.projected, self.group_squares, self.members, self.class_index,
             np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), self._node_variance(hyperparameters),
-            self.noise, self.mean, self.residual, self.variance, self.shift,
+            self.noise, self.mean, self.residual, self.variance, self.shift, self.third, self.fourth,
         )
         self.profile["sweeps"] += 1
         self.profile["passes"] += 1
@@ -296,11 +306,14 @@ class MeanFieldFixedPoints:
     def _snapshot(self) -> dict:
         return {
             "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "residual": self.residual.copy(),
+            "third": self.third.copy(), "fourth": self.fourth.copy(),
             "noise": self.noise, "site_precision": self.site_precision.copy(), "effective": self.effective,
         }
 
     def _restore(self, snapshot: dict) -> None:
-        self.mean, self.variance, self.shift, self.residual = (snapshot[name].copy() for name in ("mean", "variance", "shift", "residual"))
+        self.mean, self.variance, self.shift, self.residual, self.third, self.fourth = (
+            snapshot[name].copy() for name in ("mean", "variance", "shift", "residual", "third", "fourth")
+        )
         self.noise, self.site_precision, self.effective = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"]
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
@@ -438,7 +451,7 @@ class MeanFieldFixedPoints:
         self._response, self._response_noise = response, self.noise
         design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
         mean, shift, residual = self.mean.copy(), self.shift.copy(), self.residual.copy()
-        third, fourth = self._central_moments(hyperparameters, omega)
+        third, fourth = self.third.copy(), self.fourth.copy()
         # The tilted moments' responses to the pseudo-likelihood's precision (module docstring), zero on a dead row.
         mean_by_omega = np.where(live, -0.5 * (third + 2.0 * mean * variance), 0.0)
         variance_by_shift = np.where(live, third, 0.0)
@@ -495,21 +508,6 @@ class MeanFieldFixedPoints:
             cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
             precision_norm=norm, effective_effects=float(self.effective),
         )
-
-    def _central_moments(self, hyperparameters: MixtureHyperparameters, omega: F64Array) -> tuple[F64Array, F64Array]:
-        """Each member's tilted third and fourth central moments at the state, from its node responsibilities and
-        conditional normals N(h c_k, c_k) (``scale_mixture_ep._components``): mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and
-        mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2) with d_k = h c_k - m."""
-        prior = self.prior
-        third, fourth = np.zeros(prior.variant_count), np.zeros(prior.variant_count)
-        # The components at the state's own cavity, through the kernel rows the outer loop holds for it.
-        cavity = Cavity(precision=omega, shift=self.shift.copy())
-        for _class_position, rows, terms in _class_terms(prior, hyperparameters.coefficients, cavity, self.working_bytes):
-            conditional = terms.conditional_variance
-            deviation = self.shift[rows][:, None] * conditional - self.mean[rows][:, None]
-            third[rows] = np.sum(terms.responsibility * (deviation**3 + 3.0 * conditional * deviation), axis=1)
-            fourth[rows] = np.sum(terms.responsibility * (deviation**4 + 6.0 * conditional * deviation**2 + 3.0 * conditional**2), axis=1)
-        return third, fourth
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:
         """(p x K) draws from q itself: each member's node from its responsibilities at its pseudo-likelihood, then its
