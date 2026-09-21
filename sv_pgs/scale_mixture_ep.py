@@ -1239,16 +1239,23 @@ def _trust_region_step(
     return eigenvectors @ rest
 
 
+def _data_ceiling(cavity: Cavity) -> float:
+    """An upper bound on the data objective sum_j log Z_j over every prior: Z_j = int l_j p_j <= sup_beta l_j(beta) =
+    exp(h_j^2 / (2 P_j)) (P_j > 0; infinite where a cavity precision is not positive)."""
+    if np.any(cavity.precision <= 0.0):
+        return np.inf
+    return float(np.sum(0.5 * np.square(cavity.shift) / cavity.precision))
+
+
 def _objective_ceiling(prior: ScaleMixturePrior, penalty: F64Array, cavity: Cavity) -> float:
     """An upper bound on the penalized objective F - P - A over every x: Z_j = int l_j p_j <= sup_beta l_j(beta) =
     exp(h_j^2 / (2 P_j)) for every prior (P_j > 0; no bound where a cavity precision is not positive), and the
     quadratic P + A = 1/2 x'(S + C)x - b'x + c has a minimum c - 1/2 b'(S + C)^+ b where S + C is positive
     semidefinite with b in its range (none otherwise: the local model is then unbounded, and the maximizer's other
     stops end it). Infinite where either part has no bound."""
-    precision, shift = cavity.precision, cavity.shift
-    if np.any(precision <= 0.0):
+    data_bound = _data_ceiling(cavity)
+    if not np.isfinite(data_bound):
         return np.inf
-    data_bound = float(np.sum(0.5 * np.square(shift) / precision))
     quadratic = penalty.copy()
     linear = np.zeros(penalty.shape[0])
     constant = 0.0
@@ -2636,6 +2643,17 @@ def _evidence_once(
     # bound exceeds the tolerance (B + S near-singular off the profiled space), the point is not a certified maximum.
     if tolerance > 0.0 and 0.5 * profiled_total.rounding > tolerance:
         return None
+    if prior.anchor is not None:
+        # The local model's C term is a second-order model of E about x_k, and E itself is bounded above by the data
+        # objective's ceiling (``_objective_ceiling``: Z_j <= sup l_j for every prior): a point whose anchor term has
+        # grown past what the data objective can move is the quadratic's own, not a maximum of E, and certifies
+        # nothing. On ENSG00000100385.14 [real, snv], a gene the data do not see, a release trial's maximizer walked
+        # an indefinite C to |x| = 3.7e5 and reported V = 27,112 nats from the quadratic alone; the outer loop took
+        # it and every state after it had a decrement of 5e7.
+        anchor_term = abs(_anchor_value(prior, coefficients)[0])
+        data_ceiling = _data_ceiling(cavity)
+        if np.isfinite(data_ceiling) and anchor_term > data_ceiling - objective.value + tolerance:
+            return None
     total_covariance = profiled_total.inverse
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * profiled_total.schur_log_determinant
     if screen is not None and evidence_value <= screen:
