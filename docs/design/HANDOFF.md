@@ -1,61 +1,34 @@
-# Handoff: current state (2026-09-19)
+# Handoff: current state (2026-09-21)
 
 This is the single entry point for the project's state. The model is in [MODEL.md](MODEL.md), the rulings in [DECISIONS.md](DECISIONS.md), compute and the landing gate in [COMPUTE.md](COMPUTE.md), and evaluation and benchmark results in [EVALUATION.md](EVALUATION.md). Evidence tags are defined in MODEL.md.
 
-## On main (`8432a67`)
-- **Store:** `dosage_store`, `store_converter` (per-half manifest, typed sample IDs), `store_block_source` (the streamed reader), and `synthetic_store` (public 1kGP haplotype mosaics, with reliability targets from bench-sim's v7 cohort).
-- **Stage 0:** `genotype_statistics` (adjacent-block Grams, rank-deficient covariate projection) and `code_products` (code-domain products with derived digit counts).
-- **Engine:** `scale_mixture_ep` — variant-side EP-EB with the D3-penalized mixing density, the λ step, the certified V, and the stationarity certificate.
-- **Stage 2 solves:** `dual_solve` (DualGaussian, the negative-site split, information_solve) and `marginal_variances` (leave-block-out marginals, the information certificate, variance_jvp).
-- **Scoring:** `fast_scoring` (trapezoid-rule predictive, Student-t).
-- **Measurement and prior:** `imputation_reliability`, `sv_fusion`, `gatksv_source`, `prior_design`, `variant_typing` (merged classes), `sv_prior_features`, `external_annotations`, `hyperprior_pooling`.
-- **Cohort and phenotypes:** `cohort`, `sample_ids`, `sample_crosswalk`, `all_of_us`, `phenotype_measurement` (the per-occasion measurement model with a learned noise density), `held_out_comparison`.
-- **Benchmarks:** `benchmarks/bench_real` and `benchmarks/bench_sim` (v7 cohort from the public 1kGP founder composition, PREREG amendment 7).
-- **Guards:** `tests/ep_eb_reference.py` (the EP-EB oracle) and `tests/test_no_arbitrary_constants.py`.
-- **Still on main but being deleted:** `anderson.py` (lane/engine-anderson).
-- **Not on main:** the certified outer loop, the Stage 2 driver (`full_data_fit.py`), logistic EP, and so any end-to-end fit. No SV-PGS accuracy number exists yet.
+## On main
+- **Store:** `dosage_store`, `store_converter` (per-half manifest, typed sample IDs), `store_block_source` (the streamed reader; rowdict stores decoded on the device), `rowdict_codec`, `resident_codes`, `copy_number` (integer copy number as a first-class column) and `synthetic_store` (public 1kGP haplotype mosaics, with reliability targets from bench-sim's v7 cohort).
+- **Stage 0:** `genotype_statistics` (adjacent-block Grams, rank-deficient covariate projection, exact ties merged) and `code_products` (code-domain products with derived digit counts).
+- **Engine:** `scale_mixture_ep` — variant-side EP-EB with the D3-penalized mixing density, the λ step, the certified V with the total curvature B (`CurvatureCorrection`; the linear response by block GCRO-DR, `krylov_recycle`), the stationarity certificate from V's analytic gradient, the trust-region outer loop that accepts only a resolved gain, offset groups (gene-owned levels), and the fused fp64 device kernels (`engine_kernels`, every node with its own variance).
+- **Stage 2:** `dual_solve` (DualGaussian, the negative-site split, information_solve, the float64 floor as a reachable target, exact marginals for small n), `marginal_variances` (leave-block-out marginals, the information certificate, exact bulk marginals for flagged blocks from `exact_quadratics`, variance_jvp), `exact_marginals_scale`, `fold_share` and `fold_update`.
+- **The Stage 2 driver and the fit API:** `full_data_fit` (store → Stage 0 → Stage 2 → the fitted model, one trait × fold per model), `stage2_wiring`, `tie_members`, `fit_model` (`fit`, `write_model`), `artifact` (the model artifact with covariate columns, fit counts and the offset digest) and the `fit` CLI command.
+- **Small n and pooled fits:** `small_n` (the dense n × n route for cis windows: Stage 0 dense and EP-EB with exact algebra, the double loop, the KL certificate) and `pooled_fit` (one prior across genes, x frozen after the training genes, per-gene levels and certificates); `benchmarks/svpgs_method.py` and `benchmarks/svpgs_small_n.py` are SV-PGS's entries into bench-real and bench-sim.
+- **Scoring:** `fast_scoring` (trapezoid-rule predictive, Student-t). **Binary traits:** `logistic_ep`.
+- **Measurement and prior:** `imputation_reliability`, `measurement_model` (ancestry-pooled κ, the smooth reliability curve), `sv_fusion`, `gatksv_source`, `gatksv_store_rows`, `prior_design`, `variant_typing`, `sv_prior_features`, `external_annotations`, `hyperprior_pooling`.
+- **Cohort, phenotypes and the workspace:** `cohort`, `sample_ids`, `sample_crosswalk`, `all_of_us`, `phenotype_measurement`, `held_out_comparison`, `workspace_pipeline` (the in-workspace driver, tested on synthetic data only) and the `workspace-run` CLI command.
+- **Benchmarks:** `benchmarks/bench_real` (MAGE/1kGP expression; the within-group partial r² metric) and `benchmarks/bench_sim` (v7 cohort), plus the closed-form, tox, yeast and mouse designs.
+- **Guards:** `tests/ep_eb_reference.py` (the EP-EB oracle), `tests/test_engine_verification.py` (the independent engine harness) and `tests/test_no_arbitrary_constants.py`.
+
+## Where SV-PGS stands against mr.ash [real, bench-real chr22, one gene, loso/AFR, n = 534, p ≈ 23.6k, 1 thread]
+Measured on the run branch at `1c888d9` (before the merge), the small-n route certified a fit at 3,296 CPU-s for held-out r² 0.0129 (SNV) and 2,285 CPU-s for 0.0151 (SNV + SV); numba mr.ash took 6 CPU-s for 0.0332. The pooled arm's 20-gene runs never produced a fit record (the outer loop's non-terminating cycle, fixed on the engine lane at `73038b7`; the runs were cancelled on 2026-09-21). The definition of done (TEAM_RULES) is: never refuses, exact where it claims exactness, the inference chosen by measurement, pooled loso r² at least mr.ash's, CPU per gene at most numba mr.ash's, one code path. None of these is met yet.
 
 ## Process
-- **Landing:** lane branch → READY line in LANDQ → land-train runs the full MSI suite on the exact tip (runq cpu-node, under a memory ulimit, plus GPU tests if CUDA code changed) → fast-forward of main. GitHub CI runs on main pushes only, as a secondary signal (COMPUTE.md).
+- **Landing:** lane branch → READY line in LANDQ → the full MSI suite on the exact tip (runq, `-m "not slow"` under a memory share, plus the GPU tests if CUDA code changed) → fast-forward of main. GitHub CI runs on main pushes only, as a secondary signal (COMPUTE.md).
 - **Coordination** lives outside the repo, in the team folder (`~/svpgs-team/`): TEAM_RULES.md (binding), LANDQ.md, FIXLOG.md, and each lane's STATUS.md.
 - **Compute:** MSI only, through the runq task runners; the laptop does git and reading only. The Slurm submit counter is still wrapped, so normal `sbatch` fails (COMPUTE.md).
 - **Evidence:** accuracy claims come only from bench-real, bench-sim, or later AoU held-out data inside the workspace. A lane's own simulations check math only.
 
-## In flight, by lane
-Queued in LANDQ (READY, not yet landed):
-- **aou-audit** (URGENT): `lane/aou-audit-pipeline` replaces the untraced `PIPELINE_R2_LOSS` in `synthetic_store`.
-- **deslop-hygiene** (URGENT): `lane/deslop-hygiene-replicates`, a memory-sizing fix for the phenotype replicate test.
-- **e2e:** `lane/engine-anderson` deletes `anderson.py`.
-- **bench-sim:** `lane/bench-sim-commit7` (sealed v7 commitments) and `lane/bench-sim-truthhalf` (the beagle_truthhalf arm, PREREG amendment 8).
-- **speed-floor:** `lane/speed-floor-pooled`, compute_floor.md §10 re-measured on bench-sim v7.
-- **ablate:** `lane/ablate-prereg`, the pre-registered term ablations (benchmarks/ABLATION_PLAN.md).
-- **binary-ep:** `lane/binary-ep-logistic`, certified sample-side logistic EP (`logistic_ep.py`).
-- **docs-sync:** this documentation pass.
-
-Working:
-- **e2e:** `wip/engine-driver`, the certified outer loop (Newton-B plus a trust region) and the Stage 2 driver; `lane/engine-fdbound` (a flaky-test fix); the EM regression test awaits the v7 fixture.
-- **e2e-scale:** runs the driver at chr22 scale on bench-sim's public v7 store and profiles it against the floor [machinery].
-- **oracle:** `fit_reference` fails on real-LD windows; being fixed.
-- **verify-engine, verify-stage2, bug-engine, bug-stage2:** randomized verification and bug review of the engine, `dual_solve` and `marginal_variances`.
-- **novel-inference:** the control-variate certificate, exact quadratics, the derived cavity tolerance, the b±2 window.
-- **speed-floor, speed-krylov:** the learned-λ outer rate on the engine at chr22; batched multi-disease solves.
-- **gpu-engine, multi-gpu, codec:** fused GPU kernels in the engine; multi-GPU sharding of Stage 0 and Stage 2; a GPU-decodable store codec.
-- **measure-path:** D* recalibration and the A-map for draw-like imputed dosages (MODEL.md §2).
-- **prior-terms:** the frequency, pooling, SV-context and shape terms.
-- **fit-api:** the public fit/score API, the model artifact and the CLI.
-- **pheno-disease, deslop-hygiene:** the disease channel model; the DE/sinh level transform and the R2 lattice extent.
-- **workspace-pipeline:** the in-workspace pipeline driver, tested on synthetic data only.
-- **bench-real:** the svfunction and portable arms; evoprior pending; waits for the engine entry point.
-- **bench-sim:** the v7 Beagle arm, kernels, dev baselines; the GLIMPSE2 v7 subset at low priority.
-- **novel-measure:** the `beagle_rb` arm, waiting on v7 Beagle output.
-- **bug-recent:** guards main's CI and reviews each landing.
-- **land-train:** runs the queue. **env:** successor runq runners.
-
 ## Next, in order
-1. Land the queue.
-2. The certified outer loop and Stage 2 driver (e2e), then the logistic EP hook.
-3. The end-to-end fit: synthetic first, then chr22 on bench-sim v7 (e2e-scale).
-4. Score SV-PGS on both benchmarks, bench-real and bench-sim's sealed test, then the pre-registered ablations.
+1. The single-gene and 20-gene bench-real runs on main's tip, against mr.ash: CPU per gene and held-out r², both feature sets. Every refusal becomes a regression test with that gene's inputs.
+2. The engine's remaining certificate work (theory-ep's single V: the fixed-point term δ_fp, the C-variation slope, the pooled oracle on `lane/fit-api-pooled-targets` 0227198, which waits on those interfaces).
+3. Speed to the floor: the per-gene cost split (fixed points, hyper_step, corrections, response) from the profiler's phases, then the removals.
+4. Score SV-PGS on bench-sim's sealed test and the pre-registered ablations.
 5. The in-workspace pipeline, which needs the user's decisions below.
 
 ## The user's pending decisions
@@ -67,5 +40,5 @@ Agents never act on these and never contact anyone about them; the user decides 
 4. **The MSI Slurm counter reset** (COMPUTE.md): whether to pursue it.
 
 ## Branches and archive
-- GitHub holds `main` plus the lane branches above (`lane/*`, `wip/*`).
+- GitHub holds `main` plus the lane branches (`lane/*`, `run/*`, `wip/*`). The run branches `run/svpgs-working` and `run/svpgs-bench-1` and the engine lanes through `lane/engine-krylov-single-v` are merged into main; `lane/fit-api-pooled-targets` keeps one commit (0227198, the pooled oracle) that waits on engine interfaces.
 - Pre-restart branches are kept as `archive/2026-09-19/*` tags; recover one with `git checkout -b <name> archive/2026-09-19/<tag>`. The old fitting path is `archive/2026-09-19/old-path-final`.
