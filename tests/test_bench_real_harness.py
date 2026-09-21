@@ -773,3 +773,41 @@ def test_mismatched_partners_pair_each_gene_with_the_next_gene_on_another_chromo
 
     assert list(report.mismatched_partners(np.array(["chr1", "chr1", "chr2", "chr3", "chr3"]))) == [2, 2, 3, 0, 0]
     assert list(report.mismatched_partners(np.array(["chr1", "chr1"]))) == [-1, -1]
+
+
+def test_source_provenance_digests_the_sources_when_git_fails(monkeypatch):
+    """The commit is resolved before the fits, and a checkout-less run records a source digest instead of raising."""
+    import subprocess
+
+    def raising(error):
+        def run(*args, **kwargs):
+            raise error
+
+        return run
+
+    digests = []
+    for error in (FileNotFoundError("git"), subprocess.CalledProcessError(128, ["git", "rev-parse", "HEAD"])):
+        monkeypatch.setattr(harness.subprocess, "run", raising(error))
+        record = harness.source_provenance()
+        assert record["harness_commit"] is None and record["harness_source"] == "no-git"
+        digests.append(record["harness_source_sha256"])
+    assert len(digests[0]) == 64 and digests[0] == digests[1]
+
+
+def test_a_run_whose_git_fails_still_writes_every_fit(tmp_path, monkeypatch):
+    import json
+
+    tiny_dataset(tmp_path)
+    method = f"{harness.__file__.rsplit('/', 1)[0]}/baselines.py:top_variant"
+
+    def no_git(*args, **kwargs):
+        raise FileNotFoundError("git")
+
+    monkeypatch.setattr(harness.subprocess, "run", no_git)
+    harness.run(tmp_path, method, "top_variant", "loso", ["chr1"], tmp_path / "results", 1, ("snv",))
+    out = tmp_path / "results" / "top_variant" / "loso"
+    record = json.loads((out / "chr1.run.json").read_text())
+    assert record["harness_commit"] is None and record["harness_source"] == "no-git" and len(record["harness_source_sha256"]) == 64
+    assert record["genes"] == 1 and len(record["method_sha256"]) == 64
+    assert np.isfinite(np.load(out / "chr1.snv.predictions.npy")).any()
+    assert pd.read_csv(out / "chr1.log.tsv", sep="\t")["status"].tolist() == ["ok", "ok"]

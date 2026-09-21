@@ -662,6 +662,28 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                        _train_index(dataset, split_name))
 
 
+def source_provenance():
+    """What source this run is: the git commit of the checkout the harness lives in, or, when there is no checkout, a
+    digest of the source files themselves.
+
+    Resolved before any gene is fitted. Asking git after the fits meant a run from a source archive (no .git), or one
+    where git is missing or fails, threw away every finished fit at the last step, hours of CPU for a provenance line.
+    A run from an archive still records exactly what it ran: the sha256 over benchmarks/ and sv_pgs/, each file's path
+    with its own digest, in path order."""
+    directory = pathlib.Path(__file__).resolve().parent
+    try:
+        finished = subprocess.run(["git", "rev-parse", "HEAD"], cwd=directory, capture_output=True, text=True, check=True)
+        return {"harness_commit": finished.stdout.strip(), "harness_source": "git", "harness_source_sha256": None}
+    except (OSError, subprocess.SubprocessError):
+        pass
+    root = directory.parent.parent
+    digest = hashlib.sha256()
+    for package in ("benchmarks", "sv_pgs"):
+        for path in sorted((root / package).rglob("*.py")):
+            digest.update(path.relative_to(root).as_posix().encode() + b"\0" + hashlib.sha256(path.read_bytes()).digest())
+    return {"harness_commit": None, "harness_source": "no-git", "harness_source_sha256": digest.hexdigest()}
+
+
 def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, workers, feature_sets=FEATURE_SETS, gene_prefix=None, gene_list=None,
         confirmation=False, contract="gene", gene_ranks=None, overlay_dir=None, split_subset=None, note=None, rows_dirs=None, sample_subset=None,
         record_failures=False):
@@ -671,6 +693,10 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     contract "batch": the method is fit_batch(trains) -> list of predictors, called once per split and feature set
     with a lazy sequence of every selected gene's TrainData, so it can pool hyperparameters across genes. It never
     sees a test phenotype, and it owns its own parallelism (RUNQ_CORES)."""
+    # Before the fits: a provenance failure must never cost a finished run its results.
+    provenance = source_provenance()
+    method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
+    method_sha256 = hashlib.sha256(method_file.read_bytes()).hexdigest()
     dataset = Dataset(dataset_dir, overlay_dir, rows_dirs, sample_subset)
     split_names = [name for name in dataset.splits if name.startswith(design + "/")]
     if split_subset is not None:
@@ -727,10 +753,8 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         }) + "\n")
         progress.flush()
     progress.close()
-    method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
-    commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
     (out / f"{tag}.run.json").write_text(json.dumps({
-        "method": method_spec, "method_sha256": hashlib.sha256(method_file.read_bytes()).hexdigest(), "harness_commit": commit,
+        "method": method_spec, "method_sha256": method_sha256, **provenance,
         "design": design, "chromosomes": list(chromosomes), "feature_sets": list(feature_sets), "gene_prefix": gene_prefix,
         "gene_list": str(gene_list) if gene_list is not None else None, "gene_ranks": list(gene_ranks) if gene_ranks is not None else None,
         "confirmation": confirmation,
