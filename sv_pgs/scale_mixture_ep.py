@@ -1248,7 +1248,12 @@ def _maximize_coefficients(
     # every trust-region trial at that point; a direction flat to rounding counts as flat (``_resolved_spectrum``).
     spectrum = _resolved_spectrum(_spectrum(-hessian))
     ascent = _ascent_direction(-hessian, gradient, spectrum)
-    radius = float(np.linalg.norm(ascent))
+    # The first radius is the Cauchy step's length on |-H|, ||g||^3 / g'|-H|g (as the outer loop's, ``_cauchy_radius``),
+    # never Newton's: on a direction the data barely curve Newton's step divides a gradient at rounding by a curvature
+    # at rounding (gene 1's classes without a variant: 710 units along their unidentified deviation, at an unchanged V).
+    components = spectrum[1].T @ gradient
+    curvature = float(np.sum(np.abs(spectrum[0]) * np.square(components)))
+    radius = float(np.linalg.norm(gradient)) ** 3 / curvature if curvature > 0.0 else 0.0
     while True:
         # The objective's own rounding (its terms' and their summation's) plus the penalized value's arithmetic.
         rounding = objective.rounding + _EPSILON * abs(value)
