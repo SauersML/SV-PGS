@@ -2376,22 +2376,17 @@ def _null_complement(null_basis: F64Array) -> F64Array:
 
 
 def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Array) -> _Profiled:
-    """``_Profiled`` for M; raises LinAlgError when M is not positive definite. An eigenvalue negative within the
-    eigendecomposition's rounding of zero is not resolved as negative: M is then factored with it at the rounding
-    floor (``_resolved_spectrum``), a flat direction whose determinant the returned ``rounding`` reports as
-    unresolved, so the point certifies nothing at a positive tolerance and a tolerance of zero gets the value."""
+    """``_Profiled`` for M; raises LinAlgError when M is not resolvably positive definite: an eigenvalue within the
+    eigendecomposition's rounding of zero (eps times the dimension times the largest magnitude) is a direction flat
+    to double precision, whose sign the factorization cannot resolve (on a weak-data verification case it sat at
+    +-1e-14 and V came out as a value or None by its coin toss), and a point with one is not a strict maximum."""
     basis = np.hstack([null_basis, complement])
     rotated = basis.T @ matrix @ basis
     symmetric = 0.5 * (rotated + rotated.T)
-    try:
-        factor = np.linalg.cholesky(symmetric)
-    except np.linalg.LinAlgError:
-        eigenvalues, eigenvectors = np.linalg.eigh(symmetric)
-        resolved, _vectors = _resolved_spectrum((eigenvalues, eigenvectors))
-        if not np.all(resolved > 0.0):
-            raise
-        rotated = eigenvectors @ (resolved[:, None] * eigenvectors.T)
-        factor = np.linalg.cholesky(0.5 * (rotated + rotated.T))
+    eigenvalues = np.linalg.eigvalsh(symmetric)
+    if float(eigenvalues[0]) <= _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny):
+        raise np.linalg.LinAlgError("the profiled curvature is not resolvably positive definite: a direction is flat to rounding")
+    factor = np.linalg.cholesky(symmetric)
     inverse_factor = solve_triangular(factor, np.eye(factor.shape[0]), lower=True)
     profiled = null_basis.shape[1]
     trailing = inverse_factor[profiled:]
