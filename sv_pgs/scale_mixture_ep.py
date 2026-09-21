@@ -3381,6 +3381,15 @@ class FixedPoint:
     # point at the state's own hyperparameters on ENSG00000274602.5 [real]: V 867.7 against the state's 819.7, which
     # the path gain along x cannot see, so the trial was refused and the fit ended uncertified).
     restore: Callable[[], None] | None = None
+    # The evidence's part this fixed point carries beyond the fixed-cavity F = sum_j log Z_j, where the oracle knows
+    # it: at a mean-field fixed point q_j is the tilted law of its pseudo-likelihood, so ELBO = F + G with G the
+    # pseudo-likelihoods' Gaussian part (-n/2 log 2 pi sigma^2 - (|r|^2 + sum_j |x_j|^2 v_j) / 2 sigma^2 - sum_j
+    # E_q log l_j), whose x-gradient at fixed q is zero: E = F + G has the fixed-cavity gradient and is one function
+    # across fixed points, so two states' E differ exactly by their values plus offsets (``_path_gain``), with no
+    # path integral, and a release polished at its own fixed point is judged on a comparable value
+    # (``settle_release``; V alone moved by 48 nats between two fixed points 2.4 nats of ELBO apart on
+    # ENSG00000274602.5 [real]). NaN where the oracle gives none (EP's fixed points): the path integral then.
+    evidence_offset: float = np.nan
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
@@ -3524,6 +3533,8 @@ class _State:
     decrement: float
     polished: bool = False
     tail: float = 0.0
+    # The fixed point's ``FixedPoint.evidence_offset``: ``value`` + ``offset`` is E's units across fixed points.
+    offset: float = np.nan
 
 
 def _outer_state(
@@ -3551,7 +3562,7 @@ def _outer_state(
     fixed = -(mapping.T @ data.hessian @ mapping)
     return _State(
         value=corrected.value, rest=corrected.value - data.value, gradient=mapping.T @ data.gradient, fixed_curvature=0.5 * (fixed + fixed.T),
-        correction=correction, error=corrected.error, decrement=evidence.inner_decrement,
+        correction=correction, error=corrected.error, decrement=evidence.inner_decrement, offset=float(point.evidence_offset),
     )
 
 
@@ -3561,7 +3572,13 @@ def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Ar
     correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is quartic along s), whose plain
     rule's error |s'(B_end - B_start)s| / 12 bounds the corrected one's; the penalty and the determinant terms
     change in closed form (the states' ``rest``), and eps adds both states' own errors. The fixed points' gradient
-    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``)."""
+    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``).
+
+    Where both fixed points carry E's offset (``FixedPoint.evidence_offset``: the mean-field oracle's), the gain is
+    exact, (value + offset)_end - (value + offset)_start, with both states' errors as its resolution: no path
+    integral, no end correction, and the same E across fixed points."""
+    if np.isfinite(start.offset) and np.isfinite(end.offset):
+        return (end.value + end.offset) - (start.value + start.offset), start.error + end.error
     if not np.any(move):
         return end.rest - start.rest, start.error + end.error
     along = (prior.coefficient_map @ move)[:, None]
@@ -3733,8 +3750,15 @@ def fit_hyperparameters(
         assert anchor is not None
         anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchor
         polished_state = states[model]
-        realized = -np.inf if polished_state is None else polished_state.value - anchor_state.value
-        resolution = np.inf if polished_state is None else polished_state.error + anchor_state.error
+        if polished_state is None:
+            realized, resolution = -np.inf, np.inf
+        elif np.isfinite(polished_state.offset) and np.isfinite(anchor_state.offset):
+            # E across the two fixed points (``FixedPoint.evidence_offset``).
+            realized = (polished_state.value + polished_state.offset) - (anchor_state.value + anchor_state.offset)
+            resolution = polished_state.error + anchor_state.error
+        else:
+            realized = polished_state.value - anchor_state.value
+            resolution = polished_state.error + anchor_state.error
         remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
         anchors[model] = None
         if polished_state is not None and realized - resolution > tolerance:

@@ -81,6 +81,7 @@ from sv_pgs.scale_mixture_ep import (
     MixtureHyperparameters,
     ScaleMixturePrior,
     _components,
+    _data_value,
     class_log_density,
     log_scale,
     noise_gain,
@@ -506,9 +507,12 @@ class MeanFieldFixedPoints:
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=True)
         # The solver's state at this point, so the outer loop can put it back before a trial (``FixedPoint.restore``).
         snapshot = self._snapshot()
+        cavity = Cavity(precision=omega, shift=self.shift.copy())
+        # E's offset (``FixedPoint.evidence_offset``): the ELBO the last sweep built less the fixed-cavity F there.
+        offset = float(self.profile["elbo"]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
         return FixedPoint(
-            cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
-            precision_norm=norm, effective_effects=float(self.effective), restore=lambda: self._restore(snapshot),
+            cavity=cavity, posterior=posterior, mean=self.mean.copy(), precision_norm=norm, effective_effects=float(self.effective),
+            restore=lambda: self._restore(snapshot), evidence_offset=offset,
         )
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:
