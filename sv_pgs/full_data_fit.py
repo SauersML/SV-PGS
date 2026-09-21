@@ -1,4 +1,9 @@
-"""Stage 2: each model fitted on the full data by EP-EB, and its scoring models.
+"""Stage 2: each model fitted on the full data, and its scoring models.
+
+Two fixed points serve ``scale_mixture_ep.fit_hyperparameters`` here: the mean-field product of ``mean_field`` on
+the streamed design (``_FullDataMeanField``, ``fit_full_data(inference="mean_field")``: the public route's, since
+EP's oracle refused 59 of 65 calls on the wiring store, "the EP refreshes' updates line up with no contraction",
+2026-09-21) and EP as this docstring describes below (``inference="ep"``).
 
 For every model (a quantitative trait on its training rows) q(beta) is ``dual_solve.DualGaussian``'s Gaussian:
 its mean is exact on the full-data operator and certified in the posterior metric, and non-positive sites are
@@ -39,13 +44,13 @@ The fit ends when every model's Newton-B decrement plus its weights' remaining g
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Sequence
+from typing import Callable, Iterator, Sequence
 
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.dual_solve import DualGaussian, _host
+from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.krylov_recycle import local_response
@@ -70,6 +75,8 @@ from sv_pgs.marginal_variances import (
 )
 from sv_pgs.scale_mixture_ep import (
     Cavity,
+    _data_value,
+    class_log_density,
     FixedPoint,
     GaussianPosterior,
     MixtureHyperparameters,
@@ -253,6 +260,15 @@ class FullDataFit:
     hyperparameters: tuple[MixtureHyperparameters, ...]
     noise_variance: F64Array
     certificate: FitCertificate
+    # The mean-field route (``inference == "mean_field"``): each member's q_j by its pseudo-likelihood (omega, shift)
+    # and its mean, and the covariate coefficients at the fixed point; None on the EP route, whose scoring reads the
+    # dual solver.
+    inference: str = "ep"
+    member_mean: F64Array | None = None
+    member_shift: F64Array | None = None
+    member_omega: F64Array | None = None
+    covariate_coefficients: F64Array | None = None
+    working_bytes: int = 0
 
 
 def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Array]:
@@ -862,29 +878,390 @@ class _FullDataFixedPoints:
             target_precision, target_shift = self._targets(hyperparameters, cavities)
 
 
+class _FullDataMeanField:
+    """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
+    q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
+    stationary between sweeps; the same fixed point, ELBO, certificate and draws as the dense route, on a design the
+    store streams.
+
+    Per block the tile's standardized columns are projected on the model's training rows and covariates,
+    Xp_b = (I - H_m) X_b (``DualModels.complement``: H_m the projector of the training rows' covariates), and the
+    dense sweep kernel runs over them with the residual r = y_P - Xp m carried across blocks; the pieces of a block
+    are as wide as ``working_bytes`` allows two dense (n x width) arrays. ||xp_j||^2 are the dual solver's
+    ``unit_squares``. The fixed point's linear responses (the total curvature's ``cavity_response``) are the dense
+    route's formulas with R^-1 = (diag(tau) + Xp'Xp / sigma^2)^-1 taken from the dual solver at the sites
+    tau_j = 1/v_j - omega_j and the shifts m_j / v_j - h_j, at which its Gaussian is q's mean and precision
+    (``DualGaussian.iterate``, ``posterior_solve``), and Xp'Xp c by two tile passes. No leave-block-out variance,
+    no cavity information certificate: q's variances are its own.
+
+    Tie members (several members on one column) are not carried yet: they need the member-level R, which the dual
+    solver holds per group; the EP route takes them."""
+
+    def __init__(
+        self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
+        starts: Sequence[MixtureHyperparameters], noise: F64Array,
+    ) -> None:
+        self.gaussian = gaussian
+        self.prior = prior
+        self.draw_count = int(draw_count)
+        self.working_bytes = int(working_bytes)
+        self.ties = TieGroups.from_tie_map(statistics.tie_map)
+        if prior.variant_count != self.ties.member_count:
+            raise ValueError("the prior must be over Stage 0's active rows (the tie members), in their order")
+        if self.ties.member_count != self.ties.group_count or not np.array_equal(self.ties.group, np.arange(self.ties.group_count)):
+            raise NotImplementedError("the mean-field full-data route carries no tie members yet; the EP route does")
+        self.grams = block_grams(statistics)
+        model_count = gaussian.model_count
+        self.model_count = model_count
+        self.training = np.asarray(_host(gaussian.training), dtype=np.float64)
+        self.sample_count = int(self.training.shape[0])
+        self.training_counts = np.asarray(gaussian.training_counts, dtype=np.int64)
+        # The projector alone (unit weights): Xp and y_P do not move with the noise, which the sweeps update.
+        xp = gaussian.array_module
+        self.models = DualModels(gaussian.training, xp.zeros((gaussian.source.variant_count, model_count)), gaussian.covariates, xp)
+        factor = np.asarray(_host(self.models.covariate_factor), dtype=np.float64)
+        self.covariate_rank = np.array([int(np.count_nonzero(np.any(factor[model] != 0.0, axis=0))) for model in range(model_count)], dtype=np.int64)
+        self.residual_dimension = self.training_counts - self.covariate_rank
+        if np.any(self.residual_dimension <= 0):
+            raise ValueError("a model's training rows do not outnumber its covariates' rank")
+        self.member_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)
+        targets = np.asarray(_host(gaussian.targets), dtype=np.float64)
+        projected = np.asarray(_host(self.models.complement(xp.asarray(self.training * targets), xp.arange(model_count))), dtype=np.float64)
+        self.projected_targets = [np.ascontiguousarray(projected[:, model]) for model in range(model_count)]
+        self.class_index = np.asarray(prior.class_index, dtype=np.int64)
+        self.noise = np.array(noise, dtype=np.float64, copy=True)
+        count = prior.variant_count
+        self.mean = np.zeros((count, model_count))
+        self.variance = np.zeros((count, model_count))
+        self.shift = np.zeros((count, model_count))
+        self.third = np.zeros((count, model_count))
+        self.fourth = np.zeros((count, model_count))
+        self.residual = [values.copy() for values in self.projected_targets]
+        self.site_precision = np.zeros((count, model_count))
+        self.site_shift = np.zeros((count, model_count))
+        self.effective = np.full(model_count, float(count))
+        self.mean_move = np.full(model_count, np.inf)
+        self.noise_gain = np.full(model_count, np.inf)
+        self.mean_error = np.zeros(model_count)
+        self.elbo = np.full(model_count, -np.inf)
+        self.refusals: list[str] = []
+        self.refreshes = 0
+        self.passes = 0
+        self.version = 0
+        self.undecided_blocks = 0
+        self.information: list = []
+        self._cold = self._snapshot()
+
+    # state
+
+    def _snapshot(self) -> dict:
+        return {
+            "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "third": self.third.copy(),
+            "fourth": self.fourth.copy(), "residual": [values.copy() for values in self.residual], "noise": self.noise.copy(),
+            "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "effective": self.effective.copy(),
+            "mean_move": self.mean_move.copy(), "noise_gain": self.noise_gain.copy(), "elbo": self.elbo.copy(), "version": self.version,
+        }
+
+    def _restore(self, snapshot: dict, models: Sequence[int] | None = None) -> None:
+        columns = list(range(self.model_count)) if models is None else list(models)
+        for name in ("mean", "variance", "shift", "third", "fourth", "site_precision", "site_shift"):
+            getattr(self, name)[:, columns] = snapshot[name][:, columns]
+        for name in ("noise", "effective", "mean_move", "noise_gain", "elbo"):
+            getattr(self, name)[columns] = snapshot[name][columns]
+        for model in columns:
+            self.residual[model] = snapshot["residual"][model].copy()
+
+    def _ensure(self, snapshot: dict) -> None:
+        """The dual solver back at this fixed point's sites before it answers for it (a later trial may have moved it)."""
+        if self.version != snapshot["version"]:
+            self._iterate(snapshot["site_precision"], snapshot["site_shift"], snapshot["noise"])
+            self.version = snapshot["version"]
+
+    # the design, streamed
+
+    def _pieces(self, count: int) -> Iterator[tuple[int, int]]:
+        """Column ranges of a block whose two dense (n x width) float64 arrays (the tile's columns and their
+        projection) fit the working set."""
+        width = max(1, self.working_bytes // (2 * self.sample_count * np.dtype(np.float64).itemsize))
+        for start in range(0, count, width):
+            yield start, min(start + width, count)
+
+    def _projected(self, tile, local: I64Array, model: int) -> F64Array:
+        xp = self.gaussian.array_module
+        dense = xp.asarray(tile.columns(xp.asarray(local)), dtype=xp.float64)
+        masked = dense * xp.asarray(self.training[:, model])[:, None]
+        projected = self.models.complement(masked, xp.full(local.shape[0], model, dtype=xp.int64))
+        return np.asfortranarray(np.asarray(_host(projected), dtype=np.float64))
+
+    def _image(self, coefficients: F64Array, model: int) -> F64Array:
+        """Xp c (n x r) for c (p x r): the tiles' X_b c_b, masked to the training rows and projected."""
+        xp = self.gaussian.array_module
+        values = np.asarray(coefficients, dtype=np.float64)
+        image = np.zeros((self.sample_count, values.shape[1]))
+        for start, stop, tile in self.gaussian.source.blocks():
+            image += np.asarray(_host(tile.matmat(xp.asarray(values[start:stop]))), dtype=np.float64)
+        masked = xp.asarray(image * self.training[:, model][:, None])
+        return np.asarray(_host(self.models.complement(masked, xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
+
+    def _back(self, samples: F64Array, model: int) -> F64Array:
+        """Xp' u (p x r) for u (n x r): (I - H) and the training mask, then the tiles' X_b' u."""
+        xp = self.gaussian.array_module
+        values = np.asarray(samples, dtype=np.float64)
+        projected = np.asarray(_host(self.models.complement(xp.asarray(values), xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
+        masked = xp.asarray(projected * self.training[:, model][:, None])
+        back = np.zeros((self.prior.variant_count, values.shape[1]))
+        for start, stop, tile in self.gaussian.source.blocks():
+            back[start:stop] = np.asarray(_host(tile.rmatmat(masked)), dtype=np.float64)
+        return back
+
+    # the sweeps
+
+    def _sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
+        # ``mean_field`` imports ``small_n``, which imports this module's certificate: the kernel is bound at first use.
+        from sv_pgs.mean_field import _sweep as mean_field_sweep
+
+        prior = self.prior
+        log_density = np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients))
+        scales = log_scale(prior, hyperparameters.coefficients)
+        divergence = weighted_variance = sizes = 0.0
+        residual = self.residual[model]
+        noise = float(self.noise[model])
+        for start, stop, tile in self.gaussian.source.blocks():
+            for piece_start, piece_stop in self._pieces(stop - start):
+                local = np.arange(piece_start, piece_stop, dtype=np.int64)
+                rows = start + local
+                projected = self._projected(tile, local, model)
+                with np.errstate(over="ignore"):
+                    node_variance = np.exp(scales[rows][:, None] + prior.log_variance_grid[None, :])
+                mean, variance, shift, third, fourth = (np.ascontiguousarray(values[rows, model]) for values in (self.mean, self.variance, self.shift, self.third, self.fourth))
+                part = mean_field_sweep(
+                    projected, np.ascontiguousarray(self.member_squares[rows, model]), local - piece_start, self.class_index[rows], log_density,
+                    node_variance, noise, mean, residual, variance, shift, third, fourth,
+                )
+                for values, piece in ((self.mean, mean), (self.variance, variance), (self.shift, shift), (self.third, third), (self.fourth, fourth)):
+                    values[rows, model] = piece
+                divergence += part[0]
+                weighted_variance += part[1]
+                sizes += part[3]
+        self.passes += 1
+        return divergence, weighted_variance, float(residual @ residual), sizes
+
+    def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
+        """As ``MeanFieldFixedPoints._elbo``, on this model's training rows."""
+        noise = float(self.noise[model])
+        residual_term = 0.5 * float(self.residual_dimension[model]) * float(np.log(2.0 * np.pi * noise))
+        fit_term = (residual_square + weighted_variance) / (2.0 * noise)
+        value = -residual_term - fit_term - divergence
+        summands = 2 * self.prior.variant_count + int(self.training_counts[model])
+        return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
+
+    def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters) -> None:
+        """Sweeps at the current noise, the noise moving to its stationary value between them, until the sweeps'
+        measured remainder (the geometric extrapolation of the last two gains, ``mean_field``) plus the noise's
+        pending gain is within the tolerance."""
+        tolerance = 0.5 / self.draw_count
+        elbo: float | None = None
+        gain: float | None = None
+        previous_gain: float | None = None
+        pending_noise: float | None = None
+        while True:
+            if pending_noise is not None:
+                elbo = elbo + float(self.noise_gain[model]) if elbo is not None else None
+                self.noise[model] = pending_noise
+            divergence, weighted_variance, residual_square, sizes = self._sweep(model, hyperparameters)
+            if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
+                raise FloatingPointError(f"model {model}: a mean-field sweep is not finite")
+            value, rounding = self._elbo(model, divergence, weighted_variance, residual_square, sizes)
+            pending_noise = (residual_square + weighted_variance) / float(self.residual_dimension[model])
+            self.noise_gain[model] = noise_gain(pending_noise, float(self.noise[model]), int(self.training_counts[model]), int(self.covariate_rank[model]))
+            gain = (value - elbo) if elbo is not None else None
+            elbo = value
+            if gain is not None and gain < -rounding:
+                raise FloatingPointError(f"model {model}: a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
+            self.elbo[model] = value
+            if gain is None:
+                remaining = np.inf
+            elif gain <= rounding:
+                remaining = 0.0
+            elif previous_gain is not None and previous_gain > 0.0:
+                rate = gain / previous_gain
+                remaining = gain * rate / (1.0 - rate) if rate < 1.0 else np.inf
+            else:
+                remaining = np.inf
+            if gain is not None:
+                previous_gain = max(float(gain), 0.0)
+            self.mean_move[model] = 2.0 * remaining
+            if remaining + float(self.noise_gain[model]) <= tolerance:
+                return
+
+    def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
+        """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
+        ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m."""
+        self.gaussian.iterate(
+            site_precision=site_precision, site_shift=site_shift, noise_variance=noise,
+            error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
+        )
+        self.version += 1
+
+    def _sites(self, model: int) -> tuple[F64Array, F64Array, F64Array, np.ndarray]:
+        omega = self.member_squares[:, model] / float(self.noise[model])
+        variance = self.variance[:, model]
+        live = variance > 0.0
+        with np.errstate(divide="ignore"):
+            tau = np.where(live, 1.0 / np.where(live, variance, 1.0), np.inf) - omega
+            nu = np.where(live, self.mean[:, model] / np.where(live, variance, 1.0) - self.shift[:, model], 0.0)
+        return omega, tau, nu, live
+
+    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
+        """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
+        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x)."""
+        entry = self._snapshot()
+        solved: list[list[tuple[float, dict] | None]] = []
+        first = self.refreshes == 0
+        for start in ((entry,) if first else (entry, self._cold)):
+            self._restore(start)
+            outcome: list[tuple[float, dict] | None] = []
+            for model in range(self.model_count):
+                try:
+                    self._solve_model(model, hyperparameters[model])
+                except FloatingPointError as error:
+                    self.refusals.append(str(error))
+                    outcome.append(None)
+                    continue
+                outcome.append((float(self.elbo[model]), self._snapshot()))
+            solved.append(outcome)
+        for model in range(self.model_count):
+            candidates = [outcome[model] for outcome in solved if outcome[model] is not None]
+            if not candidates:
+                # No start reaches this model's fixed point: the trial is refused whole, as EP's oracle refuses.
+                self._restore(entry)
+                return [None] * self.model_count
+            _value, state = max(candidates, key=lambda item: item[0])
+            self._restore(state, [model])
+        for model in range(self.model_count):
+            omega, tau, nu, _live = self._sites(model)
+            self.site_precision[:, model] = tau
+            self.site_shift[:, model] = nu
+            self.effective[model] = max(float(np.sum(omega * self.variance[:, model])), _EPSILON * tau.shape[0])
+        try:
+            self._iterate(self.site_precision, self.site_shift, self.noise)
+        except np.linalg.LinAlgError as error:
+            self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
+            self._restore(entry)
+            return [None] * self.model_count
+        self.refreshes += 1
+        return [self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+
+    def _fixed_point(self, model: int, hyperparameters: MixtureHyperparameters) -> FixedPoint:
+        omega, tau, _nu, live = self._sites(model)
+        noise = float(self.noise[model])
+        squares = self.member_squares[:, model].copy()
+        mean, variance, shift = self.mean[:, model].copy(), self.variance[:, model].copy(), self.shift[:, model].copy()
+        third, fourth = self.third[:, model].copy(), self.fourth[:, model].copy()
+        residual = self.residual[model].copy()
+        mean_by_omega = np.where(live, -0.5 * (third + 2.0 * mean * variance), 0.0)
+        variance_by_shift = np.where(live, third, 0.0)
+        variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
+        residual_dimension = float(self.residual_dimension[model])
+        snapshot = self._snapshot()
+        grams = replace(self.grams, scale=1.0 / noise)
+        dual = _posterior(self.gaussian, model, grams, variance, lambda: self._ensure(snapshot))
+        noise_solve: dict[str, object] = {}
+
+        def off_diagonal_gram(columns: F64Array) -> F64Array:
+            return self._back(self._image(columns, model), model) - squares[:, None] * columns
+
+        def solve(right: F64Array, relative_tolerance: float) -> F64Array:
+            # R^-1 right: the dual solver's A = Xp'Xp / sigma^2 + diag(tau) at these sites is R itself.
+            assert dual.solve is not None
+            return dual.solve(right, relative_tolerance)
+
+        def noise_terms(relative_tolerance: float) -> tuple[F64Array, F64Array, float]:
+            if not noise_solve:
+                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
+                mean_one = solve(coupling[:, None], relative_tolerance)
+                shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
+                scalar = residual_dimension - (
+                    2.0 * float(residual @ self._image(mean_one, model)[:, 0])
+                    + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
+                ) / noise
+                noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
+            return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
+
+        def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array, relative_tolerance: float) -> tuple[F64Array, F64Array]:
+            # The dense route's ``cavity_response`` (``mean_field``), with R^-1 by the dual solver to the relative
+            # tolerance asked and Xp'Xp by tile passes.
+            scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
+            mean_step = solve(scaled, relative_tolerance)
+            shift_step = -off_diagonal_gram(mean_step) / noise
+            _mean_one, shift_one, scalar = noise_terms(relative_tolerance)
+            right = -2.0 * (residual @ self._image(mean_step, model)) + squares @ (
+                np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
+            )
+            noise_step = right / scalar
+            relative = (noise_step / noise)[None, :]
+            return shift_step + shift_one * relative, -omega[:, None] * relative
+
+        def norm(direction: F64Array) -> float:
+            values = np.asarray(direction, dtype=np.float64)
+            if np.any((values != 0.0) & ~live):
+                return np.inf
+            return float(np.sum(np.square(values[live]) / variance[live]))
+
+        posterior = GaussianPosterior(cavity_response=cavity_response, exact=False)
+        cavity = Cavity(precision=omega, shift=shift)
+        offset = float(self.elbo[model]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
+        return FixedPoint(
+            cavity=cavity, posterior=posterior, mean=mean, precision_norm=norm, effective_effects=float(self.effective[model]),
+            restore=lambda: self._restore(snapshot, [model]), evidence_offset=offset,
+        )
+
+    def covariate_coefficients(self, model: int) -> F64Array:
+        """alpha = (C'WC)^+ C'W (y - X m) on the training rows, for the scoring model."""
+        xp = self.gaussian.array_module
+        values = np.zeros((self.sample_count, 1))
+        for start, stop, tile in self.gaussian.source.blocks():
+            values += np.asarray(_host(tile.matmat(xp.asarray(self.mean[start:stop, model][:, None]))), dtype=np.float64)
+        targets = np.asarray(_host(self.gaussian.targets), dtype=np.float64)[:, model]
+        residual = self.training[:, model] * (targets - values[:, 0])
+        covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
+        right = xp.asarray((covariates.T @ residual)[:, None])
+        return np.asarray(_host(self.models.covariate_solve(right, xp.asarray([model]))), dtype=np.float64)[:, 0]
+
+
 def fit_full_data(
-    *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int
+    *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
+    inference: str = "ep",
 ) -> FullDataFit:
     """Stage 2 for quantitative models, from the prior (see the module docstring); ``seed`` draws the certificate's
-    variant-side probes."""
+    variant-side probes. ``inference`` names the fixed point: "ep" (this module's EP) or "mean_field"
+    (``_FullDataMeanField``: the product q of ``mean_field`` on the streamed design)."""
     # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
     moments = moment_starts(statistics, prior)
     if len(moments) != gaussian.model_count:
         raise ValueError("Stage 0's targets must be the models, in order")
     starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
-    fixed_points = _FullDataFixedPoints(
-        gaussian, statistics, prior, draw_count, working_bytes, seed, starts, np.array([moment.noise for moment in moments])
-    )
+    if inference not in ("ep", "mean_field"):
+        raise ValueError(f"inference must be 'ep' or 'mean_field', not {inference!r}")
+    oracle_class = _FullDataFixedPoints if inference == "ep" else _FullDataMeanField
+    fixed_points = oracle_class(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, np.array([moment.noise for moment in moments]))
     try:
         fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
     except FloatingPointError as error:
-        # The oracle's refusals say why EP had no fixed point; they belong with the failure.
-        raise FloatingPointError(f"{error}; EP refusals: {fixed_points.refusals}") from error
+        # The oracle's refusals say why it had no fixed point; they belong with the failure.
+        raise FloatingPointError(f"{error}; {inference} refusals: {fixed_points.refusals}") from error
+    mean_field = fixed_points if inference == "mean_field" else None
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
         site_shift=fixed_points.site_shift,
+        inference=inference,
+        member_mean=None if mean_field is None else mean_field.mean.copy(),
+        member_shift=None if mean_field is None else mean_field.shift.copy(),
+        member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
+        covariate_coefficients=None if mean_field is None else np.column_stack([mean_field.covariate_coefficients(model) for model in range(mean_field.model_count)]),
+        working_bytes=int(working_bytes),
         hyperparameters=tuple(fit.hyperparameters for fit in fits),
         noise_variance=fixed_points.noise,
         certificate=FitCertificate(
@@ -897,8 +1274,12 @@ def fit_full_data(
             draw_tolerance=np.full(gaussian.model_count, 1.0 / draw_count),
             noise_gain=fixed_points.noise_gain,
             mean_error=fixed_points.mean_error,
-            information_bound=np.array([float(np.max(certificate.upper_bound)) for certificate in fixed_points.information]),
-            information_tolerance=np.array([float(np.min(certificate.tolerance)) for certificate in fixed_points.information]),
+            # The cavity information certificate is EP's (its cavities come from leave-block-out variances); the
+            # mean-field route's cavities are its own pseudo-likelihoods, so it has no such term.
+            information_bound=np.array([float(np.max(certificate.upper_bound)) for certificate in fixed_points.information])
+            if fixed_points.information else np.full(gaussian.model_count, np.nan),
+            information_tolerance=np.array([float(np.min(certificate.tolerance)) for certificate in fixed_points.information])
+            if fixed_points.information else np.full(gaussian.model_count, np.nan),
             undecided_blocks=fixed_points.undecided_blocks,
             negative_sites=np.sum(fixed_points.site_precision < 0.0, axis=0).astype(np.int64),
             effective_effects=fixed_points.effective,
@@ -924,17 +1305,31 @@ def scoring_models(
     and the covariate coefficients. Tied members are equal on the training samples only, so each keeps its effect."""
     gaussian = fit.gaussian
     ties = TieGroups.from_tie_map(statistics.tie_map)
-    error_bound = np.full(len(trait_types), np.sqrt(1.0 / draw_count))
-    group_draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
-    alpha = np.asarray(_host(gaussian.alpha), dtype=np.float64)
-    group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
-    mean, _variance = member_moments(ties, fit.site_precision, fit.site_shift, group_mean, np.zeros_like(group_mean))
     identity = _compact_identity_tie_map(ties.member_count)
+    if fit.inference == "mean_field":
+        # q's own means and its product draws (``mean_field.product_draws``: conditional variational draws).
+        assert fit.member_mean is not None and fit.member_shift is not None and fit.member_omega is not None and fit.covariate_coefficients is not None
+        mean, alpha = fit.member_mean, fit.covariate_coefficients
+        class_index = np.asarray(prior.class_index, dtype=np.int64)
+    else:
+        error_bound = np.full(len(trait_types), np.sqrt(1.0 / draw_count))
+        group_draws = np.asarray(_host(gaussian.draws(draw_count=draw_count, error_bound=error_bound, seed=seed)), dtype=np.float64)
+        alpha = np.asarray(_host(gaussian.alpha), dtype=np.float64)
+        group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
+        mean, _variance = member_moments(ties, fit.site_precision, fit.site_shift, group_mean, np.zeros_like(group_mean))
     models = []
     for model, trait_type in enumerate(trait_types):
-        draws = member_draws(
-            ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
-        )
+        if fit.inference == "mean_field":
+            from sv_pgs.mean_field import product_draws
+
+            draws = product_draws(
+                prior, fit.hyperparameters[model].coefficients, fit.member_omega[:, model], fit.member_shift[:, model], class_index,
+                np.random.default_rng([seed, model]), draw_count, fit.working_bytes,
+            )
+        else:
+            draws = member_draws(
+                ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
+            )
         models.append(ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
             signed_means=np.asarray(statistics.means, dtype=np.float64),

@@ -3,8 +3,8 @@
 This is e2e's tests/test_full_data_fit wiring behind the agreed ``fit_models`` signature, run once per model:
 Stage 0 on the model's own training rows and covariate columns, the start lattice from its single-variant
 likelihoods, the prior with one class per variant class present and the records' log reliabilities as offsets (no
-annotation groups: the design builder isn't written yet), the dual Gaussian, ``fit_full_data`` and
-``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
+annotation groups: the design builder isn't written yet), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
+points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
 Quantitative traits only: ``fit_full_data`` has no binary likelihood yet.
 """
 
@@ -299,7 +299,11 @@ def _fit_one(
         probe_count=draw_count,
         seed=_seed(seed, 0),
     )
-    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1))
+    # The mean-field fixed points: EP's refused nearly every call on the wiring store ("the EP refreshes' updates line
+    # up with no contraction ... the full-data route has no double loop", 59 of 65 calls, 2026-09-21).
+    fit = fit_full_data(
+        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field"
+    )
     (scoring,) = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], draw_count, seed=_seed(seed, 2))
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
     return _ModelFit(

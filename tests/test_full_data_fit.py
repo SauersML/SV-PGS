@@ -116,6 +116,57 @@ def test_stage2_from_the_prior_is_certified_and_scores_the_held_out_samples(tmp_
     assert np.all(scores.variances[held_out, 0] > 0.0)
 
 
+def test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples(tmp_path: Path) -> None:
+    # The same store and prior through the streamed mean-field oracle (``_FullDataMeanField``), which the public route uses.
+    store, covariate, targets, genetic = _store(tmp_path / "store", 7)
+    training = np.arange(_TRAINING)
+    held_out = np.arange(_TRAINING, _SAMPLES)
+    training_covariates = np.column_stack([np.ones(_TRAINING), covariate[training]])
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)),
+        training,
+        training_covariates,
+        targets[training, None],
+        ModelConfig(),
+        _budget(),
+        _BLOCK_CAP,
+        tmp_path / "ld",
+    )
+    member_count = statistics.active_rows.shape[0]
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    offsets = np.zeros(member_count)
+    classes = (np.arange(member_count) % 5 == 0).astype(np.int64)
+    # The single-variant likelihoods that set the lattice take the covariate-only residual variance as the noise.
+    start_noise = float(covariate_residual_variance(targets[:, None], mask, store_covariates)[0])
+    nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=classes, log_variance_offset=offsets, annotation_design=np.zeros((member_count, 0)), annotation_groups=(),
+        nodes=nodes, floor=floor, top=top,
+    )
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+    gaussian = DualGaussian(
+        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+        grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
+    )
+    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
+    certificate = fit.certificate
+    assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
+    assert certificate.mean_move[0] <= certificate.draw_tolerance[0]
+    assert certificate.noise_gain[0] <= 0.5 / _DRAWS
+    scoring = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], _DRAWS, seed=12)
+    scores = score_genetic(_StoreCodes(store), ScoringPlan.from_models(scoring), _budget())
+    # The scorer's in-sample genetic score is q's own X m, read back from the store (the dual solver's mean at q's
+    # sites is m only to its solve's bound, so it is not the reference here).
+    signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
+    standardized = (signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]
+    assert fit.member_mean is not None
+    expected = standardized.T[training] @ fit.member_mean[:, 0]
+    np.testing.assert_allclose(scores.means[training, 0], expected, rtol=1e-8, atol=1e-8)
+    assert np.corrcoef(scores.means[held_out, 0], genetic[held_out])[0, 1] > 0.5
+    assert np.all(scores.variances[held_out, 0] > 0.0)
+
 def test_block_grams_share_stage0s_float32_arrays_across_models(tmp_path: Path) -> None:
     from dataclasses import replace
 

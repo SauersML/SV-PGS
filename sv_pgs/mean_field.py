@@ -76,7 +76,7 @@ import numba
 import numpy as np
 from scipy import linalg
 
-from sv_pgs._typing import F64Array
+from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.scale_mixture_ep import (
     Cavity,
     FixedPoint,
@@ -553,7 +553,8 @@ class MeanFieldFixedPoints:
                 noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
             return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
 
-        def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
+        def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array, _relative_tolerance: float = 0.0) -> tuple[F64Array, F64Array]:
+            # (The tolerance is the streamed route's, whose solves are iterative; this factor is exact.)
             # dm_0 = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest, then the
             # noise's own response and through it every pseudo-likelihood's (module docstring).
             started = time.perf_counter()
@@ -614,21 +615,30 @@ class MeanFieldFixedPoints:
         draw-wide arrays, so the width to budget is their sum. ``_sample_nodes`` samples by inverse CDF inside a
         piece, so nothing of the size (rows x nodes x draws) is ever formed. A piece boundary moves which value of
         the generator's stream lands where, so the law is preserved and the numbers are not."""
-        prior = self.prior
-        count = int(draw_count)
-        log_density = class_log_density(prior, hyperparameters.coefficients)
-        scales = log_scale(prior, hyperparameters.coefficients)
-        omega = self.member_squares / self.noise
-        draws = np.empty((prior.variant_count, count))
-        for class_position in range(log_density.shape[0]):
-            rows = np.flatnonzero(self.class_index == class_position)
-            if rows.size == 0:
-                continue
-            for piece in _row_chunks(rows, prior.grid_size + count, self.working_bytes):
-                terms = _components(log_density[class_position], scales[piece], prior.log_variance_grid, omega[piece], self.shift[piece])
-                uniform = generator.random((piece.shape[0], count))
-                nodes = np.empty((piece.shape[0], count), dtype=np.int64)
-                _sample_nodes(np.ascontiguousarray(terms.responsibility), uniform, nodes)
-                conditional = np.take_along_axis(terms.conditional_variance, nodes, axis=1)
-                draws[piece] = self.shift[piece][:, None] * conditional + np.sqrt(conditional) * generator.standard_normal(conditional.shape)
-        return draws
+        return product_draws(
+            self.prior, hyperparameters.coefficients, self.member_squares / self.noise, self.shift, self.class_index, generator, draw_count, self.working_bytes
+        )
+
+
+def product_draws(
+    prior: ScaleMixturePrior, coefficients: F64Array, omega: F64Array, shift: F64Array, class_index: I64Array,
+    generator: np.random.Generator, draw_count: int, working_bytes: int,
+) -> F64Array:
+    """``MeanFieldFixedPoints.draws`` for any product q given by its pseudo-likelihoods (omega, shift) per member:
+    the dense route's and the streamed full-data route's are one function."""
+    count = int(draw_count)
+    log_density = class_log_density(prior, coefficients)
+    scales = log_scale(prior, coefficients)
+    draws = np.empty((prior.variant_count, count))
+    for class_position in range(log_density.shape[0]):
+        rows = np.flatnonzero(class_index == class_position)
+        if rows.size == 0:
+            continue
+        for piece in _row_chunks(rows, prior.grid_size + count, working_bytes):
+            terms = _components(log_density[class_position], scales[piece], prior.log_variance_grid, omega[piece], shift[piece])
+            uniform = generator.random((piece.shape[0], count))
+            nodes = np.empty((piece.shape[0], count), dtype=np.int64)
+            _sample_nodes(np.ascontiguousarray(terms.responsibility), uniform, nodes)
+            conditional = np.take_along_axis(terms.conditional_variance, nodes, axis=1)
+            draws[piece] = shift[piece][:, None] * conditional + np.sqrt(conditional) * generator.standard_normal(conditional.shape)
+    return draws

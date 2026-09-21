@@ -1446,7 +1446,7 @@ class GaussianPosterior:
     # ``local_response(left, right, diagonal, weight)``: V -> M^-1 V for the same matrix with Sigma replaced by its
     # block-local part (read-free), the preconditioner of the Krylov route (``krylov_recycle``, lane speed-recycle).
     local_response: Callable[[F64Array, F64Array, F64Array, F64Array], Callable[[F64Array], F64Array]] | None = None
-    cavity_response: Callable[[F64Array, F64Array], tuple[F64Array, F64Array]] | None = None
+    cavity_response: Callable[[F64Array, F64Array, float], tuple[F64Array, F64Array]] | None = None
     # Whether the responses are exact to rounding whatever tolerance they are asked for (a dense factor, or
     # independent effects): B's response is then charged its rounding, not the request.
     exact: bool = False
@@ -1775,7 +1775,7 @@ def _total_curvature_columns(
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     if posterior.cavity_response is not None:
         # The fixed point's own cavity response (a mean-field fixed point: ``mean_field``), exact by construction.
-        shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z)
+        shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z, relative_tolerance)
         if achieved is not None:
             achieved.append(_EPSILON if posterior.exact else relative_tolerance)
         return _total_from_response(prior, fixed_cavity, derivatives, directions, shift_step, precision_step)
