@@ -54,6 +54,7 @@ from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
 from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
+from sv_pgs.lasso_path import cross_validated_lasso
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
     _host,
@@ -1695,26 +1696,14 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
 
 
-LASSO_FOLDS = 10
-"""Cross-validation folds of the lasso start: cv.glmnet's default (Friedman, Hastie and Tibshirani 2010), the one the
-mr.ash workflow's lasso start uses."""
-
-
 def lasso_start(statistics: DenseStatistics, seed: int) -> F64Array:
-    """q's means at the lasso on the projected standardized design, its penalty at the 10-fold cross-validated minimum
-    (folds drawn from ``seed``): a data-derived start for the first mean-field call beside zero, kept only where its
+    """q's means at the lasso on the projected standardized design, its penalty at the cross-validated minimum
+    (``lasso_path.cross_validated_lasso``, folds drawn from ``seed``): a data-derived start for the first mean-field call beside zero, kept only where its
     fixed point's ELBO is the higher. On the bench-real genes where SV-PGS trailed mr.ash (whose workflow starts at the
     CV lasso), it raised both the ELBO and the held-out r2 (ENSG00000138468.16: ELBO -341.6 -> -322.5, AFR r2 0.13 -> 0.45,
     mr.ash 0.41; ENSG00000187605.16: 88.5 -> 99.9, 0.17 -> 0.34, mr.ash 0.33) [real], and lost the ELBO where it
     predicted worse (ENSG00000100225.18)."""
-    from sklearn.linear_model import LassoCV
-    from sklearn.model_selection import KFold
-
-    folds = KFold(n_splits=LASSO_FOLDS, shuffle=True, random_state=int(np.random.SeedSequence(int(seed)).generate_state(1)[0]))
-    fit = LassoCV(cv=folds, fit_intercept=False, n_jobs=1).fit(
-        np.asarray(statistics.projected, dtype=np.float64), np.asarray(statistics.projected_target, dtype=np.float64),
-    )
-    return np.asarray(fit.coef_, dtype=np.float64)
+    return cross_validated_lasso(statistics.projected, statistics.projected_target, seed)
 
 
 def fit_small_n(
