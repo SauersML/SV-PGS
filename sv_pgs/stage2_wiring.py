@@ -29,7 +29,7 @@ from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
 from sv_pgs.imputation_reliability import checked_log_reliability
-from sv_pgs.annotation_design import annotation_design, column_variance_annotation
+from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -278,7 +278,9 @@ def _fit_one(
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
-    offsets = log_reliability[member_rows]
+    # The per-unit baseline (one prior per unit of the stored value) plus each record's log reliability; the free
+    # column-variance coefficient moves it toward standardized effects where the data say so (annotation_design).
+    offsets = log_reliability[member_rows] + per_unit_offset(np.asarray(statistics.scales))
     _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
     table = store.variant_table
     member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()}

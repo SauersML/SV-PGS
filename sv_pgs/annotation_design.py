@@ -46,6 +46,18 @@ def column_variance_annotation(scales: np.ndarray) -> dict[str, np.ndarray]:
         return {COLUMN_VARIANCE: np.where(scales > 0.0, 2.0 * np.log(np.where(scales > 0.0, scales, 1.0)), np.nan)}
 
 
+def per_unit_offset(scales: np.ndarray) -> F64Array:
+    """Each member's log prior-variance baseline at the per-unit architecture: 2 log s_j less its largest (so every
+    offset stays at or below 0, as a reliability's does), one prior per unit of the stored value. The prior starts
+    there and the column-variance annotation's free coefficient moves it toward one prior on standardized effects
+    where the data say so: the empirical Bayes searches locally, and on the bench-real genes where SV-PGS trailed
+    mr.ash most the per-unit baseline held a higher training ELBO the standardized start never reached."""
+    scales = np.asarray(scales, dtype=np.float64)
+    positive = scales > 0.0
+    log_variance = np.where(positive, 2.0 * np.log(np.where(positive, scales, 1.0)), 0.0)
+    return np.where(positive, log_variance - float(np.max(log_variance[positive])), 0.0) if positive.any() else np.zeros_like(scales)
+
+
 @dataclass(frozen=True)
 class AnnotationDesign:
     """The prior's annotation inputs: the design [variants, columns], its groups and a name per column."""
