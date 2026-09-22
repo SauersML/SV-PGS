@@ -538,7 +538,7 @@ class MeanFieldFixedPoints:
         (model_hyperparameters,) = hyperparameters
         self.profile["fixed_point_calls"] += 1
         entry = self._snapshot()
-        solved: list[tuple[float, FixedPoint, dict]] = []
+        solved: list[tuple[float, FixedPoint, dict, dict]] = []
         budget: int | None = None
         for start in (entry, self._cold) if self.profile["fixed_point_calls"] > 1 else (entry, *self._first_starts):
             self._restore(start)
@@ -555,11 +555,17 @@ class MeanFieldFixedPoints:
                 continue
             if budget is None:
                 budget = self.profile["carried_sweeps"] = self.profile["sweeps"] - before
-            solved.append((float(self.profile["elbo"]), point, self._snapshot()))
+            solved.append((float(self.profile["elbo"]), point, self._snapshot(), start))
         if not solved:
             self._restore(entry)
             return [None]
-        value, point, state = max(solved, key=lambda item: item[0])
+        value, point, state, start = max(solved, key=lambda item: item[0])
+        if self.profile["fixed_point_calls"] == 1 and start is not entry:
+            # A data start's basin is the higher ELBO's: every later call's cold solve starts there, not at zero. As a
+            # first-call start only, the carried state left it as the weights moved (ENSG00000138468.16 [real,
+            # loso/AFR]: ELBO -341.1 and r2 0.150 against -322.5 and 0.447 with the lasso as every call's cold start).
+            self._cold = start
+            self.profile["cold_start"] = "data"
         self._restore(state)
         if value > self.best[0]:
             self.best = (value, model_hyperparameters, state)
