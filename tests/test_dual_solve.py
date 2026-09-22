@@ -1005,3 +1005,26 @@ def test_information_products_stay_within_their_bound_after_a_loose_refresh() ->
     rounding = genotypes.shape[0] * conditioning * EPS * np.abs(expected).max()
     allowed = np.linalg.norm(design, 2) * relative * np.linalg.norm(image, axis=0) + rounding
     assert np.all(np.linalg.norm(back_products - expected, axis=0) <= allowed)
+
+
+def test_an_indefinite_resolved_core_is_solved_exactly_on_the_linear_response_route() -> None:
+    # A resolved core with a negative site: refused as a Gaussian's, factored as a linear response's (core = F J F'),
+    # whose solve is core's own inverse and whose bound reads min |lambda|.
+    rng = np.random.default_rng(3)
+    design = rng.normal(size=(40, 4))
+    duals = 0.1 * design
+    precision = np.array([-3.0, 0.5, 1.0, -0.2])
+    residual = np.zeros_like(design)
+    with pytest.raises(np.linalg.LinAlgError):
+        dual_solve.resolved_block(np, design, precision, duals, residual)
+    block = dual_solve.resolved_block(np, design, precision, duals, residual, indefinite=True)
+    assert block.indefinite
+    right = rng.normal(size=(4, 3))
+    np.testing.assert_allclose(dual_solve._core_solve(np, block, right), np.linalg.solve(block.core, right), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(block.factor @ np.diag(block.signs) @ block.factor.T, block.core, rtol=1e-12, atol=1e-12)
+    lowest, _residual_norm, delta = dual_solve.core_bounds(np, block)
+    assert lowest == pytest.approx(float(np.min(np.abs(np.linalg.eigvalsh(block.core)))), rel=1e-12)
+    assert delta == 0.0
+    # A PD core keeps its Cholesky factor and no signs.
+    positive = dual_solve.resolved_block(np, design, np.abs(precision) + 1.0, duals, residual, indefinite=True)
+    assert positive.signs is None and not positive.indefinite
