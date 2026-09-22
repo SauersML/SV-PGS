@@ -182,8 +182,11 @@ class HeldOut:
 
         The harness writes <tag>.raw_splits.json beside the arrays (since e448b16). A run from before that file
         records the same list in its <tag>.run.json ("splits"), and a merged run records its parts' lists in the
-        order merge_splits stacked them. A layout with neither is refused by name, and so is one whose list does not
-        have one entry per column: an array's split order is never guessed from a file name or a sort."""
+        order merge_splits stacked them. A layout with neither and no split subset (compete's runner through the
+        pinned harness e71876e, which wrote the arrays in the order of ``[name for name in dataset.splits if
+        name.startswith(design + "/")]``, its ``split_names``) takes that order, the writer's own rule and not a
+        sort, when it has one entry per column; a subset or a merge of that era cannot be read, and is refused by
+        name, as is any list without one entry per column."""
         order = None
         raw_splits = directory / f"{tag}.raw_splits.json"
         record_path = directory / f"{tag}.run.json"
@@ -192,6 +195,11 @@ class HeldOut:
         elif record_path.exists():
             record = json.loads(record_path.read_text())
             order = record.get("splits") or ([name for part in record["parts"] for name in part["splits"]] if "parts" in record else None)
+        else:
+            design = directory.name
+            writer_order = [name for name in self.tests if name.startswith(design + "/")]
+            if len(writer_order) == columns:
+                order = writer_order
         if order is None:
             raise ValueError(f"{directory}: {tag}'s raw scores have no split order. Write the splits, in the array's column order, "
                              f"to {raw_splits.name}; the run's own {record_path.name} lists them under 'splits'.")

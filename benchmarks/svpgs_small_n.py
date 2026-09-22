@@ -82,6 +82,10 @@ def classes_for_arm(variants: Any, arm: str) -> np.ndarray:
     return _METHOD._length_class(reference_length, reference_length + signed_length_change(variants))
 
 
+# Recorded in every bench-real run record (``harness.run``: ``method_assumptions``).
+ASSUMPTIONS = {"measurement": "every record measured exactly: log_variance_offset=None, log r^2 = 0 for all columns"}
+
+
 def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):

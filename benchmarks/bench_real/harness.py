@@ -472,11 +472,16 @@ def sv_coefficients(train: TrainData, predictor, gene_id: str, split_name: str, 
 
 def load_method(spec: str):
     """spec is '<path/to/file.py>:<callable>'."""
-    path, name = spec.rsplit(":", 1)
+    return getattr(load_method_module(spec), spec.rsplit(":", 1)[1])
+
+
+def load_method_module(spec: str):
+    """The module of a '<path/to/file.py>:<callable>' spec."""
+    path, _name = spec.rsplit(":", 1)
     module_spec = importlib.util.spec_from_file_location(pathlib.Path(path).stem, path)
     module = importlib.util.module_from_spec(module_spec)
     module_spec.loader.exec_module(module)
-    return getattr(module, name)
+    return module
 
 
 _WORKER = {}
@@ -900,6 +905,9 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         "splits_sha256": (dataset.directory / "splits.sha256").read_text().strip()}
     record["run_id"] = run_identity(record)
     record["note"] = json.loads(pathlib.Path(note).read_text()) if note is not None else None
+    # What the method's module declares it assumes of the data (``ASSUMPTIONS``: bench-real's SV-PGS adapters take
+    # every record as measured exactly), so no reader takes the record for a measurement-aware evaluation.
+    record["method_assumptions"] = getattr(load_method_module(method_spec), "ASSUMPTIONS", None)
     manifest = out / f"{tag}.run.json"
     if manifest.exists():
         previous = json.loads(manifest.read_text()).get("run_id")

@@ -447,6 +447,11 @@ def bench_real_covariates(train: Any) -> np.ndarray:
     return np.column_stack([np.ones(samples), np.asarray(covariates, dtype=np.float64)])
 
 
+# Recorded in every bench-real run record (``harness.run``: ``method_assumptions``); the bench-sim route reads the
+# store's quality column instead (``bench_sim_annotations``).
+ASSUMPTIONS = {"measurement": "bench-real arms: every record measured exactly (log_variance_offset=None, log r^2 = 0 for all columns)"}
+
+
 def fit_expression(train: Any) -> BenchRealPredictor:
     """bench-real: fit SV-PGS on one gene's cis window (harness.py)."""
     return _fit_expression(train, "full", "training")

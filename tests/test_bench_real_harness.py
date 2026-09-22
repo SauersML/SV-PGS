@@ -212,6 +212,8 @@ def test_run_end_to_end_on_a_tiny_synthetic_dataset(tmp_path):
                 note=tmp_path / "note.json")
     out = tmp_path / "results" / "top_variant" / "loso"
     record = json.loads((out / "chr1.run.json").read_text())
+    # The method module's declared assumptions travel with the record (None for a module that declares none).
+    assert "method_assumptions" in record and record["method_assumptions"] is None
     assert record["genes"] == 1 and record["gene_prefix"] is None and record["splits_sha256"] == "synthetic"
     assert record["gene_list_sha256"] == hashlib.sha256((tmp_path / "screened.tsv").read_bytes()).hexdigest()
     assert record["note"] == {"label": "arm X", "tests": "green"}
@@ -1000,6 +1002,12 @@ def test_raw_scores_score_from_the_run_record_when_the_split_file_is_missing(tmp
     with pytest.raises(ValueError, match="names 1 splits for 2 raw-score columns"):
         data.predictions(out, "chr", "snv", masked=False)
     (out / "chr.run.json").unlink()
+    # Neither file: the pinned harness's own rule (the design's splits in the dataset's order) when it has one entry
+    # per column, else refused by name.
+    assert list(data.tests)[:2] == order or set(list(data.tests)[:2]) == set(order)
+    if [name for name in data.tests if name.startswith("loso/")] == order:
+        assert np.array_equal(data.predictions(out, "chr", "snv", masked=False), expected, equal_nan=True)
+    np.save(out / "chr.snv.raw_scores.npy", raw[:, :1])
     with pytest.raises(ValueError, match="raw scores have no split order"):
         data.predictions(out, "chr", "snv", masked=False)
 
