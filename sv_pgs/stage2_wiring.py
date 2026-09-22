@@ -165,6 +165,7 @@ class _CovariateFit:
     noise: float
     degrees: int
     explained: bool
+    gram_pseudo_inverse: F64Array
 
 
 def _covariate_least_squares(covariates: F64Array, targets: F64Array) -> _CovariateFit:
@@ -174,6 +175,7 @@ def _covariate_least_squares(covariates: F64Array, targets: F64Array) -> _Covari
     degrees = int(targets.shape[0] - rank)
     resolution = max(covariates.shape) * _EPSILON * float(np.linalg.norm(targets))
     return _CovariateFit(
+        gram_pseudo_inverse=np.linalg.pinv(covariates.T @ covariates),
         alpha=alpha,
         noise=residual_sum / degrees if degrees > 0 else np.inf,
         degrees=degrees,
@@ -201,6 +203,11 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
         alpha=covariate_fit.alpha,
         trait_type=TraitType.QUANTITATIVE,
         predictive_intercept_shift=0.0,
+        # No genetic draw moves the covariates: every draw's conditional mean is alpha, and their covariance is the
+        # least squares' own, sigma^2 (C'C)^+.
+        covariate_draws=np.repeat(covariate_fit.alpha[:, None], draw_count, axis=1),
+        covariate_covariance=covariate_fit.noise * covariate_fit.gram_pseudo_inverse if np.isfinite(covariate_fit.noise) else np.zeros((covariate_fit.alpha.size,) * 2),
+        gaussian_posterior=True,
     )
     certificate = FitCertificate(
         remaining_gain=np.zeros(1),
@@ -280,7 +287,9 @@ def _fit_one(
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
     # The per-unit baseline (one prior per unit of the stored value) plus each record's log reliability; the free
     # column-variance coefficient moves it toward standardized effects where the data say so (annotation_design).
-    offsets = log_reliability[member_rows] + per_unit_offset(np.asarray(statistics.scales))
+    # Each member's spread in its stored value's units: code sd over codes_per_unit (a copy number's differ).
+    value_scales = np.asarray(statistics.scales) / np.asarray(store.variant_table.codes_per_unit, dtype=np.float64)[member_rows]
+    offsets = log_reliability[member_rows] + per_unit_offset(value_scales)
     _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
     table = store.variant_table
     # No annotation group enters until the outer search learns their weights: each added smoothing weight goes through
@@ -387,7 +396,11 @@ def fit_models(
         )
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fit.scoring.alpha
-        scoring.append(dataclasses.replace(fit.scoring, alpha=alpha))
+        covariate_draws = np.zeros((adjusted.size, fit.scoring.draw_count))
+        covariate_draws[adjusted] = fit.scoring.covariate_draws
+        covariate_covariance = np.zeros((adjusted.size, adjusted.size))
+        covariate_covariance[np.ix_(adjusted, adjusted)] = fit.scoring.covariate_covariance
+        scoring.append(dataclasses.replace(fit.scoring, alpha=alpha, covariate_draws=covariate_draws, covariate_covariance=covariate_covariance))
         noise.append(fit.noise)
         hyperparameters.append(fit.hyperparameters)
         certificates.append(fit.certificate)

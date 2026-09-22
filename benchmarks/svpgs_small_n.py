@@ -27,7 +27,6 @@ from sv_pgs.compute_budget import detect_compute_budget
 
 from benchmarks.seeds import seed_from_name
 from sv_pgs.config import VariantClass
-from sv_pgs.dosage_store import CODES_PER_DOSAGE
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.fit_model import DRAW_COUNT
 from sv_pgs.small_n import fit_small_n
@@ -41,12 +40,13 @@ _SPEC.loader.exec_module(_METHOD)
 class SmallNPredictor:
     scoring: ScoringModel
     profile: dict
+    codes_per_unit: np.ndarray
 
     def predict(self, genotypes: np.ndarray, covariates: np.ndarray | None = None) -> np.ndarray:
         """The genetic score plus the intercept, in closed form from dosages: x_j = (127 d_j - 127 - mu_j) / sigma_j, and
         the fixed covariate effects when the harness passes the scored samples' covariates."""
         dosages = np.asarray(genotypes, dtype=np.float64)[:, self.scoring.store_rows]
-        standardized = (CODES_PER_DOSAGE * dosages - SIGNED_CODE_OFFSET - self.scoring.signed_means) / self.scoring.signed_scales
+        standardized = (self.codes_per_unit[self.scoring.store_rows] * dosages - SIGNED_CODE_OFFSET - self.scoring.signed_means) / self.scoring.signed_scales
         score = standardized @ self.scoring.coefficients + self.scoring.alpha[0]
         if covariates is not None and self.scoring.alpha.shape[0] > 1:
             score = score + np.asarray(covariates, dtype=np.float64) @ self.scoring.alpha[1:]
@@ -114,24 +114,23 @@ def _arm_annotations(variants: Any, arm: str) -> dict[str, np.ndarray] | None:
 
 def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
     genotypes = np.asarray(train.genotypes)
-    if not np.all(np.isin(genotypes, (0, 1, 2))):
-        raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
-    codes = genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE)
+    codes, units = _METHOD.bench_real_encoding(genotypes)
     fit = fit_small_n(
         codes=codes,
         # bench-real's fixed-effect covariates [1, C] (review-mathbugs C2), as svpgs_method's arms pass them.
         covariates=_METHOD.bench_real_covariates(train),
         target=np.asarray(train.phenotype, dtype=np.float64),
         variant_class=classes_for_arm(train.variants, arm),
-        log_variance_offset=None,
+        log_variance_offset=_METHOD.bench_real_log_reliability(train.variants),
         draw_count=DRAW_COUNT,
         working_bytes=_METHOD.one_core_budget().working_bytes,
         seed=seed_from_name(str(train.gene_id)),
         inference=inference,
         array_module=_device(),
         annotations=_arm_annotations(train.variants, arm),
+        codes_per_unit=units,
     )
-    return SmallNPredictor(scoring=fit.scoring, profile=fit.profile)
+    return SmallNPredictor(scoring=fit.scoring, profile=fit.profile, codes_per_unit=units)
 
 
 def _device() -> ModuleType | None:

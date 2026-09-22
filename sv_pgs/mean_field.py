@@ -824,7 +824,7 @@ class MeanFieldFixedPoints:
             moving = values != 0.0
             if np.any(moving & ~live):
                 return np.inf
-            return float(np.sum(np.square(values[live]) / variance[live]))
+            return float(np.sum(np.square(values[moving]) * location_precision[moving]))
 
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=True)
         # The solver's state at this point, so the outer loop can put it back before a trial (``FixedPoint.restore``).

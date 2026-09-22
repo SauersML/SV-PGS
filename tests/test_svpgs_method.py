@@ -163,10 +163,14 @@ class _SmallNStub:
         target = arguments["target"] - arguments["target"].mean()
         coefficients = standardized.T @ target / (target.shape[0] * live.shape[0])
         generator = np.random.default_rng(arguments["seed"])
+        alpha = np.linalg.lstsq(arguments["covariates"], arguments["target"], rcond=None)[0]
         scoring = ScoringModel(
             store_rows=live.astype(np.int64), signed_means=means, signed_scales=scales, coefficients=coefficients,
             posterior_draws=coefficients[:, None] + generator.normal(scale=np.abs(coefficients).mean(), size=(live.shape[0], 3)),
-            alpha=np.linalg.lstsq(arguments["covariates"], arguments["target"], rcond=None)[0], trait_type=TraitType.QUANTITATIVE,
+            alpha=alpha, trait_type=TraitType.QUANTITATIVE,
+            covariate_draws=np.repeat(alpha[:, None], 3, axis=1),
+            covariate_covariance=np.zeros((alpha.size, alpha.size)),
+            gaussian_posterior=True,
             predictive_intercept_shift=0.0,
         )
         return type("SmallNFit", (), {"scoring": scoring})()
@@ -241,12 +245,12 @@ def test_bench_real_predictions_are_the_fitted_scores_and_mask_svs_exactly(small
     np.testing.assert_allclose(predictor.predict(test) - predictor.predict(masked), sv_part, rtol=0.0, atol=bound)
 
 
-def test_bench_real_refuses_training_genotypes_that_are_not_allele_counts(small_n: _SmallNStub) -> None:
+def test_bench_real_accepts_fractional_dosages(small_n: _SmallNStub) -> None:
     train, _test = _bench_real_train(np.random.default_rng(6))
     train.genotypes[0, 0] = 0.5
-    with pytest.raises(ValueError, match="allele counts"):
-        svpgs_method.fit_expression(train)
-    assert small_n.calls == []
+    predictor = svpgs_method.fit_expression(train)
+    assert small_n.calls[0]["codes"][0, 0] == round(0.5 * CODES_PER_DOSAGE)
+    assert np.all(np.isfinite(predictor.predict(train.genotypes)))
 
 
 def test_each_bench_real_fit_gets_one_cores_share(monkeypatch: pytest.MonkeyPatch) -> None:

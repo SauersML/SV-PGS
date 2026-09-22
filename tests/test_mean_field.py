@@ -102,9 +102,16 @@ def test_every_sweep_raises_the_elbo_and_the_fixed_point_is_the_tilted_moments(t
     # The residual is r = y_P - Xp m, exactly, and p_eff = sum_j omega_j v_j.
     np.testing.assert_allclose(oracle.residual, statistics.projected_target - statistics.design.image(oracle.mean), rtol=1e-9, atol=1e-11)
     np.testing.assert_allclose(point.effective_effects, float(point.cavity.precision @ oracle.variance), rtol=1e-12)
-    # The prediction check's metric is q's own: sum_j d_j^2 / v_j.
+    # The mixture's component KL bounds a marginal location shift. Its precision
+    # exceeds 1 / Var(q), which would understate this movement.
     direction = np.random.default_rng(1).standard_normal(prior.variant_count)
-    np.testing.assert_allclose(point.precision_norm(direction), float(np.sum(np.square(direction) / oracle.variance)), rtol=1e-10)
+    density, scales = class_log_density(prior, start.coefficients), log_scale(prior, start.coefficients)
+    expected = 0.0
+    for label, rows in enumerate(prior.class_rows):
+        terms = _components(density[label], scales[rows], prior.log_variance_grid, point.cavity.precision[rows], point.cavity.shift[rows])
+        expected += float(np.sum(direction[rows] ** 2 * np.sum(terms.responsibility / terms.conditional_variance, axis=1)))
+    np.testing.assert_allclose(point.precision_norm(direction), expected, rtol=1e-10)
+    assert expected >= np.sum(direction ** 2 / oracle.variance)
 
 
 def test_the_response_solves_a_symmetric_indefinite_system_exactly():

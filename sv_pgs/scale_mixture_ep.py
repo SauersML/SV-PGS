@@ -988,6 +988,9 @@ def _kernel_chunks(
     ):
         yield from held[6]
         return
+    if cache is not None:
+        cache.pop("rows", None)
+    held = None
     chunks = [list(_row_chunks(class_rows, prior.grid_size, working_bytes)) for class_rows in prior.class_rows]
     xp = _DEVICE.get()
 
@@ -998,13 +1001,15 @@ def _kernel_chunks(
             xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]), xp.asarray(cavity.shift[rows])
         )
 
-    if all(len(pieces) <= 1 for pieces in chunks):
+    # Decide before allocating: even one chunk per class can exceed the budget when several classes are live together.
+    # Reserve a second copy for the pass.
+    held_bytes = _HELD_ARRAYS_PER_ROW_SET * prior.grid_size * scales.dtype.itemsize * sum(rows.size for rows in prior.class_rows)
+    key_bytes = scales.nbytes + cavity.precision.nbytes + cavity.shift.nbytes
+    if cache is not None and all(len(pieces) <= 1 for pieces in chunks) and 2 * held_bytes + key_bytes <= working_bytes:
         formed = [(class_position, rows, form(rows)) for class_position, pieces in enumerate(chunks) for rows in pieces]
-        held_bytes = _HELD_ARRAYS_PER_ROW_SET * sum(kernel_rows.kernel.nbytes for _class, _rows, kernel_rows in formed)
-        if cache is not None and 2 * held_bytes <= working_bytes:
-            cache["rows"] = (
-                prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
-            )
+        cache["rows"] = (
+            prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
+        )
         yield from formed
         return
     for class_position, pieces in enumerate(chunks):

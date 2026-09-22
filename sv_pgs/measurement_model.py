@@ -207,12 +207,15 @@ def fit_calibration_curve(moments: CalibrationMoments, strata: NDArray, design: 
     energy = counts * moments.dosage_variance
     kept, betas, gammas = [], [], []
     for stratum in np.unique(labels):
-        members = labels == stratum
+        members = (labels == stratum) & (energy > 0.0)
         if not energy[members].sum() > 0.0:
             continue
-        gram = rows[members].T @ (energy[members, None] * rows[members])
-        betas.append(np.linalg.lstsq(gram, rows[members].T @ (counts[members] * moments.covariance[members]), rcond=None)[0])
-        gammas.append(np.linalg.lstsq(gram, rows[members].T @ (counts[members] * moments.truth_variance[members]), rcond=None)[0])
+        root_energy = np.sqrt(energy[members])
+        weighted_design = root_energy[:, None] * rows[members]
+        responses = counts[members, None] * np.column_stack([moments.covariance[members], moments.truth_variance[members]]) / root_energy[:, None]
+        coefficients = np.linalg.lstsq(weighted_design, responses, rcond=None)[0]
+        betas.append(coefficients[:, 0])
+        gammas.append(coefficients[:, 1])
         kept.append(stratum.item() if hasattr(stratum, "item") else stratum)
     width = rows.shape[1]
     return CalibrationCurve(tuple(kept), np.array(betas).reshape(-1, width), np.array(gammas).reshape(-1, width))

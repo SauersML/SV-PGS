@@ -51,7 +51,9 @@ non-Gaussian drawing law (the mean-field product's score is a sum of
 independent scale mixtures) the t_K interval is an approximation, not an
 exact coverage statement, for that law or for the posterior. The covariate
 coefficients have a flat prior and an O(1/n) posterior variance, which the
-predictive ignores.
+predictive ignores; the mixture posteriors' intervals use empirical draw quantiles, and
+the predictive carries the conditional covariate means for these same draws and the conditional covariate
+covariance, preserving their dependence.
 
 Binary models. The posterior predictive is
 
@@ -132,6 +134,9 @@ class ScoringModel:
     alpha: F64Array
     trait_type: TraitType
     predictive_intercept_shift: float
+    covariate_draws: F64Array
+    covariate_covariance: F64Array
+    gaussian_posterior: bool
 
     def __post_init__(self) -> None:
         rows = np.asarray(self.store_rows)
@@ -157,6 +162,10 @@ class ScoringModel:
         alpha = np.asarray(self.alpha)
         if alpha.ndim != 1 or alpha.size < 1 or alpha.dtype != np.float64 or not np.all(np.isfinite(alpha)):
             raise ValueError("alpha must be a finite float64 vector with the intercept first.")
+        if self.covariate_draws.shape != (alpha.size, draws.shape[1]) or not np.all(np.isfinite(self.covariate_draws)):
+            raise ValueError("covariate_draws must be finite [covariates, draws] conditional means paired with posterior_draws.")
+        if self.covariate_covariance.shape != (alpha.size, alpha.size) or not np.all(np.isfinite(self.covariate_covariance)):
+            raise ValueError("covariate_covariance must be finite [covariates, covariates].")
 
     @property
     def draw_count(self) -> int:
@@ -176,6 +185,9 @@ class ScoringModel:
         alpha: F64Array,
         trait_type: TraitType,
         predictive_intercept_shift: float,
+        covariate_draws: F64Array,
+        covariate_covariance: F64Array,
+        gaussian_posterior: bool,
     ) -> ScoringModel:
         """Expand a reduced-space fit to its active rows.
 
@@ -202,6 +214,9 @@ class ScoringModel:
             alpha=np.asarray(alpha, dtype=np.float64),
             trait_type=trait_type,
             predictive_intercept_shift=float(predictive_intercept_shift),
+            covariate_draws=np.asarray(covariate_draws, dtype=np.float64),
+            covariate_covariance=np.asarray(covariate_covariance, dtype=np.float64),
+            gaussian_posterior=gaussian_posterior,
         )
 
 
@@ -221,6 +236,7 @@ class ScoringPlan:
     mean_columns: tuple[int, ...]
     draw_columns: tuple[tuple[int, int], ...]
     row_runs: tuple[tuple[int, int, int], ...]
+    gaussian_posteriors: tuple[bool, ...]
 
     @property
     def model_count(self) -> int:
@@ -262,6 +278,7 @@ class ScoringPlan:
             mean_columns=tuple(mean_columns),
             draw_columns=tuple(draw_columns),
             row_runs=row_runs,
+            gaussian_posteriors=tuple(model.gaussian_posterior for model in models),
         )
 
     def read_ranges(self, block_rows: int) -> list[tuple[int, int, int]]:
@@ -286,17 +303,17 @@ class GeneticScores:
     means: F64Array
     variances: F64Array
     draw_counts: tuple[int, ...]
+    draws: tuple[F64Array, ...]
+    gaussian_posteriors: tuple[bool, ...]
 
     def credible_interval(self, coverage: float) -> tuple[F64Array, F64Array]:
-        """Central ``coverage`` interval of every sample's genetic value under the model's drawing law,
-        exact for any K where that law is Gaussian.
+        """Central interval: a Gaussian t pivot or empirical mixture quantiles.
 
         The mean score is exact and the K draws are independent draws of it, so K v_i / v is
         chi-square with K degrees of freedom and independent of G ~ N(g, v); (G - g) / sqrt(v_i) is
-        then Student-t with K degrees of freedom, and the interval uses its quantiles. Under a
-        non-Gaussian drawing law (the mean-field product's) G is not normal and the interval is an
-        approximation; it covers the posterior only where the drawing law is the posterior
-        (the module docstring).
+        then Student-t with K degrees of freedom. This identity applies only to
+        Gaussian posteriors. Mixture intervals use the retained draws and have
+        Monte Carlo error; no exact finite-K coverage is claimed for them.
         """
         if not 0.0 < coverage < 1.0:
             raise ValueError("coverage must lie strictly between 0 and 1.")
@@ -304,7 +321,11 @@ class GeneticScores:
         if np.any(counts == 0):
             raise ValueError("a model without posterior draws has no credible interval.")
         half_width = stats.t.isf(0.5 * (1.0 - coverage), counts)[None, :] * np.sqrt(self.variances)
-        return self.means - half_width, self.means + half_width
+        lower, upper = self.means - half_width, self.means + half_width
+        for model, gaussian in enumerate(self.gaussian_posteriors):
+            if not gaussian:
+                lower[:, model], upper[:, model] = np.quantile(self.draws[model], [0.5 * (1.0 - coverage), 0.5 * (1.0 + coverage)], axis=1)
+        return lower, upper
 
 
 def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str) -> int:
@@ -499,7 +520,8 @@ def score_genetic(
             deviations = accumulator[draw_start:draw_stop] - accumulator[plan.mean_columns[model_index]]
             variances[:, model_index] = np.mean(deviations * deviations, axis=0)
     draw_counts = tuple(draw_stop - draw_start for draw_start, draw_stop in plan.draw_columns)
-    return GeneticScores(means=means, variances=variances, draw_counts=draw_counts)
+    draws = tuple(accumulator[start:stop].T for start, stop in plan.draw_columns)
+    return GeneticScores(means=means, variances=variances, draw_counts=draw_counts, draws=draws, gaussian_posteriors=plan.gaussian_posteriors)
 
 
 def score_linear_predictor(

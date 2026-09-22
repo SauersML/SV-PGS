@@ -55,7 +55,7 @@ from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.krylov_recycle import local_response
-from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
+from sv_pgs.tie_members import TieGroups, _group_sum, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
 from sv_pgs.tie_map import _compact_identity_tie_map
 from sv_pgs.marginal_variances import (
     BlockCertificate,
@@ -147,8 +147,8 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     ties = TieGroups.from_tie_map(statistics.tie_map)
     weights = np.zeros(ties.group_count)
     np.add.at(weights, ties.group, np.exp(prior.log_variance_offset))
-    covariate_count = statistics.covariate_gram.shape[0]
-    fitted = statistics.covariate_target.T @ np.linalg.pinv(statistics.covariate_gram) @ statistics.covariate_target
+    covariate_count = statistics.covariate_rank
+    fitted = statistics.covariate_target.T @ statistics.covariate_gram_pseudo_inverse @ statistics.covariate_target
     target_square = np.diag(statistics.target_gram) - np.diag(fitted)
     score_square = np.zeros(target_square.shape[0])
     # Over the reduced columns (the groups), which the Grams index and the weights are summed to.
@@ -189,13 +189,19 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
 
 
 def covariate_residual_variance(targets: F64Array, training: F64Array, covariates: F64Array) -> F64Array:
-    """(M,): each model's residual variance after the covariates alone, over n - k degrees of freedom."""
+    """(M,): covariate-only residual variance, over n - rank(C) training directions."""
     noise = np.empty(int(targets.shape[1]))
     for model in range(noise.shape[0]):
         weights = training[:, model]
-        normal = covariates.T @ (weights[:, None] * covariates)
-        residual = weights * (targets[:, model] - covariates @ np.linalg.solve(normal, covariates.T @ (weights * targets[:, model])))
-        noise[model] = float(residual @ residual) / (float(weights.sum()) - covariates.shape[1])
+        selected = weights != 0.0
+        design = covariates[selected]
+        outcome = targets[selected, model]
+        coefficients, _, rank, _ = np.linalg.lstsq(design, outcome, rcond=None)
+        residual = outcome - design @ coefficients
+        degrees = int(selected.sum()) - rank
+        if degrees <= 0:
+            raise ValueError("residual variance requires training directions outside the covariate span.")
+        noise[model] = float(residual @ residual) / degrees
     return noise
 
 
@@ -423,6 +429,12 @@ class _FullDataFixedPoints:
         noise: F64Array,
     ) -> None:
         self.gaussian = gaussian
+        covariates = np.asarray(_host(gaussian.covariates))
+        training = np.asarray(_host(gaussian.training))
+        self.covariate_ranks = np.array([
+            np.linalg.matrix_rank(covariates[training[:, model] != 0.0]) if covariates.shape[1] else 0
+            for model in range(gaussian.model_count)
+        ], dtype=np.int64)
         self.generator = np.random.default_rng(seed)
         self.statistics = statistics
         self.prior = prior
@@ -633,7 +645,7 @@ class _FullDataFixedPoints:
             noise_variance(
                 residual_sum_of_squares=float(residual_sum_of_squares[model]),
                 sample_count=int(gaussian.training_counts[model]),
-                covariate_count=int(gaussian.covariates.shape[1]),
+                covariate_count=int(self.covariate_ranks[model]),
                 site_precision=self.site_precision[:, model],
                 posterior_variance=variances[:, model],
                 noise=float(self.noise[model]),
@@ -801,9 +813,8 @@ class _FullDataFixedPoints:
                 self.mean_move = np.where(rate < 1.0, 2.0 * fraction * fraction * upper / np.square(1.0 - rate), np.inf)
             draw_tolerance = np.full(model_count, 2.0 * budget)
             noise = self._noise(variances)
-            covariate_count = int(gaussian.covariates.shape[1])
             self.noise_gain = np.array([
-                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), covariate_count)
+                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), int(self.covariate_ranks[model]))
                 for model in range(model_count)
             ])
             if np.all(certified) and np.all(self.noise_gain <= tolerance):
@@ -1416,6 +1427,8 @@ def scoring_models(
         group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
         mean, _variance = member_moments(ties, fit.site_precision, fit.site_shift, group_mean, np.zeros_like(group_mean))
     models = []
+    loading = np.concatenate([statistics.ld.block(index).covariate_cross for index in range(statistics.ld.block_count)], axis=0).T
+    conditional_loading = statistics.covariate_gram_pseudo_inverse @ loading
     for model, trait_type in enumerate(trait_types):
         if fit.inference == "mean_field":
             from sv_pgs.mean_field import product_draws
@@ -1428,6 +1441,12 @@ def scoring_models(
             draws = member_draws(
                 ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
             )
+        # Each draw's move of the reduced columns' effects (the members' signed sums), on which the covariate
+        # coefficients' conditional means depend through the loading.
+        if fit.inference == "mean_field":
+            group_deviations = _group_sum(ties, ties.sign[:, None] * (draws - mean[:, model, None]))
+        else:
+            group_deviations = group_draws[:, model, :] - group_mean[:, model, None]
         models.append(ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
             signed_means=np.asarray(statistics.means, dtype=np.float64),
@@ -1439,5 +1458,9 @@ def scoring_models(
             alpha=alpha[:, model],
             trait_type=trait_type,
             predictive_intercept_shift=0.0,
+            covariate_draws=alpha[:, model, None] - conditional_loading @ group_deviations,
+            covariate_covariance=fit.noise_variance[model] * statistics.covariate_gram_pseudo_inverse,
+            # The EP route's draws are its Gaussian's; the mean-field route's are the product's scale mixtures.
+            gaussian_posterior=fit.inference != "mean_field",
         ))
     return models

@@ -359,19 +359,20 @@ class BenchRealPredictor:
     columns: np.ndarray
     centering: str
     input_columns: int
+    codes_per_unit: np.ndarray
 
     @property
     def coefficients(self) -> np.ndarray:
         """Each input column's effect on the genotype (0/1/2) scale, bench-real's ``sv_coefficients`` contract:
         127 beta_k / sigma_k summed over the model columns k read from it, and 0 for a column the fit left out."""
         effects = np.zeros(int(self.input_columns))
-        np.add.at(effects, self.columns, CODES_PER_DOSAGE * self.scoring.coefficients / self.scoring.signed_scales)
+        np.add.at(effects, self.columns, self.codes_per_unit[self.columns] * self.scoring.coefficients / self.scoring.signed_scales)
         return effects
 
     def predict(self, genotypes: np.ndarray, covariates: np.ndarray | None = None) -> np.ndarray:
         """The genetic score plus the intercept, in closed form from dosages."""
         dosages = np.asarray(genotypes, dtype=np.float64)[:, self.columns]
-        signed = CODES_PER_DOSAGE * dosages - SIGNED_CODE_OFFSET
+        signed = self.codes_per_unit[self.columns] * dosages - SIGNED_CODE_OFFSET
         centre = self.scoring.signed_means if self.centering == "training" else signed.mean(axis=0)
         standardized = (signed - centre) / self.scoring.signed_scales
         score = standardized @ self.scoring.coefficients + self.scoring.alpha[0]
@@ -448,27 +449,51 @@ def fit_expression_target_centered(train: Any) -> BenchRealPredictor:
     return _fit_expression(train, "full", "target")
 
 
+def bench_real_encoding(genotypes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize nonnegative dosages/CN with a training-only scale for every column.
+
+    Diploid columns use the store's 127 codes per dosage; larger copy-number
+    ranges use all 254 codes. Predictors retain these scales for held-out data.
+    """
+    values = np.asarray(genotypes, dtype=np.float64)
+    if values.ndim != 2 or not np.all(np.isfinite(values)) or np.any(values < 0.0):
+        raise ValueError("genotypes must be a finite nonnegative [samples, records] matrix.")
+    units = (2 * CODES_PER_DOSAGE) / np.maximum(2.0, values.max(axis=0))
+    return np.rint(values * units).astype(np.uint8), units
+
+
+def bench_real_log_reliability(variants: Any) -> np.ndarray | None:
+    """Use the harness's r², rejecting undefined measurements instead of inventing certainty."""
+    if variants.reliability is None:
+        return None
+    reliability = np.asarray(variants.reliability, dtype=np.float64)
+    if reliability.ndim != 1 or not np.all((reliability >= 0.0) & (reliability <= 1.0)):
+        raise ValueError("reliability must be a defined r² in [0, 1] per record.")
+    result = np.full(reliability.shape, -np.inf)
+    np.log(reliability, out=result, where=reliability > 0.0)
+    return result
+
+
 def _fit_expression(train: Any, arm: str, centering: str) -> BenchRealPredictor:
     """The small-n route (``sv_pgs.small_n``): n training samples against a cis window's columns, with exact dense
     algebra in the n x n kernel form."""
     genotypes = np.asarray(train.genotypes)
-    if not np.all(np.isin(genotypes, (0, 1, 2))):
-        raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
-    samples = genotypes.shape[0]
+    codes, units = bench_real_encoding(genotypes)
     fitted = fit_small_n(
-        codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
+        codes=codes,
         covariates=bench_real_covariates(train),
         target=np.asarray(train.phenotype, dtype=np.float64),
         variant_class=bench_real_classes_for_arm(train.variants, arm),
-        log_variance_offset=None,
+        log_variance_offset=bench_real_log_reliability(train.variants),
         draw_count=fit_model.DRAW_COUNT,
         working_bytes=one_core_budget().working_bytes,
         seed=_training_seed(genotypes, train.phenotype),
+        codes_per_unit=units,
     )
-    return BenchRealPredictor(scoring=fitted.scoring, columns=fitted.scoring.store_rows, centering=centering, input_columns=genotypes.shape[1])
+    return BenchRealPredictor(scoring=fitted.scoring, columns=fitted.scoring.store_rows, centering=centering, input_columns=genotypes.shape[1], codes_per_unit=units)
 
 
 def _training_seed(genotypes: np.ndarray, phenotype: np.ndarray) -> int:
     """The fit's seed from its training data, so the same training set always gives the same model."""
-    digest = hashlib.sha256(np.ascontiguousarray(genotypes, dtype=np.uint8).tobytes() + np.asarray(phenotype, dtype="<f8").tobytes()).digest()
+    digest = hashlib.sha256(np.ascontiguousarray(genotypes, dtype="<f8").tobytes() + np.asarray(phenotype, dtype="<f8").tobytes()).digest()
     return int.from_bytes(digest[:8], "big")
