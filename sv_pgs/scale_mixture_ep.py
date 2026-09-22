@@ -933,10 +933,11 @@ def _device_inputs(prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity) -
     held = None if cache is None else cache.get("device_inputs")
     if held is not None and held[0] is prior.class_rows and np.array_equal(held[1], scales) and held[2] is cavity:
         return held[3]
-    design = None if held is None or held[0] is not prior.class_rows else held[3][4]
-    if design is None:
-        design = xp.asarray(prior.scale_design)
-    formed = (prior.class_rows, xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift), design)
+    if held is not None and held[0] is prior.class_rows:
+        class_rows, design = held[3][0], held[3][4]
+    else:
+        class_rows, design = [xp.asarray(np.asarray(rows, dtype=np.int64)) for rows in prior.class_rows], xp.asarray(prior.scale_design)
+    formed = (class_rows, xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift), design)
     if cache is not None:
         cache["device_inputs"] = (prior.class_rows, scales.copy(), cavity, formed)
     return formed

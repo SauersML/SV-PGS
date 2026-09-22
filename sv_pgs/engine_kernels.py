@@ -338,14 +338,21 @@ def objective_statistics(
     improper = cupy.zeros(1, dtype=cupy.int32)
     density = np.exp(log_density)
     for class_position, all_rows in enumerate(class_rows):
-        # Host rows index host inputs (a direct call) and device inputs alike (CuPy takes a host index array).
-        all_rows = np.asarray(all_rows.get() if hasattr(all_rows, "get") else all_rows)
+        # Device rows gather device inputs (a host index array is uploaded at every gather: 1.0 ms against 0.35 ms
+        # per call on ENSG00000254709.8 [real], lead/objprof.log); host inputs (a direct call) take host rows.
+        host_rows = np.asarray(all_rows.get() if hasattr(all_rows, "get") else all_rows)
+        device_rows = all_rows if hasattr(all_rows, "get") else cupy.asarray(host_rows)
+
+        def gather(values: Any, start: int, stop: int) -> Any:
+            rows = device_rows[start:stop] if hasattr(values, "get") else host_rows[start:stop]
+            return _column(cupy, values[rows], cupy.float64)
+
         class_log_density = _column(cupy, log_density[class_position], cupy.float64)
         class_density = _column(cupy, density[class_position], cupy.float64)
         deviation_sum, deviation_outer, cross = sums[class_position], outers[class_position], crosses[class_position]
-        for start in range(0, all_rows.shape[0], chunk):
-            rows = all_rows[start : start + chunk]
-            count = int(rows.shape[0])
+        for start in range(0, int(host_rows.shape[0]), chunk):
+            stop = min(start + chunk, int(host_rows.shape[0]))
+            count = stop - start
             batches = min(multiprocessors, count)
             width = -(-count // batches)
             padded_rows = batches * width
@@ -356,13 +363,11 @@ def objective_statistics(
             _launch(cupy, "objective_rows", padded_rows, (
                 np.int64(count), np.int64(padded_rows), np.int64(width), np.int32(node_count), class_log_density, class_density,
                 nodes, node_exp, *_range_arguments(),
-                _column(cupy, log_scale_rows[rows], cupy.float64),
-                _column(cupy, precision[rows], cupy.float64),
-                _column(cupy, shift[rows], cupy.float64),
+                gather(log_scale_rows, start, stop), gather(precision, start, stop), gather(shift, start, stop),
                 deviations, centred, log_normalizer, curvature, improper,
             ))
             padded = cupy.zeros((padded_rows, scale_size), dtype=cupy.float64)
-            padded[:count] = cupy.asarray(scale_design[rows], dtype=cupy.float64)
+            padded[:count] = gather(scale_design, start, stop)
             design = padded[:count]
             value += log_normalizer.sum()
             magnitude += cupy.abs(log_normalizer).sum()
