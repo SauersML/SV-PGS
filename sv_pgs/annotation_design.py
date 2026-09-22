@@ -8,9 +8,10 @@ hinges at its interior quartile knots, the same basis ``prior_design`` compiles)
 mixed-model one, the hinge coefficients' squared norm with the linear term free (Ruppert, Wand and Carroll,
 Semiparametric Regression, section 3.5), and a missing value is the column's mean with an indicator that says so.
 
-The design is class-centred (the class densities carry each class's location) and then rank-screened by the same
-deterministic Gram-Schmidt screen ``prior_design`` uses, so the prior's full-column-rank check holds: an annotation
-constant within every class, or a hinge two nearby knots make dependent, leaves no column. Reliability columns are
+The design is class-centred (the class densities carry each class's location) and rank-screened twice: the
+deterministic Gram-Schmidt screen ``prior_design`` uses, then the prior's own rank test by a column-pivoted QR, so
+an annotation constant within every class, or a hinge two nearby knots or a nearly-all-zero column make dependent,
+leaves no column. Reliability columns are
 offsets, not annotations, and the caller names them to leave out.
 """
 
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import numpy as np
+import scipy.linalg
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.prior_design import _continuous_spline_knots
@@ -143,4 +145,36 @@ def annotation_design(
         if members:
             groups.append(AnnotationGroup(columns=np.asarray(members, dtype=np.int64), penalty=np.diag(member_penalty)))
     design = np.column_stack(kept_columns) if kept_columns else np.zeros((classes.shape[0], 0))
-    return AnnotationDesign(design=design, groups=tuple(groups), names=tuple(kept_names))
+    return _full_rank(design, tuple(groups), tuple(kept_names), class_rows)
+
+
+def _full_rank(design: F64Array, groups: tuple[AnnotationGroup, ...], names: tuple[str, ...], class_rows) -> AnnotationDesign:
+    """The columns the prior's own rank test accepts (``scale_mixture_prior``: the class-centred Gram's least eigenvalue
+    above eps p max(its largest, 1)), by a column-pivoted QR of the class-centred design: a column is kept while its
+    pivot's squared diagonal passes that test, in the pivot order, and the groups are re-indexed over what remains."""
+    if design.shape[1] == 0:
+        return AnnotationDesign(design=design, groups=groups, names=names)
+    centred = np.column_stack([_class_centred(design[:, column], class_rows) for column in range(design.shape[1])])
+    _q, triangle, pivots = scipy.linalg.qr(centred, mode="economic", pivoting=True)
+    squares = np.square(np.abs(np.diag(triangle)))
+    threshold = _EPSILON * centred.shape[0] * max(float(squares[0]), 1.0)
+    passing = np.flatnonzero(squares <= threshold)
+    order = list(pivots[: passing[0]] if passing.size else pivots)
+    # The QR diagonal bounds the singular values only up to the column count; the prior's exact test decides.
+    while order:
+        gram = centred[:, order].T @ centred[:, order]
+        eigenvalues = np.linalg.eigvalsh(gram)
+        if eigenvalues[0] > _EPSILON * centred.shape[0] * max(float(eigenvalues[-1]), 1.0):
+            break
+        order.pop()
+    kept = np.sort(np.asarray(order, dtype=np.int64))
+    position = {column: index for index, column in enumerate(kept)}
+    new_groups = []
+    for group in groups:
+        members = [index for index, column in enumerate(group.columns) if int(column) in position]
+        if members:
+            new_groups.append(AnnotationGroup(
+                columns=np.array([position[int(group.columns[index])] for index in members], dtype=np.int64),
+                penalty=np.asarray(group.penalty)[np.ix_(members, members)],
+            ))
+    return AnnotationDesign(design=design[:, kept], groups=tuple(new_groups), names=tuple(names[column] for column in kept))

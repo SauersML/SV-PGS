@@ -89,3 +89,20 @@ def test_a_group_with_no_penalized_column_is_free_and_has_no_smoothing_weight() 
     annotation_coordinates = prior.coefficient_size - result.design.shape[1] + np.arange(result.design.shape[1])
     # the free coefficient is in the penalty's null space
     assert np.linalg.matrix_rank(prior.null_basis[annotation_coordinates]) == result.design.shape[1]
+
+
+def test_a_nearly_dependent_hinge_is_dropped_by_the_priors_own_rank_test() -> None:
+    # A signed length change that is zero for almost every record: its hinge at a knot just above zero is the linear
+    # term on the handful of positive records, numerically dependent at the prior's tolerance.
+    rng = np.random.default_rng(12)
+    count = 200_000
+    classes = (rng.random(count) < 0.1).astype(np.int64)
+    change = np.where((classes == 1) & (rng.random(count) < 0.02), rng.integers(1, 3, count).astype(np.float64), 0.0)
+    result = annotation_design({"len_change": change, "gene": (rng.random(count) < 0.3).astype(np.float64)}, {}, class_index=classes)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 24)
+    scale_mixture_prior(
+        class_index=classes, log_variance_offset=np.zeros(count), annotation_design=result.design, annotation_groups=result.groups,
+        nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    covered = np.concatenate([group.columns for group in result.groups])
+    assert np.array_equal(np.sort(covered), np.arange(result.design.shape[1]))
