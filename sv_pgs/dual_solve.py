@@ -339,10 +339,6 @@ def _orthonormal_block(array_module: Any, values: Any) -> Any:
     return values @ (eigenvectors[:, resolvable] / array_module.sqrt(eigenvalues[resolvable]))
 
 
-def _cholesky_solve(array_module: Any, factor: Any, right: Any) -> Any:
-    return array_module.linalg.solve(factor.T, array_module.linalg.solve(factor, right))
-
-
 def column_squares(source: DualTileSource, models: DualModels, count: PassCount) -> Any:
     """||xt_k||^2 for every variant and model, one read: x_k'W x_k - ||F'(C'Wx_k)||^2, F F' = (C'WC)^+."""
     array_module = source.array_module
@@ -846,7 +842,13 @@ def split_draw_duals(
 @dataclass
 class ResolvedBlock:
     """One model's eliminated sites after a solve: Xt_L, Pi_L, Z_L = S_S^-1 Xt_L (computed), the exact
-    residuals R_L = Xt_L - S_S Z_L, and the computed core Pi_L + Xt_L'Z_L with its Cholesky factor."""
+    residuals R_L = Xt_L - S_S Z_L, and the computed core Pi_L + Xt_L'Z_L with a factor F and signs J, core = F J F'.
+
+    A positive definite core's F is its Cholesky factor and J = I. A mean-field route's core may be symmetric
+    indefinite (``resolved_block``): F = V |Lambda|^1/2 and J = sign(Lambda) from core = V Lambda V'. Every bound below
+    holds in the norm of |core| = F F' with lambda_min(core_hat) read as min |lambda|: with core_hat + Delta =
+    F (J + E) F', E = F^-1 Delta F^-T, J orthogonal, ||(J + E)^-1|| <= 1 / (1 - ||E||) and
+    ||(J + E)^-1 - J^-1|| <= ||E|| / (1 - ||E||), the PD case's own two facts."""
 
     design: Any
     precision: Any
@@ -854,16 +856,43 @@ class ResolvedBlock:
     residual: Any
     core: Any
     factor: Any
+    signs: Any = None
+
+    @property
+    def indefinite(self) -> bool:
+        return self.signs is not None and bool(np.any(_host(self.signs) < 0.0))
 
 
-def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, residual: Any) -> ResolvedBlock:
-    """The core of a model's resolved sites; LinAlgError when it, hence the global precision, is not PD."""
+def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, residual: Any, indefinite: bool = False) -> ResolvedBlock:
+    """The core of a model's resolved sites; LinAlgError when it, hence the global precision, is not PD (the bulk S_S
+    is, so the core carries the global precision's inertia, Sylvester). With ``indefinite`` (a linear response's
+    precision, which the mean-field route solves with and never draws from) a nonsingular symmetric core is factored
+    by its eigendecomposition instead; LinAlgError when it is singular to float64 (min |lambda| at or below
+    eps |L| max |lambda|)."""
     core = array_module.diag(precision) + design.T @ duals
     core = 0.5 * (core + core.T)
-    factor = array_module.linalg.cholesky(core)
-    if not bool(array_module.all(array_module.isfinite(factor))):
+    try:
+        factor = array_module.linalg.cholesky(core)
+        positive = bool(array_module.all(array_module.isfinite(factor)))
+    except np.linalg.LinAlgError:
+        positive = False
+    if positive:
+        return ResolvedBlock(design, precision, duals, residual, core, factor)
+    if not indefinite:
         raise np.linalg.LinAlgError("the resolved sites' core is not positive definite: the global precision is not.")
-    return ResolvedBlock(design, precision, duals, residual, core, factor)
+    values, vectors = array_module.linalg.eigh(core)
+    magnitude = array_module.abs(values)
+    if not float(array_module.min(magnitude)) > np.finfo(np.float64).eps * core.shape[0] * float(array_module.max(magnitude)):
+        raise np.linalg.LinAlgError("the resolved sites' core is singular: the linear response has no solution.")
+    return ResolvedBlock(design, precision, duals, residual, core, vectors * array_module.sqrt(magnitude)[None, :], array_module.sign(values))
+
+
+def _core_solve(array_module: Any, block: ResolvedBlock, right: Any) -> Any:
+    """core^-1 right = F^-T J F^-1 right (J = I for a PD core, its Cholesky solve)."""
+    whitened = array_module.linalg.solve(block.factor, right)
+    if block.signs is not None:
+        whitened = block.signs.reshape((-1,) + (1,) * (whitened.ndim - 1)) * whitened
+    return array_module.linalg.solve(block.factor.T, whitened)
 
 
 def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, float]:
@@ -872,7 +901,9 @@ def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, 
     With E = Z_L - Z_hat = S_S^-1 R_L, core - core_hat = sym(Z_hat'R_L) + R_L'S_S^-1 R_L, so
     delta = ||L^-1 sym(Z_hat'R_L) L^-T|| + ||R_L||^2 / lambda_min(core_hat) (S_S >= I); all norms spectral.
     """
-    lowest = float(array_module.linalg.eigvalsh(block.core)[0])
+    # lambda_min(core_hat), or min |lambda| for an indefinite core (ResolvedBlock).
+    eigenvalues = array_module.linalg.eigvalsh(block.core)
+    lowest = float(array_module.min(array_module.abs(eigenvalues))) if block.signs is not None else float(eigenvalues[0])
     residual_gram = block.residual.T @ block.residual
     residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
     coupling = block.duals.T @ block.residual
@@ -918,7 +949,7 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     - Z_L'r_S is off from Z_hat'r_S by R_L'S_S^-1 r_S, at most ||R_L|| ||r_S|| (S_S >= I).
     All norms are spectral. The certificate is infinite when delta is not below 1.
     """
-    resolved_mean = _cholesky_solve(array_module, block.factor, shift + block.design.T @ duals)
+    resolved_mean = _core_solve(array_module, block, shift + block.design.T @ duals)
     mean_duals = duals - block.duals @ resolved_mean
     bulk_residual = residual - block.residual @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
@@ -940,7 +971,7 @@ def exact_resolved_certificate(array_module: Any, block: ResolvedBlock, shift: A
     vanishes, so the certificate is sqrt(||r_b||^2 + ||L^-1 (r_L + Z_hat'r_b)||^2). What split_columns adds
     above it is Z_L's.
     """
-    resolved_mean = _cholesky_solve(array_module, block.factor, shift + block.design.T @ duals)
+    resolved_mean = _core_solve(array_module, block, shift + block.design.T @ duals)
     mean_duals = duals - block.duals @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
     projected = array_module.linalg.solve(block.factor, stationarity + block.duals.T @ residual)
@@ -1120,17 +1151,27 @@ class DualGaussian:
         self._resolved: dict = {}
         self.bulk_solves: list = []
         self._state: dict = {}
+        # Whether a resolved core may be symmetric indefinite (``resolved_block``): set by each ``iterate``.
+        self.indefinite_core = False
 
     def _models(self, noise_variance: np.ndarray, variances: Any) -> DualModels:
         weights = self.training / self.array_module.asarray(noise_variance)[None, :]
         return DualModels(weights, variances, self.covariates, self.array_module)
 
-    def iterate(self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float) -> DualCertificate:
+    def iterate(
+        self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float,
+        indefinite_core: bool = False,
+    ) -> DualCertificate:
         """The exact mean at the sites, certified to ||mu_hat - mu||_A <= error_bound per model.
 
         `probe_residual_ratio` is the accuracy the refresh quantities need (the probes and the Z_L
         columns solved to that share of their norm), from marginal_variances' certificate tolerance.
+        `indefinite_core` admits sites whose precision is a linear response's, symmetric and nonsingular but not
+        positive definite (the mean-field route's R = diag(1/v - omega) + Xp'Xp / sigma^2, whose tilted members'
+        variances may exceed 1 / omega): the solves stay exact and certified in |A|'s norm (``ResolvedBlock``), and
+        the Gaussian-only quantities (variances, draws) refuse.
         """
+        self.indefinite_core = bool(indefinite_core)
         array_module = self.array_module
         source = self.source
         precision = array_module.asarray(site_precision, dtype=array_module.float64)
@@ -1197,7 +1238,7 @@ class DualGaussian:
             resolved_means: dict[int, Any] = {}
             for position, model in enumerate(order):
                 columns = slice(int(offsets[position + 1]), int(offsets[position + 2]))
-                block = resolved_block(array_module, designs[model], resolved_sites.precision[model], result.solution[:, columns], residual[:, columns])
+                block = resolved_block(array_module, designs[model], resolved_sites.precision[model], result.solution[:, columns], residual[:, columns], self.indefinite_core)
                 resolved_mean, model_duals, model_certificate = split_columns(
                     array_module, block, resolved_sites.shift[model][:, None], result.solution[:, model : model + 1], residual[:, model : model + 1]
                 )
@@ -1276,7 +1317,7 @@ class DualGaussian:
             if model in order:
                 block = state["blocks"][model]
                 design = block.design
-                kernel = solved - block.duals @ _cholesky_solve(array_module, block.factor, design.T @ solved)
+                kernel = solved - block.duals @ _core_solve(array_module, block, design.T @ solved)
                 core = block.core
                 model_cross = WindowCross(positions=tuple(positions[model]), values=tuple(window_values[model]))
             self.bulk_solves.append(BulkSolve(
@@ -1341,7 +1382,7 @@ class DualGaussian:
             if block is not None:
                 coupling = block.duals.T @ image
                 shifted = coupling - values[resolved]
-                correction = _cholesky_solve(array_module, block.factor, shifted)
+                correction = _core_solve(array_module, block, shifted)
                 duals = duals - block.duals @ correction
                 error = error + resolved_correction_error(array_module, block, correction, shifted, image_norms)
             # the certificate's bound scales with ||u||, so a column with no bulk image asks nothing of it
@@ -1357,7 +1398,7 @@ class DualGaussian:
                 resolved_columns = array_module.full(int(block.design.shape[1]), model)
                 resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
                 refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="information-resolved")
-                state["blocks"][model] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+                state["blocks"][model] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual, self.indefinite_core)
             start = result.solution
         left = models.sample_to_design(duals, column_models)
         back_products = array_module.empty((self.source.variant_count, columns))
@@ -1405,7 +1446,7 @@ class DualGaussian:
         coupling = array_module.zeros((0, width))
         if block is not None:
             coupling = block.duals.T @ image
-            duals = duals - block.duals @ _cholesky_solve(array_module, block.factor, coupling)
+            duals = duals - block.duals @ _core_solve(array_module, block, coupling)
         left = models.sample_to_design(duals, column_models)
         products = array_module.zeros((rows.size, width))
         for start, stop, tile in self.source.blocks():
@@ -1476,7 +1517,7 @@ class DualGaussian:
                 resolved_columns = array_module.full(int(block.design.shape[1]), model)
                 resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
                 refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="posterior-resolved")
-                block = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+                block = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual, self.indefinite_core)
                 state["blocks"][model] = block
             bulk_limited = open_mask & ~resolved_limited
             if bulk_limited.any():
@@ -1507,6 +1548,8 @@ class DualGaussian:
         if block is None:
             zeros = array_module.zeros(self.source.sample_count)
             return SampleDiagonal(weights, covariate_leverage, zeros, zeros, zeros)
+        if block.indefinite:
+            raise np.linalg.LinAlgError("an indefinite resolved core is a linear response's, not a Gaussian's: it has no variances.")
         whitened = array_module.linalg.solve(block.factor, block.duals.T)
         resolved_term = array_module.sum(whitened * whitened, axis=0)
         lowest, residual_norm, core_error = core_bounds(array_module, block)
@@ -1557,6 +1600,8 @@ class DualGaussian:
         while True:
             # the split made S_S spike-free, so the relaxed operand error applies (an empty deflation says so)
             result = certified_block_cg(source, models, rhs, start, device_models, bound, self.count, deflation=spike_free, label="draws")
+            if any(block.indefinite for block in state["blocks"].values()):
+                raise np.linalg.LinAlgError("an indefinite resolved core is a linear response's, not a Gaussian's: it has no draws.")
             draw_duals, resolved_draws = split_draw_duals(
                 {model: block.factor for model, block in state["blocks"].items()}, state["resolved_mean"],
                 {model: block.duals for model, block in state["blocks"].items()}, draw_models, result.solution, resolved_noise, array_module,
@@ -1593,7 +1638,7 @@ class DualGaussian:
                 resolved_columns = array_module.full(int(block.design.shape[1]), int(model))
                 resolved_bound = tightening * array_module.linalg.norm(block.residual, axis=0)
                 refined = certified_block_cg(source, models, block.design, block.duals, resolved_columns, resolved_bound, self.count, deflation=spike_free, label="draws-resolved")
-                state["blocks"][int(model)] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual)
+                state["blocks"][int(model)] = resolved_block(array_module, block.design, block.precision, refined.solution, refined.residual, self.indefinite_core)
             start = result.solution
         left = models.sample_to_design(draw_duals, device_models)
         bulk_variances = state["bulk_variances"][:, device_models]

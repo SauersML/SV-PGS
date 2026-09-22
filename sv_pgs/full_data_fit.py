@@ -1202,6 +1202,10 @@ class _FullDataMeanField:
         self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=noise,
             error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
+            # q's sites: a scale-mixture member's variance can exceed 1 / omega (its tau is then negative), so R is a
+            # linear response's precision, symmetric and nonsingular, and not always a Gaussian's (``mean_field``'s
+            # dense route solves the same system by a symmetric indefinite factorization).
+            indefinite_core=True,
         )
         self.version += 1
 
