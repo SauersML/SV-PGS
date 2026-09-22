@@ -204,7 +204,11 @@ def fit_models(
         )
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fitted.alpha
-        scoring.append(dataclasses.replace(fitted, alpha=alpha))
+        covariate_draws = np.zeros((adjusted.size, fitted.draw_count))
+        covariate_draws[adjusted] = fitted.covariate_draws
+        covariate_covariance = np.zeros((adjusted.size, adjusted.size))
+        covariate_covariance[np.ix_(adjusted, adjusted)] = fitted.covariate_covariance
+        scoring.append(dataclasses.replace(fitted, alpha=alpha, covariate_draws=covariate_draws, covariate_covariance=covariate_covariance))
         noise.append(model_noise)
         hyperparameters.append(model_hyperparameters)
         certificates.append(certificate)

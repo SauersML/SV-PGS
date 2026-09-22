@@ -732,6 +732,8 @@ class GenotypeSufficientStatistics:
     tie_map: TieMap
     block_of_reduced: NDArray[np.int32]
     covariate_gram: NDArray[np.float64]
+    covariate_gram_pseudo_inverse: NDArray[np.float64]
+    covariate_rank: int
     covariate_target: NDArray[np.float64]
     target_gram: NDArray[np.float64]
     ld: LdGramStore
@@ -934,6 +936,8 @@ def _covariate_gram_pseudo_inverse(covariates: NDArray[np.float64]) -> NDArray[n
     span no direction of its column space; the others give the pseudo-inverse from ``C``'s own SVD, so the
     Gram's squared condition number never enters.
     """
+    if not covariates.shape[1]:
+        return np.zeros((0, 0))
     _, singular_values, right_vectors = np.linalg.svd(covariates, full_matrices=False)
     kept = singular_values > max(covariates.shape) * np.finfo(np.float64).eps * singular_values[0]
     basis = right_vectors[kept]
@@ -1036,7 +1040,9 @@ def compute_genotype_statistics(
     for buffer in buffers:
         buffer.close()
     return _assemble_statistics(source, summary, summaries, writer, indices.shape[0], block_cap,
-                                covariate_gram, covariate_target, target_matrix.T @ target_matrix)
+                                covariate_gram, projection.covariate_gram_pseudo_inverse,
+                                int(np.linalg.matrix_rank(covariate_matrix)) if covariate_matrix.shape[1] else 0,
+                                covariate_target, target_matrix.T @ target_matrix)
 
 
 def _tie_map(representative: NDArray[np.int64], sign: NDArray[np.float32]) -> TieMap:
@@ -1058,6 +1064,8 @@ def _assemble_statistics(
     sample_count: int,
     block_cap: int,
     covariate_gram: NDArray[np.float64],
+    covariate_gram_pseudo_inverse: NDArray[np.float64],
+    covariate_rank: int,
     covariate_target: NDArray[np.float64],
     target_gram: NDArray[np.float64],
 ) -> GenotypeSufficientStatistics:
@@ -1113,6 +1121,8 @@ def _assemble_statistics(
         tie_map=tie_map,
         block_of_reduced=np.concatenate(block_of_reduced),
         covariate_gram=covariate_gram,
+        covariate_gram_pseudo_inverse=covariate_gram_pseudo_inverse,
+        covariate_rank=covariate_rank,
         covariate_target=covariate_target,
         target_gram=target_gram,
         ld=ld,

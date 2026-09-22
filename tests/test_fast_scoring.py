@@ -138,6 +138,9 @@ def two_fold_models(codes: np.ndarray, random_generator: np.random.Generator, dr
                 alpha=np.array([0.3 * fold - 0.1, 0.5, -0.25]),
                 trait_type=TraitType.QUANTITATIVE,
                 predictive_intercept_shift=0.0,
+                covariate_draws=np.repeat(np.array([0.3 * fold - 0.1, 0.5, -0.25])[:, None], draw_count, axis=1),
+                covariate_covariance=np.zeros((3, 3)),
+                gaussian_posterior=True,
             )
         )
     return models
@@ -245,6 +248,9 @@ def test_reduced_fit_expands_mean_and_draws_by_prior_variance_weights_and_signs(
         member_prior_variances=prior_variances,
         beta_reduced=beta_reduced,
         posterior_draws_reduced=draws_reduced,
+        covariate_draws=np.zeros((1, 2)),
+        covariate_covariance=np.zeros((1, 1)),
+        gaussian_posterior=True,
         alpha=np.array([0.0]),
         trait_type=TraitType.BINARY,
         predictive_intercept_shift=0.0,
@@ -272,6 +278,9 @@ def test_a_binary_model_without_posterior_draws_is_rejected():
             signed_scales=np.ones(2),
             coefficients=np.zeros(2),
             posterior_draws=np.zeros((2, 0)),
+            covariate_draws=np.zeros((1, 0)),
+            covariate_covariance=np.zeros((1, 1)),
+            gaussian_posterior=True,
             alpha=np.array([0.0]),
             trait_type=TraitType.BINARY,
             predictive_intercept_shift=0.0,
@@ -370,7 +379,7 @@ def test_credible_intervals_are_exact_student_t_for_any_draw_count():
         genetic_value = means + np.sqrt(true_variance) * random_generator.standard_normal((sample_count, 1))
         draws = means + np.sqrt(true_variance) * random_generator.standard_normal((sample_count, draw_count))
         estimated = np.mean((draws - means) ** 2, axis=1, keepdims=True)
-        scores = GeneticScores(means=means, variances=estimated, draw_counts=(draw_count,))
+        scores = GeneticScores(means=means, variances=estimated, draw_counts=(draw_count,), draws=(draws,), gaussian_posteriors=(True,))
         lower, upper = scores.credible_interval(coverage)
         covered = int(np.sum((lower <= genetic_value) & (genetic_value <= upper)))
         assert stats.binomtest(covered, sample_count, coverage).pvalue > 0.05
@@ -379,7 +388,7 @@ def test_credible_intervals_are_exact_student_t_for_any_draw_count():
             normal_covered = int(np.sum(np.abs(genetic_value - means) <= normal_half_width))
             assert stats.binomtest(normal_covered, sample_count, coverage, alternative="less").pvalue < 0.05
     with pytest.raises(ValueError, match="no credible interval"):
-        GeneticScores(means=means, variances=np.full_like(means, np.nan), draw_counts=(0,)).credible_interval(coverage)
+        GeneticScores(means=means, variances=np.full_like(means, np.nan), draw_counts=(0,), draws=(np.zeros((sample_count, 0)),), gaussian_posteriors=(True,)).credible_interval(coverage)
 
 
 def test_predictive_intercept_shift_anchors_the_damped_mean_on_the_prevalence():

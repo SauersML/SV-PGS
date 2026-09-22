@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
-from scipy.stats import norm
+from scipy.stats import norm, rankdata
 
 from benchmarks.bench_sim.records import measured_records
 
@@ -205,12 +205,12 @@ def incremental_r2(outcome: np.ndarray, prediction: np.ndarray, covariates: np.n
 
 
 def auc(outcome: np.ndarray, score: np.ndarray) -> float:
-    order = np.argsort(score)
-    ranks = np.empty(score.size)
-    ranks[order] = np.arange(1, score.size + 1)
+    ranks = rankdata(score, method="average")
     positives = outcome > 0.5
     count_positive = positives.sum()
     count_negative = score.size - count_positive
+    if not count_positive or not count_negative:
+        raise ValueError("AUC requires both positive and negative outcomes.")
     return float((ranks[positives].sum() - count_positive * (count_positive + 1) / 2) / (count_positive * count_negative))
 
 

@@ -103,7 +103,6 @@ from __future__ import annotations
 import contextvars
 import functools
 import hashlib
-import weakref
 from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Callable, Iterator, Sequence
@@ -520,9 +519,7 @@ def scale_mixture_prior(
 
 def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | None = None) -> MixtureHyperparameters:
     """A start, not a prior: every class at one log-normal on the lattice, of the width whose density at the lattice's
-    ends is eps of its peak when it is centred; no deviation or annotation effect; every penalty weight at its
-    lambda = infinity edge, where that log-normal is the certified fit itself (the search releases a block inward
-    where V rises; a unit weight was an arbitrary start, deep in the near-collapse regime on real genes).
+    ends is eps of its peak when it is centred; no deviation or annotation effect; unit penalty weights.
 
     It is centred on the lattice unless ``mean_variance`` is given: the start's mean of e^t over the lattice, so that
     every prior variance E[beta_j^2] starts at mean_variance u_j (``moment_start``). The centre then moves along the
@@ -550,7 +547,7 @@ def initial_hyperparameters(prior: ScaleMixturePrior, mean_variance: float | Non
     quadratic = -0.5 * np.square((nodes - centre) / width)
     coefficients = np.zeros(prior.coefficient_size)
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (quadratic - quadratic.mean())
-    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.full(len(prior.smoothing_blocks), np.inf))
+    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
 
 
 def _log_sum_exp(values: F64Array, axis: int, keepdims: bool = False) -> F64Array:
@@ -697,35 +694,17 @@ def _row_chunks(rows: I64Array, grid_size: int, working_bytes: int) -> Iterator[
 # ------------------------------------------------------------------ the tilted moments
 
 
+@dataclass(frozen=True)
 class _Components:
-    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j
-    (``first`` to ``fourth``, formed by the kernel rows on first use: a pass without a scale design never asks for
-    them); ``rounding`` bounds each log Z_j's rounding (``_KernelRows.components``)."""
+    """Per variant and node: responsibilities w, conditional variances c and the derivatives of log Z_jk in eta = log u_j."""
 
-    __slots__ = ("log_normalizer", "responsibility", "conditional_variance", "rounding", "_rows")
-
-    def __init__(
-        self, log_normalizer: F64Array, responsibility: F64Array, conditional_variance: F64Array, rounding: F64Array, rows: "_KernelRows"
-    ) -> None:
-        self.log_normalizer, self.responsibility, self.conditional_variance, self.rounding, self._rows = (
-            log_normalizer, responsibility, conditional_variance, rounding, rows
-        )
-
-    @property
-    def first(self) -> F64Array:
-        return self._rows.derivatives()[0]
-
-    @property
-    def second(self) -> F64Array:
-        return self._rows.derivatives()[1]
-
-    @property
-    def third(self) -> F64Array:
-        return self._rows.derivatives()[2]
-
-    @property
-    def fourth(self) -> F64Array:
-        return self._rows.derivatives()[3]
+    log_normalizer: F64Array
+    responsibility: F64Array
+    conditional_variance: F64Array
+    first: F64Array
+    second: F64Array
+    third: F64Array
+    fourth: F64Array
 
 
 def _kernel_terms(
@@ -769,14 +748,6 @@ class _KernelRows:
         self.conditional, self.retained, self._ratio_retained, self.kernel, self._signal = _kernel_terms(
             np.zeros(grid.shape[0]), log_scale_rows, grid, precision, shift
         )
-        # For the rounding bound of ``components``, per row: the largest size of a node term's kernel pieces,
-        # log(1 + vP)/2 + h^2 c/2 (both non-negative), and the kernel's range over the nodes, both over the nodes
-        # of weight above zero (a node past the overflow limit, retained 0, has an infinite piece and weight zero).
-        with np.errstate(divide="ignore", invalid="ignore"):
-            pieces = -0.5 * np.log(self.retained) + 0.5 * self._signal
-            finite = np.isfinite(self.kernel)
-            self._pieces_max = np.max(np.where(finite, pieces, -np.inf), axis=1)
-            self._kernel_range = np.max(np.where(finite, self.kernel, -np.inf), axis=1) - np.min(np.where(finite, self.kernel, np.inf), axis=1)
         # Shifted by each row's largest term, as ``_log_sum_exp`` shifts (by 0 where that term is not finite).
         peak = np.max(self.kernel, axis=1)
         self.peak = np.where(np.isfinite(peak), peak, 0.0)
@@ -784,7 +755,7 @@ class _KernelRows:
             self.exponentials = np.exp(self.kernel - self.peak[:, None])
         self._derivatives: tuple[F64Array, F64Array, F64Array, F64Array] | None = None
         # Held from one pass to the next (``_kernel_chunks``): read-only, so no caller can change a later pass's rows.
-        for held in (self.conditional, self.retained, self.kernel, self.exponentials, self._pieces_max, self._kernel_range):
+        for held in (self.conditional, self.retained, self.kernel, self.exponentials):
             held.setflags(write=False)
 
     def derivatives(self) -> tuple[F64Array, F64Array, F64Array, F64Array]:
@@ -824,17 +795,11 @@ class _KernelRows:
         responsibility = self.exponentials * scaled[None, :] / np.where(lost, 1.0, products)[:, None]
         if np.any(lost):
             responsibility[lost] = np.exp(self.kernel[lost] + log_density[None, :] - log_normalizer[lost, None])
-        # log Z_j's rounding (the verification harness's bound, tests/test_engine_verification._objective_rounding):
-        # each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 rounds by about four ulps of its pieces' sizes,
-        # the log-sum-exp adds eps times sum_k w_k (1 + |x_k - max|) relative to its sum, and its maximum's own ulp.
-        # |log Z_j| alone understates this wherever the terms are large and cancel. Each responsibility-weighted
-        # mean is bounded by its largest term (the weights sum to one), which the kernel rows hold per row, so the
-        # bound costs a pass over the rows, not the nodes: |x_k - max| <= the kernel's range plus the density's.
-        finite_density = log_density[np.isfinite(log_density)]
-        density_range = float(np.max(finite_density) - np.min(finite_density)) if finite_density.size else 0.0
-        density_size = float(np.max(np.abs(finite_density))) if finite_density.size else 0.0
-        rounding = _EPSILON * (np.abs(log_normalizer) + 1.0 + self._kernel_range + density_range + 4.0 * (density_size + self._pieces_max))
-        return _Components(log_normalizer, responsibility, self.conditional, rounding, self)
+        first, second, third, fourth = self.derivatives()
+        return _Components(
+            log_normalizer=log_normalizer, responsibility=responsibility, conditional_variance=self.conditional,
+            first=first, second=second, third=third, fourth=fourth,
+        )
 
 
 def _components(
@@ -855,14 +820,10 @@ _STEP_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("scale
 
 
 def _step_scoped(function: Callable) -> Callable:
-    """``function`` with a ``_STEP_CACHE`` for the call's duration: its own where none is open, the open one otherwise
-    (a hyper step inside the outer loop shares the loop's, so its exact repeats at an unchanged fixed point, the
-    release trials of one polished state's successive hyper steps among them, are answered once)."""
+    """``function`` with its own ``_STEP_CACHE`` for the call's duration."""
 
     @functools.wraps(function)
     def scoped(*arguments, **keywords):
-        if _STEP_CACHE.get() is not None:
-            return function(*arguments, **keywords)
         token = _STEP_CACHE.set({})
         try:
             return function(*arguments, **keywords)
@@ -872,11 +833,7 @@ def _step_scoped(function: Callable) -> Callable:
     return scoped
 
 
-# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed (its two
-# rounding-bound rows are p-vectors). The outer
-# loop holds its own cache across its iterations (``fit_hyperparameters`` is step-scoped too): every evaluation at one
-# fixed point's cavity (its state, its Newton model, the gradient at a trial that becomes the next state, its hyper
-# steps) shares the kernel rows and the exact repeats, which the cavity key keeps exact.
+# Each held row set is ten p x K arrays: the six ``_KernelRows`` forms and the four derivatives once formed.
 _HELD_ARRAYS_PER_ROW_SET = 10
 
 
@@ -895,17 +852,22 @@ def _kernel_chunks(
     ):
         yield from held[6]
         return
+    if cache is not None:
+        cache.pop("rows", None)
+    held = None
     chunks = [list(_row_chunks(class_rows, prior.grid_size, working_bytes)) for class_rows in prior.class_rows]
-    if all(len(pieces) <= 1 for pieces in chunks):
+    # Decide before allocating: even one chunk per class can exceed the budget
+    # when several classes are live together. Reserve a second copy for the pass.
+    held_bytes = _HELD_ARRAYS_PER_ROW_SET * prior.grid_size * scales.dtype.itemsize * sum(rows.size for rows in prior.class_rows)
+    key_bytes = scales.nbytes + cavity.precision.nbytes + cavity.shift.nbytes
+    if cache is not None and all(len(pieces) <= 1 for pieces in chunks) and 2 * held_bytes + key_bytes <= working_bytes:
         formed = [
             (class_position, rows, _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows]))
             for class_position, pieces in enumerate(chunks) for rows in pieces
         ]
-        held_bytes = _HELD_ARRAYS_PER_ROW_SET * sum(kernel_rows.kernel.nbytes for _class, _rows, kernel_rows in formed)
-        if cache is not None and 2 * held_bytes <= working_bytes:
-            cache["rows"] = (
-                prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
-            )
+        cache["rows"] = (
+            prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
+        )
         yield from formed
         return
     for class_position, pieces in enumerate(chunks):
@@ -1040,44 +1002,33 @@ def noise_gain(new_noise: float, old_noise: float, sample_count: int, covariate_
 
 @dataclass(frozen=True)
 class _Objective:
-    """sum_j log Z_j at fixed cavities, its gradient and Hessian in z, the sum of |log Z_j| (its scale), and ``rounding``,
-    a bound on |value - sum_j log Z_j| in double precision: each term's own (``_Components.rounding``) plus the
-    recursive summation's, at most (p - 1) eps of the terms' sizes (Higham, Accuracy and Stability of Numerical
-    Algorithms, 2nd ed., Lemma 3.1)."""
+    """sum_j log Z_j at fixed cavities, its gradient and Hessian in z, and the sum of |log Z_j| (its rounding scale)."""
 
     value: float
     gradient: F64Array
     hessian: F64Array
     magnitude: float
-    rounding: float
 
 
 def _data_objective(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np, hessian_too: bool = True
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType = np
 ) -> _Objective:
     """For variant j of class c, with responsibilities w_j, component derivatives g_jk and their mean gbar_j, in z:
     d/deta_c = w_j - pi_c and d/d(scale) = gbar_j d_j (d_j the variant's scale-design row);
     d2/deta_c2 = diag(w_j) - w_j w_j' - (diag pi_c - pi_c pi_c'), d2/deta_ck d(scale) = w_jk (g_jk - gbar_j) d_j,
-    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel.
-    With ``hessian_too`` false the Hessian is left zero (a gradient's pass: the p x K^2 responsibility products are the
-    pass's bulk), on the host path."""
+    and d2/d(scale)2 = (Var_w(g_j) + E_w[dg_j/deta]) d_j d_j'. With ``array_module`` CuPy, by the fused device kernel."""
     if array_module is not np:
         value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
             array_module, prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients),
             prior.log_variance_grid, cavity.precision, cavity.shift, prior.scale_design, working_bytes,
         )
-        # The device kernel returns the terms' sizes, not their pieces: the bound is the summation lemma's on K-term
-        # log-sum-exps and p terms, (K + 1 + p) eps of the sizes.
-        return _Objective(
-            value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
-            rounding=(prior.grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
-        )
+        return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
     grid_size = prior.grid_size
     scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
     dimension = prior.density_size + prior.scale_size
     gradient = np.zeros(dimension)
     hessian = np.zeros((dimension, dimension))
-    value = magnitude = rounding = 0.0
+    value = magnitude = 0.0
     density = np.exp(class_log_density(prior, coefficients))
     responsibility_sum = np.zeros((prior.class_count, grid_size))
     responsibility_outer = np.zeros((prior.class_count, grid_size, grid_size))
@@ -1086,27 +1037,22 @@ def _data_objective(
         responsibility = terms.responsibility
         value += float(np.sum(terms.log_normalizer))
         magnitude += float(np.sum(np.abs(terms.log_normalizer)))
-        rounding += float(np.sum(terms.rounding))
         responsibility_sum[class_position] += responsibility.sum(axis=0)
-        if hessian_too:
-            responsibility_outer[class_position] += responsibility.T @ responsibility
+        responsibility_outer[class_position] += responsibility.T @ responsibility
         if prior.scale_size:
             # Without an annotation design the scale terms are empty products.
             design = prior.scale_design[rows]
             mean_first = np.sum(responsibility * terms.first, axis=1)
+            centred_first = terms.first - mean_first[:, None]
+            curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
+            cross[class_position] += (responsibility * centred_first).T @ design
             gradient[scale_span] += design.T @ mean_first
-            if hessian_too:
-                centred_first = terms.first - mean_first[:, None]
-                curvature = np.sum(responsibility * (np.square(centred_first) + terms.second), axis=1)
-                cross[class_position] += (responsibility * centred_first).T @ design
-                hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
+            hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
     for class_position, class_rows in enumerate(prior.class_rows):
         size = float(class_rows.shape[0])
         class_density = density[class_position]
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         gradient[span] = responsibility_sum[class_position] - size * class_density
-        if not hessian_too:
-            continue
         hessian[span, span] = (
             np.diag(responsibility_sum[class_position])
             - responsibility_outer[class_position]
@@ -1114,10 +1060,7 @@ def _data_objective(
         )
         hessian[span, scale_span] = cross[class_position]
         hessian[scale_span, span] = cross[class_position].T
-    return _Objective(
-        value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
-        rounding=rounding + max(prior.variant_count - 1, 0) * _EPSILON * magnitude,
-    )
+    return _Objective(value=value, gradient=gradient, hessian=hessian, magnitude=magnitude)
 
 
 def _data_value(
@@ -1168,16 +1111,6 @@ def _penalized(
     if prior.anchor is not None:
         hessian = hessian - prior.anchor.matrix
     return objective.value - penalty_value - anchor_value, mapping.T @ objective.gradient - penalty_gradient - anchor_gradient, hessian
-
-
-def _resolved_spectrum(spectrum: tuple[F64Array, F64Array]) -> tuple[F64Array, F64Array]:
-    """The spectrum with every eigenvalue within the eigendecomposition's rounding of zero (eps times the dimension
-    times the largest magnitude) raised to that floor: such a direction is flat to double precision, neither an
-    ascent to follow nor a negative curvature to leave by (on a weak-data verification case the smallest eigenvalue
-    of -H sat at +-1e-14 and flipped sign between iterates, and the trust-region step walked 2-10 units along it)."""
-    eigenvalues, eigenvectors = spectrum
-    floor = _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny)
-    return np.where(np.abs(eigenvalues) <= floor, floor, eigenvalues), eigenvectors
 
 
 def _spectrum(negative_hessian: F64Array) -> tuple[F64Array, F64Array]:
@@ -1239,42 +1172,6 @@ def _trust_region_step(
     return eigenvectors @ rest
 
 
-def _data_ceiling(cavity: Cavity) -> float:
-    """An upper bound on the data objective sum_j log Z_j over every prior: Z_j = int l_j p_j <= sup_beta l_j(beta) =
-    exp(h_j^2 / (2 P_j)) (P_j > 0; infinite where a cavity precision is not positive)."""
-    if np.any(cavity.precision <= 0.0):
-        return np.inf
-    return float(np.sum(0.5 * np.square(cavity.shift) / cavity.precision))
-
-
-def _objective_ceiling(prior: ScaleMixturePrior, penalty: F64Array, cavity: Cavity) -> float:
-    """An upper bound on the penalized objective F - P - A over every x: Z_j = int l_j p_j <= sup_beta l_j(beta) =
-    exp(h_j^2 / (2 P_j)) for every prior (P_j > 0; no bound where a cavity precision is not positive), and the
-    quadratic P + A = 1/2 x'(S + C)x - b'x + c has a minimum c - 1/2 b'(S + C)^+ b where S + C is positive
-    semidefinite with b in its range (none otherwise: the local model is then unbounded, and the maximizer's other
-    stops end it). Infinite where either part has no bound."""
-    data_bound = _data_ceiling(cavity)
-    if not np.isfinite(data_bound):
-        return np.inf
-    quadratic = penalty.copy()
-    linear = np.zeros(penalty.shape[0])
-    constant = 0.0
-    if prior.anchor is not None:
-        quadratic = quadratic + prior.anchor.matrix
-        linear = prior.anchor.linear
-        constant = 0.5 * prior.anchor.constant
-    eigenvalues, eigenvectors = np.linalg.eigh(0.5 * (quadratic + quadratic.T))
-    floor = _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny)
-    if eigenvalues.size and float(eigenvalues[0]) < -floor:
-        return np.inf
-    components = eigenvectors.T @ linear
-    positive = eigenvalues > floor
-    if np.any(np.abs(components[~positive]) > floor * max(float(np.max(np.abs(components), initial=0.0)), 1.0)):
-        return np.inf
-    minimum = constant - 0.5 * float(np.sum(np.square(components[positive]) / eigenvalues[positive]))
-    return data_bound - minimum
-
-
 def _maximize_coefficients(
     prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, working_bytes: int, tolerance: float
 ) -> tuple[F64Array, _Objective]:
@@ -1284,90 +1181,28 @@ def _maximize_coefficients(
     (More-Sorensen); a trial costs one value-only pass, and the radius follows the ratio of actual to
     predicted gain (Nocedal and Wright, Algorithm 4.1). It stops at a strict maximum, where -H is positive
     definite and the Newton step's predicted gain is below ``tolerance`` nats (the resolution the caller
-    certifies); a saddle's negative curvature is followed by the trust-region step instead. It also stops when no
-    step longer than half of double precision raises the objective. Where the model predicts no gain above the
-    objective's rounding inside the radius, a value-only trial would compare two values at their rounding (on
-    gene 1's release trials, whose penalized directions carry a data curvature 1e-9 of the penalty's scale, the
-    loop once accepted rounding-level gains and doubled its radius without end): such a step is judged on the
-    gradient instead, taken where its decrement in the current metric falls, as the outer loop judges its inner
-    steps, so x reaches a stationary point to the gradient's resolution when the tolerance asks for it (the
-    engine's verification harness asks with tolerance 0: the value's rounding is not the gradient's).
+    certifies, and at least the objective's rounding level); a saddle's negative curvature is followed by
+    the trust-region step instead. It also stops when no step longer than half of double precision raises
+    the objective.
     """
     penalty = _penalty_matrix(prior, log_smoothing)
-    ceiling = _objective_ceiling(prior, penalty, cavity)
     coefficients = np.array(start, dtype=np.float64, copy=True)
     objective = _data_objective(prior, coefficients, cavity, working_bytes)
     value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
     # -H changes only when a step is accepted: its one eigendecomposition serves the test, the ascent direction and
-    # every trust-region trial at that point; a direction flat to rounding counts as flat (``_resolved_spectrum``).
-    spectrum = _resolved_spectrum(_spectrum(-hessian))
+    # every trust-region trial at that point.
+    spectrum = _spectrum(-hessian)
     ascent = _ascent_direction(-hessian, gradient, spectrum)
-    # The first radius is the Cauchy step's length on |-H|, ||g||^3 / g'|-H|g (as the outer loop's, ``_cauchy_radius``),
-    # never Newton's: on a direction the data barely curve Newton's step divides a gradient at rounding by a curvature
-    # at rounding (gene 1's classes without a variant: 710 units along their unidentified deviation, at an unchanged V).
-    components = spectrum[1].T @ gradient
-    curvature = float(np.sum(np.abs(spectrum[0]) * np.square(components)))
-    radius = float(np.linalg.norm(gradient)) ** 3 / curvature if curvature > 0.0 else 0.0
-    last_contraction: float | None = None
+    radius = float(np.linalg.norm(ascent))
     while True:
-        # The objective's own rounding (its terms' and their summation's) plus the penalized value's arithmetic.
-        rounding = objective.rounding + _EPSILON * abs(value)
+        rounding = _EPSILON * (objective.magnitude + abs(value))
         definite = float(spectrum[0][0]) > 0.0
-        if definite and 0.5 * float(gradient @ ascent) <= tolerance:
-            return coefficients, objective
-        if ceiling - value <= tolerance:
-            # No x gains the tolerance over this one: the objective's ceiling (``_objective_ceiling``) is within it.
-            # On a gene the data do not see (ENSG00000100385.14 [real]: every |log Z_j| below 1e-9) the objective is
-            # flat at its rounding, -H indefinite there at rounding, and the trust region followed that curvature
-            # for over an hour at gains of 1e-8.
+        if definite and 0.5 * float(gradient @ ascent) <= max(tolerance, rounding):
             return coefficients, objective
         if radius <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
             return coefficients, objective
         step = _trust_region_step(-hessian, gradient, radius, spectrum)
         predicted = float(gradient @ step) + 0.5 * float(step @ hessian @ step)
-        if predicted <= rounding:
-            # The value cannot resolve this step; the gradient can. It is judged as the outer loop judges its inner
-            # steps: taken where the decrement in the current metric falls (a strict maximum), or where the trapezoid
-            # gain of the two gradients is positive (a saddle), and the maximization ends otherwise. A step below x's
-            # own resolution cannot be told from the point it leaves (the decrements of both sit at their rounding),
-            # so it ends the maximization too; and so does a decrement whose ratio to the last one does not fall:
-            # Newton approaches a strict maximum quadratically (each ratio smaller than the last), while an objective
-            # whose supremum lies at infinity along a direction gives one ratio for ever (the width -> 0 ray on the
-            # bench-real genes: steps of one length with the decrement falling by a fixed factor, and a maximization
-            # that ran for minutes per start at every release trial).
-            if float(np.linalg.norm(step)) <= _HALF_PRECISION * (1.0 + float(np.linalg.norm(coefficients))):
-                return coefficients, objective
-            candidate = coefficients + step
-            candidate_objective = _data_objective(prior, candidate, cavity, working_bytes)
-            candidate_value, candidate_gradient, candidate_hessian = _penalized(prior, candidate_objective, log_smoothing, penalty, candidate)
-            decrement = 0.5 * float(gradient @ ascent)
-            if definite:
-                candidate_decrement = 0.5 * float(candidate_gradient @ _ascent_direction(-hessian, candidate_gradient, spectrum))
-                resolved = candidate_decrement < decrement
-            else:
-                candidate_decrement = np.nan
-                resolved = 0.5 * float((gradient + candidate_gradient) @ step) > 0.0
-            if not (resolved and np.isfinite(candidate_value)):
-                return coefficients, objective
-            # The radius follows the same rule as the value's branch, with the trapezoid gain of the two gradients
-            # as the step's realized gain: a full-length step that realized three quarters of its model's gain
-            # doubles it. Held fixed, a saddle's negative curvature was followed at one radius for ever (on
-            # ENSG00000211673.2 [real] steps of 0.0012 along a curvature of -2e-3, each gaining 1e-7 nats, for an
-            # hour: the model's gain was below the value's rounding, so the value's branch, whose radius grows,
-            # never judged them).
-            trapezoid = 0.5 * float((gradient + candidate_gradient) @ step)
-            if float(np.linalg.norm(step)) >= radius * (1.0 - _HALF_PRECISION) and trapezoid > 0.75 * predicted:
-                radius = 2.0 * radius
-            coefficients, objective = candidate, candidate_objective
-            value, gradient, hessian = candidate_value, candidate_gradient, candidate_hessian
-            spectrum = _resolved_spectrum(_spectrum(-hessian))
-            ascent = _ascent_direction(-hessian, gradient, spectrum)
-            if definite and decrement > 0.0:
-                contraction = candidate_decrement / decrement
-                if last_contraction is not None and contraction >= last_contraction:
-                    return coefficients, objective
-                last_contraction = contraction
-            continue
         candidate = coefficients + step
         candidate_value = (
             _data_value(prior, candidate, cavity, working_bytes) - _penalty_value(prior, log_smoothing, candidate)[0] - _anchor_value(prior, candidate)[0]
@@ -1375,25 +1210,15 @@ def _maximize_coefficients(
         actual = candidate_value - value
         ratio = actual / predicted if predicted > 0.0 else -np.inf
         step_norm = float(np.linalg.norm(step))
-        # A gain at the objective's rounding is not a gain: the step is refused, and a refused step shrinks the radius
-        # whatever its ratio (a step refused at an unchanged radius would be proposed again without end).
-        accepted = bool(np.isfinite(candidate_value)) and actual > rounding
-        if not accepted or ratio < 0.25:
+        if not np.isfinite(ratio) or ratio < 0.25:
             radius = 0.25 * step_norm
         elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
             radius = 2.0 * radius
-        if accepted:
+        if np.isfinite(candidate_value) and actual > 0.0:
             coefficients = candidate
             objective = _data_objective(prior, coefficients, cavity, working_bytes)
-            if not np.any(np.abs(objective.gradient) > _EPSILON * objective.magnitude):
-                # The data no longer see x: every tilted moment has saturated (the density is a point mass on the
-                # lattice to rounding). What the model still gains beyond here is the anchor's quadratic alone, a
-                # local model of the fixed point's response taken out of its range (at a released weight of e^-22
-                # on gene 1 its indefinite C sent x to 1e153 over 6,600 accepted steps), so the maximization ends
-                # here; the point certifies nothing (``_evidence_once``).
-                return coefficients, objective
             value, gradient, hessian = _penalized(prior, objective, log_smoothing, penalty, coefficients)
-            spectrum = _resolved_spectrum(_spectrum(-hessian))
+            spectrum = _spectrum(-hessian)
             ascent = _ascent_direction(-hessian, gradient, spectrum)
 
 
@@ -1522,6 +1347,7 @@ class CurvatureCorrection:
 INDEPENDENT_EFFECTS = CurvatureCorrection()
 
 
+@dataclass(frozen=True)
 class _Anchor:
     """The EP evidence's local model about the fixed point x_k where ``correction`` (C = B - A) was solved: EP
     stationarity makes E and the fixed-cavity F_k share their gradient at x_k, with Hessians -B and -A, so
@@ -1529,43 +1355,21 @@ class _Anchor:
     that model minus the penalty, whose curvature A + C + S is the one V's determinant takes: its maximizer, its
     responses and its line integrals then belong to the same integrand. ``center`` is z_k = M x_k, the same in every
     view; ``matrix``, ``linear`` and ``constant`` are this prior's K'CK, K'C x_k and x_k'C x_k (x = K x_view), so the
-    term is -(1/2 x'(K'CK)x - (K'C x_k)'x + 1/2 x_k'C x_k).
+    term is -(1/2 x'(K'CK)x - (K'C x_k)'x + 1/2 x_k'C x_k)."""
 
-    They are formed on first use, from the correction's own lazy solve on this prior's directions: the hyper step
-    anchors the full prior, whose local model only its views evaluate (each on its own directions, the free
-    coefficients of its edges), so the full lattice's directions are solved only where a view asks for them all."""
-
-    __slots__ = ("correction", "center", "_coefficient_map", "_blocks")
-
-    def __init__(self, correction: CurvatureCorrection, center: F64Array, coefficient_map: F64Array) -> None:
-        self.correction, self.center, self._coefficient_map = correction, center, coefficient_map
-        self._blocks: F64Array | None = None
-
-    def _solved(self) -> F64Array:
-        if self._blocks is None:
-            self._blocks = self.correction.on(np.column_stack([self._coefficient_map, self.center]))
-        return self._blocks
-
-    @property
-    def matrix(self) -> F64Array:
-        size = self._coefficient_map.shape[1]
-        return self._solved()[:size, :size]
-
-    @property
-    def linear(self) -> F64Array:
-        size = self._coefficient_map.shape[1]
-        return self._solved()[:size, size]
-
-    @property
-    def constant(self) -> float:
-        size = self._coefficient_map.shape[1]
-        return float(self._solved()[size, size])
+    correction: CurvatureCorrection
+    center: F64Array
+    matrix: F64Array
+    linear: F64Array
+    constant: float
 
 
 def _anchored(prior: ScaleMixturePrior, correction: CurvatureCorrection, center: F64Array) -> ScaleMixturePrior:
     """``prior`` with the local model about z_k = ``center`` in its own coordinates (``_Anchor``): C on the prior's
-    directions and on x_k's, from the correction's own lazy solve, formed when first used."""
-    return replace(prior, anchor=_Anchor(correction, center, prior.coefficient_map))
+    directions and on x_k's, from the correction's own lazy solve."""
+    size = prior.coefficient_size
+    blocks = correction.on(np.column_stack([prior.coefficient_map, center]))
+    return replace(prior, anchor=_Anchor(correction, center, blocks[:size, :size], blocks[:size, size], float(blocks[size, size])))
 
 
 def _anchor_value(prior: ScaleMixturePrior, coefficients: F64Array) -> tuple[float, F64Array]:
@@ -1589,18 +1393,12 @@ def curvature_correction(
     relative_tolerance = max(tolerance / coefficients.shape[0], _EPSILON)
     fixed = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     achieved: list[float] = []
-    # The variants' derivatives at this fixed point serve every direction the correction is asked for.
-    formed: dict[str, _VariantDerivatives] = {}
-
-    def columns(directions: F64Array) -> F64Array:
-        if "derivatives" not in formed:
-            formed["derivatives"] = _variant_derivatives(prior, coefficients, cavity, working_bytes)
-        return _total_curvature_columns(
-            prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved,
-            derivatives=formed["derivatives"], fixed_cavity=fixed,
-        )
-
-    return CurvatureCorrection(mapping=prior.coefficient_map, columns=columns, fixed_curvature=0.5 * (fixed + fixed.T), resolutions=achieved)
+    return CurvatureCorrection(
+        mapping=prior.coefficient_map,
+        columns=lambda directions: _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved),
+        fixed_curvature=0.5 * (fixed + fixed.T),
+        resolutions=achieved,
+    )
 
 
 def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
@@ -1669,12 +1467,8 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         fields["variance_by_shift"][rows] = expectation(deviation**3) + 3.0 * expectation(conditional * deviation)
         fields["mean_by_precision"][rows] = mean_by_precision
         fields["variance_by_precision"][rows] = second_by_precision - 2.0 * mean * mean_by_precision
-        if prior.scale_size:
-            fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
-            fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
-        else:
-            # No scale design: nothing moves log u, and the kernel's derivatives are never formed.
-            fields["mean_by_log_scale"][rows] = fields["second_by_log_scale"][rows] = 0.0
+        fields["mean_by_log_scale"][rows] = covariance(terms.first, centre) + expectation(centre * retained)
+        fields["second_by_log_scale"][rows] = covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained)
         mean_by_density[rows] = weights * deviation
         second_by_density[rows] = weights * (raw_second - second[:, None])
     return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
@@ -1684,13 +1478,9 @@ def _through_z(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64
     """(p x r): each variant's derivative in z applied to the directions (C K + L) x r."""
     grid_size = prior.grid_size
     density_part = directions_z[: prior.density_size].reshape(prior.class_count, grid_size, -1)
-    # One GEMM per class (the same sums; gathering the class directions per variant would hold p x K x r at once).
-    result = np.empty((prior.variant_count, directions_z.shape[1]))
-    for class_position, rows in enumerate(prior.class_rows):
-        result[rows] = by_density[rows] @ density_part[class_position]
-    if prior.scale_size:
-        result += by_log_scale[:, None] * (prior.scale_design @ directions_z[prior.density_size :])
-    return result
+    return np.einsum("jk,jkr->jr", by_density, density_part[prior.class_index]) + by_log_scale[:, None] * (
+        prior.scale_design @ directions_z[prior.density_size :]
+    )
 
 
 def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, values: F64Array) -> F64Array:
@@ -1721,13 +1511,9 @@ def _total_curvature_columns(
     relative_tolerance: float,
     directions: F64Array,
     achieved: list[float] | None = None,
-    derivatives: _VariantDerivatives | None = None,
-    fixed_cavity: F64Array | None = None,
 ) -> F64Array:
     """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
-    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K). ``derivatives`` and
-    ``fixed_cavity`` (the variants' derivatives and A at this x and cavity) are formed here when not given: a lazy
-    correction (``curvature_correction``) forms them once and hands them to every call at its fixed point.
+    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K).
 
     B_z E = A E - m_x' dh + s2_x' dP / 2 (d grad_x log Z_j / dh_j = m_x and d grad_x log Z_j / dP_j = -s2_x / 2, with
     B the negative derivative), where the cavity response (dh, dP) to a direction E solves the linear response of the
@@ -1739,10 +1525,7 @@ def _total_curvature_columns(
     the restart length that fits ``working_bytes``. ``achieved``, when given, receives the relative residual the
     solve reached (its rounding where the posterior is ``exact``).
     """
-    if derivatives is None:
-        derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
-    if fixed_cavity is None:
-        fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
+    derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
     variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
     if posterior.cavity_response is not None:
@@ -1750,7 +1533,7 @@ def _total_curvature_columns(
         shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z)
         if achieved is not None:
             achieved.append(_EPSILON if posterior.exact else relative_tolerance)
-        return _total_from_response(prior, fixed_cavity, derivatives, directions, shift_step, precision_step)
+        return _total_from_response(prior, coefficients, cavity, derivatives, directions, shift_step, precision_step, working_bytes)
     solve, variance_jvp = posterior.solve, posterior.variance_jvp
     assert solve is not None and variance_jvp is not None
     # A variant whose tilted law is a point mass at zero (all its prior mass where v = u e^t underflows to 0) does not
@@ -1794,7 +1577,7 @@ def _total_curvature_columns(
         except np.linalg.LinAlgError as error:
             # I - L singular: the EP fixed point is not locally stable, and its linear response does not exist.
             raise LinearResponseError(f"the EP fixed point's linear response is singular: {error}") from error
-        return _total_from_response(prior, fixed_cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step)
+        return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(precision_step, relative_tolerance)[0], precision_step, working_bytes)
     # The linear part applies one p x p operator to every direction column, so the solve is block Krylov over the
     # columns (``krylov_recycle.block_gcro_dr``, speed-recycle): each application serves them all, restarts keep the
     # slowest harmonic Ritz space, and ``local_response`` (read-free) preconditions it; it stops where a cycle no longer
@@ -1851,13 +1634,15 @@ def _total_curvature_columns(
                 )
             floor_residual, tightened = residual, _EPSILON
         inner = tightened
-    return _total_from_response(prior, fixed_cavity, derivatives, directions, through(solution, inner)[0], solution)
+    return _total_from_response(prior, coefficients, cavity, derivatives, directions, through(solution, inner)[0], solution, working_bytes)
 
 
 def _total_from_response(
-    prior: ScaleMixturePrior, fixed_cavity: F64Array, derivatives: _VariantDerivatives, directions: F64Array, shift_step: F64Array, precision_step: F64Array
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, derivatives: _VariantDerivatives, directions: F64Array,
+    shift_step: F64Array, precision_step: F64Array, working_bytes: int,
 ) -> F64Array:
-    """B_z E from A (``fixed_cavity``) and the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
+    """B_z E from the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
+    fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
     return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
         _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
     )
@@ -1890,14 +1675,8 @@ def _curvature_trace_gradient(
     for class_position, rows, terms in _class_terms(prior, coefficients, cavity, working_bytes):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         density_density = covariance_z[span, span]
-        weights = terms.responsibility
-        if not prior.scale_size:
-            # Without a scale design every scale term is zero: the eta gradient is Q [diag N - 2 N w] alone, with
-            # N = Sigma_eta, and the kernel's derivatives are never formed.
-            inner = np.diag(density_density)[None, :] - 2.0 * (weights @ density_density)
-            density_gradient[class_position] -= np.sum(weights * (inner - np.sum(weights * inner, axis=1)[:, None]), axis=0)
-            continue
         density_scale = covariance_z[span, scale_span]
+        weights = terms.responsibility
         first, second, third = terms.first, terms.second, terms.third
         design = prior.scale_design[rows]
         scale_scale = np.sum((design @ scale_covariance) * design, axis=1)
@@ -2155,13 +1934,7 @@ def _line_log_integrals(
             points = centres[:, None] + halves[:, None] * nodes[None, :]
             steps = (1.0 - points) / points
             both = lines[column](np.concatenate([steps.ravel(), -steps.ravel()])) - value
-            with np.errstate(over="ignore", invalid="ignore"):
-                folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
-            if not np.all(np.isfinite(folded)):
-                # The objective along this line rises past the maximum's value by more than double precision holds:
-                # x is not its maximum along it (an anchored model's indefinite C at a freed weight), and every error
-                # estimate below would be nan, which bisection would take for "unsettled" without end.
-                raise FloatingPointError("the exact integral along a direction is not finite: the objective rises past its value at x")
+            folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
             kronrod_value = folded @ kronrod
             gauss_value = folded @ gauss
             # QUADPACK's error estimate (dqk15i): |K - G| scaled against the integrand's mean absolute deviation.
@@ -2186,11 +1959,6 @@ def _line_log_integrals(
                 raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
             middles = 0.5 * (lows + highs)
             intervals[column] = (np.concatenate([lows, middles]), np.concatenate([middles, highs]))
-            if 2 * 2 * lows.shape[0] * nodes.shape[0] * prior.variant_count * np.dtype(np.float64).itemsize > working_bytes:
-                # The next round's pass (its normalizers, one per variant and step, for both half-lines) would not
-                # fit the working budget: the integrand is not resolved to the share within what the budget can
-                # evaluate, and bisection alone would grow the open intervals without end.
-                raise FloatingPointError("the exact integral along a direction did not converge within the working budget")
             still_open.append(column)
         open_ = still_open
     return logs
@@ -2230,22 +1998,20 @@ def _prior_digest(prior: ScaleMixturePrior) -> tuple[object, ...]:
 
 
 def _repeated(name: str, cavity: Cavity, inputs: tuple[object, ...], compute: Callable[[], object], held: object | None = None) -> object:
-    """compute() once per distinct ``inputs`` at this cavity within the open cache (a hyper step's, or the outer
-    loop's; and, when given, this ``held`` object: compared by identity); outside one, compute() every time."""
+    """compute() once per distinct ``inputs`` at this cavity within a hyper step (and, when given, this ``held``
+    object: compared by identity); outside a hyper step, compute() every time."""
     cache = _STEP_CACHE.get()
     if cache is None:
         return compute()
-    # One memo per cavity: the outer loop's trials visit other fixed points between two hyper steps at one state (the
-    # halved joint trials' own), and a single-cavity memo forgot the state's repeats each time (gene 1 [real]: the
-    # certifying replan repeated the polished state's five release trials, 10 s of 40).
-    repeats = cache.setdefault("repeats", {}).setdefault(_digest(cavity.precision, cavity.shift), {})
-    holder = repeats.get(("held", name))
-    if held is not None and (holder is None or holder() is not held):
-        # Held by a weak reference: the memo neither keeps a correction's solved directions alive (p x K arrays)
-        # nor can mistake a new object at a freed one's address for it.
+    repeats = cache.setdefault("repeats", {})
+    scope = _digest(cavity.precision, cavity.shift)
+    if repeats.get("cavity") != scope:
+        repeats.clear()
+        repeats["cavity"] = scope
+    if held is not None and repeats.get(("held", name)) is not held:
         for key in [key for key in repeats if isinstance(key, tuple) and key[0] == name]:
             del repeats[key]
-        repeats[("held", name)] = weakref.ref(held)
+        repeats[("held", name)] = held
     key = (name, _digest(*inputs))
     if key not in repeats:
         repeats[key] = compute()
@@ -2511,17 +2277,10 @@ def _null_complement(null_basis: F64Array) -> F64Array:
 
 
 def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Array) -> _Profiled:
-    """``_Profiled`` for M; raises LinAlgError when M is not resolvably positive definite: an eigenvalue within the
-    eigendecomposition's rounding of zero (eps times the dimension times the largest magnitude) is a direction flat
-    to double precision, whose sign the factorization cannot resolve (on a weak-data verification case it sat at
-    +-1e-14 and V came out as a value or None by its coin toss), and a point with one is not a strict maximum."""
+    """``_Profiled`` for M; raises LinAlgError when M is not positive definite."""
     basis = np.hstack([null_basis, complement])
     rotated = basis.T @ matrix @ basis
-    symmetric = 0.5 * (rotated + rotated.T)
-    eigenvalues = np.linalg.eigvalsh(symmetric)
-    if float(eigenvalues[0]) <= _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny):
-        raise np.linalg.LinAlgError("the profiled curvature is not resolvably positive definite: a direction is flat to rounding")
-    factor = np.linalg.cholesky(symmetric)
+    factor = np.linalg.cholesky(0.5 * (rotated + rotated.T))
     inverse_factor = solve_triangular(factor, np.eye(factor.shape[0]), lower=True)
     profiled = null_basis.shape[1]
     trailing = inverse_factor[profiled:]
@@ -2558,30 +2317,22 @@ def _evidence(
     working_bytes: int,
     tolerance: float,
     maximize: bool = True,
-    screen: float | None = None,
 ) -> _Evidence | None:
     """``_evidence_once``, each distinct input once per cavity (and per correction, held by identity: one per hyper step)."""
     return _repeated(
-        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance, maximize, screen),
-        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, maximize, screen), held=correction,
+        "evidence", cavity, (*_prior_digest(prior), log_smoothing, start, working_bytes, tolerance, maximize),
+        lambda: _evidence_once(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, maximize), held=correction,
     )
 
 
 def _evidence_once(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, maximize: bool = True,
-    screen: float | None = None,
+    prior: ScaleMixturePrior, log_smoothing: F64Array, start: F64Array, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, maximize: bool = True
 ) -> _Evidence | None:
     """V(rho) with the total curvature B, and its exact rho-gradient; x_rho re-maximized from ``start``. None when x_rho is not a strict maximum of the objective V integrates, i.e. B + S is not
     positive definite there (lead ruling: such a point is never accepted, and its V never reported).
 
     With ``maximize`` false, V's formula is taken at ``start`` itself (an outer state's own x, ``_outer_state``): its
     error then carries x's own decrement there, as the inner maximizer's share does.
-
-    With ``screen`` (a release trial's, ``_best_certified``), None where the Laplace V at x_rho is at or below it,
-    before its rho-gradient is formed (a failing trial never reads it). The screen is read at x_rho itself, never
-    at an earlier iterate through the inner error bound: that bound is first order in x's remaining move, and on
-    ENSG00000274602.5 [real] the tightened iterate's V lay 0.45 nats above a first iterate's V plus its bound (the
-    determinant's change along a near-flat direction is not first order), which would have discarded the basin.
 
     V = F + 1/2 log|S|_+ - 1/2 log|B + S| + 1/2 log|N'(B + S)N|: B = -d2 log Z_EP / dx2 with EP re-solved, the
     second-order approximation of the actual marginal likelihood, taken as A + ``correction`` (``CurvatureCorrection``);
@@ -2613,7 +2364,7 @@ def _evidence_once(
         newton_decrement = 0.5 * float(gradient @ covariance @ gradient)
         curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, weight, working_bytes)
         sensitivity = max(float(curvature_gradient @ covariance @ curvature_gradient), np.finfo(np.float64).tiny)
-        rounding = objective.rounding + _EPSILON * abs(value)
+        rounding = _EPSILON * (objective.magnitude + abs(value))
         # x-hat's error moves the determinant terms by at most this at first order, and F itself by at most the
         # decrement (the quadratic model's own gain); together, the inner maximizer's share of V's error.
         inner_error = 0.5 * float(np.sqrt(sensitivity * 2.0 * newton_decrement)) + newton_decrement
@@ -2623,9 +2374,7 @@ def _evidence_once(
             # The maximizer resolves x no further (its own rounding stop): V is as accurate as double precision gives.
             break
         previous = coefficients
-        # Never below the objective's rounding: a decrement under it is unresolvable, and the maximizer asked for one
-        # ran 425 iterations to a tolerance of 4e-14 on ENSG00000274602.5 [real] (6.7 s a start) before its own stops.
-        inner_tolerance = max(2.0 * tolerance * tolerance / sensitivity, rounding)
+        inner_tolerance = 2.0 * tolerance * tolerance / sensitivity
     penalty_log_determinant = sum(_log_pseudo_determinant(penalty[np.ix_(group, group)]) for group in _penalty_groups(prior))
     # B + S at x_rho: the fixed-cavity A + S there plus the EP-response part held at the fixed point; a relative residual
     # e of that response moves 1/2 log|B + S| by at most D e / 2, charged below at the residual the solve reached
@@ -2643,29 +2392,12 @@ def _evidence_once(
     # bound exceeds the tolerance (B + S near-singular off the profiled space), the point is not a certified maximum.
     if tolerance > 0.0 and 0.5 * profiled_total.rounding > tolerance:
         return None
-    if prior.anchor is not None:
-        # The local model's C term is a second-order model of E about x_k, and E itself is bounded above by the data
-        # objective's ceiling (``_objective_ceiling``: Z_j <= sup l_j for every prior): a point whose anchor term has
-        # grown past what the data objective can move is the quadratic's own, not a maximum of E, and certifies
-        # nothing. On ENSG00000100385.14 [real, snv], a gene the data do not see, a release trial's maximizer walked
-        # an indefinite C to |x| = 3.7e5 and reported V = 27,112 nats from the quadratic alone; the outer loop took
-        # it and every state after it had a decrement of 5e7.
-        anchor_term = abs(_anchor_value(prior, coefficients)[0])
-        data_ceiling = _data_ceiling(cavity)
-        if np.isfinite(data_ceiling) and anchor_term > data_ceiling - objective.value + tolerance:
-            return None
     total_covariance = profiled_total.inverse
     evidence_value = value + 0.5 * penalty_log_determinant - 0.5 * profiled_total.schur_log_determinant
-    if screen is not None and evidence_value <= screen:
-        return None
     # V's own rho-gradient: W_B = (B + S)^-1 - N (N'(B + S)N)^-1 N' carries both determinants' dependence on rho,
     # through S directly and through x_rho in A(x_rho) (C is held), with dx/drho_i = -(-H)^-1 lambda_i S_i x.
     total_weight = profiled_total.weight
-    # The gradient's trace term is one pass over the sites' third derivatives; a view with no finite weight (every
-    # block at its edge) has no rho-gradient to take.
-    total_curvature_gradient = (
-        _curvature_trace_gradient(prior, coefficients, cavity, total_weight, working_bytes) if prior.smoothing_blocks else np.zeros(coefficients.shape[0])
-    )
+    total_curvature_gradient = _curvature_trace_gradient(prior, coefficients, cavity, total_weight, working_bytes)
     evidence_gradient = np.empty(len(prior.smoothing_blocks))
     effective_degrees = np.empty(len(prior.smoothing_blocks))
     penalty_sizes = np.empty(len(prior.smoothing_blocks))
@@ -2852,35 +2584,26 @@ def _same_basin(first: _Evidence, second: _Evidence) -> bool:
 
 
 def _best_certified(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
-    screen: float | None = None,
+    prior: ScaleMixturePrior, log_smoothing: F64Array, starts: Sequence[F64Array], cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
     """The certified inner maximum with the highest corrected V over the given starts; distinct basins are compared
     by their certified V (``_corrected``), and a start that lands in an already-found basin adds nothing.
 
     Two starts found one basin when their points are within the inner maximizer's own radii of each other,
-    sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the first
-    start's candidate stands for the basin, which is then corrected once.
-
-    With ``screen``, the corrections are taken only where some basin's Laplace V is above it, and None is returned
-    otherwise: the search's screen for a release trial (``_maximize_evidence``), never a certificate. A start whose
-    Laplace V is at or below the screen is left before its rho-gradient is formed (``_evidence_once``)."""
+    sqrt(2 d_a) + sqrt(2 d_b) in the -H metric, and their V agree to within their certified errors; the one with the
+    smaller error stands for the basin, which is then corrected once."""
     certified: list[_Evidence] = []
     for start in starts:
-        candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance, screen=screen)
+        candidate = _evidence(prior, log_smoothing, start, cavity, correction, working_bytes, tolerance)
         if candidate is None:
             continue
-        for other in certified:
+        for position, other in enumerate(certified):
             if _same_basin(candidate, other):
-                # The first start's candidate stands for the basin: the starts are ordered warm, flat, log-normal,
-                # and the warm one is the closest to the state the outer loop moves from (on gene 1 [real] a
-                # profile approaching its supremum along a ray, the log-normal start's candidate lay far along it,
-                # and the joint trial to it had no certified state at its own fixed point).
+                if candidate.error < other.error:
+                    certified[position] = candidate
                 break
         else:
             certified.append(candidate)
-    if screen is not None and not any(candidate.value > screen for candidate in certified):
-        return None
     corrected = [
         evidence
         for evidence in (_corrected(prior, log_smoothing, candidate, cavity, correction, working_bytes, tolerance) for candidate in certified)
@@ -2925,13 +2648,12 @@ def _edge_evidence(
     cavity: Cavity, correction: CurvatureCorrection,
     working_bytes: int,
     tolerance: float,
-    screen: float | None = None,
 ) -> tuple[F64Array, _Evidence] | None:
     """The best certified evidence of the model with ``infinite`` at lambda = infinity, the other weights at
-    ``weights``; with its restriction basis. ``screen`` as in ``_best_certified``."""
+    ``weights``; with its restriction basis."""
     view, allowed = _restricted_prior(prior, infinite)
     finite = [position for position in range(weights.shape[0]) if position not in infinite]
-    evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, correction, working_bytes, tolerance, screen)
+    evidence = _best_certified(view, weights[finite], [allowed.T @ start for start in starts], cavity, correction, working_bytes, tolerance)
     return None if evidence is None else (allowed, evidence)
 
 
@@ -2943,27 +2665,21 @@ def _maximize_evidence(
     working_bytes: int,
     bounds: list[tuple[float, float]],
     tolerance: float,
-    held_edges: frozenset[int] = frozenset(),
-    held_finite: frozenset[int] = frozenset(),
 ) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
     at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
-    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight is released to the
-    centre of its resolvable range when the certified V is higher there. There is no lambda = 0 edge (see the module
-    docstring), so a start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
+    (lead ruling), and the best edge that raises V past the tolerance is taken; an edge weight moves back to the
+    upper end of its range when V is higher there. There is no lambda = 0 edge (see the module docstring), so a
+    start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
     global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
     the start.
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
-    # A finite start weight past its range's resolvable end (the range moves with the data curvature at x: on
-    # ENSG00000274602.5 [real] a block's weight of 2.27, found by an earlier search, lay past the range's upper end
-    # at a later state) is clipped to the range, never remapped to the lambda = infinity edge: the edge's view
-    # projects x onto the block's null space, where the outer state's certified maximum (with the block finite) is
-    # no maximum, so every start failed and the search fell back to releasing every block at once, whose
-    # maximizations collapsed; at the range's end V is the edge's to the tolerance by construction, with x kept.
-    infinite = frozenset(int(position) for position in np.flatnonzero(start_weights == np.inf))
+    # A start weight past its range's resolvable upper end (a fit on another lattice, whose range differs) is the
+    # lambda = infinity edge itself: V is not resolved there, and the edge is its limit.
+    infinite = frozenset(int(position) for position in np.flatnonzero((start_weights == np.inf) | (start_weights > upper)))
     weights = np.where(np.isin(np.arange(start_weights.shape[0]), list(infinite)), upper, np.clip(start_weights, lower, upper))
     flat = initial_hyperparameters(prior).coefficients
     log_normal = _log_normal_start(prior, start_coefficients, cavity, working_bytes)
@@ -2973,15 +2689,12 @@ def _maximize_evidence(
         # The warm weights (a fit on another lattice, or at a fold of their basin) can have no certified maximum:
         # the search then starts from the canonical start's weights, every edge released.
         infinite = frozenset()
-        weights = 0.5 * (lower + upper)
+        weights = np.clip(initial_hyperparameters(prior).log_smoothing, lower, upper)
         first = _edge_evidence(prior, weights, infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
     if first is None:
         raise FloatingPointError("no structural start reaches a certified maximum at the starting penalty weights")
     start = first[1]
     best_corrected = -np.inf
-    # Blocks released from their edge below, once each per search: a block the ascent then returns to its edge is
-    # not tried again; ``held_edges`` (``hyper_step``) are never released.
-    released_once: set[int] = set(held_edges)
     while True:
         edges = infinite
         finite = np.array([position for position in range(len(bounds)) if position not in edges], dtype=np.int64)
@@ -3011,9 +2724,6 @@ def _maximize_evidence(
         # can prefer an edge the Laplace gradient does not see. The best edge that raises V past the tolerance is taken.
         best_edge = None
         for position in (int(index) for index in finite):
-            if position in held_finite:
-                # The outer loop measured this block's move to its edge at its own fixed point and it lost.
-                continue
             trial_infinite = infinite | {position}
             trial = _edge_evidence(prior, weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
             if trial is not None and trial[1].value > current_value + tolerance and (best_edge is None or trial[1].value > best_edge[1][1].value):
@@ -3022,29 +2732,12 @@ def _maximize_evidence(
             infinite, moved = frozenset(best_edge[0]), True
             coefficients = best_edge[1][0] @ best_edge[1][1].coefficients
         if not moved:
-            # An edge weight is released where the certified V at the centre of its resolvable range is above the
-            # edge's by more than the tolerance. The centre is the weight at which the penalty's geometric-mean
-            # eigenvalue matches the data's curvature (the log-midpoint of the two half-precision ends): the one
-            # scale-free point where the two are commensurate. The range's upper end cannot release anything: the
-            # penalty swamps the data there past half precision, so V is the edge's to the tolerance by
-            # construction and its slope is O(e^-rho) (on the mean-field test problem V's interior maximum sits
-            # mid-range, 2.7 nats above the edge on one class, with a slope of -0.0004 +- 0.06 at the upper end).
-            # The Laplace form screens the centre (``_best_certified``): the Tierney-Kadane terms lowered V on every
-            # problem measured (gene 1's flat interior by 1-66 nats, the test problem's optimum by 0.4), so the
-            # corrections are taken only where the Laplace V is itself above the edge. The ascent from the centre
-            # then searches the interior.
             for position in sorted(edges):
-                if position in released_once:
-                    continue
                 trial_infinite = infinite - {position}
                 trial_weights = weights.copy()
-                trial_weights[position] = 0.5 * (lower[position] + upper[position])
-                trial = _edge_evidence(
-                    prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance,
-                    screen=current_value + tolerance,
-                )
+                trial_weights[position] = upper[position]
+                trial = _edge_evidence(prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance)
                 if trial is not None and trial[1].value > current_value + tolerance:
-                    released_once.add(position)
                     infinite, weights, moved = frozenset(trial_infinite), trial_weights, True
                     coefficients = trial[0] @ trial[1].coefficients
                     break
@@ -3248,10 +2941,7 @@ def _stationarity(
 
 @_step_scoped
 def hyper_step(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float,
-    held_edges: frozenset[int] = frozenset(),
-    held_finite: frozenset[int] = frozenset(),
-    release_provisional: bool = False,
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> HyperStep:
     """Maximize the B-evidence over every penalty weight in [0, infinity], with x at the penalized maximum for each, to
     ``tolerance`` nats: the resolution the fit certifies (1/(2K) for a scorer with K posterior draws).
@@ -3267,18 +2957,6 @@ def hyper_step(
 
     The returned step's ``tighten`` re-checks its stationarity at the final weights with the bound tightened to a
     budget (``_stationarity``), with no new search.
-
-    ``held_edges`` are blocks the search leaves at their lambda = infinity edge: those the outer loop released on
-    this model's proposal and returned (``fit_hyperparameters``: x polished at the freed weights certified below
-    the state it left), so the local model's account of that interior was measured and refuted at its own fixed
-    point, which stands above what the model predicts here. ``held_finite`` are blocks the search never moves to
-    their edge: those whose edge the outer loop took on this model's proposal and refused at its own fixed point
-    (the same measurement, the other way: on the mean-field test problem the model put a block back at its edge
-    from the interior state whose E stood 2.9 nats above the edge's, and the edge lost there by 0.14). With
-    ``release_provisional`` (the outer loop's call), a search that released a block returns at once with an infinite
-    stationarity gain: the outer loop takes the release at its own fixed point and its next hyper step there searches
-    the weights afresh, so the released weights' polish and certificate here would be discarded; a standalone call
-    keeps the full certificate.
 
     The search is over the EP evidence's local model about the fixed point at ``hyperparameters.coefficients``, where
     ``correction`` was solved (``_Anchor``): x_rho maximizes F - 1/2 (x - x_k)'C(x - x_k) - P, whose curvature
@@ -3302,7 +2980,7 @@ def hyper_step(
     )
     start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
     log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
-        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
+        prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance
     )
     final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
     final_view, final_allowed = _restricted_prior(prior, final_infinite)
@@ -3311,17 +2989,9 @@ def hyper_step(
     lower = np.array([bound[0] for bound in bounds])[finite_final]
     upper = np.array([bound[1] for bound in bounds])[finite_final]
     evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
-    interior = (weights > lower) & (weights < upper)
-    # A search that released a block from its edge is provisional: the outer loop takes it at its own fixed point,
-    # polishes x there, and its next hyper step at that state searches the weights afresh, so the released
-    # weights' polish and stationarity certificate here would be discarded (on ENSG00000254709.8 [real] a release's
-    # hyper step spent 67 s, most of it in the weights' certified moves and difference slopes, before the release
-    # was refused at its fixed point). The step returns with an infinite stationarity gain, as a release's certificate
-    # is never read.
-    released = release_provisional and bool(np.any(finite_final & ~np.isfinite(hyperparameters.log_smoothing)))
     # The weights, evidence and check before a band move (below), until the check after it has judged it.
     band: tuple[F64Array, _Evidence, _Stationarity] | None = None
-    while not released:
+    while True:
         interior = (weights > lower) & (weights < upper)
         check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
         if band is not None:
@@ -3378,9 +3048,7 @@ def hyper_step(
         # pass and the loop ends.
         resumed_smoothing = log_smoothing.copy()
         resumed_smoothing[finite_final] = weights
-        resumed = _maximize_evidence(
-            prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
-        )
+        resumed = _maximize_evidence(prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance)
         if resumed[2].value > evidence.value:
             log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
             final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
@@ -3392,12 +3060,6 @@ def hyper_step(
             evidence = replace(evidence, coefficients=final_allowed.T @ coefficients)
     log_smoothing = log_smoothing.copy()
     log_smoothing[finite_final] = weights
-    if released:
-        count = weights.shape[0]
-        check = _Stationarity(
-            gradient=np.zeros(count), error=np.zeros(count), curvature=np.zeros((count, count)), steps=np.zeros(count), folds=np.zeros(count),
-            gain=np.inf, better=None,
-        )
 
     def checked(check: _Stationarity, evidence: _Evidence = evidence) -> HyperStep:
         """The step at ``evidence`` (V at the returned weights, as resolved so far) with the stationarity ``check``;
@@ -3458,26 +3120,11 @@ class FixedPoint:
     mean: F64Array
     precision_norm: Callable[[F64Array], float | F64Array]
     effective_effects: float | F64Array
-    # Puts the oracle back at this fixed point, where it offers that: the outer loop restores its state's point before
-    # every trial, so a trial's fixed point is a function of its hyperparameters and the state, warm from the state,
-    # never of the refused trials before it (a mean-field solve warm from a refused trial's q reached another fixed
-    # point at the state's own hyperparameters on ENSG00000274602.5 [real]: V 867.7 against the state's 819.7, which
-    # the path gain along x cannot see, so the trial was refused and the fit ended uncertified).
-    restore: Callable[[], None] | None = None
-    # The evidence's part this fixed point carries beyond the fixed-cavity F = sum_j log Z_j, where the oracle knows
-    # it: at a mean-field fixed point q_j is the tilted law of its pseudo-likelihood, so ELBO = F + G with G the
-    # pseudo-likelihoods' Gaussian part (-n/2 log 2 pi sigma^2 - (|r|^2 + sum_j |x_j|^2 v_j) / 2 sigma^2 - sum_j
-    # E_q log l_j), whose x-gradient at fixed q is zero: E = F + G has the fixed-cavity gradient and is one function
-    # across fixed points, so two states' E differ exactly by their values plus offsets (``_path_gain``), with no
-    # path integral, and a release polished at its own fixed point is judged on a comparable value
-    # (``settle_release``; V alone moved by 48 nats between two fixed points 2.4 nats of ELBO apart on
-    # ENSG00000274602.5 [real]). NaN where the oracle gives none (EP's fixed points): the path integral then.
-    evidence_offset: float = np.nan
 
 
 FixedPoints = Callable[[Sequence[MixtureHyperparameters]], Sequence["FixedPoint | None"]]
-"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call (from the state's point
-where the points offer ``restore``); None for a model where none exists (EP reaches no proper cavities there)."""
+"""Each model's certified EP fixed point at its hyperparameters, warm from the previous call; None for a model where
+none exists (EP reaches no proper cavities there)."""
 
 
 @dataclass(frozen=True)
@@ -3535,8 +3182,14 @@ class _NewtonB:
 
 def _penalized_gradient(prior: ScaleMixturePrior, weights: F64Array, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> F64Array:
     """The fixed-cavity gradient of the penalized objective in x: at an EP fixed point, the EP evidence's."""
-    objective = _data_objective(prior, coefficients, cavity, working_bytes, hessian_too=False)
+    objective = _data_objective(prior, coefficients, cavity, working_bytes)
     return _penalized(prior, objective, weights, _penalty_matrix(prior, weights), coefficients)[1]
+
+
+def _metric_decrement(newton: _NewtonB, gradient: F64Array) -> float:
+    """1/2 g'(B + S)^-1 g in the step's own metric (B + S positive definite)."""
+    components = newton.eigenvectors.T @ gradient
+    return 0.5 * float(np.sum(components * components / newton.eigenvalues))
 
 
 def _newton_b(
@@ -3568,15 +3221,18 @@ def _trial(newton: _NewtonB, step: F64Array) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + step), log_smoothing=newton.log_smoothing)
 
 
+def _newton_step(newton: _NewtonB) -> F64Array:
+    return newton.eigenvectors @ ((newton.eigenvectors.T @ newton.gradient) / newton.eigenvalues)
+
+
 def _proposal(newton: _NewtonB, radius: float) -> F64Array:
-    """The step: the maximizer of the quadratic model inside ``radius`` (More and Sorensen): Newton's (B + S)^-1 g
-    where B + S is positive definite and that step fits, the boundary maximizer otherwise, which follows B + S's
-    negative curvature out of a saddle. The radius binds the definite case too: Newton's step divides each
-    direction's gradient by its own curvature, and on a direction the data barely curve (the log-normal family at
-    the lambda = infinity edge, curvature 3e-5 against a gradient of 0.02 on the mean-field test problem) it is
-    hundreds of units long, which the acceptance test cannot refuse: it lands where the density has collapsed onto
-    one lattice node, every derivative is at rounding, and the vanished gradient reads as a maximum."""
-    return _trust_region_step(newton.total, newton.gradient, radius, spectrum=(newton.eigenvalues, newton.eigenvectors))
+    """The step: Newton's (B + S)^-1 g where B + S is positive definite (damped by halving a refused step, not by a
+    radius: a step shortened below the EP fixed point's own resolution cannot be told from the point it left), else
+    the maximizer of the quadratic model inside ``radius`` (More and Sorensen), which follows B + S's negative
+    curvature out of a saddle."""
+    if newton.definite:
+        return _newton_step(newton)
+    return _trust_region_step(newton.total, newton.gradient, radius)
 
 
 def _cauchy_radius(newton: _NewtonB) -> float:
@@ -3601,11 +3257,7 @@ class _State:
     W_j - F_j(x_j), and E's change between two states is the path integral of ``gradient`` (the EP evidence's
     x-gradient, the fixed-cavity one at a fixed point), corrected by B's change along the step (``fixed_curvature``
     A_j and ``correction`` C_j, in full x). ``decrement`` is x's own Newton decrement delta_j; ``polished`` marks a
-    state whose x inner steps have taken to its maximum at rho_j to the certificate's resolution; ``tail`` is the
-    remaining gain the inner steps' own geometric contraction bounds where they end (``fit_hyperparameters``:
-    a profile that approaches its supremum along a ray, E_inf - c e^{-t/tau}, gives Newton steps of one length
-    with gains falling by a fixed ratio r, and its remaining gain is the last gain times r / (1 - r), twice the
-    Newton decrement there; zero where the decrement is the bound)."""
+    state whose x inner steps have taken to its maximum at rho_j to double precision."""
 
     value: float
     rest: float
@@ -3615,11 +3267,6 @@ class _State:
     error: float
     decrement: float
     polished: bool = False
-    tail: float = 0.0
-    # The fixed point's ``FixedPoint.evidence_offset``: ``value`` + ``offset`` is E's units across fixed points.
-    offset: float = np.nan
-    # Whether an inner step below x's resolution ended the polish here: no further polish lowers the decrement.
-    at_resolution: bool = False
 
 
 def _outer_state(
@@ -3632,12 +3279,7 @@ def _outer_state(
     lowest = np.array([bound[0] for bound in _smoothing_bounds(prior, data)])
     log_smoothing = np.where(hyperparameters.log_smoothing == -np.inf, lowest, hyperparameters.log_smoothing)
     infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
-    # Restricted first, anchored second: the anchor asks C on the view's own directions (at an all-edge state two per
-    # class, not the lattice's K per class), and the correction's lazy solve keeps them for the hyper step's full
-    # anchor. The order is exact: z_k is the same in every view, and ``_restricted_prior`` re-anchors a restricted
-    # view with the same correction and center.
-    view, allowed = _restricted_prior(prior, infinite)
-    view = _anchored(view, correction, prior.coefficient_map @ hyperparameters.coefficients)
+    view, allowed = _restricted_prior(_anchored(prior, correction, prior.coefficient_map @ hyperparameters.coefficients), infinite)
     weights = log_smoothing[np.isfinite(log_smoothing)]
     evidence = _evidence(view, weights, allowed.T @ hyperparameters.coefficients, point.cavity, correction, working_bytes, tolerance, maximize=False)
     corrected = None if evidence is None else _corrected(view, weights, evidence, point.cavity, correction, working_bytes, tolerance)
@@ -3647,7 +3289,7 @@ def _outer_state(
     fixed = -(mapping.T @ data.hessian @ mapping)
     return _State(
         value=corrected.value, rest=corrected.value - data.value, gradient=mapping.T @ data.gradient, fixed_curvature=0.5 * (fixed + fixed.T),
-        correction=correction, error=corrected.error, decrement=evidence.inner_decrement, offset=float(point.evidence_offset),
+        correction=correction, error=corrected.error, decrement=evidence.inner_decrement,
     )
 
 
@@ -3657,13 +3299,7 @@ def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Ar
     correction, (g_start + g_end)'s / 2 + s'(B_end - B_start)s / 12 (exact where E is quartic along s), whose plain
     rule's error |s'(B_end - B_start)s| / 12 bounds the corrected one's; the penalty and the determinant terms
     change in closed form (the states' ``rest``), and eps adds both states' own errors. The fixed points' gradient
-    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``).
-
-    Where both fixed points carry E's offset (``FixedPoint.evidence_offset``: the mean-field oracle's), the gain is
-    exact, (value + offset)_end - (value + offset)_start, with both states' errors as its resolution: no path
-    integral, no end correction, and the same E across fixed points."""
-    if np.isfinite(start.offset) and np.isfinite(end.offset):
-        return (end.value + end.offset) - (start.value + start.offset), start.error + end.error
+    error along s (their perturbation probes) is not charged yet (``OuterFit.fixed_point_term_measured``)."""
     if not np.any(move):
         return end.rest - start.rest, start.error + end.error
     along = (prior.coefficient_map @ move)[:, None]
@@ -3702,7 +3338,6 @@ class _OuterTrial:
     weights_tolerance: float = np.nan
 
 
-@_step_scoped
 def fit_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
 ) -> list[OuterFit]:
@@ -3769,110 +3404,15 @@ def fit_hyperparameters(
     iterations, halvings, unresolved = [0] * count, [0] * count, [0] * count
     # |G - pi| at the model's last whole joint trial: the local model's measured error (unknown before the first).
     remainders = [np.inf] * count
-    # A release (the step frees an edge weight) is taken as its weights' move first, at x_k and its fixed point
-    # (the fixed point does not depend on the weights), and x then follows by inner steps at the freed weights; the
-    # joint step stands where x's certified V at the freed weights, once polished, is above the state's it left by
-    # more than the tolerance and both errors. ``anchors`` holds that state (and the step's predicted gain) until
-    # then, and ``refused_releases`` the blocks a model was returned from, which its next hyper steps hold at their
-    # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
-    anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
-    refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
-    # The blocks a model's hyper step moved to their edge and the joint trial refused at its own fixed point: its
-    # next hyper steps keep them finite (``hyper_step``'s ``held_finite``).
-    refused_edges: list[set[int]] = [set() for _model in range(count)]
-    # Each model's last evaluated hyper step: the certificate an uncertified return at the family's boundary reports.
-    last_steps: list[HyperStep | None] = [None] * count
-    # The realized gains of each model's consecutive accepted inner steps at its current weights (``_State.tail``).
-    inner_gains: list[list[float]] = [[] for _model in range(count)]
-    # Whether the model's last whole joint trial had no certified state at its own fixed point.
-    whole_uncertifiable: list[bool] = [False] * count
-
-    def tail_of(model: int) -> float:
-        """The remaining gain the last two inner gains' contraction bounds: g r / (1 - r) with r their ratio, where
-        two gains are measured and the ratio is below one (the geometric tail of a profile approaching its
-        supremum along a ray); infinite where the gains do not contract, zero where none is measured yet."""
-        gains = inner_gains[model]
-        if len(gains) < 2:
-            return 0.0
-        previous, last = gains[-2], gains[-1]
-        if last <= 0.0:
-            return 0.0
-        if previous <= 0.0:
-            return np.inf
-        rate = last / previous
-        return last * rate / (1.0 - rate) if rate < 1.0 else np.inf
     # The tolerance each model's weights are searched to: the fit's, until a decision finds their remaining gain is what
     # stops the certificate and their bound cannot be tightened to the share the rest leaves (``decide``).
     weight_tolerances = [tolerance] * count
-    # The decrement each model's x is polished to: the fit's tolerance, until a decision finds the state's own error
-    # (whose floor is x's decrement there) is what stops the certificate and no re-certification lowers it to the
-    # share the rest leaves (``decide``): x then polishes further, to that share.
-    polish_tolerances = [tolerance] * count
     # Whether the oracle's last solve for the model was elsewhere than the point it returns.
     displaced = [False] * count
     histories: list[list[float]] = [[] for _model in range(count)]
 
-    def segment_reach(model: int, segment: F64Array, fraction: float, gain: float) -> float:
-        """The largest gain any shorter fraction of a refused joint step can reach, under the quadratic model of the
-        gain along the segment through the state's slope (the B-model's gradient at rho_k along it) and the realized
-        gain at ``fraction``: infinite where the realized gain is positive or unmeasured (a halving may still resolve
-        it), 0 where the segment is no ascent at the state, and s^2 / (4 |c|) otherwise (the model's maximum over the
-        segment). A halving sequence whose gains are negative and rising toward zero as the fraction shrinks halved
-        thirty-one times from an unpolished state on ENSG00000285707.1 [real] (a fixed point and an outer state each,
-        31 of its 75 s) before the fraction fell below x's resolution, and x polished only then."""
-        if not np.isfinite(gain) or gain > 0.0:
-            return np.inf
+    def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
-        slope = float(newton.gradient @ (newton.allowed.T @ segment))
-        if slope <= 0.0:
-            return 0.0
-        # gain = slope f + c f^2 with gain <= 0 < slope f: c < 0, and the model peaks at slope^2 / (4 |c|).
-        curvature = (gain - slope * fraction) / (fraction * fraction)
-        return slope * slope / (4.0 * -curvature)
-
-    def settle_release(model: int) -> None:
-        """x polished at the freed weights: the release stands where its certified V is above the state's it left by
-        more than the tolerance and both errors (its realized gain measured against the step's prediction);
-        otherwise the model returns to that state and this release is not planned again."""
-        anchor = anchors[model]
-        assert anchor is not None
-        anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, predicted = anchor
-        polished_state = states[model]
-        if polished_state is None:
-            realized, resolution = -np.inf, np.inf
-        elif np.isfinite(polished_state.offset) and np.isfinite(anchor_state.offset):
-            # E across the two fixed points (``FixedPoint.evidence_offset``).
-            realized = (polished_state.value + polished_state.offset) - (anchor_state.value + anchor_state.offset)
-            resolution = polished_state.error + anchor_state.error
-        else:
-            realized = polished_state.value - anchor_state.value
-            resolution = polished_state.error + anchor_state.error
-        remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
-        anchors[model] = None
-        if polished_state is not None and realized - resolution > tolerance:
-            states[model] = replace(polished_state, polished=True)
-            return
-        refused_releases[model].add(frozenset(
-            int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
-        ))
-        hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
-        displaced[model], radii[model] = True, None
-
-    def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
-        newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
-        tail = tail_of(model)
-        if polishes and newton.definite and max(newton.decrement, tail) <= polish_tolerances[model] and states[model] is not None:
-            # x is at its maximum at rho_k to the certificate's resolution: the model predicts less gain than the
-            # tolerance, and so does the inner steps' own contraction (``_State.tail``), so the state is planned
-            # once more (a release in flight is settled here). A polish that only ends on a step below x's own
-            # resolution walks a flat ray to the family's boundary: on gene 1 [real] the width -> 0 ray, 2.8 units
-            # a step with 1e-4 to 1e-7 nats each, until the density collapsed.
-            states[model] = replace(states[model], tail=tail)
-            if anchors[model] is not None:
-                settle_release(model)
-            else:
-                states[model] = replace(states[model], polished=True)
-            return None
         radius = radii[model]
         if radius is None:
             radius = _cauchy_radius(newton)
@@ -3891,7 +3431,7 @@ def fit_hyperparameters(
         error (``_outer_state`` and ``HyperStep.resolve``: more directions integrated exactly) and the weights' bound
         is tightened to theta times their gain (``HyperStep.tighten``), and the certificate is read again. A piece
         that cannot reach its share stays as measured, so a decision fails only on what no resolution removes."""
-        fixed = remainders[model] + state.tail
+        fixed = remainders[model]
         predicted = step.evidence - state.value
         pieces = (state.error, step.evidence_error, step.stationarity_gain)
         resolvable = float(sum(pieces))
@@ -3900,16 +3440,9 @@ def fit_hyperparameters(
             return state, step, predicted, remaining
         theta = (tolerance - predicted - fixed) / resolvable
         if state.error > 0.0:
-            share = theta * state.error
-            resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, share)
+            resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, theta * state.error)
             if resolved_state is not None:
-                state = replace(resolved_state, polished=state.polished, tail=state.tail)
-            if state.error > share and state.decrement > share:
-                # The state's error cannot reach its share by re-certification alone: its floor is x's own decrement
-                # there (on ENSG00000254709.8 [real] a polished state's error 0.0029 was its decrement, and the
-                # certificate, needing it twice with the step's, stood at 0.0096 against the tolerance 0.0078).
-                # x polishes further, to the share (the refused-trial chain below re-opens the polish).
-                polish_tolerances[model] = min(polish_tolerances[model], share)
+                state = replace(resolved_state, polished=state.polished)
         if step.evidence_error > 0.0 and step.resolve is not None:
             resolved_step = step.resolve(theta * step.evidence_error)
             if resolved_step is not None:
@@ -3926,53 +3459,24 @@ def fit_hyperparameters(
         predicted = step.evidence - state.value
         return state, step, predicted, predicted + fixed + state.error + step.evidence_error + step.stationarity_gain
 
-    def plan(model: int) -> _OuterTrial | None:
+    def plan(model: int) -> _OuterTrial:
         state = states[model]
         planned = weight_tolerances[model]
-        # A polish's geometric sequence of gains belongs to one plan.
-        inner_gains[model] = []
-        # A release is judged from a polished state (below), so an unpolished state's hyper step holds every edge:
-        # its release trials (three maximizations per block at the range's centre) would be discarded.
-        held = frozenset().union(*refused_releases[model])
-        if state is not None and not state.polished:
-            held = held | frozenset(int(position) for position in np.flatnonzero(hyperparameters[model].log_smoothing == np.inf))
         try:
-            step = hyper_step(
-                prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned, held_edges=held,
-                held_finite=frozenset(refused_edges[model]), release_provisional=True,
-            )
+            step = hyper_step(prior, hyperparameters[model], points[model].cavity, corrections[model], working_bytes, planned)
         except FloatingPointError:
             # V's model has no certified maximum here (an indefinite iterate): the weights wait, and x leaves the saddle.
             step = None
         if step is None:
             histories[model].append(np.inf)
             return inner(model, step, np.inf, False)
-        last_steps[model] = step
         if state is None:
             histories[model].append(np.inf)
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
         histories[model].append(float(remaining))
-        entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
-        released = frozenset(
-            int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
-        )
-        if not released or entry.certifying:
-            return entry
-        assert not (released & frozenset().union(*refused_releases[model]))
-        if not state.polished:
-            # A release is judged against a polished state (x at its maximum at these weights, the model's own
-            # account of them reliable there), so x polishes here first; the hyper step from the polished state
-            # proposes the release again where it still holds.
-            return inner(model, step, remaining, True)
-        # The joint step to a freed edge cannot be tested as one move: its x-part is the whole distance from the
-        # edge's density to the interior's (|move| 43 on the mean-field test problem), where the path integral's
-        # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the trial is
-        # taken at its own fixed point without a gain test, x is polished there by inner steps (accepted on the
-        # model as always), and the polished certified V against the state's here decides the release (``anchors``).
-        anchors[model] = (hyperparameters[model], points[model], corrections[model], state, predicted)
-        return entry
+        return _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
 
     def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
         fits[model] = OuterFit(
@@ -3982,23 +3486,15 @@ def fit_hyperparameters(
         )
         pending[model] = None
 
-    def warm_from_states() -> None:
-        """The oracle back at the states' points (``FixedPoint.restore``), so the next solve is warm from them."""
-        for point in points:
-            if point is not None and point.restore is not None:
-                point.restore()
-
     while True:
         for model in range(count):
             if fits[model] is None and pending[model] is None:
                 pending[model] = plan(model)
         if all(fit is not None for fit in fits):
             if any(displaced):
-                warm_from_states()
                 points = list(fixed_points(hyperparameters))
             return [fit for fit in fits if fit is not None]
         trials = [hyperparameters[model] if entry is None else entry.hyperparameters for model, entry in enumerate(pending)]
-        warm_from_states()
         trial_points = list(fixed_points(trials))
         for model, entry in enumerate(pending):
             if entry is None:
@@ -4023,24 +3519,6 @@ def fit_hyperparameters(
                         continue
                 halvings[model] += 1
                 pending[model] = inner(model, entry.step, entry.remaining, False)
-                continue
-            if entry.newton is None and anchors[model] is not None:
-                # A release in flight: the trial stands provisionally at its own fixed point, and x polishes there.
-                assert entry.step is not None
-                if trial_point is None:
-                    unresolved[model] += 1
-                    anchor_hyperparameters, anchor_point, anchor_correction, anchor_state, _predicted = anchors[model]
-                    refused_releases[model].add(frozenset(
-                        int(position) for position in np.flatnonzero(np.isfinite(trial.log_smoothing) & ~np.isfinite(anchor_hyperparameters.log_smoothing))
-                    ))
-                    hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
-                    anchors[model], radii[model], pending[model] = None, None, None
-                    continue
-                trial_correction, trial_state = solve_state(trial, trial_point)
-                hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
-                displaced[model], radii[model] = False, None
-                iterations[model] += 1
-                pending[model] = inner(model, entry.step, entry.remaining, True)
                 continue
             if entry.newton is None:
                 # The joint trial.
@@ -4067,14 +3545,11 @@ def fit_hyperparameters(
                         pending[model] = None
                         continue
                 gain = -np.inf
-                previous_remainder = remainders[model]
                 if trial_point is None:
                     # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                     unresolved[model] += 1
                 else:
                     trial_correction, trial_state = solve_state(trial, trial_point)
-                    if entry.fraction == 1.0:
-                        whole_uncertifiable[model] = trial_state is None
                     if trial_state is not None:
                         gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                         if entry.fraction == 1.0:
@@ -4084,71 +3559,19 @@ def fit_hyperparameters(
                             displaced[model], pending[model] = False, None
                             iterations[model] += 1
                             continue
-                        if state.polished and whole_uncertifiable[model] and gain + resolution + state.tail <= tolerance:
-                            # The whole step's end has no certified value (on gene 1 [real] it lies along the width
-                            # -> 0 ray where the curvature has saturated), so the model's prediction beyond this
-                            # fraction is void and its remainder cannot be measured; the fraction's own certified
-                            # gain bound, G + its resolution (both states' errors and the end correction), with
-                            # the polish's tail, is the remaining gain to any certifiable point along the step,
-                            # and the fit certifies where it is within the tolerance and the fraction's trial
-                            # moves q's mean within the certificate's budget.
-                            current = points[model]
-                            moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
-                            allowed = np.full(moves.shape[0], 2.0 * tolerance)
-                            if bool(np.all(moves <= allowed)):
-                                worst = int(np.argmax(np.where(allowed > 0.0, moves / allowed, 0.0)))
-                                fits[model] = OuterFit(
-                                    hyperparameters=hyperparameters[model], step=entry.step, newton_decrement=state.decrement,
-                                    remaining_gain=gain + resolution + state.tail, prediction_move=float(moves[worst]),
-                                    prediction_tolerance=float(allowed[worst]), iterations=iterations[model], halvings=halvings[model],
-                                    unresolved=unresolved[model], history=tuple(histories[model]),
-                                )
-                                pending[model] = None
-                                continue
                 halvings[model] += 1
                 target = entry.step.hyperparameters
                 segment = target.coefficients - hyperparameters[model].coefficients
                 fraction = 0.5 * entry.fraction
                 same_edges = np.array_equal(target.log_smoothing == np.inf, hyperparameters[model].log_smoothing == np.inf)
-                # A block the step moved to its edge: the move lost at its own fixed point, so the next hyper step
-                # keeps it finite (``refused_edges``); a first such refusal replans from the state.
-                edged = {
-                    int(position) for position in np.flatnonzero(np.isfinite(hyperparameters[model].log_smoothing) & ~np.isfinite(target.log_smoothing))
-                }
-                newly_refused_edge = bool(edged - refused_edges[model])
-                refused_edges[model] |= edged
                 longer = fraction * float(np.linalg.norm(segment)) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(hyperparameters[model].coefficients))))
-                if state.polished and remainders[model] < previous_remainder:
-                    # This whole trial re-measured the model's remainder below the one the plan's certificate carried
-                    # (on the mean-field test problem the first whole trial, from the uncertified start, left 0.106
-                    # nats of remainder that the polished state's own zero-length trial measured at 1e-6; on gene 1
-                    # a 0.0247 the certifying trial measured at 2e-7): the certificate is read again with the fresh
-                    # remainder, before any halving. A remainder that did not fall leaves the certificate as it was,
-                    # so this replans at most once per measured decrease.
-                    pending[model] = None
-                elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and (
-                    # A polished state whose whole step has no certified end halves toward the fraction-certified
-                    # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
-                    # and ends where the segment's quadratic model reaches none.
-                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) > tolerance
-                ):
+                if same_edges and longer and (np.isneginf(gain) or gain > entry.realized):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
                 elif state.polished and weight_tolerances[model] < entry.weights_tolerance:
                     # The decision tightened the weights' tolerance since this plan: the polished state is planned once
                     # more, with the weights searched to what their share asks.
                     pending[model] = None
-                elif newly_refused_edge:
-                    pending[model] = None
-                elif (
-                    state.polished and not state.at_resolution and state.decrement > polish_tolerances[model]
-                    and (reopened := inner(model, entry.step, entry.remaining, True)) is not None
-                ):
-                    # The decision asked a smaller decrement of x than the polish reached (``polish_tolerances``): the
-                    # polish continues to it, and the state is planned again from there (where the B-model's decrement
-                    # is already within it, ``inner`` proposes nothing and the state stands as measured).
-                    states[model] = replace(states[model], polished=False)
-                    pending[model] = reopened
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
                     uncertified(model, entry, entry.step, state.decrement)
@@ -4172,56 +3595,25 @@ def fit_hyperparameters(
                 gradient = _penalized_gradient(
                     newton.view, newton.log_smoothing[np.isfinite(newton.log_smoothing)], newton.origin + proposal, trial_point.cavity, working_bytes,
                 )
-                if not np.any(gradient):
-                    # The data no longer see x at the trial: every derivative is at rounding, the density has collapsed
-                    # onto a lattice node (the mixing density's width -> 0 boundary: on gene 1 [real] with the
-                    # mean-field fixed point solved to its Newton decrement, V's supremum lies there, Newton's steps
-                    # along the ray being 2.8 units each with the gradient and the curvature falling by the same
-                    # factor). x is at its maximum to double precision from here on, and V has no Laplace value there
-                    # (the fixed-cavity curvature is singular), so the trial is the fit's state and the fit returns
-                    # uncertified with its last evaluated step; the boundary model is the open work (MODEL.md).
-                    hyperparameters[model], points[model] = trial, trial_point
-                    displaced[model] = False
-                    iterations[model] += 1
-                    last_step = last_steps[model]
-                    if last_step is None:
-                        raise NoCertifiedProgress("the Newton-B step reaches the mixing density's boundary before any hyper step certified a value")
-                    uncertified(model, replace(entry, remaining=np.inf), last_step, newton.decrement)
-                    continue
-                # The step is an ascent where the trapezoid rule of the two fixed points' gradients along it is
-                # positive (the path integral of E's gradient to first order). A decrement test in the origin's
-                # metric refused every step inside the radius on the mean-field test problem: with B + S's
-                # eigenvalues 2e-5 and 1e-2 the decrement is the weak direction's g^2 / lambda, which no step shorter
-                # than Newton's thousand units lowers, so the loop halved to x's resolution and read a maximum where
-                # the state's own error was 9.6 nats.
-                accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+                if newton.definite:
+                    accepted = _metric_decrement(newton, gradient) < newton.decrement
+                else:
+                    accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
-                previous_state = states[model]
-                if previous_state is not None and trial_state is not None:
-                    inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
-                    inner_gains[model].append(float(inner_gain))
-                else:
-                    inner_gains[model] = []
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
-                # A step that reached the radius widens it; one that stopped short (Newton's, fitting) keeps it.
-                radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
+                if not newton.definite:
+                    radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue
             halvings[model] += 1
-            inner_gains[model] = []
             if not resolved:
-                if entry.polishes and anchors[model] is not None:
-                    settle_release(model)
-                    pending[model] = None
-                    continue
                 if entry.polishes and states[model] is not None:
-                    # x is at its maximum at rho_k to double precision: the state is planned once more, and no
-                    # tighter polish is asked of it (``polish_tolerances``: the share the certificate wanted).
-                    states[model] = replace(states[model], polished=True, at_resolution=True)
+                    # x is at its maximum at rho_k to double precision: the state is planned once more.
+                    states[model] = replace(states[model], polished=True)
                     pending[model] = None
                     continue
                 if newton.definite and entry.step is not None:
@@ -4233,7 +3625,11 @@ def fit_hyperparameters(
                     "the Newton-B step makes no certified progress at the EP fixed point "
                     + ("(B + S is indefinite there)" if not newton.definite else "(the weights have no evaluated step)")
                 )
-            radius = 0.5 * length
-            radii[model] = radius
-            shorter = _proposal(newton, radius)
+            if newton.definite:
+                shorter = 0.5 * proposal
+                radius = entry.radius
+            else:
+                radius = 0.5 * length
+                radii[model] = radius
+                shorter = _proposal(newton, radius)
             pending[model] = replace(entry, hyperparameters=_trial(newton, shorter), proposal=shorter, radius=radius, fraction=0.5 * entry.fraction)

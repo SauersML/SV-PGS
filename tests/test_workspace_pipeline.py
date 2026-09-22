@@ -382,7 +382,8 @@ class _Recorder:
             alpha = np.zeros(1 + covariates.shape[1])
             if trait_type != TraitType.BINARY:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
-            models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0))
+            models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0,
+                                      np.repeat(alpha[:, None], draws.shape[1], axis=1), np.zeros((alpha.size, alpha.size)), True))
         return _Fitted(tuple(model_names), tuple(covariate_names), tuple(models), np.ones(len(models)))
 
 

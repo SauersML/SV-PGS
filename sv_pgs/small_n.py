@@ -240,6 +240,10 @@ class DenseStatistics:
         return self.design.sample_count
 
     @property
+    def covariate_rank(self) -> int:
+        return self.design.basis.shape[1]
+
+    @property
     def signs(self) -> F64Array:
         """Each member's sign: its standardized column is s_j x_g, and beta_j = s_j gamma_j."""
         return self.ties.sign
@@ -283,7 +287,9 @@ def _covariate_basis(covariates: F64Array) -> F64Array:
     return left[:, singular > max(covariates.shape) * _EPSILON * singular[0]]
 
 
-def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) -> DenseStatistics:
+def dense_statistics(
+    codes: np.ndarray, covariates: F64Array, target: F64Array, log_variance_offset: F64Array | None = None,
+) -> DenseStatistics:
     """Stage 0 of ``codes`` (n x records, store codes 0..254 = dosage x 127) with ``covariates`` (n x k, intercept
     included) and ``target`` (n,)."""
     values = np.asarray(codes)
@@ -294,7 +300,15 @@ def dense_statistics(codes: np.ndarray, covariates: F64Array, target: F64Array) 
     signed = values.astype(np.int64) - int(SIGNED_CODE_OFFSET)
     sums = signed.sum(axis=0)
     numerator = count * np.einsum("ij,ij->j", signed, signed) - sums * sums
-    active = np.flatnonzero(numerator > 0)
+    varying = numerator > 0
+    if log_variance_offset is not None:
+        offsets = np.asarray(log_variance_offset, dtype=np.float64)
+        if offsets.shape != (values.shape[1],) or np.any(np.isnan(offsets) | np.isposinf(offsets)):
+            raise ValueError("log_variance_offset must contain one finite value or -inf per column.")
+        varying &= np.isfinite(offsets)
+    active = np.flatnonzero(varying)
+    if not active.size:
+        raise ValueError("no varying columns with nonzero prior variance remain.")
     signed = signed[:, active]
     sums = sums[active]
     means = sums / count
@@ -1250,7 +1264,7 @@ class _DenseFixedPoints:
         self.design = statistics.design
         self.data_score = self.design.back(statistics.target)
         self.sample_count = statistics.sample_count
-        self.covariate_count = int(statistics.covariates.shape[1])
+        self.covariate_count = statistics.covariate_rank
         precision, shift = moment_matched_prior_sites(prior, start)
         self.site_precision = precision.copy()
         self.site_shift = shift.copy()
@@ -1606,7 +1620,7 @@ def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_va
     _classes, class_index = np.unique(np.asarray(variant_class)[members], return_inverse=True)
     offsets = np.asarray(log_variance_offset, dtype=np.float64)[members]
     residual = statistics.projected_target
-    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariates.shape[1])
+    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
     single_precision = statistics.design.column_squares() / start_noise
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
@@ -1627,7 +1641,7 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     score = design.back(statistics.target)
     moment = moment_start(
         target_square=float(residual @ residual),
-        residual_dimension=float(statistics.sample_count - statistics.covariates.shape[1]),
+        residual_dimension=float(statistics.sample_count - statistics.covariate_rank),
         score_square=float(score @ score),
         gram_trace=float(np.trace(kernel)),
         weighted_diagonal=float(weights @ squares),
@@ -1661,8 +1675,8 @@ def fit_small_n(
     if inference not in ("ep", "mean_field"):
         raise ValueError("inference must be 'ep' or 'mean_field'.")
     started = time.perf_counter()
-    statistics = dense_statistics(codes, covariates, target)
     offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
+    statistics = dense_statistics(codes, covariates, target, offsets)
     prior = small_n_prior(statistics, variant_class, offsets, draw_count)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(statistics, prior)
@@ -1677,6 +1691,8 @@ def fit_small_n(
         (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
+    if not outer.certified:
+        raise FloatingPointError(f"outer fit did not converge: remaining gain {outer.remaining_gain}, unresolved {outer.unresolved}; {inference} refusals: {oracle.refusals}")
     generator = np.random.default_rng(seed)
     if inference == "ep":
         # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
@@ -1698,6 +1714,9 @@ def fit_small_n(
         alpha=alpha,
         trait_type=trait_type,
         predictive_intercept_shift=0.0,
+        covariate_draws=alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - oracle.mean[:, None]),
+        covariate_covariance=oracle.noise * statistics.covariate_pseudo_inverse,
+        gaussian_posterior=inference == "ep",
     )
     certificate = FitCertificate(
         remaining_gain=np.array([outer.remaining_gain]),
@@ -1725,6 +1744,7 @@ def fit_small_n(
         outer_history=(outer.history,),
         refreshes=int(oracle.profile["refreshes"]),
         passes=int(oracle.profile["passes"]),
+        certified=np.array([outer.certified], dtype=bool),
     )
     profile = dict(oracle.profile) | {
         "stage0_seconds": stage0_seconds,

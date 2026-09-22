@@ -9,6 +9,7 @@ import pytest
 from sv_pgs.config import VariantClass
 from sv_pgs.mean_field import MeanFieldFixedPoints, _Response
 from sv_pgs.scale_mixture_ep import (
+    Cavity,
     _components,
     class_log_density,
     initial_hyperparameters,
@@ -98,9 +99,16 @@ def test_every_sweep_raises_the_elbo_and_the_fixed_point_is_the_tilted_moments(t
     # The residual is r = y_P - Xp m, exactly, and p_eff = sum_j omega_j v_j.
     np.testing.assert_allclose(oracle.residual, statistics.projected_target - statistics.design.image(oracle.mean), rtol=1e-9, atol=1e-11)
     np.testing.assert_allclose(point.effective_effects, float(point.cavity.precision @ oracle.variance), rtol=1e-12)
-    # The prediction check's metric is q's own: sum_j d_j^2 / v_j.
+    # The mixture's component KL bounds a marginal location shift. Its precision
+    # exceeds 1 / Var(q), which would understate this movement.
     direction = np.random.default_rng(1).standard_normal(prior.variant_count)
-    np.testing.assert_allclose(point.precision_norm(direction), float(np.sum(np.square(direction) / oracle.variance)), rtol=1e-10)
+    density, scales = class_log_density(prior, start.coefficients), log_scale(prior, start.coefficients)
+    expected = 0.0
+    for label, rows in enumerate(prior.class_rows):
+        terms = _components(density[label], scales[rows], prior.log_variance_grid, point.cavity.precision[rows], point.cavity.shift[rows])
+        expected += float(np.sum(direction[rows] ** 2 * np.sum(terms.responsibility / terms.conditional_variance, axis=1)))
+    np.testing.assert_allclose(point.precision_norm(direction), expected, rtol=1e-10)
+    assert expected >= np.sum(direction ** 2 / oracle.variance)
 
 
 def test_the_response_solves_a_symmetric_indefinite_system_exactly():
@@ -141,46 +149,34 @@ def test_the_cavity_response_matches_finite_differences_of_the_fixed_point():
     def tilted_mean(coefficients):
         return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).mean
 
-    def cavity_at(coefficients):
-        # The fixed point at the moved x with the noise re-solved between sweeps, as the fixed point re-solves it
-        # (the noise is profiled, and B is the profile's curvature): sweeps until the means and the noise stop
-        # moving at double precision, which resolves the cavity far below the differences' step (an ELBO stop
+    def shift_at(coefficients):
+        # The fixed point at the moved x with the noise held at the base point's, as B holds it (the noise's own
+        # response is not part of B in either inference; its stationarity is certified separately): sweeps until
+        # the means stop moving at double precision, which resolves h far below the differences' step (an ELBO stop
         # resolves the means only to the square root of its rounding).
         resolved = MeanFieldFixedPoints(oracle.statistics, prior, oracle.noise, 2**60, _WORKING_BYTES)
         resolved.mean, resolved.variance, resolved.shift, resolved.residual = (values.copy() for values in (oracle.mean, oracle.variance, oracle.shift, oracle.residual))
         hyperparameters = moved(coefficients)
         for _sweep in range(10_000):
-            before, noise_before = resolved.mean.copy(), resolved.noise
-            _divergence, weighted_variance, residual_square, _sizes = resolved._sweep(hyperparameters)
-            resolved.noise = (residual_square + weighted_variance) / resolved.residual_dimension
-            settled_means = np.max(np.abs(resolved.mean - before)) <= np.finfo(np.float64).eps * (1.0 + np.max(np.abs(resolved.mean)))
-            if settled_means and abs(resolved.noise - noise_before) <= np.finfo(np.float64).eps * resolved.noise:
+            before = resolved.mean.copy()
+            resolved._sweep(hyperparameters)
+            if np.max(np.abs(resolved.mean - before)) <= np.finfo(np.float64).eps * (1.0 + np.max(np.abs(resolved.mean))):
                 break
         else:
             raise AssertionError("the moved fixed point did not settle to double precision")
-        # One more sweep at the settled noise, so the cavity is the one that noise built (as ``_solve`` returns it).
-        resolved._sweep(hyperparameters)
-        cavity = resolved._fixed_point(hyperparameters).cavity
-        return np.concatenate([cavity.shift, cavity.precision])
+        return resolved._fixed_point(hyperparameters).cavity.shift
 
     def richardson(function, scale):
         coarse = (function(start.coefficients + scale * direction) - function(start.coefficients - scale * direction)) / (2.0 * scale)
         fine = (function(start.coefficients + 0.5 * scale * direction) - function(start.coefficients - 0.5 * scale * direction)) / scale
         return fine + (fine - coarse) / 3.0
 
-    def tilted_variance(coefficients):
-        return tilted_moments(prior, moved(coefficients), point.cavity, _WORKING_BYTES).variance
-
     scale = 1e-2
     mean_by_z = richardson(tilted_mean, scale)
-    variance_by_z = richardson(tilted_variance, scale)
-    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], variance_by_z[:, None])
-    numeric = richardson(cavity_at, scale)
-    count = prior.variant_count
-    np.testing.assert_allclose(shift_step[:, 0], numeric[:count], rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric[:count]))))
-    # The precisions move together, through the noise alone: -omega dsigma^2 / sigma^2.
-    assert np.any(precision_step)
-    np.testing.assert_allclose(precision_step[:, 0], numeric[count:], rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric[count:]))))
+    shift_step, precision_step = point.posterior.cavity_response(mean_by_z[:, None], np.zeros((prior.variant_count, 1)))
+    assert not np.any(precision_step)
+    numeric = richardson(shift_at, scale)
+    np.testing.assert_allclose(shift_step[:, 0], numeric, rtol=2e-3, atol=2e-3 * float(np.max(np.abs(numeric))))
 
 
 def test_the_noise_update_is_the_elbos_stationary_value():
@@ -231,28 +227,13 @@ def _fit(inference: str):
     )
 
 
-_INTERIOR_CERTIFICATE_REASON = (
-    "with E comparable across fixed points (bf8a3b2) the release stands on this problem (the interior's own fixed point "
-    "2.9 nats above the edge's), and at that interior state the weights' certificate is infinite: the difference "
-    "curvature K is indefinite (eigenvalues -11, -6.9, -0.24 at rho [2.45, 1.87, 2.40]) and no weight move the model "
-    "proposes raises the certified V, so the fit returns its remaining gain as infinite; the boundary model (HANDOFF "
-    "Next 0) or a certificate at a rho-boundary of certifiability is the open work"
-)
-
-
-@pytest.mark.xfail(strict=True, reason=_INTERIOR_CERTIFICATE_REASON)
-def test_the_mean_field_fit_certifies():
+def test_the_mean_field_fit_certifies_and_scores():
     """Machinery only (own simulation): the outer loop certifies on the mean-field oracle (its remaining gain within
-    the tolerance, the prediction move within its budget)."""
+    the tolerance, the prediction move within its budget),
+    and the scoring model carries the fit with the resolved effects on top."""
     fit = _fit("mean_field")
     assert fit.certificate.remaining_gain[0] <= 0.5 / 64
     assert fit.certificate.prediction_move[0] <= fit.certificate.prediction_tolerance[0]
-
-
-def test_the_mean_field_fit_scores():
-    """Machinery only (own simulation): the fixed point's own certificate holds (q's mean move and the noise's gain
-    within their budgets) and the scoring model carries the fit with the resolved effects on top."""
-    fit = _fit("mean_field")
     assert fit.certificate.mean_move[0] <= fit.certificate.draw_tolerance[0]
     assert fit.certificate.noise_gain[0] <= 0.5 / 64
     assert np.all(np.isfinite(fit.scoring.coefficients)) and fit.scoring.posterior_draws.shape == (50, 64)

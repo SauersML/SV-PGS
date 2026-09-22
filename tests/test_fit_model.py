@@ -96,6 +96,9 @@ class _StubDriver:
                     coefficients=coefficients,
                     posterior_draws=coefficients[:, None] + generator.normal(scale=np.abs(coefficients).mean(), size=(store.n_variants, _DRAWS)),
                     alpha=alpha,
+                    covariate_draws=np.repeat(alpha[:, None], _DRAWS, axis=1),
+                    covariate_covariance=np.zeros((alpha.size, alpha.size)),
+                    gaussian_posterior=True,
                     trait_type=trait_type,
                     predictive_intercept_shift=float(generator.normal()) if trait_type == TraitType.BINARY else 0.0,
                 )

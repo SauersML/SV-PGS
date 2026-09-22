@@ -135,11 +135,11 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     ties = TieGroups.from_tie_map(statistics.tie_map)
     weights = np.zeros(ties.group_count)
     np.add.at(weights, ties.group, np.exp(prior.log_variance_offset))
-    covariate_count = statistics.covariate_gram.shape[0]
-    fitted = statistics.covariate_target.T @ np.linalg.pinv(statistics.covariate_gram) @ statistics.covariate_target
+    covariate_count = statistics.covariate_rank
+    fitted = statistics.covariate_target.T @ statistics.covariate_gram_pseudo_inverse @ statistics.covariate_target
     target_square = np.diag(statistics.target_gram) - np.diag(fitted)
     score_square = np.zeros(target_square.shape[0])
-    column_square = np.zeros(prior.variant_count)
+    column_square = np.zeros(ties.group_count)
     gram_trace = 0.0
     gram_square = 0.0
     weighted_diagonal = 0.0
@@ -173,13 +173,19 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
 
 
 def covariate_residual_variance(targets: F64Array, training: F64Array, covariates: F64Array) -> F64Array:
-    """(M,): each model's residual variance after the covariates alone, over n - k degrees of freedom."""
+    """(M,): covariate-only residual variance, over n - rank(C) training directions."""
     noise = np.empty(int(targets.shape[1]))
     for model in range(noise.shape[0]):
         weights = training[:, model]
-        normal = covariates.T @ (weights[:, None] * covariates)
-        residual = weights * (targets[:, model] - covariates @ np.linalg.solve(normal, covariates.T @ (weights * targets[:, model])))
-        noise[model] = float(residual @ residual) / (float(weights.sum()) - covariates.shape[1])
+        selected = weights != 0.0
+        design = covariates[selected]
+        outcome = targets[selected, model]
+        coefficients, _, rank, _ = np.linalg.lstsq(design, outcome, rcond=None)
+        residual = outcome - design @ coefficients
+        degrees = int(selected.sum()) - rank
+        if degrees <= 0:
+            raise ValueError("residual variance requires training directions outside the covariate span.")
+        noise[model] = float(residual @ residual) / degrees
     return noise
 
 
@@ -236,7 +242,7 @@ class FitCertificate:
     passes: int
     # Per model: whether the outer loop certified it (``OuterFit.certified``); an uncertified fit is reported, never
     # passed as certified.
-    certified: F64Array | None = None
+    certified: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -390,6 +396,12 @@ class _FullDataFixedPoints:
         noise: F64Array,
     ) -> None:
         self.gaussian = gaussian
+        covariates = np.asarray(_host(gaussian.covariates))
+        training = np.asarray(_host(gaussian.training))
+        self.covariate_ranks = np.array([
+            np.linalg.matrix_rank(covariates[training[:, model] != 0.0]) if covariates.shape[1] else 0
+            for model in range(gaussian.model_count)
+        ], dtype=np.int64)
         self.generator = np.random.default_rng(seed)
         self.statistics = statistics
         self.prior = prior
@@ -600,7 +612,7 @@ class _FullDataFixedPoints:
             noise_variance(
                 residual_sum_of_squares=float(residual_sum_of_squares[model]),
                 sample_count=int(gaussian.training_counts[model]),
-                covariate_count=int(gaussian.covariates.shape[1]),
+                covariate_count=int(self.covariate_ranks[model]),
                 site_precision=self.site_precision[:, model],
                 posterior_variance=variances[:, model],
                 noise=float(self.noise[model]),
@@ -768,9 +780,8 @@ class _FullDataFixedPoints:
                 self.mean_move = np.where(rate < 1.0, 2.0 * fraction * fraction * upper / np.square(1.0 - rate), np.inf)
             draw_tolerance = np.full(model_count, 2.0 * budget)
             noise = self._noise(variances)
-            covariate_count = int(gaussian.covariates.shape[1])
             self.noise_gain = np.array([
-                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), covariate_count)
+                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), int(self.covariate_ranks[model]))
                 for model in range(model_count)
             ])
             if np.all(certified) and np.all(self.noise_gain <= tolerance):
@@ -875,6 +886,9 @@ def fit_full_data(
     except FloatingPointError as error:
         # The oracle's refusals say why EP had no fixed point; they belong with the failure.
         raise FloatingPointError(f"{error}; EP refusals: {fixed_points.refusals}") from error
+    if not all(fit.certified for fit in fits):
+        failed = [(index, fit.remaining_gain, fit.unresolved) for index, fit in enumerate(fits) if not fit.certified]
+        raise FloatingPointError(f"outer fit did not converge (model, remaining gain, unresolved): {failed}; EP refusals: {fixed_points.refusals}")
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
@@ -925,6 +939,8 @@ def scoring_models(
     mean, _variance = member_moments(ties, fit.site_precision, fit.site_shift, group_mean, np.zeros_like(group_mean))
     identity = _compact_identity_tie_map(ties.member_count)
     models = []
+    loading = np.concatenate([statistics.ld.block(index).covariate_cross for index in range(statistics.ld.block_count)], axis=0).T
+    conditional_loading = statistics.covariate_gram_pseudo_inverse @ loading
     for model, trait_type in enumerate(trait_types):
         draws = member_draws(
             ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
@@ -940,5 +956,8 @@ def scoring_models(
             alpha=alpha[:, model],
             trait_type=trait_type,
             predictive_intercept_shift=0.0,
+            covariate_draws=alpha[:, model, None] - conditional_loading @ (group_draws[:, model, :] - group_mean[:, model, None]),
+            covariate_covariance=fit.noise_variance[model] * statistics.covariate_gram_pseudo_inverse,
+            gaussian_posterior=True,
         ))
     return models

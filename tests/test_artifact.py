@@ -43,13 +43,17 @@ def _budget() -> ComputeBudget:
 
 
 def _scoring(generator: np.random.Generator, trait_type: TraitType, rows: np.ndarray) -> ScoringModel:
+    alpha = generator.normal(size=_COVARIATES + 1)
     return ScoringModel(
         store_rows=rows,
         signed_means=generator.normal(size=rows.shape[0]),
         signed_scales=generator.uniform(10.0, 60.0, size=rows.shape[0]),
         coefficients=generator.normal(size=rows.shape[0]),
         posterior_draws=generator.normal(size=(rows.shape[0], _DRAWS)),
-        alpha=generator.normal(size=_COVARIATES + 1),
+        alpha=alpha,
+        covariate_draws=np.repeat(alpha[:, None], _DRAWS, axis=1),
+        covariate_covariance=np.zeros((alpha.size, alpha.size)),
+        gaussian_posterior=True,
         trait_type=trait_type,
         predictive_intercept_shift=float(generator.normal()) if trait_type == TraitType.BINARY else 0.0,
     )
@@ -64,7 +68,8 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
         covariate_names=("age", "t2d:sex=female"),
         covariate_columns=np.array([[True, False], [True, True]]),
         scoring=(
-            replace(_scoring(generator, TraitType.QUANTITATIVE, rows_quantitative), alpha=np.array([0.3, -1.2, 0.0])),
+            replace(_scoring(generator, TraitType.QUANTITATIVE, rows_quantitative), alpha=np.array([0.3, -1.2, 0.0]),
+                    covariate_draws=np.repeat(np.array([0.3, -1.2, 0.0])[:, None], _DRAWS, axis=1)),
             binary,
         ),
         noise_variance=np.array([0.7, 1.0]),
@@ -105,9 +110,10 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     assert loaded.refusals == model.refusals
     np.testing.assert_array_equal(loaded.noise_variance, model.noise_variance)
     for original, restored in zip(model.scoring, loaded.scoring, strict=True):
-        for field_name in ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha"):
+        for field_name in ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha", "covariate_draws", "covariate_covariance"):
             np.testing.assert_array_equal(getattr(restored, field_name), getattr(original, field_name))
         assert restored.predictive_intercept_shift == original.predictive_intercept_shift
+        assert restored.gaussian_posterior == original.gaussian_posterior
     for original, restored in zip(model.hyperparameters, loaded.hyperparameters, strict=True):
         np.testing.assert_array_equal(restored.coefficients, original.coefficients)
         np.testing.assert_array_equal(restored.log_smoothing, original.log_smoothing)
@@ -132,7 +138,7 @@ def test_loading_refuses_a_model_that_is_not_exactly_what_was_written(tmp_path: 
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="is not a"):
         load_model(tmp_path / "model")
-    metadata["format"] = "svpgs-model v1"
+    metadata["format"] = "svpgs-model v2"
     metadata["arrays"] = metadata["arrays"][1:]
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="exactly the arrays"):
@@ -214,3 +220,24 @@ def test_the_score_command_writes_the_predictions_of_the_people_file(tmp_path: P
         np.testing.assert_allclose(scores["predictive_mean"], expected.predictive_mean, rtol=0.0, atol=np.finfo(np.float64).eps * _VARIANTS)
     with pytest.raises(FileExistsError):
         write_predictions(tmp_path / "model", store_root, tmp_path / "people.npz", tmp_path / "scores.npz", _budget())
+
+
+def test_prediction_preserves_genetic_covariate_cancellation(store_root: Path) -> None:
+    model = _model(np.random.default_rng(54), store_root)
+    with DosageStore.open(store_root) as store:
+        samples = np.arange(store.n_samples)
+        code = store.read_codes(0, 1)[0].astype(np.float64)
+        mean, scale = (code - 127.).mean(), code.std()
+        standardized = (code - 127. - mean) / scale
+        beta_draws = np.array([[-10., -5., 5., 10.]])
+        scoring = ScoringModel(
+            store_rows=np.array([0], dtype=np.int64), signed_means=np.array([mean]), signed_scales=np.array([scale]),
+            coefficients=np.zeros(1), posterior_draws=beta_draws, alpha=np.zeros(3), trait_type=TraitType.QUANTITATIVE,
+            predictive_intercept_shift=0., covariate_draws=np.vstack([np.zeros(4), -beta_draws, np.zeros(4)]),
+            covariate_covariance=np.diag([0.2, 0.3, 0.]), gaussian_posterior=True,
+        )
+        model = replace(model, model_names=(model.model_names[0],), scoring=(scoring,), covariate_columns=model.covariate_columns[:1],
+                        noise_variance=model.noise_variance[:1], hyperparameters=model.hyperparameters[:1], certificate={})
+        result = predict(model, store, samples, np.column_stack([standardized, np.zeros(samples.size)]), _budget())
+        np.testing.assert_allclose(result.predictive_variance[:, 0], model.noise_variance[0] + 0.2 + 0.3 * standardized ** 2, atol=1e-12)
+        assert result.genetic.variances.max() > 10.

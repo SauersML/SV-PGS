@@ -38,30 +38,13 @@ rounding (``_elbo``: a forward-error bound from the pieces' sizes) is resolved. 
 **The outer loop's view.** The pseudo-likelihoods are the ``Cavity`` the hyper step maximizes over: at the fixed
 point q_j = t_j(x), so by the envelope theorem d ELBO*/dx = sum_j d log Z_j(x; omega_j, h_j)/dx at fixed cavities,
 exactly the fixed-cavity gradient EP's outer loop uses. The total curvature B = -d2 ELBO*/dx2 needs the cavity's
-response to x, with the noise re-solved as the fixed point re-solves it (sigma^2 is profiled, so B is the
-profile's curvature): dh = -(Xp'Xp - diag ||x_j||^2) dm / sigma^2 - h dsigma^2 / sigma^2 and
-domega = -omega dsigma^2 / sigma^2, with dm = f_h dh + f_omega domega + f_x E, f_h = v (the tilted variance),
-f_omega = -(mu_3 + 2 m v) / 2 (the tilted mean's response to its precision, mu_3 the third central moment) and
-f_x E = m_x E the fixed-cavity mean change, so
-
-    (diag(1 / v - omega) + Xp'Xp / sigma^2) dm = diag(1 / v) m_x E - (dsigma^2 / sigma^2) c,
-    c = h + f_omega omega / v,
-
-dm = dm_0 - (dsigma^2 / sigma^2) dm_1 with one solve for dm_1 = R^-1 c per fixed point; and the noise's
-stationarity (n - k) sigma^2 = ||r||^2 + sum_j ||x_j||^2 v_j gives the scalar, with dr = -Xp dm and
-dv = v_x E + g dh + kappa domega (g = mu_3, kappa = -(mu_4 - v^2) / 2 - m mu_3, the tilted variance's responses),
-
-    dsigma^2 [(n - k) - (2 r'Xp dm_1 + sum_j ||x_j||^2 (g_j dh_1j - kappa_j omega_j)) / sigma^2]
-        = -2 r'Xp dm_0 + sum_j ||x_j||^2 (v_x E_j + g_j dh_0j),
-
-dh_0 = -(Xp'Xp - diag ||x_j||^2) dm_0 / sigma^2 and dh_1 = (Xp'Xp - diag ||x_j||^2) dm_1 / sigma^2 - h.
-``GaussianPosterior.cavity_response`` hands (dh, domega) to ``_total_curvature_columns``, which forms B from it as it
-does from EP's response; the solve is ``_Response`` (the matrix is symmetric, not always positive definite). With
-the noise's response left out (as it was), the outer loop's Newton steps in x converged linearly (a rate of 0.1 on
-the test problem and 0.37 on gene 1 [real]: sixteen extra outer states), the signature of a model curvature that
-misses the fixed point's own motion. The prediction check moves q's means in q's own metric, sum_j d_j^2 / v_j,
-and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws are q's own: each
-member's node from its responsibilities, then its conditional normal.
+response to x: only h moves (omega is fixed), through the means, dh = -(Xp'Xp - diag ||x_j||^2) dm / sigma^2 with
+dm = f_h dh + f_x E, f_h = v (the tilted variance) and f_x E = m_x E the fixed-cavity mean change, so
+(diag(1 / v - omega) + Xp'Xp / sigma^2) dm = diag(1 / v) m_x E. ``GaussianPosterior.cavity_response`` hands (dh, 0)
+to ``_total_curvature_columns``, which forms B from it as it does from EP's response; the solve is ``_Response``
+(the matrix is symmetric, not always positive definite). The prediction check moves q's means in q's own metric,
+the mixture's component-wise Gaussian KL upper bound, and p_eff = sum_j omega_j v_j (tr(Xp Sigma_q Xp') / sigma^2 for the product q). Posterior draws
+are q's own: each member's node from its responsibilities, then its conditional normal.
 """
 
 from __future__ import annotations
@@ -73,7 +56,7 @@ import numba
 import numpy as np
 from scipy import linalg
 
-from sv_pgs._typing import F64Array
+from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.scale_mixture_ep import (
     Cavity,
     FixedPoint,
@@ -81,7 +64,7 @@ from sv_pgs.scale_mixture_ep import (
     MixtureHyperparameters,
     ScaleMixturePrior,
     _components,
-    _data_value,
+    _class_terms,
     class_log_density,
     log_scale,
     noise_gain,
@@ -92,23 +75,19 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(cache=True)
-def _sweep(design, squares, members, class_index, log_density, node_variance, noise, mean, residual, variance, shift, third, fourth):
+def _sweep(design, squares, members, class_index, log_density, log_scale_rows, grid, noise, mean, residual, variance, shift):
     """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
     (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
     and its rounding bound are exact there.
 
     ``design`` is Xp over the groups (n x groups, Fortran order), ``squares`` their ||x_g||^2, ``members[j]`` member
-    j's group; ``log_density`` is (classes x nodes), ``node_variance`` (members x nodes) each member's variance at
-    each node, u_j e^{t_k}, formed once per hyperparameters (``MeanFieldFixedPoints._node_variance``: the sweep's
-    exponentials are its cost, and this one does not move between sweeps). The node terms are
-    ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node whose variance overflows
-    contributes conditional variance 1 / omega and weight 0. ``third`` and ``fourth`` receive each q_j's third and
-    fourth central moments (the noise's response, ``MeanFieldFixedPoints._fixed_point``): with d_k = h c_k - m,
-    mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2)."""
+    j's group; ``log_density`` is (classes x nodes), ``log_scale_rows`` per member, ``grid`` the nodes' log
+    variances. The node terms are ``scale_mixture_ep._kernel_terms``' own, with the same overflow limits: a node
+    whose variance overflows contributes conditional variance 1 / omega and weight 0."""
     sample_count = design.shape[0]
     member_count = members.shape[0]
-    node_count = node_variance.shape[1]
+    node_count = grid.shape[0]
     divergence = 0.0
     weighted_variance = 0.0
     sizes = 0.0
@@ -125,7 +104,8 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
         row = class_index[member]
         peak = -np.inf
         for node in range(node_count):
-            variance_node = node_variance[member, node]
+            log_variance = log_scale_rows[member] + grid[node]
+            variance_node = np.exp(log_variance)
             ratio = variance_node * omega
             if ratio == np.inf:
                 conditional[node] = 1.0 / omega
@@ -145,22 +125,15 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, no
             new_mean += log_weights[node] / total * h * conditional[node]
         # Var = E_w[c] + Var_w(h c): both terms non-negative, so nothing cancels.
         new_variance = 0.0
-        new_third = 0.0
-        new_fourth = 0.0
         for node in range(node_count):
             offset = h * conditional[node] - new_mean
-            weight = log_weights[node] / total
-            new_variance += weight * (conditional[node] + offset * offset)
-            new_third += weight * (offset * offset * offset + 3.0 * conditional[node] * offset)
-            new_fourth += weight * (offset**4 + 6.0 * conditional[node] * offset * offset + 3.0 * conditional[node] * conditional[node])
+            new_variance += log_weights[node] / total * (conditional[node] + offset * offset)
         step = new_mean - old_mean
         if step != 0.0:
             for sample in range(sample_count):
                 residual[sample] -= design[sample, group] * step
         mean[member] = new_mean
         variance[member] = new_variance
-        third[member] = new_third
-        fourth[member] = new_fourth
         shift[member] = h
         pull = h * new_mean
         shrink = 0.5 * omega * (new_mean * new_mean + new_variance)
@@ -238,7 +211,7 @@ class MeanFieldFixedPoints:
         self.working_bytes = int(working_bytes)
         self.design = statistics.design
         self.sample_count = statistics.sample_count
-        self.covariate_count = int(statistics.covariates.shape[1])
+        self.covariate_count = statistics.covariate_rank
         self.residual_dimension = self.sample_count - self.covariate_count
         # Xp over the groups, dense, once: every sweep is a pass over it.
         self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
@@ -251,8 +224,6 @@ class MeanFieldFixedPoints:
         self.noise = float(start_noise)
         self.mean = np.zeros(prior.variant_count)
         self.variance = np.zeros(prior.variant_count)
-        self.third = np.zeros(prior.variant_count)
-        self.fourth = np.zeros(prior.variant_count)
         self.shift = np.zeros(prior.variant_count)
         self.residual = np.array(statistics.projected_target, dtype=np.float64, copy=True)
         self.site_precision = np.zeros(prior.variant_count)
@@ -261,11 +232,6 @@ class MeanFieldFixedPoints:
         self.noise_gain = np.inf
         self.refusals: list[str] = []
         self.profile = _new_profile() | {"sweeps": 0, "sweep_seconds": 0.0, "elbo": -np.inf}
-        self._node_variance_key: bytes | None = None
-        self._node_variance_table = np.zeros((0, 0))
-        # The last fixed point's response factorization and its noise: the metric of the corrections between sweeps.
-        self._response: _Response | None = None
-        self._response_noise = float(start_noise)
 
     # the ELBO and its pieces
 
@@ -282,22 +248,14 @@ class MeanFieldFixedPoints:
         summands = 2 * self.prior.variant_count + self.sample_count
         return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
-    def _node_variance(self, hyperparameters: MixtureHyperparameters) -> F64Array:
-        """(members x nodes) u_j e^{t_k} at these hyperparameters, held for the next sweep at the same ones."""
-        key = hyperparameters.coefficients.tobytes()
-        if self._node_variance_key != key:
-            with np.errstate(over="ignore"):
-                self._node_variance_table = np.exp(log_scale(self.prior, hyperparameters.coefficients)[:, None] + self.prior.log_variance_grid[None, :])
-            self._node_variance_key = key
-        return self._node_variance_table
-
     def _sweep(self, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
         started = time.perf_counter()
         prior = self.prior
         values = _sweep(
             self.projected, self.group_squares, self.members, self.class_index,
-            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), self._node_variance(hyperparameters),
-            self.noise, self.mean, self.residual, self.variance, self.shift, self.third, self.fourth,
+            np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)),
+            np.ascontiguousarray(log_scale(prior, hyperparameters.coefficients)), np.ascontiguousarray(prior.log_variance_grid),
+            self.noise, self.mean, self.residual, self.variance, self.shift,
         )
         self.profile["sweeps"] += 1
         self.profile["passes"] += 1
@@ -307,14 +265,11 @@ class MeanFieldFixedPoints:
     def _snapshot(self) -> dict:
         return {
             "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "residual": self.residual.copy(),
-            "third": self.third.copy(), "fourth": self.fourth.copy(),
             "noise": self.noise, "site_precision": self.site_precision.copy(), "effective": self.effective,
         }
 
     def _restore(self, snapshot: dict) -> None:
-        self.mean, self.variance, self.shift, self.residual, self.third, self.fourth = (
-            snapshot[name].copy() for name in ("mean", "variance", "shift", "residual", "third", "fourth")
-        )
+        self.mean, self.variance, self.shift, self.residual = (snapshot[name].copy() for name in ("mean", "variance", "shift", "residual"))
         self.noise, self.site_precision, self.effective = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"]
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
@@ -328,48 +283,16 @@ class MeanFieldFixedPoints:
             self.refusals.append(str(error))
             return [None]
 
-    def _stale_gap(self) -> F64Array:
-        """h'_j - h_j on the live rows: each pseudo-likelihood's location recomputed from the sweep's final residual
-        against the one its site was built from, the ELBO's gradient in q's means at the sweep's end (a site updated
-        early in the sweep is stale by the later sites' moves). Zero where q_j is a point mass."""
-        live = self.variance > 0.0
-        located = (self.design.back(self.residual) + self.member_squares * self.mean) / self.noise
-        return np.where(live, located - self.shift, 0.0)
-
-    def _decrement(self, gap: F64Array, response: _Response, response_noise: float) -> tuple[float, F64Array]:
-        """(the Newton decrement of the fixed-point equation in the means, its step): the map h -> T(h) whose fixed
-        point q is has Jacobian -(Xp'Xp - diag ||x_j||^2) diag(v) / sigma^2, so Newton's step in the means is
-        dm = R^-1 (h' - h) with R = diag(tau) + Xp'Xp / sigma^2 the response matrix (module docstring), and the
-        decrement (h' - h)' dm / 2 bounds the ELBO's own quadratic model's gain (its curvature is R plus the diagonal
-        ||x_j||^2 / sigma^2, so its inverse is smaller). With a response held from an earlier fixed point the
-        decrement is that metric's estimate; the fresh one at the returned fixed point is the certificate's."""
-        step = response_noise * response.solve(gap[:, None])[:, 0]
-        return 0.5 * float(gap @ step), step
-
     def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
-        """Sweeps at the current noise, with Newton corrections in the means between them, until the remaining gain
-        (module docstring) is within the tolerance. The noise moves to its stationary value only between sweeps, so
-        the returned state (q, sigma^2) is the one the last sweep built: its pseudo-likelihoods are the cavity,
-        exactly. The noise's pending gain counts as remaining.
-
-        Coordinate ascent alone crawls along the design's correlated directions (gene 1 [real]: sweeps stopped by
-        the geometric extrapolation of their ELBO gains left q's means where the held-out r^2 was 0.0339, and
-        sweeping until the means settled gave 0.0385: the two-gain extrapolation understates the remaining gain
-        where the slow modes have not yet shown their rate). So after each sweep the stale gap h' - h (the ELBO's
-        gradient in the means) is taken through the last fixed point's response factorization as Newton's step in
-        the means, the next sweep re-tilts every site at the moved residual, and the remaining gain is the Newton
-        decrement, read with the fresh factorization at the returned fixed point before it is returned. A correction
-        the next sweep does not confirm (its ELBO below the pre-correction sweep's) is undone, and the call sweeps
-        on without corrections."""
+        """Sweeps at the current noise until the remaining gain (module docstring) is within the tolerance. The noise
+        moves to its stationary value only between sweeps, so the returned state (q, sigma^2) is the one the last
+        sweep built: its pseudo-likelihoods are the cavity, exactly. The noise's pending gain counts as remaining."""
         tolerance = 0.5 / self.draw_count
-        # The hyperparameters changed since the last call, so the state's ELBO is unknown until a sweep measures it:
-        # the first sweep's gain is not a gain, and the extrapolation starts at the second.
-        elbo: float | None = None
-        gain: float | None = None
         previous_gain: float | None = None
+        # The hyperparameters changed since the last call, so the state's ELBO is unknown until a sweep measures it:
+        # the first sweep's gain is not a gain, and the bound starts at the second.
+        elbo: float | None = None
         pending_noise: float | None = None
-        corrections = self._response is not None
-        correction: tuple[dict, float] | None = None
         while True:
             if pending_noise is not None:
                 elbo = elbo + self.noise_gain if elbo is not None else None
@@ -382,58 +305,26 @@ class MeanFieldFixedPoints:
             # next sweep, if there is one.
             pending_noise = (residual_square + weighted_variance) / self.residual_dimension
             self.noise_gain = noise_gain(pending_noise, self.noise, self.sample_count, self.covariate_count)
-            if correction is not None:
-                # The sweep after a correction: confirmed where the ELBO is at or above the pre-correction sweep's.
-                snapshot, before = correction
-                correction = None
-                if value < before - rounding:
-                    self._restore(snapshot)
-                    corrections = False
-                    elbo, gain, previous_gain, pending_noise = before, None, None, None
-                    continue
-                elbo, gain, previous_gain = value, None, None
-            else:
-                gain = (value - elbo) if elbo is not None else None
-                elbo = value
-                if gain is not None and gain < -rounding:
-                    raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
+            gain = (value - elbo) if elbo is not None else None
+            elbo = value
             self.profile["elbo"] = value
-            gap = self._stale_gap()
-            if corrections and self._response is not None:
-                remaining, step = self._decrement(gap, self._response, self._response_noise)
-                if remaining > tolerance:
-                    # Newton's step in the means; the next sweep re-tilts every site at the moved residual.
-                    correction = (self._snapshot(), value)
-                    self.mean = self.mean + step
-                    self.residual = self.residual - self.design.image(step)
-                    self.profile["passes"] += 1
-                    continue
+            if gain is None:
+                continue
+            if gain < -rounding:
+                raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
+            gain = max(float(gain), 0.0)
+            if gain <= rounding:
+                remaining = 0.0
+            elif previous_gain is not None and previous_gain > 0.0:
+                rate = gain / previous_gain
+                remaining = gain * rate / (1.0 - rate) if rate < 1.0 else np.inf
             else:
-                # Without a response yet (the fit's first fixed point), or after an unconfirmed correction: the
-                # sweeps' geometric extrapolation from the last two gains.
-                if gain is None:
-                    remaining = np.inf
-                elif gain <= rounding:
-                    remaining = 0.0
-                elif previous_gain is not None and previous_gain > 0.0:
-                    rate = gain / previous_gain
-                    remaining = gain * rate / (1.0 - rate) if rate < 1.0 else np.inf
-                else:
-                    remaining = np.inf
-                if gain is not None:
-                    previous_gain = max(float(gain), 0.0)
+                remaining = np.inf
+            previous_gain = gain
             # The remainder in the certificate's units: KL(q || q') = move / 2, so the move is twice the remaining gain.
             self.mean_move = 2.0 * remaining
             if remaining + self.noise_gain <= tolerance:
-                point = self._fixed_point(hyperparameters)
-                # The certificate reads the decrement with the fresh factorization; where it is not within the
-                # tolerance the corrections continue in that metric.
-                assert self._response is not None
-                remaining, _step = self._decrement(gap, self._response, self._response_noise)
-                self.mean_move = 2.0 * remaining
-                if remaining + self.noise_gain <= tolerance:
-                    return point
-                corrections = True
+                return self._fixed_point(hyperparameters)
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own metric
@@ -449,70 +340,38 @@ class MeanFieldFixedPoints:
         self.profile["factorizations"] += 1
         self.profile["factor_seconds"] += time.perf_counter() - started
         self.profile["refreshes"] += 1
-        self._response, self._response_noise = response, self.noise
         design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
-        mean, shift, residual = self.mean.copy(), self.shift.copy(), self.residual.copy()
-        third, fourth = self.third.copy(), self.fourth.copy()
-        # The tilted moments' responses to the pseudo-likelihood's precision (module docstring), zero on a dead row.
-        mean_by_omega = np.where(live, -0.5 * (third + 2.0 * mean * variance), 0.0)
-        variance_by_shift = np.where(live, third, 0.0)
-        variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
-        residual_dimension = float(self.residual_dimension)
-        noise_solve: dict[str, object] = {}
+        location_precision = np.empty_like(variance)
+        for _, rows, terms in _class_terms(self.prior, hyperparameters.coefficients, Cavity(omega, self.shift), self.working_bytes):
+            with np.errstate(divide="ignore", invalid="ignore"):
+                precision = np.divide(terms.responsibility, terms.conditional_variance, out=np.zeros_like(terms.responsibility), where=terms.responsibility > 0.0)
+            location_precision[rows] = precision.sum(axis=1)
 
-        def off_diagonal_gram(columns: F64Array) -> F64Array:
-            return design.back(design.image(columns)) - squares[:, None] * columns
-
-        def noise_terms() -> tuple[F64Array, F64Array, float]:
-            # dm_1 = R^-1 c, dh_1 and the scalar on dsigma^2 (module docstring): once per fixed point.
-            if not noise_solve:
-                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
-                mean_one = noise * response.solve(coupling[:, None])
-                shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
-                scalar = residual_dimension - (
-                    2.0 * float(residual @ design.image(mean_one)[:, 0])
-                    + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
-                ) / noise
-                noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
-            return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
-
-        def cavity_response(mean_by_z: F64Array, variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
-            # dm_0 = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest, then the
-            # noise's own response and through it every pseudo-likelihood's (module docstring).
+        def cavity_response(mean_by_z: F64Array, _variance_by_z: F64Array) -> tuple[F64Array, F64Array]:
+            # dm = (diag(tau) + Xp'Xp / sigma^2)^-1 diag(1 / v) (m_x E) on the live rows, 0 on the rest; then
+            # dh = -(Xp'Xp - diag(||x_j||^2)) dm / sigma^2 and dP = 0 (module docstring).
             started = time.perf_counter()
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = noise * response.solve(scaled)
-            shift_step = -off_diagonal_gram(mean_step) / noise
-            _mean_one, shift_one, scalar = noise_terms()
-            right = -2.0 * (residual @ design.image(mean_step)) + squares @ (
-                np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
-            )
-            noise_step = right / scalar
-            relative = (noise_step / noise)[None, :]
-            shift_step = shift_step + shift_one * relative
-            precision_step = -omega[:, None] * relative
+            shift_step = -(design.back(design.image(mean_step)) - squares[:, None] * mean_step) / noise
             self.profile["response_seconds"] += time.perf_counter() - started
             self.profile["responses"] += 1
-            return shift_step, precision_step
+            return shift_step, np.zeros_like(shift_step)
 
         def norm(direction: F64Array) -> float:
-            # q's own metric for a shift of its means: KL(q || q shifted) = sum_j d_j^2 / (2 v_j) for a product of
-            # laws that shift as a location family, so the move is sum_j d_j^2 / v_j; a dead row moves nowhere.
+            # Keeping the latent component gives KL = d² E[1/c] / 2. Marginalizing
+            # that component can only decrease KL, so this bounds a location shift
+            # even for non-Gaussian mixtures; 1 / Var(q) does not.
             values = np.asarray(direction, dtype=np.float64)
             moving = values != 0.0
             if np.any(moving & ~live):
                 return np.inf
-            return float(np.sum(np.square(values[live]) / variance[live]))
+            return float(np.sum(np.square(values[moving]) * location_precision[moving]))
 
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=True)
-        # The solver's state at this point, so the outer loop can put it back before a trial (``FixedPoint.restore``).
-        snapshot = self._snapshot()
-        cavity = Cavity(precision=omega, shift=self.shift.copy())
-        # E's offset (``FixedPoint.evidence_offset``): the ELBO the last sweep built less the fixed-cavity F there.
-        offset = float(self.profile["elbo"]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
         return FixedPoint(
-            cavity=cavity, posterior=posterior, mean=self.mean.copy(), precision_norm=norm, effective_effects=float(self.effective),
-            restore=lambda: self._restore(snapshot), evidence_offset=offset,
+            cavity=Cavity(precision=omega, shift=self.shift.copy()), posterior=posterior, mean=self.mean.copy(),
+            precision_norm=norm, effective_effects=float(self.effective),
         )
 
     def draws(self, hyperparameters: MixtureHyperparameters, generator: np.random.Generator, draw_count: int) -> F64Array:

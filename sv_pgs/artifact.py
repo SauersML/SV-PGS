@@ -37,10 +37,10 @@ from sv_pgs.fast_scoring import (
 )
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
-MODEL_FORMAT = "svpgs-model v1"
+MODEL_FORMAT = "svpgs-model v2"
 _METADATA = "model.json"
 _ARRAYS = "arrays.npz"
-_SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha")
+_SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha", "covariate_draws", "covariate_covariance")
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         "trait_types": [trait_type.value for trait_type in model.trait_types],
         "covariate_names": list(model.covariate_names),
         "predictive_intercept_shifts": [scoring.predictive_intercept_shift for scoring in model.scoring],
+        "gaussian_posteriors": [scoring.gaussian_posterior for scoring in model.scoring],
         "certificate_terms": sorted(model.certificate),
         "fit_counts": {name: int(count) for name, count in model.fit_counts.items()},
         "refusals": list(model.refusals),
@@ -217,12 +218,13 @@ def load_model(path: str | Path) -> FittedModel:
     trait_types = tuple(TraitType(value) for value in _required(metadata, "trait_types", list))
     covariate_names = tuple(_required(metadata, "covariate_names", list))
     shifts = _required(metadata, "predictive_intercept_shifts", list)
+    gaussian_posteriors = _required(metadata, "gaussian_posteriors", list)
     terms = _required(metadata, "certificate_terms", list)
     fit_counts = {str(name): int(count) for name, count in _required(metadata, "fit_counts", dict).items()}
     refusals = tuple(str(reason) for reason in _required(metadata, "refusals", list))
     provenance = _required(metadata, "provenance", dict)
     names = _required(metadata, "arrays", list)
-    if not len(model_names) == len(trait_types) == len(shifts):
+    if not len(model_names) == len(trait_types) == len(shifts) == len(gaussian_posteriors):
         raise ValueError("model.json lists models, trait types and intercept shifts of different lengths.")
     with np.load(directory / _ARRAYS, allow_pickle=False) as archive:
         if sorted(archive.files) != sorted(names):
@@ -233,6 +235,7 @@ def load_model(path: str | Path) -> FittedModel:
             **{field_name: arrays[f"scoring/{index}/{field_name}"] for field_name in _SCORING_FIELDS},
             trait_type=trait_type,
             predictive_intercept_shift=float(shift),
+            gaussian_posterior=gaussian_posteriors[index],
         )
         for index, (trait_type, shift) in enumerate(zip(trait_types, shifts))
     )
@@ -284,7 +287,7 @@ class Prediction:
 
     ``genetic`` holds the posterior-mean genetic scores and their K-draw posterior variances;
     ``linear_predictor`` adds the intercept and covariate effects. ``predictive_mean`` is the linear predictor for a
-    quantitative trait and P(y = 1) for a binary one; ``predictive_variance`` is the genetic variance plus the noise
+    quantitative trait and P(y = 1) for a binary one; ``predictive_variance`` is the joint linear-predictor variance plus the noise
     variance for a quantitative trait and p(1 - p) for a binary one.
     """
 
@@ -307,19 +310,22 @@ def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, 
     linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, model.scoring)
     predictive_mean = np.empty_like(linear_predictor)
     predictive_variance = np.empty_like(linear_predictor)
+    fixed_design = np.column_stack([np.ones(samples.size), covariate_matrix])
     for index, scoring in enumerate(model.scoring):
+        if not scoring.draw_count:
+            raise ValueError(f"model {model.model_names[index]!r} has no posterior draws, so no predictive variance.")
+        deviations = genetic.draws[index] - genetic.means[:, index, None]
+        deviations = deviations + fixed_design @ (scoring.covariate_draws - scoring.alpha[:, None])
+        linear_variance = np.mean(deviations * deviations, axis=1) + np.einsum("ij,jk,ik->i", fixed_design, scoring.covariate_covariance, fixed_design)
         if scoring.trait_type == TraitType.BINARY:
             probability = posterior_predictive_probability(
-                linear_predictor[:, index], genetic.variances[:, index], scoring.predictive_intercept_shift
+                linear_predictor[:, index], linear_variance, scoring.predictive_intercept_shift
             )
             predictive_mean[:, index] = probability
             predictive_variance[:, index] = probability * (1.0 - probability)
         else:
             predictive_mean[:, index] = linear_predictor[:, index]
-            genetic_variance = genetic.variances[:, index]
-            if not np.all(np.isfinite(genetic_variance)):
-                raise ValueError(f"model {model.model_names[index]!r} has no posterior draws, so no predictive variance.")
-            predictive_variance[:, index] = genetic_variance + model.noise_variance[index]
+            predictive_variance[:, index] = linear_variance + model.noise_variance[index]
     return Prediction(genetic=genetic, linear_predictor=linear_predictor, predictive_mean=predictive_mean, predictive_variance=predictive_variance)
 
 

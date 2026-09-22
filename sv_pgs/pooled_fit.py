@@ -327,7 +327,7 @@ def _gene_moment(statistics: DenseStatistics, log_variance_offset: F64Array):
     score = design.back(statistics.target)
     return moment_start(
         target_square=float(residual @ residual),
-        residual_dimension=float(statistics.sample_count - statistics.covariates.shape[1]),
+        residual_dimension=float(statistics.sample_count - statistics.covariate_rank),
         score_square=float(score @ score),
         gram_trace=float(np.trace(kernel)),
         weighted_diagonal=float(weights @ design.column_squares()),
@@ -356,9 +356,9 @@ def _pooled_start(statistics: Sequence[DenseStatistics], prior: ScaleMixturePrio
 def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_bytes: int, seed: int) -> PooledFit:
     """Fit every gene's quantitative model with one prior learned from all of them (see the module docstring)."""
     started = time.perf_counter()
-    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target) for gene in genes]
     offsets = [np.zeros(np.asarray(gene.codes).shape[1]) if gene.log_variance_offset is None else np.asarray(gene.log_variance_offset) for gene in genes]
-    residual_noise = np.array([float(gene.projected_target @ gene.projected_target) / (gene.sample_count - gene.covariates.shape[1]) for gene in statistics])
+    statistics = [dense_statistics(gene.codes, gene.covariates, gene.target, offset) for gene, offset in zip(genes, offsets)]
+    residual_noise = np.array([float(gene.projected_target @ gene.projected_target) / (gene.sample_count - gene.covariate_rank) for gene in statistics])
     prior = pooled_prior(statistics, [gene.variant_class for gene in genes], offsets, residual_noise, draw_count)
     start, start_noise = _pooled_start(statistics, prior, _gene_rows(statistics))
     stage0_seconds = time.perf_counter() - started
@@ -373,6 +373,8 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         (outer,) = fit_hyperparameters(prior, [start], oracle, engine_bytes, 0.5 / draw_count)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; EP refusals: {oracle.refusals}") from error
+    if not outer.certified:
+        raise FloatingPointError(f"pooled outer fit did not converge: remaining gain {outer.remaining_gain}, unresolved {outer.unresolved}; EP refusals: {oracle.refusals}")
     second_moment = prior_second_moment(prior, outer.hyperparameters)
     generator = np.random.default_rng(seed)
     scoring = []
@@ -388,6 +390,9 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
             tie_map=_compact_identity_tie_map(members), member_prior_variances=second_moment[rows], beta_reduced=gene_statistics.signs * mean,
             posterior_draws_reduced=gene_statistics.signs[:, None] * draws, alpha=alpha, trait_type=TraitType.QUANTITATIVE,
             predictive_intercept_shift=0.0,
+            covariate_draws=alpha[:, None] - gene_statistics.covariate_pseudo_inverse @ gene_statistics.loading @ (draws - mean[:, None]),
+            covariate_covariance=float(oracle.noise[gene_index]) * gene_statistics.covariate_pseudo_inverse,
+            gaussian_posterior=True,
         ))
     certificate = FitCertificate(
         remaining_gain=np.array([outer.remaining_gain]),
@@ -415,6 +420,7 @@ def fit_pooled_small_n(genes: Sequence[GeneData], *, draw_count: int, working_by
         outer_history=(outer.history,),
         refreshes=int(oracle.profile["refreshes"]),
         passes=int(oracle.profile["passes"]),
+        certified=np.array([outer.certified], dtype=bool),
     )
     profile = dict(oracle.profile) | {
         "stage0_seconds": stage0_seconds, "total_seconds": time.perf_counter() - started, "genes": len(genes),

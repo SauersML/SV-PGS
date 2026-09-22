@@ -700,13 +700,6 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         results = (result for chunk in _per_gene_results(dataset_dir, method_spec, feature_sets, gene_rows, split_names, workers, overlay_dir, rows_dirs, sample_subset,
                                                             record_failures) for result in chunk)
     coefficient_tables = []
-    out = pathlib.Path(out_dir) / method_name / design
-    out.mkdir(parents=True, exist_ok=True)
-    tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
-           + ("." + "+".join(name.split("/")[1] for name in split_names) if split_subset is not None else ""))
-    # One line per fit as it lands (the tables below are written once every fit is in): a run's progress and each
-    # fit's CPU time are readable while it runs, and a run that dies leaves its finished fits' record.
-    progress = (out / f"{tag}.progress.jsonl").open("w")
     for (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, variant_count, sv_count, seconds, coefficients, status,
          raw, train_index) in results:
         if coefficients is not None:
@@ -721,12 +714,10 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
         truth[position, test_index] = test_phenotype
         log.append((dataset.genes.iloc[gene_row]["gene_id"], split_name, feature_set, variant_count, sv_count, seconds, status,
                     bool(np.isfinite(prediction).all() and np.ptp(prediction) == 0)))
-        progress.write(json.dumps({
-            "gene_id": log[-1][0], "split": split_name, "feature_set": feature_set, "variants": int(variant_count), "sv_variants": int(sv_count),
-            "cpu_seconds": float(seconds), "status": status, "finished": len(log),
-        }) + "\n")
-        progress.flush()
-    progress.close()
+    out = pathlib.Path(out_dir) / method_name / design
+    out.mkdir(parents=True, exist_ok=True)
+    tag = ("_".join(chromosomes) + (f".ranks{gene_ranks[0]}-{gene_ranks[1]}" if gene_ranks is not None else "")
+           + ("." + "+".join(name.split("/")[1] for name in split_names) if split_subset is not None else ""))
     method_file = pathlib.Path(method_spec.rsplit(":", 1)[0])
     commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pathlib.Path(__file__).resolve().parent, capture_output=True, text=True, check=True).stdout.strip()
     (out / f"{tag}.run.json").write_text(json.dumps({
