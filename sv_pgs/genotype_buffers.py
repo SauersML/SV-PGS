@@ -198,10 +198,10 @@ def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, 
     # the Gram against the previous block has the same shape bound as the block's own
     adjacent = gram
     cross = layout.width * cross_columns * 8 + block_cap * _CROSS_SAMPLE_CHUNK * 8
-    # the projection step's fp64 correlation matrix and the one full-width panel temporary its rank-one update
-    # forms (the device runs every row as one panel): 2 x 11.6 GB at a 38k cap, which the model omitted and the
-    # A40 refused (bench-sim scenario_000, 40,000 samples, 2026-09-22)
-    projection = 2 * gram_rows * gram_rows * 8
+    # the projection step's own block-square arrays, live together with the Grams: the fp64 correlation matrix, the
+    # float32 projected Gram, the fp64 coupling to the previous block and its float32 copy; plus its per-panel
+    # temporaries (two fp64 and two boolean panel x width arrays for the rank-one update and the tie screen)
+    projection = gram_rows * gram_rows * (8 + 4 + 8 + 4) + _HOST_PANEL * gram_rows * (8 + 8 + 1 + 1)
     return resident + max(band, gram + adjacent + cross + projection)
 
 
@@ -548,8 +548,12 @@ class CudaGenotypeBuffer:
             yield
 
     def parallel_rows(self, function: Callable[[int, int], None], rows: int) -> None:
-        """The device runs all rows as one panel."""
-        function(0, rows)
+        """The device runs the rows as panels of ``_HOST_PANEL`` rows, in order on its compute stream: the
+        projection step's per-panel temporaries (a rank-one update, a tie screen, a covariate correction) are then
+        panel x width rather than width x width, which at a 30k cap on an A40 was three more 7.4 GB arrays than
+        the device held (bench-sim scenario_000, 40,000 samples, 2026-09-22)."""
+        for start in range(0, rows, _HOST_PANEL):
+            function(start, min(start + _HOST_PANEL, rows))
 
     def to_host(self, array: Any) -> NDArray:
         """Copy a device array into pinned host memory (recycled by CuPy's pinned pool) at full link speed."""
