@@ -490,6 +490,10 @@ def scale_mixture_prior(
     for position, group in enumerate(annotation_groups):
         eigenvalues, eigenvectors = np.linalg.eigh(np.asarray(group.penalty, dtype=np.float64))
         kept = eigenvalues > _EPSILON * eigenvalues.shape[0] * max(float(eigenvalues[-1]), np.finfo(np.float64).tiny)
+        if not kept.any():
+            # Every column of the group is unpenalized (a smooth's fixed part): there is no weight to learn, and its
+            # coefficients are free, in the penalty's null space like the densities' locations and widths.
+            continue
         blocks.append(SmoothingBlock(
             f"annotation group {position}",
             annotation_start + np.asarray(group.columns, dtype=np.int64),

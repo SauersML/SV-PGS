@@ -104,7 +104,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('genotype_buffers.py', 'SIGNED_CODE_OFFSET'): ('spec', frozenset({127}), '8-bit store code offset (STORE.md)'),
     ('genotype_buffers.py', 'build_sample_layout'): ('definitional', frozenset({3}), 'a sample correlation needs at least three samples to be non-degenerate'),
     ('device_sweep.py', 'PANEL'): ('spec', frozenset({32}), 'the CUDA warp width (CUDA C++ Programming Guide, warpSize = 32): one lane per panel member, and the shuffles reduce across it'),
-    ('device_sweep.py', 'PIECE_COLUMNS'): ('definition', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),
+    ('device_sweep.py', 'PIECE_COLUMNS'): ('definitional', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),
     ('genotype_buffers.py', 'host_buffer_bytes'): ('derived', frozenset({4, 16, 3, 8}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
     ('genotype_buffers.py', 'cuda_buffer_bytes'): ('derived', frozenset({16, 8, 4}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
     ('genotype_buffers.py', '_CUDA_R_8I'): ('spec', frozenset({3}), 'cudaDataType and cublasComputeType_t values (library_types.h, cublas_api.h)'),

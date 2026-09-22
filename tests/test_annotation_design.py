@@ -71,3 +71,21 @@ def test_a_column_constant_within_every_class_and_a_dependent_column_are_dropped
 def test_an_annotation_with_the_wrong_length_is_refused() -> None:
     with pytest.raises(ValueError, match="one value per variant"):
         annotation_design({"x": np.zeros(3)}, {}, class_index=np.zeros(4, dtype=np.int64))
+
+
+def test_a_group_with_no_penalized_column_is_free_and_has_no_smoothing_weight() -> None:
+    rng = np.random.default_rng(4)
+    classes = rng.choice(2, size=200).astype(np.int64)
+    # two distinct values: a linear term and no interior knot, so the group's penalty is zero
+    result = annotation_design({"binary_level": rng.choice([3.0, 7.0], size=200)}, {}, class_index=classes)
+    (group,) = result.groups
+    assert not np.any(group.penalty)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 24)
+    prior = scale_mixture_prior(
+        class_index=classes, log_variance_offset=np.zeros(200), annotation_design=result.design, annotation_groups=result.groups,
+        nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    assert not any(block.name.startswith("annotation group") for block in prior.smoothing_blocks)
+    annotation_coordinates = prior.coefficient_size - result.design.shape[1] + np.arange(result.design.shape[1])
+    # the free coefficient is in the penalty's null space
+    assert np.linalg.matrix_rank(prior.null_basis[annotation_coordinates]) == result.design.shape[1]
