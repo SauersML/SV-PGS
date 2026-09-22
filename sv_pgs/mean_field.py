@@ -80,7 +80,9 @@ import numpy as np
 from scipy import linalg
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs import engine_kernels
 from sv_pgs.scale_mixture_ep import (
+    _DEVICE,
     Cavity,
     FixedPoint,
     GaussianPosterior,
@@ -92,6 +94,7 @@ from sv_pgs.scale_mixture_ep import (
     class_log_density,
     log_scale,
     noise_gain,
+    tilted_cumulants,
 )
 from sv_pgs.small_n import DenseStatistics, _Design, _new_profile
 
@@ -319,6 +322,9 @@ class MeanFieldFixedPoints:
         # The last fixed point's response factorization and its noise: the metric of the corrections between sweeps.
         self._response: _Response | None = None
         self._response_noise = float(start_noise)
+        # A parallel pass (``_pass``) leaves the third and fourth moments to the fixed point that needs them.
+        self._moments_stale = False
+        self._held_device: dict | None = None
         # The start's state, from which every call is also solved cold (``__call__``).
         self._cold: dict | None = self._snapshot()
 
@@ -360,6 +366,115 @@ class MeanFieldFixedPoints:
         self.profile["sweep_seconds"] += time.perf_counter() - started
         return values
 
+    def _device(self) -> dict | None:
+        """The pass's member-side arrays on the fit's device (``scale_mixture_ep.device_scope``), held; None on the host."""
+        xp = _DEVICE.get()
+        if xp is np:
+            return None
+        held = self._held_device
+        if held is None or held["xp"] is not xp:
+            held = {
+                "xp": xp, "members": xp.asarray(self.members), "squares": xp.asarray(self.member_squares),
+                "class_index": xp.asarray(self.class_index), "target": xp.asarray(np.asarray(self.statistics.projected_target, dtype=np.float64)),
+                "scales_key": None, "scales": None,
+            }
+            self._held_device = held
+        return held
+
+    def _pass(self, hyperparameters: MixtureHyperparameters, baseline: float | None, direction: F64Array | None) -> tuple[float, float, float, float]:
+        """One pass over the members on the device, every site at once, in place of a sweep: the same ELBO, the same
+        fixed point, no serial chain.
+
+        Every q_j is the prior tilted at a site (h_j, omega_j), so the ELBO is a function L(h) of the sites (each
+        term of ``_sweep``'s sum, summed in parallel), with dL/dh_j = v_j (h*_j - h_j) where h*_j is the site the
+        residual now puts member j at (``_stale_gap``): a sweep sets each h_j to h*_j in turn, this pass moves
+        all of them along a direction dh at once and takes the step the ELBO prefers. The direction is Newton's in
+        the means through the last fixed point's response, dm = R^-1 (h* - h) (``_decrement``), in the sites
+        dh = dm / v, or the gap itself where there is no response yet (the Jacobi step: every site to h*_j). The
+        step is the unit one, the vertex of the parabola through L(0), L'(0) and L(1) when it lies inside, then
+        halvings while a step could still gain the tolerance; the best of them is taken. ``baseline`` is the ELBO
+        the state has (with the noise's pending gain applied), and a pass that beats it nowhere is replaced by a
+        sweep, which cannot lose (each of its steps maximizes over one q_j): the pass is a faster route to the same
+        ascent, never a different one. On ENSG00000254709.8 [real, p 37,106, K 88, n 534, one A40] one evaluation
+        of L took 3.9 ms against 72 ms for a sweep, at the same fixed point (the prototype, lead/pmf1_*.log).
+
+        Returns ``_sweep``'s pieces at the state it leaves."""
+        held = self._device()
+        assert held is not None
+        xp = held["xp"]
+        _xp, carriers, basis = self.design._device()
+        prior = self.prior
+        tolerance = 0.5 / self.draw_count
+        key = hyperparameters.coefficients.tobytes()
+        if held["scales_key"] != key:
+            held["scales"] = xp.asarray(log_scale(prior, hyperparameters.coefficients))
+            held["scales_key"] = key
+        log_density = np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients))
+        squares, members, target = held["squares"], held["members"], held["target"]
+        noise = self.noise
+        omega = squares / noise
+        mean, variance = xp.asarray(self.mean), xp.asarray(self.variance)
+        sites, residual = xp.asarray(self.shift), xp.asarray(self.residual)
+        tied = self.design.tied
+        group_count = self.design.group_count
+
+        def image(values):
+            grouped = xp.bincount(members, weights=values, minlength=group_count) if tied else values
+            product = carriers @ grouped
+            return product - basis @ (basis.T @ product) if basis.shape[1] else product
+
+        def back(samples):
+            projected = samples - basis @ (basis.T @ samples) if basis.shape[1] else samples
+            grouped = carriers.T @ projected
+            return grouped[members] if tied else grouped
+
+        located = (back(residual) + squares * mean) / noise
+        if direction is None:
+            step = located - sites
+        else:
+            live = variance > 0.0
+            step = xp.where(live, xp.asarray(direction) / xp.where(live, variance, 1.0), located - sites)
+        slope = float(variance @ ((located - sites) * step))
+
+        def evaluate(alpha: float):
+            moved = sites + alpha * step
+            log_normalizer, new_mean, new_variance, _flag = engine_kernels.tilted_moments(
+                xp, held["class_index"], log_density, held["scales"], prior.log_variance_grid, omega, moved, self.working_bytes, check=False,
+            )
+            new_residual = target - image(new_mean)
+            pull = moved * new_mean
+            shrink = 0.5 * omega * (new_mean * new_mean + new_variance)
+            pieces = xp.asnumpy(xp.stack([
+                xp.sum(pull - shrink - log_normalizer), squares @ new_variance, new_residual @ new_residual,
+                xp.sum(xp.abs(pull) + shrink + xp.abs(log_normalizer)),
+            ]))
+            pieces = tuple(float(piece) for piece in pieces)
+            value, _rounding = self._elbo(*pieces)
+            return value, pieces, (moved, new_mean, new_variance, new_residual)
+
+        candidates = [evaluate(1.0)]
+        if baseline is not None and slope > 0.0:
+            curvature = candidates[0][0] - baseline - slope
+            alpha = 1.0
+            if curvature < 0.0 and 0.0 < -slope / (2.0 * curvature) < 1.0:
+                alpha = -slope / (2.0 * curvature)
+                candidates.append(evaluate(alpha))
+            while max(candidate[0] for candidate in candidates) <= baseline and alpha * slope > tolerance:
+                alpha = 0.5 * alpha
+                candidates.append(evaluate(alpha))
+        best = max(candidates, key=lambda candidate: candidate[0])
+        self.profile["parallel_passes"] = self.profile.get("parallel_passes", 0) + 1
+        self.profile["parallel_evaluations"] = self.profile.get("parallel_evaluations", 0) + len(candidates)
+        if baseline is not None and best[0] <= baseline:
+            self.profile["parallel_fallbacks"] = self.profile.get("parallel_fallbacks", 0) + 1
+            return self._sweep(hyperparameters)
+        moved, new_mean, new_variance, new_residual = best[2]
+        self.shift, self.mean, self.variance, self.residual = (xp.asnumpy(values) for values in (moved, new_mean, new_variance, new_residual))
+        self._moments_stale = True
+        self.profile["sweeps"] += 1
+        self.profile["passes"] += 1
+        return best[1]
+
     def _snapshot(self) -> dict:
         return {
             "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "residual": self.residual.copy(),
@@ -369,6 +484,7 @@ class MeanFieldFixedPoints:
             # solve from the restored state (the factor is immutable, so the reference is the state).
             "response": self._response, "response_noise": self._response_noise,
             "mean_move": self.mean_move, "noise_gain": self.noise_gain, "elbo": self.profile["elbo"],
+            "moments_stale": self._moments_stale,
         }
 
     def _restore(self, snapshot: dict) -> None:
@@ -378,6 +494,7 @@ class MeanFieldFixedPoints:
         self.noise, self.site_precision, self.effective = snapshot["noise"], snapshot["site_precision"].copy(), snapshot["effective"]
         self._response, self._response_noise = snapshot["response"], snapshot["response_noise"]
         self.mean_move, self.noise_gain, self.profile["elbo"] = snapshot["mean_move"], snapshot["noise_gain"], snapshot["elbo"]
+        self._moments_stale = snapshot["moments_stale"]
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """The fixed point of the higher ELBO between the solve from the carried state and the solve from the start.
@@ -466,13 +583,20 @@ class MeanFieldFixedPoints:
         corrections = self._response is not None
         correction: tuple[dict, float] | None = None
         sweeps_at_entry = self.profile["sweeps"]
+        # On the device the pass takes Newton's direction itself (``_pass``); the sweep path applies it between sweeps.
+        parallel = self._device() is not None
+        direction: F64Array | None = None
         while True:
             if sweep_budget is not None and self.profile["sweeps"] - sweeps_at_entry >= sweep_budget:
                 raise _SweepBudget()
             if pending_noise is not None:
                 elbo = elbo + self.noise_gain if elbo is not None else None
                 self.noise = pending_noise
-            divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
+            if parallel:
+                divergence, weighted_variance, residual_square, sizes = self._pass(hyperparameters, elbo, direction)
+                direction = None
+            else:
+                divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
                 raise FloatingPointError("a mean-field sweep is not finite")
             value, rounding = self._elbo(divergence, weighted_variance, residual_square, sizes)
@@ -503,6 +627,9 @@ class MeanFieldFixedPoints:
                 if newton < 0.0:
                     # R is indefinite along the gap: no step and no bound from it; the sweeps' extrapolation governs.
                     newton, corrections = None, False
+                elif parallel:
+                    # The next pass moves along this step; the decrement is the remaining gain's estimate.
+                    direction = step
                 elif newton > tolerance:
                     # Newton's step in the means; the next sweep re-tilts every site at the moved residual.
                     correction = (self._snapshot(), value)
@@ -533,10 +660,12 @@ class MeanFieldFixedPoints:
                 # The certificate reads the decrement with the fresh factorization; where it is not within the
                 # tolerance the corrections continue in that metric.
                 assert self._response is not None
-                fresh, _step = self._decrement(gap, self._response, self._response_noise)
+                fresh, fresh_step = self._decrement(gap, self._response, self._response_noise)
                 if fresh >= 0.0:
                     # A negative form is no bound (R indefinite along the gap): the measured remainder stands.
                     remaining = fresh
+                    if parallel:
+                        direction = fresh_step
                 self.mean_move = 2.0 * remaining
                 if remaining + self.noise_gain <= tolerance:
                     return point
@@ -558,6 +687,9 @@ class MeanFieldFixedPoints:
         self.profile["factor_seconds"] += time.perf_counter() - started
         self.profile["refreshes"] += 1
         self._response, self._response_noise = response, self.noise
+        if self._moments_stale:
+            self.third, self.fourth = tilted_cumulants(self.prior, hyperparameters, Cavity(precision=omega, shift=self.shift), self.working_bytes)
+            self._moments_stale = False
         design, noise, squares, variance = self.design, self.noise, self.member_squares, self.variance.copy()
         mean, shift, residual = self.mean.copy(), self.shift.copy(), self.residual.copy()
         third, fourth = self.third.copy(), self.fourth.copy()
