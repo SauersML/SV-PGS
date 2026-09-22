@@ -1,6 +1,6 @@
 """The small-n route: Stage 2's model (``full_data_fit``) with q(beta)'s algebra in the n x n kernel form.
 
-Where the training samples are far fewer than the columns (a cis window: n ~ 600, p ~ 10^4), every quantity the EP-EB
+Where the training samples are far fewer than the columns (n ~ 600 against p ~ 10^4), every quantity the EP-EB
 fit asks of q(beta) = N(mu, Sigma) is exact from one n x n Cholesky factor per site update, so none needs a Krylov
 solve or a probe certificate:
 
