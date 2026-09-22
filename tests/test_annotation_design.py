@@ -12,7 +12,7 @@ def _table(rng: np.random.Generator, count: int):
     annotations = {
         "quality": rng.uniform(0.2, 1.0, count),
         "in_gene": (rng.random(count) < 0.3).astype(np.float64),
-        "log_length": np.where(classes > 0, rng.normal(3.0, 1.0, count), np.nan),
+        "log_length": np.where((classes > 0) & (rng.random(count) < 0.9), rng.normal(3.0, 1.0, count), np.nan),
         "distance": rng.exponential(1.0, count),
         "constant": np.ones(count),
         "kind": rng.choice(3, size=count).astype(np.int32),
