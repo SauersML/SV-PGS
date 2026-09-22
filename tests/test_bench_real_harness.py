@@ -1120,3 +1120,43 @@ def test_a_run_whose_git_fails_still_writes_every_fit(tmp_path, monkeypatch):
     assert record["genes"] == 1 and len(record["method_sha256"]) == 64
     assert np.isfinite(np.load(out / "chr1.snv.predictions.npy")).any()
     assert pd.read_csv(out / "chr1.log.tsv", sep="\t")["status"].tolist() == ["ok", "ok"]
+
+
+def test_a_stopped_run_is_consolidated_from_its_stored_fits_complete_genes_only(tmp_path):
+    # A run that dies on its second gene's fit leaves its manifest and the first gene's stored fits; consolidating it
+    # writes that gene's outputs alone (the genes table names it and no other), keeps the parts, and records what it left.
+    import json
+
+    tiny_dataset(tmp_path)
+    # A second gene, so one gene's fits can be complete while the other's are not.
+    genes = pd.read_csv(tmp_path / "genes.tsv", sep="\t")
+    pd.concat([genes, genes.assign(gene_id="g2")], ignore_index=True).to_csv(tmp_path / "genes.tsv", sep="\t", index=False)
+    expression = np.load(tmp_path / "expression.npy")
+    np.save(tmp_path / "expression.npy", np.vstack([expression, expression]))
+    annotation = json.loads((tmp_path / "gene_annotation.json").read_text())
+    annotation["g2"] = annotation["g1"]
+    (tmp_path / "gene_annotation.json").write_text(json.dumps(annotation))
+    (tmp_path / "dying.py").write_text(
+        "import pathlib\n"
+        f"MARK = pathlib.Path({str(tmp_path / 'first_gene.txt')!r})\n"
+        "def fit(train):\n"
+        "    if MARK.exists() and MARK.read_text() != str(train.gene_id):\n"
+        "        raise RuntimeError('the wall clock')\n"
+        "    MARK.write_text(str(train.gene_id))\n"
+        "    class Predictor:\n"
+        "        def predict(self, genotypes):\n"
+        "            return genotypes[:, 0].astype(float)\n"
+        "    return Predictor()\n"
+    )
+    with pytest.raises(RuntimeError, match="wall clock"):
+        harness.run(tmp_path, f"{tmp_path}/dying.py:fit", "dying", "loso", ["chr1"], tmp_path / "results", 1, ("snv", "snv_sv"))
+    out = tmp_path / "results/dying/loso"
+    assert not (out / "chr1.genes.tsv").exists() and (out / "chr1.parts").is_dir()
+    summary = harness.consolidate(tmp_path / "results", "dying", "loso", "chr1")
+    genes = pd.read_csv(out / "chr1.genes.tsv", sep="\t")
+    assert len(genes) == summary["genes_written"] == 1 and summary["genes_left"] >= 1
+    predictions = np.load(out / "chr1.snv.predictions.npy")
+    assert predictions.shape[0] == 1 and np.isfinite(predictions).any()
+    log = pd.read_csv(out / "chr1.log.tsv", sep="\t")
+    assert set(log["gene_id"]) == set(genes["gene_id"]) and (log["status"] == "ok").all()
+    assert (out / "chr1.parts").is_dir() and json.loads((out / "chr1.run.json").read_text())["consolidated_from_parts"] == summary

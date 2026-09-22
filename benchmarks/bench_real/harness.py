@@ -952,6 +952,43 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
     store.discard()
 
 
+def consolidate(out_dir, method_name, design, tag) -> dict:
+    """The outputs of a run that stopped before its last fit (a cancelled task, a wall clock, a kill), from the fits its
+    store holds: the arrays, gene table and log of the genes whose every fit is stored. A gene fitted only in part is
+    left out, so another run can score it without any gene being scored twice for one arm (``report``), and the
+    parts stay, so the same run can still continue. The run's manifest records the consolidation and what it left.
+    The store is opened under the run's own identity, read from its manifest: this is a reading of finished fits,
+    not a continuation, so the source that fitted them need not be the source that gathers them."""
+    out = pathlib.Path(out_dir) / method_name / design
+    manifest = out / f"{tag}.run.json"
+    record = json.loads(manifest.read_text())
+    rows_dirs = [pathlib.Path(entry["dir"]) for entry in record.get("rows_dirs") or []] or None
+    dataset = Dataset(record["dataset"], record.get("overlay"), rows_dirs, record.get("sample_subset"))
+    gene_rows = dataset.gene_rows(record["chromosomes"], record.get("gene_prefix"), record.get("gene_list"), record.get("confirmation", False),
+                                  record.get("gene_ranks"))
+    gene_ids = hashlib.sha256("\n".join(dataset.genes.iloc[gene_rows]["gene_id"]).encode()).hexdigest()
+    if gene_ids != record["gene_ids_sha256"]:
+        raise ValueError(f"{manifest}: the gene selection no longer names the genes the stored fits are keyed by (its list or the dataset changed).")
+    split_names, feature_sets = list(record["splits"]), list(record["feature_sets"])
+    store = FitStore(out / f"{tag}.parts", record["run_id"], gene_rows, split_names, feature_sets)
+    finished = store.finished()
+    complete = [row for row in gene_rows if all((row, split, feature_set) in finished for split in split_names for feature_set in feature_sets)]
+    log, coefficient_tables = _consolidate(store, out, tag, dataset, complete, split_names, feature_sets, len(dataset.samples))
+    record["consolidated_from_parts"] = {"genes_written": len(complete), "genes_left": len(gene_rows) - len(complete),
+                                         "fits_stored": len(finished), "fits_planned": len(store.keys)}
+    record["failed_fits"] = sum(entry[6] != "ok" for entry in log)
+    record["constant_predictions"] = sum(bool(entry[7]) for entry in log)
+    _atomic(manifest, lambda target: target.write_text(json.dumps(record, indent=1)))
+    _atomic(out / f"{tag}.raw_splits.json", lambda target: target.write_text(json.dumps(split_names)))
+    if coefficient_tables:
+        _atomic(out / f"{tag}.sv_coefficients.tsv.gz", lambda target: pd.concat(coefficient_tables, ignore_index=True).to_csv(target, sep="\t", index=False))
+    _atomic(out / f"{tag}.genes.tsv", lambda target: dataset.genes.iloc[complete].to_csv(target, sep="\t", index=False))
+    _atomic(out / f"{tag}.log.tsv", lambda target: pd.DataFrame(
+        log, columns=["gene_id", "split", "feature_set", "variants", "sv_variants", "cpu_seconds", "status", "constant_prediction"]).to_csv(
+        target, sep="\t", index=False))
+    return record["consolidated_from_parts"]
+
+
 def _consolidate(store: FitStore, out: pathlib.Path, tag: str, dataset, gene_rows, split_names, feature_sets, sample_count: int):
     """The stored fits, gathered into the run's arrays: one feature set at a time, so a run holds one feature set's
     predictions and raw scores rather than every feature set's at once. Returns the log rows, in gene, split and
@@ -1001,11 +1038,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--method", required=True, help="path/to/file.py:callable")
+    parser.add_argument("--dataset", required=False)
+    parser.add_argument("--method", required=False, help="path/to/file.py:callable")
     parser.add_argument("--name", required=True)
     parser.add_argument("--design", required=True, choices=["random5", "loso"])
-    parser.add_argument("--chromosomes", nargs="+", required=True)
+    parser.add_argument("--chromosomes", nargs="+", required=False)
     parser.add_argument("--out", required=True)
     parser.add_argument("--workers", type=int, default=int(os.environ.get("RUNQ_CORES", "1")))
     parser.add_argument("--feature-sets", nargs="+", default=list(FEATURE_SETS), choices=FEATURE_SETS)
@@ -1020,8 +1057,14 @@ if __name__ == "__main__":
     parser.add_argument("--note", help="a JSON file recorded verbatim in run.json (arm label, test status, rulings)")
     parser.add_argument("--rows", action="append", metavar="NAME=DIR", help="an extra-rows overlay (repeatable; merged in the given order)")
     parser.add_argument("--sample-subset", help="a file of sample ids, one per line: every split is cut to these people")
+    parser.add_argument("--consolidate", metavar="TAG", help="write the outputs of the stopped run <out>/<name>/<design>/TAG.* from its stored fits (complete genes only), and exit")
     parser.add_argument("--record-failures", action="store_true", help="keep going when a fit raises: the fit is recorded as failed (NaN, never a stand-in)")
     arguments = parser.parse_args()
+    if arguments.consolidate is not None:
+        print(json.dumps(consolidate(arguments.out, arguments.name, arguments.design, arguments.consolidate)))
+        raise SystemExit(0)
+    if arguments.dataset is None or arguments.method is None or arguments.chromosomes is None:
+        parser.error("--dataset, --method and --chromosomes are required for a run (only --consolidate goes without them)")
     run(arguments.dataset, arguments.method, arguments.name, arguments.design, arguments.chromosomes, arguments.out, arguments.workers,
         tuple(arguments.feature_sets), arguments.gene_prefix, arguments.genes, arguments.confirmation, arguments.contract,
         tuple(arguments.gene_ranks) if arguments.gene_ranks else None, arguments.overlay, arguments.splits, arguments.note,
