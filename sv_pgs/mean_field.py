@@ -341,7 +341,13 @@ class MeanFieldFixedPoints:
             self.variance = np.full(values.shape[0], float(np.var(values)) + np.finfo(np.float64).tiny)
             self._first_starts.append(self._snapshot())
         if self._first_starts:
-            self._restore(self._cold)
+            # The first data start is the state every solve carries from, and zero the first call's alternative: as
+            # an alternative only, its solve ran under the carried solve's sweep budget and was abandoned (6 to 13
+            # times a fit on bench-real genes [real]), so the zero start's basin was kept whatever the ELBO.
+            zero, data = self._cold, self._first_starts[0]
+            self._restore(data)
+            self._cold = data
+            self._first_starts[0] = zero
 
     # the ELBO and its pieces
 
@@ -561,11 +567,9 @@ class MeanFieldFixedPoints:
             return [None]
         value, point, state, start = max(solved, key=lambda item: item[0])
         if self.profile["fixed_point_calls"] == 1 and start is not entry:
-            # A data start's basin is the higher ELBO's: every later call's cold solve starts there, not at zero. As a
-            # first-call start only, the carried state left it as the weights moved (ENSG00000138468.16 [real,
-            # loso/AFR]: ELBO -341.1 and r2 0.150 against -322.5 and 0.447 with the lasso as every call's cold start).
+            # The alternative start won the first call: every later call's cold solve starts there.
             self._cold = start
-            self.profile["cold_start"] = "data"
+            self.profile["cold_start"] = "zero"
         self._restore(state)
         if value > self.best[0]:
             self.best = (value, model_hyperparameters, state)
