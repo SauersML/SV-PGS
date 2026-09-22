@@ -81,14 +81,34 @@ def lasso_path(x: F64Array, y: F64Array, penalties: F64Array) -> F64Array:
     threshold = THRESHOLD * null_deviance / count
     solutions = np.zeros((penalties.shape[0], x.shape[1]))
     explained = 0.0
-    previous = float(np.max(np.abs(x.T @ residual)) / count)
+    # |X'r| / n: the one p x n product each penalty needs. The KKT check's product after penalty k is at the residual
+    # the strong rule reads at penalty k + 1, so it is kept rather than formed again (the products were 93% of a
+    # path's time [real, ENSG00000138468.16: 10.1 s of products against 0.8 s of sweeps]).
+    # The product runs on a float32 copy of X (half the bytes it streams); its error on column j is at most
+    # (n + 3) eps32 ||x_j|| ||r|| (x_ij and r_i each round once to float32, their product once, the n-term sum by n eps32,
+    # and Cauchy-Schwarz), so a column can violate KKT only where its float32 value is within that bound of the penalty,
+    # and those few are formed exactly.
+    single = np.asfortranarray(x, dtype=np.float32)
+    column_norms = np.sqrt(squares)
+    rounding = float(np.finfo(np.float32).eps) * (count + 3.0)
+
+    def screened() -> tuple[np.ndarray, np.ndarray]:
+        approximate = np.abs(single.T @ residual.astype(np.float32)).astype(np.float64) / count
+        return approximate, rounding * column_norms * float(np.linalg.norm(residual)) / count
+
+    gradient, bound = screened()
+    previous = float(np.max(gradient + bound))
     for step, penalty in enumerate(penalties):
-        gradient = np.abs(x.T @ residual) / count
         active = np.flatnonzero((gradient >= 2.0 * penalty - previous) | (beta != 0.0)).astype(np.int64)
         while True:
             _sweep_active(x, squares, beta, residual, active, float(penalty), count, threshold)
-            gradient = np.abs(x.T @ residual) / count
-            violators = np.setdiff1d(np.flatnonzero(gradient > penalty), active)
+            gradient, bound = screened()
+            candidates = np.setdiff1d(np.flatnonzero(gradient + bound > penalty), active)
+            if candidates.size:
+                exact = np.abs(x[:, candidates].T @ residual) / count
+                gradient[candidates] = exact
+                bound[candidates] = 0.0
+            violators = candidates[gradient[candidates] > penalty] if candidates.size else candidates
             if violators.size == 0:
                 break
             active = np.union1d(active, violators).astype(np.int64)
