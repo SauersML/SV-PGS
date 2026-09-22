@@ -49,9 +49,6 @@ def test_the_device_sweep_is_the_host_sweep(members: int) -> None:
     pieces = cupy.zeros((count, 3))
     covariates, solve = cupy.asarray(data["covariates"]), cupy.asarray(data["solve"])
 
-    def project(values):
-        return values - covariates @ (solve @ (covariates.T @ values))
-
     grams = PanelGrams()
     for _sweep_index in range(3):
         parts = host_sweep(
@@ -62,7 +59,7 @@ def test_the_device_sweep_is_the_host_sweep(members: int) -> None:
         pieces[...] = 0.0
         dense = cupy.asarray(data["dense"])
         sweep_piece(
-            cupy, decode=lambda first, last: dense[:, first:last], width=count, mask=cupy.asarray(data["mask"]), project=project, residual=device_residual,
+            cupy, decode=lambda first, last: dense[:, first:last], width=count, mask=cupy.asarray(data["mask"]), covariates=covariates, covariate_pinv=solve, residual=device_residual,
             grams=grams, key_base=(0, 0), squares=cupy.asarray(data["squares"]), class_index=cupy.asarray(data["classes"]),
             log_density=cupy.asarray(data["log_density"]), node_variance=cupy.exp(cupy.asarray(data["log_node_variance"])),
             log_node_variance=cupy.asarray(data["log_node_variance"]), noise=noise, pieces=pieces, **device,

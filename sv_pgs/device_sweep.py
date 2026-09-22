@@ -166,7 +166,8 @@ def sweep_piece(
     decode,
     width: int,
     mask: Any,
-    project,
+    covariates: Any,
+    covariate_pinv: Any,
     residual: Any,
     grams: PanelGrams,
     key_base: tuple[int, int],
@@ -188,7 +189,11 @@ def sweep_piece(
     ``decode(first, last)`` returns the piece's standardized columns first..last-1 (n x panel, before masking and
     projection; one panel at a time, so the device holds a panel's columns, never a block's), ``width`` the piece's
     member count, ``mask`` the model's
-    training indicator (n), ``project(v)`` the covariate complement (I - H) of an (n, r) array, ``residual`` r (n);
+    training indicator (n), ``covariates`` its masked covariates M C (n x k) and ``covariate_pinv`` (C'MC)^+ (k x k):
+    the complement of M v is (I - H) M v = M v - M C (C'MC)^+ C' M v (the noise's weights cancel), so each panel keeps
+    A = (C'MC)^+ C' M X_panel (k x panel) beside its Gram and a sweep's residual update is M X s - M C (A s), two
+    small products in place of a general projection per panel (35% of a bench-sim Stage 2 [sim, scenario_001]);
+    ``residual`` r (n);
     the per-member arrays are the piece's own slices, and ``pieces`` (width x 3) receives each member's KL term,
     ||x_j||^2 v_j and the terms' sizes. ``key_base`` names the piece for the Gram cache."""
     kernel = _kernel(cupy)
@@ -198,10 +203,12 @@ def sweep_piece(
         columns = decode(first, last)
 
         def build(columns=columns):
-            masked = project(columns * mask[:, None])
-            return cupy.ascontiguousarray(masked.T @ masked)
+            masked = columns * mask[:, None]
+            coupling = cupy.ascontiguousarray(covariate_pinv @ (covariates.T @ masked))
+            projected = masked - covariates @ coupling
+            return cupy.ascontiguousarray(projected.T @ projected), coupling
 
-        gram = grams.get((key_base[0], key_base[1] + first), build)
+        gram, coupling = grams.get((key_base[0], key_base[1] + first), build)
         projection = cupy.ascontiguousarray(columns.T @ residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(
@@ -213,5 +220,4 @@ def sweep_piece(
                 pieces[first:last],
             ),
         )
-        image = project((columns @ step)[:, None] * mask[:, None])[:, 0]
-        residual -= image
+        residual -= (columns @ step) * mask - covariates @ (coupling @ step)

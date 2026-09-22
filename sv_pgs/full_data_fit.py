@@ -1112,9 +1112,8 @@ class _FullDataMeanField:
         pieces = cupy.zeros((prior.variant_count, PIECE_COLUMNS))
         noise = float(self.noise[model])
 
-        def project(values):
-            return self.models.complement(values, cupy.full(values.shape[1], model, dtype=cupy.int64))
-
+        masked_covariates = self.gaussian.covariates * mask[:, None]
+        covariate_pinv = cupy.linalg.pinv(masked_covariates.T @ masked_covariates)
         signs = cupy.asarray(self.sign)
         for tile, members, local in self._member_pieces(None):
             rows = cupy.asarray(members)
@@ -1127,7 +1126,8 @@ class _FullDataMeanField:
             piece_state = {name: cupy.ascontiguousarray(values[rows]) for name, values in state.items()}
             piece_parts = cupy.zeros((members.shape[0], PIECE_COLUMNS))
             sweep_piece(
-                cupy, decode=decode, width=int(members.shape[0]), mask=mask, project=project, residual=residual, grams=self._panel_grams,
+                cupy, decode=decode, width=int(members.shape[0]), mask=mask, covariates=masked_covariates, covariate_pinv=covariate_pinv,
+                residual=residual, grams=self._panel_grams,
                 key_base=(model, int(members[0])), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
                 log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
                 pieces=piece_parts, **piece_state,
