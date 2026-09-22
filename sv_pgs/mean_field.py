@@ -559,7 +559,10 @@ class MeanFieldFixedPoints:
                 # scale past float64's range): the same refusal as a non-finite sweep, the state restored.
                 self.refusals.append(f"{type(error).__name__}: {error}")
                 continue
-            if budget is None:
+            # Later calls' cold solves get the carried solve's own count of sweeps; the first call's starts each run to
+            # their own fixed point, so the ELBO that chooses between them compares converged states (an alternative
+            # cut short by the carried start's budget was abandoned, and its basin never compared).
+            if budget is None and self.profile["fixed_point_calls"] > 1:
                 budget = self.profile["carried_sweeps"] = self.profile["sweeps"] - before
             solved.append((float(self.profile["elbo"]), point, self._snapshot(), start))
         if not solved:
