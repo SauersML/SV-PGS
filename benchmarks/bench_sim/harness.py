@@ -40,6 +40,9 @@ ARMS = {
     "beagle_truthhalf": ("observed_beagle_truth.npy", "imputation_beagle.npz", "Beagle-imputed with a true-genotype training half"),
     # The Beagle arm plus a simulated read-depth copy-number channel on DEL/DUP records (PREREG amendment 10).
     "beagle_readcn": ("observed_beagle.npy", "imputation_beagle.npz", "Beagle-imputed + read-depth CN likelihoods"),
+    # Every measured record observed at its true genotype (measurement_truth.py): the arm that isolates the
+    # method's recovery of a known genetic architecture from the imputation arms' measurement loss.
+    "truth": ("observed_truth.npy", "imputation_truth.npz", "true genotypes"),
 }
 TRUTH_HALF_ARMS = {"beagle_truthhalf": "truth_half.npy"}
 READ_ARMS = ("beagle_readcn",)
