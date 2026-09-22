@@ -33,7 +33,9 @@ THRESHOLD = 1e-7
 pass, (||x_j||^2 / n) dbeta_j^2, is below this share of the null deviance per sample, y'y / n."""
 
 
-@numba.njit(cache=True)
+# fastmath lets the compiler reassociate the column dot products and residual updates into SIMD lanes; the start is
+# refined by the mean-field fixed point, so their rounding order does not matter.
+@numba.njit(cache=True, fastmath=True)
 def _sweep_active(x, squares, beta, residual, active, penalty, sample_count, threshold):
     """Coordinate descent over ``active`` until a pass's largest objective change, (||x_j||^2 / n) dbeta_j^2, is at
     most ``threshold`` (glmnet's rule)."""
