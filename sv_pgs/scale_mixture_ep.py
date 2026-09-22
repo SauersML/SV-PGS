@@ -3924,6 +3924,8 @@ def fit_hyperparameters(
     # then, and ``refused_releases`` the blocks a model was returned from, which its next hyper steps hold at their
     # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
     anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
+    # The hyperparameters each model's last plan was made from (``plan``: a plan made twice from one state ends the fit).
+    planned_at: list[tuple[F64Array, F64Array] | None] = [None] * count
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
     # The blocks a model's hyper step moved to their edge and the joint trial refused at its own fixed point: its
     # next hyper steps keep them finite (``hyper_step``'s ``held_finite``).
@@ -4114,6 +4116,22 @@ def fit_hyperparameters(
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
+        previous = planned_at[model]
+        planned_at[model] = (hyperparameters[model].coefficients.copy(), np.array(hyperparameters[model].log_smoothing, dtype=np.float64, copy=True))
+        if (
+            remaining > tolerance and previous is not None
+            and np.array_equal(previous[0], planned_at[model][0]) and np.array_equal(previous[1], planned_at[model][1])
+        ):
+            # The plan is made from the very state its predecessor was made from: the trial it led to was refused
+            # and nothing moved, its pieces cannot be tightened further (``decide``: a piece that cannot reach its
+            # share stays as measured), and the next plan would be this one again. On ENSG00000113441.16 snv [real]
+            # the state's certified error stood at 0.015 against the tolerance 0.0078 whatever share it was
+            # re-certified to, each joint trial from it was refused, and the cycle of plan, trial and refusal
+            # (thirty seconds of line integrals each) ran for two hours in the 500-gene run. The fit returns
+            # uncertified with the remainder as measured.
+            histories[model].append(float(remaining))
+            uncertified(model, _OuterTrial(step.hyperparameters, step, remaining, False, predicted=predicted, weights_tolerance=planned), step, state.decrement)
+            return None
         histories[model].append(float(remaining))
         entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
         released = frozenset(
