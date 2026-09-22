@@ -51,10 +51,16 @@ class _StoreCodes:
             yield start, stop, self.store.read_codes(start, stop)
 
 
-def _store(root: Path, seed: int):
-    """Two chromosomes of mosaic dosages in one store half, and a trait with 15 causal variants (h2 = 0.5)."""
+def _store(root: Path, seed: int, tied: bool = False):
+    """Two chromosomes of mosaic dosages in one store half, and a trait with 15 causal variants (h2 = 0.5). With
+    ``tied``, every tenth record repeats its predecessor and every tenth one after it is its predecessor's negation
+    (dosage 2 - d): exact training ties of both signs, as a hard-genotype store has by the tens of thousands."""
     generator = np.random.default_rng(seed)
     codes = {name: mosaic_codes(generator, _SAMPLES, count) for name, count in (("chr21", 180), ("chr22", 140))}
+    if tied:
+        for values in codes.values():
+            values[1::10] = values[0::10][: values[1::10].shape[0]]
+            values[6::10] = 254 - values[5::10][: values[6::10].shape[0]]
     milli = {name: np.rint(values.astype(np.float64) / 127.0 * 1000.0).astype(np.int64) for name, values in codes.items()}
     _write_store(root, [milli])
     store = DosageStore.open(root)
@@ -203,3 +209,46 @@ def test_block_grams_share_stage0s_float32_arrays_across_models(tmp_path: Path) 
         expected = np.asarray(ld.block(block_index).projected_gram, dtype=np.float64) * (1.0 / 0.7)
         assert np.array_equal(model.within_block(block_index), expected)
     assert window_working_bytes(model) > 0
+
+
+def test_stage2_by_mean_field_carries_tie_members(tmp_path: Path) -> None:
+    # A store with exact training ties of both signs: each member keeps its own coordinate, and the fit and its
+    # scores are the untied route's in every respect the test above checks.
+    store, covariate, targets, genetic = _store(tmp_path / "store", 7, tied=True)
+    training = np.arange(_TRAINING)
+    held_out = np.arange(_TRAINING, _SAMPLES)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    member_count = statistics.active_rows.shape[0]
+    group_count = int(np.asarray(statistics.tie_map.kept_indices).shape[0])
+    assert group_count < member_count
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    offsets = np.zeros(member_count)
+    classes = (np.arange(member_count) % 5 == 0).astype(np.int64)
+    start_noise = float(covariate_residual_variance(targets[:, None], mask, store_covariates)[0])
+    nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=classes, log_variance_offset=offsets, annotation_design=np.zeros((member_count, 0)), annotation_groups=(),
+        nodes=nodes, floor=floor, top=top,
+    )
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+    gaussian = DualGaussian(
+        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+        grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
+    )
+    fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
+    certificate = fit.certificate
+    assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
+    assert certificate.noise_gain[0] <= 0.5 / _DRAWS
+    assert fit.member_mean is not None and fit.member_mean.shape == (member_count, 1)
+    scoring = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], _DRAWS, seed=12)
+    scores = score_genetic(_StoreCodes(store), ScoringPlan.from_models(scoring), _budget())
+    signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
+    standardized = (signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]
+    expected = standardized.T[training] @ fit.member_mean[:, 0]
+    np.testing.assert_allclose(scores.means[training, 0], expected, rtol=1e-8, atol=1e-8)
+    assert np.corrcoef(scores.means[held_out, 0], genetic[held_out])[0, 1] > 0.5

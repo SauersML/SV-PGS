@@ -76,6 +76,7 @@ from sv_pgs.marginal_variances import (
 )
 from sv_pgs.scale_mixture_ep import (
     Cavity,
+    _DEVICE,
     _data_value,
     class_log_density,
     FixedPoint,
@@ -137,7 +138,10 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     start's relative prior variances. y'y after the covariates comes from the target and covariate Grams; ||X'y||^2
     from the projected scores; tr G, sum_j u_j G_jj, sum_j u_j ||G e_j||^2 and ||G||_F^2 from the projected Grams,
     within each block and with its neighbours (the LD Stage 0 keeps; farther pairs enter as zero, which only moves
-    the start)."""
+    the start). The Gram sums run on the fit's device (``scale_mixture_ep.device_scope``): each block's float32 Gram
+    goes up once and is squared there in float64, rather than on the host core by core (a 28k-column block is a 6 GB
+    float64 square, 22 of them at 40,000 samples x 518k records)."""
+    xp = _DEVICE.get()
     ld = statistics.ld
     # A group's prior variance is its members' sum (tie_members): u_g = sum_j u_j.
     ties = TieGroups.from_tie_map(statistics.tie_map)
@@ -147,7 +151,8 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     fitted = statistics.covariate_target.T @ np.linalg.pinv(statistics.covariate_gram) @ statistics.covariate_target
     target_square = np.diag(statistics.target_gram) - np.diag(fitted)
     score_square = np.zeros(target_square.shape[0])
-    column_square = np.zeros(prior.variant_count)
+    # Over the reduced columns (the groups), which the Grams index and the weights are summed to.
+    column_square = np.zeros(ties.group_count)
     gram_trace = 0.0
     gram_square = 0.0
     weighted_diagonal = 0.0
@@ -155,20 +160,23 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     for block_index in range(ld.block_count):
         block = ld.block(block_index)
         columns = np.asarray(block.reduced_columns, dtype=np.int64)
-        gram = np.asarray(block.projected_gram, dtype=np.float64)
+        gram = xp.asarray(np.asarray(block.projected_gram)).astype(xp.float64)
         score_square += np.sum(np.square(np.asarray(block.projected_score, dtype=np.float64)), axis=0)
-        diagonal = np.diag(gram)
+        diagonal = _host(xp.diag(gram))
         gram_trace += float(diagonal.sum())
         weighted_diagonal += float(weights[columns] @ diagonal)
-        squares = np.square(gram)
-        column_square[columns] += squares.sum(axis=0)
-        gram_square += float(squares.sum())
+        gram *= gram
+        column_square[columns] += _host(gram.sum(axis=0))
+        gram_square += float(_host(gram.sum()))
+        del gram
         cross = ld.adjacent_block(block_index) if block_index else None
         if cross is not None:
-            cross_squares = np.square(np.asarray(cross, dtype=np.float64))
-            column_square[previous_columns] += cross_squares.sum(axis=1)
-            column_square[columns] += cross_squares.sum(axis=0)
-            gram_square += 2.0 * float(cross_squares.sum())
+            cross_squares = xp.asarray(np.asarray(cross)).astype(xp.float64)
+            cross_squares *= cross_squares
+            column_square[previous_columns] += _host(cross_squares.sum(axis=1))
+            column_square[columns] += _host(cross_squares.sum(axis=0))
+            gram_square += 2.0 * float(_host(cross_squares.sum()))
+            del cross_squares
         previous_columns = columns
     return [
         moment_start(
