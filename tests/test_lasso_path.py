@@ -24,8 +24,8 @@ def test_every_solution_on_the_path_is_the_lasso() -> None:
     for penalty, solution in zip(penalties[::6], solutions[::6]):
         reference = Lasso(alpha=penalty, fit_intercept=False, tol=1e-12, max_iter=100000).fit(x, y).coef_
         np.testing.assert_allclose(solution, reference, atol=1e-6)
-    # the first penalty is lambda_max: every coefficient is zero there
-    assert np.all(solutions[0] == 0.0)
+    # the first penalty is lambda_max: every coefficient is zero there, to the soft threshold's rounding
+    assert np.max(np.abs(solutions[0])) <= 1e-12
 
 
 def test_the_cross_validated_lasso_is_deterministic_and_sparse() -> None:
