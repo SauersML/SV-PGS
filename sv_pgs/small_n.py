@@ -1707,6 +1707,19 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
 
 
+def lasso_starts(statistics: DenseStatistics, seed: int, unit_scales: F64Array) -> tuple[F64Array, F64Array]:
+    """q's means at the cross-validated lasso in the two scales the model has: on the standardized columns
+    (``lasso_start``), and on the prior's own per-unit columns, column j times ``unit_scales``_j (its spread in its stored
+    value's units, the per-unit baseline's scale), returned on the standardized columns (gamma_j = b_j s_j). The lasso
+    penalizes each column's coefficient alike, so the two starts weigh rare and common variants differently; neither
+    basin is the higher ELBO on every gene, and the fit keeps the one that is [real, loso/AFR: ENSG00000132879.14 ELBO
+    -199.95, r2 0.075 standardized against -197.60, 0.206 per unit; ENSG00000138468.16 -322.45, 0.447 against -322.73,
+    0.378]."""
+    scales = np.asarray(unit_scales, dtype=np.float64)
+    per_unit = cross_validated_lasso(np.asarray(statistics.projected, dtype=np.float64) * scales[None, :], statistics.projected_target, seed)
+    return lasso_start(statistics, seed), per_unit * scales
+
+
 def lasso_start(statistics: DenseStatistics, seed: int) -> F64Array:
     """q's means at the lasso on the projected standardized design, its penalty at the cross-validated minimum
     (``lasso_path.cross_validated_lasso``, folds drawn from ``seed``): a data-derived start for the first mean-field call beside zero, kept only where its
@@ -1754,7 +1767,10 @@ def fit_small_n(
     else:
         from sv_pgs.mean_field import MeanFieldFixedPoints
 
-        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, start_means=(lasso_start(statistics, seed),))
+        units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
+        oracle = MeanFieldFixedPoints(
+            statistics, prior, start_noise, draw_count, working_bytes, start_means=lasso_starts(statistics, seed, statistics.scales / units),
+        )
     tolerance = 0.5 / draw_count
     try:
         # The variant side's objective and moments on ``array_module`` (``scale_mixture_ep.device_scope``); the

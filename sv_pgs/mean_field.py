@@ -341,9 +341,8 @@ class MeanFieldFixedPoints:
             self.variance = np.full(values.shape[0], float(np.var(values)) + np.finfo(np.float64).tiny)
             self._first_starts.append(self._snapshot())
         if self._first_starts:
-            # The first data start is the state every solve carries from, and zero the first call's alternative: as
-            # an alternative only, its solve ran under the carried solve's sweep budget and was abandoned (6 to 13
-            # times a fit on bench-real genes [real]), so the zero start's basin was kept whatever the ELBO.
+            # The first data start is the state the first call carries from, zero and the other data starts its
+            # alternatives, each solved to its own fixed point; the winner's start is every later call's cold start.
             zero, data = self._cold, self._first_starts[0]
             self._restore(data)
             self._cold = data
@@ -572,7 +571,7 @@ class MeanFieldFixedPoints:
         if self.profile["fixed_point_calls"] == 1 and start is not entry:
             # The alternative start won the first call: every later call's cold solve starts there.
             self._cold = start
-            self.profile["cold_start"] = "zero"
+            self.profile["cold_start"] = next(index for index, candidate in enumerate(self._first_starts) if candidate is start)
         self._restore(state)
         if value > self.best[0]:
             self.best = (value, model_hyperparameters, state)
