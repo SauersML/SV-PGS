@@ -29,6 +29,9 @@ import numpy as np
 
 PANEL = 32
 """Columns per panel: the CUDA warp width (one lane per member of the panel)."""
+DEVICE_PIECE_ARRAYS = 4
+"""Live (n x width) float64 arrays while a piece is decoded: the codes as float64, their centred and scaled copies,
+and the signed product (``code_products.CodeBlockTile.columns`` and the caller's sign)."""
 PIECE_COLUMNS = 3
 """Per member: its KL term, ||x_j||^2 v_j, and the KL term's pieces' sizes (the ELBO and its rounding bound)."""
 

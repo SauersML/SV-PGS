@@ -50,7 +50,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
+from sv_pgs.device_sweep import DEVICE_PIECE_ARRAYS, PANEL, PIECE_COLUMNS, PanelGrams, sweep_piece
 from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
@@ -998,10 +998,12 @@ class _FullDataMeanField:
 
     # the design, streamed
 
-    def _member_pieces(self) -> Iterator[tuple[object, I64Array, I64Array]]:
-        """(tile, members, their columns in the tile) per piece, the blocks and their members in order."""
+    def _member_pieces(self, width: int | None = None) -> Iterator[tuple[object, I64Array, I64Array]]:
+        """(tile, members, their columns in the tile) per piece, the blocks and their members in order; ``width`` caps
+        a piece's members (the device sweep's, from its free memory), else the host working set sets it."""
         for (start, stop, tile), members in zip(self.gaussian.source.blocks(), self.member_blocks):
-            for piece_start, piece_stop in self._pieces(members.shape[0]):
+            pieces = self._pieces(members.shape[0]) if width is None else ((first, min(first + width, members.shape[0])) for first in range(0, members.shape[0], width))
+            for piece_start, piece_stop in pieces:
                 piece = members[piece_start:piece_stop]
                 yield tile, piece, self.ties.group[piece] - start
 
@@ -1098,7 +1100,7 @@ class _FullDataMeanField:
             return self.models.complement(values, cupy.full(values.shape[1], model, dtype=cupy.int64))
 
         signs = cupy.asarray(self.sign)
-        for tile, members, local in self._member_pieces():
+        for tile, members, local in self._member_pieces(self._device_piece_width(cupy)):
             rows = cupy.asarray(members)
             dense = cupy.asarray(tile.columns(cupy.asarray(local)), dtype=cupy.float64) * signs[rows][None, :]
             log_node_variance = cupy.ascontiguousarray(scales[rows][:, None] + grid[None, :])
@@ -1121,6 +1123,15 @@ class _FullDataMeanField:
         self.passes += 1
         residual_square = float(cupy.asnumpy(residual @ residual))
         return float(totals[0]), float(totals[1]), residual_square, float(totals[2])
+
+    def _device_piece_width(self, cupy) -> int:
+        """Members per device piece: as many whole panels as the device's free memory holds the piece's live float64
+        (n x width) arrays for (``tile.columns``' codes, centred and scaled copies, and the signed product,
+        ``DEVICE_PIECE_ARRAYS``), measured now; at least one panel."""
+        free_bytes, _total = cupy.cuda.runtime.memGetInfo()
+        free_bytes += cupy.get_default_memory_pool().free_bytes()
+        width = int(free_bytes // (DEVICE_PIECE_ARRAYS * self.sample_count * np.dtype(np.float64).itemsize))
+        return max(PANEL, width // PANEL * PANEL)
 
     def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
         """As ``MeanFieldFixedPoints._elbo``, on this model's training rows."""
