@@ -198,7 +198,11 @@ def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, 
     # the Gram against the previous block has the same shape bound as the block's own
     adjacent = gram
     cross = layout.width * cross_columns * 8 + block_cap * _CROSS_SAMPLE_CHUNK * 8
-    return resident + max(band, gram + adjacent + cross)
+    # the projection step's fp64 correlation matrix and the one full-width panel temporary its rank-one update
+    # forms (the device runs every row as one panel): 2 x 11.6 GB at a 38k cap, which the model omitted and the
+    # A40 refused (bench-sim scenario_000, 40,000 samples, 2026-09-22)
+    projection = 2 * gram_rows * gram_rows * 8
+    return resident + max(band, gram + adjacent + cross + projection)
 
 
 class HostGenotypeBuffer:
