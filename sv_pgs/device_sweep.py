@@ -29,6 +29,8 @@ import numpy as np
 
 PANEL = 32
 """Columns per panel: the CUDA warp width (one lane per member of the panel)."""
+PIECE_COLUMNS = 3
+"""Per member: its KL term, ||x_j||^2 v_j, and the KL term's pieces' sizes (the ELBO and its rounding bound)."""
 
 _SOURCE = r"""
 extern "C" __global__ void panel_sweep(

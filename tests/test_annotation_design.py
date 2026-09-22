@@ -62,10 +62,10 @@ def test_a_column_constant_within_every_class_and_a_dependent_column_are_dropped
     annotations = {"per_class": classes.astype(np.float64), "x": values, "twice_x": 2.0 * values + 1.0}
     result = annotation_design(annotations, {}, class_index=classes)
     assert not any(name.startswith("per_class") for name in result.names)
-    # x and 2x + 1 share every column after centring: the second annotation's linear term is dependent and dropped,
-    # and so are its hinges (the same knots on the same standardized values)
-    assert sum(name.startswith("twice_x") for name in result.names) == 0
-    assert sum(name.startswith("x") for name in result.names) >= 1
+    # x and 2x + 1 share every column after standardizing: whichever comes first (in name order) keeps its linear
+    # term and hinges, and the other's are all dependent on them and dropped
+    kept = {source: sum(name.split(":")[0] == source for name in result.names) for source in ("twice_x", "x")}
+    assert sorted(kept.values())[0] == 0 and sorted(kept.values())[1] >= 1
 
 
 def test_an_annotation_with_the_wrong_length_is_refused() -> None:

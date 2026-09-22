@@ -50,7 +50,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.device_sweep import PanelGrams, sweep_piece
+from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
 from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
@@ -899,8 +899,10 @@ class _FullDataMeanField:
     (``DualGaussian.iterate``, ``posterior_solve``), and Xp'Xp c by two tile passes. No leave-block-out variance,
     no cavity information certificate: q's variances are its own.
 
-    Tie members (several members on one column) are not carried yet: they need the member-level R, which the dual
-    solver holds per group; the EP route takes them."""
+    Tie members (several members on one column, ``tie_members``) are coordinates of their own: each has its own q_j,
+    class prior and offset, and its column is its group's, signed. The dual solver sees each group's sites
+    (``group_sites``), and the members' responses follow from the groups' by conditioning on the sum
+    (``_member_posterior``), as on the EP route."""
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
@@ -913,9 +915,10 @@ class _FullDataMeanField:
         self.ties = TieGroups.from_tie_map(statistics.tie_map)
         if prior.variant_count != self.ties.member_count:
             raise ValueError("the prior must be over Stage 0's active rows (the tie members), in their order")
-        if self.ties.member_count != self.ties.group_count or not np.array_equal(self.ties.group, np.arange(self.ties.group_count)):
-            raise NotImplementedError("the mean-field full-data route carries no tie members yet; the EP route does")
         self.grams = block_grams(statistics)
+        # Each block's members in their order, and each member's group column within its block.
+        self.member_blocks = tuple(np.flatnonzero(np.isin(self.ties.group, block)) for block in self.grams.blocks)
+        self.sign = np.asarray(self.ties.sign, dtype=np.float64)
         model_count = gaussian.model_count
         self.model_count = model_count
         self.training = np.asarray(_host(gaussian.training), dtype=np.float64)
@@ -929,7 +932,7 @@ class _FullDataMeanField:
         self.residual_dimension = self.training_counts - self.covariate_rank
         if np.any(self.residual_dimension <= 0):
             raise ValueError("a model's training rows do not outnumber its covariates' rank")
-        self.member_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)
+        self.member_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)[self.ties.group]
         targets = np.asarray(_host(gaussian.targets), dtype=np.float64)
         projected = np.asarray(_host(self.models.complement(xp.asarray(self.training * targets), xp.arange(model_count))), dtype=np.float64)
         self.projected_targets = [np.ascontiguousarray(projected[:, model]) for model in range(model_count)]
@@ -985,6 +988,19 @@ class _FullDataMeanField:
 
     # the design, streamed
 
+    def _member_pieces(self) -> Iterator[tuple[object, I64Array, I64Array]]:
+        """(tile, members, their columns in the tile) per piece, the blocks and their members in order."""
+        for (start, stop, tile), members in zip(self.gaussian.source.blocks(), self.member_blocks):
+            for piece_start, piece_stop in self._pieces(members.shape[0]):
+                piece = members[piece_start:piece_stop]
+                yield tile, piece, self.ties.group[piece] - start
+
+    def _group_values(self, values: F64Array) -> F64Array:
+        """sum_j s_j v_j per group, for member values (p_members x r)."""
+        grouped = np.zeros((self.ties.group_count,) + values.shape[1:])
+        np.add.at(grouped, self.ties.group, self.sign.reshape((-1,) + (1,) * (values.ndim - 1)) * values)
+        return grouped
+
     def _pieces(self, count: int) -> Iterator[tuple[int, int]]:
         """Column ranges of a block whose two dense (n x width) float64 arrays (the tile's columns and their
         projection) fit the working set."""
@@ -1002,7 +1018,7 @@ class _FullDataMeanField:
     def _image(self, coefficients: F64Array, model: int) -> F64Array:
         """Xp c (n x r) for c (p x r): the tiles' X_b c_b, masked to the training rows and projected."""
         xp = self.gaussian.array_module
-        values = np.asarray(coefficients, dtype=np.float64)
+        values = self._group_values(np.asarray(coefficients, dtype=np.float64))
         image = np.zeros((self.sample_count, values.shape[1]))
         for start, stop, tile in self.gaussian.source.blocks():
             image += np.asarray(_host(tile.matmat(xp.asarray(values[start:stop]))), dtype=np.float64)
@@ -1015,10 +1031,10 @@ class _FullDataMeanField:
         values = np.asarray(samples, dtype=np.float64)
         projected = np.asarray(_host(self.models.complement(xp.asarray(values), xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
         masked = xp.asarray(projected * self.training[:, model][:, None])
-        back = np.zeros((self.prior.variant_count, values.shape[1]))
+        back = np.zeros((self.ties.group_count, values.shape[1]))
         for start, stop, tile in self.gaussian.source.blocks():
             back[start:stop] = np.asarray(_host(tile.rmatmat(masked)), dtype=np.float64)
-        return back
+        return self.sign[:, None] * back[self.ties.group]
 
     # the sweeps
 
@@ -1034,18 +1050,15 @@ class _FullDataMeanField:
         divergence = weighted_variance = sizes = 0.0
         residual = self.residual[model]
         noise = float(self.noise[model])
-        for start, stop, tile in self.gaussian.source.blocks():
-            for piece_start, piece_stop in self._pieces(stop - start):
-                local = np.arange(piece_start, piece_stop, dtype=np.int64)
-                rows = start + local
-                projected = self._projected(tile, local, model)
+        for tile, rows, local in self._member_pieces():
+                projected = np.asfortranarray(self._projected(tile, local, model) * self.sign[rows][None, :])
                 log_node_variance = scales[rows][:, None] + prior.log_variance_grid[None, :]
                 with np.errstate(over="ignore"):
                     node_variance = np.exp(log_node_variance)
                 mean, variance, shift, third, fourth = (np.ascontiguousarray(values[rows, model]) for values in (self.mean, self.variance, self.shift, self.third, self.fourth))
                 part = mean_field_sweep(
-                    projected, np.ascontiguousarray(self.member_squares[rows, model]), local - piece_start, self.class_index[rows], log_density,
-                    node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth,
+                    projected, np.ascontiguousarray(self.member_squares[rows, model]), np.arange(rows.shape[0], dtype=np.int64), self.class_index[rows],
+                    log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth,
                 )
                 for values, piece in ((self.mean, mean), (self.variance, variance), (self.shift, shift), (self.third, third), (self.fourth, fourth)):
                     values[rows, model] = piece
@@ -1068,26 +1081,29 @@ class _FullDataMeanField:
         squares = cupy.asarray(np.ascontiguousarray(self.member_squares[:, model]))
         classes = cupy.asarray(self.class_index)
         state = {name: cupy.asarray(np.ascontiguousarray(getattr(self, name)[:, model])) for name in ("mean", "variance", "shift", "third", "fourth")}
-        pieces = cupy.zeros((prior.variant_count, 3))
+        pieces = cupy.zeros((prior.variant_count, PIECE_COLUMNS))
         noise = float(self.noise[model])
 
         def project(values):
             return self.models.complement(values, cupy.full(values.shape[1], model, dtype=cupy.int64))
 
-        for start, stop, tile in self.gaussian.source.blocks():
-            for piece_start, piece_stop in self._pieces(stop - start):
-                local = np.arange(piece_start, piece_stop, dtype=np.int64)
-                rows = slice(start + piece_start, start + piece_stop)
-                dense = cupy.asarray(tile.columns(cupy.asarray(local)), dtype=cupy.float64)
-                log_node_variance = cupy.ascontiguousarray(scales[rows][:, None] + grid[None, :])
-                node_variance = cupy.exp(log_node_variance)
-                sweep_piece(
-                    cupy, dense=dense, mask=mask, project=project, residual=residual, grams=self._panel_grams,
-                    key_base=(model, start + piece_start), squares=squares[rows], class_index=classes[rows],
-                    log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
-                    mean=state["mean"][rows], variance=state["variance"][rows], shift=state["shift"][rows],
-                    third=state["third"][rows], fourth=state["fourth"][rows], pieces=pieces[rows],
-                )
+        signs = cupy.asarray(self.sign)
+        for tile, members, local in self._member_pieces():
+            rows = cupy.asarray(members)
+            dense = cupy.asarray(tile.columns(cupy.asarray(local)), dtype=cupy.float64) * signs[rows][None, :]
+            log_node_variance = cupy.ascontiguousarray(scales[rows][:, None] + grid[None, :])
+            node_variance = cupy.exp(log_node_variance)
+            piece_state = {name: cupy.ascontiguousarray(values[rows]) for name, values in state.items()}
+            piece_parts = cupy.zeros((members.shape[0], PIECE_COLUMNS))
+            sweep_piece(
+                cupy, dense=dense, mask=mask, project=project, residual=residual, grams=self._panel_grams,
+                key_base=(model, int(members[0])), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
+                log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
+                pieces=piece_parts, **piece_state,
+            )
+            for name, values in piece_state.items():
+                state[name][rows] = values
+            pieces[rows] = piece_parts
         for name, values in state.items():
             getattr(self, name)[:, model] = cupy.asnumpy(values)
         self.residual[model] = cupy.asnumpy(residual)
@@ -1150,8 +1166,9 @@ class _FullDataMeanField:
     def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
         """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
         ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m."""
+        group_precision, group_shift = group_sites(self.ties, site_precision, site_shift)
         self.gaussian.iterate(
-            site_precision=site_precision, site_shift=site_shift, noise_variance=noise,
+            site_precision=group_precision, site_shift=group_shift, noise_variance=noise,
             error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
         )
         self.version += 1
@@ -1226,7 +1243,10 @@ class _FullDataMeanField:
         residual_dimension = float(self.residual_dimension[model])
         snapshot = self._snapshot()
         grams = replace(self.grams, scale=1.0 / noise)
-        dual = _posterior(self.gaussian, model, grams, variance, lambda: self._ensure(snapshot))
+        group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
+        dual = _member_posterior(
+            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(snapshot)), self.ties, tau, group_variance,
+        )
         noise_solve: dict[str, object] = {}
 
         def off_diagonal_gram(columns: F64Array) -> F64Array:
@@ -1281,8 +1301,9 @@ class _FullDataMeanField:
         """alpha = (C'WC)^+ C'W (y - X m) on the training rows, for the scoring model."""
         xp = self.gaussian.array_module
         values = np.zeros((self.sample_count, 1))
+        grouped = self._group_values(self.mean[:, model][:, None])
         for start, stop, tile in self.gaussian.source.blocks():
-            values += np.asarray(_host(tile.matmat(xp.asarray(self.mean[start:stop, model][:, None]))), dtype=np.float64)
+            values += np.asarray(_host(tile.matmat(xp.asarray(grouped[start:stop]))), dtype=np.float64)
         targets = np.asarray(_host(self.gaussian.targets), dtype=np.float64)[:, model]
         residual = self.training[:, model] * (targets - values[:, 0])
         covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
