@@ -63,7 +63,6 @@ from sv_pgs.dosage_store import (
     write_dosage_store,
 )
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel, ScoringPlan, score_genetic
-from sv_pgs.pooled_fit import GeneData, fit_pooled_small_n
 from sv_pgs.small_n import fit_small_n
 from sv_pgs.variant_typing import normalize_variant_token, structural_variant_class_from_token
 
@@ -413,29 +412,6 @@ def one_core_budget() -> ComputeBudget:
     )
 
 
-def process_budget() -> ComputeBudget:
-    """The whole process's share, for the batch and views contracts, which the harness runs in its one process (no
-    worker pool): every thread for BLAS, and the usable host memory less what the process already holds. MemAvailable
-    and the cgroup headroom already exclude it; the runner's per-task allotment covers the whole task, so it is
-    reduced by the resident bytes here. The pooled fit is dense host algebra, so the budget is the CPU's."""
-    machine = detect_compute_budget()
-    host_bytes = machine.host_bytes
-    allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
-    if allotment is not None:
-        host_bytes = min(host_bytes, int(allotment) - _resident_bytes())
-    if host_bytes <= 0:
-        raise MemoryError("the task's memory allotment is already spent by the loaded views.")
-    return ComputeBudget(
-        device_kind="cpu",
-        device_ids=(),
-        device_names=(),
-        device_bytes=(),
-        device_compute_capabilities=(),
-        host_bytes=host_bytes,
-        cpu_threads=machine.cpu_threads,
-    )
-
-
 def bench_real_covariates(train: Any) -> np.ndarray:
     """The fit's fixed-effect covariates, intercept first: [1, C] with C the covariates bench-real residualized the
     phenotype on (``TrainData.covariates``: sex, genotype PCs, PEER factors; review-mathbugs C2), so the design is
@@ -496,37 +472,3 @@ def _training_seed(genotypes: np.ndarray, phenotype: np.ndarray) -> int:
     """The fit's seed from its training data, so the same training set always gives the same model."""
     digest = hashlib.sha256(np.ascontiguousarray(genotypes, dtype=np.uint8).tobytes() + np.asarray(phenotype, dtype="<f8").tobytes()).digest()
     return int.from_bytes(digest[:8], "big")
-
-
-def fit_expression_batch(trains: Sequence[Any]) -> list[BenchRealPredictor]:
-    """bench-real's pooled arm (batch_design.md rev 2): every gene of one split and feature set fitted at once, with
-    one prior (the mixing density, the class deviations and each gene's level) learned from all of them by
-    ``sv_pgs.pooled_fit``; one predictor per gene, in order."""
-    genes = []
-    for train in trains:
-        genotypes = np.asarray(train.genotypes)
-        if not np.all(np.isin(genotypes, (0, 1, 2))):
-            raise ValueError("bench-real training genotypes must be allele counts 0, 1 or 2.")
-        genes.append(GeneData(
-            codes=genotypes.astype(np.uint8) * np.uint8(CODES_PER_DOSAGE),
-            covariates=bench_real_covariates(train),
-            target=np.asarray(train.phenotype, dtype=np.float64),
-            variant_class=bench_real_classes_for_arm(train.variants, "full"),
-        ))
-    digest = hashlib.sha256(b"".join(_training_seed(gene.codes, gene.target).to_bytes(8, "big") for gene in genes)).digest()
-    # Measured after every gene's training data is loaded, so the fit's memory is what remains.
-    fitted = fit_pooled_small_n(genes, draw_count=fit_model.DRAW_COUNT, working_bytes=process_budget().working_bytes, seed=int.from_bytes(digest[:8], "big"))
-    return [
-        BenchRealPredictor(scoring=scoring, columns=scoring.store_rows, centering="training", input_columns=gene.codes.shape[1])
-        for scoring, gene in zip(fitted.scoring, genes)
-    ]
-
-
-def fit_expression_views(views: Mapping) -> Iterator[tuple[tuple, BenchRealPredictor]]:
-    """bench-real's views contract for the pooled arm: the views grouped by (split, feature set), each group's genes
-    fitted together by ``fit_expression_batch``; yields (key, predictor) for every view exactly once."""
-    groups: dict[tuple, list[tuple]] = {}
-    for key in views:
-        groups.setdefault(tuple(key[1:]), []).append(tuple(key))
-    for keys in groups.values():
-        yield from zip(keys, fit_expression_batch([views[key] for key in keys]))

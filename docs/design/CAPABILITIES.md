@@ -6,7 +6,7 @@ meet, what it does instead, and the test that pins that behaviour today. Change 
 behaviour; delete a row when the code meets the requirement.
 
 The public routes are `sv_pgs.fit_model.fit` (the `sv-pgs fit` command, over a dosage store),
-`sv_pgs.small_n.fit_small_n` and `sv_pgs.pooled_fit.fit_pooled_small_n` (the dense cis-window routes that
+`sv_pgs.small_n.fit_small_n` (the dense small-n route that
 `benchmarks/svpgs_method.py` and `benchmarks/svpgs_small_n.py` enter), `sv_pgs.artifact.predict` (the `sv-pgs score`
 command) and `sv_pgs.workspace_pipeline.run_pipeline` (the `sv-pgs workspace-run` command).
 

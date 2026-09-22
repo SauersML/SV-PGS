@@ -125,7 +125,7 @@ def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
 
 def task_budget() -> ComputeBudget:
     """The machine's budget (its device where it has one), with the host share capped by the runner's allotment
-    less what this process already holds, as ``svpgs_method.process_budget`` caps it."""
+    less what this process already holds."""
     machine = detect_compute_budget()
     allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
     host_bytes = machine.host_bytes

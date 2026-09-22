@@ -307,60 +307,6 @@ def test_the_coefficients_are_the_genotype_scale_effects_of_the_prediction(small
         np.testing.assert_allclose(change, predictor.coefficients[column], rtol=0.0, atol=rounding(test) + rounding(moved))
 
 
-def test_the_batch_arm_fits_every_gene_with_one_pooled_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    single = _SmallNStub()
-    calls: list[Any] = []
-
-    def pooled(genes: Any, **arguments: Any) -> Any:
-        calls.append((genes, arguments))
-        fits = [single(codes=gene.codes, covariates=gene.covariates, target=gene.target, seed=index) for index, gene in enumerate(genes)]
-        return type("PooledFit", (), {"scoring": tuple(fit.scoring for fit in fits)})()
-
-    monkeypatch.setattr(svpgs_method, "fit_pooled_small_n", pooled)
-    trains = [_bench_real_train(np.random.default_rng(seed)) for seed in (10, 11, 12)]
-    predictors = svpgs_method.fit_expression_batch([train for train, _test in trains])
-    (genes, arguments), = calls
-    assert len(genes) == len(predictors) == 3 and arguments["draw_count"] == fit_model.DRAW_COUNT
-    for (train, test), gene, predictor in zip(trains, genes, predictors):
-        np.testing.assert_array_equal(gene.codes, (train.genotypes * CODES_PER_DOSAGE).astype(np.uint8))
-        np.testing.assert_array_equal(gene.variant_class, svpgs_method.bench_real_classes(train.variants))
-        assert predictor.predict(test).shape == (test.shape[0],)
-
-
-def test_the_views_arm_pools_each_split_and_feature_set_over_its_genes(monkeypatch: pytest.MonkeyPatch) -> None:
-    batches: list[int] = []
-
-    def batch(trains: Any) -> list[Any]:
-        batches.append(len(trains))
-        return [f"predictor of {train.gene_id}" for train in trains]
-
-    monkeypatch.setattr(svpgs_method, "fit_expression_batch", batch)
-    trains = {}
-    for gene in ("a", "b", "c"):
-        for split in ("loso/AFR", "loso/EUR"):
-            for feature_set in ("snv", "snv_sv"):
-                train, _test = _bench_real_train(np.random.default_rng(len(trains)))
-                trains[(gene, split, feature_set)] = dataclasses.replace(train, gene_id=gene)
-    returned = dict(svpgs_method.fit_expression_views(trains))
-    assert sorted(returned) == sorted(trains) and batches == [3, 3, 3, 3]
-    assert all(returned[key] == f"predictor of {key[0]}" for key in trains)
-
-
-def test_the_batch_arms_take_the_whole_process_less_what_it_holds(monkeypatch: pytest.MonkeyPatch) -> None:
-    machine = ComputeBudget(
-        device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(), host_bytes=1 << 40, cpu_threads=16
-    )
-    monkeypatch.setattr(svpgs_method, "detect_compute_budget", lambda: machine)
-    monkeypatch.delenv("RUNQ_MEM_BYTES", raising=False)
-    assert (svpgs_method.process_budget().host_bytes, svpgs_method.process_budget().cpu_threads) == (1 << 40, 16)
-    allotment = 1 << 36
-    monkeypatch.setenv("RUNQ_MEM_BYTES", str(allotment))
-    budget = svpgs_method.process_budget()
-    with open("/proc/self/statm") as handle:
-        resident = int(handle.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
-    assert allotment - 2 * resident <= budget.host_bytes <= allotment - resident // 2 and budget.cpu_threads == 16
-
-
 def test_bench_reals_covariates_are_the_fits_fixed_effects(small_n: _SmallNStub) -> None:
     """review-mathbugs C2: the phenotype was residualized on [1, C], so the fit projects on the same [1, C]."""
     train, test = _bench_real_train(np.random.default_rng(15))
