@@ -1763,12 +1763,22 @@ def fit_small_n(
             (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
+    hyperparameters = outer.hyperparameters
+    if inference == "mean_field" and oracle.best[1] is not None and oracle.best[0] > float(oracle.profile["elbo"]) + tolerance:
+        # A nested prior can never have a lower best ELBO than the one it contains, but the outer loop's own objective
+        # (the corrected fixed-cavity evidence) is not the ELBO, and it ended below a state it had visited
+        # (ENSG00000187605.16 [real]: 87.0 with annotation groups against 99.9 without). The fit returns the visited
+        # state of the highest ELBO, the variational objective the oracle itself maximizes.
+        best_elbo, hyperparameters, best_state = oracle.best
+        ended = float(oracle.profile["elbo"])
+        oracle._restore(best_state)
+        oracle.profile["elbo_best_restored"] = float(best_elbo) - ended
     generator = np.random.default_rng(seed)
     if inference == "ep":
         # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
         draws = oracle.mean[:, None] + np.sqrt(oracle.noise) * oracle.kernel.draws(generator, draw_count)
     else:
-        draws = oracle.draws(outer.hyperparameters, generator, draw_count)
+        draws = oracle.draws(hyperparameters, generator, draw_count)
     alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ oracle.mean)
     # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
@@ -1778,7 +1788,7 @@ def fit_small_n(
         signed_means=statistics.means,
         signed_scales=statistics.scales,
         tie_map=_compact_identity_tie_map(member_count),
-        member_prior_variances=prior_second_moment(prior, outer.hyperparameters),
+        member_prior_variances=prior_second_moment(prior, hyperparameters),
         beta_reduced=statistics.signs * oracle.mean,
         posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
@@ -1839,9 +1849,9 @@ def fit_small_n(
         "prediction_tolerance": float(outer.prediction_tolerance),
         "halvings": int(outer.halvings),
         "unresolved": int(outer.unresolved),
-        "final_log_smoothing": [float(value) for value in np.atleast_1d(outer.hyperparameters.log_smoothing)],
+        "final_log_smoothing": [float(value) for value in np.atleast_1d(hyperparameters.log_smoothing)],
     }
     return SmallNFit(
-        scoring=scoring, noise_variance=float(oracle.noise), hyperparameters=outer.hyperparameters, certificate=certificate, prior=prior,
+        scoring=scoring, noise_variance=float(oracle.noise), hyperparameters=hyperparameters, certificate=certificate, prior=prior,
         statistics=statistics, profile=profile,
     )

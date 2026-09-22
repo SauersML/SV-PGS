@@ -330,6 +330,9 @@ class MeanFieldFixedPoints:
         self._cold: dict | None = self._snapshot()
         # Further first-call starts: q's means at each (a data-derived point such as the cross-validated lasso), the
         # residual they leave and each member's variance at their spread; the first call keeps the higher ELBO.
+        # The highest-ELBO state any call solved, with its hyperparameters: the outer loop climbs a corrected
+        # fixed-cavity evidence, not the ELBO, and can end at a state whose ELBO is below one it visited (``best``).
+        self.best: tuple[float, MixtureHyperparameters | None, dict | None] = (-np.inf, None, None)
         self._first_starts = []
         for means in start_means:
             values = np.asarray(means, dtype=np.float64)
@@ -556,8 +559,10 @@ class MeanFieldFixedPoints:
         if not solved:
             self._restore(entry)
             return [None]
-        _value, point, state = max(solved, key=lambda item: item[0])
+        value, point, state = max(solved, key=lambda item: item[0])
         self._restore(state)
+        if value > self.best[0]:
+            self.best = (value, model_hyperparameters, state)
         return [point]
 
     def _stale_gap(self) -> F64Array:
