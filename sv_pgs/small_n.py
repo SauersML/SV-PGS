@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Sequence
 
 from types import ModuleType
@@ -53,7 +53,7 @@ from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
-from sv_pgs.annotation_design import annotation_design, column_variance_annotation
+from sv_pgs.annotation_design import COLUMN_VARIANCE, annotation_design, column_variance_annotation
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
     _host,
@@ -1695,6 +1695,44 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
 
 
+def per_unit_start(statistics: DenseStatistics, prior: ScaleMixturePrior, start: MixtureHyperparameters) -> MixtureHyperparameters | None:
+    """``start`` moved to the per-unit architecture: the column-variance annotation's linear coefficient at the raw
+    column's standard deviation, so log u_j carries 2 log s_j in full (one prior per unit of the stored value, c = 1 in
+    ``annotation_design.column_variance_annotation``); None where the prior has no such column."""
+    raw = column_variance_annotation(statistics.scales)[COLUMN_VARIANCE]
+    if not np.all(np.isfinite(raw)) or raw.std() <= 0.0:
+        return None
+    column = (raw - raw.mean()) / raw.std()
+    for rows in prior.class_rows:
+        column[rows] -= column[rows].mean()
+    annotation_count = prior.scale_size - prior.level_size
+    for index in range(annotation_count):
+        if np.allclose(prior.scale_design[:, index], column, rtol=0.0, atol=float(np.sqrt(np.finfo(np.float64).eps)) * float(np.max(np.abs(column)))):
+            coefficients = np.array(start.coefficients, copy=True)
+            coefficients[prior.density_size + index] = float(raw.std())
+            return replace(start, coefficients=coefficients)
+    return None
+
+
+def _better_start(statistics, prior, start, start_noise, draw_count, working_bytes, array_module):
+    """The start of the higher mean-field ELBO between the moment start (one prior on standardized effects) and the
+    same start at the per-unit architecture (``per_unit_start``), each solved by its own oracle: the fit's own criterion
+    decides which basin the empirical Bayes climbs from (on ENSG00000237248.5 [real] the standardized start held the
+    fit at ELBO -530.7 while the per-unit one reached -512.9)."""
+    from sv_pgs.mean_field import MeanFieldFixedPoints
+
+    alternative = per_unit_start(statistics, prior, start)
+    if alternative is None:
+        return start, None
+    values = []
+    for candidate in (start, alternative):
+        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes)
+        with device_scope(array_module):
+            (point,) = oracle([candidate])
+        values.append(float(oracle.profile.get("elbo", -np.inf)) if point is not None else -np.inf)
+    return (alternative if values[1] > values[0] else start), values
+
+
 def fit_small_n(
     *,
     codes: np.ndarray,
@@ -1726,6 +1764,7 @@ def fit_small_n(
     prior = small_n_prior(statistics, variant_class, offsets, draw_count, annotations)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(statistics, prior)
+    start, start_values = _better_start(statistics, prior, start, start_noise, draw_count, working_bytes, array_module)
     if inference == "ep":
         oracle: _DenseFixedPoints | MeanFieldFixedPoints = _DenseFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
     else:
@@ -1791,6 +1830,7 @@ def fit_small_n(
         outer_criterion_met=np.array([outer.certified], dtype=bool),
     )
     profile = dict(oracle.profile) | {
+        "start_elbos": start_values,
         "stage0_seconds": stage0_seconds,
         "total_seconds": time.perf_counter() - started,
         "samples": statistics.sample_count,
