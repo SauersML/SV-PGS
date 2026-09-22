@@ -1128,8 +1128,11 @@ class _FullDataMeanField:
         """Members per device piece: as many whole panels as the device's free memory holds the piece's live float64
         (n x width) arrays for (``tile.columns``' codes, centred and scaled copies, and the signed product,
         ``DEVICE_PIECE_ARRAYS``), measured now; at least one panel."""
+        # The pool's cached blocks are fragmented: counted as free, one piece's contiguous arrays did not fit in them
+        # (8.9 GB refused with 42 GB allocated, bench-sim scenario_000). They go back to the driver, which then reports
+        # what one allocation can have.
+        cupy.get_default_memory_pool().free_all_blocks()
         free_bytes, _total = cupy.cuda.runtime.memGetInfo()
-        free_bytes += cupy.get_default_memory_pool().free_bytes()
         width = int(free_bytes // (DEVICE_PIECE_ARRAYS * self.sample_count * np.dtype(np.float64).itemsize))
         return max(PANEL, width // PANEL * PANEL)
 
