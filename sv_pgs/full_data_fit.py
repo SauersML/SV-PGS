@@ -981,6 +981,11 @@ class _FullDataMeanField:
         self.information: list = []
         self._panel_grams = PanelGrams()
         self._cold = self._snapshot()
+        # Each model's highest-ELBO refreshed state and its hyperparameters (``mean_field.MeanFieldFixedPoints.best``):
+        # the outer loop's objective is not the ELBO and can end below a state it visited.
+        self.best_elbo = np.full(model_count, -np.inf)
+        self.best_state: list[dict | None] = [None] * model_count
+        self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
 
     # state
 
@@ -1255,7 +1260,25 @@ class _FullDataMeanField:
             self._restore(entry)
             return [None] * self.model_count
         self.refreshes += 1
+        improved = [model for model in range(self.model_count) if self.elbo[model] > self.best_elbo[model]]
+        if improved:
+            state = self._snapshot()
+            for model in improved:
+                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], state, hyperparameters[model]
         return [self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+
+    def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[MixtureHyperparameters, ...]:
+        """Each model back at its highest-ELBO refreshed state where that is above where the outer loop ended by more than
+        ``tolerance``, the dual solver refactored at the restored sites; returns each model's hyperparameters."""
+        chosen = list(hyperparameters)
+        restored = [model for model in range(self.model_count)
+                    if self.best_state[model] is not None and self.best_elbo[model] > self.elbo[model] + tolerance]
+        for model in restored:
+            self._restore(self.best_state[model], [model])  # type: ignore[arg-type]
+            chosen[model] = self.best_hyperparameters[model]  # type: ignore[assignment]
+        if restored:
+            self._iterate(self.site_precision, self.site_shift, self.noise)
+        return tuple(chosen)
 
     def _fixed_point(self, model: int, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         omega, tau, _nu, live = self._sites(model)
@@ -1361,6 +1384,9 @@ def fit_full_data(
         # The oracle's refusals say why it had no fixed point; they belong with the failure.
         raise FloatingPointError(f"{error}; {inference} refusals: {fixed_points.refusals}") from error
     mean_field = fixed_points if inference == "mean_field" else None
+    hyperparameters = tuple(fit.hyperparameters for fit in fits)
+    if mean_field is not None:
+        hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
@@ -1371,7 +1397,7 @@ def fit_full_data(
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
         covariate_coefficients=None if mean_field is None else np.column_stack([mean_field.covariate_coefficients(model) for model in range(mean_field.model_count)]),
         working_bytes=int(working_bytes),
-        hyperparameters=tuple(fit.hyperparameters for fit in fits),
+        hyperparameters=hyperparameters,
         noise_variance=fixed_points.noise,
         certificate=FitCertificate(
             remaining_gain=np.array([fit.remaining_gain for fit in fits]),
