@@ -375,9 +375,9 @@ def objective_statistics(
             scale_hessian += design.T @ (curvature[:, None] * design)
     # One transfer for everything (each read of a device value is a sync of ~0.7 ms, on a call made thousands of
     # times per fit: 12 reads per call were 8 s of a 57 s fit on ENSG00000254709.8 [real]).
+    trailing = cupy.stack([value, magnitude, improper[0].astype(cupy.float64)])
     packed = cupy.asnumpy(cupy.concatenate([
-        sums.ravel(), outers.ravel(), crosses.ravel(), scale_gradient, scale_hessian.ravel(),
-        cupy.stack([value, magnitude, improper[0].astype(cupy.float64)]),
+        sums.ravel(), outers.ravel(), crosses.ravel(), scale_gradient, scale_hessian.ravel(), trailing,
     ]))
     offset = 0
     def take(count: int) -> np.ndarray:
@@ -399,6 +399,6 @@ def objective_statistics(
         hessian[scale_span, span] = host_crosses[class_position].T
     gradient[scale_span] = take(scale_size)
     hessian[scale_span, scale_span] = take(scale_size * scale_size).reshape(scale_size, scale_size)
-    scalars = take(3)
-    _raise_if_improper(scalars[2:])
+    scalars = take(int(trailing.shape[0]))
+    _raise_if_improper(scalars[-1:])
     return float(scalars[0]), gradient, hessian, float(scalars[1])
