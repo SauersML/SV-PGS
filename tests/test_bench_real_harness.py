@@ -1010,6 +1010,11 @@ def test_raw_scores_score_from_the_run_record_when_the_split_file_is_missing(tmp
     np.save(out / "chr.snv.raw_scores.npy", raw[:, :1])
     with pytest.raises(ValueError, match="raw scores have no split order"):
         data.predictions(out, "chr", "snv", masked=False)
+    # The pinned harness's one-score-per-person layout (genes x people) has no train-side scores: the predictions
+    # stand as saved, constant fits included.
+    np.save(out / "chr.snv.raw_scores.npy", raw[:, 0])
+    saved = np.load(out / "chr.snv.predictions.npy")
+    assert np.array_equal(data.predictions(out, "chr", "snv", masked=False), saved, equal_nan=True)
 
 
 def test_a_foreign_dataset_is_refused_when_no_person_is_held_out_for_every_gene(tmp_path):

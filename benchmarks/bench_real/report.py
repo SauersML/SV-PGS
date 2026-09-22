@@ -220,6 +220,11 @@ class HeldOut:
         raw_path = directory / f"{tag}.{feature_set}.raw_scores{suffix}.npy"
         if raw_path.exists():
             raw = np.load(raw_path)
+            if raw.ndim == 2:
+                # The pinned harness e71876e (compete) kept one raw score per person, from the split that held the
+                # person out: no train-side scores, so a constant fit cannot be told here; its unadjusted prediction
+                # of such a fit is exactly constant already, and stands.
+                return predictions
             for position, name in enumerate(self.raw_split_order(directory, tag, raw.shape[1])):
                 block = raw[:, position]
                 finite = np.isfinite(block)
