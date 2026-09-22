@@ -86,6 +86,33 @@ def classes_for_arm(variants: Any, arm: str) -> np.ndarray:
 ASSUMPTIONS = {"measurement": "every record measured exactly: log_variance_offset=None, log r^2 = 0 for all columns"}
 
 
+def bench_real_annotations(variants: Any) -> dict[str, np.ndarray]:
+    """The prior's per-column annotations from bench-real's public variant fields: the distance to the gene's TSS
+    (log1p of its magnitude), the training allele frequency (its log-odds, the minor allele's: effect sizes that
+    depend on frequency), and for structural variants the log length and the signed allele-length change (missing
+    for a small variant, whose class already says so). Training data only: the frequency is the training samples'."""
+    frequency = np.asarray(variants.train_allele_frequency, dtype=np.float64)
+    minor = np.clip(np.minimum(frequency, 1.0 - frequency), np.finfo(np.float64).tiny, 0.5)
+    is_sv = np.asarray(variants.is_sv, dtype=bool)
+    return {
+        "log_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
+        "minor_allele_log_odds": np.log(minor / (1.0 - minor)),
+        "log_sv_length": np.where(is_sv, np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))), np.nan),
+        "length_change": np.where(is_sv, np.asarray(variants.allele_length_change, dtype=np.float64), np.nan),
+    }
+
+
+def _arm_annotations(variants: Any, arm: str) -> dict[str, np.ndarray] | None:
+    """The full model's annotations; the SV-term ablation's without the structural ones (length and length change);
+    none for the genotypes-alone arm."""
+    if arm == "no_annotations":
+        return None
+    annotations = bench_real_annotations(variants)
+    if arm == "no_sv_terms":
+        annotations = {name: values for name, values in annotations.items() if name not in ("log_sv_length", "length_change")}
+    return annotations
+
+
 def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
     genotypes = np.asarray(train.genotypes)
     if not np.all(np.isin(genotypes, (0, 1, 2))):
@@ -103,6 +130,7 @@ def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
         seed=seed_from_name(str(train.gene_id)),
         inference=inference,
         array_module=_device(),
+        annotations=_arm_annotations(train.variants, arm),
     )
     return SmallNPredictor(scoring=fit.scoring, profile=fit.profile)
 

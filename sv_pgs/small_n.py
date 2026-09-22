@@ -40,7 +40,7 @@ from __future__ import annotations
 import time
 import weakref
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Callable, Iterator, Sequence
+from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Sequence
 
 from types import ModuleType
 
@@ -53,6 +53,7 @@ from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
+from sv_pgs.annotation_design import annotation_design
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
     _host,
@@ -1647,11 +1648,15 @@ class SmallNFit:
     profile: dict = field(default_factory=dict)
 
 
-def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_variance_offset: F64Array, draw_count: int) -> ScaleMixturePrior:
+def small_n_prior(
+    statistics: DenseStatistics, variant_class: np.ndarray, log_variance_offset: F64Array, draw_count: int,
+    annotations: Mapping[str, np.ndarray] | None = None,
+) -> ScaleMixturePrior:
     """The run wiring's prior (``stage2_wiring._fit_one``) over every member (review-mathbugs T1: an exact-tie member
     keeps its own class and offset, so an SV tied to SNVs keeps the SV prior): one class per variant class present,
-    each member's log reliability as its offset, no annotation groups, and the start lattice from the single-variant
-    likelihoods at the covariate-only residual variance."""
+    each member's log reliability as its offset, the members' ``annotations`` (per input column) as the prior's
+    annotation groups (``annotation_design``), and the start lattice from the single-variant likelihoods at the
+    covariate-only residual variance."""
     members = statistics.active_rows
     _classes, class_index = np.unique(np.asarray(variant_class)[members], return_inverse=True)
     offsets = np.asarray(log_variance_offset, dtype=np.float64)[members]
@@ -1660,9 +1665,12 @@ def small_n_prior(statistics: DenseStatistics, variant_class: np.ndarray, log_va
     single_precision = statistics.design.column_squares() / start_noise
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
+    design = annotation_design(
+        {name: np.asarray(values)[members] for name, values in (annotations or {}).items()}, {}, class_index=class_index.astype(np.int64),
+    )
     return scale_mixture_prior(
-        class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=np.zeros((members.shape[0], 0)),
-        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+        class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=design.design,
+        annotation_groups=design.groups, nodes=nodes, floor=floor, top=top,
     )
 
 
@@ -1700,6 +1708,7 @@ def fit_small_n(
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "ep",
     array_module: ModuleType | None = None,
+    annotations: Mapping[str, np.ndarray] | None = None,
 ) -> SmallNFit:
     """Fit one quantitative model on the dense training codes (n x records, store codes) with ``covariates`` (n x k,
     intercept first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of
@@ -1714,7 +1723,7 @@ def fit_small_n(
     started = time.perf_counter()
     statistics = dense_statistics(codes, covariates, target)
     offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
-    prior = small_n_prior(statistics, variant_class, offsets, draw_count)
+    prior = small_n_prior(statistics, variant_class, offsets, draw_count, annotations)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(statistics, prior)
     if inference == "ep":
