@@ -132,6 +132,44 @@ class StoreGenotypeBlockSource:
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
+        # Every block's signed codes held on the device after the first read, when they fit (``_resident_fits``): each
+        # later read (every mean-field sweep, every dual-solver pass) then builds its tiles from device memory. Streamed,
+        # 43% of a 518k x 40k bench-sim Stage 2 was the store's reads [sim, scenario_000, py-spy on the A40].
+        self._resident: list[Any] | None = None
+        self._resident_complete = False
+        self.resident_codes_bytes = sum(_aligned(int(rows.shape[0])) * self._padded_samples for rows in self._block_rows)
+
+    def _resident_fits(self) -> bool:
+        """The codes stay on the device when they fit in its free memory and leave at least as much free as the fit
+        already holds (the fit's working set at its first read is a lower bound of what it needs again)."""
+        cupy = self._cupy
+        if cupy is None:
+            return False
+        free, _total = cupy.cuda.runtime.memGetInfo()
+        pool = cupy.get_default_memory_pool()
+        held = int(pool.used_bytes())
+        available = int(free) + int(pool.free_bytes())
+        return self.resident_codes_bytes <= available - held
+
+    def _keep(self, block_index: int, slot: int) -> None:
+        """Copy block ``block_index``'s signed codes into the resident set (on the first read), or drop the set if the
+        device cannot hold it after all."""
+        if self._resident is None:
+            return
+        rows = _aligned(int(self._block_rows[block_index].shape[0]))
+        try:
+            self._resident[block_index] = self._signed[slot][:rows].copy()
+        except self._cupy.cuda.memory.OutOfMemoryError:
+            self._resident = None
+            self._cupy.get_default_memory_pool().free_all_blocks()
+
+    def _resident_tile(self, block_index: int) -> CodeBlockTile:
+        rows = int(self._block_rows[block_index].shape[0])
+        offset = slice(int(self._offsets[block_index]), int(self._offsets[block_index + 1]))
+        return CodeBlockTile.from_aligned(
+            self._resident[block_index], rows, self._samples, self._means[offset], self._scales[offset],
+            self._scale_spreads[block_index], self.array_module, self._workspace_bytes,
+        )
 
     @classmethod
     def from_statistics(
@@ -164,8 +202,15 @@ class StoreGenotypeBlockSource:
 
     def iter_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
         """Yield (block_index, tile) in block order; a tile is valid until the next is requested."""
+        if self._cupy is not None and self._resident_complete and self._resident is not None:
+            for block_index in range(len(self._block_rows)):
+                yield block_index, self._resident_tile(block_index)
+            return
+        if self._cupy is not None and self._resident is None and not self._resident_complete and self._resident_fits():
+            self._resident = [None] * len(self._block_rows)
         if self._cupy is not None and self._decoder is not None:
             yield from self._iter_decoded_tiles()
+            self._resident_complete = True
             return
         spans = self._store.iter_codes(self._spans, None, self._budget)
         if self._cupy is None:
@@ -177,6 +222,8 @@ class StoreGenotypeBlockSource:
                 yield block_index, self._tile(block_index, block_index % 2)
             return
         yield from self._iter_device_tiles(spans)
+        # only a read that reached every block leaves a complete resident set
+        self._resident_complete = True
 
     def _iter_device_tiles(self, spans: Iterator[tuple[int, int, NDArray[np.uint8]]]) -> Iterator[tuple[int, CodeBlockTile]]:
         cupy = self._cupy
@@ -205,6 +252,7 @@ class StoreGenotypeBlockSource:
                 upload(block_index + 1, following)
             compute.wait_event(copied[slot])
             self._gather_block(block_index, slot)
+            self._keep(block_index, slot)
             yield block_index, self._tile(block_index, slot)
             computed[slot].record(compute)
 
@@ -253,6 +301,7 @@ class StoreGenotypeBlockSource:
             slot = block_index % 2
             compute.wait_event(decoded[slot])
             self._gather_block(block_index, slot)
+            self._keep(block_index, slot)
             gathered[slot].record(compute)
             yield block_index, self._tile(block_index, slot)
             if block_index + 1 < len(self._spans):

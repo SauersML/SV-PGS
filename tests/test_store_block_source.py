@@ -127,3 +127,30 @@ def test_a_stage_2_read_over_streamed_tiles_equals_the_per_block_products(tmp_pa
         assert np.array_equal(_bits(seen[block_index]), _bits(tile.rmatmat(left)))
         expected += tile.matmat(rights[block_index])
     assert np.array_equal(_bits(image), _bits(expected))
+
+
+@pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
+@pytest.mark.parametrize("codec", ["zstd", "rowdict"])
+def test_cuda_reads_after_the_first_come_from_the_resident_codes(tmp_path: Path, codec: str, monkeypatch) -> None:
+    # The first read keeps every block's signed codes on the device; a second read builds the same tiles from them
+    # without touching the store.
+    _write_store(tmp_path / "store", _two_half_dosage(), codec)
+    source, _signed, _means, _scales = _source(tmp_path / "store", "cuda")
+    rng = np.random.default_rng(4)
+    rights = [cupy.asarray(rng.standard_normal((block.shape[0], 2))) for block in BLOCK_ROWS]
+
+    def image() -> np.ndarray:
+        total = cupy.zeros((source.sample_count, 2))
+        for block_index, tile in source.iter_tiles():
+            tile.accumulate_matmat(rights[block_index], total, FLOAT64_ROUNDING)
+        return cupy.asnumpy(total)
+
+    first = image()
+    assert source._resident_complete and source._resident is not None
+
+    def no_read(*_args, **_kwargs):
+        raise AssertionError("a resident read touched the store")
+
+    monkeypatch.setattr(source._store, "iter_codes", no_read)
+    monkeypatch.setattr(source._store, "read_codes_to_device", no_read)
+    assert np.array_equal(_bits(image()), _bits(first))
