@@ -20,10 +20,21 @@ def test_every_solution_on_the_path_is_the_lasso() -> None:
     x, y = _data(1, 120, 400)
     largest = float(np.max(np.abs(x.T @ y)) / x.shape[0])
     penalties = largest * np.geomspace(1.0, PATH_RATIO, 25)
-    solutions = lasso_path(x, y, penalties, 1e-10)
+    solutions = lasso_path(x, y, penalties)
+    count = x.shape[0]
+    null = float(y @ y) / (2.0 * count)
+
+    def objective(beta, penalty):
+        residual = y - x @ beta
+        return float(residual @ residual) / (2.0 * count) + penalty * float(np.sum(np.abs(beta)))
+
     for penalty, solution in zip(penalties[::6], solutions[::6]):
         reference = Lasso(alpha=penalty, fit_intercept=False, tol=1e-12, max_iter=100000).fit(x, y).coef_
-        np.testing.assert_allclose(solution, reference, atol=1e-6)
+        # glmnet's stopping rule (THRESHOLD of the null deviance per coordinate move): the objective is the lasso's
+        # to a small share of the null objective, and the support is the lasso's where its coefficients are resolved.
+        assert objective(solution, penalty) - objective(reference, penalty) <= 1e-5 * null
+        resolved = np.abs(reference) > 1e-2
+        assert np.all(solution[resolved] != 0.0)
     # the first penalty is lambda_max: every coefficient is zero there, to the soft threshold's rounding
     assert np.max(np.abs(solutions[0])) <= 1e-12
 
