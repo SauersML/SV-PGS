@@ -52,7 +52,7 @@ extern "C" __global__ void panel_sweep(
         const double* variance_row = node_variance + member * (long long)node_count;
         const double* log_variance_row = log_node_variance + member * (long long)node_count;
         // pass 1: the peak of the log weights
-        double peak = -INFINITY;
+        double peak = __longlong_as_double(0xfff0000000000000ULL);  // -inf: NVRTC has no INFINITY
         for (int node = lane; node < node_count; node += 32) {
             const double variance_node = variance_row[node];
             const double ratio = variance_node * omega;
