@@ -533,8 +533,10 @@ class MeanFieldFixedPoints:
             except _SweepBudget:
                 self.profile["cold_abandoned"] = self.profile.get("cold_abandoned", 0) + 1
                 continue
-            except (FloatingPointError, np.linalg.LinAlgError) as error:
-                self.refusals.append(str(error))
+            except (FloatingPointError, ZeroDivisionError, np.linalg.LinAlgError) as error:
+                # The compiled sweep raises ZeroDivisionError where a node's normalizer underflows to zero (a prior
+                # scale past float64's range): the same refusal as a non-finite sweep, the state restored.
+                self.refusals.append(f"{type(error).__name__}: {error}")
                 continue
             if budget is None:
                 budget = self.profile["carried_sweeps"] = self.profile["sweeps"] - before

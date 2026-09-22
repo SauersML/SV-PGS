@@ -1225,8 +1225,8 @@ class _FullDataMeanField:
                 except _PassBudget:
                     outcome.append(None)
                     continue
-                except FloatingPointError as error:
-                    self.refusals.append(str(error))
+                except (FloatingPointError, ZeroDivisionError) as error:
+                    self.refusals.append(f"{type(error).__name__}: {error}")
                     outcome.append(None)
                     continue
                 if budgets[model] is None:
