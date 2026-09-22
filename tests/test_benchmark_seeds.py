@@ -25,12 +25,10 @@ def test_the_seed_is_stable_across_processes():
 
 
 def test_the_benchmarks_seed_their_per_name_fits_through_the_helper():
-    """The two fits that seed from a name (bench-real's small-n route, bench-tox's per compound) call the helper."""
+    """The fit that seeds from a name (bench-real's small-n route) calls the helper."""
     from benchmarks import svpgs_small_n
-    from benchmarks.bench_tox import harness
 
     assert svpgs_small_n.seed_from_name is seeds.seed_from_name
-    assert harness.seed_from_name is seeds.seed_from_name
 
 
 def test_no_benchmark_builds_a_seed_from_a_name_prefix():

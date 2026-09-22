@@ -1013,7 +1013,8 @@ def test_an_indefinite_resolved_core_is_solved_exactly_on_the_linear_response_ro
     rng = np.random.default_rng(3)
     design = rng.normal(size=(40, 4))
     duals = 0.1 * design
-    precision = np.array([-3.0, 0.5, 1.0, -0.2])
+    # site -30 against a Gram diagonal near 0.1 x 40 = 4: the core has a negative eigenvalue
+    precision = np.array([-30.0, 0.5, 1.0, -0.2])
     residual = np.zeros_like(design)
     with pytest.raises(np.linalg.LinAlgError):
         dual_solve.resolved_block(np, design, precision, duals, residual)
