@@ -36,6 +36,9 @@ from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
+INFERENCE = "mean_field"
+"""Stage 2's fixed point: "mean_field" (``full_data_fit._FullDataMeanField``) or "ep" (its EP)."""
+
 
 @dataclass(frozen=True)
 class FittedModels:
@@ -336,7 +339,7 @@ def _fit_one(
     # The mean-field fixed points: EP's refused nearly every call on the wiring store ("the EP refreshes' updates line
     # up with no contraction ... the full-data route has no double loop", 59 of 65 calls, 2026-09-21).
     fit = fit_full_data(
-        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field"
+        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=INFERENCE
     )
     (scoring,) = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], draw_count, seed=_seed(seed, 2))
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
