@@ -3,4 +3,6 @@ otherwise): EP's site approximation keeps the posterior's correlations, which me
 from sv_pgs import stage2_wiring
 
 stage2_wiring.INFERENCE = "ep"
-from benchmarks.bench_sim.submissions.svpgs_full import Model, fit  # noqa: E402,F401
+from benchmarks.bench_sim.submissions.svpgs_full import Model, fit  # noqa: E402
+
+__all__ = ["Model", "fit"]
