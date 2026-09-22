@@ -276,7 +276,8 @@ def test_prediction_preserves_genetic_covariate_cancellation(store_root: Path) -
             covariate_covariance=np.diag([0.2, 0.3, 0.]), gaussian_posterior=True,
         )
         model = replace(model, model_names=(model.model_names[0],), scoring=(scoring,), covariate_columns=model.covariate_columns[:1],
-                        noise_variance=model.noise_variance[:1], hyperparameters=model.hyperparameters[:1], certificate={})
+                        noise_variance=model.noise_variance[:1], hyperparameters=model.hyperparameters[:1],
+                        certificate={name: np.asarray(values)[:1] for name, values in model.certificate.items()})
         result = predict(model, store, samples, np.column_stack([standardized, np.zeros(samples.size)]), _budget())
         np.testing.assert_allclose(result.predictive_variance[:, 0], model.noise_variance[0] + 0.2 + 0.3 * standardized ** 2, atol=1e-12)
         assert result.genetic.variances.max() > 10.

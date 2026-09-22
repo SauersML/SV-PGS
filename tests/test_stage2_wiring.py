@@ -202,7 +202,8 @@ def test_a_training_set_with_no_genetic_column_fits_the_covariates_alone(tmp_pat
     save_model(tmp_path / "model", model)
     prediction = predict(load_model(tmp_path / "model"), store, np.arange(samples), np.zeros((samples, 0)), _budget())
     np.testing.assert_allclose(prediction.predictive_mean[:, 0], expected, rtol=0.0, atol=1e-12)
-    np.testing.assert_allclose(prediction.predictive_variance[:, 0], model.noise_variance[0], rtol=0.0, atol=0.0)
+    # Its predictive variance is the noise's plus the intercept's own posterior variance, sigma^2 / n.
+    np.testing.assert_allclose(prediction.predictive_variance[:, 0], model.noise_variance[0] * (1.0 + 1.0 / rows), rtol=1e-12, atol=0.0)
     assert expected_noise == 0.0 or abs(model.noise_variance[0] - expected_noise) <= 1e-12
 
 
