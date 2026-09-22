@@ -2,8 +2,8 @@
 
 This is e2e's tests/test_full_data_fit wiring behind the agreed ``fit_models`` signature, run once per model:
 Stage 0 on the model's own training rows and covariate columns, the start lattice from its single-variant
-likelihoods, the prior with one class per variant class present and the records' log reliabilities as offsets (no
-annotation groups: the design builder isn't written yet), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
+likelihoods, the prior with one class per variant class present, the records' log reliabilities as offsets and the store's
+other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
 points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
 Quantitative traits only: ``fit_full_data`` has no binary likelihood yet.
 """
@@ -29,6 +29,7 @@ from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
 from sv_pgs.imputation_reliability import checked_log_reliability
+from sv_pgs.annotation_design import annotation_design
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -48,6 +49,10 @@ class FittedModels:
 
 def _seed(seed: int, *keys: int) -> int:
     return int(np.random.SeedSequence([seed, *keys]).generate_state(1, dtype=np.uint64)[0])
+
+
+RELIABILITY_COLUMNS = ("quality", "r2_truth")
+"""Sidecar columns that are a measurement's reliability, the prior's offset, never one of its annotations."""
 
 
 def store_log_reliability(store: DosageStore) -> F64Array:
@@ -130,12 +135,19 @@ class _ModelFit:
     prior_digest: str
 
 
-def _prior_schema_digest(*, nodes: F64Array, floor: F64Array, top: F64Array, class_index: I64Array, offsets: F64Array, rows: I64Array) -> str:
+def _prior_schema_digest(
+    *, nodes: F64Array, floor: F64Array, top: F64Array, class_index: I64Array, offsets: F64Array, rows: I64Array,
+    annotations: F64Array | None = None, annotation_names: Sequence[str] = (),
+) -> str:
     """The prior's schema, which its fitted coefficients do not carry: the lattice its density is written on, the
-    variant class of each row the prior covers, those rows in the store, and the offset each one was given. Without
-    it the saved hyperparameters name no density (``artifact.Provenance.prior_digest``). Empty arrays for a model
-    with no prior at all (the null genetic model)."""
-    return named_digest({"nodes": nodes, "floor": floor, "top": top, "class_index": class_index, "offsets": offsets, "rows": rows})
+    variant class of each row the prior covers, those rows in the store, the offset each one was given, and the
+    annotation design theta multiplies (its columns by name). Without it the saved hyperparameters name no density
+    (``artifact.Provenance.prior_digest``). Empty arrays for a model with no prior at all (the null genetic model)."""
+    return named_digest({
+        "nodes": nodes, "floor": floor, "top": top, "class_index": class_index, "offsets": offsets, "rows": rows,
+        "annotations": np.zeros((0, 0)) if annotations is None else annotations,
+        "annotation_names": np.array(list(annotation_names), dtype=str),
+    })
 
 
 @dataclass(frozen=True)
@@ -268,6 +280,14 @@ def _fit_one(
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
     offsets = log_reliability[member_rows]
     _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
+    table = store.variant_table
+    annotations = annotation_design(
+        {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()},
+        table.annotation_legends,
+        class_index=class_index.astype(np.int64),
+        exclude=RELIABILITY_COLUMNS,
+    )
+    log(f"stage2 wiring: {annotations.design.shape[1]} annotation columns in {len(annotations.groups)} groups: {', '.join(annotations.names) or 'none'}")
     mask = np.zeros((store.n_samples, 1))
     mask[training_columns, 0] = 1.0
     store_targets = np.zeros((store.n_samples, 1))
@@ -280,8 +300,8 @@ def _fit_one(
     prior = scale_mixture_prior(
         class_index=class_index.astype(np.int64),
         log_variance_offset=offsets,
-        annotation_design=np.zeros((member_rows.shape[0], 0)),
-        annotation_groups=(),
+        annotation_design=annotations.design,
+        annotation_groups=annotations.groups,
         nodes=nodes,
         floor=floor,
         top=top,
@@ -313,7 +333,7 @@ def _fit_one(
         certificate=fit.certificate,
         prior_digest=_prior_schema_digest(
             nodes=nodes, floor=np.array([floor]), top=np.array([top]), class_index=class_index.astype(np.int64),
-            offsets=offsets, rows=member_rows,
+            offsets=offsets, rows=member_rows, annotations=annotations.design, annotation_names=annotations.names,
         ),
     )
 

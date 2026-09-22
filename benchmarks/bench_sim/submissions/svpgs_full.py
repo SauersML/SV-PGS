@@ -64,6 +64,18 @@ def quality(imputation_info: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(info), np.clip(info, 0.0, 1.0), 1.0)
 
 
+def store_annotations(variants) -> dict[str, np.ndarray]:
+    """The store's sidecar columns: the arm's reliability as ``quality`` (the prior's offset) and the public
+    per-record annotations that vary over the records (a constant one carries no prior information), which the prior
+    reads as its annotation design (``annotation_design``)."""
+    columns = {"quality": quality(variants["imputation_info"])}
+    for name in ("in_gene", "in_exon", "in_repeat", "log_tss_distance", "log_sv_length", "len_change"):
+        values = np.asarray(variants[name], dtype=np.float64)
+        if np.unique(values[np.isfinite(values)]).shape[0] > 1:
+            columns[name] = values
+    return columns
+
+
 def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
     """Write the training samples' codes as a one-half store in position order; returns (path, order) with
     order[store row] the harness row."""
@@ -97,7 +109,7 @@ def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
         group_first=np.arange(n_var, dtype=np.int64),
         sum_code=sums,
         sum_code2=squares,
-        annotations={"quality": quality(variants["imputation_info"])[order]},
+        annotations={name: values[order] for name, values in store_annotations(variants).items()},
         annotation_legends={},
         id_bytes=id_bytes,
         id_offsets=np.concatenate([[0], np.cumsum([len(name) for name in ids])]).astype(np.int64),
