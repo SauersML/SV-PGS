@@ -922,16 +922,21 @@ def device_scope(array_module: ModuleType | None) -> Iterator[None]:
         _DEVICE.reset(token)
 
 
-def _device_inputs(prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity) -> tuple[list, F64Array, F64Array, F64Array]:
-    """(class rows, log scales, cavity precision, cavity shift) on the fit's device for the fused kernels, held for
-    the hyper step while they are the ones they were formed for: the kernels took a host copy of each per call, and
-    on ENSG00000254709.8 [real] those uploads were 3.5 s of a 73 s device fit (69,643 of them)."""
+def _device_inputs(prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity) -> tuple[list, F64Array, F64Array, F64Array, F64Array]:
+    """(class rows, log scales, cavity precision, cavity shift, scale design) on the fit's device for the fused
+    kernels, held for the hyper step while they are the ones they were formed for: the kernels took a host copy of
+    each per call, and on ENSG00000254709.8 [real] those uploads were 3.5 s of a 73 s device fit (69,643 of them).
+    The scale design is the prior's own, uploaded once per prior (the objective gathered and uploaded its rows on
+    every one of 2,055 calls)."""
     xp = _DEVICE.get()
     cache = _STEP_CACHE.get()
     held = None if cache is None else cache.get("device_inputs")
     if held is not None and held[0] is prior.class_rows and np.array_equal(held[1], scales) and held[2] is cavity:
         return held[3]
-    formed = (prior.class_rows, xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift))
+    design = None if held is None or held[0] is not prior.class_rows else held[3][4]
+    if design is None:
+        design = xp.asarray(prior.scale_design)
+    formed = (prior.class_rows, xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift), design)
     if cache is not None:
         cache["device_inputs"] = (prior.class_rows, scales.copy(), cavity, formed)
     return formed
@@ -1156,10 +1161,10 @@ def _data_objective(
     if array_module is None:
         array_module = _DEVICE.get()
     if array_module is not np:
-        class_rows, scales, precision, shift = _device_inputs(prior, log_scale(prior, coefficients), cavity)
+        class_rows, scales, precision, shift, scale_design = _device_inputs(prior, log_scale(prior, coefficients), cavity)
         value, gradient, hessian, magnitude = engine_kernels.objective_statistics(
             array_module, class_rows, class_log_density(prior, coefficients), scales, prior.log_variance_grid, precision, shift,
-            prior.scale_design, working_bytes,
+            scale_design, working_bytes,
         )
         # The device kernel returns the terms' sizes, not their pieces: the bound is the summation lemma's on K-term
         # log-sum-exps and p terms, (K + 1 + p) eps of the sizes.
@@ -1224,7 +1229,7 @@ def _data_value(
     if array_module is None:
         array_module = _DEVICE.get()
     if array_module is not np:
-        _rows, device_scales, precision, shift = _device_inputs(prior, scales, cavity)
+        _rows, device_scales, precision, shift, _design = _device_inputs(prior, scales, cavity)
         log_normalizer, _mean, _variance, improper = engine_kernels.tilted_moments(
             array_module, prior.class_index, log_density, device_scales, prior.log_variance_grid, precision, shift, working_bytes, check=False,
         )
