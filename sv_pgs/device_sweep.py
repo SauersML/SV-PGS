@@ -29,9 +29,6 @@ import numpy as np
 
 PANEL = 32
 """Columns per panel: the CUDA warp width (one lane per member of the panel)."""
-DEVICE_PIECE_ARRAYS = 4
-"""Live (n x width) float64 arrays while a piece is decoded: the codes as float64, their centred and scaled copies,
-and the signed product (``code_products.CodeBlockTile.columns`` and the caller's sign)."""
 PIECE_COLUMNS = 3
 """Per member: its KL term, ||x_j||^2 v_j, and the KL term's pieces' sizes (the ELBO and its rounding bound)."""
 
@@ -166,7 +163,8 @@ class PanelGrams:
 def sweep_piece(
     cupy: Any,
     *,
-    dense: Any,
+    decode,
+    width: int,
     mask: Any,
     project,
     residual: Any,
@@ -187,16 +185,17 @@ def sweep_piece(
 ) -> None:
     """One sweep over a piece's columns in order, in place on the device.
 
-    ``dense`` is the piece's standardized columns X (n x width, before masking and projection), ``mask`` the model's
+    ``decode(first, last)`` returns the piece's standardized columns first..last-1 (n x panel, before masking and
+    projection; one panel at a time, so the device holds a panel's columns, never a block's), ``width`` the piece's
+    member count, ``mask`` the model's
     training indicator (n), ``project(v)`` the covariate complement (I - H) of an (n, r) array, ``residual`` r (n);
     the per-member arrays are the piece's own slices, and ``pieces`` (width x 3) receives each member's KL term,
     ||x_j||^2 v_j and the terms' sizes. ``key_base`` names the piece for the Gram cache."""
     kernel = _kernel(cupy)
-    width = int(dense.shape[1])
     node_count = int(node_variance.shape[1])
     for first in range(0, width, PANEL):
         last = min(first + PANEL, width)
-        columns = dense[:, first:last]
+        columns = decode(first, last)
 
         def build(columns=columns):
             masked = project(columns * mask[:, None])

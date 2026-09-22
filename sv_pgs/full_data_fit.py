@@ -50,7 +50,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.device_sweep import DEVICE_PIECE_ARRAYS, PANEL, PIECE_COLUMNS, PanelGrams, sweep_piece
+from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
 from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
@@ -1100,15 +1100,18 @@ class _FullDataMeanField:
             return self.models.complement(values, cupy.full(values.shape[1], model, dtype=cupy.int64))
 
         signs = cupy.asarray(self.sign)
-        for tile, members, local in self._member_pieces(self._device_piece_width(cupy)):
+        for tile, members, local in self._member_pieces(None):
             rows = cupy.asarray(members)
-            dense = cupy.asarray(tile.columns(cupy.asarray(local)), dtype=cupy.float64) * signs[rows][None, :]
+            local_device, member_signs = cupy.asarray(local), signs[rows]
+
+            def decode(first, last, tile=tile, local_device=local_device, member_signs=member_signs):
+                return cupy.asarray(tile.columns(local_device[first:last]), dtype=cupy.float64) * member_signs[first:last][None, :]
             log_node_variance = cupy.ascontiguousarray(scales[rows][:, None] + grid[None, :])
             node_variance = cupy.exp(log_node_variance)
             piece_state = {name: cupy.ascontiguousarray(values[rows]) for name, values in state.items()}
             piece_parts = cupy.zeros((members.shape[0], PIECE_COLUMNS))
             sweep_piece(
-                cupy, dense=dense, mask=mask, project=project, residual=residual, grams=self._panel_grams,
+                cupy, decode=decode, width=int(members.shape[0]), mask=mask, project=project, residual=residual, grams=self._panel_grams,
                 key_base=(model, int(members[0])), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
                 log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
                 pieces=piece_parts, **piece_state,
@@ -1123,18 +1126,6 @@ class _FullDataMeanField:
         self.passes += 1
         residual_square = float(cupy.asnumpy(residual @ residual))
         return float(totals[0]), float(totals[1]), residual_square, float(totals[2])
-
-    def _device_piece_width(self, cupy) -> int:
-        """Members per device piece: as many whole panels as the device's free memory holds the piece's live float64
-        (n x width) arrays for (``tile.columns``' codes, centred and scaled copies, and the signed product,
-        ``DEVICE_PIECE_ARRAYS``), measured now; at least one panel."""
-        # The pool's cached blocks are fragmented: counted as free, one piece's contiguous arrays did not fit in them
-        # (8.9 GB refused with 42 GB allocated, bench-sim scenario_000). They go back to the driver, which then reports
-        # what one allocation can have.
-        cupy.get_default_memory_pool().free_all_blocks()
-        free_bytes, _total = cupy.cuda.runtime.memGetInfo()
-        width = int(free_bytes // (DEVICE_PIECE_ARRAYS * self.sample_count * np.dtype(np.float64).itemsize))
-        return max(PANEL, width // PANEL * PANEL)
 
     def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
         """As ``MeanFieldFixedPoints._elbo``, on this model's training rows."""
