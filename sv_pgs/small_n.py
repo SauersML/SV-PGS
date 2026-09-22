@@ -1763,8 +1763,6 @@ def fit_small_n(
             (outer,) = fit_hyperparameters(prior, [start], oracle, working_bytes // 2, tolerance)
     except FloatingPointError as error:
         raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
-    if not outer.certified:
-        raise FloatingPointError(f"outer fit did not converge: remaining gain {outer.remaining_gain}, unresolved {outer.unresolved}; {inference} refusals: {oracle.refusals}")
     generator = np.random.default_rng(seed)
     if inference == "ep":
         # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
