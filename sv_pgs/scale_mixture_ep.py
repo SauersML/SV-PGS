@@ -931,7 +931,7 @@ def _device_inputs(prior: ScaleMixturePrior, scales: F64Array, cavity: Cavity) -
     held = None if cache is None else cache.get("device_inputs")
     if held is not None and held[0] is prior.class_rows and np.array_equal(held[1], scales) and held[2] is cavity:
         return held[3]
-    formed = ([xp.asarray(rows) for rows in prior.class_rows], xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift))
+    formed = (prior.class_rows, xp.asarray(scales), xp.asarray(cavity.precision), xp.asarray(cavity.shift))
     if cache is not None:
         cache["device_inputs"] = (prior.class_rows, scales.copy(), cavity, formed)
     return formed
@@ -1025,7 +1025,7 @@ def tilted_moments(
             array_module, prior.class_index, class_log_density(prior, hyperparameters.coefficients),
             log_scale(prior, hyperparameters.coefficients), prior.log_variance_grid, cavity.precision, cavity.shift, working_bytes,
         )
-        log_normalizer, mean, variance = (array_module.asnumpy(values) for values in on_device)
+        log_normalizer, mean, variance = (array_module.asnumpy(values) for values in on_device[:3])
         return TiltedMoments(log_normalizer=log_normalizer, mean=mean, variance=variance)
     log_normalizer = np.empty(prior.variant_count)
     mean = np.empty(prior.variant_count)
@@ -1225,10 +1225,13 @@ def _data_value(
         array_module = _DEVICE.get()
     if array_module is not np:
         _rows, device_scales, precision, shift = _device_inputs(prior, scales, cavity)
-        log_normalizer, _mean, _variance = engine_kernels.tilted_moments(
-            array_module, prior.class_index, log_density, device_scales, prior.log_variance_grid, precision, shift, working_bytes,
+        log_normalizer, _mean, _variance, improper = engine_kernels.tilted_moments(
+            array_module, prior.class_index, log_density, device_scales, prior.log_variance_grid, precision, shift, working_bytes, check=False,
         )
-        return float(log_normalizer.sum())
+        # The value and the improper flag in one transfer (each read is a sync; this is a trial's evaluation).
+        total, flag = _host(array_module.stack([log_normalizer.sum(), improper[0].astype(array_module.float64)]))
+        engine_kernels._raise_if_improper(np.array([flag]))
+        return float(total)
     total = 0.0
     for class_position, _rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
         total += float(np.sum(kernel_rows.normalizers(log_density[class_position])[0]))
@@ -1762,20 +1765,27 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
         slope = -0.5 * raw_second
         mean_by_precision = covariance(slope, centre) - expectation(centre * conditional)
         second_by_precision = covariance(slope, raw_second) - expectation(conditional * conditional + 2.0 * centre * centre * conditional)
-        fields["mean"][rows] = _host(mean)
-        fields["second"][rows] = _host(second)
-        fields["variance"][rows] = _host(second - mean * mean)
-        fields["variance_by_shift"][rows] = _host(expectation(deviation**3) + 3.0 * expectation(conditional * deviation))
-        fields["mean_by_precision"][rows] = _host(mean_by_precision)
-        fields["variance_by_precision"][rows] = _host(second_by_precision - 2.0 * mean * mean_by_precision)
+        # The chunk's row-wise results in one transfer (each device read is a sync): the eight fields as columns, then
+        # the two (rows x K) arrays.
         if prior.scale_size:
-            fields["mean_by_log_scale"][rows] = _host(covariance(terms.first, centre) + expectation(centre * retained))
-            fields["second_by_log_scale"][rows] = _host(covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained))
+            by_log_scale = (
+                covariance(terms.first, centre) + expectation(centre * retained),
+                covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained),
+            )
         else:
             # No scale design: nothing moves log u, and the kernel's derivatives are never formed.
-            fields["mean_by_log_scale"][rows] = fields["second_by_log_scale"][rows] = 0.0
-        mean_by_density[rows] = _host(weights * deviation)
-        second_by_density[rows] = _host(weights * (raw_second - second[:, None]))
+            by_log_scale = (xp.zeros_like(mean), xp.zeros_like(mean))
+        columns = _host(xp.stack([
+            mean, second, second - mean * mean, expectation(deviation**3) + 3.0 * expectation(conditional * deviation),
+            mean_by_precision, second_by_precision - 2.0 * mean * mean_by_precision, by_log_scale[0], by_log_scale[1],
+        ], axis=1))
+        for position, name in enumerate((
+            "mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
+        )):
+            fields[name][rows] = columns[:, position]
+        both = _host(xp.stack([weights * deviation, weights * (raw_second - second[:, None])]))
+        mean_by_density[rows] = both[0]
+        second_by_density[rows] = both[1]
     return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
 
 
@@ -2099,6 +2109,8 @@ def _directional_derivatives(
             steps = xp.asarray(directions_z[class_position * grid_size : (class_position + 1) * grid_size])
             weights = terms.responsibility
             modes = np.argmax(weights, axis=1)
+            third_here = xp.zeros(directions.shape[1])
+            fourth_here = xp.zeros(directions.shape[1])
             for node in _host(np.unique(modes)).tolist():
                 offset = steps - steps[node][None, :]
                 node_weights = weights[modes == node]
@@ -2106,10 +2118,14 @@ def _directional_derivatives(
                 second = node_weights @ np.square(offset)
                 cubed = node_weights @ offset**3
                 central_second = second - mean * mean
-                third += _host(np.sum(cubed - 3.0 * mean * second + 2.0 * mean**3, axis=0))
-                fourth += _host(np.sum(
+                third_here += np.sum(cubed - 3.0 * mean * second + 2.0 * mean**3, axis=0)
+                fourth_here += np.sum(
                     node_weights @ offset**4 - 4.0 * mean * cubed + 6.0 * mean * mean * second - 3.0 * mean**4 - 3.0 * central_second**2, axis=0
-                ))
+                )
+            # One transfer per class for both cumulants (a read per node was a sync each).
+            both = _host(xp.stack([third_here, fourth_here]))
+            third += both[0]
+            fourth += both[1]
     for class_position, rows, terms in (() if not prior.scale_size else _class_terms(prior, coefficients, cavity, working_bytes)):
         weights = terms.responsibility
         xp = _DEVICE.get()

@@ -247,10 +247,12 @@ def tilted_moments(
     precision: Any,
     shift: Any,
     working_bytes: int,
-) -> tuple[Any, Any, Any]:
-    """log Z_j, the tilted mean and the tilted variance of every effect (device float64), as
+    check: bool = True,
+) -> tuple[Any, Any, Any, Any]:
+    """log Z_j, the tilted mean and the tilted variance of every effect (device float64) and the improper flag, as
     ``scale_mixture_ep.tilted_moments`` computes them. ``log_density`` is the (C x K) normalized log pi; inputs may
-    live on the host or the device, and rows go in chunks whose device copies fit ``working_bytes``."""
+    live on the host or the device, and rows go in chunks whose device copies fit ``working_bytes``. With ``check``
+    the improper flag is read here (a sync) and raises; without it the caller reads it with its own values."""
     if working_bytes <= 0:
         raise ValueError("working_bytes must be positive")
     rows = int(class_index.shape[0])
@@ -273,8 +275,9 @@ def tilted_moments(
             _column(cupy, shift[start:stop], cupy.float64),
             log_normalizer[start:stop], mean[start:stop], variance[start:stop], improper,
         ))
-    _raise_if_improper(improper)
-    return log_normalizer, mean, variance
+    if check:
+        _raise_if_improper(improper)
+    return log_normalizer, mean, variance, improper
 
 
 def _objective_row_bytes(node_count: int, scale_size: int) -> int:
@@ -317,8 +320,13 @@ def objective_statistics(
     scale_size = int(scale_design.shape[1])
     scale_span = slice(class_count * node_count, class_count * node_count + scale_size)
     dimension = class_count * node_count + scale_size
-    gradient = np.zeros(dimension)
-    hessian = np.zeros((dimension, dimension))
+    # The result's pieces accumulate on the device: per class its deviation sum (K), outer product (K x K) and
+    # cross product (K x L), plus the scale gradient (L), scale Hessian (L x L) and the scalars; one transfer at
+    # the end, and the block-diagonal Hessian is assembled on the host (its (C K)^2 dense form would be C times the
+    # bytes for nothing).
+    sums = cupy.zeros((class_count, node_count), dtype=cupy.float64)
+    outers = cupy.zeros((class_count, node_count, node_count), dtype=cupy.float64)
+    crosses = cupy.zeros((class_count, node_count, scale_size), dtype=cupy.float64)
     multiprocessors = int(cupy.cuda.Device().attributes["MultiProcessorCount"])
     chunk = _objective_chunk_rows(working_bytes, node_count, scale_size, multiprocessors)
     nodes = _column(cupy, grid, cupy.float64)
@@ -330,12 +338,11 @@ def objective_statistics(
     improper = cupy.zeros(1, dtype=cupy.int32)
     density = np.exp(log_density)
     for class_position, all_rows in enumerate(class_rows):
-        all_rows = cupy.asarray(all_rows)
+        # Host rows index host inputs (a direct call) and device inputs alike (CuPy takes a host index array).
+        all_rows = np.asarray(all_rows.get() if hasattr(all_rows, "get") else all_rows)
         class_log_density = _column(cupy, log_density[class_position], cupy.float64)
         class_density = _column(cupy, density[class_position], cupy.float64)
-        deviation_sum = cupy.zeros(node_count, dtype=cupy.float64)
-        deviation_outer = cupy.zeros((node_count, node_count), dtype=cupy.float64)
-        cross = cupy.zeros((node_count, scale_size), dtype=cupy.float64)
+        deviation_sum, deviation_outer, cross = sums[class_position], outers[class_position], crosses[class_position]
         for start in range(0, all_rows.shape[0], chunk):
             rows = all_rows[start : start + chunk]
             count = int(rows.shape[0])
@@ -355,7 +362,7 @@ def objective_statistics(
                 deviations, centred, log_normalizer, curvature, improper,
             ))
             padded = cupy.zeros((padded_rows, scale_size), dtype=cupy.float64)
-            padded[:count] = cupy.asarray(scale_design)[rows] if scale_size else cupy.zeros((count, 0))
+            padded[:count] = cupy.asarray(scale_design[rows], dtype=cupy.float64)
             design = padded[:count]
             value += log_normalizer.sum()
             magnitude += cupy.abs(log_normalizer).sum()
@@ -366,18 +373,32 @@ def objective_statistics(
             cross += products[:node_count]
             scale_gradient += products[node_count]
             scale_hessian += design.T @ (curvature[:, None] * design)
+    # One transfer for everything (each read of a device value is a sync of ~0.7 ms, on a call made thousands of
+    # times per fit: 12 reads per call were 8 s of a 57 s fit on ENSG00000254709.8 [real]).
+    packed = cupy.asnumpy(cupy.concatenate([
+        sums.ravel(), outers.ravel(), crosses.ravel(), scale_gradient, scale_hessian.ravel(),
+        cupy.stack([value, magnitude, improper[0].astype(cupy.float64)]),
+    ]))
+    offset = 0
+    def take(count: int) -> np.ndarray:
+        nonlocal offset
+        piece = packed[offset : offset + count]
+        offset += count
+        return piece
+    host_sums = take(class_count * node_count).reshape(class_count, node_count)
+    host_outers = take(class_count * node_count * node_count).reshape(class_count, node_count, node_count)
+    host_crosses = take(class_count * node_count * scale_size).reshape(class_count, node_count, scale_size)
+    gradient = np.zeros(dimension)
+    hessian = np.zeros((dimension, dimension))
+    for class_position in range(class_count):
         span = slice(class_position * node_count, (class_position + 1) * node_count)
-        summed = cupy.asnumpy(deviation_sum)
-        outer = cupy.asnumpy(deviation_outer)
-        mass = density[class_position]
+        summed, mass = host_sums[class_position], density[class_position]
         gradient[span] = summed
-        hessian[span, span] = np.diag(summed) - outer - np.outer(summed, mass) - np.outer(mass, summed)
-        hessian[span, scale_span] = cupy.asnumpy(cross)
-        hessian[scale_span, span] = hessian[span, scale_span].T
-    # One transfer for the scalars and the improper flag: each ``float`` or flag read is a device sync (~0.7 ms), and
-    # this call is made thousands of times per fit.
-    totals = cupy.asnumpy(cupy.stack([value, magnitude, improper[0].astype(cupy.float64)]))
-    _raise_if_improper(totals[2:])
-    gradient[scale_span] = cupy.asnumpy(scale_gradient)
-    hessian[scale_span, scale_span] = cupy.asnumpy(scale_hessian)
-    return float(totals[0]), gradient, hessian, float(totals[1])
+        hessian[span, span] = np.diag(summed) - host_outers[class_position] - np.outer(summed, mass) - np.outer(mass, summed)
+        hessian[span, scale_span] = host_crosses[class_position]
+        hessian[scale_span, span] = host_crosses[class_position].T
+    gradient[scale_span] = take(scale_size)
+    hessian[scale_span, scale_span] = take(scale_size * scale_size).reshape(scale_size, scale_size)
+    scalars = take(3)
+    _raise_if_improper(scalars[2:])
+    return float(scalars[0]), gradient, hessian, float(scalars[1])
