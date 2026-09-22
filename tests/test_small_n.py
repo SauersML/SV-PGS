@@ -2,6 +2,8 @@
 against the definitions, and one end-to-end fit on synthetic genotypes. Synthetic data only."""
 
 import numpy as np
+import sys
+
 import pytest
 
 from sv_pgs.config import VariantClass
@@ -809,3 +811,18 @@ def test_the_ec_free_energy_is_minus_log_z_ep_at_a_fixed_point(monkeypatch):
     dense, score = _Design.dense(design), design.T @ target
     free_energy = _ec_free_energy(dense, noise, score, fixed.site_precision, fixed.site_shift, tilted, largest)
     np.testing.assert_allclose(free_energy, -_log_evidence(dense, noise, score, fixed.site_precision, fixed.site_shift, tilted), rtol=1e-9)
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "the outer loop stalls uncertified on the small simulated problems: every seed and size scanned (160x50, 120x40, 100x30; "
+    "lead/hostprobe_*.log, 2026-09-22) returns remaining_gain inf and prediction_move inf with outer_criterion_met False, "
+    "before and after the cold-start budget (aab8892, 8773178), while real genes certify (gpu_vs_host, ENSG00000254709.8). "
+    "The stall is the small problems' own and is unexplained: a fit that certifies here removes this marker."
+))
+def test_the_small_simulated_fit_certifies():
+    sys.path.insert(0, "tests")
+    from test_mean_field import _WORKING_BYTES as working_bytes, _problem
+    codes, covariates, target, classes = _problem(9, samples=160, variants=50)
+    fit = fit_small_n(codes=codes, covariates=covariates, target=target, variant_class=classes, log_variance_offset=None, draw_count=64,
+                      working_bytes=working_bytes, seed=0, inference="mean_field")
+    assert fit.profile["outer_criterion_met"], (fit.profile["remaining_gain"], fit.profile["prediction_move"])

@@ -429,12 +429,11 @@ class MeanFieldFixedPoints:
             return grouped[members] if tied else grouped
 
         located = (back(residual) + squares * mean) / noise
-        if direction is None:
-            step = located - sites
-        else:
+        gap = located - sites
+        directions = [gap]
+        if direction is not None:
             live = variance > 0.0
-            step = xp.where(live, xp.asarray(direction) / xp.where(live, variance, 1.0), located - sites)
-        slope = float(variance @ ((located - sites) * step))
+            directions.insert(0, xp.where(live, xp.asarray(direction) / xp.where(live, variance, 1.0), gap))
 
         def evaluate(alpha: float):
             moved = sites + alpha * step
@@ -452,9 +451,18 @@ class MeanFieldFixedPoints:
             value, _rounding = self._elbo(*pieces)
             return value, pieces, (moved, new_mean, new_variance, new_residual)
 
-        candidates = [evaluate(1.0)]
-        if baseline is not None and slope > 0.0:
-            curvature = candidates[0][0] - baseline - slope
+        # Newton's direction first, where there is one and it ascends here (the response is the last fixed point's,
+        # and the noise may have moved since: a stale direction can point downhill); the gap's own direction next
+        # (the Jacobi step, always an ascent direction where the gap is not zero); the sweep last.
+        candidates: list = []
+        for step in directions:
+            slope = float(variance @ (gap * step))
+            if slope <= 0.0 and step is not gap:
+                continue
+            candidates.append(evaluate(1.0))
+            if baseline is None:
+                break
+            curvature = candidates[-1][0] - baseline - slope
             alpha = 1.0
             if curvature < 0.0 and 0.0 < -slope / (2.0 * curvature) < 1.0:
                 alpha = -slope / (2.0 * curvature)
@@ -462,6 +470,8 @@ class MeanFieldFixedPoints:
             while max(candidate[0] for candidate in candidates) <= baseline and alpha * slope > tolerance:
                 alpha = 0.5 * alpha
                 candidates.append(evaluate(alpha))
+            if max(candidate[0] for candidate in candidates) > baseline:
+                break
         best = max(candidates, key=lambda candidate: candidate[0])
         self.profile["parallel_passes"] = self.profile.get("parallel_passes", 0) + 1
         self.profile["parallel_evaluations"] = self.profile.get("parallel_evaluations", 0) + len(candidates)
@@ -593,8 +603,16 @@ class MeanFieldFixedPoints:
                 elbo = elbo + self.noise_gain if elbo is not None else None
                 self.noise = pending_noise
             if parallel:
+                along_newton = direction is not None
                 divergence, weighted_variance, residual_square, sizes = self._pass(hyperparameters, elbo, direction)
                 direction = None
+                if self._response is None:
+                    # Before the first fixed point the passes would take the gap's own direction, which crawls along
+                    # the design's correlated directions as the sweeps do (84 passes on ENSG00000100385.14 [real]
+                    # against 4 sweeps): the response at this state gives them Newton's direction at once.
+                    self._response, self._response_noise = self._response_at(), self.noise
+                    self.profile["factorizations"] += 1
+                    corrections = True
             else:
                 divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
@@ -619,6 +637,14 @@ class MeanFieldFixedPoints:
                 elbo = value
                 if gain is not None and gain < -rounding:
                     raise FloatingPointError(f"a mean-field sweep lowered the ELBO by {-gain:.3g} nats: the bound's ascent is broken")
+                if parallel and along_newton and gain is not None and gain <= rounding:
+                    # The pass along the held response's Newton step gained nothing above rounding while that step's
+                    # decrement promised more: the response is another fixed point's and its model is wrong here, as
+                    # a correction the next sweep does not confirm is on the sweep path. Its decrement no longer
+                    # bounds the remainder; the sweeps' extrapolation does, and the fresh response at the fixed point
+                    # gives the next direction (ENSG00000115806.13 sv [real, p 49]: 415 passes of 1e-12 nats each
+                    # against a stale decrement above the tolerance, until the run was killed).
+                    corrections = False
             self.profile["elbo"] = value
             gap = self._stale_gap()
             newton: float | None = None
@@ -670,6 +696,14 @@ class MeanFieldFixedPoints:
                 if remaining + self.noise_gain <= tolerance:
                     return point
                 corrections = True
+
+    def _response_at(self) -> _Response:
+        """The response factorization at the current state (``_Response``): the fixed point's own when built there."""
+        omega = self.member_squares / self.noise
+        live = self.variance > 0.0
+        with np.errstate(divide="ignore"):
+            tau = np.where(live, 1.0 / np.where(live, self.variance, 1.0), np.inf) - omega
+        return _Response(self.design, self.noise * tau, live)
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own local
