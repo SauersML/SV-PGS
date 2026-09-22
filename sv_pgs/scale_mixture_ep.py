@@ -1182,6 +1182,23 @@ def _data_objective(
             value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
             rounding=(prior.grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
         )
+    # The host twin of the fused device kernel (``engine_kernels.objective_statistics_host``): one compiled pass per
+    # row and BLAS Grams, with the device's rounding bound.
+    value, gradient, hessian, magnitude = engine_kernels.objective_statistics_host(
+        prior.class_rows, class_log_density(prior, coefficients), log_scale(prior, coefficients), prior.log_variance_grid,
+        cavity.precision, cavity.shift, prior.scale_design, working_bytes, hessian_too,
+    )
+    return _Objective(
+        value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
+        rounding=(prior.grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
+    )
+
+
+def _data_objective_numpy(
+    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, hessian_too: bool = True
+) -> _Objective:
+    """``_data_objective`` by the kernel rows' numpy passes (``_class_terms``): the reference the compiled host kernel
+    is tested against, with the rows' own rounding bound."""
     grid_size = prior.grid_size
     scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
     dimension = prior.density_size + prior.scale_size
