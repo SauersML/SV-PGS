@@ -14,6 +14,7 @@ the harness scores its total on the liability scale.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import tempfile
@@ -123,6 +124,54 @@ def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
     return path, order
 
 
+STORE_CACHE_VARIABLE = "SVPGS_STORE_CACHE"
+"""A directory where the training store of an arm is kept between scenarios: the store is the arm's training codes
+and public fields only (no phenotype), the same for every scenario on the arm."""
+
+
+def _store_key(train) -> str:
+    """The training store's identity: the table's public fields, the training sample count and the codes of a
+    spread of rows (the first, middle and last of every 4096), so another arm's or cohort's codes never match."""
+    variants = train.variants
+    digest = hashlib.sha256()
+    digest.update(np.int64(train.n_samples).tobytes())
+    for name in ("pos", "cls", "len_change", "imputation_info"):
+        digest.update(np.ascontiguousarray(np.asarray(variants[name])).tobytes())
+    probe = np.unique(np.concatenate([np.arange(0, train.n_variants, BLOCK_ROWS), [train.n_variants // 2, train.n_variants - 1]]))
+    digest.update(np.ascontiguousarray(train.codes(probe)).tobytes())
+    return digest.hexdigest()[:24]
+
+
+def cached_store(train, work: Path) -> tuple[Path, np.ndarray]:
+    """The training store under ``work``: built once per arm into ``$SVPGS_STORE_CACHE`` (atomically, by rename),
+    then copied to the task's local disk, where the fit streams it every sweep. Without the variable, built in place."""
+    cache = os.environ.get(STORE_CACHE_VARIABLE)
+    if not cache:
+        return build_store(train, work)
+    order = np.argsort(train.variants["pos"], kind="stable").astype(np.int64)
+    root = Path(cache) / _store_key(train)
+    if not (root / "store" / "COMPLETE").exists():
+        staging = Path(tempfile.mkdtemp(prefix=f"{root.name}.", dir=cache))
+        built, _order = build_store(train, staging)
+        (built / "COMPLETE").write_text("")
+        try:
+            staging.rename(root)
+        except OSError:
+            shutil.rmtree(staging, ignore_errors=True)
+            if not (root / "store" / "COMPLETE").exists():
+                raise
+    started = time.time()
+    shutil.copytree(root / "store", work / "store")
+    log(f"svpgs_full: cached store {root.name} copied in {time.time() - started:.0f} s")
+    # The copy is the arm's training codes: a spread of rows read afresh must equal the store's.
+    with DosageStore.open(work / "store") as store:
+        probe = np.unique(np.linspace(0, train.n_variants - 1, 64).astype(np.int64))
+        for row in probe:
+            if not np.array_equal(store.read_codes(int(row), int(row) + 1)[0], np.asarray(train.codes(order[[row]]))[0]):
+                raise ValueError(f"the cached store {root} differs from the training codes at store row {row}")
+    return work / "store", order
+
+
 def task_budget() -> ComputeBudget:
     """The machine's budget (its device where it has one), with the host share capped by the runner's allotment
     less what this process already holds."""
@@ -175,7 +224,7 @@ class Model:
 def fit(train) -> Model:
     work = Path(tempfile.mkdtemp(prefix="svpgs_full_", dir=os.environ.get("TMPDIR")))
     try:
-        store_path, order = build_store(train, work)
+        store_path, order = cached_store(train, work)
         budget = task_budget()
         phenotype = np.asarray(train.phenotype, dtype=np.float64)
         covariates = np.column_stack([np.ones(train.n_samples), np.asarray(train.covariates, dtype=np.float64)])

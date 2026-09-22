@@ -79,3 +79,35 @@ def test_the_truth_arm_is_the_true_genotypes_in_code_units(tmp_path: Path) -> No
     imputation = np.load(tmp_path / "imputation_truth.npz")
     assert np.all(imputation["info"] == 1.0) and np.all(imputation["realized_r2"] == 1.0)
     assert harness.ARMS["truth"] == ("observed_truth.npy", "imputation_truth.npz", "true genotypes")
+
+
+def test_the_store_cache_builds_once_and_is_reused(tmp_path: Path, monkeypatch) -> None:
+    rng = np.random.default_rng(9)
+    observed, variants = _cohort(rng, 40, 60)
+    columns = np.arange(60)
+    reads = harness.ReadEvidence(rows=np.zeros(0, dtype=np.int64), _pl=np.zeros((0, 0, 3), dtype=np.uint8), _columns=columns)
+    train = harness.TrainData(
+        variants=variants, covariates=np.zeros((60, 1)), covariate_names=("a",), phenotype=np.zeros(60), trait_type="quantitative",
+        prevalence=None, cores=1, truth_half=np.zeros(60, dtype=bool), reads=reads, _observed=observed, _columns=columns, _records=np.arange(40),
+    )
+    module = harness.load_method(SUBMISSION)
+    monkeypatch.setenv(module.STORE_CACHE_VARIABLE, str(tmp_path / "cache"))
+    (tmp_path / "cache").mkdir()
+    built = []
+    original = module.build_store
+    monkeypatch.setattr(module, "build_store", lambda train, work: built.append(1) or original(train, work))
+    for attempt in range(2):
+        work = tmp_path / f"work{attempt}"
+        work.mkdir()
+        path, order = module.cached_store(train, work)
+        with module.DosageStore.open(path) as store:
+            assert np.array_equal(store.read_codes(0, store.n_variants), observed[order])
+    assert built == [1]
+    # another arm's codes are another store
+    other = observed.copy()
+    other[0] = 254 - other[0]
+    train_other = harness.TrainData(**{**{name: getattr(train, name) for name in train.__dataclass_fields__}, "_observed": other})
+    work = tmp_path / "work_other"
+    work.mkdir()
+    module.cached_store(train_other, work)
+    assert len(list((tmp_path / "cache").iterdir())) == 2
