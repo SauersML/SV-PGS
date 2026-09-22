@@ -418,3 +418,20 @@ def test_the_cold_start_gets_the_carried_solve_s_own_effort_and_no_more():
     oracle._restore(oracle._cold)
     with pytest.raises(_SweepBudget):
         oracle._solve(start, sweep_budget=0)
+
+
+def test_the_early_response_is_withheld_where_its_schur_block_outgrows_the_kernel():
+    # A state whose tilted variances exceed every pseudo-likelihood's puts every live row outside the Woodbury bulk:
+    # the bounded response is None there (its LU would cost |N|^3 > the kernel's n^2 p), and the unbounded one is built.
+    from sv_pgs import small_n
+
+    codes, covariates, target, classes = _problem(9, samples=60, variants=200)
+    statistics = small_n.dense_statistics(codes, covariates, target)
+    prior = small_n.small_n_prior(statistics, classes, np.zeros(codes.shape[1]), 64)
+    start, start_noise, _moment = small_n.small_n_start(statistics, prior)
+    oracle = MeanFieldFixedPoints(statistics, prior, start_noise, 64, _WORKING_BYTES)
+    oracle.variance = np.full(prior.variant_count, 1e6)
+    assert oracle._response_at(bounded=True) is None
+    assert oracle._response_at(bounded=False) is not None
+    oracle.variance = np.full(prior.variant_count, 1e-9)
+    assert oracle._response_at(bounded=True) is not None

@@ -623,10 +623,13 @@ class MeanFieldFixedPoints:
                 if self._response is None:
                     # Before the first fixed point the passes would take the gap's own direction, which crawls along
                     # the design's correlated directions as the sweeps do (84 passes on ENSG00000100385.14 [real]
-                    # against 4 sweeps): the response at this state gives them Newton's direction at once.
-                    self._response, self._response_noise = self._response_at(), self.noise
-                    self.profile["factorizations"] += 1
-                    corrections = True
+                    # against 4 sweeps): the response at this state gives them Newton's direction at once, where
+                    # its factorization is no dearer than the kernel's (``_response_at``).
+                    early = self._response_at(bounded=True)
+                    if early is not None:
+                        self._response, self._response_noise = early, self.noise
+                        self.profile["factorizations"] += 1
+                        corrections = True
             else:
                 divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
@@ -711,13 +714,23 @@ class MeanFieldFixedPoints:
                     return point
                 corrections = True
 
-    def _response_at(self) -> _Response:
-        """The response factorization at the current state (``_Response``): the fixed point's own when built there."""
+    def _response_at(self, bounded: bool = False) -> _Response | None:
+        """The response factorization at the current state (``_Response``): the fixed point's own when built there.
+        With ``bounded``, None where the state's Schur block (the rows outside the Woodbury bulk, ``_Response``)
+        holds more rows than the kernel itself: far from a fixed point the tilted variances can put thousands of
+        rows there, and the block's LU at |N|^3 then costs more than the passes it would steer (ENSG00000179399.15
+        snv in the GPU benchmark chunk [real]: a worker in that LU for 40 minutes at a state one pass from cold, a
+        fit that takes 14 s when the response is small). The bulk's own cost is the kernel's n^2 p, which no
+        state changes; the comparison is between the two blocks' sizes, and the passes take the gap's own
+        direction until a fixed point gives the response."""
         omega = self.member_squares / self.noise
         live = self.variance > 0.0
         with np.errstate(divide="ignore"):
             tau = np.where(live, 1.0 / np.where(live, self.variance, 1.0), np.inf) - omega
-        return _Response(self.design, self.noise * tau, live)
+        scaled = self.noise * tau
+        if bounded and int(np.sum(live & (scaled < self.design.squares))) > self.sample_count:
+            return None
+        return _Response(self.design, scaled, live)
 
     def _fixed_point(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         """The certified state as the outer loop's fixed point: the pseudo-likelihoods as the cavity, q's own local
