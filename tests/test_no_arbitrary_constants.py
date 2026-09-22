@@ -103,6 +103,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('logistic_ep.py', '_LOG_SIGMOID_CURVATURE_BOUND'): ('math', frozenset({0.25}), 'max of sigmoid(w) sigmoid(-w), the curvature of -log sigmoid, attained at w = 0'),
     ('genotype_buffers.py', 'SIGNED_CODE_OFFSET'): ('spec', frozenset({127}), '8-bit store code offset (STORE.md)'),
     ('genotype_buffers.py', 'build_sample_layout'): ('definitional', frozenset({3}), 'a sample correlation needs at least three samples to be non-degenerate'),
+    ('small_n.py', 'LASSO_FOLDS'): ('spec', frozenset({10}), 'cv.glmnet default nfolds (Friedman, Hastie and Tibshirani 2010), the mr.ash workflow lasso start'),
     ('device_sweep.py', 'PANEL'): ('spec', frozenset({32}), 'the CUDA warp width (CUDA C++ Programming Guide, warpSize = 32): one lane per panel member, and the shuffles reduce across it'),
     ('device_sweep.py', 'DEVICE_PIECE_ARRAYS'): ('derived', frozenset({4}), 'byte accounting of a decoded piece: the float64 codes, their centred and scaled copies, and the signed product'),
     ('device_sweep.py', 'PIECE_COLUMNS'): ('definitional', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),

@@ -20,6 +20,8 @@ classifiers = [
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.15,<2",
+    # The mean-field oracle's cross-validated lasso start (small_n.lasso_start).
+    "scikit-learn>=1.3",
     "cyvcf2>=0.31.4",
     "google-cloud-bigquery>=3.40.1",
     # crc32c checksums guard the dosage store's Zarr v3 shard indexes and zstd chunks.

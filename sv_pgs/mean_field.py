@@ -286,7 +286,8 @@ class MeanFieldFixedPoints:
     without a certified fixed point restores it and records the refusal."""
 
     def __init__(
-        self, statistics: DenseStatistics, prior: ScaleMixturePrior, start_noise: float, draw_count: int, working_bytes: int
+        self, statistics: DenseStatistics, prior: ScaleMixturePrior, start_noise: float, draw_count: int, working_bytes: int,
+        start_means: Sequence[F64Array] = (),
     ) -> None:
         self.statistics = statistics
         self.prior = prior
@@ -327,6 +328,17 @@ class MeanFieldFixedPoints:
         self._held_device: dict | None = None
         # The start's state, from which every call is also solved cold (``__call__``).
         self._cold: dict | None = self._snapshot()
+        # Further first-call starts: q's means at each (a data-derived point such as the cross-validated lasso), the
+        # residual they leave and each member's variance at their spread; the first call keeps the higher ELBO.
+        self._first_starts = []
+        for means in start_means:
+            values = np.asarray(means, dtype=np.float64)
+            self.mean = values.copy()
+            self.residual = np.asarray(statistics.projected_target, dtype=np.float64) - self.design.image(values)
+            self.variance = np.full(values.shape[0], float(np.var(values)) + np.finfo(np.float64).tiny)
+            self._first_starts.append(self._snapshot())
+        if self._first_starts:
+            self._restore(self._cold)
 
     # the ELBO and its pieces
 
@@ -525,7 +537,7 @@ class MeanFieldFixedPoints:
         entry = self._snapshot()
         solved: list[tuple[float, FixedPoint, dict]] = []
         budget: int | None = None
-        for start in (entry, self._cold) if self.profile["fixed_point_calls"] > 1 else (entry,):
+        for start in (entry, self._cold) if self.profile["fixed_point_calls"] > 1 else (entry, *self._first_starts):
             self._restore(start)
             before = self.profile["sweeps"]
             try:
