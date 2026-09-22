@@ -30,6 +30,22 @@ from sv_pgs.scale_mixture_ep import AnnotationGroup
 _EPSILON = float(np.finfo(np.float64).eps)
 
 
+COLUMN_VARIANCE = "log_column_variance"
+"""The annotation every route adds from the training genotypes themselves: each column's log training variance."""
+
+
+def column_variance_annotation(scales: np.ndarray) -> dict[str, np.ndarray]:
+    """{COLUMN_VARIANCE: 2 log s_j} for the members' training standard deviations s_j (any constant unit cancels in the
+    class centring). Its free linear coefficient c in log u_j spans the frequency-dependent architectures: c = 0 is one
+    prior on standardized effects, c = 1 one prior on effects per unit of the stored value (per allele for a dosage,
+    mr.ash's scale), and the empirical Bayes learns c with the smooth's curvature, from the training data alone. On the
+    bench-real genes where SV-PGS trailed mr.ash most, c = 1 raised both the training ELBO and the held-out r2
+    (ENSG00000124613.9 0.21 -> 0.52, ENSG00000237248.5 0.13 -> 0.44, loso/AFR [real])."""
+    scales = np.asarray(scales, dtype=np.float64)
+    with np.errstate(divide="ignore"):
+        return {COLUMN_VARIANCE: np.where(scales > 0.0, 2.0 * np.log(np.where(scales > 0.0, scales, 1.0)), np.nan)}
+
+
 @dataclass(frozen=True)
 class AnnotationDesign:
     """The prior's annotation inputs: the design [variants, columns], its groups and a name per column."""

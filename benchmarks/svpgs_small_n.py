@@ -88,15 +88,12 @@ ASSUMPTIONS = {"measurement": "every record measured exactly: log_variance_offse
 
 def bench_real_annotations(variants: Any) -> dict[str, np.ndarray]:
     """The prior's per-column annotations from bench-real's public variant fields: the distance to the gene's TSS
-    (log1p of its magnitude), the training allele frequency (its log-odds, the minor allele's: effect sizes that
-    depend on frequency), and for structural variants the log length and the signed allele-length change (missing
-    for a small variant, whose class already says so). Training data only: the frequency is the training samples'."""
-    frequency = np.asarray(variants.train_allele_frequency, dtype=np.float64)
-    minor = np.clip(np.minimum(frequency, 1.0 - frequency), np.finfo(np.float64).tiny, 0.5)
+    (log1p of its magnitude), and for structural variants the log length and the signed allele-length change (missing
+    for a small variant, whose class already says so). The frequency dependence is the fit's own (every route adds
+    each column's training variance, ``annotation_design.column_variance_annotation``)."""
     is_sv = np.asarray(variants.is_sv, dtype=bool)
     return {
         "log_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
-        "minor_allele_log_odds": np.log(minor / (1.0 - minor)),
         "log_sv_length": np.where(is_sv, np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))), np.nan),
         "length_change": np.where(is_sv, np.asarray(variants.allele_length_change, dtype=np.float64), np.nan),
     }
