@@ -4359,6 +4359,22 @@ def fit_hyperparameters(
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
                 previous_state = states[model]
+                if previous_state is None and trial_state is None and last_steps[model] is not None:
+                    current = points[model]
+                    moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
+                    if bool(np.all(moves <= 2.0 * tolerance)):
+                        # Outside every basin at both ends (no certified V at x or at the trial) with the fixed point
+                        # unmoved at the certificate's own resolution: the data do not see this move of x, and nothing
+                        # the fit could certify changes along the walk. On ENSG00000135100.19 snv_sv [real] 782 such
+                        # steps were accepted on the gradients' trapezoid at |x| 1.3e5 with the ELBO fixed at
+                        # -611.7085 (a released block's weight at its range's lower end let the density collapse), until
+                        # the run was killed. x stands as its maximum to the data's resolution and the fit returns
+                        # uncertified with its last evaluated step, as at the boundary below.
+                        hyperparameters[model], points[model] = trial, trial_point
+                        displaced[model] = False
+                        iterations[model] += 1
+                        uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement)
+                        continue
                 if previous_state is not None and trial_state is not None:
                     inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                     inner_gains[model].append(float(inner_gain))
