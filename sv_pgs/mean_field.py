@@ -214,6 +214,10 @@ def _sample_nodes(responsibility, uniform, nodes):
             nodes[row, draw] = min(low, node_count - 1)
 
 
+class _SweepBudget(Exception):
+    """A second-start solve used the first start's count of sweeps without converging: abandoned, not refused."""
+
+
 class _Response:
     """(Xp'Xp + diag t)^-1 applied to columns, for sites t of either sign: the mean-field fixed point's response
     matrix diag(tau) + Xp'Xp / sigma^2 (t = sigma^2 tau, module docstring) is symmetric but need not be positive
@@ -383,18 +387,30 @@ class MeanFieldFixedPoints:
         at 11 of 13 calls on ENSG00000075234.17 (19 at the fit's end, where the held-out r^2 was 0.457 cold against
         0.388 carried), below it by 0.6 on ENSG00000100385.14, and equal to 0.01 nats on two other genes. The ELBO
         is a lower bound on the evidence at this x, so the higher one is the better approximation, and the oracle
-        is then nearer a function of x than of the path that reached it. The first call's two starts are one."""
+        is then nearer a function of x than of the path that reached it. The first call's two starts are one.
+
+        The cold solve gets the carried solve's own effort, its count of sweeps, and no more: it is the second
+        candidate, not a requirement, and from the start's zero means a trial's wide prior can leave it an ELBO of
+        -1e5 climbing by 4e4 a sweep with an extrapolated remainder of 3e8 (the 500-gene run [real]: fits of hours
+        where the carried solve had converged in seconds)."""
         (model_hyperparameters,) = hyperparameters
         self.profile["fixed_point_calls"] += 1
         entry = self._snapshot()
         solved: list[tuple[float, FixedPoint, dict]] = []
+        budget: int | None = None
         for start in (entry, self._cold) if self.profile["fixed_point_calls"] > 1 else (entry,):
             self._restore(start)
+            before = self.profile["sweeps"]
             try:
-                point = self._solve(model_hyperparameters)
+                point = self._solve(model_hyperparameters, sweep_budget=budget)
+            except _SweepBudget:
+                self.profile["cold_abandoned"] = self.profile.get("cold_abandoned", 0) + 1
+                continue
             except (FloatingPointError, np.linalg.LinAlgError) as error:
                 self.refusals.append(str(error))
                 continue
+            if budget is None:
+                budget = self.profile["carried_sweeps"] = self.profile["sweeps"] - before
             solved.append((float(self.profile["elbo"]), point, self._snapshot()))
         if not solved:
             self._restore(entry)
@@ -425,7 +441,7 @@ class MeanFieldFixedPoints:
         step = response_noise * response.solve(gap[:, None])[:, 0]
         return 0.5 * float(gap @ step), step
 
-    def _solve(self, hyperparameters: MixtureHyperparameters) -> FixedPoint:
+    def _solve(self, hyperparameters: MixtureHyperparameters, sweep_budget: int | None = None) -> FixedPoint:
         """Sweeps at the current noise, with Newton corrections in the means between them, until the remaining gain
         (module docstring) is within the tolerance. The noise moves to its stationary value only between sweeps, so
         the returned state (q, sigma^2) is the one the last sweep built: its pseudo-likelihoods are the cavity,
@@ -449,7 +465,10 @@ class MeanFieldFixedPoints:
         pending_noise: float | None = None
         corrections = self._response is not None
         correction: tuple[dict, float] | None = None
+        sweeps_at_entry = self.profile["sweeps"]
         while True:
+            if sweep_budget is not None and self.profile["sweeps"] - sweeps_at_entry >= sweep_budget:
+                raise _SweepBudget()
             if pending_noise is not None:
                 elbo = elbo + self.noise_gain if elbo is not None else None
                 self.noise = pending_noise

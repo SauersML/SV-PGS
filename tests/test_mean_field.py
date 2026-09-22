@@ -395,3 +395,26 @@ def test_the_draws_stay_inside_their_working_budget():
     tracemalloc.stop()
     assert values.shape == (prior.variant_count, count) and np.all(np.isfinite(values))
     assert peak <= values.nbytes + budget
+
+
+def test_the_cold_start_gets_the_carried_solve_s_own_effort_and_no_more():
+    # The second candidate's sweeps are capped at the first's count: a call never costs more than twice the carried
+    # solve, and an abandoned cold solve leaves the carried fixed point standing.
+    from sv_pgs import small_n
+    from sv_pgs.mean_field import _SweepBudget
+
+    codes, covariates, target, classes = _problem(9, samples=160, variants=50)
+    statistics = small_n.dense_statistics(codes, covariates, target)
+    prior = small_n.small_n_prior(statistics, classes, np.zeros(codes.shape[1]), 64)
+    start, start_noise, _moment = small_n.small_n_start(statistics, prior)
+    oracle = MeanFieldFixedPoints(statistics, prior, start_noise, 64, _WORKING_BYTES)
+    (first,) = oracle([start])
+    assert first is not None
+    before = oracle.profile["sweeps"]
+    (second,) = oracle([start])
+    assert second is not None
+    carried = oracle.profile["carried_sweeps"]
+    assert oracle.profile["sweeps"] - before <= 2 * carried
+    oracle._restore(oracle._cold)
+    with pytest.raises(_SweepBudget):
+        oracle._solve(start, sweep_budget=0)

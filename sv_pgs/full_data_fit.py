@@ -878,6 +878,10 @@ class _FullDataFixedPoints:
             target_precision, target_shift = self._targets(hyperparameters, cavities)
 
 
+class _PassBudget(Exception):
+    """A second-start solve used the first start's count of passes without converging: abandoned, not refused."""
+
+
 class _FullDataMeanField:
     """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
     q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
@@ -1056,7 +1060,7 @@ class _FullDataMeanField:
         summands = 2 * self.prior.variant_count + int(self.training_counts[model])
         return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
-    def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters) -> None:
+    def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
         """Sweeps at the current noise, the noise moving to its stationary value between them, until the sweeps'
         measured remainder (the geometric extrapolation of the last two gains, ``mean_field``) plus the noise's
         pending gain is within the tolerance."""
@@ -1065,7 +1069,10 @@ class _FullDataMeanField:
         gain: float | None = None
         previous_gain: float | None = None
         pending_noise: float | None = None
+        passes_at_entry = self.passes
         while True:
+            if pass_budget is not None and self.passes - passes_at_entry >= pass_budget:
+                raise _PassBudget()
             if pending_noise is not None:
                 elbo = elbo + float(self.noise_gain[model]) if elbo is not None else None
                 self.noise[model] = pending_noise
@@ -1119,16 +1126,24 @@ class _FullDataMeanField:
         entry = self._snapshot()
         solved: list[list[tuple[float, dict] | None]] = []
         first = self.refreshes == 0
+        # The cold solve gets the carried solve's own count of passes per model, and no more (``mean_field``).
+        budgets: list[int | None] = [None] * self.model_count
         for start in ((entry,) if first else (entry, self._cold)):
             self._restore(start)
             outcome: list[tuple[float, dict] | None] = []
             for model in range(self.model_count):
+                before = self.passes
                 try:
-                    self._solve_model(model, hyperparameters[model])
+                    self._solve_model(model, hyperparameters[model], pass_budget=budgets[model])
+                except _PassBudget:
+                    outcome.append(None)
+                    continue
                 except FloatingPointError as error:
                     self.refusals.append(str(error))
                     outcome.append(None)
                     continue
+                if budgets[model] is None:
+                    budgets[model] = self.passes - before
                 outcome.append((float(self.elbo[model]), self._snapshot()))
             solved.append(outcome)
         for model in range(self.model_count):
