@@ -50,6 +50,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
+from sv_pgs.device_sweep import PanelGrams, sweep_piece
 from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
@@ -954,6 +955,7 @@ class _FullDataMeanField:
         self.version = 0
         self.undecided_blocks = 0
         self.information: list = []
+        self._panel_grams = PanelGrams()
         self._cold = self._snapshot()
 
     # state
@@ -1021,6 +1023,8 @@ class _FullDataMeanField:
     # the sweeps
 
     def _sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
+        if self.gaussian.array_module is not np:
+            return self._device_sweep(model, hyperparameters)
         # ``mean_field`` imports ``small_n``, which imports this module's certificate: the kernel is bound at first use.
         from sv_pgs.mean_field import _sweep as mean_field_sweep
 
@@ -1050,6 +1054,47 @@ class _FullDataMeanField:
                 sizes += part[3]
         self.passes += 1
         return divergence, weighted_variance, float(residual @ residual), sizes
+
+    def _device_sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
+        """The same sweep on the device (``device_sweep``): the members in the same order, the residual and the panel
+        Grams held there, and only each piece's moments copied back."""
+        cupy = self.gaussian.array_module
+        prior = self.prior
+        log_density = cupy.asarray(np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)))
+        scales = cupy.asarray(log_scale(prior, hyperparameters.coefficients))
+        grid = cupy.asarray(prior.log_variance_grid)
+        mask = cupy.asarray(self.training[:, model])
+        residual = cupy.asarray(self.residual[model])
+        squares = cupy.asarray(np.ascontiguousarray(self.member_squares[:, model]))
+        classes = cupy.asarray(self.class_index)
+        state = {name: cupy.asarray(np.ascontiguousarray(getattr(self, name)[:, model])) for name in ("mean", "variance", "shift", "third", "fourth")}
+        pieces = cupy.zeros((prior.variant_count, 3))
+        noise = float(self.noise[model])
+
+        def project(values):
+            return self.models.complement(values, cupy.full(values.shape[1], model, dtype=cupy.int64))
+
+        for start, stop, tile in self.gaussian.source.blocks():
+            for piece_start, piece_stop in self._pieces(stop - start):
+                local = np.arange(piece_start, piece_stop, dtype=np.int64)
+                rows = slice(start + piece_start, start + piece_stop)
+                dense = cupy.asarray(tile.columns(cupy.asarray(local)), dtype=cupy.float64)
+                log_node_variance = cupy.ascontiguousarray(scales[rows][:, None] + grid[None, :])
+                node_variance = cupy.exp(log_node_variance)
+                sweep_piece(
+                    cupy, dense=dense, mask=mask, project=project, residual=residual, grams=self._panel_grams,
+                    key_base=(model, start + piece_start), squares=squares[rows], class_index=classes[rows],
+                    log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
+                    mean=state["mean"][rows], variance=state["variance"][rows], shift=state["shift"][rows],
+                    third=state["third"][rows], fourth=state["fourth"][rows], pieces=pieces[rows],
+                )
+        for name, values in state.items():
+            getattr(self, name)[:, model] = cupy.asnumpy(values)
+        self.residual[model] = cupy.asnumpy(residual)
+        totals = cupy.asnumpy(pieces.sum(axis=0))
+        self.passes += 1
+        residual_square = float(cupy.asnumpy(residual @ residual))
+        return float(totals[0]), float(totals[1]), residual_square, float(totals[2])
 
     def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
         """As ``MeanFieldFixedPoints._elbo``, on this model's training rows."""
