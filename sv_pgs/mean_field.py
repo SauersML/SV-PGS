@@ -596,6 +596,7 @@ class MeanFieldFixedPoints:
         # On the device the pass takes Newton's direction itself (``_pass``); the sweep path applies it between sweeps.
         parallel = self._device() is not None
         direction: F64Array | None = None
+        promised = 0.0
         while True:
             if sweep_budget is not None and self.profile["sweeps"] - sweeps_at_entry >= sweep_budget:
                 raise _SweepBudget()
@@ -605,7 +606,20 @@ class MeanFieldFixedPoints:
             if parallel:
                 along_newton = direction is not None
                 divergence, weighted_variance, residual_square, sizes = self._pass(hyperparameters, elbo, direction)
+                if along_newton and elbo is not None and promised > tolerance:
+                    value, _rounding = self._elbo(divergence, weighted_variance, residual_square, sizes)
+                    if value - elbo <= tolerance:
+                        # The step's decrement promised more than the tolerance and the pass along it realized less:
+                        # the quadratic model in the sites is wrong at this scale (a site far from its maximum with
+                        # a small variance takes a huge Newton step that the line search cuts to nothing; the tilted
+                        # moments saturate where the model is quadratic). A sweep maximizes each site exactly, as the
+                        # sweep path's corrections are confirmed by one, and the pass resumes from where it leaves
+                        # (ENSG00000179399.15 snv in the GPU benchmark chunk [real]: passes of gains below the
+                        # tolerance against a stale decrement above it, for an hour).
+                        self.profile["parallel_sweeps"] = self.profile.get("parallel_sweeps", 0) + 1
+                        divergence, weighted_variance, residual_square, sizes = self._sweep(hyperparameters)
                 direction = None
+                promised = 0.0
                 if self._response is None:
                     # Before the first fixed point the passes would take the gap's own direction, which crawls along
                     # the design's correlated directions as the sweeps do (84 passes on ENSG00000100385.14 [real]
@@ -655,7 +669,7 @@ class MeanFieldFixedPoints:
                     newton, corrections = None, False
                 elif parallel:
                     # The next pass moves along this step; the decrement is the remaining gain's estimate.
-                    direction = step
+                    direction, promised = step, newton
                 elif newton > tolerance:
                     # Newton's step in the means; the next sweep re-tilts every site at the moved residual.
                     correction = (self._snapshot(), value)
@@ -691,7 +705,7 @@ class MeanFieldFixedPoints:
                     # A negative form is no bound (R indefinite along the gap): the measured remainder stands.
                     remaining = fresh
                     if parallel:
-                        direction = fresh_step
+                        direction, promised = fresh_step, fresh
                 self.mean_move = 2.0 * remaining
                 if remaining + self.noise_gain <= tolerance:
                     return point
