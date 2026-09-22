@@ -324,7 +324,9 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
     )
 
 
-def _member_posterior(reduced: GaussianPosterior, ties: TieGroups, member_precision: F64Array, group_marginals: F64Array) -> GaussianPosterior:
+def _member_posterior(
+    reduced: GaussianPosterior, ties: TieGroups, member_precision: F64Array, group_marginals: F64Array, algebraic: bool = False
+) -> GaussianPosterior:
     """q's responses over the tie members from the solver's over the groups (``tie_members``): with w_j = s_j D_j / D_g
     and the within-group conditional covariance C_w = diag(D) - D s s' D / D_g (block diagonal over the tied groups,
     zero for a singleton), Sigma_members = C_w + W Sigma_groups W', so Sigma R = C_w R + W Sigma_groups (W' R), and
@@ -332,11 +334,11 @@ def _member_posterior(reduced: GaussianPosterior, ties: TieGroups, member_precis
     each tied group. The block-local preconditioner is the groups' own, carried over where every group is a single
     member (a permutation); a tied model's Krylov solve runs without it."""
     precision = np.asarray(member_precision, dtype=np.float64)
-    weight = member_weights(ties, precision)
+    weight = member_weights(ties, precision, algebraic)
     tied = tied_groups(ties)
     conditionals = []
     for members in tied:
-        shares, _group_precision, _total = tied_weights(precision[members])
+        shares, _group_precision, _total = tied_weights(precision[members], algebraic)
         variance = 1.0 / precision[members]
         signs = ties.sign[members]
         conditionals.append(np.diag(variance) - np.outer(signs * shares, signs * variance))
@@ -1174,7 +1176,8 @@ class _FullDataMeanField:
     def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
         """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
         ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m."""
-        group_precision, group_shift = group_sites(self.ties, site_precision, site_shift)
+        # A linear response's sites, not a Gaussian's: the members' elimination needs no sign (tied_weights).
+        group_precision, group_shift = group_sites(self.ties, site_precision, site_shift, algebraic=True)
         self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=noise,
             error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
@@ -1253,7 +1256,7 @@ class _FullDataMeanField:
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
         dual = _member_posterior(
-            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(snapshot)), self.ties, tau, group_variance,
+            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(snapshot)), self.ties, tau, group_variance, algebraic=True,
         )
         noise_solve: dict[str, object] = {}
 

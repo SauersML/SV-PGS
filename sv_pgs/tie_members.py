@@ -70,35 +70,40 @@ def _as_columns(values: F64Array) -> F64Array:
     return values[:, None] if values.ndim == 1 else values
 
 
-def tied_weights(precision: F64Array) -> tuple[F64Array, float, float]:
+def tied_weights(precision: F64Array, algebraic: bool = False) -> tuple[F64Array, float, float]:
     """For one tied group's member precisions t_j: the weights w_j = D_j / D_g, and the group's precision
     t_g = 1 / D_g, computed from the ratios a_j = t_ref / t_j (|a_j| <= 1, t_ref the least |t_j|) so a near-flat member
     neither overflows nor cancels; with the group's variance's sign. The members' law restricted to the hyperplane
     s'beta = beta_g is proper exactly when every D_j > 0, or when one D_j < 0 and D_g < 0 (Haynsworth's inertia of
     diag(t) on s-perp; speed-smalln): any other sites raise LinAlgError, as a precision that is not positive definite
-    does, so EP halves its negative sites."""
+    does, so EP halves its negative sites.
+
+    ``algebraic`` (the mean-field route's, set by the route itself): the weights as the block elimination of
+    R = diag(t) + B'KB needs them, exact whenever every t_j and D_g are nonzero whatever their signs. Mean-field sites
+    t_j = 1/v_j - omega_j are a linear response's, not a Gaussian's, and are negative wherever a scale-mixture
+    posterior is wider than its likelihood."""
     negative = int(np.count_nonzero(precision < 0.0))
     if np.any(precision == 0.0):
         raise np.linalg.LinAlgError("a tied member's site is flat: the members' posterior is improper along their difference")
     reference = float(np.min(np.abs(precision)))
     ratios = reference / precision
     total = float(np.sum(ratios))
-    if negative > 1 or (negative == 1 and not total < 0.0) or total == 0.0:
+    if total == 0.0 or (not algebraic and (negative > 1 or (negative == 1 and not total < 0.0))):
         raise np.linalg.LinAlgError("a tie group's member sites are not positive definite on their difference directions")
     return ratios / total, reference / total, total
 
 
-def member_weights(ties: TieGroups, precision: F64Array) -> F64Array:
+def member_weights(ties: TieGroups, precision: F64Array, algebraic: bool = False) -> F64Array:
     """w_j = s_j D_j / D_g for every member at one model's sites (p_members,): each member's share of its group's
     posterior move (a singleton's is its sign)."""
     weights = np.array(ties.sign, copy=True)
     member_precision = np.asarray(precision, dtype=np.float64)
     for members in tied_groups(ties):
-        weights[members] = ties.sign[members] * tied_weights(member_precision[members])[0]
+        weights[members] = ties.sign[members] * tied_weights(member_precision[members], algebraic)[0]
     return weights
 
 
-def group_sites(ties: TieGroups, precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array]:
+def group_sites(ties: TieGroups, precision: F64Array, shift: F64Array, algebraic: bool = False) -> tuple[F64Array, F64Array]:
     """The groups' sites (precision, shift) from the members': the law of beta_g = sum_j s_j beta_j under them,
     t_g = 1 / sum_j D_j and nu_g = t_g sum_j s_j nu_j / t_j, in natural parameters (a singleton's is its own, signed)."""
     shape = np.shape(precision)
@@ -110,7 +115,7 @@ def group_sites(ties: TieGroups, precision: F64Array, shift: F64Array) -> tuple[
     for members in tied_groups(ties):
         group = int(ties.group[members[0]])
         for column in range(member_precision.shape[1]):
-            weights, precision_g, _total = tied_weights(member_precision[members, column])
+            weights, precision_g, _total = tied_weights(member_precision[members, column], algebraic)
             group_precision[group, column] = precision_g
             # nu_g = t_g sum_j s_j nu_j / t_j = sum_j s_j nu_j w_j t_g / t_j ... = sum_j s_j nu_j (D_j / D_g).
             group_shift[group, column] = float(np.sum(ties.sign[members] * member_shift[members, column] * weights))
