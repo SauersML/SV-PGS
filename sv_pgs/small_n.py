@@ -53,7 +53,7 @@ from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
-from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
+from sv_pgs.annotation_design import annotation_design, per_unit_offset
 from sv_pgs.lasso_path import cross_validated_lasso
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
@@ -1667,7 +1667,6 @@ def small_n_prior(
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     member_annotations = {name: np.asarray(values)[members] for name, values in (annotations or {}).items()}
-    member_annotations.update(column_variance_annotation(statistics.scales))
     design = annotation_design(member_annotations, {}, class_index=class_index.astype(np.int64))
     return scale_mixture_prior(
         class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=design.design,
