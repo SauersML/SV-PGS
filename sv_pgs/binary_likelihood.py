@@ -265,8 +265,8 @@ class WeightedGaussianStep(Protocol):
     ``step(weights, response)`` maximizes (or improves) the Gaussian value over q at the weights omega (n,), zero off
     the training rows, and the working response z = kappa / omega, with the noise variance fixed at 1, and returns its
     ``WeightedGaussianState``. Its covariate projection must be W's, and anything it caches from the projected design
-    must be keyed by the weights. The structured model's background Gaussian and local single effects (``structured``,
-    ``structured_full``) implement it by running their Gaussian updates on X~ = W^1/2 X and y~ = W^1/2 z at unit noise."""
+    must be keyed by the weights. A Gaussian route implements it by running its Gaussian updates on X~ = W^1/2 X and
+    y~ = W^1/2 z at unit noise."""
 
     def __call__(self, weights: F64Array, response: F64Array) -> WeightedGaussianState:
         ...
