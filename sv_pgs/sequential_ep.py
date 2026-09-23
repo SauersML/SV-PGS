@@ -548,6 +548,81 @@ class SequentialSweep:
         site = (np.diag(precision[groups]) + self.coupling[index]) / self.noise
         return inverse - site, inverse @ mean - shift[groups], mean, covariance
 
+    def current_cluster_cavity(self, index: int, precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array]:
+        """``cluster_cavity`` at the state as it stands (after ``run`` or ``step_cluster``), with no rebuild."""
+        groups = self.clusters[index]
+        slots = self.rest_slot[groups]
+        covariance = self.noise * self.schur_inverse[np.ix_(slots, slots)]
+        mean = self.rest_mean[slots]
+        inverse = np.linalg.inv(covariance)
+        site = (np.diag(precision[groups]) + self.coupling[index]) / self.noise
+        return inverse - site, inverse @ mean - shift[groups], mean, covariance
+
+    def step_cluster(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> bool:
+        """Cluster ``index``'s site moved to (``site_precision``, ``site_shift``), unscaled, where every cavity stays
+        inside EP's domain, updating the state in place and returning True; the state is kept otherwise.
+
+        The cluster's groups are in the rest N, so the move is S <- S + E D E' on their slots (D the scaled site's
+        change, m x m): with U = S^-1 E and V = E'S^-1 E, S^-1 <- S^-1 - U (I + D V)^-1 D U' (Woodbury), and S stays
+        positive definite where I + L'DL is (V = LL'). Every group's I = x'W x moves by y' (I + D V)^-1 D y with
+        y = U'Q x (one G x n' x m product), which gives every bulk cavity; the rest's and the clusters' come from the
+        new S^-1 itself."""
+        groups = self.clusters[index]
+        slots = self.rest_slot[groups]
+        size = groups.shape[0]
+        new_scaled = self.noise * np.asarray(site_precision, dtype=np.float64)
+        old_scaled = np.diag(precision[groups]) + self.coupling[index]
+        change = 0.5 * (new_scaled + new_scaled.T) - old_scaled
+        images = self.schur_inverse[:, slots]
+        block = images[slots]
+        try:
+            factor = np.linalg.cholesky(0.5 * (block + block.T))
+        except np.linalg.LinAlgError:
+            return False
+        if not np.linalg.eigvalsh(np.eye(size) + factor.T @ change @ factor)[0] > 0.0:
+            return False
+        core = np.linalg.solve(np.eye(size) + change @ block, change)
+        schur_inverse = self.schur_inverse - images @ core @ images.T
+        schur_inverse = 0.5 * (schur_inverse + schur_inverse.T)
+        projected = self.rows @ (self.rest_images.T @ images)
+        informed = self.informed + np.einsum("ij,jk,ik->i", projected, core, projected)
+        bulk = ~self.is_rest
+        with np.errstate(divide="ignore", invalid="ignore"):
+            scaled = informed[bulk] / (1.0 - informed[bulk] / precision[bulk])
+        cavity = scaled / self.noise
+        if not np.all(np.isfinite(cavity)) or np.any((cavity < 0.0) & ~(1.0 + self.largest[bulk] * cavity > 0.0)):
+            return False
+        trial_t = precision.copy()
+        trial_t[groups] = np.diag(new_scaled)
+        single_rest = self.rest_rows[~self.clustered[self.rest_rows]]
+        if single_rest.size:
+            with np.errstate(divide="ignore"):
+                rest_cavity = (1.0 / np.diag(schur_inverse)[self.rest_slot[single_rest]] - trial_t[single_rest]) / self.noise
+            if not np.all(np.isfinite(rest_cavity)) or np.any((rest_cavity < 0.0) & ~(1.0 + self.largest[single_rest] * rest_cavity > 0.0)):
+                return False
+        couplings = [block.copy() for block in self.coupling]
+        couplings[index] = new_scaled - np.diag(np.diag(new_scaled))
+        for other, members in enumerate(self.clusters):
+            member_slots = self.rest_slot[members]
+            try:
+                inverse = np.linalg.inv(self.noise * schur_inverse[np.ix_(member_slots, member_slots)])
+            except np.linalg.LinAlgError:
+                return False
+            cavity_precision = inverse - (np.diag(trial_t[members]) + couplings[other]) / self.noise
+            with np.errstate(divide="ignore"):
+                bound = np.diag(1.0 / self.largest[members])
+            if not np.linalg.eigvalsh(0.5 * (cavity_precision + cavity_precision.T) + bound)[0] > 0.0:
+                return False
+        self.schur_inverse = np.ascontiguousarray(schur_inverse)
+        self.informed = informed
+        precision[groups] = np.diag(new_scaled)
+        self.coupling[index] = couplings[index]
+        shift[groups] = site_shift
+        self.shift_value[groups] = self.group_score[groups] + self.noise * np.asarray(site_shift, dtype=np.float64)
+        _rest_mean(self.rest_rows.shape[0], self.rest_rows, self.rows, self.shift_value[self.rest_rows].copy(), self.solved, self.rest_images,
+                   self.schur_inverse, self.rest_mean, self.combined)
+        return True
+
     def set_cluster_site(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> None:
         """Cluster ``index``'s site (unscaled precision matrix and shift on its sums), into ``precision``, ``shift``
         and the coupling."""

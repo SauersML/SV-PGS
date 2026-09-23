@@ -233,3 +233,29 @@ def test_the_blocked_sweep_is_the_per_step_sweep():
     np.testing.assert_allclose(results[1][0], results[0][0], rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(results[1][1], results[0][1], rtol=1e-9, atol=1e-12)
     assert results[1][2] == results[0][2]
+
+
+def test_a_cluster_step_by_woodbury_is_the_rebuilt_state():
+    """``step_cluster``'s rank-m update of S^-1, every I and the rest's mean gives the cavities a fresh build gives at
+    the new site."""
+    rows, _members, priors, target = _problem(23, 30, 20, 1)
+    noise = 0.8
+    score = rows @ target
+    second = np.array([float(np.exp(_components(priors, g)[0]) @ np.exp(_components(priors, g)[1])) for g in range(rows.shape[0])])
+    t, nu = noise / second, np.zeros(rows.shape[0])
+    sweep = SequentialSweep(rows, np.einsum("ij,ij->i", rows, rows), score, priors, noise)
+    sweep.set_clusters([np.array([0, 1, 4])])
+    assert sweep.run(t, nu, np.arange(rows.shape[0], dtype=np.int64)) is not None
+    before = sweep.current_cluster_cavity(0, t, nu)
+    rng = np.random.default_rng(1)
+    factor = rng.standard_normal((3, 3))
+    site = (np.diag(t[[0, 1, 4]]) + sweep.coupling[0]) / noise + 0.1 * (factor @ factor.T)
+    site_shift = nu[[0, 1, 4]] + rng.standard_normal(3)
+    assert sweep.step_cluster(0, site, site_shift, t, nu)
+    stepped = sweep.current_cluster_cavity(0, t, nu)
+    stepped_informed = sweep.informed.copy()
+    rebuilt = sweep.cluster_cavity(0, t, nu)
+    for got, expected in zip(stepped, rebuilt):
+        np.testing.assert_allclose(got, expected, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(stepped_informed, sweep.informed, rtol=1e-8, atol=1e-12)
+    assert not np.allclose(before[2], stepped[2])

@@ -13,7 +13,7 @@ The contract and the dial. A sweep updates every single group by its exact seque
 of its tilted law from q's marginal, nats) is measured. EP has reached its fixed point when the residuals summed over the units are
 within the resolution 1 / (2 K) (less each sampled cluster's own Monte Carlo floor, the KL its moments' errors make in
 expectation) and q has stopped moving (the sweep's summed KL move of the groups' marginals within the resolution). A unit breaks the contract where its update is refused (no damping keeps every cavity finite) or where
-its residual, above the resolution, did not fall over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
+its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
 unit joins the unit of the group whose column is most correlated with its own, and the sweeps continue from the
 joined sites (the cluster's site starts as the block of its groups' sites). Clusters are thus admitted by measured
 failure, never by a hand-picked correlation.
@@ -214,13 +214,14 @@ class AliasEP:
         return True, indicator.T @ member_mean, covariance, floor, members, (member_mean, np.diag(member_covariance))
 
     def _update_cluster(self, index: int, precision: F64Array, shift: F64Array, stamp: int) -> tuple[float | None, float]:
-        """One cluster's damped site update; (residual or None where refused, Monte Carlo floor)."""
+        """One cluster's damped site update at the sweep's current state (``SequentialSweep.step_cluster``); (residual or
+        None where refused, Monte Carlo floor)."""
         sweep = self.sweep
         cluster = sweep.clusters[index]
-        cavity = sweep.cluster_cavity(index, precision, shift)
-        if cavity is None:
+        try:
+            cavity_precision, cavity_shift, mean, covariance = sweep.current_cluster_cavity(index, precision, shift)
+        except np.linalg.LinAlgError:
             return None, 0.0
-        cavity_precision, cavity_shift, mean, covariance = cavity
         with np.errstate(divide="ignore"):
             if not np.linalg.eigvalsh(cavity_precision + np.diag(1.0 / self.largest[cluster]))[0] > 0.0:
                 return None, 0.0
@@ -234,15 +235,11 @@ class AliasEP:
         target_precision, target_shift = inverse - cavity_precision, inverse @ tilted_mean - cavity_shift
         old_precision = (np.diag(precision[cluster]) + sweep.coupling[index]) / self.noise
         old_shift = shift[cluster].copy()
-        old_t, old_nu, old_coupling = precision.copy(), shift.copy(), sweep.coupling[index].copy()
         fraction = 1.0
         while fraction > _EPSILON:
-            sweep.set_cluster_site(index, old_precision + fraction * (target_precision - old_precision),
-                                   old_shift + fraction * (target_shift - old_shift), precision, shift)
-            if sweep.valid(precision, shift):
+            if sweep.step_cluster(index, old_precision + fraction * (target_precision - old_precision), old_shift + fraction * (target_shift - old_shift),
+                                  precision, shift):
                 return residual, floor
-            precision[:], shift[:] = old_t, old_nu
-            sweep.coupling[index] = old_coupling.copy()
             fraction *= 0.5
         return None, floor
 
@@ -280,7 +277,7 @@ class AliasEP:
         shift = np.array(shift, dtype=np.float64, copy=True)
         sweep = self.sweep
         sweep.set_clusters(list(clusters or []))
-        # Each unit's last residual and its count of consecutive sweeps without a fall (``fit``'s contract).
+        # Each unit's lowest residual and its count of consecutive sweeps without a new low (``fit``'s contract).
         history: dict[int, float] = {}
         streak: dict[int, int] = {}
         sweeps_since_change = 0
@@ -315,13 +312,14 @@ class AliasEP:
             for index, value in cluster_residual.items():
                 current[self.group_count + index], allowed[self.group_count + index] = value, self.resolution + floors[index]
             failing = {self.group_count + index for index in refused_clusters}
-            # Non-contraction: above the resolution and not falling over two consecutive sweeps, counted from the second
-            # sweep since the units last changed (the first is the transient's, and is not recorded).
+            # Non-contraction: above the resolution and with no new low over two consecutive sweeps, counted from the
+            # second sweep since the units last changed (the first is the transient's, and is not recorded). A
+            # contracting unit sets a new low every sweep; an oscillating or stalled one does not.
             if sweeps_since_change:
                 for key, value in current.items():
                     if key in history:
                         streak[key] = streak.get(key, 0) + 1 if value >= history[key] else 0
-                    history[key] = value
+                    history[key] = min(value, history.get(key, np.inf))
             sweeps_since_change += 1
             failing |= {key for key, count in streak.items() if key in current and count >= 2 and current[key] > allowed[key]}
             # A single group whose update the sweep refused shows as an infinite residual (improper tilted law).
