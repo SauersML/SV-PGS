@@ -352,3 +352,33 @@ def test_cuda_an_improper_cavity_is_an_error_as_on_the_host():
         tilted_moments(prior, hyperparameters, improper, _WORKING_BYTES, cupy)
     with pytest.raises(FloatingPointError):
         _data_objective(prior, hyperparameters.coefficients, improper, _WORKING_BYTES, cupy)
+
+
+def test_cuda_kernel_allocations_inside_a_ledger_evict_its_caches_rather_than_run_out():
+    """The EB kernels' device arrays are allocations like any other: inside a ledger scope (``memory_broker``) each
+    goes through the ledger's allocator, which evicts an idle device cache (the resident genotype codes, the panel
+    Grams) to make room before it would refuse. Here a cache fills the device's capacity to within a few kernel
+    arrays, and the kernel call still runs, with the cache dropped (bench-sim scenario_004 [sim]: a 0.49 GB kernel
+    allocation against 41.7 GB held on an A100-40GB, the resident codes among them, died before the ledger)."""
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import device_pool, memory_scope
+
+    prior, cavity = _problem(variant_count=400, seed=9)
+    hyperparameters = _hyperparameters(prior, 10)
+    expected = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES, cupy)
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    device = int(cupy.cuda.runtime.getDevice())
+    capacity = int(pool.used_bytes()) + (64 << 20)
+    budget = ComputeBudget(
+        device_kind="cuda", device_ids=(device,), device_names=("test",), device_bytes=(capacity,), device_compute_capabilities=((8, 0),),
+        host_bytes=1 << 34, cpu_threads=1,
+    )
+    cache, dropped = {}, []
+    with memory_scope(budget) as broker:
+        cache["codes"] = cupy.zeros((64 << 20) - (1 << 12), dtype=cupy.uint8)
+        assert broker.admit(device_pool(device), cache["codes"].nbytes, "stand-in resident codes", lambda: (dropped.append(1), cache.clear()), allocated=True)
+        moments = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES, cupy)
+        assert dropped == [1] and broker.held(device_pool(device)) <= capacity
+    for name in ("log_normalizer", "mean", "variance"):
+        np.testing.assert_array_equal(getattr(moments, name), getattr(expected, name))

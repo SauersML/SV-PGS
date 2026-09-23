@@ -518,8 +518,15 @@ class _FullDataFixedPoints:
         xp = gaussian.array_module
         window_budget = int(working_bytes)
         if xp is not np:
-            free, _total = xp.cuda.runtime.memGetInfo()
-            window_budget = min(window_budget, int(free) + int(xp.get_default_memory_pool().free_bytes()))
+            broker = current_broker()
+            pool = device_pool(int(xp.cuda.runtime.getDevice()))
+            if broker is not None and pool in broker.meters:
+                # What the shared ledger has left on the device (``memory_broker``: its capacity less every live
+                # allocation, the resident codes' included), not a free-memory snapshot.
+                window_budget = min(window_budget, broker.remaining(pool))
+            else:
+                free, _total = xp.cuda.runtime.memGetInfo()
+                window_budget = min(window_budget, int(free) + int(xp.get_default_memory_pool().free_bytes()))
         self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp)
         gaussian.windows = _WindowLayout(self.grams, gaussian.source)
         window_bytes = window_working_bytes(self.grams, xp)
