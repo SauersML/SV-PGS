@@ -24,6 +24,9 @@ MINOR_ALLELE_FLOOR = 0.01
 """HapMap3's minor allele frequency floor."""
 BAND = 500
 """snp_cor's default window: 500 neighbouring variants."""
+DUPLICATE_CORRELATION = 0.99
+"""|r| above which two records are one variable to LDpred2: a singular LD block breaks its Gibbs chains (every chain
+diverged on bench-sim scenario_000 with near-duplicates kept), and the bigsnpr tutorial prunes them before snp_cor."""
 CHUNK = 4096
 _SCRIPT = pathlib.Path(__file__).with_name("ldpred2_auto.R")
 
@@ -62,6 +65,19 @@ def fit(train) -> Model:
     chosen = np.unique(np.minimum(np.searchsorted(cm, targets), common.shape[0] - 1))
     rows = np.sort(common[chosen])
     genotypes = np.vstack([_dosages(train, rows[start : start + CHUNK]) for start in range(0, rows.shape[0], CHUNK)])
+    # near-duplicates within the band: the later of any pair above DUPLICATE_CORRELATION leaves
+    standardized = (genotypes - genotypes.mean(axis=1, keepdims=True)) / np.maximum(genotypes.std(axis=1, keepdims=True), 1e-12)
+    keep = np.ones(rows.shape[0], dtype=bool)
+    for start in range(0, rows.shape[0], CHUNK):
+        stop = min(start + CHUNK, rows.shape[0]); reach = min(stop + BAND, rows.shape[0])
+        block = np.abs(standardized[start:stop] @ standardized[start:reach].T) / standardized.shape[1]
+        for i in range(stop - start):
+            if not keep[start + i]:
+                continue
+            later = np.flatnonzero(block[i, i + 1 :] > DUPLICATE_CORRELATION) + start + i + 1
+            keep[later] = False
+    rows, genotypes = rows[keep], genotypes[keep]
+    del standardized
     means = genotypes.mean(axis=1, dtype=np.float64)
     centred = genotypes - means[:, None].astype(np.float32)
     del genotypes
