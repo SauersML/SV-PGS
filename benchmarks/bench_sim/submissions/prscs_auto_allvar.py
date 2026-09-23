@@ -8,7 +8,14 @@ thinning 5), the covariate-adjusted GWAS, the in-sample LD of the same projected
 written in PRS-CS's hdf5 reference format, and the standardized effects put back on the projected dosages' scale,
 beta_j = beta_std_j sd(P y) / sd(P x_j). The dosages are projected a block at a time (all 230,000 of them at once would
 not fit). PRS-CS's cost per iteration is a Cholesky factorization of each block's matrix, cubic in the block's size, so
-at this density a fit takes hours. The prediction's structural part is that of the TR and SV records.
+at this density a fit takes about a day (about 60 s per iteration on 16 cores). The prediction's structural part is that
+of the TR and SV records.
+
+Two changes to PRS-CS's parse_genet.parse_ldblk (in the PRSCS install below; the MCMC is untouched): its
+membership test against the summary statistics' SNP list is a set instead of a list (quadratic at 230,000 variants;
+the parsed blocks were checked bit-identical against the original on block 1 of scenario_000), and with
+PRSCS_LD_CACHE set it saves its exact float64 output with np.save, so a resubmitted fit loads it instead of redoing
+the per-block SVDs.
 """
 from __future__ import annotations
 
