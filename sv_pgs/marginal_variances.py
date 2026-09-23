@@ -452,6 +452,48 @@ def window_working_bytes(grams: BlockGrams) -> int:
     return peak
 
 
+def window_width(working_bytes: int) -> int:
+    """The widest block whose window (itself and its two neighbours at the same width) keeps the window algebra's
+    working set (``window_working_bytes``) within ``working_bytes``: that set is quadratic in the width, so it is the
+    unit-width window's bytes times w^2. At least one variant (the algebra's floor, where the budget is below it)."""
+    unit = window_working_bytes(BlockGrams(
+        blocks=tuple(np.array([index], dtype=np.int64) for index in range(3)), within=tuple(np.ones((1, 1)) for _ in range(3)),
+        next_cross=tuple(np.zeros((1, 1)) for _ in range(2)),
+    ))
+    return max(1, int(np.floor(np.sqrt(max(int(working_bytes), 0) / unit))))
+
+
+def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:
+    """The same Grams over blocks of at most ``width`` variants: each block cut into near-equal consecutive parts,
+    every part's Gram and each part's Gram with its successor slices of the stored ones (views of a memory map, no
+    copy), across an original boundary from the stored cross-Gram (zero where there is none). The windows of the
+    refined blocks are then as wide as the budget allows (``window_width``), and whatever LD reaches beyond a part's
+    neighbours is far field, which ``block_trace_certificate`` tests like any other."""
+    width = max(1, int(width))
+    blocks: list[NDArray[np.int64]] = []
+    within: list[Any] = []
+    next_cross: list[Any] = []
+    last_rows: tuple[int, slice] | None = None
+    for block, members in enumerate(grams.blocks):
+        size = int(members.shape[0])
+        parts = max(1, -(-size // width))
+        cuts = np.linspace(0, size, parts + 1).round().astype(np.int64)
+        for part in range(parts):
+            span = slice(int(cuts[part]), int(cuts[part + 1]))
+            if last_rows is not None:
+                previous_block, previous_span = last_rows
+                if previous_block == block:
+                    next_cross.append(grams.within[block][previous_span, span])
+                elif grams.next_cross:
+                    next_cross.append(grams.next_cross[previous_block][previous_span, span])
+                else:
+                    next_cross.append(np.zeros((previous_span.stop - previous_span.start, span.stop - span.start), dtype=np.float32))
+            blocks.append(members[span])
+            within.append(grams.within[block][span, span])
+            last_rows = (block, span)
+    return BlockGrams(blocks=tuple(blocks), within=tuple(within), next_cross=tuple(next_cross), scale=grams.scale)
+
+
 def _to_host(values: Any) -> NDArray[np.float64]:
     return values.get() if hasattr(values, "get") else np.asarray(values)
 

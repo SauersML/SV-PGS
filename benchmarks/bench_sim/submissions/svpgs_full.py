@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import resource
 import shutil
 import tempfile
 import time
@@ -222,6 +223,12 @@ class Model:
 
 
 def fit(train) -> Model:
+    return fit_with(train, "mean_field")
+
+
+def fit_with(train, inference: str) -> Model:
+    """The fit by ``inference``'s fixed points (``stage2_wiring.fit_models``), with its profile: time, the process's
+    peak resident set and the device pool's bytes at the end."""
     work = Path(tempfile.mkdtemp(prefix="svpgs_full_", dir=os.environ.get("TMPDIR")))
     try:
         store_path, order = cached_store(train, work)
@@ -244,6 +251,7 @@ def fit(train) -> Model:
                 work_dir=work / "fit",
                 seed=20260922,
                 draw_count=DRAW_COUNT,
+                inference=inference,
             )
         (scoring,) = fitted.scoring
         certificate = fitted.certificate
@@ -255,6 +263,10 @@ def fit(train) -> Model:
             "phenotype_variance": float(phenotype.var()),
             "certified": None if certificate.outer_criterion_met is None else bool(np.all(certificate.outer_criterion_met)),
             "remaining_gain": float(np.max(certificate.remaining_gain)) if np.asarray(certificate.remaining_gain).size else None,
+            "inference": inference,
+            "refusals": len(certificate.refusals),
+            "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
+            "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
         }
         log(f"svpgs_full: {profile}")
         return Model(scoring, order, np.asarray(train.variants["cls"]) >= 2, profile)

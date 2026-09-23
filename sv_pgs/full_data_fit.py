@@ -55,6 +55,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Callable, Iterator, Sequence
 
+import time
+
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
@@ -64,6 +66,7 @@ from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate
 from sv_pgs.dual_solve import DualGaussian, DualModels, _host, column_squares
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
+from sv_pgs.progress import log
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
 from sv_pgs.tie_map import _compact_identity_tie_map
@@ -81,7 +84,9 @@ from sv_pgs.marginal_variances import (
     information_products,
     information_solve_tolerance,
     marginal_variances,
+    refined_grams,
     variance_jvp,
+    window_width,
     window_working_bytes,
 )
 from sv_pgs.scale_mixture_ep import (
@@ -127,13 +132,18 @@ def stage0_lattice(
     return derived_lattice(single_precision[ties.group], ties.sign * single_shift[ties.group], log_variance_offset, tolerance)
 
 
-def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0) -> BlockGrams:
+def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0, working_bytes: int | None = None) -> BlockGrams:
     """Stage 0's projected Grams, R_b within each block and R_{b,b+1} between neighbours (zero across a chromosome's
     end), as the stored float32 arrays themselves: memory-mapped views, no copy. A model's metric W = training /
     sigma^2 enters as ``scale = 1 / noise``; every model of a fit shares the arrays through
     ``dataclasses.replace(grams, scale=...)``, and ``marginal_variances`` promotes one window at a time to float64.
     (Building float64 copies per model and refresh held about 12 GB of each kind per model at p = 466k and ran
-    e2e-scale's chr22 fit out of host memory at 45 GB.)"""
+    e2e-scale's chr22 fit out of host memory at 45 GB.)
+
+    With ``working_bytes`` the blocks are cut into parts whose leave-block-out windows fit it (``refined_grams`` at
+    ``window_width``): a window of three whole Stage 0 blocks is sized only by Stage 0's budget (256 GB of float64
+    working set at bench-sim's 28k-column blocks), not by the EP fit's. The dual solver and the marginal variances
+    must be given the same partition."""
     ld = statistics.ld
     blocks = tuple(np.asarray(ld.block(block_index).reduced_columns, dtype=np.int64) for block_index in range(ld.block_count))
     within = tuple(ld.block(block_index).projected_gram for block_index in range(ld.block_count))
@@ -142,7 +152,8 @@ def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0) ->
         cross = ld.adjacent_block(block_index)
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
         next_cross.append(np.zeros(shape, dtype=np.float32) if cross is None else cross)
-    return BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
+    grams = BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
+    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes))
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:
@@ -479,9 +490,14 @@ class _FullDataFixedPoints:
         self.prior = prior
         self.draw_count = draw_count
         self.working_bytes = working_bytes
-        # Stage 0's Grams, built once per fit and shared by every model and refresh (``block_grams``); the window
-        # algebra's float64 working set is charged against the fit's budget.
-        self.grams = block_grams(statistics)
+        # Stage 0's Grams, built once per fit and shared by every model and refresh (``block_grams``), over blocks cut
+        # so that the window algebra's float64 working set fits the fit's budget; the dual solver's windows must be the
+        # same partition (its window cross products are gathered on them).
+        self.grams = block_grams(statistics, working_bytes=working_bytes)
+        if len(self.grams.blocks) != len(gaussian.windows.blocks) or any(
+            not np.array_equal(ours, theirs) for ours, theirs in zip(self.grams.blocks, gaussian.windows.blocks)
+        ):
+            raise ValueError("the dual solver's windows must be block_grams(statistics, working_bytes=working_bytes)'s blocks")
         window_bytes = window_working_bytes(self.grams)
         if window_bytes > working_bytes:
             raise MemoryError(f"the leave-block-out windows need {window_bytes} bytes of float64 working set, over the fit's {working_bytes}")
@@ -554,15 +570,21 @@ class _FullDataFixedPoints:
         the precision is not positive definite or a cavity is not proper."""
         gaussian = self.gaussian
         while True:
+            started = time.time()
             try:
                 self._iterate(self.site_precision, self.site_shift)
             except np.linalg.LinAlgError:
                 failure = "the full-data precision is not positive definite with non-negative sites"
             else:
+                solved = time.time()
                 grams = [replace(self.grams, scale=1.0 / float(self.noise[model])) for model in range(gaussian.model_count)]
                 group_variances = np.column_stack([
                     marginal_variances(solve, model_grams, gaussian.array_module) for solve, model_grams in zip(gaussian.bulk_solves, grams)
                 ])
+                log(
+                    f"ep refresh {self.refreshes + 1}: mean solve {solved - started:.1f} s, marginal variances {time.time() - solved:.1f} s "
+                    f"over {len(self.grams.blocks)} windows of at most {max(block.shape[0] for block in self.grams.blocks)} columns"
+                )
                 try:
                     mean, variances = self._member_moments(group_variances)
                 except np.linalg.LinAlgError:
@@ -764,6 +786,7 @@ class _FullDataFixedPoints:
         except NoFixedPoint as error:
             self._restore(snapshot)
             self.refusals.append(str(error))
+            log(f"ep fixed point refused: {error}")
             return [None] * self.gaussian.model_count
 
     def _solve(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint]:

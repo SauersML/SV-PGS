@@ -309,6 +309,7 @@ def _fit_one(
     seed: int,
     draw_count: int,
     trait_type: TraitType = TraitType.QUANTITATIVE,
+    inference: str = "mean_field",
 ) -> _ModelFit:
     """One model on the sorted store columns ``training_columns``, whose covariates (intercept first) and targets follow
     them; the null genetic model where the training set has no genetic column to fit.
@@ -402,19 +403,20 @@ def _fit_one(
         targets=store_targets,
         offsets=np.zeros((store.n_samples, 1)),
         covariates=store_covariates,
-        grams=block_grams(statistics, start_noise),
+        # EP's leave-block-out windows are cut to the fit's budget; the mean-field sweeps read whole Stage 0 blocks.
+        grams=block_grams(statistics, start_noise, working_bytes=share if inference == "ep" else None),
         probe_count=draw_count,
         seed=_seed(seed, 0),
         # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
         sample_weights=None if store_sites is None else store_sites.weights[:, None],
     )
-    # The mean-field fixed points: EP's refused nearly every call on the wiring store ("the EP refreshes' updates line
-    # up with no contraction ... the full-data route has no double loop", 59 of 65 calls, 2026-09-21).
+    # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
+    # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
     # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
     # from the start's single-variant likelihoods only; where the fitted state's normalizers or moments move on the
     # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
     fit = fit_full_data(
-        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field",
+        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
         sites=[store_sites],
     )
     while True:
@@ -431,7 +433,7 @@ def _fit_one(
             moved, moved_hyperparameters = halved_lattice(moved, moved_hyperparameters)
         try:
             refit = fit_full_data(
-                gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field",
+                gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
                 sites=[store_sites],
             )
         except FloatingPointError as error:
@@ -468,8 +470,11 @@ def fit_models(
     work_dir: Path,
     seed: int,
     draw_count: int,
+    inference: str = "mean_field",
 ) -> FittedModels:
-    """Every model of ``fit_model.fit``, one at a time (see the module docstring)."""
+    """Every model of ``fit_model.fit``, one at a time (see the module docstring); ``inference`` names the fixed
+    point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's genome-scale
+    EP) is measured on bench-sim, which then replaces it."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
     measurement = store_measurement(store, log_variance_offset)
@@ -492,6 +497,7 @@ def fit_models(
             _seed(seed, model),
             draw_count,
             trait_types[model],
+            inference,
         )
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fit.scoring.alpha
