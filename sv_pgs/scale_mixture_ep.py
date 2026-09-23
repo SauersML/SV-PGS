@@ -110,7 +110,7 @@ import contextvars
 import functools
 import hashlib
 import weakref
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from types import ModuleType
 from typing import Callable, Iterator, Sequence
 
@@ -1882,6 +1882,21 @@ class _VariantDerivatives:
     second_by_density: F64Array
     mean_by_log_scale: F64Array
     second_by_log_scale: F64Array
+    # Each density derivative's rows gathered by class, contiguous, formed on first use (``density_blocks``).
+    _blocks: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def density_blocks(self, name: str, prior: ScaleMixturePrior) -> tuple[F64Array, ...]:
+        """``name`` (``mean_by_density`` or ``second_by_density``) with its rows gathered per class of ``prior``, once
+        per fixed point: every direction the correction is asked for reads the same p x K array, and gathering a
+        class's rows on each call copied the whole array per class, on one thread (e2e bench-sim 005 [sim]: 100% of a
+        90 s sample of stage 2 on that gather, the process at 87% of one core)."""
+        key = (name, id(prior.class_rows))
+        blocks = self._blocks.get(key)
+        if blocks is None:
+            values = getattr(self, name)
+            blocks = tuple(np.ascontiguousarray(values[rows]) for rows in prior.class_rows)
+            self._blocks[key] = blocks
+        return blocks
 
 
 def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _VariantDerivatives:
@@ -1944,25 +1959,26 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
     return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
 
 
-def _through_z(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, directions_z: F64Array) -> F64Array:
-    """(p x r): each variant's derivative in z applied to the directions (C K + L) x r."""
+def _through_z(prior: ScaleMixturePrior, by_density: tuple[F64Array, ...], by_log_scale: F64Array, directions_z: F64Array) -> F64Array:
+    """(p x r): each variant's derivative in z applied to the directions (C K + L) x r; ``by_density`` is the p x K
+    derivative's rows per class (``_VariantDerivatives.density_blocks``)."""
     grid_size = prior.grid_size
     density_part = directions_z[: prior.density_size].reshape(prior.class_count, grid_size, -1)
     # One GEMM per class (the same sums; gathering the class directions per variant would hold p x K x r at once).
     result = np.empty((prior.variant_count, directions_z.shape[1]))
     for class_position, rows in enumerate(prior.class_rows):
-        result[rows] = by_density[rows] @ density_part[class_position]
+        result[rows] = by_density[class_position] @ density_part[class_position]
     if prior.scale_size:
         result += by_log_scale[:, None] * (prior.scale_design @ directions_z[prior.density_size :])
     return result
 
 
-def _through_z_transposed(prior: ScaleMixturePrior, by_density: F64Array, by_log_scale: F64Array, values: F64Array) -> F64Array:
-    """(C K + L) x r: the transpose of ``_through_z`` applied to (p x r) values."""
+def _through_z_transposed(prior: ScaleMixturePrior, by_density: tuple[F64Array, ...], by_log_scale: F64Array, values: F64Array) -> F64Array:
+    """(C K + L) x r: the transpose of ``_through_z`` applied to (p x r) values (``by_density`` per class, as there)."""
     grid_size = prior.grid_size
     result = np.zeros((prior.density_size + prior.scale_size, values.shape[1]))
     for class_position, rows in enumerate(prior.class_rows):
-        result[class_position * grid_size : (class_position + 1) * grid_size] = by_density[rows].T @ values[rows]
+        result[class_position * grid_size : (class_position + 1) * grid_size] = by_density[class_position].T @ values[rows]
     result[prior.density_size :] = prior.scale_design.T @ (by_log_scale[:, None] * values)
     return result
 
@@ -2007,8 +2023,11 @@ def _total_curvature_columns(
         derivatives = _variant_derivatives(prior, coefficients, cavity, working_bytes)
     if fixed_cavity is None:
         fixed_cavity = -_data_objective(prior, coefficients, cavity, working_bytes).hessian
-    mean_by_z = _through_z(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, directions)
-    variance_by_z = _through_z(prior, derivatives.second_by_density, derivatives.second_by_log_scale, directions) - 2.0 * derivatives.mean[:, None] * mean_by_z
+    mean_by_z = _through_z(prior, derivatives.density_blocks("mean_by_density", prior), derivatives.mean_by_log_scale, directions)
+    variance_by_z = (
+        _through_z(prior, derivatives.density_blocks("second_by_density", prior), derivatives.second_by_log_scale, directions)
+        - 2.0 * derivatives.mean[:, None] * mean_by_z
+    )
     if posterior.cavity_response is not None:
         # The fixed point's own cavity response (a mean-field fixed point: ``mean_field``), exact by construction.
         shift_step, precision_step = posterior.cavity_response(mean_by_z, variance_by_z, relative_tolerance)
@@ -2122,8 +2141,8 @@ def _total_from_response(
     prior: ScaleMixturePrior, fixed_cavity: F64Array, derivatives: _VariantDerivatives, directions: F64Array, shift_step: F64Array, precision_step: F64Array
 ) -> F64Array:
     """B_z E from A (``fixed_cavity``) and the cavity response (dh, dP) to each direction E (``_total_curvature_columns``)."""
-    return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.mean_by_density, derivatives.mean_by_log_scale, shift_step) + 0.5 * (
-        _through_z_transposed(prior, derivatives.second_by_density, derivatives.second_by_log_scale, precision_step)
+    return fixed_cavity @ directions - _through_z_transposed(prior, derivatives.density_blocks("mean_by_density", prior), derivatives.mean_by_log_scale, shift_step) + 0.5 * (
+        _through_z_transposed(prior, derivatives.density_blocks("second_by_density", prior), derivatives.second_by_log_scale, precision_step)
     )
 
 
