@@ -112,6 +112,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('lasso_path.py', 'DEVIANCE_MAX'): ('spec', frozenset({0.999}), 'glmnet default devmax: the path stops past this deviance ratio (glmnet.control)'),
     ('device_sweep.py', 'PANEL'): ('spec', frozenset({32}), 'the CUDA warp width (CUDA C++ Programming Guide, warpSize = 32): one lane per panel member, and the shuffles reduce across it'),
     ('device_sweep.py', 'PIECE_COLUMNS'): ('definitional', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),
+    ('structured_full.py', 'stage0_proxies'): ('derived', frozenset({3}), "byte accounting of a row chunk's float64 arrays: its values, their squares and the comparison"),
     ('genotype_buffers.py', 'host_buffer_bytes'): ('derived', frozenset({4, 16, 3, 8}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
     ('genotype_buffers.py', 'cuda_buffer_bytes'): ('derived', frozenset({16, 8, 4}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
     ('genotype_buffers.py', '_CUDA_R_8I'): ('spec', frozenset({3}), 'cudaDataType and cublasComputeType_t values (library_types.h, cublas_api.h)'),

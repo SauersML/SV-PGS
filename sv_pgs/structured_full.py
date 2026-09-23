@@ -113,7 +113,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 
@@ -668,6 +668,9 @@ class StructuredFit:
     history: tuple[History, ...]
     passes: int
     converged: bool
+    # Which start this state came from ("background" or "effects": ``fit_structured``) and both starts' ELBOs.
+    start: str = ""
+    start_elbos: tuple[float, ...] = ()
 
 
 class StructuredFull:
@@ -678,6 +681,7 @@ class StructuredFull:
     def __init__(
         self, *, source: DualTileSource, chromosomes: Sequence[str], ties: TieGroups, prior: ScaleMixturePrior, mask: Any, targets: Any,
         covariates: Any, noise: float, background_variance: float, draw_count: int, seed: int, proxies: I64Array | None = None,
+        local_variance: float | None = None,
     ) -> None:
         xp = source.array_module
         self.xp = xp
@@ -712,7 +716,7 @@ class StructuredFull:
         self.background_image = xp.zeros_like(self.residual)
         self.noise = float(noise)
         # The local magnitudes (x), the candidate logits and the background's log variances, each with its blocks.
-        start = initial_hyperparameters(prior, background_variance)
+        start = initial_hyperparameters(prior, background_variance if local_variance is None else local_variance)
         self.local = _Hyper(start.coefficients.copy(), tuple((np.asarray(block.coordinates), np.asarray(block.factor)) for block in prior.smoothing_blocks), start.log_smoothing.copy())
         head = prior.coefficient_size - prior.scale_size
         indicator = np.zeros((members, self.class_count))
@@ -1144,19 +1148,11 @@ class StructuredFull:
         return result.residual_norm
 
 
-def fit_structured(
-    *, source: DualTileSource, chromosomes: Sequence[str], ties: TieGroups, prior: ScaleMixturePrior, mask: Any, targets: Any, covariates: Any,
-    noise: float, background_variance: float, draw_count: int, seed: int, proxies: I64Array | None = None,
-) -> StructuredFit:
-    """The structured fit from a start (``noise`` sigma^2 and ``background_variance`` the background's level, e.g.
-    Haseman-Elston's split: ``full_data_fit.moment_starts``), to where one iteration's ascent at fixed weights and
-    the weights' own evidence step are both at most 1/(2K) nats (K = ``draw_count``). Each iteration: the local sweep,
-    the M-steps (local prior, candidate logits, the expanded background scale, the background log variances, sigma^2),
-    the background E-step, then one smoothing step (module docstring)."""
-    state = StructuredFull(
-        source=source, chromosomes=chromosomes, ties=ties, prior=prior, mask=mask, targets=targets, covariates=covariates, noise=noise,
-        background_variance=background_variance, draw_count=draw_count, seed=seed, proxies=proxies,
-    )
+def _ascend(state: StructuredFull, start: str) -> StructuredFit:
+    """One start to where one iteration's ascent at fixed weights and the weights' own evidence step are both at most
+    1/(2K) nats (K = ``draw_count``). Each iteration: the local sweep, the M-steps (local prior, candidate logits, the
+    expanded background scale, the background log variances, sigma^2), the background E-step, then one smoothing step
+    (module docstring)."""
     state.background_step()
     objective = state.objective()
     converged = False
@@ -1184,7 +1180,7 @@ def fit_structured(
             live_effects=sum(len(effects) for effects in state.effects), expansion=alpha, passes=state.count.passes - passes,
             seconds=time.time() - started,
         ))
-        log(f"structured: iteration {len(state.history)}: {state.history[-1]}")
+        log(f"structured ({start} start): iteration {len(state.history)}: {state.history[-1]}")
         if abs(gain) <= max(state.tolerance, gain_error) and evidence_rise <= state.tolerance:
             converged = True
             break
@@ -1212,7 +1208,29 @@ def fit_structured(
         history=tuple(state.history),
         passes=state.count.passes,
         converged=converged,
+        start=start,
     )
+
+
+def fit_structured(
+    *, source: DualTileSource, chromosomes: Sequence[str], ties: TieGroups, prior: ScaleMixturePrior, mask: Any, targets: Any, covariates: Any,
+    noise: float, background_variance: float, draw_count: int, seed: int, proxies: I64Array | None = None,
+) -> StructuredFit:
+    """The structured fit from two starts, kept by the higher ELBO (structured-small's rule: coordinate ascent between
+    a Gaussian background and single effects has a basin for each): the background first, at ``background_variance``
+    (Haseman-Elston's split: ``full_data_fit.moment_starts``) with ``noise`` sigma^2, and the effects first, with the
+    background at the lattice's floor, where every kernel is flat (``scale_mixture_ep.kernel_floor``: it explains
+    nothing yet). Both start the local magnitudes' prior at the same mean variance."""
+    fits = []
+    for start, level in (("background", background_variance), ("effects", math.exp(prior.kernel_floor))):
+        state = StructuredFull(
+            source=source, chromosomes=chromosomes, ties=ties, prior=prior, mask=mask, targets=targets, covariates=covariates, noise=noise,
+            background_variance=level, local_variance=background_variance, draw_count=draw_count, seed=seed, proxies=proxies,
+        )
+        fits.append(_ascend(state, start))
+        del state
+    best = max(fits, key=lambda fit: fit.elbo)
+    return replace(best, start_elbos=tuple(fit.elbo for fit in fits))
 
 
 @dataclass(frozen=True)

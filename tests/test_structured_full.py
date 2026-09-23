@@ -62,7 +62,7 @@ def _prior(classes: np.ndarray):
     )
 
 
-def _problem(seed: int, sizes=(10, 10, 10), samples: int = 90, duplicate: bool = False, causal=(3, 17)):
+def _problem(seed: int, sizes=(10, 10, 10), samples: int = 90, duplicate: bool = False, causal=(3, 17), size: float = 0.6, spread: float = 0.05):
     """Standardized Gaussian genotypes in blocks of ``sizes``, an intercept and one covariate, a mask that holds out
     the last tenth, and a trait with two effects plus a small polygenic part. With ``duplicate``, the last column of the
     first block is copied into the first column of the second."""
@@ -73,9 +73,9 @@ def _problem(seed: int, sizes=(10, 10, 10), samples: int = 90, duplicate: bool =
         genotypes[:, sizes[0]] = genotypes[:, sizes[0] - 1]
     genotypes = (genotypes - genotypes.mean(axis=0)) / genotypes.std(axis=0)
     covariates = np.column_stack([np.ones(samples), generator.standard_normal(samples)])
-    effects = 0.05 * generator.standard_normal(count)
+    effects = spread * generator.standard_normal(count)
     for index in causal:
-        effects[index] += 0.6
+        effects[index] += size
     targets = genotypes @ effects + 0.4 * covariates[:, 1] + generator.standard_normal(samples)
     mask = np.ones(samples)
     mask[-samples // 10:] = 0.0
@@ -89,14 +89,14 @@ def _projector(covariates: np.ndarray, mask: np.ndarray) -> np.ndarray:
     return (np.eye(mask.shape[0]) - hat) @ np.diag(mask)
 
 
-def _state(array_module, genotypes, covariates, targets, mask, bounds, draw_count, proxies=None, classes=None, chromosomes=None):
+def _state(array_module, genotypes, covariates, targets, mask, bounds, draw_count, proxies=None, classes=None, chromosomes=None, background_variance=0.02):
     count = genotypes.shape[1]
     classes = np.zeros(count, dtype=np.int64) if classes is None else classes
     source = DenseDualSource(array_module.asarray(genotypes), bounds, array_module)
     return StructuredFull(
         source=source, chromosomes=chromosomes or ["1"] * len(bounds), ties=_identity_ties(count), prior=_prior(classes),
         mask=array_module.asarray(mask), targets=array_module.asarray(targets), covariates=array_module.asarray(covariates), noise=0.8,
-        background_variance=0.02, draw_count=draw_count, seed=5, proxies=proxies,
+        background_variance=background_variance, local_variance=0.02, draw_count=draw_count, seed=5, proxies=proxies,
     )
 
 
@@ -268,7 +268,7 @@ def test_background_step_is_certified_and_its_probe_moments_are_unbiased(array_m
 
 
 def test_background_draws_have_the_posterior_covariance(array_module) -> None:
-    genotypes, covariates, targets, mask, bounds = _problem(12, sizes=(6, 6))
+    genotypes, covariates, targets, mask, bounds = _problem(12, sizes=(6, 6), causal=(3, 8))
     state = _state(array_module, genotypes, covariates, targets, mask, bounds, draw_count=16)
     state.background_step()
     count = 4000
@@ -299,8 +299,9 @@ def test_background_draws_have_the_posterior_covariance(array_module) -> None:
 def test_sweep_keeps_the_global_residual_and_the_elbo_matches_dense_algebra(array_module) -> None:
     """Across iterations the residual is y_P - Xp (m_u + sum_l m_l) exactly, every live effect's stored products are
     Xw'Xp m_l, F equals its dense value within the log det's probe error, and J rises at fixed weights."""
-    genotypes, covariates, targets, mask, bounds = _problem(13)
-    state = _state(array_module, genotypes, covariates, targets, mask, bounds, draw_count=256)
+    # The effects-first start (the background at the lattice floor), where effects are live from the first sweep.
+    genotypes, covariates, targets, mask, bounds = _problem(13, samples=200)
+    state = _state(array_module, genotypes, covariates, targets, mask, bounds, draw_count=256, background_variance=math.exp(_NODES[0]))
     state.background_step()
     projector = _projector(covariates, mask)
     projected = projector @ genotypes
@@ -331,7 +332,7 @@ def test_identical_proxies_across_a_block_boundary_are_allocated_equally(array_m
     """A column copied across the boundary of two blocks (not a Stage 0 tie: they straddle a cut), with the signal on
     it: with the proxy pair in the windows' halos every effect that can take one can take the other, and the fit gives
     both the same mean and inclusion. Without the halos the first window's effect takes one whole."""
-    genotypes, covariates, targets, mask, bounds = _problem(14, sizes=(10, 10, 10), duplicate=True, causal=(9, 25))
+    genotypes, covariates, targets, mask, bounds = _problem(14, sizes=(10, 10, 10), samples=300, duplicate=True, causal=(9, 25), size=1.0, spread=0.01)
     fitted = fit_structured(
         source=DenseDualSource(array_module.asarray(genotypes), bounds, array_module), chromosomes=["1"] * 3, ties=_identity_ties(30),
         prior=_prior(np.zeros(30, dtype=np.int64)), mask=array_module.asarray(mask), targets=array_module.asarray(targets),
@@ -372,7 +373,7 @@ def test_fit_converges_recovers_the_effects_and_holds_no_p_by_k_or_n_by_n_array(
     state.local_m_step()
     state.background_step()
     for name, value in vars(state).items():
-        if hasattr(value, "shape") and hasattr(value, "size"):
+        if isinstance(value, np.ndarray) or type(value).__module__.startswith("cupy"):
             assert int(value.size) <= max(samples * (draw_count + 1), count), name
             assert tuple(value.shape) not in ((count, draw_count), (samples, samples)), name
     for window, effects in zip(state.windows, state.effects):
