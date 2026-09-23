@@ -5,20 +5,19 @@ effects from the training people, in-sample LD in snp_cor's default band (500 ne
 vec_p_init = seq_log(1e-4, 0.2, 30), allow_jump_sign = FALSE, shrink_corr = 0.95, h2_init from LD score regression, and
 the tutorial's chain filter. LDpred2 is run at HapMap3 density, not on every sequenced record: the SNVs of minor allele
 frequency at least 1% (the HapMap3 set's floor), thinned evenly in genetic distance to HapMap3's density on chr22
-(about 16,000 of its 1.1 million variants genome-wide; LDPRED2_VARIANTS overrides). The phenotype is residualized on
+(about 16,000 of its 1.1 million variants genome-wide). The phenotype is residualized on
 [1, covariates] before the marginal regressions, and the test prediction is the fitted per-allele effects on the test
 dosages. Quantitative traits (a binary one is fitted as its 0/1 values, the liability-scale linear approximation).
 Needs R with bigsnpr (module R/4.4.2-openblas-rocky8 and R_LIBS_USER at the compete library)."""
 from __future__ import annotations
 
-import os
 import pathlib
 import subprocess
 import tempfile
 
 import numpy as np
 
-HAPMAP3_CHR22 = int(os.environ.get("LDPRED2_VARIANTS", "16000"))
+HAPMAP3_CHR22 = 16000
 """HapMap3's variant count on chr22 (about 16,000 of its 1.1 million genome-wide): the density LDpred2 is run at."""
 MINOR_ALLELE_FLOOR = 0.01
 """HapMap3's minor allele frequency floor."""
