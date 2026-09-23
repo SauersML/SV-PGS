@@ -991,7 +991,8 @@ class _FullDataMeanField:
         self.version = 0
         self.undecided_blocks = 0
         self.information: list = []
-        self._panel_grams = PanelGrams()
+        # The panels' Grams are kept within the fit's working budget (``PanelGrams``), the rest rebuilt per sweep.
+        self._panel_grams = PanelGrams(capacity_bytes=int(working_bytes))
         if start_mean is not None:
             # A data start (``_mode_mixture``'s ridge component): q's means there and the residual they leave.
             self.mean[...] = np.asarray(start_mean, dtype=np.float64)
@@ -1146,7 +1147,7 @@ class _FullDataMeanField:
             sweep_piece(
                 cupy, decode=decode, width=int(members.shape[0]), mask=mask, covariates=masked_covariates, covariate_pinv=covariate_pinv,
                 residual=residual, grams=self._panel_grams,
-                key_base=(model, int(members[0])), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
+                model=model, members=np.asarray(members), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
                 log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
                 pieces=piece_parts, **piece_state,
             )
@@ -1530,8 +1531,10 @@ def _mode_mixture(
 
     def admit(oracle: "_FullDataMeanField") -> None:
         """A new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture is over distinct
-        modes, each weighted by its own mass once); the repeat of the higher evidence is kept."""
+        modes, each weighted by its own mass once); the repeat of the higher evidence is kept. The component's panel
+        Grams are released: its order's panels are no other component's."""
         mean, shift, omega = pieces(oracle)
+        oracle._panel_grams.clear()
         elbo = np.array(oracle.elbo, dtype=np.float64)
         for index, held in enumerate(means):
             if all(
@@ -1575,6 +1578,7 @@ def _mode_mixture(
         if settled:
             break
     main._iterate(main.site_precision, main.site_shift, main.noise)
+    main._panel_grams.clear()
     return average, tuple(components), weighted()[1]
 
 

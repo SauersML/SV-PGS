@@ -146,18 +146,33 @@ def _kernel(cupy: Any) -> Any:
 
 
 class PanelGrams:
-    """Each panel's projected Gram Xp_P' Xp_P (float64, width x width), formed once per (model, panel) on the
-    device: the design is fixed through a fit, so every sweep reuses them."""
+    """Each panel's projected Gram Xp_P' Xp_P (float64, width x width) and covariate coupling, formed on the device
+    and kept for later sweeps while their bytes fit ``capacity_bytes``: the design is fixed through a fit, so a kept
+    panel is never rebuilt. A panel is named by its model and its members' own indices in sweep order, so a panel of
+    another order or of other members never reads it (keyed by a piece's first member plus an offset, two panels of a
+    random within-block order could share a key and one read the other's Gram). Sweeps visit the panels in one cycle,
+    where any eviction order misses every evicted panel once per sweep, so the cache keeps the panels it met first
+    and rebuilds the rest; ``None`` capacity keeps every panel."""
 
-    def __init__(self) -> None:
-        self._grams: dict[tuple[int, int], Any] = {}
+    def __init__(self, capacity_bytes: int | None = None) -> None:
+        self._grams: dict[tuple[int, bytes], Any] = {}
+        self._capacity = capacity_bytes
+        self._bytes = 0
 
-    def get(self, key: tuple[int, int], build) -> Any:
-        gram = self._grams.get(key)
-        if gram is None:
-            gram = build()
-            self._grams[key] = gram
-        return gram
+    def get(self, key: tuple[int, bytes], build) -> Any:
+        held = self._grams.get(key)
+        if held is not None:
+            return held
+        built = build()
+        size = sum(int(part.nbytes) for part in built)
+        if self._capacity is None or self._bytes + size <= self._capacity:
+            self._grams[key] = built
+            self._bytes += size
+        return built
+
+    def clear(self) -> None:
+        self._grams.clear()
+        self._bytes = 0
 
 
 def sweep_piece(
@@ -170,7 +185,8 @@ def sweep_piece(
     covariate_pinv: Any,
     residual: Any,
     grams: PanelGrams,
-    key_base: tuple[int, int],
+    model: int,
+    members: np.ndarray,
     squares: Any,
     class_index: Any,
     log_density: Any,
@@ -195,7 +211,8 @@ def sweep_piece(
     small products in place of a general projection per panel (35% of a bench-sim Stage 2 [sim, scenario_001]);
     ``residual`` r (n);
     the per-member arrays are the piece's own slices, and ``pieces`` (width x 3) receives each member's KL term,
-    ||x_j||^2 v_j and the terms' sizes. ``key_base`` names the piece for the Gram cache."""
+    ||x_j||^2 v_j and the terms' sizes. ``model`` and ``members`` (the piece's member indices, host, in sweep order)
+    name each panel for the Gram cache."""
     kernel = _kernel(cupy)
     node_count = int(node_variance.shape[1])
     for first in range(0, width, PANEL):
@@ -208,7 +225,7 @@ def sweep_piece(
             projected = masked - covariates @ coupling
             return cupy.ascontiguousarray(projected.T @ projected), coupling
 
-        gram, coupling = grams.get((key_base[0], key_base[1] + first), build)
+        gram, coupling = grams.get((int(model), np.ascontiguousarray(members[first:last], dtype=np.int64).tobytes()), build)
         projection = cupy.ascontiguousarray(columns.T @ residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(

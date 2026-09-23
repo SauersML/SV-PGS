@@ -60,7 +60,7 @@ def test_the_device_sweep_is_the_host_sweep(members: int) -> None:
         dense = cupy.asarray(data["dense"])
         sweep_piece(
             cupy, decode=lambda first, last: dense[:, first:last], width=count, mask=cupy.asarray(data["mask"]), covariates=covariates, covariate_pinv=solve, residual=device_residual,
-            grams=grams, key_base=(0, 0), squares=cupy.asarray(data["squares"]), class_index=cupy.asarray(data["classes"]),
+            grams=grams, model=0, members=np.arange(len(data["squares"])), squares=cupy.asarray(data["squares"]), class_index=cupy.asarray(data["classes"]),
             log_density=cupy.asarray(data["log_density"]), node_variance=cupy.exp(cupy.asarray(data["log_node_variance"])),
             log_node_variance=cupy.asarray(data["log_node_variance"]), noise=noise, pieces=pieces, **device,
         )
