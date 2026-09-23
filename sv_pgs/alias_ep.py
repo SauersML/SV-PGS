@@ -14,8 +14,8 @@ of its tilted law from q's marginal, nats) is measured. EP has reached its fixed
 within the resolution 1 / (2 K) (less each sampled cluster's own Monte Carlo floor, the KL its moments' errors make in
 expectation) and q has stopped moving (the sweep's summed KL move of the groups' marginals within the resolution). A unit breaks the contract where its update is refused (no damping keeps every cavity finite) or where
 its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
-unit joins the unit of the group whose column is most correlated with its own, and the sweeps continue from the
-joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
+unit joins the unit of the group whose column is most correlated with its own, all failing units at once with their
+joins closed transitively (the links' connected components), and the sweeps continue from the joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
 leaves a residual above the resolution breaks it at once, the first sweep included: its step was damped because no
 single site that matches its tilted law keeps every cavity inside the domain, so one site cannot represent it (a
 near-flat cavity with a large pull [real, ENSG00000105612.9: residuals to 4e26]); joined to the block, its joint law
@@ -394,24 +394,35 @@ class AliasEP:
             members_of_unit = {g: np.array([g]) for g in range(self.group_count) if not sweep.clustered[g]}
             for index, groups in enumerate(clusters_now):
                 members_of_unit[self.group_count + index] = groups
-            joined: set[int] = set()
-            merges: list[tuple[int, int]] = []
+            # Every failing unit is joined at once with the unit its columns are most correlated with, and the joins
+            # are closed transitively: the connected components of those links are the new units (one step, not one
+            # merge per unit per sweep, which grew clusters only pairwise).
+            parent = {key: key for key in members_of_unit}
+
+            def root(key):
+                while parent[key] != key:
+                    parent[key] = parent[parent[key]]
+                    key = parent[key]
+                return key
+
             for key in sorted(failing):
-                if key in joined:
-                    continue
                 other = self._partner(members_of_unit[key], unit_of)
-                if other in joined or other == key:
-                    continue
-                merges.append((key, other))
-                joined.update((key, other))
+                if other != key:
+                    parent[root(key)] = root(other)
+            components: dict[int, list[int]] = {}
+            for key in members_of_unit:
+                components.setdefault(root(key), []).append(key)
+            joined = {key for parts in components.values() if len(parts) > 1 for key in parts}
             keep = [index for index in range(len(clusters_now)) if self.group_count + index not in joined]
             new_clusters = [clusters_now[index] for index in keep]
             new_coupling = [coupling_now[index] for index in keep]
-            for first, second in merges:
-                union = np.concatenate([members_of_unit[first], members_of_unit[second]])
+            for parts in components.values():
+                if len(parts) < 2:
+                    continue
+                union = np.concatenate([members_of_unit[key] for key in parts])
                 block = np.zeros((union.shape[0], union.shape[0]))
                 position = 0
-                for key in (first, second):
+                for key in parts:
                     size = members_of_unit[key].shape[0]
                     if key >= self.group_count:
                         block[position:position + size, position:position + size] = coupling_now[key - self.group_count]
