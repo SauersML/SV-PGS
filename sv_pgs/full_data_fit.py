@@ -2236,8 +2236,16 @@ def fit_full_data(
         )
         try:
             fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
-        except FloatingPointError as error:
-            raise FloatingPointError(f"{error}; ep refusals: {oracle.refusals}") from error
+        except FloatingPointError as warm_error:
+            # EP has no certified fixed point from mean field's point (its refusals say why): EP from the prior, as
+            # without the warm start.
+            log(f"ep: no certified fixed point from the mean-field start ({warm_error}; {oracle.refusals}): EP from the prior")
+            starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
+            oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise)
+            try:
+                fits = fit_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
+            except FloatingPointError as error:
+                raise FloatingPointError(f"{error}; ep refusals: {oracle.refusals}") from error
         fixed_points = oracle
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
