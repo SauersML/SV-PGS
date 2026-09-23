@@ -163,3 +163,23 @@ def test_device_eigensolver_bytes_cover_what_the_eigensolver_allocates() -> None
     cupy.linalg.eigvalsh(matrix)
     peak = pool.total_bytes() - before
     assert eigensolver_bytes(size, cupy) >= peak
+
+
+def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
+    """With more memory than any window needs, the width search returns the widest block there is to cut (bench-sim's
+    41,984-column Stage 0 blocks on an H100 asked cuSOLVER about a window it refuses) and never queries past it; on a
+    device, a size the eigensolver refuses reads as not fitting rather than raising."""
+    from sv_pgs.marginal_variances import window_width
+
+    assert window_width(1 << 62, np, 41_984) == 41_984
+    assert window_width(1 << 62, np, 1) == 1
+    try:
+        import cupy
+    except ImportError:
+        return
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        return
+    from sv_pgs.marginal_variances import eigensolver_bytes
+
+    assert window_width(1 << 62, cupy, 41_984) == 41_984
+    assert eigensolver_bytes(3 * 1_000_000, cupy) > 0
