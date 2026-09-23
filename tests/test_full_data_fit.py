@@ -16,7 +16,7 @@ from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringPlan, score_genetic
-from sv_pgs.full_data_fit import block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
+from sv_pgs.full_data_fit import _ridge_mean, block_grams, covariate_residual_variance, fit_full_data, moment_starts, scoring_models, stage0_lattice
 from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
 from sv_pgs.scale_mixture_ep import scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -178,6 +178,46 @@ def test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples(tmp_p
     np.testing.assert_allclose(scores.means[training, 0], expected, rtol=1e-8, atol=1e-8)
     assert np.corrcoef(scores.means[held_out, 0], genetic[held_out])[0, 1] > 0.5
     assert np.all(scores.variances[held_out, 0] > 0.0)
+
+def test_ridge_component_is_the_gaussian_members_posterior_mean(tmp_path: Path) -> None:
+    # ``_ridge_mean``: the dual solver at uniform Gaussian sites against the dense posterior mean
+    # D Xp' (Xp D Xp' + sigma^2 I)^-1 yp, D = diag(v e^o), on the covariate-projected training rows.
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 5)
+    training = np.arange(_TRAINING)
+    training_covariates = np.column_stack([np.ones(_TRAINING), covariate[training]])
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, training_covariates, targets[training, None],
+        ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    member_count = statistics.active_rows.shape[0]
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    offsets = np.random.default_rng(3).normal(scale=0.5, size=member_count)
+    start_noise = float(covariate_residual_variance(targets[:, None], mask, store_covariates)[0])
+    nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(member_count, dtype=np.int64), log_variance_offset=offsets, annotation_design=np.zeros((member_count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+    gaussian = DualGaussian(
+        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+        grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
+    )
+    moments = moment_starts(statistics, prior)
+    mean = _ridge_mean(gaussian, statistics, prior, moments, _DRAWS)[:, 0]
+    signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
+    standardized = ((signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]).T[training]
+    projection = np.eye(_TRAINING) - training_covariates @ np.linalg.pinv(training_covariates)
+    design, target = projection @ standardized, projection @ targets[training]
+    prior_variance = float(moments[0].mean_variance) * np.exp(offsets)
+    expected = prior_variance * (design.T @ np.linalg.solve((design * prior_variance) @ design.T + float(moments[0].noise) * np.eye(_TRAINING), target))
+    # The solver's certificate is in the posterior precision's norm, to the draws' resolution.
+    precision = design.T @ design / float(moments[0].noise) + np.diag(1.0 / prior_variance)
+    difference = mean - expected
+    assert float(difference @ precision @ difference) <= 1.0 / _DRAWS
+
 
 def test_block_grams_share_stage0s_float32_arrays_across_models(tmp_path: Path) -> None:
     from dataclasses import replace

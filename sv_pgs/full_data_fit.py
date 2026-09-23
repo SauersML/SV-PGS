@@ -932,7 +932,7 @@ class _FullDataMeanField:
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
-        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None,
+        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
     ) -> None:
         self.gaussian = gaussian
         self.prior = prior
@@ -990,6 +990,11 @@ class _FullDataMeanField:
         self.undecided_blocks = 0
         self.information: list = []
         self._panel_grams = PanelGrams()
+        if start_mean is not None:
+            # A data start (``_mode_mixture``'s ridge component): q's means there and the residual they leave.
+            self.mean[...] = np.asarray(start_mean, dtype=np.float64)
+            for model in range(model_count):
+                self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
         self._cold = self._snapshot()
         # Each model's highest-ELBO refreshed state and its hyperparameters (``mean_field.MeanFieldFixedPoints.best``):
         # the outer loop's objective is not the ELBO and can end below a state it visited.
@@ -1405,7 +1410,9 @@ def fit_full_data(
     member_mean = component_weights = None
     if mean_field is not None:
         hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
-        member_mean, components, component_weights = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters)
+        member_mean, components, component_weights = _mode_mixture(
+            mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments,
+        )
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
@@ -1455,17 +1462,40 @@ def fit_full_data(
     )
 
 
+def _ridge_mean(
+    gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, moments: Sequence[MomentStart], draw_count: int,
+) -> F64Array:
+    """Each model's members' posterior means under the prior family's Gaussian member, beta_j ~ N(0, v u_j) with v the
+    moment start's mean variance (``moment_starts``, the heritability's moment estimate) and u_j = e^(o_j): the dense
+    end of the architectures, solved by the dual solver at uniform Gaussian sites. Tied members split their group's
+    mean by their prior variances (the Gaussian posterior's split between identical columns)."""
+    ties = TieGroups.from_tie_map(statistics.tie_map)
+    offsets = np.exp(np.asarray(prior.log_variance_offset, dtype=np.float64))
+    variances = np.array([float(moment.mean_variance) for moment in moments])
+    precision = 1.0 / (offsets[:, None] * variances[None, :])
+    shift = np.zeros_like(precision)
+    group_precision, group_shift = group_sites(ties, precision, shift)
+    gaussian.iterate(
+        site_precision=group_precision, site_shift=group_shift, noise_variance=np.array([float(moment.noise) for moment in moments]),
+        error_bound=np.full(len(moments), np.sqrt(1.0 / draw_count)), probe_residual_ratio=_HALF_PRECISION,
+    )
+    group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
+    mean, _variance = member_moments(ties, precision, shift, group_mean, np.zeros_like(group_mean))
+    return mean
+
+
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
-    working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...],
+    working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
 ) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...], F64Array]:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
     random within-block member orders, each weighted per model by its evidence, exp(ELBO) (``small_n._mixture_weights``:
     a poor fixed point carries no weight), until one more moves every model's fitted genetic values by at most the
-    draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component, and its dual-solver
-    state is put back at the end. Returns the weighted mean, each component's (shift, omega) and the weights."""
+    draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component and the fixed point from
+    the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are given) the second, and the main fixed
+    point's dual-solver state is put back at the end. Returns the weighted mean, each component's (shift, omega) and the weights."""
     def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
         return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
 
@@ -1480,6 +1510,19 @@ def _mode_mixture(
         return np.einsum("cm,cjm->jm", weights, np.array(means)), weights
 
     average, _weights = weighted()
+    if moments:
+        # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
+        # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
+        # the evidence weights decide between the basins.
+        ridge = _FullDataMeanField(
+            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(),
+            start_mean=_ridge_mean(gaussian, statistics, prior, moments, draw_count),
+        )
+        points = ridge(list(hyperparameters))
+        if not any(point is None for point in points):
+            mean, shift, omega = pieces(ridge)
+            means.append(mean); components.append((shift, omega)); elbos.append(np.array(ridge.elbo, dtype=np.float64))
+            average, _weights = weighted()
     component = 0
     while True:
         component += 1
