@@ -248,3 +248,114 @@ def decode(priors: GroupPriors, cavity_precision: F64Array, cavity_shift: F64Arr
     mean = (np.bincount(priors.exchangeable, weights=mean) / counts)[priors.exchangeable]
     variance = (np.bincount(priors.exchangeable, weights=variance) / counts)[priors.exchangeable]
     return mean, variance, proper
+
+
+@numba.njit(cache=True, error_model="numpy")
+def cluster_tilted(counts, log_weight, log_variance, precision, shift):
+    """(proper, log Z, mean, covariance) of a cluster's joint tilted law by enumeration of its component tuples: the
+    cluster's m sums, each with its own induced prior (``counts[i]`` components, packed in order in ``log_weight`` and
+    ``log_variance``), times the joint cavity exp(-T' Lambda T / 2 + h' T). Given a tuple the law is Gaussian with
+    precision D^-1 + Lambda (D = diag V, D^-1 = 0 where V overflows) and mean (D^-1 + Lambda)^-1 h, and its integral is
+    det(I + D^1/2 Lambda D^1/2)^-1/2 exp(h' (D^-1 + Lambda)^-1 h / 2) with log det(I + D^1/2 Lambda D^1/2) = sum log V +
+    log det(D^-1 + Lambda). The law is proper exactly where D^-1 + Lambda is positive definite at every tuple, i.e. at
+    the tuple of each sum's largest variance."""
+    size = counts.shape[0]
+    offsets = np.zeros(size + 1, dtype=np.int64)
+    for i in range(size):
+        offsets[i + 1] = offsets[i] + counts[i]
+    index = np.zeros(size, dtype=np.int64)
+    mean = np.zeros(size)
+    second = np.zeros((size, size))
+    largest = -np.inf
+    total = 0.0
+    matrix = np.empty((size, size))
+    while True:
+        log_prior = 0.0
+        log_det_variance = 0.0
+        for i in range(size):
+            c = offsets[i] + index[i]
+            log_prior += log_weight[c]
+            log_det_variance += log_variance[c]
+        for i in range(size):
+            for j in range(size):
+                matrix[i, j] = precision[i, j]
+            c = offsets[i] + index[i]
+            matrix[i, i] += np.exp(-log_variance[c])
+        # Cholesky by hand: positive definite or the law is improper.
+        lower = np.zeros((size, size))
+        for i in range(size):
+            for j in range(i + 1):
+                value = matrix[i, j]
+                for k in range(j):
+                    value -= lower[i, k] * lower[j, k]
+                if i == j:
+                    if not value > 0.0:
+                        return False, 0.0, mean, second
+                    lower[i, i] = np.sqrt(value)
+                else:
+                    lower[i, j] = value / lower[j, j]
+        forward = np.empty(size)
+        for i in range(size):
+            value = shift[i]
+            for k in range(i):
+                value -= lower[i, k] * forward[k]
+            forward[i] = value / lower[i, i]
+        location = np.empty(size)
+        for i in range(size - 1, -1, -1):
+            value = forward[i]
+            for k in range(i + 1, size):
+                value -= lower[k, i] * location[k]
+            location[i] = value / lower[i, i]
+        log_det = 0.0
+        quadratic = 0.0
+        for i in range(size):
+            log_det += 2.0 * np.log(lower[i, i])
+            quadratic += forward[i] * forward[i]
+        log_term = log_prior - 0.5 * (log_det_variance + log_det) + 0.5 * quadratic
+        # The tuple's covariance (D^-1 + Lambda)^-1 from the factor.
+        inverse = np.zeros((size, size))
+        for column in range(size):
+            unit = np.zeros(size)
+            unit[column] = 1.0
+            for i in range(size):
+                value = unit[i]
+                for k in range(i):
+                    value -= lower[i, k] * unit[k]
+                unit[i] = value / lower[i, i]
+            for i in range(size - 1, -1, -1):
+                value = unit[i]
+                for k in range(i + 1, size):
+                    value -= lower[k, i] * unit[k]
+                unit[i] = value / lower[i, i]
+            for i in range(size):
+                inverse[i, column] = unit[i]
+        if log_term > largest:
+            scale = np.exp(largest - log_term) if largest > -np.inf else 0.0
+            total *= scale
+            for i in range(size):
+                mean[i] *= scale
+                for j in range(size):
+                    second[i, j] *= scale
+            largest = log_term
+        weight = np.exp(log_term - largest)
+        total += weight
+        for i in range(size):
+            mean[i] += weight * location[i]
+            for j in range(size):
+                second[i, j] += weight * (inverse[i, j] + location[i] * location[j])
+        # The next tuple (mixed radix).
+        position = 0
+        while position < size:
+            index[position] += 1
+            if index[position] < counts[position]:
+                break
+            index[position] = 0
+            position += 1
+        if position == size:
+            break
+    for i in range(size):
+        mean[i] /= total
+    for i in range(size):
+        for j in range(size):
+            second[i, j] = second[i, j] / total - mean[i] * mean[j]
+    return True, largest + np.log(total), mean, second
