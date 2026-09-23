@@ -135,7 +135,65 @@ extern "C" __global__ void panel_sweep(
 }
 """
 
+_CODE_SOURCE = r"""
+// A panel's products read straight from the held int8 codes, standardized on the fly: x_j = s_j (c_j - mu_j) / sigma_j
+// with c_j the code row rows[j] of the tile, s_j the member's tie sign. Neither forms the float64 columns.
+extern "C" __global__ void panel_project(
+    const signed char* __restrict__ codes, const long long stride, const long long* __restrict__ rows, const int sample_count,
+    const double* __restrict__ mask, const double* __restrict__ residual, const double* __restrict__ means,
+    const double* __restrict__ scales, const double* __restrict__ signs, double* __restrict__ out
+) {
+    // out_j = x_j' M r, one block per member: sum_i c_ji w_i and sum_i w_i with w = M r, then the standardization.
+    __shared__ double products[PROJECT_THREADS];
+    __shared__ double totals[PROJECT_THREADS];
+    const int j = blockIdx.x;
+    const long long row = rows[j];
+    const signed char* code = codes + row * stride;
+    double product = 0.0, total = 0.0;
+    for (int i = threadIdx.x; i < sample_count; i += blockDim.x) {
+        const double weighted = mask[i] * residual[i];
+        product += (double)code[i] * weighted;
+        total += weighted;
+    }
+    products[threadIdx.x] = product;
+    totals[threadIdx.x] = total;
+    __syncthreads();
+    for (int half = blockDim.x / 2; half > 0; half /= 2) {
+        if (threadIdx.x < half) {
+            products[threadIdx.x] += products[threadIdx.x + half];
+            totals[threadIdx.x] += totals[threadIdx.x + half];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) out[j] = signs[j] * (products[0] - means[row] * totals[0]) / scales[row];
+}
+
+extern "C" __global__ void panel_apply(
+    const signed char* __restrict__ codes, const long long stride, const long long* __restrict__ rows, const int width,
+    const int sample_count, const double* __restrict__ step, const double* __restrict__ means, const double* __restrict__ scales,
+    const double* __restrict__ signs, const double* __restrict__ mask, const double* __restrict__ covariates,
+    const double* __restrict__ covariate_step, const int covariate_count, double* __restrict__ residual
+) {
+    // r -= M X_P s - (M C) u, u = A s (``sweep_piece``), one thread per sample.
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= sample_count) return;
+    double moved = 0.0;
+    for (int j = 0; j < width; ++j) {
+        const long long row = rows[j];
+        moved += signs[j] * step[j] * ((double)codes[row * stride + i] - means[row]) / scales[row];
+    }
+    double covariate = 0.0;
+    for (int c = 0; c < covariate_count; ++c) covariate += covariates[(long long)i * covariate_count + c] * covariate_step[c];
+    residual[i] -= moved * mask[i] - covariate;
+}
+"""
+
+PROJECT_THREADS = 1024
+"""Threads per block in the code kernels: CUDA's maximum threads per block (a power of two, which the tree reduction
+halves), so one block covers the most samples per pass that a block can."""
+
 _KERNELS: dict[int, Any] = {}
+_CODE_KERNELS: dict[int, tuple[Any, Any]] = {}
 
 
 def _kernel(cupy: Any) -> Any:
@@ -143,6 +201,60 @@ def _kernel(cupy: Any) -> Any:
     if device not in _KERNELS:
         _KERNELS[device] = cupy.RawKernel(_SOURCE, "panel_sweep", options=("--std=c++11",))
     return _KERNELS[device]
+
+
+def _code_kernels(cupy: Any) -> tuple[Any, Any]:
+    device = int(cupy.cuda.runtime.getDevice())
+    if device not in _CODE_KERNELS:
+        source = _CODE_SOURCE.replace("PROJECT_THREADS", str(PROJECT_THREADS))
+        _CODE_KERNELS[device] = (
+            cupy.RawKernel(source, "panel_project", options=("--std=c++11",)),
+            cupy.RawKernel(source, "panel_apply", options=("--std=c++11",)),
+        )
+    return _CODE_KERNELS[device]
+
+
+class CodePanels:
+    """A piece's panel products read from its tile's held int8 codes (``code_products.CodeBlockTile``): c_P = X_P' M r
+    and the residual's move r -= M X_P s - (M C) A s, each one kernel over the codes, never forming X_P in float64.
+
+    A sweep reads every column twice per pass (c_P, then the move), so where the columns were decoded each time a
+    sweep moved 8 bytes per entry through the device three times over (decoded, read, read again) against 1 byte of
+    code: decoding was 35% of a genome fit's stage 2 and the panel products most of the rest (bench-sim 015 [sim],
+    py-spy). ``rows`` are the members' tile rows, ``signs`` their tie signs, both in sweep order."""
+
+    def __init__(self, cupy: Any, tile: Any, rows: Any, signs: Any) -> None:
+        self.cupy = cupy
+        self.codes = tile.aligned_codes
+        self.stride = int(self.codes.shape[1])
+        self.sample_count = int(tile.sample_count)
+        self.means = cupy.ascontiguousarray(cupy.asarray(tile.means, dtype=cupy.float64))
+        self.scales = cupy.ascontiguousarray(cupy.asarray(tile.scales, dtype=cupy.float64))
+        self.rows = cupy.ascontiguousarray(cupy.asarray(rows, dtype=cupy.int64))
+        self.signs = cupy.ascontiguousarray(cupy.asarray(signs, dtype=cupy.float64))
+        self.project_kernel, self.apply_kernel = _code_kernels(cupy)
+
+    @staticmethod
+    def supports(tile: Any) -> bool:
+        return all(hasattr(tile, name) for name in ("aligned_codes", "means", "scales", "sample_count"))
+
+    def project(self, first: int, last: int, mask: Any, residual: Any) -> Any:
+        out = self.cupy.empty(last - first, dtype=self.cupy.float64)
+        self.project_kernel(
+            (last - first,), (PROJECT_THREADS,),
+            (self.codes, np.int64(self.stride), self.rows[first:last], np.int32(self.sample_count), mask, residual,
+             self.means, self.scales, self.signs[first:last], out),
+        )
+        return out
+
+    def apply(self, first: int, last: int, step: Any, mask: Any, covariates: Any, covariate_step: Any, residual: Any) -> None:
+        threads = PROJECT_THREADS
+        self.apply_kernel(
+            (-(-self.sample_count // threads),), (threads,),
+            (self.codes, np.int64(self.stride), self.rows[first:last], np.int32(last - first), np.int32(self.sample_count),
+             step, self.means, self.scales, self.signs[first:last], mask, covariates, covariate_step,
+             np.int32(covariates.shape[1]), residual),
+        )
 
 
 class PanelGrams:
@@ -212,6 +324,7 @@ def sweep_piece(
     third: Any,
     fourth: Any,
     pieces: Any,
+    panels: CodePanels | None = None,
 ) -> None:
     """One sweep over a piece's columns in order, in place on the device.
 
@@ -227,21 +340,23 @@ def sweep_piece(
     the per-member arrays are the piece's own slices, and ``pieces`` (width x 3) receives each member's KL term,
     ||x_j||^2 v_j and the terms' sizes. ``model``, ``metric`` (the weights' key: a binary model's Grams belong to one
     set of Polya-Gamma weights) and ``members`` (the piece's member indices, host, in sweep order) name each panel for
-    the Gram cache."""
+    the Gram cache. With ``panels`` (``CodePanels``) the panel products read the codes and ``decode`` runs only to
+    build a Gram the cache does not hold."""
     kernel = _kernel(cupy)
     node_count = int(node_variance.shape[1])
     for first in range(0, width, PANEL):
         last = min(first + PANEL, width)
-        columns = decode(first, last)
+        columns = decode(first, last) if panels is None else None
 
-        def build(columns=columns):
+        def build(columns=columns, first=first, last=last):
+            columns = decode(first, last) if columns is None else columns
             masked = columns * mask[:, None]
             coupling = cupy.ascontiguousarray(covariate_pinv @ (covariates.T @ masked))
             projected = masked - covariates @ coupling
             return cupy.ascontiguousarray(projected.T @ projected), coupling
 
         gram, coupling = grams.get((int(model), metric, np.ascontiguousarray(members[first:last], dtype=np.int64).tobytes()), build)
-        projection = cupy.ascontiguousarray(columns.T @ (mask * residual))
+        projection = cupy.ascontiguousarray(columns.T @ (mask * residual)) if panels is None else panels.project(first, last, mask, residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(
             (1,), (PANEL,),
@@ -252,4 +367,7 @@ def sweep_piece(
                 pieces[first:last],
             ),
         )
-        residual -= (columns @ step) * mask - covariates @ (coupling @ step)
+        if panels is None:
+            residual -= (columns @ step) * mask - covariates @ (coupling @ step)
+        else:
+            panels.apply(first, last, step, mask, covariates, cupy.ascontiguousarray(coupling @ step), residual)

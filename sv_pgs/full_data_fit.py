@@ -64,7 +64,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
+from sv_pgs.device_sweep import PIECE_COLUMNS, CodePanels, PanelGrams, sweep_piece
 from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate_evidence
 from sv_pgs.draw_laws import ProductMixtureDraws, seed_key, tile_rows
 from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, column_squares
@@ -1819,6 +1819,7 @@ class _FullDataMeanField:
                 squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
                 log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
                 pieces=piece_parts, **piece_state,
+                panels=CodePanels(cupy, tile, local_device, member_signs) if CodePanels.supports(tile) else None,
             )
             for name, values in piece_state.items():
                 state[name][rows] = values

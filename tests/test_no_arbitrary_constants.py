@@ -123,6 +123,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('lasso_path.py', 'DEVIANCE_CHANGE'): ('spec', frozenset({1e-5}), 'glmnet default fdev: the path stops on a smaller fractional deviance change (glmnet.control)'),
     ('lasso_path.py', 'DEVIANCE_MAX'): ('spec', frozenset({0.999}), 'glmnet default devmax: the path stops past this deviance ratio (glmnet.control)'),
     ('device_sweep.py', 'PANEL'): ('spec', frozenset({32}), 'the CUDA warp width (CUDA C++ Programming Guide, warpSize = 32): one lane per panel member, and the shuffles reduce across it'),
+    ('device_sweep.py', 'PROJECT_THREADS'): ('spec', frozenset({1024}), "CUDA's maximum threads per block (CUDA C++ Programming Guide, maxThreadsPerBlock = 1024 for every compute capability >= 2.0), a power of two as the tree reduction needs"),
     ('device_sweep.py', 'PIECE_COLUMNS'): ('definitional', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),
     ('marginal_variances.py', 'window_width.fits'): ('definitional', frozenset({3}), 'a window is a block and its two neighbours, b - 1, b and b + 1 (_window_blocks)'),
     ('marginal_variances.py', 'window_width.fits.within'): ('definitional', frozenset({3}), 'a window is a block and its two neighbours, b - 1, b and b + 1 (_window_blocks)'),
