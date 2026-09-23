@@ -36,12 +36,26 @@ digit split, exact zeros kept); relative_error 0 means the exact products.
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
 
 import numpy as np
 
 from sv_pgs.marginal_variances import BlockGrams, BulkSolve, KernelFactor, WindowCross, exact_block_information
+from sv_pgs.memory_broker import HOST, current_broker
+
+_DUAL_LIVE_COLUMN_ARRAYS = (
+    "right-hand sides", "start", "previous duals", "solution", "residual", "direction blocks", "stacked directions", "image",
+    "candidate", "next directions",
+)
+"""The n x columns arrays ``DualGaussian.iterate`` holds at once: its stacked right-hand sides, the start, the duals kept
+from the last call, and ``certified_block_cg``'s solution, residual, per-model direction blocks, their concatenation, the
+operator's image, the conjugation candidate and the next orthonormal directions."""
+_DUAL_SAMPLE_ARRAYS = ("training", "targets", "offsets", "sample weights", "genetic image")
+"""``DualGaussian``'s samples x models arrays for its lifetime."""
+_DUAL_MEMBER_ARRAYS = ("mean", "unit squares")
+"""``DualGaussian``'s variants x models arrays for its lifetime."""
 
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
@@ -1138,6 +1152,20 @@ class DualGaussian:
         sample_weights: Any = None,
     ) -> None:
         array_module = source.array_module
+        broker = current_broker()
+        if broker is not None and array_module is np:
+            # The Gaussian's own host arrays for its lifetime, charged to the shared ledger before they are formed (on a
+            # device the ledger's allocator meters them): per model, the samples' training mask, targets, offsets and
+            # likelihood weights (a binary model's, which ``reweight`` replaces in place of size) and the genetic image,
+            # its probes (samples x probes), and its members' mean and column squares.
+            sample_count, model_count = np.shape(training)
+            lease = broker.reserve(
+                HOST, np.dtype(np.float64).itemsize * (
+                    len(_DUAL_SAMPLE_ARRAYS) * sample_count * model_count + sample_count * model_count * int(probe_count)
+                    + len(_DUAL_MEMBER_ARRAYS) * source.variant_count * model_count
+                ), "the dual Gaussian's arrays",
+            )
+            weakref.finalize(self, lease.release)
         self.source = source
         self.windows = _WindowLayout(grams, source)
         self.array_module = array_module
@@ -1190,7 +1218,16 @@ class DualGaussian:
         self.metric_key = key
         self._duals = None
 
-    def iterate(
+    def iterate(self, **arguments: Any) -> DualCertificate:
+        """``_iterate`` (below), with the host lease it takes released however it ends."""
+        try:
+            return self._iterate(**arguments)
+        finally:
+            lease, self._iterate_lease = getattr(self, "_iterate_lease", None), None
+            if lease is not None:
+                lease.release()
+
+    def _iterate(
         self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float,
         indefinite_core: bool = False,
     ) -> DualCertificate:
@@ -1238,6 +1275,15 @@ class DualGaussian:
         column_models = np.concatenate(
             [np.arange(self.model_count)] + [np.full(int(designs[model].shape[1]), model) for model in order] + [self.probe_models]
         )
+        broker = current_broker()
+        if broker is not None and array_module is np:
+            # The solve's sample-side arrays on the host (``_DUAL_LIVE_COLUMN_ARRAYS``, n x columns float64 each), charged
+            # to the shared ledger before they are formed and released when ``iterate`` returns (on a device the ledger's
+            # allocator meters them).
+            self._iterate_lease = broker.reserve(
+                HOST, len(_DUAL_LIVE_COLUMN_ARRAYS) * np.dtype(np.float64).itemsize * source.sample_count * int(column_models.shape[0]),
+                "the dual solve's sample-side arrays",
+            )
         stacked = array_module.concatenate(blocks, axis=1)
         widths = [self.model_count] + [int(designs[model].shape[1]) for model in order] + [int(self.probes.shape[1])]
         offsets = np.concatenate([[0], np.cumsum(widths)])

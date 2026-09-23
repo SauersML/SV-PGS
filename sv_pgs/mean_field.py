@@ -90,6 +90,7 @@ from scipy import linalg
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs import engine_kernels
+from sv_pgs.draw_laws import ProductMixtureDraws, tile_rows
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
     Cavity,
@@ -97,9 +98,7 @@ from sv_pgs.scale_mixture_ep import (
     GaussianPosterior,
     MixtureHyperparameters,
     ScaleMixturePrior,
-    _components,
     _data_value,
-    _row_chunks,
     class_log_density,
     log_scale,
     noise_gain,
@@ -107,6 +106,7 @@ from sv_pgs.scale_mixture_ep import (
 )
 from sv_pgs.binary_likelihood import BernoulliSites, covariate_evidence
 from sv_pgs.small_n import DenseStatistics, _Design, _new_profile, weighted_statistics
+from sv_pgs.full_data_fit import SweepBudget, elbo_ceiling, noise_floor
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -724,6 +724,13 @@ class MeanFieldFixedPoints:
         parallel = self._device() is not None
         direction: F64Array | None = None
         promised = 0.0
+        # The derived work budget (``full_data_fit.SweepBudget``): the ELBO ceiling at the noise floor of the prior's
+        # smallest lattice variance per member at these hyperparameters; for a binary trait the ELBO bounds the
+        # Bernoulli log marginal likelihood, the log probability of the observed outcomes, so its ceiling is 0.
+        smallest = np.exp(log_scale(self.prior, hyperparameters.coefficients) + float(np.min(self.prior.log_variance_grid)))
+        floor = noise_floor(self.member_squares, smallest, float(self.residual_dimension), float(self.noise))
+        ceiling = 0.0 if self.sites is not None else elbo_ceiling(float(self.residual_dimension), floor)
+        budget = SweepBudget(ceiling=ceiling, tolerance=tolerance)
         while True:
             if sweep_budget is not None and self.profile["sweeps"] - sweeps_at_entry >= sweep_budget:
                 raise _SweepBudget()
@@ -794,6 +801,12 @@ class MeanFieldFixedPoints:
                     # against a stale decrement above the tolerance, until the run was killed).
                     corrections = False
             self.profile["elbo"] = value
+            if budget.exhausted(value, rounding):
+                self.profile["unresolved_solves"] = self.profile.get("unresolved_solves", 0) + 1
+                raise FloatingPointError(
+                    f"the mean-field solve spent its derived work budget ({budget.iterations} iterations against the ELBO ceiling "
+                    f"{budget.ceiling:.6g} from {budget.first:.6g} in steps of at least {budget.step:.3g}): unresolved"
+                )
             gap = self._stale_gap()
             newton: float | None = None
             if corrections and self._response is not None:
@@ -1000,35 +1013,49 @@ class MeanFieldFixedPoints:
         posterior's 20 along [1, -1] and 1.05 along [1, 1]), and the hyperparameters are held fixed, so the draws
         carry the posterior's marginal spread per member and no joint-posterior or predictive-interval coverage.
 
-        The rows are taken in pieces whose per-row intermediates fit ``working_bytes``
-        (``scale_mixture_ep._row_chunks``): the widest of them are the kernel's node-wide forms and the sampler's
-        draw-wide arrays, so the width to budget is their sum. ``_sample_nodes`` samples by inverse CDF inside a
-        piece, so nothing of the size (rows x nodes x draws) is ever formed. A piece boundary moves which value of
-        the generator's stream lands where, so the law is preserved and the numbers are not."""
-        return product_draws(
-            self.prior, hyperparameters.coefficients, self.member_squares / self.noise, self.shift, self.class_index, generator, draw_count, self.working_bytes
+        The law is ``product_law``'s, keyed from ``generator``; the small-n route holds its draws as a matrix (its
+        mixture has joint Gaussian components, and the dense router bounds its size), filled a tile of rows at a time
+        whose working rows fit ``working_bytes`` (``draw_laws.tile_rows``), so nothing of the size (rows x nodes x
+        draws) is ever formed. The draws are counter-based, so the tiling moves no number: any budget gives the same
+        matrix."""
+        law = product_law(
+            self.prior, hyperparameters.coefficients, (self.member_squares / self.noise)[None, :], self.shift[None, :], self.class_index,
+            generator_key(generator), draw_count,
         )
+        return materialized(law, self.working_bytes)
 
 
-def product_draws(
+def generator_key(generator: np.random.Generator) -> tuple[int, int]:
+    """A Philox key (two 32-bit words) drawn from ``generator``, so a caller's generator still decides the draws."""
+    words = generator.integers(np.iinfo(np.uint32).max, size=2, dtype=np.uint64, endpoint=True)
+    return int(words[0]), int(words[1])
+
+
+def product_law(
     prior: ScaleMixturePrior, coefficients: F64Array, omega: F64Array, shift: F64Array, class_index: I64Array,
-    generator: np.random.Generator, draw_count: int, working_bytes: int,
-) -> F64Array:
-    """``MeanFieldFixedPoints.draws`` for any product q given by its pseudo-likelihoods (omega, shift) per member:
-    the dense route's and the streamed full-data route's are one function."""
-    count = int(draw_count)
-    log_density = class_log_density(prior, coefficients)
-    scales = log_scale(prior, coefficients)
-    draws = np.empty((prior.variant_count, count))
-    for class_position in range(log_density.shape[0]):
-        rows = np.flatnonzero(class_index == class_position)
-        if rows.size == 0:
-            continue
-        for piece in _row_chunks(rows, prior.grid_size + count, working_bytes):
-            terms = _components(log_density[class_position], scales[piece], prior.log_variance_grid, omega[piece], shift[piece])
-            uniform = generator.random((piece.shape[0], count))
-            nodes = np.empty((piece.shape[0], count), dtype=np.int64)
-            _sample_nodes(np.ascontiguousarray(terms.responsibility), uniform, nodes)
-            conditional = np.take_along_axis(terms.conditional_variance, nodes, axis=1)
-            draws[piece] = shift[piece][:, None] * conditional + np.sqrt(conditional) * generator.standard_normal(conditional.shape)
-    return draws
+    key: tuple[int, int], draw_count: int, weights: F64Array | None = None,
+) -> ProductMixtureDraws:
+    """The law of a mixture of products q = sum_c w_c prod_j q_cj given by each component's pseudo-likelihoods,
+    omega_cj = ||x_j||^2 / sigma_c^2 in its own metric and h_cj (``omega``, ``shift``: components x members): the dense
+    route's, the streamed full-data route's and every scorer's one law (``draw_laws.ProductMixtureDraws``),
+    O(components x members) in size; its draws exist only as the tiles asked of it. One component unless ``weights``."""
+    shifts = np.atleast_2d(np.asarray(shift, dtype=np.float64))
+    components = shifts.shape[0]
+    return ProductMixtureDraws(
+        class_index=np.asarray(class_index, dtype=np.int64), log_scale=log_scale(prior, coefficients),
+        omega=np.atleast_2d(np.asarray(omega, dtype=np.float64)), log_density=class_log_density(prior, coefficients),
+        log_variance_grid=np.asarray(prior.log_variance_grid, dtype=np.float64), shift=shifts,
+        weights=np.full(components, 1.0 / components) if weights is None else np.asarray(weights, dtype=np.float64),
+        key=key, draw_count=int(draw_count),
+    )
+
+
+def materialized(law: ProductMixtureDraws, working_bytes: int) -> F64Array:
+    """Every row of ``law``'s draws as one (p x K) matrix, filled a tile of rows at a time within ``working_bytes``."""
+    rows, count = law.shape
+    out = np.empty((rows, count))
+    step = tile_rows(law, working_bytes)
+    for first in range(0, rows, step):
+        last = min(first + step, rows)
+        out[first:last] = law.tile(first, last)
+    return out

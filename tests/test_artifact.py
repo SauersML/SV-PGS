@@ -125,7 +125,7 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     np.testing.assert_array_equal(loaded.noise_variance, model.noise_variance)
     for original, restored in zip(model.scoring, loaded.scoring, strict=True):
         for field_name in ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha", "covariate_draws", "covariate_covariance"):
-            np.testing.assert_array_equal(getattr(restored, field_name), getattr(original, field_name))
+            np.testing.assert_array_equal(np.asarray(getattr(restored, field_name)), np.asarray(getattr(original, field_name)))
         assert restored.predictive_intercept_shift == original.predictive_intercept_shift
         assert restored.gaussian_posterior == original.gaussian_posterior
     for original, restored in zip(model.hyperparameters, loaded.hyperparameters, strict=True):
@@ -134,6 +134,29 @@ def test_a_saved_model_loads_back_exactly(tmp_path: Path, store_root: Path) -> N
     assert sorted(loaded.certificate) == sorted(model.certificate)
     for name, values in model.certificate.items():
         np.testing.assert_array_equal(loaded.certificate[name], values)
+
+
+def test_a_product_mixture_law_is_saved_as_its_parameters_and_draws_the_same_numbers(tmp_path: Path, store_root: Path) -> None:
+    """The mean-field route's draws are a law (``draw_laws.ProductMixtureDraws``): the artifact holds its O(components x
+    rows) parameters, never the rows x K draws, and the loaded law draws exactly what the saved one draws."""
+    from sv_pgs.draw_laws import ProductMixtureDraws
+
+    model = _model(np.random.default_rng(3), store_root)
+    first = model.scoring[0]
+    rows, draws = first.store_rows.shape[0], first.draw_count
+    generator = np.random.default_rng(5)
+    law = ProductMixtureDraws(
+        class_index=np.zeros(rows, dtype=np.int64), log_scale=generator.normal(-3.0, 0.5, rows), omega=generator.uniform(50.0, 100.0, (2, rows)),
+        log_density=np.log(np.full((1, 7), 1.0 / 7.0)), log_variance_grid=np.linspace(-6.0, 2.0, 7),
+        shift=generator.normal(size=(2, rows)), weights=np.array([0.7, 0.3]), key=(11, 12), draw_count=draws,
+    )
+    model = replace(model, scoring=(replace(first, posterior_draws=law), *model.scoring[1:]))
+    save_model(tmp_path / "model", model)
+    with np.load(tmp_path / "model" / "arrays.npz") as archive:
+        assert not any(archive[name].size >= rows * draws for name in archive.files if name.startswith("scoring/0/draw_law/"))
+    loaded = load_model(tmp_path / "model").scoring[0].posterior_draws
+    assert isinstance(loaded, ProductMixtureDraws)
+    np.testing.assert_array_equal(loaded.tile(0, rows), law.tile(0, rows))
 
 
 def test_a_model_needs_a_well_formed_certificate_with_its_fit_status(tmp_path: Path, store_root: Path) -> None:
@@ -210,7 +233,7 @@ def test_prediction_equals_the_standardized_scores_read_from_the_store(tmp_path:
     for index, scoring in enumerate(model.scoring):
         standardized = (signed[scoring.store_rows][:, samples] - scoring.signed_means[:, None]) / scoring.signed_scales[:, None]
         genetic = standardized.T @ scoring.coefficients
-        draw_scores = standardized.T @ scoring.posterior_draws
+        draw_scores = standardized.T @ np.asarray(scoring.posterior_draws)
         variance = np.mean(np.square(draw_scores - genetic[:, None]), axis=1)
         linear = genetic + scoring.alpha[0] + covariates @ scoring.alpha[1:]
         rounding = np.finfo(np.float64).eps * (np.abs(standardized.T) @ np.abs(scoring.coefficients) + np.abs(linear)) * store.n_variants

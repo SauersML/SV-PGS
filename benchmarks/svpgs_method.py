@@ -178,7 +178,7 @@ def _restricted(scoring: ScoringModel, members: np.ndarray) -> ScoringModel:
         signed_means=scoring.signed_means[members],
         signed_scales=scoring.signed_scales[members],
         coefficients=scoring.coefficients[members],
-        posterior_draws=scoring.posterior_draws[members],
+        posterior_draws=scoring.posterior_draws.subset(members),
     )
 
 
@@ -248,7 +248,7 @@ class BenchSimModel:
 
     def score(self, test: Any) -> dict[str, np.ndarray]:
         models = [self.total] if self.structural is None else [self.total, self.structural]
-        genetic = score_genetic(_HarnessCodes(test, self.records), ScoringPlan.from_models(models), self.budget)
+        genetic = score_genetic(_HarnessCodes(test, self.records), ScoringPlan.from_models(models), self.budget, draws="none")
         structural = genetic.means[:, 1] if self.structural is not None else np.zeros(test.n_samples)
         return {"total": genetic.means[:, 0], "structural": structural}
 

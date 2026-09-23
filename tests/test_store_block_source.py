@@ -154,3 +154,57 @@ def test_cuda_reads_after_the_first_come_from_the_resident_codes(tmp_path: Path,
     monkeypatch.setattr(source._store, "iter_codes", no_read)
     monkeypatch.setattr(source._store, "read_codes_to_device", no_read)
     assert np.array_equal(_bits(image()), _bits(first))
+
+
+@pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
+@pytest.mark.parametrize("codec", ["zstd", "rowdict"])
+def test_cuda_resident_codes_evicted_mid_read_stream_the_blocks_left(tmp_path: Path, codec: str) -> None:
+    # The resident codes are a cache of the shared ledger: evicted during a read, the blocks not yet reached are read
+    # from the store, the image is the same, and an evicted set is never admitted again.
+    _write_store(tmp_path / "store", _two_half_dosage(), codec)
+    source, _signed, _means, _scales = _source(tmp_path / "store", "cuda")
+    rng = np.random.default_rng(5)
+    rights = [cupy.asarray(rng.standard_normal((block.shape[0], 2))) for block in BLOCK_ROWS]
+
+    def image(evict_after: int | None = None) -> np.ndarray:
+        total = cupy.zeros((source.sample_count, 2))
+        for block_index, tile in source.iter_tiles():
+            tile.accumulate_matmat(rights[block_index], total, FLOAT64_ROUNDING)
+            if block_index == evict_after:
+                (lease,) = [lease for lease in source._broker.leases if lease.evict == source._drop_resident]
+                source._broker._evict(lease)
+        return cupy.asnumpy(total)
+
+    first = image()
+    assert source._resident_complete and source._resident is not None
+    assert np.array_equal(_bits(image(evict_after=0)), _bits(first))
+    assert source._resident is None and source._resident_dropped
+    assert np.array_equal(_bits(image()), _bits(first)) and source._resident is None
+
+
+@pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
+def test_inside_a_cuda_scope_every_allocation_is_charged_before_it_is_made() -> None:
+    from sv_pgs.memory_broker import device_pool, memory_scope
+
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    capacity = int(pool.used_bytes()) + (64 << 20)
+    budget = ComputeBudget(
+        device_kind="cuda", device_ids=(0,), device_names=("test",), device_bytes=(capacity,), device_compute_capabilities=((8, 6),),
+        host_bytes=1 << 30, cpu_threads=2,
+    )
+    dropped = []
+    cache = {}
+    with memory_scope(budget) as broker:
+        held = cupy.zeros(4 << 20, dtype=cupy.uint8)
+        cache["array"] = cupy.zeros(32 << 20, dtype=cupy.uint8)
+        lease = broker.admit(device_pool(0), 32 << 20, "a test cache", lambda: (dropped.append(1), cache.clear()), allocated=True)
+        assert lease is not None
+        # 40 MB more fits only once the cache is dropped: the allocator evicts it before allocating.
+        more = cupy.zeros(40 << 20, dtype=cupy.uint8)
+        assert dropped == [1] and broker.held(device_pool(0)) <= capacity
+        with pytest.raises(MemoryError):
+            cupy.zeros(64 << 20, dtype=cupy.uint8)
+        del held, more
+    # Outside the scope the default allocator is back.
+    cupy.zeros(1 << 20, dtype=cupy.uint8)

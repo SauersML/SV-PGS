@@ -57,6 +57,7 @@ from sv_pgs import rowdict_codec
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
+from sv_pgs.memory_broker import HOST, PINNED, broker_for, current_broker
 from sv_pgs.sample_ids import ResearchId, SequencingId
 
 
@@ -64,33 +65,69 @@ class _PinnedBufferPool:
     """Process-wide pool of pinned host buffers for the store's CUDA staging ring.
 
     Pinning (``cudaHostAlloc``) locks pages and updates the IOMMU, which is slow for large
-    buffers, so released buffers are kept and the smallest one that fits is reused. The pool
-    only grows; its size is bounded by the host budget its callers already enforce. The lock is
-    not held across a fresh allocation, so pool hits never wait behind one.
+    buffers, so released buffers are kept and the smallest one that fits is reused. A buffer in
+    use is covered by its caller's mandatory lease (``memory_broker``); a released one is kept
+    only as a cache lease on the current ledger's pinned pool, from what that pool has left, and
+    is freed (its pages unpinned) when the ledger evicts it for a mandatory lease or has no room
+    for it. The lock is not held across a fresh allocation, so pool hits never wait behind one.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._available: list[tuple[int, Any]] = []
         self._in_flight: dict[int, tuple[int, Any]] = {}
+        self._idle_leases: dict[int, Any] = {}
 
     def acquire(self, cupy: Any, byte_count: int) -> tuple[Any, U8Array]:
         """A pinned buffer of at least ``byte_count`` bytes and a uint8 view of its first ``byte_count``."""
+        reused = None
         with self._lock:
             fitting = [position for position, (size, _) in enumerate(self._available) if size >= byte_count]
             if fitting:
-                size, memory = self._available.pop(min(fitting, key=lambda position: self._available[position][0]))
-                self._in_flight[id(memory)] = (size, memory)
-                return memory, np.frombuffer(memory, dtype=np.uint8, count=byte_count)
+                size, reused = self._available.pop(min(fitting, key=lambda position: self._available[position][0]))
+                self._in_flight[id(reused)] = (size, reused)
+                idle = self._idle_leases.pop(id(reused), None)
+        if reused is not None:
+            if idle is not None:
+                # Reused: the caller's own lease covers it from here (released outside the pool's lock, the ledger's
+                # evictions taking the ledger's lock first).
+                idle.release()
+            return reused, np.frombuffer(reused, dtype=np.uint8, count=byte_count)
         memory = cupy.cuda.alloc_pinned_memory(byte_count)
         with self._lock:
             self._in_flight[id(memory)] = (byte_count, memory)
         return memory, np.frombuffer(memory, dtype=np.uint8, count=byte_count)
 
     def release(self, memory: Any) -> None:
-        """Return a buffer from ``acquire`` to the pool."""
+        """Return a buffer from ``acquire`` to the pool, kept as a cache lease where the current ledger has room."""
         with self._lock:
-            self._available.append(self._in_flight.pop(id(memory)))
+            size, held = self._in_flight.pop(id(memory))
+        broker = current_broker()
+        # The ledger's lock is taken outside the pool's, as an eviction (``_free``) takes them in that order.
+        lease = None if broker is None else broker.admit(PINNED, size, "an idle pinned staging buffer", lambda key=id(held): self._free(key))
+        if broker is not None and lease is None:
+            del held
+            self._unpin()
+            return
+        with self._lock:
+            self._available.append((size, held))
+            if lease is not None:
+                self._idle_leases[id(held)] = lease
+
+    def _free(self, key: int) -> None:
+        """The ledger evicts an idle buffer: it leaves the pool and its pages are unpinned."""
+        with self._lock:
+            self._idle_leases.pop(key, None)
+            self._available = [(size, memory) for size, memory in self._available if id(memory) != key]
+        self._unpin()
+
+    @staticmethod
+    def _unpin() -> None:
+        """CuPy keeps a freed pinned block for reuse: its idle blocks, a dropped buffer's among them once its last
+        reference is gone, go back to the operating system here."""
+        cupy = _try_import_cupy()
+        if cupy is not None:
+            cupy.get_default_pinned_memory_pool().free_all_blocks()
 
 
 _PINNED_POOL = _PinnedBufferPool()
@@ -787,6 +824,10 @@ class CodeArray:
         encoded = sum(int(shard.chunk_sizes[chunks].sum()) for shard, _, chunks in plans)
         window_bytes = max(largest, min(encoded, wanted.shape[0] * layout.sample_count))
         stream = cupy.cuda.get_current_stream()
+        # The pinned window is charged to the scope's ledger (``memory_broker``) while it is in use; the device window is
+        # a CuPy allocation, metered there by the ledger's allocator.
+        broker = current_broker()
+        window_lease = None if broker is None else broker.reserve(PINNED, window_bytes, "the rowdict read's pinned window")
         owner, pinned = _PINNED_POOL.acquire(cupy, window_bytes)
         copied = None
         checks = []
@@ -828,6 +869,8 @@ class CodeArray:
         finally:
             if copied is not None:
                 copied.synchronize()
+            if window_lease is not None:
+                window_lease.release()
             _PINNED_POOL.release(owner)
         for error, first_bad, window_chunks in checks:
             failure = int(error.get(stream=stream)[0])
@@ -1475,9 +1518,13 @@ class DosageStore:
             return
         widest = max(stop - start for start, stop in ranges)
         buffer_bytes = widest * selection.indices.size
-        depth = min(self._ring_depth(widest), budget.host_bytes // max(buffer_bytes, 1))
+        # The ring is charged to the shared ledger (``memory_broker``), pinned on CUDA, from what the ledger can grant.
+        broker = broker_for(budget)
+        pool = PINNED if budget.device_kind == "cuda" else HOST
+        depth = min(self._ring_depth(widest), broker.reclaimable(pool) // max(buffer_bytes, 1))
         if depth < 2:
-            raise MemoryError(f"double-buffering {widest}-row blocks needs {2 * buffer_bytes} host bytes.")
+            raise MemoryError(f"double-buffering {widest}-row blocks needs {2 * buffer_bytes} host bytes: {broker.describe()}")
+        ring_lease = broker.reserve(pool, depth * buffer_bytes, "the dosage store's read-ahead ring")
         ring, pinned = self._ring(depth, buffer_bytes, budget)
         # Every ring slot but the consumer's is read concurrently: one block has only as many
         # independent pieces as it has inner chunks, so a lone reader leaves most of the pool idle
@@ -1502,6 +1549,7 @@ class DosageStore:
             for pending in in_flight:
                 pending.cancel()
             prefetch.shutdown(wait=True)
+            ring_lease.release()
             for owner in pinned:
                 _PINNED_POOL.release(owner)
 

@@ -27,7 +27,8 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
-from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
+from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
+from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
@@ -266,6 +267,10 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
         passes=0,
         # There is no outer loop to stop and no fixed point to perturb: the covariate least squares is exact.
         outer_criterion_met=np.ones(1, dtype=bool),
+        restored_best=np.zeros(1, dtype=bool),
+        budget_unresolved=np.zeros(1, dtype=np.int64),
+        mixture_components=np.zeros(1, dtype=np.int64),
+        state_digest=state_digest([covariate_fit.alpha, np.array([covariate_fit.noise])])[None, :],
     )
     return _ModelFit(
         scoring=scoring,
@@ -485,19 +490,21 @@ def fit_models(
         adjusted = np.asarray(covariate_columns[model], dtype=bool)
         model_dir = Path(work_dir) / f"model{model}"
         model_dir.mkdir()
-        fit = _fit_one(
-            store,
-            np.asarray(store_columns[rows], dtype=np.int64),
-            np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
-            np.asarray(targets[rows, model], dtype=np.float64),
-            measurement,
-            budget,
-            model_dir,
-            _seed(seed, model),
-            draw_count,
-            trait_types[model],
-            inference,
-        )
+        # One ledger per model's fit (``memory_broker``): its host leases and, on CUDA, every device allocation.
+        with memory_scope(budget):
+            fit = _fit_one(
+                store,
+                np.asarray(store_columns[rows], dtype=np.int64),
+                np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
+                np.asarray(targets[rows, model], dtype=np.float64),
+                measurement,
+                budget,
+                model_dir,
+                _seed(seed, model),
+                draw_count,
+                trait_types[model],
+                inference,
+            )
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fit.scoring.alpha
         covariate_draws = np.zeros((adjusted.size, fit.scoring.draw_count))

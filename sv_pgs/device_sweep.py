@@ -147,32 +147,44 @@ def _kernel(cupy: Any) -> Any:
 
 class PanelGrams:
     """Each panel's projected Gram Xp_P' Xp_P (float64, width x width) and covariate coupling, formed on the device
-    and kept for later sweeps while their bytes fit ``capacity_bytes``: the design is fixed through a fit, so a kept
-    panel is never rebuilt. A panel is named by its model and its members' own indices in sweep order, so a panel of
-    another order or of other members never reads it (keyed by a piece's first member plus an offset, two panels of a
-    random within-block order could share a key and one read the other's Gram). Sweeps visit the panels in one cycle,
-    where any eviction order misses every evicted panel once per sweep, so the cache keeps the panels it met first
-    and rebuilds the rest; ``None`` capacity keeps every panel."""
+    and kept for later sweeps as a cache of the shared ledger (``memory_broker``): the design is fixed through a fit,
+    so a kept panel is never rebuilt. A panel is admitted only from what the device's pool has left once the fit's
+    mandatory buffers are reserved, and a later mandatory lease evicts it (the panel is then rebuilt when met), so the
+    cache never takes what a mandatory buffer needs. A panel is named by its model and its members' own indices in
+    sweep order, so a panel of another order or of other members never reads it (keyed by a piece's first member plus
+    an offset, two panels of a random within-block order could share a key and one read the other's Gram). Sweeps
+    visit the panels in one cycle, where any eviction order misses every evicted panel once per sweep, so the cache
+    keeps the panels it met first and rebuilds the rest. With no ``broker`` every panel is kept."""
 
-    def __init__(self, capacity_bytes: int | None = None) -> None:
+    def __init__(self, broker: Any = None, pool: str | None = None) -> None:
         self._grams: dict[tuple, Any] = {}
-        self._capacity = capacity_bytes
-        self._bytes = 0
+        self._leases: dict[tuple, Any] = {}
+        self._broker = broker
+        self._pool = pool
 
     def get(self, key: tuple, build) -> Any:
         held = self._grams.get(key)
         if held is not None:
             return held
         built = build()
-        size = sum(int(part.nbytes) for part in built)
-        if self._capacity is None or self._bytes + size <= self._capacity:
+        if self._broker is None:
             self._grams[key] = built
-            self._bytes += size
+            return built
+        lease = self._broker.admit(self._pool, sum(int(part.nbytes) for part in built), "a panel Gram", lambda key=key: self._evict(key), allocated=True)
+        if lease is not None:
+            self._grams[key] = built
+            self._leases[key] = lease
         return built
 
+    def _evict(self, key: tuple) -> None:
+        self._grams.pop(key, None)
+        self._leases.pop(key, None)
+
     def clear(self) -> None:
+        for lease in self._leases.values():
+            lease.release()
         self._grams.clear()
-        self._bytes = 0
+        self._leases.clear()
 
 
 def sweep_piece(

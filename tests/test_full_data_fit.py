@@ -158,10 +158,27 @@ def test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples(tmp_p
     )
     fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
     certificate = fit.certificate
-    assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
+    # The certificate is bound to the returned state: a restored best-ELBO state withholds the outer loop's terms.
+    if certificate.restored_best[0]:
+        assert np.isnan(certificate.remaining_gain[0]) and not certificate.outer_criterion_met[0]
+    else:
+        assert certificate.remaining_gain[0] <= 0.5 / _DRAWS
+    assert certificate.budget_unresolved[0] == 0 and certificate.mixture_components[0] == len(fit.member_components) >= 1
     assert certificate.mean_move[0] <= certificate.draw_tolerance[0]
     assert certificate.noise_gain[0] <= 0.5 / _DRAWS
+    from sv_pgs.full_data_fit import state_digest
+
+    parts = [fit.member_mean[:, 0], fit.hyperparameters[0].coefficients, np.atleast_1d(fit.hyperparameters[0].log_smoothing),
+             np.array([float(fit.noise_variance[0])])]
+    parts += [part[:, 0] for shift, omega in fit.member_components for part in (shift, omega)]
+    parts += [fit.component_weights[:, 0], fit.covariate_coefficients[:, 0]]
+    np.testing.assert_array_equal(certificate.state_digest[0], state_digest(parts))
+    assert not np.array_equal(certificate.state_digest[0], state_digest([fit.member_mean[:, 0] * 2.0, *parts[1:]]))
     scoring = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], _DRAWS, seed=12)
+    # The draws are a law, drawn by tiles when scored; nothing members x draws is held by the scoring model.
+    from sv_pgs.draw_laws import ProductMixtureDraws
+
+    assert isinstance(scoring[0].posterior_draws, ProductMixtureDraws)
     scores = score_genetic(_StoreCodes(store), ScoringPlan.from_models(scoring), _budget())
     # The scorer's in-sample genetic score is q's own X m, read back from the store (the dual solver's mean at q's
     # sites is m only to its solve's bound, so it is not the reference here).

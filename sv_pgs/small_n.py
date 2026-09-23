@@ -55,7 +55,7 @@ from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.config import TraitType
 from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
-from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
+from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint, state_digest
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
 from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.imputation_reliability import ColumnMeasurement
@@ -2030,13 +2030,17 @@ def fit_small_n(
             break
         prior, solves = moved[0][0], continued
     components = list(solves)
+    mixture_unresolved = False
     if inference == "mean_field":
+        searched, mixture_unresolved = _mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed)
         dense_end = BinaryGaussianMember.fit(statistics, prior, sites, tolerance) if binary else GaussianMember.fit(statistics, prior)
-        components = [*_mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed), dense_end]
+        components = [*searched, dense_end]
     generator = np.random.default_rng(seed)
     weights = _mixture_weights(components)
-    shares = _draw_shares(weights, draw_count)
-    parts = [(component, component.draws(generator, share)) for component, share in zip(components, shares) if share]
+    # Each draw is one sample of the mixture: its component drawn from the weights (``_draw_components``), then the draw
+    # from that component. The draws are exchangeable, so each component's are drawn together and placed side by side.
+    counts = np.bincount(_draw_components(weights, draw_count, generator), minlength=len(components))
+    parts = [(component, component.draws(generator, int(count))) for component, count in zip(components, counts) if count]
     draws = np.concatenate([part for _component, part in parts], axis=1)
     mean = np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
     noise = float(np.dot(weights, [float(component.oracle.noise) for component in components]))
@@ -2067,19 +2071,27 @@ def fit_small_n(
     )
     outers = [solve.outer for solve in solves]
     oracles = [solve.oracle for solve in solves]
-    certified = all(outer.certified for outer in outers)
+    # Bound to the returned state (``full_data_fit.fit_full_data``): a solve that returned its best-ELBO state in place of
+    # where its outer loop ended has that loop's remaining gain, Newton decrement and prediction move withheld (NaN) and
+    # its criterion unmet; the fixed-point terms are the largest over every component of the returned mixture (each at
+    # its own fixed point; the Gaussian member's is exact); unresolved budgets leave the criterion unmet.
+    restored = any("elbo_best_restored" in oracle.profile for oracle in oracles)
+    unresolved_budgets = int(mixture_unresolved) + sum(int(getattr(component.oracle, "profile", {}).get("unresolved_solves", 0)) for component in components)
+    withheld = np.nan if restored else 1.0
+    certified = all(outer.certified for outer in outers) and not restored and unresolved_budgets == 0
+    component_oracles = [component.oracle for component in components]
     # The mixture's certificate is its components' least favourable: the largest remaining gain and prediction move,
     # certified only where every component is.
     certificate = FitCertificate(
-        remaining_gain=np.array([max(outer.remaining_gain for outer in outers)]),
-        newton_decrement=np.array([max(outer.newton_decrement for outer in outers)]),
+        remaining_gain=np.array([max(outer.remaining_gain for outer in outers)]) * withheld,
+        newton_decrement=np.array([max(outer.newton_decrement for outer in outers)]) * withheld,
         smoothing_gradient=np.array([outers[0].step.smoothing_gradient]),
         stationarity_steps=(outers[0].step.stationarity_steps,),
         stationarity_errors=(outers[0].step.stationarity_errors,),
-        mean_move=np.array([max(oracle.mean_move for oracle in oracles)]),
+        mean_move=np.array([max(float(getattr(oracle, "mean_move", 0.0)) for oracle in component_oracles)]),
         # The move's tolerance: 1/2 r' Sigma r <= 1/(2K) nats.
         draw_tolerance=np.array([1.0 / draw_count]),
-        noise_gain=np.array([max(oracle.noise_gain for oracle in oracles)]),
+        noise_gain=np.array([max(float(getattr(oracle, "noise_gain", 0.0)) for oracle in component_oracles)]),
         # Exact algebra: the mean and the variances carry rounding only.
         mean_error=np.zeros(1),
         information_bound=np.zeros(1),
@@ -2089,14 +2101,22 @@ def fit_small_n(
         effective_effects=np.array([float(np.mean([oracle.effective for oracle in oracles]))]),
         outer_iterations=np.array([sum(outer.iterations for outer in outers)], dtype=np.int64),
         halvings=np.array([sum(outer.halvings for outer in outers)], dtype=np.int64),
-        prediction_move=np.array([max(outer.prediction_move for outer in outers)]),
+        prediction_move=np.array([max(outer.prediction_move for outer in outers)]) * withheld,
         prediction_tolerance=np.array([min(outer.prediction_tolerance for outer in outers)]),
         unresolved=np.array([sum(outer.unresolved for outer in outers)], dtype=np.int64),
-        refusals=tuple(refusal for oracle in oracles for refusal in oracle.refusals),
+        refusals=tuple(refusal for oracle in oracles for refusal in oracle.refusals)
+        + (("the mode mixture tried its budget of orders without settling: unresolved",) if mixture_unresolved else ())
+        + (("a component returned its best-ELBO state; the outer loop's remaining gain, decrement and move are withheld",) if restored else ()),
         outer_history=(tuple(value for outer in outers for value in outer.history),),
         refreshes=int(sum(oracle.profile["refreshes"] for oracle in oracles)),
         passes=int(sum(oracle.profile["passes"] for oracle in oracles)),
         outer_criterion_met=np.array([certified], dtype=bool),
+        restored_best=np.array([restored], dtype=bool),
+        budget_unresolved=np.array([unresolved_budgets], dtype=np.int64),
+        mixture_components=np.array([len(components)], dtype=np.int64),
+        state_digest=state_digest(
+            [scoring.coefficients, np.asarray(scoring.posterior_draws), scoring.alpha, np.array([noise]), weights, solves[0].hyperparameters.coefficients]
+        )[None, :],
     )
     remaining = max(outer.remaining_gain for outer in outers)
     move = max(outer.prediction_move for outer in outers)
@@ -2168,21 +2188,25 @@ def _mixture_weights(components: Sequence["_SmallNSolve | GaussianMember"]) -> F
     return weights / weights.sum()
 
 
-def _draw_shares(weights: F64Array, draw_count: int) -> list[int]:
-    """``draw_count`` draws allotted to the components in proportion to their weights (largest remainders)."""
-    exact = weights * draw_count
-    shares = np.floor(exact).astype(np.int64)
-    for index in np.argsort(-(exact - shares), kind="stable")[: draw_count - int(shares.sum())]:
-        shares[index] += 1
-    return [int(share) for share in shares]
+def _draw_components(weights: F64Array, draw_count: int, generator: np.random.Generator) -> I64Array:
+    """Each draw's mixture component, c_k ~ Categorical(w) independently: every draw is then an exact sample of the
+    mixture q = sum_c w_c q_c, and a component's share of the draws is Binomial(K, w_c), unbiased for its weight at
+    every K. (The largest-remainder quotas this replaces gave round(w_c K) draws deterministically: a component below
+    1 / (2K) got none and the draws' mixture was not q's.)"""
+    probabilities = np.asarray(weights, dtype=np.float64)
+    return generator.choice(probabilities.shape[0], size=int(draw_count), p=probabilities / probabilities.sum()).astype(np.int64)
 
 
 def _mode_mixture(
     statistics: DenseStatistics, prior: ScaleMixturePrior, solves: list, starts: Sequence[F64Array], start_noise: float, draw_count: int,
     working_bytes: int, seed: int,
-) -> list:
+) -> tuple[list, bool]:
     """The fixed points of coordinate ascent at each start's fitted hyperparameters, in successive random member orders,
-    until the mixture's mean has settled.
+    until the mixture's mean has settled; returns the components and whether the search ended unsettled at its budget.
+
+    Work budget: at most K orders (``full_data_fit._mode_mixture``'s: the mixture reaches the scorer through K draws,
+    each from one component, so no more than K components are ever represented; a refused order consumes its attempt),
+    after which the search ends unresolved and says so.
 
     Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
     each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
@@ -2208,11 +2232,9 @@ def _mode_mixture(
         return np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
 
     average = mixture_mean()
-    index = 0
-    while True:
+    for index in range(draw_count):
         solve, start_mean = solves[index % len(solves)], starts[index % len(starts)]
         from_start = (index // len(solves)) % 2 == 0
-        index += 1
         oracle = MeanFieldFixedPoints(
             statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,) if from_start else (),
             order=generator.permutation(member_count), sites=getattr(solve.oracle, "sites", None),
@@ -2226,7 +2248,8 @@ def _mode_mixture(
         move = _metric(statistics, oracle).image(updated - average)
         average = updated
         if float(move @ move) / noise <= 1.0 / draw_count:
-            return components
+            return components, False
+    return components, True
 
 
 def _component_log_evidence(component: "_SmallNSolve | GaussianMember") -> float:

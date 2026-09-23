@@ -342,8 +342,8 @@ def test_the_node_sampler_is_the_inverse_cdf_of_the_responsibilities():
 
 def test_the_draws_are_one_law_however_the_budget_splits_them():
     """P03: ``working_bytes`` sets how many rows a piece of ``draws`` holds, and the smallest budget takes one row per
-    piece. A piece boundary changes which value of the generator's stream lands where, so the two runs are NOT
-    bit-for-bit equal; what must hold is that both are draws of q. Checked on each member's first two moments."""
+    piece. The draws are counter-based (``draw_laws``): every (member, draw) has its own counter, so the tiling moves
+    no number and the two runs are equal bit for bit; both are draws of q, checked on each member's first two moments."""
     _statistics, prior, start, oracle = _oracle(13)
     (point,) = oracle([start])
     assert point is not None
@@ -352,7 +352,7 @@ def test_the_draws_are_one_law_however_the_budget_splits_them():
     oracle.working_bytes = 1  # every piece is one row
     pieces = oracle.draws(start, np.random.default_rng(2), count)
     assert whole.shape == pieces.shape == (prior.variant_count, count)
-    assert not np.array_equal(whole, pieces)
+    np.testing.assert_array_equal(whole, pieces)
     for values in (whole, pieces):
         assert np.all(np.isfinite(values))
         error = 5.0 * np.sqrt(oracle.variance / count) + 1e-12

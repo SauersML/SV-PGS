@@ -10,15 +10,17 @@ device. A node that exposes NVIDIA devices but whose CuPy runtime cannot use
 them raises instead of silently running on the CPU.
 
 Memory is measured, never taken as a hand-set share: host bytes are the
-kernel's MemAvailable, capped by every memory cgroup the process sits in, and
-device bytes are what each device has free once the CUDA context and the
-cuBLAS and cuSOLVER workspaces exist. Every consumer plans its own buffers
-exactly against these numbers.
+kernel's MemAvailable, capped by every memory cgroup the process sits in and by
+the address space RLIMIT_AS leaves, and device bytes are what each device has
+free once the CUDA context and the cuBLAS and cuSOLVER workspaces exist. These
+numbers are the capacities of ``memory_broker``'s ledger, against which every
+consumer charges its buffers before it allocates them.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import resource
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
@@ -240,13 +242,34 @@ RUNQ_MEMORY_VARIABLE = "RUNQ_MEM_BYTES"
 so the job cgroup's headroom is every task's at once; the allotment is this task's share of it."""
 
 
+def _address_space_headroom_bytes(status_file: Path = Path("/proc/self/status")) -> int | None:
+    """What RLIMIT_AS still lets the process map, its soft limit less the current ``VmSize``, or None when unlimited.
+
+    ``ulimit -v`` (and ``prlimit --as``) cap the address space, which the kernel enforces on every mapping whether or
+    not its pages are touched, so a budget that ignores it plans allocations the kernel refuses."""
+    soft, _hard = resource.getrlimit(resource.RLIMIT_AS)
+    if soft == resource.RLIM_INFINITY:
+        return None
+    with open(status_file, encoding="ascii") as status:
+        for line in status:
+            if line.startswith("VmSize:"):
+                key, value, unit = line.split()
+                if unit != "kB":
+                    raise RuntimeError(f"{status_file} reports VmSize in {unit}, not kB")
+                return max(int(soft) - int(value) * 1024, 0)
+    raise RuntimeError(f"{status_file} has no VmSize line")
+
+
 def _usable_host_bytes() -> int:
-    """MemAvailable, capped by every limited memory cgroup the process sits in (its own included) and by
-    the runner's per-task allotment when it sets one."""
+    """MemAvailable, capped by every limited memory cgroup the process sits in (its own included), by the address
+    space RLIMIT_AS leaves, and by the runner's per-task allotment when it sets one."""
     limits = [_detect_available_host_ram_bytes()]
     cgroup_headroom = _cgroup_memory_headroom_bytes()
     if cgroup_headroom is not None:
         limits.append(cgroup_headroom)
+    address_headroom = _address_space_headroom_bytes()
+    if address_headroom is not None:
+        limits.append(address_headroom)
     allotment = os.environ.get(RUNQ_MEMORY_VARIABLE)
     if allotment is not None:
         if not allotment.strip().isdigit() or int(allotment) <= 0:

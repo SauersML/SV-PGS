@@ -27,6 +27,7 @@ from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import MANIFEST_FILE, DosageStore, read_manifest
+from sv_pgs.draw_laws import law_from_arrays
 from sv_pgs.fast_scoring import (
     GeneticScores,
     ScoringModel,
@@ -37,10 +38,13 @@ from sv_pgs.fast_scoring import (
 )
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
-MODEL_FORMAT = "svpgs-model v2"
+MODEL_FORMAT = "svpgs-model v3"
 _METADATA = "model.json"
 _ARRAYS = "arrays.npz"
-_SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "posterior_draws", "alpha", "covariate_draws", "covariate_covariance")
+_SCORING_FIELDS = ("store_rows", "signed_means", "signed_scales", "coefficients", "alpha", "covariate_draws", "covariate_covariance")
+_DRAW_LAW_PREFIX = "draw_law"
+"""Each scoring model's draw law is saved as its parameters (``draw_laws.DrawLaw.arrays``) under this name, its kind in
+model.json: a product mixture's O(components x rows) parameters, never its rows x K draws."""
 CERTIFICATE_STATUS = "outer_criterion_met"
 """The certificate term every fit records (``full_data_fit.FitCertificate``): per model, whether the outer loop's own
 stopping criterion was met. It is not certification (M04), and a model whose certificate lacks it says nothing at all
@@ -237,6 +241,8 @@ def save_model(path: str | Path, model: FittedModel) -> None:
     for index, scoring in enumerate(model.scoring):
         for field_name in _SCORING_FIELDS:
             arrays[f"scoring/{index}/{field_name}"] = getattr(scoring, field_name)
+        for name, values in scoring.posterior_draws.arrays().items():
+            arrays[f"scoring/{index}/{_DRAW_LAW_PREFIX}/{name}"] = values
     for index, hyperparameters in enumerate(model.hyperparameters):
         arrays[f"hyperparameters/{index}/coefficients"] = hyperparameters.coefficients
         arrays[f"hyperparameters/{index}/log_smoothing"] = hyperparameters.log_smoothing
@@ -249,6 +255,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         "covariate_names": list(model.covariate_names),
         "predictive_intercept_shifts": [scoring.predictive_intercept_shift for scoring in model.scoring],
         "gaussian_posteriors": [scoring.gaussian_posterior for scoring in model.scoring],
+        "draw_laws": [scoring.posterior_draws.kind for scoring in model.scoring],
         "certificate_terms": sorted(model.certificate),
         "fit_counts": {name: int(count) for name, count in model.fit_counts.items()},
         "refusals": list(model.refusals),
@@ -299,13 +306,14 @@ def load_model(path: str | Path) -> FittedModel:
     covariate_names = tuple(_required(metadata, "covariate_names", list))
     shifts = _required(metadata, "predictive_intercept_shifts", list)
     gaussian_posteriors = _required(metadata, "gaussian_posteriors", list)
+    draw_laws = _required(metadata, "draw_laws", list)
     terms = _required(metadata, "certificate_terms", list)
     fit_counts = {str(name): int(count) for name, count in _required(metadata, "fit_counts", dict).items()}
     refusals = tuple(str(reason) for reason in _required(metadata, "refusals", list))
     provenance = _required(metadata, "provenance", dict)
     names = _required(metadata, "arrays", list)
-    if not len(model_names) == len(trait_types) == len(shifts) == len(gaussian_posteriors):
-        raise ValueError("model.json lists models, trait types and intercept shifts of different lengths.")
+    if not len(model_names) == len(trait_types) == len(shifts) == len(gaussian_posteriors) == len(draw_laws):
+        raise ValueError("model.json lists models, trait types, intercept shifts and draw laws of different lengths.")
     with np.load(directory / _ARRAYS, allow_pickle=False) as archive:
         if sorted(archive.files) != sorted(names):
             raise ValueError("arrays.npz does not hold exactly the arrays model.json lists.")
@@ -313,6 +321,10 @@ def load_model(path: str | Path) -> FittedModel:
     scoring = tuple(
         ScoringModel(
             **{field_name: arrays[f"scoring/{index}/{field_name}"] for field_name in _SCORING_FIELDS},
+            posterior_draws=law_from_arrays(str(draw_laws[index]), {
+                name[len(f"scoring/{index}/{_DRAW_LAW_PREFIX}/"):]: values for name, values in arrays.items()
+                if name.startswith(f"scoring/{index}/{_DRAW_LAW_PREFIX}/")
+            }),
             trait_type=trait_type,
             predictive_intercept_shift=float(shift),
             gaussian_posterior=gaussian_posteriors[index],
@@ -349,7 +361,10 @@ def load_model(path: str | Path) -> FittedModel:
 
 
 class StoreCodeBlocks:
-    """A ``DosageStore`` as ``fast_scoring.CodeBlockSource``: its own read-ahead ring, all samples."""
+    """A ``DosageStore`` as ``fast_scoring.CodeBlockSource``: its own read-ahead ring (charged to the ledger by the
+    store's reader), all samples."""
+
+    owns_buffers = True
 
     def __init__(self, store: DosageStore, budget: ComputeBudget) -> None:
         self.store = store
@@ -390,26 +405,37 @@ def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, 
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
     if covariate_matrix.shape != (samples.shape[0], len(model.covariate_names)):
         raise ValueError("covariates must be [samples, the model's covariates].")
-    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(model.scoring), budget, samples)
-    linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, model.scoring)
-    predictive_mean = np.empty_like(linear_predictor)
-    predictive_variance = np.empty_like(linear_predictor)
-    fixed_design = np.column_stack([np.ones(samples.size), covariate_matrix])
     for index, scoring in enumerate(model.scoring):
         if not scoring.draw_count:
             raise ValueError(f"model {model.model_names[index]!r} has no posterior draws, so no predictive variance.")
-        deviations = genetic.draws[index] - genetic.means[:, index, None]
-        deviations = deviations + fixed_design @ (scoring.covariate_draws - scoring.alpha[:, None])
-        linear_variance = np.mean(deviations * deviations, axis=1) + np.einsum("ij,jk,ik->i", fixed_design, scoring.covariate_covariance, fixed_design)
+    fixed_design = np.column_stack([np.ones(samples.size), covariate_matrix])
+    linear_variances = np.empty((samples.size, len(model.scoring)))
+
+    def linear_variance(index: int, mean_scores: F64Array, draw_scores: F64Array) -> None:
+        # Each draw's move of the linear predictor, its genetic score's and its covariate coefficients' together, formed
+        # while the draw scores are in the scorer's accumulator (none is kept).
+        scoring = model.scoring[index]
+        deviations = draw_scores - mean_scores[:, None]
+        deviations += fixed_design @ (scoring.covariate_draws - scoring.alpha[:, None])
+        linear_variances[:, index] = np.mean(deviations * deviations, axis=1) + np.einsum(
+            "ij,jk,ik->i", fixed_design, scoring.covariate_covariance, fixed_design
+        )
+
+    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(model.scoring), budget, samples, draws="variance", reduce=linear_variance)
+    linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, model.scoring)
+    predictive_mean = np.empty_like(linear_predictor)
+    predictive_variance = np.empty_like(linear_predictor)
+    for index, scoring in enumerate(model.scoring):
+        linear_variance_values = linear_variances[:, index]
         if scoring.trait_type == TraitType.BINARY:
             probability = posterior_predictive_probability(
-                linear_predictor[:, index], linear_variance, scoring.predictive_intercept_shift
+                linear_predictor[:, index], linear_variance_values, scoring.predictive_intercept_shift
             )
             predictive_mean[:, index] = probability
             predictive_variance[:, index] = probability * (1.0 - probability)
         else:
             predictive_mean[:, index] = linear_predictor[:, index]
-            predictive_variance[:, index] = linear_variance + model.noise_variance[index]
+            predictive_variance[:, index] = linear_variance_values + model.noise_variance[index]
     return Prediction(genetic=genetic, linear_predictor=linear_predictor, predictive_mean=predictive_mean, predictive_variance=predictive_variance)
 
 

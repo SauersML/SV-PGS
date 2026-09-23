@@ -52,6 +52,9 @@ component's own metric (``BinaryComponent``).
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import weakref
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator, Sequence
 
@@ -63,8 +66,10 @@ from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
 from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
 from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate_evidence
+from sv_pgs.draw_laws import ProductMixtureDraws, seed_key, tile_rows
 from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, column_squares
 from sv_pgs.fast_scoring import ScoringModel
+from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.progress import log
 from sv_pgs.krylov_recycle import local_response
@@ -117,6 +122,7 @@ from sv_pgs.scale_mixture_ep import (
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _HALF_PRECISION = _EPSILON ** 0.5
+_FLOAT_BYTES = np.dtype(np.float64).itemsize
 
 
 def stage0_lattice(
@@ -290,6 +296,17 @@ class FitCertificate:
     # caller must then treat the result as uncertified. The name says what the outer loop did establish, so no reader
     # has to know that rule to avoid overclaiming. None where a route does not record it.
     outer_criterion_met: BoolArray | None = None
+    # The certificate's binding to the state the fit returns (``fit_full_data``). ``restored_best``: the model's
+    # returned state is its best-ELBO one, not where the outer loop ended, so the outer loop's remaining gain, Newton
+    # decrement and prediction move are withheld (NaN) and its criterion is unmet; ``budget_unresolved``: solves and
+    # mixture searches that ended at their derived work budgets (a nonzero count also leaves the criterion unmet);
+    # ``mixture_components``: the components of the returned mixture, whose largest mean move and noise gain the
+    # fixed-point terms report; ``state_digest``: models x 32 uint8, the SHA-256 of the returned state
+    # (``state_digest``). None where a route does not record them, which an artifact refuses.
+    restored_best: BoolArray | None = None
+    budget_unresolved: I64Array | None = None
+    mixture_components: I64Array | None = None
+    state_digest: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -309,8 +326,9 @@ class FullDataFit:
     member_omega: F64Array | None = None
     covariate_coefficients: F64Array | None = None
     working_bytes: int = 0
-    # The mean-field mixture's components (``fit_full_data``): each fixed point's (shift, omega), members x models; the
-    # scorer draws from each in turn, and ``member_mean`` is their average.
+    # The mean-field mixture's components (``fit_full_data``): each fixed point's (shift, omega), members x models, omega
+    # in the component's own metric; each scorer's draw picks a component from the weights
+    # (``draw_laws.ProductMixtureDraws``), and ``member_mean`` is their weighted average.
     member_components: tuple[tuple[F64Array, F64Array], ...] = ()
     # Each component's weight per model (components x models), exp(ELBO) normalized (``small_n._mixture_weights``).
     component_weights: F64Array | None = None
@@ -1213,6 +1231,109 @@ class _PassBudget(Exception):
     """A second-start solve used the first start's count of passes without converging: abandoned, not refused."""
 
 
+def noise_floor(squares: F64Array, smallest_variance: F64Array, residual_dimension: float, entry_noise: float) -> float:
+    """A lower bound on every noise variance a mean-field ascent reaches from ``entry_noise``, or 0 where none follows.
+
+    The noise update is sigma^2 = (RSS + sum_j a_j v_j) / n' (a_j = ||x_j||^2, n' the residual dimension), and each
+    member's variance under its q_j is at least its smallest conditional variance, v_j >= 1 / (1/V_j + a_j / s) with V_j
+    its prior's smallest lattice variance and s the noise its sweep used. So the next noise is at least h(s) =
+    (1/n') sum_j a_j V_j s / (s + a_j V_j): increasing in s, with h(s)/s decreasing from p_+ / n' (p_+ the members with
+    a_j V_j > 0) to 0. Where p_+ > n', h has one positive fixed point s*, and s >= s* gives h(s) >= s*, s < s* gives
+    h(s) > s: every noise the ascent reaches is at least min(entry_noise, s*). Where p_+ <= n' the bound is 0 (the
+    likelihood alone keeps the noise from zero there, through the least-squares residual, which this bound does not
+    form). s* is found by bisection on log s to float64 resolution."""
+    weights = np.asarray(squares, dtype=np.float64) * np.asarray(smallest_variance, dtype=np.float64)
+    weights = weights[weights > 0.0]
+    dimension = float(residual_dimension)
+    if weights.shape[0] <= dimension:
+        return 0.0
+
+    def excess(log_noise: float) -> float:
+        return float(np.sum(weights / (np.exp(log_noise) + weights))) - dimension
+
+    # sum_j w_j / (s + w_j) falls from p_+ > n' to 0, and each term is at most W / (s + W) (W the largest w): at
+    # s = W (p_+ - n') / n' the sum is at most p_+ W / (s + W) = n', so the root lies at or below it.
+    high = float(np.log(float(np.max(weights)) * (weights.shape[0] - dimension) / dimension))
+    low = high
+    while excess(low) <= 0.0:
+        low -= 1.0
+    while high - low > _EPSILON * max(abs(high), 1.0):
+        middle = 0.5 * (low + high)
+        if excess(middle) > 0.0:
+            low = middle
+        else:
+            high = middle
+    return min(float(entry_noise), float(np.exp(low)))
+
+
+def elbo_ceiling(residual_dimension: float, floor: float) -> float:
+    """An upper bound on the ELBO at every noise >= ``floor``: ELBO <= log p(y | sigma^2) <= -(n'/2) log(2 pi sigma^2),
+    the Gaussian density of the projected residual at zero residual (the prior integrates to one); inf at floor 0."""
+    return -0.5 * float(residual_dimension) * float(np.log(2.0 * np.pi * floor)) if floor > 0.0 else np.inf
+
+
+@dataclass
+class SweepBudget:
+    """The work budget of a coordinate-ascent solve, derived from its problem: every iteration that does not end the
+    loop raises the ELBO by more than min(rho_k, tolerance) (a sweep's gain above its rounding rho_k, else the noise
+    update's gain above the tolerance, which the next ELBO includes), and every ELBO the loop reaches is at most the
+    ceiling C (``noise_floor``, ``elbo_ceiling``). So after the first sweep's ELBO E_1 the loop can take at most
+    (C - E_1) / min_k min(rho_k, tolerance) more iterations; one past that contradicts the bound, and the loop ends
+    unresolved there rather than run on. Where no ceiling is derived (C = inf) there is no finite budget, and the count
+    of iterations is what the solve reports."""
+
+    ceiling: float
+    tolerance: float
+    first: float | None = None
+    step: float = np.inf
+    iterations: int = 0
+
+    def exhausted(self, elbo: float, rounding: float) -> bool:
+        """Counts one iteration at ELBO ``elbo`` with rounding ``rounding``; True once the count passes the budget."""
+        self.iterations += 1
+        if self.first is None:
+            self.first = float(elbo)
+            return False
+        self.step = min(self.step, float(rounding), self.tolerance)
+        if not np.isfinite(self.ceiling) or not self.step > 0.0:
+            return False
+        return self.iterations - 1 > (self.ceiling - self.first) / self.step
+
+
+@dataclass(eq=False)
+class _ModelState:
+    """One model's q and its scalars: the snapshot the oracle keeps of a model (a candidate fixed point, the best state,
+    a fixed point's restore point), and nothing of any other model. ``sites`` are a binary model's Polya-Gamma sites
+    (immutable, held by reference; None for a quantitative model), which name the metric its residual and moments
+    belong to. Its arrays are charged to the shared ledger for as long as it lives (``_FullDataMeanField._charged``)."""
+
+    mean: F64Array
+    variance: F64Array
+    shift: F64Array
+    third: F64Array
+    fourth: F64Array
+    residual: F64Array
+    noise: float
+    effective: float
+    mean_move: float
+    noise_gain: float
+    elbo: float
+    version: int
+    sites: BernoulliSites | None = None
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(getattr(self, name).nbytes) for name in _MODEL_STATE_ARRAYS)
+
+
+_MODEL_STATE_ARRAYS = ("mean", "variance", "shift", "third", "fourth", "residual")
+# The oracle's own live arrays per model beyond a model state's: over the members, the sites (precision and shift)
+# and the metric's column squares (per member, per group, and the training mask's); over the samples, the metric's
+# weights, root weights and targets, the training targets, the projected target and the cold start's residual.
+_ORACLE_MEMBER_ARRAYS = ("site_precision", "site_shift", "member_squares", "group_squares", "training_squares")
+_ORACLE_SAMPLE_ARRAYS = ("weights", "root", "targets", "training_targets", "projected_target", "cold_residual")
+
+
 class _FullDataMeanField:
     """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
     q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
@@ -1232,7 +1353,21 @@ class _FullDataMeanField:
     Tie members (several members on one column, ``tie_members``) are coordinates of their own: each has its own q_j,
     class prior and offset, and its column is its group's, signed. The dual solver sees each group's sites
     (``group_sites``), and the members' responses follow from the groups' by conditioning on the sum
-    (``_member_posterior``), as on the EP route."""
+    (``_member_posterior``), as on the EP route.
+
+    Memory (p members, n samples, M models; float64). Live for the oracle's life, charged to the shared ledger
+    (``memory_broker``) when the oracle is built: the state, five p x M arrays (mean, variance, shift, third and fourth
+    central moments) and the n x M residuals; the sites and the metric's member arrays (``_ORACLE_MEMBER_ARRAYS``); and
+    the metric's sample arrays (``_ORACLE_SAMPLE_ARRAYS``: a binary model's weights and working response go through
+    the ledger with them). The cold start is a recipe, not a copy: zero moments or the caller's start means (held by
+    reference), the start's sites, and the residual they leave. A snapshot is one model's state (``_ModelState``: five
+    p-vectors, its residual and its sites), never every model's arrays: the entry state of a call (M of them, dropped
+    when the call returns), each start's solved state per model (at most two per model, dropped with the call), the
+    best state per model (kept), and each returned fixed point's restore point, whose arrays are the ones its
+    responses read (the outer loop keeps a model's current and trial fixed points). Every snapshot is charged to the
+    ledger for as long as it lives. On a CUDA device a sweep charges its per-model device arrays, the predictor-moment
+    read sizes its pieces from what the ledger can grant, and the panel Grams are the ledger's cache
+    (``device_sweep.PanelGrams``)."""
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
@@ -1260,6 +1395,14 @@ class _FullDataMeanField:
         self.training = np.asarray(_host(gaussian.training), dtype=np.float64)
         self.sample_count = int(self.training.shape[0])
         self.training_counts = np.asarray(gaussian.training_counts, dtype=np.int64)
+        self._broker = current_broker()
+        if self._broker is not None:
+            state_bytes = _FLOAT_BYTES * model_count * (
+                (len(_MODEL_STATE_ARRAYS) - 1 + len(_ORACLE_MEMBER_ARRAYS)) * prior.variant_count
+                + (1 + len(_ORACLE_SAMPLE_ARRAYS)) * self.sample_count
+            )
+            lease = self._broker.reserve(HOST, state_bytes, "the mean-field oracle's state")
+            weakref.finalize(self, lease.release)
         # A binary model's Polya-Gamma sites (``binary_likelihood``): its metric is W = diag(omega) at unit noise, known,
         # rebuilt whenever its sites move; a quantitative model's is its training mask, fixed, over the noise the sweeps
         # update. Every metric-bound array (the projector, the column squares, the projected targets, the panel Grams)
@@ -1304,20 +1447,29 @@ class _FullDataMeanField:
         self.reweights = 0
         self.passes = 0
         self.version = 0
+        # Which state each model's column of the dual solver was last factored at (``_ensure``).
+        self._solver_version = np.zeros(model_count, dtype=np.int64)
         self.undecided_blocks = 0
         self.information: list = []
-        # The panels' Grams are kept within the fit's working budget (``PanelGrams``), the rest rebuilt per sweep.
-        self._panel_grams = PanelGrams(capacity_bytes=int(working_bytes))
+        # Solves that ended at their derived work budget (``SweepBudget``), per model, with their reasons in refusals.
+        self.unresolved = np.zeros(model_count, dtype=np.int64)
+        device = self._device_pool()
+        self._panel_grams = PanelGrams(self._broker, device) if device is not None else PanelGrams()
+        # The cold start (a recipe: zero moments or the start means, the start's sites, and the residual they leave) and
+        # the entry noise.
+        self._cold_mean = None if start_mean is None else np.asarray(start_mean, dtype=np.float64)
+        self._cold_noise = self.noise.copy()
+        self._cold_sites = list(self.sites)
         if start_mean is not None:
             # A data start (``_mode_mixture``'s ridge component): q's means there and the residual they leave.
-            self.mean[...] = np.asarray(start_mean, dtype=np.float64)
+            self.mean[...] = self._cold_mean
             for model in range(model_count):
                 self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
-        self._cold = self._snapshot()
+        self._cold_residual = [values.copy() for values in self.residual]
         # Each model's highest-ELBO refreshed state and its hyperparameters (``mean_field.MeanFieldFixedPoints.best``):
         # the outer loop's objective is not the ELBO and can end below a state it visited.
         self.best_elbo = np.full(model_count, -np.inf)
-        self.best_state: list[dict | None] = [None] * model_count
+        self.best_state: list[_ModelState | None] = [None] * model_count
         self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
 
     # the metric: each model's likelihood weights
@@ -1399,16 +1551,22 @@ class _FullDataMeanField:
 
     def _moment_pieces(self, count: int) -> Iterator[tuple[int, int]]:
         """Column ranges of a block for the predictor-variance read: its three dense (n x width) float64 arrays (the
-        columns, their weighted copy, their projection) fit the host working set, and on a device what the device has
-        free besides what the fit holds (its pool's cached blocks count as free), measured at each call: the device
-        also holds the resident codes and the panel Grams, which the host budget does not see (bench-sim scenario_014
-        [sim]: a 4.3 GB piece against 43 GB already held on a 48 GB A40)."""
+        columns, their weighted copy, their projection) fit the host working set, and on a device what the shared ledger
+        can grant there (``memory_broker``: the capacity less every live allocation, with the idle caches, the resident
+        codes and the panel Grams, counted as reclaimable, since the ledger's allocator evicts them before it refuses);
+        the device also holds what the host budget does not see (bench-sim scenario_014 [sim]: a 4.3 GB piece against
+        43 GB already held on a 48 GB A40). Outside a ledger's scope the device's free bytes and its pool's cached
+        blocks, read at each call, stand in for the ledger."""
         column_bytes = 3 * self.sample_count * np.dtype(np.float64).itemsize
         width = max(1, self.working_bytes // column_bytes)
         xp = self.gaussian.array_module
         if xp is not np:
-            free, _total = xp.cuda.runtime.memGetInfo()
-            available = int(free) + int(xp.get_default_memory_pool().free_bytes())
+            pool = self._device_pool()
+            if pool is not None:
+                available = self._broker.reclaimable(pool)
+            else:
+                free, _total = xp.cuda.runtime.memGetInfo()
+                available = int(free) + int(xp.get_default_memory_pool().free_bytes())
             width = max(1, min(width, available // column_bytes))
         for start in range(0, count, width):
             yield start, min(start + width, count)
@@ -1446,46 +1604,84 @@ class _FullDataMeanField:
 
     # state
 
-    def _snapshot(self) -> dict:
-        return {
-            "mean": self.mean.copy(), "variance": self.variance.copy(), "shift": self.shift.copy(), "third": self.third.copy(),
-            "fourth": self.fourth.copy(), "residual": [values.copy() for values in self.residual], "noise": self.noise.copy(),
-            "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "effective": self.effective.copy(),
-            "mean_move": self.mean_move.copy(), "noise_gain": self.noise_gain.copy(), "elbo": self.elbo.copy(), "version": self.version,
-            # The binary models' sites name the metric the residuals and moments belong to (immutable, so held).
-            "sites": list(self.sites),
-        }
+    def _device_pool(self) -> str | None:
+        """The ledger's pool of the device the fit runs on, None on the host or outside a ledger's scope."""
+        if self._broker is None or self.gaussian.array_module is np:
+            return None
+        pool = device_pool(int(self.gaussian.array_module.cuda.runtime.getDevice()))
+        return pool if pool in self._broker.meters else None
 
-    def _restore(self, snapshot: dict, models: Sequence[int] | None = None) -> None:
-        columns = list(range(self.model_count)) if models is None else list(models)
-        moved = [model for model in columns if snapshot["sites"][model] is not self.sites[model]]
-        for model in moved:
-            self.sites[model] = snapshot["sites"][model]
-        if moved:
+    def _charged(self, state: _ModelState) -> _ModelState:
+        """``state``'s arrays charged to the ledger for as long as the state lives."""
+        if self._broker is not None:
+            lease = self._broker.reserve(HOST, state.nbytes, "a mean-field model snapshot")
+            weakref.finalize(state, lease.release)
+        return state
+
+    def _state(self, model: int) -> _ModelState:
+        """Model ``model``'s state: copies of its columns and residual, its scalars, and its sites (by reference)."""
+        return self._charged(_ModelState(
+            mean=self.mean[:, model].copy(), variance=self.variance[:, model].copy(), shift=self.shift[:, model].copy(),
+            third=self.third[:, model].copy(), fourth=self.fourth[:, model].copy(), residual=self.residual[model].copy(),
+            noise=float(self.noise[model]), effective=float(self.effective[model]), mean_move=float(self.mean_move[model]),
+            noise_gain=float(self.noise_gain[model]), elbo=float(self.elbo[model]), version=self.version, sites=self.sites[model],
+        ))
+
+    def _move_sites(self, model: int, sites: BernoulliSites | None) -> None:
+        """Model ``model``'s metric at ``sites``: every metric-bound array rebuilt and the old metric's panels released."""
+        if sites is not self.sites[model]:
+            self.sites[model] = sites
             self._install_metric()
             self._panel_grams.clear()
-        for name in ("mean", "variance", "shift", "third", "fourth", "site_precision", "site_shift"):
-            getattr(self, name)[:, columns] = snapshot[name][:, columns]
-        for name in ("noise", "effective", "mean_move", "noise_gain", "elbo"):
-            getattr(self, name)[columns] = snapshot[name][columns]
-        for model in columns:
-            self.residual[model] = snapshot["residual"][model].copy()
 
-    def _ensure(self, snapshot: dict) -> None:
-        """The dual solver back at this fixed point's sites and metric before it answers for it (a later trial may have
-        moved either)."""
-        if self.version != snapshot["version"] or any(held is not now for held, now in zip(snapshot["sites"], self.sites)):
-            current = list(self.sites)
-            self.sites = list(snapshot["sites"])
+    def _cold_state(self, model: int) -> None:
+        """Model ``model`` back at the cold start (the recipe: zero moments or the start means, the start's sites, and
+        their residual)."""
+        self._move_sites(model, self._cold_sites[model])
+        for name in ("variance", "shift", "third", "fourth"):
+            getattr(self, name)[:, model] = 0.0
+        self.mean[:, model] = 0.0 if self._cold_mean is None else self._cold_mean[:, model]
+        self.residual[model] = self._cold_residual[model].copy()
+        self.noise[model] = self._cold_noise[model]
+        self.effective[model] = float(self.prior.variant_count)
+        self.mean_move[model], self.noise_gain[model], self.elbo[model] = np.inf, np.inf, -np.inf
+        self.site_precision[:, model] = 0.0
+        self.site_shift[:, model] = 0.0
+
+    def _restore_state(self, state: _ModelState, model: int) -> None:
+        """Model ``model`` back at ``state``: its metric, columns and residual, its scalars, and its sites from them."""
+        self._move_sites(model, state.sites)
+        for name in _MODEL_STATE_ARRAYS[:-1]:
+            getattr(self, name)[:, model] = getattr(state, name)
+        self.residual[model] = state.residual.copy()
+        self.noise[model], self.effective[model] = state.noise, state.effective
+        self.mean_move[model], self.noise_gain[model], self.elbo[model] = state.mean_move, state.noise_gain, state.elbo
+        _omega, tau, nu, _live = self._sites(model)
+        self.site_precision[:, model], self.site_shift[:, model] = tau, nu
+
+    def _ensure(self, state: _ModelState, model: int) -> None:
+        """The dual solver's column of ``model`` back at this fixed point's sites and metric before it answers for it (a
+        later trial may have moved either); the other models' columns are factored at the oracle's current sites and
+        metrics, and no model's solves read another's. The oracle's own state stays where it was."""
+        if self._solver_version[model] == state.version and state.sites is self.sites[model] and self.gaussian.metric_key == self.metric_key:
+            return
+        current = self.sites[model]
+        moved = state.sites is not current
+        if moved:
+            self.sites[model] = state.sites
             self._install_metric()
-            self._sync()
-            self._iterate(snapshot["site_precision"], snapshot["site_shift"], snapshot["noise"])
-            if any(held is not now for held, now in zip(current, self.sites)):
-                # The oracle's own state stays where it was: only the dual solver answers for the snapshot.
-                self.sites = current
-                self._install_metric()
-            else:
-                self.version = snapshot["version"]
+        precision, shift, noise = self.site_precision.copy(), self.site_shift.copy(), self.noise.copy()
+        omega = self.member_squares[:, model] / state.noise
+        live = state.variance > 0.0
+        with np.errstate(divide="ignore"):
+            precision[:, model] = np.where(live, 1.0 / np.where(live, state.variance, 1.0), np.inf) - omega
+            shift[:, model] = np.where(live, state.mean / np.where(live, state.variance, 1.0) - state.shift, 0.0)
+        noise[model] = state.noise
+        self._iterate(precision, shift, noise)
+        self._solver_version[model] = state.version
+        if moved:
+            self.sites[model] = current
+            self._install_metric()
 
     # the design, streamed
 
@@ -1643,16 +1839,28 @@ class _FullDataMeanField:
         summands = 2 * self.prior.variant_count + int(self.training_counts[model])
         return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (abs(residual_term) + fit_term + sizes)
 
+    def _sweep_budget(self, model: int, hyperparameters: MixtureHyperparameters) -> SweepBudget:
+        """This solve's work budget (``SweepBudget``): the ELBO ceiling at the noise floor from the prior's smallest
+        lattice variance per member at these hyperparameters; a binary model's ELBO bounds the Bernoulli log likelihood
+        of its labels, a log probability, so its ceiling is 0."""
+        if self.sites[model] is not None:
+            return SweepBudget(ceiling=0.0, tolerance=0.5 / self.draw_count)
+        smallest = np.exp(log_scale(self.prior, hyperparameters.coefficients) + float(np.min(self.prior.log_variance_grid)))
+        floor = noise_floor(self.member_squares[:, model], smallest, float(self.residual_dimension[model]), float(self.noise[model]))
+        return SweepBudget(ceiling=elbo_ceiling(float(self.residual_dimension[model]), floor), tolerance=0.5 / self.draw_count)
+
     def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
         """Sweeps at the current noise, the noise moving to its stationary value between them, until the sweeps'
         measured remainder (the geometric extrapolation of the last two gains, ``mean_field``) plus the noise's
-        pending gain is within the tolerance."""
+        pending gain is within the tolerance, or the solve's derived work budget (``SweepBudget``) is spent, which
+        raises ``FloatingPointError`` (the trial is refused, counted in ``unresolved``, and never reported solved)."""
         tolerance = 0.5 / self.draw_count
         elbo: float | None = None
         gain: float | None = None
         previous_gain: float | None = None
         pending_noise: float | None = None
         passes_at_entry = self.passes
+        budget = self._sweep_budget(model, hyperparameters)
         while True:
             if pass_budget is not None and self.passes - passes_at_entry >= pass_budget:
                 raise _PassBudget()
@@ -1701,6 +1909,13 @@ class _FullDataMeanField:
                 self._reweight(model, updated)
                 elbo = value + site_gain
                 gain = previous_gain = None
+            if budget.exhausted(value, rounding):
+                self.unresolved[model] += 1
+                raise FloatingPointError(
+                    f"model {model}: the mean-field solve spent its derived work budget ({budget.iterations} iterations against the ELBO "
+                    f"ceiling {budget.ceiling:.6g} from {budget.first:.6g} in steps of at least {budget.step:.3g}) with {remaining:.3g} nats "
+                    "extrapolated to go: unresolved"
+                )
 
     def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
         """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
@@ -1717,6 +1932,7 @@ class _FullDataMeanField:
             indefinite_core=True,
         )
         self.version += 1
+        self._solver_version[:] = self.version
 
     def _sites(self, model: int) -> tuple[F64Array, F64Array, F64Array, np.ndarray]:
         omega = self.member_squares[:, model] / float(self.noise[model])
@@ -1730,81 +1946,77 @@ class _FullDataMeanField:
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
         start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x)."""
-        entry = self._snapshot()
-        solved: list[list[tuple[float, dict] | None]] = []
+        entry = [self._state(model) for model in range(self.model_count)]
         first = self.refreshes == 0
+        candidates: list[list[_ModelState]] = [[] for _ in range(self.model_count)]
         # The cold solve gets the carried solve's own count of passes per model, and no more (``mean_field``).
         budgets: list[int | None] = [None] * self.model_count
-        for start in ((entry,) if first else (entry, self._cold)):
-            self._restore(start)
-            outcome: list[tuple[float, dict] | None] = []
+        for cold in ((False,) if first else (False, True)):
             for model in range(self.model_count):
+                if cold:
+                    self._cold_state(model)
                 before = self.passes
                 try:
                     self._solve_model(model, hyperparameters[model], pass_budget=budgets[model])
                 except _PassBudget:
-                    outcome.append(None)
                     continue
                 except (FloatingPointError, ZeroDivisionError) as error:
                     self.refusals.append(f"{type(error).__name__}: {error}")
-                    outcome.append(None)
                     continue
                 if budgets[model] is None:
                     budgets[model] = self.passes - before
-                outcome.append((float(self.elbo[model]), self._snapshot()))
-            solved.append(outcome)
+                candidates[model].append(self._state(model))
+        if any(not solved for solved in candidates):
+            # No start reaches some model's fixed point: the trial is refused whole, as EP's oracle refuses.
+            for model, state in enumerate(entry):
+                self._restore_state(state, model)
+            return [None] * self.model_count
+        for model, solved in enumerate(candidates):
+            self._restore_state(max(solved, key=lambda state: state.elbo), model)
+        del candidates
         for model in range(self.model_count):
-            candidates = [outcome[model] for outcome in solved if outcome[model] is not None]
-            if not candidates:
-                # No start reaches this model's fixed point: the trial is refused whole, as EP's oracle refuses.
-                self._restore(entry)
-                return [None] * self.model_count
-            _value, state = max(candidates, key=lambda item: item[0])
-            self._restore(state, [model])
-        for model in range(self.model_count):
-            omega, tau, nu, _live = self._sites(model)
-            self.site_precision[:, model] = tau
-            self.site_shift[:, model] = nu
-            self.effective[model] = max(float(np.sum(omega * self.variance[:, model])), _EPSILON * tau.shape[0])
+            omega, _tau, _nu, _live = self._sites(model)
+            self.effective[model] = max(float(np.sum(omega * self.variance[:, model])), _EPSILON * self.prior.variant_count)
         try:
             self._iterate(self.site_precision, self.site_shift, self.noise)
         except np.linalg.LinAlgError as error:
             self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
-            self._restore(entry)
+            for model, state in enumerate(entry):
+                self._restore_state(state, model)
             return [None] * self.model_count
+        del entry
         self.refreshes += 1
-        improved = [model for model in range(self.model_count) if self.elbo[model] > self.best_elbo[model]]
-        if improved:
-            state = self._snapshot()
-            for model in improved:
-                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], state, hyperparameters[model]
+        for model in range(self.model_count):
+            if self.elbo[model] > self.best_elbo[model]:
+                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
         return [self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
 
-    def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[MixtureHyperparameters, ...]:
+    def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[tuple[MixtureHyperparameters, ...], BoolArray]:
         """Each model back at its highest-ELBO refreshed state where that is above where the outer loop ended by more than
-        ``tolerance``, the dual solver refactored at the restored sites; returns each model's hyperparameters."""
+        ``tolerance``, the dual solver refactored at the restored sites; returns each model's hyperparameters and which
+        models were restored (their outer-loop diagnostics describe another state: ``fit_full_data``)."""
         chosen = list(hyperparameters)
-        restored = [model for model in range(self.model_count)
-                    if self.best_state[model] is not None and self.best_elbo[model] > self.elbo[model] + tolerance]
-        for model in restored:
-            self._restore(self.best_state[model], [model])  # type: ignore[arg-type]
+        restored = np.array([
+            self.best_state[model] is not None and self.best_elbo[model] > self.elbo[model] + tolerance for model in range(self.model_count)
+        ], dtype=bool)
+        for model in np.flatnonzero(restored):
+            self._restore_state(self.best_state[model], int(model))  # type: ignore[arg-type]
             chosen[model] = self.best_hyperparameters[model]  # type: ignore[assignment]
-        if restored:
+        if np.any(restored):
             self._iterate(self.site_precision, self.site_shift, self.noise)
-        return tuple(chosen)
+        return tuple(chosen), restored
 
     def _fixed_point(self, model: int, hyperparameters: MixtureHyperparameters) -> FixedPoint:
         omega, tau, _nu, live = self._sites(model)
         noise = float(self.noise[model])
         squares = self.member_squares[:, model].copy()
-        mean, variance, shift = self.mean[:, model].copy(), self.variance[:, model].copy(), self.shift[:, model].copy()
-        third, fourth = self.third[:, model].copy(), self.fourth[:, model].copy()
-        residual = self.residual[model].copy()
+        # The fixed point's restore point is its model's state, and its responses read those same arrays.
+        state = self._state(model)
+        mean, variance, shift, third, fourth, residual = (getattr(state, name) for name in _MODEL_STATE_ARRAYS)
         mean_by_omega = np.where(live, -0.5 * (third + 2.0 * mean * variance), 0.0)
         variance_by_shift = np.where(live, third, 0.0)
         variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
         residual_dimension = float(self.residual_dimension[model])
-        snapshot = self._snapshot()
         # The metric this fixed point was solved in, held: a later trial may move a binary model's sites.
         metric = (self.models, self.root)
         binary = self.sites[model] is not None
@@ -1813,7 +2025,7 @@ class _FullDataMeanField:
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
         dual = _member_posterior(
-            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(snapshot)), self.ties, tau, group_variance, algebraic=True,
+            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model)), self.ties, tau, group_variance, algebraic=True,
         )
         noise_solve: dict[str, object] = {}
 
@@ -1866,7 +2078,7 @@ class _FullDataMeanField:
         offset = float(self.elbo[model]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
         return FixedPoint(
             cavity=cavity, posterior=posterior, mean=mean, precision_norm=norm, effective_effects=float(self.effective[model]),
-            restore=lambda: self._restore(snapshot, [model]), evidence_offset=offset,
+            restore=lambda: self._restore_state(state, model), evidence_offset=offset,
         )
 
     def binary_component(self, model: int) -> BinaryComponent:
@@ -1906,6 +2118,17 @@ class _FullDataMeanField:
         return np.asarray(_host(self.models.covariate_solve(right, xp.asarray([model]))), dtype=np.float64)[:, 0]
 
 
+def state_digest(parts: Sequence[F64Array]) -> np.ndarray:
+    """SHA-256 over the returned state's arrays, in order (each one's dtype, shape and bytes), as 32 uint8: what the
+    certificate is bound to, so a reader can check that the diagnostics it holds are the ones of the model it scores."""
+    digest = hashlib.sha256()
+    for part in parts:
+        array = np.ascontiguousarray(np.asarray(part, dtype=np.float64))
+        digest.update(f"{array.dtype.str}{array.shape}".encode())
+        digest.update(array.tobytes())
+    return np.frombuffer(digest.digest(), dtype=np.uint8).copy()
+
+
 def fit_full_data(
     *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
     inference: str = "ep",
@@ -1919,7 +2142,16 @@ def fit_full_data(
     ``binary_likelihood``), with the dual solver already in their metric (its sample weights the sites' weights, its
     targets their working responses): such a model is fitted on its Bernoulli bound at unit noise, known, by the
     mean-field route only, and its fixed points move their own sites. Stage 0's statistics for it are those of its
-    start's equal-weight problem (response 4 kappa at noise 4, ``stage2_wiring``), exact at xi = 0."""
+    start's equal-weight problem (response 4 kappa at noise 4, ``stage2_wiring``), exact at xi = 0.
+
+    The certificate is bound to the returned state. On the mean-field route a model whose best-ELBO state is returned
+    in place of where the outer loop ended (``restore_best``) has its outer-loop terms (remaining gain, Newton
+    decrement, prediction move) withheld as NaN and its outer criterion unmet, since they describe the state the loop
+    ended at, and ``restored_best`` says so; the fixed-point terms (mean move, noise gain) are the returned mixture's,
+    the largest over its components (each measured at its own fixed point); ``mixture_components`` counts them,
+    ``budget_unresolved`` counts the solves and mixture searches that ended at their derived work budgets, and
+    ``state_digest`` is the SHA-256 of the returned mean, hyperparameters, noise, components, weights and covariate
+    coefficients (``state_digest``)."""
     # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
     moments = moment_starts(statistics, prior)
@@ -1965,14 +2197,46 @@ def fit_full_data(
         fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None, model_sites)
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
+    model_count = gaussian.model_count
+    restored = np.zeros(model_count, dtype=bool)
+    mean_move = np.array(fixed_points.mean_move, dtype=np.float64)
+    noise_gains = np.array(fixed_points.noise_gain, dtype=np.float64)
+    component_count = np.ones(model_count, dtype=np.int64)
+    budget_unresolved = np.zeros(model_count, dtype=np.int64)
+    if prior.annotation_groups and mean_field is not None:
+        budget_unresolved += np.asarray(base_points.unresolved, dtype=np.int64)
+    refusals = list(fixed_points.refusals)
     components: tuple[tuple[F64Array, F64Array], ...] = ()
     member_mean = component_weights = None
     binary_parts: tuple = ()
     if mean_field is not None:
-        hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
-        member_mean, components, component_weights, binary_parts = _mode_mixture(
-            mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments,
+        hyperparameters, restored = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
+        for model in np.flatnonzero(restored):
+            refusals.append(
+                f"model {int(model)}: the fit returns its best-ELBO state, not the one the outer loop ended at; the outer loop's "
+                "remaining gain, Newton decrement and prediction move describe that other state and are withheld"
+            )
+        mixture = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments)
+        member_mean, components, component_weights, binary_parts = mixture.mean, mixture.components, mixture.weights, mixture.binaries
+        mean_move, noise_gains = mixture.mean_move, mixture.noise_gain
+        component_count = np.full(model_count, len(components), dtype=np.int64)
+        budget_unresolved += np.asarray(mean_field.unresolved, dtype=np.int64) + mixture.unresolved
+        refusals.extend(mixture.refusals)
+    covariate_coefficients = None if mean_field is None else np.column_stack(
+        [mean_field.covariate_coefficients(model, member_mean[:, model]) for model in range(mean_field.model_count)]
+    )
+    withheld = np.where(restored, np.nan, 1.0)
+    returned_mean = member_mean if member_mean is not None else np.asarray(_host(gaussian.mean), dtype=np.float64)
+    digests = np.stack([
+        state_digest(
+            [returned_mean[:, model], hyperparameters[model].coefficients, np.atleast_1d(hyperparameters[model].log_smoothing),
+             np.array([float(fixed_points.noise[model])])]
+            + [part[:, model] for shift, omega in components for part in (shift, omega)]
+            + ([] if component_weights is None else [component_weights[:, model]])
+            + ([] if covariate_coefficients is None else [covariate_coefficients[:, model]])
         )
+        for model in range(model_count)
+    ])
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
@@ -1984,21 +2248,19 @@ def fit_full_data(
         component_weights=component_weights,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
-        covariate_coefficients=None if mean_field is None else np.column_stack(
-            [mean_field.covariate_coefficients(model, member_mean[:, model]) for model in range(mean_field.model_count)]
-        ),
+        covariate_coefficients=covariate_coefficients,
         working_bytes=int(working_bytes),
         hyperparameters=hyperparameters,
         noise_variance=fixed_points.noise,
         certificate=FitCertificate(
-            remaining_gain=np.array([fit.remaining_gain for fit in fits]),
-            newton_decrement=np.array([fit.newton_decrement for fit in fits]),
+            remaining_gain=np.array([fit.remaining_gain for fit in fits]) * withheld,
+            newton_decrement=np.array([fit.newton_decrement for fit in fits]) * withheld,
             smoothing_gradient=np.array([fit.step.smoothing_gradient for fit in fits]),
             stationarity_steps=tuple(fit.step.stationarity_steps for fit in fits),
             stationarity_errors=tuple(fit.step.stationarity_errors for fit in fits),
-            mean_move=fixed_points.mean_move,
+            mean_move=mean_move,
             draw_tolerance=np.full(gaussian.model_count, 1.0 / draw_count),
-            noise_gain=fixed_points.noise_gain,
+            noise_gain=noise_gains,
             mean_error=fixed_points.mean_error,
             # The cavity information certificate is EP's (its cavities come from leave-block-out variances); the
             # mean-field route's cavities are its own pseudo-likelihoods, so it has no such term.
@@ -2011,16 +2273,22 @@ def fit_full_data(
             effective_effects=fixed_points.effective,
             outer_iterations=np.array([fit.iterations for fit in fits], dtype=np.int64),
             halvings=np.array([fit.halvings for fit in fits], dtype=np.int64),
-            prediction_move=np.array([fit.prediction_move for fit in fits]),
+            prediction_move=np.array([fit.prediction_move for fit in fits]) * withheld,
             prediction_tolerance=np.array([fit.prediction_tolerance for fit in fits]),
             unresolved=np.array([fit.unresolved for fit in fits], dtype=np.int64),
-            refusals=tuple(fixed_points.refusals),
+            refusals=tuple(refusals),
             outer_history=tuple(fit.history for fit in fits),
             refreshes=fixed_points.refreshes,
             passes=fixed_points.passes,
-            outer_criterion_met=np.array([fit.certified for fit in fits], dtype=bool),
+            outer_criterion_met=np.array([fit.certified for fit in fits], dtype=bool) & ~restored & (budget_unresolved == 0),
+            restored_best=restored,
+            budget_unresolved=budget_unresolved,
+            mixture_components=component_count,
+            state_digest=digests,
         ),
     )
+
+
 
 
 def _ridge_mean(
@@ -2048,32 +2316,58 @@ def _ridge_mean(
     return mean
 
 
+@dataclass(frozen=True)
+class _Mixture:
+    """``_mode_mixture``'s result: the weighted mean (members x models), each component's (shift h, omega), members x
+    models, the weights (components x models), each component's ``BinaryComponent`` per binary model (None per
+    quantitative one), the largest mean move and noise gain over the components (each at its own fixed point), per
+    model, and whether the search ended at its budget unsettled (1) with why."""
+
+    mean: F64Array
+    components: tuple[tuple[F64Array, F64Array], ...]
+    weights: F64Array
+    binaries: tuple
+    mean_move: F64Array
+    noise_gain: F64Array
+    unresolved: I64Array
+    refusals: tuple[str, ...]
+
+
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
-) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...], F64Array, tuple]:
+) -> _Mixture:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
     random within-block member orders, each weighted per model by its evidence, exp(ELBO) (``small_n._mixture_weights``:
-    a poor fixed point carries no weight; a repeat of a held mode is merged into it), until one more moves every model's fitted genetic values by at most the
-    draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component and the fixed point from
-    the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are given) the second, and the main fixed
-    point's dual-solver state is put back at the end. Returns the weighted mean, each component's (shift, omega), the
-    weights, and each component's ``BinaryComponent`` per binary model (None per quantitative one).
+    a poor fixed point carries no weight; a repeat of a held mode is merged into it), until one more moves every model's
+    fitted genetic values by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the
+    first component and the fixed point from the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are
+    given) the second, and the main fixed point's dual-solver state is put back at the end.
 
     A binary model's components each start from the main fixed point's sites and move their own (their Bernoulli
     bounds are the evidence that weighs them); a move of the fitted genetic values is measured in the main fixed point's
-    metric at its known unit noise."""
+    metric at its known unit noise.
+
+    Work budget: at most K random orders are tried. The mixture reaches the scorer through its K draws, each from one
+    component (``draw_laws.ProductMixtureDraws``), so no more than K components are ever represented; a search that has
+    tried K orders (a refused order counts: it consumed the attempt) without settling ends there, unresolved, and says
+    so rather than run on."""
     def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
         return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
 
     def binary_of(oracle: "_FullDataMeanField") -> tuple:
         return tuple(None if model_sites is None else oracle.binary_component(model) for model, model_sites in enumerate(oracle.sites))
 
-    means, components, elbos, binaries = [], [], [], []
-    mean, shift, omega = pieces(main)
-    means.append(mean); components.append((shift, omega)); elbos.append(np.array(main.elbo, dtype=np.float64)); binaries.append(binary_of(main))
+    means, components, elbos, binaries, moves, gains = [], [], [], [], [], []
+
+    def held(oracle: "_FullDataMeanField") -> None:
+        mean, shift, omega = pieces(oracle)
+        means.append(mean); components.append((shift, omega)); elbos.append(np.array(oracle.elbo, dtype=np.float64)); binaries.append(binary_of(oracle))
+        moves.append(np.array(oracle.mean_move, dtype=np.float64)); gains.append(np.array(oracle.noise_gain, dtype=np.float64))
+
+    held(main)
 
     def weighted() -> tuple[F64Array, F64Array]:
         values = np.array(elbos)
@@ -2085,18 +2379,19 @@ def _mode_mixture(
         """A new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture is over distinct
         modes, each weighted by its own mass once); the repeat of the higher evidence is kept. The component's panel
         Grams are released: its order's panels are no other component's."""
-        mean, shift, omega = pieces(oracle)
         oracle._panel_grams.clear()
         elbo = np.array(oracle.elbo, dtype=np.float64)
-        for index, held in enumerate(means):
+        for index, kept in enumerate(means):
             if all(
-                float(np.sum(np.square(main._image((mean - held)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
+                float(np.sum(np.square(main._image((oracle.mean - kept)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
                 for model in range(main.model_count)
             ):
                 if float(np.sum(elbo)) > float(np.sum(elbos[index])):
+                    mean, shift, omega = pieces(oracle)
                     means[index], components[index], elbos[index], binaries[index] = mean, (shift, omega), elbo, binary_of(oracle)
+                    moves[index], gains[index] = np.array(oracle.mean_move, dtype=np.float64), np.array(oracle.noise_gain, dtype=np.float64)
                 return
-        means.append(mean); components.append((shift, omega)); elbos.append(elbo); binaries.append(binary_of(oracle))
+        held(oracle)
 
     average, _weights = weighted()
     if moments:
@@ -2116,17 +2411,21 @@ def _mode_mixture(
         if not any(point is None for point in points):
             admit(ridge)
             average, _weights = weighted()
-    component = 0
-    while True:
-        component += 1
+        del ridge, points
+    settled = False
+    unresolved = np.zeros(main.model_count, dtype=np.int64)
+    refusals: list[str] = []
+    for component in range(1, draw_count + 1):
         oracle = _FullDataMeanField(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component,
             sites=list(main.sites),
         )
         points = oracle(list(hyperparameters))
+        unresolved += oracle.unresolved
         if any(point is None for point in points):
             continue
         admit(oracle)
+        del oracle, points
         updated, _weights = weighted()
         settled = all(
             float(np.sum(np.square(main._image((updated - average)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
@@ -2135,22 +2434,40 @@ def _mode_mixture(
         average = updated
         if settled:
             break
+    if not settled:
+        unresolved += 1
+        refusals.append(
+            f"the mode mixture tried its budget of {draw_count} orders (one per draw that can represent a component) without settling: "
+            f"{len(components)} components, unresolved"
+        )
     main._iterate(main.site_precision, main.site_shift, main.noise)
     main._panel_grams.clear()
-    return average, tuple(components), weighted()[1], tuple(binaries)
+    average, weights = weighted()
+    return _Mixture(
+        mean=average, components=tuple(components), weights=weights, binaries=tuple(binaries), mean_move=np.max(np.array(moves), axis=0),
+        noise_gain=np.max(np.array(gains), axis=0), unresolved=unresolved, refusals=tuple(refusals),
+    )
 
 
 def scoring_models(
     fit: FullDataFit, prior: ScaleMixturePrior, statistics: GenotypeSufficientStatistics, trait_types: Sequence[TraitType], draw_count: int, seed: int
 ) -> list[ScoringModel]:
     """One ``fast_scoring.ScoringModel`` per model over every active store row: each tie member's own posterior mean
-    and K exact posterior draws (``tie_members``: its group's, conditioned on the sum, with its own site and prior),
-    and the covariate coefficients. Tied members are equal on the training samples only, so each keeps its effect."""
+    and the law of its K posterior draws, and the covariate coefficients. Tied members are equal on the training samples
+    only, so each keeps its effect.
+
+    The mean-field route's draws are a law (``draw_laws.ProductMixtureDraws``: the mixture's components, weights and
+    lattice, O(components x members), each draw's component drawn from the weights), drawn a tile of rows at a time
+    when scored or exported; nothing of the size members x draws is formed here. The covariate coefficients'
+    conditional means per draw are summed over tiles of members: a quantitative model's alpha - (C'C)^+ L d_k with d_k
+    the draw's move of the reduced columns' effects, as (C'C)^+ L S (tile - mean) (S the members' signed group map); a
+    binary model's anchor_c - loading_c b_k in the metric of the draw's own component c (``BinaryComponent``), as
+    loading_c S tile. So no group x draws array is formed either. The EP route's draws are its Gaussian's
+    perturb-and-solve draws, joint over every column, which exist only whole (the dual solver's p x K)."""
     gaussian = fit.gaussian
     ties = TieGroups.from_tie_map(statistics.tie_map)
     identity = _compact_identity_tie_map(ties.member_count)
     if fit.inference == "mean_field":
-        # q's own means and its product draws (``mean_field.product_draws``: conditional variational draws).
         assert fit.member_mean is not None and fit.member_shift is not None and fit.member_omega is not None and fit.covariate_coefficients is not None
         mean, alpha = fit.member_mean, fit.covariate_coefficients
         class_index = np.asarray(prior.class_index, dtype=np.int64)
@@ -2163,53 +2480,53 @@ def scoring_models(
     models = []
     loading = np.concatenate([statistics.ld.block(index).covariate_cross for index in range(statistics.ld.block_count)], axis=0).T
     conditional_loading = statistics.covariate_gram_pseudo_inverse @ loading
+    # A tile of draws is as many members as the widest LD block holds (the fit's own scheduling unit).
+    block_of_group = np.searchsorted(np.asarray(statistics.ld.block_boundaries), np.arange(ties.group_count), side="right") - 1
+    widest = int(np.max(np.bincount(block_of_group[ties.group])))
+    broker = current_broker()
     for model, trait_type in enumerate(trait_types):
-        if fit.inference == "mean_field":
-            from sv_pgs.mean_field import product_draws
-
-            parts = fit.member_components or ((fit.member_shift, fit.member_omega),)
-            from sv_pgs.small_n import _draw_shares
-
-            weights = np.ones(len(parts)) / len(parts) if fit.component_weights is None else fit.component_weights[:, model]
-            shares = _draw_shares(weights, draw_count)
-            # One p x K array, each component's draws written into its own columns (no per-component copies).
-            draws = np.empty((ties.member_count, draw_count))
-            column = 0
-            spans = []
-            for index, ((shift, omega), share) in enumerate(zip(parts, shares)):
-                if share:
-                    draws[:, column:column + share] = product_draws(
-                        prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
-                        np.random.default_rng([seed, model, index]), share, fit.working_bytes,
-                    )
-                    spans.append((index, column, column + share))
-                    column += share
-        else:
-            draws = member_draws(
-                ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
-            )
-        # Each draw's move of the reduced columns' effects (the members' signed sums), on which the covariate
-        # coefficients' conditional means depend through the loading.
-        if fit.inference == "mean_field":
-            # Summed over row chunks of the fit's working budget, so no p x K temporary is formed.
-            group_deviations = np.zeros((ties.group_count, draw_count))
-            rows = max(1, int(fit.working_bytes) // (np.dtype(np.float64).itemsize * draw_count)) if fit.working_bytes > 0 else ties.member_count
-            for first in range(0, ties.member_count, rows):
-                chunk = slice(first, min(first + rows, ties.member_count))
-                np.add.at(group_deviations, ties.group[chunk], ties.sign[chunk, None] * (draws[chunk] - mean[chunk, model, None]))
-        else:
-            group_deviations = group_draws[:, model, :] - group_mean[:, model, None]
         model_alpha = alpha[:, model]
-        covariate_draws = alpha[:, model, None] - conditional_loading @ group_deviations
         covariate_covariance = fit.noise_variance[model] * statistics.covariate_gram_pseudo_inverse
         shift_value = 0.0
-        binary = [part[model] for part in fit.binary_components] if fit.binary_components else []
-        if binary and binary[0] is not None:
-            # Each draw's reduced-column sums, b_g = its deviation plus the mixture mean's sums.
-            mean_sums = np.bincount(ties.group, weights=ties.sign * mean[:, model], minlength=ties.group_count)
-            model_alpha, covariate_draws, covariate_covariance, shift_value = _binary_covariates(
-                binary, weights, spans, group_deviations + mean_sums[:, None],
+        if fit.inference == "mean_field":
+            parts = fit.member_components or ((fit.member_shift, fit.member_omega),)
+            weights = np.ones(len(parts)) / len(parts) if fit.component_weights is None else fit.component_weights[:, model]
+            coefficients = fit.hyperparameters[model].coefficients
+            law = ProductMixtureDraws(
+                class_index=class_index, log_scale=log_scale(prior, coefficients), log_density=class_log_density(prior, coefficients),
+                log_variance_grid=np.asarray(prior.log_variance_grid, dtype=np.float64),
+                shift=np.stack([np.asarray(shift, dtype=np.float64)[:, model] for shift, _omega in parts]),
+                omega=np.stack([np.asarray(omega, dtype=np.float64)[:, model] for _shift, omega in parts]),
+                weights=np.asarray(weights, dtype=np.float64) / float(np.sum(weights)), key=seed_key(seed, model), draw_count=draw_count,
             )
+            binary = [part[model] for part in fit.binary_components] if fit.binary_components else []
+            binary = binary if binary and binary[0] is not None else []
+            chosen = law.components_of_draws()
+            # Each (quantitative) or each component's (binary) loading over the members, signed: k x members.
+            loadings = [component.loading[:, ties.group] * ties.sign[None, :] for component in binary] or [conditional_loading[:, ties.group] * ties.sign[None, :]]
+            loaded = np.zeros((alpha.shape[0], draw_count))
+            step = max(1, min(widest, tile_rows(law, fit.working_bytes) if fit.working_bytes > 0 else widest))
+            row_bytes = law.tile_row_bytes() + _FLOAT_BYTES * draw_count
+            with (broker.reserve(HOST, min(step, ties.member_count) * row_bytes, "a tile of posterior draws") if broker is not None else contextlib.nullcontext()):
+                for first in range(0, ties.member_count, step):
+                    last = min(first + step, ties.member_count)
+                    tile = law.tile(first, last)
+                    if binary:
+                        for index, member_loading in enumerate(loadings):
+                            columns = np.flatnonzero(chosen == index)
+                            if columns.size:
+                                loaded[:, columns] += member_loading[:, first:last] @ tile[:, columns]
+                    else:
+                        loaded += loadings[0][:, first:last] @ (tile - mean[first:last, model, None])
+            if binary:
+                model_alpha, covariate_draws, covariate_covariance, shift_value = _binary_covariates(binary, weights, chosen, loaded)
+            else:
+                covariate_draws = alpha[:, model, None] - loaded
+        else:
+            law = member_draws(
+                ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
+            )
+            covariate_draws = alpha[:, model, None] - conditional_loading @ (group_draws[:, model, :] - group_mean[:, model, None])
         models.append(ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
             signed_means=np.asarray(statistics.means, dtype=np.float64),
@@ -2217,7 +2534,7 @@ def scoring_models(
             tie_map=identity,
             member_prior_variances=prior_second_moment(prior, fit.hyperparameters[model]),
             beta_reduced=mean[:, model],
-            posterior_draws_reduced=draws,
+            posterior_draws_reduced=law,
             alpha=model_alpha,
             trait_type=trait_type,
             predictive_intercept_shift=shift_value,
@@ -2230,19 +2547,17 @@ def scoring_models(
 
 
 def _binary_covariates(
-    components: Sequence[BinaryComponent], weights: F64Array, spans: Sequence[tuple[int, int, int]], group_sums: F64Array,
+    components: Sequence[BinaryComponent], weights: F64Array, chosen: I64Array, loaded: F64Array,
 ) -> tuple[F64Array, F64Array, F64Array, float]:
     """A binary model's covariate terms and predictive shift over its mixture (``small_n._binary_covariates``), each
-    component in its own metric: alpha = sum_c w_c alpha_c, each draw's covariates anchor_c - loading_c b_g for the
-    component c it came from (``spans``: (component, first column, last column)), the within-component covariance
-    sum_c w_c (C'W_c C)^+, and the intercept shift that puts the mean predictive over the training rows at their
-    prevalence under the mixture's predictor moments (``binary_likelihood.calibrated_shift``)."""
+    component in its own metric: alpha = sum_c w_c alpha_c, each draw k's covariates anchor_c - loading_c b_k for the
+    component c = ``chosen[k]`` it came from (``loaded[:, k]`` = loading_c b_k, summed over tiles of members), the
+    within-component covariance sum_c w_c (C'W_c C)^+, and the intercept shift that puts the mean predictive over the
+    training rows at their prevalence under the mixture's predictor moments (``binary_likelihood.calibrated_shift``)."""
     alpha = np.einsum("c,ck->k", weights, np.array([component.alpha for component in components]))
     covariance = np.einsum("c,ckl->kl", weights, np.array([component.covariance for component in components]))
-    covariate_draws = np.empty((alpha.shape[0], group_sums.shape[1]))
-    for index, first, last in spans:
-        component = components[index]
-        covariate_draws[:, first:last] = component.anchor[:, None] - component.loading @ group_sums[:, first:last]
+    anchors = np.array([component.anchor for component in components])
+    covariate_draws = anchors[chosen].T - loaded
     means = np.array([component.predictor_mean for component in components])
     mixture_mean = np.einsum("c,ci->i", weights, means)
     mixture_variance = np.einsum("c,ci->i", weights, np.array([component.predictor_variance for component in components]) + (means - mixture_mean[None, :]) ** 2)

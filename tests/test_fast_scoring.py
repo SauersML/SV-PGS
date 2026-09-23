@@ -23,7 +23,9 @@ from sv_pgs.fast_scoring import (
     GeneticScores,
     ScoringPlan,
     _cpu_panels,
+    _batch_bytes,
     _host_bytes,
+    _output_bytes,
     _trapezoid_rule,
     posterior_predictive_probability,
     predictive_intercept_shift,
@@ -110,11 +112,12 @@ def dense_reference(codes: np.ndarray, model: ScoringModel) -> tuple[np.ndarray,
     moments = (codes, model.store_rows, model.signed_means, model.signed_scales)
     mean_score = dense_scores(*moments, model.coefficients[:, None])[0]
     mean_bound = score_rounding_bound(*moments, model.coefficients[:, None])[0]
-    draw_scores = dense_scores(*moments, model.posterior_draws)
+    draws = np.asarray(model.posterior_draws)
+    draw_scores = dense_scores(*moments, draws)
     deviations = draw_scores - mean_score[None, :]
     variance = np.mean(deviations**2, axis=0)
     # each deviation moves by at most d = its draw's bound + the mean's bound, so its square by 2|dev| d + d^2
-    deviation_bound = score_rounding_bound(*moments, model.posterior_draws) + mean_bound[None, :]
+    deviation_bound = score_rounding_bound(*moments, draws) + mean_bound[None, :]
     variance_bound = np.mean(2.0 * np.abs(deviations) * deviation_bound + deviation_bound**2, axis=0)
     return mean_score, mean_bound, variance, variance_bound + gamma(model.draw_count + 2) * variance
 
@@ -266,7 +269,7 @@ def test_reduced_fit_expands_mean_and_draws_by_prior_variance_weights_and_signs(
     )
     # a weight is a ratio of a sum, times the group coefficient and a sign: a few roundings each way
     assert_within(model.coefficients, expected_mean, gamma(8) * np.abs(expected_mean))
-    assert_within(model.posterior_draws, expected_draws, gamma(8) * np.abs(expected_draws))
+    assert_within(np.asarray(model.posterior_draws), expected_draws, gamma(8) * np.abs(expected_draws))
     assert model.coefficients.dtype == np.float64 and model.draw_count == 2
 
 
@@ -287,13 +290,15 @@ def test_a_binary_model_without_posterior_draws_is_rejected():
         )
 
 
-def test_a_host_budget_below_one_block_row_is_refused_and_panels_balance():
+def test_a_host_budget_below_one_models_block_row_is_refused_and_panels_balance():
     random_generator = np.random.default_rng(9)
     codes = random_codes(random_generator, variant_count=30, sample_count=20)
     plan = ScoringPlan.from_models(two_fold_models(codes, random_generator))
-    budget = cpu_budget(plan, sample_count=20, block_rows=1, threads=1)
+    # The result for both models plus the smaller of the two models' one-row reads, less a byte: no batch fits.
+    smallest = min(_batch_bytes(plan, [model], 20, 20, 1, "cpu", "keep") for model in range(plan.model_count))
+    budget = replace(cpu_budget(plan, sample_count=20, block_rows=1, threads=1), host_bytes=_output_bytes(plan, 20, "keep") + smallest - 1)
     with pytest.raises(MemoryError):
-        score_genetic(InMemoryCodes(codes), plan, replace(budget, host_bytes=budget.host_bytes - 1))
+        score_genetic(InMemoryCodes(codes), plan, budget)
     widths = [stop - start for start, stop in _cpu_panels(103, 4)]
     assert sum(widths) == 103 and max(widths) - min(widths) <= 1 and len(widths) == 4
     assert _cpu_panels(3, 8) == [(0, 1), (1, 2), (2, 3)]
@@ -429,3 +434,78 @@ def test_cuda_scores_equal_cpu_scores():
         _mean, mean_bound, _variance, variance_bound = dense_reference(codes, model)
         assert_within(device_scores.means[:, model_index], host_scores.means[:, model_index], 2.0 * mean_bound)
         assert_within(device_scores.variances[:, model_index], host_scores.variances[:, model_index], 2.0 * variance_bound)
+
+
+class _RefusingLaw:
+    """A draw law that fails if any tile is asked of it: mean prediction must never generate a draw."""
+
+    kind = "refusing"
+
+    def __init__(self, rows: int, draw_count: int) -> None:
+        self.shape = (rows, draw_count)
+
+    def tile(self, start: int, stop: int) -> np.ndarray:
+        raise AssertionError("mean prediction asked for posterior draws")
+
+    def tile_row_bytes(self) -> int:
+        return 0
+
+
+def test_mean_prediction_generates_no_draw_and_forms_no_weight_matrix_over_the_rows():
+    random_generator = np.random.default_rng(21)
+    codes = random_codes(random_generator, variant_count=150, sample_count=60)
+    models = [replace(model, posterior_draws=_RefusingLaw(model.store_rows.shape[0], 5), covariate_draws=np.zeros((3, 5)))
+              for model in two_fold_models(codes, random_generator)]
+    plan = ScoringPlan.from_models(models)
+    # The plan holds per-model row positions and mean offsets only: nothing of the size rows x columns.
+    assert not hasattr(plan, "weights")
+    budget = cpu_budget(plan, sample_count=60, block_rows=20, threads=2)
+    scores = score_genetic(InMemoryCodes(codes), plan, budget, draws="none")
+    assert scores.draw_counts == (0, 0) and scores.draws == () and np.all(np.isnan(scores.variances))
+    for model_index, model in enumerate(models):
+        effects = model.coefficients[:, None]
+        expected = dense_scores(codes, model.store_rows, model.signed_means, model.signed_scales, effects)[0]
+        bound = score_rounding_bound(codes, model.store_rows, model.signed_means, model.signed_scales, effects)[0]
+        assert_within(scores.means[:, model_index], expected, bound)
+
+
+def test_a_budget_for_one_model_at_a_time_scores_in_batches_to_the_same_values():
+    random_generator = np.random.default_rng(22)
+    codes = random_codes(random_generator, variant_count=120, sample_count=50)
+    models = two_fold_models(codes, random_generator, draw_count=4)
+    plan = ScoringPlan.from_models(models)
+    whole = score_genetic(InMemoryCodes(codes), plan, cpu_budget(plan, sample_count=50, block_rows=30, threads=2))
+    # Room for the result and one model's read, not both models' at once: two batches, two reads of the rows.
+    one_model = max(_batch_bytes(plan, [model], 50, 50, 1, "cpu", "keep") for model in range(plan.model_count))
+    both = _batch_bytes(plan, [0, 1], 50, 50, 1, "cpu", "keep")
+    assert one_model < both
+    source = InMemoryCodes(codes)
+    batched = score_genetic(source, plan, replace(cpu_budget(plan, sample_count=50, block_rows=1, threads=2),
+                                                  host_bytes=_output_bytes(plan, 50, "keep") + one_model))
+    assert sum(stop - start for start, stop in source.reads) == 2 * plan.store_rows.shape[0]
+    for model_index, model in enumerate(models):
+        _mean, mean_bound, _variance, variance_bound = dense_reference(codes, model)
+        assert_within(batched.means[:, model_index], whole.means[:, model_index], 2.0 * mean_bound)
+        assert_within(batched.variances[:, model_index], whole.variances[:, model_index], 2.0 * variance_bound)
+
+
+def test_a_product_mixture_law_scores_to_the_dense_reference_of_its_own_draws():
+    """The law's draws are generated a block of rows at a time inside the read; the scores are those of the same draws
+    formed whole (the law is counter-based, so both see the same numbers)."""
+    from sv_pgs.draw_laws import ProductMixtureDraws
+
+    random_generator = np.random.default_rng(23)
+    codes = random_codes(random_generator, variant_count=100, sample_count=40)
+    base = two_fold_models(codes, random_generator)[0]
+    rows = base.store_rows.shape[0]
+    law = ProductMixtureDraws(
+        class_index=np.zeros(rows, dtype=np.int64), log_scale=np.full(rows, -4.0), omega=np.outer([40.0, 20.0], np.ones(rows)),
+        log_density=np.log(np.full((1, 5), 0.2)), log_variance_grid=np.linspace(-4.0, 2.0, 5),
+        shift=random_generator.normal(size=(2, rows)), weights=np.array([0.5, 0.5]), key=(3, 4), draw_count=6,
+    )
+    model = replace(base, posterior_draws=law, covariate_draws=np.repeat(base.alpha[:, None], 6, axis=1))
+    plan = ScoringPlan.from_models([model])
+    scores = score_genetic(InMemoryCodes(codes), plan, cpu_budget(plan, sample_count=40, block_rows=7, threads=2))
+    mean_score, mean_bound, variance, variance_bound = dense_reference(codes, model)
+    assert_within(scores.means[:, 0], mean_score, mean_bound)
+    assert_within(scores.variances[:, 0], variance, variance_bound)

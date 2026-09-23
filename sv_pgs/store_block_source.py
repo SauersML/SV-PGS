@@ -18,6 +18,7 @@ one contiguous span from its first to its last row.
 
 from __future__ import annotations
 
+import weakref
 from typing import Any, Iterator, Sequence
 
 import numpy as np
@@ -29,6 +30,7 @@ from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
+from sv_pgs.memory_broker import HOST, MemoryBroker, _device_meter, current_broker, device_pool
 
 _GATHER_SOURCE = r"""
 extern "C" __global__
@@ -116,7 +118,13 @@ class StoreGenotypeBlockSource:
         ]
         self._means = xp.asarray(means, dtype=xp.float64)
         self._scales = xp.asarray(host_scales)
-        # Two slots, so that the next block's span and codes fill while the current block computes.
+        # Two slots, so that the next block's span and codes fill while the current block computes. On the host they are
+        # this source's own mandatory buffers, charged to the shared ledger for its lifetime before they are allocated
+        # (on a device, the ledger's allocator meters them).
+        broker = current_broker()
+        if self._cupy is None and broker is not None:
+            lease = broker.reserve(HOST, 2 * widest_block * self._padded_samples, "the block source's code slots")
+            weakref.finalize(self, lease.release)
         self._signed = [xp.empty((widest_block, self._padded_samples), dtype=xp.int8) for _ in range(2)]
         self.resident_bytes = sum(int(slot.nbytes) for slot in self._signed) + int(self._means.nbytes) + int(self._scales.nbytes)
         if self._cupy is not None:
@@ -132,42 +140,64 @@ class StoreGenotypeBlockSource:
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
-        # Every block's signed codes held on the device after the first read, when they fit (``_resident_fits``): each
-        # later read (every mean-field sweep, every dual-solver pass) then builds its tiles from device memory. Streamed,
-        # 43% of a 518k x 40k bench-sim Stage 2 was the store's reads [sim, scenario_000, py-spy on the A40].
+        # Every block's signed codes held on the device after the first read, as a cache of the shared ledger
+        # (``memory_broker``): each later read (every mean-field sweep, every dual-solver pass) then builds its tiles from
+        # device memory. Streamed, 43% of a 518k x 40k bench-sim Stage 2 was the store's reads [sim, scenario_000, py-spy
+        # on the A40]. The cache is admitted only from what the device's pool has left once everything the fit holds is
+        # counted, and never from a free-memory snapshot; a later allocation that needs its bytes evicts it
+        # (``_drop_resident``), and the read in progress then streams the blocks it has not reached, so the eviction
+        # frees every block but the one a tile still references. An evicted set is not admitted again: the fit's own
+        # working set has shown it needs those bytes.
         self._resident: list[Any] | None = None
         self._resident_complete = False
+        self._resident_dropped = False
         self.resident_codes_bytes = sum(_aligned(int(rows.shape[0])) * self._padded_samples for rows in self._block_rows)
+        self._broker = None
+        if self._cupy is not None:
+            device_id = int(self._cupy.cuda.runtime.getDevice())
+            self._pool = device_pool(device_id)
+            self._broker = current_broker()
+            if self._broker is None or self._pool not in self._broker.meters:
+                # Outside a CUDA scope: this source's own ledger of its device, metered by CuPy's live bytes (no allocator
+                # is routed through it, so only the cache's admission reads it).
+                self._broker = MemoryBroker.from_budget(budget)
+                self._broker.meters[self._pool] = _device_meter(self._cupy, device_id)
 
-    def _resident_fits(self) -> bool:
-        """The codes stay on the device when they fit in its free memory and leave at least as much free as the fit
-        already holds (the fit's working set at its first read is a lower bound of what it needs again)."""
-        cupy = self._cupy
-        if cupy is None:
+    def _admit_resident(self) -> bool:
+        """Admit the resident set as a device cache from what the ledger has left (the class docstring)."""
+        if self._cupy is None or self._resident_dropped or self._broker is None:
             return False
-        free, _total = cupy.cuda.runtime.memGetInfo()
-        pool = cupy.get_default_memory_pool()
-        held = int(pool.used_bytes())
-        available = int(free) + int(pool.free_bytes())
-        return self.resident_codes_bytes <= available - held
+        lease = self._broker.admit(self._pool, self.resident_codes_bytes, "the resident genotype codes", self._drop_resident)
+        return lease is not None
+
+    def _drop_resident(self) -> None:
+        """The ledger evicts the resident set: its blocks are freed as their last tile releases them."""
+        self._resident = None
+        self._resident_complete = False
+        self._resident_dropped = True
 
     def _keep(self, block_index: int, slot: int) -> None:
         """Copy block ``block_index``'s signed codes into the resident set (on the first read), or drop the set if the
         device cannot hold it after all."""
-        if self._resident is None:
+        resident = self._resident
+        if resident is None:
             return
         rows = _aligned(int(self._block_rows[block_index].shape[0]))
         try:
-            self._resident[block_index] = self._signed[slot][:rows].copy()
+            copy = self._signed[slot][:rows].copy()
         except self._cupy.cuda.memory.OutOfMemoryError:
-            self._resident = None
-            self._cupy.get_default_memory_pool().free_all_blocks()
+            for lease in [lease for lease in self._broker.leases if lease.evict == self._drop_resident]:
+                lease.release()
+            self._drop_resident()
+            return
+        if self._resident is resident:
+            resident[block_index] = copy
 
-    def _resident_tile(self, block_index: int) -> CodeBlockTile:
+    def _resident_tile(self, block_index: int, codes: Any) -> CodeBlockTile:
         rows = int(self._block_rows[block_index].shape[0])
         offset = slice(int(self._offsets[block_index]), int(self._offsets[block_index + 1]))
         return CodeBlockTile.from_aligned(
-            self._resident[block_index], rows, self._samples, self._means[offset], self._scales[offset],
+            codes, rows, self._samples, self._means[offset], self._scales[offset],
             self._scale_spreads[block_index], self.array_module, self._workspace_bytes,
         )
 
@@ -204,28 +234,37 @@ class StoreGenotypeBlockSource:
         """Yield (block_index, tile) in block order; a tile is valid until the next is requested."""
         if self._cupy is not None and self._resident_complete and self._resident is not None:
             for block_index in range(len(self._block_rows)):
-                yield block_index, self._resident_tile(block_index)
+                resident = self._resident
+                if resident is None:
+                    # Evicted mid-read (``_drop_resident``): the blocks not yet reached are streamed.
+                    yield from self._iter_streamed(block_index)
+                    return
+                yield block_index, self._resident_tile(block_index, resident[block_index])
             return
-        if self._cupy is not None and self._resident is None and not self._resident_complete and self._resident_fits():
+        if self._cupy is not None and self._resident is None and not self._resident_complete and self._admit_resident():
             self._resident = [None] * len(self._block_rows)
+        yield from self._iter_streamed(0)
+        # only a read that reached every block leaves a complete resident set
+        self._resident_complete = self._cupy is not None and self._resident is not None
+
+    def _iter_streamed(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The blocks from ``first_block`` on, read from the store."""
         if self._cupy is not None and self._decoder is not None:
-            yield from self._iter_decoded_tiles()
-            self._resident_complete = True
+            yield from self._iter_decoded_tiles(first_block)
             return
-        spans = self._store.iter_codes(self._spans, None, self._budget)
+        spans = self._store.iter_codes(self._spans[first_block:], None, self._budget)
         if self._cupy is None:
-            for block_index, (start, _stop, codes) in enumerate(spans):
+            for position, (start, _stop, codes) in enumerate(spans):
+                block_index = first_block + position
                 rows = self._block_rows[block_index]
                 target = self._signed[block_index % 2][: rows.shape[0], : self._samples]
                 gathered = codes[rows - start]
                 np.subtract(gathered.view(np.int8), np.int8(SIGNED_CODE_OFFSET), out=target)
                 yield block_index, self._tile(block_index, block_index % 2)
             return
-        yield from self._iter_device_tiles(spans)
-        # only a read that reached every block leaves a complete resident set
-        self._resident_complete = True
+        yield from self._iter_device_tiles(spans, first_block)
 
-    def _iter_device_tiles(self, spans: Iterator[tuple[int, int, NDArray[np.uint8]]]) -> Iterator[tuple[int, CodeBlockTile]]:
+    def _iter_device_tiles(self, spans: Iterator[tuple[int, int, NDArray[np.uint8]]], first_block: int = 0) -> Iterator[tuple[int, CodeBlockTile]]:
         cupy = self._cupy
         compute = cupy.cuda.get_current_stream()
         copied = [cupy.cuda.Event() for _ in range(2)]
@@ -242,8 +281,8 @@ class StoreGenotypeBlockSource:
 
         count = len(self._spans)
         _start, _stop, first = next(spans)
-        upload(0, first)
-        for block_index in range(count):
+        upload(first_block, first)
+        for block_index in range(first_block, count):
             slot = block_index % 2
             # iter_codes reuses the host buffer of this span once the next span is requested.
             copied[slot].synchronize()
@@ -273,7 +312,7 @@ class StoreGenotypeBlockSource:
             ),
         )
 
-    def _iter_decoded_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
+    def _iter_decoded_tiles(self, first_block: int = 0) -> Iterator[tuple[int, CodeBlockTile]]:
         """The rowdict path: each block's rows decode on the device, on the copy stream.
 
         Block b + 1's span is fetched after block b is yielded, so its host work (read, crc32c,
@@ -296,8 +335,8 @@ class StoreGenotypeBlockSource:
                 self._store.read_codes_to_device(start, stop, self._spans_on_device[slot][: rows.shape[0]], self._decoder, rows=rows)
             decoded[slot].record(self._copy_stream)
 
-        fetch(0)
-        for block_index in range(len(self._spans)):
+        fetch(first_block)
+        for block_index in range(first_block, len(self._spans)):
             slot = block_index % 2
             compute.wait_event(decoded[slot])
             self._gather_block(block_index, slot)

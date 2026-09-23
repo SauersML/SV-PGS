@@ -116,6 +116,7 @@ def test_cgroup_v2_tightest_ancestor_binds(tmp_path: Path) -> None:
 def test_the_runner_allotment_and_the_cgroup_both_cap_host_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(compute_budget, "_detect_available_host_ram_bytes", lambda: 100 * 2**30)
     monkeypatch.setattr(compute_budget, "_cgroup_memory_headroom_bytes", lambda: 60 * 2**30)
+    monkeypatch.setattr(compute_budget, "_address_space_headroom_bytes", lambda: None)
     monkeypatch.delenv(compute_budget.RUNQ_MEMORY_VARIABLE, raising=False)
     assert compute_budget._usable_host_bytes() == 60 * 2**30
     monkeypatch.setenv(compute_budget.RUNQ_MEMORY_VARIABLE, str(24 * 2**30))
@@ -146,3 +147,13 @@ def test_exposed_device_without_usable_cupy_raises(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     with pytest.raises(RuntimeError, match="CuPy cannot use them"):
         compute_budget.detect_compute_budget()
+
+
+def test_the_address_space_limit_caps_the_host_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # ``ulimit -v``: what RLIMIT_AS still lets the process map is its soft limit less the current VmSize.
+    status = tmp_path / "status"
+    _write(status, "Name:\tpython\nVmPeak:\t  900 kB\nVmSize:\t  800 kB\nVmRSS:\t  100 kB\n")
+    monkeypatch.setattr(compute_budget.resource, "getrlimit", lambda _kind: (2_000 * 1024, compute_budget.resource.RLIM_INFINITY))
+    assert compute_budget._address_space_headroom_bytes(status) == 1_200 * 1024
+    monkeypatch.setattr(compute_budget.resource, "getrlimit", lambda _kind: (compute_budget.resource.RLIM_INFINITY,) * 2)
+    assert compute_budget._address_space_headroom_bytes(status) is None

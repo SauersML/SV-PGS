@@ -1,8 +1,11 @@
-"""``device_sweep.PanelGrams``: panels are named by their members, and the cache holds what its capacity allows."""
+"""``device_sweep.PanelGrams``: panels are named by their members, and the cache holds what the shared ledger leaves
+it, giving its panels back when a mandatory lease needs the bytes."""
 
 import numpy as np
+import pytest
 
 from sv_pgs.device_sweep import PanelGrams
+from sv_pgs.memory_broker import MemoryBroker
 
 
 def _panel(members):
@@ -27,20 +30,49 @@ def test_panels_of_other_members_never_read_each_others_gram():
     assert grams.get(_panel(first), build(first)) is one and len(built) == 2
 
 
-def test_the_cache_keeps_the_panels_that_fit_and_rebuilds_the_rest():
-    part = (np.zeros((4, 4)), np.zeros((1, 4)))
-    size = sum(value.nbytes for value in part)
-    grams, calls = PanelGrams(capacity_bytes=2 * size), []
+def _part():
+    return (np.zeros((4, 4)), np.zeros((1, 4)))
+
+
+def test_the_cache_keeps_the_panels_the_ledger_leaves_room_for_and_rebuilds_the_rest():
+    size = sum(value.nbytes for value in _part())
+    broker = MemoryBroker({"device0": 3 * size})
+    mandatory = broker.reserve("device0", size, "a mandatory buffer")
+    grams, calls = PanelGrams(broker, "device0"), []
 
     def build():
         calls.append(1)
-        return tuple(value.copy() for value in part)
+        return _part()
 
-    for sweep in range(2):
+    for _sweep in range(2):
         for panel in range(3):
             grams.get(_panel([panel]), build)
-    # Panels 0 and 1 fit and are kept; panel 2 is rebuilt on every sweep.
-    assert len(calls) == 4
+    # The mandatory buffer leaves room for two panels: 0 and 1 are kept, panel 2 is rebuilt on every sweep.
+    assert len(calls) == 4 and broker.held("device0") == 3 * size
     grams.clear()
+    assert broker.held("device0") == size
     grams.get(_panel([0]), build)
     assert len(calls) == 5
+    mandatory.release()
+
+
+def test_a_mandatory_lease_evicts_panels_and_never_fails_for_them():
+    size = sum(value.nbytes for value in _part())
+    broker = MemoryBroker({"device0": 2 * size})
+    grams, calls = PanelGrams(broker, "device0"), []
+
+    def build():
+        calls.append(1)
+        return _part()
+
+    grams.get(_panel([0]), build)
+    grams.get(_panel([1]), build)
+    assert broker.remaining("device0") == 0
+    # The whole pool is mandatory now: both panels are evicted, and the next sweep rebuilds them without keeping them.
+    lease = broker.reserve("device0", 2 * size, "the fit's mandatory buffers")
+    assert broker.held("device0") == 2 * size
+    grams.get(_panel([0]), build)
+    assert len(calls) == 3 and broker.held("device0") == 2 * size
+    with pytest.raises(MemoryError):
+        broker.reserve("device0", 1, "one byte more")
+    lease.release()

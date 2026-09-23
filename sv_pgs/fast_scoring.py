@@ -34,8 +34,9 @@ and hyperparameter uncertainty is left out. Everything below is a statement
 about the law the draws come from, so it is a posterior statement exactly
 where that law is the posterior.
 
-Each draw is one more weight column, so the same single read gives
-the draw scores g_i^(k). The mean score g_i is known exactly, so
+Each draw is one more weight column, so the same read gives the draw
+scores g_i^(k) (every model of a batch; a column batch is one read). The
+mean score g_i is known exactly, so
 
     v_i = (1 / K) sum_k (g_i^(k) - g_i)^2
 
@@ -66,10 +67,20 @@ shift c anchors the mean predictive on the training prevalence; the fitted
 intercept anchors the plug-in predictor, and the damped one needs its own
 anchor.
 
-Memory. Every block size is the exact solution of a memory plan: the fixed
-allocations (weights, accumulator) are subtracted from the budget and the
-block's own buffers take the rest; on CUDA the block rows and the sample tile
-width together minimize the kernel launches within the device memory.
+Memory. No array of the size (store rows x columns) is ever formed: a model's
+draws are a law read a tile of rows at a time (``draw_laws``), and each read
+block's weight matrix (its rows x the batch's columns) is built from the
+models' coefficients and their draws' tiles for that block alone, then
+dropped. The output is scored in batches of whole models whose accumulator
+(columns x samples) fits: the widest batch that fits, since every batch past
+the first costs another read of the store, the dominant cost; the block rows
+take what the batch leaves. Mean prediction (``draws="none"``) scores the mean
+columns alone and generates no draw. Every buffer is charged to the shared
+ledger (``memory_broker``) before it is allocated: the accumulator and the
+per-block buffers on the host (page-locked read buffers as pinned), and on CUDA
+each device's accumulator and tile buffers on its own pool; on CUDA the block
+rows and the sample tile width together minimize the kernel launches within
+the device memory that remains.
 """
 
 from __future__ import annotations
@@ -77,7 +88,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import math
-from typing import Any, Iterable, Iterator, Protocol, Sequence
+from typing import Any, Callable, Iterable, Iterator, Protocol, Sequence
 
 import numpy as np
 from scipy import stats
@@ -89,6 +100,8 @@ from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
 from sv_pgs.compute_budget import ComputeBudget, _cupy_device_context, _try_import_cupy
 from sv_pgs.config import TraitType
 from sv_pgs.data import TieMap
+from sv_pgs.draw_laws import DenseDraws, DrawLaw
+from sv_pgs.memory_broker import HOST, PINNED, broker_for, device_pool
 from sv_pgs.progress import log
 
 SIGNED_CODE_OFFSET = 127.0
@@ -117,10 +130,12 @@ class ScoringModel:
     """One fitted model in store rows and signed-code units (see the module docstring).
 
     ``coefficients`` are the posterior-mean effects of the standardized columns at
-    ``store_rows`` and ``posterior_draws`` [rows, K] are K draws of the same effects
-    from the law the fitting route represents the posterior by (the module docstring:
-    the full-data route's exact posterior draws, or the mean-field route's conditional
-    variational draws of its product approximation), both tie-expanded.
+    ``store_rows`` and ``posterior_draws`` is the law of K draws of the same effects
+    (``draw_laws``: [rows, K], read a tile of rows at a time) from the law the fitting
+    route represents the posterior by (the module docstring: the full-data route's
+    exact posterior draws, or the mean-field route's conditional variational draws of
+    its product approximation), both tie-expanded. A matrix given here is held as
+    ``draw_laws.DenseDraws``.
     ``alpha`` are the covariate coefficients
     with the intercept first. ``predictive_intercept_shift`` calibrates the damped
     binary predictive (0.0 for quantitative models).
@@ -130,7 +145,7 @@ class ScoringModel:
     signed_means: F64Array
     signed_scales: F64Array
     coefficients: F64Array
-    posterior_draws: F64Array
+    posterior_draws: DrawLaw
     alpha: F64Array
     trait_type: TraitType
     predictive_intercept_shift: float
@@ -152,11 +167,14 @@ class ScoringModel:
                 raise ValueError(f"{name} must be finite.")
         if np.any(self.signed_scales <= 0.0):
             raise ValueError("signed_scales must be positive; inactive rows carry no model column.")
-        draws = np.asarray(self.posterior_draws)
-        if draws.ndim != 2 or draws.shape[0] != rows.shape[0] or draws.dtype != np.float64:
-            raise ValueError("posterior_draws must be float64 [store rows, draws].")
-        if not np.all(np.isfinite(draws)):
-            raise ValueError("posterior_draws must be finite.")
+        if isinstance(self.posterior_draws, np.ndarray):
+            values = self.posterior_draws
+            if values.ndim != 2 or values.dtype != np.float64:
+                raise ValueError("posterior_draws must be float64 [store rows, draws].")
+            object.__setattr__(self, "posterior_draws", DenseDraws(values))
+        draws = self.posterior_draws
+        if not hasattr(draws, "tile") or len(draws.shape) != 2 or draws.shape[0] != rows.shape[0]:
+            raise ValueError("posterior_draws must be a draw law (or float64 matrix) of [store rows, draws].")
         if self.trait_type == TraitType.BINARY and draws.shape[1] == 0:
             raise ValueError("a binary model needs posterior draws for its predictive.")
         alpha = np.asarray(self.alpha)
@@ -181,7 +199,7 @@ class ScoringModel:
         tie_map: TieMap,
         member_prior_variances: F64Array,
         beta_reduced: F64Array,
-        posterior_draws_reduced: F64Array,
+        posterior_draws_reduced: F64Array | DrawLaw,
         alpha: F64Array,
         trait_type: TraitType,
         predictive_intercept_shift: float,
@@ -197,23 +215,27 @@ class ScoringModel:
         draw [reduced, K] expands with the same weights.
         """
         group_weights = tie_map.prior_variance_group_weights(np.asarray(member_prior_variances, dtype=np.float64))
-        draws_reduced = np.asarray(posterior_draws_reduced, dtype=np.float64)
+        law = posterior_draws_reduced if hasattr(posterior_draws_reduced, "tile") else DenseDraws(np.asarray(posterior_draws_reduced, dtype=np.float64))
         beta = np.asarray(beta_reduced, dtype=np.float64)
-        if draws_reduced.ndim != 2 or draws_reduced.shape[0] != beta.shape[0]:
+        if len(law.shape) != 2 or law.shape[0] != beta.shape[0]:
             raise ValueError("posterior_draws_reduced must be [reduced coefficients, draws].")
         coefficients = np.asarray(tie_map.expand_coefficients(beta, group_weights), dtype=np.float64)
         identity = (
-            not tie_map.reduced_to_group and tie_map.original_to_reduced.shape[0] == draws_reduced.shape[0]
-            and np.array_equal(tie_map.kept_indices, np.arange(draws_reduced.shape[0]))
+            not tie_map.reduced_to_group and tie_map.original_to_reduced.shape[0] == law.shape[0]
+            and np.array_equal(tie_map.kept_indices, np.arange(law.shape[0]))
         )
         if identity:
-            # Every member is its own effect: the draws are the members' already, held without a copy (a p x K copy
-            # is the scoring route's largest array at biobank scale).
-            draws = draws_reduced
+            # Every member is its own effect: the law is the members' already, held as it is (a p x K copy is the
+            # scoring route's largest array at biobank scale).
+            draws = law
         else:
-            draws = np.empty((coefficients.shape[0], draws_reduced.shape[1]), dtype=np.float64)
-            for draw_index in range(draws_reduced.shape[1]):
-                draws[:, draw_index] = tie_map.expand_coefficients(draws_reduced[:, draw_index], group_weights)
+            # Expanding groups to members mixes rows, so the law is drawn whole here: the routes with ties to expand
+            # (the full-data EP route and the small-n routes) hold their draws as a matrix already.
+            reduced = np.asarray(law, dtype=np.float64)
+            expanded = np.empty((coefficients.shape[0], law.shape[1]), dtype=np.float64)
+            for draw_index in range(law.shape[1]):
+                expanded[:, draw_index] = tie_map.expand_coefficients(reduced[:, draw_index], group_weights)
+            draws = DenseDraws(expanded)
         return cls(
             store_rows=np.asarray(active_rows, dtype=np.int64),
             signed_means=np.asarray(signed_means, dtype=np.float64),
@@ -229,49 +251,45 @@ class ScoringModel:
         )
 
 
+DRAW_MODES = ("none", "variance", "keep")
+"""What ``score_genetic`` does with the draws: nothing (mean prediction: no draw is generated or scored), their
+variance around the mean score, or that and every draw's score kept (``GeneticScores.draws``)."""
+
+
 @dataclass(frozen=True)
 class ScoringPlan:
-    """Every model's mean and draws packed as weight columns over the union of their store rows.
+    """Every model to score over the union of their store rows, with no weight matrix: each read block's weights are
+    formed for that block alone (``block_weights``).
 
-    Model m owns column ``mean_columns[m]`` and the draw columns
-    ``draw_columns[m] = (start, stop)``. ``row_runs`` are the maximal runs of
-    consecutive store rows, as (store_start, store_stop, plan_start); rows no model
-    uses are never read.
+    ``positions[m]`` are model m's rows' places in ``store_rows``; ``row_runs`` are the maximal runs of consecutive
+    store rows, as (store_start, store_stop, plan_start); rows no model uses are never read. ``mean_offsets[m]`` is
+    the mean score's offset -sum_j mu_j beta_j / sigma_j (a draw's offset is summed block by block as its weights are
+    formed).
     """
 
+    models: tuple[ScoringModel, ...]
     store_rows: I64Array
-    weights: F64Array
-    offsets: F64Array
-    mean_columns: tuple[int, ...]
-    draw_columns: tuple[tuple[int, int], ...]
+    positions: tuple[I64Array, ...]
+    mean_offsets: F64Array
     row_runs: tuple[tuple[int, int, int], ...]
     gaussian_posteriors: tuple[bool, ...]
 
     @property
     def model_count(self) -> int:
-        return len(self.mean_columns)
+        return len(self.models)
+
+    def draw_count(self, model: int, draws: str) -> int:
+        """Model ``model``'s draw columns under ``draws`` (``DRAW_MODES``)."""
+        return 0 if draws == "none" else self.models[model].draw_count
+
+    def column_count(self, models: Sequence[int], draws: str) -> int:
+        return sum(1 + self.draw_count(model, draws) for model in models)
 
     @classmethod
     def from_models(cls, models: Sequence[ScoringModel]) -> ScoringPlan:
         if not models:
             raise ValueError("a scoring plan needs at least one model.")
         store_rows = np.unique(np.concatenate([model.store_rows for model in models]))
-        column_count = sum(1 + model.draw_count for model in models)
-        weights = np.zeros((store_rows.shape[0], column_count), dtype=np.float64)
-        offsets = np.zeros(column_count, dtype=np.float64)
-        mean_columns: list[int] = []
-        draw_columns: list[tuple[int, int]] = []
-        next_column = 0
-        for model in models:
-            positions = np.searchsorted(store_rows, model.store_rows)
-            model_effects = np.column_stack([model.coefficients, model.posterior_draws])
-            model_weights = model_effects / model.signed_scales[:, None]
-            stop = next_column + model_effects.shape[1]
-            weights[positions, next_column:stop] = model_weights
-            offsets[next_column:stop] = -(model.signed_means @ model_weights)
-            mean_columns.append(next_column)
-            draw_columns.append((next_column + 1, stop))
-            next_column = stop
         breaks = np.flatnonzero(np.diff(store_rows) != 1) + 1
         run_starts = np.concatenate([[0], breaks]).astype(np.int64)
         run_stops = np.concatenate([breaks, [store_rows.shape[0]]]).astype(np.int64)
@@ -281,14 +299,34 @@ class ScoringPlan:
             if stop > start
         )
         return cls(
+            models=tuple(models),
             store_rows=store_rows,
-            weights=weights,
-            offsets=offsets,
-            mean_columns=tuple(mean_columns),
-            draw_columns=tuple(draw_columns),
+            positions=tuple(np.searchsorted(store_rows, model.store_rows).astype(np.int64) for model in models),
+            mean_offsets=np.array([-float(model.signed_means @ (model.coefficients / model.signed_scales)) for model in models]),
             row_runs=row_runs,
             gaussian_posteriors=tuple(model.gaussian_posterior for model in models),
         )
+
+    def block_weights(self, batch: Sequence[int], draws: str, plan_start: int, plan_stop: int, offsets: F64Array) -> F64Array:
+        """The weights of plan rows [plan_start, plan_stop) for the batch's columns (rows x columns; each model's mean
+        column, then its draws), with each draw column's share of its offset, -mu' w, subtracted from ``offsets``.
+        A model's draws for these rows are its law's tile for them, generated here and dropped with the block."""
+        weights = np.zeros((plan_stop - plan_start, self.column_count(batch, draws)))
+        column = 0
+        for model_index in batch:
+            model = self.models[model_index]
+            positions = self.positions[model_index]
+            first, last = (int(value) for value in np.searchsorted(positions, [plan_start, plan_stop]))
+            local = positions[first:last] - plan_start
+            scales = model.signed_scales[first:last]
+            weights[local, column] = model.coefficients[first:last] / scales
+            count = self.draw_count(model_index, draws)
+            if count and last > first:
+                draw_weights = model.posterior_draws.tile(first, last) / scales[:, None]
+                weights[local, column + 1 : column + 1 + count] = draw_weights
+                offsets[column + 1 : column + 1 + count] -= model.signed_means[first:last] @ draw_weights
+            column += 1 + count
+        return weights
 
     def read_ranges(self, block_rows: int) -> list[tuple[int, int, int]]:
         """The row runs cut into reads of at most ``block_rows`` rows, as (store_start, store_stop, plan_start)."""
@@ -304,9 +342,11 @@ class ScoringPlan:
 class GeneticScores:
     """Scores [samples, models]: posterior-mean genetic scores and their variances under each model's drawing law.
 
-    ``variances`` are the K-draw estimates v_i (NaN for a model without posterior draws) and
-    ``draw_counts`` holds each model's K. The drawing law is the posterior only on the full-data
-    route; on the mean-field route it is that fit's product approximation (the module docstring).
+    ``variances`` are the K-draw estimates v_i (NaN for a model without posterior draws, or when
+    the draws were not scored) and ``draw_counts`` holds each model's K as scored. ``draws`` holds
+    every draw's score (samples x K per model) when they were kept, else it is empty. The drawing
+    law is the posterior only on the full-data route; on the mean-field route it is that fit's
+    product approximation (the module docstring).
     """
 
     means: F64Array
@@ -333,39 +373,80 @@ class GeneticScores:
         lower, upper = self.means - half_width, self.means + half_width
         for model, gaussian in enumerate(self.gaussian_posteriors):
             if not gaussian:
+                if not self.draws:
+                    raise ValueError("a mixture posterior's interval needs its draws' scores: score with draws='keep'.")
                 lower[:, model], upper[:, model] = np.quantile(self.draws[model], [0.5 * (1.0 - coverage), 0.5 * (1.0 + coverage)], axis=1)
         return lower, upper
 
 
-def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str) -> int:
-    """Host bytes of one scoring pass with reads of ``rows`` rows: the plan's weights, the
-    accumulator, the read-ahead ring, the selected-sample copy of a block, the transposed
-    block weights and, on the CPU, every panel's fp64 codes and product."""
-    columns = int(plan.weights.shape[1])
-    fixed = _FLOAT64_BYTES * (int(plan.weights.size) + columns * selected_samples)
-    per_row = _READ_AHEAD_BUFFERS * store_samples + _FLOAT64_BYTES * columns
+
+
+def _source_owns_buffers(source: CodeBlockSource) -> bool:
+    """A source that reads through its own ring (``artifact.StoreCodeBlocks``: the store's reader charges its ring to
+    the ledger itself) is handed no buffers."""
+    return bool(getattr(source, "owns_buffers", False))
+
+
+def _output_bytes(plan: ScoringPlan, selected_samples: int, draws: str) -> int:
+    """The result's arrays: each model's mean and variance scores, and every draw's score where they are kept."""
+    kept = sum(plan.draw_count(model, draws) for model in range(plan.model_count)) if draws == "keep" else 0
+    return _FLOAT64_BYTES * selected_samples * (2 * plan.model_count + kept)
+
+
+def _batch_bytes(plan: ScoringPlan, batch: Sequence[int], store_samples: int, selected_samples: int, rows: int, device_kind: str, draws: str) -> int:
+    """Host bytes of one batch's read with blocks of ``rows`` rows: the accumulator (columns x samples) and one more
+    columns x samples of temporaries (on the CPU every panel's product, on CUDA each device accumulator's copy back;
+    then each model's draw deviations, never live with either); per block row the read-ahead ring, the block's weights
+    as built and as their transposed copy, the widest of its models' draw tiles with their working rows, the
+    selected-sample copy and, on the CPU, every panel's fp64 codes."""
+    columns = plan.column_count(batch, draws)
+    fixed = 2 * _FLOAT64_BYTES * columns * selected_samples
+    tile = max(
+        (_FLOAT64_BYTES * plan.draw_count(model, draws) + plan.models[model].posterior_draws.tile_row_bytes() for model in batch if plan.draw_count(model, draws)),
+        default=0,
+    )
+    per_row = _READ_AHEAD_BUFFERS * store_samples + 2 * _FLOAT64_BYTES * columns + tile
     if selected_samples != store_samples:
         per_row += selected_samples
     if device_kind == "cpu":
-        fixed += _FLOAT64_BYTES * columns * selected_samples
         per_row += _FLOAT64_BYTES * selected_samples
     return fixed + rows * per_row
 
 
-def _block_rows(plan: ScoringPlan, store_samples: int, selected_samples: int, budget: ComputeBudget) -> int:
-    """The most rows per read whose host plan fits the budget, and on CUDA the device plan."""
-    fixed = _host_bytes(plan, store_samples, selected_samples, 0, budget.device_kind)
-    per_row = _host_bytes(plan, store_samples, selected_samples, 1, budget.device_kind) - fixed
-    rows = (int(budget.host_bytes) - fixed) // per_row
-    if rows < 1:
-        raise MemoryError(
-            f"scoring {plan.weights.shape[1]} weight columns x {selected_samples} samples needs "
-            f"{(fixed + per_row) / 1e9:.2f} GB of host memory; the budget holds {budget.host_bytes / 1e9:.2f} GB"
-        )
-    if budget.device_kind == "cuda":
-        rows = min(rows, min(_device_tile(int(plan.weights.shape[1]), selected_samples, device_bytes)[0]
-                             for device_bytes in budget.device_bytes))
-    return min(rows, int(plan.store_rows.shape[0]))
+def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str, draws: str = "keep") -> int:
+    """Host bytes of scoring every model in one batch with reads of ``rows`` rows: the result's arrays and the batch's
+    read (``_batch_bytes``)."""
+    batch = list(range(plan.model_count))
+    return _output_bytes(plan, selected_samples, draws) + _batch_bytes(plan, batch, store_samples, selected_samples, rows, device_kind, draws)
+
+
+def _batches(
+    plan: ScoringPlan, store_samples: int, selected_samples: int, host_bytes: int, device_kind: str, draws: str
+) -> list[tuple[list[int], int]]:
+    """Consecutive models grouped into the widest batches whose one-row read fits ``host_bytes``, each with the most
+    block rows that fit beside it (the module docstring's rule); MemoryError where one model alone does not fit."""
+    batches: list[tuple[list[int], int]] = []
+    current: list[int] = []
+
+    def close(batch: list[int]) -> None:
+        fixed = _batch_bytes(plan, batch, store_samples, selected_samples, 0, device_kind, draws)
+        per_row = _batch_bytes(plan, batch, store_samples, selected_samples, 1, device_kind, draws) - fixed
+        rows = (int(host_bytes) - fixed) // per_row
+        if rows < 1:
+            raise MemoryError(
+                f"scoring model {batch[0]} ({plan.column_count(batch, draws)} weight columns) x {selected_samples} samples needs "
+                f"{(fixed + per_row) / 1e9:.3f} GB of host memory beside the result; the budget holds {int(host_bytes) / 1e9:.3f} GB"
+            )
+        batches.append((batch, min(rows, int(plan.store_rows.shape[0]))))
+
+    for model in range(plan.model_count):
+        widened = current + [model]
+        if current and _batch_bytes(plan, widened, store_samples, selected_samples, 1, device_kind, draws) > int(host_bytes):
+            close(current)
+            widened = [model]
+        current = widened
+    close(current)
+    return batches
 
 
 def _device_tile(columns: int, samples: int, device_bytes: int) -> tuple[int, int]:
@@ -388,6 +469,12 @@ def _device_tile(columns: int, samples: int, device_bytes: int) -> tuple[int, in
     return rows, min(tile, samples)
 
 
+def _device_bytes(columns: int, samples: int, rows: int, tile: int) -> int:
+    """The device plan of ``_device_tile`` at (r, t): the accumulator, a block's codes and weights, a tile's fp64 codes
+    and product."""
+    return _FLOAT64_BYTES * columns * samples + rows * (samples + _FLOAT64_BYTES * columns) + _FLOAT64_BYTES * tile * (rows + columns)
+
+
 def _selected_codes(codes: U8Array, sample_indices: I64Array | None) -> U8Array:
     return codes if sample_indices is None else np.take(codes, sample_indices, axis=1)
 
@@ -400,7 +487,7 @@ def _cpu_panels(sample_count: int, worker_count: int) -> list[tuple[int, int]]:
 
 def _score_cpu(
     blocks: Iterable[tuple[int, int, int, U8Array]],
-    weights: F64Array,
+    weights_for: Callable[[int, int], F64Array],
     accumulator: F64Array,
     budget: ComputeBudget,
 ) -> None:
@@ -409,7 +496,7 @@ def _score_cpu(
     panels = _cpu_panels(accumulator.shape[1], worker_count)
     with ThreadPoolExecutor(max_workers=worker_count) as pool, threadpool_limits(limits=1, user_api="blas"):
         for plan_start, plan_stop, codes in _plan_blocks(blocks):
-            block_weights = np.ascontiguousarray(weights[plan_start:plan_stop].T)
+            block_weights = np.ascontiguousarray(weights_for(plan_start, plan_stop).T)
 
             def panel(column_range: tuple[int, int], codes: U8Array = codes, block_weights: F64Array = block_weights) -> None:
                 start, stop = column_range
@@ -422,11 +509,13 @@ def _score_cpu(
 
 def _score_cuda(
     blocks: Iterable[tuple[int, int, int, U8Array]],
-    weights: F64Array,
+    weights_for: Callable[[int, int], F64Array],
     accumulator: F64Array,
     budget: ComputeBudget,
+    tiles: Sequence[int],
 ) -> None:
-    """Blocks round-robin over the visible devices; each device keeps its own fp64 accumulator."""
+    """Blocks round-robin over the visible devices; each device keeps its own fp64 accumulator. ``tiles`` are each
+    device's sample tile widths from its planned share (``_device_tile``)."""
     cupy: Any = _try_import_cupy()
     if cupy is None:
         raise RuntimeError("the compute budget selected CUDA but CuPy is unavailable.")
@@ -438,8 +527,8 @@ def _score_cuda(
     for block_position, (plan_start, plan_stop, codes) in enumerate(_plan_blocks(blocks)):
         device_position = block_position % len(budget.device_ids)
         with _cupy_device_context(cupy, budget.device_ids[device_position]):
-            tile_columns = _device_tile(column_count, sample_count, int(budget.device_bytes[device_position]))[1]
-            block_weights = cupy.asarray(np.ascontiguousarray(weights[plan_start:plan_stop].T))
+            tile_columns = int(tiles[device_position])
+            block_weights = cupy.asarray(np.ascontiguousarray(weights_for(plan_start, plan_stop).T))
             device_codes = cupy.asarray(codes)
             for start in range(0, sample_count, tile_columns):
                 stop = min(sample_count, start + tile_columns)
@@ -494,45 +583,96 @@ def _validated_sample_indices(sample_indices: NDArray | None, sample_count: int)
     return indices
 
 
+BatchReducer = Callable[[int, F64Array, F64Array], None]
+"""``reduce(model, mean_scores (samples,), draw_scores (samples x K))``: called once per model with its scores, while its
+batch's accumulator holds them (``artifact.predict`` forms its predictive variance there, with no draw kept)."""
+
+
 def score_genetic(
     source: CodeBlockSource,
     plan: ScoringPlan,
     budget: ComputeBudget,
     sample_indices: NDArray | None = None,
+    draws: str = "keep",
+    reduce: BatchReducer | None = None,
 ) -> GeneticScores:
-    """Posterior-mean genetic scores and their posterior variances for every planned model,
-    from one read of the codes.
+    """Posterior-mean genetic scores and, unless ``draws`` is "none", their variances under each model's drawing law,
+    for every planned model, from one read of the codes per batch of models (the module docstring).
 
-    ``sample_indices`` selects store samples (all of them when ``None``); scoring all
-    samples once and slicing folds afterwards reads the store once for every fold.
+    ``sample_indices`` selects store samples (all of them when ``None``); scoring all samples once and slicing folds
+    afterwards reads the store once for every fold. ``draws`` is one of ``DRAW_MODES``; ``reduce`` sees every model's
+    mean and draw scores as its batch ends.
     """
+    if draws not in DRAW_MODES:
+        raise ValueError(f"draws must be one of {DRAW_MODES}, not {draws!r}")
     selected = _validated_sample_indices(sample_indices, source.sample_count)
     sample_count = source.sample_count if selected is None else int(selected.shape[0])
-    block_rows = _block_rows(plan, source.sample_count, sample_count, budget)
-    ranges = plan.read_ranges(block_rows)
-    log(
-        f"  fast scoring: {plan.model_count} models ({plan.weights.shape[1]} weight columns) x {sample_count} "
-        + f"samples over {plan.store_rows.shape[0]} store rows in {len(ranges)} reads of <= {block_rows} rows "
-        + f"on {budget.describe()}"
+    broker = broker_for(budget)
+    owns_buffers = _source_owns_buffers(source)
+    with broker.reserve(HOST, _output_bytes(plan, sample_count, draws), "the scores"):
+        means = np.empty((sample_count, plan.model_count))
+        variances = np.full_like(means, np.nan)
+        kept: list[F64Array] = [np.zeros((sample_count, 0)) for _ in range(plan.model_count)]
+        batches = _batches(plan, source.sample_count, sample_count, broker.remaining(HOST), budget.device_kind, draws)
+        for batch, block_rows in batches:
+            columns = plan.column_count(batch, draws)
+            tiles: list[int] = []
+            device_leases = []
+            if budget.device_kind == "cuda":
+                for device_id in budget.device_ids:
+                    rows, tile = _device_tile(columns, sample_count, broker.remaining(device_pool(device_id)))
+                    block_rows = min(block_rows, rows)
+                    tiles.append(tile)
+                for device_id, tile in zip(budget.device_ids, tiles):
+                    device_leases.append(broker.reserve(device_pool(device_id), _device_bytes(columns, sample_count, block_rows, tile), "a scoring batch's device plan"))
+            host_plan = _batch_bytes(plan, batch, source.sample_count, sample_count, block_rows, budget.device_kind, draws)
+            ring = 0 if owns_buffers else _READ_AHEAD_BUFFERS * block_rows * source.sample_count
+            with broker.reserve(HOST, host_plan - ring, "a scoring batch's accumulator and block buffers"):
+                ring_lease = broker.reserve(PINNED if budget.device_kind == "cuda" else HOST, ring, "the scorer's read-ahead ring")
+                try:
+                    ranges = plan.read_ranges(block_rows)
+                    log(
+                        f"  fast scoring: {len(batch)} of {plan.model_count} models ({columns} weight columns) x {sample_count} samples over "
+                        + f"{plan.store_rows.shape[0]} store rows in {len(ranges)} reads of <= {block_rows} rows on {budget.describe()}"
+                    )
+                    accumulator = np.zeros((columns, sample_count), dtype=np.float64)
+                    offsets = np.zeros(columns)
+                    buffers = [] if owns_buffers else _read_ahead_buffers(block_rows, source.sample_count, budget)
+                    blocks = _read_plan_blocks(source, ranges, buffers, selected)
+
+                    def weights_for(plan_start: int, plan_stop: int, batch=batch, offsets=offsets) -> F64Array:
+                        return plan.block_weights(batch, draws, plan_start, plan_stop, offsets)
+
+                    if budget.device_kind == "cuda":
+                        _score_cuda(blocks, weights_for, accumulator, budget, tiles)
+                    else:
+                        _score_cpu(blocks, weights_for, accumulator, budget)
+                    del buffers, blocks
+                finally:
+                    ring_lease.release()
+                    for lease in device_leases:
+                        lease.release()
+                column = 0
+                for model in batch:
+                    count = plan.draw_count(model, draws)
+                    accumulator[column] += plan.mean_offsets[model]
+                    means[:, model] = accumulator[column]
+                    if count:
+                        draw_scores = accumulator[column + 1 : column + 1 + count]
+                        draw_scores += offsets[column + 1 : column + 1 + count, None]
+                        deviations = draw_scores - accumulator[column]
+                        variances[:, model] = np.mean(deviations * deviations, axis=0)
+                        if draws == "keep":
+                            kept[model] = np.ascontiguousarray(draw_scores.T)
+                    if reduce is not None:
+                        reduce(model, means[:, model], accumulator[column + 1 : column + 1 + count].T)
+                    column += 1 + count
+                del accumulator
+    draw_counts = tuple(plan.draw_count(model, draws) for model in range(plan.model_count))
+    return GeneticScores(
+        means=means, variances=variances, draw_counts=draw_counts, draws=tuple(kept) if draws == "keep" else (),
+        gaussian_posteriors=plan.gaussian_posteriors,
     )
-    accumulator = np.zeros((plan.weights.shape[1], sample_count), dtype=np.float64)
-    blocks = _read_plan_blocks(source, ranges, _read_ahead_buffers(block_rows, source.sample_count, budget), selected)
-    if budget.device_kind == "cuda":
-        _score_cuda(blocks, plan.weights, accumulator, budget)
-    else:
-        _score_cpu(blocks, plan.weights, accumulator, budget)
-    accumulator += plan.offsets[:, None]
-    means = np.ascontiguousarray(accumulator[list(plan.mean_columns)].T)
-    variances = np.full_like(means, np.nan)
-    for model_index, (draw_start, draw_stop) in enumerate(plan.draw_columns):
-        if draw_stop > draw_start:
-            deviations = accumulator[draw_start:draw_stop] - accumulator[plan.mean_columns[model_index]]
-            variances[:, model_index] = np.mean(deviations * deviations, axis=0)
-    draw_counts = tuple(draw_stop - draw_start for draw_start, draw_stop in plan.draw_columns)
-    draws = tuple(accumulator[start:stop].T for start, stop in plan.draw_columns)
-    return GeneticScores(means=means, variances=variances, draw_counts=draw_counts, draws=draws, gaussian_posteriors=plan.gaussian_posteriors)
-
-
 def score_linear_predictor(
     genetic_scores: F64Array,
     covariates: F64Array,
