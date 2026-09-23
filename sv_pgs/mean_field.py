@@ -102,8 +102,8 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(cache=True, fastmath=True)
-def _sweep(design, squares, members, class_index, log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth):
-    """One coordinate-ascent sweep over the members in order, in place: ``mean`` and ``variance`` (each q_j's
+def _sweep(design, squares, members, class_index, log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth, order):
+    """One coordinate-ascent sweep over the members in ``order`` (a permutation of 0..members-1), in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
     (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, ||r||^2, the sizes of the KL terms' pieces) at the sweep's end, so the ELBO
     and its rounding bound are exact there.
@@ -130,7 +130,8 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, lo
     sizes = 0.0
     log_weights = np.empty(node_count)
     conditional = np.empty(node_count)
-    for member in range(member_count):
+    for position in range(member_count):
+        member = order[position]
         group = members[member]
         omega = squares[group] / noise
         projection = 0.0
@@ -288,6 +289,7 @@ class MeanFieldFixedPoints:
     def __init__(
         self, statistics: DenseStatistics, prior: ScaleMixturePrior, start_noise: float, draw_count: int, working_bytes: int,
         start_means: Sequence[F64Array] = (),
+        order: np.ndarray | None = None,
     ) -> None:
         self.statistics = statistics
         self.prior = prior
@@ -300,6 +302,12 @@ class MeanFieldFixedPoints:
         # Xp over the groups, dense, once: every sweep is a pass over it.
         self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
         self.members = np.asarray(self.design.members, dtype=np.int64)
+        # The order coordinate ascent visits the members in: each order can end in a different mode of a multimodal
+        # posterior (between near-duplicate columns the one visited first takes the effect), so the fit's mixture over
+        # fixed points (``small_n.fit_small_n``) solves from several.
+        self.order = np.arange(self.members.shape[0], dtype=np.int64) if order is None else np.asarray(order, dtype=np.int64)
+        if np.sort(self.order).tolist() != list(range(self.members.shape[0])):
+            raise ValueError("order must be a permutation of the members")
         # ||x_g||^2 as the design defines it (``_Design.squares``: the same numbers the response and the tests use).
         self.member_squares = np.asarray(self.design.squares, dtype=np.float64)
         self.group_squares = np.zeros(self.design.group_count)
@@ -379,7 +387,7 @@ class MeanFieldFixedPoints:
         values = _sweep(
             self.projected, self.group_squares, self.members, self.class_index,
             np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), *self._node_variance(hyperparameters),
-            self.noise, self.mean, self.residual, self.variance, self.shift, self.third, self.fourth,
+            self.noise, self.mean, self.residual, self.variance, self.shift, self.third, self.fourth, self.order,
         )
         self.profile["sweeps"] += 1
         self.profile["passes"] += 1

@@ -54,7 +54,7 @@ def test_the_device_sweep_is_the_host_sweep(members: int) -> None:
         parts = host_sweep(
             np.asfortranarray(data["projected"]), data["squares"], np.arange(count), data["classes"], data["log_density"],
             np.exp(data["log_node_variance"]), data["log_node_variance"], noise, host["mean"], host_residual, host["variance"],
-            host["shift"], host["third"], host["fourth"],
+            host["shift"], host["third"], host["fourth"], np.arange(count, dtype=np.int64),
         )
         pieces[...] = 0.0
         dense = cupy.asarray(data["dense"])

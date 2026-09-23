@@ -1772,15 +1772,19 @@ def fit_small_n(
         # from the cross-validated lasso in each of the model's scales (``lasso_starts``); on those genes the mixture's
         # mean r2 was 0.1328 against 0.1287 and 0.1218 for either alone (all 494: 0.0690 against 0.0685 and 0.0677).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
+        starts = lasso_starts(statistics, seed, statistics.scales / units)
         solves = [
             _solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means)
-            for means in lasso_starts(statistics, seed, statistics.scales / units)
+            for means in starts
         ]
+    components = list(solves)
+    if inference == "mean_field":
+        components = _mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed)
     generator = np.random.default_rng(seed)
-    shares = [draw_count // len(solves) + (1 if index < draw_count % len(solves) else 0) for index in range(len(solves))]
-    draws = np.concatenate([solve.draws(generator, share) for solve, share in zip(solves, shares)], axis=1)
-    mean = np.mean([solve.oracle.mean for solve in solves], axis=0)
-    noise = float(np.mean([float(solve.oracle.noise) for solve in solves]))
+    shares = [draw_count // len(components) + (1 if index < draw_count % len(components) else 0) for index in range(len(components))]
+    draws = np.concatenate([component.draws(generator, share) for component, share in zip(components, shares) if share], axis=1)
+    mean = np.mean([component.oracle.mean for component in components], axis=0)
+    noise = float(np.mean([float(component.oracle.noise) for component in components]))
     alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
     # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
@@ -1790,7 +1794,7 @@ def fit_small_n(
         signed_means=statistics.means,
         signed_scales=statistics.scales,
         tie_map=_compact_identity_tie_map(member_count),
-        member_prior_variances=np.mean([prior_second_moment(prior, solve.hyperparameters) for solve in solves], axis=0),
+        member_prior_variances=np.mean([prior_second_moment(prior, component.hyperparameters) for component in components], axis=0),
         beta_reduced=statistics.signs * mean,
         posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
@@ -1836,8 +1840,8 @@ def fit_small_n(
     remaining = max(outer.remaining_gain for outer in outers)
     move = max(outer.prediction_move for outer in outers)
     move_tolerance = min(outer.prediction_tolerance for outer in outers)
-    elbos = [float(oracle.profile["elbo"]) for oracle in oracles if "elbo" in oracle.profile]
-    profile = dict(oracles[0].profile) | ({"mixture_elbos": elbos, "elbo": float(np.mean(elbos))} if elbos else {}) | {
+    elbos = [float(component.oracle.profile["elbo"]) for component in components if "elbo" in component.oracle.profile]
+    profile = dict(oracles[0].profile) | ({"mixture_elbos": elbos, "elbo": float(np.mean(elbos)), "mixture_components": len(components)} if elbos else {}) | {
         "stage0_seconds": stage0_seconds,
         "total_seconds": time.perf_counter() - started,
         "samples": statistics.sample_count,
@@ -1866,6 +1870,44 @@ def fit_small_n(
         scoring=scoring, noise_variance=noise, hyperparameters=solves[0].hyperparameters, certificate=certificate, prior=prior,
         statistics=statistics, profile=profile,
     )
+
+
+def _mode_mixture(
+    statistics: DenseStatistics, prior: ScaleMixturePrior, solves: list, starts: Sequence[F64Array], start_noise: float, draw_count: int,
+    working_bytes: int, seed: int,
+) -> list:
+    """The fixed points of coordinate ascent at each start's fitted hyperparameters, from that start in successive
+    random member orders, until their average mean has settled.
+
+    Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
+    each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
+    it visits first. The posterior mean averages the modes; the mixture of fixed points from random orders is a Monte
+    Carlo estimate of that average, and it stops when one more component moves the fitted genetic values
+    Xp mean-bar by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K (a component moves the average by about
+    1/k of its own distance, so this ends)."""
+    from sv_pgs.mean_field import MeanFieldFixedPoints
+
+    components = list(solves)
+    generator = np.random.default_rng([seed, 1])
+    member_count = int(np.asarray(starts[0]).shape[0])
+    average = np.mean([component.oracle.mean for component in components], axis=0)
+    index = 0
+    while True:
+        solve, start_mean = solves[index % len(solves)], starts[index % len(starts)]
+        index += 1
+        oracle = MeanFieldFixedPoints(
+            statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,), order=generator.permutation(member_count),
+        )
+        (point,) = oracle([solve.hyperparameters])
+        if point is None:
+            continue
+        components.append(_SmallNSolve(oracle=oracle, outer=None, hyperparameters=solve.hyperparameters, inference="mean_field", draw_count=draw_count))
+        updated = np.mean([component.oracle.mean for component in components], axis=0)
+        noise = float(np.mean([float(component.oracle.noise) for component in components]))
+        move = statistics.design.image(updated - average)
+        average = updated
+        if float(move @ move) / noise <= 1.0 / draw_count:
+            return components
 
 
 @dataclass

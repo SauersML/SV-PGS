@@ -1087,6 +1087,7 @@ class _FullDataMeanField:
                 part = mean_field_sweep(
                     projected, np.ascontiguousarray(self.member_squares[rows, model]), np.arange(rows.shape[0], dtype=np.int64), self.class_index[rows],
                     log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth,
+                    np.arange(rows.shape[0], dtype=np.int64),
                 )
                 for values, piece in ((self.mean, mean), (self.variance, variance), (self.shift, shift), (self.third, third), (self.fourth, fourth)):
                     values[rows, model] = piece
