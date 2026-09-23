@@ -287,6 +287,8 @@ class FullDataFit:
     # The mean-field mixture's components (``fit_full_data``): each fixed point's (shift, omega), members x models; the
     # scorer draws from each in turn, and ``member_mean`` is their average.
     member_components: tuple[tuple[F64Array, F64Array], ...] = ()
+    # Each component's weight per model (components x models), exp(ELBO) normalized (``small_n._mixture_weights``).
+    component_weights: F64Array | None = None
 
 
 def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Array]:
@@ -1400,10 +1402,10 @@ def fit_full_data(
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
     components: tuple[tuple[F64Array, F64Array], ...] = ()
-    member_mean = None
+    member_mean = component_weights = None
     if mean_field is not None:
         hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
-        member_mean, components = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters)
+        member_mean, components, component_weights = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters)
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
@@ -1411,6 +1413,7 @@ def fit_full_data(
         inference=inference,
         member_mean=member_mean,
         member_components=components,
+        component_weights=component_weights,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
         covariate_coefficients=None if mean_field is None else np.column_stack(
@@ -1455,20 +1458,28 @@ def fit_full_data(
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...],
-) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...]]:
+) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...], F64Array]:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
-    random within-block member orders until one more moves every model's fitted genetic values by at most the draws'
-    resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component, and its dual-solver state is
-    put back at the end. Returns the average mean and each component's (shift, omega)."""
+    random within-block member orders, each weighted per model by its evidence, exp(ELBO) (``small_n._mixture_weights``:
+    a poor fixed point carries no weight), until one more moves every model's fitted genetic values by at most the
+    draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component, and its dual-solver
+    state is put back at the end. Returns the weighted mean, each component's (shift, omega) and the weights."""
     def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
         return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
 
-    means, components = [], []
+    means, components, elbos = [], [], []
     mean, shift, omega = pieces(main)
-    means.append(mean); components.append((shift, omega))
-    average = mean.copy()
+    means.append(mean); components.append((shift, omega)); elbos.append(np.array(main.elbo, dtype=np.float64))
+
+    def weighted() -> tuple[F64Array, F64Array]:
+        values = np.array(elbos)
+        weights = np.exp(values - values.max(axis=0))
+        weights /= weights.sum(axis=0)
+        return np.einsum("cm,cjm->jm", weights, np.array(means)), weights
+
+    average, _weights = weighted()
     component = 0
     while True:
         component += 1
@@ -1479,8 +1490,8 @@ def _mode_mixture(
         if any(point is None for point in points):
             continue
         mean, shift, omega = pieces(oracle)
-        means.append(mean); components.append((shift, omega))
-        updated = np.mean(means, axis=0)
+        means.append(mean); components.append((shift, omega)); elbos.append(np.array(oracle.elbo, dtype=np.float64))
+        updated, _weights = weighted()
         settled = all(
             float(np.sum(np.square(main._image((updated - average)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
             for model in range(main.model_count)
@@ -1489,7 +1500,7 @@ def _mode_mixture(
         if settled:
             break
     main._iterate(main.site_precision, main.site_shift, main.noise)
-    return average, tuple(components)
+    return average, tuple(components), weighted()[1]
 
 
 def scoring_models(
@@ -1520,7 +1531,10 @@ def scoring_models(
             from sv_pgs.mean_field import product_draws
 
             parts = fit.member_components or ((fit.member_shift, fit.member_omega),)
-            shares = [draw_count // len(parts) + (1 if index < draw_count % len(parts) else 0) for index in range(len(parts))]
+            from sv_pgs.small_n import _draw_shares
+
+            weights = np.ones(len(parts)) / len(parts) if fit.component_weights is None else fit.component_weights[:, model]
+            shares = _draw_shares(weights, draw_count)
             draws = np.concatenate([
                 product_draws(
                     prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
