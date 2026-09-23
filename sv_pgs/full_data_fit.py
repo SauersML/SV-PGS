@@ -161,7 +161,7 @@ def block_grams(
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
         next_cross.append(np.zeros(shape, dtype=np.float32) if cross is None else cross)
     grams = BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
-    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes, array_module))
+    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes, array_module, max(block.shape[0] for block in blocks)))
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:

@@ -462,6 +462,9 @@ def eigensolver_bytes(size: int, array_module: Any = np) -> int:
             handle, params, cusolver.CUSOLVER_EIG_MODE_NOVECTOR, cublas.CUBLAS_FILL_MODE_LOWER, size, kind, stand_in.data.ptr, size, kind,
             stand_in.data.ptr, kind,
         )
+    except cusolver.CUSOLVERError:
+        # The device's eigensolver refuses a matrix this large: no window of this size can run there.
+        return np.iinfo(np.int64).max
     finally:
         cusolver.destroyParams(params)
     # CuPy's pool hands out whole allocation units, each allocation rounded up: the matrix's copy, the workspace, the
@@ -489,10 +492,11 @@ def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
     return peak
 
 
-def window_width(working_bytes: int, array_module: Any = np) -> int:
+def window_width(working_bytes: int, array_module: Any = np, limit: int | None = None) -> int:
     """The widest block whose window (itself and its two neighbours at the same width) keeps the window algebra's
     working set (``window_working_bytes`` on ``array_module``) within ``working_bytes``, by bisection on the width (the
-    set grows with it). At least one variant (the algebra's floor, where the budget is below it)."""
+    set grows with it). At least one variant (the algebra's floor, where the budget is below it), and never wider
+    than ``limit`` (the widest block there is to cut, where one is given)."""
 
     def fits(width: int) -> bool:
         blocks = tuple(np.arange(index * width, (index + 1) * width, dtype=np.int64) for index in range(3))
@@ -503,6 +507,8 @@ def window_width(working_bytes: int, array_module: Any = np) -> int:
 
     low, high = 1, 2
     while fits(high):
+        if limit is not None and high >= limit:
+            return int(limit)
         low, high = high, 2 * high
     while high - low > 1:
         middle = (low + high) // 2
@@ -510,7 +516,7 @@ def window_width(working_bytes: int, array_module: Any = np) -> int:
             low = middle
         else:
             high = middle
-    return low
+    return low if limit is None else min(low, int(limit))
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:
