@@ -1160,3 +1160,25 @@ def test_a_stopped_run_is_consolidated_from_its_stored_fits_complete_genes_only(
     log = pd.read_csv(out / "chr1.log.tsv", sep="\t")
     assert set(log["gene_id"]) == set(genes["gene_id"]) and (log["status"] == "ok").all()
     assert (out / "chr1.parts").is_dir() and json.loads((out / "chr1.run.json").read_text())["consolidated_from_parts"] == summary
+
+
+def test_the_fitted_schema_is_the_predictors_own_record_in_canonical_json():
+    """``harness.fitted_schema``: the predictor's ``fitted_schema`` as canonical JSON (key order irrelevant), "null"
+    for a predictor without one and for a failed fit."""
+    import json
+    from types import SimpleNamespace
+
+    one = harness.fitted_schema(SimpleNamespace(fitted_schema={"b": 1, "a": ["x"]}))
+    other = harness.fitted_schema(SimpleNamespace(fitted_schema={"a": ["x"], "b": 1}))
+    assert one == other and json.loads(one) == {"a": ["x"], "b": 1}
+    assert harness.fitted_schema(object()) == "null" and harness.fitted_schema(None) == "null"
+
+
+def test_the_calibration_slope_is_the_regression_of_the_expression_on_the_score():
+    from benchmarks.bench_real import report
+
+    rng = np.random.default_rng(3)
+    score = rng.standard_normal((2, 40))
+    truth = np.vstack([2.0 * score[0], 0.5 * score[1] + 0.0 * rng.standard_normal(40)])
+    np.testing.assert_allclose(report.calibration_slope(score, truth), [2.0, 0.5])
+    assert np.isnan(report.calibration_slope(np.zeros((1, 5)), np.ones((1, 5)))[0])

@@ -37,6 +37,7 @@ per call after that), else works from the factors at O(n^2 p) per column (see ``
 
 from __future__ import annotations
 
+import hashlib
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -1963,11 +1964,29 @@ def fit_small_n(
         "halvings": int(sum(outer.halvings for outer in outers)),
         "unresolved": int(sum(outer.unresolved for outer in outers)),
         "final_log_smoothing": [float(value) for value in np.atleast_1d(solves[0].hyperparameters.log_smoothing)],
+        "fitted_schema": fitted_schema(prior, inference, annotations),
     }
     return SmallNFit(
         scoring=scoring, noise_variance=noise, hyperparameters=solves[0].hyperparameters, certificate=certificate, prior=prior,
         statistics=statistics, profile=profile,
     )
+
+
+def fitted_schema(prior: ScaleMixturePrior, inference: str, annotations: Mapping[str, np.ndarray] | None) -> dict:
+    """What a fit contains, recorded with it: the inference family, the annotation inputs that reached the prior (None
+    for the prior without annotations), its annotation groups, scale columns and classes, and a SHA-256 digest of the
+    prior's defining arrays (classes, offsets, annotation design, lattice), so two results are the same model exactly
+    when their digests agree."""
+    digest = hashlib.sha256()
+    for values in (prior.class_index, prior.log_variance_offset, prior.scale_design, prior.log_variance_grid):
+        array = np.ascontiguousarray(values)
+        digest.update(str((array.dtype.str, array.shape)).encode())
+        digest.update(array.tobytes())
+    return {
+        "inference": inference, "annotation_inputs": None if annotations is None else sorted(annotations),
+        "annotation_groups": len(prior.annotation_groups), "scale_columns": int(prior.scale_size), "classes": int(prior.class_count),
+        "prior_sha256": digest.hexdigest(),
+    }
 
 
 def _mixture_weights(components: Sequence["_SmallNSolve | GaussianMember"]) -> F64Array:

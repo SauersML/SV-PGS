@@ -18,6 +18,9 @@ superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted ov
            score worse than that fit, and is never clipped. Its nuisance fit is made inside the target group, so it
            is a target-residualized statistic, not the R^2 of a deployable predictor whose covariate model was
            fitted in training: this benchmark measures conditional association, not prospective skill (see E03).
+  calibration_slope  <R_T s, R_T y> / |R_T s|^2, the least-squares slope of the within-group expression on the score
+           (NaN for a constant score): 1 for a score on the expression's scale, above 1 for an over-shrunk score, below
+           1 for an over-dispersed one. It is the scale r2 ignores, separated from the direction.
   null_r2  1 / d with d = n_T - rank[1, C_T], the mean of r2 under one explicit null: R_T s fixed and nonzero, and
            R_T y uniform in direction over the d-dimensional residual subspace, independent of the score. r2 is then
            the squared cosine between a fixed direction and a uniform one, Beta(1/2, (d-1)/2), whose mean is 1/d.
@@ -65,7 +68,7 @@ import pandas as pd
 
 SUPERPOPULATIONS = ("AFR", "AMR", "EAS", "EUR", "SAS")
 # The columns of the per-gene table, so a results directory that scored nothing still concatenates with one that did.
-SCORE_COLUMNS = ("gene_id", "chrom", "method", "feature_set", "design", "superpopulation", "partial_correlation", "r2", "oos_r2", "null_r2",
+SCORE_COLUMNS = ("gene_id", "chrom", "method", "feature_set", "design", "superpopulation", "partial_correlation", "r2", "oos_r2", "calibration_slope", "null_r2",
                  "mismatched_r2", "people")
 POOLED = "pooled"
 FEATURE_SETS = ("snv", "snv_sv", "snv_pgsv", "sv", "pgsv", "snv_matched", "hgsvc3", "snv_hgsvc3", "ont", "snv_ont",
@@ -131,6 +134,14 @@ def partial_scores(score, truth):
     with np.errstate(invalid="ignore", divide="ignore"):
         correlation = np.where(score_norm == 0, 0.0, product / np.sqrt(score_norm * truth_norm))
         return correlation, correlation ** 2, 1.0 - np.sum((truth - score) ** 2, axis=1) / truth_norm
+
+
+def calibration_slope(score, truth):
+    """Per row of within-group residuals: the slope <R s, R y> / |R s|^2 of the expression on the score (NaN where the
+    score is constant). See this module's docstring."""
+    score_norm = np.sum(score ** 2, axis=1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.where(score_norm == 0, np.nan, np.sum(score * truth, axis=1) / score_norm)
 
 
 class HeldOut:
@@ -275,7 +286,7 @@ def per_gene_scores(results_dir: pathlib.Path, dataset_dir: pathlib.Path, method
                 frames.append(pd.DataFrame({"gene_id": genes["gene_id"].to_numpy()[rows], "chrom": genes["chrom"].to_numpy()[rows], "method": method,
                                             "feature_set": feature_set, "design": design, "superpopulation": group,
                                             "partial_correlation": correlation, "r2": r2, "oos_r2": oos_r2,
-                                            "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
+                                            "calibration_slope": calibration_slope(score, truth), "null_r2": 1.0 / (people - rank), "mismatched_r2": mismatched, "people": people}))
     if not frames:
         # The directory exists but scored nothing of this method and design (another results root holds those genes).
         return pd.DataFrame({column: [] for column in SCORE_COLUMNS})
@@ -338,10 +349,10 @@ def paired(scores: pd.DataFrame, arm_a, arm_b):
 
 def pooled_r2(scores: pd.DataFrame):
     """Per method, feature set and design: the mean over genes of each gene's r^2 (and its signed partial correlation,
-    oos_r2, and the null r^2) averaged over the held-out groups, complete-case (failed genes dropped and counted) and
+    oos_r2, the null r^2, and the median gene's calibration slope) averaged over the held-out groups, complete-case (failed genes dropped and counted) and
     intention-to-treat (a failed group scored as the training-mean prediction: r^2 = oos_r2 = 0)."""
     key = ["method", "feature_set", "design", "gene_id", "chrom"]
-    per_gene = scores.groupby(key, as_index=False)[["partial_correlation", "r2", "oos_r2", "null_r2", "mismatched_r2"]].agg(
+    per_gene = scores.groupby(key, as_index=False)[["partial_correlation", "r2", "oos_r2", "calibration_slope", "null_r2", "mismatched_r2"]].agg(
         lambda values: values.mean(skipna=False))
     per_gene_itt = scores.fillna({"r2": 0.0}).groupby(key, as_index=False)["r2"].mean()
     itt_groups = dict(list(per_gene_itt.groupby(["method", "feature_set", "design"])))
@@ -356,7 +367,10 @@ def pooled_r2(scores: pd.DataFrame):
         itt_mean, itt_error, _ = jackknife(whole["r2"], whole["chrom"])
         rows.append(dict(zip(["method", "feature_set", "design"], arm), superpopulation=POOLED, genes=len(complete), mean_r2=mean, se=error, se_kind=kind,
                          null_r2=complete["null_r2"].mean(), mismatched_r2=complete["mismatched_r2"].mean(), mean_oos_r2=oos_mean, oos_se=oos_error,
-                         mean_partial_correlation=correlation_mean, partial_correlation_se=correlation_error, failed_genes=failed, itt_genes=len(whole),
+                         mean_partial_correlation=correlation_mean, partial_correlation_se=correlation_error,
+                         # The median gene's slope: a gene whose score is nearly constant has an unbounded slope, which a
+                         # mean over genes would carry.
+                         median_calibration_slope=complete["calibration_slope"].median(), failed_genes=failed, itt_genes=len(whole),
                          itt_mean_r2=itt_mean, itt_se=itt_error))
     return pd.DataFrame(rows)
 

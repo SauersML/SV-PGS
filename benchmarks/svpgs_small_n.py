@@ -42,6 +42,11 @@ class SmallNPredictor:
     profile: dict
     codes_per_unit: np.ndarray
 
+    @property
+    def fitted_schema(self) -> dict | None:
+        """The fit's own record of what it contains (``small_n.fit_small_n``'s profile), for the harness."""
+        return self.profile.get("fitted_schema")
+
     def predict(self, genotypes: np.ndarray, covariates: np.ndarray | None = None) -> np.ndarray:
         """The genetic score plus the intercept, in closed form from dosages: x_j = (127 d_j - 127 - mu_j) / sigma_j, and
         the fixed covariate effects when the harness passes the scored samples' covariates."""
@@ -128,6 +133,11 @@ def _fit(train: Any, arm: str, inference: str = "ep") -> SmallNPredictor:
         annotations=_arm_annotations(train.variants, arm),
         codes_per_unit=units,
     )
+    annotations = _arm_annotations(train.variants, arm)
+    if annotations and not fit.profile["fitted_schema"]["annotation_groups"]:
+        # An arm that passes annotations must fit them: an annotation-free fit under an annotated arm's name is refused,
+        # not reported (the full arms once fitted none, a8e6062).
+        raise ValueError(f"arm {arm!r} passed annotations {sorted(annotations)} but its prior has no annotation group")
     return SmallNPredictor(scoring=fit.scoring, profile=fit.profile, codes_per_unit=units)
 
 

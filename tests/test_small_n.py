@@ -891,3 +891,23 @@ def test_the_embedded_hyperparameters_define_the_base_prior_in_the_annotated_one
     by_name = dict(zip((block.name for block in base.smoothing_blocks), moved.log_smoothing))
     for block, value in zip(annotated.smoothing_blocks, embedded.log_smoothing):
         assert value == by_name.get(block.name, np.inf)
+
+
+def test_the_fitted_schema_digest_names_the_prior_exactly():
+    """``small_n.fitted_schema``: equal priors give equal digests; adding an annotation changes the digest and the
+    recorded groups and inputs."""
+    from sv_pgs.small_n import fitted_schema, small_n_prior
+
+    rng = np.random.default_rng(97)
+    samples, variants = 40, 30
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    classes = np.zeros(variants, dtype=np.uint8)
+    base = fitted_schema(small_n_prior(statistics, classes, np.zeros(variants), 64), "mean_field", None)
+    again = fitted_schema(small_n_prior(statistics, classes, np.zeros(variants), 64), "mean_field", None)
+    annotations = {"distance": rng.standard_normal(variants)}
+    annotated = fitted_schema(small_n_prior(statistics, classes, np.zeros(variants), 64, annotations), "mean_field", annotations)
+    assert base == again
+    assert base["annotation_inputs"] is None and base["annotation_groups"] == 0
+    assert annotated["annotation_inputs"] == ["distance"] and annotated["annotation_groups"] > 0
+    assert annotated["prior_sha256"] != base["prior_sha256"]

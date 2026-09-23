@@ -537,6 +537,14 @@ def _without_structural_variants(train: TrainData, test_genotypes: np.ndarray):
     return masked
 
 
+def fitted_schema(predictor) -> str:
+    """What the fit actually contains, as the predictor reports it (``fitted_schema``: its inference family, the
+    annotations that reached its prior, its classes and a digest of its prior), in canonical JSON; "null" for a
+    predictor that reports none or a failed fit. Stored with every fit and summarized per run, so an arm is judged by
+    the model it fitted, not by its name (an arm named "full" once fitted no annotation at all, a8e6062)."""
+    return json.dumps(getattr(predictor, "fitted_schema", None), sort_keys=True, default=str)
+
+
 def _call_predict(predictor, genotypes, covariates):
     """predictor.predict(genotypes), passing the samples' covariates too when the predictor accepts them."""
     if "covariates" in inspect.signature(predictor.predict).parameters:
@@ -598,6 +606,7 @@ def _run_gene(arguments):
             started = time.process_time()
             try:
                 predictor = fit(train)
+                schema = fitted_schema(predictor)
                 raw = {}
                 prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
                 coefficients, status = sv_coefficients(train, predictor, window.gene_id, split_name, feature_set), "ok"
@@ -607,11 +616,11 @@ def _run_gene(arguments):
                 if not _WORKER["record_failures"]:
                     raise
                 prediction = without_sv = np.full(len(test_index), np.nan)
-                raw = None
+                raw, schema = None, fitted_schema(None)
                 coefficients, status = None, f"failed: {type(error).__name__}: {str(error)[:300]}"
             seconds = time.process_time() - started
             results.append((gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-                            int(train.variants.is_sv.sum()), seconds, coefficients, status, raw, _train_index(dataset, split_name)))
+                            int(train.variants.is_sv.sum()), seconds, coefficients, status, raw, _train_index(dataset, split_name), schema))
     return results
 
 
@@ -736,7 +745,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
 
 
 FIT_FIELDS = ("gene_row", "split_name", "feature_set", "test_index", "prediction", "without_sv", "test_phenotype", "variant_count", "sv_count",
-              "seconds", "coefficients", "status", "raw", "train_index")
+              "seconds", "coefficients", "status", "raw", "train_index", "schema")
 
 
 def _atomic(path: pathlib.Path, write):
@@ -804,7 +813,8 @@ class FitStore:
                   "status": np.asarray(fit["status"]), "test_index": np.asarray(fit["test_index"], dtype=np.int64),
                   "train_index": np.asarray(fit["train_index"], dtype=np.int64), "prediction": np.asarray(fit["prediction"], dtype=np.float32),
                   "without_sv": np.asarray(fit["without_sv"], dtype=np.float32), "truth": np.asarray(fit["test_phenotype"], dtype=np.float32),
-                  "variant_count": np.int64(fit["variant_count"]), "sv_count": np.int64(fit["sv_count"]), "seconds": np.float64(fit["seconds"])}
+                  "variant_count": np.int64(fit["variant_count"]), "sv_count": np.int64(fit["sv_count"]), "seconds": np.float64(fit["seconds"]),
+                  "schema": np.asarray(fit.get("schema", "null"))}
         for kind, (train_score, test_score) in (fit["raw"] or {}).items():
             arrays[f"raw_{kind}_train"] = np.asarray(train_score, dtype=np.float32)
             arrays[f"raw_{kind}_test"] = np.asarray(test_score, dtype=np.float32)
@@ -936,6 +946,7 @@ def run(dataset_dir, method_spec, method_name, design, chromosomes, out_dir, wor
                 "gene_id": dataset.genes.iloc[fit["gene_row"]]["gene_id"], "split": fit["split_name"], "feature_set": fit["feature_set"],
                 "variants": int(fit["variant_count"]), "sv_variants": int(fit["sv_count"]), "cpu_seconds": float(fit["seconds"]),
                 "status": fit["status"], "finished": len(carried) + position + 1,
+                "schema_sha256": hashlib.sha256(fit["schema"].encode()).hexdigest()[:16],
             }) + "\n")
             progress.flush()
     log, coefficient_tables = _consolidate(store, out, tag, dataset, gene_rows, split_names, feature_sets, sample_count)
@@ -998,6 +1009,8 @@ def _consolidate(store: FitStore, out: pathlib.Path, tag: str, dataset, gene_row
     truth = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
     available = store.finished()
     entries, coefficient_tables = {}, {}
+    # Every distinct fitted schema of the run, with the fits that carry it, per feature set (``fitted_schema``).
+    schemas: dict[str, dict] = {}
     for feature_set in feature_sets:
         predictions = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
         without_sv = np.full((len(gene_rows), sample_count), np.nan, dtype=np.float32)
@@ -1018,6 +1031,10 @@ def _consolidate(store: FitStore, out: pathlib.Path, tag: str, dataset, gene_row
                         if f"raw_{kind}_train" in part.files:
                             array[position, split_position[split_name], part["train_index"]] = part[f"raw_{kind}_train"]
                             array[position, split_position[split_name], test_index] = part[f"raw_{kind}_test"]
+                    schema = str(part["schema"]) if "schema" in part.files else "null"
+                    digest = hashlib.sha256(schema.encode()).hexdigest()[:16]
+                    entry = schemas.setdefault(digest, {"schema": json.loads(schema), "fits": {}})
+                    entry["fits"][feature_set] = entry["fits"].get(feature_set, 0) + 1
                     table = _load_frame(part, "coefficients_")
                     if table is not None:
                         coefficient_tables[key] = table
@@ -1030,6 +1047,7 @@ def _consolidate(store: FitStore, out: pathlib.Path, tag: str, dataset, gene_row
             suffix = "" if kind == "full" else "_without_sv"
             _atomic(out / f"{tag}.{feature_set}.raw_scores{suffix}.npy", lambda target, values=array: np.save(target, values))
     _atomic(out / f"{tag}.truth.npy", lambda target: np.save(target, truth))
+    _atomic(out / f"{tag}.schemas.json", lambda target: target.write_text(json.dumps(schemas, indent=1, sort_keys=True)))
     order = [key for key in store.keys if key in entries]
     return [entries[key] for key in order], [coefficient_tables[key] for key in order if key in coefficient_tables]
 
