@@ -3173,48 +3173,34 @@ def _maximize_evidence(
             infinite, moved = frozenset(best_edge[0]), True
             coefficients = best_edge[1][0] @ best_edge[1][1].coefficients
         if not moved:
-            # An edge weight is released where V, followed inward from the edge along its own basin, rises above the
-            # edge's by more than the tolerance. At the range's upper end V is the edge's by construction (the penalty
-            # swamps the data there past half precision), so the path starts there and steps inward, each point
-            # warm-started from the last one's x: a single far probe (the range's centre, as before) jumps to whatever
-            # basin its starts reach, and on bench-real genes [real] that basin was a collapse at the centre while the
-            # path from the edge rose steadily (ENSG00000112685.14: ELBO -252.3 rigid, -244.7 at log rho 8, -243.8 at
-            # 4, r2 0.230 -> 0.354; ENSG00000187605.16 collapsed to r2 0.025 at 4 from a cold start). The step starts at
-            # half the range and halves wherever V falls past the tolerance or has no certified maximum; the path
-            # stops where the step's first-order gain |dV/drho| h is within the tolerance, or the step is below the
-            # range's half-precision resolution.
+            # An edge weight is released where the certified V at the centre of its resolvable range is above the
+            # edge's by more than the tolerance. The centre is the weight at which the penalty's geometric-mean
+            # eigenvalue matches the data's curvature (the log-midpoint of the two half-precision ends): the one
+            # scale-free point where the two are commensurate. The range's upper end cannot release anything: the
+            # penalty swamps the data there past half precision, so V is the edge's to the tolerance by
+            # construction and its slope is O(e^-rho) (on the mean-field test problem V's interior maximum sits
+            # mid-range, 2.7 nats above the edge on one class, with a slope of -0.0004 +- 0.06 at the upper end).
+            # The Laplace form screens the centre (``_best_certified``): the corrections are taken only where the
+            # Laplace V is itself above the edge, and the ascent from the centre then searches the interior. The
+            # screen is a heuristic on the search, not a certificate: a correction can be positive (measured on
+            # bench-real chr22 [real]: 2 of 89 on ENSG00000254709.8, the larger +0.55 nats, against 1-66 nats of
+            # lowering elsewhere; the audit's M05), so a trial whose Laplace V sits within such a correction below
+            # the edge is missed, and the fit ends at the edge with its certificate as a local one. What the screen
+            # buys: on ENSG00000274602.5 [real] the corrections are 59% of a 412 s fit.
             for position in sorted(edges):
                 if position in released_once:
                     continue
                 trial_infinite = infinite - {position}
-                finite_after = [index for index in range(len(bounds)) if index not in trial_infinite]
-                slot = finite_after.index(position)
-                path_weights = weights.copy()
-                point = float(upper[position])
-                step = 0.5 * float(upper[position] - lower[position])
-                resolution = _HALF_PRECISION * (1.0 + abs(point))
-                warm = coefficients
-                path_value = current_value
-                best = None
-                while step > resolution and point - step >= lower[position]:
-                    path_weights[position] = point - step
-                    trial = _edge_evidence(
-                        prior, path_weights, trial_infinite, [warm, coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance,
-                    )
-                    if trial is None or trial[1].value < path_value - tolerance:
-                        step *= 0.5
-                        continue
-                    point = float(path_weights[position])
-                    warm = trial[0] @ trial[1].coefficients
-                    path_value = trial[1].value
-                    if best is None or path_value > best[2]:
-                        best = (path_weights.copy(), trial, path_value)
-                    if abs(float(trial[1].gradient[slot])) * step <= tolerance:
-                        break
-                if best is not None and best[2] > current_value + tolerance:
+                trial_weights = weights.copy()
+                trial_weights[position] = 0.5 * (lower[position] + upper[position])
+                trial = _edge_evidence(
+                    prior, trial_weights, trial_infinite, [coefficients, flat, log_normal], cavity, correction, working_bytes, tolerance,
+                    screen=current_value + tolerance,
+                )
+                if trial is not None and trial[1].value > current_value + tolerance:
                     released_once.add(position)
-                    infinite, weights, moved = frozenset(trial_infinite), best[0], True
-                    coefficients = best[1][0] @ best[1][1].coefficients
+                    infinite, weights, moved = frozenset(trial_infinite), trial_weights, True
+                    coefficients = trial[0] @ trial[1].coefficients
                     break
         if not moved:
             log_smoothing = weights.copy()
