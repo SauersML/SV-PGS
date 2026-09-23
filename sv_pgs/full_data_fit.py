@@ -503,6 +503,7 @@ class _FullDataFixedPoints:
         seed: int,
         starts: Sequence[MixtureHyperparameters],
         noise: F64Array,
+        start_sites: tuple[F64Array, F64Array] | None = None,
     ) -> None:
         self.gaussian = gaussian
         covariates = np.asarray(_host(gaussian.covariates))
@@ -548,6 +549,13 @@ class _FullDataFixedPoints:
         sites = [moment_matched_prior_sites(prior, start) for start in starts]
         self.site_precision = np.column_stack([precision for precision, _shift in sites])
         self.site_shift = np.column_stack([shift for _precision, shift in sites])
+        if start_sites is not None:
+            # A warm start (``fit_full_data``): the mean-field fixed point's sites, whose Gaussian has q's means and
+            # precision; a member with no mean-field variance keeps the prior's moment-matched site.
+            precision, shift = (np.asarray(values, dtype=np.float64) for values in start_sites)
+            usable = np.isfinite(precision) & np.isfinite(shift)
+            self.site_precision = np.where(usable, precision, self.site_precision)
+            self.site_shift = np.where(usable, shift, self.site_shift)
         self.noise = np.array(noise, dtype=np.float64, copy=True)
         self.effective = np.full(model_count, float(prior.variant_count))
         self.probe_ratio = _HALF_PRECISION
@@ -2149,8 +2157,8 @@ def fit_full_data(
     sites: Sequence[BernoulliSites | None] | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
-    ``inference`` names the fixed point: "ep" (this module's EP) or "mean_field" (``_FullDataMeanField``: the product q
-    of ``mean_field`` on the streamed design).
+    ``inference`` names the fixed point: "mean_field" (``_FullDataMeanField``: the product q of ``mean_field`` on the
+    streamed design) or "ep" (this module's EP, started from the mean-field fixed point).
 
     ``sites`` gives each binary model's starting Polya-Gamma sites (None for a quantitative model;
     ``binary_likelihood``), with the dual solver already in their metric (its sample weights the sites' weights, its
@@ -2177,21 +2185,18 @@ def fit_full_data(
     binary = np.array([entry is not None for entry in model_sites])
     if binary.any() and inference != "mean_field":
         raise ValueError("a binary model is fitted by the mean-field route (its Polya-Gamma bound); EP has no binary likelihood")
-    oracle_class = _FullDataFixedPoints if inference == "ep" else _FullDataMeanField
-
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
         start_sites: Sequence[BernoulliSites | None],
     ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
-        if inference == "mean_field":
-            extra["sites"] = list(start_sites)
-        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
+        extra["sites"] = list(start_sites)
+        oracle = _FullDataMeanField(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
         try:
             return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
-            raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
+            raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
 
     # A binary model's noise is known: 1 in its whitened coordinates.
     noise = np.where(binary, 1.0, np.array([moment.noise for moment in moments]))
@@ -2203,12 +2208,25 @@ def fit_full_data(
         base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None, model_sites)
         starts = [embed_hyperparameters(base, prior, fit.hyperparameters) for fit in base_fits]
         fixed_points, fits = solve(
-            prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(),
-            base_points.mean.copy() if inference == "mean_field" else None,
-            base_points.sites if inference == "mean_field" else model_sites,
+            prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(), base_points.mean.copy(), base_points.sites,
         )
     else:
         fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None, model_sites)
+    if inference == "ep":
+        # EP starts where mean field ended (its fitted hyperparameters, noise and sites: q's means and precision), so its
+        # refreshes pay for EP's correction to mean field, not the path from the prior. Mean field is its own route to
+        # that point; EP then moves both q and the hyperparameters to EP's own fixed point.
+        field_hyperparameters = list(fixed_points.restore_best(tuple(fit.hyperparameters for fit in fits), 0.5 / draw_count))
+        log(f"ep: warm start from the mean-field fixed point after {fixed_points.passes} sweeps")
+        oracle = _FullDataFixedPoints(
+            gaussian, statistics, prior, draw_count, working_bytes, seed, field_hyperparameters, np.asarray(fixed_points.noise, dtype=np.float64).copy(),
+            start_sites=(fixed_points.site_precision.copy(), fixed_points.site_shift.copy()),
+        )
+        try:
+            fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
+        except FloatingPointError as error:
+            raise FloatingPointError(f"{error}; ep refusals: {oracle.refusals}") from error
+        fixed_points = oracle
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
     model_count = gaussian.model_count

@@ -464,9 +464,12 @@ def _window_quadratic(
     # Cholesky factor exactly when B is inside it; anything beyond means the within- and cross-block Grams are not the
     # Gram of one design (different rows, units, projection or block order): the map would be wrong, so refuse.
     rounding = _storage_allowance(whitened, xp) + size * np.finfo(np.float64).eps / 2 * float(_to_host(xp.linalg.norm(whitened)))
-    whitened[diagonal, diagonal] += rounding
+    # B + rounding I is positive semidefinite exactly when B is inside the allowance; the Cholesky test needs it
+    # definite, which the smallest positive float adds where the allowance is 0 (B = 0: every site resolved).
+    shift = max(rounding, float(np.finfo(np.float64).tiny))
+    whitened[diagonal, diagonal] += shift
     check = _positive_cholesky(whitened, xp)
-    whitened[diagonal, diagonal] -= rounding
+    whitened[diagonal, diagonal] -= shift
     if size and check is None:
         raise ValueError(
             f"block {block}: a window Gram is not positive semidefinite within its rounding allowance {rounding:.3e}: the "
