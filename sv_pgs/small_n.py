@@ -1876,13 +1876,15 @@ def _mode_mixture(
     statistics: DenseStatistics, prior: ScaleMixturePrior, solves: list, starts: Sequence[F64Array], start_noise: float, draw_count: int,
     working_bytes: int, seed: int,
 ) -> list:
-    """The fixed points of coordinate ascent at each start's fitted hyperparameters, from that start in successive
-    random member orders, until their average mean has settled.
+    """The fixed points of coordinate ascent at each start's fitted hyperparameters, from zero in successive random
+    member orders, until their average mean has settled.
 
     Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
     each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
     it visits first. The posterior mean averages the modes; the mixture of fixed points from random orders is a Monte
-    Carlo estimate of that average, and it stops when one more component moves the fitted genetic values
+    Carlo estimate of that average. Each further component starts from zero: a data start already holds one mode's
+    choice between the columns, and every order carried from it ends there (from the lasso start the order components
+    reproduced the first fixed point in most of 60 simulations on real genotypes). The mixture stops when one more component moves the fitted genetic values
     Xp mean-bar by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K (a component moves the average by about
     1/k of its own distance, so this ends)."""
     from sv_pgs.mean_field import MeanFieldFixedPoints
@@ -1893,11 +1895,9 @@ def _mode_mixture(
     average = np.mean([component.oracle.mean for component in components], axis=0)
     index = 0
     while True:
-        solve, start_mean = solves[index % len(solves)], starts[index % len(starts)]
+        solve = solves[index % len(solves)]
         index += 1
-        oracle = MeanFieldFixedPoints(
-            statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,), order=generator.permutation(member_count),
-        )
+        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, order=generator.permutation(member_count))
         (point,) = oracle([solve.hyperparameters])
         if point is None:
             continue
