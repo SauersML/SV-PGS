@@ -43,7 +43,8 @@ def linear_scores(scoring: ScoringModel, order: np.ndarray, structural_rows: np.
         members = structural_rows[order[rows]]
         structural += weights[members] @ standardized[members]
         if draw_scores is not None:
-            draw_scores += standardized.T @ scoring.posterior_draws[first:first + BLOCK_ROWS]
+            # The draws are a law read a tile of rows at a time (``draw_laws``): this block's rows only.
+            draw_scores += standardized.T @ scoring.posterior_draws.tile(first, first + rows.shape[0])
     fixed = np.column_stack([np.ones(data.n_samples), np.asarray(data.covariates, dtype=np.float64)])
     result = {"total": total, "structural": structural, "linear": total + fixed @ scoring.alpha}
     if draw_scores is not None:
