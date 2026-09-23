@@ -128,3 +128,17 @@ def test_streamed_double_loop_reaches_the_dense_double_loops_fixed_point(tmp_pat
     streamed_inverse = np.linalg.inv(design.T @ design / noise + np.diag(oracle.site_precision[:, 0]))
     np.testing.assert_allclose(np.diag(streamed_inverse), dense_variance, rtol=scale)
     np.testing.assert_allclose(streamed_mean, dense_mean, rtol=scale, atol=scale * float(np.max(np.sqrt(dense_variance))))
+
+
+def test_prediction_error_bound_holds_for_every_row() -> None:
+    """|x'(mu_hat - mu)| <= sqrt(x'A^-1 x) ||mu_hat - mu||_A for rows x, with a perturbed mean and its exact A-norm."""
+    from sv_pgs.dual_solve import prediction_error_bound
+
+    generator = np.random.default_rng(5)
+    design = generator.standard_normal((40, 12))
+    precision = design.T @ design + np.diag(generator.uniform(0.5, 2.0, 12))
+    error = generator.standard_normal(12) * 1e-3
+    norm = float(np.sqrt(error @ precision @ error))
+    rows = generator.standard_normal((25, 12))
+    variance = np.einsum("ij,jk,ik->i", rows, np.linalg.inv(precision), rows)
+    assert np.all(np.abs(rows @ error) <= prediction_error_bound(norm, variance) * (1.0 + 1e-12))

@@ -1016,6 +1016,15 @@ class SampleDiagonal:
         return rows, (base + self.resolved_lower[rows]) / self.weights[rows], (base + self.resolved_upper[rows]) / self.weights[rows]
 
 
+def prediction_error_bound(error_bound: Any, predictive_variance: Any) -> Any:
+    """A mean's certificate in prediction units: for any person's row x, |x'(mu_hat - mu)| <= sqrt(x'A^-1 x)
+    ||mu_hat - mu||_A (Cauchy-Schwarz in A's inner product), and x'A^-1 x is the posterior variance of that person's
+    linear predictor, so each prediction's error is at most ``error_bound`` (``DualCertificate.error_bound``, from the
+    residual recomputed with the full operator) posterior standard deviations of it. Returns the bound per row for
+    the rows' predictive variances (any shape broadcasting against the certificate)."""
+    return np.sqrt(np.asarray(predictive_variance, dtype=np.float64)) * np.asarray(error_bound, dtype=np.float64)
+
+
 @dataclass(frozen=True)
 class DualCertificate:
     """Per model, the certified bound on the mean's error ||mu_hat - mu||_A, and the bound asked for.
