@@ -1127,6 +1127,22 @@ class _FullDataMeanField:
         self._panel_grams.clear()
         self.reweights += 1
 
+    def _moment_pieces(self, count: int) -> Iterator[tuple[int, int]]:
+        """Column ranges of a block for the predictor-variance read: its three dense (n x width) float64 arrays (the
+        columns, their weighted copy, their projection) fit the host working set, and on a device what the device has
+        free besides what the fit holds (its pool's cached blocks count as free), measured at each call: the device
+        also holds the resident codes and the panel Grams, which the host budget does not see (bench-sim scenario_014
+        [sim]: a 4.3 GB piece against 43 GB already held on a 48 GB A40)."""
+        column_bytes = 3 * self.sample_count * np.dtype(np.float64).itemsize
+        width = max(1, self.working_bytes // column_bytes)
+        xp = self.gaussian.array_module
+        if xp is not np:
+            free, _total = xp.cuda.runtime.memGetInfo()
+            available = int(free) + int(xp.get_default_memory_pool().free_bytes())
+            width = max(1, min(width, available // column_bytes))
+        for start in range(0, count, width):
+            yield start, min(start + width, count)
+
     def _predictor_moments(self, model: int) -> tuple[F64Array, F64Array]:
         """A binary model's E eta_i and Var eta_i under q on its training rows (0 elsewhere; ``binary_likelihood``):
         z_i - r_i / sqrt(omega_i) and (sum_g Xp_ig^2 V_g + H_ii) / omega_i, V_g the group's column's effect variance (its
@@ -1137,12 +1153,19 @@ class _FullDataMeanField:
         safe = np.where(rows, root, 1.0)
         mean = np.where(rows, self.targets[:, model] - self.residual[model] / safe, 0.0)
         group_variance = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
-        explained = np.zeros(self.sample_count)
+        xp = self.gaussian.array_module
+        models = self.models
+        root = xp.asarray(self.root[:, model])
+        explained = xp.zeros(self.sample_count)
         for start, stop, tile in self.gaussian.source.blocks():
-            for first, last in self._pieces(stop - start):
-                local = np.arange(first, last, dtype=np.int64)
-                projected = self._projected(tile, local, model)
-                explained += np.square(projected) @ group_variance[start + first:start + last]
+            for first, last in self._moment_pieces(stop - start):
+                local = xp.arange(first, last, dtype=xp.int64)
+                masked = xp.asarray(tile.columns(local), dtype=xp.float64) * root[:, None]
+                projected = models.complement(masked, xp.full(last - first, model, dtype=xp.int64))
+                del masked
+                explained += xp.square(projected) @ xp.asarray(group_variance[start + first:start + last])
+                del projected
+        explained = np.asarray(_host(explained), dtype=np.float64)
         self.passes += 1
         covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
         factor = np.asarray(_host(self.models.covariate_factor[model]), dtype=np.float64)
