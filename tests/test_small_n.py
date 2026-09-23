@@ -257,6 +257,26 @@ def test_the_small_n_fit_meets_the_outer_criterion_and_scores():
     np.testing.assert_array_equal(fit.scoring.store_rows, np.arange(variants))
 
 
+def test_the_dense_route_refuses_a_problem_whose_sample_side_algebra_exceeds_its_budget():
+    """The router: the dense route's floor (Stage 0's int64 window twice, then the design and the n x n kernel) is
+    checked before any of it is allocated, and a problem over it is sent to the streamed route by name."""
+    from sv_pgs.small_n import dense_kernel_bytes, dense_stage0_bytes
+
+    rng = np.random.default_rng(3)
+    samples, variants = 60, 40
+    codes = (rng.binomial(2, 0.3, size=(samples, variants)) * 127).astype(np.uint8)
+    classes = np.full(variants, list(VariantClass).index(VariantClass.SNV), dtype=np.uint8)
+    arguments = dict(codes=codes, covariates=np.ones((samples, 1)), target=rng.standard_normal(samples), variant_class=classes,
+                     log_variance_offset=None, draw_count=8, seed=0)
+    with pytest.raises(MemoryError, match="streamed route"):
+        fit_small_n(**arguments, working_bytes=dense_stage0_bytes(samples, variants) - 1)
+    # Past Stage 0 the design's groups are known: the kernel's floor refuses before the first kernel is formed.
+    floor = dense_kernel_bytes(samples, variants)
+    assert floor > dense_stage0_bytes(samples, variants)
+    with pytest.raises(MemoryError, match="n x n kernel"):
+        fit_small_n(**arguments, working_bytes=dense_kernel_bytes(samples, 1) - 1)
+
+
 def _engine_problem(seed, samples, variants, noise):
     """A small dense problem with the engine's lattice prior at its start hyperparameters: (design, target, prior,
     hyperparameters, tilted, largest prior variance)."""

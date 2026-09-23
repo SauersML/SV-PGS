@@ -1814,6 +1814,37 @@ def lasso_start(statistics: DenseStatistics, seed: int) -> F64Array:
     return cross_validated_lasso(statistics.projected, statistics.projected_target, seed)
 
 
+# Stage 0's dense pass holds the window's signed codes as int64 twice at its peak (the whole window, and its active
+# columns while the whole is still referenced: ``dense_statistics``).
+_STAGE0_WINDOW_COPIES = ("signed codes", "active columns")
+# The kernel form's n x n float64 arrays alive at once: the kernel Xp diag(w) Xp' + I, its Cholesky factor (in place of
+# the kernel only when LAPACK overwrites it, which scipy may decline) and the core P K^-1 P (``_Kernel``).
+_KERNEL_SQUARES = ("kernel", "factor", "core")
+
+
+def dense_stage0_bytes(sample_count: int, record_count: int) -> int:
+    """Bytes of ``dense_statistics``' peak: the n x records codes as int64, twice (``_STAGE0_WINDOW_COPIES``)."""
+    return len(_STAGE0_WINDOW_COPIES) * np.dtype(np.int64).itemsize * int(sample_count) * int(record_count)
+
+
+def dense_kernel_bytes(sample_count: int, group_count: int) -> int:
+    """Bytes the dense route cannot run without after Stage 0: the design G (float64 n x groups) and its uint8 codes,
+    and the kernel form's n x n arrays (``_KERNEL_SQUARES``)."""
+    n, groups = int(sample_count), int(group_count)
+    return (_FLOAT_BYTES + np.dtype(np.uint8).itemsize) * n * groups + len(_KERNEL_SQUARES) * _FLOAT_BYTES * n * n
+
+
+def refuse_dense_route(needed: int, working_bytes: int, what: str) -> None:
+    """The dense route's sample-side algebra is its floor: where it alone exceeds ``working_bytes`` the problem is not
+    a small-n problem, and it goes by the streamed route, which never forms an n x n or n x p dense array."""
+    if needed > int(working_bytes):
+        raise MemoryError(
+            f"the dense small-n route needs {needed / 1e9:.3f} GB for {what}, over its {int(working_bytes) / 1e9:.3f} GB budget: fit this "
+            "problem by the streamed route (a dosage store through sv_pgs.fit_model.fit, i.e. stage2_wiring.fit_models), whose memory "
+            "is planned per block"
+        )
+
+
 def fit_small_n(
     *,
     codes: np.ndarray,
@@ -1841,8 +1872,11 @@ def fit_small_n(
     if inference not in ("ep", "mean_field"):
         raise ValueError("inference must be 'ep' or 'mean_field'.")
     started = time.perf_counter()
-    offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
+    sample_count, record_count = (int(size) for size in np.shape(codes))
+    refuse_dense_route(dense_stage0_bytes(sample_count, record_count), working_bytes, "Stage 0's dense pass")
+    offsets = np.zeros(record_count) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
     statistics = dense_statistics(codes, covariates, target, offsets)
+    refuse_dense_route(dense_kernel_bytes(sample_count, statistics.design.group_count), working_bytes, "the dense design and its n x n kernel")
     # Nested empirical Bayes: the prior without annotation groups first, then the annotated prior continued from its fit
     # with every annotation effect zero and its penalty weight at the lambda = infinity edge (``embed_hyperparameters``),
     # so the annotated fit starts where the base one ended and an annotation group enters only where the evidence rises.
