@@ -19,7 +19,7 @@ def _components(priors, group):
     return priors.log_weight[start:stop], priors.log_variance[start:stop]
 
 
-def _reference_sweep(gram, score, t, nu, noise, priors, largest, coupling=None, skip=()):
+def _reference_sweep(gram, score, t, nu, noise, priors, largest, coupling=None, skip=(), residuals=None):
     """One sweep over the groups' sums: dense A' = X'X + diag t (+ a cluster's scaled off-diagonal ``coupling``)
     re-inverted before every update; a step that would make another unclustered cavity improper halves; ``skip``'s
     groups (a cluster's) keep their sites."""
@@ -49,6 +49,11 @@ def _reference_sweep(gram, score, t, nu, noise, priors, largest, coupling=None, 
             valid = np.all((cavities[others] >= 0.0) | (1.0 + largest[others] * cavities[others] > 0.0))
             if valid:
                 t, nu = trial_t, trial_nu
+                if residuals is not None:
+                    q_variance = 1.0 / (cavity_precision + t[group] / noise)
+                    q_mean = q_variance * (cavity_shift + nu[group])
+                    residuals[group] = 0.5 * (tilted_variance / q_variance + (q_mean - tilted_mean) ** 2 / q_variance - 1.0
+                                              + np.log(q_variance / tilted_variance))
                 break
             fraction *= 0.5
             if fraction * abs(target_t - t[group]) <= np.finfo(np.float64).eps * abs(t[group]):
@@ -259,3 +264,25 @@ def test_a_cluster_step_by_woodbury_is_the_rebuilt_state():
         np.testing.assert_allclose(got, expected, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(stepped_informed, sweep.informed, rtol=1e-8, atol=1e-12)
     assert not np.allclose(before[2], stepped[2])
+
+
+def test_each_steps_own_residual_is_the_tilted_laws_kl_from_the_new_marginal():
+    """``SequentialSweep.own_residual``: after each group's step, the KL of its tilted law from q's marginal at its new
+    site, zero for a full step and positive for a damped one, as the dense reference computes it."""
+    rows, _members, priors, target = _problem(31, 20, 60, 1)
+    rows[5:15] = rows[4] + 0.01 * np.random.default_rng(2).standard_normal((10, 20))
+    target = 2.0 * rows[4] + np.random.default_rng(3).standard_normal(20)
+    noise = 0.5
+    gram = rows @ rows.T
+    score = rows @ target
+    second = np.array([float(np.exp(_components(priors, g)[0]) @ np.exp(_components(priors, g)[1])) for g in range(rows.shape[0])])
+    t, nu = noise / second, np.zeros(rows.shape[0])
+    with np.errstate(over="ignore"):
+        largest = np.exp(priors.largest_log_variance())
+    expected = np.full(rows.shape[0], np.nan)
+    _reference_sweep(gram, score, t, nu, noise, priors, largest, residuals=expected)
+    sweep = SequentialSweep(rows, np.einsum("ij,ij->i", rows, rows), score, priors, noise)
+    assert sweep.run(t.copy(), nu.copy(), np.arange(rows.shape[0], dtype=np.int64)) is not None
+    swept = ~np.isnan(expected)
+    np.testing.assert_allclose(sweep.own_residual[swept], expected[swept], rtol=1e-6, atol=1e-9)
+    assert np.all(expected[swept] >= -1e-12)

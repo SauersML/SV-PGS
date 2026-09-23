@@ -15,11 +15,11 @@ within the resolution 1 / (2 K) (less each sampled cluster's own Monte Carlo flo
 expectation) and q has stopped moving (the sweep's summed KL move of the groups' marginals within the resolution). A unit breaks the contract where its update is refused (no damping keeps every cavity finite) or where
 its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
 unit joins the unit of the group whose column is most correlated with its own, and the sweeps continue from the
-joined sites (the cluster's site starts as the block of its groups' sites). A single group whose tilted law is pulled
-where its own data cannot hold it breaks it at once (``_tilted_sums``): the shift moves its mass to an atom whose
-precision exceeds the cavity's though not the column's own data precision, so the column's information sits in
-correlated columns' sites and the atom's weight is the lattice's, not the data's (a near-flat cavity with a large
-pull [real, ENSG00000105612.9: residuals to 4e26]); joined to the block holding its data, its joint law is conditioned by the block's data. Clusters are thus admitted by measured failure, never by a
+joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
+leaves a residual above the resolution breaks it at once, the first sweep included: its step was damped because no
+single site that matches its tilted law keeps every cavity inside the domain, so one site cannot represent it (a
+near-flat cavity with a large pull [real, ENSG00000105612.9: residuals to 4e26]); joined to the block, its joint law
+is conditioned by the block's data. Clusters are thus admitted by measured failure, never by a
 hand-picked correlation.
 
 Cost. A single group's update is O(n'^2) plus the cavity refresh (``sequential_ep``); a cluster's is one tilted law
@@ -44,23 +44,12 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
-def _tilted_sums(start, log_weight, log_variance, precision, shift, own, mean, variance, proper, pinned):
-    """Every group's sum's tilted mean and variance at its cavity (``alias_groups.tilted_sum``), in parallel, and
-    whether its tilted law is pulled where its own data cannot hold it (``AliasEP.fit``'s contract): its heaviest
-    tilted atom V has a larger variance than the prior's heaviest atom (the shift pulled the mass up), and the cavity's
-    precision is below that atom's own, P V < 1, while the column's own data precision ``own`` = ||x||^2 / sigma^2 is
-    not, own V >= 1. The column's information is then in the other columns' sites, not in its cavity: the atom's
-    weight exp(h^2 V / (2 (1 + V P))) grows with V unchecked, and the moments are the lattice's, not the data's."""
+def _tilted_sums(start, log_weight, log_variance, precision, shift, mean, variance, proper):
+    """Every group's sum's tilted mean and variance at its cavity (``alias_groups.tilted_sum``), in parallel."""
     for g in numba.prange(start.shape[0] - 1):
         a, b = start[g], start[g + 1]
         P, h = precision[g], shift[g]
-        pinned[g] = False
-        prior_heaviest = a
-        for c in range(a, b):
-            if log_weight[c] > log_weight[prior_heaviest]:
-                prior_heaviest = c
         peak = -np.inf
-        heaviest = a
         values = np.empty(b - a)
         conditional = np.empty(b - a)
         ok = True
@@ -78,12 +67,9 @@ def _tilted_sums(start, log_weight, log_variance, precision, shift, own, mean, v
             values[c - a] = log_weight[c] - 0.5 * spread + 0.5 * h * h * conditional[c - a]
             if values[c - a] > peak:
                 peak = values[c - a]
-                heaviest = c
         proper[g] = ok
         if not ok:
             continue
-        heavy_variance = np.exp(log_variance[heaviest])
-        pinned[g] = log_variance[heaviest] > log_variance[prior_heaviest] and heavy_variance * P < 1.0 and heavy_variance * own[g] >= 1.0
         total = 0.0
         for c in range(b - a):
             values[c] = np.exp(values[c] - peak)
@@ -303,10 +289,7 @@ class AliasEP:
         mean = np.empty(self.group_count)
         variance = np.empty(self.group_count)
         proper = np.empty(self.group_count, dtype=np.bool_)
-        pinned = np.empty(self.group_count, dtype=np.bool_)
-        _tilted_sums(laws.law_start, laws.law_log_mass, laws.law_log_variance, cavity_precision, cavity_shift, self.squares / self.noise, mean, variance,
-                     proper, pinned)
-        self.pinned = pinned
+        _tilted_sums(laws.law_start, laws.law_log_mass, laws.law_log_variance, cavity_precision, cavity_shift, mean, variance, proper)
         site = precision / self.noise
         q_variance = 1.0 / (cavity_precision + site)
         q_mean = q_variance * (cavity_shift + shift)
@@ -380,9 +363,11 @@ class AliasEP:
             failing |= {key for key, count in streak.items() if key in current and count >= 2 and current[key] > allowed[key]}
             # A single group whose update the sweep refused shows as an infinite residual (improper tilted law).
             failing |= {key for key, value in current.items() if not np.isfinite(value)}
-            # A single group pulled where its own data cannot hold it (a near-flat cavity with a large pull): its
-            # moments are the lattice's, not resolvable alone, so it joins the block that holds its data, at once.
-            failing |= {int(g) for g in np.flatnonzero(self.pinned & ~sweep.clustered)}
+            # A single group whose own exact step left more than the resolution (a step no damping could take whole
+            # inside the domain): no single site represents its tilted law, so it joins its most correlated unit at
+            # once, the first sweep included; this is measured on the step, not inferred from the sweeps' course.
+            own = sweep.own_residual
+            failing |= {int(g) for g in np.flatnonzero(~sweep.clustered & ~np.isnan(own) & (own > self.resolution))}
             # The fixed point's test is q's, not each unit's: the residuals summed over the units (each one's own
             # Monte Carlo floor allowed) within the resolution.
             total = sum(current.values()) - sum(allowed[key] - self.resolution for key in current)
@@ -449,8 +434,8 @@ class AliasEP:
         floor = -1.0 / float(self.largest[group]) if np.isfinite(self.largest[group]) else 0.0
 
         def errors(point):
-            mean_out, variance_out, proper, pinned = np.empty(1), np.empty(1), np.empty(1, dtype=np.bool_), np.empty(1, dtype=np.bool_)
-            _tilted_sums(start, log_mass, log_variance, np.array([point[0]]), np.array([point[1]]), np.zeros(1), mean_out, variance_out, proper, pinned)
+            mean_out, variance_out, proper = np.empty(1), np.empty(1), np.empty(1, dtype=np.bool_)
+            _tilted_sums(start, log_mass, log_variance, np.array([point[0]]), np.array([point[1]]), mean_out, variance_out, proper)
             if not proper[0] or not variance_out[0] > 0.0:
                 return np.array([np.inf, np.inf])
             return np.array([(mean_out[0] - mean) / np.sqrt(variance), np.log(variance_out[0] / variance)])

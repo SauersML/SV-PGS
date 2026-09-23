@@ -129,7 +129,7 @@ def _bulk_proper(informed, t, largest, noise):
 @numba.njit(cache=True, error_model="numpy")
 def _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision, shift_value, informed,
           is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image, solved, rest_mean, combined, target, half_precision,
-          exact, w_out):
+          exact, w_out, own_residual):
     """One group's damped sequential update, in place. ``exact``: every other cavity is checked now, by its rank-one
     move, and ``informed`` follows; otherwise only the rest's are, the bulk's being checked by the caller from the
     step's w (written to ``w_out``) and the returned factor. Returns (status: 0 refused, 1 applied, 2 crossing of the
@@ -182,10 +182,12 @@ def _step(group, rows, squares, group_score, component_start, log_weight, log_va
     start_c, stop_c = component_start[group], component_start[group + 1]
     proper, _log_z, tilted_mean, tilted_variance = tilted_sum(log_weight[start_c:stop_c], log_variance[start_c:stop_c], cavity_precision, cavity_shift)
     if not proper or not tilted_variance > 0.0:
+        own_residual[group] = np.inf
         return 0, 0.0
     target_t = noise * (1.0 / tilted_variance - cavity_precision)
     target_b = group_score[group] + noise * (tilted_mean / tilted_variance - cavity_shift)
     if not (np.isfinite(target_t) and np.isfinite(target_b)) or target_t == 0.0:
+        own_residual[group] = np.inf
         return 0, 0.0
     projection = np.dot(rows, w) if exact else np.zeros(1)
     fraction = 1.0
@@ -231,7 +233,13 @@ def _step(group, rows, squares, group_score, component_start, log_weight, log_va
                         break
         fraction *= 0.5
     if not accepted:
+        own_residual[group] = np.inf
         return 0, 0.0
+    # The residual this group's own step leaves: KL of its tilted law from q's new marginal (cavity times the new site),
+    # zero where the full step was taken, and what no single site in the domain can remove where it was damped.
+    q_variance = 1.0 / (cavity_precision + t_new / noise)
+    q_mean = q_variance * (cavity_shift + (b_new - group_score[group]) / noise)
+    own_residual[group] = 0.5 * (tilted_variance / q_variance + (q_mean - tilted_mean) ** 2 / q_variance - 1.0 + np.log(q_variance / tilted_variance))
     bulk_new = t_new > 0.0 and t_new >= half_precision * squares[group]
     if is_rest[group] == bulk_new:
         target[0] = t_new
@@ -275,7 +283,7 @@ def _step(group, rows, squares, group_score, component_start, log_weight, log_va
 @numba.njit(cache=True, error_model="numpy")
 def _sweep(order, start, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision, shift_value,
            informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image, solved, rest_mean, combined,
-           target, half_precision, block_width):
+           target, half_precision, block_width, own_residual):
     """Sequential EP site updates over ``order`` from position ``start``, in place (module docstring), until the end or
     a crossing of the bulk boundary: returns (position, event, group, refused), with the group's new (t, b) in
     ``target`` for an event. ``precision`` holds each group's t, ``shift_value`` its b = X'y + sigma^2 nu, ``informed``
@@ -316,7 +324,7 @@ def _sweep(order, start, rows, squares, group_score, component_start, log_weight
             t_before, b_before = precision[group], shift_value[group]
             status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
                                    shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
-                                   solved, rest_mean, combined, target, half_precision, False, w_block[count])
+                                   solved, rest_mean, combined, target, half_precision, False, w_block[count], own_residual)
             if status == 2:
                 crossing = True
                 break
@@ -360,7 +368,7 @@ def _sweep(order, start, rows, squares, group_score, component_start, log_weight
             group = order[position]
             status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
                                    shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
-                                   solved, rest_mean, combined, target, half_precision, True, unused)
+                                   solved, rest_mean, combined, target, half_precision, True, unused, own_residual)
             if status == 2:
                 return position, _TO_BULK if is_rest[group] else _TO_REST, group, refused
             if status == 0:
@@ -384,7 +392,7 @@ def _sweep(order, start, rows, squares, group_score, component_start, log_weight
             group = order[position]
             status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
                                    shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
-                                   solved, rest_mean, combined, target, half_precision, True, unused)
+                                   solved, rest_mean, combined, target, half_precision, True, unused, own_residual)
             if status == 2:
                 return position, _TO_BULK if is_rest[group] else _TO_REST, group, refused
             if status == 0:
@@ -497,6 +505,8 @@ class SequentialSweep:
     def run(self, precision: F64Array, shift: F64Array, order: I64Array) -> int | None:
         """One sweep over the unclustered groups in ``order``, updating ``precision`` (t) and ``shift`` (nu) in place."""
         order = np.ascontiguousarray(order[~self.clustered[order]], dtype=np.int64)
+        # Each group's residual after its own step this sweep (``_step``): inf where refused, nan where not swept.
+        self.own_residual = np.full(self.rows.shape[0], np.nan)
         if not self._build(precision, shift):
             return None
         target = np.empty(2)
@@ -508,7 +518,7 @@ class SequentialSweep:
                 order, position, self.rows, self.squares, self.group_score, priors.component_start, priors.log_weight, priors.log_variance,
                 self.checked_largest, self.noise, precision, self.shift_value, self.informed, self.is_rest, self.rest_slot, self.rest_rows,
                 self.rest_rows.shape[0], self.inverse, self.rest_images, self.schur_inverse, self.image, self.solved, self.rest_mean,
-                self.combined, target, _HALF_PRECISION, self.block_width,
+                self.combined, target, _HALF_PRECISION, self.block_width, self.own_residual,
             )
             refused += count
             if event == _DONE:
