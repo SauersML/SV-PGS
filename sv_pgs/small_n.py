@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Sequence
 from types import ModuleType
 
 import numpy as np
+import scipy.optimize
 from scipy import linalg, sparse
 
 from sv_pgs._typing import F64Array, I64Array
@@ -1707,6 +1708,33 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
 
 
+def ridge_start(statistics: DenseStatistics) -> F64Array:
+    """q's means at the empirical-Bayes ridge: the prior family's Gaussian member (every effect N(0, t sigma^2) on the
+    standardized columns), t by the marginal likelihood y_P ~ N(0, sigma^2 (I + t K)), K = Xp Xp', with sigma^2
+    profiled, over t's resolvable range [sqrt(eps) / lambda_max, 1 / (sqrt(eps) lambda_min)] of K's nonzero spectrum
+    (past either end t I + ... is t K or I to half precision). The dense end of the architecture the lasso's sparse
+    starts leave out: with 5% of a window's variants causal the lasso-carried fit kept its sparse basin and
+    over-shrank (r2 0.076, calibration slope 1.68, against the ridge's 0.127 and 0.95 over 9 simulations on real
+    genotypes), and the evidence weights (``_mixture_weights``) decide between the basins."""
+    x = np.asarray(statistics.projected, dtype=np.float64)
+    y = np.asarray(statistics.projected_target, dtype=np.float64)
+    values, vectors = np.linalg.eigh(x @ x.T)
+    resolvable = values > values[-1] * x.shape[0] * _EPSILON
+    values, vectors = values[resolvable], vectors[:, resolvable]
+    rotated = vectors.T @ y
+    residual_square = float(y @ y - rotated @ rotated)
+    dimension = statistics.sample_count - statistics.covariate_rank
+
+    def negative(log_t: float) -> float:
+        spread = 1.0 + np.exp(log_t) * values
+        return 0.5 * (float(np.sum(np.log(spread))) + dimension * np.log((float(np.sum(rotated ** 2 / spread)) + residual_square) / dimension))
+
+    half = np.sqrt(_EPSILON)
+    bounds = (float(np.log(half / values[-1])), float(np.log(1.0 / (half * values[0]))))
+    t = float(np.exp(scipy.optimize.minimize_scalar(negative, bounds=bounds, method="bounded").x))
+    return t * x.T @ (vectors @ (rotated / (1.0 + t * values)))
+
+
 def lasso_starts(statistics: DenseStatistics, seed: int, unit_scales: F64Array) -> tuple[F64Array, F64Array]:
     """q's means at the cross-validated lasso in the two scales the model has: on the standardized columns
     (``lasso_start``), and on the prior's own per-unit columns, column j times ``unit_scales``_j (its spread in its stored
@@ -1770,7 +1798,7 @@ def fit_small_n(
         # the model's scales (``lasso_starts``), each with its own empirical Bayes. They join the mode mixture below as
         # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
-        starts = lasso_starts(statistics, seed, statistics.scales / units)
+        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics))
         solves = [
             _solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means)
             for means in starts
