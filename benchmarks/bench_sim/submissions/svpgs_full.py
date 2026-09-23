@@ -265,6 +265,12 @@ def fit_with(train, inference: str) -> Model:
             "remaining_gain": float(np.max(certificate.remaining_gain)) if np.asarray(certificate.remaining_gain).size else None,
             "inference": inference,
             "refusals": len(certificate.refusals),
+            # The outer loop's own record, so an uncertified fit shows how it ended: accepted steps, refused trials, those
+            # with no fixed point, and the remaining gain at its last evaluations.
+            "outer_iterations": np.asarray(certificate.outer_iterations).tolist(),
+            "halvings": np.asarray(certificate.halvings).tolist(),
+            "unresolved": np.asarray(certificate.unresolved).tolist(),
+            "outer_history_tail": [list(map(float, history[-8:])) for history in certificate.outer_history],
             "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
             "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
         }
