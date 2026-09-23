@@ -11,6 +11,7 @@ dosages. Quantitative traits (a binary one is fitted as its 0/1 values, the liab
 Needs R with bigsnpr (module R/4.4.2-openblas-rocky8 and R_LIBS_USER at the compete library)."""
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -95,6 +96,8 @@ def fit(train) -> Model:
         np.concatenate(second).astype("<i4").tofile(folder / "ld_j.bin")
         np.concatenate(values).astype("<f8").tofile(folder / "ld_x.bin")
         (folder / "meta.txt").write_text(f"{total} {count} {int(train.cores)}\n")
-        subprocess.run(["Rscript", str(_SCRIPT), str(folder)], check=True)
+        # bigstatsr refuses two levels of parallelism: the chains run on the cores, each with single-threaded BLAS
+        single = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
+        subprocess.run(["Rscript", str(_SCRIPT), str(folder)], check=True, env=os.environ | single)
         effects = np.fromfile(folder / "beta.bin", dtype="<f8")
     return Model(rows, means, effects, np.zeros(0))
