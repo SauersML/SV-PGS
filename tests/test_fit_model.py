@@ -77,11 +77,14 @@ class _StubDriver:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.results: list[_StubFit] = []
+        self.store_contents: list[tuple[np.ndarray, Any]] = []
 
     def __call__(self, **arguments: Any) -> _StubFit:
         self.calls.append(arguments)
         assert arguments["work_dir"].is_dir()
         store: DosageStore = arguments["store"]
+        # What the store held during the call: a caller may close and remove it once the fit returns.
+        self.store_contents.append((store.read_codes(0, store.n_variants).copy(), store.variant_table))
         signed = store.read_codes(0, store.n_variants).astype(np.float64) - CODES_PER_DOSAGE
         generator = np.random.default_rng(arguments["seed"])
         scoring, noise = [], []

@@ -272,9 +272,13 @@ def fit(train: Any) -> BenchSimModel:
             code_rows=lambda rows: np.ascontiguousarray(train.codes(kept[rows])),
             sample_count=train.n_samples,
         )
-        (Path(scratch) / "work").mkdir()
-        trait_type = TraitType(train.trait_type)
-        scoring = _fit_one(store, train.covariates, train.covariate_names, train.phenotype, trait_type, Path(scratch) / "work", budget)
+        # The store is closed before its directory is removed: on a network filesystem (the task's TMPDIR on
+        # /scratch.global) a file still open or mapped is silly-renamed to a .nfs* file on unlink, and the directory
+        # holding it cannot be removed ("Directory not empty").
+        with store:
+            (Path(scratch) / "work").mkdir()
+            trait_type = TraitType(train.trait_type)
+            scoring = _fit_one(store, train.covariates, train.covariate_names, train.phenotype, trait_type, Path(scratch) / "work", budget)
     structural = (_bench_sim_class(variants, "TR") | _bench_sim_class(variants, "SV"))[kept][scoring.store_rows]
     return BenchSimModel(
         total=scoring,

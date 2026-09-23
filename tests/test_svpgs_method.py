@@ -103,10 +103,10 @@ def _bench_sim_views(generator: np.random.Generator, trait_type: str) -> tuple[b
 def test_the_bench_sim_store_holds_the_training_codes_and_the_public_table(driver: _StubDriver) -> None:
     train, _test, variants = _bench_sim_views(np.random.default_rng(1), "quantitative")
     svpgs_method.fit(train)
-    store: DosageStore = driver.calls[0]["store"]
+    # The store as the fit saw it (the adapter closes and removes it once the fit returns).
+    codes, table = driver.store_contents[0]
     kept = np.flatnonzero(variants["imputation_info"] > 0.0)
-    np.testing.assert_array_equal(store.read_codes(0, store.n_variants), train.codes(kept))
-    table = store.variant_table
+    np.testing.assert_array_equal(codes, train.codes(kept))
     np.testing.assert_array_equal(table.position, variants["pos"][kept])
     assert [_CLASSES[code] for code in table.variant_class] == [
         _expected_class(*row) for row in zip(variants["cls"][kept], variants["ref_len"][kept], variants["alt_len"][kept])
