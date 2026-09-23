@@ -1633,7 +1633,7 @@ def scoring_models(
         if fit.inference == "mean_field":
             # Summed over row chunks of the fit's working budget, so no p x K temporary is formed.
             group_deviations = np.zeros((ties.group_count, draw_count))
-            rows = max(1, int(fit.working_bytes) // (8 * draw_count)) if fit.working_bytes > 0 else ties.member_count
+            rows = max(1, int(fit.working_bytes) // (np.dtype(np.float64).itemsize * draw_count)) if fit.working_bytes > 0 else ties.member_count
             for first in range(0, ties.member_count, rows):
                 chunk = slice(first, min(first + rows, ties.member_count))
                 np.add.at(group_deviations, ties.group[chunk], ties.sign[chunk, None] * (draws[chunk] - mean[chunk, model, None]))

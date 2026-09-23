@@ -166,8 +166,8 @@ def test_the_ascent_is_monotone_and_the_bound_is_below_the_exact_evidence() -> N
     scale = ascent.state.detail["scale"]
     x = genotypes[:, 0]
 
-    grid_a = np.linspace(-6.0, 6.0, 601)
-    grid_b = np.linspace(-6.0, 6.0, 601)
+    grid_a = np.linspace(-12.0, 12.0, 801)
+    grid_b = np.linspace(-12.0, 12.0, 801)
     predictor = grid_a[:, None, None] + grid_b[None, :, None] * x[None, None, :]
     values = (
         np.sum(bernoulli_log_likelihood(labels[None, None, :], predictor), axis=2)
