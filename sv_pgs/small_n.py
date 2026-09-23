@@ -1762,16 +1762,141 @@ def fit_small_n(
     prior = small_n_prior(statistics, variant_class, offsets, draw_count, annotations, codes_per_unit)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(statistics, prior)
+    tolerance = 0.5 / draw_count
+    if inference == "ep":
+        solves = [_solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, None)]
+    else:
+        # Coordinate ascent reaches a different fixed point from each data start, and neither ELBO says which predicts
+        # better (the bound's slack differs between basins): choosing by it moved 57 of 494 bench-real genes, 28 up by
+        # 0.51 in total and 29 down by 0.90 [real, loso/AFR snv_sv]. The fit is the equal mixture of the fixed points
+        # from the cross-validated lasso in each of the model's scales (``lasso_starts``); on those genes the mixture's
+        # mean r2 was 0.1328 against 0.1287 and 0.1218 for either alone (all 494: 0.0690 against 0.0685 and 0.0677).
+        units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
+        solves = [
+            _solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means)
+            for means in lasso_starts(statistics, seed, statistics.scales / units)
+        ]
+    generator = np.random.default_rng(seed)
+    shares = [draw_count // len(solves) + (1 if index < draw_count % len(solves) else 0) for index in range(len(solves))]
+    draws = np.concatenate([solve.draws(generator, share) for solve, share in zip(solves, shares)], axis=1)
+    mean = np.mean([solve.oracle.mean for solve in solves], axis=0)
+    noise = float(np.mean([float(solve.oracle.noise) for solve in solves]))
+    alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
+    # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
+    # no split of a group's effect; the identity map carries each member's own mean and draws.
+    member_count = statistics.active_rows.shape[0]
+    scoring = ScoringModel.from_reduced_fit(
+        active_rows=statistics.active_rows,
+        signed_means=statistics.means,
+        signed_scales=statistics.scales,
+        tie_map=_compact_identity_tie_map(member_count),
+        member_prior_variances=np.mean([prior_second_moment(prior, solve.hyperparameters) for solve in solves], axis=0),
+        beta_reduced=statistics.signs * mean,
+        posterior_draws_reduced=statistics.signs[:, None] * draws,
+        alpha=alpha,
+        trait_type=trait_type,
+        predictive_intercept_shift=0.0,
+        covariate_draws=alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - mean[:, None]),
+        covariate_covariance=noise * statistics.covariate_pseudo_inverse,
+        gaussian_posterior=inference == "ep",
+    )
+    outers = [solve.outer for solve in solves]
+    oracles = [solve.oracle for solve in solves]
+    certified = all(outer.certified for outer in outers)
+    # The mixture's certificate is its components' least favourable: the largest remaining gain and prediction move,
+    # certified only where every component is.
+    certificate = FitCertificate(
+        remaining_gain=np.array([max(outer.remaining_gain for outer in outers)]),
+        newton_decrement=np.array([max(outer.newton_decrement for outer in outers)]),
+        smoothing_gradient=np.array([outers[0].step.smoothing_gradient]),
+        stationarity_steps=(outers[0].step.stationarity_steps,),
+        stationarity_errors=(outers[0].step.stationarity_errors,),
+        mean_move=np.array([max(oracle.mean_move for oracle in oracles)]),
+        # The move's tolerance: 1/2 r' Sigma r <= 1/(2K) nats.
+        draw_tolerance=np.array([1.0 / draw_count]),
+        noise_gain=np.array([max(oracle.noise_gain for oracle in oracles)]),
+        # Exact algebra: the mean and the variances carry rounding only.
+        mean_error=np.zeros(1),
+        information_bound=np.zeros(1),
+        information_tolerance=np.zeros(1),
+        undecided_blocks=0,
+        negative_sites=np.array([max(int(np.sum(oracle.site_precision < 0.0)) for oracle in oracles)], dtype=np.int64),
+        effective_effects=np.array([float(np.mean([oracle.effective for oracle in oracles]))]),
+        outer_iterations=np.array([sum(outer.iterations for outer in outers)], dtype=np.int64),
+        halvings=np.array([sum(outer.halvings for outer in outers)], dtype=np.int64),
+        prediction_move=np.array([max(outer.prediction_move for outer in outers)]),
+        prediction_tolerance=np.array([min(outer.prediction_tolerance for outer in outers)]),
+        unresolved=np.array([sum(outer.unresolved for outer in outers)], dtype=np.int64),
+        refusals=tuple(refusal for oracle in oracles for refusal in oracle.refusals),
+        outer_history=(tuple(value for outer in outers for value in outer.history),),
+        refreshes=int(sum(oracle.profile["refreshes"] for oracle in oracles)),
+        passes=int(sum(oracle.profile["passes"] for oracle in oracles)),
+        outer_criterion_met=np.array([certified], dtype=bool),
+    )
+    remaining = max(outer.remaining_gain for outer in outers)
+    move = max(outer.prediction_move for outer in outers)
+    move_tolerance = min(outer.prediction_tolerance for outer in outers)
+    elbos = [float(oracle.profile["elbo"]) for oracle in oracles if "elbo" in oracle.profile]
+    profile = dict(oracles[0].profile) | ({"mixture_elbos": elbos, "elbo": float(np.mean(elbos))} if elbos else {}) | {
+        "stage0_seconds": stage0_seconds,
+        "total_seconds": time.perf_counter() - started,
+        "samples": statistics.sample_count,
+        "active": int(statistics.active_rows.shape[0]),
+        "members": int(statistics.design.variant_count),
+        "groups": int(statistics.design.group_count),
+        "coefficients": int(prior.coefficient_size),
+        "grid": int(prior.grid_size),
+        "classes": int(prior.class_count),
+        "outer_iterations": int(sum(outer.iterations for outer in outers)),
+        "start_heritability": float(moment.heritability),
+        "start_resolution": float(moment.resolution),
+        # The certificate's decisive numbers, so every recorded fit says what its outer loop established: its
+        # remaining gain and its prediction move are both within their tolerances. That is not certification of the
+        # fit, and no reader may report it as such (``full_data_fit.FitCertificate.outer_criterion_met``): while
+        # ``OuterFit.fixed_point_term_measured`` is False the outer steps charge the fixed points' own error as zero.
+        "outer_criterion_met": bool(certified and remaining <= tolerance and move <= move_tolerance),
+        "remaining_gain": float(remaining),
+        "prediction_move": float(move),
+        "prediction_tolerance": float(move_tolerance),
+        "halvings": int(sum(outer.halvings for outer in outers)),
+        "unresolved": int(sum(outer.unresolved for outer in outers)),
+        "final_log_smoothing": [float(value) for value in np.atleast_1d(solves[0].hyperparameters.log_smoothing)],
+    }
+    return SmallNFit(
+        scoring=scoring, noise_variance=noise, hyperparameters=solves[0].hyperparameters, certificate=certificate, prior=prior,
+        statistics=statistics, profile=profile,
+    )
+
+
+@dataclass
+class _SmallNSolve:
+    """One fixed point's empirical Bayes: its oracle at the returned state, the outer fit and the hyperparameters."""
+
+    oracle: object
+    outer: object
+    hyperparameters: MixtureHyperparameters
+    inference: str
+    draw_count: int
+
+    def draws(self, generator: np.random.Generator, count: int) -> F64Array:
+        if self.inference == "ep":
+            # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
+            return self.oracle.mean[:, None] + np.sqrt(self.oracle.noise) * self.oracle.kernel.draws(generator, count)
+        return self.oracle.draws(self.hyperparameters, generator, count)
+
+
+def _solve_small_n(
+    statistics: DenseStatistics, prior: ScaleMixturePrior, start: MixtureHyperparameters, start_noise: float, draw_count: int,
+    working_bytes: int, tolerance: float, inference: str, array_module: ModuleType | None, start_mean: F64Array | None,
+) -> _SmallNSolve:
+    """The certified empirical Bayes at the fixed points of ``inference``: EP's, or mean field's carried from
+    ``start_mean``; the returned state is the visited one of the highest ELBO where the outer loop ended below it."""
     if inference == "ep":
         oracle: _DenseFixedPoints | MeanFieldFixedPoints = _DenseFixedPoints(statistics, prior, start, start_noise, draw_count, working_bytes)
     else:
         from sv_pgs.mean_field import MeanFieldFixedPoints
 
-        units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
-        oracle = MeanFieldFixedPoints(
-            statistics, prior, start_noise, draw_count, working_bytes, start_means=lasso_starts(statistics, seed, statistics.scales / units),
-        )
-    tolerance = 0.5 / draw_count
+        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,))
     try:
         # The variant side's objective and moments on ``array_module`` (``scale_mixture_ep.device_scope``); the
         # fixed points' dense sample-side algebra stays on the host.
@@ -1789,85 +1914,4 @@ def fit_small_n(
         ended = float(oracle.profile["elbo"])
         oracle._restore(best_state)
         oracle.profile["elbo_best_restored"] = float(best_elbo) - ended
-    generator = np.random.default_rng(seed)
-    if inference == "ep":
-        # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
-        draws = oracle.mean[:, None] + np.sqrt(oracle.noise) * oracle.kernel.draws(generator, draw_count)
-    else:
-        draws = oracle.draws(hyperparameters, generator, draw_count)
-    alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ oracle.mean)
-    # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
-    # no split of a group's effect; the identity map carries each member's own mean and draws.
-    member_count = statistics.active_rows.shape[0]
-    scoring = ScoringModel.from_reduced_fit(
-        active_rows=statistics.active_rows,
-        signed_means=statistics.means,
-        signed_scales=statistics.scales,
-        tie_map=_compact_identity_tie_map(member_count),
-        member_prior_variances=prior_second_moment(prior, hyperparameters),
-        beta_reduced=statistics.signs * oracle.mean,
-        posterior_draws_reduced=statistics.signs[:, None] * draws,
-        alpha=alpha,
-        trait_type=trait_type,
-        predictive_intercept_shift=0.0,
-        covariate_draws=alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - oracle.mean[:, None]),
-        covariate_covariance=oracle.noise * statistics.covariate_pseudo_inverse,
-        gaussian_posterior=inference == "ep",
-    )
-    certificate = FitCertificate(
-        remaining_gain=np.array([outer.remaining_gain]),
-        newton_decrement=np.array([outer.newton_decrement]),
-        smoothing_gradient=np.array([outer.step.smoothing_gradient]),
-        stationarity_steps=(outer.step.stationarity_steps,),
-        stationarity_errors=(outer.step.stationarity_errors,),
-        mean_move=np.array([oracle.mean_move]),
-        # The move's tolerance: 1/2 r' Sigma r <= 1/(2K) nats.
-        draw_tolerance=np.array([1.0 / draw_count]),
-        noise_gain=np.array([oracle.noise_gain]),
-        # Exact algebra: the mean and the variances carry rounding only.
-        mean_error=np.zeros(1),
-        information_bound=np.zeros(1),
-        information_tolerance=np.zeros(1),
-        undecided_blocks=0,
-        negative_sites=np.array([int(np.sum(oracle.site_precision < 0.0))], dtype=np.int64),
-        effective_effects=np.array([oracle.effective]),
-        outer_iterations=np.array([outer.iterations], dtype=np.int64),
-        halvings=np.array([outer.halvings], dtype=np.int64),
-        prediction_move=np.array([outer.prediction_move]),
-        prediction_tolerance=np.array([outer.prediction_tolerance]),
-        unresolved=np.array([outer.unresolved], dtype=np.int64),
-        refusals=tuple(oracle.refusals),
-        outer_history=(outer.history,),
-        refreshes=int(oracle.profile["refreshes"]),
-        passes=int(oracle.profile["passes"]),
-        outer_criterion_met=np.array([outer.certified], dtype=bool),
-    )
-    profile = dict(oracle.profile) | {
-        "stage0_seconds": stage0_seconds,
-        "total_seconds": time.perf_counter() - started,
-        "samples": statistics.sample_count,
-        "active": int(statistics.active_rows.shape[0]),
-        "members": int(statistics.design.variant_count),
-        "groups": int(statistics.design.group_count),
-        "coefficients": int(prior.coefficient_size),
-        "grid": int(prior.grid_size),
-        "classes": int(prior.class_count),
-        "outer_iterations": int(outer.iterations),
-        "start_heritability": float(moment.heritability),
-        "start_resolution": float(moment.resolution),
-        # The certificate's decisive numbers, so every recorded fit says what its outer loop established: its
-        # remaining gain and its prediction move are both within their tolerances. That is not certification of the
-        # fit, and no reader may report it as such (``full_data_fit.FitCertificate.outer_criterion_met``): while
-        # ``OuterFit.fixed_point_term_measured`` is False the outer steps charge the fixed points' own error as zero.
-        "outer_criterion_met": bool(outer.certified and outer.remaining_gain <= tolerance and outer.prediction_move <= outer.prediction_tolerance),
-        "remaining_gain": float(outer.remaining_gain),
-        "prediction_move": float(outer.prediction_move),
-        "prediction_tolerance": float(outer.prediction_tolerance),
-        "halvings": int(outer.halvings),
-        "unresolved": int(outer.unresolved),
-        "final_log_smoothing": [float(value) for value in np.atleast_1d(hyperparameters.log_smoothing)],
-    }
-    return SmallNFit(
-        scoring=scoring, noise_variance=float(oracle.noise), hyperparameters=hyperparameters, certificate=certificate, prior=prior,
-        statistics=statistics, profile=profile,
-    )
+    return _SmallNSolve(oracle=oracle, outer=outer, hyperparameters=hyperparameters, inference=inference, draw_count=draw_count)
