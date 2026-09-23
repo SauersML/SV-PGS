@@ -115,6 +115,7 @@ from types import ModuleType
 from typing import Callable, Iterator, Sequence
 
 import math
+import time
 
 import numpy as np
 from scipy import sparse
@@ -126,6 +127,7 @@ from scipy.special import erfcx
 from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.krylov_recycle import block_gcro_dr
+from sv_pgs.progress import log
 
 _EPSILON = float(np.finfo(np.float64).eps)
 # Half of double precision: the resolution of a quantity whose square is compared at eps.
@@ -1849,12 +1851,19 @@ def curvature_correction(
     formed: dict[str, _VariantDerivatives] = {}
 
     def columns(directions: F64Array) -> F64Array:
+        started = time.perf_counter()
         if "derivatives" not in formed:
             formed["derivatives"] = _variant_derivatives(prior, coefficients, cavity, working_bytes)
-        return _total_curvature_columns(
+        formed_at = time.perf_counter()
+        total = _total_curvature_columns(
             prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved,
             derivatives=formed["derivatives"], fixed_cavity=fixed,
         )
+        log(
+            f"eb curvature: {directions.shape[1]} directions over {prior.variant_count} variants, {prior.class_count} classes x "
+            f"{prior.grid_size} nodes; derivatives {formed_at - started:.1f} s, response {time.perf_counter() - formed_at:.1f} s"
+        )
+        return total
 
     return CurvatureCorrection(mapping=prior.coefficient_map, columns=columns, fixed_curvature=0.5 * (fixed + fixed.T), resolutions=achieved)
 
