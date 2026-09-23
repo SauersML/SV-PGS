@@ -465,3 +465,21 @@ def test_read_depth_calls_resolve_unique_cnvs_and_blur_paralogous_ones() -> None
     paralogous = measurement_readcn.simulate(genotype, np.array([True, False]), np.array([50_000.0, 50_000.0]),
                                              np.array([6, 6]), params, rng)
     assert (np.argmin(paralogous, axis=-1) == genotype).mean() < (called == genotype).mean()
+
+
+def test_genetic_accuracy_is_the_partial_correlation_and_the_genetic_scale_slope():
+    from benchmarks.bench_sim.harness import genetic_accuracy
+
+    rng = np.random.default_rng(3)
+    covariates = rng.standard_normal((4000, 3))
+    genetic = rng.standard_normal(4000) + covariates @ np.array([0.5, -0.2, 0.1])
+    prediction = 0.5 * genetic + rng.standard_normal(4000)
+    r2, slope = genetic_accuracy(genetic, prediction, covariates)
+    base = np.column_stack([np.ones(4000), covariates])
+    project = lambda values: values - base @ np.linalg.lstsq(base, values, rcond=None)[0]
+    g, p = project(genetic), project(prediction)
+    assert np.isclose(r2, np.corrcoef(g, p)[0, 1] ** 2)
+    assert np.isclose(slope, (g @ p) / (p @ p))
+    # A prediction shrunk by any factor keeps its r2 and scales its slope by the inverse.
+    shrunk_r2, shrunk_slope = genetic_accuracy(genetic, 0.1 * prediction, covariates)
+    assert np.isclose(shrunk_r2, r2) and np.isclose(shrunk_slope, 10.0 * slope)

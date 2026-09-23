@@ -247,7 +247,30 @@ def score(cohort: Path, scenario: Path, prediction_path: Path, arm: str) -> dict
         result["structural_share_predicted"] = float(np.cov(prediction["structural"], total)[0, 1] / np.var(total, ddof=1))
     result["structural_share_truth"] = record["summary"]["structural_share"]
     result["oracle_r2"] = incremental_r2(outcome, truth["genetic_value"][test_columns], covariates[test_columns])[0]
+    result["genetic_r2"], result["genetic_slope"] = genetic_accuracy(truth["genetic_value"][test_columns], total, covariates[test_columns])
     return result
+
+
+def genetic_accuracy(genetic_value: np.ndarray, prediction: np.ndarray, covariates: np.ndarray) -> tuple[float, float]:
+    """The prediction against the simulated genetic value itself, both beyond the covariates: the squared partial
+    correlation and the slope of the genetic value on the prediction (1 = calibrated on the genetic scale).
+
+    On the phenotype the test people's non-genetic part enters every method's score: on the polygenic scenario 001
+    (h2 0.046, 10,000 test people) 40-45% of each method's covariance with the phenotype was covariance with that
+    noise, correlated across methods, so phenotype r2 differences there were mostly the draw. The genetic value has no
+    such term; it is the simulation's noise-free measure of what each method learned, and the phenotype r2 stays the
+    one comparable with real data."""
+    base = np.column_stack([np.ones(genetic_value.size), covariates])
+
+    def residual(values: np.ndarray) -> np.ndarray:
+        coefficients, *_ = np.linalg.lstsq(base, values, rcond=None)
+        return values - base @ coefficients
+
+    genetic, predicted = residual(np.asarray(genetic_value, dtype=np.float64)), residual(np.asarray(prediction, dtype=np.float64))
+    if not np.any(predicted):
+        return 0.0, float("nan")
+    correlation = float(genetic @ predicted / np.sqrt((genetic @ genetic) * (predicted @ predicted)))
+    return correlation * correlation, float(genetic @ predicted / (predicted @ predicted))
 
 
 def main() -> None:
