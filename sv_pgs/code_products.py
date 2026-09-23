@@ -416,8 +416,9 @@ class CodeBlockTile:
         (max scale / min scale) 2^-(7m-2) ||R_k||_2. The tile's scale spread sets m by the right-hand
         bound without waiting on the device; a tile without one measures the left (``accumulate_digits``).
         At a budget of fp64
-        rounding (m = OPERAND_DIGITS) the values equal ``image += self.matmat(right)`` exactly; the
-        CPU products are exact fp64 whatever the budget.
+        rounding (m = OPERAND_DIGITS) the values equal ``image += self.matmat(right)`` to the rounding of
+        two fp64 sums of the same terms in different orders (the device GEMM's order is the hardware's:
+        an H100's FP64 tensor cores and an A40 differ); the CPU products are exact fp64 whatever the budget.
         """
         xp = self._array_module
         scaled = xp.asarray(right, dtype=xp.float64) / self._scales[:, None]

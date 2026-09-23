@@ -90,6 +90,7 @@ def test_cuda_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, c
     offsets = np.cumsum([0] + [block.shape[0] for block in BLOCK_ROWS])
     image = cupy.zeros((source.sample_count, 2))
     expected_image = cupy.zeros((source.sample_count, 2))
+    magnitude = np.zeros((source.sample_count, 2))
     operand = None
     for block_index, tile in source.iter_tiles():
         columns = slice(int(offsets[block_index]), int(offsets[block_index + 1]))
@@ -101,7 +102,16 @@ def test_cuda_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, c
         assert np.array_equal(_bits(tile.rmatmat(operand)), _bits(expected.rmatmat(left)))
         tile.accumulate_matmat(right, image, FLOAT64_ROUNDING)
         expected_image += expected.matmat(right)
-    assert np.array_equal(_bits(image), _bits(expected_image))
+        # The block's terms' sizes: |s_ij| |r_jk / scale_j| and the centring's |mean_j| |r_jk / scale_j|.
+        weights = np.abs(cupy.asnumpy(right)) / scales[columns, None]
+        magnitude += np.abs(signed[BLOCK_ROWS[block_index]].astype(np.float64)).T @ weights + (np.abs(means[columns]) @ weights)[None, :]
+    # Two float64 sums of the same terms in different orders (the digit kernel's and the device GEMM's: an H100's FP64
+    # tensor cores order a dot product differently from an A40's): each is within gamma_m of the exact sum, m the
+    # longest chain of roundings (every block's rows, its centring and scaling, and the image's sum over blocks), so
+    # they are within twice that of each other (Higham 2002, section 3.1). Summation order is not a contract.
+    chain = max(block.shape[0] for block in BLOCK_ROWS) + len(("centring", "scaling")) + len(BLOCK_ROWS)
+    gamma = chain * FLOAT64_ROUNDING / (1.0 - chain * FLOAT64_ROUNDING)
+    assert np.all(np.abs(cupy.asnumpy(image) - cupy.asnumpy(expected_image)) <= 2.0 * gamma * magnitude)
 
 
 def test_a_stage_2_read_over_streamed_tiles_equals_the_per_block_products(tmp_path: Path) -> None:
