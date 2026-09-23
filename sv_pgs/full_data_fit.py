@@ -2228,7 +2228,8 @@ def fit_full_data(
         # EP starts where mean field ended (its fitted hyperparameters, noise and sites: q's means and precision), so its
         # refreshes pay for EP's correction to mean field, not the path from the prior. Mean field is its own route to
         # that point; EP then moves both q and the hyperparameters to EP's own fixed point.
-        field_hyperparameters = list(fixed_points.restore_best(tuple(fit.hyperparameters for fit in fits), 0.5 / draw_count))
+        restored_hyperparameters, _restored = fixed_points.restore_best(tuple(fit.hyperparameters for fit in fits), 0.5 / draw_count)
+        field_hyperparameters = list(restored_hyperparameters)
         log(f"ep: warm start from the mean-field fixed point after {fixed_points.passes} sweeps")
         oracle = _FullDataFixedPoints(
             gaussian, statistics, prior, draw_count, working_bytes, seed, field_hyperparameters, np.asarray(fixed_points.noise, dtype=np.float64).copy(),
