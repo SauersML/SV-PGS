@@ -40,7 +40,7 @@ from __future__ import annotations
 import hashlib
 import time
 import weakref
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable, Iterator, Mapping, Sequence
 
 from types import ModuleType
@@ -50,6 +50,8 @@ import scipy.optimize
 from scipy import linalg, sparse
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.binary_likelihood import BernoulliSites
+from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.config import TraitType
 from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
@@ -278,6 +280,12 @@ class DenseStatistics:
     covariate_pseudo_inverse: F64Array
     target: F64Array
     projected_target: F64Array
+    # Each group's standardized column less its carrier column, X~_g - g_g (a constant per group): what C'W X~ needs
+    # besides C'W G when the metric is weighted (``weighted_statistics``).
+    column_constants: F64Array | None = None
+    # A binary model's Polya-Gamma sites where this is its whitened problem (``weighted_statistics``); None for the
+    # unweighted problem.
+    sites: "BernoulliSites | None" = None
 
     @property
     def covariate_rank(self) -> int:
@@ -289,6 +297,11 @@ class DenseStatistics:
     @property
     def sample_count(self) -> int:
         return self.design.sample_count
+
+    @property
+    def whitened_target(self) -> F64Array:
+        """The target in the design's metric: y itself, or W^1/2 z for a binary model's whitened problem."""
+        return self.target if self.sites is None else np.sqrt(self.sites.weights) * self.target
 
     @property
     def signs(self) -> F64Array:
@@ -393,6 +406,37 @@ def dense_statistics(
         covariate_pseudo_inverse=_covariate_gram_pseudo_inverse(covariate_matrix),
         target=target_values,
         projected_target=design.project(target_values),
+        column_constants=constants,
+    )
+
+
+def weighted_statistics(statistics: DenseStatistics, sites: BernoulliSites) -> DenseStatistics:
+    """A binary model's whitened problem at its Polya-Gamma sites (``binary_likelihood``): the same members, columns
+    and ties in the metric W = diag(omega), so every dense Gaussian algebra of this route serves it at unit noise.
+
+    ``design`` is Xt = (I - H_W) W^1/2 X~ (carriers W^1/2 G, basis an orthonormal basis of W^1/2 C: W^1/2 X~_g and
+    W^1/2 g_g differ by a multiple of W^1/2 1, which the intercept puts in the basis's span, as for the unweighted
+    design), ``target`` the working response z = kappa / omega and ``projected_target`` (I - H_W) W^1/2 z;
+    ``loading`` is C'W X~ over the members and ``covariate_pseudo_inverse`` (C'WC)^+, so the covariates' conditional
+    mean given beta is (C'WC)^+ (C'W z - loading beta). Only the training rows carry weight (every row of a dense
+    problem is a training row), and every weight is positive, since xi is finite."""
+    if statistics.column_constants is None:
+        raise ValueError("the statistics must carry their column constants to be reweighted")
+    weights = sites.weights
+    root = np.sqrt(weights)
+    base = statistics.design
+    design = _Design(root[:, None] * base.carriers, _covariate_basis(root[:, None] * statistics.covariates), members=base.members)
+    weighted_covariates = weights[:, None] * statistics.covariates
+    loading = ((base.carriers.T @ weighted_covariates).T + np.outer(weighted_covariates.sum(axis=0), statistics.column_constants))[:, statistics.ties.group]
+    response = sites.response
+    return replace(
+        statistics,
+        design=design,
+        loading=loading,
+        covariate_pseudo_inverse=_covariate_gram_pseudo_inverse(root[:, None] * statistics.covariates),
+        target=response,
+        projected_target=design.project(root * response),
+        sites=sites,
     )
 
 
@@ -1677,9 +1721,10 @@ def small_n_prior(
     units = np.ones(members.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[members]
     offsets = np.asarray(log_variance_offset, dtype=np.float64)[members] + per_unit_offset(statistics.scales / units)
     residual = statistics.projected_target
-    start_noise = float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
+    # A binary model's whitened problem has unit noise, known (``binary_likelihood``).
+    start_noise = 1.0 if statistics.sites is not None else float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
     single_precision = statistics.design.column_squares() / start_noise
-    single_shift = statistics.design.back(statistics.target) / start_noise
+    single_shift = statistics.design.back(statistics.whitened_target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     member_annotations = {name: np.asarray(values)[members] for name, values in (annotations or {}).items()}
     if annotations is not None:
@@ -1701,7 +1746,7 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     weights = np.exp(prior.log_variance_offset)
     kernel = design.weighted_gram(np.ones(design.variant_count))
     squares = design.column_squares()
-    score = design.back(statistics.target)
+    score = design.back(statistics.whitened_target)
     moment = moment_start(
         target_square=float(residual @ residual),
         residual_dimension=float(statistics.sample_count - statistics.covariate_rank),
@@ -1711,7 +1756,9 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
         weighted_square=float(weights @ design.quadratic_diagonal(kernel)),
         gram_square=float(np.sum(kernel * kernel)),
     )
-    return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
+    # A binary model's noise is known (1); its moment start's genetic variance is on the whitened problem's logit scale.
+    noise = 1.0 if statistics.sites is not None else float(moment.noise)
+    return initial_hyperparameters(prior, moment.mean_variance), noise, moment
 
 
 def ridge_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> F64Array:
@@ -1753,17 +1800,25 @@ class GaussianMember:
         residual_square = float(y @ y - rotated @ rotated)
         dimension = statistics.sample_count - statistics.covariate_rank
 
+        # A binary model's whitened problem has its noise known, 1 (``binary_likelihood``): t alone is searched.
+        known = statistics.sites is not None
+
+        def quadratic(t: float) -> float:
+            return float(np.sum(rotated ** 2 / (1.0 + t * values))) + residual_square
+
         def noise_at(t: float) -> float:
-            return (float(np.sum(rotated ** 2 / (1.0 + t * values))) + residual_square) / dimension
+            return 1.0 if known else quadratic(t) / dimension
 
         def negative(log_t: float) -> float:
+            if known:
+                return 0.5 * (float(np.sum(np.log1p(np.exp(log_t) * values))) + quadratic(float(np.exp(log_t))))
             return 0.5 * (float(np.sum(np.log1p(np.exp(log_t) * values))) + dimension * np.log(noise_at(float(np.exp(log_t)))))
 
         half = np.sqrt(_EPSILON)
         bounds = (float(np.log(half / values[-1])), float(np.log(1.0 / (half * values[0]))))
         t = float(np.exp(scipy.optimize.minimize_scalar(negative, bounds=bounds, method="bounded").x))
         noise = noise_at(t)
-        log_evidence = -0.5 * (dimension * np.log(2.0 * np.pi * noise) + float(np.sum(np.log1p(t * values))) + dimension)
+        log_evidence = -0.5 * (dimension * np.log(2.0 * np.pi * noise) + float(np.sum(np.log1p(t * values))) + (quadratic(t) if known else dimension))
         mean = t * weights * (x.T @ (vectors @ (rotated / (1.0 + t * values))))
         return cls(mean=mean, noise=noise, variances=t * noise * weights, log_evidence=float(log_evidence), statistics=statistics)
 
@@ -1860,32 +1915,51 @@ def fit_small_n(
     array_module: ModuleType | None = None,
     annotations: Mapping[str, np.ndarray] | None = None,
     codes_per_unit: np.ndarray | None = None,
+    population_prevalence: float | None = None,
 ) -> SmallNFit:
-    """Fit one quantitative model on the dense training codes (n x records, store codes) with ``covariates`` (n x k,
-    intercept first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of
-    ``fit_hyperparameters`` at the fixed points of ``inference`` ("ep": Stage 2's EP with exact dense algebra;
-    "mean_field": coordinate-ascent VB, ``mean_field.MeanFieldFixedPoints``), and ``draw_count`` posterior draws
-    (``seed``). The two inferences exist for the definition of done's measurement (item 3: the one that predicts
-    better under the same prior on bench-real is kept, the other deleted)."""
-    if trait_type != TraitType.QUANTITATIVE:
-        raise NotImplementedError("the small-n route fits quantitative traits (Stage 2 has no binary likelihood yet).")
+    """Fit one model on the dense training codes (n x records, store codes) with ``covariates`` (n x k, intercept
+    first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of ``fit_hyperparameters`` at
+    the fixed points of ``inference`` ("ep": Stage 2's EP with exact dense algebra; "mean_field": coordinate-ascent VB,
+    ``mean_field.MeanFieldFixedPoints``), and ``draw_count`` posterior draws (``seed``). The two inferences exist for
+    the definition of done's measurement (item 3: the one that predicts better under the same prior on bench-real is
+    kept, the other deleted).
+
+    A binary trait (0/1 ``target``) is fitted by the mean-field route on its Polya-Gamma bound (``binary_likelihood``):
+    every fixed point holds its own sites and reports the Bernoulli bound, the dense end is ``BinaryGaussianMember``,
+    and the scoring model's intercept shift calibrates its predictive to the training prevalence, moved by the
+    ascertainment offset to ``population_prevalence`` where the training rows are a case-control sample of a population
+    with that prevalence."""
+    binary = trait_type == TraitType.BINARY
+    if trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY):
+        raise ValueError(f"unknown trait type {trait_type!r}")
     if inference not in ("ep", "mean_field"):
         raise ValueError("inference must be 'ep' or 'mean_field'.")
+    if binary and inference != "mean_field":
+        raise ValueError("a binary model is fitted by the mean-field route (its Polya-Gamma bound, ``binary_likelihood``); EP has no binary likelihood.")
     started = time.perf_counter()
     sample_count, record_count = (int(size) for size in np.shape(codes))
     refuse_dense_route(dense_stage0_bytes(sample_count, record_count), working_bytes, "Stage 0's dense pass")
     offsets = np.zeros(record_count) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
     statistics = dense_statistics(codes, covariates, target, offsets)
     refuse_dense_route(dense_kernel_bytes(sample_count, statistics.design.group_count), working_bytes, "the dense design and its n x n kernel")
+    # A binary model (``binary_likelihood``): the separation check, then its Polya-Gamma sites at xi = 0, where the
+    # whitened problem is the equal-weight Gaussian one with response 4 kappa. The prior's lattice, the EB start and the
+    # data starts are that problem's; every fixed point then moves its own sites (``MeanFieldFixedPoints``).
+    sites = None
+    working = statistics
+    if binary:
+        assert_no_separation(statistics.covariates, statistics.target)
+        sites = BernoulliSites.start(statistics.target)
+        working = weighted_statistics(statistics, sites)
     # Nested empirical Bayes: the prior without annotation groups first, then the annotated prior continued from its fit
     # with every annotation effect zero and its penalty weight at the lambda = infinity edge (``embed_hyperparameters``),
     # so the annotated fit starts where the base one ended and an annotation group enters only where the evidence rises.
     # Searched from the annotated prior's own start instead, the edge search stalled below the base fit
     # (ENSG00000187605.16 [real, loso/AFR]: ELBO 87.0 and r2 0.17 in 20 minutes, against 99.9 and 0.34 without).
-    base = small_n_prior(statistics, variant_class, offsets, draw_count, None, codes_per_unit)
-    prior = base if annotations is None else small_n_prior(statistics, variant_class, offsets, draw_count, annotations, codes_per_unit)
+    base = small_n_prior(working, variant_class, offsets, draw_count, None, codes_per_unit)
+    prior = base if annotations is None else small_n_prior(working, variant_class, offsets, draw_count, annotations, codes_per_unit)
     stage0_seconds = time.perf_counter() - started
-    start, start_noise, moment = small_n_start(statistics, base)
+    start, start_noise, moment = small_n_start(working, base)
     tolerance = 0.5 / draw_count
 
     def nested(solve: "_SmallNSolve", start_mean: F64Array | None) -> "_SmallNSolve":
@@ -1894,7 +1968,7 @@ def fit_small_n(
         embedded = embed_hyperparameters(base, prior, solve.hyperparameters)
         return _solve_small_n(
             statistics, prior, embedded, float(solve.oracle.noise), draw_count, working_bytes, tolerance, inference, array_module,
-            None if start_mean is None else np.asarray(solve.oracle.mean, dtype=np.float64),
+            None if start_mean is None else np.asarray(solve.oracle.mean, dtype=np.float64), sites=getattr(solve.oracle, "sites", None),
         )
 
     if inference == "ep":
@@ -1904,21 +1978,29 @@ def fit_small_n(
         # the model's scales (``lasso_starts``), each with its own empirical Bayes. They join the mode mixture below as
         # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
-        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics, base))
+        starts = (*lasso_starts(working, seed, statistics.scales / units), ridge_start(working, base))
         solves = [
-            nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means), means)
+            nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means, sites=sites), means)
             for means in starts
         ]
     components = list(solves)
     if inference == "mean_field":
-        components = [*_mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed), GaussianMember.fit(statistics, prior)]
+        dense_end = BinaryGaussianMember.fit(statistics, prior, sites, tolerance) if binary else GaussianMember.fit(statistics, prior)
+        components = [*_mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed), dense_end]
     generator = np.random.default_rng(seed)
     weights = _mixture_weights(components)
     shares = _draw_shares(weights, draw_count)
-    draws = np.concatenate([component.draws(generator, share) for component, share in zip(components, shares) if share], axis=1)
+    parts = [(component, component.draws(generator, share)) for component, share in zip(components, shares) if share]
+    draws = np.concatenate([part for _component, part in parts], axis=1)
     mean = np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
     noise = float(np.dot(weights, [float(component.oracle.noise) for component in components]))
-    alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
+    shift = 0.0
+    if binary:
+        alpha, covariate_draws, covariate_covariance, shift = _binary_covariates(statistics, components, weights, parts, population_prevalence)
+    else:
+        alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
+        covariate_draws = alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - mean[:, None])
+        covariate_covariance = noise * statistics.covariate_pseudo_inverse
     # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
     member_count = statistics.active_rows.shape[0]
@@ -1932,9 +2014,9 @@ def fit_small_n(
         posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
         trait_type=trait_type,
-        predictive_intercept_shift=0.0,
-        covariate_draws=alpha[:, None] - statistics.covariate_pseudo_inverse @ statistics.loading @ (draws - mean[:, None]),
-        covariate_covariance=noise * statistics.covariate_pseudo_inverse,
+        predictive_intercept_shift=shift,
+        covariate_draws=covariate_draws,
+        covariate_covariance=covariate_covariance,
         gaussian_posterior=inference == "ep",
     )
     outers = [solve.outer for solve in solves]
@@ -2083,7 +2165,7 @@ def _mode_mixture(
         index += 1
         oracle = MeanFieldFixedPoints(
             statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,) if from_start else (),
-            order=generator.permutation(member_count),
+            order=generator.permutation(member_count), sites=getattr(solve.oracle, "sites", None),
         )
         (point,) = oracle([solve.hyperparameters])
         if point is None:
@@ -2091,7 +2173,7 @@ def _mode_mixture(
         _admit(statistics, components, _SmallNSolve(oracle=oracle, outer=None, hyperparameters=solve.hyperparameters, inference="mean_field", draw_count=draw_count), draw_count)
         updated = mixture_mean()
         noise = float(np.dot(_mixture_weights(components), [float(component.oracle.noise) for component in components]))
-        move = statistics.design.image(updated - average)
+        move = _metric(statistics, oracle).image(updated - average)
         average = updated
         if float(move @ move) / noise <= 1.0 / draw_count:
             return components
@@ -2111,12 +2193,122 @@ def _admit(statistics: DenseStatistics, components: list, candidate: "_SmallNSol
     <= 1/K (the mixture's own stopping scale); the one of the higher evidence is kept."""
     noise = float(candidate.oracle.noise)
     for index, component in enumerate(components):
-        move = statistics.design.image(np.asarray(candidate.oracle.mean) - np.asarray(component.oracle.mean))
+        move = _metric(statistics, candidate.oracle).image(np.asarray(candidate.oracle.mean) - np.asarray(component.oracle.mean))
         if float(move @ move) / noise <= 1.0 / draw_count:
             if _component_log_evidence(candidate) > _component_log_evidence(component):
                 components[index] = candidate
             return
     components.append(candidate)
+
+
+def _metric(statistics: DenseStatistics, oracle: object) -> _Design:
+    """The design whose ||Xp d||^2 / sigma^2 measures a move of the fitted genetic values: the unweighted one, or for a
+    binary model the whitened one at the oracle's own sites (its noise is 1)."""
+    own = getattr(oracle, "statistics", None)
+    return own.design if own is not None and own.sites is not None else statistics.design
+
+
+@dataclass
+class BinaryGaussianMember:
+    """A binary model's ``GaussianMember``: the prior family's Gaussian member at its marginal-likelihood variance under
+    the Polya-Gamma bound, by ``binary_likelihood.bernoulli_ascent`` over ``GaussianPriorStep`` (the Jaakkola-Jordan
+    variational logistic regression with the Gaussian prior beta_j ~ N(0, t u_j), t and xi jointly at their fixed point).
+    Its q is Gaussian at its sites, so its value is the Bernoulli bound L of that exact conditional q, weighed against the
+    mean-field fixed points' L (``_mixture_weights``), and its draws are exact draws of that q (``GaussianMember.draws``
+    on the whitened problem at unit noise)."""
+
+    member: GaussianMember
+    ascent: object
+    sites: BernoulliSites
+    hyperparameters: None = None
+
+    @classmethod
+    def fit(cls, statistics: DenseStatistics, prior: ScaleMixturePrior, sites: BernoulliSites, tolerance: float) -> "BinaryGaussianMember":
+        from sv_pgs.binary_likelihood import GaussianPriorStep, bernoulli_ascent
+
+        relative = np.exp(np.asarray(prior.log_variance_offset, dtype=np.float64))
+        design = statistics.design
+        # Each member's oriented column is its group's carrier column: the constant that separates it from X~ lies in the
+        # intercept's span, which the step's projection removes.
+        step = GaussianPriorStep(design.carriers[:, design.members], statistics.covariates, relative)
+        ascent = bernoulli_ascent(step, sites, tolerance)
+        detail = ascent.state.detail
+        member = GaussianMember(
+            mean=np.asarray(detail["effects"], dtype=np.float64), noise=1.0, variances=float(detail["scale"]) * relative,
+            log_evidence=float(ascent.bound), statistics=weighted_statistics(statistics, ascent.sites),
+        )
+        return cls(member=member, ascent=ascent, sites=ascent.sites)
+
+    @property
+    def oracle(self) -> "BinaryGaussianMember":
+        return self
+
+    @property
+    def mean(self) -> F64Array:
+        return self.member.mean
+
+    @property
+    def noise(self) -> float:
+        return 1.0
+
+    @property
+    def statistics(self) -> DenseStatistics:
+        return self.member.statistics
+
+    @property
+    def design(self) -> _Design:
+        return self.member.statistics.design
+
+    @property
+    def profile(self) -> dict:
+        return {"elbo": float(self.ascent.bound), "evidence_correction": 0.0}
+
+    def predictor_moments(self) -> tuple[F64Array, F64Array]:
+        return self.ascent.state.predictor_mean, self.ascent.state.predictor_variance
+
+    def prior_variance(self, prior: ScaleMixturePrior) -> F64Array:
+        return self.member.variances
+
+    def draws(self, generator: np.random.Generator, count: int) -> F64Array:
+        return self.member.draws(generator, count)
+
+
+def _binary_covariates(
+    statistics: DenseStatistics, components: Sequence, weights: F64Array, parts: Sequence[tuple[object, F64Array]], population_prevalence: float | None,
+) -> tuple[F64Array, F64Array, F64Array, float]:
+    """A binary mixture's covariate terms and its predictive's intercept shift, each component in its own metric W_m
+    (its final sites): alpha_m = (C'W_m C)^+ (C'kappa - C'W_m X~ m_m) (the conditional mean given beta at beta's mean),
+    each draw's alpha_m - (C'W_m C)^+ C'W_m X~ (b - m_m) for the component it came from, and the mixture's alpha and
+    within-component covariance sum_m w_m alpha_m and sum_m w_m (C'W_m C)^+ (the between-component spread is the draws').
+    The shift puts the mean predictive E sigmoid(eta + shift) over the training rows at their prevalence, under the
+    mixture's predictor moments (``binary_likelihood.calibrated_shift``), plus the ascertainment offset to
+    ``population_prevalence`` where one is given."""
+    from sv_pgs.binary_likelihood import calibrated_shift
+
+    kappa = statistics.target - 0.5
+    score = statistics.covariates.T @ kappa
+    alphas, covariances, means, variances = [], [], [], []
+    per_component: dict[int, tuple[F64Array, F64Array, F64Array]] = {}
+    for component in components:
+        metric = component.oracle.statistics
+        component_mean = np.asarray(component.oracle.mean, dtype=np.float64)
+        alpha = metric.covariate_pseudo_inverse @ (score - metric.loading @ component_mean)
+        alphas.append(alpha)
+        covariances.append(metric.covariate_pseudo_inverse)
+        per_component[id(component)] = (alpha, metric.covariate_pseudo_inverse @ metric.loading, component_mean)
+        predictor_mean, predictor_variance = component.oracle.predictor_moments()
+        means.append(predictor_mean)
+        variances.append(predictor_variance)
+    alpha = np.einsum("m,mk->k", weights, np.array(alphas))
+    covariance = np.einsum("m,mkl->kl", weights, np.array(covariances))
+    covariate_draws = np.concatenate([
+        per_component[id(component)][0][:, None] - per_component[id(component)][1] @ (part - per_component[id(component)][2][:, None])
+        for component, part in parts
+    ], axis=1)
+    mixture_mean = np.einsum("m,mi->i", weights, np.array(means))
+    mixture_variance = np.einsum("m,mi->i", weights, np.array(variances) + (np.array(means) - mixture_mean[None, :]) ** 2)
+    shift = calibrated_shift(mixture_mean, mixture_variance, statistics.target, population_prevalence)
+    return alpha, covariate_draws, covariance, shift
 
 
 @dataclass
@@ -2142,6 +2334,7 @@ class _SmallNSolve:
 def _solve_small_n(
     statistics: DenseStatistics, prior: ScaleMixturePrior, start: MixtureHyperparameters, start_noise: float, draw_count: int,
     working_bytes: int, tolerance: float, inference: str, array_module: ModuleType | None, start_mean: F64Array | None,
+    sites: BernoulliSites | None = None,
 ) -> _SmallNSolve:
     """The certified empirical Bayes at the fixed points of ``inference``: EP's, or mean field's carried from
     ``start_mean``; the returned state is the visited one of the highest ELBO where the outer loop ended below it."""
@@ -2150,7 +2343,7 @@ def _solve_small_n(
     else:
         from sv_pgs.mean_field import MeanFieldFixedPoints
 
-        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,))
+        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,), sites=sites)
     try:
         # The variant side's objective and moments on ``array_module`` (``scale_mixture_ep.device_scope``); the
         # fixed points' dense sample-side algebra stays on the host.

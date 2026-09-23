@@ -29,6 +29,15 @@ built from.
 (``scale_mixture_ep.noise_variance``'s form with the mean-field variances), and its gain is
 ``scale_mixture_ep.noise_gain``.
 
+**A binary trait** (``sites``: its Polya-Gamma factors, ``binary_likelihood``). At fixed sites the Bernoulli bound L
+is this ELBO on the whitened problem (y~ = W^1/2 z, Xp = (I - H_W) W^1/2 X, ``small_n.weighted_statistics``) at unit
+noise, known, plus the sites' constant and the covariates' evidence, so the sweeps are unchanged and ``_elbo`` reports
+L. The sites' update xi_i^2 = E eta_i^2 (``predictor_moments``) takes the noise update's place: once the sweeps are
+within the tolerance at the current sites, its exact gain is either within what is left of the tolerance (the joint
+fixed point of (q, xi), the gain reported where the noise's would be) or xi moves with q held, raising L by that gain,
+and the sweeps continue in the new metric. Every metric-bound array (the design, its squares, the device copies) is
+rebuilt from the sites and keyed by them, and a snapshot carries its sites, so a restore restores its metric.
+
 **The fixed point.** Sweeps end when the gain they can still find is at most the fit's resolution, 1/(2K) nats
 for a scorer with K posterior draws: the remaining gain is estimated as the last sweep's gain g_t times
 rho / (1 - rho), rho = g_t / g_(t-1) the measured contraction (the same extrapolation the EP oracles use for their
@@ -96,7 +105,8 @@ from sv_pgs.scale_mixture_ep import (
     noise_gain,
     tilted_cumulants,
 )
-from sv_pgs.small_n import DenseStatistics, _Design, _new_profile
+from sv_pgs.binary_likelihood import BernoulliSites, covariate_evidence
+from sv_pgs.small_n import DenseStatistics, _Design, _new_profile, weighted_statistics
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -299,17 +309,20 @@ class MeanFieldFixedPoints:
         self, statistics: DenseStatistics, prior: ScaleMixturePrior, start_noise: float, draw_count: int, working_bytes: int,
         start_means: Sequence[F64Array] = (),
         order: np.ndarray | None = None,
+        sites: BernoulliSites | None = None,
     ) -> None:
-        self.statistics = statistics
+        # A binary model (``sites``: its Polya-Gamma factors, ``binary_likelihood``) is fitted on its whitened problem at
+        # the current sites (``small_n.weighted_statistics``), rebuilt from the unweighted ``statistics`` whenever xi
+        # moves; its noise is 1, known, and never re-estimated.
+        self.base_statistics = statistics
+        self.sites = sites
+        self._metrics: dict[bytes, DenseStatistics] = {}
         self.prior = prior
         self.draw_count = int(draw_count)
         self.working_bytes = int(working_bytes)
-        self.design = statistics.design
-        self.sample_count = statistics.sample_count
-        self.covariate_count = statistics.covariate_rank
-        self.residual_dimension = self.sample_count - self.covariate_count
-        # Xp over the groups, dense, once: every sweep is a pass over it.
-        self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
+        self._held_device: dict | None = None
+        self._install(statistics if sites is None else self._weighted(sites))
+        statistics = self.statistics
         self.members = np.asarray(self.design.members, dtype=np.int64)
         # The order coordinate ascent visits the members in: each order can end in a different mode of a multimodal
         # posterior (between near-duplicate columns the one visited first takes the effect), so the fit's mixture over
@@ -317,12 +330,9 @@ class MeanFieldFixedPoints:
         self.order = np.arange(self.members.shape[0], dtype=np.int64) if order is None else np.asarray(order, dtype=np.int64)
         if np.sort(self.order).tolist() != list(range(self.members.shape[0])):
             raise ValueError("order must be a permutation of the members")
-        # ||x_g||^2 as the design defines it (``_Design.squares``: the same numbers the response and the tests use).
-        self.member_squares = np.asarray(self.design.squares, dtype=np.float64)
-        self.group_squares = np.zeros(self.design.group_count)
-        self.group_squares[self.members] = self.member_squares
         self.class_index = np.asarray(prior.class_index, dtype=np.int64)
-        self.noise = float(start_noise)
+        self.noise = 1.0 if sites is not None else float(start_noise)
+        start_noise = self.noise
         self.mean = np.zeros(prior.variant_count)
         self.variance = np.zeros(prior.variant_count)
         self.third = np.zeros(prior.variant_count)
@@ -342,7 +352,6 @@ class MeanFieldFixedPoints:
         self._response_noise = float(start_noise)
         # A parallel pass (``_pass``) leaves the third and fourth moments to the fixed point that needs them.
         self._moments_stale = False
-        self._held_device: dict | None = None
         # The start's state, from which every call is also solved cold (``__call__``).
         self._cold: dict | None = self._snapshot()
         # The highest-ELBO state any call solved, with its hyperparameters: the outer loop climbs a corrected
@@ -365,6 +374,62 @@ class MeanFieldFixedPoints:
             self._cold = data
             self._first_starts[0] = zero
 
+    # the metric: the design, and for a binary model its Polya-Gamma weights
+
+    def _weighted(self, sites: BernoulliSites) -> DenseStatistics:
+        """The whitened problem at ``sites``, held for the sites the state and one restore point use (keyed by the
+        sites, ``BernoulliSites.key``): a rejected trial's restore finds its metric without rebuilding it."""
+        held = self._metrics.get(sites.key)
+        if held is None:
+            held = weighted_statistics(self.base_statistics, sites)
+            current = getattr(self, "statistics", None)
+            self._metrics = {key: value for key, value in self._metrics.items() if value is current}
+            self._metrics[sites.key] = held
+        return held
+
+    def _install(self, statistics: DenseStatistics) -> None:
+        """Every metric-bound array from ``statistics``: the design, its dense projected columns and their squares, and
+        for a binary model L's terms outside the Gaussian value (``binary_likelihood``: the sites' constant and the
+        covariates' evidence at these weights)."""
+        self.statistics = statistics
+        self.design = statistics.design
+        self.sample_count = statistics.sample_count
+        self.covariate_count = statistics.covariate_rank
+        self.residual_dimension = self.sample_count - self.covariate_count
+        # Xp over the groups, dense, once per metric: every sweep is a pass over it.
+        self.projected = np.asfortranarray(self.design.group_columns(np.arange(self.design.group_count)))
+        # ||x_g||^2 as the design defines it (``_Design.squares``: the same numbers the response and the tests use).
+        members = np.asarray(self.design.members, dtype=np.int64)
+        self.member_squares = np.asarray(self.design.squares, dtype=np.float64)
+        self.group_squares = np.zeros(self.design.group_count)
+        self.group_squares[members] = self.member_squares
+        self._held_device = None
+        self._bernoulli_offset = 0.0
+        self._bernoulli_size = 0.0
+        if self.sites is not None:
+            self._bernoulli_offset = self.sites.constant() + covariate_evidence(self.sites.weights, statistics.covariates)
+            self._bernoulli_size = self.sites.constant_size() + abs(covariate_evidence(self.sites.weights, statistics.covariates))
+
+    def _reweight(self, sites: BernoulliSites) -> None:
+        """The xi update's new sites with q held: the metric moves, and the residual is q's in it."""
+        self.sites = sites
+        self._install(self._weighted(sites))
+        self.residual = np.asarray(self.statistics.projected_target, dtype=np.float64) - self.design.image(self.mean)
+        self.profile["reweights"] = self.profile.get("reweights", 0) + 1
+
+    def predictor_moments(self) -> tuple[F64Array, F64Array]:
+        """A binary model's E eta_i and Var eta_i under q (``binary_likelihood``): z_i - r_i / sqrt(omega_i) and
+        (sum_g Xp_ig^2 V_g + H_ii) / omega_i, V_g the variance of group g's column's effect (its members' sum, since each
+        member is its own independent factor) and H_ii the weighted covariate leverage."""
+        assert self.sites is not None
+        root = np.sqrt(self.sites.weights)
+        mean = np.asarray(self.statistics.target, dtype=np.float64) - self.residual / root
+        group_variance = np.bincount(self.members, weights=self.variance, minlength=self.design.group_count)
+        explained = np.square(self.projected) @ group_variance
+        basis = self.design.basis
+        leverage = np.sum(basis * basis, axis=1)
+        return mean, (explained + leverage) / (root * root)
+
     # the ELBO and its pieces
 
     def _elbo(self, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
@@ -372,7 +437,16 @@ class MeanFieldFixedPoints:
         terms, p weighted variances, n residual squares) is formed from pieces whose sizes sum to S, with at most
         K + 1 rounded operations on each (its log-sum-exp over the K nodes and its combination), and recursive
         summation of N terms adds at most N eps of their sizes (Higham, Accuracy and Stability of Numerical
-        Algorithms, 2nd ed., Lemma 3.1 with gamma_N <= N eps at N eps << 1): |rounding| <= (K + 1 + N) eps S."""
+        Algorithms, 2nd ed., Lemma 3.1 with gamma_N <= N eps at N eps << 1): |rounding| <= (K + 1 + N) eps S.
+
+        A binary model's is its Bernoulli bound L (``binary_likelihood``): the Gaussian value at unit noise,
+        -(||r||^2 + sum_j ||x_j||^2 v_j) / 2 - sum_j KL_j, plus the sites' constant and the covariates' evidence, whose
+        n + 1 terms add their sizes to S."""
+        if self.sites is not None:
+            fit_term = 0.5 * (residual_square + weighted_variance)
+            value = -fit_term - divergence + self._bernoulli_offset
+            summands = 2 * self.prior.variant_count + 2 * self.sample_count + 1
+            return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (fit_term + sizes + self._bernoulli_size)
         noise = self.noise
         residual_term = 0.5 * self.residual_dimension * float(np.log(2.0 * np.pi * noise))
         fit_term = (residual_square + weighted_variance) / (2.0 * noise)
@@ -532,9 +606,14 @@ class MeanFieldFixedPoints:
             "response": self._response, "response_noise": self._response_noise,
             "mean_move": self.mean_move, "noise_gain": self.noise_gain, "elbo": self.profile["elbo"],
             "moments_stale": self._moments_stale,
+            # A binary model's sites name the metric the residual and the moments belong to (immutable, so held).
+            "sites": self.sites,
         }
 
     def _restore(self, snapshot: dict) -> None:
+        if snapshot["sites"] is not self.sites:
+            self.sites = snapshot["sites"]
+            self._install(self._weighted(self.sites))
         self.mean, self.variance, self.shift, self.residual, self.third, self.fourth = (
             snapshot[name].copy() for name in ("mean", "variance", "shift", "residual", "third", "fourth")
         )
@@ -684,9 +763,13 @@ class MeanFieldFixedPoints:
                 raise FloatingPointError("a mean-field sweep is not finite")
             value, rounding = self._elbo(divergence, weighted_variance, residual_square, sizes)
             # The noise's stationary value at this q, and the gain it would bring (both exact); applied before the
-            # next sweep, if there is one.
-            pending_noise = (residual_square + weighted_variance) / self.residual_dimension
-            self.noise_gain = noise_gain(pending_noise, self.noise, self.sample_count, self.covariate_count)
+            # next sweep, if there is one. A binary model's noise is known (1): its likelihood's own update, xi's, is
+            # taken at the fixed point below, and its gain stands where the noise's does.
+            if self.sites is None:
+                pending_noise = (residual_square + weighted_variance) / self.residual_dimension
+                self.noise_gain = noise_gain(pending_noise, self.noise, self.sample_count, self.covariate_count)
+            else:
+                self.noise_gain = 0.0
             if correction is not None:
                 # The sweep after a correction: confirmed where the ELBO is at or above the pre-correction sweep's.
                 snapshot, before = correction
@@ -759,7 +842,22 @@ class MeanFieldFixedPoints:
                         direction, promised = fresh_step, fresh
                 self.mean_move = 2.0 * remaining
                 if remaining + self.noise_gain <= tolerance:
-                    return point
+                    if self.sites is None:
+                        return point
+                    # A binary model at its fixed point for these sites: the xi update's exact gain at q
+                    # (``binary_likelihood``). Within the tolerance with the sweeps' remainder, this is the joint fixed
+                    # point of (q, xi) and the gain stands as the likelihood's pending one; otherwise xi moves (q held),
+                    # which raises L by the gain, and the sweeps go on in the new metric from that value (the first
+                    # sweep also re-profiles the covariates at the new weights, which cannot lower L).
+                    updated, site_gain = self.sites.updated(*self.predictor_moments())
+                    if remaining + site_gain <= tolerance:
+                        self.noise_gain = site_gain
+                        return point
+                    self._reweight(updated)
+                    elbo = value + site_gain
+                    gain = previous_gain = None
+                    direction, promised = None, 0.0
+                    continue
                 corrections = True
 
     def _response_at(self, bounded: bool = False) -> _Response | None:
@@ -819,6 +917,7 @@ class MeanFieldFixedPoints:
         variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
         residual_dimension = float(self.residual_dimension)
         noise_solve: dict[str, object] = {}
+        binary = self.sites is not None
 
         def off_diagonal_gram(columns: F64Array) -> F64Array:
             return design.back(design.image(columns)) - squares[:, None] * columns
@@ -844,6 +943,14 @@ class MeanFieldFixedPoints:
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = noise * response.solve(scaled)
             shift_step = -off_diagonal_gram(mean_step) / noise
+            if binary:
+                # A binary model's noise is known, so it has no response. Its sites' response (xi_i^2 = E eta_i^2 moves
+                # with q, and the metric with xi) is left out of the curvature: an n x n implicit response the outer
+                # loop's monotonicity test does not need (its steps are accepted on the objective itself), at the
+                # cost the noise's omission once had, linear convergence of the outer Newton steps.
+                self.profile["response_seconds"] += time.perf_counter() - started
+                self.profile["responses"] += 1
+                return shift_step, np.zeros_like(shift_step)
             _mean_one, shift_one, scalar = noise_terms()
             right = -2.0 * (residual @ design.image(mean_step)) + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
