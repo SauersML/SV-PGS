@@ -19,12 +19,16 @@ def _components(priors, group):
     return priors.log_weight[start:stop], priors.log_variance[start:stop]
 
 
-def _reference_sweep(gram, score, t, nu, noise, priors, largest):
-    """One sweep over the groups' sums: dense A' = X'X + diag t re-inverted before every update; a step that would make
-    another cavity improper halves."""
+def _reference_sweep(gram, score, t, nu, noise, priors, largest, coupling=None, skip=()):
+    """One sweep over the groups' sums: dense A' = X'X + diag t (+ a cluster's scaled off-diagonal ``coupling``)
+    re-inverted before every update; a step that would make another unclustered cavity improper halves; ``skip``'s
+    groups (a cluster's) keep their sites."""
     t, nu = t.copy(), nu.copy()
+    coupling = np.zeros_like(gram) if coupling is None else coupling
     for group in range(t.shape[0]):
-        inverse = np.linalg.inv(gram + np.diag(t))
+        if group in skip:
+            continue
+        inverse = np.linalg.inv(gram + np.diag(t) + coupling)
         mean = inverse @ (score + noise * nu)
         marginal = noise * inverse[group, group]
         cavity_precision = 1.0 / marginal - t[group] / noise
@@ -39,9 +43,9 @@ def _reference_sweep(gram, score, t, nu, noise, priors, largest):
             trial_t, trial_nu = t.copy(), nu.copy()
             trial_t[group] = t[group] + fraction * (target_t - t[group])
             trial_nu[group] = nu[group] + fraction * (target_nu - nu[group])
-            trial = np.linalg.inv(gram + np.diag(trial_t))
+            trial = np.linalg.inv(gram + np.diag(trial_t) + coupling)
             cavities = (1.0 / (noise * np.diag(trial)) - trial_t / noise)
-            others = np.arange(t.shape[0]) != group
+            others = (np.arange(t.shape[0]) != group) & ~np.isin(np.arange(t.shape[0]), list(skip))
             valid = np.all((cavities[others] >= 0.0) | (1.0 + largest[others] * cavities[others] > 0.0))
             if valid:
                 t, nu = trial_t, trial_nu
@@ -158,3 +162,46 @@ def test_a_group_whose_cavity_integral_is_infinite_is_reported_not_decoded():
     mean, variance, proper = decode(priors, np.array([1.0, -1e-2]), np.array([0.5, 0.5]), 2)
     assert proper.tolist() == [True, False]
     assert np.isfinite(mean[0]) and np.isnan(mean[1]) and np.isnan(variance[1])
+
+
+def test_a_cluster_site_is_the_dense_block_and_the_sweep_moves_around_it():
+    """A cluster of three groups with a joint site (a full block on their sums): its cavity and every other group's
+    are the dense A' = X'X + sites' (Sigma_C^-1 less the block), and one sweep of the other groups is the dense
+    sequential update with the block held."""
+    rows, _members, priors, target = _problem(11, 30, 20, 1)
+    noise = 0.8
+    gram = rows @ rows.T
+    score = rows @ target
+    second = np.array([float(np.exp(_components(priors, g)[0]) @ np.exp(_components(priors, g)[1])) for g in range(rows.shape[0])])
+    t, nu = noise / second, np.zeros(rows.shape[0])
+    cluster = np.array([0, 1, 5])
+    rng = np.random.default_rng(3)
+    factor = rng.standard_normal((3, 3))
+    block = factor @ factor.T / 3 + np.diag(1.0 / second[cluster])
+    block_shift = rng.standard_normal(3)
+    sweep = SequentialSweep(rows, np.einsum("ij,ij->i", rows, rows), score, priors, noise)
+    sweep.set_clusters([cluster])
+    sweep.set_cluster_site(0, block, block_shift, t, nu)
+    scaled_coupling = np.zeros_like(gram)
+    scaled_coupling[np.ix_(cluster, cluster)] = noise * (block - np.diag(np.diag(block)))
+    inverse = np.linalg.inv(gram + np.diag(t) + scaled_coupling)
+    covariance = noise * inverse
+    mean = inverse @ (score + noise * nu)
+    cavity_precision, cavity_shift, cluster_mean, cluster_covariance = sweep.cluster_cavity(0, t, nu)
+    expected_inverse = np.linalg.inv(covariance[np.ix_(cluster, cluster)])
+    np.testing.assert_allclose(cluster_covariance, covariance[np.ix_(cluster, cluster)], rtol=1e-9)
+    np.testing.assert_allclose(cluster_mean, mean[cluster], rtol=1e-9)
+    np.testing.assert_allclose(cavity_precision, expected_inverse - block, rtol=1e-8, atol=1e-8)
+    np.testing.assert_allclose(cavity_shift, expected_inverse @ mean[cluster] - block_shift, rtol=1e-8, atol=1e-8)
+    single_precision, single_shift = sweep.cavities(t, nu)
+    others = np.setdiff1d(np.arange(rows.shape[0]), cluster)
+    np.testing.assert_allclose(single_precision[others], 1.0 / np.diag(covariance)[others] - t[others] / noise, rtol=1e-8)
+    np.testing.assert_allclose(single_shift[others], mean[others] / np.diag(covariance)[others] - nu[others], rtol=1e-8, atol=1e-10)
+    with np.errstate(over="ignore"):
+        largest = np.exp(priors.largest_log_variance())
+    expected_t, expected_nu = _reference_sweep(gram, score, t, nu, noise, priors, largest, scaled_coupling, set(cluster.tolist()))
+    got_t, got_nu = t.copy(), nu.copy()
+    assert sweep.run(got_t, got_nu, np.arange(rows.shape[0], dtype=np.int64)) is not None
+    np.testing.assert_allclose(got_t, expected_t, rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(got_nu, expected_nu, rtol=1e-8, atol=1e-10)
+    assert sweep.valid(got_t, got_nu)

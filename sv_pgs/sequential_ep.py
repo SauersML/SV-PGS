@@ -251,12 +251,31 @@ class SequentialSweep:
             self.largest = np.exp(priors.largest_log_variance())
         self.noise = float(noise)
         self.dimension = int(self.rows.shape[1])
+        self.clusters: list[I64Array] = []
+        self.coupling: list[F64Array] = []
+        self.clustered = np.zeros(self.rows.shape[0], dtype=bool)
+        self.checked_largest = self.largest
+
+    def set_clusters(self, clusters: list[I64Array], coupling: list[F64Array] | None = None) -> None:
+        """Joint sites: each cluster's groups share one Gaussian site on their sums, its diagonal in the groups'
+        ``precision`` (t) and its off-diagonal part (scaled, sigma^2 Lambda) in ``coupling`` (zero where None: the
+        groups' own sites, the start of a newly joined cluster). A cluster's groups stay in the rest N, whose Schur
+        complement S = T_N + X_N' M X_N takes the off-diagonal blocks as they are; the per-group sweep skips them and
+        its domain check leaves their cavities to the cluster's own (``cluster_cavity``)."""
+        self.clusters = [np.asarray(groups, dtype=np.int64) for groups in clusters]
+        self.coupling = [np.zeros((groups.shape[0], groups.shape[0])) for groups in self.clusters] if coupling is None else [
+            np.array(block, dtype=np.float64) for block in coupling]
+        self.clustered = np.zeros(self.rows.shape[0], dtype=bool)
+        for groups in self.clusters:
+            self.clustered[groups] = True
+        # 1 + 0 P > 0 always: a clustered group's scalar cavity is not its cavity.
+        self.checked_largest = np.where(self.clustered, 0.0, self.largest)
 
     def _build(self, precision: F64Array, shift: F64Array) -> bool:
         """The state at these sites from scratch; False where it is not positive definite."""
         t = precision
         self.shift_value = self.group_score + self.noise * shift
-        self.is_rest = ~((t > 0.0) & (t >= _HALF_PRECISION * self.squares))
+        self.is_rest = ~((t > 0.0) & (t >= _HALF_PRECISION * self.squares)) | self.clustered
         bulk_inverse = np.where(self.is_rest, 0.0, 1.0 / np.where(self.is_rest, 1.0, t))
         kernel = self.rows.T @ (self.rows * bulk_inverse[:, None])
         kernel[np.diag_indices_from(kernel)] += 1.0
@@ -277,6 +296,9 @@ class SequentialSweep:
         self.rest_images = np.ascontiguousarray(columns @ self.inverse)
         schur = columns @ self.rest_images.T
         schur[np.diag_indices_from(schur)] += precision[self.rest_rows]
+        for groups, block in zip(self.clusters, self.coupling):
+            slots = self.rest_slot[groups]
+            schur[np.ix_(slots, slots)] += block
         if schur.size:
             try:
                 upper = linalg.cholesky(0.5 * (schur + schur.T), lower=False, check_finite=False)
@@ -311,7 +333,8 @@ class SequentialSweep:
         self.solved += -c * a * projection + change * (1.0 - c * quadratic) * a
 
     def run(self, precision: F64Array, shift: F64Array, order: I64Array) -> int | None:
-        """One sweep over the groups in ``order``, updating ``precision`` (t) and ``shift`` (nu) in place."""
+        """One sweep over the unclustered groups in ``order``, updating ``precision`` (t) and ``shift`` (nu) in place."""
+        order = np.ascontiguousarray(order[~self.clustered[order]], dtype=np.int64)
         if not self._build(precision, shift):
             return None
         target = np.empty(2)
@@ -321,7 +344,7 @@ class SequentialSweep:
         while True:
             position, event, group, count = _sweep(
                 order, position, self.rows, self.squares, self.group_score, priors.component_start, priors.log_weight, priors.log_variance,
-                self.largest, self.noise, precision, self.shift_value, self.informed, self.is_rest, self.rest_slot, self.rest_rows,
+                self.checked_largest, self.noise, precision, self.shift_value, self.informed, self.is_rest, self.rest_slot, self.rest_rows,
                 self.rest_rows.shape[0], self.inverse, self.rest_images, self.schur_inverse, self.image, self.solved, self.rest_mean,
                 self.combined, target, _HALF_PRECISION,
             )
@@ -348,6 +371,49 @@ class SequentialSweep:
                 if not self._build(precision, shift):
                     return None
             position += 1
+
+    def cluster_cavity(self, index: int, precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array, F64Array, F64Array] | None:
+        """Cluster ``index``'s cavity on its sums (unscaled precision matrix, shift) and q's marginal there (mean,
+        covariance), from a fresh build: Sigma_C = sigma^2 (S^-1)_CC, mu_C = mu_N[C], and the cavity is Sigma_C^-1
+        less the cluster's site."""
+        if not self._build(precision, shift):
+            return None
+        groups = self.clusters[index]
+        slots = self.rest_slot[groups]
+        covariance = self.noise * self.schur_inverse[np.ix_(slots, slots)]
+        mean = self.rest_mean[slots]
+        inverse = np.linalg.inv(covariance)
+        site = (np.diag(precision[groups]) + self.coupling[index]) / self.noise
+        return inverse - site, inverse @ mean - shift[groups], mean, covariance
+
+    def set_cluster_site(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> None:
+        """Cluster ``index``'s site (unscaled precision matrix and shift on its sums), into ``precision``, ``shift``
+        and the coupling."""
+        groups = self.clusters[index]
+        scaled = self.noise * np.asarray(site_precision, dtype=np.float64)
+        precision[groups] = np.diag(scaled)
+        self.coupling[index] = scaled - np.diag(np.diag(scaled))
+        shift[groups] = site_shift
+
+    def valid(self, precision: F64Array, shift: F64Array) -> bool:
+        """Whether the state is inside EP's domain: q definite, every unclustered group's cavity with 1 + V_max P > 0,
+        every cluster's cavity with Lambda + diag(1 / V_max) positive definite."""
+        cavities = self.cavities(precision, shift)
+        if cavities is None:
+            return False
+        cavity_precision, _cavity_shift = cavities
+        alone = ~self.clustered
+        if not np.all(np.isfinite(cavity_precision[alone])) or np.any((cavity_precision[alone] < 0.0) & ~(1.0 + self.largest[alone] * cavity_precision[alone] > 0.0)):
+            return False
+        for index, groups in enumerate(self.clusters):
+            cavity = self.cluster_cavity(index, precision, shift)
+            if cavity is None:
+                return False
+            with np.errstate(divide="ignore"):
+                bound = np.diag(1.0 / self.largest[groups])
+            if not np.linalg.eigvalsh(cavity[0] + bound)[0] > 0.0:
+                return False
+        return True
 
     def cavities(self, precision: F64Array, shift: F64Array) -> tuple[F64Array, F64Array] | None:
         """Every group's cavity (unscaled precision, shift) at these sites, from a fresh build."""
