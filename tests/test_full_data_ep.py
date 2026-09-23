@@ -142,3 +142,24 @@ def test_prediction_error_bound_holds_for_every_row() -> None:
     rows = generator.standard_normal((25, 12))
     variance = np.einsum("ij,jk,ik->i", rows, np.linalg.inv(precision), rows)
     assert np.all(np.abs(rows @ error) <= prediction_error_bound(norm, variance) * (1.0 + 1e-12))
+
+
+def test_device_eigensolver_bytes_cover_what_the_eigensolver_allocates() -> None:
+    """On a CUDA device the window's measured eigensolver bytes are at least what CuPy's eigvalsh allocates (its copy of
+    the matrix and cuSOLVER's workspace), so the budget-cut windows fit (the A40 run that ran out of memory at 11.5 GB
+    counted one |W|^2 array for it)."""
+    import pytest
+
+    cupy = pytest.importorskip("cupy")
+    if cupy.cuda.runtime.getDeviceCount() == 0:
+        pytest.skip("no CUDA device")
+    from sv_pgs.marginal_variances import eigensolver_bytes
+
+    size = 2048
+    pool = cupy.get_default_memory_pool()
+    matrix = cupy.asarray(np.eye(size))
+    pool.free_all_blocks()
+    before = pool.total_bytes()
+    cupy.linalg.eigvalsh(matrix)
+    peak = pool.total_bytes() - before
+    assert eigensolver_bytes(size, cupy) >= peak
