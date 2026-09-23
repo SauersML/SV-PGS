@@ -55,7 +55,7 @@ from sv_pgs.dual_solve import DualGaussian, DualModels, _host
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.krylov_recycle import local_response
-from sv_pgs.tie_members import TieGroups, _group_sum, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
+from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
 from sv_pgs.tie_map import _compact_identity_tie_map
 from sv_pgs.marginal_variances import (
     BlockCertificate,
@@ -1614,13 +1614,16 @@ def scoring_models(
 
             weights = np.ones(len(parts)) / len(parts) if fit.component_weights is None else fit.component_weights[:, model]
             shares = _draw_shares(weights, draw_count)
-            draws = np.concatenate([
-                product_draws(
-                    prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
-                    np.random.default_rng([seed, model, index]), share, fit.working_bytes,
-                )
-                for index, ((shift, omega), share) in enumerate(zip(parts, shares)) if share
-            ], axis=1)
+            # One p x K array, each component's draws written into its own columns (no per-component copies).
+            draws = np.empty((ties.member_count, draw_count))
+            column = 0
+            for index, ((shift, omega), share) in enumerate(zip(parts, shares)):
+                if share:
+                    draws[:, column:column + share] = product_draws(
+                        prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
+                        np.random.default_rng([seed, model, index]), share, fit.working_bytes,
+                    )
+                    column += share
         else:
             draws = member_draws(
                 ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
@@ -1628,7 +1631,12 @@ def scoring_models(
         # Each draw's move of the reduced columns' effects (the members' signed sums), on which the covariate
         # coefficients' conditional means depend through the loading.
         if fit.inference == "mean_field":
-            group_deviations = _group_sum(ties, ties.sign[:, None] * (draws - mean[:, model, None]))
+            # Summed over row chunks of the fit's working budget, so no p x K temporary is formed.
+            group_deviations = np.zeros((ties.group_count, draw_count))
+            rows = max(1, int(fit.working_bytes) // (8 * draw_count)) if fit.working_bytes > 0 else ties.member_count
+            for first in range(0, ties.member_count, rows):
+                chunk = slice(first, min(first + rows, ties.member_count))
+                np.add.at(group_deviations, ties.group[chunk], ties.sign[chunk, None] * (draws[chunk] - mean[chunk, model, None]))
         else:
             group_deviations = group_draws[:, model, :] - group_mean[:, model, None]
         models.append(ScoringModel.from_reduced_fit(

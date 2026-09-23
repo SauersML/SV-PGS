@@ -202,9 +202,18 @@ class ScoringModel:
         if draws_reduced.ndim != 2 or draws_reduced.shape[0] != beta.shape[0]:
             raise ValueError("posterior_draws_reduced must be [reduced coefficients, draws].")
         coefficients = np.asarray(tie_map.expand_coefficients(beta, group_weights), dtype=np.float64)
-        draws = np.empty((coefficients.shape[0], draws_reduced.shape[1]), dtype=np.float64)
-        for draw_index in range(draws_reduced.shape[1]):
-            draws[:, draw_index] = tie_map.expand_coefficients(draws_reduced[:, draw_index], group_weights)
+        identity = (
+            not tie_map.reduced_to_group and tie_map.original_to_reduced.shape[0] == draws_reduced.shape[0]
+            and np.array_equal(tie_map.kept_indices, np.arange(draws_reduced.shape[0]))
+        )
+        if identity:
+            # Every member is its own effect: the draws are the members' already, held without a copy (a p x K copy
+            # is the scoring route's largest array at biobank scale).
+            draws = draws_reduced
+        else:
+            draws = np.empty((coefficients.shape[0], draws_reduced.shape[1]), dtype=np.float64)
+            for draw_index in range(draws_reduced.shape[1]):
+                draws[:, draw_index] = tie_map.expand_coefficients(draws_reduced[:, draw_index], group_weights)
         return cls(
             store_rows=np.asarray(active_rows, dtype=np.int64),
             signed_means=np.asarray(signed_means, dtype=np.float64),
