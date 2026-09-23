@@ -88,6 +88,7 @@ from sv_pgs.marginal_variances import (
     certificate_tolerance,
     information_products,
     information_solve_tolerance,
+    ld_extent,
     marginal_variances,
     refined_grams,
     variance_jvp,
@@ -148,9 +149,10 @@ def block_grams(
     (Building float64 copies per model and refresh held about 12 GB of each kind per model at p = 466k and ran
     e2e-scale's chr22 fit out of host memory at 45 GB.)
 
-    With ``working_bytes`` the blocks are cut into parts whose leave-block-out windows fit it (``refined_grams`` at
-    ``window_width`` on ``array_module``): a window of three whole Stage 0 blocks is sized only by Stage 0's budget
-    (256 GB of float64 working set at bench-sim's 28k-column blocks), not by the EP fit's. The dual solver and the
+    With ``working_bytes`` the blocks are cut into parts no wider than the data's LD reaches (``ld_extent``) and
+    whose leave-block-out windows fit the budget (``window_width`` on ``array_module``): a window of three whole Stage 0
+    blocks is sized only by Stage 0's budget (256 GB of float64 working set at bench-sim's 28k-column blocks), not by
+    the EP fit's, and its cost, |W|^3 per window, is set by its width. The dual solver and the
     marginal variances must be given the same partition."""
     ld = statistics.ld
     blocks = tuple(np.asarray(ld.block(block_index).reduced_columns, dtype=np.int64) for block_index in range(ld.block_count))
@@ -161,7 +163,11 @@ def block_grams(
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
         next_cross.append(np.zeros(shape, dtype=np.float32) if cross is None else cross)
     grams = BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
-    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes, array_module, max(block.shape[0] for block in blocks)))
+    if working_bytes is None:
+        return grams
+    widest = max(block.shape[0] for block in blocks)
+    extent = ld_extent(grams, statistics.sample_count, working_bytes, array_module)
+    return refined_grams(grams, min(window_width(working_bytes, array_module, widest), extent))
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:

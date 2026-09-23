@@ -397,36 +397,83 @@ class _BlockTerms:
     covariance: NDArray[np.float64]
 
 
+def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any) -> tuple[float, Any]:
+    """omega_F (``far_field_trace``'s root, the same Newton from omega_S) with B's spectral sums from the Cholesky
+    factor L of M = I + w B: tr M^-1 = ||L^-1||_F^2 and ||M^-1||_F^2 = ||L^-T L^-1||_F^2, three |W|^3 / 3 products per
+    step. Returns omega_F and the factor of I + omega_F B, which the caller's solves reuse."""
+    xp = array_module
+    size = int(whitened.shape[0])
+    diagonal = xp.arange(size)
+    weight = solve.bulk_square_trace / solve.sample_count
+    current = solve.bulk_trace
+    identity = xp.eye(size)
+
+    def factor(value: float) -> Any:
+        matrix = whitened * value
+        matrix[diagonal, diagonal] += 1.0
+        return xp.linalg.cholesky(matrix)
+
+    lower = factor(current)
+    while True:
+        inverse = _triangular_inverse(xp, lower, identity)
+        inverse_trace = float(_to_host(xp.sum(inverse * inverse)))
+        full = inverse.T @ inverse
+        del inverse
+        inverse_square = float(_to_host(xp.sum(full * full)))
+        del full
+        spectral = (size - inverse_trace) / current
+        spectral_square = (size - 2.0 * inverse_trace + inverse_square) / (current * current)
+        value = current - solve.bulk_trace - weight * spectral
+        slope = 1.0 + weight * spectral_square
+        candidate = current - value / slope
+        if not candidate > current:
+            return current, lower
+        current = candidate
+        lower = factor(current)
+
+
+def _triangular_inverse(xp: Any, lower: Any, identity: Any) -> Any:
+    """L^-1 for a lower-triangular L, on numpy or cupy."""
+    if xp is np:
+        return solve_triangular(lower, identity, lower=True)
+    from cupyx.scipy.linalg import solve_triangular as device_triangular
+
+    return device_triangular(lower, identity, lower=True)
+
+
 def _window_quadratic(
     gram: NDArray[np.float64], window_variance: NDArray[np.float64], own: slice, block: int, solve: BulkSolve, array_module: Any
 ) -> NDArray[np.float64]:
     """The window's bulk quadratic rows (own x window): (omega_F R - omega_F^2 R D^1/2 (I + omega_F B)^-1 D^1/2 R)[own].
 
-    B's spectrum is needed only for omega_F, and (I + omega_F B)^-1 only on the own block's columns: eigenvalues
-    (about 4/3 |W|^3), one Cholesky (|W|^3 / 3) and solves for |b| columns, not a full eigendecomposition (about
-    9 |W|^3; e2e-scale: 37 min per model at |W| up to 3 x 2,144 on host). The dense algebra runs on
-    ``array_module`` (numpy, or cupy on a device), in float64; omega_F's scalar root is found on host.
+    B enters only through omega_F and (I + omega_F B)^-1 on the own block's columns, so no eigendecomposition is formed
+    (about 9 |W|^3, and cuSOLVER's took 11 s per 15k-column window on an A100, 18 min per bench-sim refresh): the
+    window's positive semidefiniteness is one Cholesky of B plus its rounding allowance, and omega_F is Newton on the
+    same equation as ``far_field_trace`` with its two spectral sums read from Cholesky factors,
+    sum lambda / (1 + w lambda) = (|W| - tr M^-1) / w and sum (lambda / (1 + w lambda))^2 = ||I - M^-1||_F^2 / w^2 for
+    M = I + w B (``_far_field_factored``); the last factor serves the solves. The dense algebra runs on
+    ``array_module`` (numpy, or cupy on a device), in float64.
     """
     xp = array_module
     device_gram, whitened, root = _whitened_window(gram, window_variance, own, block, xp)
-    raw_eigenvalues = _to_host(xp.linalg.eigvalsh(whitened))
+    size = whitened.shape[0]
+    diagonal = xp.arange(size)
     # A window Gram must be positive semidefinite, and then every quadratic here is >= 0: omega R (I + omega D R)^-1
     # = omega R^1/2 (I + omega R^1/2 D R^1/2)^-1 R^1/2. The stored pieces' rounding and the completion keep B above
-    # -u32 |B|_F (``_whitened_window``), and the float64 eigensolver adds |W| u64 |B|_F. Anything beyond that means
-    # the within- and cross-block Grams are not the Gram of one design (different rows, units, projection or block
-    # order): the map would be wrong, so refuse.
-    rounding = _storage_allowance(whitened, xp) + whitened.shape[0] * np.finfo(np.float64).eps / 2 * float(_to_host(xp.linalg.norm(whitened)))
-    if raw_eigenvalues.shape[0] and float(raw_eigenvalues[0]) < -rounding:
+    # -u32 |B|_F (``_whitened_window``), and a float64 factorization adds |W| u64 |B|_F. B plus that allowance has a
+    # Cholesky factor exactly when B is inside it; anything beyond means the within- and cross-block Grams are not the
+    # Gram of one design (different rows, units, projection or block order): the map would be wrong, so refuse.
+    rounding = _storage_allowance(whitened, xp) + size * np.finfo(np.float64).eps / 2 * float(_to_host(xp.linalg.norm(whitened)))
+    whitened[diagonal, diagonal] += rounding
+    check = _positive_cholesky(whitened, xp)
+    whitened[diagonal, diagonal] -= rounding
+    if size and check is None:
         raise ValueError(
-            f"block {block}: a window Gram is not positive semidefinite (smallest whitened eigenvalue "
-            f"{float(raw_eigenvalues[0]):.3e}, rounding allows {-rounding:.3e}): the within- and cross-block Grams do "
-            f"not come from one design; {_inconsistency(whitened, own, xp)}"
+            f"block {block}: a window Gram is not positive semidefinite within its rounding allowance {rounding:.3e}: the "
+            f"within- and cross-block Grams do not come from one design; {_inconsistency(whitened, own, xp)}"
         )
-    eigenvalues = np.maximum(raw_eigenvalues, 0.0)
-    far_trace = far_field_trace(solve.bulk_trace, solve.bulk_square_trace, solve.sample_count, eigenvalues)
-    whitened *= far_trace  # in place: I + omega_F B, with no second |W| x |W| array
-    whitened[xp.arange(whitened.shape[0]), xp.arange(whitened.shape[0])] += 1.0
-    lower = xp.linalg.cholesky(whitened)
+    del check
+    far_trace, lower = _far_field_factored(whitened, solve, xp)
     del whitened
     right = root[:, None] * device_gram[:, own]  # D^1/2 R[:, own]
     solved = _cholesky_solve(xp, lower, right)  # (I + omega_F B)^-1 D^1/2 R[:, own]
@@ -435,60 +482,22 @@ def _window_quadratic(
     return _to_host(quadratic.T)
 
 
-CUPY_ALLOCATION_UNIT = 512
-"""Bytes of CuPy's memory-pool allocation unit: every device allocation is rounded up to a multiple of it (CuPy
-MemoryPool, ``cupy/cuda/memory.pyx``)."""
-
-
-def eigensolver_bytes(size: int, array_module: Any = np) -> int:
-    """What the window's eigenvalue solve allocates beyond the whitened window, measured: on a device, CuPy's copy of
-    the matrix plus cuSOLVER's own workspace for it (``xsyevd_bufferSize`` at this size, eigenvalues only: 11.5 GB in bench-sim's first budget-cut window on an
-    A40, more than the matrix itself, which the fixed count of |W|^2 arrays had missed); on the host, LAPACK's workspace is O(|W|) and the
-    copy is the only |W|^2 term."""
-    itemsize = np.dtype(np.float64).itemsize
-    matrix = size * size * itemsize
-    if array_module is np or size == 0:
-        return matrix
-    from cupy._core import _dtype  # noqa: PLC0415 - only on a device
-    from cupy_backends.cuda.libs import cublas, cusolver  # noqa: PLC0415
-
-    handle = array_module.cuda.device.Device().cusolver_handle
-    params = cusolver.createParams()
-    # The size query reads the shape and types only; one-element buffers stand in for the matrix and the eigenvalues.
-    stand_in = array_module.empty(1, dtype=array_module.float64)
-    kind = _dtype.to_cuda_dtype(np.dtype(np.float64))
-    try:
-        device_bytes, _host_bytes = cusolver.xsyevd_bufferSize(
-            handle, params, cusolver.CUSOLVER_EIG_MODE_NOVECTOR, cublas.CUBLAS_FILL_MODE_LOWER, size, kind, stand_in.data.ptr, size, kind,
-            stand_in.data.ptr, kind,
-        )
-    except cusolver.CUSOLVERError:
-        # The device's eigensolver refuses a matrix this large: no window of this size can run there.
-        return np.iinfo(np.int64).max
-    finally:
-        cusolver.destroyParams(params)
-    # CuPy's pool hands out whole allocation units, each allocation rounded up: the matrix's copy, the workspace, the
-    # eigenvalues and cuSOLVER's status word.
-    unit = CUPY_ALLOCATION_UNIT
-    pieces = (matrix, int(device_bytes), size * itemsize, np.dtype(np.int32).itemsize)
-    return sum(-(-piece // unit) * unit for piece in pieces)
-
-
 def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
     """The window algebra's peak float64 working set over the blocks, for the fit's working_bytes budget.
 
-    Three |W| x |W| arrays are live in a window (the assembled Gram, its whitened form, then the Cholesky factor)
-    plus four |W| x |b| ones (the right-hand sides, their solve, the quadratic rows and the covariance rows), with |W|
-    the window's and |b| the block's size, and during the eigenvalue solve its own allocations (``eigensolver_bytes``,
-    measured on ``array_module``'s device). The shared Grams themselves stay where the caller keeps them (Stage 0's
-    memory map).
+    Six |W| x |W| arrays are live at once in a window (the assembled Gram, its whitened form, the identity, the
+    Cholesky factor of I + w B, its inverse and the inverse's Gram, in ``_far_field_factored``; while a factor is
+    formed, the scaled matrix takes the inverse's place) plus four |W| x |b| ones (the right-hand sides, their solve,
+    the quadratic rows and the covariance rows), with |W| the window's and |b| the block's size. The factorizations'
+    own workspaces are O(|W|) blocks. The shared Grams themselves stay where the caller keeps them (Stage 0's memory
+    map). ``array_module`` is accepted for the callers that pass their device; the count does not depend on it.
     """
     itemsize = np.dtype(np.float64).itemsize
     peak = 0
     for block in range(len(grams.blocks)):
         window = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
         own = grams.blocks[block].shape[0]
-        peak = max(peak, (3 * window * window + 4 * window * own) * itemsize + eigensolver_bytes(window, array_module))
+        peak = max(peak, (6 * window * window + 4 * window * own) * itemsize)
     return peak
 
 
@@ -517,6 +526,45 @@ def window_width(working_bytes: int, array_module: Any = np, limit: int | None =
         else:
             high = middle
     return low if limit is None else min(low, int(limit))
+
+
+def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
+    """The lag (in variants, along the block order) beyond which the data show no LD: the smallest w whose tail
+    excess, the summed r^2 over every within-block pair more than w apart less its null expectation 1/n per pair, is
+    at most that sum's own null standard deviation sqrt(2 N(w)) / n (N(w) the pairs beyond w; r^2 of an unlinked pair
+    has mean 1/n and variance 2/n^2 to leading order). Beyond it the Grams hold nothing a window could use, so blocks
+    need be no wider: the leave-block-out windows (the block and its two neighbours) then reach at least w on each
+    side, and whatever the data do hold beyond is far field, which ``block_trace_certificate`` tests.
+
+    The lag profile is summed from Stage 0's own within-block Grams, one block at a time on ``array_module``, in row
+    chunks whose float64 arrays (the rows, their squares, the lags and the mask) fit ``working_bytes``. Lags reach
+    at most the widest block, which bounds the extent."""
+    xp = array_module
+    itemsize = np.dtype(np.float64).itemsize
+    widest = max(int(members.shape[0]) for members in grams.blocks)
+    excess = xp.zeros(widest)
+    pairs = xp.zeros(widest)
+    for block, members in enumerate(grams.blocks):
+        width = int(members.shape[0])
+        if width < 2:
+            continue
+        stored = np.asarray(grams.within[block])
+        diagonal = xp.asarray(np.diagonal(stored), dtype=xp.float64)
+        columns = xp.arange(width)
+        chunk = max(1, int(working_bytes) // (4 * itemsize * width))
+        for first in range(0, width, chunk):
+            last = min(first + chunk, width)
+            rows = xp.arange(first, last)
+            squared = xp.asarray(stored[first:last], dtype=xp.float64) ** 2 / (diagonal[first:last, None] * diagonal[None, :])
+            lags = xp.abs(columns[None, :] - rows[:, None])
+            above = lags > 0
+            excess += xp.bincount(lags[above], weights=squared[above] - 1.0 / sample_count, minlength=widest)[:widest]
+            pairs += xp.bincount(lags[above], minlength=widest)[:widest].astype(xp.float64)
+            del squared, lags, above
+    tail_excess = _to_host(xp.cumsum(excess[::-1])[::-1])
+    tail_pairs = _to_host(xp.cumsum(pairs[::-1])[::-1])
+    resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) / sample_count
+    return max(1, int(np.argmax(resolved))) if resolved.any() else widest
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:

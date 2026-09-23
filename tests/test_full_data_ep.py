@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from sv_pgs.marginal_variances import BlockGrams, refined_grams, window_width, window_working_bytes
 
@@ -144,47 +145,45 @@ def test_prediction_error_bound_holds_for_every_row() -> None:
     assert np.all(np.abs(rows @ error) <= prediction_error_bound(norm, variance) * (1.0 + 1e-12))
 
 
-def test_device_eigensolver_bytes_cover_what_the_eigensolver_allocates() -> None:
-    """On a CUDA device the window's measured eigensolver bytes are at least what CuPy's eigvalsh allocates (its copy of
-    the matrix and cuSOLVER's workspace), so the budget-cut windows fit (the A40 run that ran out of memory at 11.5 GB
-    counted one |W|^2 array for it)."""
-    import pytest
 
-    cupy = pytest.importorskip("cupy")
-    if cupy.cuda.runtime.getDeviceCount() == 0:
-        pytest.skip("no CUDA device")
-    from sv_pgs.marginal_variances import eigensolver_bytes
+def test_ld_extent_is_the_lag_where_the_excess_ld_is_unresolved() -> None:
+    """A design whose LD reaches exactly three variants (a moving sum of four independent columns) has extent at most
+    a few lags beyond three and at least three; independent columns have extent 1 (nothing to reach)."""
+    from sv_pgs.marginal_variances import ld_extent
 
-    size = 2048
-    pool = cupy.get_default_memory_pool()
-    matrix = cupy.asarray(np.eye(size))
-    pool.free_all_blocks()
-    before = pool.total_bytes()
-    cupy.linalg.eigvalsh(matrix)
-    peak = pool.total_bytes() - before
-    assert eigensolver_bytes(size, cupy) >= peak
+    generator = np.random.default_rng(7)
+    samples, count = 4000, 300
+    noise = generator.standard_normal((samples, count + 3))
+    moving = sum(noise[:, shift:shift + count] for shift in range(4))
+    for design, low, high in ((moving, 3, 8), (generator.standard_normal((samples, count)), 1, 2)):
+        gram = design.T @ design
+        blocks = (np.arange(count // 2), np.arange(count // 2, count))
+        grams = BlockGrams(
+            blocks=blocks, within=tuple(gram[np.ix_(block, block)].astype(np.float32) for block in blocks),
+            next_cross=(gram[np.ix_(blocks[0], blocks[1])].astype(np.float32),),
+        )
+        extent = ld_extent(grams, samples, 1 << 24)
+        assert low <= extent <= high, extent
+
+
+def test_factored_far_field_trace_matches_the_spectral_one() -> None:
+    """omega_F from Cholesky factors (``_far_field_factored``) equals ``far_field_trace`` from B's eigenvalues, and
+    the factor returned is of I + omega_F B."""
+    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored, far_field_trace
+
+    generator = np.random.default_rng(9)
+    design = generator.standard_normal((50, 30))
+    whitened = design.T @ design * 0.01
+    solve = BulkSolve(
+        site_precision=np.ones(30), resolved=np.zeros(0, np.int64), resolved_core=np.zeros((0, 0)),
+        resolved_cross=WindowCross(positions=(), values=()), bulk_trace=0.7, bulk_square_trace=0.5, kernel_square_trace=0.5, sample_count=400,
+    )
+    omega, lower = _far_field_factored(whitened, solve, np)
+    expected = far_field_trace(0.7, 0.5, 400, np.linalg.eigvalsh(whitened))
+    assert omega == pytest.approx(expected, rel=1e-12)
+    np.testing.assert_allclose(lower @ lower.T, np.eye(30) + omega * whitened, rtol=1e-12, atol=1e-12)
 
 
 def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
-    """With more memory than any window needs, the width search returns the widest block there is to cut (bench-sim's
-    41,984-column Stage 0 blocks on an H100 asked cuSOLVER about a window it refuses) and never queries past it; on a
-    device, a size the eigensolver refuses reads as not fitting rather than raising."""
-    from sv_pgs.marginal_variances import window_width
-
     assert window_width(1 << 62, np, 41_984) == 41_984
     assert window_width(1 << 62, np, 1) == 1
-    try:
-        import cupy
-    except ImportError:
-        return
-    if cupy.cuda.runtime.getDeviceCount() == 0:
-        return
-    from sv_pgs.marginal_variances import eigensolver_bytes
-
-    # The device's eigensolver takes windows up to its own size limit (measured on the A100s' cuSOLVER: a 32,766-column
-    # window accepted, a 32,769-column one refused, so width 10,922), and the search returns the widest width it accepts.
-    width = window_width(1 << 62, cupy, 41_984)
-    refused = np.iinfo(np.int64).max
-    assert 1 <= width <= 41_984
-    assert eigensolver_bytes(3 * width, cupy) < refused
-    assert width == 41_984 or eigensolver_bytes(3 * (width + 1), cupy) == refused
