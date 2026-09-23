@@ -1766,11 +1766,9 @@ def fit_small_n(
     if inference == "ep":
         solves = [_solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, None)]
     else:
-        # Coordinate ascent reaches a different fixed point from each data start, and neither ELBO says which predicts
-        # better (the bound's slack differs between basins): choosing by it moved 57 of 494 bench-real genes, 28 up by
-        # 0.51 in total and 29 down by 0.90 [real, loso/AFR snv_sv]. The fit is the equal mixture of the fixed points
-        # from the cross-validated lasso in each of the model's scales (``lasso_starts``); on those genes the mixture's
-        # mean r2 was 0.1328 against 0.1287 and 0.1218 for either alone (all 494: 0.0690 against 0.0685 and 0.0677).
+        # Coordinate ascent reaches a different fixed point from each data start: the cross-validated lasso in each of
+        # the model's scales (``lasso_starts``), each with its own empirical Bayes. They join the mode mixture below as
+        # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
         starts = lasso_starts(statistics, seed, statistics.scales / units)
         solves = [
@@ -1781,10 +1779,11 @@ def fit_small_n(
     if inference == "mean_field":
         components = _mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed)
     generator = np.random.default_rng(seed)
-    shares = [draw_count // len(components) + (1 if index < draw_count % len(components) else 0) for index in range(len(components))]
+    weights = _mixture_weights(components)
+    shares = _draw_shares(weights, draw_count)
     draws = np.concatenate([component.draws(generator, share) for component, share in zip(components, shares) if share], axis=1)
-    mean = np.mean([component.oracle.mean for component in components], axis=0)
-    noise = float(np.mean([float(component.oracle.noise) for component in components]))
+    mean = np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
+    noise = float(np.dot(weights, [float(component.oracle.noise) for component in components]))
     alpha = statistics.covariate_pseudo_inverse @ (statistics.covariates.T @ statistics.target - statistics.loading @ mean)
     # Every member is its own effect (review-mathbugs T1): beta_j = s_j gamma_j on its own standardized column, with
     # no split of a group's effect; the identity map carries each member's own mean and draws.
@@ -1794,7 +1793,7 @@ def fit_small_n(
         signed_means=statistics.means,
         signed_scales=statistics.scales,
         tie_map=_compact_identity_tie_map(member_count),
-        member_prior_variances=np.mean([prior_second_moment(prior, component.hyperparameters) for component in components], axis=0),
+        member_prior_variances=np.einsum("m,mj->j", weights, np.array([prior_second_moment(prior, component.hyperparameters) for component in components])),
         beta_reduced=statistics.signs * mean,
         posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
@@ -1872,38 +1871,69 @@ def fit_small_n(
     )
 
 
+def _mixture_weights(components: Sequence["_SmallNSolve"]) -> F64Array:
+    """Each fixed point's weight in the mixture q = sum_m w_m q_m: w_m proportional to exp(ELBO_m), the optimal weights of
+    a mixture of well-separated components (their overlap negligible, the mixture's ELBO is sum_m w_m (ELBO_m - log w_m)).
+    It is the exact posterior's weighting of its modes too: between two near-duplicate columns the modes' masses are
+    exp(z_1^2 / 2) : exp(z_2^2 / 2) to leading order, their ELBOs' difference. An EP fit has one component."""
+    elbos = np.array([float(component.oracle.profile.get("elbo", 0.0)) for component in components])
+    weights = np.exp(elbos - np.max(elbos))
+    return weights / weights.sum()
+
+
+def _draw_shares(weights: F64Array, draw_count: int) -> list[int]:
+    """``draw_count`` draws allotted to the components in proportion to their weights (largest remainders)."""
+    exact = weights * draw_count
+    shares = np.floor(exact).astype(np.int64)
+    for index in np.argsort(-(exact - shares), kind="stable")[: draw_count - int(shares.sum())]:
+        shares[index] += 1
+    return [int(share) for share in shares]
+
+
 def _mode_mixture(
     statistics: DenseStatistics, prior: ScaleMixturePrior, solves: list, starts: Sequence[F64Array], start_noise: float, draw_count: int,
     working_bytes: int, seed: int,
 ) -> list:
-    """The fixed points of coordinate ascent at each start's fitted hyperparameters, from zero in successive random
-    member orders, until their average mean has settled.
+    """The fixed points of coordinate ascent at each start's fitted hyperparameters, in successive random member orders,
+    until the mixture's mean has settled.
 
     Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
     each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
-    it visits first. The posterior mean averages the modes; the mixture of fixed points from random orders is a Monte
-    Carlo estimate of that average. Each further component starts from zero: a data start already holds one mode's
-    choice between the columns, and every order carried from it ends there (from the lasso start the order components
-    reproduced the first fixed point in most of 60 simulations on real genotypes). The mixture stops when one more component moves the fitted genetic values
-    Xp mean-bar by at most the draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K (a component moves the average by about
-    1/k of its own distance, so this ends)."""
+    it visits first. The posterior mean averages the modes; fixed points from random orders are its candidate modes,
+    weighted by their evidence (``_mixture_weights``), so a poor fixed point carries no weight and modes that differ
+    only in which near-duplicate column holds an effect share it. Components alternate between the start the
+    hyperparameters were fitted from and zero: a data start holds one mode's choice, which most orders carried from it
+    keep, and zero leaves the choice to the order (in 60 simulations on real genotypes neither alone hedged: from the
+    lasso most components repeated the first fixed point, from zero many were poor modes). It stops when one more
+    component moves the mixture's fitted genetic values Xp mean-bar by at most the draws' resolution,
+    ||Xp d||^2 / sigma^2 <= 1/K; a component moves the mean by at most its weight times its distance, and the weights of
+    further components of one mode shrink as they share it, so this ends."""
     from sv_pgs.mean_field import MeanFieldFixedPoints
 
     components = list(solves)
     generator = np.random.default_rng([seed, 1])
     member_count = int(np.asarray(starts[0]).shape[0])
-    average = np.mean([component.oracle.mean for component in components], axis=0)
+
+    def mixture_mean() -> F64Array:
+        weights = _mixture_weights(components)
+        return np.einsum("m,mj->j", weights, np.array([component.oracle.mean for component in components]))
+
+    average = mixture_mean()
     index = 0
     while True:
-        solve = solves[index % len(solves)]
+        solve, start_mean = solves[index % len(solves)], starts[index % len(starts)]
+        from_start = (index // len(solves)) % 2 == 0
         index += 1
-        oracle = MeanFieldFixedPoints(statistics, prior, start_noise, draw_count, working_bytes, order=generator.permutation(member_count))
+        oracle = MeanFieldFixedPoints(
+            statistics, prior, start_noise, draw_count, working_bytes, start_means=(start_mean,) if from_start else (),
+            order=generator.permutation(member_count),
+        )
         (point,) = oracle([solve.hyperparameters])
         if point is None:
             continue
         components.append(_SmallNSolve(oracle=oracle, outer=None, hyperparameters=solve.hyperparameters, inference="mean_field", draw_count=draw_count))
-        updated = np.mean([component.oracle.mean for component in components], axis=0)
-        noise = float(np.mean([float(component.oracle.noise) for component in components]))
+        updated = mixture_mean()
+        noise = float(np.dot(_mixture_weights(components), [float(component.oracle.noise) for component in components]))
         move = statistics.design.image(updated - average)
         average = updated
         if float(move @ move) / noise <= 1.0 / draw_count:
