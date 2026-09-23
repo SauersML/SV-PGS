@@ -36,6 +36,7 @@ digit split, exact zeros kept); relative_error 0 means the exact products.
 
 from __future__ import annotations
 
+import time
 import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Protocol
@@ -44,6 +45,7 @@ import numpy as np
 
 from sv_pgs.marginal_variances import BlockGrams, BulkSolve, KernelFactor, WindowCross, exact_block_information
 from sv_pgs.memory_broker import HOST, current_broker
+from sv_pgs.progress import log
 
 _DUAL_LIVE_COLUMN_ARRAYS = (
     "right-hand sides", "start", "previous duals", "solution", "residual", "direction blocks", "stacked directions", "image",
@@ -1570,7 +1572,9 @@ class DualGaussian:
         final = np.zeros(columns, dtype=bool)
         previous, open_mask = None, None
         while True:
+            started = time.perf_counter()
             result = certified_block_cg(source, models, rhs, start, column_models, bound, self.count, deflation=spike_free, label="posterior")
+            log(f"posterior solve: {columns} columns, {result.iterations} CG iterations, {result.restarts} restarts, {time.perf_counter() - started:.1f} s")
             if block is None:
                 duals, certificate, resolved_values = result.solution, result.residual_norm, None
                 exact = certificate
