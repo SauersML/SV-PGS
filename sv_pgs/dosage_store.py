@@ -1074,9 +1074,10 @@ class VariantTable:
         return int(self.position.shape[0])
 
     def variant_ids(self, rows: NDArray) -> list[str]:
-        buffer = self.id_bytes.tobytes()
+        """The IDs of ``rows``: each row's bytes are a slice (a view) of ``id_bytes``, so asking for a few IDs copies
+        those IDs' bytes and never the whole buffer (a genome's IDs are gigabytes)."""
         return [
-            buffer[int(self.id_offsets[row]) : int(self.id_offsets[row + 1])].decode()
+            self.id_bytes[int(self.id_offsets[row]) : int(self.id_offsets[row + 1])].tobytes().decode()
             for row in np.asarray(rows, dtype=np.int64)
         ]
 

@@ -1,3 +1,4 @@
+import dataclasses
 from fractions import Fraction
 import json
 import os
@@ -193,6 +194,27 @@ def test_store_round_trip_matches_quantized_float_dosage(two_half_store: tuple[P
         assert np.array_equal(table.sum_code, expected_codes.astype(np.uint64).sum(axis=1))
     with DosageStore.open(root, half_indices=[1]) as half_store:
         assert np.array_equal(half_store.variant_table.sum_code, expected_codes[:, 37:].astype(np.uint64).sum(axis=1))
+
+
+class _CountingBytes(np.ndarray):
+    """An ID byte buffer that records the size of every ``tobytes`` copy made from it or its views."""
+
+    copied: list[int] = []
+
+    def tobytes(self, order: str = "C") -> bytes:  # type: ignore[override]
+        _CountingBytes.copied.append(int(self.size))
+        return np.asarray(self).tobytes(order)
+
+
+def test_selecting_a_few_ids_copies_only_their_bytes(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
+    root, _milli = two_half_store
+    with DosageStore.open(root) as store:
+        table = store.variant_table
+        counting = np.asarray(table.id_bytes).view(_CountingBytes)
+        _CountingBytes.copied = []
+        ids = dataclasses.replace(table, id_bytes=counting).variant_ids([0, 449])
+    assert ids == ["chr21-100-allele0-1", "chr22-15000-allele0-1"]
+    assert _CountingBytes.copied == [len(ids[0]), len(ids[1])]
 
 
 def test_raw_single_half_ranges_inside_a_shard_are_zero_copy_views(tmp_path: Path) -> None:
