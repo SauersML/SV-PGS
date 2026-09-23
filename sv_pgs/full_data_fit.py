@@ -945,7 +945,7 @@ class _FullDataFixedPoints:
             return None
         if not np.all(variance > 0.0):
             return None
-        tilted_mean, tilted_variance, third, fourth = (np.empty_like(mean) for _ in range(4))
+        tilted_mean, tilted_variance, third, fourth = np.empty_like(mean), np.empty_like(mean), np.empty_like(mean), np.empty_like(mean)
         for model, model_hyperparameters in enumerate(hyperparameters):
             cavity = Cavity(precision=cavity_precision[:, model], shift=marginal_shift[:, model] - site_shift[:, model])
             moments = tilted_moments(self.prior, model_hyperparameters, cavity, self.working_bytes)
@@ -1007,8 +1007,10 @@ class _FullDataFixedPoints:
     ) -> tuple[F64Array, F64Array, int]:
         """The inner problem, min Phi over the sites at fixed marginals, by preconditioned nonlinear conjugate
         gradients (Polak-Ribiere+, the site blocks as the preconditioner) with ``_line_search``, from the current
-        sites, until the preconditioned decrement 1/2 g'M^-1 g is at most ``tolerance``. Returns the sites and the
-        count of accepted steps."""
+        sites, until 1/2 g' Cov_r^-1 g is at most ``tolerance``: H >= Cov_r (Cov_q is positive semidefinite), so that
+        bounds Newton's decrement 1/2 g'H^-1 g, the gain still to go to second order, from above (``small_n._newton_step``'s
+        bound; the preconditioner's own decrement can understate it where LD couples the sites). Returns the sites and
+        the count of accepted steps."""
         point = self._loop_point(hyperparameters, self.site_precision, self.site_shift, marginal_precision, marginal_shift)
         if point is None:
             # q's own cavities at its own marginals are the sites' cavities, which the outer refresh found proper.
@@ -1018,7 +1020,7 @@ class _FullDataFixedPoints:
         direction = -preconditioned
         steps = 0
         while True:
-            decrement = 0.5 * float(gradient.ravel() @ preconditioned.ravel())
+            decrement = 0.5 * float(gradient.ravel() @ _block_solve(point, gradient, tilted_only=True).ravel())
             if not decrement > tolerance:
                 return point.site_precision, point.site_shift, steps
             accepted = self._line_search(hyperparameters, point, direction, marginal_precision, marginal_shift, tolerance)
@@ -1045,6 +1047,11 @@ class _FullDataFixedPoints:
         gaussian = self.gaussian
         model_count = gaussian.model_count
         budget = 0.5 / self.draw_count
+        # The inner problem's stop, on 1/2 g' Cov_r^-1 g, and the outer check, the undamped EP update's KL in q's full
+        # LD metric, are different norms of one residual; where an outer step starts already inside the inner stop but
+        # outside the check, the inner stop tightens by the measured ratio of the two (as the solves tighten by their
+        # measured shortfall), until the inner problem moves the sites again.
+        inner_tolerance = budget
         while True:
             variances, mean, group_variances, grams = self._refresh(hyperparameters)
             frozen = 1.0 / variances - self.site_precision
@@ -1090,14 +1097,19 @@ class _FullDataFixedPoints:
                 self.noise = noise
                 continue
             start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
-            precision, shift, steps = self._inner(hyperparameters, 1.0 / variances, mean / variances, budget)
-            log(f"ep double loop: inner problem {steps} steps")
-            if np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
-                # Phi stationary at q's own marginals to its rounding: EP's fixed point, though its KL check above did not
-                # pass within the budget (the marginal variances' approximation sets that floor).
-                raise NoFixedPoint(
-                    f"the double loop is stationary at KL {np.array2string(divergence, precision=3)}, above the 1/(2K) budget its check needs"
-                )
+            while True:
+                precision, shift, steps = self._inner(hyperparameters, 1.0 / variances, mean / variances, inner_tolerance)
+                log(f"ep double loop: inner problem {steps} steps at tolerance {inner_tolerance:.3e}")
+                if steps:
+                    break
+                tightened = inner_tolerance * budget / float(np.max(divergence))
+                if not tightened > _EPSILON * float(np.max(divergence)):
+                    # The inner stop at float64's floor and still no step: Phi is stationary at q's own marginals to its
+                    # rounding, yet the check above fails; the marginal variances' approximation sets that floor.
+                    raise NoFixedPoint(
+                        f"the double loop is stationary at KL {np.array2string(divergence, precision=3)}, above the 1/(2K) budget its check needs"
+                    )
+                inner_tolerance = tightened
             self.site_precision, self.site_shift = precision, shift
 
     def _frozen_passes(self, hyperparameters: Sequence[MixtureHyperparameters], frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
@@ -1165,13 +1177,15 @@ class _LoopPoint:
     gradient: F64Array
 
 
-def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
-    """The 2 x 2 blocks, per site, of Phi's Hessian's diagonal part: Cov_r of (beta, -beta^2 / 2) under each tilted law
-    plus q's own marginal part (``small_n._newton_step``'s preconditioner)."""
+def _site_blocks(point: _LoopPoint, tilted_only: bool = False) -> tuple[F64Array, F64Array, F64Array]:
+    """The 2 x 2 blocks, per site, of Phi's Hessian H = Cov_q + Cov_r: Cov_r of (beta, -beta^2 / 2) under each tilted
+    law alone (``tilted_only``), or plus q's own marginal part (``small_n._newton_step``'s preconditioner)."""
     mean, variance, third, fourth = point.tilted_mean, point.tilted_variance, point.third, point.fourth
     a_r = variance
     b_r = -0.5 * (third + 2.0 * mean * variance)
     c_r = 0.25 * (fourth + 2.0 * variance**2 + 4.0 * mean * third + 4.0 * mean**2 * variance)
+    if tilted_only:
+        return a_r, b_r, c_r
     return (
         a_r + point.variance,
         b_r - point.variance * point.mean,
@@ -1179,9 +1193,9 @@ def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     )
 
 
-def _block_solve(point: _LoopPoint, vector: F64Array) -> F64Array:
+def _block_solve(point: _LoopPoint, vector: F64Array, tilted_only: bool = False) -> F64Array:
     """The site blocks' inverse applied to a (nu, tau) vector (members x models each half)."""
-    a, b, c = _site_blocks(point)
+    a, b, c = _site_blocks(point, tilted_only)
     half = vector.shape[0] // 2
     first, second = vector[:half], vector[half:]
     determinant = a * c - b * b
