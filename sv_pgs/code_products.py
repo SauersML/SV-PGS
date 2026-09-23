@@ -360,6 +360,16 @@ class CodeBlockTile:
             raise ValueError("means and scales need one entry per variant")
         self._workspace_bytes = int(workspace_bytes)
 
+    def held_copy(self) -> CodeBlockTile:
+        """This tile over its own copy of the codes, valid after the read that yielded it moves on (a streamed read
+        reuses a tile's buffer for the block after next); the copy is variant-major only."""
+        tile = CodeBlockTile.__new__(CodeBlockTile)
+        tile._hold(
+            self._codes.copy(), self._variant_count, self._sample_count, self._means, self._scales, self._scale_spread,
+            self._array_module, self._workspace_bytes,
+        )
+        return tile
+
     @property
     def variant_count(self) -> int:
         return self._variant_count
