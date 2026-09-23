@@ -151,6 +151,8 @@ class AliasEP:
         self.sweep = SequentialSweep(self.rows, self.squares, self.score, laws, self.noise)
         self.states: dict[tuple, I64Array] = {}
         self.calls = 0
+        # Why cluster updates were refused, counted per sweep for the record.
+        self.refusals: dict[str, int] = {}
 
     def _indicator(self, cluster: I64Array) -> tuple[I64Array, F64Array]:
         members = np.concatenate([self.members_of[g] for g in cluster])
@@ -192,6 +194,7 @@ class AliasEP:
             return False, None, None, 0.0
         self.states[key] = moments.state.copy()
         mean, covariance = moments.cluster(0)
+        self.last_exact = bool(moments.exact[0])
         return True, mean.copy(), covariance.copy(), monte_carlo_floor(moments.mean_error, covariance, bool(moments.exact[0]))
 
     def member_tilted(self, cluster: I64Array, precision: F64Array, shift: F64Array, stamp: int):
@@ -213,6 +216,9 @@ class AliasEP:
         floor = monte_carlo_floor(np.sqrt(indicator.T @ moments.mean_error**2), covariance, bool(moments.exact[0]))
         return True, indicator.T @ member_mean, covariance, floor, members, (member_mean, np.diag(member_covariance))
 
+    def _refuse(self, reason: str) -> None:
+        self.refusals[reason] = self.refusals.get(reason, 0) + 1
+
     def _update_cluster(self, index: int, precision: F64Array, shift: F64Array, stamp: int) -> tuple[float | None, float]:
         """One cluster's damped site update at the sweep's current state (``SequentialSweep.step_cluster``); (residual or
         None where refused, Monte Carlo floor)."""
@@ -221,15 +227,22 @@ class AliasEP:
         try:
             cavity_precision, cavity_shift, mean, covariance = sweep.current_cluster_cavity(index, precision, shift)
         except np.linalg.LinAlgError:
-            return None, 0.0
+            return self._refuse("marginal"), 0.0
         with np.errstate(divide="ignore"):
             if not np.linalg.eigvalsh(cavity_precision + np.diag(1.0 / self.largest[cluster]))[0] > 0.0:
-                return None, 0.0
+                return self._refuse("cavity"), 0.0
         proper, tilted_mean, tilted_covariance, floor = self.cluster_tilted(cluster, cavity_precision, cavity_shift, stamp)
         # A covariance that is not positive definite to its rounding (nearly collinear sums, sampled) has no Gaussian
         # to match: the update is refused.
-        if not proper or not np.linalg.eigvalsh(tilted_covariance)[0] > 0.0:
-            return None, 0.0
+        if not proper:
+            return self._refuse("tilted improper"), 0.0
+        if not np.all(np.isfinite(tilted_covariance)) or not np.all(np.isfinite(tilted_mean)):
+            return self._refuse(f"tilted moments not finite {'enumerated' if self.last_exact else 'sampled'} m={cluster.shape[0]}"), 0.0
+        spectrum = np.linalg.eigvalsh(tilted_covariance)
+        if not spectrum[0] > 0.0:
+            ratio = spectrum[0] / spectrum[-1]
+            return self._refuse(f"tilted covariance {'enumerated' if self.last_exact else 'sampled'} m={cluster.shape[0]} "
+                                f"ratio~1e{int(np.floor(np.log10(abs(ratio)))) if ratio else 0}"), 0.0
         residual = _gaussian_kl(tilted_mean, tilted_covariance, mean, covariance)
         inverse = np.linalg.inv(tilted_covariance)
         target_precision, target_shift = inverse - cavity_precision, inverse @ tilted_mean - cavity_shift
@@ -241,7 +254,7 @@ class AliasEP:
                                   precision, shift):
                 return residual, floor
             fraction *= 0.5
-        return None, floor
+        return self._refuse("domain"), floor
 
     def _single_residuals(self, precision: F64Array, shift: F64Array) -> tuple[F64Array, np.ndarray]:
         """Every group's residual KL (tilted law from q's marginal), and whether its tilted law is proper."""
@@ -336,7 +349,8 @@ class AliasEP:
             if not np.isfinite(move):
                 move = np.inf
             record.append({"sweep": stamp, "refused": int(refused_count), "failing": len(failing), "residual": total, "move": move,
-                           "clusters": sorted((int(c.shape[0]) for c in sweep.clusters), reverse=True)})
+                           "clusters": sorted((int(c.shape[0]) for c in sweep.clusters), reverse=True), "cluster refusals": dict(self.refusals)})
+            self.refusals = {}
             if progress is not None:
                 progress(record[-1])
             if not failing and total <= self.resolution and move <= self.resolution and not refused_clusters:
