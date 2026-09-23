@@ -284,6 +284,9 @@ class FullDataFit:
     member_omega: F64Array | None = None
     covariate_coefficients: F64Array | None = None
     working_bytes: int = 0
+    # The mean-field mixture's components (``fit_full_data``): each fixed point's (shift, omega), members x models; the
+    # scorer draws from each in turn, and ``member_mean`` is their average.
+    member_components: tuple[tuple[F64Array, F64Array], ...] = ()
 
 
 def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Array]:
@@ -927,7 +930,7 @@ class _FullDataMeanField:
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
-        starts: Sequence[MixtureHyperparameters], noise: F64Array,
+        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None,
     ) -> None:
         self.gaussian = gaussian
         self.prior = prior
@@ -939,6 +942,11 @@ class _FullDataMeanField:
         self.grams = block_grams(statistics)
         # Each block's members in their order, and each member's group column within its block.
         self.member_blocks = tuple(np.flatnonzero(np.isin(self.ties.group, block)) for block in self.grams.blocks)
+        if order_seed is not None:
+            # A mixture component's sweep order (``fit_full_data``): each block's members in a random order, so coordinate
+            # ascent can end in another mode between near-duplicate columns.
+            order = np.random.default_rng([seed, order_seed])
+            self.member_blocks = tuple(order.permutation(members) for members in self.member_blocks)
         self.sign = np.asarray(self.ties.sign, dtype=np.float64)
         model_count = gaussian.model_count
         self.model_count = model_count
@@ -1352,11 +1360,12 @@ class _FullDataMeanField:
             restore=lambda: self._restore(snapshot, [model]), evidence_offset=offset,
         )
 
-    def covariate_coefficients(self, model: int) -> F64Array:
-        """alpha = (C'WC)^+ C'W (y - X m) on the training rows, for the scoring model."""
+    def covariate_coefficients(self, model: int, mean: F64Array | None = None) -> F64Array:
+        """alpha = (C'WC)^+ C'W (y - X m) on the training rows, for the scoring model (m this fixed point's mean, or
+        ``mean``: the mixture's)."""
         xp = self.gaussian.array_module
         values = np.zeros((self.sample_count, 1))
-        grouped = self._group_values(self.mean[:, model][:, None])
+        grouped = self._group_values((self.mean[:, model] if mean is None else np.asarray(mean, dtype=np.float64))[:, None])
         for start, stop, tile in self.gaussian.source.blocks():
             values += np.asarray(_host(tile.matmat(xp.asarray(grouped[start:stop]))), dtype=np.float64)
         targets = np.asarray(_host(self.gaussian.targets), dtype=np.float64)[:, model]
@@ -1390,17 +1399,23 @@ def fit_full_data(
         raise FloatingPointError(f"{error}; {inference} refusals: {fixed_points.refusals}") from error
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
+    components: tuple[tuple[F64Array, F64Array], ...] = ()
+    member_mean = None
     if mean_field is not None:
         hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
+        member_mean, components = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters)
     return FullDataFit(
         gaussian=gaussian,
         site_precision=fixed_points.site_precision,
         site_shift=fixed_points.site_shift,
         inference=inference,
-        member_mean=None if mean_field is None else mean_field.mean.copy(),
+        member_mean=member_mean,
+        member_components=components,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
-        covariate_coefficients=None if mean_field is None else np.column_stack([mean_field.covariate_coefficients(model) for model in range(mean_field.model_count)]),
+        covariate_coefficients=None if mean_field is None else np.column_stack(
+            [mean_field.covariate_coefficients(model, member_mean[:, model]) for model in range(mean_field.model_count)]
+        ),
         working_bytes=int(working_bytes),
         hyperparameters=hyperparameters,
         noise_variance=fixed_points.noise,
@@ -1437,6 +1452,46 @@ def fit_full_data(
     )
 
 
+def _mode_mixture(
+    main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
+    working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...],
+) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...]]:
+    """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
+    columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
+    effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
+    random within-block member orders until one more moves every model's fitted genetic values by at most the draws'
+    resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component, and its dual-solver state is
+    put back at the end. Returns the average mean and each component's (shift, omega)."""
+    def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
+        return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
+
+    means, components = [], []
+    mean, shift, omega = pieces(main)
+    means.append(mean); components.append((shift, omega))
+    average = mean.copy()
+    component = 0
+    while True:
+        component += 1
+        oracle = _FullDataMeanField(
+            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component,
+        )
+        points = oracle(list(hyperparameters))
+        if any(point is None for point in points):
+            continue
+        mean, shift, omega = pieces(oracle)
+        means.append(mean); components.append((shift, omega))
+        updated = np.mean(means, axis=0)
+        settled = all(
+            float(np.sum(np.square(main._image((updated - average)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
+            for model in range(main.model_count)
+        )
+        average = updated
+        if settled:
+            break
+    main._iterate(main.site_precision, main.site_shift, main.noise)
+    return average, tuple(components)
+
+
 def scoring_models(
     fit: FullDataFit, prior: ScaleMixturePrior, statistics: GenotypeSufficientStatistics, trait_types: Sequence[TraitType], draw_count: int, seed: int
 ) -> list[ScoringModel]:
@@ -1464,10 +1519,15 @@ def scoring_models(
         if fit.inference == "mean_field":
             from sv_pgs.mean_field import product_draws
 
-            draws = product_draws(
-                prior, fit.hyperparameters[model].coefficients, fit.member_omega[:, model], fit.member_shift[:, model], class_index,
-                np.random.default_rng([seed, model]), draw_count, fit.working_bytes,
-            )
+            parts = fit.member_components or ((fit.member_shift, fit.member_omega),)
+            shares = [draw_count // len(parts) + (1 if index < draw_count % len(parts) else 0) for index in range(len(parts))]
+            draws = np.concatenate([
+                product_draws(
+                    prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
+                    np.random.default_rng([seed, model, index]), share, fit.working_bytes,
+                )
+                for index, ((shift, omega), share) in enumerate(zip(parts, shares)) if share
+            ], axis=1)
         else:
             draws = member_draws(
                 ties, fit.site_precision[:, model], fit.site_shift[:, model], group_draws[:, model, :], np.random.default_rng([seed, model])
