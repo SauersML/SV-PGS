@@ -101,7 +101,7 @@ from sv_pgs.small_n import DenseStatistics, _Design, _new_profile
 _EPSILON = float(np.finfo(np.float64).eps)
 
 
-@numba.njit(cache=True, fastmath=True)
+@numba.njit(cache=True, fastmath={"reassoc", "contract"})
 def _sweep(design, squares, members, class_index, log_density, node_variance, log_node_variance, noise, mean, residual, variance, shift, third, fourth, order):
     """One coordinate-ascent sweep over the members in ``order`` (a permutation of 0..members-1), in place: ``mean`` and ``variance`` (each q_j's
     moments), ``residual`` (r = y_P - Xp mean) and ``shift`` (the h_j each q_j was built from). Returns
@@ -117,11 +117,12 @@ def _sweep(design, squares, members, class_index, log_density, node_variance, lo
     fourth central moments (the noise's response, ``MeanFieldFixedPoints._fixed_point``): with d_k = h c_k - m,
     mu_3 = sum_k w_k (d_k^3 + 3 c_k d_k) and mu_4 = sum_k w_k (d_k^4 + 6 c_k d_k^2 + 3 c_k^2).
 
-    Compiled with fastmath: the node sums and the sample dot products may be reassociated and vectorized, which the
-    ELBO's rounding bound (``_elbo``: N eps of the pieces' sizes, for any summation order) already covers; on
-    ENSG00000254709.8 [real, 37,106 members, 88 nodes, 534 samples] a sweep took 86 ms against 183 ms, with the
-    divergence equal to six decimals. Every value stays finite by construction (the overflow branch), which fastmath
-    assumes."""
+    Compiled with reassociation and contraction only: the node sums and the sample dot products may be reordered and
+    vectorized, which the ELBO's rounding bound (``_elbo``: N eps of the pieces' sizes, for any summation order)
+    already covers (on ENSG00000254709.8 [real, 37,106 members, 88 nodes, 534 samples] full fastmath took 86 ms a
+    sweep against 183 ms strict). Not the no-infinity and no-NaN assumptions of full fastmath: ``node_variance`` holds
+    +inf where u_j e^{t_k} overflowed, and the overflow branch that reads ``log_node_variance`` there is exactly what
+    those assumptions let the compiler delete (a finite log variance of 1000 raised ZeroDivisionError under them)."""
     sample_count = design.shape[0]
     member_count = members.shape[0]
     node_count = node_variance.shape[1]

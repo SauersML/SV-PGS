@@ -435,3 +435,19 @@ def test_the_early_response_is_withheld_where_its_schur_block_outgrows_the_kerne
     assert oracle._response_at(bounded=False) is not None
     oracle.variance = np.full(prior.variant_count, 1e-9)
     assert oracle._response_at(bounded=True) is not None
+
+
+def test_the_compiled_sweep_keeps_the_overflow_limit_of_a_finite_log_variance():
+    """A node whose variance u_j e^{t_k} overflows (finite log variance, infinite variance) contributes the
+    pseudo-likelihood's own conditional variance 1 / omega: the compiled sweep keeps that limit (full fastmath's
+    no-infinity assumption removed it and divided by zero)."""
+    from sv_pgs.mean_field import _sweep
+
+    state = [np.zeros(1) for _ in range(6)]
+    mean, residual, variance, shift, third, fourth = state
+    totals = _sweep(
+        np.ones((1, 1), order="F"), np.ones(1), np.zeros(1, dtype=np.int64), np.zeros(1, dtype=np.int64), np.zeros((1, 1)),
+        np.array([[np.inf]]), np.array([[1000.0]]), 1.0, mean, residual, variance, shift, third, fourth, np.zeros(1, dtype=np.int64),
+    )
+    assert np.all(np.isfinite(np.asarray(totals)))
+    assert variance[0] == 1.0
