@@ -86,7 +86,9 @@ from sv_pgs.scale_mixture_ep import (
     ScaleMixturePrior,
     derived_lattice,
     fit_hyperparameters,
+    embed_hyperparameters,
     initial_hyperparameters,
+    without_annotations,
     log_scale,
     moment_matched_prior_sites,
     moment_start,
@@ -1394,16 +1396,33 @@ def fit_full_data(
     moments = moment_starts(statistics, prior)
     if len(moments) != gaussian.model_count:
         raise ValueError("Stage 0's targets must be the models, in order")
-    starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
     if inference not in ("ep", "mean_field"):
         raise ValueError(f"inference must be 'ep' or 'mean_field', not {inference!r}")
     oracle_class = _FullDataFixedPoints if inference == "ep" else _FullDataMeanField
-    fixed_points = oracle_class(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, np.array([moment.noise for moment in moments]))
-    try:
-        fits = fit_hyperparameters(prior, starts, fixed_points, working_bytes, 0.5 / draw_count)
-    except FloatingPointError as error:
-        # The oracle's refusals say why it had no fixed point; they belong with the failure.
-        raise FloatingPointError(f"{error}; {inference} refusals: {fixed_points.refusals}") from error
+
+    def solve(model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None):
+        extra = {} if start_mean is None else {"start_mean": start_mean}
+        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
+        try:
+            return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
+        except FloatingPointError as error:
+            # The oracle's refusals say why it had no fixed point; they belong with the failure.
+            raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
+
+    noise = np.array([moment.noise for moment in moments])
+    if prior.annotation_groups:
+        # Nested empirical Bayes (``small_n.fit_small_n``): the prior without annotation groups first, then the annotated
+        # one continued from its fit, every annotation effect zero at its lambda = infinity edge
+        # (``embed_hyperparameters``), so an annotation group enters only where the evidence rises.
+        base = without_annotations(prior)
+        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None)
+        starts = [embed_hyperparameters(base, prior, fit.hyperparameters) for fit in base_fits]
+        fixed_points, fits = solve(
+            prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(),
+            base_points.mean.copy() if inference == "mean_field" else None,
+        )
+    else:
+        fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None)
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
     components: tuple[tuple[F64Array, F64Array], ...] = ()
@@ -1492,7 +1511,7 @@ def _mode_mixture(
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
     random within-block member orders, each weighted per model by its evidence, exp(ELBO) (``small_n._mixture_weights``:
-    a poor fixed point carries no weight), until one more moves every model's fitted genetic values by at most the
+    a poor fixed point carries no weight; a repeat of a held mode is merged into it), until one more moves every model's fitted genetic values by at most the
     draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component and the fixed point from
     the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are given) the second, and the main fixed
     point's dual-solver state is put back at the end. Returns the weighted mean, each component's (shift, omega) and the weights."""
@@ -1509,6 +1528,21 @@ def _mode_mixture(
         weights /= weights.sum(axis=0)
         return np.einsum("cm,cjm->jm", weights, np.array(means)), weights
 
+    def admit(oracle: "_FullDataMeanField") -> None:
+        """A new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture is over distinct
+        modes, each weighted by its own mass once); the repeat of the higher evidence is kept."""
+        mean, shift, omega = pieces(oracle)
+        elbo = np.array(oracle.elbo, dtype=np.float64)
+        for index, held in enumerate(means):
+            if all(
+                float(np.sum(np.square(main._image((mean - held)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
+                for model in range(main.model_count)
+            ):
+                if float(np.sum(elbo)) > float(np.sum(elbos[index])):
+                    means[index], components[index], elbos[index] = mean, (shift, omega), elbo
+                return
+        means.append(mean); components.append((shift, omega)); elbos.append(elbo)
+
     average, _weights = weighted()
     if moments:
         # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
@@ -1520,8 +1554,7 @@ def _mode_mixture(
         )
         points = ridge(list(hyperparameters))
         if not any(point is None for point in points):
-            mean, shift, omega = pieces(ridge)
-            means.append(mean); components.append((shift, omega)); elbos.append(np.array(ridge.elbo, dtype=np.float64))
+            admit(ridge)
             average, _weights = weighted()
     component = 0
     while True:
@@ -1532,8 +1565,7 @@ def _mode_mixture(
         points = oracle(list(hyperparameters))
         if any(point is None for point in points):
             continue
-        mean, shift, omega = pieces(oracle)
-        means.append(mean); components.append((shift, omega)); elbos.append(np.array(oracle.elbo, dtype=np.float64))
+        admit(oracle)
         updated, _weights = weighted()
         settled = all(
             float(np.sum(np.square(main._image((updated - average)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count

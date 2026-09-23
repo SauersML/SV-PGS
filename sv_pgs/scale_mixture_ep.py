@@ -635,6 +635,43 @@ def class_log_density(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Ar
     return log_weights - _log_sum_exp(log_weights, axis=1, keepdims=True)
 
 
+def without_annotations(prior: ScaleMixturePrior) -> ScaleMixturePrior:
+    """The same prior with no annotation group: its classes, offsets, lattice, kernel range and offset groups; the
+    base of the nested empirical Bayes (``embed_hyperparameters``)."""
+    return scale_mixture_prior(
+        class_index=prior.class_index, log_variance_offset=prior.log_variance_offset,
+        annotation_design=np.zeros((prior.variant_count, 0)), annotation_groups=(), nodes=prior.log_variance_grid,
+        floor=prior.kernel_floor, top=prior.kernel_top, offset_groups=prior.offset_groups,
+    )
+
+
+def embed_hyperparameters(base: ScaleMixturePrior, prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> MixtureHyperparameters:
+    """``base``'s hyperparameters in ``prior``, the same model with annotation groups added: the densities, the class
+    deviations and the offset-group levels carried over, every annotation effect zero and every annotation group's
+    penalty weight at its lambda = infinity edge. The nested prior's hyperparameters there define the same prior as
+    ``base``'s (log u_j = o_j + d_j' theta with the annotation part of theta zero), so an empirical Bayes continued from
+    them starts at ``base``'s fit and releases an annotation group only where its evidence rises."""
+    if base.annotation_groups or base.scale_size != base.level_size:
+        raise ValueError("the base prior must have no annotation groups")
+    if (
+        not np.array_equal(base.log_variance_grid, prior.log_variance_grid) or base.class_count != prior.class_count
+        or not np.array_equal(base.log_variance_offset, prior.log_variance_offset) or base.level_size != prior.level_size
+    ):
+        raise ValueError("the priors must share their lattice, classes, offsets and offset groups")
+    head = prior.coefficient_size - prior.scale_size
+    base_head = base.coefficient_size - base.scale_size
+    if head != base_head:
+        raise ValueError("the priors' density coefficients must agree")
+    source = np.asarray(hyperparameters.coefficients, dtype=np.float64)
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[:head] = source[:head]
+    if prior.level_size:
+        coefficients[prior.coefficient_size - prior.level_size :] = source[base.coefficient_size - base.level_size :]
+    weights = {block.name: float(value) for block, value in zip(base.smoothing_blocks, np.atleast_1d(hyperparameters.log_smoothing))}
+    log_smoothing = np.array([weights.get(block.name, np.inf) for block in prior.smoothing_blocks], dtype=np.float64)
+    return MixtureHyperparameters(coefficients=coefficients, log_smoothing=log_smoothing)
+
+
 def log_scale(prior: ScaleMixturePrior, coefficients: F64Array) -> F64Array:
     """log u_j = o_j + d_j' theta."""
     _density, scale_coefficients = _density_and_scale(prior, coefficients)

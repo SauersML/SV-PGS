@@ -100,11 +100,9 @@ def bench_real_annotations(variants: Any) -> dict[str, np.ndarray]:
 
 
 def _arm_annotations(variants: Any, arm: str) -> dict[str, np.ndarray] | None:
-    """None for every arm, until the outer search learns annotation weights: with bench-real's annotations and the
-    column-variance smooth, ENSG00000187605.16 [real, loso/AFR] ended at ELBO 87.0 and r2 0.17 in 20 minutes, against
-    99.9 and 0.34 in 2 minutes without them (every added smoothing weight goes through the edge search, which stalls).
-    ``bench_real_annotations`` stays for that experiment."""
-    if arm in ("full", "no_sv_terms", "no_annotations"):
+    """The full model's annotations; the SV-term ablation's without the structural ones (length and length change);
+    none for the genotypes-alone arm. The fit nests them on the prior without annotations (``small_n.fit_small_n``)."""
+    if arm == "no_annotations":
         return None
     annotations = bench_real_annotations(variants)
     if arm == "no_sv_terms":

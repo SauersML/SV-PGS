@@ -29,7 +29,7 @@ from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
 from sv_pgs.imputation_reliability import checked_log_reliability
-from sv_pgs.annotation_design import annotation_design, per_unit_offset
+from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -292,9 +292,11 @@ def _fit_one(
     offsets = log_reliability[member_rows] + per_unit_offset(value_scales)
     _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
     table = store.variant_table
-    # No annotation group enters until the outer search learns their weights: each added smoothing weight goes through
-    # the edge search, which stalls (bench-real ENSG00000187605.16: ELBO 87.0 with annotations against 99.9 without).
-    member_annotations: dict[str, np.ndarray] = {}
+    # The store's annotations per member, and each member's training spread (statistics.scales are over the active rows,
+    # in their order); ``fit_full_data`` nests them on the prior without annotations, so each enters where the evidence
+    # rises.
+    member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()}
+    member_annotations.update(column_variance_annotation(np.asarray(statistics.scales)))
     annotations = annotation_design(
         member_annotations,
         table.annotation_legends,

@@ -54,7 +54,7 @@ from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
-from sv_pgs.annotation_design import annotation_design, per_unit_offset
+from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
 from sv_pgs.lasso_path import cross_validated_lasso
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
@@ -66,6 +66,7 @@ from sv_pgs.scale_mixture_ep import (
     MixtureHyperparameters,
     ScaleMixturePrior,
     derived_lattice,
+    embed_hyperparameters,
     fit_hyperparameters,
     _components,
     class_log_density,
@@ -1680,6 +1681,10 @@ def small_n_prior(
     single_shift = statistics.design.back(statistics.target) / start_noise
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     member_annotations = {name: np.asarray(values)[members] for name, values in (annotations or {}).items()}
+    if annotations is not None:
+        # The frequency dependence is the fit's own smooth of each member's training spread (statistics.scales are over
+        # the active rows, in their order); None is the prior without any annotation group, the nested fit's base.
+        member_annotations.update(column_variance_annotation(np.asarray(statistics.scales)))
     design = annotation_design(member_annotations, {}, class_index=class_index.astype(np.int64))
     return scale_mixture_prior(
         class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=design.design,
@@ -1837,20 +1842,36 @@ def fit_small_n(
     started = time.perf_counter()
     offsets = np.zeros(np.asarray(codes).shape[1]) if log_variance_offset is None else np.asarray(log_variance_offset, dtype=np.float64)
     statistics = dense_statistics(codes, covariates, target, offsets)
-    prior = small_n_prior(statistics, variant_class, offsets, draw_count, annotations, codes_per_unit)
+    # Nested empirical Bayes: the prior without annotation groups first, then the annotated prior continued from its fit
+    # with every annotation effect zero and its penalty weight at the lambda = infinity edge (``embed_hyperparameters``),
+    # so the annotated fit starts where the base one ended and an annotation group enters only where the evidence rises.
+    # Searched from the annotated prior's own start instead, the edge search stalled below the base fit
+    # (ENSG00000187605.16 [real, loso/AFR]: ELBO 87.0 and r2 0.17 in 20 minutes, against 99.9 and 0.34 without).
+    base = small_n_prior(statistics, variant_class, offsets, draw_count, None, codes_per_unit)
+    prior = base if annotations is None else small_n_prior(statistics, variant_class, offsets, draw_count, annotations, codes_per_unit)
     stage0_seconds = time.perf_counter() - started
-    start, start_noise, moment = small_n_start(statistics, prior)
+    start, start_noise, moment = small_n_start(statistics, base)
     tolerance = 0.5 / draw_count
+
+    def nested(solve: "_SmallNSolve", start_mean: F64Array | None) -> "_SmallNSolve":
+        if prior is base:
+            return solve
+        embedded = embed_hyperparameters(base, prior, solve.hyperparameters)
+        return _solve_small_n(
+            statistics, prior, embedded, float(solve.oracle.noise), draw_count, working_bytes, tolerance, inference, array_module,
+            None if start_mean is None else np.asarray(solve.oracle.mean, dtype=np.float64),
+        )
+
     if inference == "ep":
-        solves = [_solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, None)]
+        solves = [nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, None), None)]
     else:
         # Coordinate ascent reaches a different fixed point from each data start: the cross-validated lasso in each of
         # the model's scales (``lasso_starts``), each with its own empirical Bayes. They join the mode mixture below as
         # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
-        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics, prior))
+        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics, base))
         solves = [
-            _solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means)
+            nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means), means)
             for means in starts
         ]
     components = list(solves)
@@ -1957,10 +1978,7 @@ def _mixture_weights(components: Sequence["_SmallNSolve | GaussianMember"]) -> F
     exact for a Gaussian prior), its ELBO alone where the response is not positive definite; the Gaussian member's is
     exact. The ELBO alone would weigh the modes by a bound whose gap grows with each one's spread over correlated
     columns, against the dense ones (``GaussianMember``). An EP fit has one component."""
-    elbos = np.array([
-        float(component.oracle.profile.get("elbo", 0.0)) + float(component.oracle.profile.get("evidence_correction") or 0.0)
-        for component in components
-    ])
+    elbos = np.array([_log_evidence(component) for component in components])
     weights = np.exp(elbos - np.max(elbos))
     return weights / weights.sum()
 
@@ -1984,17 +2002,19 @@ def _mode_mixture(
     Between near-duplicate columns the posterior is multimodal (the effect on one column or on the other, weighted by
     each one's evidence), and the product family holds one mode: coordinate ascent gives the effect to whichever column
     it visits first. The posterior mean averages the modes; fixed points from random orders are its candidate modes,
-    weighted by their evidence (``_mixture_weights``), so a poor fixed point carries no weight and modes that differ
-    only in which near-duplicate column holds an effect share it. Components alternate between the start the
+    weighted by their evidence (``_mixture_weights``), so a poor fixed point carries no weight; a fixed point that repeats
+    a mode already held is merged into it (``_admit``), so each distinct mode carries its own mass once. Components alternate between the start the
     hyperparameters were fitted from and zero: a data start holds one mode's choice, which most orders carried from it
     keep, and zero leaves the choice to the order (in 60 simulations on real genotypes neither alone hedged: from the
     lasso most components repeated the first fixed point, from zero many were poor modes). It stops when one more
     component moves the mixture's fitted genetic values Xp mean-bar by at most the draws' resolution,
-    ||Xp d||^2 / sigma^2 <= 1/K; a component moves the mean by at most its weight times its distance, and the weights of
-    further components of one mode shrink as they share it, so this ends."""
+    ||Xp d||^2 / sigma^2 <= 1/K: a run that repeats a held mode moves it by nothing, so the search ends at the first
+    run that finds no new mode of weight."""
     from sv_pgs.mean_field import MeanFieldFixedPoints
 
-    components = list(solves)
+    components: list = []
+    for solve in solves:
+        _admit(statistics, components, solve, draw_count)
     generator = np.random.default_rng([seed, 1])
     member_count = int(np.asarray(starts[0]).shape[0])
 
@@ -2015,13 +2035,35 @@ def _mode_mixture(
         (point,) = oracle([solve.hyperparameters])
         if point is None:
             continue
-        components.append(_SmallNSolve(oracle=oracle, outer=None, hyperparameters=solve.hyperparameters, inference="mean_field", draw_count=draw_count))
+        _admit(statistics, components, _SmallNSolve(oracle=oracle, outer=None, hyperparameters=solve.hyperparameters, inference="mean_field", draw_count=draw_count), draw_count)
         updated = mixture_mean()
         noise = float(np.dot(_mixture_weights(components), [float(component.oracle.noise) for component in components]))
         move = statistics.design.image(updated - average)
         average = updated
         if float(move @ move) / noise <= 1.0 / draw_count:
             return components
+
+
+def _log_evidence(component: "_SmallNSolve | GaussianMember") -> float:
+    """A component's log Z: its ELBO plus its linear-response correction where it has one (``_mixture_weights``)."""
+    profile = component.oracle.profile
+    return float(profile.get("elbo", 0.0)) + float(profile.get("evidence_correction") or 0.0)
+
+
+def _admit(statistics: DenseStatistics, components: list, candidate: "_SmallNSolve", draw_count: int) -> None:
+    """Adds a fixed point to the mixture as a new mode, or merges it into the mode it repeats: the mixture is over the
+    posterior's distinct modes, each weighted by its own mass, and a mode the random orders reach k times is one mode,
+    not k (weighted per run it would carry k times its mass, a property of the search and not of the posterior). Two
+    fixed points are one mode when their fitted genetic values agree to the draws' resolution, ||Xp d||^2 / sigma^2
+    <= 1/K (the mixture's own stopping scale); the one of the higher evidence is kept."""
+    noise = float(candidate.oracle.noise)
+    for index, component in enumerate(components):
+        move = statistics.design.image(np.asarray(candidate.oracle.mean) - np.asarray(component.oracle.mean))
+        if float(move @ move) / noise <= 1.0 / draw_count:
+            if _log_evidence(candidate) > _log_evidence(component):
+                components[index] = candidate
+            return
+    components.append(candidate)
 
 
 @dataclass

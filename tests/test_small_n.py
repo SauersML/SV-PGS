@@ -863,3 +863,31 @@ def test_the_gaussian_member_is_the_exact_posterior_and_evidence_of_its_prior():
     spread = np.sqrt(np.diag(covariance))
     np.testing.assert_allclose(draws.mean(axis=1), member.mean, atol=4.0 * spread.max() / np.sqrt(40_000) * 1.5)
     np.testing.assert_allclose(np.var(draws, axis=1), spread ** 2, rtol=0.05)
+
+
+def test_the_embedded_hyperparameters_define_the_base_prior_in_the_annotated_one():
+    """``embed_hyperparameters``: the annotated prior at the embedded hyperparameters is the base prior at its own (the
+    same per-member scales and class densities), with every annotation group's penalty weight at its infinite edge
+    and every shared block's carried over."""
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters, class_log_density, embed_hyperparameters, log_scale
+    from sv_pgs.small_n import small_n_prior, small_n_start
+
+    rng = np.random.default_rng(89)
+    samples, variants = 50, 40
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), np.ones((samples, 1)), rng.standard_normal(samples))
+    classes = (np.arange(variants) % 3 == 0).astype(np.uint8)
+    base = small_n_prior(statistics, classes, np.zeros(variants), 64)
+    annotated = small_n_prior(statistics, classes, np.zeros(variants), 64, {"distance": rng.standard_normal(variants)})
+    assert len(annotated.smoothing_blocks) > len(base.smoothing_blocks)
+    start = small_n_start(statistics, base)[0]
+    moved = MixtureHyperparameters(
+        coefficients=start.coefficients + 0.1 * rng.standard_normal(start.coefficients.shape[0]),
+        log_smoothing=rng.normal(size=len(base.smoothing_blocks)),
+    )
+    embedded = embed_hyperparameters(base, annotated, moved)
+    np.testing.assert_allclose(log_scale(annotated, embedded.coefficients), log_scale(base, moved.coefficients), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(class_log_density(annotated, embedded.coefficients), class_log_density(base, moved.coefficients), rtol=0, atol=1e-12)
+    by_name = dict(zip((block.name for block in base.smoothing_blocks), moved.log_smoothing))
+    for block, value in zip(annotated.smoothing_blocks, embedded.log_smoothing):
+        assert value == by_name.get(block.name, np.inf)
