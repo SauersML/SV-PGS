@@ -181,5 +181,10 @@ def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
         return
     from sv_pgs.marginal_variances import eigensolver_bytes
 
-    assert window_width(1 << 62, cupy, 41_984) == 41_984
-    assert eigensolver_bytes(3 * 1_000_000, cupy) > 0
+    # The device's eigensolver takes windows up to its own size limit (measured on the A100s' cuSOLVER: a 32,766-column
+    # window accepted, a 32,769-column one refused, so width 10,922), and the search returns the widest width it accepts.
+    width = window_width(1 << 62, cupy, 41_984)
+    refused = np.iinfo(np.int64).max
+    assert 1 <= width <= 41_984
+    assert eigensolver_bytes(3 * width, cupy) < refused
+    assert width == 41_984 or eigensolver_bytes(3 * (width + 1), cupy) == refused
