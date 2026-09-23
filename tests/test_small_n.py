@@ -931,3 +931,49 @@ def test_the_fitted_schema_digest_names_the_prior_exactly():
     assert base["annotation_inputs"] is None and base["annotation_groups"] == 0
     assert annotated["annotation_inputs"] == ["distance"] and annotated["annotation_groups"] > 0
     assert annotated["prior_sha256"] != base["prior_sha256"]
+
+
+def _invariance_problem(seed=41):
+    rng = np.random.default_rng(seed)
+    samples, held, variants = 150, 60, 120
+    frequency = rng.uniform(0.05, 0.5, variants)
+    dosage = rng.binomial(2, frequency, size=(samples + held, variants))
+    effects = np.zeros(variants)
+    effects[[10, 50, 90]] = [0.8, -0.6, 0.5]
+    effects += rng.normal(0.0, 0.05, variants)
+    standardized = (dosage - dosage[:samples].mean(axis=0)) / dosage[:samples].std(axis=0)
+    target = standardized[:samples] @ effects + rng.standard_normal(samples)
+    return dosage, target, samples
+
+
+def _fit_and_score(dosage, target, samples):
+    classes = np.full(dosage.shape[1], list(VariantClass).index(VariantClass.SNV), dtype=np.uint8)
+    codes = (dosage * 127).astype(np.uint8)
+    fit = fit_small_n(
+        codes=codes[:samples], covariates=np.ones((samples, 1)), target=target, variant_class=classes, log_variance_offset=None,
+        draw_count=64, working_bytes=2 * 10**9, seed=0,
+    )
+    scoring = fit.scoring
+    signed = codes[samples:, scoring.store_rows].astype(np.float64) - SIGNED_CODE_OFFSET
+    standardized = (signed - scoring.signed_means) / scoring.signed_scales
+    return standardized @ scoring.coefficients + scoring.alpha[0]
+
+
+def test_recoding_an_allele_does_not_change_a_prediction():
+    """REF/ALT is a coding choice for an SNV: with a sign-symmetric prior, recoding a column d -> 2 - d (training and
+    scored people alike) flips its effect's sign and leaves every prediction unchanged."""
+    dosage, target, samples = _invariance_problem()
+    reference = _fit_and_score(dosage, target, samples)
+    flipped = dosage.copy()
+    columns = np.arange(0, dosage.shape[1], 2)
+    flipped[:, columns] = 2 - flipped[:, columns]
+    np.testing.assert_allclose(_fit_and_score(flipped, target, samples), reference, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(reference))))
+
+
+def test_the_order_of_the_variants_does_not_change_a_prediction():
+    """The variants' column order is a storage choice: permuting it (training and scored people alike) leaves every
+    prediction unchanged."""
+    dosage, target, samples = _invariance_problem()
+    reference = _fit_and_score(dosage, target, samples)
+    order = np.random.default_rng(7).permutation(dosage.shape[1])
+    np.testing.assert_allclose(_fit_and_score(dosage[:, order], target, samples), reference, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(reference))))
