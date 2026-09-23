@@ -273,3 +273,31 @@ def test_the_covariate_step_is_the_exact_conditional() -> None:
     alpha, covariance = step.coefficients(sites.weights, sites.response)
     assert np.allclose(state.predictor_mean, covariates @ alpha, rtol=1e-12, atol=1e-12)
     assert np.allclose(state.predictor_variance, np.einsum("ij,jk,ik->i", covariates, covariance, covariates), rtol=1e-10)
+
+
+def test_the_fourier_predictive_is_the_posterior_predictive_by_quadrature() -> None:
+    """E[sigmoid(eta + U)] for a Gaussian-mixture score law against direct quadrature over U, and against the
+    trapezoid rule of ``fast_scoring`` for one Gaussian component; the posterior predictive is not sigmoid of the mean."""
+    from sv_pgs.binary_likelihood import fourier_predictive_probability
+    from sv_pgs.fast_scoring import posterior_predictive_probability
+
+    eta = np.array([-6.0, -1.3, 0.0, 0.4, 2.5, 9.0])
+    weights = np.array([0.6, 0.3, 0.1])
+    means = np.array([0.0, 1.5, -2.0])
+    variances = np.array([0.5, 2.0, 0.01])
+    chance, bound = fourier_predictive_probability(eta, weights, means, variances)
+    for index, value in enumerate(eta):
+        expected = 0.0
+        for weight, mean, variance in zip(weights, means, variances):
+            spread = np.sqrt(variance)
+
+            def integrand(u: float, mean=mean, spread=spread) -> float:
+                return float(expit(value + u) * np.exp(-0.5 * ((u - mean) / spread) ** 2) / (np.sqrt(2.0 * np.pi) * spread))
+
+            part, _error = integrate.quad(integrand, mean - 40.0 * spread, mean + 40.0 * spread, epsabs=1e-14, epsrel=1e-13, limit=400)
+            expected += weight * part
+        assert chance[index] == pytest.approx(expected, abs=1e-12)
+        assert bound[index] <= 1e-12
+    single, _bound = fourier_predictive_probability(eta, np.ones(1), np.zeros(1), np.full(1, 3.0))
+    np.testing.assert_allclose(single, posterior_predictive_probability(eta, np.full(eta.shape, 3.0), 0.0), rtol=0.0, atol=1e-13)
+    assert not np.allclose(single, expit(eta), atol=1e-3)
