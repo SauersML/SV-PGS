@@ -103,6 +103,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('dual_solve.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('full_data_fit.py', '_FullDataMeanField._moment_pieces'): ('derived', frozenset({3}), "byte accounting of the predictor-variance read: a piece's columns, their weighted copy and their projection live at once"),
     ('engine_kernels.py', '_tilted_row_bytes'): ('derived', frozenset({3}), "byte accounting of a chunk's device copies: its three float64 inputs (log u, P, h)"),
+    ('scale_mixture_ep.py', '_moving_line_sum'): ('derived', frozenset({3}), "byte accounting of a (row, step) pair on the device: its three float64 outputs (log Z, mean, variance) beside its inputs"),
     ('engine_kernels.py', '_objective_row_bytes'): ('derived', frozenset({6}), "byte accounting of a chunk's device arrays: three float64 inputs, two outputs and the |log Z| temporary per row"),
     ('resident_codes.py', 'read_tile_rows'): ('derived', frozenset({3}), "byte accounting of CodeBlockTile._codes_times: the fp64 total and two recombination terms per row"),
     ('external_annotations.py', 'TIER_COORDINATE'): ('definitional', frozenset({3}), 'enum code; (chromosome << 32 | position) site key'),

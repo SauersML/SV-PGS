@@ -269,6 +269,8 @@ def cluster_tilted(counts, log_weight, log_variance, precision, shift):
     largest = -np.inf
     total = 0.0
     matrix = np.empty((size, size))
+    within = np.zeros((size, size))
+    delta = np.empty(size)
     while True:
         log_prior = 0.0
         log_det_variance = 0.0
@@ -329,20 +331,29 @@ def cluster_tilted(counts, log_weight, log_variance, precision, shift):
                 unit[i] = value / lower[i, i]
             for i in range(size):
                 inverse[i, column] = unit[i]
+        # Weighted running moments, rescaled when the largest log term moves: the tuples' mean location, the scatter
+        # of the locations about it (Welford, so no difference of second moments cancels) and their covariances'
+        # sum; the covariance is their sum over the total, positive definite by construction.
         if log_term > largest:
             scale = np.exp(largest - log_term) if largest > -np.inf else 0.0
             total *= scale
             for i in range(size):
-                mean[i] *= scale
                 for j in range(size):
                     second[i, j] *= scale
+                    within[i, j] *= scale
             largest = log_term
         weight = np.exp(log_term - largest)
-        total += weight
-        for i in range(size):
-            mean[i] += weight * location[i]
-            for j in range(size):
-                second[i, j] += weight * (inverse[i, j] + location[i] * location[j])
+        if weight > 0.0:
+            updated = total + weight
+            for i in range(size):
+                delta[i] = location[i] - mean[i]
+            share = weight * total / updated
+            for i in range(size):
+                mean[i] += delta[i] * (weight / updated)
+                for j in range(size):
+                    second[i, j] += share * delta[i] * delta[j]
+                    within[i, j] += weight * inverse[i, j]
+            total = updated
         # The next tuple (mixed radix).
         position = 0
         while position < size:
@@ -354,8 +365,6 @@ def cluster_tilted(counts, log_weight, log_variance, precision, shift):
         if position == size:
             break
     for i in range(size):
-        mean[i] /= total
-    for i in range(size):
         for j in range(size):
-            second[i, j] = second[i, j] / total - mean[i] * mean[j]
+            second[i, j] = (second[i, j] + within[i, j]) / total
     return True, largest + np.log(total), mean, second

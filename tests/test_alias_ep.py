@@ -55,3 +55,43 @@ def test_a_clusters_site_is_its_exact_joint_tilted_laws_projection():
         assert proper
         assert _gaussian_kl(tilted_mean, tilted_covariance, mean, covariance) <= engine.resolution + floor
     assert np.all(np.isfinite(fit.mean))
+
+
+def test_the_enumerated_cluster_law_is_the_mixture_of_its_tuples_gaussians_and_stays_finite_at_a_flat_cavity():
+    """``alias_groups.cluster_tilted`` against the tuples' Gaussian mixture formed densely, and at a near-flat cavity
+    with a large pull (a variance past double precision among the atoms) finite with a positive definite covariance."""
+    from itertools import product
+
+    from sv_pgs.alias_groups import cluster_tilted
+
+    counts = np.array([3, 2], dtype=np.int64)
+    log_weight = np.log(np.array([0.5, 0.3, 0.2, 0.6, 0.4]))
+    log_variance = np.array([-4.0, -1.0, 1.0, -2.0, 0.5])
+    precision = np.array([[3.0, 2.5], [2.5, 3.0]])
+    shift = np.array([1.2, -0.4])
+    proper, _log_z, mean, covariance = cluster_tilted(counts, log_weight, log_variance, precision, shift)
+    assert proper
+    weights, means, covariances = [], [], []
+    for first, second in product(range(3), range(3, 5)):
+        variances = np.exp(log_variance[[first, second]])
+        matrix = np.diag(1.0 / variances) + precision
+        inverse = np.linalg.inv(matrix)
+        location = inverse @ shift
+        log_term = (log_weight[first] + log_weight[second] - 0.5 * (np.sum(np.log(variances)) + np.linalg.slogdet(matrix)[1])
+                    + 0.5 * shift @ location)
+        weights.append(log_term)
+        means.append(location)
+        covariances.append(inverse)
+    weights = np.exp(np.array(weights) - max(weights))
+    weights /= weights.sum()
+    expected_mean = np.einsum("t,ti->i", weights, np.array(means))
+    centred = np.array(means) - expected_mean
+    expected_covariance = np.einsum("t,tij->ij", weights, np.array(covariances)) + np.einsum("t,ti,tj->ij", weights, centred, centred)
+    np.testing.assert_allclose(mean, expected_mean, rtol=1e-12, atol=1e-14)
+    np.testing.assert_allclose(covariance, expected_covariance, rtol=1e-11, atol=1e-14)
+    flat = np.array([[1e-12, 0.0], [0.0, 2.0]])
+    log_variance_far = log_variance.copy()
+    log_variance_far[2] = 800.0
+    proper, _log_z, mean, covariance = cluster_tilted(counts, log_weight, log_variance_far, flat, np.array([80.0, 1.0]))
+    assert proper and np.all(np.isfinite(mean)) and np.all(np.isfinite(covariance))
+    assert np.linalg.eigvalsh(0.5 * (covariance + covariance.T))[0] > 0.0

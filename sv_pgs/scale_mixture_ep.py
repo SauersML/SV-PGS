@@ -117,6 +117,7 @@ from typing import Callable, Iterator, Sequence
 import math
 import time
 
+import numba
 import numpy as np
 from scipy import sparse
 from scipy.interpolate import make_interp_spline
@@ -2347,6 +2348,79 @@ def _directional_derivatives(
     return third, fourth
 
 
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _moving_line_rows(log_density, log_scale_rows, slopes, steps, grid, precision, shift, out):
+    """log Z_j at every step for rows whose log scale moves along the line: out[j, s] = LSE_k(log_density[s, k] +
+    L(log u_j + slope_j t_s, k)), each node term exactly ``_kernel_terms``'s (its overflow limit included), fused over
+    (row, step, node) so no rows x steps x K array is formed. Returns whether some 1 + v P <= 0."""
+    rows, count, nodes = log_scale_rows.shape[0], steps.shape[0], grid.shape[0]
+    bad = np.zeros(rows, dtype=np.bool_)
+    for row in numba.prange(rows):
+        terms = np.empty(nodes)
+        P, h2 = precision[row], shift[row] * shift[row]
+        for step in range(count):
+            eta = log_scale_rows[row] + slopes[row] * steps[step]
+            peak = -np.inf
+            for k in range(nodes):
+                log_variance = eta + grid[k]
+                variance = np.exp(log_variance)
+                ratio = variance * P
+                if ratio <= -1.0:
+                    bad[row] = True
+                conditional = 1.0 / (1.0 / variance + P)
+                if not np.isfinite(variance) and P > 0.0:
+                    log_one_plus = log_variance + np.log(P)
+                else:
+                    log_one_plus = np.log1p(ratio)
+                terms[k] = log_density[step, k] - 0.5 * log_one_plus + 0.5 * (h2 * conditional)
+                if terms[k] > peak:
+                    peak = terms[k]
+            shift_peak = peak if np.isfinite(peak) else 0.0
+            total = 0.0
+            for k in range(nodes):
+                total += np.exp(terms[k] - shift_peak)
+            out[row, step] = np.log(total) + shift_peak
+    improper = False
+    for row in range(rows):
+        if bad[row]:
+            improper = True
+    return improper
+
+
+def _moving_line_sum(
+    class_density: F64Array, log_scale_rows: F64Array, slopes: F64Array, steps: F64Array, grid: F64Array, precision: F64Array, shift: F64Array,
+    working_bytes: int,
+) -> F64Array:
+    """sum_j log Z_j(t_s) over rows whose log scale moves along the line, per step (``_line``): on the fit's device
+    the fused tilted kernel (``engine_kernels.tilted_moments``) over (row, step) pairs, each step its own class
+    density row; on the host ``_moving_line_rows``. Rows go in chunks whose rows x steps outputs fit
+    ``working_bytes``."""
+    count = steps.shape[0]
+    rows = log_scale_rows.shape[0]
+    # Per row and step: the device's inputs and three outputs (the host's one output is less).
+    chunk = max(1, int(working_bytes) // (max(count, 1) * (engine_kernels._tilted_row_bytes() + 3 * np.dtype(np.float64).itemsize)))
+    xp = _DEVICE.get()
+    total = np.zeros(count)
+    for start in range(0, rows, chunk):
+        stop = min(start + chunk, rows)
+        if xp is not np:
+            size = stop - start
+            device_steps = xp.asarray(steps)
+            scales = (xp.asarray(log_scale_rows[start:stop])[:, None] + xp.asarray(slopes[start:stop])[:, None] * device_steps[None, :]).ravel()
+            log_normalizer, _mean, _variance, _improper = engine_kernels.tilted_moments(
+                xp, xp.tile(xp.arange(count, dtype=xp.int64), size), class_density, scales, grid,
+                xp.repeat(xp.asarray(precision[start:stop]), count), xp.repeat(xp.asarray(shift[start:stop]), count), working_bytes,
+            )
+            total += _host(log_normalizer.reshape(size, count).sum(axis=0))
+            continue
+        out = np.empty((stop - start, count))
+        if _moving_line_rows(np.ascontiguousarray(class_density), log_scale_rows[start:stop], slopes[start:stop], steps, grid, precision[start:stop],
+                             shift[start:stop], out):
+            raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+        total += out.sum(axis=0)
+    return total
+
+
 def _line(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int
 ) -> Callable[[F64Array], F64Array]:
@@ -2357,7 +2431,10 @@ def _line(
     is exactly quadratic in t. A variant whose log scale does not move along b keeps its kernel row L_jk, so its
     log Z_j(t) = LSE_k(L_jk + log pi_ck(t)) is one product of exp(L - max) with exp(log pi(t) - max) over the nodes
     for all its steps (a GEMM of positive terms: exact to K eps in relative terms), with the rows whose product
-    falls to where subnormal terms could matter taken exactly. The other variants' kernels are evaluated per step."""
+    falls to where subnormal terms could matter taken exactly. The other variants' kernels are evaluated per step, in
+    one fused pass over (variant, step, node) (``_moving_line_sum``): with an annotation scale design every variant
+    moves, and forming their rows x steps x K terms was 0.5 s a point on ENSG00000105612.9 [real, 29,742 variants],
+    a correction 340-750 s."""
     density, _scale = _density_and_scale(prior, origin)
     density_step, scale_step = _density_and_scale(prior, direction)
     scales = log_scale(prior, origin)
@@ -2410,14 +2487,11 @@ def _line(
                     normalizers[row_index, step_index] = _log_sum_exp(row_kernel[row_index] + device_density[step_index], axis=1)
                 total += _host(normalizers.sum(axis=0))
             moving = moving_rows[class_position]
-            for rows in _row_chunks(moving, prior.grid_size * count, working_bytes):
-                size = rows.shape[0] * count
-                normalizers = _log_normalizers(
-                    np.broadcast_to(class_density[None], (rows.shape[0], count, prior.grid_size)).reshape(size, prior.grid_size),
-                    (scales[rows][:, None] + scale_slope[rows][:, None] * steps[None, :]).reshape(size),
-                    prior.log_variance_grid, np.repeat(cavity.precision[rows], count), np.repeat(cavity.shift[rows], count),
+            if moving.shape[0]:
+                total += _moving_line_sum(
+                    class_density, scales[moving], scale_slope[moving], np.asarray(steps, dtype=np.float64), prior.log_variance_grid,
+                    cavity.precision[moving], cavity.shift[moving], working_bytes,
                 )
-                total += normalizers.reshape(rows.shape[0], count).sum(axis=0)
         return total
 
     return values

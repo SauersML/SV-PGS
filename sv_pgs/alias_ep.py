@@ -15,8 +15,12 @@ within the resolution 1 / (2 K) (less each sampled cluster's own Monte Carlo flo
 expectation) and q has stopped moving (the sweep's summed KL move of the groups' marginals within the resolution). A unit breaks the contract where its update is refused (no damping keeps every cavity finite) or where
 its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
 unit joins the unit of the group whose column is most correlated with its own, and the sweeps continue from the
-joined sites (the cluster's site starts as the block of its groups' sites). Clusters are thus admitted by measured
-failure, never by a hand-picked correlation.
+joined sites (the cluster's site starts as the block of its groups' sites). A single group whose tilted law is pinned
+to its law's top breaks it at once: its heaviest atom is its largest variance while the cavity's precision is below
+that atom's own, so its moments are where the lattice ends, not the data's (a near-flat cavity with a large pull,
+the column's data shared with a correlated block [real, ENSG00000105612.9: residuals to 4e26]); joined to the block,
+its joint law is conditioned by the block's data. Clusters are thus admitted by measured failure, never by a
+hand-picked correlation.
 
 Cost. A single group's update is O(n'^2) plus the cavity refresh (``sequential_ep``); a cluster's is one tilted law
 of its members and a damped rebuild, O(G n'^2).
@@ -31,6 +35,7 @@ import numpy as np
 from scipy.optimize import least_squares
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.alias_groups import cluster_tilted as enumerated_cluster
 from sv_pgs.alias_laws import GroupLaws, group_terms
 from sv_pgs.scale_sampler import NodePrior, cluster_tilted_moments
 from sv_pgs.sequential_ep import SequentialSweep
@@ -39,12 +44,21 @@ _EPSILON = float(np.finfo(np.float64).eps)
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
-def _tilted_sums(start, log_weight, log_variance, precision, shift, mean, variance, proper):
-    """Every group's sum's tilted mean and variance at its cavity (``alias_groups.tilted_sum``), in parallel."""
+def _tilted_sums(start, log_weight, log_variance, precision, shift, mean, variance, proper, pinned):
+    """Every group's sum's tilted mean and variance at its cavity (``alias_groups.tilted_sum``), in parallel, and
+    whether its tilted law is pinned to its law's top: its heaviest atom is its largest variance while the cavity's
+    precision is below that atom's own, P V_top < 1, so the atom's weight exp(h^2 V / (2 (1 + V P))) is set by where
+    the lattice ends, not by the data (``AliasEP.fit``'s contract)."""
     for g in numba.prange(start.shape[0] - 1):
         a, b = start[g], start[g + 1]
         P, h = precision[g], shift[g]
+        pinned[g] = False
+        top = a
+        for c in range(a, b):
+            if log_variance[c] > log_variance[top]:
+                top = c
         peak = -np.inf
+        heaviest = a
         values = np.empty(b - a)
         conditional = np.empty(b - a)
         ok = True
@@ -62,9 +76,11 @@ def _tilted_sums(start, log_weight, log_variance, precision, shift, mean, varian
             values[c - a] = log_weight[c] - 0.5 * spread + 0.5 * h * h * conditional[c - a]
             if values[c - a] > peak:
                 peak = values[c - a]
+                heaviest = c
         proper[g] = ok
         if not ok:
             continue
+        pinned[g] = heaviest == top and np.exp(log_variance[top]) * P < 1.0
         total = 0.0
         for c in range(b - a):
             values[c] = np.exp(values[c] - peak)
@@ -182,7 +198,28 @@ class AliasEP:
 
     def cluster_tilted(self, cluster: I64Array, precision: F64Array, shift: F64Array, stamp: int):
         """(proper, mean, covariance, Monte Carlo floor) of a cluster's sums' tilted law: the product of the sums'
-        induced laws and the Gaussian cavity on the sums, enumerated or sampled over the sums' atoms."""
+        induced laws and the Gaussian cavity on the sums, enumerated or sampled over the sums' atoms.
+
+        Enumerated (where the tuples cost no more than the sampling they replace, ``scale_sampler``'s rule) in
+        precision form (``alias_groups.cluster_tilted``): each tuple's law has precision D^-1 + Lambda, a variance
+        past double precision is D^-1 = 0, and the moments accumulate as weighted Welford sums of the tuples'
+        locations plus their covariances, so the covariance is positive definite by construction and no finite case
+        overflows. The variance-form updates of the sampler's enumeration overflowed on near-flat cavities with a
+        large pull [real, ENSG00000138468.16: 141 pairs]."""
+        laws = self.laws
+        counts = (laws.law_start[cluster + 1] - laws.law_start[cluster]).astype(np.int64)
+        size = cluster.shape[0]
+        if np.sum(np.log(counts)) - np.log(counts.max()) <= np.log(size * cluster_draws(size, self.draw_count)):
+            atoms = np.concatenate([np.arange(laws.law_start[g], laws.law_start[g + 1]) for g in cluster])
+            self.calls += 1
+            proper, _log_z, mean, covariance = enumerated_cluster(
+                counts, np.ascontiguousarray(laws.law_log_mass[atoms]), np.ascontiguousarray(laws.law_log_variance[atoms]),
+                np.ascontiguousarray(precision, dtype=np.float64), np.ascontiguousarray(shift, dtype=np.float64),
+            )
+            self.last_exact = True
+            if not proper:
+                return False, None, None, 0.0
+            return True, mean.copy(), 0.5 * (covariance + covariance.T), 0.0
         key = ("sums", *cluster.tolist())
         state = self.states.get(key)
         moments = cluster_tilted_moments(
@@ -263,7 +300,9 @@ class AliasEP:
         mean = np.empty(self.group_count)
         variance = np.empty(self.group_count)
         proper = np.empty(self.group_count, dtype=np.bool_)
-        _tilted_sums(laws.law_start, laws.law_log_mass, laws.law_log_variance, cavity_precision, cavity_shift, mean, variance, proper)
+        pinned = np.empty(self.group_count, dtype=np.bool_)
+        _tilted_sums(laws.law_start, laws.law_log_mass, laws.law_log_variance, cavity_precision, cavity_shift, mean, variance, proper, pinned)
+        self.pinned = pinned
         site = precision / self.noise
         q_variance = 1.0 / (cavity_precision + site)
         q_mean = q_variance * (cavity_shift + shift)
@@ -337,6 +376,9 @@ class AliasEP:
             failing |= {key for key, count in streak.items() if key in current and count >= 2 and current[key] > allowed[key]}
             # A single group whose update the sweep refused shows as an infinite residual (improper tilted law).
             failing |= {key for key, value in current.items() if not np.isfinite(value)}
+            # A single group whose tilted law is pinned to its law's top (a near-flat cavity with a large pull): its
+            # moments are the lattice's end, not resolvable alone, so it joins the block that pulls it, at once.
+            failing |= {int(g) for g in np.flatnonzero(self.pinned & ~sweep.clustered)}
             # The fixed point's test is q's, not each unit's: the residuals summed over the units (each one's own
             # Monte Carlo floor allowed) within the resolution.
             total = sum(current.values()) - sum(allowed[key] - self.resolution for key in current)
@@ -403,8 +445,8 @@ class AliasEP:
         floor = -1.0 / float(self.largest[group]) if np.isfinite(self.largest[group]) else 0.0
 
         def errors(point):
-            mean_out, variance_out, proper = np.empty(1), np.empty(1), np.empty(1, dtype=np.bool_)
-            _tilted_sums(start, log_mass, log_variance, np.array([point[0]]), np.array([point[1]]), mean_out, variance_out, proper)
+            mean_out, variance_out, proper, pinned = np.empty(1), np.empty(1), np.empty(1, dtype=np.bool_), np.empty(1, dtype=np.bool_)
+            _tilted_sums(start, log_mass, log_variance, np.array([point[0]]), np.array([point[1]]), mean_out, variance_out, proper, pinned)
             if not proper[0] or not variance_out[0] > 0.0:
                 return np.array([np.inf, np.inf])
             return np.array([(mean_out[0] - mean) / np.sqrt(variance), np.log(variance_out[0] / variance)])
