@@ -1978,7 +1978,7 @@ def _mixture_weights(components: Sequence["_SmallNSolve | GaussianMember"]) -> F
     exact for a Gaussian prior), its ELBO alone where the response is not positive definite; the Gaussian member's is
     exact. The ELBO alone would weigh the modes by a bound whose gap grows with each one's spread over correlated
     columns, against the dense ones (``GaussianMember``). An EP fit has one component."""
-    elbos = np.array([_log_evidence(component) for component in components])
+    elbos = np.array([_component_log_evidence(component) for component in components])
     weights = np.exp(elbos - np.max(elbos))
     return weights / weights.sum()
 
@@ -2044,7 +2044,7 @@ def _mode_mixture(
             return components
 
 
-def _log_evidence(component: "_SmallNSolve | GaussianMember") -> float:
+def _component_log_evidence(component: "_SmallNSolve | GaussianMember") -> float:
     """A component's log Z: its ELBO plus its linear-response correction where it has one (``_mixture_weights``)."""
     profile = component.oracle.profile
     return float(profile.get("elbo", 0.0)) + float(profile.get("evidence_correction") or 0.0)
@@ -2060,7 +2060,7 @@ def _admit(statistics: DenseStatistics, components: list, candidate: "_SmallNSol
     for index, component in enumerate(components):
         move = statistics.design.image(np.asarray(candidate.oracle.mean) - np.asarray(component.oracle.mean))
         if float(move @ move) / noise <= 1.0 / draw_count:
-            if _log_evidence(candidate) > _log_evidence(component):
+            if _component_log_evidence(candidate) > _component_log_evidence(component):
                 components[index] = candidate
             return
     components.append(candidate)
