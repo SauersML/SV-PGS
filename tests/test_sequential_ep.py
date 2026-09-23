@@ -205,3 +205,31 @@ def test_a_cluster_site_is_the_dense_block_and_the_sweep_moves_around_it():
     np.testing.assert_allclose(got_t, expected_t, rtol=1e-8, atol=1e-10)
     np.testing.assert_allclose(got_nu, expected_nu, rtol=1e-8, atol=1e-10)
     assert sweep.valid(got_t, got_nu)
+
+
+def test_the_blocked_sweep_is_the_per_step_sweep():
+    """Blocks with their checks deferred to one product (restored and redone step by step where a state is not
+    proper) give the per-step sweep's sites, over several sweeps of p >> n' with a tight near-proxy cluster."""
+    rng = np.random.default_rng(17)
+    rows, _members, priors, _target = _problem(17, 40, 200, 1)
+    rows[3:12] = rows[2] + 0.02 * rng.standard_normal((9, 40))
+    target = 1.5 * rows[2] + 0.6 * rows[40] + rng.standard_normal(40)
+    noise = 0.5
+    score = rows @ target
+    squares = np.einsum("ij,ij->i", rows, rows)
+    second = np.array([float(np.exp(_components(priors, g)[0]) @ np.exp(_components(priors, g)[1])) for g in range(rows.shape[0])])
+    order = np.arange(rows.shape[0], dtype=np.int64)
+    results = []
+    for width in (1, None):
+        sweep = SequentialSweep(rows, squares, score, priors, noise)
+        if width is None:
+            width = sweep.block_width
+            assert width > 1
+        sweep.block_width = width
+        t, nu = noise / second, np.zeros(rows.shape[0])
+        refused = [sweep.run(t, nu, order) for _ in range(6)]
+        assert all(count is not None for count in refused)
+        results.append((t, nu, refused))
+    np.testing.assert_allclose(results[1][0], results[0][0], rtol=1e-9, atol=1e-12)
+    np.testing.assert_allclose(results[1][1], results[0][1], rtol=1e-9, atol=1e-12)
+    assert results[1][2] == results[0][2]

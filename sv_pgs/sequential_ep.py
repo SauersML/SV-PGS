@@ -103,134 +103,293 @@ def _proper_everywhere(group, informed, projection, factor, precision, is_rest, 
 
 
 @numba.njit(cache=True, error_model="numpy")
+def _proper_rest(group, precision, rest_rows, rest_count, schur_diagonal, largest, noise):
+    """Whether every rest group's cavity stays finite after the step (the new (S^-1)_kk)."""
+    for slot in range(rest_count):
+        k = rest_rows[slot]
+        if k == group:
+            continue
+        cavity = (1.0 / schur_diagonal[slot] - precision[k]) / noise
+        if cavity < 0.0 and not 1.0 + largest[k] * cavity > 0.0:
+            return False
+        if not np.isfinite(cavity):
+            return False
+    return True
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _bulk_proper(informed, t, largest, noise):
+    """Whether a bulk group's cavity at I = ``informed`` and site t is finite (module docstring)."""
+    cavity = informed / (1.0 - informed / t) / noise
+    if cavity < 0.0 and not 1.0 + largest * cavity > 0.0:
+        return False
+    return np.isfinite(cavity)
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision, shift_value, informed,
+          is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image, solved, rest_mean, combined, target, half_precision,
+          exact, w_out):
+    """One group's damped sequential update, in place. ``exact``: every other cavity is checked now, by its rank-one
+    move, and ``informed`` follows; otherwise only the rest's are, the bulk's being checked by the caller from the
+    step's w (written to ``w_out``) and the returned factor. Returns (status: 0 refused, 1 applied, 2 crossing of the
+    bulk boundary with the new site in ``target`` and nothing applied, factor)."""
+    dimension = image.shape[0]
+    r = np.zeros(rest_count)
+    solved_r = np.zeros(rest_count)
+    schur_diagonal = np.empty(rest_count)
+    t_old = precision[group]
+    b_old = shift_value[group]
+    x = rows[group]
+    d_old = 0.0
+    quadratic = 0.0
+    explained = 0.0
+    here = 0.0
+    slot_g = -1
+    a = solved
+    column = np.zeros(rest_count)
+    if not is_rest[group]:
+        d_old = 1.0 / t_old
+        a = np.dot(inverse, x)
+        quadratic = np.dot(x, a)
+        if rest_count:
+            r = np.dot(rest_images, x)
+        w = a.copy()
+        for slot in range(rest_count):
+            value = 0.0
+            for other in range(rest_count):
+                value += schur_inverse[slot, other] * r[other]
+            solved_r[slot] = value
+            explained += r[slot] * value
+            for i in range(dimension):
+                w[i] -= value * rest_images[slot, i]
+        here = quadratic - explained
+        marginal = d_old - d_old * d_old * here
+        mean = d_old * (b_old - np.dot(x, combined))
+        cavity_scaled = here / (1.0 - d_old * here)
+    else:
+        slot_g = rest_slot[group]
+        marginal = schur_inverse[slot_g, slot_g]
+        mean = rest_mean[slot_g]
+        cavity_scaled = 1.0 / marginal - t_old
+        column = schur_inverse[:, slot_g][:rest_count].copy()
+        w = np.zeros(dimension)
+        for slot in range(rest_count):
+            for i in range(dimension):
+                w[i] += column[slot] * rest_images[slot, i]
+    cavity_precision = cavity_scaled / noise
+    cavity_shift = mean / (noise * marginal) - (b_old - group_score[group]) / noise
+    start_c, stop_c = component_start[group], component_start[group + 1]
+    proper, _log_z, tilted_mean, tilted_variance = tilted_sum(log_weight[start_c:stop_c], log_variance[start_c:stop_c], cavity_precision, cavity_shift)
+    if not proper or not tilted_variance > 0.0:
+        return 0, 0.0
+    target_t = noise * (1.0 / tilted_variance - cavity_precision)
+    target_b = group_score[group] + noise * (tilted_mean / tilted_variance - cavity_shift)
+    if not (np.isfinite(target_t) and np.isfinite(target_b)) or target_t == 0.0:
+        return 0, 0.0
+    projection = np.dot(rows, w) if exact else np.zeros(1)
+    fraction = 1.0
+    accepted = False
+    factor = 0.0
+    c = 0.0
+    denominator = 1.0
+    step = 0.0
+    t_new = t_old
+    b_new = b_old
+    while fraction * abs(target_t - t_old) > half_precision * half_precision * abs(t_old) or fraction == 1.0:
+        t_new = t_old + fraction * (target_t - t_old)
+        b_new = b_old + fraction * (target_b - b_old)
+        if t_new != 0.0:
+            if not is_rest[group]:
+                delta = 1.0 / t_new - d_old
+                factor = delta / (1.0 + delta * here)
+                c = delta / (1.0 + delta * quadratic)
+                denominator = 1.0 - c * explained
+                if denominator > 0.0:
+                    for slot in range(rest_count):
+                        schur_diagonal[slot] = schur_inverse[slot, slot] + c * solved_r[slot] * solved_r[slot] / denominator
+                    if exact:
+                        if _proper_everywhere(group, informed, projection, factor, precision, is_rest, rest_slot, schur_diagonal, largest, noise):
+                            accepted = True
+                            break
+                    elif _proper_rest(group, precision, rest_rows, rest_count, schur_diagonal, largest, noise):
+                        accepted = True
+                        break
+            else:
+                step = t_new - t_old
+                denominator = 1.0 + step * schur_inverse[slot_g, slot_g]
+                if denominator > 0.0:
+                    factor = -step / denominator
+                    for slot in range(rest_count):
+                        schur_diagonal[slot] = schur_inverse[slot, slot] - step * column[slot] * column[slot] / denominator
+                    if exact:
+                        if _proper_everywhere(group, informed, projection, factor, precision, is_rest, rest_slot, schur_diagonal, largest, noise):
+                            accepted = True
+                            break
+                    elif _proper_rest(group, precision, rest_rows, rest_count, schur_diagonal, largest, noise):
+                        accepted = True
+                        break
+        fraction *= 0.5
+    if not accepted:
+        return 0, 0.0
+    bulk_new = t_new > 0.0 and t_new >= half_precision * squares[group]
+    if is_rest[group] == bulk_new:
+        target[0] = t_new
+        target[1] = b_new
+        return 2, factor
+    if exact:
+        for k in range(informed.shape[0]):
+            informed[k] -= factor * projection[k] * projection[k]
+    else:
+        for i in range(dimension):
+            w_out[i] = w[i]
+    if not is_rest[group]:
+        d_new = 1.0 / t_new
+        for slot in range(rest_count):
+            for other in range(rest_count):
+                schur_inverse[slot, other] += c * solved_r[slot] * solved_r[other] / denominator
+        for slot in range(rest_count):
+            for i in range(dimension):
+                rest_images[slot, i] -= c * r[slot] * a[i]
+        projection_u = np.dot(a, image)
+        change = d_new * b_new - d_old * b_old
+        for i in range(dimension):
+            scaled = c * a[i]
+            for k in range(dimension):
+                inverse[i, k] -= scaled * a[k]
+            image[i] += change * x[i]
+            solved[i] += -c * a[i] * projection_u + change * (1.0 - c * quadratic) * a[i]
+    else:
+        for slot in range(rest_count):
+            for other in range(rest_count):
+                schur_inverse[slot, other] -= step * column[slot] * column[other] / denominator
+    precision[group] = t_new
+    shift_value[group] = b_new
+    rest_score_update = np.empty(rest_count)
+    for slot in range(rest_count):
+        rest_score_update[slot] = shift_value[rest_rows[slot]]
+    _rest_mean(rest_count, rest_rows, rows, rest_score_update, solved, rest_images, schur_inverse, rest_mean, combined)
+    return 1, factor
+
+
+@numba.njit(cache=True, error_model="numpy")
 def _sweep(order, start, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision, shift_value,
            informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image, solved, rest_mean, combined,
-           target, half_precision):
+           target, half_precision, block_width):
     """Sequential EP site updates over ``order`` from position ``start``, in place (module docstring), until the end or
-    an event: returns (position, event, group, refused), with the group's new (t, b) in ``target`` for an event.
-    ``precision`` holds each group's t, ``shift_value`` its b = X'y + sigma^2 nu, ``informed`` I = x' W x per group."""
+    a crossing of the bulk boundary: returns (position, event, group, refused), with the group's new (t, b) in
+    ``target`` for an event. ``precision`` holds each group's t, ``shift_value`` its b = X'y + sigma^2 nu, ``informed``
+    I = x' W x per group.
+
+    Blocked, with the per-step sweep's results. Checking every other group's cavity at each step is a G x n' product
+    per step, memory-bound (32 s a sweep on 7,221 groups [real, ENSG00000144369.13]). So each block of
+    ``block_width`` steps runs with the bulk's checks deferred (the rest's, O(|N|), stay per step), keeping each
+    step's w and factor; at the block's end one G x n' x B product gives every bulk cavity after every step of the
+    block exactly (I_k less the steps' factor (x_k' w)^2 in turn), and every intermediate state is checked as the
+    per-step sweep checks it. A block with a state that is not proper is restored from its snapshot and run again
+    step by step with the per-step checks, which is the sequential sweep itself; so is a step that crosses the bulk
+    boundary."""
     dimension = image.shape[0]
     group_count = order.shape[0]
     refused = 0
-    r = np.zeros(rest_count)
-    solved_r = np.empty(rest_count)
-    schur_diagonal = np.empty(rest_count)
-    for position in range(start, group_count):
-        group = order[position]
-        t_old = precision[group]
-        b_old = shift_value[group]
-        x = rows[group]
-        d_old = 0.0
-        quadratic = 0.0
-        explained = 0.0
-        a = solved
-        w = solved
-        if not is_rest[group]:
-            d_old = 1.0 / t_old
-            a = np.dot(inverse, x)
-            quadratic = np.dot(x, a)
-            if rest_count:
-                r = np.dot(rest_images, x)
-            w = a.copy()
-            for slot in range(rest_count):
-                value = 0.0
-                for other in range(rest_count):
-                    value += schur_inverse[slot, other] * r[other]
-                solved_r[slot] = value
-                explained += r[slot] * value
-                for i in range(dimension):
-                    w[i] -= value * rest_images[slot, i]
-            here = quadratic - explained
-            marginal = d_old - d_old * d_old * here
-            mean = d_old * (b_old - np.dot(x, combined))
-            cavity_scaled = here / (1.0 - d_old * here)
-        else:
-            slot_g = rest_slot[group]
-            marginal = schur_inverse[slot_g, slot_g]
-            mean = rest_mean[slot_g]
-            cavity_scaled = 1.0 / marginal - t_old
-            column = schur_inverse[:, slot_g][:rest_count].copy()
-            w = np.zeros(dimension)
-            for slot in range(rest_count):
-                for i in range(dimension):
-                    w[i] += column[slot] * rest_images[slot, i]
-        cavity_precision = cavity_scaled / noise
-        cavity_shift = mean / (noise * marginal) - (b_old - group_score[group]) / noise
-        start_c, stop_c = component_start[group], component_start[group + 1]
-        proper, _log_z, tilted_mean, tilted_variance = tilted_sum(log_weight[start_c:stop_c], log_variance[start_c:stop_c], cavity_precision, cavity_shift)
-        if not proper or not tilted_variance > 0.0:
-            refused += 1
+    position = start
+    w_block = np.zeros((block_width, dimension))
+    factors = np.zeros(block_width)
+    groups = np.zeros(block_width, dtype=np.int64)
+    old_t = np.zeros(block_width)
+    old_b = np.zeros(block_width)
+    unused = np.zeros(dimension)
+    while position < group_count:
+        block_start = position
+        saved_inverse = inverse.copy()
+        saved_images = rest_images.copy()
+        saved_schur = schur_inverse.copy()
+        saved_image = image.copy()
+        saved_solved = solved.copy()
+        saved_rest_mean = rest_mean.copy()
+        saved_combined = combined.copy()
+        count = 0
+        block_refused = 0
+        crossing = False
+        while position < group_count and count < block_width:
+            group = order[position]
+            t_before, b_before = precision[group], shift_value[group]
+            status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
+                                   shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
+                                   solved, rest_mean, combined, target, half_precision, False, w_block[count])
+            if status == 2:
+                crossing = True
+                break
+            if status == 0:
+                block_refused += 1
+            else:
+                groups[count] = group
+                factors[count] = factor
+                old_t[count] = t_before
+                old_b[count] = b_before
+                count += 1
+            position += 1
+        valid = True
+        if count:
+            projections = np.dot(rows, np.ascontiguousarray(w_block[:count].T))
+            current = informed.copy()
+            sites = precision.copy()
+            for index in range(count):
+                sites[groups[index]] = old_t[index]
+            for index in range(count):
+                group = groups[index]
+                sites[group] = precision[group]
+                for k in range(informed.shape[0]):
+                    current[k] -= factors[index] * projections[k, index] * projections[k, index]
+                for k in range(informed.shape[0]):
+                    if k == group or is_rest[k]:
+                        continue
+                    if not _bulk_proper(current[k], sites[k], largest[k], noise):
+                        valid = False
+                        break
+                if not valid:
+                    break
+            if valid:
+                for k in range(informed.shape[0]):
+                    informed[k] = current[k]
+        if valid:
+            refused += block_refused
+            if not crossing:
+                continue
+            # The crossing step again with the per-step checks, from the verified state.
+            group = order[position]
+            status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
+                                   shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
+                                   solved, rest_mean, combined, target, half_precision, True, unused)
+            if status == 2:
+                return position, _TO_BULK if is_rest[group] else _TO_REST, group, refused
+            if status == 0:
+                refused += 1
+            position += 1
             continue
-        target_t = noise * (1.0 / tilted_variance - cavity_precision)
-        target_b = group_score[group] + noise * (tilted_mean / tilted_variance - cavity_shift)
-        if not (np.isfinite(target_t) and np.isfinite(target_b)) or target_t == 0.0:
-            refused += 1
-            continue
-        projection = np.dot(rows, w)
-        fraction = 1.0
-        accepted = False
-        while fraction * abs(target_t - t_old) > half_precision * half_precision * abs(t_old) or fraction == 1.0:
-            t_new = t_old + fraction * (target_t - t_old)
-            b_new = b_old + fraction * (target_b - b_old)
-            if t_new != 0.0:
-                if not is_rest[group]:
-                    delta = 1.0 / t_new - d_old
-                    factor = delta / (1.0 + delta * here)
-                    c = delta / (1.0 + delta * quadratic)
-                    denominator = 1.0 - c * explained
-                    if denominator > 0.0:
-                        for slot in range(rest_count):
-                            schur_diagonal[slot] = schur_inverse[slot, slot] + c * solved_r[slot] * solved_r[slot] / denominator
-                        if _proper_everywhere(group, informed, projection, factor, precision, is_rest, rest_slot, schur_diagonal, largest, noise):
-                            accepted = True
-                            break
-                else:
-                    step = t_new - t_old
-                    denominator = 1.0 + step * schur_inverse[slot_g, slot_g]
-                    if denominator > 0.0:
-                        factor = -step / denominator
-                        for slot in range(rest_count):
-                            schur_diagonal[slot] = schur_inverse[slot, slot] - step * column[slot] * column[slot] / denominator
-                        if _proper_everywhere(group, informed, projection, factor, precision, is_rest, rest_slot, schur_diagonal, largest, noise):
-                            accepted = True
-                            break
-            fraction *= 0.5
-        if not accepted:
-            refused += 1
-            continue
-        bulk_new = t_new > 0.0 and t_new >= half_precision * squares[group]
-        if is_rest[group] == bulk_new:
-            target[0] = t_new
-            target[1] = b_new
-            return position, _TO_BULK if bulk_new else _TO_REST, group, refused
-        for k in range(informed.shape[0]):
-            informed[k] -= factor * projection[k] * projection[k]
-        if not is_rest[group]:
-            d_new = 1.0 / t_new
-            for slot in range(rest_count):
-                for other in range(rest_count):
-                    schur_inverse[slot, other] += c * solved_r[slot] * solved_r[other] / denominator
-            for slot in range(rest_count):
-                for i in range(dimension):
-                    rest_images[slot, i] -= c * r[slot] * a[i]
-            projection_u = np.dot(a, image)
-            change = d_new * b_new - d_old * b_old
-            for i in range(dimension):
-                scaled = c * a[i]
-                for k in range(dimension):
-                    inverse[i, k] -= scaled * a[k]
-                image[i] += change * x[i]
-                solved[i] += -c * a[i] * projection_u + change * (1.0 - c * quadratic) * a[i]
-        else:
-            for slot in range(rest_count):
-                for other in range(rest_count):
-                    schur_inverse[slot, other] -= step * column[slot] * column[other] / denominator
-        precision[group] = t_new
-        shift_value[group] = b_new
-        rest_score_update = np.empty(rest_count)
-        for slot in range(rest_count):
-            rest_score_update[slot] = shift_value[rest_rows[slot]]
-        _rest_mean(rest_count, rest_rows, rows, rest_score_update, solved, rest_images, schur_inverse, rest_mean, combined)
+        # Restore the block and run it step by step.
+        inverse[:, :] = saved_inverse
+        rest_images[:, :] = saved_images
+        schur_inverse[:, :] = saved_schur
+        image[:] = saved_image
+        solved[:] = saved_solved
+        rest_mean[:] = saved_rest_mean
+        combined[:] = saved_combined
+        for index in range(count):
+            precision[groups[index]] = old_t[index]
+            shift_value[groups[index]] = old_b[index]
+        block_end = position
+        position = block_start
+        while position < block_end:
+            group = order[position]
+            status, factor = _step(group, rows, squares, group_score, component_start, log_weight, log_variance, largest, noise, precision,
+                                   shift_value, informed, is_rest, rest_slot, rest_rows, rest_count, inverse, rest_images, schur_inverse, image,
+                                   solved, rest_mean, combined, target, half_precision, True, unused)
+            if status == 2:
+                return position, _TO_BULK if is_rest[group] else _TO_REST, group, refused
+            if status == 0:
+                refused += 1
+            position += 1
     return group_count, _DONE, -1, refused
 
 
@@ -251,6 +410,9 @@ class SequentialSweep:
             self.largest = np.exp(priors.largest_log_variance())
         self.noise = float(noise)
         self.dimension = int(self.rows.shape[1])
+        # A block's deferred checks (``_sweep``) cost one G x n' x B product; B = sqrt(n') columns make it a matrix
+        # product rather than B matrix-vector products, and a restored block repeats at most that many steps.
+        self.block_width = max(1, int(np.sqrt(self.dimension)))
         self.clusters: list[I64Array] = []
         self.coupling: list[F64Array] = []
         self.clustered = np.zeros(self.rows.shape[0], dtype=bool)
@@ -346,7 +508,7 @@ class SequentialSweep:
                 order, position, self.rows, self.squares, self.group_score, priors.component_start, priors.log_weight, priors.log_variance,
                 self.checked_largest, self.noise, precision, self.shift_value, self.informed, self.is_rest, self.rest_slot, self.rest_rows,
                 self.rest_rows.shape[0], self.inverse, self.rest_images, self.schur_inverse, self.image, self.solved, self.rest_mean,
-                self.combined, target, _HALF_PRECISION,
+                self.combined, target, _HALF_PRECISION, self.block_width,
             )
             refused += count
             if event == _DONE:
