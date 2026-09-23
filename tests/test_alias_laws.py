@@ -59,26 +59,56 @@ def test_singles_and_pairs_are_exact(groups):
     np.testing.assert_allclose(terms.variance[rows], expected[3], rtol=1e-9)
 
 
-def test_a_larger_groups_splitting_error_falls_as_the_spacings_square_to_the_enumeration():
+@pytest.mark.parametrize("count", [2, 3])
+def test_a_binned_groups_splitting_error_falls_as_the_spacings_square_to_the_enumeration(count):
+    """A pair is binned while its K^2 atoms outnumber its nodes (here to refinement 8) and exact past that."""
     grid = np.linspace(-6.0, 1.0, 15)
     log_density = (-0.5 * np.square((grid + 2.5) / 1.5))[None, :]
     log_density -= np.log(np.exp(log_density).sum())
-    log_scale = np.array([0.0, 0.3, -0.2])
+    log_scale = np.array([0.0, 0.3, -0.2])[:count]
     precision, shift = np.array([4.0]), np.array([3.0])
-    expected = _enumerate(log_density[[0, 0, 0]], log_scale[:, None] + grid[None, :], precision[0], shift[0])
+    expected = _enumerate(log_density[[0] * count], log_scale[:, None] + grid[None, :], precision[0], shift[0])
     errors = []
     for refinement in (1, 2, 4, 8, 16):
-        laws = GroupLaws.of(np.zeros(3, dtype=np.int64), log_density, np.zeros(3, dtype=np.int64), log_scale, grid, refinement)
+        laws = GroupLaws.of(np.zeros(count, dtype=np.int64), log_density, np.zeros(count, dtype=np.int64), log_scale, grid, refinement)
         terms = group_terms(laws, precision, shift)
         errors.append(abs(terms.log_normalizer[0] - expected[0]))
     print("log Z error by refinement", errors)
     assert all(later < earlier for earlier, later in zip(errors, errors[1:]))
     assert errors[-1] < errors[0] / 50
+    if count == 2:
+        assert laws.law_start[-1] == grid.shape[0] ** 2 and errors[-1] < 1e-12
     np.testing.assert_allclose(terms.mean, expected[2], rtol=2e-3)
     np.testing.assert_allclose(terms.variance, expected[3], rtol=5e-3)
     np.testing.assert_allclose(terms.marginal, expected[1], atol=2e-3)
-    coarse = GroupLaws.of(np.zeros(3, dtype=np.int64), log_density, np.zeros(3, dtype=np.int64), log_scale, grid, 8)
+    coarse = GroupLaws.of(np.zeros(count, dtype=np.int64), log_density, np.zeros(count, dtype=np.int64), log_scale, grid, 8)
     assert law_resolution(coarse, laws, precision, shift) > errors[-1]
+
+
+def test_exchangeable_members_share_one_leave_one_out_law_and_are_exactly_equal():
+    """Four members, three of one class and scale and one of another, in one group with a single and a pair beside it:
+    the three are exactly equal, and all agree with the K^4 enumeration to the splitting's resolution."""
+    grid = np.linspace(-5.0, 1.0, 9)
+    log_density = np.stack([-0.5 * np.square((grid + 2.0) / 1.2), -0.5 * np.square((grid + 1.0) / 1.0)])
+    log_density -= np.log(np.exp(log_density).sum(axis=1, keepdims=True))
+    groups = np.array([1, 0, 1, 2, 1, 1, 2], dtype=np.int64)
+    classes = np.array([0, 1, 1, 0, 0, 0, 0], dtype=np.int64)
+    log_scale = np.array([0.2, 0.0, -0.4, 0.1, 0.2, 0.2, 0.1])
+    precision, shift = np.array([2.0, 3.0, 1.5]), np.array([1.0, 2.5, -2.0])
+    terms = group_terms(GroupLaws.of(groups, log_density, classes, log_scale, grid, 16), precision, shift)
+    same = np.array([0, 4, 5])
+    assert terms.mean[same[0]] == terms.mean[same[1]] == terms.mean[same[2]]
+    assert np.array_equal(terms.marginal[same[0]], terms.marginal[same[2]])
+    for group in range(3):
+        members = np.flatnonzero(groups == group)
+        expected = _enumerate(log_density[classes[members]], log_scale[members][:, None] + grid[None, :], precision[group], shift[group])
+        exact = members.shape[0] < 3
+        np.testing.assert_allclose(terms.log_normalizer[group], expected[0], rtol=1e-12, atol=0.0 if exact else 2e-4)
+        np.testing.assert_allclose(terms.mean[members], expected[2], rtol=1e-10 if exact else 5e-3)
+        np.testing.assert_allclose(terms.variance[members], expected[3], rtol=1e-9 if exact else 1e-2)
+        np.testing.assert_allclose(terms.marginal[members], expected[1], atol=1e-12 if exact else 5e-3)
+    # Exact pair members of one class and scale are exactly equal too.
+    assert terms.mean[3] == terms.mean[6]
 
 
 @pytest.mark.parametrize("groups", [[0], [0, 0], [0, 0, 0]])

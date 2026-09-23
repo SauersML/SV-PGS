@@ -16,13 +16,17 @@ from the same leave-one-out law: given its node a and V_-j = W the sum's tilted 
 E[gamma_j^2] = E[v_ja W / V + (v_ja / V)^2 (c + h^2 c^2)].
 
 The laws. A group of one member is its member's K atoms; a pair's law is its K^2 atoms and each leave-one-out law the
-other member's K atoms, all exact. A larger group's laws are formed on nodes at the lattice's spacing in log V (the
-lattice is a quadrature rule in log variance at that spacing, ``scale_mixture_ep.derived_lattice``): prefix laws
-member by member (at a spacing refined by a measured factor, ``law_resolution``), each sum's mass split between its two neighbouring nodes linearly in log V (mass and the mean of
-log V kept), the suffix laws the same way from the other end, and member j's leave-one-out law the convolution of the
-prefix before it with the suffix after it. Masses are held in logs throughout (a tilted law can put its weight on
-masses far below the largest). The laws depend on the hyperparameters, not on the cavity: they are formed once per
-hyperparameter setting (``GroupLaws.of``) and read at every cavity.
+other member's K atoms, all exact. A larger group's laws are formed on nodes evenly spaced in log V at the lattice's
+spacing divided by a measured refinement (``law_resolution``; the lattice is a quadrature rule in log variance at its
+spacing, ``scale_mixture_ep.derived_lattice``): prefix laws member by member, each sum's mass split between its two
+neighbouring nodes linearly in log V (mass and the mean of log V kept), suffix laws the same way from the other end,
+and a member's leave-one-out law the convolution of the prefix before it with the suffix after it. Every leave-one-out
+law and every member's atoms lie on even grids in log V, so where a sum W_i + v_k lands and the shares v / V depend on
+i - r k alone (r the grids' spacing ratio): each convolution and each member's terms read those from one table, and
+the kernel is evaluated at the exact sum. Members of one class with one scale are exchangeable: their leave-one-out
+laws are one law, formed once, and their terms are computed once and are exactly equal. Masses are held in logs
+throughout (a tilted law can put its weight on masses far below the largest). The laws depend on the hyperparameters,
+not on the cavity: they are formed once per hyperparameter setting (``GroupLaws.of``) and read at every cavity.
 """
 
 from __future__ import annotations
@@ -36,45 +40,290 @@ from sv_pgs._typing import F64Array, I64Array
 
 
 @numba.njit(cache=True, error_model="numpy")
-def _log_add(left, right):
-    if left == -np.inf:
-        return right
-    if right == -np.inf:
-        return left
-    if left > right:
-        return left + np.log1p(np.exp(right - left))
-    return right + np.log1p(np.exp(left - right))
+def _softplus(value):
+    """log(1 + e^value), without overflow."""
+    if value > 0.0:
+        return value + np.log1p(np.exp(-value))
+    return np.log1p(np.exp(value))
 
 
 @numba.njit(cache=True, error_model="numpy")
-def _convolve(first_log_variance, first_log_mass, second_log_variance, second_log_mass, low, spacing, node_count):
-    """The law of the sum of two independent variances, each given as atoms (log V, log mass), on ``node_count`` nodes at
-    ``spacing`` in log V from ``low``: each pair's sum split between its neighbouring nodes linearly in log V."""
-    result = np.full(node_count, -np.inf)
-    for i in range(first_log_variance.shape[0]):
-        if first_log_mass[i] == -np.inf:
+def _landing(origin, stride, count, node_count, spacing):
+    """Where a sum lands, for a law on nodes i (spacing ``spacing`` in log V from its origin) plus atoms at
+    ``origin`` + ``stride`` k nodes (k < ``count``): with u = i - stride k and D = u - origin, the sum is at node
+    i + L(u), L(u) = softplus(-spacing D) / spacing. Returns (L, log share of the atom, log share of the law) over u
+    from -stride (count - 1) to node_count - 1."""
+    size = node_count + stride * (count - 1)
+    offset = np.empty(size)
+    log_atom_share = np.empty(size)
+    log_law_share = np.empty(size)
+    for index in range(size):
+        distance = spacing * (index - stride * (count - 1) - origin)
+        offset[index] = _softplus(-distance) / spacing
+        log_atom_share[index] = -_softplus(distance)
+        log_law_share[index] = -_softplus(-distance)
+    return offset, log_atom_share, log_law_share
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _split(position, node_count):
+    """(lower node, fraction to the upper) of a position, the upper end clamped."""
+    lower = int(np.floor(position))
+    if lower > node_count - 2:
+        lower = node_count - 2
+    fraction = position - lower
+    if fraction > 1.0:
+        fraction = 1.0
+    if fraction < 0.0:
+        fraction = 0.0
+    return lower, fraction
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _bin(origin, stride, log_mass, node_count, out):
+    """Atoms at ``origin`` + ``stride`` k nodes onto the nodes, each split between its neighbours linearly in log V."""
+    out[:] = -np.inf
+    for k in range(log_mass.shape[0]):
+        if log_mass[k] == -np.inf:
             continue
-        for k in range(second_log_variance.shape[0]):
-            if second_log_mass[k] == -np.inf:
+        lower, fraction = _split(origin + stride * k, node_count)
+        if fraction < 1.0:
+            out[lower] = np.logaddexp(out[lower], log_mass[k] + np.log1p(-fraction))
+        if fraction > 0.0:
+            out[lower + 1] = np.logaddexp(out[lower + 1], log_mass[k] + np.log(fraction))
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _convolve(law, origin, stride, log_mass, spacing, out, peak):
+    """The law of the sum of a law on the nodes and independent atoms at ``origin`` + ``stride`` k nodes, split onto the
+    nodes (module docstring), in logs by two passes: each node's largest term, then the sum relative to it."""
+    node_count = law.shape[0]
+    count = log_mass.shape[0]
+    offset, _atom, _law = _landing(origin, stride, count, node_count, spacing)
+    base = stride * (count - 1)
+    # The split depends on u alone (the landing's whole and fractional parts) except at the clamped upper end.
+    whole = np.empty(offset.shape[0], dtype=np.int64)
+    log_lower = np.empty(offset.shape[0])
+    log_upper = np.empty(offset.shape[0])
+    for index in range(offset.shape[0]):
+        whole[index] = int(np.floor(offset[index]))
+        fraction = offset[index] - whole[index]
+        log_lower[index] = np.log1p(-fraction)
+        log_upper[index] = np.log(fraction) if fraction > 0.0 else -np.inf
+    peak[:] = -np.inf
+    out[:] = 0.0
+    for sweep in range(2):
+        for i in range(node_count):
+            if law[i] == -np.inf:
                 continue
-            log_total = _log_add(first_log_variance[i], second_log_variance[k])
-            position = (log_total - low) / spacing
-            lower = int(np.floor(position))
-            if lower < 0:
-                lower = 0
-            if lower > node_count - 2:
-                lower = node_count - 2
-            fraction = position - lower
-            if fraction < 0.0:
-                fraction = 0.0
-            if fraction > 1.0:
-                fraction = 1.0
-            mass = first_log_mass[i] + second_log_mass[k]
-            if fraction < 1.0:
-                result[lower] = _log_add(result[lower], mass + np.log1p(-fraction))
-            if fraction > 0.0:
-                result[lower + 1] = _log_add(result[lower + 1], mass + np.log(fraction))
-    return result
+            for k in range(count):
+                if log_mass[k] == -np.inf:
+                    continue
+                index = i - stride * k + base
+                lower = i + whole[index]
+                if lower <= node_count - 2:
+                    lower_term = law[i] + log_mass[k] + log_lower[index]
+                    upper_term = law[i] + log_mass[k] + log_upper[index]
+                else:
+                    lower, fraction = _split(i + offset[index], node_count)
+                    lower_term = law[i] + log_mass[k] + np.log1p(-fraction) if fraction < 1.0 else -np.inf
+                    upper_term = law[i] + log_mass[k] + np.log(fraction) if fraction > 0.0 else -np.inf
+                if sweep == 0:
+                    if lower_term > peak[lower]:
+                        peak[lower] = lower_term
+                    if upper_term > peak[lower + 1]:
+                        peak[lower + 1] = upper_term
+                else:
+                    if lower_term > -np.inf:
+                        out[lower] += np.exp(lower_term - peak[lower])
+                    if upper_term > -np.inf:
+                        out[lower + 1] += np.exp(upper_term - peak[lower + 1])
+    for node in range(node_count):
+        out[node] = peak[node] + np.log(out[node]) if peak[node] > -np.inf else -np.inf
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _larger_laws(larger, with_loo, member_start, member_index, representative, member_origin, member_log_weight, stride, spacing, low,
+                 law_start, law_log_mass, loo_start, loo_log_mass):
+    """Each binned group's law and, where ``with_loo``, its representatives' leave-one-out laws on its nodes (module
+    docstring)."""
+    for position in numba.prange(larger.shape[0]):
+        group = larger[position]
+        start, stop = member_start[group], member_start[group + 1]
+        count = stop - start
+        node_count = law_start[group + 1] - law_start[group]
+        prefix = np.empty((count, node_count))
+        peak = np.empty(node_count)
+        origins = np.empty(count)
+        for p in range(count):
+            origins[p] = (member_origin[member_index[start + p]] - low[group]) / spacing
+        _bin(origins[0], stride, member_log_weight[member_index[start]], node_count, prefix[0])
+        for p in range(1, count):
+            _convolve(prefix[p - 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, prefix[p], peak)
+        law_log_mass[law_start[group]:law_start[group + 1]] = prefix[count - 1]
+        if not with_loo[position]:
+            continue
+        single_run = representative[member_index[stop - 1]] == member_index[start]
+        if single_run:
+            j = member_index[start]
+            loo_log_mass[loo_start[j]:loo_start[j + 1]] = prefix[count - 2]
+            continue
+        suffix = np.empty((count, node_count))
+        _bin(origins[count - 1], stride, member_log_weight[member_index[stop - 1]], node_count, suffix[count - 1])
+        for p in range(count - 2, 0, -1):
+            _convolve(suffix[p + 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, suffix[p], peak)
+        for p in range(count):
+            j = member_index[start + p]
+            if representative[j] != j:
+                continue
+            target = loo_log_mass[loo_start[j]:loo_start[j + 1]]
+            if p == 0:
+                target[:] = suffix[1]
+            elif p == count - 1:
+                target[:] = prefix[count - 2]
+            else:
+                _convolve(prefix[p - 1], 0.0, 1, suffix[p + 1], spacing, target, peak)
+
+
+@dataclass(frozen=True)
+class GroupLaws:
+    """Every alias group's law of V and its members' leave-one-out laws at one hyperparameter setting. Group g's law is
+    the atoms ``law_start[g]:law_start[g + 1]`` (log V, log mass). Member j's own atoms are at log V =
+    ``member_origin[j]`` + ``grid_spacing`` k with log weights ``member_log_weight[j]``; its leave-one-out law (a
+    representative's, empty for a group of one and for a member that copies its ``representative``) is the masses
+    ``loo_start[j]:loo_start[j + 1]`` on nodes at ``loo_low[j]`` + ``loo_spacing[j]`` i, where its own atoms are every
+    ``loo_stride[j]``-th node."""
+
+    groups: I64Array
+    member_start: I64Array
+    member_index: I64Array
+    representative: I64Array
+    law_start: I64Array
+    law_log_variance: F64Array
+    law_log_mass: F64Array
+    member_origin: F64Array
+    member_log_weight: F64Array
+    grid_spacing: float
+    loo_start: I64Array
+    loo_log_mass: F64Array
+    loo_low: F64Array
+    loo_spacing: F64Array
+    loo_stride: I64Array
+
+    @property
+    def group_count(self) -> int:
+        return int(self.member_start.shape[0] - 1)
+
+    @property
+    def member_log_variance(self) -> F64Array:
+        """Member j's atoms' log variances (members x K)."""
+        return self.member_origin[:, None] + self.grid_spacing * np.arange(self.member_log_weight.shape[1])[None, :]
+
+    @classmethod
+    def of(cls, groups: I64Array, log_density: F64Array, class_index: I64Array, log_scale: F64Array, grid: F64Array, refinement: int = 1) -> "GroupLaws":
+        """The laws at the class log densities ``log_density`` (classes x K, normalized), each member's class and log
+        scale log u_j, on the evenly spaced lattice ``grid`` (module docstring); a larger group's nodes are at the
+        lattice's spacing divided by ``refinement`` (the splitting's error falls as its square; ``law_resolution``
+        measures it)."""
+        groups = np.asarray(groups, dtype=np.int64)
+        class_index = np.asarray(class_index, dtype=np.int64)
+        log_scale = np.asarray(log_scale, dtype=np.float64)
+        grid = np.asarray(grid, dtype=np.float64)
+        member_count, node_count = groups.shape[0], grid.shape[0]
+        group_count = int(groups.max()) + 1
+        grid_spacing = float(grid[1] - grid[0]) if node_count > 1 else 1.0
+        spacing = grid_spacing / refinement
+        member_origin = log_scale + grid[0]
+        member_log_weight = np.ascontiguousarray(np.asarray(log_density, dtype=np.float64)[class_index])
+        # Within a group, exchangeable members (one class, one scale) are adjacent; each run's first is its representative.
+        member_index = np.lexsort((log_scale, class_index, groups)).astype(np.int64)
+        sizes = np.bincount(groups, minlength=group_count)
+        member_start = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        ordered_group, ordered_class, ordered_scale = groups[member_index], class_index[member_index], log_scale[member_index]
+        new_run = np.ones(member_count, dtype=bool)
+        new_run[1:] = (ordered_group[1:] != ordered_group[:-1]) | (ordered_class[1:] != ordered_class[:-1]) | (ordered_scale[1:] != ordered_scale[:-1])
+        run_first = member_index[np.maximum.accumulate(np.where(new_run, np.arange(member_count), 0))]
+        representative = np.empty(member_count, dtype=np.int64)
+        representative[member_index] = run_first
+        member_size = sizes[groups]
+        # Laws: a single's K atoms; binned, nodes from the group's smallest atom to the log of the sum of its members'
+        # largest, and one more.
+        low = np.full(group_count, np.inf)
+        np.minimum.at(low, groups, member_origin)
+        high = np.full(group_count, -np.inf)
+        np.logaddexp.at(high, groups, log_scale + grid[-1])
+        # A pair's law is its K^2 atoms exactly where they are no more than its binned nodes; past that it is binned
+        # like a larger group's (the sweep reads every atom of every law at every update), its leave-one-out laws exact.
+        binned_size = np.ceil((high - low) / spacing).astype(np.int64) + 2
+        exact_pair = (sizes == 2) & (node_count * node_count <= binned_size)
+        binned = np.flatnonzero((sizes > 2) | ((sizes == 2) & ~exact_pair)).astype(np.int64)
+        law_size = np.where(sizes == 1, node_count, np.where(exact_pair, node_count * node_count, binned_size))
+        law_start = np.concatenate([[0], np.cumsum(law_size)]).astype(np.int64)
+        law_log_variance = np.empty(law_start[-1])
+        law_log_mass = np.empty(law_start[-1])
+        loo_low = np.zeros(member_count)
+        loo_spacing = np.full(member_count, grid_spacing)
+        loo_stride = np.ones(member_count, dtype=np.int64)
+        loo_size = np.zeros(member_count, dtype=np.int64)
+        computes = (representative == np.arange(member_count)) & (member_size > 1)
+        singles = np.flatnonzero(sizes == 1)
+        single_members = member_index[member_start[singles]]
+        single_atoms = law_start[singles][:, None] + np.arange(node_count)[None, :]
+        law_log_variance[single_atoms] = member_origin[single_members][:, None] + grid_spacing * np.arange(node_count)[None, :]
+        law_log_mass[single_atoms] = member_log_weight[single_members]
+        exact_pairs = np.flatnonzero(exact_pair)
+        first, second = member_index[member_start[exact_pairs]], member_index[member_start[exact_pairs] + 1]
+        pair_atoms = law_start[exact_pairs][:, None] + np.arange(node_count * node_count)[None, :]
+        first_variance = member_origin[first][:, None] + grid_spacing * np.arange(node_count)[None, :]
+        second_variance = member_origin[second][:, None] + grid_spacing * np.arange(node_count)[None, :]
+        law_log_variance[pair_atoms] = np.logaddexp(first_variance[:, :, None], second_variance[:, None, :]).reshape(exact_pairs.shape[0], node_count * node_count)
+        law_log_mass[pair_atoms] = (member_log_weight[first][:, :, None] + member_log_weight[second][:, None, :]).reshape(exact_pairs.shape[0], node_count * node_count)
+        pairs = np.flatnonzero(sizes == 2)
+        first, second = member_index[member_start[pairs]], member_index[member_start[pairs] + 1]
+        # A pair's leave-one-out law is the other member's atoms: on their grid, at the lattice's spacing.
+        loo_low[first], loo_low[second] = member_origin[second], member_origin[first]
+        loo_size[first[computes[first]]] = node_count
+        loo_size[second[computes[second]]] = node_count
+        larger_members = np.flatnonzero(member_size > 2)
+        loo_low[larger_members] = low[groups[larger_members]]
+        loo_spacing[larger_members] = spacing
+        loo_stride[larger_members] = refinement
+        larger_computes = larger_members[computes[larger_members]]
+        loo_size[larger_computes] = law_size[groups[larger_computes]]
+        loo_start = np.concatenate([[0], np.cumsum(loo_size)]).astype(np.int64)
+        loo_log_mass = np.empty(loo_start[-1])
+        paired = np.concatenate([first[computes[first]], second[computes[second]]])
+        other = np.concatenate([second[computes[first]], first[computes[second]]])
+        loo_log_mass[loo_start[paired][:, None] + np.arange(node_count)[None, :]] = member_log_weight[other]
+        for group in binned:
+            law_log_variance[law_start[group]:law_start[group + 1]] = low[group] + spacing * np.arange(law_size[group])
+        if binned.shape[0]:
+            _larger_laws(binned, sizes[binned] > 2, member_start, member_index, representative, member_origin, member_log_weight, refinement, spacing, low,
+                         law_start, law_log_mass, loo_start, loo_log_mass)
+        return cls(
+            groups=groups, member_start=member_start, member_index=member_index, representative=representative, law_start=law_start,
+            law_log_variance=law_log_variance, law_log_mass=law_log_mass, member_origin=member_origin, member_log_weight=member_log_weight,
+            grid_spacing=grid_spacing, loo_start=loo_start, loo_log_mass=loo_log_mass, loo_low=loo_low, loo_spacing=loo_spacing,
+            loo_stride=loo_stride,
+        )
+
+    @property
+    def component_start(self) -> I64Array:
+        """The group laws' atoms as the EP sweep's components (``sequential_ep.SequentialSweep``)."""
+        return self.law_start
+
+    @property
+    def log_weight(self) -> F64Array:
+        return self.law_log_mass
+
+    @property
+    def log_variance(self) -> F64Array:
+        return self.law_log_variance
+
+    def largest_log_variance(self) -> F64Array:
+        """Each group's largest atom: its tilted law is proper exactly where 1 + V_max P > 0."""
+        finite = np.where(self.law_log_mass > -np.inf, self.law_log_variance, -np.inf)
+        return np.maximum.reduceat(finite, self.law_start[:-1])
 
 
 @numba.njit(cache=True, error_model="numpy")
@@ -93,186 +342,94 @@ def _log_kernel(log_variance, precision, shift):
     return log_kernel, first, conditional
 
 
-@dataclass(frozen=True)
-class GroupLaws:
-    """Every alias group's law of V and its members' leave-one-out laws at one hyperparameter setting, packed as atoms
-    (log V, log mass): group g's law is ``law_start[g]:law_start[g + 1]``; member j's leave-one-out law is
-    ``loo_start[j]:loo_start[j + 1]`` (empty for a group of one); each member's own atoms are its K nodes
-    (``member_log_variance`` j x K, ``member_log_weight`` j x K)."""
-
-    groups: I64Array
-    member_start: I64Array
-    member_index: I64Array
-    law_start: I64Array
-    law_log_variance: F64Array
-    law_log_mass: F64Array
-    loo_start: I64Array
-    loo_log_variance: F64Array
-    loo_log_mass: F64Array
-    member_log_variance: F64Array
-    member_log_weight: F64Array
-
-    @property
-    def group_count(self) -> int:
-        return int(self.member_start.shape[0] - 1)
-
-    @classmethod
-    def of(cls, groups: I64Array, log_density: F64Array, class_index: I64Array, log_scale: F64Array, grid: F64Array, refinement: int = 1) -> "GroupLaws":
-        """The laws at the class log densities ``log_density`` (classes x K, normalized), each member's class and log
-        scale log u_j, on the lattice ``grid`` (module docstring); a larger group's nodes are at the lattice's spacing
-        divided by ``refinement`` (the splitting's error falls as its square; ``law_resolution`` measures it)."""
-        groups = np.asarray(groups, dtype=np.int64)
-        group_count = int(groups.max()) + 1
-        member_index = np.argsort(groups, kind="stable").astype(np.int64)
-        member_start = np.concatenate([[0], np.cumsum(np.bincount(groups, minlength=group_count))]).astype(np.int64)
-        grid = np.asarray(grid, dtype=np.float64)
-        spacing = (float(grid[1] - grid[0]) if grid.shape[0] > 1 else 1.0) / refinement
-        member_log_variance = np.asarray(log_scale, dtype=np.float64)[:, None] + grid[None, :]
-        member_log_weight = np.asarray(log_density, dtype=np.float64)[np.asarray(class_index, dtype=np.int64)]
-        law_variance, law_mass, law_start = [], [], [0]
-        loo_variance = [np.zeros(0) for _ in range(groups.shape[0])]
-        loo_mass = [np.zeros(0) for _ in range(groups.shape[0])]
-        for group in range(group_count):
-            members = member_index[member_start[group]:member_start[group + 1]]
-            count = members.shape[0]
-            atoms_v = [member_log_variance[j] for j in members]
-            atoms_m = [member_log_weight[j] for j in members]
-            if count == 1:
-                law_v, law_m = atoms_v[0], atoms_m[0]
-            elif count == 2:
-                law_v = np.logaddexp(atoms_v[0][:, None], atoms_v[1][None, :]).ravel()
-                law_m = (atoms_m[0][:, None] + atoms_m[1][None, :]).ravel()
-                loo_variance[members[0]], loo_mass[members[0]] = atoms_v[1], atoms_m[1]
-                loo_variance[members[1]], loo_mass[members[1]] = atoms_v[0], atoms_m[0]
-            else:
-                low = float(np.min([values.min() for values in atoms_v]))
-                high = float(np.logaddexp.reduce([values.max() for values in atoms_v]))
-                node_count = int(np.ceil((high - low) / spacing)) + 2
-                nodes = low + spacing * np.arange(node_count)
-                prefix = [(atoms_v[0], atoms_m[0])]
-                for position in range(1, count):
-                    previous_v, previous_m = prefix[-1]
-                    prefix.append((nodes, _convolve(previous_v, previous_m, atoms_v[position], atoms_m[position], low, spacing, node_count)))
-                suffix = [None] * count
-                suffix[count - 1] = (atoms_v[count - 1], atoms_m[count - 1])
-                for position in range(count - 2, -1, -1):
-                    later_v, later_m = suffix[position + 1]
-                    suffix[position] = (nodes, _convolve(later_v, later_m, atoms_v[position], atoms_m[position], low, spacing, node_count))
-                law_v, law_m = prefix[count - 1]
-                for position, member in enumerate(members):
-                    if position == 0:
-                        loo_variance[member], loo_mass[member] = suffix[1]
-                    elif position == count - 1:
-                        loo_variance[member], loo_mass[member] = prefix[count - 2]
-                    else:
-                        before_v, before_m = prefix[position - 1]
-                        after_v, after_m = suffix[position + 1]
-                        loo_variance[member] = nodes
-                        loo_mass[member] = _convolve(before_v, before_m, after_v, after_m, low, spacing, node_count)
-            law_variance.append(np.asarray(law_v, dtype=np.float64))
-            law_mass.append(np.asarray(law_m, dtype=np.float64))
-            law_start.append(law_start[-1] + law_variance[-1].shape[0])
-        loo_start = np.concatenate([[0], np.cumsum([values.shape[0] for values in loo_variance])]).astype(np.int64)
-        return cls(
-            groups=groups, member_start=member_start, member_index=member_index, law_start=np.asarray(law_start, dtype=np.int64),
-            law_log_variance=np.concatenate(law_variance), law_log_mass=np.concatenate(law_mass), loo_start=loo_start,
-            loo_log_variance=np.concatenate(loo_variance) if loo_start[-1] else np.zeros(0),
-            loo_log_mass=np.concatenate(loo_mass) if loo_start[-1] else np.zeros(0),
-            member_log_variance=member_log_variance, member_log_weight=member_log_weight,
-        )
-
-    @property
-    def component_start(self) -> I64Array:
-        """The group laws' atoms as the EP sweep's components (``sequential_ep.SequentialSweep``)."""
-        return self.law_start
-
-    @property
-    def log_weight(self) -> F64Array:
-        return self.law_log_mass
-
-    @property
-    def log_variance(self) -> F64Array:
-        return self.law_log_variance
-
-    def largest_log_variance(self) -> F64Array:
-        """Each group's largest atom: its tilted law is proper exactly where 1 + V_max P > 0."""
-        return np.array([self.law_log_variance[a:b][self.law_log_mass[a:b] > -np.inf].max() for a, b in zip(self.law_start[:-1], self.law_start[1:])])
-
-
-@numba.njit(cache=True, error_model="numpy")
-def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member_index, loo_start, loo_log_variance, loo_log_mass,
-                 member_log_variance, member_log_weight, precision, shift, log_normalizer, marginal, scale_derivative, member_mean, member_second):
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member_index, representative, member_origin, member_log_weight,
+                 grid_spacing, loo_start, loo_log_mass, loo_low, loo_spacing, loo_stride, precision, shift, log_normalizer, marginal,
+                 scale_derivative, member_mean, member_second):
     """Per group at its cavity: log Z, and per member its node marginals, d log Z / d log u_j and its posterior mean and
-    second moment, in place (module docstring). A group of one member reads its own atoms for everything."""
+    second moment, in place (module docstring)."""
     group_count = member_start.shape[0] - 1
-    node_count = member_log_variance.shape[1]
-    for group in range(group_count):
+    node_count = member_log_weight.shape[1]
+    for group in numba.prange(group_count):
         P = precision[group]
         h = shift[group]
         start, stop = law_start[group], law_start[group + 1]
-        total = -np.inf
+        peak = -np.inf
         for a in range(start, stop):
-            if law_log_mass[a] == -np.inf:
-                continue
-            log_k, _first, _conditional = _log_kernel(law_log_variance[a], P, h)
-            total = _log_add(total, law_log_mass[a] + log_k)
-        log_normalizer[group] = total
+            if law_log_mass[a] > -np.inf:
+                log_k, _first, _conditional = _log_kernel(law_log_variance[a], P, h)
+                if law_log_mass[a] + log_k > peak:
+                    peak = law_log_mass[a] + log_k
+        total = 0.0
+        for a in range(start, stop):
+            if law_log_mass[a] > -np.inf:
+                log_k, _first, _conditional = _log_kernel(law_log_variance[a], P, h)
+                total += np.exp(law_log_mass[a] + log_k - peak)
+        log_normalizer[group] = peak + np.log(total)
+        size = member_start[group + 1] - member_start[group]
+        node_terms = np.empty(node_count)
+        share_first = np.zeros(node_count)
+        mean_part = np.zeros(node_count)
+        second_part = np.zeros(node_count)
         for position in range(member_start[group], member_start[group + 1]):
             j = member_index[position]
-            size = member_start[group + 1] - member_start[group]
-            node_terms = np.full(node_count, -np.inf)
-            share_first = np.zeros(node_count)
-            mean_part = np.zeros(node_count)
-            second_part = np.zeros(node_count)
-            for k in range(node_count):
-                if member_log_weight[j, k] == -np.inf:
-                    continue
-                log_v = member_log_variance[j, k]
-                if size == 1:
-                    log_k, first, conditional = _log_kernel(log_v, P, h)
+            if representative[j] != j:
+                continue
+            node_terms[:] = -np.inf
+            if size == 1:
+                for k in range(node_count):
+                    if member_log_weight[j, k] == -np.inf:
+                        continue
+                    log_k, first, conditional = _log_kernel(member_origin[j] + grid_spacing * k, P, h)
                     node_terms[k] = member_log_weight[j, k] + log_k
                     share_first[k] = first
                     mean_part[k] = h * conditional
                     second_part[k] = conditional + h * h * conditional * conditional
-                    continue
-                # Over the leave-one-out law: sum_W m(W) K(W + v) with the share-weighted pieces as weighted means.
-                weighted_first = 0.0
-                weighted_mean = 0.0
-                weighted_second = 0.0
-                peak = -np.inf
-                terms = np.empty(loo_start[j + 1] - loo_start[j])
-                for index in range(loo_start[j], loo_start[j + 1]):
-                    if loo_log_mass[index] == -np.inf:
-                        terms[index - loo_start[j]] = -np.inf
+            else:
+                # Over the leave-one-out law W on its nodes, with the member's atom v_k: sum_W m(W) K(W + v_k) and the
+                # share-weighted pieces as weighted means; where W_i + v_k lands and its shares depend on i - r k alone.
+                law = loo_log_mass[loo_start[j]:loo_start[j + 1]]
+                count = law.shape[0]
+                spacing = loo_spacing[j]
+                stride = loo_stride[j]
+                origin = (member_origin[j] - loo_low[j]) / spacing
+                offset, log_atom_share, log_law_share = _landing(origin, stride, node_count, count, spacing)
+                base = stride * (node_count - 1)
+                values = np.empty(count)
+                for k in range(node_count):
+                    if member_log_weight[j, k] == -np.inf:
                         continue
-                    log_total = _log_add(loo_log_variance[index], log_v)
-                    log_k, _f, _c = _log_kernel(log_total, P, h)
-                    value = loo_log_mass[index] + log_k
-                    terms[index - loo_start[j]] = value
-                    if value > peak:
-                        peak = value
-                if peak == -np.inf:
-                    continue
-                weight_sum = 0.0
-                for index in range(loo_start[j], loo_start[j + 1]):
-                    value = terms[index - loo_start[j]]
-                    if value == -np.inf:
+                    inner_peak = -np.inf
+                    for i in range(count):
+                        values[i] = -np.inf
+                        if law[i] == -np.inf:
+                            continue
+                        log_total = loo_low[j] + spacing * (i + offset[i - stride * k + base])
+                        log_k, _f, _c = _log_kernel(log_total, P, h)
+                        values[i] = law[i] + log_k
+                        if values[i] > inner_peak:
+                            inner_peak = values[i]
+                    if inner_peak == -np.inf:
                         continue
-                    weight = np.exp(value - peak)
-                    log_total = _log_add(loo_log_variance[index], log_v)
-                    _lk, first, conditional = _log_kernel(log_total, P, h)
-                    share = np.exp(log_v - log_total)
-                    weight_sum += weight
-                    weighted_first += weight * share * first
-                    weighted_mean += weight * share * h * conditional
-                    # E[gamma_j^2 | node, W] = v W / V + share^2 (c + h^2 c^2), the first term in logs.
-                    allocation = np.exp(log_v + loo_log_variance[index] - log_total)
-                    weighted_second += weight * (allocation + share * share * (conditional + h * h * conditional * conditional))
-                inner = peak + np.log(weight_sum)
-                node_terms[k] = member_log_weight[j, k] + inner
-                share_first[k] = weighted_first / weight_sum
-                mean_part[k] = weighted_mean / weight_sum
-                second_part[k] = weighted_second / weight_sum
+                    weight_sum = weighted_first = weighted_mean = weighted_second = 0.0
+                    for i in range(count):
+                        if values[i] == -np.inf:
+                            continue
+                        weight = np.exp(values[i] - inner_peak)
+                        index = i - stride * k + base
+                        log_total = loo_low[j] + spacing * (i + offset[index])
+                        _lk, first, conditional = _log_kernel(log_total, P, h)
+                        share = np.exp(log_atom_share[index])
+                        weight_sum += weight
+                        weighted_first += weight * share * first
+                        weighted_mean += weight * share * h * conditional
+                        # E[gamma_j^2 | node, W] = v W / V + share^2 (c + h^2 c^2), v W / V = V s (1 - s) in logs.
+                        allocation = np.exp(log_total + log_atom_share[index] + log_law_share[index])
+                        weighted_second += weight * (allocation + share * share * (conditional + h * h * conditional * conditional))
+                    node_terms[k] = member_log_weight[j, k] + inner_peak + np.log(weight_sum)
+                    share_first[k] = weighted_first / weight_sum
+                    mean_part[k] = weighted_mean / weight_sum
+                    second_part[k] = weighted_second / weight_sum
             peak = -np.inf
             for k in range(node_count):
                 if node_terms[k] > peak:
@@ -281,9 +438,7 @@ def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member
             for k in range(node_count):
                 if node_terms[k] > -np.inf:
                     norm += np.exp(node_terms[k] - peak)
-            derivative = 0.0
-            mean_value = 0.0
-            second_value = 0.0
+            derivative = mean_value = second_value = 0.0
             for k in range(node_count):
                 probability = np.exp(node_terms[k] - peak) / norm if node_terms[k] > -np.inf else 0.0
                 marginal[j, k] = probability
@@ -293,6 +448,14 @@ def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member
             scale_derivative[j] = derivative
             member_mean[j] = mean_value
             member_second[j] = second_value
+        for position in range(member_start[group], member_start[group + 1]):
+            j = member_index[position]
+            source = representative[j]
+            if source != j:
+                marginal[j] = marginal[source]
+                scale_derivative[j] = scale_derivative[source]
+                member_mean[j] = member_mean[source]
+                member_second[j] = member_second[source]
 
 
 @dataclass(frozen=True)
@@ -309,16 +472,17 @@ class GroupTerms:
 
 def group_terms(laws: GroupLaws, cavity_precision: F64Array, cavity_shift: F64Array) -> GroupTerms:
     """Every group's terms at its cavity (unscaled precision P and shift h on its sum)."""
-    member_count, node_count = laws.member_log_variance.shape
+    member_count, node_count = laws.member_log_weight.shape
     log_normalizer = np.empty(laws.group_count)
     marginal = np.zeros((member_count, node_count))
     scale_derivative = np.empty(member_count)
     mean = np.empty(member_count)
     second = np.empty(member_count)
     _group_terms(
-        laws.law_start, laws.law_log_variance, laws.law_log_mass, laws.member_start, laws.member_index, laws.loo_start, laws.loo_log_variance,
-        laws.loo_log_mass, laws.member_log_variance, laws.member_log_weight, np.asarray(cavity_precision, dtype=np.float64),
-        np.asarray(cavity_shift, dtype=np.float64), log_normalizer, marginal, scale_derivative, mean, second,
+        laws.law_start, laws.law_log_variance, laws.law_log_mass, laws.member_start, laws.member_index, laws.representative, laws.member_origin,
+        laws.member_log_weight, laws.grid_spacing, laws.loo_start, laws.loo_log_mass, laws.loo_low, laws.loo_spacing, laws.loo_stride,
+        np.asarray(cavity_precision, dtype=np.float64), np.asarray(cavity_shift, dtype=np.float64), log_normalizer, marginal, scale_derivative,
+        mean, second,
     )
     return GroupTerms(log_normalizer=log_normalizer, marginal=marginal, scale_derivative=scale_derivative, mean=mean, variance=second - mean * mean)
 
