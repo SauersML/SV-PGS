@@ -435,6 +435,11 @@ def _window_quadratic(
     return _to_host(quadratic.T)
 
 
+CUPY_ALLOCATION_UNIT = 512
+"""Bytes of CuPy's memory-pool allocation unit: every device allocation is rounded up to a multiple of it (CuPy
+MemoryPool, ``cupy/cuda/memory.pyx``)."""
+
+
 def eigensolver_bytes(size: int, array_module: Any = np) -> int:
     """What the window's eigenvalue solve allocates beyond the whitened window, measured: on a device, CuPy's copy of
     the matrix plus cuSOLVER's own workspace for it (``xsyevd_bufferSize`` at this size, eigenvalues only: 11.5 GB in bench-sim's first budget-cut window on an
@@ -459,7 +464,11 @@ def eigensolver_bytes(size: int, array_module: Any = np) -> int:
         )
     finally:
         cusolver.destroyParams(params)
-    return matrix + int(device_bytes)
+    # CuPy's pool hands out whole allocation units, each allocation rounded up: the matrix's copy, the workspace, the
+    # eigenvalues and cuSOLVER's status word.
+    unit = CUPY_ALLOCATION_UNIT
+    pieces = (matrix, int(device_bytes), size * itemsize, np.dtype(np.int32).itemsize)
+    return sum(-(-piece // unit) * unit for piece in pieces)
 
 
 def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:

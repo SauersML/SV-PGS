@@ -115,6 +115,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('device_sweep.py', 'PIECE_COLUMNS'): ('definitional', frozenset({3}), 'the per-member ELBO pieces the host sweep returns: KL term, ||x||^2 v, and the KL pieces sizes'),
     ('marginal_variances.py', 'window_width.fits'): ('definitional', frozenset({3}), 'a window is a block and its two neighbours, b - 1, b and b + 1 (_window_blocks)'),
     ('marginal_variances.py', 'window_width.fits.within'): ('definitional', frozenset({3}), 'a window is a block and its two neighbours, b - 1, b and b + 1 (_window_blocks)'),
+    ('marginal_variances.py', 'CUPY_ALLOCATION_UNIT'): ('spec', frozenset({512}), "CuPy MemoryPool's allocation unit: every device allocation is rounded up to a multiple of 512 bytes (cupy/cuda/memory.pyx)"),
     ('full_data_fit.py', '_FullDataFixedPoints._double_loop'): ('math', frozenset({0.25}), "KL(q || q') to second order in a site change: 1/2 r'Sigma r + 1/4 dtau'(Sigma o Sigma) dtau, as in _FullDataFixedPoints._solve"),
     ('full_data_fit.py', '_site_blocks'): ('math', frozenset({0.25, 4.0}), 'the tilted covariance of the statistics (beta, -beta^2 / 2) from the central moments: Var(beta^2) / 4 = (k4 + 2 v^2 + 4 m k3 + 4 m^2 v) / 4 (small_n._site_blocks)'),
     ('genotype_buffers.py', 'host_buffer_bytes'): ('derived', frozenset({4, 16, 3, 8}), "byte accounting of this module's allocations: 4-byte int32/float32, 8-byte int64/float64, two int64 row sums, three block matrices"),
