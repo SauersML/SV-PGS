@@ -104,7 +104,10 @@ def write_band(train, rows: np.ndarray, folder: pathlib.Path):
 def fit(train) -> Model:
     rows = common_rows(train)
     structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
-    with tempfile.TemporaryDirectory(prefix="ldpred2_allvar_", dir=os.environ.get("TMPDIR")) as directory:
+    # on a network scratch TMPDIR, files the R session's forked workers still hold open linger as .nfs entries for a
+    # while after it exits; a directory that cannot be removed yet must not discard a finished fit
+    with tempfile.TemporaryDirectory(prefix="ldpred2_allvar_", dir=os.environ.get("TMPDIR"),
+                                     ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         means, beta, se, lo, hi, scores = write_band(train, rows, folder)
         np.column_stack([beta, se]).astype("<f8").tofile(folder / "sumstats.bin")

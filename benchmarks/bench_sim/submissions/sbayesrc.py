@@ -144,7 +144,8 @@ def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool)
 def fit_sbayesrc(train, annotated: bool) -> Model:
     rows = common_rows(train)
     structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
-    with tempfile.TemporaryDirectory(prefix="sbayesrc_", dir=os.environ.get("TMPDIR")) as directory:
+    with tempfile.TemporaryDirectory(prefix="sbayesrc_", dir=os.environ.get("TMPDIR"),
+                                     ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         means = write_inputs(train, rows, folder, annotated)
         threads = {name: str(int(train.cores)) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}

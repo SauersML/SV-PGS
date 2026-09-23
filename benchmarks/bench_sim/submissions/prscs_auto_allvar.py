@@ -39,7 +39,8 @@ def fit(train) -> Model:
     names = [f"v{row}" for row in rows]
     adjuster = Adjuster(train)
     means, beta, beta_se, squares = (np.empty(total) for _ in range(4))
-    with tempfile.TemporaryDirectory(prefix="prscs_allvar_", dir=os.environ.get("TMPDIR")) as directory:
+    with tempfile.TemporaryDirectory(prefix="prscs_allvar_", dir=os.environ.get("TMPDIR"),
+                                     ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         reference = folder / "ref_1kg"
         reference.mkdir()
