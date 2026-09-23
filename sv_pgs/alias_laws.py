@@ -24,8 +24,9 @@ and a member's leave-one-out law the convolution of the prefix before it with th
 law and every member's atoms lie on even grids in log V, so where a sum W_i + v_k lands and the shares v / V depend on
 i - r k alone (r the grids' spacing ratio): each convolution and each member's terms read those from one table, and
 the kernel is evaluated at the exact sum. Members of one class with one scale are exchangeable: their leave-one-out
-laws are one law, formed once, and their terms are computed once and are exactly equal. Masses are held in logs
-throughout (a tilted law can put its weight on masses far below the largest). The laws depend on the hyperparameters,
+laws are one law, formed once, and their terms are computed once and are exactly equal. Masses are held in logs (a
+tilted law can put its weight on masses far below the largest), and convolved linearly in bands of half the double
+range, which loses no term that logs would keep. The laws depend on the hyperparameters,
 not on the cavity: they are formed once per hyperparameter setting (``GroupLaws.of``) and read at every cavity.
 """
 
@@ -37,6 +38,9 @@ import numba
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
+
+# Half the double range in logs: a product of two masses each within it of its band's largest is representable.
+_BAND_WIDTH = -float(np.log(np.finfo(np.float64).tiny)) / 2
 
 
 @numba.njit(cache=True, error_model="numpy")
@@ -94,57 +98,92 @@ def _bin(origin, stride, log_mass, node_count, out):
 
 
 @numba.njit(cache=True, error_model="numpy")
-def _convolve(law, origin, stride, log_mass, spacing, out, peak):
+def _bands(log_mass, band_width):
+    """(largest, band count, each mass's band): band b holds the masses between b and b + 1 band widths below the
+    largest (-1 for a zero mass)."""
+    largest = -np.inf
+    for value in log_mass:
+        if value > largest:
+            largest = value
+    band = np.full(log_mass.shape[0], -1, dtype=np.int64)
+    count = 0
+    if largest == -np.inf:
+        return largest, count, band
+    for index in range(log_mass.shape[0]):
+        if log_mass[index] > -np.inf:
+            band[index] = int((largest - log_mass[index]) // band_width)
+            if band[index] + 1 > count:
+                count = band[index] + 1
+    return largest, count, band
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _convolve(law, origin, stride, log_mass, spacing, out, peak, band_width):
     """The law of the sum of a law on the nodes and independent atoms at ``origin`` + ``stride`` k nodes, split onto the
-    nodes (module docstring), in logs by two passes: each node's largest term, then the sum relative to it."""
+    nodes (module docstring); ``peak`` is scratch."""
     node_count = law.shape[0]
     count = log_mass.shape[0]
     offset, _atom, _law = _landing(origin, stride, count, node_count, spacing)
     base = stride * (count - 1)
     # The split depends on u alone (the landing's whole and fractional parts) except at the clamped upper end.
     whole = np.empty(offset.shape[0], dtype=np.int64)
-    log_lower = np.empty(offset.shape[0])
-    log_upper = np.empty(offset.shape[0])
+    upper_weight = np.empty(offset.shape[0])
     for index in range(offset.shape[0]):
         whole[index] = int(np.floor(offset[index]))
-        fraction = offset[index] - whole[index]
-        log_lower[index] = np.log1p(-fraction)
-        log_upper[index] = np.log(fraction) if fraction > 0.0 else -np.inf
-    peak[:] = -np.inf
-    out[:] = 0.0
-    for sweep in range(2):
+        upper_weight[index] = offset[index] - whole[index]
+    lower_weight = 1.0 - upper_weight
+    # Linear accumulation in bands: each input's masses are grouped by their distance below its largest in steps of
+    # ``band_width``, half the double range, and each pair of bands is summed linearly relative to the bands' largest
+    # masses, so every product of two band-relative masses is representable; the bands' sums are combined in logs. One
+    # band each is the common case.
+    _law_peak, law_bands, law_band = _bands(law, band_width)
+    _mass_peak, mass_bands, mass_band = _bands(log_mass, band_width)
+    out[:] = -np.inf
+    law_linear = np.empty(node_count)
+    mass_linear = np.empty(count)
+    for first_band in range(law_bands):
+        law_top = -np.inf
         for i in range(node_count):
-            if law[i] == -np.inf:
+            if law_band[i] == first_band and law[i] > law_top:
+                law_top = law[i]
+        if law_top == -np.inf:
+            continue
+        for i in range(node_count):
+            law_linear[i] = np.exp(law[i] - law_top) if law_band[i] == first_band else 0.0
+        for second_band in range(mass_bands):
+            mass_top = -np.inf
+            for k in range(count):
+                if mass_band[k] == second_band and log_mass[k] > mass_top:
+                    mass_top = log_mass[k]
+            if mass_top == -np.inf:
                 continue
             for k in range(count):
-                if log_mass[k] == -np.inf:
+                mass_linear[k] = np.exp(log_mass[k] - mass_top) if mass_band[k] == second_band else 0.0
+            peak[:] = 0.0
+            for i in range(node_count):
+                if law_linear[i] == 0.0:
                     continue
-                index = i - stride * k + base
-                lower = i + whole[index]
-                if lower <= node_count - 2:
-                    lower_term = law[i] + log_mass[k] + log_lower[index]
-                    upper_term = law[i] + log_mass[k] + log_upper[index]
-                else:
-                    lower, fraction = _split(i + offset[index], node_count)
-                    lower_term = law[i] + log_mass[k] + np.log1p(-fraction) if fraction < 1.0 else -np.inf
-                    upper_term = law[i] + log_mass[k] + np.log(fraction) if fraction > 0.0 else -np.inf
-                if sweep == 0:
-                    if lower_term > peak[lower]:
-                        peak[lower] = lower_term
-                    if upper_term > peak[lower + 1]:
-                        peak[lower + 1] = upper_term
-                else:
-                    if lower_term > -np.inf:
-                        out[lower] += np.exp(lower_term - peak[lower])
-                    if upper_term > -np.inf:
-                        out[lower + 1] += np.exp(upper_term - peak[lower + 1])
-    for node in range(node_count):
-        out[node] = peak[node] + np.log(out[node]) if peak[node] > -np.inf else -np.inf
+                for k in range(count):
+                    if mass_linear[k] == 0.0:
+                        continue
+                    product = law_linear[i] * mass_linear[k]
+                    index = i - stride * k + base
+                    lower = i + whole[index]
+                    if lower <= node_count - 2:
+                        peak[lower] += product * lower_weight[index]
+                        peak[lower + 1] += product * upper_weight[index]
+                    else:
+                        lower, fraction = _split(i + offset[index], node_count)
+                        peak[lower] += product * (1.0 - fraction)
+                        peak[lower + 1] += product * fraction
+            for node in range(node_count):
+                if peak[node] > 0.0:
+                    out[node] = np.logaddexp(out[node], np.log(peak[node]) + law_top + mass_top)
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _larger_laws(larger, with_loo, member_start, member_index, representative, member_origin, member_log_weight, stride, spacing, low,
-                 law_start, law_log_mass, loo_start, loo_log_mass):
+                 law_start, law_log_mass, loo_start, loo_log_mass, band_width):
     """Each binned group's law and, where ``with_loo``, its representatives' leave-one-out laws on its nodes (module
     docstring)."""
     for position in numba.prange(larger.shape[0]):
@@ -159,7 +198,7 @@ def _larger_laws(larger, with_loo, member_start, member_index, representative, m
             origins[p] = (member_origin[member_index[start + p]] - low[group]) / spacing
         _bin(origins[0], stride, member_log_weight[member_index[start]], node_count, prefix[0])
         for p in range(1, count):
-            _convolve(prefix[p - 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, prefix[p], peak)
+            _convolve(prefix[p - 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, prefix[p], peak, band_width)
         law_log_mass[law_start[group]:law_start[group + 1]] = prefix[count - 1]
         if not with_loo[position]:
             continue
@@ -171,7 +210,7 @@ def _larger_laws(larger, with_loo, member_start, member_index, representative, m
         suffix = np.empty((count, node_count))
         _bin(origins[count - 1], stride, member_log_weight[member_index[stop - 1]], node_count, suffix[count - 1])
         for p in range(count - 2, 0, -1):
-            _convolve(suffix[p + 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, suffix[p], peak)
+            _convolve(suffix[p + 1], origins[p], stride, member_log_weight[member_index[start + p]], spacing, suffix[p], peak, band_width)
         for p in range(count):
             j = member_index[start + p]
             if representative[j] != j:
@@ -182,7 +221,7 @@ def _larger_laws(larger, with_loo, member_start, member_index, representative, m
             elif p == count - 1:
                 target[:] = prefix[count - 2]
             else:
-                _convolve(prefix[p - 1], 0.0, 1, suffix[p + 1], spacing, target, peak)
+                _convolve(prefix[p - 1], 0.0, 1, suffix[p + 1], spacing, target, peak, band_width)
 
 
 @dataclass(frozen=True)
@@ -299,7 +338,7 @@ class GroupLaws:
             law_log_variance[law_start[group]:law_start[group + 1]] = low[group] + spacing * np.arange(law_size[group])
         if binned.shape[0]:
             _larger_laws(binned, sizes[binned] > 2, member_start, member_index, representative, member_origin, member_log_weight, refinement, spacing, low,
-                         law_start, law_log_mass, loo_start, loo_log_mass)
+                         law_start, law_log_mass, loo_start, loo_log_mass, _BAND_WIDTH)
         return cls(
             groups=groups, member_start=member_start, member_index=member_index, representative=representative, law_start=law_start,
             law_log_variance=law_log_variance, law_log_mass=law_log_mass, member_origin=member_origin, member_log_weight=member_log_weight,
@@ -396,6 +435,9 @@ def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member
                 offset, log_atom_share, log_law_share = _landing(origin, stride, node_count, count, spacing)
                 base = stride * (node_count - 1)
                 values = np.empty(count)
+                firsts = np.empty(count)
+                conditionals = np.empty(count)
+                totals = np.empty(count)
                 for k in range(node_count):
                     if member_log_weight[j, k] == -np.inf:
                         continue
@@ -404,8 +446,8 @@ def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member
                         values[i] = -np.inf
                         if law[i] == -np.inf:
                             continue
-                        log_total = loo_low[j] + spacing * (i + offset[i - stride * k + base])
-                        log_k, _f, _c = _log_kernel(log_total, P, h)
+                        totals[i] = loo_low[j] + spacing * (i + offset[i - stride * k + base])
+                        log_k, firsts[i], conditionals[i] = _log_kernel(totals[i], P, h)
                         values[i] = law[i] + log_k
                         if values[i] > inner_peak:
                             inner_peak = values[i]
@@ -417,8 +459,8 @@ def _group_terms(law_start, law_log_variance, law_log_mass, member_start, member
                             continue
                         weight = np.exp(values[i] - inner_peak)
                         index = i - stride * k + base
-                        log_total = loo_low[j] + spacing * (i + offset[index])
-                        _lk, first, conditional = _log_kernel(log_total, P, h)
+                        log_total = totals[i]
+                        first, conditional = firsts[i], conditionals[i]
                         share = np.exp(log_atom_share[index])
                         weight_sum += weight
                         weighted_first += weight * share * first
