@@ -39,6 +39,15 @@ genetic variance never exceeds the phenotypic. ``scale_mixture_ep.fit_hyperparam
    indefinite. It is never the plain EP-EM step, which diverges where (A + S)^-1 (B + S) exceeds 2 and has no
    maximum to move to where A + S is indefinite.
 The fit ends when every model's Newton-B decrement plus its weights' remaining gain is at most 1/(2K).
+
+A binary model (``binary_likelihood``) runs on the mean-field route only: its likelihood is the Polya-Gamma bound,
+which at fixed sites is the weighted Gaussian problem with W = diag(omega), working response z = kappa / omega and unit
+noise, known. The dual solver carries its weights as sample weights (``DualGaussian.reweight``), the oracle holds its
+sites and rebuilds every metric-bound array from them (the projector, the column squares, the projected targets and
+the device panels' Grams, all keyed by the sites), the ELBO it reports is the Bernoulli bound, and the sites' update
+xi^2 = E eta^2 stands where the noise's does, its exact gain the certificate's ``noise_gain``. Each mixture component
+keeps its own sites, and the scoring model's covariate terms and predictive intercept shift come from each
+component's own metric (``BinaryComponent``).
 """
 
 from __future__ import annotations
@@ -51,7 +60,8 @@ import numpy as np
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
 from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
-from sv_pgs.dual_solve import DualGaussian, DualModels, _host
+from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate_evidence
+from sv_pgs.dual_solve import DualGaussian, DualModels, _host, column_squares
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.krylov_recycle import local_response
@@ -291,6 +301,28 @@ class FullDataFit:
     member_components: tuple[tuple[F64Array, F64Array], ...] = ()
     # Each component's weight per model (components x models), exp(ELBO) normalized (``small_n._mixture_weights``).
     component_weights: F64Array | None = None
+    # Per component, per model: a binary model's ``BinaryComponent`` (its covariate terms and training-row predictor
+    # moments in its own metric), None for a quantitative model.
+    binary_components: tuple = ()
+
+
+@dataclass(frozen=True)
+class BinaryComponent:
+    """A binary model's mixture component in its own metric W (its final Polya-Gamma sites): the covariates'
+    conditional mean at the component's effects, alpha = (C'WC)^+ C'W (z - X m), their conditional loading
+    (C'WC)^+ C'W X over the reduced columns (k x groups: a draw b moves them by -loading (b - m) in the group sums), their
+    conditional covariance (C'WC)^+, and E eta, Var eta on the training rows (``_FullDataMeanField._predictor_moments``)
+    with the rows' labels, for the predictive's calibration."""
+
+    alpha: F64Array
+    loading: F64Array
+    covariance: F64Array
+    # alpha + loading m_g, m_g the component's mean effects summed per reduced column (signed): a draw b's covariates'
+    # conditional mean is anchor - loading b_g.
+    anchor: F64Array
+    predictor_mean: F64Array
+    predictor_variance: F64Array
+    labels: F64Array
 
 
 def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Array]:
@@ -935,6 +967,7 @@ class _FullDataMeanField:
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
         starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
+        sites: Sequence[BernoulliSites | None] | None = None,
     ) -> None:
         self.gaussian = gaussian
         self.prior = prior
@@ -957,20 +990,31 @@ class _FullDataMeanField:
         self.training = np.asarray(_host(gaussian.training), dtype=np.float64)
         self.sample_count = int(self.training.shape[0])
         self.training_counts = np.asarray(gaussian.training_counts, dtype=np.int64)
-        # The projector alone (unit weights): Xp and y_P do not move with the noise, which the sweeps update.
-        xp = gaussian.array_module
-        self.models = DualModels(gaussian.training, xp.zeros((gaussian.source.variant_count, model_count)), gaussian.covariates, xp)
+        # A binary model's Polya-Gamma sites (``binary_likelihood``): its metric is W = diag(omega) at unit noise, known,
+        # rebuilt whenever its sites move; a quantitative model's is its training mask, fixed, over the noise the sweeps
+        # update. Every metric-bound array (the projector, the column squares, the projected targets, the panel Grams)
+        # is keyed by the sites.
+        self.sites: list[BernoulliSites | None] = list(sites) if sites is not None else [None] * model_count
+        if len(self.sites) != model_count:
+            raise ValueError("sites needs one entry (None for a quantitative model) per model")
+        self._training_targets = np.asarray(_host(gaussian.targets), dtype=np.float64).copy()
+        self._training_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64).copy()
+        self._square_cache: dict[bytes, F64Array] = {}
+        if gaussian.metric_key is not None:
+            # The dual solver is in another oracle's binary metric: a quantitative model's squares are the mask's, which a
+            # reweight never moves, and every binary model's come from its own sites below.
+            binary_columns = [model for model, model_sites in enumerate(self.sites) if model_sites is not None]
+            if len(binary_columns) != sum(1 for key in gaussian.metric_key if key is not None):
+                raise ValueError("the dual solver's binary models must be this oracle's")
+        self._install_metric()
         factor = np.asarray(_host(self.models.covariate_factor), dtype=np.float64)
         self.covariate_rank = np.array([int(np.count_nonzero(np.any(factor[model] != 0.0, axis=0))) for model in range(model_count)], dtype=np.int64)
         self.residual_dimension = self.training_counts - self.covariate_rank
         if np.any(self.residual_dimension <= 0):
             raise ValueError("a model's training rows do not outnumber its covariates' rank")
-        self.member_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64)[self.ties.group]
-        targets = np.asarray(_host(gaussian.targets), dtype=np.float64)
-        projected = np.asarray(_host(self.models.complement(xp.asarray(self.training * targets), xp.arange(model_count))), dtype=np.float64)
-        self.projected_targets = [np.ascontiguousarray(projected[:, model]) for model in range(model_count)]
         self.class_index = np.asarray(prior.class_index, dtype=np.int64)
         self.noise = np.array(noise, dtype=np.float64, copy=True)
+        self.noise[[model for model, model_sites in enumerate(self.sites) if model_sites is not None]] = 1.0
         count = prior.variant_count
         self.mean = np.zeros((count, model_count))
         self.variance = np.zeros((count, model_count))
@@ -987,6 +1031,7 @@ class _FullDataMeanField:
         self.elbo = np.full(model_count, -np.inf)
         self.refusals: list[str] = []
         self.refreshes = 0
+        self.reweights = 0
         self.passes = 0
         self.version = 0
         self.undecided_blocks = 0
@@ -1005,6 +1050,107 @@ class _FullDataMeanField:
         self.best_state: list[dict | None] = [None] * model_count
         self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
 
+    # the metric: each model's likelihood weights
+
+    @property
+    def metric_key(self) -> tuple | None:
+        """The binary models' sites keys (None for a quantitative model), or None where every model is quantitative."""
+        if all(model_sites is None for model_sites in self.sites):
+            return None
+        return tuple(None if model_sites is None else model_sites.key for model_sites in self.sites)
+
+    def _group_squares(self, model: int, model_sites: BernoulliSites | None) -> F64Array:
+        """||xt_g||^2 per group in the model's metric: the mask's from the dual solver's construction, or a binary model's
+        at its sites by one read (``dual_solve.column_squares``), held per sites."""
+        if model_sites is None:
+            return self._training_squares[:, model]
+        held = self._square_cache.get(model_sites.key)
+        if held is None:
+            xp = self.gaussian.array_module
+            single = DualModels(xp.asarray(model_sites.weights[:, None]), xp.zeros((self.gaussian.source.variant_count, 1)), self.gaussian.covariates, xp)
+            held = np.asarray(_host(column_squares(self.gaussian.source, single, self.gaussian.count)), dtype=np.float64)[:, 0]
+            self._square_cache = {key: value for key, value in self._square_cache.items() if any(
+                other is not None and other.key == key for other in self.sites
+            )}
+            self._square_cache[model_sites.key] = held
+        return held
+
+    def _metric_arrays(self, sites: Sequence[BernoulliSites | None]) -> tuple[F64Array, F64Array, F64Array]:
+        """(weights (n, M), targets (n, M), group squares (groups, M)) of the metric the ``sites`` define."""
+        weights = self.training.copy()
+        targets = self._training_targets.copy()
+        squares = np.empty((self.ties.group_count, self.model_count))
+        for model, model_sites in enumerate(sites):
+            if model_sites is not None:
+                weights[:, model] = model_sites.weights
+                targets[:, model] = model_sites.response
+            squares[:, model] = self._group_squares(model, model_sites)
+        return weights, targets, squares
+
+    def _install_metric(self) -> None:
+        """Every metric-bound array at the current sites: the projector W's (``DualModels``, its covariate factor per
+        model), the root weights, the targets, the members' squares, the projected targets, and a binary model's terms of
+        L beside its Gaussian value (the sites' constant and the covariates' evidence)."""
+        xp = self.gaussian.array_module
+        self.weights, self.targets, self.group_squares = self._metric_arrays(self.sites)
+        self.root = np.sqrt(self.weights)
+        # The projector alone (unit noise): Xp and y_P do not move with the noise, which the sweeps update.
+        self.models = DualModels(xp.asarray(self.weights), xp.zeros((self.gaussian.source.variant_count, self.model_count)), self.gaussian.covariates, xp)
+        self.member_squares = self.group_squares[self.ties.group]
+        projected = np.asarray(_host(self.models.complement(xp.asarray(self.root * self.targets), xp.arange(self.model_count))), dtype=np.float64)
+        self.projected_targets = [np.ascontiguousarray(projected[:, model]) for model in range(self.model_count)]
+        covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
+        self._bernoulli_offset = np.zeros(self.model_count)
+        self._bernoulli_size = np.zeros(self.model_count)
+        for model, model_sites in enumerate(self.sites):
+            if model_sites is not None:
+                evidence = covariate_evidence(model_sites.weights, covariates)
+                self._bernoulli_offset[model] = model_sites.constant() + evidence
+                self._bernoulli_size[model] = model_sites.constant_size() + abs(evidence)
+
+    def _sync(self) -> None:
+        """The dual solver in this oracle's metric (it is shared with the mixture's other oracles)."""
+        key = self.metric_key
+        if self.gaussian.metric_key != key:
+            xp = self.gaussian.array_module
+            self.gaussian.reweight(
+                sample_weights=xp.asarray(self.weights), targets=xp.asarray(self.targets), unit_squares=xp.asarray(self.group_squares), key=key,
+            )
+            self.version += 1
+
+    def _reweight(self, model: int, sites: BernoulliSites) -> None:
+        """A binary model's xi update with q held (``binary_likelihood``): the metric moves, the residual is q's in it, and
+        the panel Grams of the old metric are released."""
+        self.sites[model] = sites
+        self._install_metric()
+        self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
+        self._panel_grams.clear()
+        self.reweights += 1
+
+    def _predictor_moments(self, model: int) -> tuple[F64Array, F64Array]:
+        """A binary model's E eta_i and Var eta_i under q on its training rows (0 elsewhere; ``binary_likelihood``):
+        z_i - r_i / sqrt(omega_i) and (sum_g Xp_ig^2 V_g + H_ii) / omega_i, V_g the group's column's effect variance (its
+        members' sum: each member is its own independent factor) and H_ii = omega_i ||F'c_i||^2 the weighted covariate
+        leverage (F F' = (C'WC)^+). One read of the store, the projected columns formed piece by piece."""
+        rows = self.training[:, model] > 0.0
+        root = self.root[:, model]
+        safe = np.where(rows, root, 1.0)
+        mean = np.where(rows, self.targets[:, model] - self.residual[model] / safe, 0.0)
+        group_variance = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
+        explained = np.zeros(self.sample_count)
+        for start, stop, tile in self.gaussian.source.blocks():
+            for first, last in self._pieces(stop - start):
+                local = np.arange(first, last, dtype=np.int64)
+                projected = self._projected(tile, local, model)
+                explained += np.square(projected) @ group_variance[start + first:start + last]
+        self.passes += 1
+        covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
+        factor = np.asarray(_host(self.models.covariate_factor[model]), dtype=np.float64)
+        whitened = covariates @ factor
+        leverage = self.weights[:, model] * np.sum(whitened * whitened, axis=1)
+        variance = np.where(rows, (explained + leverage) / (safe * safe), 0.0)
+        return mean, variance
+
     # state
 
     def _snapshot(self) -> dict:
@@ -1013,10 +1159,18 @@ class _FullDataMeanField:
             "fourth": self.fourth.copy(), "residual": [values.copy() for values in self.residual], "noise": self.noise.copy(),
             "site_precision": self.site_precision.copy(), "site_shift": self.site_shift.copy(), "effective": self.effective.copy(),
             "mean_move": self.mean_move.copy(), "noise_gain": self.noise_gain.copy(), "elbo": self.elbo.copy(), "version": self.version,
+            # The binary models' sites name the metric the residuals and moments belong to (immutable, so held).
+            "sites": list(self.sites),
         }
 
     def _restore(self, snapshot: dict, models: Sequence[int] | None = None) -> None:
         columns = list(range(self.model_count)) if models is None else list(models)
+        moved = [model for model in columns if snapshot["sites"][model] is not self.sites[model]]
+        for model in moved:
+            self.sites[model] = snapshot["sites"][model]
+        if moved:
+            self._install_metric()
+            self._panel_grams.clear()
         for name in ("mean", "variance", "shift", "third", "fourth", "site_precision", "site_shift"):
             getattr(self, name)[:, columns] = snapshot[name][:, columns]
         for name in ("noise", "effective", "mean_move", "noise_gain", "elbo"):
@@ -1025,10 +1179,20 @@ class _FullDataMeanField:
             self.residual[model] = snapshot["residual"][model].copy()
 
     def _ensure(self, snapshot: dict) -> None:
-        """The dual solver back at this fixed point's sites before it answers for it (a later trial may have moved it)."""
-        if self.version != snapshot["version"]:
+        """The dual solver back at this fixed point's sites and metric before it answers for it (a later trial may have
+        moved either)."""
+        if self.version != snapshot["version"] or any(held is not now for held, now in zip(snapshot["sites"], self.sites)):
+            current = list(self.sites)
+            self.sites = list(snapshot["sites"])
+            self._install_metric()
+            self._sync()
             self._iterate(snapshot["site_precision"], snapshot["site_shift"], snapshot["noise"])
-            self.version = snapshot["version"]
+            if any(held is not now for held, now in zip(current, self.sites)):
+                # The oracle's own state stays where it was: only the dual solver answers for the snapshot.
+                self.sites = current
+                self._install_metric()
+            else:
+                self.version = snapshot["version"]
 
     # the design, streamed
 
@@ -1054,29 +1218,37 @@ class _FullDataMeanField:
         for start in range(0, count, width):
             yield start, min(start + width, count)
 
-    def _projected(self, tile, local: I64Array, model: int) -> F64Array:
+    def _metric(self, metric: tuple | None) -> tuple[DualModels, F64Array]:
+        """(the projector, the root weights (n, M)): the current metric's, or a fixed point's own held one."""
+        return (self.models, self.root) if metric is None else metric
+
+    def _projected(self, tile, local: I64Array, model: int, metric: tuple | None = None) -> F64Array:
+        """Xt_b = (I - H) W^1/2 X_b on the tile's ``local`` columns (n x |local|, F-ordered)."""
+        models, root = self._metric(metric)
         xp = self.gaussian.array_module
         dense = xp.asarray(tile.columns(xp.asarray(local)), dtype=xp.float64)
-        masked = dense * xp.asarray(self.training[:, model])[:, None]
-        projected = self.models.complement(masked, xp.full(local.shape[0], model, dtype=xp.int64))
+        masked = dense * xp.asarray(root[:, model])[:, None]
+        projected = models.complement(masked, xp.full(local.shape[0], model, dtype=xp.int64))
         return np.asfortranarray(np.asarray(_host(projected), dtype=np.float64))
 
-    def _image(self, coefficients: F64Array, model: int) -> F64Array:
-        """Xp c (n x r) for c (p x r): the tiles' X_b c_b, masked to the training rows and projected."""
+    def _image(self, coefficients: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        """Xp c (n x r) for c (p x r): the tiles' X_b c_b, weighted (the training mask, or W^1/2) and projected."""
+        models, root = self._metric(metric)
         xp = self.gaussian.array_module
         values = self._group_values(np.asarray(coefficients, dtype=np.float64))
         image = np.zeros((self.sample_count, values.shape[1]))
         for start, stop, tile in self.gaussian.source.blocks():
             image += np.asarray(_host(tile.matmat(xp.asarray(values[start:stop]))), dtype=np.float64)
-        masked = xp.asarray(image * self.training[:, model][:, None])
-        return np.asarray(_host(self.models.complement(masked, xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
+        masked = xp.asarray(image * root[:, model][:, None])
+        return np.asarray(_host(models.complement(masked, xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
 
-    def _back(self, samples: F64Array, model: int) -> F64Array:
-        """Xp' u (p x r) for u (n x r): (I - H) and the training mask, then the tiles' X_b' u."""
+    def _back(self, samples: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        """Xp' u (p x r) for u (n x r): (I - H) and the weights (the training mask, or W^1/2), then the tiles' X_b' u."""
+        models, root = self._metric(metric)
         xp = self.gaussian.array_module
         values = np.asarray(samples, dtype=np.float64)
-        projected = np.asarray(_host(self.models.complement(xp.asarray(values), xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
-        masked = xp.asarray(projected * self.training[:, model][:, None])
+        projected = np.asarray(_host(models.complement(xp.asarray(values), xp.full(values.shape[1], model, dtype=xp.int64))), dtype=np.float64)
+        masked = xp.asarray(projected * root[:, model][:, None])
         back = np.zeros((self.ties.group_count, values.shape[1]))
         for start, stop, tile in self.gaussian.source.blocks():
             back[start:stop] = np.asarray(_host(tile.rmatmat(masked)), dtype=np.float64)
@@ -1123,7 +1295,7 @@ class _FullDataMeanField:
         log_density = cupy.asarray(np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)))
         scales = cupy.asarray(log_scale(prior, hyperparameters.coefficients))
         grid = cupy.asarray(prior.log_variance_grid)
-        mask = cupy.asarray(self.training[:, model])
+        mask = cupy.asarray(self.root[:, model])
         residual = cupy.asarray(self.residual[model])
         squares = cupy.asarray(np.ascontiguousarray(self.member_squares[:, model]))
         classes = cupy.asarray(self.class_index)
@@ -1147,7 +1319,8 @@ class _FullDataMeanField:
             sweep_piece(
                 cupy, decode=decode, width=int(members.shape[0]), mask=mask, covariates=masked_covariates, covariate_pinv=covariate_pinv,
                 residual=residual, grams=self._panel_grams,
-                model=model, members=np.asarray(members), squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
+                model=model, members=np.asarray(members), metric=b"" if self.sites[model] is None else self.sites[model].key,
+                squares=cupy.ascontiguousarray(squares[rows]), class_index=cupy.ascontiguousarray(classes[rows]),
                 log_density=log_density, node_variance=node_variance, log_node_variance=log_node_variance, noise=noise,
                 pieces=piece_parts, **piece_state,
             )
@@ -1163,7 +1336,13 @@ class _FullDataMeanField:
         return float(totals[0]), float(totals[1]), residual_square, float(totals[2])
 
     def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
-        """As ``MeanFieldFixedPoints._elbo``, on this model's training rows."""
+        """As ``MeanFieldFixedPoints._elbo``, on this model's training rows: a binary model's Bernoulli bound L at unit
+        noise, its sites' constant and covariate evidence added."""
+        if self.sites[model] is not None:
+            fit_term = 0.5 * (residual_square + weighted_variance)
+            value = -fit_term - divergence + float(self._bernoulli_offset[model])
+            summands = 2 * self.prior.variant_count + 2 * int(self.training_counts[model]) + 1
+            return value, (self.prior.grid_size + 1 + summands) * _EPSILON * (fit_term + sizes + float(self._bernoulli_size[model]))
         noise = float(self.noise[model])
         residual_term = 0.5 * float(self.residual_dimension[model]) * float(np.log(2.0 * np.pi * noise))
         fit_term = (residual_square + weighted_variance) / (2.0 * noise)
@@ -1191,8 +1370,12 @@ class _FullDataMeanField:
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
                 raise FloatingPointError(f"model {model}: a mean-field sweep is not finite")
             value, rounding = self._elbo(model, divergence, weighted_variance, residual_square, sizes)
-            pending_noise = (residual_square + weighted_variance) / float(self.residual_dimension[model])
-            self.noise_gain[model] = noise_gain(pending_noise, float(self.noise[model]), int(self.training_counts[model]), int(self.covariate_rank[model]))
+            if self.sites[model] is None:
+                pending_noise = (residual_square + weighted_variance) / float(self.residual_dimension[model])
+                self.noise_gain[model] = noise_gain(pending_noise, float(self.noise[model]), int(self.training_counts[model]), int(self.covariate_rank[model]))
+            else:
+                # A binary model's noise is known (1); its sites' update is taken at the fixed point below.
+                self.noise_gain[model] = 0.0
             gain = (value - elbo) if elbo is not None else None
             elbo = value
             if gain is not None and gain < -rounding:
@@ -1211,13 +1394,27 @@ class _FullDataMeanField:
                 previous_gain = max(float(gain), 0.0)
             self.mean_move[model] = 2.0 * remaining
             if remaining + float(self.noise_gain[model]) <= tolerance:
-                return
+                model_sites = self.sites[model]
+                if model_sites is None:
+                    return
+                # A binary model at its fixed point for these sites (``mean_field.MeanFieldFixedPoints._solve``): the xi
+                # update's exact gain at q, one read for the predictor variances. Within what is left of the tolerance
+                # this is the joint fixed point of (q, xi), its gain reported as the likelihood's pending one; otherwise
+                # xi moves with q held, L rises by the gain, and the sweeps continue in the new metric from there.
+                updated, site_gain = model_sites.updated(*self._predictor_moments(model))
+                if remaining + site_gain <= tolerance:
+                    self.noise_gain[model] = site_gain
+                    return
+                self._reweight(model, updated)
+                elbo = value + site_gain
+                gain = previous_gain = None
 
     def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
         """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
         ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m."""
         # A linear response's sites, not a Gaussian's: the members' elimination needs no sign (tied_weights).
         group_precision, group_shift = group_sites(self.ties, site_precision, site_shift, algebraic=True)
+        self._sync()
         self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=noise,
             error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
@@ -1315,6 +1512,11 @@ class _FullDataMeanField:
         variance_by_omega = np.where(live, -0.5 * (fourth - variance * variance) - mean * third, 0.0)
         residual_dimension = float(self.residual_dimension[model])
         snapshot = self._snapshot()
+        # The metric this fixed point was solved in, held: a later trial may move a binary model's sites.
+        metric = (self.models, self.root)
+        binary = self.sites[model] is not None
+        # The Stage 0 Grams feed only the posterior's variance map, which the mean-field fixed point never reads (its
+        # responses are the dual solver's solves, in this fixed point's own metric); a binary model's are unweighted.
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
         dual = _member_posterior(
@@ -1323,7 +1525,7 @@ class _FullDataMeanField:
         noise_solve: dict[str, object] = {}
 
         def off_diagonal_gram(columns: F64Array) -> F64Array:
-            return self._back(self._image(columns, model), model) - squares[:, None] * columns
+            return self._back(self._image(columns, model, metric), model, metric) - squares[:, None] * columns
 
         def solve(right: F64Array, relative_tolerance: float) -> F64Array:
             # R^-1 right: the dual solver's A = Xp'Xp / sigma^2 + diag(tau) at these sites is R itself.
@@ -1336,7 +1538,7 @@ class _FullDataMeanField:
                 mean_one = solve(coupling[:, None], relative_tolerance)
                 shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
                 scalar = residual_dimension - (
-                    2.0 * float(residual @ self._image(mean_one, model)[:, 0])
+                    2.0 * float(residual @ self._image(mean_one, model, metric)[:, 0])
                     + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
                 ) / noise
                 noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
@@ -1348,8 +1550,12 @@ class _FullDataMeanField:
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = solve(scaled, relative_tolerance)
             shift_step = -off_diagonal_gram(mean_step) / noise
+            if binary:
+                # Known noise: no noise response. The sites' own response is left out of the curvature, as in
+                # ``mean_field`` (the outer loop accepts its steps on the objective itself).
+                return shift_step, np.zeros_like(shift_step)
             _mean_one, shift_one, scalar = noise_terms(relative_tolerance)
-            right = -2.0 * (residual @ self._image(mean_step, model)) + squares @ (
+            right = -2.0 * (residual @ self._image(mean_step, model, metric)) + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )
             noise_step = right / scalar
@@ -1370,16 +1576,38 @@ class _FullDataMeanField:
             restore=lambda: self._restore(snapshot, [model]), evidence_offset=offset,
         )
 
+    def binary_component(self, model: int) -> BinaryComponent:
+        """A binary model's ``BinaryComponent`` at this oracle's state and metric: three reads of the store (the
+        covariates' coefficients, their cross-products C'W X, the predictor variances)."""
+        model_sites = self.sites[model]
+        assert model_sites is not None
+        xp = self.gaussian.array_module
+        covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
+        weighted = xp.asarray(self.weights[:, model:model + 1] * covariates)
+        cross = np.zeros((self.ties.group_count, covariates.shape[1]))
+        for start, stop, tile in self.gaussian.source.blocks():
+            cross[start:stop] = np.asarray(_host(tile.rmatmat(weighted)), dtype=np.float64)
+        factor = np.asarray(_host(self.models.covariate_factor[model]), dtype=np.float64)
+        covariance = factor @ factor.T
+        mean, variance = self._predictor_moments(model)
+        rows = self.training[:, model] > 0.0
+        alpha = self.covariate_coefficients(model)
+        loading = covariance @ cross.T
+        return BinaryComponent(
+            alpha=alpha, loading=loading, covariance=covariance, anchor=alpha + loading @ self._group_values(self.mean[:, model]),
+            predictor_mean=mean[rows], predictor_variance=variance[rows], labels=model_sites.labels[rows],
+        )
+
     def covariate_coefficients(self, model: int, mean: F64Array | None = None) -> F64Array:
         """alpha = (C'WC)^+ C'W (y - X m) on the training rows, for the scoring model (m this fixed point's mean, or
-        ``mean``: the mixture's)."""
+        ``mean``: the mixture's); a binary model's in its metric, W = diag(omega) and y its working response z."""
         xp = self.gaussian.array_module
         values = np.zeros((self.sample_count, 1))
         grouped = self._group_values((self.mean[:, model] if mean is None else np.asarray(mean, dtype=np.float64))[:, None])
         for start, stop, tile in self.gaussian.source.blocks():
             values += np.asarray(_host(tile.matmat(xp.asarray(grouped[start:stop]))), dtype=np.float64)
-        targets = np.asarray(_host(self.gaussian.targets), dtype=np.float64)[:, model]
-        residual = self.training[:, model] * (targets - values[:, 0])
+        targets = self.targets[:, model]
+        residual = self.weights[:, model] * (targets - values[:, 0])
         covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
         right = xp.asarray((covariates.T @ residual)[:, None])
         return np.asarray(_host(self.models.covariate_solve(right, xp.asarray([model]))), dtype=np.float64)[:, 0]
@@ -1388,10 +1616,17 @@ class _FullDataMeanField:
 def fit_full_data(
     *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
     inference: str = "ep",
+    sites: Sequence[BernoulliSites | None] | None = None,
 ) -> FullDataFit:
-    """Stage 2 for quantitative models, from the prior (see the module docstring); ``seed`` draws the certificate's
-    variant-side probes. ``inference`` names the fixed point: "ep" (this module's EP) or "mean_field"
-    (``_FullDataMeanField``: the product q of ``mean_field`` on the streamed design)."""
+    """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
+    ``inference`` names the fixed point: "ep" (this module's EP) or "mean_field" (``_FullDataMeanField``: the product q
+    of ``mean_field`` on the streamed design).
+
+    ``sites`` gives each binary model's starting Polya-Gamma sites (None for a quantitative model;
+    ``binary_likelihood``), with the dual solver already in their metric (its sample weights the sites' weights, its
+    targets their working responses): such a model is fitted on its Bernoulli bound at unit noise, known, by the
+    mean-field route only, and its fixed points move their own sites. Stage 0's statistics for it are those of its
+    start's equal-weight problem (response 4 kappa at noise 4, ``stage2_wiring``), exact at xi = 0."""
     # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
     moments = moment_starts(statistics, prior)
@@ -1399,10 +1634,19 @@ def fit_full_data(
         raise ValueError("Stage 0's targets must be the models, in order")
     if inference not in ("ep", "mean_field"):
         raise ValueError(f"inference must be 'ep' or 'mean_field', not {inference!r}")
+    model_sites = list(sites) if sites is not None else [None] * gaussian.model_count
+    binary = np.array([entry is not None for entry in model_sites])
+    if binary.any() and inference != "mean_field":
+        raise ValueError("a binary model is fitted by the mean-field route (its Polya-Gamma bound); EP has no binary likelihood")
     oracle_class = _FullDataFixedPoints if inference == "ep" else _FullDataMeanField
 
-    def solve(model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None):
+    def solve(
+        model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
+        start_sites: Sequence[BernoulliSites | None],
+    ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
+        if inference == "mean_field":
+            extra["sites"] = list(start_sites)
         oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
         try:
             return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
@@ -1410,27 +1654,30 @@ def fit_full_data(
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
             raise FloatingPointError(f"{error}; {inference} refusals: {oracle.refusals}") from error
 
-    noise = np.array([moment.noise for moment in moments])
+    # A binary model's noise is known: 1 in its whitened coordinates.
+    noise = np.where(binary, 1.0, np.array([moment.noise for moment in moments]))
     if prior.annotation_groups:
         # Nested empirical Bayes (``small_n.fit_small_n``): the prior without annotation groups first, then the annotated
         # one continued from its fit, every annotation effect zero at its lambda = infinity edge
         # (``embed_hyperparameters``), so an annotation group enters only where the evidence rises.
         base = without_annotations(prior)
-        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None)
+        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None, model_sites)
         starts = [embed_hyperparameters(base, prior, fit.hyperparameters) for fit in base_fits]
         fixed_points, fits = solve(
             prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(),
             base_points.mean.copy() if inference == "mean_field" else None,
+            base_points.sites if inference == "mean_field" else model_sites,
         )
     else:
-        fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None)
+        fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None, model_sites)
     mean_field = fixed_points if inference == "mean_field" else None
     hyperparameters = tuple(fit.hyperparameters for fit in fits)
     components: tuple[tuple[F64Array, F64Array], ...] = ()
     member_mean = component_weights = None
+    binary_parts: tuple = ()
     if mean_field is not None:
         hyperparameters = mean_field.restore_best(hyperparameters, 0.5 / draw_count)
-        member_mean, components, component_weights = _mode_mixture(
+        member_mean, components, component_weights, binary_parts = _mode_mixture(
             mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments,
         )
     return FullDataFit(
@@ -1440,6 +1687,7 @@ def fit_full_data(
         inference=inference,
         member_mean=member_mean,
         member_components=components,
+        binary_components=binary_parts,
         component_weights=component_weights,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
@@ -1484,11 +1732,13 @@ def fit_full_data(
 
 def _ridge_mean(
     gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, moments: Sequence[MomentStart], draw_count: int,
+    noise: F64Array | None = None,
 ) -> F64Array:
     """Each model's members' posterior means under the prior family's Gaussian member, beta_j ~ N(0, v u_j) with v the
     moment start's mean variance (``moment_starts``, the heritability's moment estimate) and u_j = e^(o_j): the dense
-    end of the architectures, solved by the dual solver at uniform Gaussian sites. Tied members split their group's
-    mean by their prior variances (the Gaussian posterior's split between identical columns)."""
+    end of the architectures, solved by the dual solver at uniform Gaussian sites, in the dual solver's current metric
+    at ``noise`` (the moment start's, or a binary model's known 1). Tied members split their group's mean by their prior
+    variances (the Gaussian posterior's split between identical columns)."""
     ties = TieGroups.from_tie_map(statistics.tie_map)
     offsets = np.exp(np.asarray(prior.log_variance_offset, dtype=np.float64))
     variances = np.array([float(moment.mean_variance) for moment in moments])
@@ -1496,7 +1746,8 @@ def _ridge_mean(
     shift = np.zeros_like(precision)
     group_precision, group_shift = group_sites(ties, precision, shift)
     gaussian.iterate(
-        site_precision=group_precision, site_shift=group_shift, noise_variance=np.array([float(moment.noise) for moment in moments]),
+        site_precision=group_precision, site_shift=group_shift,
+        noise_variance=np.array([float(moment.noise) for moment in moments]) if noise is None else np.asarray(noise, dtype=np.float64),
         error_bound=np.full(len(moments), np.sqrt(1.0 / draw_count)), probe_residual_ratio=_HALF_PRECISION,
     )
     group_mean = np.asarray(_host(gaussian.mean), dtype=np.float64)
@@ -1507,7 +1758,7 @@ def _ridge_mean(
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
-) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...], F64Array]:
+) -> tuple[F64Array, tuple[tuple[F64Array, F64Array], ...], F64Array, tuple]:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
     effect, while the posterior mean averages them. Fixed points are solved at the fitted hyperparameters from zero in
@@ -1515,13 +1766,21 @@ def _mode_mixture(
     a poor fixed point carries no weight; a repeat of a held mode is merged into it), until one more moves every model's fitted genetic values by at most the
     draws' resolution, ||Xp d||^2 / sigma^2 <= 1/K; the main fixed point is the first component and the fixed point from
     the Gaussian member's posterior mean (``_ridge_mean``, when ``moments`` are given) the second, and the main fixed
-    point's dual-solver state is put back at the end. Returns the weighted mean, each component's (shift, omega) and the weights."""
+    point's dual-solver state is put back at the end. Returns the weighted mean, each component's (shift, omega), the
+    weights, and each component's ``BinaryComponent`` per binary model (None per quantitative one).
+
+    A binary model's components each start from the main fixed point's sites and move their own (their Bernoulli
+    bounds are the evidence that weighs them); a move of the fitted genetic values is measured in the main fixed point's
+    metric at its known unit noise."""
     def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
         return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
 
-    means, components, elbos = [], [], []
+    def binary_of(oracle: "_FullDataMeanField") -> tuple:
+        return tuple(None if model_sites is None else oracle.binary_component(model) for model, model_sites in enumerate(oracle.sites))
+
+    means, components, elbos, binaries = [], [], [], []
     mean, shift, omega = pieces(main)
-    means.append(mean); components.append((shift, omega)); elbos.append(np.array(main.elbo, dtype=np.float64))
+    means.append(mean); components.append((shift, omega)); elbos.append(np.array(main.elbo, dtype=np.float64)); binaries.append(binary_of(main))
 
     def weighted() -> tuple[F64Array, F64Array]:
         values = np.array(elbos)
@@ -1542,18 +1801,23 @@ def _mode_mixture(
                 for model in range(main.model_count)
             ):
                 if float(np.sum(elbo)) > float(np.sum(elbos[index])):
-                    means[index], components[index], elbos[index] = mean, (shift, omega), elbo
+                    means[index], components[index], elbos[index], binaries[index] = mean, (shift, omega), elbo, binary_of(oracle)
                 return
-        means.append(mean); components.append((shift, omega)); elbos.append(elbo)
+        means.append(mean); components.append((shift, omega)); elbos.append(elbo); binaries.append(binary_of(oracle))
 
     average, _weights = weighted()
     if moments:
         # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
         # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
         # the evidence weights decide between the basins.
+        main._sync()
         ridge = _FullDataMeanField(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(),
-            start_mean=_ridge_mean(gaussian, statistics, prior, moments, draw_count),
+            start_mean=_ridge_mean(
+                gaussian, statistics, prior, moments, draw_count,
+                np.where([model_sites is not None for model_sites in main.sites], 1.0, [float(moment.noise) for moment in moments]),
+            ),
+            sites=list(main.sites),
         )
         points = ridge(list(hyperparameters))
         if not any(point is None for point in points):
@@ -1564,6 +1828,7 @@ def _mode_mixture(
         component += 1
         oracle = _FullDataMeanField(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component,
+            sites=list(main.sites),
         )
         points = oracle(list(hyperparameters))
         if any(point is None for point in points):
@@ -1579,7 +1844,7 @@ def _mode_mixture(
             break
     main._iterate(main.site_precision, main.site_shift, main.noise)
     main._panel_grams.clear()
-    return average, tuple(components), weighted()[1]
+    return average, tuple(components), weighted()[1], tuple(binaries)
 
 
 def scoring_models(
@@ -1617,12 +1882,14 @@ def scoring_models(
             # One p x K array, each component's draws written into its own columns (no per-component copies).
             draws = np.empty((ties.member_count, draw_count))
             column = 0
+            spans = []
             for index, ((shift, omega), share) in enumerate(zip(parts, shares)):
                 if share:
                     draws[:, column:column + share] = product_draws(
                         prior, fit.hyperparameters[model].coefficients, omega[:, model], shift[:, model], class_index,
                         np.random.default_rng([seed, model, index]), share, fit.working_bytes,
                     )
+                    spans.append((index, column, column + share))
                     column += share
         else:
             draws = member_draws(
@@ -1639,6 +1906,17 @@ def scoring_models(
                 np.add.at(group_deviations, ties.group[chunk], ties.sign[chunk, None] * (draws[chunk] - mean[chunk, model, None]))
         else:
             group_deviations = group_draws[:, model, :] - group_mean[:, model, None]
+        model_alpha = alpha[:, model]
+        covariate_draws = alpha[:, model, None] - conditional_loading @ group_deviations
+        covariate_covariance = fit.noise_variance[model] * statistics.covariate_gram_pseudo_inverse
+        shift_value = 0.0
+        binary = [part[model] for part in fit.binary_components] if fit.binary_components else []
+        if binary and binary[0] is not None:
+            # Each draw's reduced-column sums, b_g = its deviation plus the mixture mean's sums.
+            mean_sums = np.bincount(ties.group, weights=ties.sign * mean[:, model], minlength=ties.group_count)
+            model_alpha, covariate_draws, covariate_covariance, shift_value = _binary_covariates(
+                binary, weights, spans, group_deviations + mean_sums[:, None],
+            )
         models.append(ScoringModel.from_reduced_fit(
             active_rows=np.asarray(statistics.active_rows, dtype=np.int64),
             signed_means=np.asarray(statistics.means, dtype=np.float64),
@@ -1647,12 +1925,33 @@ def scoring_models(
             member_prior_variances=prior_second_moment(prior, fit.hyperparameters[model]),
             beta_reduced=mean[:, model],
             posterior_draws_reduced=draws,
-            alpha=alpha[:, model],
+            alpha=model_alpha,
             trait_type=trait_type,
-            predictive_intercept_shift=0.0,
-            covariate_draws=alpha[:, model, None] - conditional_loading @ group_deviations,
-            covariate_covariance=fit.noise_variance[model] * statistics.covariate_gram_pseudo_inverse,
+            predictive_intercept_shift=shift_value,
+            covariate_draws=covariate_draws,
+            covariate_covariance=covariate_covariance,
             # The EP route's draws are its Gaussian's; the mean-field route's are the product's scale mixtures.
             gaussian_posterior=fit.inference != "mean_field",
         ))
     return models
+
+
+def _binary_covariates(
+    components: Sequence[BinaryComponent], weights: F64Array, spans: Sequence[tuple[int, int, int]], group_sums: F64Array,
+) -> tuple[F64Array, F64Array, F64Array, float]:
+    """A binary model's covariate terms and predictive shift over its mixture (``small_n._binary_covariates``), each
+    component in its own metric: alpha = sum_c w_c alpha_c, each draw's covariates anchor_c - loading_c b_g for the
+    component c it came from (``spans``: (component, first column, last column)), the within-component covariance
+    sum_c w_c (C'W_c C)^+, and the intercept shift that puts the mean predictive over the training rows at their
+    prevalence under the mixture's predictor moments (``binary_likelihood.calibrated_shift``)."""
+    alpha = np.einsum("c,ck->k", weights, np.array([component.alpha for component in components]))
+    covariance = np.einsum("c,ckl->kl", weights, np.array([component.covariance for component in components]))
+    covariate_draws = np.empty((alpha.shape[0], group_sums.shape[1]))
+    for index, first, last in spans:
+        component = components[index]
+        covariate_draws[:, first:last] = component.anchor[:, None] - component.loading @ group_sums[:, first:last]
+    means = np.array([component.predictor_mean for component in components])
+    mixture_mean = np.einsum("c,ci->i", weights, means)
+    mixture_variance = np.einsum("c,ci->i", weights, np.array([component.predictor_variance for component in components]) + (means - mixture_mean[None, :]) ** 2)
+    shift = calibrated_shift(mixture_mean, mixture_variance, components[0].labels)
+    return alpha, covariate_draws, covariance, shift

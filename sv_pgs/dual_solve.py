@@ -1117,10 +1117,16 @@ class DualGaussian:
     tr(S_S^-1)/n, tr(S_S^-2)/n and tr(Q^2)/n for marginal_variances.BulkSolve. `grams` gives the LD
     blocks and windows the marginal-variance maps use (only its blocks and whether it has cross-Grams
     are read), so C = Xt'Z_L is kept only where the maps read it (marginal_variances.WindowCross).
+
+    ``sample_weights`` (n, M), zero off the training rows, are the likelihood's weights per unit noise, so that
+    W = sample_weights / sigma^2: the training mask itself (the default) for a quantitative model, and a binary model's
+    Polya-Gamma weights omega with its working response z = kappa / omega as its targets and sigma^2 = 1
+    (``binary_likelihood``), moved by ``reweight``. The probes stay Rademacher on the training rows.
     """
 
     def __init__(
-        self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, grams: BlockGrams, probe_count: int, seed: int
+        self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, grams: BlockGrams, probe_count: int, seed: int,
+        sample_weights: Any = None,
     ) -> None:
         array_module = source.array_module
         self.source = source
@@ -1137,7 +1143,13 @@ class DualGaussian:
         self.model_count = int(self.training.shape[1])
         self.training_counts = _host(self.training.sum(axis=0))
         self.count = PassCount()
-        self.unit_squares = column_squares(source, DualModels(self.training, array_module.zeros((source.variant_count, self.model_count)), self.covariates, array_module), self.count)
+        # The likelihood's weights per unit noise: the training mask for a quantitative model, a binary model's
+        # Polya-Gamma weights on its training rows (``binary_likelihood``), set by ``reweight`` as its sites move.
+        self.sample_weights = self.training if sample_weights is None else array_module.asarray(sample_weights, dtype=array_module.float64)
+        if bool(array_module.any((self.sample_weights != 0.0) & (self.training == 0.0))) or bool(array_module.any(self.sample_weights < 0.0)):
+            raise ValueError("sample weights must be non-negative and zero off a model's training rows.")
+        self.unit_squares = column_squares(source, DualModels(self.sample_weights, array_module.zeros((source.variant_count, self.model_count)), self.covariates, array_module), self.count)
+        self.metric_key: Any = None
         generator = np.random.default_rng(seed)
         signs = generator.choice(np.array([-1.0, 1.0]), size=(source.sample_count, self.model_count * probe_count))
         self.probe_models = np.repeat(np.arange(self.model_count), probe_count)
@@ -1155,8 +1167,19 @@ class DualGaussian:
         self.indefinite_core = False
 
     def _models(self, noise_variance: np.ndarray, variances: Any) -> DualModels:
-        weights = self.training / self.array_module.asarray(noise_variance)[None, :]
+        weights = self.sample_weights / self.array_module.asarray(noise_variance)[None, :]
         return DualModels(weights, variances, self.covariates, self.array_module)
+
+    def reweight(self, *, sample_weights: Any, targets: Any, unit_squares: Any, key: Any) -> None:
+        """A binary model's metric moved (``binary_likelihood``): its weights and working response, and the column
+        squares ||xt_k||^2 in the new metric (the caller's, formed once per metric and keyed by ``key``). The last
+        solve's duals belong to the old metric, so the next solve starts cold."""
+        array_module = self.array_module
+        self.sample_weights = array_module.asarray(sample_weights, dtype=array_module.float64)
+        self.targets = array_module.where(self.training == 0.0, 0.0, array_module.asarray(targets, dtype=array_module.float64))
+        self.unit_squares = array_module.asarray(unit_squares, dtype=array_module.float64)
+        self.metric_key = key
+        self._duals = None
 
     def iterate(
         self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float,

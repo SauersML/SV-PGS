@@ -34,6 +34,7 @@ from sv_pgs.artifact import (
     sites_digest,
     store_digest,
 )
+from sv_pgs.binary_likelihood import ascertainment_offset, training_prevalence
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
@@ -119,6 +120,10 @@ class FitRequest:
     budget: ComputeBudget
     work_dir: Path
     seed: int
+    # Per model, the prevalence of the population a binary model is deployed in, where its training rows are a
+    # case-control sample of it (None: the training rows are the population's sample; ``binary_likelihood``: the logit
+    # offset logit(K) - logit(p) moves the predictive's intercept). None for every quantitative model.
+    population_prevalence: tuple[float | None, ...] | None = None
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -183,6 +188,16 @@ class FitRequest:
         for model, trait_type in enumerate(self.trait_types):
             if trait_type == TraitType.BINARY and not np.all(np.isin(target_matrix[training_mask[:, model], model], (0.0, 1.0))):
                 raise ValueError(f"binary model {self.model_names[model]!r} has training targets other than 0 and 1.")
+        if self.population_prevalence is not None:
+            prevalences = tuple(None if value is None else float(value) for value in self.population_prevalence)
+            if len(prevalences) != model_count:
+                raise ValueError("population_prevalence needs one entry per model.")
+            for model, (trait_type, prevalence) in enumerate(zip(self.trait_types, prevalences)):
+                if prevalence is None:
+                    continue
+                if trait_type != TraitType.BINARY or not 0.0 < prevalence < 1.0:
+                    raise ValueError(f"model {self.model_names[model]!r}: a population prevalence belongs to a binary model and lies in (0, 1).")
+            set_field(self, "population_prevalence", prevalences)
         set_field(self, "store_columns", columns)
         set_field(self, "covariates", covariate_matrix)
         set_field(self, "targets", target_matrix)
@@ -213,11 +228,20 @@ def fit(request: FitRequest) -> FittedModel:
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)
+    scoring = list(fitted.scoring)
+    for model, prevalence in enumerate(request.population_prevalence or ()):
+        if prevalence is not None:
+            # The fit calibrated the predictive to its training rows; the deployment population's prevalence moves the
+            # intercept by the ascertainment offset (``binary_likelihood``).
+            sample = training_prevalence(request.targets[request.training[:, model], model])
+            scoring[model] = dataclasses.replace(
+                scoring[model], predictive_intercept_shift=scoring[model].predictive_intercept_shift + ascertainment_offset(sample, prevalence),
+            )
     return FittedModel(
         model_names=request.model_names,
         covariate_names=request.covariate_names,
         covariate_columns=request.covariate_columns,
-        scoring=tuple(fitted.scoring),
+        scoring=tuple(scoring),
         noise_variance=np.asarray(fitted.noise_variance, dtype=np.float64),
         hyperparameters=tuple(fitted.hyperparameters),
         certificate=parts.terms,

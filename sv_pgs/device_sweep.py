@@ -7,10 +7,10 @@ projected columns on the host: at 40,000 samples x 518k records, 166 GB copied o
 Here the same updates, in the same order, run on the device a panel of ``PANEL`` columns at a time. For a panel
 with projected columns Xp_P:
 
-  c_P = X_P' r            (r already lies in the projected, training-masked space, so Xp_P' r = X_P' r);
+  c_P = X_P' M r          (r already lies in the projected space, so Xp_P' r = X_P' M r, = X_P' r for a 0/1 mask);
   within the panel, member j's update reads c_j and then c_i -= (Xp_P' Xp_P)_ij dm_j for the panel's members,
   which is exactly x_i' r after x_j dm_j has left it: one warp, one lane per member, the node sums by shuffles;
-  r -= (I - H) M X_P dm_P  (M the training mask, H the covariate projector).
+  r -= (I - H) M X_P dm_P  (M the root weights: the training mask, or a binary model's sqrt(omega); H the covariate projector).
 
 Nothing but the panel's moments leaves the device. The panel Grams Xp_P' Xp_P depend on neither the prior nor the
 noise, so each is formed once per fit (``PanelGrams``) and reused by every sweep. Every quantity is float64 and the
@@ -155,11 +155,11 @@ class PanelGrams:
     and rebuilds the rest; ``None`` capacity keeps every panel."""
 
     def __init__(self, capacity_bytes: int | None = None) -> None:
-        self._grams: dict[tuple[int, bytes], Any] = {}
+        self._grams: dict[tuple, Any] = {}
         self._capacity = capacity_bytes
         self._bytes = 0
 
-    def get(self, key: tuple[int, bytes], build) -> Any:
+    def get(self, key: tuple, build) -> Any:
         held = self._grams.get(key)
         if held is not None:
             return held
@@ -187,6 +187,7 @@ def sweep_piece(
     grams: PanelGrams,
     model: int,
     members: np.ndarray,
+    metric: bytes = b"",
     squares: Any,
     class_index: Any,
     log_density: Any,
@@ -204,15 +205,17 @@ def sweep_piece(
 
     ``decode(first, last)`` returns the piece's standardized columns first..last-1 (n x panel, before masking and
     projection; one panel at a time, so the device holds a panel's columns, never a block's), ``width`` the piece's
-    member count, ``mask`` the model's
-    training indicator (n), ``covariates`` its masked covariates M C (n x k) and ``covariate_pinv`` (C'MC)^+ (k x k):
-    the complement of M v is (I - H) M v = M v - M C (C'MC)^+ C' M v (the noise's weights cancel), so each panel keeps
-    A = (C'MC)^+ C' M X_panel (k x panel) beside its Gram and a sweep's residual update is M X s - M C (A s), two
+    member count, ``mask`` M the model's root weights W^1/2 per unit noise (n: its training indicator for a
+    quantitative model, sqrt(omega) on the training rows for a binary one, ``binary_likelihood``), ``covariates`` its
+    masked covariates M C (n x k) and ``covariate_pinv`` (C'M^2 C)^+ (k x k): the complement of M v is
+    (I - H) M v = M v - M C (C'M^2 C)^+ C' M^2 v (the noise's weights cancel), so each panel keeps
+    A = (C'M^2 C)^+ C' M^2 X_panel (k x panel) beside its Gram and a sweep's residual update is M X s - M C (A s), two
     small products in place of a general projection per panel (35% of a bench-sim Stage 2 [sim, scenario_001]);
-    ``residual`` r (n);
+    ``residual`` r (n), which lies in the projected space, so Xp_P' r = X_P' M r (M r = r for a 0/1 mask);
     the per-member arrays are the piece's own slices, and ``pieces`` (width x 3) receives each member's KL term,
-    ||x_j||^2 v_j and the terms' sizes. ``model`` and ``members`` (the piece's member indices, host, in sweep order)
-    name each panel for the Gram cache."""
+    ||x_j||^2 v_j and the terms' sizes. ``model``, ``metric`` (the weights' key: a binary model's Grams belong to one
+    set of Polya-Gamma weights) and ``members`` (the piece's member indices, host, in sweep order) name each panel for
+    the Gram cache."""
     kernel = _kernel(cupy)
     node_count = int(node_variance.shape[1])
     for first in range(0, width, PANEL):
@@ -225,8 +228,8 @@ def sweep_piece(
             projected = masked - covariates @ coupling
             return cupy.ascontiguousarray(projected.T @ projected), coupling
 
-        gram, coupling = grams.get((int(model), np.ascontiguousarray(members[first:last], dtype=np.int64).tobytes()), build)
-        projection = cupy.ascontiguousarray(columns.T @ residual)
+        gram, coupling = grams.get((int(model), metric, np.ascontiguousarray(members[first:last], dtype=np.int64).tobytes()), build)
+        projection = cupy.ascontiguousarray(columns.T @ (mask * residual))
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(
             (1,), (PANEL,),

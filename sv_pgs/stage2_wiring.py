@@ -5,7 +5,8 @@ Stage 0 on the model's own training rows and covariate columns, the start lattic
 likelihoods, the prior with one class per variant class present, the records' log reliabilities as offsets and the store's
 other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
 points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
-Quantitative traits only: ``fit_full_data`` has no binary likelihood yet.
+A binary model (0/1 targets) is fitted on its Polya-Gamma bound (``binary_likelihood``), on the same route; its reported
+noise variance is its whitened problem's known unit noise, which its predictive never reads.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.artifact import named_digest
+from sv_pgs.binary_likelihood import POLYA_GAMMA_MEAN_AT_ZERO, BernoulliSites, calibrated_shift, fit_binary_covariates
+from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import ModelConfig, TraitType
 from sv_pgs.dosage_store import DosageStore
@@ -249,6 +252,25 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
     )
 
 
+def _null_binary_model(covariates: F64Array, labels: F64Array, draw_count: int, reason: str) -> _ModelFit:
+    """A binary training set with no genetic column to fit: the covariates alone on the Bernoulli bound
+    (``binary_likelihood.fit_binary_covariates``: q(alpha) Gaussian at its Polya-Gamma fixed point), its predictive's
+    intercept shift calibrated to the training prevalence. The certificate is the null genetic model's, with the sites'
+    remaining gain as the likelihood's pending one."""
+    ascent, alpha, covariance = fit_binary_covariates(covariates, labels, 0.5 / draw_count)
+    log(f"stage2 wiring: null binary genetic model ({reason}); the covariates alone, bound {ascent.bound:.6g}")
+    base = _null_genetic_model(
+        _CovariateFit(alpha=alpha, noise=1.0, degrees=labels.shape[0] - covariates.shape[1], explained=False, gram_pseudo_inverse=covariance),
+        draw_count, reason,
+    )
+    scoring = dataclasses.replace(
+        base.scoring, trait_type=TraitType.BINARY, covariate_covariance=covariance,
+        predictive_intercept_shift=calibrated_shift(ascent.state.predictor_mean, ascent.state.predictor_variance, labels),
+    )
+    certificate = dataclasses.replace(base.certificate, noise_gain=np.array([ascent.remaining_gain]))
+    return dataclasses.replace(base, scoring=scoring, noise=1.0, certificate=certificate)
+
+
 def _fit_one(
     store: DosageStore,
     training_columns: I64Array,
@@ -259,11 +281,21 @@ def _fit_one(
     work_dir: Path,
     seed: int,
     draw_count: int,
+    trait_type: TraitType = TraitType.QUANTITATIVE,
 ) -> _ModelFit:
-    """One quantitative model on the sorted store columns ``training_columns``, whose covariates (intercept first) and
-    targets follow them; the null genetic model where the training set has no genetic column to fit."""
+    """One model on the sorted store columns ``training_columns``, whose covariates (intercept first) and targets follow
+    them; the null genetic model where the training set has no genetic column to fit.
+
+    A binary model (0/1 targets) is fitted on its Polya-Gamma bound (``binary_likelihood``): after the separation check,
+    Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where the lattice and
+    the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0."""
     # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
+    binary = trait_type == TraitType.BINARY
+    if binary:
+        assert_no_separation(covariates, targets)
+        start_sites = BernoulliSites.start(targets)
+        labels, targets = targets, start_sites.response
     # Before the store is read: what the covariates alone leave, which decides whether there is anything to fit.
     covariate_fit = _covariate_least_squares(covariates, targets)
     if covariate_fit.degrees <= 0:
@@ -271,17 +303,22 @@ def _fit_one(
             f"{targets.shape[0]} training rows against covariates of rank {targets.shape[0] - covariate_fit.degrees} leave no "
             "residual degrees of freedom, so the noise variance is not identified."
         )
+
+    def null_model(reason: str) -> _ModelFit:
+        return _null_binary_model(covariates, labels, draw_count, reason) if binary else _null_genetic_model(covariate_fit, draw_count, reason)
+
     if covariate_fit.explained:
-        return _null_genetic_model(covariate_fit, draw_count, "the covariates explain every training target to working precision")
+        # (Never for a binary model: labels the covariates span exactly would separate, which the check refused.)
+        return null_model("the covariates explain every training target to working precision")
     candidates = stage0_candidates(store, training_columns, log_reliability, config)
     if candidates.shape[0] == 0:
-        return _null_genetic_model(covariate_fit, draw_count, "no store record carries signal on these training rows")
+        return null_model("no store record carries signal on these training rows")
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
     statistics = compute_genotype_statistics(
         DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
     )
     if np.asarray(statistics.active_rows).shape[0] == 0:
-        return _null_genetic_model(covariate_fit, draw_count, "every candidate record is monomorphic on these training rows")
+        return null_model("every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
@@ -310,7 +347,15 @@ def _fit_one(
     store_targets[training_columns, 0] = targets
     store_covariates = np.zeros((store.n_samples, covariates.shape[1]))
     store_covariates[training_columns] = covariates
-    start_noise = float(covariate_residual_variance(store_targets, mask, store_covariates)[0])
+    store_sites = None
+    if binary:
+        store_labels = np.zeros(store.n_samples)
+        store_labels[training_columns] = labels
+        store_sites = BernoulliSites.start(store_labels, mask[:, 0] > 0.0)
+        # The start's equal-weight problem has noise 1 / omega(0) = 4 exactly, in the response's units.
+        start_noise = 1.0 / POLYA_GAMMA_MEAN_AT_ZERO
+    else:
+        start_noise = float(covariate_residual_variance(store_targets, mask, store_covariates)[0])
     tolerance = 0.5 / draw_count
     nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, tolerance)
     prior = scale_mixture_prior(
@@ -334,13 +379,16 @@ def _fit_one(
         grams=block_grams(statistics, start_noise),
         probe_count=draw_count,
         seed=_seed(seed, 0),
+        # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
+        sample_weights=None if store_sites is None else store_sites.weights[:, None],
     )
     # The mean-field fixed points: EP's refused nearly every call on the wiring store ("the EP refreshes' updates line
     # up with no contraction ... the full-data route has no double loop", 59 of 65 calls, 2026-09-21).
     fit = fit_full_data(
-        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field"
+        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field",
+        sites=[store_sites],
     )
-    (scoring,) = scoring_models(fit, prior, statistics, [TraitType.QUANTITATIVE], draw_count, seed=_seed(seed, 2))
+    (scoring,) = scoring_models(fit, prior, statistics, [trait_type], draw_count, seed=_seed(seed, 2))
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
     return _ModelFit(
         scoring=scoring,
@@ -370,8 +418,8 @@ def fit_models(
     draw_count: int,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, one at a time (see the module docstring)."""
-    if any(trait_type != TraitType.QUANTITATIVE for trait_type in trait_types):
-        raise NotImplementedError("run/svpgs-bench-1 fits quantitative traits only: fit_full_data has no binary likelihood yet.")
+    if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
+        raise ValueError(f"unknown trait types in {list(trait_types)}")
     log_reliability = (
         store_log_reliability(store)
         if log_variance_offset is None
@@ -395,6 +443,7 @@ def fit_models(
             model_dir,
             _seed(seed, model),
             draw_count,
+            trait_types[model],
         )
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fit.scoring.alpha
