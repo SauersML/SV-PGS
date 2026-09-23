@@ -129,6 +129,10 @@ class MemoryBroker:
 
     capacities: dict[str, int]
     meters: dict[str, Callable[[], int]] = field(default_factory=dict)
+    # A metered pool's O(1) upper bound on its meter (CuPy's reserved bytes >= its used bytes): where the bound
+    # already decides a question (a request fits, or no new peak), the meter, which walks the pool's free lists, is
+    # not read. Reading it on every device allocation was 92% of a genome fit's stage 2 (bench-sim 013 [sim], py-spy).
+    bounds: dict[str, Callable[[], int]] = field(default_factory=dict)
     leases: list[Lease] = field(default_factory=list)
     peaks: dict[str, int] = field(default_factory=dict)
 
@@ -193,13 +197,19 @@ class MemoryBroker:
         return pool in lease.pools and pool not in self.meters
 
     def _fits(self, charged: tuple[str, ...], nbytes: int, ignoring: Lease | None = None) -> bool:
-        return all(
-            self.held(pool) - (ignoring.nbytes if ignoring is not None and self._counted(ignoring, pool) else 0) + nbytes <= self.capacities[pool]
-            for pool in charged
-        )
+        def fits(pool: str) -> bool:
+            bound = self.bounds.get(pool)
+            if bound is not None and int(bound()) + nbytes <= self.capacities[pool]:
+                return True  # held <= bound: the request fits whatever the pool's used bytes are
+            return self.held(pool) - (ignoring.nbytes if ignoring is not None and self._counted(ignoring, pool) else 0) + nbytes <= self.capacities[pool]
+
+        return all(fits(pool) for pool in charged)
 
     def _note_peaks(self, charged: tuple[str, ...]) -> None:
         for pool in charged:
+            bound = self.bounds.get(pool)
+            if bound is not None and int(bound()) <= self.peaks[pool]:
+                continue  # held <= bound <= the recorded peak
             self.peaks[pool] = max(self.peaks[pool], self.held(pool))
 
     def _make_room(self, charged: tuple[str, ...], nbytes: int, purpose: str, ignoring: Lease | None = None) -> None:
@@ -299,14 +309,17 @@ class _LedgerAllocator:
         return self.pool.malloc(size)
 
 
-def _device_meter(cupy: Any, device_id: int) -> Callable[[], int]:
+def _device_meter(cupy: Any, device_id: int, reserved: bool = False) -> Callable[[], int]:
+    """The device pool's used bytes, or with ``reserved`` its reserved bytes (every block the pool holds, used or
+    free: an upper bound on the used bytes, read in O(1))."""
     pool = cupy.get_default_memory_pool()
+    read = pool.total_bytes if reserved else pool.used_bytes
 
     def used() -> int:
         if int(cupy.cuda.runtime.getDevice()) == device_id:
-            return int(pool.used_bytes())
+            return int(read())
         with cupy.cuda.Device(device_id):
-            return int(pool.used_bytes())
+            return int(read())
 
     return used
 
@@ -328,6 +341,7 @@ def memory_scope(budget: ComputeBudget) -> Iterator[MemoryBroker]:
     if cupy is not None:
         for device_id in budget.device_ids:
             broker.meters[device_pool(device_id)] = _device_meter(cupy, device_id)
+            broker.bounds[device_pool(device_id)] = _device_meter(cupy, device_id, reserved=True)
         previous = cupy.cuda.get_allocator() if hasattr(cupy.cuda, "get_allocator") else cupy.get_default_memory_pool().malloc
         cupy.cuda.set_allocator(_LedgerAllocator(broker, cupy))
     token = _CURRENT.set(broker)
