@@ -826,3 +826,40 @@ def test_the_small_simulated_fit_certifies():
     fit = fit_small_n(codes=codes, covariates=covariates, target=target, variant_class=classes, log_variance_offset=None, draw_count=64,
                       working_bytes=working_bytes, seed=0, inference="mean_field")
     assert fit.profile["outer_criterion_met"], (fit.profile["remaining_gain"], fit.profile["prediction_move"])
+
+
+def test_the_gaussian_member_is_the_exact_posterior_and_evidence_of_its_prior():
+    """``GaussianMember``: at its fitted (v, sigma^2) the mean is the dense posterior mean, the log evidence is
+    log N(y_P; 0, sigma^2 I + v Xp U Xp') on the covariate-projected space (n - k dimensions), the variance ratio is the
+    marginal likelihood's maximum, and the draws' covariance is the posterior's."""
+    from sv_pgs.small_n import GaussianMember, small_n_prior
+
+    rng = np.random.default_rng(83)
+    samples, variants = 60, 90
+    dosage = rng.binomial(2, rng.uniform(0.1, 0.5, variants), size=(samples, variants))
+    covariates = np.column_stack([np.ones(samples), rng.standard_normal(samples)])
+    target = (dosage - dosage.mean(axis=0)) @ rng.normal(0.0, 0.15, variants) + rng.standard_normal(samples)
+    statistics = dense_statistics((dosage * 127).astype(np.uint8), covariates, target)
+    prior = small_n_prior(statistics, np.zeros(variants, dtype=np.uint8), np.zeros(variants), 64)
+    member = GaussianMember.fit(statistics, prior)
+    x, y = statistics.projected, statistics.projected_target
+    basis = np.linalg.svd(np.eye(samples) - covariates @ np.linalg.pinv(covariates))[0][:, : samples - statistics.covariate_rank]
+
+    def log_evidence(variances, noise):
+        covariance = basis.T @ ((x * variances) @ x.T + noise * np.eye(samples)) @ basis
+        rotated = basis.T @ y
+        sign, log_det = np.linalg.slogdet(covariance)
+        return -0.5 * (rotated.size * np.log(2.0 * np.pi) + log_det + rotated @ np.linalg.solve(covariance, rotated))
+
+    np.testing.assert_allclose(member.log_evidence, log_evidence(member.variances, member.noise), rtol=1e-9)
+    for factor in (0.8, 1.25):
+        # The fit maximizes the evidence over the variance ratio (sigma^2 profiled at each).
+        assert log_evidence(member.variances * factor, member.noise) < member.log_evidence
+        assert log_evidence(member.variances, member.noise * factor) < member.log_evidence
+    precision = x.T @ x / member.noise + np.diag(1.0 / member.variances)
+    covariance = np.linalg.inv(precision)
+    np.testing.assert_allclose(member.mean, covariance @ (x.T @ y) / member.noise, rtol=1e-7, atol=1e-10)
+    draws = member.draws(np.random.default_rng(5), 40_000)
+    spread = np.sqrt(np.diag(covariance))
+    np.testing.assert_allclose(draws.mean(axis=1), member.mean, atol=4.0 * spread.max() / np.sqrt(40_000) * 1.5)
+    np.testing.assert_allclose(np.var(draws, axis=1), spread ** 2, rtol=0.05)

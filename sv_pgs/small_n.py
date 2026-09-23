@@ -1708,31 +1708,81 @@ def small_n_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> tupl
     return initial_hyperparameters(prior, moment.mean_variance), float(moment.noise), moment
 
 
-def ridge_start(statistics: DenseStatistics) -> F64Array:
-    """q's means at the empirical-Bayes ridge: the prior family's Gaussian member (every effect N(0, t sigma^2) on the
-    standardized columns), t by the marginal likelihood y_P ~ N(0, sigma^2 (I + t K)), K = Xp Xp', with sigma^2
-    profiled, over t's resolvable range [sqrt(eps) / lambda_max, 1 / (sqrt(eps) lambda_min)] of K's nonzero spectrum
-    (past either end t I + ... is t K or I to half precision). The dense end of the architecture the lasso's sparse
-    starts leave out: with 5% of a window's variants causal the lasso-carried fit kept its sparse basin and
-    over-shrank (r2 0.076, calibration slope 1.68, against the ridge's 0.127 and 0.95 over 9 simulations on real
-    genotypes), and the evidence weights (``_mixture_weights``) decide between the basins."""
-    x = np.asarray(statistics.projected, dtype=np.float64)
-    y = np.asarray(statistics.projected_target, dtype=np.float64)
-    values, vectors = np.linalg.eigh(x @ x.T)
-    resolvable = values > values[-1] * x.shape[0] * _EPSILON
-    values, vectors = values[resolvable], vectors[:, resolvable]
-    rotated = vectors.T @ y
-    residual_square = float(y @ y - rotated @ rotated)
-    dimension = statistics.sample_count - statistics.covariate_rank
+def ridge_start(statistics: DenseStatistics, prior: ScaleMixturePrior) -> F64Array:
+    """q's means at the empirical-Bayes ridge (``GaussianMember``): the dense end of the architecture the lasso's sparse
+    starts leave out."""
+    return GaussianMember.fit(statistics, prior).mean
 
-    def negative(log_t: float) -> float:
-        spread = 1.0 + np.exp(log_t) * values
-        return 0.5 * (float(np.sum(np.log(spread))) + dimension * np.log((float(np.sum(rotated ** 2 / spread)) + residual_square) / dimension))
 
-    half = np.sqrt(_EPSILON)
-    bounds = (float(np.log(half / values[-1])), float(np.log(1.0 / (half * values[0]))))
-    t = float(np.exp(scipy.optimize.minimize_scalar(negative, bounds=bounds, method="bounded").x))
-    return t * x.T @ (vectors @ (rotated / (1.0 + t * values)))
+@dataclass
+class GaussianMember:
+    """The prior family's Gaussian member at its marginal-likelihood variance, solved exactly: every effect
+    beta_j ~ N(0, v u_j) on the standardized columns, u_j = e^(o_j) the prior's offsets, so y_P ~ N(0, sigma^2 I + v
+    Xp U Xp') = N(0, sigma^2 (I + t K)), K = Xp U Xp' = V diag(lambda) V', with sigma^2 profiled and t = v / sigma^2 over
+    its resolvable range [sqrt(eps) / lambda_max, 1 / (sqrt(eps) lambda_min)] of K's nonzero spectrum (past either end
+    I + t K is t K or I to half precision). Its posterior is Gaussian, so its mean, its draws and its log evidence are
+    exact: it is the mixture's dense component, weighed against the mean-field fixed points by the evidence
+    (``_mixture_weights``). The mean-field ELBO of this same prior sits below its log evidence by q's KL to the posterior,
+    1/2 (sum_j log P_jj - log det P), which grows with the prior's spread over correlated columns, so the ELBO alone
+    rejects the dense end where the evidence prefers it [sim, 5% of a gene window's variants causal on real
+    genotypes, own simulation]: ENSG00000113643.9 log Z -600.3, its mean-field ELBO -623.5, the fitted sparse
+    mixture's ELBO -603.0 (r2 0.114 against the ridge's 0.137); ENSG00000160796.18 -601.3, -618.3, -606.0."""
+
+    mean: F64Array
+    noise: float
+    variances: F64Array
+    log_evidence: float
+    statistics: DenseStatistics
+    hyperparameters: None = None
+
+    @classmethod
+    def fit(cls, statistics: DenseStatistics, prior: ScaleMixturePrior) -> "GaussianMember":
+        x = np.asarray(statistics.projected, dtype=np.float64)
+        y = np.asarray(statistics.projected_target, dtype=np.float64)
+        weights = np.exp(np.asarray(prior.log_variance_offset, dtype=np.float64))
+        values, vectors = np.linalg.eigh((x * weights[None, :]) @ x.T)
+        resolvable = values > values[-1] * x.shape[0] * _EPSILON
+        values, vectors = values[resolvable], vectors[:, resolvable]
+        rotated = vectors.T @ y
+        residual_square = float(y @ y - rotated @ rotated)
+        dimension = statistics.sample_count - statistics.covariate_rank
+
+        def noise_at(t: float) -> float:
+            return (float(np.sum(rotated ** 2 / (1.0 + t * values))) + residual_square) / dimension
+
+        def negative(log_t: float) -> float:
+            return 0.5 * (float(np.sum(np.log1p(np.exp(log_t) * values))) + dimension * np.log(noise_at(float(np.exp(log_t)))))
+
+        half = np.sqrt(_EPSILON)
+        bounds = (float(np.log(half / values[-1])), float(np.log(1.0 / (half * values[0]))))
+        t = float(np.exp(scipy.optimize.minimize_scalar(negative, bounds=bounds, method="bounded").x))
+        noise = noise_at(t)
+        log_evidence = -0.5 * (dimension * np.log(2.0 * np.pi * noise) + float(np.sum(np.log1p(t * values))) + dimension)
+        mean = t * weights * (x.T @ (vectors @ (rotated / (1.0 + t * values))))
+        return cls(mean=mean, noise=noise, variances=t * noise * weights, log_evidence=float(log_evidence), statistics=statistics)
+
+    @property
+    def oracle(self) -> "GaussianMember":
+        return self
+
+    @property
+    def profile(self) -> dict:
+        return {"elbo": self.log_evidence, "evidence_correction": 0.0}
+
+    def prior_variance(self, prior: ScaleMixturePrior) -> F64Array:
+        return self.variances
+
+    def draws(self, generator: np.random.Generator, count: int) -> F64Array:
+        """Exact posterior draws by perturbation: b ~ N(0, D), e ~ N(0, sigma^2 (I - H_C)), and
+        beta = mean + b - D Xp' (Xp D Xp' + sigma^2 I)^-1 (Xp b + e) ~ N(mean, (Xp'Xp / sigma^2 + D^-1)^-1)."""
+        statistics = self.statistics
+        x = np.asarray(statistics.projected, dtype=np.float64)
+        prior_draws = np.sqrt(self.variances)[:, None] * generator.standard_normal((x.shape[1], count))
+        noise_draws = statistics.design.project(np.sqrt(self.noise) * generator.standard_normal((x.shape[0], count)))
+        kernel = (x * self.variances[None, :]) @ x.T
+        kernel[np.diag_indices_from(kernel)] += self.noise
+        correction = self.variances[:, None] * (x.T @ linalg.solve(kernel, x @ prior_draws + noise_draws, assume_a="pos"))
+        return self.mean[:, None] + prior_draws - correction
 
 
 def lasso_starts(statistics: DenseStatistics, seed: int, unit_scales: F64Array) -> tuple[F64Array, F64Array]:
@@ -1798,14 +1848,14 @@ def fit_small_n(
         # the model's scales (``lasso_starts``), each with its own empirical Bayes. They join the mode mixture below as
         # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
-        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics))
+        starts = (*lasso_starts(statistics, seed, statistics.scales / units), ridge_start(statistics, prior))
         solves = [
             _solve_small_n(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means)
             for means in starts
         ]
     components = list(solves)
     if inference == "mean_field":
-        components = _mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed)
+        components = [*_mode_mixture(statistics, prior, solves, starts, start_noise, draw_count, working_bytes, seed), GaussianMember.fit(statistics, prior)]
     generator = np.random.default_rng(seed)
     weights = _mixture_weights(components)
     shares = _draw_shares(weights, draw_count)
@@ -1821,7 +1871,7 @@ def fit_small_n(
         signed_means=statistics.means,
         signed_scales=statistics.scales,
         tie_map=_compact_identity_tie_map(member_count),
-        member_prior_variances=np.einsum("m,mj->j", weights, np.array([prior_second_moment(prior, component.hyperparameters) for component in components])),
+        member_prior_variances=np.einsum("m,mj->j", weights, np.array([component.prior_variance(prior) for component in components])),
         beta_reduced=statistics.signs * mean,
         posterior_draws_reduced=statistics.signs[:, None] * draws,
         alpha=alpha,
@@ -1899,12 +1949,18 @@ def fit_small_n(
     )
 
 
-def _mixture_weights(components: Sequence["_SmallNSolve"]) -> F64Array:
-    """Each fixed point's weight in the mixture q = sum_m w_m q_m: w_m proportional to exp(ELBO_m), the optimal weights of
-    a mixture of well-separated components (their overlap negligible, the mixture's ELBO is sum_m w_m (ELBO_m - log w_m)).
-    It is the exact posterior's weighting of its modes too: between two near-duplicate columns the modes' masses are
-    exp(z_1^2 / 2) : exp(z_2^2 / 2) to leading order, their ELBOs' difference. An EP fit has one component."""
-    elbos = np.array([float(component.oracle.profile.get("elbo", 0.0)) for component in components])
+def _mixture_weights(components: Sequence["_SmallNSolve | GaussianMember"]) -> F64Array:
+    """Each component's weight in the mixture q = sum_m w_m q_m: w_m proportional to its evidence Z_m, the posterior mass
+    of its mode (between two near-duplicate columns the modes' masses are exp(z_1^2 / 2) : exp(z_2^2 / 2) to leading
+    order). A mean-field fixed point's log Z_m is its ELBO plus the linear-response correction
+    (``MeanFieldFixedPoints``' ``evidence_correction``: q's KL to the Gaussian with the linear response's covariance,
+    exact for a Gaussian prior), its ELBO alone where the response is not positive definite; the Gaussian member's is
+    exact. The ELBO alone would weigh the modes by a bound whose gap grows with each one's spread over correlated
+    columns, against the dense ones (``GaussianMember``). An EP fit has one component."""
+    elbos = np.array([
+        float(component.oracle.profile.get("elbo", 0.0)) + float(component.oracle.profile.get("evidence_correction") or 0.0)
+        for component in components
+    ])
     weights = np.exp(elbos - np.max(elbos))
     return weights / weights.sum()
 
@@ -1977,6 +2033,9 @@ class _SmallNSolve:
     hyperparameters: MixtureHyperparameters
     inference: str
     draw_count: int
+
+    def prior_variance(self, prior: ScaleMixturePrior) -> F64Array:
+        return prior_second_moment(prior, self.hyperparameters)
 
     def draws(self, generator: np.random.Generator, count: int) -> F64Array:
         if self.inference == "ep":

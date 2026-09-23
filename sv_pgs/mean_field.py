@@ -252,11 +252,19 @@ class _Response:
         kernel[np.diag_indices_from(kernel)] += 1.0
         self.upper = linalg.cholesky(kernel, lower=False, check_finite=False, overwrite_a=True)
         self.rest = np.flatnonzero(~bulk)
+        # log |det(Xp'Xp + diag t)| over the live rows, and its sign: det T_P det K det S (the bulk's Woodbury
+        # factor, then the rest's Schur complement S = T_N + Xp_N' K^-1 Xp_N).
+        self.log_determinant = float(np.sum(np.log(scaled_sites[bulk & live])) + 2.0 * np.sum(np.log(np.diag(self.upper))))
+        self.determinant_sign = 1.0
         if self.rest.size:
             self.rest_columns = design.columns(self.rest)
             whitened = linalg.solve_triangular(self.upper, self.rest_columns, trans="T", lower=False, check_finite=False)
             schur = whitened.T @ whitened
             schur[np.diag_indices_from(schur)] += scaled_sites[self.rest]
+            # S's eigenvalues: all positive where the whole matrix is positive definite (K and T_P are).
+            eigenvalues = np.linalg.eigvalsh(schur)
+            self.determinant_sign = 1.0 if float(eigenvalues[0]) > 0.0 else -1.0
+            self.log_determinant += float(np.sum(np.log(np.abs(eigenvalues))))
             self.schur = linalg.lu_factor(schur, check_finite=False)
             if not np.all(np.isfinite(self.schur[0])) or np.any(np.diag(self.schur[0]) == 0.0):
                 raise np.linalg.LinAlgError("the mean-field fixed point's response matrix is singular on its Schur block")
@@ -787,6 +795,17 @@ class MeanFieldFixedPoints:
         self.profile["factor_seconds"] += time.perf_counter() - started
         self.profile["refreshes"] += 1
         self._response, self._response_noise = response, self.noise
+        # The linear-response correction to the evidence: q's KL to the posterior in the Gaussian with q's means and
+        # the linear response's covariance R^-1, R = diag(tau) + Xp'Xp / sigma^2, whose diagonal is q's precisions
+        # 1 / v_j, so log Z ~ ELBO + 1/2 (sum_j log(1 / v_j) - log det R) = ELBO - 1/2 log det of R's correlation
+        # form (>= 0 where R is positive definite; exact for a Gaussian prior). The factorized q drops it, and it grows
+        # with the prior's spread over correlated columns, so the ELBO alone prefers sparser densities than the
+        # evidence. None where R is not positive definite (no Gaussian at the fixed point).
+        live_count = int(np.sum(live))
+        self.profile["evidence_correction"] = (
+            0.5 * (float(np.sum(np.log(tau[live] + omega[live]))) - (response.log_determinant - live_count * float(np.log(self.noise))))
+            if response.determinant_sign > 0.0 and np.all(tau[live] + omega[live] > 0.0) else None
+        )
         if self._moments_stale:
             self.third, self.fourth = tilted_cumulants(self.prior, hyperparameters, Cavity(precision=omega, shift=self.shift), self.working_bytes)
             self._moments_stale = False
