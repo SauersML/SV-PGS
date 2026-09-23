@@ -4,11 +4,14 @@ fitted from the training genotypes in memory with exact dense algebra (no dosage
 The arms are ``svpgs_method``'s: the full model, ``fit_expression_no_sv_terms`` and ``fit_expression_no_annotations``
 (the variant classes each arm's prior sees). The prediction is the posterior-mean genetic score plus the intercept.
 
-Every arm here passes ``log_variance_offset=None``, so the fit takes every record as measured exactly: its prior
-log-variance offset is log r^2 = 0. That is what bench-real's genotypes are, the panel's hard calls, and it is a
-statement about this benchmark, not about the model. A number from these arms measures the prior and the inference,
-never the measurement model, and none of them may be cited as evidence that the r^2-scaled prior helps or does not
-(``svpgs_method``'s module docstring says the same of its own bench-real arms).
+The unit contract (``imputation_reliability.ColumnMeasurement``) is the harness's: every column's raw unit is one ALT
+allele, its encoding scale the training-only ``bench_real_encoding``, its reliability the harness's
+``variants.reliability`` (1 for the panel's hard calls, Beagle's DR2 for an imputed overlay's columns), and its
+calibration slope 1: a hard call is measured exactly and a Beagle DS is a calibrated posterior mean (its measured
+energy-weighted slope on the panel calls is 0.87 on the chr16 overlay [real genotypes]), so the reliability reaches the
+prior through the frequency function's argument log Var(G) = log Var(D) - log r^2, never as a second offset. On the
+default dataset every reliability is 1, so a number from these arms measures the prior and the inference, not the
+measurement model; the imputed-overlay feature sets (``--overlay``, snv_svimp) are the ones that exercise it.
 
 Both harnesses load this file without registering it as a module, so it has no ``from __future__ import
 annotations`` and loads its sibling ``svpgs_method.py`` by path.
@@ -88,19 +91,26 @@ def classes_for_arm(variants: Any, arm: str) -> np.ndarray:
 
 
 # Recorded in every bench-real run record (``harness.run``: ``method_assumptions``).
-ASSUMPTIONS = {"measurement": "every record measured exactly: log_variance_offset=None, log r^2 = 0 for all columns"}
+ASSUMPTIONS = {
+    "measurement": "the harness's reliability per column (1 for hard calls, DR2 for an imputed overlay), calibration slope 1 "
+    "(calibrated conditional means): the reliability enters log Var(G), the frequency function's argument, never the offset",
+}
 
 
 def bench_real_annotations(variants: Any) -> dict[str, np.ndarray]:
     """The prior's per-column annotations from bench-real's public variant fields: the distance to the gene's TSS
-    (log1p of its magnitude), and for structural variants the log length and the signed allele-length change (missing
-    for a small variant, whose class already says so). The frequency dependence is the fit's own (every route adds
-    each column's training variance, ``annotation_design.column_variance_annotation``)."""
+    (log1p of its magnitude, in bp), and for structural variants the log length (log1p bp) and the signed allele-length
+    change on the same scale, sign(c) log1p |c| (a deletion negative, an insertion positive), each missing for a small
+    variant (its own state in the design, never a length of zero). Lengths span five orders of magnitude, so on the raw
+    bp scale the smooth's standardization and its quantile knots were set by a handful of the longest events; on the
+    log scale they spread over the events. The frequency function is the fit's own (``small_n.small_n_prior`` adds
+    ``annotation_design.frequency_annotation`` from the unit contract)."""
     is_sv = np.asarray(variants.is_sv, dtype=bool)
+    change = np.asarray(variants.allele_length_change, dtype=np.float64)
     return {
         "log_tss_distance": np.log1p(np.abs(np.asarray(variants.distance_to_tss, dtype=np.float64))),
         "log_sv_length": np.where(is_sv, np.log1p(np.abs(np.asarray(variants.sv_length, dtype=np.float64))), np.nan),
-        "length_change": np.where(is_sv, np.asarray(variants.allele_length_change, dtype=np.float64), np.nan),
+        "length_change": np.where(is_sv, np.sign(change) * np.log1p(np.abs(change)), np.nan),
     }
 
 

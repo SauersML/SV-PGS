@@ -57,7 +57,8 @@ from sv_pgs.data import TieMap
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, NoFixedPoint
 from sv_pgs.genotype_statistics import _covariate_gram_pseudo_inverse
-from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
+from sv_pgs.annotation_design import annotation_design, frequency_annotation
+from sv_pgs.imputation_reliability import ColumnMeasurement
 from sv_pgs.lasso_path import cross_validated_lasso
 from sv_pgs.scale_mixture_ep import (
     _DEVICE,
@@ -70,7 +71,10 @@ from sv_pgs.scale_mixture_ep import (
     ScaleMixturePrior,
     derived_lattice,
     embed_hyperparameters,
+    extended_lattice,
     fit_hyperparameters,
+    halved_lattice,
+    lattice_check,
     _components,
     class_log_density,
     initial_hyperparameters,
@@ -1709,17 +1713,23 @@ class SmallNFit:
 def small_n_prior(
     statistics: DenseStatistics, variant_class: np.ndarray, log_variance_offset: F64Array, draw_count: int,
     annotations: Mapping[str, np.ndarray] | None = None, codes_per_unit: np.ndarray | None = None,
+    calibration_slope: np.ndarray | None = None,
 ) -> ScaleMixturePrior:
     """The run wiring's prior (``stage2_wiring._fit_one``) over every member (review-mathbugs T1: an exact-tie member
     keeps its own class and offset, so an SV tied to SNVs keeps the SV prior): one class per variant class present,
-    each member's log reliability as its offset, the members' ``annotations`` (per input column) as the prior's
-    annotation groups (``annotation_design``), and the start lattice from the single-variant likelihoods at the
-    covariate-only residual variance."""
+    each member's unit offset log(kappa^2 Var(D)) from the unit contract of its input column
+    (``imputation_reliability.ColumnMeasurement``: ``log_variance_offset`` is each column's log reliability log r^2,
+    ``codes_per_unit`` its encoding scale, ``calibration_slope`` its kappa, 1 for a calibrated dosage), the members'
+    ``annotations`` (per input column) and the frequency function of log Var(G) as the prior's named annotation groups
+    (``annotation_design``), and the start lattice from the single-variant likelihoods at the covariate-only residual
+    variance."""
     members = statistics.active_rows
     _classes, class_index = np.unique(np.asarray(variant_class)[members], return_inverse=True)
-    # Each column's spread in its stored value's units (codes_per_unit codes per unit; all columns alike by default).
-    units = np.ones(members.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[members]
-    offsets = np.asarray(log_variance_offset, dtype=np.float64)[members] + per_unit_offset(statistics.scales / units)
+    measurement = ColumnMeasurement.build(
+        np.asarray(variant_class).shape[0], log_reliability=log_variance_offset, codes_per_unit=codes_per_unit,
+        calibration_slope=calibration_slope,
+    )
+    offsets, log_genotype_variance = measurement.standardized_terms(members, statistics.scales)
     residual = statistics.projected_target
     # A binary model's whitened problem has unit noise, known (``binary_likelihood``).
     start_noise = 1.0 if statistics.sites is not None else float(residual @ residual) / (statistics.sample_count - statistics.covariate_rank)
@@ -1728,9 +1738,9 @@ def small_n_prior(
     nodes, floor, top = derived_lattice(single_precision, single_shift, offsets, 0.5 / draw_count)
     member_annotations = {name: np.asarray(values)[members] for name, values in (annotations or {}).items()}
     if annotations is not None:
-        # The frequency dependence is the fit's own smooth of each member's training spread (statistics.scales are over
-        # the active rows, in their order); None is the prior without any annotation group, the nested fit's base.
-        member_annotations.update(column_variance_annotation(np.asarray(statistics.scales)))
+        # The frequency function, a learned smooth of each member's log true-genotype variance (statistics.scales are
+        # over the active rows, in their order); None is the prior without any annotation group, the nested fit's base.
+        member_annotations.update(frequency_annotation(log_genotype_variance))
     design = annotation_design(member_annotations, {}, class_index=class_index.astype(np.int64))
     return scale_mixture_prior(
         class_index=class_index.astype(np.int64), log_variance_offset=offsets, annotation_design=design.design,
@@ -1916,6 +1926,7 @@ def fit_small_n(
     annotations: Mapping[str, np.ndarray] | None = None,
     codes_per_unit: np.ndarray | None = None,
     population_prevalence: float | None = None,
+    calibration_slope: np.ndarray | None = None,
 ) -> SmallNFit:
     """Fit one model on the dense training codes (n x records, store codes) with ``covariates`` (n x k, intercept
     first) and ``target`` (n,): Stage 0 dense, the prior, the certified empirical Bayes of ``fit_hyperparameters`` at
@@ -1956,8 +1967,8 @@ def fit_small_n(
     # so the annotated fit starts where the base one ended and an annotation group enters only where the evidence rises.
     # Searched from the annotated prior's own start instead, the edge search stalled below the base fit
     # (ENSG00000187605.16 [real, loso/AFR]: ELBO 87.0 and r2 0.17 in 20 minutes, against 99.9 and 0.34 without).
-    base = small_n_prior(working, variant_class, offsets, draw_count, None, codes_per_unit)
-    prior = base if annotations is None else small_n_prior(working, variant_class, offsets, draw_count, annotations, codes_per_unit)
+    base = small_n_prior(working, variant_class, offsets, draw_count, None, codes_per_unit, calibration_slope)
+    prior = base if annotations is None else small_n_prior(working, variant_class, offsets, draw_count, annotations, codes_per_unit, calibration_slope)
     stage0_seconds = time.perf_counter() - started
     start, start_noise, moment = small_n_start(working, base)
     tolerance = 0.5 / draw_count
@@ -1983,6 +1994,41 @@ def fit_small_n(
             nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means, sites=sites), means)
             for means in starts
         ]
+    # The quadrature at the fitted states (review F17): the start lattice is derived from single-variant likelihoods at
+    # the start, which certify nothing about a fitted density that concentrates more sharply or puts mass at a lattice
+    # end. Each solve's normalizers and tilted moments are compared at its own fitted state on the refined and the
+    # extended lattice (``lattice_check``); where any comparison fails, every solve continues from its fitted state on
+    # the lattice that passed it, warm from its means, and is checked again.
+    lattice_checks: list[list[dict]] = []
+    lattice_unresolved: str | None = None
+    while True:
+        checks = [lattice_check(prior, solve.hyperparameters, _fitted_cavity(solve), working_bytes, draw_count) for solve in solves]
+        lattice_checks.append([check.record() for check in checks])
+        refine, extend = any(check.refine for check in checks), any(check.extend for check in checks)
+        if not (refine or extend):
+            break
+        moved = []
+        for solve in solves:
+            moved_prior, moved_hyperparameters = prior, solve.hyperparameters
+            if extend:
+                moved_prior, moved_hyperparameters = extended_lattice(moved_prior, moved_hyperparameters)
+            if refine:
+                moved_prior, moved_hyperparameters = halved_lattice(moved_prior, moved_hyperparameters)
+            moved.append((moved_prior, moved_hyperparameters))
+        try:
+            continued = [
+                _solve_small_n(
+                    statistics, moved_prior, moved_hyperparameters, float(solve.oracle.noise), draw_count, working_bytes, tolerance, inference,
+                    array_module, np.asarray(solve.oracle.mean, dtype=np.float64) if inference == "mean_field" else None, sites=sites,
+                )
+                for (moved_prior, moved_hyperparameters), solve in zip(moved, solves)
+            ]
+        except FloatingPointError as error:
+            # The empirical Bayes found no certified step on the checked lattice: the fit keeps the solves it has, and
+            # their failed check stays in the profile (``lattice_unresolved``), never read as passed.
+            lattice_unresolved = str(error)
+            break
+        prior, solves = moved[0][0], continued
     components = list(solves)
     if inference == "mean_field":
         dense_end = BinaryGaussianMember.fit(statistics, prior, sites, tolerance) if binary else GaussianMember.fit(statistics, prior)
@@ -2080,6 +2126,9 @@ def fit_small_n(
         "halvings": int(sum(outer.halvings for outer in outers)),
         "unresolved": int(sum(outer.unresolved for outer in outers)),
         "final_log_smoothing": [float(value) for value in np.atleast_1d(solves[0].hyperparameters.log_smoothing)],
+        "smoothing_block_names": [block.name for block in prior.smoothing_blocks],
+        "lattice_checks": lattice_checks,
+        "lattice_unresolved": lattice_unresolved,
         "fitted_schema": fitted_schema(prior, inference, annotations),
     }
     return SmallNFit(
@@ -2100,7 +2149,8 @@ def fitted_schema(prior: ScaleMixturePrior, inference: str, annotations: Mapping
         digest.update(array.tobytes())
     return {
         "inference": inference, "annotation_inputs": None if annotations is None else sorted(annotations),
-        "annotation_groups": len(prior.annotation_groups), "scale_columns": int(prior.scale_size), "classes": int(prior.class_count),
+        "annotation_groups": len(prior.annotation_groups),
+        "annotation_group_names": [group.name for group in prior.annotation_groups], "scale_columns": int(prior.scale_size), "classes": int(prior.class_count),
         "prior_sha256": digest.hexdigest(),
     }
 
@@ -2329,6 +2379,16 @@ class _SmallNSolve:
             # Draws of N(mu, sigma^2 A'^-1): the kernel's N(0, A'^-1) draws, scaled by sigma, around the mean.
             return self.oracle.mean[:, None] + np.sqrt(self.oracle.noise) * self.oracle.kernel.draws(generator, count)
         return self.oracle.draws(self.hyperparameters, generator, count)
+
+
+def _fitted_cavity(solve: "_SmallNSolve") -> Cavity:
+    """The cavity of every effect at a solve's fitted state: mean field's pseudo-likelihoods (precision
+    ||x_j||^2 / sigma^2, shift x_j' r_-j / sigma^2), or EP's cavities at its current sites."""
+    oracle = solve.oracle
+    if solve.inference == "mean_field":
+        return Cavity(precision=np.asarray(oracle.member_squares, dtype=np.float64) / float(oracle.noise), shift=np.array(oracle.shift, dtype=np.float64))
+    variances, _removed, precision = oracle._cavity()
+    return Cavity(precision=precision, shift=np.asarray(oracle.mean, dtype=np.float64) / variances - oracle.site_shift)
 
 
 def _solve_small_n(

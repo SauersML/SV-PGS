@@ -255,6 +255,10 @@ def test_the_small_n_fit_meets_the_outer_criterion_and_scores():
     assert np.all(np.isfinite(fit.scoring.coefficients)) and fit.scoring.posterior_draws.shape == (variants, 64)
     assert np.all(np.isfinite(fit.scoring.posterior_draws)) and fit.noise_variance > 0.0
     np.testing.assert_array_equal(fit.scoring.store_rows, np.arange(variants))
+    # F17: the quadrature is checked at the fitted state, and the fit ends on a lattice that passes it
+    final = fit.profile["lattice_checks"][-1]
+    assert final and not any(check["refine"] or check["extend"] for check in final)
+    assert all(check["refined_log_normalizer"] <= check["tolerance"] for check in final)
 
 
 def test_the_dense_route_refuses_a_problem_whose_sample_side_algebra_exceeds_its_budget():

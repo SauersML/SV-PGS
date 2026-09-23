@@ -1,18 +1,38 @@
 """The prior's annotation design from a variant table's annotation columns.
 
-Each annotation becomes one ``AnnotationGroup`` of the scale-mixture prior (``scale_mixture_ep.scale_mixture_prior``):
-columns of the class-centred design d_j that enter log u_j = o_j + d_j' theta, and a penalty whose weight the
-empirical Bayes learns with the rest of the hyperparameters. Nothing here is chosen by hand: a factor is its
-indicators, a continuous annotation is a smoothing spline in its truncated-power form (a linear term and cubic
-hinges at its interior quartile knots, the same basis ``prior_design`` compiles), whose penalty is the standard
-mixed-model one, the hinge coefficients' squared norm with the linear term free (Ruppert, Wand and Carroll,
-Semiparametric Regression, section 3.5), and a missing value is the column's mean with an indicator that says so.
+Each annotation becomes one named ``AnnotationGroup`` of the scale-mixture prior (``scale_mixture_ep.scale_mixture_prior``):
+columns of the class-centred design d_j that enter the raw-unit log prior variance a_j = d_j' theta (added to the
+unit offset, ``imputation_reliability.ColumnMeasurement``), and a penalty whose weight the empirical Bayes learns with
+the rest of the hyperparameters. Nothing here is chosen by hand:
 
-The design is class-centred (the class densities carry each class's location) and rank-screened twice: the
-deterministic Gram-Schmidt screen ``prior_design`` uses, then the prior's own rank test by a column-pivoted QR, so
-an annotation constant within every class, or a hinge two nearby knots or a nearly-all-zero column make dependent,
-leaves no column. Reliability columns are
-offsets, not annotations, and the caller names them to leave out.
+- A continuous annotation f(x) is a cubic spline on a local-support B-spline basis over its observed range, penalized
+  by its roughness as a function, the integral of f''(x)^2 over that range (the O'Sullivan penalty; Wand and Ormerod,
+  "On semiparametric regression with O'Sullivan penalized splines", 2008), the basis and its exact penalty built by
+  gamfit (``gamfit.basis.bspline_basis``, ``smoothness_penalty``). The penalty's null space, the
+  linear functions, is handled explicitly: the constant is the class densities' (class centring removes it) and the
+  linear term is a free column; the penalized part is the basis rotated onto the penalty's eigenvectors, so its
+  penalty is diagonal there and is the same function-space penalty, transformed with the basis (a change of basis
+  that drops the penalty's null directions changes no function's roughness). x is the annotation standardized over
+  its observed values; the knots are its interior quartiles (``prior_design._continuous_spline_knots``), where the
+  spline space refines toward the full smoothing spline as knots are added, and the penalty, not the knot count,
+  sets the smoothness.
+- A factor (a legend-coded annotation, or a numeric one whose observed values are all 0 or 1) is a level per
+  distinct observed value, with an exchangeable Gaussian prior on the levels about their mean: the level indicators
+  times the closed-form orthonormal sum-to-zero (Helmert) basis, penalty identity, so the prior does not depend on
+  which level comes first and no dense level-by-level change of basis is formed (the rows are gathered from it).
+- A missing value is its own state, built apart from the numeric basis and kept whenever it is identified: the
+  numeric columns are 0 on a missing row, a continuous annotation gets a free missing-state column, and a factor gets
+  a missing level. So an annotation constant where observed but missing elsewhere keeps its missing state (its
+  observed level is the missing state's complement after class centring), and a binary annotation's unknown stays
+  apart from its false (review F19).
+
+The design is class-centred (the class densities carry each class's location) and rank-screened once, in the order
+the columns are built, against the class-centred Gram the prior itself tests (``scale_mixture_prior``: its least
+eigenvalue above eps p max(its largest, 1)): a column is dropped where it adds nothing resolvable to the ones before
+it, so an annotation constant within every class, a spline direction that too few distinct values support, or a
+nearly-all-zero column leaves nothing. A dropped column of a penalized group restricts that group's function space,
+and its penalty becomes the restriction of the quadratic form. Reliability columns are the unit contract's, not
+annotations, and the caller names them to leave out.
 """
 
 from __future__ import annotations
@@ -21,41 +41,39 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 import numpy as np
-import scipy.linalg
+from scipy import sparse
+from scipy.linalg import solve_triangular
+from gamfit.basis import bspline_basis, smoothness_penalty
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.prior_design import _continuous_spline_knots
-from sv_pgs.scale_mixture_ep import AnnotationGroup
+from sv_pgs.scale_mixture_ep import AnnotationGroup, _sum_to_zero_rows
 
 _EPSILON = float(np.finfo(np.float64).eps)
+# A cubic spline: f'' continuous and piecewise linear, the lowest degree whose roughness integral f''^2 is finite and
+# whose penalty null space is exactly the linear functions.
+_SPLINE_DEGREE = 3
+# The roughness is the integral of the squared second derivative: its null space, the linear functions, is the
+# smooth's free fixed part (the constant going to the class densities).
+_ROUGHNESS_DERIVATIVE = 2
 
 
-COLUMN_VARIANCE = "log_column_variance"
-"""The annotation every route adds from the training genotypes themselves: each column's log training variance."""
+FREQUENCY = "log_genotype_variance"
+"""The frequency function's annotation: each member's log true-genotype variance log Var(G_j), from the unit contract
+(``imputation_reliability.ColumnMeasurement.standardized_terms``)."""
 
 
-def column_variance_annotation(scales: np.ndarray) -> dict[str, np.ndarray]:
-    """{COLUMN_VARIANCE: 2 log s_j} for the members' training standard deviations s_j (any constant unit cancels in the
-    class centring). Its free linear coefficient c in log u_j spans the frequency-dependent architectures: c = 0 is one
-    prior on standardized effects, c = 1 one prior on effects per unit of the stored value (per allele for a dosage,
-    mr.ash's scale), and the empirical Bayes learns c with the smooth's curvature, from the training data alone. On the
-    bench-real genes where SV-PGS trailed mr.ash most, c = 1 raised both the training ELBO and the held-out r2
-    (ENSG00000124613.9 0.21 -> 0.52, ENSG00000237248.5 0.13 -> 0.44, loso/AFR [real])."""
-    scales = np.asarray(scales, dtype=np.float64)
-    with np.errstate(divide="ignore"):
-        return {COLUMN_VARIANCE: np.where(scales > 0.0, 2.0 * np.log(np.where(scales > 0.0, scales, 1.0)), np.nan)}
-
-
-def per_unit_offset(scales: np.ndarray) -> F64Array:
-    """Each member's log prior-variance baseline at the per-unit architecture: 2 log s_j less its largest (so every
-    offset stays at or below 0, as a reliability's does), one prior per unit of the stored value. The prior starts
-    there and the column-variance annotation's free coefficient moves it toward one prior on standardized effects
-    where the data say so: the empirical Bayes searches locally, and on the bench-real genes where SV-PGS trailed
-    mr.ash most the per-unit baseline held a higher training ELBO the standardized start never reached."""
-    scales = np.asarray(scales, dtype=np.float64)
-    positive = scales > 0.0
-    log_variance = np.where(positive, 2.0 * np.log(np.where(positive, scales, 1.0)), 0.0)
-    return np.where(positive, log_variance - float(np.max(log_variance[positive])), 0.0) if positive.any() else np.zeros_like(scales)
+def frequency_annotation(log_genotype_variance: np.ndarray) -> dict[str, np.ndarray]:
+    """{FREQUENCY: log Var(G_j)}: the frequency function h(log Var G_j), a learned smooth of the raw-unit log prior
+    variance, as its own named group. Its linear coefficient c spans the alpha models of frequency-dependent
+    architecture, Var(b_j) proportional to Var(G_j)^c: c = 0 is one prior per raw unit (per allele for a dosage,
+    mr.ash's scale), c = -1 one prior on true-genotype-standardized effects (whose standardized-dosage variance is then
+    r^2 tau^2, the SPEC's r^2-scaled prior), and its curvature departs from both where the data say so; the empirical
+    Bayes learns it from the training data alone. On the bench-real genes where SV-PGS trailed mr.ash most, the
+    per-unit end raised both the training ELBO and the held-out r2 (ENSG00000124613.9 0.21 -> 0.52,
+    ENSG00000237248.5 0.13 -> 0.44, loso/AFR [real]), which is why the unit offset sits there and this term moves away
+    from it. Any constant unit cancels in the class centring."""
+    return {FREQUENCY: np.asarray(log_genotype_variance, dtype=np.float64)}
 
 
 @dataclass(frozen=True)
@@ -67,52 +85,102 @@ class AnnotationDesign:
     names: tuple[str, ...]
 
 
+@dataclass
+class _Candidate:
+    """One annotation's candidate columns (dense, one row per variant), their names and the group's penalty."""
+
+    name: str
+    columns: list[F64Array]
+    names: list[str]
+    penalty: F64Array
+
+
 def _is_indicator(values: np.ndarray) -> bool:
     finite = values[np.isfinite(values)]
     return finite.shape[0] > 0 and bool(np.all((finite == 0.0) | (finite == 1.0)))
 
 
-def _factor_columns(name: str, codes: np.ndarray, legend: Sequence[str]) -> tuple[list[F64Array], list[str]]:
-    """Indicators of every level but the most frequent one (the reference; the class densities carry the constant)."""
-    counts = np.bincount(codes.astype(np.int64), minlength=len(legend))
-    reference = int(np.argmax(counts))
-    columns, names = [], []
-    for level in range(len(legend)):
-        if level == reference or counts[level] == 0:
-            continue
-        columns.append((codes == level).astype(np.float64))
-        names.append(f"{name}={legend[level]}")
-    return columns, names
+def _factor_candidate(name: str, level_of_row: I64Array, labels: Sequence[str]) -> _Candidate:
+    """Level contrasts of a factor: row j's level indicator times the orthonormal sum-to-zero basis, gathered by level.
+
+    With levels l ~ N(0, (I - 11'/L) / lambda) (exchangeable about their mean, which the class densities carry), the
+    coordinates c = H' l of the Helmert basis H are N(0, I / lambda) and row j's contribution is H[level_j] c."""
+    present, level = np.unique(level_of_row, return_inverse=True)
+    if present.shape[0] < 2:
+        return _Candidate(name, [], [], np.zeros((0, 0)))
+    contrasts = _sum_to_zero_rows(level, present.shape[0])
+    names = [f"{name}:contrast({labels[int(present[position + 1])]})" for position in range(present.shape[0] - 1)]
+    return _Candidate(name, [np.ascontiguousarray(contrasts[:, position]) for position in range(contrasts.shape[1])], names, np.eye(contrasts.shape[1]))
 
 
-def _continuous_columns(name: str, values: np.ndarray) -> tuple[list[F64Array], list[str], list[float]]:
-    """The truncated-power smoothing-spline basis of a continuous annotation, with a missing indicator where it has
-    non-finite values; returns the columns, their names and their penalty diagonal (0 free, 1 penalised)."""
-    finite = np.isfinite(values)
-    if not finite.any():
-        return [], [], []
-    filled = np.where(finite, values, values[finite].mean())
-    mean, scale = float(filled.mean()), float(filled.std())
-    if scale <= _EPSILON * max(float(np.max(np.abs(filled))), 1.0):
-        return [], [], []
-    standardized = (filled - mean) / scale
-    columns, names, penalty = [standardized], [f"{name}:linear"], [0.0]
-    for knot in _continuous_spline_knots(standardized[finite]):
-        columns.append(np.maximum(standardized - knot, 0.0) ** 3)
-        names.append(f"{name}:hinge@{knot:.4g}")
-        penalty.append(1.0)
-    if not finite.all():
-        columns.append((~finite).astype(np.float64))
+def spline_basis(standardized: F64Array) -> tuple[F64Array, F64Array, F64Array]:
+    """(knots, B, S) of a cubic B-spline on ``standardized``'s range with its interior quartile knots: the basis at
+    those points (n x K, local support: at most 4 nonzero per row) and the exact roughness penalty S_ik = integral of
+    B_i''(x) B_k''(x) dx (K x K), both from gamfit (``gamfit.basis``)."""
+    low, high = float(np.min(standardized)), float(np.max(standardized))
+    interior = np.asarray(_continuous_spline_knots(standardized), dtype=np.float64)
+    knots = np.concatenate([np.full(_SPLINE_DEGREE + 1, low), interior, np.full(_SPLINE_DEGREE + 1, high)])
+    basis = np.asarray(bspline_basis(np.clip(standardized, low, high), knots, degree=_SPLINE_DEGREE), dtype=np.float64)
+    penalty, _null_basis = smoothness_penalty(knots, degree=_SPLINE_DEGREE, order=_ROUGHNESS_DERIVATIVE)
+    return knots, basis, np.asarray(penalty, dtype=np.float64)
+
+
+def _continuous_candidate(name: str, values: F64Array) -> _Candidate:
+    """A continuous annotation's free linear term, its penalized spline directions (the basis on the penalty's range
+    space, penalty diagonal there) and, where it has missing values, a free missing-state column; every numeric column
+    is 0 on a missing row, and the missing state is built whatever the observed values are."""
+    observed = np.isfinite(values)
+    columns: list[F64Array] = []
+    names: list[str] = []
+    penalty: list[float] = []
+    finite = values[observed]
+    if np.unique(finite).shape[0] >= 2:
+        mean, scale = float(finite.mean()), float(finite.std())
+        standardized = (finite - mean) / scale
+        linear = np.zeros(values.shape[0])
+        linear[observed] = standardized
+        columns.append(linear)
+        names.append(f"{name}:linear")
+        penalty.append(0.0)
+        _knots, basis, roughness = spline_basis(standardized)
+        eigenvalues, eigenvectors = np.linalg.eigh(roughness)
+        # The penalty's null space is the linear functions (rank K - 2); its range directions carry the roughness.
+        rough = eigenvalues > _EPSILON * eigenvalues.shape[0] * max(float(eigenvalues[-1]), np.finfo(np.float64).tiny)
+        rotated = basis @ eigenvectors[:, rough]
+        for position in range(rotated.shape[1]):
+            column = np.zeros(values.shape[0])
+            column[observed] = rotated[:, position]
+            columns.append(column)
+            names.append(f"{name}:spline{position + 1}")
+        penalty.extend(eigenvalues[rough].tolist())
+    if not observed.all():
+        columns.append((~observed).astype(np.float64))
         names.append(f"{name}:missing")
         penalty.append(0.0)
-    return columns, names, penalty
+    return _Candidate(name, columns, names, np.diag(penalty))
 
 
-def _class_centred(column: F64Array, class_rows: Sequence[I64Array]) -> F64Array:
-    centred = column.copy()
-    for rows in class_rows:
-        centred[rows] -= centred[rows].mean()
-    return centred
+def _candidate(name: str, raw: np.ndarray, legend: Sequence[str] | None, variant_count: int) -> _Candidate:
+    if legend is not None:
+        codes = np.asarray(raw).astype(np.int64)
+        if codes.shape != (variant_count,):
+            raise ValueError(f"annotation {name!r} needs one value per variant")
+        missing = (codes < 0) | (codes >= len(legend))
+        # The missing state is one more level, after every legend level.
+        return _factor_candidate(name, np.where(missing, len(legend), codes), [*legend, "missing"])
+    values = np.asarray(raw, dtype=np.float64)
+    if values.shape != (variant_count,):
+        raise ValueError(f"annotation {name!r} needs one value per variant")
+    if _is_indicator(values):
+        missing = ~np.isfinite(values)
+        return _factor_candidate(name, np.where(missing, 2, np.nan_to_num(values)).astype(np.int64), ["0", "1", "missing"])
+    return _continuous_candidate(name, values)
+
+
+def _class_sums(columns: F64Array, classes: I64Array, class_count: int) -> F64Array:
+    """Each class's column sums (classes x columns): the sparse class incidence times the columns."""
+    incidence = sparse.csr_matrix((np.ones(classes.shape[0]), (classes, np.arange(classes.shape[0]))), shape=(class_count, classes.shape[0]))
+    return np.asarray(incidence @ columns)
 
 
 def annotation_design(
@@ -123,86 +191,66 @@ def annotation_design(
     exclude: Sequence[str] = (),
 ) -> AnnotationDesign:
     """The prior's annotation design over the rows of ``annotations`` (already restricted to the prior's members),
-    one group per annotation, rank-screened after class centring; ``exclude`` names the columns that are not
-    annotations (a reliability column is the prior's offset)."""
+    one named group per annotation in name order, rank-screened after class centring; ``exclude`` names the columns
+    that are not annotations (a reliability column is the unit contract's)."""
     classes = np.asarray(class_index, dtype=np.int64)
-    order = np.argsort(classes, kind="stable")
-    class_rows = tuple(np.split(order, np.cumsum(np.bincount(classes))[:-1]))
-    orthonormal: list[F64Array] = []
-    kept_columns: list[F64Array] = []
-    kept_names: list[str] = []
-    groups: list[AnnotationGroup] = []
-
-    def independent(column: F64Array) -> bool:
-        centred = _class_centred(column, class_rows)
-        norm = float(np.linalg.norm(centred))
-        if norm <= _EPSILON * centred.shape[0] * max(float(np.max(np.abs(column))), 1.0):
-            return False
-        residual = centred / norm
-        for _ in range(2):
-            for basis in orthonormal:
-                residual -= basis * float(basis @ residual)
-        residual_norm = float(np.linalg.norm(residual))
-        if residual_norm <= max(centred.shape[0], len(orthonormal) + 1) * _EPSILON:
-            return False
-        orthonormal.append(residual / residual_norm)
-        return True
-
-    for name in sorted(annotations):
-        if name in exclude:
-            continue
-        raw = annotations[name]
-        if name in annotation_legends:
-            columns, names = _factor_columns(name, np.asarray(raw), annotation_legends[name])
-            penalty = [1.0] * len(columns)
-        else:
-            values = np.asarray(raw, dtype=np.float64)
-            if values.shape[0] != classes.shape[0]:
-                raise ValueError(f"annotation {name!r} needs one value per variant")
-            if _is_indicator(values):
-                columns, names, penalty = [np.where(np.isfinite(values), values, 0.0)], [name], [1.0]
-            else:
-                columns, names, penalty = _continuous_columns(name, values)
-        members, member_penalty = [], []
-        for column, column_name, weight in zip(columns, names, penalty):
-            if independent(column):
-                members.append(len(kept_columns))
-                member_penalty.append(weight)
-                kept_columns.append(column)
-                kept_names.append(column_name)
+    variant_count = classes.shape[0]
+    class_count = int(classes.max()) + 1 if variant_count else 0
+    candidates = [
+        _candidate(name, annotations[name], annotation_legends.get(name), variant_count)
+        for name in sorted(annotations) if name not in exclude
+    ]
+    flat = [(position, index) for position, candidate in enumerate(candidates) for index in range(len(candidate.columns))]
+    if not flat:
+        return AnnotationDesign(design=np.zeros((variant_count, 0)), groups=(), names=())
+    design = np.column_stack([candidates[position].columns[index] for position, index in flat])
+    counts = np.bincount(classes, minlength=class_count).astype(np.float64)
+    centred = design - (_class_sums(design, classes, class_count) / np.maximum(counts, 1.0)[:, None])[classes]
+    kept = _screened(centred)
+    groups = []
+    names = []
+    for new_position, column in enumerate(kept):
+        names.append(candidates[flat[column][0]].names[flat[column][1]])
+    for position, candidate in enumerate(candidates):
+        members = [(new_position, flat[column][1]) for new_position, column in enumerate(kept) if flat[column][0] == position]
         if members:
-            groups.append(AnnotationGroup(columns=np.asarray(members, dtype=np.int64), penalty=np.diag(member_penalty)))
-    design = np.column_stack(kept_columns) if kept_columns else np.zeros((classes.shape[0], 0))
-    return _full_rank(design, tuple(groups), tuple(kept_names), class_rows)
-
-
-def _full_rank(design: F64Array, groups: tuple[AnnotationGroup, ...], names: tuple[str, ...], class_rows) -> AnnotationDesign:
-    """The columns the prior's own rank test accepts (``scale_mixture_prior``: the class-centred Gram's least eigenvalue
-    above eps p max(its largest, 1)), by a column-pivoted QR of the class-centred design: a column is kept while its
-    pivot's squared diagonal passes that test, in the pivot order, and the groups are re-indexed over what remains."""
-    if design.shape[1] == 0:
-        return AnnotationDesign(design=design, groups=groups, names=names)
-    centred = np.column_stack([_class_centred(design[:, column], class_rows) for column in range(design.shape[1])])
-    _q, triangle, pivots = scipy.linalg.qr(centred, mode="economic", pivoting=True)
-    squares = np.square(np.abs(np.diag(triangle)))
-    threshold = _EPSILON * centred.shape[0] * max(float(squares[0]), 1.0)
-    passing = np.flatnonzero(squares <= threshold)
-    order = list(pivots[: passing[0]] if passing.size else pivots)
-    # The QR diagonal bounds the singular values only up to the column count; the prior's exact test decides.
-    while order:
-        gram = centred[:, order].T @ centred[:, order]
-        eigenvalues = np.linalg.eigvalsh(gram)
-        if eigenvalues[0] > _EPSILON * centred.shape[0] * max(float(eigenvalues[-1]), 1.0):
-            break
-        order.pop()
-    kept = np.sort(np.asarray(order, dtype=np.int64))
-    position = {column: index for index, column in enumerate(kept)}
-    new_groups = []
-    for group in groups:
-        members = [index for index, column in enumerate(group.columns) if int(column) in position]
-        if members:
-            new_groups.append(AnnotationGroup(
-                columns=np.array([position[int(group.columns[index])] for index in members], dtype=np.int64),
-                penalty=np.asarray(group.penalty)[np.ix_(members, members)],
+            local = np.array([index for _new, index in members], dtype=np.int64)
+            groups.append(AnnotationGroup(
+                columns=np.array([new for new, _index in members], dtype=np.int64),
+                penalty=candidate.penalty[np.ix_(local, local)],
+                name=candidate.name,
             ))
-    return AnnotationDesign(design=design[:, kept], groups=tuple(new_groups), names=tuple(names[column] for column in kept))
+    return AnnotationDesign(design=design[:, kept], groups=tuple(groups), names=tuple(names))
+
+
+def _screened(centred: F64Array) -> I64Array:
+    """The columns of the class-centred design kept in order: a column enters when its squared residual against the
+    kept ones (its Schur complement in their Gram) exceeds the Gram's own rounding, p eps times its squared norm, and
+    is nonzero beyond eps p max(|column|, 1); then the prior's exact test (the kept Gram's least eigenvalue above
+    eps p max(its largest, 1)) removes the latest columns until it passes, since a residual screen bounds the
+    singular values only up to the column count."""
+    count = centred.shape[0]
+    kept: list[int] = []
+    factor = np.zeros((0, 0))
+    for column in range(centred.shape[1]):
+        values = centred[:, column]
+        square = float(values @ values)
+        if np.sqrt(square) <= _EPSILON * count * max(float(np.max(np.abs(values))), 1.0):
+            continue
+        cross = centred[:, kept].T @ values if kept else np.zeros(0)
+        solved = solve_triangular(factor, cross, lower=True) if kept else cross
+        residual = square - float(solved @ solved)
+        if residual <= count * _EPSILON * square:
+            continue
+        kept.append(column)
+        grown = np.zeros((len(kept), len(kept)))
+        grown[:-1, :-1] = factor
+        grown[-1, :-1] = solved
+        grown[-1, -1] = np.sqrt(residual)
+        factor = grown
+    while kept:
+        eigenvalues = np.linalg.eigvalsh(centred[:, kept].T @ centred[:, kept])
+        if eigenvalues[0] > _EPSILON * count * max(float(eigenvalues[-1]), 1.0):
+            break
+        kept.pop()
+    return np.asarray(kept, dtype=np.int64)

@@ -45,8 +45,13 @@ with no point mass at zero.
   that tolerance (log Z's error there is bounded), but each node keeps its own
   variance v = u e^t in the kernel, so a density with its mass below the floor
   is a near-zero effect, never a point mass at zero (review-mathbugs N1).
-- o_j = log r2_j is the measurement offset, with coefficient exactly 1 by
-  derivation (the prior is on the true genotype's effect).
+- o_j is the unit offset, log(kappa_j^2 Var(D_j)) of the stored column D_j
+  with calibration slope kappa_j (``imputation_reliability.ColumnMeasurement``),
+  with coefficient exactly 1 by derivation: the prior is on the raw effect per
+  unit of the true genotype, and a standardized column carries kappa_j sd(D_j)
+  of it. A calibrated dosage (kappa = 1) already holds its reliability in
+  Var(D_j); the reliability enters the frequency function's argument
+  log Var(G_j), an annotation, never the offset a second time.
 - d_j is the annotation row centred within its class; theta splits into
   groups, each with a penalty matrix and a learned weight.
 
@@ -112,6 +117,7 @@ from typing import Callable, Iterator, Sequence
 import math
 
 import numpy as np
+from scipy import sparse
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
@@ -157,10 +163,11 @@ _QUADPACK_ERROR_POWER = 1.5
 
 @dataclass(frozen=True)
 class AnnotationGroup:
-    """Annotation columns that share one smoothing weight, and their penalty matrix."""
+    """Annotation columns that share one smoothing weight, their penalty matrix, and the annotation they come from."""
 
     columns: I64Array
     penalty: F64Array
+    name: str = ""
 
 
 @dataclass(frozen=True)
@@ -298,10 +305,23 @@ class HyperStep:
 
 
 def _sum_to_zero_basis(size: int) -> F64Array:
-    """Orthonormal basis of the vectors that sum to zero."""
+    """Orthonormal basis of the vectors that sum to zero: the lattice's coordinates (K x K - 1, K the node count)."""
     centred = np.eye(size) - np.full((size, size), 1.0 / size)
     basis, _singular, _rows = np.linalg.svd(centred)
     return basis[:, : size - 1]
+
+
+def _sum_to_zero_rows(rows: I64Array, size: int) -> F64Array:
+    """Rows ``rows`` of the orthonormal Helmert basis of the vectors of length ``size`` that sum to zero, in closed
+    form, for level coordinates (offset groups, factor levels), whose count can reach tens of thousands: entry (i, k)
+    is 1 / sqrt(k (k + 1)) for i < k, -k / sqrt(k (k + 1)) for i = k and 0 beyond, with k = 1..size - 1. Only the
+    requested rows are formed, with no size x size matrix and no decomposition."""
+    index = np.asarray(rows, dtype=np.int64)
+    order = np.arange(1, size, dtype=np.float64)
+    norm = 1.0 / np.sqrt(order * (order + 1.0))
+    column = np.arange(1, size)[None, :]
+    position = index[:, None]
+    return np.where(position < column, norm[None, :], np.where(position == column, -order[None, :] * norm[None, :], 0.0))
 
 
 def roughness_factor(size: int, spacing: float, order: int) -> F64Array:
@@ -442,19 +462,33 @@ def scale_mixture_prior(
         labels, group_of_row = np.unique(groups, return_inverse=True)
         if groups.shape != classes.shape or labels.shape[0] < 2:
             raise ValueError("offset_groups needs one group per variant and at least two groups")
-        indicator = np.zeros((classes.shape[0], labels.shape[0]))
-        indicator[np.arange(classes.shape[0]), group_of_row] = 1.0
-        # Uncentred: every variant of group g shifts by l_g exactly, whatever its class.
-        levels = indicator @ _sum_to_zero_basis(labels.shape[0])
+        group_count = labels.shape[0]
         # The levels must reach no class location (which the class densities carry) and no annotation: full column
-        # rank of [annotations | levels | class indicators], i.e. the groups connect the classes.
-        class_indicator = np.zeros((classes.shape[0], class_count))
-        class_indicator[np.arange(classes.shape[0]), classes] = 1.0
-        combined = np.column_stack([design, levels, class_indicator])
-        eigenvalues = np.linalg.eigvalsh(combined.T @ combined)
-        if eigenvalues[0] <= _EPSILON * combined.shape[0] * max(float(eigenvalues[-1]), 1.0):
+        # rank of [annotations | levels | class indicators], i.e. the groups connect the classes. Its Gram is formed
+        # from grouped sums through the sparse incidences (group x variant, class x variant) and the Helmert basis
+        # H, never from a variant x group indicator: with L = E H and C the class incidence,
+        # A'L = (E'A)' H, L'L = H' diag(n_g) H, L'C = H' (E'C) and C'C = diag(n_c).
+        variants = np.arange(classes.shape[0])
+        group_incidence = sparse.csr_matrix((np.ones(classes.shape[0]), (group_of_row, variants)), shape=(group_count, classes.shape[0]))
+        class_incidence = sparse.csr_matrix((np.ones(classes.shape[0]), (classes, variants)), shape=(class_count, classes.shape[0]))
+        helmert = _sum_to_zero_rows(np.arange(group_count), group_count)
+        group_sizes = np.asarray(group_incidence.sum(axis=1)).ravel()
+        gram_blocks = [
+            [design.T @ design, np.asarray(group_incidence @ design).T @ helmert, np.asarray(class_incidence @ design).T],
+            [None, helmert.T @ (group_sizes[:, None] * helmert), helmert.T @ np.asarray((group_incidence @ class_incidence.T).todense())],
+            [None, None, np.diag(class_sizes.astype(np.float64))],
+        ]
+        for row in range(len(gram_blocks)):
+            for column in range(row):
+                gram_blocks[row][column] = gram_blocks[column][row].T
+        combined_gram = np.block(gram_blocks)
+        eigenvalues = np.linalg.eigvalsh(combined_gram)
+        if eigenvalues[0] <= _EPSILON * classes.shape[0] * max(float(eigenvalues[-1]), 1.0):
             raise ValueError("the offset groups' levels are not identified: the groups must connect the classes")
-        design = np.column_stack([design, levels])
+        # Uncentred: every variant of group g shifts by l_g exactly, whatever its class; its row of the level design is
+        # its group's row of H, gathered. The prior's consumers read ``scale_design`` as one dense array, so the level
+        # columns are stored dense there (variants x (G - 1)); nothing variant x G is formed on the way.
+        design = np.column_stack([design, _sum_to_zero_rows(group_of_row, group_count)])
     lattice = np.asarray(nodes, dtype=np.float64)
     spacing = np.diff(lattice)
     if lattice.shape[0] <= ROUGHNESS_ORDER or spacing[0] <= 0.0 or not np.allclose(spacing, spacing[0], rtol=_HALF_PRECISION, atol=0.0):
@@ -495,7 +529,7 @@ def scale_mixture_prior(
             # coefficients are free, in the penalty's null space like the densities' locations and widths.
             continue
         blocks.append(SmoothingBlock(
-            f"annotation group {position}",
+            f"annotation group {position}" + (f" ({group.name})" if group.name else ""),
             annotation_start + np.asarray(group.columns, dtype=np.int64),
             np.sqrt(eigenvalues[kept])[:, None] * eigenvectors[:, kept].T,
         ))
@@ -749,6 +783,75 @@ def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparame
     """The same model on the lattice with half the spacing over the same extent and kernel range."""
     nodes = prior.log_variance_grid
     return relattice(prior, hyperparameters, np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1), prior.kernel_floor, prior.kernel_top)
+
+
+def extended_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
+    """The same model on the lattice of the same spacing reaching past its top by the old extent, each density
+    continued past its old top by ``relattice``'s roughness-free polynomial continuation.
+
+    Only the top is extended. Below the kernel floor every kernel is 1 to the lattice tolerance (``kernel_floor``, a
+    bound, not a comparison), so where the mass below the floor sits changes no normalizer or moment the data can see;
+    continuing a density whose mass rises toward the bottom end instead extrapolates an improper log density and moves
+    mass off the nodes the data see (41 nats on a small simulated fit whose density held 94% of its mass at the bottom
+    node [own-sim]), a different model rather than a finer quadrature of this one. Above the top no bound holds."""
+    nodes = prior.log_variance_grid
+    spacing = float(nodes[1] - nodes[0])
+    wider = nodes[0] + spacing * np.arange(2 * nodes.shape[0] - 1)
+    return relattice(prior, hyperparameters, wider, prior.kernel_floor, prior.kernel_top)
+
+
+@dataclass(frozen=True)
+class LatticeCheck:
+    """The quadrature's a-posteriori check at a fitted state: the fixed-cavity normalizers and tilted moments of every
+    effect on the fitted lattice against the same model on the refined lattice (half the spacing) and on the extended
+    one (twice the extent, past its top: ``extended_lattice``), both in nats. ``*_log_normalizer`` is |sum_j log Z_j' - sum_j log Z_j|, the evidence's
+    change; ``*_moments`` is 1/2 sum_j |P_j| ((m_j' - m_j)^2 + |v_j' - v_j|), the moments' change in the metric of the
+    data each effect sees (P_j its cavity precision): the expected data fit -P (beta - h / P)^2 / 2 moves by at most
+    this much, so an effect the data cannot see (a near-zero effect whose density sits below the kernel floor, whose
+    relative variance depends on where the lattice ends) contributes what it is worth to the fit, nothing. The lattice
+    passes where all four are within ``tolerance``, the lattice's own (the error its construction was derived for).
+
+    This is a numerical comparison at the actual state, not a bound: the start lattice's floor, top and spacing are
+    derived from single-variant likelihoods at the start (``derived_lattice``), and a fitted density concentrated more
+    sharply than those kernels, or with its mass at a lattice end, is exactly what they do not certify (review F17)."""
+
+    refined_log_normalizer: float
+    extended_log_normalizer: float
+    refined_moments: float
+    extended_moments: float
+    tolerance: float
+
+    @property
+    def refine(self) -> bool:
+        return self.refined_log_normalizer > self.tolerance or self.refined_moments > self.tolerance
+
+    @property
+    def extend(self) -> bool:
+        return self.extended_log_normalizer > self.tolerance or self.extended_moments > self.tolerance
+
+    def record(self) -> dict[str, float | bool]:
+        return {name: getattr(self, name) for name in (
+            "refined_log_normalizer", "extended_log_normalizer", "refined_moments", "extended_moments", "tolerance", "refine", "extend",
+        )}
+
+
+def lattice_check(
+    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int, draw_count: int,
+) -> LatticeCheck:
+    """``LatticeCheck`` of the fitted ``hyperparameters`` at the fitted state's ``cavity`` (EP's cavities, or mean
+    field's pseudo-likelihoods), at the lattice tolerance 1 / (2K) of ``derived_lattice``'s callers."""
+    base = tilted_moments(prior, hyperparameters, cavity, working_bytes, np)
+    weight = np.abs(np.asarray(cavity.precision, dtype=np.float64))
+    changes = []
+    for moved_prior, moved in (halved_lattice(prior, hyperparameters), extended_lattice(prior, hyperparameters)):
+        other = tilted_moments(moved_prior, moved, cavity, working_bytes, np)
+        moments = 0.5 * float(np.sum(weight * (np.square(other.mean - base.mean) + np.abs(other.variance - base.variance))))
+        changes.append((abs(float(np.sum(other.log_normalizer) - np.sum(base.log_normalizer))), moments))
+    (refined_z, refined_m), (extended_z, extended_m) = changes
+    return LatticeCheck(
+        refined_log_normalizer=refined_z, extended_log_normalizer=extended_z, refined_moments=refined_m, extended_moments=extended_m,
+        tolerance=0.5 / draw_count,
+    )
 
 
 def prior_second_moment(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> F64Array:

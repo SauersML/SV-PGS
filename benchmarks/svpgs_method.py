@@ -16,13 +16,13 @@ annotation columns wait for e2e's prior design builder. Test genotypes are dosag
 to their training means), so they are scored in closed form from the fitted ``ScoringModel``, with no rounding to
 codes.
 
-Every bench-real arm here passes ``log_variance_offset=None`` to the small-n route, which takes every record as
-measured exactly: its prior log-variance offset is log r^2 = 0. That is what the panel's hard calls are, and it is a
-statement about this benchmark, not about the model. A bench-real number therefore measures the prior and the
-inference, never the measurement model, and none of these arms may be cited as evidence that the r^2-scaled prior
-helps or does not. The measurement-aware path is bench-sim's, whose store carries the arm's imputation r^2 as its
-``quality`` column (``bench_sim_annotations``); ``log_variance_offset=None`` in ``_fit_one`` means that column, not
-perfect measurement.
+Every bench-real arm here passes the harness's reliability (``bench_real_log_reliability``: 1 for the panel's hard
+calls, Beagle's DR2 for an imputed overlay's columns) to the small-n route's unit contract
+(``imputation_reliability.ColumnMeasurement``), with calibration slope 1 (calibrated conditional means): the
+reliability enters the frequency function's argument log Var(G), never a second offset. On the default dataset every
+reliability is 1, so a bench-real number there measures the prior and the inference, not the measurement model. bench-sim's
+store carries the arm's imputation r^2 as its ``quality`` column (``bench_sim_annotations``); ``log_variance_offset=None``
+in ``_fit_one`` means that column (``stage2_wiring.store_measurement``), not perfect measurement.
 
 The prediction is the posterior-mean genetic score (plus the fitted intercept for bench-real, whose phenotype is
 already residualized). Covariate effects are left out, as the harnesses adjust for covariates themselves.
@@ -203,7 +203,8 @@ def bench_sim_annotations(variants: Mapping[str, np.ndarray]) -> tuple[dict[str,
     """The store's prior columns and the rows kept.
 
     ``quality`` is the arm's imputation r^2 (GLIMPSE2 INFO or Beagle DR2), which the prior reads as the measurement
-    reliability. A record at r^2 = 0 has prior effect variance r^2 x (its class's) = 0, so its effect is exactly zero
+    reliability (``stage2_wiring.store_measurement``). A record at r^2 = 0 carries no information about its genotype (its
+    standardized prior variance r^2 Var(G) tau^2 is 0), so its effect is exactly zero
     and the record is left out.
     """
     quality = np.asarray(variants["imputation_info"], dtype=np.float64)
@@ -426,7 +427,7 @@ def bench_real_covariates(train: Any) -> np.ndarray:
 
 # Recorded in every bench-real run record (``harness.run``: ``method_assumptions``); the bench-sim route reads the
 # store's quality column instead (``bench_sim_annotations``).
-ASSUMPTIONS = {"measurement": "bench-real arms: every record measured exactly (log_variance_offset=None, log r^2 = 0 for all columns)"}
+ASSUMPTIONS = {"measurement": "bench-real arms: the harness's reliability per column (1 for hard calls, DR2 for an imputed overlay), calibration slope 1: the reliability enters log Var(G), never the offset"}
 
 
 def fit_expression(train: Any) -> BenchRealPredictor:

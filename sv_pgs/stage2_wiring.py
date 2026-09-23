@@ -2,8 +2,8 @@
 
 This is e2e's tests/test_full_data_fit wiring behind the agreed ``fit_models`` signature, run once per model:
 Stage 0 on the model's own training rows and covariate columns, the start lattice from its single-variant
-likelihoods, the prior with one class per variant class present, the records' log reliabilities as offsets and the store's
-other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
+likelihoods, the prior with one class per variant class present, the records' unit offsets and frequency function from the
+store's unit contract (``store_measurement``), the store's other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
 points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
 A binary model (0/1 targets) is fitted on its Polya-Gamma bound (``binary_likelihood``), on the same route; its reported
 noise variance is its whitened problem's known unit noise, which its predictive never reads.
@@ -23,18 +23,18 @@ from sv_pgs.artifact import named_digest
 from sv_pgs.binary_likelihood import POLYA_GAMMA_MEAN_AT_ZERO, BernoulliSites, calibrated_shift, fit_binary_covariates
 from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.config import ModelConfig, TraitType
-from sv_pgs.dosage_store import DosageStore
+from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
-from sv_pgs.imputation_reliability import checked_log_reliability
-from sv_pgs.annotation_design import annotation_design, column_variance_annotation, per_unit_offset
+from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
+from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.progress import log
-from sv_pgs.scale_mixture_ep import MixtureHyperparameters, scale_mixture_prior
+from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -55,7 +55,7 @@ def _seed(seed: int, *keys: int) -> int:
 
 
 RELIABILITY_COLUMNS = ("quality", "r2_truth")
-"""Sidecar columns that are a measurement's reliability, the prior's offset, never one of its annotations."""
+"""Sidecar columns that are a measurement's reliability, read by the unit contract (``store_measurement``), never annotations."""
 
 
 def store_log_reliability(store: DosageStore) -> F64Array:
@@ -74,6 +74,27 @@ def store_log_reliability(store: DosageStore) -> F64Array:
     with np.errstate(divide="ignore", invalid="ignore"):
         offsets = np.log(np.asarray(quality, dtype=np.float64))
     return checked_log_reliability(offsets, "the store's quality column")
+
+
+def store_measurement(store: DosageStore, log_variance_offset: F64Array | None) -> ColumnMeasurement:
+    """The unit contract of every store record (``imputation_reliability.ColumnMeasurement``), from the store's own
+    metadata: its raw unit (one ALT allele, or one copy for a ``VariantClass.COPY_NUMBER`` record, whose value is
+    CN - modal CN), its encoding scale ``codes_per_unit``, calibration slope 1 (the store holds calibrated conditional
+    means: a GLIMPSE2 or Beagle DS, the measurement step's rewritten D*, or a hard call), and the log reliability from
+    the caller's ``log_variance_offset`` (the measurement model's) or else the store's ``quality`` column, named as its
+    source."""
+    table = store.variant_table
+    copy_number = np.asarray(table.variant_class) == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER)
+    if log_variance_offset is None:
+        reliability, source = store_log_reliability(store), (
+            "the store's quality column (reported imputation r^2)" if "quality" in table.annotations else "none: every record measured exactly"
+        )
+    else:
+        reliability, source = checked_log_reliability(log_variance_offset, "the caller's log_variance_offset"), "the caller's log reliability (the measurement model's)"
+    return ColumnMeasurement.build(
+        store.n_variants, log_reliability=reliability, codes_per_unit=table.codes_per_unit,
+        raw_unit=np.where(copy_number, "copy", "ALT allele").astype(object), reliability_source=source,
+    )
 
 
 def stage0_candidates(store: DosageStore, training_columns: I64Array, log_reliability: F64Array, config: ModelConfig) -> I64Array:
@@ -140,16 +161,22 @@ class _ModelFit:
 
 def _prior_schema_digest(
     *, nodes: F64Array, floor: F64Array, top: F64Array, class_index: I64Array, offsets: F64Array, rows: I64Array,
-    annotations: F64Array | None = None, annotation_names: Sequence[str] = (),
+    annotations: F64Array | None = None, annotation_names: Sequence[str] = (), measurement: ColumnMeasurement | None = None,
 ) -> str:
     """The prior's schema, which its fitted coefficients do not carry: the lattice its density is written on, the
     variant class of each row the prior covers, those rows in the store, the offset each one was given, and the
-    annotation design theta multiplies (its columns by name). Without it the saved hyperparameters name no density
+    annotation design theta multiplies (its columns by name), and the covered rows' unit contract (raw unit, encoding
+    scale, calibration slope, log reliability and its source: ``imputation_reliability.ColumnMeasurement``). Without it the saved hyperparameters name no density
     (``artifact.Provenance.prior_digest``). Empty arrays for a model with no prior at all (the null genetic model)."""
     return named_digest({
         "nodes": nodes, "floor": floor, "top": top, "class_index": class_index, "offsets": offsets, "rows": rows,
         "annotations": np.zeros((0, 0)) if annotations is None else annotations,
         "annotation_names": np.array(list(annotation_names), dtype=str),
+        **({} if measurement is None else {
+            "raw_unit": np.asarray(measurement.raw_unit[rows], dtype=str), "codes_per_unit": measurement.codes_per_unit[rows],
+            "calibration_slope": measurement.calibration_slope[rows], "log_reliability": measurement.log_reliability[rows],
+            "reliability_source": np.array([measurement.reliability_source], dtype=str),
+        }),
     })
 
 
@@ -276,7 +303,7 @@ def _fit_one(
     training_columns: I64Array,
     covariates: F64Array,
     targets: F64Array,
-    log_reliability: F64Array,
+    measurement: ColumnMeasurement,
     budget: ComputeBudget,
     work_dir: Path,
     seed: int,
@@ -310,7 +337,7 @@ def _fit_one(
     if covariate_fit.explained:
         # (Never for a binary model: labels the covariates span exactly would separate, which the check refused.)
         return null_model("the covariates explain every training target to working precision")
-    candidates = stage0_candidates(store, training_columns, log_reliability, config)
+    candidates = stage0_candidates(store, training_columns, measurement.log_reliability, config)
     if candidates.shape[0] == 0:
         return null_model("no store record carries signal on these training rows")
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
@@ -322,18 +349,17 @@ def _fit_one(
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
-    # The per-unit baseline (one prior per unit of the stored value) plus each record's log reliability; the free
-    # column-variance coefficient moves it toward standardized effects where the data say so (annotation_design).
-    # Each member's spread in its stored value's units: code sd over codes_per_unit (a copy number's differ).
-    value_scales = np.asarray(statistics.scales) / np.asarray(store.variant_table.codes_per_unit, dtype=np.float64)[member_rows]
-    offsets = log_reliability[member_rows] + per_unit_offset(value_scales)
+    # The unit contract (``imputation_reliability.ColumnMeasurement``): each member's offset log(kappa^2 Var(D)) in its
+    # stored value's raw units (code sd over codes_per_unit; a copy number's differ), with kappa = 1 because the store
+    # holds calibrated conditional means (a GLIMPSE2/Beagle DS, or the measurement step's rewritten D*), and its log
+    # true-genotype variance, the frequency function's argument, where the reliability enters.
+    offsets, log_genotype_variance = measurement.standardized_terms(member_rows, np.asarray(statistics.scales))
     _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
     table = store.variant_table
-    # The store's annotations per member, and each member's training spread (statistics.scales are over the active rows,
-    # in their order); ``fit_full_data`` nests them on the prior without annotations, so each enters where the evidence
-    # rises.
+    # The store's annotations per member and the frequency function; ``fit_full_data`` nests them on the prior without
+    # annotations, so each enters where the evidence rises.
     member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()}
-    member_annotations.update(column_variance_annotation(np.asarray(statistics.scales)))
+    member_annotations.update(frequency_annotation(log_genotype_variance))
     annotations = annotation_design(
         member_annotations,
         table.annotation_legends,
@@ -384,10 +410,35 @@ def _fit_one(
     )
     # The mean-field fixed points: EP's refused nearly every call on the wiring store ("the EP refreshes' updates line
     # up with no contraction ... the full-data route has no double loop", 59 of 65 calls, 2026-09-21).
+    # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
+    # from the start's single-variant likelihoods only; where the fitted state's normalizers or moments move on the
+    # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
     fit = fit_full_data(
         gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field",
         sites=[store_sites],
     )
+    while True:
+        check = lattice_check(
+            prior, fit.hyperparameters[0], Cavity(precision=fit.member_omega[:, 0], shift=fit.member_shift[:, 0]), share, draw_count,
+        )
+        log(f"stage2 wiring: lattice check on {prior.grid_size} nodes: {check.record()}")
+        if not (check.refine or check.extend):
+            break
+        moved, moved_hyperparameters = prior, fit.hyperparameters[0]
+        if check.extend:
+            moved, moved_hyperparameters = extended_lattice(moved, moved_hyperparameters)
+        if check.refine:
+            moved, moved_hyperparameters = halved_lattice(moved, moved_hyperparameters)
+        try:
+            refit = fit_full_data(
+                gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference="mean_field",
+                sites=[store_sites],
+            )
+        except FloatingPointError as error:
+            # No certified fit on the checked lattice: the model keeps the fit it has, and the failed check is logged.
+            log(f"stage2 wiring: lattice check unresolved, the fit on {prior.grid_size} nodes stands: {error}")
+            break
+        prior, nodes, fit = moved, moved.log_variance_grid, refit
     (scoring,) = scoring_models(fit, prior, statistics, [trait_type], draw_count, seed=_seed(seed, 2))
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
     return _ModelFit(
@@ -398,6 +449,7 @@ def _fit_one(
         prior_digest=_prior_schema_digest(
             nodes=nodes, floor=np.array([floor]), top=np.array([top]), class_index=class_index.astype(np.int64),
             offsets=offsets, rows=member_rows, annotations=annotations.design, annotation_names=annotations.names,
+            measurement=measurement,
         ),
     )
 
@@ -420,11 +472,7 @@ def fit_models(
     """Every model of ``fit_model.fit``, one at a time (see the module docstring)."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
-    log_reliability = (
-        store_log_reliability(store)
-        if log_variance_offset is None
-        else checked_log_reliability(log_variance_offset, "the caller's log_variance_offset")
-    )
+    measurement = store_measurement(store, log_variance_offset)
     scoring, noise, hyperparameters, certificates, prior_digests = [], [], [], [], []
     for model in range(training.shape[1]):
         rows = np.flatnonzero(training[:, model])
@@ -438,7 +486,7 @@ def fit_models(
             np.asarray(store_columns[rows], dtype=np.int64),
             np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
             np.asarray(targets[rows, model], dtype=np.float64),
-            log_reliability,
+            measurement,
             budget,
             model_dir,
             _seed(seed, model),

@@ -17,6 +17,7 @@ from scipy.optimize import minimize_scalar
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
     _sum_to_zero_basis,
+    _sum_to_zero_rows,
     INDEPENDENT_EFFECTS,
     CurvatureCorrection,
     FixedPoint,
@@ -1343,7 +1344,7 @@ def test_offset_group_levels_shift_every_variant_of_a_group_by_its_level_whateve
     assert prior.level_size == 1 and prior.smoothing_blocks[-1].name == "offset group levels"
     levels = np.array([0.7, -0.7])
     coefficients = np.zeros(prior.coefficient_size)
-    coefficients[-1:] = _sum_to_zero_basis(2).T @ levels
+    coefficients[-1:] = _sum_to_zero_rows(np.arange(2), 2).T @ levels
     shift = log_scale(prior, coefficients) - log_scale(prior, np.zeros(prior.coefficient_size))
     np.testing.assert_allclose(shift, levels[groups], rtol=0.0, atol=8 * np.finfo(np.float64).eps)
     hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
@@ -1360,6 +1361,53 @@ def test_offset_groups_that_do_not_connect_the_classes_are_refused():
             class_index=np.array([0, 0, 1, 1]), log_variance_offset=np.zeros(4), annotation_design=np.zeros((4, 0)), annotation_groups=(),
             nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=np.array([0, 0, 1, 1]),
         )
+
+
+def test_offset_group_levels_are_the_gathered_helmert_rows_and_many_groups_need_no_dense_indicator():
+    """F18: the level design is each variant's group's row of the orthonormal sum-to-zero basis (no variant x group
+    indicator, no group x group decomposition), and the identifiability test runs on grouped sums."""
+    rng = np.random.default_rng(61)
+    count, group_count = 3000, 400
+    groups = rng.integers(0, group_count, count)
+    classes = rng.integers(0, 2, count)
+    nodes = np.linspace(np.log(1e-5), np.log(0.5), 8)
+    prior = scale_mixture_prior(
+        class_index=classes, log_variance_offset=np.zeros(count), annotation_design=np.zeros((count, 0)), annotation_groups=(),
+        nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1], offset_groups=groups,
+    )
+    labels, group_of_row = np.unique(groups, return_inverse=True)
+    np.testing.assert_array_equal(prior.scale_design, _sum_to_zero_rows(group_of_row, labels.shape[0]))
+    # a level vector l = H c shifts every member of group g by l_g and sums to zero over the groups
+    levels = rng.normal(size=prior.level_size)
+    coefficients = np.zeros(prior.coefficient_size)
+    coefficients[-prior.level_size :] = levels
+    shift = engine.log_scale(prior, coefficients)
+    per_group = np.array([shift[group_of_row == group][0] for group in range(labels.shape[0])])
+    np.testing.assert_allclose(shift, per_group[group_of_row], atol=1e-14)
+    np.testing.assert_allclose(per_group.sum(), 0.0, atol=1e-12)
+
+
+def test_the_lattice_check_flags_mass_at_a_lattice_end_and_passes_a_contained_density():
+    """F17: at a fitted state whose density rises to the lattice's top, the extended lattice changes the normalizers;
+    a density well inside a fine lattice changes under neither refinement nor extension."""
+    rng = np.random.default_rng(7)
+    count = 50
+    nodes = np.linspace(-6.0, 2.0, 33)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(count, dtype=np.int64), log_variance_offset=np.zeros(count), annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=nodes[0] + 1.0, top=nodes[-1] - 1.0,
+    )
+    cavity = Cavity(precision=np.full(count, 50.0), shift=rng.normal(0.0, 30.0, count))
+
+    def at(log_density):
+        coefficients = np.zeros(prior.coefficient_size)
+        coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (log_density - log_density.mean())
+        return MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
+
+    rising = engine.lattice_check(prior, at(3.0 * nodes), cavity, 1 << 24, 64)
+    assert rising.extend and rising.extended_log_normalizer > rising.tolerance
+    contained = engine.lattice_check(prior, at(-0.5 * ((nodes + 2.0) / 0.7) ** 2), cavity, 1 << 24, 64)
+    assert not contained.extend and not contained.refine, contained.record()
 
 
 def test_a_finite_log_variance_past_double_precision_keeps_its_finite_normalizer():

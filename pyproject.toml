@@ -32,6 +32,8 @@ dependencies = [
     # sv_pgs/mean_field.py imports numba at module level: its kernels are the small-n route's inference, so an
     # install without numba cannot fit anything.
     "numba>=0.60",
+    # The prior's annotation smooths: B-spline bases and their exact derivative roughness penalties (gamfit.basis).
+    "gamfit==0.1.272",
 ]
 
 [project.optional-dependencies]
