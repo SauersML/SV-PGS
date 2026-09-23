@@ -489,6 +489,10 @@ class NoFixedPoint(FloatingPointError):
     certificate, or no positive definite precision): the outer loop refuses the trial. Any other error is a failure."""
 
 
+class _NoDefinitePass(NoFixedPoint):
+    """No damped frozen pass keeps the full-data precision positive definite: the refresh map cannot move from here."""
+
+
 class _FullDataFixedPoints:
     """``scale_mixture_ep.FixedPoints`` on the full data: each model's certified EP fixed point at its
     hyperparameters, with its noise variance stationary, warm from the previous call (the module docstring's step 1)."""
@@ -948,7 +952,15 @@ class _FullDataFixedPoints:
             measured = np.where(lower > 0.0, lower, upper)
             self.mean_bound = np.minimum(np.sqrt(1.0 / self.draw_count), np.sqrt(1.0 / self.draw_count) * fraction * np.sqrt(2.0 * measured))
             start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
-            self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
+            try:
+                self._frozen_passes(hyperparameters, frozen, target_precision, target_shift)
+            except _NoDefinitePass as error:
+                # No damped pass keeps the precision definite from here (a warm start's negative sites can sit at the
+                # domain's edge): EP's fixed point is found by the convergent double loop, which never leaves the
+                # domain (``small_n``'s same fallback).
+                log(f"ep: {error}: the double loop takes over")
+                self._restore(snapshot)
+                return self._double_loop(hyperparameters)
             if fraction < 1.0:
                 change = max(float(np.max(np.abs(self.site_precision - start_precision))), float(np.max(np.abs(self.site_shift - start_shift))))
                 scale = 1.0 + max(float(np.max(np.abs(start_precision))), float(np.max(np.abs(start_shift))))
@@ -1176,7 +1188,7 @@ class _FullDataFixedPoints:
                 if fraction * move <= _EPSILON * scale:
                     # The damped step no longer moves the sites past their rounding: no damped EP pass keeps the
                     # precision positive definite from here.
-                    raise NoFixedPoint("no damped EP pass keeps the full-data precision positive definite")
+                    raise _NoDefinitePass("no damped EP pass keeps the full-data precision positive definite")
                 trial_precision = self.site_precision + fraction * (target_precision - self.site_precision)
                 trial_shift = self.site_shift + fraction * (target_shift - self.site_shift)
                 try:
