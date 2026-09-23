@@ -165,12 +165,14 @@ def proxy_threshold(draw_count: int) -> float:
     return 1.0 / draw_count
 
 
-def stage0_proxies(statistics: Any, threshold: float, working_bytes: int) -> I64Array:
+def stage0_proxies(statistics: Any, threshold: float, working_bytes: int, array_module: Any = np) -> I64Array:
     """The cross-boundary proxy pairs (groups i in block b - 1, j in block b of one chromosome) with 1 - r^2 at most
     ``threshold`` plus the float32 rounding of Stage 0's adjacent Grams (a pair the rounding could hide is kept), read
-    from its projected adjacent Grams in row chunks whose float64 copies fit ``working_bytes``."""
+    from its projected adjacent Grams in row chunks whose float64 copies fit ``working_bytes`` on ``array_module``'s
+    device (each chunk goes up once as float32, as ``full_data_fit.moment_starts`` takes the Grams)."""
+    xp = array_module
     ld = statistics.ld
-    diagonal = np.asarray(ld.ld_diagonal(), dtype=np.float64) * float(ld.sample_count)
+    diagonal = xp.asarray(np.asarray(ld.ld_diagonal(), dtype=np.float64) * float(ld.sample_count))
     # A stored entry is within one float32 rounding of its exact value relative to its size, so r^2 within two.
     limit = threshold + 2.0 * float(np.finfo(np.float32).eps)
     found = []
@@ -180,13 +182,14 @@ def stage0_proxies(statistics: Any, threshold: float, working_bytes: int) -> I64
             continue
         rows = np.asarray(ld.block(block - 1).reduced_columns, dtype=np.int64)
         columns = np.asarray(ld.block(block).reduced_columns, dtype=np.int64)
-        column_diagonal = diagonal[columns]
-        # Three float64 arrays of a chunk live at once: its values, their squares and the comparison.
+        column_diagonal = diagonal[xp.asarray(columns)]
+        # Three arrays of a chunk live at once: its float32 upload, its float64 values and the comparison.
         chunk = max(1, int(working_bytes) // (3 * np.dtype(np.float64).itemsize * columns.shape[0]))
         for first in range(0, rows.shape[0], chunk):
-            values = np.asarray(cross[first:first + chunk], dtype=np.float64)
-            squared = values * values / (diagonal[rows[first:first + chunk], None] * column_diagonal[None, :])
-            left, right = np.nonzero(1.0 - squared <= limit)
+            values = xp.asarray(np.asarray(cross[first:first + chunk])).astype(xp.float64)
+            values *= values
+            values /= diagonal[xp.asarray(rows[first:first + chunk])][:, None] * column_diagonal[None, :]
+            left, right = (np.asarray(_host(index), dtype=np.int64) for index in xp.nonzero(1.0 - values <= limit))
             if left.size:
                 found.append(np.column_stack([rows[first + left], columns[right]]))
     return np.concatenate(found).astype(np.int64) if found else np.zeros((0, 2), dtype=np.int64)
@@ -1296,7 +1299,7 @@ def fit_store(
     (moment,) = moment_starts(statistics, prior)
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, budget.working_bytes // 2))
     chromosomes = [statistics.ld.block(block).chromosome for block in range(statistics.ld.block_count)]
-    proxies = stage0_proxies(statistics, proxy_threshold(draw_count), budget.working_bytes // 2)
+    proxies = stage0_proxies(statistics, proxy_threshold(draw_count), budget.working_bytes // 2, source.array_module)
     log(
         f"structured: {member_rows.shape[0]:,} members, {source.variant_count:,} reduced columns in {statistics.ld.block_count} blocks; "
         f"{proxies.shape[0]:,} cross-boundary proxy pairs; start h2 {moment.heritability:.4g}, noise {moment.noise:.6g}"
