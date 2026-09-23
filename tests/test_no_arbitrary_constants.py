@@ -106,6 +106,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('lasso_path.py', 'PATH_LENGTH'): ('spec', frozenset({100}), 'glmnet default nlambda (Friedman, Hastie and Tibshirani 2010)'),
     ('lasso_path.py', 'PATH_RATIO'): ('spec', frozenset({0.01}), 'glmnet default lambda.min.ratio where n < p (Friedman, Hastie and Tibshirani 2010)'),
     ('lasso_path.py', 'FOLDS'): ('spec', frozenset({10}), 'cv.glmnet default nfolds, the mr.ash workflow lasso start'),
+    ('lasso_path.py', 'FLOAT32_ROUNDINGS'): ('math', frozenset({3}), 'float32 roundings in one product term: each factor and the product (Higham, Accuracy and Stability, 2002, section 3.1)'),
     ('lasso_path.py', 'THRESHOLD'): ('spec', frozenset({1e-7}), 'glmnet default thresh: coordinate descent convergence (Friedman, Hastie and Tibshirani 2010)'),
     ('lasso_path.py', 'DEVIANCE_CHANGE'): ('spec', frozenset({1e-5}), 'glmnet default fdev: the path stops on a smaller fractional deviance change (glmnet.control)'),
     ('lasso_path.py', 'DEVIANCE_MAX'): ('spec', frozenset({0.999}), 'glmnet default devmax: the path stops past this deviance ratio (glmnet.control)'),

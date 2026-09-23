@@ -22,6 +22,8 @@ PATH_LENGTH = 100
 """Penalties on the path: glmnet's default nlambda."""
 PATH_RATIO = 0.01
 """The path's smallest penalty over its largest where n < p: glmnet's default lambda.min.ratio."""
+FLOAT32_ROUNDINGS = 3
+"""The float32 roundings in one term x_ij r_i of the screened product besides its sum's: x_ij's, r_i's and the product's."""
 FOLDS = 10
 """Cross-validation folds: cv.glmnet's default nfolds, the one the mr.ash workflow's lasso start uses."""
 DEVIANCE_CHANGE = 1e-5
@@ -90,7 +92,7 @@ def lasso_path(x: F64Array, y: F64Array, penalties: F64Array) -> F64Array:
     # and those few are formed exactly.
     single = np.asfortranarray(x, dtype=np.float32)
     column_norms = np.sqrt(squares)
-    rounding = float(np.finfo(np.float32).eps) * (count + 3.0)
+    rounding = float(np.finfo(np.float32).eps) * (count + FLOAT32_ROUNDINGS)
 
     def screened() -> tuple[np.ndarray, np.ndarray]:
         approximate = np.abs(single.T @ residual.astype(np.float32)).astype(np.float64) / count

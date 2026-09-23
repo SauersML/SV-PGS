@@ -18,6 +18,8 @@ chains <- snp_ldpred2_auto(corr, frame, h2_init = heritability, vec_p_init = seq
                            ncores = cores, allow_jump_sign = FALSE, shrink_corr = 0.95)
 spread <- vapply(chains, function(chain) diff(range(chain$corr_est)), numeric(1))
 keep <- which(spread > 0.95 * quantile(spread, 0.95, na.rm = TRUE))
-beta <- rowMeans(sapply(chains[keep], function(chain) chain$beta_est))
-cat("ldpred2: h2_init", heritability, "chains kept", length(keep), "of", length(chains), "\n")
+cat("ldpred2: h2_init", heritability, "chains kept", length(keep), "of", length(chains), "spread", signif(range(spread, na.rm = TRUE), 3), "\n")
+if (length(keep) == 0) stop("no LDpred2-auto chain passed the tutorial's filter")
+# sapply returns a vector, not a matrix, when one chain is kept
+beta <- rowMeans(matrix(sapply(chains[keep], function(chain) chain$beta_est), nrow = p))
 con <- file(file.path(folder, "beta.bin"), "wb"); writeBin(as.double(beta), con, size = 8, endian = "little"); close(con)
