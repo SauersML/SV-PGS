@@ -721,7 +721,8 @@ def _run_views(dataset, fit_views, gene_rows, split_names, feature_sets):
         raw = {}
         prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
         yield (views.row_of_gene[key[0]], key[1], key[2], test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
-               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok", raw, _train_index(dataset, key[1]))
+               int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, key[0], key[1], key[2]), "ok", raw, _train_index(dataset, key[1]),
+               fitted_schema(predictor))
     if len(seen) != len(views):
         raise ValueError(f"fit_views returned {len(seen)} of {len(views)} requested views")
 
@@ -741,7 +742,7 @@ def _run_batch(dataset, fit_batch, gene_rows, split_names, feature_sets):
                 prediction, without_sv = predict_for_truth(predictor, train, test_genotypes, dataset.covariates[test_index], raw)
                 yield (gene_row, split_name, feature_set, test_index, prediction, without_sv, test_phenotype, train.genotypes.shape[1],
                        int(train.variants.is_sv.sum()), seconds, sv_coefficients(train, predictor, train.gene_id, split_name, feature_set), "ok", raw,
-                       _train_index(dataset, split_name))
+                       _train_index(dataset, split_name), fitted_schema(predictor))
 
 
 FIT_FIELDS = ("gene_row", "split_name", "feature_set", "test_index", "prediction", "without_sv", "test_phenotype", "variant_count", "sv_count",
