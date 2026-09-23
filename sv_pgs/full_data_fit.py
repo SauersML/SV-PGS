@@ -863,11 +863,13 @@ class _FullDataFixedPoints:
                     # are J's eigenvalue -lambda, which the damping removes; ones that line up are an eigenvalue at least
                     # 1, which no share contracts (1 - f (1 - mu) >= 1), and that needs the double loop this route lacks.
                     if cross > cross_error:
-                        raise NoFixedPoint(
-                            f"model {model}: the EP refreshes' updates line up with no contraction (KL {lower[model]:.3e}..{upper[model]:.3e} after "
-                            f"{last:.3e}, r_k' Sigma r_(k-1) = {cross:.3e} +- {cross_error:.3e}): no damping contracts it, and the full-data route "
-                            "has no double loop"
+                        # No share of the refresh map contracts here: EP's fixed point is found by the convergent double
+                        # loop instead (``_double_loop``), which lowers the EC free energy at every outer step.
+                        log(
+                            f"ep: model {model}'s refreshes line up with no contraction (KL {lower[model]:.3e}..{upper[model]:.3e} after {last:.3e}, "
+                            f"r_k' Sigma r_(k-1) = {cross:.3e} +- {cross_error:.3e}): the double loop takes over"
                         )
+                        return self._double_loop(hyperparameters)
                     damped = min(damped, fraction / (1.0 + float(np.sqrt(upper[model] / last))) if last > 0.0 else 0.0)
             with np.errstate(divide="ignore", invalid="ignore"):
                 rate = np.sqrt(upper / previous[0]) if previous is not None else np.full(model_count, np.inf)
@@ -912,6 +914,191 @@ class _FullDataFixedPoints:
                 self._iterate(blended_precision, blended_shift)
                 self.site_precision, self.site_shift = blended_precision, blended_shift
             self.noise = self._noise(1.0 / (frozen + self.site_precision))
+
+    # the double loop
+
+    def _loop_point(
+        self, hyperparameters: Sequence[MixtureHyperparameters], site_precision: F64Array, site_shift: F64Array,
+        marginal_precision: F64Array, marginal_shift: F64Array,
+    ) -> _LoopPoint | None:
+        """The inner problem at these sites (``small_n._loop_point`` on the streamed design), or None outside EP's
+        domain: q's precision not positive definite, or an inner cavity (P_s - tau, h_s - nu) whose tilted law is
+        improper (1 + v_max P <= 0) or has no finite moments. q's moments are the mean solve's and the windows'
+        marginal variances (``marginal_variances``); the cavity certificate is the outer step's."""
+        gaussian = self.gaussian
+        cavity_precision = marginal_precision - site_precision
+        largest = np.column_stack([
+            np.exp(log_scale(self.prior, model.coefficients) + self.prior.log_variance_grid[-1]) for model in hyperparameters
+        ])
+        if not np.all(1.0 + largest * cavity_precision > 0.0):
+            return None
+        try:
+            self._iterate(site_precision, site_shift)
+            grams = [replace(self.grams, scale=1.0 / float(self.noise[model])) for model in range(gaussian.model_count)]
+            group_variances = np.column_stack([
+                marginal_variances(solve, model_grams, gaussian.array_module) for solve, model_grams in zip(gaussian.bulk_solves, grams)
+            ])
+            mean, variance = member_moments(
+                self.ties, site_precision, site_shift, np.asarray(_host(gaussian.mean), dtype=np.float64), group_variances
+            )
+        except np.linalg.LinAlgError:
+            return None
+        if not np.all(variance > 0.0):
+            return None
+        tilted_mean, tilted_variance, third, fourth = (np.empty_like(mean) for _ in range(4))
+        for model, model_hyperparameters in enumerate(hyperparameters):
+            cavity = Cavity(precision=cavity_precision[:, model], shift=marginal_shift[:, model] - site_shift[:, model])
+            moments = tilted_moments(self.prior, model_hyperparameters, cavity, self.working_bytes)
+            tilted_mean[:, model], tilted_variance[:, model] = moments.mean, moments.variance
+            third[:, model], fourth[:, model] = tilted_cumulants(self.prior, model_hyperparameters, cavity, self.working_bytes)
+        values = (tilted_mean, tilted_variance, third, fourth)
+        if not (all(np.all(np.isfinite(value)) for value in values) and np.all(tilted_variance > 0.0)):
+            return None
+        gradient = np.concatenate([mean - tilted_mean, -0.5 * (variance + mean**2 - tilted_variance - tilted_mean**2)])
+        return _LoopPoint(site_precision, site_shift, mean, variance, tilted_mean, tilted_variance, third, fourth, gradient)
+
+    def _line_search(
+        self, hyperparameters: Sequence[MixtureHyperparameters], point: _LoopPoint, direction: F64Array, marginal_precision: F64Array,
+        marginal_shift: F64Array, tolerance: float,
+    ) -> _LoopPoint | None:
+        """The inner problem's minimum along ``direction`` from ``point``, to where the one-dimensional model's gain
+        still to go is at most ``tolerance``: Phi is convex, so its directional derivative phi'(t) = g(t)'d rises
+        along the line, the root is bracketed between a point with phi' < 0 and one with phi' >= 0 or outside the
+        domain (where Phi is +inf), and the secant of phi' between them gives the next trial and the remaining gain
+        phi'(lo)^2 / (2 kappa). The point returned has phi' < 0 on [0, t], so Phi fell along the whole step: a
+        certified decrease with no value of Phi (no log determinant). None where no point along d has phi' < 0
+        beyond the start's rounding (the start is the line's minimum)."""
+        half = direction.shape[0] // 2
+        slope = float(point.gradient.ravel() @ direction.ravel())
+        low, low_slope, low_point = 0.0, slope, None
+        high, high_slope = np.inf, np.nan
+        trial = 1.0
+        scale = 1.0 + max(float(np.max(np.abs(point.site_precision))), float(np.max(np.abs(point.site_shift))))
+        step_size = float(np.max(np.abs(direction)))
+        while True:
+            if (trial - low) * step_size <= _EPSILON * scale:
+                return low_point
+            candidate = self._loop_point(
+                hyperparameters, point.site_precision + trial * direction[half:], point.site_shift + trial * direction[:half], marginal_precision,
+                marginal_shift,
+            )
+            if candidate is None:
+                high, high_slope = trial, np.nan
+            else:
+                candidate_slope = float(candidate.gradient.ravel() @ direction.ravel())
+                if candidate_slope < 0.0:
+                    low, low_slope, low_point = trial, candidate_slope, candidate
+                else:
+                    high, high_slope = trial, candidate_slope
+            if np.isfinite(high) and np.isfinite(high_slope):
+                curvature = (high_slope - low_slope) / (high - low)
+                if low_point is not None and low_slope * low_slope / (2.0 * curvature) <= tolerance:
+                    return low_point
+                trial = low - low_slope / curvature
+                if not low < trial < high:
+                    trial = 0.5 * (low + high)
+            elif np.isfinite(high):
+                trial = 0.5 * (low + high)
+            else:
+                trial = 2.0 * trial
+
+    def _inner(
+        self, hyperparameters: Sequence[MixtureHyperparameters], marginal_precision: F64Array, marginal_shift: F64Array, tolerance: float,
+    ) -> tuple[F64Array, F64Array, int]:
+        """The inner problem, min Phi over the sites at fixed marginals, by preconditioned nonlinear conjugate
+        gradients (Polak-Ribiere+, the site blocks as the preconditioner) with ``_line_search``, from the current
+        sites, until the preconditioned decrement 1/2 g'M^-1 g is at most ``tolerance``. Returns the sites and the
+        count of accepted steps."""
+        point = self._loop_point(hyperparameters, self.site_precision, self.site_shift, marginal_precision, marginal_shift)
+        if point is None:
+            # q's own cavities at its own marginals are the sites' cavities, which the outer refresh found proper.
+            raise NoFixedPoint("the double loop's inner problem starts outside EP's domain")
+        gradient = point.gradient
+        preconditioned = _block_solve(point, gradient)
+        direction = -preconditioned
+        steps = 0
+        while True:
+            decrement = 0.5 * float(gradient.ravel() @ preconditioned.ravel())
+            if not decrement > tolerance:
+                return point.site_precision, point.site_shift, steps
+            accepted = self._line_search(hyperparameters, point, direction, marginal_precision, marginal_shift, tolerance)
+            if accepted is None:
+                if np.array_equal(direction, -preconditioned):
+                    return point.site_precision, point.site_shift, steps
+                # A conjugate direction the line cannot lower Phi along: restart from the preconditioned gradient.
+                direction = -preconditioned
+                continue
+            steps += 1
+            new_gradient = accepted.gradient
+            new_preconditioned = _block_solve(accepted, new_gradient)
+            ratio = max(0.0, float(new_gradient.ravel() @ (new_preconditioned - preconditioned).ravel()) / float(gradient.ravel() @ preconditioned.ravel()))
+            direction = -new_preconditioned + ratio * direction
+            point, gradient, preconditioned = accepted, new_gradient, new_preconditioned
+
+    def _double_loop(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint]:
+        """EP's fixed point by the Opper-Winther double loop on the streamed design (``small_n.double_loop_sites``),
+        with the noise stationary between its runs. Each outer step fixes (P_s, h_s) at q's marginals, which bounds the
+        EC free energy's concave part linearly, and lowers the convex Phi (``_inner``): majorize-minimize, so every
+        accepted inner step lowers the free energy. It ends where the undamped EP update's KL is within 1/(2K) nats
+        and the noise update's gain within 1/(2K) (the refresh's own checks, at the certified marginal variances), or
+        where an outer step leaves the sites unchanged, which is Phi stationary at q's own marginals: EP's fixed point."""
+        gaussian = self.gaussian
+        model_count = gaussian.model_count
+        budget = 0.5 / self.draw_count
+        while True:
+            variances, mean, group_variances, grams = self._refresh(hyperparameters)
+            frozen = 1.0 / variances - self.site_precision
+            cavities = [
+                Cavity(precision=frozen[:, model], shift=mean[:, model] / variances[:, model] - self.site_shift[:, model]) for model in range(model_count)
+            ]
+            target_precision, target_shift = self._targets(hyperparameters, cavities)
+            if not (np.all(np.isfinite(target_precision)) and np.all(np.isfinite(target_shift))):
+                raise NoFixedPoint("a site target is not finite at the double loop's outer step")
+            snapshot = self._snapshot()
+            posteriors = [
+                _member_posterior(
+                    _posterior(gaussian, model, grams[model], group_variances[:, model], lambda snapshot=snapshot: self._ensure(snapshot)),
+                    self.ties, self.site_precision[:, model], group_variances[:, model],
+                )
+                for model in range(model_count)
+            ]
+            precision_step = target_precision - self.site_precision
+            right = (target_shift - self.site_shift) - precision_step * mean
+            divergence = np.empty(model_count)
+            for model in range(model_count):
+                spread = max(-float(precision_step[:, model] @ posteriors[model].variance_jvp(precision_step[:, [model]])[:, 0]), 0.0)
+                _lower, upper, _cross, _error = self._move_bounds(model, right[:, model])
+                divergence[model] = 0.5 * upper + 0.25 * spread
+            noise = self._noise(variances)
+            self.noise_gain = np.array([
+                noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), int(self.covariate_ranks[model]))
+                for model in range(model_count)
+            ])
+            self.mean_move = 2.0 * divergence
+            log(f"ep double loop: outer step at KL {np.array2string(divergence, precision=3)}, noise gain {np.array2string(self.noise_gain, precision=3)}")
+            if np.all(divergence <= budget):
+                if np.all(self.noise_gain <= budget):
+                    self._ensure(snapshot)
+                    return [
+                        FixedPoint(
+                            cavity=cavities[model], posterior=posteriors[model], mean=mean[:, model].copy(),
+                            precision_norm=_precision_norm(gaussian, model, self.site_precision[:, model], self.ties),
+                            effective_effects=float(self.effective[model]),
+                        )
+                        for model in range(model_count)
+                    ]
+                self.noise = noise
+                continue
+            start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
+            precision, shift, steps = self._inner(hyperparameters, 1.0 / variances, mean / variances, budget)
+            log(f"ep double loop: inner problem {steps} steps")
+            if np.array_equal(precision, start_precision) and np.array_equal(shift, start_shift):
+                # Phi stationary at q's own marginals to its rounding: EP's fixed point, though its KL check above did not
+                # pass within the budget (the marginal variances' approximation sets that floor).
+                raise NoFixedPoint(
+                    f"the double loop is stationary at KL {np.array2string(divergence, precision=3)}, above the 1/(2K) budget its check needs"
+                )
+            self.site_precision, self.site_shift = precision, shift
 
     def _frozen_passes(self, hyperparameters: Sequence[MixtureHyperparameters], frozen: F64Array, target_precision: F64Array, target_shift: F64Array) -> None:
         """Mean-only EP with the cavity precisions frozen, from the check's targets, until the frozen move is below
@@ -960,6 +1147,45 @@ class _FullDataFixedPoints:
                 Cavity(precision=frozen[:, model], shift=new_mean[:, model] / marginal[:, model] - self.site_shift[:, model]) for model in range(model_count)
             ]
             target_precision, target_shift = self._targets(hyperparameters, cavities)
+
+
+@dataclass
+class _LoopPoint:
+    """The double loop's inner problem at sites (tau, nu) under fixed marginals: q's members' means and marginal
+    variances there, the inner cavities' tilted moments and cumulants, and Phi's gradient in (nu, tau)."""
+
+    site_precision: F64Array
+    site_shift: F64Array
+    mean: F64Array
+    variance: F64Array
+    tilted_mean: F64Array
+    tilted_variance: F64Array
+    third: F64Array
+    fourth: F64Array
+    gradient: F64Array
+
+
+def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
+    """The 2 x 2 blocks, per site, of Phi's Hessian's diagonal part: Cov_r of (beta, -beta^2 / 2) under each tilted law
+    plus q's own marginal part (``small_n._newton_step``'s preconditioner)."""
+    mean, variance, third, fourth = point.tilted_mean, point.tilted_variance, point.third, point.fourth
+    a_r = variance
+    b_r = -0.5 * (third + 2.0 * mean * variance)
+    c_r = 0.25 * (fourth + 2.0 * variance**2 + 4.0 * mean * third + 4.0 * mean**2 * variance)
+    return (
+        a_r + point.variance,
+        b_r - point.variance * point.mean,
+        c_r + 0.5 * point.variance**2 + point.mean**2 * point.variance,
+    )
+
+
+def _block_solve(point: _LoopPoint, vector: F64Array) -> F64Array:
+    """The site blocks' inverse applied to a (nu, tau) vector (members x models each half)."""
+    a, b, c = _site_blocks(point)
+    half = vector.shape[0] // 2
+    first, second = vector[:half], vector[half:]
+    determinant = a * c - b * b
+    return np.concatenate([(c * first - b * second) / determinant, (a * second - b * first) / determinant])
 
 
 class _PassBudget(Exception):
