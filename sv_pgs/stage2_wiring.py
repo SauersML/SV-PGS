@@ -403,8 +403,7 @@ def _fit_one(
         targets=store_targets,
         offsets=np.zeros((store.n_samples, 1)),
         covariates=store_covariates,
-        # EP's leave-block-out windows are cut to the fit's budget; the mean-field sweeps read whole Stage 0 blocks.
-        grams=block_grams(statistics, start_noise, working_bytes=share if inference == "ep" else None),
+        grams=block_grams(statistics, start_noise),
         probe_count=draw_count,
         seed=_seed(seed, 0),
         # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.

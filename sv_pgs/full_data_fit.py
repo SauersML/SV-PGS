@@ -53,7 +53,7 @@ component's own metric (``BinaryComponent``).
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Sequence
 
 import time
 
@@ -63,7 +63,7 @@ from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
 from sv_pgs.device_sweep import PIECE_COLUMNS, PanelGrams, sweep_piece
 from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate_evidence
-from sv_pgs.dual_solve import DualGaussian, DualModels, _host, column_squares
+from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, column_squares
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.progress import log
@@ -132,7 +132,9 @@ def stage0_lattice(
     return derived_lattice(single_precision[ties.group], ties.sign * single_shift[ties.group], log_variance_offset, tolerance)
 
 
-def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0, working_bytes: int | None = None) -> BlockGrams:
+def block_grams(
+    statistics: GenotypeSufficientStatistics, noise: float = 1.0, working_bytes: int | None = None, array_module: Any = np,
+) -> BlockGrams:
     """Stage 0's projected Grams, R_b within each block and R_{b,b+1} between neighbours (zero across a chromosome's
     end), as the stored float32 arrays themselves: memory-mapped views, no copy. A model's metric W = training /
     sigma^2 enters as ``scale = 1 / noise``; every model of a fit shares the arrays through
@@ -141,9 +143,9 @@ def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0, wo
     e2e-scale's chr22 fit out of host memory at 45 GB.)
 
     With ``working_bytes`` the blocks are cut into parts whose leave-block-out windows fit it (``refined_grams`` at
-    ``window_width``): a window of three whole Stage 0 blocks is sized only by Stage 0's budget (256 GB of float64
-    working set at bench-sim's 28k-column blocks), not by the EP fit's. The dual solver and the marginal variances
-    must be given the same partition."""
+    ``window_width`` on ``array_module``): a window of three whole Stage 0 blocks is sized only by Stage 0's budget
+    (256 GB of float64 working set at bench-sim's 28k-column blocks), not by the EP fit's. The dual solver and the
+    marginal variances must be given the same partition."""
     ld = statistics.ld
     blocks = tuple(np.asarray(ld.block(block_index).reduced_columns, dtype=np.int64) for block_index in range(ld.block_count))
     within = tuple(ld.block(block_index).projected_gram for block_index in range(ld.block_count))
@@ -153,7 +155,7 @@ def block_grams(statistics: GenotypeSufficientStatistics, noise: float = 1.0, wo
         shape = (blocks[block_index - 1].shape[0], blocks[block_index].shape[0])
         next_cross.append(np.zeros(shape, dtype=np.float32) if cross is None else cross)
     grams = BlockGrams(blocks=blocks, within=within, next_cross=tuple(next_cross), scale=1.0 / noise)
-    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes))
+    return grams if working_bytes is None else refined_grams(grams, window_width(working_bytes, array_module))
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:
@@ -491,15 +493,20 @@ class _FullDataFixedPoints:
         self.draw_count = draw_count
         self.working_bytes = working_bytes
         # Stage 0's Grams, built once per fit and shared by every model and refresh (``block_grams``), over blocks cut
-        # so that the window algebra's float64 working set fits the fit's budget; the dual solver's windows must be the
-        # same partition (its window cross products are gathered on them).
-        self.grams = block_grams(statistics, working_bytes=working_bytes)
-        if len(self.grams.blocks) != len(gaussian.windows.blocks) or any(
-            not np.array_equal(ours, theirs) for ours, theirs in zip(self.grams.blocks, gaussian.windows.blocks)
-        ):
-            raise ValueError("the dual solver's windows must be block_grams(statistics, working_bytes=working_bytes)'s blocks")
-        window_bytes = window_working_bytes(self.grams)
-        if window_bytes > working_bytes:
+        # so that the window algebra's working set fits what the fit can give it: its budget, and on a device no more
+        # than is free once the dual solver holds its state (the resident codes: 21 GB of an A40's 48 at bench-sim's
+        # 518k x 40k), measured here. The dual solver's windows are laid on the same parts (its window cross products
+        # are gathered on them); it has not solved yet, so nothing it holds depends on the old ones.
+        xp = gaussian.array_module
+        window_budget = int(working_bytes)
+        if xp is not np:
+            free, _total = xp.cuda.runtime.memGetInfo()
+            window_budget = min(window_budget, int(free) + int(xp.get_default_memory_pool().free_bytes()))
+        self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp)
+        gaussian.windows = _WindowLayout(self.grams, gaussian.source)
+        window_bytes = window_working_bytes(self.grams, xp)
+        log(f"ep: {len(self.grams.blocks)} leave-block-out windows of at most {max(block.shape[0] for block in self.grams.blocks)} columns, {window_bytes / 1e9:.1f} GB of {window_budget / 1e9:.1f} GB")
+        if window_bytes > window_budget and max(block.shape[0] for block in self.grams.blocks) > 1:
             raise MemoryError(f"the leave-block-out windows need {window_bytes} bytes of float64 working set, over the fit's {working_bytes}")
         model_count = gaussian.model_count
         # Tie members keep their own sites and priors; the solver sees each group's signed sum (tie_members).

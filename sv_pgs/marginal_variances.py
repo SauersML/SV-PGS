@@ -435,32 +435,73 @@ def _window_quadratic(
     return _to_host(quadratic.T)
 
 
-def window_working_bytes(grams: BlockGrams) -> int:
+def eigensolver_bytes(size: int, array_module: Any = np) -> int:
+    """What the window's eigenvalue solve allocates beyond the whitened window, measured: on a device, CuPy's copy of
+    the matrix plus cuSOLVER's own workspace for it (``xsyevd_bufferSize`` at this size, eigenvalues only: 11.5 GB in bench-sim's first budget-cut window on an
+    A40, more than the matrix itself, which the fixed count of |W|^2 arrays had missed); on the host, LAPACK's workspace is O(|W|) and the
+    copy is the only |W|^2 term."""
+    itemsize = np.dtype(np.float64).itemsize
+    matrix = size * size * itemsize
+    if array_module is np or size == 0:
+        return matrix
+    from cupy._core import _dtype  # noqa: PLC0415 - only on a device
+    from cupy_backends.cuda.libs import cublas, cusolver  # noqa: PLC0415
+
+    handle = array_module.cuda.device.Device().cusolver_handle
+    params = cusolver.createParams()
+    # The size query reads the shape and types only; one-element buffers stand in for the matrix and the eigenvalues.
+    stand_in = array_module.empty(1, dtype=array_module.float64)
+    kind = _dtype.to_cuda_dtype(np.dtype(np.float64))
+    try:
+        device_bytes, _host_bytes = cusolver.xsyevd_bufferSize(
+            handle, params, cusolver.CUSOLVER_EIG_MODE_NOVECTOR, cublas.CUBLAS_FILL_MODE_LOWER, size, kind, stand_in.data.ptr, size, kind,
+            stand_in.data.ptr, kind,
+        )
+    finally:
+        cusolver.destroyParams(params)
+    return matrix + int(device_bytes)
+
+
+def window_working_bytes(grams: BlockGrams, array_module: Any = np) -> int:
     """The window algebra's peak float64 working set over the blocks, for the fit's working_bytes budget.
 
-    At most four |W| x |W| arrays are live in a window (the assembled Gram, its whitened form, the eigensolver's
-    workspace, the Cholesky factor) plus four |W| x |b| ones (the right-hand sides, their solve, the quadratic
-    rows and the covariance rows), with |W| the window's and |b| the block's size. The shared Grams themselves stay
-    where the caller keeps them (Stage 0's memory map).
+    Three |W| x |W| arrays are live in a window (the assembled Gram, its whitened form, then the Cholesky factor)
+    plus four |W| x |b| ones (the right-hand sides, their solve, the quadratic rows and the covariance rows), with |W|
+    the window's and |b| the block's size, and during the eigenvalue solve its own allocations (``eigensolver_bytes``,
+    measured on ``array_module``'s device). The shared Grams themselves stay where the caller keeps them (Stage 0's
+    memory map).
     """
     itemsize = np.dtype(np.float64).itemsize
     peak = 0
     for block in range(len(grams.blocks)):
         window = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
         own = grams.blocks[block].shape[0]
-        peak = max(peak, (4 * window * window + 4 * window * own) * itemsize)
+        peak = max(peak, (3 * window * window + 4 * window * own) * itemsize + eigensolver_bytes(window, array_module))
     return peak
 
 
-def window_width(working_bytes: int) -> int:
+def window_width(working_bytes: int, array_module: Any = np) -> int:
     """The widest block whose window (itself and its two neighbours at the same width) keeps the window algebra's
-    working set (``window_working_bytes``) within ``working_bytes``: that set is quadratic in the width, so it is the
-    unit-width window's bytes times w^2. At least one variant (the algebra's floor, where the budget is below it)."""
-    unit = window_working_bytes(BlockGrams(
-        blocks=tuple(np.array([index], dtype=np.int64) for index in range(3)), within=tuple(np.ones((1, 1)) for _ in range(3)),
-        next_cross=tuple(np.zeros((1, 1)) for _ in range(2)),
-    ))
-    return max(1, int(np.floor(np.sqrt(max(int(working_bytes), 0) / unit))))
+    working set (``window_working_bytes`` on ``array_module``) within ``working_bytes``, by bisection on the width (the
+    set grows with it). At least one variant (the algebra's floor, where the budget is below it)."""
+
+    def fits(width: int) -> bool:
+        blocks = tuple(np.arange(index * width, (index + 1) * width, dtype=np.int64) for index in range(3))
+        layout = BlockGrams(
+            blocks=blocks, within=tuple(np.zeros((0, 0)) for _ in range(3)), next_cross=tuple(np.zeros((0, 0)) for _ in range(2)),
+        )
+        return window_working_bytes(layout, array_module) <= working_bytes
+
+    low, high = 1, 2
+    while fits(high):
+        low, high = high, 2 * high
+    while high - low > 1:
+        middle = (low + high) // 2
+        if fits(middle):
+            low = middle
+        else:
+            high = middle
+    return low
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:
