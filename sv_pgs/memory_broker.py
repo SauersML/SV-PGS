@@ -56,10 +56,27 @@ Scope. ``memory_scope(budget)`` makes one broker current for the code under it (
 inside inherit it only through ``contextvars.copy_context``) and, on CUDA, installs the ledger's allocator for its
 duration; ``broker_for(budget)`` returns the current broker, or, outside every scope, a fresh broker of that budget
 whose ledger is then the caller's alone; ``current_broker()`` returns the current one or None.
+
+Host allocator. glibc's malloc returns every freed block above its mmap threshold (dynamic, capped at 32 MB on
+64-bit) to the kernel, and trims the heap's free top above its trim threshold. A fit forms and frees temporaries far
+above that cap many times over (the curvature correction's response blocks are variants x columns x 8 bytes), so each
+one is unmapped on free and faulted in again, zeroed, on its next allocation: with transparent huge pages that is a
+huge-page zero fault and, in regions numpy madvises, a direct compaction per block (bench-sim chr22 013 on an A100
+node: the main thread at ~90% system time, curvature calls of 33-300 s). For the scope of a fit the allocator keeps
+what the fit frees instead (``_retain_freed_host_memory``): the mmap threshold should be at least the largest
+temporary, which exceeds glibc's cap, and the one setting that serves every temporary from the heap is M_MMAP_MAX = 0;
+the trim threshold should be the host budget, the memory the fit is entitled to keep, and since the ledger bounds the
+fit's host bytes by that budget the heap's free top never exceeds it, so any threshold at or above it (the largest,
+(size_t)-1) is the same. The settings are the process's from the first scope on (glibc cannot report the values it
+replaces, so there is nothing exact to restore); when each outermost scope ends ``malloc_trim(0)`` returns what was
+kept. Linux/glibc only: elsewhere it does nothing.
 """
 
 from __future__ import annotations
 
+import ctypes
+import platform
+import sys
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -351,6 +368,35 @@ def _device_meter(cupy: Any, device_id: int, reserved: bool = False) -> Callable
 
 _CURRENT: ContextVar[MemoryBroker | None] = ContextVar("svpgs_memory_broker", default=None)
 
+# glibc's mallopt parameters (malloc/malloc.h).
+_M_TRIM_THRESHOLD = -1
+_M_MMAP_MAX = -4
+
+
+def _glibc() -> Any | None:
+    """The process's C library where it is glibc on Linux, else None."""
+    if not sys.platform.startswith("linux") or platform.libc_ver()[0] != "glibc":
+        return None
+    libc = ctypes.CDLL(None)
+    return libc if hasattr(libc, "mallopt") and hasattr(libc, "malloc_trim") else None
+
+
+@contextmanager
+def _retain_freed_host_memory() -> Iterator[bool]:
+    """Keep the blocks a fit frees in the heap for its next allocations (module docstring, Host allocator); yields
+    whether the allocator was set (Linux/glibc)."""
+    libc = _glibc()
+    if libc is None:
+        yield False
+        return
+    # mallopt takes an int: -1 is (size_t)-1, the largest trim threshold, which never trims.
+    if libc.mallopt(_M_MMAP_MAX, 0) != 1 or libc.mallopt(_M_TRIM_THRESHOLD, -1) != 1:
+        raise OSError("glibc refused mallopt(M_MMAP_MAX, 0) or mallopt(M_TRIM_THRESHOLD, -1)")
+    try:
+        yield True
+    finally:
+        libc.malloc_trim(0)
+
 
 @contextmanager
 def memory_scope(budget: ComputeBudget) -> Iterator[MemoryBroker]:
@@ -371,7 +417,8 @@ def memory_scope(budget: ComputeBudget) -> Iterator[MemoryBroker]:
         cupy.cuda.set_allocator(_LedgerAllocator(broker, cupy))
     token = _CURRENT.set(broker)
     try:
-        yield broker
+        with _retain_freed_host_memory():
+            yield broker
     finally:
         _CURRENT.reset(token)
         if cupy is not None:

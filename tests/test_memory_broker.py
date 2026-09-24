@@ -248,3 +248,42 @@ def test_a_bounded_pools_allocations_under_its_bound_never_read_its_meter():
     assert reads["meter"] == 0 and broker.peak("device0") == 60 >= state["used"]
     broker.make_room("device0", 60, "past the bound: the meter decides")
     assert reads["meter"] > 0
+
+
+_REFAULT = """
+import resource
+import numpy as np
+from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.memory_broker import memory_scope
+
+# A block above glibc's largest mmap threshold (32 MB on 64-bit), as the fit's response blocks are.
+count = 2 * 32 * 2**20 // 8
+
+def refaults() -> int:
+    np.empty(count).fill(1.0)
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
+    np.empty(count).fill(1.0)
+    return resource.getrusage(resource.RUSAGE_SELF).ru_minflt - before
+
+outside = refaults()
+with memory_scope(ComputeBudget("cpu", (), (), (), (), 2**34, 1)):
+    inside = refaults()
+print(outside, inside)
+"""
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="the host allocator setting is Linux/glibc only")
+def test_a_fit_scope_keeps_a_freed_block_above_the_mmap_cap_for_its_next_allocation():
+    """Outside a scope glibc unmaps a freed block above its mmap cap and the next one faults its pages in again;
+    inside a fit's scope the heap keeps the block, so the next allocation of its size faults nothing."""
+    result = subprocess.run([sys.executable, "-c", _REFAULT], capture_output=True, text=True, check=True, cwd=Path(__file__).resolve().parents[1])
+    outside, inside = map(int, result.stdout.split())
+    assert outside > 0 and inside == 0
+
+
+def test_the_host_allocator_setting_does_nothing_off_glibc(monkeypatch):
+    from sv_pgs import memory_broker
+
+    monkeypatch.setattr(memory_broker.sys, "platform", "darwin")
+    with memory_broker._retain_freed_host_memory() as set_:
+        assert set_ is False

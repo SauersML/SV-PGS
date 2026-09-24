@@ -73,6 +73,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('compute_budget.py', '_CGROUP_V1_UNLIMITED'): ('spec', frozenset({63}), 'Linux PAGE_COUNTER_MAX, (2^63 - 1) rounded down to a page (include/linux/page_counter.h)'),
     ('compute_budget.py', '_detect_available_host_ram_bytes'): ('unit', frozenset({1024}), '/proc/meminfo reports kB'),
     ('compute_budget.py', '_address_space_headroom_bytes'): ('unit', frozenset({1024}), '/proc/self/status reports VmSize in kB'),
+    ('memory_broker.py', '_M_MMAP_MAX'): ('spec', frozenset({-4}), 'glibc malloc/malloc.h: M_MMAP_MAX is mallopt parameter -4 (M_TRIM_THRESHOLD -1); the values set, 0 mmap chunks and trim (size_t)-1, are derived in the module docstring (Host allocator)'),
     ('memory_broker.py', '_CUPY_ALLOCATION_ALIGNMENT'): ('spec', frozenset({512}), "CuPy's memory pool rounds every allocation to 512 bytes (cupy/cuda/memory.pyx, _round_size)"),
     ('draw_laws.py', '_PHILOX_MULTIPLIERS'): ('spec', frozenset({0xD2511F53, 0xCD9E8D57}), 'Philox4x32 round multipliers (Salmon, Moraes, Dror and Shaw 2011; Random123 philox.h)'),
     ('draw_laws.py', '_PHILOX_WEYL'): ('spec', frozenset({0x9E3779B9, 0xBB67AE85}), 'Philox4x32 Weyl key increments (Salmon et al. 2011; Random123 philox.h)'),
