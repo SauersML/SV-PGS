@@ -4666,6 +4666,16 @@ def fit_hyperparameters(
         if state is None:
             histories[model].append(np.inf)
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
+        current = hyperparameters[model]
+        if (
+            not np.isfinite(remainders[model]) and np.array_equal(step.hyperparameters.coefficients, current.coefficients)
+            and np.array_equal(np.asarray(step.hyperparameters.log_smoothing), np.asarray(current.log_smoothing))
+        ):
+            # A zero-length step: its joint trial would be the state itself, whose realized gain is 0 by definition, so
+            # the model's remainder there is |0 - predicted| exactly, with no trial. Waiting for a trial to measure it
+            # left an annotated search started at its optimum with no measured remainder, and it returned uncertified
+            # ("planned twice from one state") where it had nothing left to gain (bench-sim chr22 000 [sim]).
+            remainders[model] = abs(step.evidence - state.value)
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
         previous = planned_at[model]

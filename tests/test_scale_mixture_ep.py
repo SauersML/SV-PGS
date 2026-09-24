@@ -1314,6 +1314,31 @@ def test_a_halved_lattice_does_not_alias_the_fitted_density_on_the_v7_gap_case()
     assert abs(values[0] - values[1]) <= 2.0 * _EVIDENCE_TOLERANCE, values
 
 
+@pytest.mark.slow
+def test_a_search_started_at_its_certified_optimum_certifies_again():
+    """The outer loop continued from its own certified fit (an annotated search from the base fit, a lattice check's
+    refit): its plan's step has zero length, whose joint trial is the state itself, so the remainder is known without
+    a trial and the fit certifies, never ending "planned twice from one state" uncertified."""
+    data = np.load(_GAP_CASE)
+    likelihood_precision, linear_term = data["likelihood_precision"], data["linear_term"]
+    count = linear_term.shape[0]
+    offset = np.full(count, float(np.asarray(data["offset"]).ravel()[0]))
+    nodes, floor, top = derived_lattice(np.diag(likelihood_precision), linear_term, offset, _EVIDENCE_TOLERANCE)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(count, np.int64), log_variance_offset=offset, annotation_design=np.zeros((count, 0)), annotation_groups=(),
+        nodes=nodes, floor=floor, top=top,
+    )
+    # One oracle, warm between the two searches, as the refit's oracle starts at the fit's own fixed point.
+    fixed_points = _dense_fixed_points(prior, likelihood_precision, linear_term)
+    (fit,) = fit_hyperparameters(prior, [initial_hyperparameters(prior)], fixed_points, 1 << 26, _EVIDENCE_TOLERANCE)
+    assert fit.certified
+    (again,) = fit_hyperparameters(prior, [fit.hyperparameters], fixed_points, 1 << 26, _EVIDENCE_TOLERANCE)
+    assert again.certified and again.remaining_gain <= _EVIDENCE_TOLERANCE
+    assert abs(again.step.evidence - fit.step.evidence) <= 2.0 * _EVIDENCE_TOLERANCE
+    # Its first plan certifies: no joint trial had to measure the zero step's remainder (and be refused for its zero gain).
+    assert again.halvings == 0 and len(again.history) == 1, (again.halvings, again.history)
+
+
 def test_the_trust_region_step_takes_the_hard_case_exactly():
     """More and Sorensen's hard case: g = 0 at an indefinite point (and g orthogonal to -H's lowest eigenvector) puts
     mu at -lambda_min, where the lowest eigenspace's shifted eigenvalue is 0. The step reaches the boundary along the
