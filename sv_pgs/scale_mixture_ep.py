@@ -4938,7 +4938,13 @@ def fit_hyperparameters(
                     inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                     inner_gains[model].append(float(inner_gain))
                 else:
+                    inner_gain = np.nan
                     inner_gains[model] = []
+                log(
+                    f"eb outer: model {model} inner step accepted: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g} "
+                    f"{'definite' if newton.definite else 'indefinite'}, gain {inner_gain:.4g}, state error "
+                    f"{trial_state.error if trial_state is not None else np.inf:.3g} (decrement {trial_state.decrement if trial_state is not None else np.inf:.3g})"
+                )
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
@@ -4949,6 +4955,10 @@ def fit_hyperparameters(
                 continue
             halvings[model] += 1
             inner_gains[model] = []
+            log(
+                f"eb outer: model {model} inner step refused: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g}, "
+                f"{'unresolved trial' if trial_point is None else 'below resolution' if not resolved else 'no ascent'}"
+            )
             if not resolved:
                 if entry.polishes and anchors[model] is not None:
                     settle_release(model)
