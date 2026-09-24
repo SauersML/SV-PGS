@@ -102,7 +102,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('rowdict_codec.py', 'CRC32C_POLYNOMIAL'): ('spec', frozenset({0x82F63B78}), 'reflected Castagnoli crc32c polynomial, the store chain\'s crc32c codec (RFC 3720 §B.4; google_crc32c)'),
     ('dosage_store.py', 'DEFAULT_INNER_CHUNK_ROWS'): ('derived', frozenset({64}), 'minimax-regret chunk rows over read runs no shorter than the smallest Stage 0 tile, from the measured read-path cost fit (docs/design/math/codec.md §3)'),
     ('marginal_variances.py', 'window_working_bytes'): ('derived', frozenset({6, 4}), "byte accounting of the window algebra's arrays: the number of simultaneously live |W| x |W| (6) and |W| x |b| (4) arrays"),
-    ('marginal_variances.py', 'ld_extent'): ('derived', frozenset({4}), "byte accounting of a row chunk's arrays: the rows, their squares, the lags and the mask"),
+    ('marginal_variances.py', 'ld_lag_profiles'): ('derived', frozenset({4}), "byte accounting of a row chunk's arrays: the rows, their squares, the lags and the mask"),
     ('dual_solve.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('full_data_fit.py', '_FullDataMeanField._moment_pieces'): ('derived', frozenset({3}), "byte accounting of the predictor-variance read: a piece's columns, their weighted copy and their projection live at once"),
     ('engine_kernels.py', '_tilted_row_bytes'): ('derived', frozenset({3}), "byte accounting of a chunk's device copies: its three float64 inputs (log u, P, h)"),

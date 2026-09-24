@@ -547,28 +547,25 @@ def window_width(working_bytes: int, array_module: Any = np, limit: int | None =
     return low if limit is None else min(low, int(limit))
 
 
-def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
-    """The lag (in variants, along the block order) beyond which the data show no LD: the smallest w whose tail
-    excess, the summed r^2 over every within-block pair more than w apart less its null expectation 1/n per pair, is
-    at most that sum's own null standard deviation sqrt(2 N(w)) / n (N(w) the ordered pairs beyond w; r^2 of an
-    unlinked pair has mean 1/n and variance 2/n^2 to leading order). A looser, per-variant reading of the same test
-    (a variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and
-    failed its cavity information certificate in 1 of 9 blocks, so the extent is the whole tail's. Beyond it the Grams hold nothing a window could use, so blocks
-    need be no wider: the leave-block-out windows (the block and its two neighbours) then reach at least w on each
-    side, and whatever the data do hold beyond is far field, which ``block_trace_certificate`` tests.
-
-    The lag profile is summed from Stage 0's own within-block Grams, one block at a time on ``array_module``, in row
-    chunks whose float64 arrays (the rows, their squares, the lags and the mask) fit ``working_bytes``. Lags reach
-    at most the widest block, which bounds the extent."""
+def ld_lag_profiles(
+    grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Each block's LD by lag: (excess, pairs), both (blocks, widest block), with excess[b, d] the summed r^2 over the
+    block's ordered pairs d apart less their null expectation 1/n each, and pairs[b, d] = 2 (|b| - d) their count
+    (lag 0 zero in both). Summed from Stage 0's own within-block Grams, one block at a time on ``array_module``, in
+    row chunks whose float64 arrays (the rows, their excess r^2, the lags and the product's temporary) fit
+    ``working_bytes``. Any region's profile is the sum of its blocks' rows, and ``extent_from_profile`` reads its
+    extent."""
     xp = array_module
     itemsize = np.dtype(np.float64).itemsize
     widest = max(int(members.shape[0]) for members in grams.blocks)
-    excess = xp.zeros(widest)
-    pairs = xp.zeros(widest)
+    excess_rows = np.zeros((len(grams.blocks), widest))
+    pair_rows = np.zeros((len(grams.blocks), widest))
     for block, members in enumerate(grams.blocks):
         width = int(members.shape[0])
         if width < 2:
             continue
+        excess = xp.zeros(widest)
         stored = np.asarray(grams.within[block])
         diagonal = xp.asarray(np.diagonal(stored), dtype=xp.float64)
         columns = xp.arange(width)
@@ -584,16 +581,36 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_mo
             lags = xp.abs(columns[None, :] - rows[:, None])
             excess += xp.bincount(lags.ravel(), weights=squared.ravel(), minlength=widest)[:widest]
             del squared, lags
-        # A block of w columns holds 2 (w - d) ordered pairs at lag d (lag 0 is each column with itself).
-        lag = xp.arange(widest)
-        pairs += xp.maximum(2.0 * (width - lag), 0.0)
-    # Lag 0 is no pair: its terms are the diagonal's own r^2 = 1.
-    excess[0] = 0.0
-    pairs[0] = 0.0
-    tail_excess = _to_host(xp.cumsum(excess[::-1])[::-1])
-    tail_pairs = _to_host(xp.cumsum(pairs[::-1])[::-1])
+        # Lag 0 is no pair: its terms are the diagonal's own r^2 = 1.
+        excess_rows[block] = _to_host(excess)
+        excess_rows[block, 0] = 0.0
+        # A block of w columns holds 2 (w - d) ordered pairs at lag d.
+        pair_rows[block] = np.maximum(2.0 * (width - np.arange(widest)), 0.0)
+        pair_rows[block, 0] = 0.0
+    return excess_rows, pair_rows
+
+
+def extent_from_profile(excess: NDArray[np.float64], pairs: NDArray[np.float64], sample_count: int) -> int:
+    """The LD extent of one lag profile (``ld_lag_profiles``, summed over a region's blocks): the smallest lag w whose
+    tail excess, the summed excess r^2 over the pairs more than w apart, is at most that sum's own null standard
+    deviation sqrt(2 N(w)) / n (N(w) those pairs; r^2 of an unlinked pair has mean 1/n and variance 2/n^2 to leading
+    order). At least 1; the profile's length where no lag qualifies."""
+    tail_excess = np.cumsum(np.asarray(excess, dtype=np.float64)[::-1])[::-1]
+    tail_pairs = np.cumsum(np.asarray(pairs, dtype=np.float64)[::-1])[::-1]
     resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) / sample_count
-    return max(1, int(np.argmax(resolved))) if resolved.any() else widest
+    return max(1, int(np.argmax(resolved))) if resolved.any() else int(np.asarray(excess).shape[0])
+
+
+def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
+    """The lag (in variants, along the block order) beyond which the data show no LD: the whole genome's lag profile
+    (``ld_lag_profiles``) read by ``extent_from_profile``. A looser, per-variant reading of the same test (a
+    variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and failed
+    its cavity information certificate in 1 of 9 blocks, so the extent is the whole tail's. Beyond it the Grams hold
+    nothing a window could use, so blocks need be no wider: the leave-block-out windows (the block and its two
+    neighbours) then reach at least w on each side, and whatever the data do hold beyond is far field, which
+    ``block_trace_certificate`` tests."""
+    excess, pairs = ld_lag_profiles(grams, sample_count, working_bytes, array_module)
+    return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count)
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:

@@ -225,3 +225,27 @@ def test_warm_start_zeroes_negative_sites_and_every_cavity_is_proper() -> None:
     assert np.all(kept_shift[precision < 0.0] == 0.0)
     covariance = np.linalg.inv(likelihood + np.diag(kept_precision))
     assert np.all(1.0 / np.diag(covariance) - kept_precision >= 0.0)
+
+
+def test_ld_lag_profiles_give_each_region_its_own_extent() -> None:
+    """Per-block lag profiles: a region whose LD reaches three variants has an extent of at least three, an
+    independent region's is one, and their rows sum to the whole design's profile (``ld_extent``)."""
+    from sv_pgs.marginal_variances import extent_from_profile, ld_extent, ld_lag_profiles
+
+    generator = np.random.default_rng(17)
+    samples, count = 4000, 150
+    noise = generator.standard_normal((samples, count + 3))
+    linked = sum(noise[:, shift:shift + count] for shift in range(4))
+    independent = generator.standard_normal((samples, count))
+    design = np.column_stack([linked, independent])
+    gram = design.T @ design
+    blocks = (np.arange(count), np.arange(count, 2 * count))
+    grams = BlockGrams(
+        blocks=blocks, within=tuple(gram[np.ix_(block, block)].astype(np.float32) for block in blocks),
+        next_cross=(gram[np.ix_(blocks[0], blocks[1])].astype(np.float32),),
+    )
+    excess, pairs = ld_lag_profiles(grams, samples, 1 << 24)
+    assert excess.shape == pairs.shape == (2, count)
+    assert 3 <= extent_from_profile(excess[0], pairs[0], samples) <= 8
+    assert extent_from_profile(excess[1], pairs[1], samples) <= 2
+    assert ld_extent(grams, samples, 1 << 24) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples)
