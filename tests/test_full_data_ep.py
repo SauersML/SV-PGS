@@ -249,3 +249,21 @@ def test_ld_lag_profiles_give_each_region_its_own_extent() -> None:
     assert 3 <= extent_from_profile(excess[0], pairs[0], samples, count, 1.0 / 64) <= 8
     assert extent_from_profile(excess[1], pairs[1], samples, count, 1.0 / 64) <= 2
     assert ld_extent(grams, samples, 1 << 24, 1.0 / 64) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples, 2 * count, 1.0 / 64)
+
+
+def test_warm_start_gives_a_tied_members_negative_site_a_positive_one() -> None:
+    """A negative site inside a tie group becomes its group's smallest positive site (a zero would leave the group's
+    split improper: ``tied_weights``); an untied negative site is zeroed; a group with no positive site is left for the
+    prior (not finite)."""
+    from sv_pgs.full_data_fit import warm_start_sites
+    from sv_pgs.tie_members import TieGroups, group_sites
+
+    ties = TieGroups(group=np.array([0, 0, 1, 2, 2, 3]), sign=np.ones(6), group_count=4)
+    precision = np.array([[2.0], [-0.5], [-0.3], [-1.0], [-2.0], [1.5]])
+    shift = np.ones((6, 1))
+    kept, kept_shift = warm_start_sites(precision, shift, ties)
+    assert kept[1, 0] == 2.0 and kept_shift[1, 0] == 0.0
+    assert kept[2, 0] == 0.0
+    assert not np.isfinite(kept[3, 0]) and not np.isfinite(kept[4, 0])
+    assert kept[0, 0] == 2.0 and kept[5, 0] == 1.5
+    group_sites(ties, np.where(np.isfinite(kept), kept, 1.0)[[0, 1, 2, 3, 4, 5]], kept_shift)
