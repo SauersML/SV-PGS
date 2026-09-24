@@ -4658,9 +4658,15 @@ def fit_hyperparameters(
             # (thirty seconds of line integrals each) ran for two hours in the 500-gene run. The fit returns
             # uncertified with the remainder as measured.
             histories[model].append(float(remaining))
-            uncertified(model, _OuterTrial(step.hyperparameters, step, remaining, False, predicted=predicted, weights_tolerance=planned), step, state.decrement)
+            uncertified(model, _OuterTrial(step.hyperparameters, step, remaining, False, predicted=predicted, weights_tolerance=planned), step, state.decrement,
+                        "planned twice from one state")
             return None
         histories[model].append(float(remaining))
+        log(
+            f"eb outer: model {model} plan {len(histories[model])}: predicted gain {predicted:.4g}, remaining {remaining:.4g} "
+            f"(state error {state.error:.3g}, step error {step.evidence_error:.3g}, weights {step.stationarity_gain:.3g}), "
+            f"{iterations[model]} accepted steps, {halvings[model]} halvings so far"
+        )
         entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
         released = frozenset(
             int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
@@ -4681,7 +4687,12 @@ def fit_hyperparameters(
         anchors[model] = (hyperparameters[model], points[model], corrections[model], state, predicted)
         return entry
 
-    def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float) -> None:
+    def uncertified(model: int, entry: _OuterTrial, step: HyperStep, newton_decrement: float, reason: str) -> None:
+        tail = ", ".join(f"{value:.4g}" for value in histories[model][-8:])
+        log(
+            f"eb outer: model {model} returns uncertified ({reason}) after {iterations[model]} accepted steps, {halvings[model]} halvings, "
+            f"{unresolved[model]} unresolved; remaining gain {entry.remaining:.4g}, decrement {newton_decrement:.4g}; plans' remaining gains [{tail}]"
+        )
         fits[model] = OuterFit(
             hyperparameters=hyperparameters[model], step=step, newton_decrement=newton_decrement, remaining_gain=entry.remaining,
             prediction_move=np.inf, prediction_tolerance=2.0 * tolerance, iterations=iterations[model], halvings=halvings[model],
@@ -4858,7 +4869,7 @@ def fit_hyperparameters(
                     pending[model] = reopened
                 elif state.polished:
                     # x is at its maximum at rho_k to double precision and the joint step still resolves no gain.
-                    uncertified(model, entry, entry.step, state.decrement)
+                    uncertified(model, entry, entry.step, state.decrement, "polished state's joint trial refused")
                 else:
                     pending[model] = inner(model, entry.step, entry.remaining, True)
                 continue
@@ -4893,7 +4904,7 @@ def fit_hyperparameters(
                     last_step = last_steps[model]
                     if last_step is None:
                         raise NoCertifiedProgress("the Newton-B step reaches the mixing density's boundary before any hyper step certified a value")
-                    uncertified(model, replace(entry, remaining=np.inf), last_step, newton.decrement)
+                    uncertified(model, replace(entry, remaining=np.inf), last_step, newton.decrement, "density collapsed to the family's boundary")
                     continue
                 # The step is an ascent where the trapezoid rule of the two fixed points' gradients along it is
                 # positive (the path integral of E's gradient to first order). A decrement test in the origin's
@@ -4919,7 +4930,7 @@ def fit_hyperparameters(
                         hyperparameters[model], points[model] = trial, trial_point
                         displaced[model] = False
                         iterations[model] += 1
-                        uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement)
+                        uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement, "fixed point unmoved outside every basin")
                         continue
                 if previous_state is not None and trial_state is not None:
                     inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
@@ -4950,13 +4961,14 @@ def fit_hyperparameters(
                 if newton.definite and entry.step is not None:
                     # x is at its maximum to double precision (no trial can lower a decrement at its rounding) and what
                     # stops the certificate is not x: the fit is returned uncertified with its measured remaining gain.
-                    uncertified(model, entry, entry.step, newton.decrement)
+                    uncertified(model, entry, entry.step, newton.decrement, "x at its maximum to double precision")
                     continue
                 if newton.definite and last_steps[model] is not None:
                     # The same, at a state whose own plan had no certified hyper step (a saddle of V's model): the
                     # last evaluated step is the fit's, and the remaining gain is unmeasured. Raising here threw
                     # away a 945 s fit whose x was at its maximum (ENSG00000124596.17 [real], snv_sv).
-                    uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement)
+                    uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement,
+                                "x at its maximum at a saddle of V's model, no certified hyper step")
                     continue
                 raise NoCertifiedProgress(
                     "the Newton-B step makes no certified progress at the EP fixed point "
