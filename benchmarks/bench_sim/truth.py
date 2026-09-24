@@ -256,7 +256,11 @@ def phenotype(params: dict, value: np.ndarray, root: Path) -> np.ndarray:
 
 
 def build(seed: int, root: Path, out: Path) -> dict:
-    params = draw_parameters(seed)
+    return write_scenario(draw_parameters(seed), root, out)
+
+
+def write_scenario(params: dict, root: Path, out: Path) -> dict:
+    """The scenario of ``params`` on the cohort chromosome ``root``: truth.npz and scenario.json under ``out``."""
     value, truth = genetic_value(params, root)
     observed_phenotype = phenotype(params, value, root)
     out.mkdir(parents=True, exist_ok=True)
