@@ -294,3 +294,51 @@ def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gr
     assert abs(samples["remaining_gain"][0] - gram["remaining_gain"][0]) <= 1e-3 * 0.5 / fit_model.DRAW_COUNT
     coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "gram")]
     assert np.linalg.norm(coefficients[1] - coefficients[0]) <= 1e-4 * np.linalg.norm(coefficients[0])
+
+
+def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path: Path) -> None:
+    """``build_band_store``: Stage 0's blocks re-cut by their measured LD extents into parts no wider than it, each
+    part's Gram and each part's Gram with the next written once. The band's product is the dense Gram's restricted to
+    pairs within one part or two neighbouring ones, and every pair closer than its block's extent is among them."""
+    from sv_pgs.gram_space import BandStore, build_band_store
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = np.arange(_TRAINING)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    ld = statistics.ld
+    band_store = build_band_store(ld, statistics.sample_count, tmp_path / "band", 1 << 20)
+    assert isinstance(band_store, BandStore) and int(band_store.widths.sum()) == int(ld.block_boundaries[-1])
+    # The dense Gram Stage 0 holds: within blocks and between adjacent ones.
+    count = int(ld.block_boundaries[-1])
+    dense = np.zeros((count, count))
+    for block in range(ld.block_count):
+        span = slice(int(ld.block_boundaries[block]), int(ld.block_boundaries[block + 1]))
+        dense[span, span] = ld.read_gram(block)
+        if ld.has_adjacent(block):
+            before = slice(int(ld.block_boundaries[block - 1]), int(ld.block_boundaries[block]))
+            dense[before, span] = ld.read_adjacent(block)
+            dense[span, before] = ld.read_adjacent(block).T
+    starts = np.concatenate([[0], np.cumsum(band_store.widths)])
+    part = np.searchsorted(starts, np.arange(count), side="right") - 1
+    reach = np.abs(part[:, None] - part[None, :]) <= 1
+    linked = np.ones(count, dtype=bool)
+    for block in range(band_store.block_count):
+        if block and not band_store.has_adjacent(block):
+            # No Gram across a chromosome's end: those neighbouring parts do not reach each other.
+            left, right = slice(int(starts[block - 1]), int(starts[block])), slice(int(starts[block]), int(starts[block + 1]))
+            reach[left, right] = reach[right, left] = False
+    band = GramBand(statistics, 1 << 20, store=band_store)
+    values = np.random.default_rng(3).standard_normal((count, 2))
+    expected = np.where(reach, dense, 0.0) @ values
+    np.testing.assert_allclose(band.product(values), expected, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(expected))))
+    # Every pair within its block's extent is reached.
+    for entry in band_store.extents:
+        block = entry["block"]
+        first = int(ld.block_boundaries[block])
+        members = np.arange(first, first + entry["width"])
+        lag = np.abs(members[:, None] - members[None, :])
+        assert np.all(reach[np.ix_(members, members)][lag < entry["extent"]])
+    assert band_store.stored_bytes > 0 and linked.all()
