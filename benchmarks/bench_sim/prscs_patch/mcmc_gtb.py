@@ -47,16 +47,46 @@ def block_step_gpu(ld, psi_blk, beta_mrg_blk, noise, sigma, n):
 
 def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom, out_dir, beta_std, write_psi, write_pst, seed):
     print('... MCMC ...')
+    devices = 1
     if GPU:
-        # the blocks stay resident on the device when they fit beside one block's working set (dinvt, its factor and
-        # the product); otherwise each is copied to the device when it is updated
-        free = cp.cuda.Device().mem_info[0]
-        largest = max(blk.nbytes for blk in ld_blk)
-        if sum(blk.nbytes for blk in ld_blk) + 4*largest < free:
-            ld_blk = [cp.asarray(blk) if blk.size else blk for blk in ld_blk]
-            where = 'resident'
+        devices = cp.cuda.runtime.getDeviceCount()
+        if devices > 1:
+            # several GPUs: given psi and sigma the blocks' updates are independent, so each device holds a share of
+            # the blocks (greedy by Cholesky cost, size^3) and updates them while the others update theirs; every
+            # draw is still made on the host in PRS-CS's order and the quadratic forms are summed in block order
+            load = [0.0]*devices; device_of = [0]*len(ld_blk)
+            for kk in sorted(range(len(ld_blk)), key=lambda k: -ld_blk[k].shape[0] if ld_blk[k].size else 0):
+                if ld_blk[kk].size:
+                    device_of[kk] = int(np.argmin(load)); load[device_of[kk]] += float(ld_blk[kk].shape[0])**3
+            placed = []
+            for kk, blk in enumerate(ld_blk):
+                if blk.size:
+                    host = blk.get() if isinstance(blk, cp.ndarray) else blk
+                    with cp.cuda.Device(device_of[kk]):
+                        placed.append(cp.asarray(host))
+                else:
+                    placed.append(blk)
+                ld_blk[kk] = None
+            ld_blk = placed
+            for d in range(devices):
+                with cp.cuda.Device(d):
+                    cp.get_default_memory_pool().free_all_blocks()
+            import concurrent.futures
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=devices)
+            where = 'resident on %d devices (Cholesky cost per device %s)' % (devices, ', '.join('%.2e' % l for l in load))
         else:
-            where = 'streamed per update'
+            # the blocks stay resident on the device when they fit beside one block's working set (dinvt, its factor
+            # and the product); otherwise each is copied to the device when it is updated
+            cp.get_default_memory_pool().free_all_blocks()
+            free = cp.cuda.Device().mem_info[0]
+            largest = max(blk.nbytes for blk in ld_blk)
+            if all(isinstance(blk, cp.ndarray) for blk in ld_blk if blk.size):
+                where = 'resident (prepared on the device)'
+            elif sum(blk.nbytes for blk in ld_blk) + 4*largest < free:
+                ld_blk = [cp.asarray(blk) if blk.size else blk for blk in ld_blk]
+                where = 'resident'
+            else:
+                where = 'streamed per update'
         block_step = block_step_gpu
         print('... block updates on the GPU (%s), LD %s ...' % (cp.cuda.runtime.getDeviceProperties(0)['name'].decode(), where))
     else:
@@ -102,18 +132,48 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         block_started = time.time()
         mm = 0; quad = 0.0
-        for kk in range(n_blk):
-            if blk_size[kk] == 0:
-                continue
-            else:
+        if devices > 1:
+            # the same draws in the same order as the sequential loop, then every device's blocks at once
+            tasks = []
+            for kk in range(n_blk):
+                if blk_size[kk] == 0:
+                    continue
                 idx_blk = range(mm,mm+blk_size[kk])
-                noise = random.randn(len(idx_blk),1)
-                beta[idx_blk], quad_blk = block_step(ld_blk[kk], psi[idx_blk], beta_mrg[idx_blk], noise, sigma, n)
-                quad += quad_blk
+                tasks.append((kk, idx_blk, random.randn(len(idx_blk),1)))
                 mm += blk_size[kk]
 
+            def run_device(d):
+                out = {}
+                with cp.cuda.Device(d):
+                    for kk, idx_blk, noise in tasks:
+                        if device_of[kk] == d:
+                            out[kk] = block_step(ld_blk[kk], psi[idx_blk], beta_mrg[idx_blk], noise, sigma, n)
+                return out
+
+            results = {}
+            for out in pool.map(run_device, range(devices)):
+                results.update(out)
+            for kk, idx_blk, noise in tasks:
+                beta[idx_blk], quad_blk = results[kk]
+                quad += quad_blk
+        else:
+            for kk in range(n_blk):
+                if blk_size[kk] == 0:
+                    continue
+                else:
+                    idx_blk = range(mm,mm+blk_size[kk])
+                    noise = random.randn(len(idx_blk),1)
+                    beta[idx_blk], quad_blk = block_step(ld_blk[kk], psi[idx_blk], beta_mrg[idx_blk], noise, sigma, n)
+                    quad += quad_blk
+                    mm += blk_size[kk]
+
         block_seconds += time.time() - block_started
-        err = max(n/2.0*(1.0-2.0*sum(beta*beta_mrg)+quad), n/2.0*sum(beta**2/psi))
+        if GPU:
+            # numpy's sums over the variants in place of Python's builtin sum over the rows (a Python loop over all
+            # variants); the same sums to rounding
+            err = max(n/2.0*(1.0-2.0*np.sum(beta*beta_mrg, axis=0)+quad), n/2.0*np.sum(beta**2/psi, axis=0))
+        else:
+            err = max(n/2.0*(1.0-2.0*sum(beta*beta_mrg)+quad), n/2.0*sum(beta**2/psi))
         sigma = 1.0/random.gamma((n+p)/2.0, 1.0/err)
 
         delta = random.gamma(a+b, 1.0/(psi+phi))
@@ -127,7 +187,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
 
         if phi_updt == True:
             w = random.gamma(1.0, 1.0/(phi+1.0))
-            phi = random.gamma(p*b+0.5, 1.0/(sum(delta)+w))
+            phi = random.gamma(p*b+0.5, 1.0/((np.sum(delta, axis=0) if GPU else sum(delta))+w))
 
         # posterior
         if (itr>n_burnin) and (itr % thin == 0):
@@ -178,5 +238,7 @@ def mcmc(a, b, phi, sst_dict, n, ld_blk, blk_size, n_iter, n_burnin, thin, chrom
         print('... Estimated global shrinkage parameter: %1.2e ...' % phi_est )
 
     print('... Done ...')
+    # (baselines-genome addition) the posterior means, for validation; PRS-CS's own caller ignores the return value
+    return beta_est, psi_est, sigma_est, phi_est
 
 

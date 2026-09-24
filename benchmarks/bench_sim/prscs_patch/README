@@ -1,11 +1,23 @@
 PRS-CS (github.com/getian107/PRScs, MIT, LICENSE here) files as patched for the bench-sim all-variant arm; they replace
-the same files of the install that prscs_auto.PRSCS points at. Every change but the first is opt-in by environment
-variable, so with none set PRS-CS runs its own code:
-- parse_genet.py: set membership in parse_ldblk (always on; output bit-identical); PRSCS_LD_CACHE saves/loads its output;
-  PRSCS_DEVICE=gpu computes the symmetrization on the GPU by the symmetric eigendecomposition, Q|L|Q' = the SVD's
-  V' diag(s) V (9e-14 relative to scipy's SVD on a 6,922 block; cusolver's gesvd took hours on the largest blocks).
+the same files of the install that prscs_auto.PRSCS points at. PRS-CS's own model, priors, iterations, burn-in,
+thinning and draw order are unchanged; with no environment variable set its code runs as released, apart from the set
+membership in parse_ldblk (output bit-identical).
+
+- parse_genet.py: set membership in parse_ldblk; parse_ldblk split into the hdf5 read and prepare_ldblk (selection, sign
+  flips, symmetrization), callable on blocks in memory (prscs_auto_allvar.py runs PRS-CS's functions in-process
+  that way instead of through an hdf5 file); PRSCS_LD_CACHE saves/loads parse_ldblk's output. PRSCS_DEVICE=gpu:
+  the selection and flips are skipped when they are the identity (bit-identical), and the symmetrization is computed
+  on the GPU by the symmetric eigendecomposition, Q|L|Q' = the SVD's V' diag(s) V (9e-14 relative to scipy's SVD on a
+  6,922 block); the prepared blocks stay on the device when they fit.
 - mcmc_gtb.py: PRSCS_DEVICE=gpu runs each block's Cholesky, triangular solves and quadratic form in float64 on CuPy,
-  every draw still on the host (validate_gpu.py: 5 iterations of two chains from one seed agree to 8e-15 relative);
-  PRSCS_GIG=vector draws psi for all variants at once.
-- gigrnd.py: gigrnd_vec, the same Devroye sampler over arrays (validate_gig.py: KS against the scalar sampler and
-  scipy's exact GIG at 8 parameter sets, 1e5 draws each, all P > 0.1).
+  every draw still on the host in PRS-CS's order; with several visible GPUs the blocks are shared out by Cholesky cost
+  and updated concurrently (independent given psi and sigma), quadratic forms summed in block order. The sums over
+  variants use numpy's in place of Python's builtin sum. PRSCS_GIG=vector draws psi for all variants at once.
+  mcmc returns the posterior means (for validation).
+- gigrnd.py: gigrnd_vec, the same Devroye sampler over arrays.
+
+Validations: validate_gpu.py (one real 6,922-variant block: GPU chain equals CPU chain to 8e-15 over 5 iterations;
+eigh symmetrization 9e-14); validate_multi.sh/.py (CPU, 1-GPU and 2-GPU samplers on 5 synthetic blocks, 5 iterations:
+2e-15); validate_gig.py (KS of gigrnd_vec against gigrnd and scipy's GIG, 8 parameter sets, 1e5 draws, all P > 0.1).
+bench_step.py times the block step's operations (H100: dpotrf ~22 TF fp64, 233 ms at 25k). run_gpu.sh is the MSI
+launcher (16-stream prefetch of the cohort genotypes into page cache, the harness under the GPU venv).

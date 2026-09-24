@@ -166,7 +166,10 @@ def parse_ldblk(ldblk_dir, sst_dict, chrom):
         blk_size = [int(size) for size in np.load(os.path.join(cache, 'blk_size.npy'))]
         ld_blk = [np.load(os.path.join(cache, 'blk_%d.npy' % blk)) for blk in range(len(blk_size))]
         return ld_blk, blk_size
+    import time
+    started = time.time()
     ld_blk, blk_size = _parse_ldblk(ldblk_dir, sst_dict, chrom)
+    print('... reference LD parsed in %.1f s ...' % (time.time() - started), flush=True)
     if cache:
         os.makedirs(cache, exist_ok=True)
         for blk, matrix in enumerate(ld_blk):
@@ -192,27 +195,50 @@ def _parse_ldblk(ldblk_dir, sst_dict, chrom):
     for blk in range(1,n_blk+1):
         snp_blk.append([bb.decode("UTF-8") for bb in list(hdf_chr['blk_'+str(blk)]['snplist'])])
 
+    return prepare_ldblk(ld_blk, snp_blk, sst_dict)
+
+
+def prepare_ldblk(ld_blk, snp_blk, sst_dict):
+    """parse_ldblk's work after reading the reference (baselines-genome split): keep each block's summary-statistic
+    SNPs, flip their signs, and symmetrize; callable on blocks held in memory. Overwrites ld_blk's entries."""
+    n_blk = len(ld_blk)
     blk_size = []
     mm = 0
     sst_snp_set = set(sst_dict['SNP'])  # set membership: the same idx as the list test, O(1) per SNP
+    gpu = os.environ.get('PRSCS_DEVICE') == 'gpu'
+    if gpu:
+        import cupy as cp
+        # the prepared blocks stay on the device when all of them fit beside one block's eigendecomposition
+        largest = max(blk.nbytes for blk in ld_blk)
+        resident = sum(blk.nbytes for blk in ld_blk) + 4*largest < cp.cuda.Device().mem_info[1]
     for blk in range(n_blk):
         idx = [ii for (ii, snp) in enumerate(snp_blk[blk]) if snp in sst_snp_set]
         blk_size.append(len(idx))
         if idx != []:
             idx_blk = range(mm,mm+len(idx))
             flip = [sst_dict['FLP'][jj] for jj in idx_blk]
-            ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]*np.outer(flip,flip)
-
-            if os.environ.get('PRSCS_DEVICE') == 'gpu':
+            if gpu:
+                # the same selection and sign flips, skipped when they are the identity (every SNP kept, no flip):
+                # x[ix_(all, all)]*1 is x bit for bit
+                if len(idx) != ld_blk[blk].shape[0]:
+                    ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]
+                flip = np.asarray(flip, dtype=np.float64)
+                block = cp.asarray(ld_blk[blk])
+                ld_blk[blk] = None
+                if np.any(flip != 1):
+                    device_flip = cp.asarray(flip)
+                    block = block*cp.outer(device_flip, device_flip)
                 # the same symmetrization in float64 on the GPU (baselines-genome addition), by the symmetric
                 # eigendecomposition: for symmetric A = Q L Q', the SVD's V' diag(s) V is Q |L| Q' (cusolver's
                 # gesvd is far slower than its syevd at these sizes)
-                import cupy as cp
-                block = cp.asarray(ld_blk[blk])
                 w, q = cp.linalg.eigh(block)
-                ld_blk[blk] = cp.asnumpy((block+cp.dot(q*cp.abs(w)[None, :], q.T))/2)
-                del block, w, q
+                block = (block+cp.dot(q*cp.abs(w)[None, :], q.T))/2
+                del w, q
+                ld_blk[blk] = block if resident else cp.asnumpy(block)
+                del block
+                cp.get_default_memory_pool().free_all_blocks()
             else:
+                ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]*np.outer(flip,flip)
                 _, s, v = linalg.svd(ld_blk[blk])
                 h = np.dot(v.T, np.dot(np.diag(s), v))
                 ld_blk[blk] = (ld_blk[blk]+h)/2
