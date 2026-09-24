@@ -118,7 +118,6 @@ def fit(root: Path, work: Path, seed: int) -> dict:
             peaks["pool_bytes"] = max(peaks["pool_bytes"], int(pool.total_bytes()))
             time.sleep(0.25)
 
-    threading.Thread(target=sample, daemon=True).start()
     timings: dict[str, float] = {}
     stage0 = stage2_wiring.compute_genotype_statistics
 
@@ -144,6 +143,9 @@ def fit(root: Path, work: Path, seed: int) -> dict:
     samples = phenotype.shape[0]
     covariates = np.column_stack([np.ones(samples), trait["covariates"]])
     budget = task_budget()
+    # The sampler starts once the device's context and libraries exist: a thread polling CuPy's pool while the main
+    # thread created them failed the first allocation (cudaErrorInvalidValue in memsetAsync, twice on A100 nodes).
+    threading.Thread(target=sample, daemon=True).start()
     work.mkdir(parents=True, exist_ok=True)
     started = time.time()
     with DosageStore.open(root / "store") as store, device_scope(_array_module(budget)):
