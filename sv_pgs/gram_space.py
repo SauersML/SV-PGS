@@ -470,7 +470,7 @@ class GramBand:
     def _device_sweep(self, cupy, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped) -> SweepResult:
         import cupyx
 
-        from sv_pgs.device_sweep import PANEL, PIECE_COLUMNS, PROJECT_THREADS, _kernel
+        from sv_pgs.device_sweep import PANEL, PIECE_COLUMNS, _kernel, step_threads
 
         kernel = _kernel(cupy)
         log_density_device = cupy.asarray(np.ascontiguousarray(log_density))
@@ -502,7 +502,7 @@ class GramBand:
                 projection = cupy.ascontiguousarray(field[rows] * panel_signs)
                 step = cupy.empty(last - first, dtype=cupy.float64)
                 kernel(
-                    (1,), (PROJECT_THREADS,),
+                    (1,), (step_threads(kernel),),
                     (
                         panel_gram, projection, cupy.ascontiguousarray(member_squares[first:last]), classes[first:last], log_density_device,
                         np.int32(node_count), node_variance[first:last], log_node_variance[first:last], np.float64(float(noise) / float(self.temper[block])),
