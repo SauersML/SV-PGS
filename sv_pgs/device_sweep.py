@@ -38,9 +38,36 @@ extern "C" __global__ void panel_sweep(
     const long long* __restrict__ class_index, const double* __restrict__ log_density, const int node_count,
     const double* __restrict__ node_variance, const double* __restrict__ log_node_variance, const double noise,
     const int width, double* __restrict__ mean, double* __restrict__ variance, double* __restrict__ shift,
-    double* __restrict__ third, double* __restrict__ fourth, double* __restrict__ step_out, double* __restrict__ pieces)
+    double* __restrict__ third, double* __restrict__ fourth, double* __restrict__ step_out, double* __restrict__ pieces,
+    double* __restrict__ conditional_scratch, double* __restrict__ base_scratch, double* __restrict__ weight_scratch)
 {
-    const int lane = threadIdx.x;
+    // Phase 0, every thread of the block: each (member, node)'s h-free terms, the conditional variance
+    // c = 1 / (1 / v + omega) and the log weight's base log pi - log(1 + v omega) / 2 (or its overflow limit), which do
+    // not depend on the member's cavity shift h. The log weight is then base + h^2 c / 2, the same expression, in the same
+    // order, as when it was formed whole per pass.
+    const int thread = threadIdx.x;
+    for (int index = thread; index < width * node_count; index += blockDim.x) {
+        const int member = index / node_count;
+        const int node = index - member * node_count;
+        const double omega = squares[member] / noise;
+        const double variance_node = node_variance[member * (long long)node_count + node];
+        const double ratio = variance_node * omega;
+        const double density = log_density[class_index[member] * (long long)node_count + node];
+        double conditional, base;
+        if (isinf(ratio)) {
+            conditional = 1.0 / omega;
+            base = density - 0.5 * (log_node_variance[member * (long long)node_count + node] + log(omega));
+        } else {
+            conditional = variance_node > 0.0 ? 1.0 / (1.0 / variance_node + omega) : 0.0;
+            base = density - 0.5 * log1p(ratio);
+        }
+        conditional_scratch[index] = conditional;
+        base_scratch[index] = base;
+    }
+    __syncthreads();
+    if (thread >= 32) return;
+    // Phase 1, one warp, one lane per panel member for the Gram update and the node sums by shuffles, the members in order.
+    const int lane = thread;
     const unsigned full = 0xffffffffu;
     double c = lane < width ? projection[lane] : 0.0;
     for (int member = 0; member < width; ++member) {
@@ -48,41 +75,24 @@ extern "C" __global__ void panel_sweep(
         const double omega = square / noise;
         const double old_mean = mean[member];
         const double h = (__shfl_sync(full, c, member) + square * old_mean) / noise;
-        const double* density = log_density + class_index[member] * (long long)node_count;
-        const double* variance_row = node_variance + member * (long long)node_count;
-        const double* log_variance_row = log_node_variance + member * (long long)node_count;
+        const double* conditional_row = conditional_scratch + member * (long long)node_count;
+        const double* base_row = base_scratch + member * (long long)node_count;
+        double* weight_row = weight_scratch + member * (long long)node_count;
         // pass 1: the peak of the log weights
         double peak = __longlong_as_double(0xfff0000000000000ULL);  // -inf: NVRTC has no INFINITY
         for (int node = lane; node < node_count; node += 32) {
-            const double variance_node = variance_row[node];
-            const double ratio = variance_node * omega;
-            double log_weight;
-            if (isinf(ratio)) {
-                const double conditional = 1.0 / omega;
-                log_weight = density[node] - 0.5 * (log_variance_row[node] + log(omega)) + 0.5 * h * h * conditional;
-            } else {
-                const double conditional = variance_node > 0.0 ? 1.0 / (1.0 / variance_node + omega) : 0.0;
-                log_weight = density[node] - 0.5 * log1p(ratio) + 0.5 * h * h * conditional;
-            }
+            const double log_weight = base_row[node] + 0.5 * h * h * conditional_row[node];
+            weight_row[node] = log_weight;
             peak = fmax(peak, log_weight);
         }
         for (int offset = 16; offset > 0; offset >>= 1) peak = fmax(peak, __shfl_xor_sync(full, peak, offset));
         // pass 2: the normalizer and the mean
         double total = 0.0, first = 0.0;
         for (int node = lane; node < node_count; node += 32) {
-            const double variance_node = variance_row[node];
-            const double ratio = variance_node * omega;
-            double conditional, log_weight;
-            if (isinf(ratio)) {
-                conditional = 1.0 / omega;
-                log_weight = density[node] - 0.5 * (log_variance_row[node] + log(omega)) + 0.5 * h * h * conditional;
-            } else {
-                conditional = variance_node > 0.0 ? 1.0 / (1.0 / variance_node + omega) : 0.0;
-                log_weight = density[node] - 0.5 * log1p(ratio) + 0.5 * h * h * conditional;
-            }
-            const double weight = exp(log_weight - peak);
+            const double weight = exp(weight_row[node] - peak);
+            weight_row[node] = weight;
             total += weight;
-            first += weight * h * conditional;
+            first += weight * h * conditional_row[node];
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
             total += __shfl_xor_sync(full, total, offset);
@@ -92,17 +102,8 @@ extern "C" __global__ void panel_sweep(
         // pass 3: the central moments about the new mean
         double second = 0.0, third_sum = 0.0, fourth_sum = 0.0;
         for (int node = lane; node < node_count; node += 32) {
-            const double variance_node = variance_row[node];
-            const double ratio = variance_node * omega;
-            double conditional, log_weight;
-            if (isinf(ratio)) {
-                conditional = 1.0 / omega;
-                log_weight = density[node] - 0.5 * (log_variance_row[node] + log(omega)) + 0.5 * h * h * conditional;
-            } else {
-                conditional = variance_node > 0.0 ? 1.0 / (1.0 / variance_node + omega) : 0.0;
-                log_weight = density[node] - 0.5 * log1p(ratio) + 0.5 * h * h * conditional;
-            }
-            const double weight = exp(log_weight - peak) / total;
+            const double conditional = conditional_row[node];
+            const double weight = weight_row[node] / total;
             const double offset_value = h * conditional - new_mean;
             const double offset_square = offset_value * offset_value;
             second += weight * (conditional + offset_square);
@@ -344,6 +345,11 @@ def sweep_piece(
     build a Gram the cache does not hold."""
     kernel = _kernel(cupy)
     node_count = int(node_variance.shape[1])
+    # The step kernel's per-(member, node) terms that do not depend on the cavity shift, formed by the whole block
+    # before its one warp's sequential member loop (``panel_sweep``), and the loop's weights: one panel's worth each.
+    conditional_scratch = cupy.empty(PANEL * node_count, dtype=cupy.float64)
+    base_scratch = cupy.empty(PANEL * node_count, dtype=cupy.float64)
+    weight_scratch = cupy.empty(PANEL * node_count, dtype=cupy.float64)
     for first in range(0, width, PANEL):
         last = min(first + PANEL, width)
         columns = decode(first, last) if panels is None else None
@@ -359,12 +365,12 @@ def sweep_piece(
         projection = cupy.ascontiguousarray(columns.T @ (mask * residual)) if panels is None else panels.project(first, last, mask, residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(
-            (1,), (PANEL,),
+            (1,), (PROJECT_THREADS,),
             (
                 gram, projection, squares[first:last], class_index[first:last], log_density, np.int32(node_count),
                 node_variance[first:last], log_node_variance[first:last], np.float64(noise), np.int32(last - first),
                 mean[first:last], variance[first:last], shift[first:last], third[first:last], fourth[first:last], step,
-                pieces[first:last],
+                pieces[first:last], conditional_scratch, base_scratch, weight_scratch,
             ),
         )
         if panels is None:
