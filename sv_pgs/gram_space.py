@@ -210,7 +210,7 @@ class GramBand:
         band.residual_dimension = float(residual_dimension)
         band.working_bytes = int(working_bytes)
         band.scores = np.asarray(scores, dtype=np.float64)
-        band.squares = np.concatenate([np.diagonal(np.asarray(values)).astype(np.float64) for values in within])
+        band.squares = np.concatenate([np.asarray(_host(values.diagonal()), dtype=np.float64) for values in within])
         band.target_square = float(target_square)
         band.covariate_cross = np.zeros((band.group_count, 0)) if covariate_cross is None else np.asarray(covariate_cross, dtype=np.float64)
         band.covariate_target = np.zeros(0) if covariate_target is None else np.asarray(covariate_target, dtype=np.float64)
