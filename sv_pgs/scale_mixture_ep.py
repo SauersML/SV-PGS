@@ -4254,6 +4254,28 @@ def _proposal(newton: _NewtonB, radius: float) -> F64Array:
     return _trust_region_step(newton.total, newton.gradient, radius, spectrum=(newton.eigenvalues, newton.eigenvectors))
 
 
+def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: float, realized: float, resolution: float) -> float:
+    """The trust radius after an accepted inner step of ``length`` inside ``radius``, from the model's measured
+    agreement along it (the trust-region update; Nocedal and Wright, Numerical Optimization, 2nd ed., Section 4.1, its
+    thresholds replaced by the measured error). A step that stopped short of the radius (Newton's, fitting) keeps it.
+    One that reached it: the model predicted m = g's - s'(B + S)s / 2 and the gain realized was G, so the model's
+    relative error there is e = |1 - G / m|, known no better than the realized gain's own resolution (e >= resolution
+    / m). The model is the quadratic Taylor model, whose remainder is cubic in the length, so its relative error grows
+    linearly with the length, e L' / L at L'; the realized gain m(L') (1 - e L' / L), with m(L') growing linearly in
+    L' on the boundary of the trust region, is largest at L' = L / (2 e). So the radius goes to L / (2 e) where that is
+    past doubling (the polish on bench-sim chr22 [sim] spent four fixed points doubling from the Cauchy radius 4 to 32
+    before Newton's step fitted), and doubles otherwise, as an accepted step always did: shrinking the radius after an
+    accepted step left three certificate tests uncertified. Without a measured gain (a state with no certified value
+    at either end) the radius doubles."""
+    if length < radius * (1.0 - _HALF_PRECISION):
+        return radius
+    predicted = float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
+    if not (np.isfinite(realized) and np.isfinite(resolution) and predicted > 0.0):
+        return 2.0 * radius
+    error = max(abs(1.0 - realized / predicted), resolution / predicted)
+    return max(2.0 * radius, radius / (2.0 * error)) if error > 0.0 else 2.0 * radius
+
+
 def _cauchy_radius(newton: _NewtonB) -> float:
     """The first trust radius: the Cauchy step's length on |B + S|, ||g||^3 / g'|B + S| g, the model's steepest-ascent
     maximizer. Newton's step on |B + S| divides each direction's gradient by its own curvature, which the rounding
@@ -4935,10 +4957,10 @@ def fit_hyperparameters(
                         uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement, "fixed point unmoved outside every basin")
                         continue
                 if previous_state is not None and trial_state is not None:
-                    inner_gain, _inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+                    inner_gain, inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                     inner_gains[model].append(float(inner_gain))
                 else:
-                    inner_gain = np.nan
+                    inner_gain, inner_resolution = np.nan, np.nan
                     inner_gains[model] = []
                 log(
                     f"eb outer: model {model} inner step accepted: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g} "
@@ -4948,8 +4970,7 @@ def fit_hyperparameters(
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
-                # A step that reached the radius widens it; one that stopped short (Newton's, fitting) keeps it.
-                radii[model] = 2.0 * entry.radius if length >= entry.radius * (1.0 - _HALF_PRECISION) else entry.radius
+                radii[model] = _next_radius(newton, proposal, entry.radius, length, float(inner_gain), float(inner_resolution))
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue

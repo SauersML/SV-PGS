@@ -1497,3 +1497,21 @@ def test_the_fused_variant_derivatives_are_the_dense_components_moments():
         np.testing.assert_allclose(getattr(got, name), values, rtol=1e-10, atol=1e-10 * scale, err_msg=name)
     np.testing.assert_allclose(got.mean_by_density, by_mean, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(by_mean))))
     np.testing.assert_allclose(got.second_by_density, by_second, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(by_second))))
+
+
+def test_the_trust_radius_follows_the_models_measured_agreement():
+    """``_next_radius``: a step that reached the radius goes to L / (2 e), e the model's relative error along it (at
+    least the realized gain's resolution over the prediction), where that is past doubling, and doubles otherwise; a
+    step short of the radius keeps it; an unmeasured gain doubles it."""
+    from types import SimpleNamespace
+
+    from sv_pgs.scale_mixture_ep import _next_radius
+
+    newton = SimpleNamespace(gradient=np.array([2.0, 0.0]), total=np.diag([1.0, 1.0]))
+    proposal = np.array([1.0, 0.0])
+    predicted = 2.0 - 0.5
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted * 0.99, 1e-6) == pytest.approx(1.0 / (2.0 * 0.01))
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted * 0.2, 1e-6) == 2.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted, 0.03) == pytest.approx(1.0 / (2.0 * 0.03 / predicted))
+    assert _next_radius(newton, proposal, 4.0, 1.0, predicted, 1e-6) == 4.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, np.nan, np.nan) == 2.0
