@@ -190,3 +190,22 @@ def test_a_streamed_fit_and_its_scoring_stay_under_an_address_space_cap_of_their
 def test_a_budget_the_fit_cannot_run_in_ends_in_memory_error_not_a_kill(tmp_path: Path):
     """Under a cap of a few megabytes the fit refuses (the planners' or the allocator's MemoryError), never dies."""
     assert "memory-error" in _capped_fit(tmp_path, 1 << 22)
+
+
+def test_a_bounded_pools_allocations_under_its_bound_never_read_its_meter():
+    """A metered pool with an O(1) bound (a device's reserved bytes): allocations that fit under the bound record the
+    bound's peak and never read the meter (the meter walks CuPy's free lists: read on every allocation, it was 74% of a
+    genome fit's sweeps); one that does not fit under the bound reads it."""
+    reads = {"meter": 0}
+    state = {"used": 10, "reserved": 60}
+
+    def meter() -> int:
+        reads["meter"] += 1
+        return state["used"]
+
+    broker = MemoryBroker({"device0": 100}, meters={"device0": meter}, bounds={"device0": lambda: state["reserved"]})
+    for _ in range(50):
+        broker.make_room("device0", 30, "an allocation under the bound")
+    assert reads["meter"] == 0 and broker.peak("device0") == 60 >= state["used"]
+    broker.make_room("device0", 60, "past the bound: the meter decides")
+    assert reads["meter"] > 0

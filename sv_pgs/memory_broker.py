@@ -176,6 +176,8 @@ class MemoryBroker:
             )
 
     def peak(self, pool: str) -> int:
+        """The pool's largest held bytes seen at a lease or allocation; for a pool with a bound (a device's), the
+        bound's largest, an upper bound on that."""
         with self._lock:
             return self.peaks[pool]
 
@@ -208,8 +210,13 @@ class MemoryBroker:
     def _note_peaks(self, charged: tuple[str, ...]) -> None:
         for pool in charged:
             bound = self.bounds.get(pool)
-            if bound is not None and int(bound()) <= self.peaks[pool]:
-                continue  # held <= bound <= the recorded peak
+            if bound is not None:
+                # A pool with an O(1) bound records the bound's peak, an upper bound on its held bytes' peak. Reading
+                # the meter whenever the bound was above the recorded peak (the pool's reserved bytes usually are
+                # above its used bytes' peak, so nearly always) was 74% of a genome fit's mean-field sweeps
+                # (bench-sim chr22 004 [sim], py-spy: used <- held <- _note_peaks on every device allocation).
+                self.peaks[pool] = max(self.peaks[pool], int(bound()))
+                continue
             self.peaks[pool] = max(self.peaks[pool], self.held(pool))
 
     def _make_room(self, charged: tuple[str, ...], nbytes: int, purpose: str, ignoring: Lease | None = None) -> None:
