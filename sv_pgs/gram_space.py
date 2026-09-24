@@ -662,7 +662,9 @@ class BandStore:
         return self._read(self.directory / _BAND_FILES["cross"], int(self.cross_offsets[block]), shape, np.dtype(np.float32), out)
 
 
-def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes: int, level: float, array_module: Any = np) -> BandStore:
+def build_band_store(
+    ld: Any, sample_count: int, directory: Path, working_bytes: int, level: float, array_module: Any = np, null_scale: float = 1.0,
+) -> BandStore:
     """Stage 0's Grams (``ld``, an ``LdGramStore``) as the summary band: each Stage 0 block's LD extent measured on its
     own Gram (``marginal_variances.ld_extent``, the whole tail's test within the block: the lag beyond which its pairs'
     excess r^2 is within its null resolution), the block cut into near-equal consecutive parts no wider than it, and
@@ -670,7 +672,9 @@ def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes:
     Gram; none across a chromosome's end). Every pair closer than its block's extent is then within one part or two
     neighbouring ones, so the band holds the LD the data show and 2 p w float32 entries in place of Stage 0's sum of
     squared block widths. An extent is never capped: a region whose LD reaches far (admixture's local-ancestry tracts,
-    an inversion) keeps its wide parts, and each block's extent is logged. One read of Stage 0's Grams."""
+    an inversion) keeps its wide parts, and each block's extent is logged. ``null_scale`` is kappa, the unlinked pairs'
+    measured mean r^2 n (``far_field_scale``): each extent is read against kappa / n (``extent_from_profile``), without
+    which a pooled cross-ancestry cohort's extents ran to every block's edge. One read of Stage 0's Grams."""
     from sv_pgs.marginal_variances import BlockGrams, ld_extent
 
     directory = Path(directory)
@@ -698,7 +702,7 @@ def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes:
                 continue
             within = read_block(ld, "within", block)
             single = BlockGrams(blocks=(np.arange(width, dtype=np.int64),), within=(within,), next_cross=())
-            extent = int(ld_extent(single, int(sample_count), int(working_bytes), level, array_module)) if width > 1 else 1
+            extent = int(ld_extent(single, int(sample_count), int(working_bytes), level, array_module, null_scale)) if width > 1 else 1
             parts = max(1, -(-width // extent))
             cuts = np.linspace(0, width, parts + 1).round().astype(np.int64)
             spans = [slice(int(cuts[part]), int(cuts[part + 1])) for part in range(parts)]
@@ -722,7 +726,8 @@ def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes:
     (directory / _BAND_INDEX).write_text(json.dumps(index), encoding="utf-8")
     values = np.array([entry["extent"] for entry in extents])
     log(
-        f"summary band: {len(extents)} Stage 0 blocks re-cut into {len(widths)} parts by their LD extents (median {np.median(values):.0f}, "
+        f"summary band: {len(extents)} Stage 0 blocks re-cut into {len(widths)} parts by their LD extents against kappa {float(null_scale):.4g} / n "
+        f"(median {np.median(values):.0f}, "
         f"90% {np.quantile(values, 0.9):.0f}, max {values.max()} variants; blocks at their full width: "
         f"{sum(entry['extent'] >= entry['width'] for entry in extents)}), {stored / 1e9:.2f} GB against Stage 0's {ld.stored_bytes / 1e9:.2f} GB, "
         f"in {time.perf_counter() - started:.0f} s"
@@ -733,19 +738,23 @@ def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes:
 
 
 def far_field_scale(
-    store: Any, training_columns: I64Array, covariates: F64Array, statistics: Any, band: GramBand, draw_count: int, seed: int,
+    store: Any, training_columns: I64Array, covariates: F64Array, statistics: Any, starts: I64Array, linked: np.ndarray, draw_count: int, seed: int,
 ) -> tuple[float, float, int]:
     """kappa, the mean r^2 n' of the pairs beyond the band (chance alone: 1), with its standard error and the pairs it
     is taken over, measured on the store: m reduced columns drawn at random, read on the training samples, standardized
-    and projected on the covariates as Stage 0 projects its Grams, and their pairwise r^2 over the pairs the band does
-    not reach (other parts than a column's own and its linked neighbours'). On bench-sim chr22 [sim] the pooled
+    and projected on the covariates as Stage 0 projects its Grams, and their pairwise r^2 over the pairs no block reaches
+    (``starts`` the blocks' first columns and ``linked[b]`` whether blocks b and b + 1 are neighbours: pairs in other
+    blocks than a column's own and its linked neighbours'). Stage 0's blocks serve before the band is cut: the extent
+    test reads its excess against this kappa (``build_band_store``). On bench-sim chr22 [sim] the pooled
     cohort's pairs beyond 20 Mb sit at 1.30 / n' (0.30 / n' above chance at 150 standard errors: between-group structure
     the PCs leave), so chance alone would under-state the far field. m is the least count whose chance standard error,
     2 / m for m (m - 1) / 2 pairs of chi-square(1) r^2 n', is within the fit's resolution 1 / (2K) of the scale: 4K
     columns, one read of each, never a pass over the store."""
     generator = np.random.default_rng(seed)
-    count = min(band.group_count, 4 * int(draw_count))
-    chosen = np.sort(generator.choice(band.group_count, size=count, replace=False))
+    starts = np.asarray(starts, dtype=np.int64)
+    group_count = int(starts[-1])
+    count = min(group_count, 4 * int(draw_count))
+    chosen = np.sort(generator.choice(group_count, size=count, replace=False))
     ties = statistics.tie_map
     kept = np.asarray(ties.kept_indices, dtype=np.int64)
     rows = np.asarray(statistics.active_rows, dtype=np.int64)[kept[chosen]]
@@ -761,12 +770,12 @@ def far_field_scale(
     values = values[:, norms > 0.0] / norms[norms > 0.0]
     chosen = chosen[norms > 0.0]
     residual = float(columns.shape[0] - basis.shape[1])
-    part = np.searchsorted(band.starts, chosen, side="right") - 1
+    part = np.searchsorted(starts, chosen, side="right") - 1
     near = np.abs(part[:, None] - part[None, :]) <= 1
     step = part[:, None] - part[None, :]
     # Neighbouring parts reach each other only where a Gram links them (none across a chromosome's end).
     lower = np.minimum(part[:, None], part[None, :])
-    links = np.concatenate([band.linked, [False]])
+    links = np.concatenate([np.asarray(linked, dtype=bool), [False]])
     near &= (step == 0) | links[np.clip(lower, 0, links.shape[0] - 1)]
     upper = np.triu(~near, 1)
     squares = (values.T @ values)[upper] ** 2 * residual

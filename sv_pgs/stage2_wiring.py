@@ -420,8 +420,18 @@ def _fit_one(
     band = None
     if not binary:
         started = time.perf_counter()
-        band_store = build_band_store(statistics.ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module)
+        # kappa first, on Stage 0's blocks (pairs beyond a block's neighbours): the extent test reads each block's LD
+        # against kappa / n, and the band's far field is scaled by it.
+        ld = statistics.ld
+        stage0_starts = np.asarray(ld.block_boundaries, dtype=np.int64)
+        stage0_linked = np.array([ld.has_adjacent(block + 1) for block in range(ld.block_count - 1)], dtype=bool)
+        kappa, kappa_error, pairs = far_field_scale(
+            store, training_columns, covariates, statistics, stage0_starts, stage0_linked, draw_count, _seed(seed, _FAR_FIELD_KEY),
+        )
+        log(f"stage2 wiring: far field: mean r^2 n' = {kappa:.4g} +- {kappa_error:.2g} over {pairs:,} pairs beyond Stage 0's neighbouring blocks (chance alone: 1)")
+        band_store = build_band_store(ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module, kappa)
         band = GramBand(statistics, share, store=band_store)
+        band.far_scale, band.far_scale_error = kappa, kappa_error
         sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
         log(
             f"stage2 wiring: a pass costs {sample_seconds:.3g} s over the samples and {gram_seconds:.3g} s over the summary band "
@@ -432,9 +442,6 @@ def _fit_one(
             band.release()
             band = None
     if band is not None:
-        kappa, kappa_error, pairs = far_field_scale(store, training_columns, covariates, statistics, band, draw_count, _seed(seed, _FAR_FIELD_KEY))
-        band.far_scale, band.far_scale_error = kappa, kappa_error
-        log(f"stage2 wiring: far field beyond the band: mean r^2 n' = {kappa:.4g} +- {kappa_error:.2g} over {pairs:,} pairs (chance alone: 1)")
         gaussian = GramGaussian(band, training=mask, targets=store_targets, covariates=store_covariates, array_module=source.array_module, probe_count=draw_count)
     else:
         gaussian = DualGaussian(

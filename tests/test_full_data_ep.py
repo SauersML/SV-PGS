@@ -251,6 +251,30 @@ def test_ld_lag_profiles_give_each_region_its_own_extent() -> None:
     assert ld_extent(grams, samples, 1 << 24, 1.0 / 64) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples, 2 * count, 1.0 / 64)
 
 
+def test_a_regions_extent_read_against_its_far_pairs_measured_null_is_its_true_short_one() -> None:
+    """A pooled cohort of two groups whose genotype variances differ alike at every variant (1.5 and 0.5 of the pooled
+    one: variance heterogeneity, no correlation) puts every unlinked pair's r^2 at kappa / n, kappa = E[v_x v_y] =
+    (1.5^2 + 0.5^2) / 2 = 1.25, at every lag. Against chance's 1/n that excess over thousands of far pairs reads as LD
+    and the extent runs far out; read against the far pairs' measured kappa / n (``null_scale``) the region's extent is
+    its true one, its LD reaching three variants."""
+    from sv_pgs.marginal_variances import extent_from_profile, ld_lag_profiles
+
+    generator = np.random.default_rng(23)
+    samples, count = 8000, 300
+    scale = np.where(np.arange(samples) < samples // 2, np.sqrt(1.5), np.sqrt(0.5))
+    noise = generator.standard_normal((samples, count + 3)) * scale[:, None]
+    design = sum(noise[:, shift:shift + count] for shift in range(4))
+    design -= design.mean(axis=0)
+    gram = design.T @ design
+    grams = BlockGrams(blocks=(np.arange(count),), within=(gram.astype(np.float32),), next_cross=())
+    excess, pairs = ld_lag_profiles(grams, samples, 1 << 24)
+    far = np.arange(excess.shape[1]) > 20
+    kappa = 1.0 + float(excess[0, far].sum() / pairs[0, far].sum()) * samples
+    assert 1.15 < kappa < 1.35
+    assert extent_from_profile(excess[0], pairs[0], samples, count, 1.0 / 64) > 20
+    assert 3 <= extent_from_profile(excess[0], pairs[0], samples, count, 1.0 / 64, null_scale=kappa) <= 8
+
+
 def test_warm_start_gives_a_tied_members_negative_site_a_positive_one() -> None:
     """A negative site inside a tie group becomes its group's smallest positive site (a zero would leave the group's
     split improper: ``tied_weights``); an untied negative site is zeroed; a group with no positive site is left for the

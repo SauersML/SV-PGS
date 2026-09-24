@@ -591,7 +591,7 @@ def ld_lag_profiles(
 
 
 def extent_from_profile(
-    excess: NDArray[np.float64], pairs: NDArray[np.float64], sample_count: int, variants: int, level: float,
+    excess: NDArray[np.float64], pairs: NDArray[np.float64], sample_count: int, variants: int, level: float, null_scale: float = 1.0,
 ) -> int:
     """The LD extent of one lag profile (``ld_lag_profiles``, summed over a region's ``variants`` variants): the smallest
     lag w whose tail excess, the summed excess r^2 over the pairs more than w apart, is not significantly positive:
@@ -602,18 +602,26 @@ def extent_from_profile(
     2 rho_ik^2 rho_jl^2 / n^2 to leading order, so the sum over N(w) pairs has variance 2 N(w) l^2 / n^2 with l the
     region's mean LD score (1 + its summed excess over its variants): the near LD each variant carries makes neighbouring
     far pairs' r^2 move together (independent columns, l = 1, give 2 N / n^2). At least 1; the profile's length where
-    no lag qualifies."""
-    excess = np.asarray(excess, dtype=np.float64)
+    no lag qualifies.
+
+    ``null_scale`` kappa is the unlinked pairs' own mean r^2 n (1: chance alone). A cohort pooled over ancestry groups
+    has kappa above 1 at every distance, the groups' genotype variances differing and co-varying across variants
+    (bench-sim chr22 [sim]: 1.36, flat beyond 5 Mb, unmoved by global-ancestry covariates; 1.02-1.07 within each
+    group). Against 1/n, N pairs at kappa/n exceed any z sqrt(2N)/n once N is a few hundred, and the extent ran to
+    every block's edge (97-99% of each block's width). So a far pair's null is kappa/n: its mean r^2 and its standard
+    deviation (a scaled chi-square(1)) are kappa times chance's, and the excess is read against it."""
+    kappa = float(null_scale)
+    excess = np.asarray(excess, dtype=np.float64) - (kappa - 1.0) * np.asarray(pairs, dtype=np.float64) / sample_count
     tail_excess = np.cumsum(excess[::-1])[::-1]
     tail_pairs = np.cumsum(np.asarray(pairs, dtype=np.float64)[::-1])[::-1]
     score = 1.0 + max(float(excess.sum()), 0.0) / max(int(variants), 1)
     lags = max(int(np.count_nonzero(tail_pairs > 0.0)), 1)
     quantile = float(norm.isf(float(level) / lags))
-    resolved = tail_excess <= quantile * np.sqrt(2.0 * tail_pairs) * score / sample_count
+    resolved = tail_excess <= quantile * np.sqrt(2.0 * tail_pairs) * score * kappa / sample_count
     return max(1, int(np.argmax(resolved))) if resolved.any() else int(np.asarray(excess).shape[0])
 
 
-def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: float, array_module: Any = np) -> int:
+def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: float, array_module: Any = np, null_scale: float = 1.0) -> int:
     """The lag (in variants, along the block order) beyond which the data show no LD: the whole genome's lag profile
     (``ld_lag_profiles``) read by ``extent_from_profile``. A looser, per-variant reading of the same test (a
     variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and failed
@@ -621,10 +629,10 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: f
     nothing a window could use, so blocks need be no wider: the leave-block-out windows (the block and its two
     neighbours) then reach at least w on each side, and whatever the data do hold beyond is far field, which
     ``block_trace_certificate`` tests. ``level`` is the test's family-wise error (EP: its certificate's,
-    ``certificate_level``)."""
+    ``certificate_level``); ``null_scale`` the far pairs' measured mean r^2 n (``extent_from_profile``; 1 by default)."""
     excess, pairs = ld_lag_profiles(grams, sample_count, working_bytes, array_module)
     variants = sum(int(members.shape[0]) for members in grams.blocks)
-    return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count, variants, level)
+    return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count, variants, level, null_scale)
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:
