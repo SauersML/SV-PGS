@@ -4810,17 +4810,29 @@ def fit_hyperparameters(
                         continue
                 gain = -np.inf
                 previous_remainder = remainders[model]
+
+                def report(outcome: str, trial_state: _State | None = None, resolution: float = np.nan) -> None:
+                    log(
+                        f"eb outer: model {model} joint trial at fraction {entry.fraction:.4g} of a step predicted {entry.predicted:.4g}: realized {gain:.4g} "
+                        f"(resolution {resolution:.3g}), trial state error {trial_state.error if trial_state is not None else np.inf:.3g}, "
+                        f"decrement {trial_state.decrement if trial_state is not None else np.inf:.3g}: {outcome}"
+                    )
+
                 if trial_point is None:
                     # No EP fixed point at the trial: refused, like a trial the test rejects, and counted.
                     unresolved[model] += 1
+                    report("no fixed point")
                 else:
                     trial_correction, trial_state = solve_state(trial, trial_point)
                     if entry.fraction == 1.0:
                         whole_uncertifiable[model] = trial_state is None
+                    if trial_state is None:
+                        report("no certified value")
                     if trial_state is not None:
                         gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                         if entry.fraction == 1.0:
                             remainders[model] = abs(gain - entry.predicted)
+                        report("accepted" if gain - resolution > tolerance else "refused", trial_state, resolution)
                         if gain - resolution > tolerance:
                             hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                             displaced[model], pending[model] = False, None
