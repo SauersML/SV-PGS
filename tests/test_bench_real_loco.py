@@ -55,3 +55,20 @@ def test_gain_is_paired_per_gene_and_a_gene_failed_in_any_group_is_dropped():
     assert summary.loc[(report.POOLED, "gain"), "genes"] == 5
     assert np.isclose(summary.loc[(report.POOLED, "gain"), "mean"], expected, rtol=1e-12)
     assert np.isclose(summary.loc[(report.POOLED, "snv_sv"), "mean"] - summary.loc[(report.POOLED, "snv"), "mean"], expected, rtol=1e-12)
+
+
+def test_chromosome_bootstrap_resamples_whole_chromosomes_and_pairs_the_arms():
+    generator = np.random.default_rng(3)
+    blocks = pd.Series(np.repeat(["chr1", "chr2"], [3, 5]))
+    values = pd.Series(np.r_[np.full(3, 0.1), np.full(5, 0.3)])
+    draws = loco.cluster_bootstrap(values, blocks)
+    # Two chromosomes: a draw holds chr1 twice, chr2 twice, or one of each (probability 1/2).
+    outcomes = {0.1: 0.25, 0.3: 0.25, values.mean(): 0.5}
+    for outcome, probability in outcomes.items():
+        share = np.isclose(draws, outcome).mean()
+        assert abs(share - probability) < 4 * np.sqrt(probability * (1 - probability) / loco.DRAWS)
+    assert np.isclose(draws, np.array(list(outcomes))[:, None]).any(axis=0).all()
+    baseline, joint = pd.Series(generator.uniform(size=8)), pd.Series(generator.uniform(size=8))
+    assert np.allclose(loco.cluster_bootstrap(joint - baseline, blocks), loco.cluster_bootstrap(joint, blocks) - loco.cluster_bootstrap(baseline, blocks))
+    result = loco.interval(values, blocks)
+    assert result["cluster_lo"] <= result["mean"] <= result["cluster_hi"]

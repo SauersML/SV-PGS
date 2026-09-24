@@ -1,11 +1,14 @@
-"""SNVs alone against SNVs + SVs on held-out expression, per method, with leave-one-chromosome-out intervals.
+"""SNVs alone against SNVs + SVs on held-out expression, per method, with intervals that resample chromosomes.
 
 Reads one or more per_gene_r2.tsv.gz tables written by report.py (the within-group partial r^2, one row per gene,
 method, feature set, design and held-out group). Per method and design, a gene's r^2 under each arm is its mean over
 the held-out groups (report.py's pooled headline), or one group's value in the per-group rows; the SV gain is the
 joint arm's r^2 minus the baseline's, on the genes both arms completed.
 
-Each mean over genes gets two 95% normal intervals:
+Each mean over genes gets three 95% intervals:
+  cluster  the headline: the chromosome cluster bootstrap. The chromosomes are drawn with replacement, each keeping
+        all of its genes, the mean over the drawn genes is recomputed, and the interval is the percentile one. The
+        arms and their paired difference are read off the same draws.
   loco  the delete-one-chromosome jackknife weighted for unequal chromosome sizes (report.weighted_jackknife). Genes
         of one chromosome share variants, LD and local trans structure, so the chromosome is the resampling unit.
   gene  the gene-level bootstrap, which treats genes as independent. For a mean its variance is known exactly,
@@ -22,13 +25,28 @@ from scipy import stats
 from benchmarks.bench_real import report
 
 Z = float(stats.norm.ppf(0.975))
+# The chromosome bootstrap: its draw count (10,000, set by the lead) and a fixed seed, so a rerun gives the same interval
+# and the arms and gain of one method share their draws.
+DRAWS, SEED = 10_000, 0
+
+
+def cluster_bootstrap(values: pd.Series, blocks: pd.Series, draws: int = DRAWS, seed: int = SEED):
+    """The mean over genes under draws of the chromosomes with replacement, each chromosome keeping all its genes: the
+    draw weights each chromosome by how often it was drawn, so a draw's mean is sum_c w_c S_c / sum_c w_c n_c over the
+    chromosome sums S_c and gene counts n_c."""
+    labels, codes = np.unique(blocks.to_numpy(), return_inverse=True)
+    sums, sizes = np.bincount(codes, weights=values.to_numpy(dtype=np.float64)), np.bincount(codes)
+    counts = np.random.default_rng(seed).multinomial(len(labels), np.full(len(labels), 1.0 / len(labels)), size=draws)
+    return (counts @ sums) / (counts @ sizes)
 
 
 def interval(values: pd.Series, blocks: pd.Series) -> dict:
-    """The mean of values over genes with its chromosome-jackknife and gene-bootstrap 95% intervals."""
+    """The mean of values over genes with its chromosome-bootstrap, chromosome-jackknife and gene-bootstrap 95% intervals."""
     mean, loco_se, kind = report.jackknife(values, blocks)
     boot_se = float(np.sqrt(((values - mean) ** 2).sum()) / len(values))
-    return {"genes": len(values), "chromosomes": int(blocks.nunique()), "mean": mean, "loco_se": loco_se, "loco_lo": mean - Z * loco_se,
+    cluster_lo, cluster_hi = np.quantile(cluster_bootstrap(values, blocks), [0.025, 0.975])
+    return {"genes": len(values), "chromosomes": int(blocks.nunique()), "mean": mean, "cluster_lo": float(cluster_lo), "cluster_hi": float(cluster_hi),
+            "loco_se": loco_se, "loco_lo": mean - Z * loco_se,
             "loco_hi": mean + Z * loco_se, "loco_kind": kind, "boot_se": boot_se, "boot_lo": mean - Z * boot_se, "boot_hi": mean + Z * boot_se}
 
 
