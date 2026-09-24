@@ -202,6 +202,8 @@ def main() -> None:
     parser.add_argument("--size", type=int, default=50_000)
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--sample-batch", type=int, default=1024)
+    parser.add_argument("--truth-only", action="store_true",
+                        help="skip truth_hapA.npy (only the Beagle arm's phasing reads it), halving the build's memory")
     args = parser.parse_args()
 
     out_root = Path(args.out)
@@ -310,7 +312,7 @@ def main() -> None:
     # Built in RAM (n_var x N bytes) and written once: column-block writes into a network-FS memmap are
     # random I/O and far slower than the mosaic itself.
     truth = np.zeros((n_var, args.size), dtype=np.uint8)
-    first_haplotype = np.zeros((n_var, args.size), dtype=np.uint8)
+    first_haplotype = None if args.truth_only else np.zeros((n_var, args.size), dtype=np.uint8)
     realized = np.zeros((args.size, len(SUPERPOPS)), dtype=np.float32)
     donors_t = np.ascontiguousarray(haps.T)
     del haps
@@ -331,10 +333,12 @@ def main() -> None:
                 if haplotype_index == 0:
                     first_rows[offset] = rows[offset]
         truth[:, first:last] = rows.T
-        first_haplotype[:, first:last] = first_rows.T
+        if first_haplotype is not None:
+            first_haplotype[:, first:last] = first_rows.T
         print(f"cohort samples {last}/{args.size}", flush=True)
     np.save(out / "truth_G.npy", truth)
-    np.save(out / "truth_hapA.npy", first_haplotype)
+    if first_haplotype is not None:
+        np.save(out / "truth_hapA.npy", first_haplotype)
     del truth, first_haplotype
     realized /= realized.sum(axis=1, keepdims=True)
     np.savez(

@@ -6,7 +6,6 @@ import json
 import shutil
 
 import numpy as np
-from scipy.stats import t as student_t
 
 from benchmarks.bench_sim import harness, per_chrom, truth
 
@@ -82,13 +81,44 @@ def test_people_differences_name_the_fields_that_differ(tmp_path) -> None:
     assert per_chrom.people_differences(tmp_path / "chr21", tmp_path / "chr22") == ["is_test"]
 
 
-def test_across_interval_is_the_t_interval() -> None:
-    interval = per_chrom.across_interval([1.0, 2.0, 3.0, 4.0])
-    half = student_t.ppf(0.975, 3) * np.std([1.0, 2.0, 3.0, 4.0], ddof=1) / 2.0
-    assert interval["n"] == 4 and interval["mean"] == 2.5
-    assert abs(interval["high"] - 2.5 - half) <= 1e2 * EPSILON and abs(2.5 - interval["low"] - half) <= 1e2 * EPSILON
-    single = per_chrom.across_interval([0.3])
-    assert single["mean"] == 0.3 and np.isnan(single["low"]) and np.isnan(single["high"])
+def test_bootstrap_levels_and_pairing() -> None:
+    points = np.array([0.1, 0.2, 0.3, 0.4])
+    # Pools with no person-level spread: the two-level interval is the chromosome-only one.
+    flat = np.repeat(points[:, None], per_chrom.BOOTSTRAP_DRAWS, axis=1)
+    interval = per_chrom.bootstrap_interval(points, flat, 7)
+    assert interval["n"] == 4 and abs(interval["mean"] - 0.25) <= 4 * EPSILON
+    assert np.allclose(interval["two_level"], interval["chromosomes"], rtol=0, atol=4 * EPSILON)
+    assert interval["chromosomes"][0] < 0.25 < interval["chromosomes"][1]
+    # Person-level spread widens the two-level interval, on the same chromosome draws.
+    rng = np.random.default_rng(34)
+    spread = flat + 0.05 * rng.standard_normal(flat.shape)
+    wide = per_chrom.bootstrap_interval(points, spread, 7)
+    assert wide["chromosomes"] == interval["chromosomes"]
+    assert wide["two_level"][1] - wide["two_level"][0] > interval["two_level"][1] - interval["two_level"][0]
+    # A method that is the reference plus a constant on every drawn person differs by exactly that constant.
+    names = ("chr1", "chr2", "chr3", "chr4")
+    reference = {chrom: {"r2": value, "pool": spread[index]} for index, (chrom, value) in enumerate(zip(names, points))}
+    shifted = {chrom: {"r2": entry["r2"] + 0.05, "pool": entry["pool"] + 0.05} for chrom, entry in reference.items()}
+    summary = per_chrom.summarize_methods({"ref": reference, "shifted": shifted}, "ref", 7)
+    for level in ("two_level", "chromosomes"):
+        assert np.allclose(summary["shifted"]["difference"][level], 0.05, rtol=0, atol=16 * EPSILON)
+        assert summary["ref"]["difference"][level] == [0.0, 0.0]
+    # A method with no fits yet has an empty summary.
+    empty = per_chrom.summarize_methods({"ref": reference, "none": {}}, "ref", 7)["none"]
+    assert empty["mean"]["n"] == 0 and empty["difference"]["n"] == 0
+
+
+def test_chromosome_accuracy_is_the_harness_r2_on_shared_people() -> None:
+    rng = np.random.default_rng(35)
+    size = 500
+    covariates = rng.standard_normal((size, 3))
+    value = rng.standard_normal(size) + covariates @ np.array([0.3, -0.2, 0.1])
+    prediction = value + rng.standard_normal(size)
+    accuracy = per_chrom.chromosome_accuracy(value, {"a": prediction, "b": prediction.copy()}, covariates, 3)
+    assert abs(accuracy["a"]["r2"] - harness.genetic_accuracy(value, prediction, covariates)[0]) <= 1e6 * EPSILON
+    assert accuracy["a"]["low"] <= accuracy["a"]["r2"] <= accuracy["a"]["high"]
+    # Every method is scored on the same resampled people.
+    assert np.array_equal(accuracy["a"]["pool"], accuracy["b"]["pool"])
 
 
 def test_summary_pairs_each_method_with_the_reference_on_shared_chromosomes(tmp_path) -> None:
@@ -120,7 +150,10 @@ def test_summary_pairs_each_method_with_the_reference_on_shared_chromosomes(tmp_
             assert abs(entry["r2"] - harness.genetic_accuracy(value, prediction, covariates)[0]) <= 1e6 * EPSILON
             assert entry["low"] <= entry["r2"] <= entry["high"]
     r2 = {method: {chrom: entry["r2"] for chrom, entry in methods[method]["chromosomes"].items()} for method in methods}
-    assert methods["other"]["mean"] == per_chrom.across_interval(r2["other"].values())
-    assert methods["other"]["difference"] == per_chrom.across_interval(
-        r2["other"][chrom] - r2["ref"][chrom] for chrom in ("chr20", "chr22"))
-    assert methods["ref"]["difference"]["mean"] == 0.0 and methods["ref"]["difference"]["n"] == 3
+    assert abs(methods["other"]["mean"]["mean"] - np.mean(list(r2["other"].values()))) <= 4 * EPSILON and methods["other"]["mean"]["n"] == 2
+    assert methods["other"]["difference"]["n"] == 2 and abs(
+        methods["other"]["difference"]["mean"] - np.mean([r2["other"][chrom] - r2["ref"][chrom] for chrom in ("chr20", "chr22")])) <= 4 * EPSILON
+    assert methods["ref"]["difference"]["two_level"] == [0.0, 0.0] and methods["ref"]["difference"]["n"] == 3
+    for method in methods:
+        low, high = methods[method]["mean"]["two_level"]
+        assert low <= methods[method]["mean"]["mean"] <= high

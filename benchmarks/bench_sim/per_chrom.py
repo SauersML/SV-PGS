@@ -5,9 +5,12 @@ the fit stay fixed, so it misses trait-to-trait and fit-to-fit variation. Here e
 own seeds: the same people, groups, covariates and 40k/10k split; only the haplotype mosaic differs) carries its own
 draw of a dev scenario: the dev scenario's parameters with the effect and annotation seeds drawn afresh per
 chromosome, so the causal variants lie on that chromosome alone and their effects and the phenotype noise are
-independent between chromosomes. chr22 keeps the dev scenario itself. Each method is fitted on each chromosome alone,
-and the chromosomes are the replicates of the across-chromosome interval (a t interval on n_chrom - 1 degrees of
-freedom), for each method's genetic r2 and for its paired difference from the reference method.
+independent between chromosomes. chr22 keeps the dev scenario itself. Each method is fitted on each chromosome alone.
+
+The headline interval of a method's mean genetic r2 over chromosomes is a two-level bootstrap: the chromosomes resampled
+with replacement, then the test people within each drawn chromosome, so it covers both the trait-and-fit variation
+between chromosomes and the test sample within each. A method's difference from the reference method is computed on the
+same drawn chromosomes and the same drawn people. The chromosome-only bootstrap (people fixed) is reported beside it.
 
     python -m benchmarks.bench_sim.per_chrom scenarios --cohort <v7/cohort/chr19> --dev <v7/dev> --out <root>/chr19 --tags 000 005
     python -m benchmarks.bench_sim.per_chrom people --cohort <v7/cohort/chr19> --reference <v7/cohort/chr22>
@@ -25,7 +28,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-from scipy.stats import t as student_t
 
 from benchmarks.bench_sim.harness import covariate_matrix
 from benchmarks.bench_sim.truth import write_scenario
@@ -38,9 +40,10 @@ PEOPLE_FIELDS = ("group", "group_weights", "proportions", "sex", "age", "batch",
 """samples.npz fields drawn from cohort.py's public seed alone, so equal on every chromosome. The realized ancestry
 proportions are each chromosome's own mosaic and differ."""
 LEVEL = 0.95
-BOOTSTRAP_DRAWS = 1000
+BOOTSTRAP_DRAWS = 10_000
 BOOTSTRAP_SEED = 2026
-"""The within-chromosome interval: test people resampled as in the chr22 figure (lead/plot_human.py)."""
+PEOPLE_CHUNK = 250
+"""Person resamples evaluated per step (250 x 10,000 test people x 8 bytes = 20 MB per array)."""
 
 
 def replicate_params(params: dict, chrom: str) -> dict:
@@ -77,39 +80,72 @@ def residualized(values: np.ndarray, covariates: np.ndarray) -> np.ndarray:
     return values - base @ np.linalg.lstsq(base, values, rcond=None)[0]
 
 
-def replicate_accuracy(genetic_value: np.ndarray, prediction: np.ndarray, covariates: np.ndarray,
-                       draws: list[np.ndarray]) -> dict:
-    """Genetic r2 on one chromosome (harness.genetic_accuracy's: both residualized on [1, covariates] over the test
-    people), with its interval over the test people resampled by ``draws``."""
-    genetic, predicted = residualized(genetic_value, covariates), residualized(prediction, covariates)
-
-    def r2(rows) -> float:
-        return float(np.corrcoef(predicted[rows], genetic[rows])[0, 1] ** 2) if np.any(predicted[rows]) else 0.0
-
-    low, high = np.quantile([r2(rows) for rows in draws], [(1.0 - LEVEL) / 2.0, (1.0 + LEVEL) / 2.0])
-    return {"r2": r2(slice(None)), "low": float(low), "high": float(high)}
+def squared_correlation(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Row-wise squared Pearson correlation of two [draws, people] arrays (0 where a row has no spread)."""
+    first = first - first.mean(axis=1, keepdims=True)
+    second = second - second.mean(axis=1, keepdims=True)
+    denominator = (first * first).sum(axis=1) * (second * second).sum(axis=1)
+    numerator = (first * second).sum(axis=1) ** 2
+    return np.divide(numerator, denominator, out=np.zeros_like(numerator), where=denominator > 0)
 
 
-def across_interval(values) -> dict:
-    """Mean over the chromosome replicates and its t interval on n - 1 degrees of freedom (none below two)."""
-    values = np.asarray(list(values), dtype=np.float64)
-    count = values.shape[0]
-    mean = float(values.mean()) if count else float("nan")
-    if count < 2:
-        return {"mean": mean, "low": float("nan"), "high": float("nan"), "n": count}
-    half = float(student_t.ppf((1.0 + LEVEL) / 2.0, count - 1) * values.std(ddof=1) / np.sqrt(count))
-    return {"mean": mean, "low": mean - half, "high": mean + half, "n": count}
+def chromosome_accuracy(genetic_value: np.ndarray, predictions: dict[str, np.ndarray], covariates: np.ndarray,
+                        seed) -> dict[str, dict]:
+    """Each method's genetic r2 on one chromosome (harness.genetic_accuracy's: the prediction and the genetic value
+    residualized on [1, covariates] over the test people) and its BOOTSTRAP_DRAWS person-resampled values ("pool"),
+    every method on the same resampled people, with the pool's percentile interval."""
+    genetic = residualized(genetic_value, covariates)
+    predicted = {name: residualized(values, covariates) for name, values in predictions.items()}
+    pools = {name: np.empty(BOOTSTRAP_DRAWS) for name in predicted}
+    rng = np.random.default_rng(seed)
+    size = genetic.shape[0]
+    for first in range(0, BOOTSTRAP_DRAWS, PEOPLE_CHUNK):
+        rows = rng.integers(0, size, (min(PEOPLE_CHUNK, BOOTSTRAP_DRAWS - first), size))
+        drawn = genetic[rows]
+        for name, values in predicted.items():
+            pools[name][first:first + rows.shape[0]] = squared_correlation(values[rows], drawn)
+    result = {}
+    for name, values in predicted.items():
+        low, high = np.quantile(pools[name], [(1.0 - LEVEL) / 2.0, (1.0 + LEVEL) / 2.0])
+        result[name] = {"r2": float(squared_correlation(values[None], genetic[None])[0]), "low": float(low),
+                        "high": float(high), "pool": pools[name]}
+    return result
 
 
-def summarize_methods(per_chromosome: dict[str, dict[str, float]], reference: str) -> dict:
-    """Per method: the across-chromosome interval of its r2, and of its paired difference from ``reference`` over
-    the chromosomes both have."""
+def bootstrap_interval(points: np.ndarray, pools: np.ndarray, seed) -> dict:
+    """The mean over chromosomes of per-chromosome values ``points`` [n], with two percentile intervals over
+    BOOTSTRAP_DRAWS draws of n chromosomes with replacement: "two_level" also takes, for each drawn chromosome, one of
+    its person-resampled values (``pools`` [n, BOOTSTRAP_DRAWS], themselves independent person resamples);
+    "chromosomes" keeps each chromosome's point. The same seed and chromosome set give the same draws, so intervals of
+    differences built from paired pools are paired."""
+    count = points.shape[0]
+    if count == 0:
+        return {"mean": float("nan"), "n": 0, "two_level": [float("nan")] * 2, "chromosomes": [float("nan")] * 2}
+    rng = np.random.default_rng(seed)
+    chosen = rng.integers(0, count, (BOOTSTRAP_DRAWS, count))
+    person = rng.integers(0, pools.shape[1], (BOOTSTRAP_DRAWS, count))
+    quantiles = [(1.0 - LEVEL) / 2.0, (1.0 + LEVEL) / 2.0]
+    return {
+        "mean": float(points.mean()),
+        "n": count,
+        "two_level": np.quantile(pools[chosen, person].mean(axis=1), quantiles).tolist(),
+        "chromosomes": np.quantile(points[chosen].mean(axis=1), quantiles).tolist(),
+    }
+
+
+def summarize_methods(per_chromosome: dict[str, dict[str, dict]], reference: str, seed) -> dict:
+    """Per method: the bootstrap intervals of its mean r2 over its chromosomes, and of its paired difference from
+    ``reference`` over the chromosomes both have (the difference of their pools, drawn on the same people)."""
     summary = {}
-    for method, values in per_chromosome.items():
-        shared = sorted(set(values) & set(per_chromosome.get(reference, {})))
+    for method, entries in per_chromosome.items():
+        chromosomes = sorted(entries)
+        shared = [chrom for chrom in chromosomes if chrom in per_chromosome.get(reference, {})]
+        base = per_chromosome.get(reference, {})
         summary[method] = {
-            "mean": across_interval(values.values()),
-            "difference": across_interval(values[chrom] - per_chromosome[reference][chrom] for chrom in shared),
+            "mean": bootstrap_interval(np.array([entries[c]["r2"] for c in chromosomes]),
+                                       np.array([entries[c]["pool"] for c in chromosomes]).reshape(len(chromosomes), BOOTSTRAP_DRAWS), seed),
+            "difference": bootstrap_interval(np.array([entries[c]["r2"] - base[c]["r2"] for c in shared]),
+                                             np.array([entries[c]["pool"] - base[c]["pool"] for c in shared]).reshape(len(shared), BOOTSTRAP_DRAWS), seed),
         }
     return summary
 
@@ -118,32 +154,31 @@ def summarize(cohorts: Path, scenarios: Path, dev: Path, tags: list[str], result
     chromosomes = sorted({chrom.name for _, root in results if root.is_dir() for chrom in root.iterdir() if chrom.is_dir()},
                          key=lambda name: int(name.removeprefix("chr")))
     reference_method = results[0][0]
-    output: dict = {"reference": reference_method, "level": LEVEL, "scenarios": {}}
+    output: dict = {"reference": reference_method, "level": LEVEL, "draws": BOOTSTRAP_DRAWS, "scenarios": {}}
     for tag in tags:
-        per_chromosome: dict[str, dict[str, float]] = {name: {} for name, _ in results}
-        detail: dict[str, dict] = {name: {} for name, _ in results}
+        per_chromosome: dict[str, dict[str, dict]] = {name: {} for name, _ in results}
         truths: dict[str, dict] = {}
         for chrom in chromosomes:
             scenario = scenario_path(scenarios, dev, chrom, tag)
-            if not (scenario / "truth.npz").exists():
+            predictions = {name: root / chrom / f"scenario_{tag}" / "prediction.npz" for name, root in results}
+            predictions = {name: path for name, path in predictions.items() if path.exists()}
+            if not (scenario / "truth.npz").exists() or not predictions:
                 continue
-            is_test = np.load(cohorts / chrom / "samples.npz")["is_test"]
-            test = np.flatnonzero(is_test)
+            test = np.flatnonzero(np.load(cohorts / chrom / "samples.npz")["is_test"])
             covariates = covariate_matrix(cohorts / chrom, "truth")[0][test]
-            genetic_value = np.load(scenario / "truth.npz")["genetic_value"][test]
             record = json.loads((scenario / "scenario.json").read_text())
             truths[chrom] = {"h2": record["params"]["h2"], **record["summary"]}
-            rng = np.random.default_rng(BOOTSTRAP_SEED)
-            draws = [rng.integers(0, test.size, test.size) for _ in range(BOOTSTRAP_DRAWS)]
-            for name, root in results:
-                prediction = root / chrom / f"scenario_{tag}" / "prediction.npz"
-                if prediction.exists():
-                    detail[name][chrom] = replicate_accuracy(genetic_value, np.load(prediction)["total"], covariates, draws)
-                    per_chromosome[name][chrom] = detail[name][chrom]["r2"]
-        summary = summarize_methods(per_chromosome, reference_method)
+            accuracy = chromosome_accuracy(np.load(scenario / "truth.npz")["genetic_value"][test],
+                                           {name: np.load(path)["total"] for name, path in predictions.items()},
+                                           covariates, [BOOTSTRAP_SEED, int(chrom.removeprefix("chr"))])
+            for name, entry in accuracy.items():
+                per_chromosome[name][chrom] = entry
+        summary = summarize_methods(per_chromosome, reference_method, BOOTSTRAP_SEED)
         output["scenarios"][tag] = {
             "truth": truths,
-            "methods": {name: {"chromosomes": detail[name], **summary[name]} for name, _ in results},
+            "methods": {name: {"chromosomes": {chrom: {key: value for key, value in entry.items() if key != "pool"}
+                                               for chrom, entry in per_chromosome[name].items()},
+                               **summary[name]} for name, _ in results},
         }
     return output
 
