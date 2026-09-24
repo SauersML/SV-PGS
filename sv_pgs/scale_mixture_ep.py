@@ -4701,6 +4701,17 @@ def fit_hyperparameters(
             f"(state error {state.error:.3g}, step error {step.evidence_error:.3g}, weights {step.stationarity_gain:.3g}), "
             f"{iterations[model]} accepted steps, {halvings[model]} halvings so far"
         )
+        if (
+            remaining > tolerance and not state.polished and np.isfinite(remainders[model])
+            and predicted + remainders[model] <= state.error + tolerance
+        ):
+            # The joint trial cannot be accepted from here: its realized gain is at most the prediction plus the model's
+            # measured remainder, and acceptance needs it above both states' errors and the tolerance, of which this
+            # state's error alone takes it all. x is polished first, which lowers that error, and the state is planned
+            # again from there (on bench-sim chr22 001 [sim] a trial predicted 2.25 realized 2.28 and was refused on its
+            # start's error, 4.28, its two fixed points spent).
+            log(f"eb outer: model {model} polishes before its trial: predicted {predicted:.4g} + remainder {remainders[model]:.3g} within the state's error {state.error:.3g}")
+            return inner(model, step, remaining, True)
         entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
         released = frozenset(
             int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
