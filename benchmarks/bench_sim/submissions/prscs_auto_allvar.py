@@ -80,7 +80,7 @@ def fit(train) -> Model:
             for index, name in enumerate(names):
                 handle.write(f"{name}\tA\tC\t{beta[index]:.10g}\t{beta_se[index]:.10g}\n")
         threads = {name: str(int(train.cores)) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
-        subprocess.run([sys.executable, "-u", str(PRSCS), f"--ref_dir={reference}", f"--bim_prefix={folder / 'target'}",
+        subprocess.run([os.environ.get("PRSCS_PYTHON", sys.executable), "-u", str(PRSCS), f"--ref_dir={reference}", f"--bim_prefix={folder / 'target'}",
                         f"--sst_file={folder / 'sumstats.txt'}", f"--n_gwas={count}", "--chrom=22",
                         f"--out_dir={folder / 'out'}", "--beta_std=True", "--seed=1"],
                        check=True, env=os.environ | threads)
