@@ -1302,6 +1302,143 @@ class _Objective:
     rounding: float
 
 
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _node_terms(log_scale_value, node, precision, shift_square, tiny):
+    """One effect's terms at one node, as ``engine_kernels``' node_terms computes them: (retained r, q r, v r,
+    a = h^2 v r, log sqrt(r), improper)."""
+    variance = np.exp(log_scale_value + node)
+    ratio = variance * precision
+    retained = 1.0 / (1.0 + ratio)
+    if abs(ratio) * tiny < 0.5:
+        ratio_retained = ratio * retained
+        conditional = variance * retained
+    else:
+        ratio_retained = 1.0 / (1.0 + 1.0 / ratio)
+        conditional = 1.0 / (1.0 / variance + precision)
+    signal = shift_square * conditional
+    if np.isinf(variance) and precision > 0.0:
+        log_root = -0.5 * (log_scale_value + node + np.log(precision))
+    else:
+        log_root = -0.5 * np.log1p(ratio)
+    return retained, ratio_retained, conditional, signal, log_root, ratio <= -1.0
+
+
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _objective_rows(log_density, density, grid, log_scale_rows, precision, shift, deviations, centred, log_normalizer, curvature):
+    """The host twin of ``engine_kernels``' objective_rows, one row per iteration, no row's terms held past its two
+    passes: per row log Z and Var_r(d1) + E_r[d2] (``curvature``), and per node its deviation D = r - pi and centred
+    G = r (d1 - mean d1), with a last column of ones under D and mean d1 under G (the Grams D'[D 1] and G'S then
+    carry sum D and the scale gradient). The running log-sum-exp and weighted Welford updates are the device's.
+    Returns whether some 1 + v P <= 0."""
+    rows, nodes = log_scale_rows.shape[0], grid.shape[0]
+    tiny = np.finfo(np.float64).tiny
+    bad = np.zeros(rows, dtype=np.bool_)
+    for row in numba.prange(rows):
+        scale_value, cavity_precision = log_scale_rows[row], precision[row]
+        shift_square = shift[row] * shift[row]
+        peak, total, first_mean, first_square, second_mean = -np.inf, 0.0, 0.0, 0.0, 0.0
+        for node in range(nodes):
+            retained, ratio_retained, _conditional, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+            if improper:
+                bad[row] = True
+            exponent = log_density[node] + 0.5 * signal + log_root
+            first = 0.5 * (retained * signal - ratio_retained)
+            second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained
+            if np.isinf(exponent) or np.isnan(exponent):
+                continue
+            if exponent > peak:
+                rescale = np.exp(peak - exponent)
+                total *= rescale
+                first_square *= rescale
+                peak = exponent
+                weight = 1.0
+            else:
+                weight = np.exp(exponent - peak)
+            updated = total + weight
+            share = weight / updated
+            deviation = first - first_mean
+            step = deviation * share
+            first_mean += step
+            first_square += total * deviation * step
+            second_mean += (second - second_mean) * share
+            total = updated
+        inverse_total = 1.0 / total
+        for node in range(nodes):
+            retained, ratio_retained, _conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+            exponent = log_density[node] + 0.5 * signal + log_root
+            first = 0.5 * (retained * signal - ratio_retained)
+            responsibility = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak) * inverse_total
+            deviations[row, node] = responsibility - density[node]
+            centred[row, node] = responsibility * (first - first_mean)
+        deviations[row, nodes] = 1.0
+        centred[row, nodes] = first_mean
+        log_normalizer[row] = peak + np.log(total)
+        curvature[row] = first_square / total + second_mean
+    improper = False
+    for row in range(rows):
+        if bad[row]:
+            improper = True
+    return improper
+
+
+def _host_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, hessian_too: bool) -> _Objective:
+    """``_data_objective`` on the host by one fused pass per row (``_objective_rows``) where the log scales move with
+    x (an annotation scale design): the held kernel rows (``_kernel_chunks``) are keyed by the scales, so every
+    evaluation inside a maximization formed them afresh, 13.5% of an annotated fit plus the derivatives' 14%
+    [real, ENSG00000105612.9]. Chunks' D and G are (rows x (K + 1)), sized by ``working_bytes``, and the Grams are
+    BLAS products, as the device kernel's (``engine_kernels.objective_statistics``); so is the rounding bound."""
+    grid_size = prior.grid_size
+    scale_size = prior.scale_size
+    scale_span = slice(prior.density_size, prior.density_size + scale_size)
+    dimension = prior.density_size + scale_size
+    log_density = class_log_density(prior, coefficients)
+    density = np.exp(log_density)
+    scales = log_scale(prior, coefficients)
+    gradient = np.zeros(dimension)
+    hessian = np.zeros((dimension, dimension))
+    value = magnitude = 0.0
+    # Per row: D and G (K + 1 each), the design row and its curvature-scaled copy, and the two outputs.
+    row_bytes = np.dtype(np.float64).itemsize * (2 * (grid_size + 1) + 2 * scale_size + 2)
+    chunk = max(1, int(working_bytes) // row_bytes)
+    for class_position, class_rows in enumerate(prior.class_rows):
+        mass = density[class_position]
+        summed = np.zeros(grid_size)
+        outer = np.zeros((grid_size, grid_size))
+        cross = np.zeros((grid_size, scale_size))
+        for start in range(0, class_rows.shape[0], chunk):
+            rows = class_rows[start : start + chunk]
+            count = rows.shape[0]
+            deviations = np.empty((count, grid_size + 1))
+            centred = np.empty((count, grid_size + 1))
+            log_normalizer = np.empty(count)
+            curvature = np.empty(count)
+            if _objective_rows(log_density[class_position], mass, prior.log_variance_grid, scales[rows], cavity.precision[rows], cavity.shift[rows],
+                               deviations, centred, log_normalizer, curvature):
+                raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+            value += float(np.sum(log_normalizer))
+            magnitude += float(np.sum(np.abs(log_normalizer)))
+            summed += deviations[:, :grid_size].sum(axis=0)
+            if scale_size:
+                design = prior.scale_design[rows]
+                products = centred.T @ design
+                gradient[scale_span] += products[grid_size]
+                if hessian_too:
+                    cross += products[:grid_size]
+                    hessian[scale_span, scale_span] += design.T @ (curvature[:, None] * design)
+            if hessian_too:
+                outer += deviations[:, :grid_size].T @ deviations[:, :grid_size]
+        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
+        gradient[span] = summed
+        if hessian_too:
+            hessian[span, span] = np.diag(summed) - outer - np.outer(summed, mass) - np.outer(mass, summed)
+            hessian[span, scale_span] = cross
+            hessian[scale_span, span] = cross.T
+    return _Objective(
+        value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
+        rounding=(grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
+    )
+
+
 def _data_objective(
     prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, array_module: ModuleType | None = None, hessian_too: bool = True
 ) -> _Objective:
@@ -1325,6 +1462,14 @@ def _data_objective(
             value=value, gradient=gradient, hessian=hessian, magnitude=magnitude,
             rounding=(prior.grid_size + 1 + prior.variant_count) * _EPSILON * magnitude,
         )
+    if prior.scale_size:
+        return _host_objective(prior, coefficients, cavity, working_bytes, hessian_too)
+    return _held_rows_objective(prior, coefficients, cavity, working_bytes, hessian_too)
+
+
+def _held_rows_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int, hessian_too: bool) -> _Objective:
+    """``_data_objective`` on the host from the kernel rows (``_kernel_chunks``), held across a hyper step's passes
+    while the log scales stay fixed."""
     grid_size = prior.grid_size
     scale_span = slice(prior.density_size, prior.density_size + prior.scale_size)
     dimension = prior.density_size + prior.scale_size
@@ -1390,6 +1535,14 @@ def _data_value(
         total, flag = _host(array_module.stack([log_normalizer.sum(), improper[0].astype(array_module.float64)]))
         engine_kernels._raise_if_improper(np.array([flag]))
         return float(total)
+    if prior.scale_size:
+        # The log scales move with x: one fused pass per row (``_moving_line_sum`` at a single step), not held rows.
+        zero = np.zeros(1)
+        return float(sum(
+            _moving_line_sum(log_density[class_position][None, :], scales[rows], np.zeros(rows.shape[0]), zero, prior.log_variance_grid,
+                             cavity.precision[rows], cavity.shift[rows], working_bytes, np)[0]
+            for class_position, rows in enumerate(prior.class_rows) if rows.shape[0]
+        ))
     total = 0.0
     for class_position, _rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
         total += float(np.sum(kernel_rows.normalizers(log_density[class_position])[0]))
@@ -2389,7 +2542,7 @@ def _moving_line_rows(log_density, log_scale_rows, slopes, steps, grid, precisio
 
 def _moving_line_sum(
     class_density: F64Array, log_scale_rows: F64Array, slopes: F64Array, steps: F64Array, grid: F64Array, precision: F64Array, shift: F64Array,
-    working_bytes: int,
+    working_bytes: int, array_module: ModuleType | None = None,
 ) -> F64Array:
     """sum_j log Z_j(t_s) over rows whose log scale moves along the line, per step (``_line``): on the fit's device
     the fused tilted kernel (``engine_kernels.tilted_moments``) over (row, step) pairs, each step its own class
@@ -2399,7 +2552,7 @@ def _moving_line_sum(
     rows = log_scale_rows.shape[0]
     # Per row and step: the device's inputs and three outputs (the host's one output is less).
     chunk = max(1, int(working_bytes) // (max(count, 1) * (engine_kernels._tilted_row_bytes() + 3 * np.dtype(np.float64).itemsize)))
-    xp = _DEVICE.get()
+    xp = _DEVICE.get() if array_module is None else array_module
     total = np.zeros(count)
     for start in range(0, rows, chunk):
         stop = min(start + chunk, rows)

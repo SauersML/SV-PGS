@@ -1420,3 +1420,27 @@ def test_a_finite_log_variance_past_double_precision_keeps_its_finite_normalizer
     # With a shift the h^2 / (2P) term stays too.
     log_component = engine._kernel_terms(np.zeros((1, 1)), np.zeros(1), np.array([1000.0]), np.array([2.0]), np.array([3.0]))[3]
     assert np.isclose(log_component[0, 0], -0.5 * (1000.0 + np.log(2.0)) + 0.5 * 9.0 / 2.0, rtol=0.0, atol=1e-9)
+
+
+def test_the_fused_host_objective_is_the_held_rows_objective():
+    """``_host_objective`` (one fused pass per row, the device kernel's host twin) against the held kernel rows' path,
+    value, gradient and Hessian, with an annotation scale design and in small chunks; and ``_data_value``'s fused
+    pass against the rows' normalizers."""
+    from sv_pgs.scale_mixture_ep import _held_rows_objective, _host_objective, _data_value, _kernel_chunks, class_log_density, log_scale
+
+    prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
+    assert prior.scale_size
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    expected = _held_rows_objective(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES, True)
+    for working_bytes in (_WORKING_BYTES, 1 << 12):
+        got = _host_objective(prior, hyperparameters.coefficients, cavity, working_bytes, True)
+        np.testing.assert_allclose(got.value, expected.value, rtol=1e-12)
+        np.testing.assert_allclose(got.magnitude, expected.magnitude, rtol=1e-12)
+        scale = float(np.max(np.abs(expected.gradient)))
+        np.testing.assert_allclose(got.gradient, expected.gradient, rtol=1e-12, atol=1e-12 * scale)
+        scale = float(np.max(np.abs(expected.hessian)))
+        np.testing.assert_allclose(got.hessian, expected.hessian, rtol=1e-12, atol=1e-12 * scale)
+    log_density = class_log_density(prior, hyperparameters.coefficients)
+    scales = log_scale(prior, hyperparameters.coefficients)
+    held = sum(float(np.sum(rows.normalizers(log_density[c])[0])) for c, _r, rows in _kernel_chunks(prior, scales, cavity, _WORKING_BYTES))
+    np.testing.assert_allclose(_data_value(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES, np), held, rtol=1e-12)
