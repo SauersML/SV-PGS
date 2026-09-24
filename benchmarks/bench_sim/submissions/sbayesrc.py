@@ -52,6 +52,28 @@ def _dosages(source, rows: np.ndarray) -> np.ndarray:
     return np.asarray(source.codes(rows), dtype=np.float32) / np.float32(127.0)
 
 
+def gemm_nt(left: np.ndarray, right: np.ndarray) -> np.ndarray:
+    """left @ right.T in the inputs' precision: on the GPU (CuPy) when BASELINES_GPU=1, the same product to rounding.
+    The baselines' in-sample LD is these products of the projected dosages (n = 40,000 people per product)."""
+    if os.environ.get("BASELINES_GPU") == "1":
+        import cupy as cp
+        product = cp.asnumpy(cp.asarray(left) @ cp.asarray(right).T)
+        cp.get_default_memory_pool().free_all_blocks()
+        return product
+    return left @ right.T
+
+
+class Stages:
+    """Prints how long a fit's stages took (seconds since the fit started)."""
+
+    def __init__(self, name: str) -> None:
+        import time
+        self.name, self.clock, self.started = name, time.time, time.time()
+
+    def __call__(self, label: str) -> None:
+        print(f"{self.name}: {label} at {self.clock() - self.started:.1f} s", flush=True)
+
+
 class Model:
     def __init__(self, rows: np.ndarray, means: np.ndarray, beta: np.ndarray, structural: np.ndarray) -> None:
         self.rows, self.means, self.beta, self.structural = rows, means, beta, structural
@@ -112,7 +134,7 @@ def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool)
         se = np.sqrt((residual @ residual - beta * cross) / (degrees * squares))
         scaled = projected / np.sqrt(squares).astype(np.float32)[:, None]
         del projected
-        correlation = scaled @ scaled.T
+        correlation = gemm_nt(scaled, scaled)
         del scaled
         np.fill_diagonal(correlation, 1.0)
         correlation.astype("<f4").tofile(ld / f"b{number}.ldm.full.bin")
@@ -142,15 +164,19 @@ def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool)
 
 
 def fit_sbayesrc(train, annotated: bool) -> Model:
+    stage = Stages("sbayesrc")
     rows = common_rows(train)
+    stage(f"{rows.shape[0]} common records found")
     structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
     with tempfile.TemporaryDirectory(prefix="sbayesrc_", dir=os.environ.get("TMPDIR"),
                                      ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         means = write_inputs(train, rows, folder, annotated)
+        stage("GWAS, LD blocks and annotations written")
         threads = {name: str(int(train.cores)) for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
         subprocess.run(["Rscript", str(_SCRIPT), str(folder), "annot.txt" if annotated else ""], check=True,
                        env=os.environ | threads)
+        stage("SBayesRC done")
         effects = {}
         with open(folder / "sbrc.txt") as handle:
             next(handle)

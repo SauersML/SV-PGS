@@ -27,7 +27,7 @@ import tempfile
 import numpy as np
 
 from benchmarks.bench_sim.submissions.ldpred2_auto import WINDOW_CM
-from benchmarks.bench_sim.submissions.sbayesrc import Model, common_rows
+from benchmarks.bench_sim.submissions.sbayesrc import Model, Stages, common_rows, gemm_nt
 
 __all__ = ["Model", "fit"]
 CHUNK = 4096
@@ -88,7 +88,7 @@ def write_band(train, rows: np.ndarray, folder: pathlib.Path):
                     means[part], beta[part], se[part], _, cache[index] = adjuster.block(rows[part])
             columns = cache[c0 // CHUNK]
             # products[k, i - r0] = r(c0 + k, i) for i in [r0, r1)
-            products = np.hstack([columns @ cache[index][max(r0 - index * CHUNK, 0) : r1 - index * CHUNK].T
+            products = np.hstack([gemm_nt(columns, cache[index][max(r0 - index * CHUNK, 0) : r1 - index * CHUNK])
                                   for index in range(r0 // CHUNK, (r1 - 1) // CHUNK + 1)])
             within = np.arange(c1 - c0)
             products[within, np.arange(c0, c1) - r0] = 1.0
@@ -102,7 +102,9 @@ def write_band(train, rows: np.ndarray, folder: pathlib.Path):
 
 
 def fit(train) -> Model:
+    stage = Stages("ldpred2_auto_allvar")
     rows = common_rows(train)
+    stage(f"{rows.shape[0]} common records found")
     structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
     # on a network scratch TMPDIR, files the R session's forked workers still hold open linger as .nfs entries for a
     # while after it exits; a directory that cannot be removed yet must not discard a finished fit
@@ -110,6 +112,7 @@ def fit(train) -> Model:
                                      ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         means, beta, se, lo, hi, scores = write_band(train, rows, folder)
+        stage("GWAS and LD band written")
         np.column_stack([beta, se]).astype("<f8").tofile(folder / "sumstats.bin")
         lo.astype("<i4").tofile(folder / "ld_lo.bin")
         hi.astype("<i4").tofile(folder / "ld_hi.bin")
@@ -117,5 +120,6 @@ def fit(train) -> Model:
         (folder / "meta.txt").write_text(f"{rows.shape[0]} {train.n_samples} {int(train.cores)} {CHUNK}\n")
         single = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
         subprocess.run(["Rscript", str(_SCRIPT), str(folder)], check=True, env=os.environ | single)
+        stage("LDpred2 done")
         effects = np.fromfile(folder / "beta.bin", dtype="<f8")
     return Model(rows, means, effects, structural)
