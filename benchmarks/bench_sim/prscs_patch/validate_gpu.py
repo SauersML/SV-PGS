@@ -56,6 +56,15 @@ block = cp.asarray(ld)
 _, gs, gv = cp.linalg.svd(block)
 gpu_sym = cp.asnumpy((block + cp.dot(gv.T, gs[:, None] * gv)) / 2)
 print("parse symmetrization: max |gpu - cpu| / max |cpu| =", np.abs(gpu_sym - cpu_sym).max() / np.abs(cpu_sym).max())
+# the same symmetrization by the symmetric eigendecomposition: for symmetric A = Q L Q', V' diag(s) V = Q |L| Q'
+cp.cuda.Device().synchronize(); started = time.time()
+_, gs, gv = cp.linalg.svd(block); cp.cuda.Device().synchronize(); svd_seconds = time.time() - started
+started = time.time()
+w, q = cp.linalg.eigh(block)
+eig_sym = cp.asnumpy((block + cp.dot(q * cp.abs(w)[None, :], q.T)) / 2); eig_seconds = time.time() - started
+print("parse symmetrization by eigh: max |gpu eigh - cpu svd| / max |cpu| =", np.abs(eig_sym - cpu_sym).max() / np.abs(cpu_sym).max(),
+      f"| GPU svd {svd_seconds:.1f} s, GPU eigh {eig_seconds:.1f} s at {rows.size} variants", flush=True)
+del gs, gv, w, q
 ld = cpu_sym
 
 beta_mrg = (beta / (se * np.sqrt(n)))[:, None]

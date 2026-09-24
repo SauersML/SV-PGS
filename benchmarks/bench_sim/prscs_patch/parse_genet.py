@@ -204,12 +204,14 @@ def _parse_ldblk(ldblk_dir, sst_dict, chrom):
             ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]*np.outer(flip,flip)
 
             if os.environ.get('PRSCS_DEVICE') == 'gpu':
-                # the same symmetrization with the SVD in float64 on the GPU (baselines-genome addition)
+                # the same symmetrization in float64 on the GPU (baselines-genome addition), by the symmetric
+                # eigendecomposition: for symmetric A = Q L Q', the SVD's V' diag(s) V is Q |L| Q' (cusolver's
+                # gesvd is far slower than its syevd at these sizes)
                 import cupy as cp
                 block = cp.asarray(ld_blk[blk])
-                _, s, v = cp.linalg.svd(block)
-                ld_blk[blk] = cp.asnumpy((block+cp.dot(v.T, s[:, None]*v))/2)
-                del block, s, v
+                w, q = cp.linalg.eigh(block)
+                ld_blk[blk] = cp.asnumpy((block+cp.dot(q*cp.abs(w)[None, :], q.T))/2)
+                del block, w, q
             else:
                 _, s, v = linalg.svd(ld_blk[blk])
                 h = np.dot(v.T, np.dot(np.diag(s), v))

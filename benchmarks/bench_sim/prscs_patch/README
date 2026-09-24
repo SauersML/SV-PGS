@@ -2,7 +2,8 @@ PRS-CS (github.com/getian107/PRScs, MIT, LICENSE here) files as patched for the 
 the same files of the install that prscs_auto.PRSCS points at. Every change but the first is opt-in by environment
 variable, so with none set PRS-CS runs its own code:
 - parse_genet.py: set membership in parse_ldblk (always on; output bit-identical); PRSCS_LD_CACHE saves/loads its output;
-  PRSCS_DEVICE=gpu runs the symmetrizing SVD on the GPU (max relative difference 2e-14 against scipy on a 6,922 block).
+  PRSCS_DEVICE=gpu computes the symmetrization on the GPU by the symmetric eigendecomposition, Q|L|Q' = the SVD's
+  V' diag(s) V (9e-14 relative to scipy's SVD on a 6,922 block; cusolver's gesvd took hours on the largest blocks).
 - mcmc_gtb.py: PRSCS_DEVICE=gpu runs each block's Cholesky, triangular solves and quadratic form in float64 on CuPy,
   every draw still on the host (validate_gpu.py: 5 iterations of two chains from one seed agree to 8e-15 relative);
   PRSCS_GIG=vector draws psi for all variants at once.
