@@ -572,6 +572,12 @@ _LD_ARRAYS = {
 }
 
 
+def _largest_read() -> int:
+    """The most bytes one read call moves: Linux's MAX_RW_COUNT, INT_MAX & PAGE_MASK. A 2.7 GB block asked of one
+    ``preadv`` spun in the kernel for hours on a job's encrypted local disk (bench-sim chr22 000, block cap 26,112 [sim])."""
+    return int(np.iinfo(np.int32).max) & ~(os.sysconf("SC_PAGE_SIZE") - 1)
+
+
 class LdGramStore:
     """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 2).
 
@@ -663,10 +669,11 @@ class LdGramStore:
         path = self.directory / _LD_ARRAYS[name][0]
         start = offset * dtype.itemsize
         view = memoryview(values.reshape(-1).view(np.uint8))
+        largest = _largest_read()
         with open(path, "rb", buffering=0) as handle:
             done = 0
             while done < view.nbytes:
-                count = os.preadv(handle.fileno(), [view[done:]], start + done)
+                count = os.preadv(handle.fileno(), [view[done:done + largest]], start + done)
                 if count <= 0:
                     raise OSError(f"{path}: short read at byte {start + done}")
                 done += count

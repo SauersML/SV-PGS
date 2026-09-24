@@ -152,6 +152,17 @@ def test_store_block_reads_are_the_mapped_blocks(tmp_path: Path) -> None:
             np.testing.assert_array_equal(ld.read_adjacent(block), ld.adjacent_block(block))
         else:
             assert ld.adjacent_block(block) is None
+    # A read longer than one call moves is taken in pieces, each at most the call's limit.
+    from sv_pgs import genotype_statistics
+
+    widest = max(range(ld.block_count), key=ld.block_width)
+    whole = ld.read_gram(widest)
+    original = genotype_statistics._largest_read
+    try:
+        genotype_statistics._largest_read = lambda: 4096 + 4
+        np.testing.assert_array_equal(ld.read_gram(widest), whole)
+    finally:
+        genotype_statistics._largest_read = original
     band = GramBand(statistics, 1 << 20)
     np.testing.assert_array_equal(band.squares, np.concatenate([np.diagonal(ld.block(b).projected_gram).astype(np.float64) for b in range(ld.block_count)]))
 
