@@ -662,7 +662,7 @@ class BandStore:
         return self._read(self.directory / _BAND_FILES["cross"], int(self.cross_offsets[block]), shape, np.dtype(np.float32), out)
 
 
-def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes: int, array_module: Any = np) -> BandStore:
+def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes: int, level: float, array_module: Any = np) -> BandStore:
     """Stage 0's Grams (``ld``, an ``LdGramStore``) as the summary band: each Stage 0 block's LD extent measured on its
     own Gram (``marginal_variances.ld_extent``, the whole tail's test within the block: the lag beyond which its pairs'
     excess r^2 is within its null resolution), the block cut into near-equal consecutive parts no wider than it, and
@@ -698,7 +698,7 @@ def build_band_store(ld: Any, sample_count: int, directory: Path, working_bytes:
                 continue
             within = read_block(ld, "within", block)
             single = BlockGrams(blocks=(np.arange(width, dtype=np.int64),), within=(within,), next_cross=())
-            extent = int(ld_extent(single, int(sample_count), int(working_bytes), array_module)) if width > 1 else 1
+            extent = int(ld_extent(single, int(sample_count), int(working_bytes), level, array_module)) if width > 1 else 1
             parts = max(1, -(-width // extent))
             cuts = np.linspace(0, width, parts + 1).round().astype(np.int64)
             spans = [slice(int(cuts[part]), int(cuts[part + 1])) for part in range(parts)]

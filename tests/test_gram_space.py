@@ -313,7 +313,7 @@ def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path:
         targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
     )
     ld = statistics.ld
-    band_store = build_band_store(ld, statistics.sample_count, tmp_path / "band", 1 << 20)
+    band_store = build_band_store(ld, statistics.sample_count, tmp_path / "band", 1 << 20, 1.0 / 64)
     assert isinstance(band_store, BandStore) and int(band_store.widths.sum()) == int(ld.block_boundaries[-1])
     # The dense Gram Stage 0 holds: within blocks and between adjacent ones.
     count = int(ld.block_boundaries[-1])

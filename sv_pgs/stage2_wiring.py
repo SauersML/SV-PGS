@@ -30,6 +30,7 @@ from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.gram_space import GramBand, GramGaussian, build_band_store, far_field_scale, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
+from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
@@ -419,7 +420,7 @@ def _fit_one(
     band = None
     if not binary:
         started = time.perf_counter()
-        band_store = build_band_store(statistics.ld, statistics.sample_count, work_dir / "band", share, source.array_module)
+        band_store = build_band_store(statistics.ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module)
         band = GramBand(statistics, share, store=band_store)
         sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
         log(
