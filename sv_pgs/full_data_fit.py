@@ -2133,13 +2133,16 @@ class _FullDataMeanField:
             # tolerance asked and Xp'Xp by tile passes.
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = solve(scaled, relative_tolerance)
-            shift_step = -off_diagonal_gram(mean_step) / noise
+            # The solution's image X dm, formed once: the off-diagonal Gram's back pass and the noise's residual term
+            # both read it (one genotype pass fewer per call).
+            image = self._image(mean_step, model, metric)
+            shift_step = -(self._back(image, model, metric) - squares[:, None] * mean_step) / noise
             if binary:
                 # Known noise: no noise response. The sites' own response is left out of the curvature, as in
                 # ``mean_field`` (the outer loop accepts its steps on the objective itself).
                 return shift_step, np.zeros_like(shift_step)
             _mean_one, shift_one, scalar = noise_terms(relative_tolerance)
-            right = -2.0 * (residual @ self._image(mean_step, model, metric)) + squares @ (
+            right = -2.0 * (residual @ image) + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )
             noise_step = right / scalar
