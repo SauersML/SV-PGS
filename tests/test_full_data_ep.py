@@ -246,6 +246,6 @@ def test_ld_lag_profiles_give_each_region_its_own_extent() -> None:
     )
     excess, pairs = ld_lag_profiles(grams, samples, 1 << 24)
     assert excess.shape == pairs.shape == (2, count)
-    assert 3 <= extent_from_profile(excess[0], pairs[0], samples) <= 8
-    assert extent_from_profile(excess[1], pairs[1], samples) <= 2
-    assert ld_extent(grams, samples, 1 << 24) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples)
+    assert 3 <= extent_from_profile(excess[0], pairs[0], samples, count) <= 8
+    assert extent_from_profile(excess[1], pairs[1], samples, count) <= 2
+    assert ld_extent(grams, samples, 1 << 24) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples, 2 * count)
