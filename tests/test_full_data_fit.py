@@ -157,6 +157,15 @@ def test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples(tmp_p
         grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
     )
     fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
+    # Continued from its own fit (``stage2_wiring``'s lattice-check refit, here on the same lattice): certified again,
+    # with no more outer iterations than the fit from the prior took.
+    continued = fit_full_data(
+        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field",
+        starts=list(fit.hyperparameters), start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
+    )
+    if not continued.certificate.restored_best[0]:
+        assert continued.certificate.remaining_gain[0] <= 0.5 / _DRAWS
+    assert continued.certificate.outer_iterations[0] <= fit.certificate.outer_iterations[0]
     certificate = fit.certificate
     # The certificate is bound to the returned state: a restored best-ELBO state withholds the outer loop's terms.
     if certificate.restored_best[0]:

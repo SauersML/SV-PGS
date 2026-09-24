@@ -2225,8 +2225,14 @@ def fit_full_data(
     *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
     inference: str = "ep",
     sites: Sequence[BernoulliSites | None] | None = None,
+    starts: Sequence[MixtureHyperparameters] | None = None,
+    start_noise: F64Array | None = None,
+    start_mean: F64Array | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
+    ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
+    model on another lattice (``stage2_wiring``'s lattice check): the empirical Bayes starts from its hyperparameters
+    carried to this prior, with the annotation groups already entered, in place of the nested search from the prior.
     ``inference`` names the fixed point: "mean_field" (``_FullDataMeanField``: the product q of ``mean_field`` on the
     streamed design) or "ep" (this module's EP, started from the mean-field fixed point).
 
@@ -2270,7 +2276,11 @@ def fit_full_data(
 
     # A binary model's noise is known: 1 in its whitened coordinates.
     noise = np.where(binary, 1.0, np.array([moment.noise for moment in moments]))
-    if prior.annotation_groups:
+    if starts is not None:
+        continued_noise = noise if start_noise is None else np.where(binary, 1.0, np.asarray(start_noise, dtype=np.float64))
+        fixed_points, fits = solve(prior, list(starts), continued_noise, None if start_mean is None else np.asarray(start_mean, dtype=np.float64).copy(),
+                                   model_sites)
+    elif prior.annotation_groups:
         # Nested empirical Bayes (``small_n.fit_small_n``): the prior without annotation groups first, then the annotated
         # one continued from its fit, every annotation effect zero at its lambda = infinity edge
         # (``embed_hyperparameters``), so an annotation group enters only where the evidence rises.
@@ -2314,7 +2324,7 @@ def fit_full_data(
     noise_gains = np.array(fixed_points.noise_gain, dtype=np.float64)
     component_count = np.ones(model_count, dtype=np.int64)
     budget_unresolved = np.zeros(model_count, dtype=np.int64)
-    if prior.annotation_groups and mean_field is not None:
+    if starts is None and prior.annotation_groups and mean_field is not None:
         budget_unresolved += np.asarray(base_points.unresolved, dtype=np.int64)
     refusals = list(fixed_points.refusals)
     components: tuple[tuple[F64Array, F64Array], ...] = ()

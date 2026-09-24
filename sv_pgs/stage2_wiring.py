@@ -436,9 +436,13 @@ def _fit_one(
         if check.refine:
             moved, moved_hyperparameters = halved_lattice(moved, moved_hyperparameters)
         try:
+            # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its noise
+            # and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior repeated
+            # the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
             refit = fit_full_data(
                 gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-                sites=[store_sites],
+                sites=[store_sites], starts=[moved_hyperparameters], start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
+                start_mean=fit.member_mean,
             )
         except FloatingPointError as error:
             # No certified fit on the checked lattice: the model keeps the fit it has, and the failed check is logged.
