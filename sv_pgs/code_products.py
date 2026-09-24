@@ -53,6 +53,7 @@ from sv_pgs.genotype_buffers import (
     _CUDA_R_8I,
     _CUDA_R_32I,
 )
+from sv_pgs.memory_broker import current_broker, device_pool
 
 DIGIT_BITS = 7
 """Each operand digit covers 7 bits: balanced digits lie in [-64, 63], safely inside int8."""
@@ -592,8 +593,49 @@ class CodeBlockTile:
         padded[: operand.shape[0]] = operand
         return padded
 
+    def _column_block(self, columns: int, per_column_bytes: int) -> int:
+        """Columns of a product formed at once: all of them on the host or outside a ledger, and on a device as many
+        as leave their temporaries (``per_column_bytes`` each) within what the shared ledger can grant there
+        (``memory_broker.reclaimable``: the remainder with every idle cache counted, since the allocator evicts them
+        first), at least one. A genome fit's block CG formed the integer products of every column at once (~290
+        columns: 1.03 GB refused with 41.4 GB held on an A100, bench-sim chr22 015 [sim])."""
+        xp = self._array_module
+        if xp is np or columns == 0:
+            return max(columns, 1)
+        broker = current_broker()
+        if broker is None:
+            return columns
+        pool = device_pool(int(xp.cuda.runtime.getDevice()))
+        if pool not in broker.capacities:
+            return columns
+        return max(1, min(columns, broker.reclaimable(pool) // max(int(per_column_bytes), 1)))
+
     def _codes_times(self, operand: Any) -> Any:
-        """S @ operand for operand [n, K] float64; returns [p_b, K] float64."""
+        """S @ operand for operand [n, K] float64; returns [p_b, K] float64. On a device a block of columns at a time
+        (``_column_block``): per column the operand's copy and padding, the block's total, its integer products, three
+        fp64 recombination terms live at once (``recombine_digit_products``: the running sum, its scaled copy and their
+        sum) and the digit split of one sample chunk."""
+        xp = self._array_module
+        columns = int(operand.shape[1])
+        if xp is not np and columns > 1:
+            variants, samples = (int(extent) for extent in self._codes.shape)
+            per_column = (
+                2 * _FLOAT64_BYTES * samples
+                + variants * (4 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
+                + _digit_working_bytes(OPERAND_DIGITS) * min(samples, INT32_EXACT_DIGIT_ROWS)
+            )
+            out = xp.empty((self._variant_count, columns), dtype=xp.float64)
+            width = self._column_block(columns, per_column)
+            if width < columns:
+                for first in range(0, columns, width):
+                    last = min(first + width, columns)
+                    out[:, first:last] = self._codes_times_block(operand[:, first:last])
+                return out
+            del out
+        return self._codes_times_block(operand)
+
+    def _codes_times_block(self, operand: Any) -> Any:
+        """S @ operand for operand [n, K] float64, every column at once; returns [p_b, K] float64."""
         xp = self._array_module
         variants, samples = (int(extent) for extent in self._codes.shape)
         columns = int(operand.shape[1])
@@ -613,10 +655,37 @@ class CodeBlockTile:
         fixed = operand_bytes + variants * columns * (3 * _FLOAT64_BYTES + OPERAND_DIGITS * _INT32_BYTES)
         chunk = self._sample_chunk(fixed, _digit_working_bytes(OPERAND_DIGITS) * columns, INT32_EXACT_DIGIT_ROWS)
         chunks = ((start, min(start + chunk, samples), *operand_digits(padded[start : start + chunk], xp)) for start in range(0, samples, chunk))
-        return self._digit_products(self._codes, chunks, columns, OPERAND_DIGITS)[: self._variant_count]
+        return self._digit_block_products(self._codes, chunks, columns, OPERAND_DIGITS)[: self._variant_count]
 
-    def _digit_products(self, left_codes: Any, chunks: Any, columns: int, digit_count: int) -> Any:
-        """sum over the operand's sample chunks of left_codes @ chunk, from its digits (CUDA); [p_b, K]."""
+    def _digit_products(self, left_codes: Any, chunks: list[tuple[int, int, Any, Any]], columns: int, digit_count: int) -> Any:
+        """sum over a prepared operand's sample chunks of left_codes @ chunk, from its digits (CUDA); [p_b, K]. A block
+        of columns at a time (``_column_block``): per column the block's total, its integer products, three fp64
+        recombination terms live at once (``recombine_digit_products``) and its digits gathered from every chunk (twice: the gather and its column-major copy)."""
+        xp = self._array_module
+        variants = int(left_codes.shape[0])
+        chunk_rows = sum(stop - start for start, stop, _, _ in chunks)
+        per_column = variants * (4 * _FLOAT64_BYTES + digit_count * _INT32_BYTES) + 2 * digit_count * chunk_rows
+        out = xp.empty((variants, columns), dtype=xp.float64) if columns > 1 else None
+        width = self._column_block(columns, per_column)
+        if width >= columns:
+            del out
+            return self._digit_block_products(left_codes, chunks, columns, digit_count)
+        for first in range(0, columns, width):
+            last = min(first + width, columns)
+            block = [
+                (
+                    start, stop,
+                    xp.asfortranarray(xp.concatenate([digits[:, d * columns + first : d * columns + last] for d in range(digit_count)], axis=1)),
+                    scale[first:last],
+                )
+                for start, stop, digits, scale in chunks
+            ]
+            out[:, first:last] = self._digit_block_products(left_codes, block, last - first, digit_count)
+        return out
+
+    def _digit_block_products(self, left_codes: Any, chunks: Any, columns: int, digit_count: int) -> Any:
+        """sum over the operand's sample chunks of left_codes @ chunk, from its digits (CUDA), every column at once;
+        [p_b, K]."""
         xp = self._array_module
         variants, samples = (int(extent) for extent in left_codes.shape)
         total = xp.zeros((variants, columns), dtype=xp.float64)

@@ -158,3 +158,49 @@ def test_cuda_budgeted_products_stay_within_their_bound(relative_error: float) -
     exact_image = standardized.T @ right
     rounding = 2 * (variants + 4) * unit_roundoff * (np.abs(standardized).T @ np.abs(right))
     assert np.all(np.linalg.norm(cupy.asnumpy(image) - exact_image, axis=0) <= relative_error * norm * np.linalg.norm(right, axis=0) + np.linalg.norm(rounding, axis=0))
+
+
+def test_cuda_products_inside_a_tight_device_ledger_form_their_columns_by_blocks_bit_for_bit() -> None:
+    """``rmatmat`` of an array and of a prepared operand, and the squared codes' product of a prepared operand, on a
+    device whose ledger leaves room for their outputs and a few columns' temporaries only: the integer products are
+    formed a block of columns at a time (``_column_block``), no allocation is refused, and every column is the
+    unconstrained product's bit for bit (a genome fit's block CG formed ~290 columns' products at once and was refused
+    1.03 GB with 41.4 GB held on an A100, bench-sim chr22 015)."""
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import memory_scope
+
+    rng = np.random.default_rng(15)
+    variants, samples, columns = 2000, 1003, 1000
+    tile, codes = _cuda_tile(rng, variants, samples, 1 << 33)
+    left = cupy.asarray(rng.standard_normal((samples, columns)) * np.exp(rng.uniform(-30, 30, columns))[None, :])
+    operand = tile.sample_operand(left, FLOAT64_ROUNDING)
+    weights = tile.sample_operand(cupy.asarray(rng.uniform(0.05, 0.25, (samples, columns))), FLOAT64_ROUNDING)
+    calls = (
+        (lambda: tile.rmatmat(left), 4, 0),
+        (lambda: tile.rmatmat(operand), 4, 0),
+        # the two digit products, their combination and sum; the int16 squares and their two int8 halves
+        (lambda: tile._squared_codes_times_operand(weights), 5, 4 * codes.size),
+    )
+    expected = [_bits(call()) for call, _, _ in calls]
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    output_bytes = variants * columns * np.dtype(np.float64).itemsize
+    # A few columns' temporaries of the widest product (the array's: its copy, padding and digit split per sample).
+    few_columns = 4 * (56 * samples + 56 * variants)
+    for (call, outputs, fixed), bits in zip(calls, expected):
+        used = int(pool.used_bytes())
+        # The call's outputs whole and its fixed buffers, and a few columns: below the 56 bytes per variant and column
+        # the products of every column at once held.
+        capacity = used + outputs * output_bytes + fixed + few_columns
+        budget = ComputeBudget(
+            device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(capacity,),
+            device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
+        )
+        # Every device allocation inside the scope is admitted by the ledger's allocator, which refuses any that
+        # would take the pool's live bytes past the capacity: the call completing is the bound holding.
+        with memory_scope(budget):
+            assert tile._column_block(columns, 56 * variants) < columns
+            got = call()
+        assert np.array_equal(_bits(got), bits)
+        del got
+        pool.free_all_blocks()
