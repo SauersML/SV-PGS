@@ -493,6 +493,10 @@ class AliasEP:
         mean, variance = terms.mean.copy(), terms.variance.copy()
         fallback: list[int] = []
         for index, cluster in enumerate(sweep.clusters):
+            if index in self.held:
+                # A held cluster's cavity leaves its tilted law improper (``fit``): its members are decoded from q.
+                fallback.extend(int(g) for g in cluster)
+                continue
             cavity = sweep.cluster_cavity(index, precision, shift)
             proper, _m, _v, _floor, members, decoded = self.member_tilted(cluster, cavity[0], cavity[1], sweeps + 1)
             if proper:
