@@ -414,11 +414,13 @@ class GramBand:
     def _device_sweep(self, cupy, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped) -> SweepResult:
         import cupyx
 
-        from sv_pgs.device_sweep import PANEL, PIECE_COLUMNS, _kernel
+        from sv_pgs.device_sweep import PANEL, PIECE_COLUMNS, PROJECT_THREADS, _kernel
 
         kernel = _kernel(cupy)
         log_density_device = cupy.asarray(np.ascontiguousarray(log_density))
         node_count = int(grid.shape[0])
+        # The step kernel's per-(member, node) scratch (``device_sweep.sweep_piece``): one panel's worth each.
+        scratch = [cupy.empty(PANEL * node_count, dtype=cupy.float64) for _name in ("conditional", "base", "weight")]
         device_grouped = cupy.asarray(grouped)
         squares = cupy.asarray(self.squares)
         divergence = weighted_variance = sizes = quadratic = quadratic_size = 0.0
@@ -444,11 +446,12 @@ class GramBand:
                 projection = cupy.ascontiguousarray(field[rows] * panel_signs)
                 step = cupy.empty(last - first, dtype=cupy.float64)
                 kernel(
-                    (1,), (PANEL,),
+                    (1,), (PROJECT_THREADS,),
                     (
                         panel_gram, projection, cupy.ascontiguousarray(member_squares[first:last]), classes[first:last], log_density_device,
                         np.int32(node_count), node_variance[first:last], log_node_variance[first:last], np.float64(noise), np.int32(last - first),
                         state[0][first:last], state[1][first:last], state[2][first:last], state[3][first:last], state[4][first:last], step, pieces[first:last],
+                        *scratch,
                     ),
                 )
                 signed_step = step * panel_signs
