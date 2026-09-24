@@ -2270,12 +2270,26 @@ class _FullDataMeanField:
 
 
 class _GramMeanField(_FullDataMeanField):
-    """``_FullDataMeanField`` on Stage 0's banded Gram (``gram_space``): the same fixed points, ELBO, noise updates,
-    responses and certificate, with every read of the design replaced by the band's, so nothing after Stage 0 reads
-    the samples. A model's residual is carried as its fields c = s - G_band mbar over the groups (the sample-space
-    oracle's r, seen through Xp'), formed afresh at the end of every solve; the sweep forms each block's fields from the
-    means as it arrives there (``GramBand.sweep``), so no rounding accumulates across sweeps. A quantitative model only
-    (one target: Stage 0's statistics are one model's)."""
+    """``_FullDataMeanField`` with its sweeps and solves on Stage 0's banded Gram (``gram_space``): the same fixed points,
+    ELBO, noise updates, responses and certificate. A model's residual is carried as its fields c = Xp'r over the groups
+    (the sample-space oracle's r, seen through Xp'). A quantitative model only (one target: Stage 0's statistics are
+    one model's).
+
+    Exact route (the dual solver's role played by a ``GramGaussian`` with the store's tiles): iterative refinement of
+    the mean-field fixed point. At the start of a solve one read of the store gives the exact fields c = Xp'(y_P - Xp
+    mbar) at the current means, and the far field f = c - (s - G_band mbar), what the band leaves out there; the sweeps
+    then run on the band with f held (fields s + f - G_band mbar: coordinate ascent on the ELBO whose quadratic term's
+    far part is linearized at the round's means, exact there), to the band solve's own tolerance; the exact fields
+    are read again at the new means, and another round follows while the change of f could still move the fixed
+    point by more than the tolerance (its pending gain, sum_j v_j df_j^2 / (2 sigma^4): each q_j's gain from the shift of
+    its field alone, as the sweeps' own remainder is each coordinate's). Where f stops changing, the band's fields plus
+    f are the exact fields, so the fixed point is the sample-space oracle's; the final state's residual and ELBO are
+    the exact ones. Every other read of the design (the responses' Gram products, the mixture's move test) is the
+    sample-space oracle's own. A round whose exact ELBO falls, or whose pending gain does not shrink, refuses the solve
+    (the refinement does not contract there), counted in ``unresolved``.
+
+    Pure band route (no tiles): every read is the band's, and the far field is left out (``FitCertificate.far_field``
+    reports its size); exact only where the band is the whole Gram."""
 
     def __init__(
         self, gaussian: GramGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
@@ -2285,6 +2299,13 @@ class _GramMeanField(_FullDataMeanField):
         if sites is not None and any(entry is not None for entry in sites):
             raise ValueError("the Gram-space route fits quantitative models only: a binary model's metric moves with its sites")
         self.band = gaussian.band
+        self.exact = bool(gaussian.exact)
+        # Each model's far field f held through a round, and the grouped means it was read at.
+        self._far = np.zeros((gaussian.band.group_count, gaussian.model_count))
+        self._far_reference = np.zeros((gaussian.band.group_count, gaussian.model_count))
+        self._last_residual_square = 0.0
+        self._last_rounding = 0.0
+        self.refinements = 0
         super().__init__(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, order_seed=order_seed, start_mean=start_mean, sites=sites)
 
     def _grouped(self, values: F64Array) -> F64Array:
@@ -2296,19 +2317,36 @@ class _GramMeanField(_FullDataMeanField):
         image = np.asarray(_host(self.band.product(values[:, None] if column else values, self.gaussian.array_module)), dtype=np.float64)
         return image[:, 0] if column else image
 
+    def _exact_fields(self, model: int) -> tuple[F64Array, float]:
+        """(c = Xp'r over the groups, ||r||^2) at the model's current means, r = y_P - Xp m: two reads of the store."""
+        residual = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
+        xp = self.gaussian.array_module
+        projected = np.asarray(_host(self.models.complement(xp.asarray(residual[:, None]), xp.full(1, model, dtype=xp.int64))), dtype=np.float64)
+        masked = xp.asarray(projected * self.root[:, model][:, None])
+        fields = np.zeros(self.ties.group_count)
+        for start, stop, tile in self.gaussian.source.blocks():
+            fields[start:stop] = np.asarray(_host(tile.rmatmat(masked)), dtype=np.float64)[:, 0]
+        return fields, float(residual @ residual)
+
     def _start_residual(self, model: int) -> F64Array:
         return self.band.scores.copy()
 
     def _residual_of(self, model: int) -> F64Array:
+        if self.exact:
+            return self._exact_fields(model)[0]
         return self.band.scores - self._band_product(self._grouped(self.mean[:, model]))
 
     def _gram_product(self, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        if self.exact:
+            return super()._gram_product(columns, model, metric)
         return self.sign[:, None] * self._band_product(self._grouped(columns))[self.ties.group]
 
     def _residual_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
         return np.asarray(residual, dtype=np.float64) @ self._grouped(columns)
 
     def _fitted_square(self, values: F64Array, model: int) -> float:
+        if self.exact:
+            return super()._fitted_square(values, model)
         grouped = self._grouped(values)
         return float(grouped @ self._band_product(grouped))
 
@@ -2331,22 +2369,71 @@ class _GramMeanField(_FullDataMeanField):
         arrays = {name: np.ascontiguousarray(getattr(self, name)[:, model]) for name in names}
         noise = float(self.noise[model])
         started, read_before = time.perf_counter(), self.band.read_bytes
+        far = self._far[:, model] if self.exact else None
         result = self.band.sweep(
             self.gaussian.array_module, member_blocks=self.member_blocks, group=self.ties.group, sign=self.sign, class_index=self.class_index,
             log_density=np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), scales=log_scale(prior, hyperparameters.coefficients),
-            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, **arrays,
+            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, field_shift=far, **arrays,
         )
         for name in names:
             getattr(self, name)[:, model] = arrays[name]
         self.passes += 1
         log(f"gram sweep {self.passes}: {time.perf_counter() - started:.1f} s, {(self.band.read_bytes - read_before) / 1e9:.1f} GB read from Stage 0's files")
+        residual_square, size = result.residual_square, result.residual_size
+        if far is not None:
+            # The far part of mbar'G mbar linearized at the round's means m0 (f = -F m0): mbar'F mbar ~ -2 mbar'f + m0'f,
+            # exact at mbar = m0; the band's residual square already carries -2 mbar'f.
+            reference = self._far_reference[:, model]
+            residual_square += float(reference @ far)
+            size += float(np.abs(reference) @ np.abs(far))
         # The residual square is y'Py - 2 mbar's + mbar'G mbar, formed from terms of the size ``residual_size``: its
         # rounding enters the ELBO's bound with the KL pieces' (``_elbo``'s count of summands covers its sums).
-        return result.divergence, result.weighted_variance, result.residual_square, result.sizes + result.residual_size / (2.0 * noise)
+        return result.divergence, result.weighted_variance, residual_square, result.sizes + size / (2.0 * noise)
 
     def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
-        super()._solve_model(model, hyperparameters, pass_budget)
-        self.residual[model] = self._residual_of(model)
+        if not self.exact:
+            super()._solve_model(model, hyperparameters, pass_budget)
+            self.residual[model] = self._residual_of(model)
+            return
+        tolerance = 0.5 / self.draw_count
+        fields, residual_square = self._exact_fields(model)
+        pending: float | None = None
+        exact_elbo: float | None = None
+        rounds = 0
+        while True:
+            grouped = self._grouped(self.mean[:, model])
+            far = fields - (self.band.scores - self._band_product(grouped))
+            if rounds:
+                noise = float(self.noise[model])
+                change = (far - self._far[:, model])[self.ties.group]
+                round_pending = float(np.sum(self.variance[:, model] * change * change)) / (2.0 * noise * noise)
+                # The state's ELBO with the exact residual in place of the round's linearized one.
+                self.elbo[model] += (self._last_residual_square - residual_square) / (2.0 * noise)
+                if exact_elbo is not None and self.elbo[model] < exact_elbo - self._last_rounding:
+                    self.unresolved[model] += 1
+                    raise FloatingPointError(f"model {model}: a refinement round lowered the exact ELBO by {exact_elbo - self.elbo[model]:.3g} nats: unresolved")
+                if pending is not None and round_pending >= pending and round_pending > tolerance:
+                    self.unresolved[model] += 1
+                    raise FloatingPointError(
+                        f"model {model}: the far field's refinement does not contract (pending gain {round_pending:.3g} after {pending:.3g} nats): unresolved"
+                    )
+                exact_elbo = float(self.elbo[model])
+                pending = round_pending
+                log(f"gram refinement {rounds}: pending gain {round_pending:.3g} nats of the far field's change (tolerance {tolerance:.3g})")
+                if round_pending <= tolerance:
+                    break
+            self._far[:, model], self._far_reference[:, model] = far, grouped
+            super()._solve_model(model, hyperparameters, pass_budget)
+            self.refinements += 1
+            fields, residual_square = self._exact_fields(model)
+            rounds += 1
+        self._far[:, model], self._far_reference[:, model] = far, grouped
+        self.residual[model] = fields
+
+    def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
+        value, rounding = super()._elbo(model, divergence, weighted_variance, residual_square, sizes)
+        self._last_residual_square, self._last_rounding = residual_square, rounding
+        return value, rounding
 
     def covariate_coefficients(self, model: int, mean: F64Array | None = None) -> F64Array:
         """alpha = (C'C)^+ (C'y - C'X mbar) from Stage 0's cross-products X'C and C'y (the training rows'), as the
@@ -2356,10 +2443,15 @@ class _GramMeanField(_FullDataMeanField):
         return band.covariate_pseudo_inverse @ (band.covariate_target - band.covariate_cross.T @ grouped)
 
     def far_field(self, model: int, mean: F64Array | None = None) -> float:
-        """``GramBand.far_field_ratio`` at this state: E beta_g^2 = mbar_g^2 + sum of its members' variances."""
+        """``GramBand.far_field_ratio`` at this state (E beta_g^2 = mbar_g^2 + its members' variances): what the pure band
+        route leaves out; the exact route corrects it, so it reports 0 and logs the ratio."""
         grouped = self._grouped(self.mean[:, model] if mean is None else mean)
         spread = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
-        return self.band.far_field_ratio(grouped * grouped + spread, float(self.noise[model]))
+        ratio = self.band.far_field_ratio(grouped * grouped + spread, float(self.noise[model]))
+        if self.exact:
+            log(f"gram space: the band alone would leave out a far field of ratio {ratio:.3g}; corrected by {self.refinements} refinement rounds")
+            return 0.0
+        return ratio
 
 
 def state_digest(parts: Sequence[F64Array]) -> np.ndarray:

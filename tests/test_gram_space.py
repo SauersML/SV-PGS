@@ -183,21 +183,75 @@ def _fits(tmp_path: Path, block_cap: int, seed: int = 7):
     )
     band = GramBand(statistics, 1 << 22)
     gram_space = GramGaussian(band, training=mask, targets=targets[:, None], covariates=store_covariates, probe_count=_DRAWS)
+    exact_space = GramGaussian(band, training=mask, targets=targets[:, None], covariates=store_covariates, probe_count=_DRAWS, source=source)
     sample_seconds, gram_seconds = pass_costs(band, source, np)
     assert sample_seconds > 0.0 and gram_seconds > 0.0
     fits = [
         fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
-        for gaussian in (sample_space, gram_space)
+        for gaussian in (sample_space, gram_space, exact_space)
     ]
     return fits, statistics, store, genetic
 
 
-@pytest.mark.slow  # two mean-field fits of the synthetic store: about a minute on acl42
+def _held_out_predictions(fits, statistics, store) -> list[np.ndarray]:
+    signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
+    standardized = (signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]
+    return [standardized.T[_TRAINING:_SAMPLES] @ fit.member_mean[:, 0] for fit in fits]
+
+
+def test_exact_band_solve_is_the_dense_solve_of_the_design_within_its_certificate(tmp_path: Path) -> None:
+    # The exact route's refinement: band solves of exact residuals read from the store, certified by the exact residual.
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = np.arange(_TRAINING)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+    band = GramBand(statistics, 1 << 22)
+    solver = GramGaussian(
+        band, training=mask, targets=targets[:, None], covariates=np.column_stack([np.ones(_SAMPLES), covariate]), source=source,
+    )
+    count = band.group_count
+    gram = solver.gram_product(np.eye(count))
+    # On the band the design's Gram is Stage 0's, to float32's rounding of the stored one.
+    for block in range(band.block_count):
+        own = band.span(block)
+        stored = band.within(block).astype(np.float64)
+        np.testing.assert_allclose(gram[own, own], stored, rtol=0, atol=4 * np.finfo(np.float32).eps * np.max(np.abs(stored)))
+    generator = np.random.default_rng(9)
+    precision = generator.uniform(0.2, 2.0, size=count) * np.median(np.diag(gram)) / 50.0
+    precision[[4, 40]] = [-1e-3 * precision[4], 0.0]
+    noise = 0.7
+    solver.iterate(site_precision=precision[:, None], site_shift=np.zeros((count, 1)), noise_variance=np.array([noise]))
+    right = generator.normal(size=(count, 2))
+    solution, certificate = solver.posterior_solve(right, 0, np.array([1e-4, 1e-8]))
+    exact = np.linalg.solve(gram / noise + np.diag(precision), right)
+    assert np.all(np.isfinite(certificate))
+    np.testing.assert_allclose(solution, exact, rtol=0, atol=1e-5 * float(np.max(np.abs(exact))))
+
+
+def _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store) -> None:
+    """The exact route's fit is the sample-space fit's model: no far field left out, its fixed points solved to the
+    fit's resolution, and its predictions those of the sample-space fit. The two reach their fixed points by different
+    paths (the band's sweeps against the far field held for a round, against the samples' Gauss-Seidel), so where the
+    mean field has several modes they may settle in different ones, and their outer loops end at different gains."""
+    assert exact_fit.certificate.far_field[0] == 0.0 and exact_fit.certificate.budget_unresolved[0] == 0
+    assert exact_fit.certificate.mean_move[0] <= exact_fit.certificate.draw_tolerance[0]
+    sample, exact = _held_out_predictions([sample_fit, exact_fit], statistics, store)
+    print("exact route: remaining gains", sample_fit.certificate.remaining_gain[0], exact_fit.certificate.remaining_gain[0], "prediction correlation", np.corrcoef(sample, exact)[0, 1])
+    assert np.corrcoef(sample, exact)[0, 1] > 0.99
+
+
+@pytest.mark.slow  # three mean-field fits of the synthetic store: about two minutes on acl42
 def test_band_fit_is_near_the_sample_fit_with_one_block_per_chromosome(tmp_path: Path) -> None:
     # One block per chromosome, and the chromosomes' cross-Gram is chance LD only: the band is G but for the chance
     # coupling of the two chromosomes and float32's rounding of the stored Gram.
-    (sample_fit, band_fit), statistics, _store_, _genetic = _fits(tmp_path, 256)
+    (sample_fit, band_fit, exact_fit), statistics, store, _genetic = _fits(tmp_path, 256)
     assert statistics.ld.block_count == 2
+    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store)
     for fit in (sample_fit, band_fit):
         assert fit.certificate.budget_unresolved[0] == 0
         assert fit.certificate.mean_move[0] <= fit.certificate.draw_tolerance[0]
@@ -207,14 +261,13 @@ def test_band_fit_is_near_the_sample_fit_with_one_block_per_chromosome(tmp_path:
     assert difference < 4.0 / np.sqrt(_TRAINING)
 
 
-@pytest.mark.slow  # two mean-field fits of the synthetic store: about a minute on acl42
+@pytest.mark.slow  # three mean-field fits of the synthetic store: about two minutes on acl42
 def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> None:
-    (sample_fit, band_fit), statistics, store, genetic = _fits(tmp_path, _BLOCK_CAP)
+    (sample_fit, band_fit, exact_fit), statistics, store, genetic = _fits(tmp_path, _BLOCK_CAP)
     assert statistics.ld.block_count > 2
-    signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
-    standardized = (signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]
+    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store)
     held_out = np.arange(_TRAINING, _SAMPLES)
-    predictions = [standardized.T[held_out] @ fit.member_mean[:, 0] for fit in (sample_fit, band_fit)]
+    predictions = _held_out_predictions([sample_fit, band_fit], statistics, store)
     accuracy = [np.corrcoef(values, genetic[held_out])[0, 1] for values in predictions]
     assert accuracy[1] > 0.5
     assert np.corrcoef(predictions[0], predictions[1])[0, 1] > 0.9
@@ -235,8 +288,9 @@ def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gr
     _write_store(tmp_path / "store", [{"chr22": np.rint(codes.astype(np.float64) / 127.0 * 1000.0).astype(np.int64)}])
     store = DosageStore.open(tmp_path / "store")
     dosage = store.read_codes(0, store.n_variants).astype(np.float64).T / 127.0
+    causal = generator.choice(dosage.shape[1], size=15, replace=False)
     effects = np.zeros(dosage.shape[1])
-    effects[generator.choice(dosage.shape[1], size=15, replace=False)] = generator.standard_normal(15)
+    effects[causal] = generator.standard_normal(15)
     genetic = (dosage - dosage.mean(axis=0)) @ effects
     genetic *= np.sqrt(0.5) / np.std(genetic)
     covariate = generator.standard_normal(_SAMPLES)

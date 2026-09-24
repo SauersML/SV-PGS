@@ -404,10 +404,10 @@ def _fit_one(
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share))
-    # The design's space (``gram_space``): a quantitative model is fitted on Stage 0's banded Gram wherever a pass over
-    # the band costs less than a pass over the samples, measured on this store and device (``pass_costs``), since every
-    # sweep, product and solve is a pass in either space; a binary model's metric moves with its sites, so its passes
-    # are over the samples.
+    # The design's space (``gram_space``): a quantitative model's sweeps and solves run on Stage 0's banded Gram, with the
+    # far field corrected exactly by reads of the samples, wherever a pass over the band costs less than a pass over the
+    # samples, measured on this store and device (``pass_costs``): both routes are exact, and the band's replaces most
+    # of the sample passes. A binary model's metric moves with its sites, so its passes are over the samples.
     band = None
     if not binary:
         band = GramBand(statistics, share)
@@ -420,8 +420,11 @@ def _fit_one(
             band.release()
             band = None
     if band is not None:
+        # The exact route: sweeps and solves on the band, the far field corrected by exact residuals read from the store
+        # (``full_data_fit._GramMeanField``), so the fit is the sample-space fit's, in a few reads of the samples.
         gaussian = GramGaussian(
             band, training=mask, targets=store_targets, covariates=store_covariates, array_module=source.array_module, probe_count=draw_count,
+            source=source,
         )
     else:
         gaussian = DualGaussian(
