@@ -33,12 +33,15 @@ def _band(generator: np.random.Generator, widths: list[int], dtype=np.float64):
     return band, starts
 
 
-@pytest.mark.parametrize("dtype", [np.float64, np.float32])
-def test_device_band_sweep_is_the_host_band_sweep(dtype) -> None:
+@pytest.mark.parametrize("dtype, tempered", [(np.float64, False), (np.float32, False), (np.float64, True)])
+def test_device_band_sweep_is_the_host_band_sweep(dtype, tempered) -> None:
     generator = np.random.default_rng(11)
     # Blocks wider than a panel (32), so a block takes several panels and a tie shares one.
     widths = [70, 45, 90]
     band, starts = _band(generator, widths, dtype)
+    if tempered:
+        # The tempered band (the summary route's far field): each block its own lambda, the kernels its noise / lambda.
+        band.set_tempering(generator.uniform(0.4, 1.0, size=len(widths)))
     count = band.group_count
     groups = np.concatenate([np.arange(count), [3, 3]])
     signs = np.concatenate([np.ones(count), [1.0, -1.0]])
