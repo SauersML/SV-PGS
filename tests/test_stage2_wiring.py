@@ -26,7 +26,15 @@ def _budget() -> ComputeBudget:
     )
 
 
-def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path) -> None:
+@pytest.mark.parametrize("route", ["samples", "gram"])
+def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
+    # Each route by name (the measured pass costs tie at this size, so either could be chosen): the sample-space fit is
+    # certified; the Gram-space fit leaves out the chance LD between the store's two chromosomes, which its certificate
+    # reports as the far field (at n = 400 and h2 = 0.5 a large share of a field's noise), so its outer loop is not
+    # asked to certify here (on one block, where the band is G, both routes certify alike: test_gram_space).
+    from sv_pgs import stage2_wiring
+
+    monkeypatch.setattr(stage2_wiring, "pass_costs", (lambda band, source, xp: (0.0, np.inf)) if route == "samples" else (lambda band, source, xp: (np.inf, 0.0)))
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
     samples = store.n_samples
     training = np.arange(samples) < samples * 4 // 5
@@ -48,7 +56,10 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
             seed=3,
         )
     )
-    assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
+    if route == "samples":
+        assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT and model.certificate["far_field"][0] == 0.0
+    else:
+        assert model.certificate["far_field"][0] > 0.0
     save_model(tmp_path / "model", model)
     loaded = load_model(tmp_path / "model")
     prediction = predict(loaded, store, np.arange(samples), covariate[:, None], _budget())

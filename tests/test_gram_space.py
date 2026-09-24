@@ -193,7 +193,7 @@ def _fits(tmp_path: Path, block_cap: int, seed: int = 7):
 
 
 @pytest.mark.slow  # two mean-field fits of the synthetic store: about a minute on acl42
-def test_band_fit_is_the_sample_fit_where_one_block_holds_every_variant(tmp_path: Path) -> None:
+def test_band_fit_is_near_the_sample_fit_with_one_block_per_chromosome(tmp_path: Path) -> None:
     # One block per chromosome, and the chromosomes' cross-Gram is chance LD only: the band is G but for the chance
     # coupling of the two chromosomes and float32's rounding of the stored Gram.
     (sample_fit, band_fit), statistics, _store_, _genetic = _fits(tmp_path, 256)
@@ -218,3 +218,45 @@ def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> N
     accuracy = [np.corrcoef(values, genetic[held_out])[0, 1] for values in predictions]
     assert accuracy[1] > 0.5
     assert np.corrcoef(predictions[0], predictions[1])[0, 1] > 0.9
+
+
+@pytest.mark.slow  # two engine fits of a synthetic chromosome: about 40 s on acl42
+def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One chromosome in one LD block: the band is G up to float32's rounding of the stored Gram, so the whole fit, its
+    # outer loop and certificate included, is the sample-space fit's to that rounding.
+    from sv_pgs import fit_model, stage2_wiring
+    from sv_pgs.config import TraitType
+    from sv_pgs.dosage_store import DosageStore
+    from tests.stage0_support import mosaic_codes
+    from tests.test_dosage_store import _write_store
+
+    generator = np.random.default_rng(7)
+    codes = mosaic_codes(generator, _SAMPLES, 240)
+    _write_store(tmp_path / "store", [{"chr22": np.rint(codes.astype(np.float64) / 127.0 * 1000.0).astype(np.int64)}])
+    store = DosageStore.open(tmp_path / "store")
+    dosage = store.read_codes(0, store.n_variants).astype(np.float64).T / 127.0
+    effects = np.zeros(dosage.shape[1])
+    effects[generator.choice(dosage.shape[1], size=15, replace=False)] = generator.standard_normal(15)
+    genetic = (dosage - dosage.mean(axis=0)) @ effects
+    genetic *= np.sqrt(0.5) / np.std(genetic)
+    covariate = generator.standard_normal(_SAMPLES)
+    targets = 0.3 * covariate + genetic + np.sqrt(0.5) * generator.standard_normal(_SAMPLES)
+    training = np.arange(_SAMPLES) < _TRAINING
+    models = {}
+    for route, costs in (("samples", (0.0, np.inf)), ("gram", (np.inf, 0.0))):
+        monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp, costs=costs: costs)
+        (tmp_path / route).mkdir()
+        models[route] = fit_model.fit(fit_model.FitRequest(
+            store=store, store_columns=np.arange(_SAMPLES, dtype=np.int64), covariates=covariate[:, None], covariate_names=("covariate",),
+            covariate_columns=np.ones((1, 1), dtype=bool), targets=np.where(training, targets, np.nan)[:, None], training=training[:, None],
+            model_names=("trait",), trait_types=(TraitType.QUANTITATIVE,), research_ids=tuple(f"person{index}" for index in range(_SAMPLES)),
+            log_variance_offset=None, budget=_budget(), work_dir=tmp_path / route, seed=3,
+        ))
+    samples, gram = models["samples"].certificate, models["gram"].certificate
+    assert gram["far_field"][0] == 0.0
+    assert samples["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT and gram["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
+    assert samples["outer_iterations"][0] == gram["outer_iterations"][0]
+    # Float32's rounding of the stored Gram, carried through the fit: the gains agree far inside the tolerance.
+    assert abs(samples["remaining_gain"][0] - gram["remaining_gain"][0]) <= 1e-3 * 0.5 / fit_model.DRAW_COUNT
+    coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "gram")]
+    assert np.linalg.norm(coefficients[1] - coefficients[0]) <= 1e-4 * np.linalg.norm(coefficients[0])
