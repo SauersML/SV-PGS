@@ -1939,6 +1939,12 @@ class _FullDataMeanField:
         pending_noise: float | None = None
         passes_at_entry = self.passes
         budget = self._sweep_budget(model, hyperparameters)
+        started = time.perf_counter()
+        sweeps = 0
+
+        def done(outcome: str) -> None:
+            log(f"mean-field solve: model {model} {outcome} after {sweeps} sweeps in {time.perf_counter() - started:.1f} s, {self.passes - passes_at_entry} passes")
+
         while True:
             if pass_budget is not None and self.passes - passes_at_entry >= pass_budget:
                 raise _PassBudget()
@@ -1946,6 +1952,7 @@ class _FullDataMeanField:
                 elbo = elbo + float(self.noise_gain[model]) if elbo is not None else None
                 self.noise[model] = pending_noise
             divergence, weighted_variance, residual_square, sizes = self._sweep(model, hyperparameters)
+            sweeps += 1
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
                 raise FloatingPointError(f"model {model}: a mean-field sweep is not finite")
             value, rounding = self._elbo(model, divergence, weighted_variance, residual_square, sizes)
@@ -1975,6 +1982,7 @@ class _FullDataMeanField:
             if remaining + float(self.noise_gain[model]) <= tolerance:
                 model_sites = self.sites[model]
                 if model_sites is None:
+                    done("solved")
                     return
                 # A binary model at its fixed point for these sites (``mean_field.MeanFieldFixedPoints._solve``): the xi
                 # update's exact gain at q, one read for the predictor variances. Within what is left of the tolerance
@@ -1983,12 +1991,14 @@ class _FullDataMeanField:
                 updated, site_gain = model_sites.updated(*self._predictor_moments(model))
                 if remaining + site_gain <= tolerance:
                     self.noise_gain[model] = site_gain
+                    done("solved")
                     return
                 self._reweight(model, updated)
                 elbo = value + site_gain
                 gain = previous_gain = None
             if budget.exhausted(value, rounding):
                 self.unresolved[model] += 1
+                done("unresolved")
                 raise FloatingPointError(
                     f"model {model}: the mean-field solve spent its derived work budget ({budget.iterations} iterations against the ELBO "
                     f"ceiling {budget.ceiling:.6g} from {budget.first:.6g} in steps of at least {budget.step:.3g}) with {remaining:.3g} nats "
