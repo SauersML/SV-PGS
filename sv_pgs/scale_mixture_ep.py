@@ -127,6 +127,7 @@ from scipy.special import erfcx
 
 from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.memory_broker import current_broker, device_pool
 from sv_pgs.krylov_recycle import block_gcro_dr
 from sv_pgs.progress import log
 
@@ -1059,6 +1060,25 @@ def _host(values):
     return values.get() if hasattr(values, "get") else values
 
 
+def _device_budget(working_bytes: int) -> int:
+    """The bytes a pass may allocate at once on the fit's device: ``working_bytes`` (sized for the host) bounded by
+    what the current ledger's device pool can still grant (``memory_broker``: its remainder plus its idle caches), so
+    a device chunk is sized from the device's memory, not the host's; ``working_bytes`` itself on the host or outside
+    a ledger's scope. A device allocation past the ledger's capacity is refused by its allocator (``MemoryError``):
+    on bench-sim chr22 [sim, 466k columns] the line integrals' chunks, sized from the host's budget, were refused at
+    41.6 GB of an A100-40GB."""
+    xp = _DEVICE.get()
+    if xp is np:
+        return int(working_bytes)
+    broker = current_broker()
+    if broker is None:
+        return int(working_bytes)
+    pool = device_pool(int(xp.cuda.Device().id))
+    if pool not in broker.capacities:
+        return int(working_bytes)
+    return max(1, min(int(working_bytes), int(broker.reclaimable(pool))))
+
+
 @contextlib.contextmanager
 def device_scope(array_module: ModuleType | None) -> Iterator[None]:
     """Every objective and moment evaluation inside runs on ``array_module`` (None: numpy)."""
@@ -1134,7 +1154,8 @@ def _kernel_chunks(
     if cache is not None:
         cache.pop("rows", None)
     held = None
-    chunks = [list(_row_chunks(class_rows, prior.grid_size, working_bytes)) for class_rows in prior.class_rows]
+    budget = _device_budget(working_bytes)
+    chunks = [list(_row_chunks(class_rows, prior.grid_size, budget)) for class_rows in prior.class_rows]
     xp = _DEVICE.get()
 
     def form(rows: I64Array) -> _KernelRows:
@@ -1148,7 +1169,7 @@ def _kernel_chunks(
     # Reserve a second copy for the pass.
     held_bytes = _HELD_ARRAYS_PER_ROW_SET * prior.grid_size * scales.dtype.itemsize * sum(rows.size for rows in prior.class_rows)
     key_bytes = scales.nbytes + cavity.precision.nbytes + cavity.shift.nbytes
-    if cache is not None and all(len(pieces) <= 1 for pieces in chunks) and 2 * held_bytes + key_bytes <= working_bytes:
+    if cache is not None and all(len(pieces) <= 1 for pieces in chunks) and 2 * held_bytes + key_bytes <= budget:
         formed = [(class_position, rows, form(rows)) for class_position, pieces in enumerate(chunks) for rows in pieces]
         cache["rows"] = (
             prior.class_rows, prior.log_variance_grid, working_bytes, scales.copy(), cavity.precision.copy(), cavity.shift.copy(), formed,
@@ -2550,9 +2571,11 @@ def _moving_line_sum(
     ``working_bytes``."""
     count = steps.shape[0]
     rows = log_scale_rows.shape[0]
-    # Per row and step: the device's inputs and three outputs (the host's one output is less).
-    chunk = max(1, int(working_bytes) // (max(count, 1) * (engine_kernels._tilted_row_bytes() + 3 * np.dtype(np.float64).itemsize)))
     xp = _DEVICE.get() if array_module is None else array_module
+    budget = int(working_bytes) if xp is np else _device_budget(working_bytes)
+    # Per row and step: the device's inputs, its copies of them (``engine_kernels.tilted_moments``) and three outputs
+    # (the host's one output is less).
+    chunk = max(1, budget // (max(count, 1) * (2 * engine_kernels._tilted_row_bytes() + 3 * np.dtype(np.float64).itemsize)))
     total = np.zeros(count)
     for start in range(0, rows, chunk):
         stop = min(start + chunk, rows)
@@ -2562,7 +2585,7 @@ def _moving_line_sum(
             scales = (xp.asarray(log_scale_rows[start:stop])[:, None] + xp.asarray(slopes[start:stop])[:, None] * device_steps[None, :]).ravel()
             log_normalizer, _mean, _variance, _improper = engine_kernels.tilted_moments(
                 xp, xp.tile(xp.arange(count, dtype=xp.int64), size), class_density, scales, grid,
-                xp.repeat(xp.asarray(precision[start:stop]), count), xp.repeat(xp.asarray(shift[start:stop]), count), working_bytes,
+                xp.repeat(xp.asarray(precision[start:stop]), count), xp.repeat(xp.asarray(shift[start:stop]), count), budget,
             )
             total += _host(log_normalizer.reshape(size, count).sum(axis=0))
             continue
@@ -2575,7 +2598,8 @@ def _moving_line_sum(
 
 
 def _line(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int,
+    shared: dict | None = None,
 ) -> Callable[[F64Array], F64Array]:
     """The penalized objective F(x + t b) - P(x + t b) as a function of the steps t, each call one pass over the
     variants for all its steps.
@@ -2601,22 +2625,39 @@ def _line(
         penalty += anchor_value
         penalty_slope += float(anchor_gradient @ direction)
         penalty_curvature += float(direction @ prior.anchor.matrix @ direction)
-    fixed_rows, moving_rows, kernels = [], [], []
+    fixed_rows, moving_rows = [], []
     for class_position, class_rows in enumerate(prior.class_rows):
-        still = class_rows[scale_slope[class_rows] == 0.0]
-        fixed_rows.append(still)
+        fixed_rows.append(class_rows[scale_slope[class_rows] == 0.0])
         moving_rows.append(class_rows[scale_slope[class_rows] != 0.0])
-        rows_kernels = []
-        xp = _DEVICE.get()
-        for rows in _row_chunks(still, prior.grid_size, working_bytes):
-            # L_jk: the kernel's log with a flat class density (its log pi part enters per step), on the fit's device.
-            row_kernel = _kernel_terms(
-                xp.zeros(prior.grid_size), xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]),
-                xp.asarray(cavity.shift[rows]),
-            )[3]
-            peak = np.max(row_kernel, axis=1)
-            rows_kernels.append((rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel))
-        kernels.append(rows_kernels)
+    budget = _device_budget(working_bytes)
+    xp = _DEVICE.get()
+
+    def form(rows: I64Array):
+        # L_jk: the kernel's log with a flat class density (its log pi part enters per step), on the fit's device.
+        row_kernel = _kernel_terms(
+            xp.zeros(prior.grid_size), xp.asarray(scales[rows]), xp.asarray(prior.log_variance_grid), xp.asarray(cavity.precision[rows]),
+            xp.asarray(cavity.shift[rows]),
+        )[3]
+        peak = np.max(row_kernel, axis=1)
+        return rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel
+
+    # The fixed rows' kernels depend on the origin, not the direction: formed once for every direction of one origin
+    # (``shared``, the line integrals' own), and held only where two row sets (the held one and a pass's own) fit the
+    # device's budget; otherwise each pass forms them chunk by chunk.
+    held_bytes = 2 * prior.grid_size * np.dtype(np.float64).itemsize * sum(int(rows.shape[0]) for rows in fixed_rows)
+    key = ("fixed kernels", _digest(scales, cavity.precision, cavity.shift, scale_slope == 0.0))
+    kernels = None if shared is None else shared.get(key)
+    if kernels is None and 2 * held_bytes <= budget:
+        kernels = [[form(rows) for rows in _row_chunks(still, prior.grid_size, budget)] for still in fixed_rows]
+        if shared is not None:
+            shared[key] = kernels
+
+    def fixed_chunks(class_position: int):
+        if kernels is not None:
+            yield from kernels[class_position]
+            return
+        for rows in _row_chunks(fixed_rows[class_position], prior.grid_size, _device_budget(working_bytes)):
+            yield form(rows)
 
     def values(steps: F64Array) -> F64Array:
         count = steps.shape[0]
@@ -2629,7 +2670,7 @@ def _line(
             density_peak = np.max(class_density, axis=1)
             scaled = xp.asarray(np.exp(class_density - density_peak[:, None]).T)
             device_density = xp.asarray(class_density)
-            for rows, peak, exponentials, row_kernel in kernels[class_position]:
+            for rows, peak, exponentials, row_kernel in fixed_chunks(class_position):
                 products = exponentials @ scaled
                 # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
                 lost = products < np.finfo(np.float64).tiny / _EPSILON
@@ -2670,7 +2711,8 @@ def _line_log_integrals(
     tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
     count = directions.shape[1]
-    lines = [_line(prior, log_smoothing, origin, directions[:, column], cavity, working_bytes) for column in range(count)]
+    shared: dict = {}
+    lines = [_line(prior, log_smoothing, origin, directions[:, column], cavity, working_bytes, shared) for column in range(count)]
     tolerance = max(share, _HALF_PRECISION)
     nodes = np.concatenate([-_KRONROD_NODES[:-1], _KRONROD_NODES[::-1]])
     kronrod = np.concatenate([_KRONROD_WEIGHTS[:-1], _KRONROD_WEIGHTS[::-1]])

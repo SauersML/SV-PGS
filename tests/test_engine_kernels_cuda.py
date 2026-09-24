@@ -382,3 +382,30 @@ def test_cuda_kernel_allocations_inside_a_ledger_evict_its_caches_rather_than_ru
         assert dropped == [1] and broker.held(device_pool(device)) <= capacity
     for name in ("log_normalizer", "mean", "variance"):
         np.testing.assert_array_equal(getattr(moments, name), getattr(expected, name))
+
+
+def test_the_line_values_stay_inside_a_tight_device_ledger():
+    """``_line`` on the device under a ledger whose device pool leaves 32 MiB, with a host budget of 16 GiB: its chunks
+    (fixed rows' kernels and the fused moving rows) are sized from the device's remainder, so no allocation is
+    refused, and the values are the host's (bench-sim chr22: chunks sized from the host's budget were refused)."""
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import memory_scope
+    from sv_pgs.scale_mixture_ep import _line, device_scope
+
+    prior, cavity = _problem(variant_count=20000, seed=51, node_count=40)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    moving = 0.3 * np.random.default_rng(53).standard_normal(prior.coefficient_size)
+    still = moving.copy()
+    still[prior.coefficient_size - prior.scale_size :] = 0.0
+    steps = np.array([-1.0, 0.0, 0.7])
+    host_bytes = 1 << 34
+    for direction in (moving, still):
+        expected = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, _WORKING_BYTES)(steps)
+        used = int(cupy.get_default_memory_pool().used_bytes())
+        budget = ComputeBudget(
+            device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(used + (32 << 20),),
+            device_compute_capabilities=((0, 0),), host_bytes=host_bytes, cpu_threads=1,
+        )
+        with memory_scope(budget), device_scope(cupy):
+            got = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, host_bytes)(steps)
+        np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(expected))))
