@@ -204,6 +204,13 @@ def _kernel(cupy: Any) -> Any:
     return _KERNELS[device]
 
 
+def step_threads(kernel: Any) -> int:
+    """The step kernel's block: every thread forms the h-free terms, then its first warp runs the members. The kernel's
+    own limit on this device (its registers per thread against the multiprocessor's file: an H100 refused 1,024 with
+    CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES), at most ``PROJECT_THREADS``, and whole warps (at least the one the loop needs)."""
+    return max(PANEL, min(PROJECT_THREADS, int(kernel.max_threads_per_block)) // PANEL * PANEL)
+
+
 def _code_kernels(cupy: Any) -> tuple[Any, Any]:
     device = int(cupy.cuda.runtime.getDevice())
     if device not in _CODE_KERNELS:
@@ -365,7 +372,7 @@ def sweep_piece(
         projection = cupy.ascontiguousarray(columns.T @ (mask * residual)) if panels is None else panels.project(first, last, mask, residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
         kernel(
-            (1,), (PROJECT_THREADS,),
+            (1,), (step_threads(kernel),),
             (
                 gram, projection, squares[first:last], class_index[first:last], log_density, np.int32(node_count),
                 node_variance[first:last], log_node_variance[first:last], np.float64(noise), np.int32(last - first),
