@@ -1214,15 +1214,17 @@ def tilted_moments(
     log_normalizer = np.empty(prior.variant_count)
     mean = np.empty(prior.variant_count)
     variance = np.empty(prior.variant_count)
-    for _class, rows, terms in _class_terms(prior, hyperparameters.coefficients, cavity, working_bytes):
-        shift = cavity.shift[rows]
-        conditional = terms.conditional_variance
-        first_moment = np.sum(terms.responsibility * conditional, axis=1)
-        # Var = E_w[c] + h^2 Var_w(c): both terms are non-negative, so nothing cancels.
-        spread = np.sum(terms.responsibility * np.square(conditional - first_moment[:, None]), axis=1)
-        log_normalizer[rows] = terms.log_normalizer
-        mean[rows] = shift * first_moment
-        variance[rows] = first_moment + np.square(shift) * spread
+    # The host's moments are the host's terms: the scope's device would otherwise form them (``_class_terms`` reads it).
+    with device_scope(np):
+        for _class, rows, terms in _class_terms(prior, hyperparameters.coefficients, cavity, working_bytes):
+            shift = cavity.shift[rows]
+            conditional = terms.conditional_variance
+            first_moment = np.sum(terms.responsibility * conditional, axis=1)
+            # Var = E_w[c] + h^2 Var_w(c): both terms are non-negative, so nothing cancels.
+            spread = np.sum(terms.responsibility * np.square(conditional - first_moment[:, None]), axis=1)
+            log_normalizer[rows] = terms.log_normalizer
+            mean[rows] = shift * first_moment
+            variance[rows] = first_moment + np.square(shift) * spread
     return TiltedMoments(log_normalizer=log_normalizer, mean=mean, variance=variance)
 
 
