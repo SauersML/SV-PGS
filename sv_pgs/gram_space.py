@@ -23,13 +23,17 @@ reads the band once, never the n samples:
   of non-positive precision eliminated exactly by their Schur complement, as the dual solver does in sample space
   (``dual_solve``: the two are the same system, B's spectrum being S = I + Xt D Xt''s apart from ones).
 
-The far field. Whatever LD lies beyond the band (G - G_band: blocks two apart, and other chromosomes) is the
-approximation. True LD between blocks two apart is what Stage 0's partition cuts at the LD's minimum, and its reach
-is the data's (``marginal_variances.ld_extent``). Chance LD does not vanish: an unlinked pair has r^2 of mean 1/n, so
-the far field adds to each field c_j a term sum_{k beyond j's band} G_jk E beta_k, of variance
-G_jj (1/n) sum_k G_kk E beta_k^2 (``far_field_ratio``): relative to the noise's own G_jj sigma^2 that is the far
-variants' share of the genetic variance over sigma^2, whatever n is. The fit reports it (``FitCertificate.far_field``),
-largest over the blocks, at the fitted state; it is exactly 0 on the sample-space route.
+The far field. Whatever LD lies beyond the band (G - G_band: blocks two apart, and other chromosomes) is left out of
+the band. True LD between blocks two apart is what Stage 0's partition cuts at the LD's minimum, and its reach is the
+data's (``marginal_variances.ld_extent``). Chance LD does not vanish: an unlinked pair has r^2 of mean 1/n, so the far
+field adds to each field c_j a term sum_{k beyond j's band} G_jk E beta_k, of variance G_jj (1/n) sum_k G_kk E beta_k^2
+(``far_field_ratio``): relative to the noise's own G_jj sigma^2 that is the far variants' share of the genetic variance
+over sigma^2, whatever n is (0.71 on the two-chromosome test store at h2 = 0.5, where the pure band fit's outer loop
+ended uncertified [own-sim]). So the fit's route is exact (``full_data_fit._GramMeanField`` with the dual solver): the
+band's sweeps with the far field corrected from the samples by iterative refinement, a few reads of the store per
+solve in place of one per sweep, and the dual solver's solves; the pure band route (a ``GramGaussian``, every product
+the band's) leaves the far field out, reports it (``FitCertificate.far_field``, largest over the blocks at the fitted
+state; 0 on every exact route) and is exact only where the band is the whole Gram.
 
 Memory. The band is read block by block from Stage 0's files, never mapped whole (``LdGramStore.read_gram``); each
 block read is charged to the shared ledger (``memory_broker``) while it lives, and a block is kept for later sweeps
@@ -578,18 +582,11 @@ class GramGaussian:
     solves (``posterior_solve``) and mean are conjugate gradients on the band.
 
     One model (Stage 0's statistics are one target's). ``mean`` is solved when first read after an ``iterate``, so a
-    fixed point's refresh (the mean-field route never reads it) costs nothing.
+    fixed point's refresh (the mean-field route never reads it) costs nothing. Every product is the band's: the pure
+    band route, exact only where the band is the whole Gram (the exact route solves over the samples:
+    ``full_data_fit._GramMeanField``)."""
 
-    With ``source`` (the store's tiles, ``dual_solve.DualTileSource``) the solves are exact: flexible CG on the exact B,
-    preconditioned by the band's solve (``_bulk_solve``), each iteration one product with Xp'Xp (two reads of the
-    store), until the exact residual meets the bound or stops falling; the certificate is that exact residual's norm
-    (B >= I holds for the Gram of any design), so the band's far field costs reads, never accuracy. The squares are then the design's own (``dual_solve.column_squares``, one read),
-    and ``source`` is the oracle's for its exact passes (``full_data_fit._GramMeanField``). Without it every product is
-    the band's (the pure band route, exact only where the band is the whole Gram)."""
-
-    def __init__(
-        self, band: GramBand, *, training: Any, targets: Any, covariates: Any, array_module: Any = np, probe_count: int = 0, source: Any = None,
-    ) -> None:
+    def __init__(self, band: GramBand, *, training: Any, targets: Any, covariates: Any, array_module: Any = np, probe_count: int = 0) -> None:
         self.band = band
         self.array_module = array_module
         xp = array_module
@@ -602,18 +599,8 @@ class GramGaussian:
         self.training_counts = _host(self.training.sum(axis=0))
         self.sample_weights = self.training
         self.metric_key = None
-        self.exact = source is not None
-        self.sample_passes = 0
-        if self.exact:
-            from sv_pgs.dual_solve import DualModels, PassCount, column_squares
-
-            self.source = source
-            self._models = DualModels(self.training, xp.zeros((band.group_count, 1)), self.covariates, xp)
-            self.unit_squares = column_squares(source, self._models, PassCount())
-            self.sample_passes += 1
-        else:
-            self.source = _GramSource(band.group_count, int(self.training.shape[0]))
-            self.unit_squares = xp.asarray(band.squares[:, None])
+        self.source = _GramSource(band.group_count, int(self.training.shape[0]))
+        self.unit_squares = xp.asarray(band.squares[:, None])
         self.noise_variance = np.ones(1)
         self.probe_count = int(probe_count)
         self._precision: F64Array | None = None
@@ -672,93 +659,9 @@ class GramGaussian:
 
         return apply
 
-    def gram_product(self, values: Any) -> Any:
-        """Xp'Xp values (groups x r) by two reads of the store (the exact route's): the tiles' X v, masked and projected,
-        then the tiles' X' back."""
-        xp = self.array_module
-        values = xp.asarray(values, dtype=xp.float64)
-        mask = self.training[:, 0]
-        columns = xp.zeros(int(values.shape[1]), dtype=xp.int64)
-        image = xp.zeros((int(self.source.sample_count), int(values.shape[1])))
-        for start, stop, tile in self.source.blocks():
-            image += tile.matmat(values[start:stop])
-        projected = self._models.complement(image * mask[:, None], columns) * mask[:, None]
-        del image
-        out = xp.zeros_like(values)
-        for start, stop, tile in self.source.blocks():
-            out[start:stop] = tile.rmatmat(projected)
-        self.sample_passes += 2
-        return out
-
-    def _exact_operator(self, root: Any, noise: float) -> Callable[[Any], Any]:
-        """y -> B y with the design's own Gram (two reads of the store)."""
-
-        def apply(values: Any) -> Any:
-            return values + root[:, None] * self.gram_product(root[:, None] * values) / noise
-
-        return apply
-
     def _bulk_solve(self, root: Any, noise: float, right: Any, bound: Any) -> tuple[Any, Any, Any]:
-        """B y = right to each column's bound in B's metric: the band's CG, or on the exact route flexible CG on the exact
-        B (Notay 2000, FCG(1)) whose preconditioner is the band's own solve of the residual (to the column's bound, the
-        inner CG stopping at the band's indefiniteness where it has one). Each iteration is one exact product, two reads
-        of the store, and where the band holds the LD one iteration is the whole solve; a band that models B poorly costs
-        iterations, never accuracy: B is the design's Gram (B >= I), so FCG converges and the exact residual, recomputed
-        before a column is released, certifies it. Returns (y, exact residual, its norms)."""
-        xp = self.array_module
-        operator, preconditioner = self._bulk_operator(root, noise), self._preconditioner(root, noise)
-        if not self.exact:
-            return self._cg(operator, preconditioner, right, bound, root, noise)
-        exact = self._exact_operator(root, noise)
-        target = xp.broadcast_to(xp.asarray(bound, dtype=xp.float64), (int(right.shape[1]),))
-        solution = xp.zeros_like(right)
-        residual = right.copy()
-        norms = xp.sqrt(xp.sum(residual * residual, axis=0))
-        best = norms.copy()
-        stalled = xp.zeros(norms.shape, dtype=bool)
-        since = xp.zeros(norms.shape, dtype=xp.int64)
-        previous_direction = previous_image = None
-        iterations = 0
-        released = xp.full(norms.shape, np.inf)
-        while True:
-            open_columns = (norms > target) & ~stalled
-            if not bool(xp.any(open_columns)):
-                # Every column is within its bound by the recursion, or stalled: the exact residual decides. A column whose
-                # exact residual misses its bound restarts from it while that residual still falls from one release to the
-                # next (the recursion's drift, which a restart removes); where it no longer falls it is float64's floor.
-                exact_residual = right - exact(solution) if iterations else residual
-                exact_norms = xp.sqrt(xp.sum(exact_residual * exact_residual, axis=0))
-                reopened = (exact_norms > target) & (exact_norms < released)
-                released = exact_norms
-                residual, norms = exact_residual, exact_norms
-                if not bool(xp.any(reopened)) or not iterations:
-                    log(f"gram flexible CG: {iterations} exact products, residual/bound max {float(_host(xp.max(norms / target))):.3g}")
-                    return solution, residual, norms
-                previous_direction = previous_image = None
-                best, stalled, since = norms.copy(), ~reopened, xp.zeros(norms.shape, dtype=xp.int64)
-                open_columns = reopened
-            step, _band_residual, _band_norms = self._cg(operator, preconditioner, residual, target, root, noise, inner=True)
-            # A preconditioned residual that is not a descent direction (the band's indefiniteness) is replaced by the residual.
-            descent = xp.sum(step * residual, axis=0) > 0.0
-            direction = xp.where(descent[None, :], step, residual)
-            if previous_direction is not None:
-                curvature = xp.sum(previous_direction * previous_image, axis=0)
-                beta = xp.where(curvature > 0.0, -xp.sum(direction * previous_image, axis=0) / xp.where(curvature > 0.0, curvature, 1.0), 0.0)
-                direction = direction + previous_direction * beta[None, :]
-            direction = direction * open_columns[None, :]
-            image = exact(direction)
-            iterations += 1
-            curvature = xp.sum(direction * image, axis=0)
-            alpha = xp.where(open_columns & (curvature > 0.0), xp.sum(direction * residual, axis=0) / xp.where(curvature > 0.0, curvature, 1.0), 0.0)
-            solution += direction * alpha[None, :]
-            residual -= image * alpha[None, :]
-            norms = xp.sqrt(xp.sum(residual * residual, axis=0))
-            improved = norms < best
-            best = xp.where(improved, norms, best)
-            since = xp.where(improved, 0, since + 1)
-            # As the band's CG: the residual may rise for as many products as the band has blocks, not longer.
-            stalled |= since > self.band.block_count + 1
-            previous_direction, previous_image = direction, image
+        """B y = right to each column's bound in B's metric, by the band's CG. Returns (y, residual, its norms)."""
+        return self._cg(self._bulk_operator(root, noise), self._preconditioner(root, noise), right, bound, root, noise)
 
     def _preconditioner(self, root: Any, noise: float) -> Callable[[Any], Any]:
         """M^-1 for M the block-Jacobi part of B: B's diagonal blocks over parts of each LD block no wider than the
@@ -811,16 +714,11 @@ class GramGaussian:
         widest = int(np.max(np.diff(self.band.starts))) if self.band.block_count else 1
         return max(1, min(widest, self.band.working_bytes // max(1, _FLOAT_BYTES * self.band.group_count)))
 
-    def _cg(
-        self, operator: Callable[[Any], Any], preconditioner: Callable[[Any], Any], right: Any, bound: Any, root: Any, noise: float,
-        inner: bool = False,
-    ) -> tuple[Any, Any, Any]:
+    def _cg(self, operator: Callable[[Any], Any], preconditioner: Callable[[Any], Any], right: Any, bound: Any, root: Any, noise: float) -> tuple[Any, Any, Any]:
         """Preconditioned CG on B y = right, column by column in one block of products, until each column's exact
         residual ||right - B y|| is within its bound or stops falling (float64's floor). Returns (y, residual, norms).
         B >= I holds where G_band is positive semidefinite; a direction with p'Bp < ||p||^2 beyond rounding says it is not,
-        which is refused (LinAlgError), since the certificate ||y - y*||_B <= ||residual|| needs it. As the ``inner`` solve
-        of the exact route's refinement the band is only the step's model, certified by the exact residual: a column
-        whose direction meets the band's indefiniteness stops there with the iterate it has."""
+        which is refused (LinAlgError), since the certificate ||y - y*||_B <= ||residual|| needs it."""
         xp = self.array_module
         solution = xp.zeros_like(right)
         residual = right.copy()
@@ -842,11 +740,7 @@ class GramGaussian:
             curvature = xp.sum(direction * image, axis=0)
             length = xp.sum(direction * direction, axis=0)
             magnitude = length + xp.sum(xp.abs(direction) * xp.abs(image - direction), axis=0)
-            indefinite = open_columns & (curvature - length < -rounding * magnitude)
-            if inner:
-                stalled |= indefinite
-                open_columns &= ~indefinite
-            elif bool(xp.any(indefinite)):
+            if bool(xp.any(open_columns & (curvature - length < -rounding * magnitude))):
                 raise np.linalg.LinAlgError(
                     "the banded Gram is not positive semidefinite along a conjugate-gradient direction (p'Bp < ||p||^2): the "
                     "blocks' and their neighbours' Grams do not bound a Gram, so the Gram-space posterior is not certified"
@@ -877,7 +771,7 @@ class GramGaussian:
         band = self.band
         unit = xp.zeros((band.group_count, resolved.shape[0]))
         unit[xp.asarray(resolved), xp.arange(resolved.shape[0])] = 1.0
-        columns = self.gram_product(unit) if self.exact else band.product(unit, xp)
+        columns = band.product(unit, xp)
         del unit
         root_device = xp.asarray(root)
         design = root_device[:, None] * columns / noise
@@ -923,7 +817,6 @@ class GramGaussian:
         values = xp.asarray(np.asarray(_host(right), dtype=np.float64).reshape(self.band.group_count, -1))
         target = xp.broadcast_to(xp.asarray(error_bound, dtype=xp.float64), (int(values.shape[1]),)).copy()
         root_device = xp.asarray(root)
-        passes = self.sample_passes
         bulk_right = root_device[:, None] * values
         if resolved.shape[0]:
             bulk_right[xp.asarray(resolved)] = 0.0
@@ -956,8 +849,8 @@ class GramGaussian:
         self.last_posterior_duals = duals
         self.solves += 1
         log(
-            f"gram posterior solve: {int(values.shape[1])} columns, {self.iterations - before} band products, {self.sample_passes - passes} reads "
-            f"of the samples, {resolved.shape[0]} resolved sites, {time.perf_counter() - started:.1f} s"
+            f"gram posterior solve: {int(values.shape[1])} columns, {self.iterations - before} band products, {resolved.shape[0]} resolved sites, "
+            f"{time.perf_counter() - started:.1f} s"
         )
         return np.asarray(_host(solution), dtype=np.float64), np.asarray(_host(certificate), dtype=np.float64)
 

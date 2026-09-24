@@ -71,7 +71,7 @@ from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, co
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.gram_space import GramGaussian, read_block
+from sv_pgs.gram_space import GramBand, GramGaussian, read_block
 from sv_pgs.progress import log
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
@@ -1441,6 +1441,10 @@ _ORACLE_SAMPLE_ARRAYS = ("weights", "root", "targets", "training_targets", "proj
 
 
 class _FullDataMeanField:
+    # The keyword arguments a sibling oracle (the mode mixture's components, ``_mode_mixture``) is built with beside the
+    # common ones: a subclass's own (``_GramMeanField``'s band).
+    _siblings: dict = {}
+
     """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
     q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
     stationary between sweeps; the same fixed point, ELBO, certificate and draws as the dense route, on a design the
@@ -2270,13 +2274,16 @@ class _FullDataMeanField:
 
 
 class _GramMeanField(_FullDataMeanField):
-    """``_FullDataMeanField`` with its sweeps and solves on Stage 0's banded Gram (``gram_space``): the same fixed points,
-    ELBO, noise updates, responses and certificate. A model's residual is carried as its fields c = Xp'r over the groups
-    (the sample-space oracle's r, seen through Xp'). A quantitative model only (one target: Stage 0's statistics are
-    one model's).
+    """``_FullDataMeanField`` with its sweeps on Stage 0's banded Gram (``gram_space``): the same fixed points, ELBO, noise
+    updates, responses and certificate. A model's residual is carried as its fields c = Xp'r over the groups (the
+    sample-space oracle's r, seen through Xp'). A quantitative model only (one target: Stage 0's statistics are one
+    model's).
 
-    Exact route (the dual solver's role played by a ``GramGaussian`` with the store's tiles): iterative refinement of
-    the mean-field fixed point. At the start of a solve one read of the store gives the exact fields c = Xp'(y_P - Xp
+    Exact route (the dual solver ``dual_solve.DualGaussian`` and the ``band``): the posterior solves are the dual
+    solver's own, over the samples (on bench-sim-like stores a band-preconditioned flexible CG on the exact operator took
+    as many exact products as the dual's CG takes iterations, 5 to 15 per solve against about 8, and its resolved sites'
+    elimination holds groups x |L| arrays where the dual's holds samples x |L|), and the sweeps, the many passes of a
+    fit, are the band's, by iterative refinement of the mean-field fixed point. At the start of a solve one read of the store gives the exact fields c = Xp'(y_P - Xp
     mbar) at the current means, and the far field f = c - (s - G_band mbar), what the band leaves out there; the sweeps
     then run on the band with f held (fields s + f - G_band mbar: coordinate ascent on the ELBO whose quadratic term's
     far part is linearized at the round's means, exact there), to the band solve's own tolerance; the exact fields
@@ -2288,21 +2295,27 @@ class _GramMeanField(_FullDataMeanField):
     sample-space oracle's own. A round whose exact ELBO falls, or whose pending gain does not shrink, refuses the solve
     (the refinement does not contract there), counted in ``unresolved``.
 
-    Pure band route (no tiles): every read is the band's, and the far field is left out (``FitCertificate.far_field``
+    Pure band route (a ``GramGaussian``): every read is the band's, and the far field is left out (``FitCertificate.far_field``
     reports its size); exact only where the band is the whole Gram."""
 
     def __init__(
         self, gaussian: GramGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
         starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
-        sites: Sequence[BernoulliSites | None] | None = None,
+        sites: Sequence[BernoulliSites | None] | None = None, band: GramBand | None = None,
     ) -> None:
         if sites is not None and any(entry is not None for entry in sites):
             raise ValueError("the Gram-space route fits quantitative models only: a binary model's metric moves with its sites")
-        self.band = gaussian.band
-        self.exact = bool(gaussian.exact)
+        # The exact route: the dual solver's own posterior solves over the samples, and the band beside it for the sweeps;
+        # the pure band route: a ``GramGaussian``, whose solves are the band's.
+        self._dual_solves = not isinstance(gaussian, GramGaussian)
+        if self._dual_solves and band is None:
+            raise ValueError("the Gram-space route over the dual solver needs Stage 0's band")
+        self.band = gaussian.band if band is None else band
+        self._siblings = {} if band is None else {"band": band}
+        self.exact = self._dual_solves
         # Each model's far field f held through a round, and the grouped means it was read at.
-        self._far = np.zeros((gaussian.band.group_count, gaussian.model_count))
-        self._far_reference = np.zeros((gaussian.band.group_count, gaussian.model_count))
+        self._far = np.zeros((self.band.group_count, gaussian.model_count))
+        self._far_reference = np.zeros((self.band.group_count, gaussian.model_count))
         self._last_residual_square = 0.0
         self._last_rounding = 0.0
         self.refinements = 0
@@ -2351,6 +2364,9 @@ class _GramMeanField(_FullDataMeanField):
         return float(grouped @ self._band_product(grouped))
 
     def _reduced_posterior(self, model: int, grams: BlockGrams, group_variance: F64Array, state: _ModelState) -> GaussianPosterior:
+        if self._dual_solves:
+            return super()._reduced_posterior(model, grams, group_variance, state)
+
         def variance_map(_weights: F64Array) -> F64Array:
             # The mean-field fixed point's responses read Sigma R only (``_fixed_point``'s cavity_response).
             raise ValueError("the Gram-space mean-field posterior has no leave-block-out variance map; its fixed point never reads one")
@@ -2472,6 +2488,7 @@ def fit_full_data(
     starts: Sequence[MixtureHyperparameters] | None = None,
     start_noise: F64Array | None = None,
     start_mean: F64Array | None = None,
+    band: GramBand | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -2505,10 +2522,13 @@ def fit_full_data(
     binary = np.array([entry is not None for entry in model_sites])
     if binary.any() and inference != "mean_field":
         raise ValueError("a binary model is fitted by the mean-field route (its Polya-Gamma bound); EP has no binary likelihood")
-    gram_route = isinstance(gaussian, GramGaussian)
+    # ``band``: the exact Gram-space route (``_GramMeanField``: the band's sweeps, the far field refined from the samples,
+    # the dual solver's solves); a ``GramGaussian``: the pure band route.
+    gram_route = isinstance(gaussian, GramGaussian) or band is not None
     if gram_route and (inference != "mean_field" or binary.any()):
         raise ValueError("the Gram-space route (``gram_space``) is the mean-field fit of a quantitative model")
     oracle_class = _GramMeanField if gram_route else _FullDataMeanField
+    extra_oracle = {} if band is None else {"band": band}
 
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
@@ -2516,7 +2536,7 @@ def fit_full_data(
     ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
-        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
+        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
         try:
             return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
@@ -2776,7 +2796,7 @@ def _mode_mixture(
         # the evidence weights decide between the basins.
         main._sync()
         ridge = type(main)(
-            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(),
+            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), **main._siblings,
             start_mean=_ridge_mean(
                 gaussian, statistics, prior, moments, draw_count,
                 np.where([model_sites is not None for model_sites in main.sites], 1.0, [float(moment.noise) for moment in moments]),
@@ -2793,7 +2813,7 @@ def _mode_mixture(
     refusals: list[str] = []
     for component in range(1, draw_count + 1):
         oracle = type(main)(
-            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component,
+            gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component, **main._siblings,
             sites=list(main.sites),
         )
         points = oracle(list(hyperparameters))

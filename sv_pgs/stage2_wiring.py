@@ -27,7 +27,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
-from sv_pgs.gram_space import GramBand, GramGaussian, pass_costs
+from sv_pgs.gram_space import GramBand, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
@@ -404,10 +404,11 @@ def _fit_one(
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share))
-    # The design's space (``gram_space``): a quantitative model's sweeps and solves run on Stage 0's banded Gram, with the
-    # far field corrected exactly by reads of the samples, wherever a pass over the band costs less than a pass over the
-    # samples, measured on this store and device (``pass_costs``): both routes are exact, and the band's replaces most
-    # of the sample passes. A binary model's metric moves with its sites, so its passes are over the samples.
+    # The design's space for the sweeps (``gram_space``): a quantitative model's sweeps run on Stage 0's banded Gram, with
+    # the far field corrected exactly by reads of the samples (``full_data_fit._GramMeanField``), wherever a pass over the
+    # band costs less than a pass over the samples, measured on this store and device (``pass_costs``); its solves stay
+    # the dual solver's. Both routes are exact. A binary model's metric moves with its sites, so its passes are over the
+    # samples.
     band = None
     if not binary:
         band = GramBand(statistics, share)
@@ -419,26 +420,18 @@ def _fit_one(
         if not gram_seconds < sample_seconds:
             band.release()
             band = None
-    if band is not None:
-        # The exact route: sweeps and solves on the band, the far field corrected by exact residuals read from the store
-        # (``full_data_fit._GramMeanField``), so the fit is the sample-space fit's, in a few reads of the samples.
-        gaussian = GramGaussian(
-            band, training=mask, targets=store_targets, covariates=store_covariates, array_module=source.array_module, probe_count=draw_count,
-            source=source,
-        )
-    else:
-        gaussian = DualGaussian(
-            source=source,
-            training=mask,
-            targets=store_targets,
-            offsets=np.zeros((store.n_samples, 1)),
-            covariates=store_covariates,
-            grams=block_grams(statistics, start_noise),
-            probe_count=draw_count,
-            seed=_seed(seed, 0),
-            # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
-            sample_weights=None if store_sites is None else store_sites.weights[:, None],
-        )
+    gaussian = DualGaussian(
+        source=source,
+        training=mask,
+        targets=store_targets,
+        offsets=np.zeros((store.n_samples, 1)),
+        covariates=store_covariates,
+        grams=block_grams(statistics, start_noise),
+        probe_count=draw_count,
+        seed=_seed(seed, 0),
+        # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
+        sample_weights=None if store_sites is None else store_sites.weights[:, None],
+    )
     # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
     # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
     # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
@@ -446,7 +439,7 @@ def _fit_one(
     # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
     fit = fit_full_data(
         gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-        sites=[store_sites],
+        sites=[store_sites], band=band,
     )
     while True:
         check = lattice_check(
@@ -467,7 +460,7 @@ def _fit_one(
             refit = fit_full_data(
                 gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
                 sites=[store_sites], starts=[moved_hyperparameters], start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
-                start_mean=fit.member_mean,
+                start_mean=fit.member_mean, band=band,
             )
         except FloatingPointError as error:
             # No certified fit on the checked lattice: the model keeps the fit it has, and the failed check is logged.

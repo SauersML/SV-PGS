@@ -183,12 +183,15 @@ def _fits(tmp_path: Path, block_cap: int, seed: int = 7):
     )
     band = GramBand(statistics, 1 << 22)
     gram_space = GramGaussian(band, training=mask, targets=targets[:, None], covariates=store_covariates, probe_count=_DRAWS)
-    exact_space = GramGaussian(band, training=mask, targets=targets[:, None], covariates=store_covariates, probe_count=_DRAWS, source=source)
+    exact_space = DualGaussian(
+        source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+        grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
+    )
     sample_seconds, gram_seconds = pass_costs(band, source, np)
     assert sample_seconds > 0.0 and gram_seconds > 0.0
     fits = [
-        fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
-        for gaussian in (sample_space, gram_space, exact_space)
+        fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field", band=route_band)
+        for gaussian, route_band in ((sample_space, None), (gram_space, None), (exact_space, band))
     ]
     return fits, statistics, store, genetic
 
@@ -197,40 +200,6 @@ def _held_out_predictions(fits, statistics, store) -> list[np.ndarray]:
     signed = store.read_codes(0, store.n_variants).astype(np.float64) - 127.0
     standardized = (signed[statistics.active_rows] - statistics.means[:, None]) / statistics.scales[:, None]
     return [standardized.T[_TRAINING:_SAMPLES] @ fit.member_mean[:, 0] for fit in fits]
-
-
-def test_exact_band_solve_is_the_dense_solve_of_the_design_within_its_certificate(tmp_path: Path) -> None:
-    # The exact route's refinement: band solves of exact residuals read from the store, certified by the exact residual.
-    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
-    training = np.arange(_TRAINING)
-    statistics = compute_genotype_statistics(
-        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
-        targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
-    )
-    mask = np.zeros((_SAMPLES, 1))
-    mask[training, 0] = 1.0
-    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
-    band = GramBand(statistics, 1 << 22)
-    solver = GramGaussian(
-        band, training=mask, targets=targets[:, None], covariates=np.column_stack([np.ones(_SAMPLES), covariate]), source=source,
-    )
-    count = band.group_count
-    gram = solver.gram_product(np.eye(count))
-    # On the band the design's Gram is Stage 0's, to float32's rounding of the stored one.
-    for block in range(band.block_count):
-        own = band.span(block)
-        stored = band.within(block).astype(np.float64)
-        np.testing.assert_allclose(gram[own, own], stored, rtol=0, atol=4 * np.finfo(np.float32).eps * np.max(np.abs(stored)))
-    generator = np.random.default_rng(9)
-    precision = generator.uniform(0.2, 2.0, size=count) * np.median(np.diag(gram)) / 50.0
-    precision[[4, 40]] = [-1e-3 * precision[4], 0.0]
-    noise = 0.7
-    solver.iterate(site_precision=precision[:, None], site_shift=np.zeros((count, 1)), noise_variance=np.array([noise]))
-    right = generator.normal(size=(count, 2))
-    solution, certificate = solver.posterior_solve(right, 0, np.array([1e-4, 1e-8]))
-    exact = np.linalg.solve(gram / noise + np.diag(precision), right)
-    assert np.all(np.isfinite(certificate))
-    np.testing.assert_allclose(solution, exact, rtol=0, atol=1e-5 * float(np.max(np.abs(exact))))
 
 
 def _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store) -> None:
