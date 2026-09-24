@@ -29,6 +29,7 @@ standardized columns. The 1/127 of ``DS = (s + 127) / 127`` cancels.
 from __future__ import annotations
 
 import json
+import os
 import queue
 import threading
 import time
@@ -630,6 +631,49 @@ class LdGramStore:
             return np.zeros((rows, columns), dtype=np.float32)
         offset = int(entry["adjacent_offset"])
         return np.asarray(self._arrays["adjacent"][offset : offset + rows * columns]).reshape(rows, columns)
+
+    def block_width(self, block_index: int) -> int:
+        entry = self._blocks[block_index]
+        return int(entry["reduced_stop"]) - int(entry["reduced_start"])
+
+    def has_adjacent(self, block_index: int) -> bool:
+        """Whether block ``block_index`` has a stored Gram with its predecessor (not a chromosome's first block)."""
+        return block_index > 0 and self._blocks[block_index - 1]["chromosome"] == self._blocks[block_index]["chromosome"]
+
+    def read_gram(self, block_index: int, out: NDArray[np.float32] | None = None) -> NDArray[np.float32]:
+        """``projected_gram`` of block ``block_index`` read from the file into ``out`` (a new array by default), not mapped:
+        the caller owns (and charges) the bytes it reads into, and the pages it read are dropped from the page cache
+        (``_read``), so a fit that reads the store block by block holds a block, never the store."""
+        width = self.block_width(block_index)
+        return self._read("gram", int(self._blocks[block_index].get("gram_offset", 0)), (width, width), out)
+
+    def read_adjacent(self, block_index: int, out: NDArray[np.float32] | None = None) -> NDArray[np.float32]:
+        """``adjacent_block(block_index)`` (the predecessor's rows against this block's columns) read like ``read_gram``;
+        the caller asks only where ``has_adjacent``."""
+        rows, columns = self.block_width(block_index - 1), self.block_width(block_index)
+        return self._read("adjacent", int(self._blocks[block_index].get("adjacent_offset", 0)), (rows, columns), out)
+
+    def _read(self, name: str, offset: int, shape: tuple[int, int], out: NDArray | None) -> NDArray:
+        dtype = np.dtype(_LD_ARRAYS[name][1])
+        values = np.empty(shape, dtype=dtype) if out is None else out
+        if values.shape != shape or values.dtype != dtype or not values.flags.c_contiguous:
+            raise ValueError(f"a {name} read needs a C-contiguous {dtype} array of shape {shape}")
+        if values.size == 0:
+            return values
+        path = self.directory / _LD_ARRAYS[name][0]
+        start = offset * dtype.itemsize
+        view = memoryview(values.reshape(-1).view(np.uint8))
+        with open(path, "rb", buffering=0) as handle:
+            done = 0
+            while done < view.nbytes:
+                count = os.preadv(handle.fileno(), [view[done:]], start + done)
+                if count <= 0:
+                    raise OSError(f"{path}: short read at byte {start + done}")
+                done += count
+            if hasattr(os, "posix_fadvise"):
+                # The bytes now live in the caller's buffer; their page-cache copy would only crowd the job's memory.
+                os.posix_fadvise(handle.fileno(), start, view.nbytes, os.POSIX_FADV_DONTNEED)
+        return values
 
     def correlation_block(self, block_index: int) -> NDArray[np.float32]:
         """``R_b = X~_b^T X~_b / n`` (exactly symmetric, float32)."""

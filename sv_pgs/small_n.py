@@ -2117,6 +2117,8 @@ def fit_small_n(
         state_digest=state_digest(
             [scoring.coefficients, np.asarray(scoring.posterior_draws), scoring.alpha, np.array([noise]), weights, solves[0].hyperparameters.coefficients]
         )[None, :],
+        # The dense route reads the whole design: no far field is left out.
+        far_field=np.zeros(1),
     )
     remaining = max(outer.remaining_gain for outer in outers)
     move = max(outer.prediction_move for outer in outers)

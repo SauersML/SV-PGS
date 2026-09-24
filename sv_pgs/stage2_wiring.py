@@ -27,6 +27,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
+from sv_pgs.gram_space import GramBand, GramGaussian, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
@@ -271,6 +272,7 @@ def _null_genetic_model(covariate_fit: _CovariateFit, draw_count: int, reason: s
         budget_unresolved=np.zeros(1, dtype=np.int64),
         mixture_components=np.zeros(1, dtype=np.int64),
         state_digest=state_digest([covariate_fit.alpha, np.array([covariate_fit.noise])])[None, :],
+        far_field=np.zeros(1),
     )
     return _ModelFit(
         scoring=scoring,
@@ -402,18 +404,38 @@ def _fit_one(
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share))
-    gaussian = DualGaussian(
-        source=source,
-        training=mask,
-        targets=store_targets,
-        offsets=np.zeros((store.n_samples, 1)),
-        covariates=store_covariates,
-        grams=block_grams(statistics, start_noise),
-        probe_count=draw_count,
-        seed=_seed(seed, 0),
-        # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
-        sample_weights=None if store_sites is None else store_sites.weights[:, None],
-    )
+    # The design's space (``gram_space``): a quantitative model is fitted on Stage 0's banded Gram wherever a pass over
+    # the band costs less than a pass over the samples, measured on this store and device (``pass_costs``), since every
+    # sweep, product and solve is a pass in either space; a binary model's metric moves with its sites, so its passes
+    # are over the samples.
+    band = None
+    if not binary:
+        band = GramBand(statistics, share)
+        sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
+        log(
+            f"stage2 wiring: a pass costs {sample_seconds:.3g} s over the samples and {gram_seconds:.3g} s over the banded Gram "
+            f"({band.group_count:,} columns, band {band.band_width:,}): {'Gram' if gram_seconds < sample_seconds else 'sample'} space"
+        )
+        if not gram_seconds < sample_seconds:
+            band.release()
+            band = None
+    if band is not None:
+        gaussian = GramGaussian(
+            band, training=mask, targets=store_targets, covariates=store_covariates, array_module=source.array_module, probe_count=draw_count,
+        )
+    else:
+        gaussian = DualGaussian(
+            source=source,
+            training=mask,
+            targets=store_targets,
+            offsets=np.zeros((store.n_samples, 1)),
+            covariates=store_covariates,
+            grams=block_grams(statistics, start_noise),
+            probe_count=draw_count,
+            seed=_seed(seed, 0),
+            # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
+            sample_weights=None if store_sites is None else store_sites.weights[:, None],
+        )
     # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
     # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
     # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
@@ -450,6 +472,8 @@ def _fit_one(
             break
         prior, nodes, fit = moved, moved.log_variance_grid, refit
     (scoring,) = scoring_models(fit, prior, statistics, [trait_type], draw_count, seed=_seed(seed, 2))
+    if band is not None:
+        band.release()
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
     return _ModelFit(
         scoring=scoring,

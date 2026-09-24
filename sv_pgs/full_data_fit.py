@@ -71,6 +71,7 @@ from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, co
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
+from sv_pgs.gram_space import GramGaussian, read_block
 from sv_pgs.progress import log
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
@@ -200,7 +201,8 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     for block_index in range(ld.block_count):
         block = ld.block(block_index)
         columns = np.asarray(block.reduced_columns, dtype=np.int64)
-        gram = xp.asarray(np.asarray(block.projected_gram)).astype(xp.float64)
+        # Read, not mapped (``gram_space.read_block``): the store is larger than the job's memory at biobank scale.
+        gram = xp.asarray(read_block(ld, "within", block_index)).astype(xp.float64)
         score_square += np.sum(np.square(np.asarray(block.projected_score, dtype=np.float64)), axis=0)
         diagonal = _host(xp.diag(gram))
         gram_trace += float(diagonal.sum())
@@ -209,9 +211,8 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
         column_square[columns] += _host(gram.sum(axis=0))
         gram_square += float(_host(gram.sum()))
         del gram
-        cross = ld.adjacent_block(block_index) if block_index else None
-        if cross is not None:
-            cross_squares = xp.asarray(np.asarray(cross)).astype(xp.float64)
+        if ld.has_adjacent(block_index):
+            cross_squares = xp.asarray(read_block(ld, "cross", block_index - 1)).astype(xp.float64)
             cross_squares *= cross_squares
             column_square[previous_columns] += _host(cross_squares.sum(axis=1))
             column_square[columns] += _host(cross_squares.sum(axis=0))
@@ -316,6 +317,10 @@ class FitCertificate:
     budget_unresolved: I64Array | None = None
     mixture_components: I64Array | None = None
     state_digest: np.ndarray | None = None
+    # Per model, the Gram-space route's approximation (``gram_space``): the variance chance LD beyond the stored band
+    # would add to a field, per unit of the field's own noise, largest over the blocks, at the returned state
+    # (``GramBand.far_field_ratio``); 0 where the fit read the samples themselves (no far field is left out).
+    far_field: F64Array | None = None
 
 
 @dataclass(frozen=True)
@@ -410,6 +415,19 @@ def _posterior(
     (``scale_mixture_ep.solve_key``): the certified CG stops on its own certificate from any start, so this is exact,
     and at nearby fixed points it starts close to the answer."""
     solve = gaussian.bulk_solves[model]
+    return GaussianPosterior(
+        solve=_relative_solve(gaussian, model, variances, ensure, starts),
+        variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values,
+        local_response=local_response(solve, grams),
+    )
+
+
+def _relative_solve(
+    gaussian: Any, model: int, variances: F64Array, ensure: Callable[[], None], starts: dict | None = None
+) -> Callable[[F64Array, float], F64Array]:
+    """Sigma R, each column to relative error e in the posterior metric, from any solver with the dual solver's
+    ``posterior_solve`` contract (``dual_solve.DualGaussian``, ``gram_space.GramGaussian``), warm-started from
+    ``starts`` (``_posterior``)."""
 
     def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
         # A column is done when its certified error b is at most e times the lower bound on ||x||_A. The first b
@@ -444,10 +462,7 @@ def _posterior(
             _hold_start(starts, memory, duals)
         return solution
 
-    return GaussianPosterior(
-        solve=relative_solve, variance_jvp=lambda weights: variance_jvp(solve, grams, weights, gaussian.array_module).values,
-        local_response=local_response(solve, grams),
-    )
+    return relative_solve
 
 
 def _member_posterior(
@@ -1525,7 +1540,7 @@ class _FullDataMeanField:
         self.shift = np.zeros((count, model_count))
         self.third = np.zeros((count, model_count))
         self.fourth = np.zeros((count, model_count))
-        self.residual = [values.copy() for values in self.projected_targets]
+        self.residual = [self._start_residual(model) for model in range(model_count)]
         self.site_precision = np.zeros((count, model_count))
         self.site_shift = np.zeros((count, model_count))
         self.effective = np.full(model_count, float(count))
@@ -1557,7 +1572,7 @@ class _FullDataMeanField:
             # A data start (``_mode_mixture``'s ridge component): q's means there and the residual they leave.
             self.mean[...] = self._cold_mean
             for model in range(model_count):
-                self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
+                self.residual[model] = self._residual_of(model)
         self._cold_residual = [values.copy() for values in self.residual]
         # Each model's highest-ELBO refreshed state and its hyperparameters (``mean_field.MeanFieldFixedPoints.best``):
         # the outer loop's objective is not the ELBO and can end below a state it visited.
@@ -1835,6 +1850,38 @@ class _FullDataMeanField:
         for start, stop, tile in self.gaussian.source.blocks():
             back[start:stop] = np.asarray(_host(tile.rmatmat(masked)), dtype=np.float64)
         return self.sign[:, None] * back[self.ties.group]
+
+    # what the fixed point reads of the design: the sample-space route's by tile passes (``_GramMeanField``: the band's)
+
+    def _start_residual(self, model: int) -> F64Array:
+        """The residual at zero means: y_P."""
+        return self.projected_targets[model].copy()
+
+    def _residual_of(self, model: int) -> F64Array:
+        """The residual at the model's current means: y_P - Xp m."""
+        return self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
+
+    def _gram_product(self, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        """Xp'Xp c over the members (members x r), each group's column once, signed."""
+        return self._back(self._image(columns, model, metric), model, metric)
+
+    def _residual_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        """r'Xp c (r,) for member columns c."""
+        return residual @ self._image(columns, model, metric)
+
+    def _fitted_square(self, values: F64Array, model: int) -> float:
+        """||Xp d||^2 for a member vector d."""
+        return float(np.sum(np.square(self._image(np.asarray(values, dtype=np.float64)[:, None], model))))
+
+    def _response_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> tuple[F64Array, F64Array]:
+        """(Xp'Xp c over the members, r'Xp c) for member columns c, from one image X c (one genotype pass fewer than
+        the two separately)."""
+        image = self._image(columns, model, metric)
+        return self._back(image, model, metric), residual @ image
+
+    def _reduced_posterior(self, model: int, grams: BlockGrams, group_variance: F64Array, state: "_ModelState") -> GaussianPosterior:
+        """The groups' responses at this fixed point from the dual solver, warm-started across fixed points."""
+        return _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model), self._solve_starts)
 
     # the sweeps
 
@@ -2128,14 +2175,11 @@ class _FullDataMeanField:
         # responses are the dual solver's solves, in this fixed point's own metric); a binary model's are unweighted.
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
-        dual = _member_posterior(
-            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model), self._solve_starts), self.ties, tau, group_variance,
-            algebraic=True,
-        )
+        dual = _member_posterior(self._reduced_posterior(model, grams, group_variance, state), self.ties, tau, group_variance, algebraic=True)
         noise_solve: dict[str, object] = {}
 
         def off_diagonal_gram(columns: F64Array) -> F64Array:
-            return self._back(self._image(columns, model, metric), model, metric) - squares[:, None] * columns
+            return self._gram_product(columns, model, metric) - squares[:, None] * columns
 
         def solve(right: F64Array, relative_tolerance: float) -> F64Array:
             # R^-1 right: the dual solver's A = Xp'Xp / sigma^2 + diag(tau) at these sites is R itself.
@@ -2148,7 +2192,7 @@ class _FullDataMeanField:
                 mean_one = solve(coupling[:, None], relative_tolerance)
                 shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
                 scalar = residual_dimension - (
-                    2.0 * float(residual @ self._image(mean_one, model, metric)[:, 0])
+                    2.0 * float(self._residual_products(residual, mean_one, model, metric)[0])
                     + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
                 ) / noise
                 noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
@@ -2159,16 +2203,15 @@ class _FullDataMeanField:
             # tolerance asked and Xp'Xp by tile passes.
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
             mean_step = solve(scaled, relative_tolerance)
-            # The solution's image X dm, formed once: the off-diagonal Gram's back pass and the noise's residual term
-            # both read it (one genotype pass fewer per call).
-            image = self._image(mean_step, model, metric)
-            shift_step = -(self._back(image, model, metric) - squares[:, None] * mean_step) / noise
+            # Xp'Xp dm and r'Xp dm (``_response_products``: on the samples from one image X dm, which both read).
+            products, residual_terms = self._response_products(residual, mean_step, model, metric)
+            shift_step = -(products - squares[:, None] * mean_step) / noise
             if binary:
                 # Known noise: no noise response. The sites' own response is left out of the curvature, as in
                 # ``mean_field`` (the outer loop accepts its steps on the objective itself).
                 return shift_step, np.zeros_like(shift_step)
             _mean_one, shift_one, scalar = noise_terms(relative_tolerance)
-            right = -2.0 * (residual @ image) + squares @ (
+            right = -2.0 * residual_terms + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )
             noise_step = right / scalar
@@ -2226,6 +2269,99 @@ class _FullDataMeanField:
         return np.asarray(_host(self.models.covariate_solve(right, xp.asarray([model]))), dtype=np.float64)[:, 0]
 
 
+class _GramMeanField(_FullDataMeanField):
+    """``_FullDataMeanField`` on Stage 0's banded Gram (``gram_space``): the same fixed points, ELBO, noise updates,
+    responses and certificate, with every read of the design replaced by the band's, so nothing after Stage 0 reads
+    the samples. A model's residual is carried as its fields c = s - G_band mbar over the groups (the sample-space
+    oracle's r, seen through Xp'), formed afresh at the end of every solve; the sweep forms each block's fields from the
+    means as it arrives there (``GramBand.sweep``), so no rounding accumulates across sweeps. A quantitative model only
+    (one target: Stage 0's statistics are one model's)."""
+
+    def __init__(
+        self, gaussian: GramGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
+        starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
+        sites: Sequence[BernoulliSites | None] | None = None,
+    ) -> None:
+        if sites is not None and any(entry is not None for entry in sites):
+            raise ValueError("the Gram-space route fits quantitative models only: a binary model's metric moves with its sites")
+        self.band = gaussian.band
+        super().__init__(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, order_seed=order_seed, start_mean=start_mean, sites=sites)
+
+    def _grouped(self, values: F64Array) -> F64Array:
+        return self._group_values(np.asarray(values, dtype=np.float64))
+
+    def _band_product(self, grouped: F64Array) -> F64Array:
+        values = np.asarray(grouped, dtype=np.float64)
+        column = values.ndim == 1
+        image = np.asarray(_host(self.band.product(values[:, None] if column else values, self.gaussian.array_module)), dtype=np.float64)
+        return image[:, 0] if column else image
+
+    def _start_residual(self, model: int) -> F64Array:
+        return self.band.scores.copy()
+
+    def _residual_of(self, model: int) -> F64Array:
+        return self.band.scores - self._band_product(self._grouped(self.mean[:, model]))
+
+    def _gram_product(self, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        return self.sign[:, None] * self._band_product(self._grouped(columns))[self.ties.group]
+
+    def _residual_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
+        return np.asarray(residual, dtype=np.float64) @ self._grouped(columns)
+
+    def _fitted_square(self, values: F64Array, model: int) -> float:
+        grouped = self._grouped(values)
+        return float(grouped @ self._band_product(grouped))
+
+    def _reduced_posterior(self, model: int, grams: BlockGrams, group_variance: F64Array, state: _ModelState) -> GaussianPosterior:
+        def variance_map(_weights: F64Array) -> F64Array:
+            # The mean-field fixed point's responses read Sigma R only (``_fixed_point``'s cavity_response).
+            raise ValueError("the Gram-space mean-field posterior has no leave-block-out variance map; its fixed point never reads one")
+
+        return GaussianPosterior(
+            solve=_relative_solve(self.gaussian, model, group_variance, lambda: self._ensure(state, model), self._solve_starts), variance_jvp=variance_map,
+        )
+
+    def _response_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> tuple[F64Array, F64Array]:
+        # The residual is carried as its fields c = Xp'r, so r'Xp c is c'(the columns' group sums).
+        return self._gram_product(columns, model, metric), self._residual_products(residual, columns, model, metric)
+
+    def _sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
+        prior = self.prior
+        names = ("mean", "variance", "shift", "third", "fourth")
+        arrays = {name: np.ascontiguousarray(getattr(self, name)[:, model]) for name in names}
+        noise = float(self.noise[model])
+        started, read_before = time.perf_counter(), self.band.read_bytes
+        result = self.band.sweep(
+            self.gaussian.array_module, member_blocks=self.member_blocks, group=self.ties.group, sign=self.sign, class_index=self.class_index,
+            log_density=np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), scales=log_scale(prior, hyperparameters.coefficients),
+            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, **arrays,
+        )
+        for name in names:
+            getattr(self, name)[:, model] = arrays[name]
+        self.passes += 1
+        log(f"gram sweep {self.passes}: {time.perf_counter() - started:.1f} s, {(self.band.read_bytes - read_before) / 1e9:.1f} GB read from Stage 0's files")
+        # The residual square is y'Py - 2 mbar's + mbar'G mbar, formed from terms of the size ``residual_size``: its
+        # rounding enters the ELBO's bound with the KL pieces' (``_elbo``'s count of summands covers its sums).
+        return result.divergence, result.weighted_variance, result.residual_square, result.sizes + result.residual_size / (2.0 * noise)
+
+    def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
+        super()._solve_model(model, hyperparameters, pass_budget)
+        self.residual[model] = self._residual_of(model)
+
+    def covariate_coefficients(self, model: int, mean: F64Array | None = None) -> F64Array:
+        """alpha = (C'C)^+ (C'y - C'X mbar) from Stage 0's cross-products X'C and C'y (the training rows'), as the
+        sample-space oracle forms it by a read of the store."""
+        band = self.band
+        grouped = self._grouped(self.mean[:, model] if mean is None else mean)
+        return band.covariate_pseudo_inverse @ (band.covariate_target - band.covariate_cross.T @ grouped)
+
+    def far_field(self, model: int, mean: F64Array | None = None) -> float:
+        """``GramBand.far_field_ratio`` at this state: E beta_g^2 = mbar_g^2 + sum of its members' variances."""
+        grouped = self._grouped(self.mean[:, model] if mean is None else mean)
+        spread = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
+        return self.band.far_field_ratio(grouped * grouped + spread, float(self.noise[model]))
+
+
 def state_digest(parts: Sequence[F64Array]) -> np.ndarray:
     """SHA-256 over the returned state's arrays, in order (each one's dtype, shape and bytes), as 32 uint8: what the
     certificate is bound to, so a reader can check that the diagnostics it holds are the ones of the model it scores."""
@@ -2277,13 +2413,18 @@ def fit_full_data(
     binary = np.array([entry is not None for entry in model_sites])
     if binary.any() and inference != "mean_field":
         raise ValueError("a binary model is fitted by the mean-field route (its Polya-Gamma bound); EP has no binary likelihood")
+    gram_route = isinstance(gaussian, GramGaussian)
+    if gram_route and (inference != "mean_field" or binary.any()):
+        raise ValueError("the Gram-space route (``gram_space``) is the mean-field fit of a quantitative model")
+    oracle_class = _GramMeanField if gram_route else _FullDataMeanField
+
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
         start_sites: Sequence[BernoulliSites | None],
     ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
-        oracle = _FullDataMeanField(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
+        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra)
         try:
             return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
@@ -2362,6 +2503,11 @@ def fit_full_data(
     covariate_coefficients = None if mean_field is None else np.column_stack(
         [mean_field.covariate_coefficients(model, member_mean[:, model]) for model in range(mean_field.model_count)]
     )
+    far_field = np.zeros(model_count)
+    if gram_route:
+        assert mean_field is not None and member_mean is not None
+        far_field = np.array([mean_field.far_field(model, member_mean[:, model]) for model in range(model_count)])
+        log(f"gram space: far-field variance ratio {', '.join(f'{value:.3g}' for value in far_field)} (chance LD beyond the band, per unit noise)")
     withheld = np.where(restored, np.nan, 1.0)
     returned_mean = member_mean if member_mean is not None else np.asarray(_host(gaussian.mean), dtype=np.float64)
     digests = np.stack([
@@ -2422,6 +2568,7 @@ def fit_full_data(
             budget_unresolved=budget_unresolved,
             mixture_components=component_count,
             state_digest=digests,
+            far_field=far_field,
         ),
     )
 
@@ -2520,7 +2667,7 @@ def _mode_mixture(
         elbo = np.array(oracle.elbo, dtype=np.float64)
         for index, kept in enumerate(means):
             if all(
-                float(np.sum(np.square(main._image((oracle.mean - kept)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
+                main._fitted_square((oracle.mean - kept)[:, model], model) / float(main.noise[model]) <= 1.0 / draw_count
                 for model in range(main.model_count)
             ):
                 if float(np.sum(elbo)) > float(np.sum(elbos[index])):
@@ -2536,7 +2683,7 @@ def _mode_mixture(
         # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
         # the evidence weights decide between the basins.
         main._sync()
-        ridge = _FullDataMeanField(
+        ridge = type(main)(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(),
             start_mean=_ridge_mean(
                 gaussian, statistics, prior, moments, draw_count,
@@ -2553,7 +2700,7 @@ def _mode_mixture(
     unresolved = np.zeros(main.model_count, dtype=np.int64)
     refusals: list[str] = []
     for component in range(1, draw_count + 1):
-        oracle = _FullDataMeanField(
+        oracle = type(main)(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component,
             sites=list(main.sites),
         )
@@ -2565,7 +2712,7 @@ def _mode_mixture(
         del oracle, points
         updated, _weights = weighted()
         settled = all(
-            float(np.sum(np.square(main._image((updated - average)[:, model:model + 1], model)))) / float(main.noise[model]) <= 1.0 / draw_count
+            main._fitted_square((updated - average)[:, model], model) / float(main.noise[model]) <= 1.0 / draw_count
             for model in range(main.model_count)
         )
         average = updated
