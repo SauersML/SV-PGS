@@ -181,6 +181,118 @@ extern "C" __global__ void objective_rows(
 }
 """
 
+_SOURCE += r"""
+// One effect's tilted-moment derivatives (scale_mixture_ep._variant_derivatives), in three passes over its nodes: the
+// running log-sum-exp; the weighted means; the centred moments and the per-node outputs. Given node k the tilted law is
+// N(mu, c) with mu = h c, raw = c + mu^2, ell = -raw / 2 and f = d log Z_k / d log u. ``fields`` per row: m, s2, s2 - m^2,
+// v_h, m_P, s2_P - 2 m m_P, m_logu, s2_logu; ``by_mean`` and ``by_second`` (rows x K): w (mu - m) and w (raw - s2).
+extern "C" __global__ void derivative_rows(
+    const long long rows, const int node_count, const int with_scale,
+    const double* __restrict__ class_log_density, const double* __restrict__ nodes, const double* __restrict__ node_exp,
+    const double tiny, const double huge, const double log_zero,
+    const double* __restrict__ log_scale, const double* __restrict__ precision, const double* __restrict__ shift,
+    double* __restrict__ fields, double* __restrict__ by_mean, double* __restrict__ by_second, int* __restrict__ improper)
+{
+    const long long row = (long long)blockDim.x * blockIdx.x + threadIdx.x;
+    if (row >= rows) return;
+    const double scale_value = log_scale[row], scale_exp = exp(scale_value), cavity_precision = precision[row];
+    const double h = shift[row], shift_square = h * h;
+    int bad = 0;
+    double retained, ratio_retained, conditional, signal, log_root;
+    double peak = log_zero, total = 0.0, unused = 0.0;
+    for (int node = 0; node < node_count; ++node) {
+        node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = class_log_density[node] + 0.5 * signal + log_root;
+        if (exponent == log_zero || isinf(exponent)) continue;
+        const double weight = running_weight(exponent, &peak, &total, &unused);
+        total += weight;
+    }
+    const double inverse_total = 1.0 / total;
+    double m = 0.0, s2 = 0.0, mean_f = 0.0, mu_c = 0.0, c_terms = 0.0, mu_r = 0.0, raw_r = 0.0;
+    for (int node = 0; node < node_count; ++node) {
+        node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = class_log_density[node] + 0.5 * signal + log_root;
+        if (exponent == log_zero || isinf(exponent)) continue;
+        const double w = exp(exponent - peak) * inverse_total;
+        const double mu = h * conditional, raw = conditional + mu * mu;
+        m += w * mu;
+        s2 += w * raw;
+        mu_c += w * mu * conditional;
+        c_terms += w * (conditional * conditional + 2.0 * mu * mu * conditional);
+        if (with_scale) {
+            mean_f += w * 0.5 * (retained * signal - ratio_retained);
+            mu_r += w * mu * retained;
+            raw_r += w * (conditional + 2.0 * mu * mu) * retained;
+        }
+    }
+    const double mean_ell = -0.5 * s2;
+    double third = 0.0, c_dev = 0.0, ell_mu = 0.0, ell_raw = 0.0, f_mu = 0.0, f_raw = 0.0;
+    const long long at = row * (long long)node_count;
+    for (int node = 0; node < node_count; ++node) {
+        node_terms(scale_value, scale_exp, nodes[node], node_exp[node], cavity_precision, shift_square, tiny, huge,
+                   &retained, &ratio_retained, &conditional, &signal, &log_root, &bad);
+        const double exponent = class_log_density[node] + 0.5 * signal + log_root;
+        const double w = (exponent == log_zero || isinf(exponent)) ? 0.0 : exp(exponent - peak) * inverse_total;
+        const double mu = h * conditional, raw = conditional + mu * mu;
+        const double deviation = mu - m, raw_deviation = raw - s2, ell_deviation = -0.5 * raw - mean_ell;
+        by_mean[at + node] = w * deviation;
+        by_second[at + node] = w * raw_deviation;
+        if (w == 0.0) continue;
+        third += w * deviation * deviation * deviation;
+        c_dev += w * conditional * deviation;
+        ell_mu += w * ell_deviation * deviation;
+        ell_raw += w * ell_deviation * raw_deviation;
+        if (with_scale) {
+            const double f_deviation = 0.5 * (retained * signal - ratio_retained) - mean_f;
+            f_mu += w * f_deviation * deviation;
+            f_raw += w * f_deviation * raw_deviation;
+        }
+    }
+    const double mean_by_precision = ell_mu - mu_c;
+    const double second_by_precision = ell_raw - c_terms;
+    double* out = fields + row * 8;
+    out[0] = m;
+    out[1] = s2;
+    out[2] = s2 - m * m;
+    out[3] = third + 3.0 * c_dev;
+    out[4] = mean_by_precision;
+    out[5] = second_by_precision - 2.0 * m * mean_by_precision;
+    out[6] = with_scale ? f_mu + mu_r : 0.0;
+    out[7] = with_scale ? f_raw + raw_r : 0.0;
+    if (bad) *improper = 1;
+}
+"""
+
+
+def derivative_row_bytes(node_count: int) -> int:
+    """Device bytes one row of a derivative chunk holds: its two (K) outputs, eight fields and three inputs."""
+    return np.dtype(np.float64).itemsize * (2 * node_count + 8 + 3)
+
+
+def variant_derivatives(
+    cupy: ModuleType, log_density: Any, log_scale_rows: Any, grid: Any, precision: Any, shift: Any, with_scale: bool
+) -> tuple[Any, Any, Any, Any]:
+    """(fields (rows x 8), w (mu - m) and w (raw - s2) (rows x K), improper flag) on the device for rows of one class
+    (``log_density`` its K log pi), as ``scale_mixture_ep._variant_derivatives`` defines them; the caller sizes the
+    rows from its device budget (``derivative_row_bytes``)."""
+    rows = int(log_scale_rows.shape[0])
+    node_count = int(log_density.shape[0])
+    nodes = _column(cupy, grid, cupy.float64)
+    fields = cupy.empty((rows, 8), dtype=cupy.float64)
+    by_mean = cupy.empty((rows, node_count), dtype=cupy.float64)
+    by_second = cupy.empty((rows, node_count), dtype=cupy.float64)
+    improper = cupy.zeros(1, dtype=cupy.int32)
+    if rows:
+        _launch(cupy, "derivative_rows", rows, (
+            np.int64(rows), np.int32(node_count), np.int32(1 if with_scale else 0), _column(cupy, log_density, cupy.float64), nodes, cupy.exp(nodes),
+            *_range_arguments(), _column(cupy, log_scale_rows, cupy.float64), _column(cupy, precision, cupy.float64),
+            _column(cupy, shift, cupy.float64), fields, by_mean, by_second, improper,
+        ))
+    return fields, by_mean, by_second, improper
+
+
 _KERNELS: dict[tuple[int, int, str], tuple[Any, int]] = {}
 _FLOAT64 = np.finfo(np.float64)
 

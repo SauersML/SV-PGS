@@ -2092,64 +2092,137 @@ class _VariantDerivatives:
         return blocks
 
 
+@numba.njit(parallel=True, cache=True, error_model="numpy")
+def _derivative_rows(log_density, grid, log_scale_rows, precision, shift, with_scale, fields, by_mean, by_second):
+    """The host twin of ``engine_kernels``' derivative_rows: per row, three passes over its nodes (the running
+    log-sum-exp, the weighted means, the centred moments and the per-node outputs), no row's terms held past them.
+    Returns whether some 1 + v P <= 0."""
+    rows, nodes = log_scale_rows.shape[0], grid.shape[0]
+    tiny = np.finfo(np.float64).tiny
+    bad = np.zeros(rows, dtype=np.bool_)
+    for row in numba.prange(rows):
+        scale_value, cavity_precision, h = log_scale_rows[row], precision[row], shift[row]
+        shift_square = h * h
+        peak, total = -np.inf, 0.0
+        for node in range(nodes):
+            _r, _qr, _c, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+            if improper:
+                bad[row] = True
+            exponent = log_density[node] + 0.5 * signal + log_root
+            if np.isinf(exponent) or np.isnan(exponent):
+                continue
+            if exponent > peak:
+                total = total * np.exp(peak - exponent) + 1.0
+                peak = exponent
+            else:
+                total += np.exp(exponent - peak)
+        inverse_total = 1.0 / total
+        m = s2 = mean_f = mu_c = c_terms = mu_r = raw_r = 0.0
+        for node in range(nodes):
+            retained, ratio_retained, conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+            exponent = log_density[node] + 0.5 * signal + log_root
+            if np.isinf(exponent) or np.isnan(exponent):
+                continue
+            w = np.exp(exponent - peak) * inverse_total
+            mu = h * conditional
+            raw = conditional + mu * mu
+            m += w * mu
+            s2 += w * raw
+            mu_c += w * mu * conditional
+            c_terms += w * (conditional * conditional + 2.0 * mu * mu * conditional)
+            if with_scale:
+                mean_f += w * 0.5 * (retained * signal - ratio_retained)
+                mu_r += w * mu * retained
+                raw_r += w * (conditional + 2.0 * mu * mu) * retained
+        mean_ell = -0.5 * s2
+        third = c_dev = ell_mu = ell_raw = f_mu = f_raw = 0.0
+        for node in range(nodes):
+            retained, ratio_retained, conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+            exponent = log_density[node] + 0.5 * signal + log_root
+            w = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak) * inverse_total
+            mu = h * conditional
+            raw = conditional + mu * mu
+            deviation = mu - m
+            raw_deviation = raw - s2
+            ell_deviation = -0.5 * raw - mean_ell
+            by_mean[row, node] = w * deviation
+            by_second[row, node] = w * raw_deviation
+            if w == 0.0:
+                continue
+            third += w * deviation * deviation * deviation
+            c_dev += w * conditional * deviation
+            ell_mu += w * ell_deviation * deviation
+            ell_raw += w * ell_deviation * raw_deviation
+            if with_scale:
+                f_deviation = 0.5 * (retained * signal - ratio_retained) - mean_f
+                f_mu += w * f_deviation * deviation
+                f_raw += w * f_deviation * raw_deviation
+        mean_by_precision = ell_mu - mu_c
+        fields[row, 0] = m
+        fields[row, 1] = s2
+        fields[row, 2] = s2 - m * m
+        fields[row, 3] = third + 3.0 * c_dev
+        fields[row, 4] = mean_by_precision
+        fields[row, 5] = ell_raw - c_terms - 2.0 * m * mean_by_precision
+        fields[row, 6] = f_mu + mu_r if with_scale else 0.0
+        fields[row, 7] = f_raw + raw_r if with_scale else 0.0
+    improper = False
+    for row in range(rows):
+        if bad[row]:
+            improper = True
+    return improper
+
+
+_DERIVATIVE_FIELDS = ("mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale")
+
+
 def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _VariantDerivatives:
     """Given node k the tilted law is N(mu_k, c_k) with mu_k = h c_k; with weights w and ell_k = -(c_k + mu_k^2)/2
     (d log Z_k / dP), f_k = d log Z_k / d eta and dc_k / d eta = c_k r_k (r_k = 1/(1 + v_k P)):
         v_h = E[(mu - m)^3] + 3 E[c (mu - m)],   m_P = Cov(ell, mu) - E[mu c],   s2_P = Cov(ell, c + mu^2) - E[c^2 + 2 mu^2 c],
         m_eta = w (mu - m),   s2_eta = w (c + mu^2 - s2),
         m_logu = Cov(f, mu) + E[mu r],   s2_logu = Cov(f, c + mu^2) + E[(c + 2 mu^2) r]
-    (the eta derivatives are the same in normalized and unnormalized coordinates, since sum_k w_k (mu_k - m) = 0)."""
+    (the eta derivatives are the same in normalized and unnormalized coordinates, since sum_k w_k (mu_k - m) = 0).
+
+    One fused pass per row (``_derivative_rows`` on the host, ``engine_kernels.derivative_rows`` on the device):
+    three passes over its nodes, the covariances centred, and no rows x K temporaries but the two outputs. The
+    kernel-row form built about twenty rows x K arrays per chunk, and on a device its chunks, sized for the kernel
+    rows alone, were refused by the ledger (bench-sim chr22 [sim]: 484 MB at 33.5 GB allocated). Device chunks are
+    sized from the ledger's device remainder (``_device_budget``)."""
     variant_count, grid_size = prior.variant_count, prior.grid_size
-    fields = {name: np.empty(variant_count) for name in (
-        "mean", "variance", "second", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
-    )}
+    fields = np.empty((variant_count, len(_DERIVATIVE_FIELDS)))
     mean_by_density = np.empty((variant_count, grid_size))
     second_by_density = np.empty((variant_count, grid_size))
     scales = log_scale(prior, coefficients)
     log_density = class_log_density(prior, coefficients)
-    for _class, rows, kernel_rows in _kernel_chunks(prior, scales, cavity, working_bytes):
-        terms = kernel_rows.components(log_density[_class])
-        weights = terms.responsibility
-        conditional = terms.conditional_variance
-        retained = kernel_rows.retained
-        xp = _DEVICE.get()
-        centre = xp.asarray(cavity.shift[rows])[:, None] * conditional
-
-        def expectation(values: F64Array) -> F64Array:
-            return np.sum(weights * values, axis=1)
-
-        def covariance(left: F64Array, right: F64Array) -> F64Array:
-            return expectation(left * right) - expectation(left) * expectation(right)
-
-        mean = expectation(centre)
-        raw_second = conditional + centre * centre
-        second = expectation(raw_second)
-        deviation = centre - mean[:, None]
-        slope = -0.5 * raw_second
-        mean_by_precision = covariance(slope, centre) - expectation(centre * conditional)
-        second_by_precision = covariance(slope, raw_second) - expectation(conditional * conditional + 2.0 * centre * centre * conditional)
-        # The chunk's row-wise results in one transfer (each device read is a sync): the eight fields as columns, then
-        # the two (rows x K) arrays.
-        if prior.scale_size:
-            by_log_scale = (
-                covariance(terms.first, centre) + expectation(centre * retained),
-                covariance(terms.first, raw_second) + expectation((conditional + 2.0 * centre * centre) * retained),
-            )
-        else:
-            # No scale design: nothing moves log u, and the kernel's derivatives are never formed.
-            by_log_scale = (xp.zeros_like(mean), xp.zeros_like(mean))
-        columns = _host(xp.stack([
-            mean, second, second - mean * mean, expectation(deviation**3) + 3.0 * expectation(conditional * deviation),
-            mean_by_precision, second_by_precision - 2.0 * mean * mean_by_precision, by_log_scale[0], by_log_scale[1],
-        ], axis=1))
-        for position, name in enumerate((
-            "mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
-        )):
-            fields[name][rows] = columns[:, position]
-        both = _host(xp.stack([weights * deviation, weights * (raw_second - second[:, None])]))
-        mean_by_density[rows] = both[0]
-        second_by_density[rows] = both[1]
-    return _VariantDerivatives(mean_by_density=mean_by_density, second_by_density=second_by_density, **fields)
+    with_scale = bool(prior.scale_size)
+    xp = _DEVICE.get()
+    if xp is not np:
+        chunk = max(1, _device_budget(working_bytes) // engine_kernels.derivative_row_bytes(grid_size))
+        for class_position, class_rows in enumerate(prior.class_rows):
+            for start in range(0, class_rows.shape[0], chunk):
+                rows = class_rows[start : start + chunk]
+                values, by_mean, by_second, improper = engine_kernels.variant_derivatives(
+                    xp, log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows], with_scale,
+                )
+                engine_kernels._raise_if_improper(_host(improper))
+                fields[rows] = _host(values)
+                mean_by_density[rows] = _host(by_mean)
+                second_by_density[rows] = _host(by_second)
+                del values, by_mean, by_second
+    else:
+        for class_position, rows in enumerate(prior.class_rows):
+            values = np.empty((rows.shape[0], len(_DERIVATIVE_FIELDS)))
+            by_mean = np.empty((rows.shape[0], grid_size))
+            by_second = np.empty((rows.shape[0], grid_size))
+            if _derivative_rows(log_density[class_position], prior.log_variance_grid, scales[rows], cavity.precision[rows], cavity.shift[rows],
+                                with_scale, values, by_mean, by_second):
+                raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
+            fields[rows], mean_by_density[rows], second_by_density[rows] = values, by_mean, by_second
+    return _VariantDerivatives(
+        mean_by_density=mean_by_density, second_by_density=second_by_density,
+        **{name: np.ascontiguousarray(fields[:, position]) for position, name in enumerate(_DERIVATIVE_FIELDS)},
+    )
 
 
 def _through_z(prior: ScaleMixturePrior, by_density: tuple[F64Array, ...], by_log_scale: F64Array, directions_z: F64Array) -> F64Array:

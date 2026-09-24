@@ -1444,3 +1444,56 @@ def test_the_fused_host_objective_is_the_held_rows_objective():
     scales = log_scale(prior, hyperparameters.coefficients)
     held = sum(float(np.sum(rows.normalizers(log_density[c])[0])) for c, _r, rows in _kernel_chunks(prior, scales, cavity, _WORKING_BYTES))
     np.testing.assert_allclose(_data_value(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES, np), held, rtol=1e-12)
+
+
+def _reference_variant_derivatives(prior, coefficients, cavity):
+    """The derivatives of ``_variant_derivatives``' docstring from the dense components, two-pass centred."""
+    from sv_pgs.scale_mixture_ep import _KernelRows, class_log_density, log_scale
+
+    log_density = class_log_density(prior, coefficients)
+    scales = log_scale(prior, coefficients)
+    out = {name: np.empty(prior.variant_count) for name in (
+        "mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale",
+    )}
+    by_mean = np.empty((prior.variant_count, prior.grid_size))
+    by_second = np.empty((prior.variant_count, prior.grid_size))
+    for class_position, rows in enumerate(prior.class_rows):
+        kernel = _KernelRows(scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows])
+        terms = kernel.components(log_density[class_position])
+        w, c, r = terms.responsibility, terms.conditional_variance, kernel.retained
+        mu = cavity.shift[rows][:, None] * c
+        raw = c + mu * mu
+        ell = -0.5 * raw
+        f = terms.first
+
+        def expectation(values):
+            return np.sum(w * values, axis=1)
+
+        m, s2 = expectation(mu), expectation(raw)
+        d, dr = mu - m[:, None], raw - s2[:, None]
+        dl, df = ell - expectation(ell)[:, None], f - expectation(f)[:, None]
+        m_p = expectation(dl * d) - expectation(mu * c)
+        out["mean"][rows], out["second"][rows], out["variance"][rows] = m, s2, s2 - m * m
+        out["variance_by_shift"][rows] = expectation(d**3) + 3.0 * expectation(c * d)
+        out["mean_by_precision"][rows] = m_p
+        out["variance_by_precision"][rows] = expectation(dl * dr) - expectation(c * c + 2.0 * mu * mu * c) - 2.0 * m * m_p
+        out["mean_by_log_scale"][rows] = expectation(df * d) + expectation(mu * r)
+        out["second_by_log_scale"][rows] = expectation(df * dr) + expectation((c + 2.0 * mu * mu) * r)
+        by_mean[rows], by_second[rows] = w * d, w * dr
+    return out, by_mean, by_second
+
+
+def test_the_fused_variant_derivatives_are_the_dense_components_moments():
+    """``_variant_derivatives``' fused host pass (``_derivative_rows``) against the moments formed densely from the
+    components, with an annotation scale design."""
+    from sv_pgs.scale_mixture_ep import _variant_derivatives
+
+    prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    got = _variant_derivatives(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    expected, by_mean, by_second = _reference_variant_derivatives(prior, hyperparameters.coefficients, cavity)
+    for name, values in expected.items():
+        scale = float(np.max(np.abs(values)))
+        np.testing.assert_allclose(getattr(got, name), values, rtol=1e-10, atol=1e-10 * scale, err_msg=name)
+    np.testing.assert_allclose(got.mean_by_density, by_mean, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(by_mean))))
+    np.testing.assert_allclose(got.second_by_density, by_second, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(by_second))))

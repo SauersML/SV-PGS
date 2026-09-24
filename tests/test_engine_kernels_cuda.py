@@ -409,3 +409,27 @@ def test_the_line_values_stay_inside_a_tight_device_ledger():
         with memory_scope(budget), device_scope(cupy):
             got = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, host_bytes)(steps)
         np.testing.assert_allclose(got, expected, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(expected))))
+
+
+def test_the_device_variant_derivatives_are_the_host_twins_within_a_tight_ledger():
+    """``_variant_derivatives`` on the device (``engine_kernels.derivative_rows``), chunked from a ledger that leaves
+    32 MiB on the device with a 16 GiB host budget, against its host twin."""
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import memory_scope
+    from sv_pgs.scale_mixture_ep import _variant_derivatives, device_scope
+
+    prior, cavity = _problem(variant_count=20000, seed=51, node_count=40)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    expected = _variant_derivatives(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
+    used = int(cupy.get_default_memory_pool().used_bytes())
+    budget = ComputeBudget(
+        device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(used + (32 << 20),),
+        device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
+    )
+    with memory_scope(budget), device_scope(cupy):
+        got = _variant_derivatives(prior, hyperparameters.coefficients, cavity, 1 << 34)
+    for name in ("mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale",
+                 "second_by_log_scale", "mean_by_density", "second_by_density"):
+        values = getattr(expected, name)
+        scale = float(np.max(np.abs(values)))
+        np.testing.assert_allclose(getattr(got, name), values, rtol=1e-10, atol=1e-10 * scale, err_msg=name)
