@@ -321,6 +321,10 @@ class FitCertificate:
     # would add to a field, per unit of the field's own noise, largest over the blocks, at the returned state
     # (``GramBand.far_field_ratio``); 0 where the fit read the samples themselves (no far field is left out).
     far_field: F64Array | None = None
+    # Per model, the summary route's measured far-field scale kappa (``gram_space.far_field_scale``: the mean r^2 n' of
+    # the pairs beyond the band; 1 is chance alone) and its standard error; 0 where no far field is left out.
+    far_field_scale: F64Array | None = None
+    far_field_scale_error: F64Array | None = None
 
 
 @dataclass(frozen=True)
@@ -2301,7 +2305,7 @@ class _GramMeanField(_FullDataMeanField):
     def __init__(
         self, gaussian: GramGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
         starts: Sequence[MixtureHyperparameters], noise: F64Array, order_seed: int | None = None, start_mean: F64Array | None = None,
-        sites: Sequence[BernoulliSites | None] | None = None, band: GramBand | None = None,
+        sites: Sequence[BernoulliSites | None] | None = None, band: GramBand | None = None, phi: F64Array | None = None,
     ) -> None:
         if sites is not None and any(entry is not None for entry in sites):
             raise ValueError("the Gram-space route fits quantitative models only: a binary model's metric moves with its sites")
@@ -2312,6 +2316,14 @@ class _GramMeanField(_FullDataMeanField):
             raise ValueError("the Gram-space route over the dual solver needs Stage 0's band")
         self.band = gaussian.band if band is None else band
         self._siblings = {} if band is None else {"band": band}
+        if self._dual_solves and np.any(self.band.temper != 1.0):
+            # The exact route corrects the whole far field from the samples: its band is the untempered one.
+            self.band.set_tempering(np.ones(self.band.block_count))
+        if not self._dual_solves:
+            # The summary route's tempering, fixed for this oracle's life (``fit_full_data``'s phi rounds): the band and
+            # its solver are shared, so each oracle puts its own phi back before it sweeps (``_temper``).
+            self._frozen_phi = np.zeros(gaussian.band.block_count) if phi is None else np.asarray(phi, dtype=np.float64).copy()
+            self._siblings = {"phi": self._frozen_phi}
         self.exact = self._dual_solves
         # Each model's far field f held through a round, and the grouped means it was read at.
         self._far = np.zeros((self.band.group_count, gaussian.model_count))
@@ -2319,7 +2331,18 @@ class _GramMeanField(_FullDataMeanField):
         self._last_residual_square = 0.0
         self._last_rounding = 0.0
         self.refinements = 0
+        self._tempered = False
         super().__init__(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, order_seed=order_seed, start_mean=start_mean, sites=sites)
+        # The sweep's blocks are the band's (its parts: the summary band re-cuts Stage 0's blocks), each part's members in
+        # their order, or in a mixture component's random order within the part.
+        part = np.searchsorted(self.band.starts, self.ties.group, side="right") - 1
+        order = np.argsort(part, kind="stable")
+        bounds = np.searchsorted(part[order], np.arange(self.band.block_count + 1))
+        blocks = [order[bounds[index]:bounds[index + 1]] for index in range(self.band.block_count)]
+        if order_seed is not None:
+            generator = np.random.default_rng([seed, order_seed])
+            blocks = [generator.permutation(members) for members in blocks]
+        self.member_blocks = tuple(blocks)
 
     def _grouped(self, values: F64Array) -> F64Array:
         return self._group_values(np.asarray(values, dtype=np.float64))
@@ -2406,8 +2429,49 @@ class _GramMeanField(_FullDataMeanField):
         # rounding enters the ELBO's bound with the KL pieces' (``_elbo``'s count of summands covers its sums).
         return result.divergence, result.weighted_variance, residual_square, result.sizes + size / (2.0 * noise)
 
+    def _temper(self, model: int) -> None:
+        """The summary route's likelihood (``gram_space``: the tempered band) at this oracle's phi and the model's noise:
+        each block's lambda_b = sigma^2 / (sigma^2 + phi_b), and every square the oracle and its solver read in the
+        tempered band's units. phi is this oracle's own, fixed (``fit_full_data``'s phi rounds); lambda follows the noise."""
+        noise = float(self.noise[model])
+        temper = noise / (noise + self._frozen_phi)
+        if np.array_equal(temper, self.band.temper) and self._tempered:
+            return
+        self.band.set_tempering(temper)
+        self.gaussian.refresh()
+        self._training_squares = np.asarray(self.band.squares, dtype=np.float64)[:, None].copy()
+        self._install_metric()
+        self._tempered = True
+
+    def current_phi(self, model: int = 0) -> F64Array:
+        """phi_b (``GramBand.far_variances``) at the model's current posterior second moments: E beta_g^2 = mbar_g^2 plus
+        its members' variances, the posterior's, never the prior's."""
+        grouped = self._grouped(self.mean[:, model])
+        spread = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
+        return self.band.far_variances(grouped * grouped + spread)
+
+    def phi_pending(self, updated: F64Array, model: int = 0) -> float:
+        """What moving phi to ``updated`` could still change, in nats: each q_j's precision omega_j moves by the factor
+        lambda_new / lambda of its block, which moves its log normalizer by about (1/2) omega_j v_j |log(lambda_new /
+        lambda)| (the precision's own derivative, -v/2 per unit), so the sum over the members, (1/2) sum_b p_eff,b
+        |log ratio_b| with p_eff,b = sum_{j in b} omega_j v_j. Logged with phi's size and move."""
+        noise = float(self.noise[model])
+        current = noise / (noise + self._frozen_phi)
+        moved = noise / (noise + np.asarray(updated, dtype=np.float64))
+        part = np.searchsorted(self.band.starts, self.ties.group, side="right") - 1
+        omega = self.member_squares[:, model] / noise
+        effective = np.bincount(part, weights=omega * self.variance[:, model], minlength=self.band.block_count)
+        pending = 0.5 * float(np.sum(effective * np.abs(np.log(moved / current))))
+        log(
+            f"summary band: far field phi/sigma^2 max {float(np.max(updated, initial=0.0)) / noise:.4g}, mean {float(np.mean(updated)) / noise:.4g} "
+            f"(kappa {self.band.far_scale:.4g} +- {self.band.far_scale_error:.2g}); moved {float(np.max(np.abs(updated - self._frozen_phi))) / noise:.3g} "
+            "since the last round"
+        )
+        return pending
+
     def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
         if not self.exact:
+            self._temper(model)
             super()._solve_model(model, hyperparameters, pass_budget)
             self.residual[model] = self._residual_of(model)
             return
@@ -2464,6 +2528,8 @@ class _GramMeanField(_FullDataMeanField):
         grouped = self._grouped(self.mean[:, model] if mean is None else mean)
         spread = np.bincount(self.ties.group, weights=self.variance[:, model], minlength=self.ties.group_count)
         ratio = self.band.far_field_ratio(grouped * grouped + spread, float(self.noise[model]))
+        # The summary route's far field is in its likelihood (the tempering), and this is its size; the exact route
+        # corrects it from the samples.
         if self.exact:
             log(f"gram space: the band alone would leave out a far field of ratio {ratio:.3g}; corrected by {self.refinements} refinement rounds")
             return 0.0
@@ -2529,6 +2595,7 @@ def fit_full_data(
         raise ValueError("the Gram-space route (``gram_space``) is the mean-field fit of a quantitative model")
     oracle_class = _GramMeanField if gram_route else _FullDataMeanField
     extra_oracle = {} if band is None else {"band": band}
+    summary_route = isinstance(gaussian, GramGaussian)
 
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
@@ -2536,12 +2603,43 @@ def fit_full_data(
     ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
-        oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
-        try:
-            return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
-        except FloatingPointError as error:
-            # The oracle's refusals say why it had no fixed point; they belong with the failure.
-            raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
+        if not summary_route:
+            oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
+            try:
+                return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
+            except FloatingPointError as error:
+                # The oracle's refusals say why it had no fixed point; they belong with the failure.
+                raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
+        # The summary route: the tempered band's phi held through a whole empirical Bayes (every solve and trial of one
+        # search sees one likelihood), and refreshed from the returned fixed point's posterior second moments until its
+        # pending gain (``_GramMeanField.phi_pending``) is within the tolerance. The first phi is the starts' own fixed
+        # point's, the untempered band's.
+        phi = np.zeros(gaussian.band.block_count)
+        probe = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, phi=phi)
+        if any(point is None for point in probe(list(starts))):
+            raise FloatingPointError(f"the summary band's starts have no fixed point; mean_field refusals: {probe.refusals}")
+        phi = probe.current_phi()
+        del probe
+        pending: float | None = None
+        while True:
+            oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, phi=phi)
+            try:
+                fits = fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
+            except FloatingPointError as error:
+                raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
+            updated = oracle.current_phi()
+            round_pending = oracle.phi_pending(updated)
+            log(f"summary band: phi round, pending gain {round_pending:.3g} nats of phi's move (tolerance {0.5 / draw_count:.3g})")
+            if round_pending <= 0.5 / draw_count:
+                return oracle, fits
+            if pending is not None and round_pending >= pending:
+                raise FloatingPointError(
+                    f"the summary band's far field does not settle: phi's pending gain {round_pending:.3g} after {pending:.3g} nats"
+                )
+            pending, phi = round_pending, updated
+            starts = [fit.hyperparameters for fit in fits]
+            noise = np.asarray(oracle.noise, dtype=np.float64).copy()
+            extra["start_mean"] = oracle.mean.copy()
 
     # A binary model's noise is known: 1 in its whitened coordinates.
     noise = np.where(binary, 1.0, np.array([moment.noise for moment in moments]))
@@ -2616,6 +2714,8 @@ def fit_full_data(
         [mean_field.covariate_coefficients(model, member_mean[:, model]) for model in range(mean_field.model_count)]
     )
     far_field = np.zeros(model_count)
+    far_field_scale = np.full(model_count, float(gaussian.band.far_scale) if summary_route else 0.0)
+    far_field_scale_error = np.full(model_count, float(gaussian.band.far_scale_error) if summary_route else 0.0)
     if gram_route:
         assert mean_field is not None and member_mean is not None
         far_field = np.array([mean_field.far_field(model, member_mean[:, model]) for model in range(model_count)])
@@ -2681,6 +2781,8 @@ def fit_full_data(
             mixture_components=component_count,
             state_digest=digests,
             far_field=far_field,
+            far_field_scale=far_field_scale,
+            far_field_scale_error=far_field_scale_error,
         ),
     )
 

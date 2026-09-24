@@ -1,6 +1,7 @@
-"""bench-sim submission: ``svpgs_full`` with the quantitative fit on Stage 0's banded Gram (``gram_space``) whatever the
-measured pass costs say, for the measurement of that route against the sample-space one (``svpgs_full_samples``) on
-the same commit; the peaks of ``svpgs_full_memcontract`` are logged after the fit and the score."""
+"""bench-sim submission: ``svpgs_full`` by the summary route (``gram_space``: every step after Stage 0 on the summary
+band, its far field in the likelihood) whatever the measured pass costs say, for the accuracy gate against the exact
+route (``benchmarks.summary_gate``) and its wall time; the peaks of ``svpgs_full_memcontract`` are logged after the fit
+and the score."""
 from __future__ import annotations
 
 from benchmarks.bench_sim.submissions import svpgs_full, svpgs_full_memcontract

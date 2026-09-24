@@ -28,9 +28,9 @@ def _budget() -> ComputeBudget:
 
 @pytest.mark.parametrize("route", ["samples", "gram"])
 def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
-    # Each route by name (the measured pass costs tie at this size, so either could be chosen); both are exact (the Gram
-    # route corrects the band's far field, the chance LD between the store's two chromosomes, from the samples), so
-    # both certify and leave no far field out.
+    # Each route by name (the measured pass costs tie at this size, so either could be chosen). The sample route is exact
+    # and certifies; the summary route fits on the band with its far field in the likelihood as measured field noise,
+    # which its certificate reports (the measured scale kappa and the far field's size), and scores the store alike.
     from sv_pgs import stage2_wiring
 
     monkeypatch.setattr(stage2_wiring, "pass_costs", (lambda band, source, xp: (0.0, np.inf)) if route == "samples" else (lambda band, source, xp: (np.inf, 0.0)))
@@ -55,7 +55,11 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
             seed=3,
         )
     )
-    assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT and model.certificate["far_field"][0] == 0.0
+    if route == "samples":
+        assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT and model.certificate["far_field"][0] == 0.0
+    else:
+        assert model.certificate["far_field_scale"][0] > 0.0 and model.certificate["far_field_scale_error"][0] >= 0.0
+        assert model.certificate["far_field"][0] >= 0.0 and model.certificate["budget_unresolved"][0] == 0
     save_model(tmp_path / "model", model)
     loaded = load_model(tmp_path / "model")
     prediction = predict(loaded, store, np.arange(samples), covariate[:, None], _budget())

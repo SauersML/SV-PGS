@@ -2119,6 +2119,8 @@ def fit_small_n(
         )[None, :],
         # The dense route reads the whole design: no far field is left out.
         far_field=np.zeros(1),
+        far_field_scale=np.zeros(1),
+        far_field_scale_error=np.zeros(1),
     )
     remaining = max(outer.remaining_gain for outer in outers)
     move = max(outer.prediction_move for outer in outers)

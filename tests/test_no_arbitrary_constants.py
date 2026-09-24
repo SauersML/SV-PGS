@@ -185,6 +185,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('full_data_fit.py', '_norm_bounds'): ('math', frozenset({4.0}), 'the quadratic formula for t^2 +- b t = r x_hat (the 4ac of b^2 + 4ac)'),
     ('scale_mixture_ep.py', '_KernelRows.components'): ('math', frozenset({4.0}), "log Z_j's rounding bound: each node's term x_k = log pi_k - log(1 + vP)/2 + h^2 c/2 is four rounded operations on its pieces (tests/test_engine_verification._objective_rounding, the harness's own bound)"),
     ('mean_field.py', '_sweep'): ('math', frozenset({3.0, 4, 6.0}), 'central moments of a Gaussian mixture from its components: E[(d + sqrt(c) Z)^3] = d^3 + 3 d c, E[(d + sqrt(c) Z)^4] = d^4 + 6 d^2 c + 3 c^2'),
+    ('gram_space.py', 'far_field_scale'): ('derived', frozenset({4}), "m = 4K columns: kappa's chance standard error 2 / m within the fit's resolution 1 / (2K)"),
     ('gram_space.py', '_gram_sweep'): ('math', frozenset({3.0, 4, 6.0}), 'central moments of a Gaussian mixture from its components: E[(d + sqrt(c) Z)^3] = d^3 + 3 d c, E[(d + sqrt(c) Z)^4] = d^4 + 6 d^2 c + 3 c^2'),
     ('mean_field.py', 'MeanFieldFixedPoints._fixed_point.cavity_response'): ('math', frozenset({-2.0}), "the noise's stationarity differentiated: d||r||^2 = 2 r'dr with dr = -Xp dm (module docstring)"),
     ('full_data_fit.py', '_FullDataMeanField._fixed_point.cavity_response'): ('math', frozenset({-2.0}), "the same stationarity on the streamed design: d||r||^2 = 2 r'dr with dr = -Xp dm (mean_field's docstring)"),

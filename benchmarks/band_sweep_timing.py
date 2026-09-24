@@ -51,6 +51,7 @@ def main() -> None:
             residual_dimension=float(samples), working_bytes=1 << 30,
         )
         band.squares = np.full(members, float(samples))
+        band._raw_squares = band.squares.copy()
         state = [np.zeros(members) for _ in range(5)]
         times = []
         for _sweep in range(arguments.sweeps):

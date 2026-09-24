@@ -229,16 +229,17 @@ def _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store) -> None:
 def test_band_fit_is_near_the_sample_fit_with_one_block_per_chromosome(tmp_path: Path) -> None:
     # One block per chromosome, and the chromosomes' cross-Gram is chance LD only: the band is G but for the chance
     # coupling of the two chromosomes and float32's rounding of the stored Gram.
-    (sample_fit, band_fit, exact_fit), statistics, store, _genetic = _fits(tmp_path, 256)
+    (sample_fit, band_fit, exact_fit), statistics, _store_, _genetic = _fits(tmp_path, 256)
     assert statistics.ld.block_count == 2
-    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store)
+    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, _store_)
     for fit in (sample_fit, band_fit):
         assert fit.certificate.budget_unresolved[0] == 0
         assert fit.certificate.mean_move[0] <= fit.certificate.draw_tolerance[0]
     assert band_fit.certificate.far_field[0] > 0.0 and sample_fit.certificate.far_field[0] == 0.0
-    difference = np.linalg.norm(band_fit.member_mean - sample_fit.member_mean) / np.linalg.norm(sample_fit.member_mean)
-    # The chance coupling between the chromosomes is O(1/sqrt(n)) per pair: the two fits differ at that order.
-    assert difference < 4.0 / np.sqrt(_TRAINING)
+    # The band fit leaves the chromosomes' chance coupling out of its fields and tempers each block's likelihood by the
+    # noise it adds (kappa 1 here, chance alone): its predictions are the sample fit's up to that approximation.
+    sample, band_prediction = _held_out_predictions([sample_fit, band_fit], statistics, _store_)
+    assert np.corrcoef(sample, band_prediction)[0, 1] > 0.95
 
 
 @pytest.mark.slow  # three mean-field fits of the synthetic store: about two minutes on acl42
@@ -254,9 +255,10 @@ def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> N
 
 
 @pytest.mark.slow  # two engine fits of a synthetic chromosome: about 40 s on acl42
-def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gram(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # One chromosome in one LD block: the band is G up to float32's rounding of the stored Gram, so the whole fit, its
-    # outer loop and certificate included, is the sample-space fit's to that rounding.
+def test_the_summary_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One chromosome in one Stage 0 block: the summary route re-cuts it by its measured LD extent and puts what lies
+    # beyond each part's neighbours in the likelihood as field noise, measured (kappa); its effects are the sample
+    # route's up to that approximation, so the two fits' coefficients agree closely [own-sim].
     from sv_pgs import fit_model, stage2_wiring
     from sv_pgs.config import TraitType
     from sv_pgs.dosage_store import DosageStore
@@ -277,7 +279,7 @@ def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gr
     targets = 0.3 * covariate + genetic + np.sqrt(0.5) * generator.standard_normal(_SAMPLES)
     training = np.arange(_SAMPLES) < _TRAINING
     models = {}
-    for route, costs in (("samples", (0.0, np.inf)), ("gram", (np.inf, 0.0))):
+    for route, costs in (("samples", (0.0, np.inf)), ("summary", (np.inf, 0.0))):
         monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp, costs=costs: costs)
         (tmp_path / route).mkdir()
         models[route] = fit_model.fit(fit_model.FitRequest(
@@ -286,14 +288,16 @@ def test_band_route_certifies_as_the_sample_route_where_the_band_is_the_whole_gr
             model_names=("trait",), trait_types=(TraitType.QUANTITATIVE,), research_ids=tuple(f"person{index}" for index in range(_SAMPLES)),
             log_variance_offset=None, budget=_budget(), work_dir=tmp_path / route, seed=3,
         ))
-    samples, gram = models["samples"].certificate, models["gram"].certificate
-    assert gram["far_field"][0] == 0.0
-    assert samples["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT and gram["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
-    assert samples["outer_iterations"][0] == gram["outer_iterations"][0]
-    # Float32's rounding of the stored Gram, carried through the fit: the gains agree far inside the tolerance.
-    assert abs(samples["remaining_gain"][0] - gram["remaining_gain"][0]) <= 1e-3 * 0.5 / fit_model.DRAW_COUNT
-    coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "gram")]
-    assert np.linalg.norm(coefficients[1] - coefficients[0]) <= 1e-4 * np.linalg.norm(coefficients[0])
+    samples, summary = models["samples"].certificate, models["summary"].certificate
+    assert samples["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
+    assert summary["far_field_scale"][0] > 0.0 and summary["budget_unresolved"][0] == 0
+    coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "summary")]
+    standardized = (dosage - dosage.mean(axis=0)) / dosage.std(axis=0)
+    rows = np.asarray(models["samples"].scoring[0].store_rows)
+    held_out = ~training
+    predictions = [standardized[held_out][:, rows] @ values for values in coefficients]
+    assert np.corrcoef(predictions[0], predictions[1])[0, 1] > 0.95
+    assert np.corrcoef(predictions[1], genetic[held_out])[0, 1] > 0.5
 
 
 def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path: Path) -> None:
