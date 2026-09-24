@@ -36,7 +36,10 @@ def projected(codes: np.ndarray, covariates: np.ndarray) -> np.ndarray:
     scale = values.std(axis=0)
     keep = scale > 0.0
     values = values[:, keep] / scale[keep]
-    basis, _ = np.linalg.qr(np.column_stack([np.ones(values.shape[0]), covariates]))
+    # The covariates' column space by its SVD (ancestry proportions sum to one, so with the intercept they lose a rank).
+    design = np.column_stack([np.ones(values.shape[0]), covariates])
+    left, singular, _ = np.linalg.svd(design, full_matrices=False)
+    basis = left[:, singular > max(design.shape) * np.finfo(np.float64).eps * singular[0]]
     values -= basis @ (basis.T @ values)
     values /= np.linalg.norm(values, axis=0) / np.sqrt(values.shape[0])
     return values, keep
@@ -90,6 +93,10 @@ def main() -> None:
     parser.add_argument("--variants", type=int, default=4000)
     parser.add_argument("--ends", type=int, default=800)
     parser.add_argument("--seed", type=int, default=20260924)
+    parser.add_argument(
+        "--ancestry", choices=("none", "proportions", "realized_proportions"), default="none",
+        help="global-ancestry covariates beside the harness's: the cohort's per-person ancestry proportions (drawn, or realized)",
+    )
     parser.add_argument("--out", type=Path, required=True)
     arguments = parser.parse_args()
     samples = np.load(arguments.cohort / "samples.npz")
@@ -101,10 +108,12 @@ def main() -> None:
     observed = np.load(arguments.cohort / ARMS[arguments.arm][0], mmap_mode="r")
     codes = np.asarray(observed[records[chosen]])[:, train].T
     covariates, _names = covariate_matrix(arguments.cohort, arguments.arm)
+    if arguments.ancestry != "none":
+        covariates = np.column_stack([covariates, np.asarray(samples[arguments.ancestry], dtype=np.float64)])
     covariates = covariates[train]
     groups = samples["group"][train]
     names = [str(name) for name in samples["group_names"]]
-    report = {"variants": int(chosen.size), "training_samples": int(train.size), "groups": {}}
+    report = {"variants": int(chosen.size), "training_samples": int(train.size), "ancestry_covariates": arguments.ancestry, "groups": {}}
     values, keep = projected(codes, covariates)
     positions = positions_all[chosen][keep].astype(np.float64)
     residual = float(values.shape[0] - np.linalg.matrix_rank(np.column_stack([np.ones(values.shape[0]), covariates])))
