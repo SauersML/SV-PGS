@@ -418,6 +418,7 @@ def _fit_one(
     # this store and device (``pass_costs``); otherwise on the samples. A binary model's metric moves with its sites,
     # so its passes are over the samples.
     band = None
+    kappa = 1.0
     if not binary:
         started = time.perf_counter()
         # kappa first, on Stage 0's blocks (pairs beyond a block's neighbours): the extent test reads each block's LD
@@ -429,6 +430,9 @@ def _fit_one(
             store, training_columns, covariates, statistics, stage0_starts, stage0_linked, draw_count, _seed(seed, _FAR_FIELD_KEY),
         )
         log(f"stage2 wiring: far field: mean r^2 n' = {kappa:.4g} +- {kappa_error:.2g} over {pairs:,} pairs beyond Stage 0's neighbouring blocks (chance alone: 1)")
+    if not binary and inference == "mean_field":
+        # The summary band is the mean-field route's; EP runs over the samples, its windows cut at the LD extent read
+        # against the same kappa (``null_scale``).
         band_store = build_band_store(ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module, kappa)
         band = GramBand(statistics, share, store=band_store)
         band.far_scale, band.far_scale_error = kappa, kappa_error
@@ -463,11 +467,14 @@ def _fit_one(
     # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
     fit = fit_full_data(
         gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-        sites=[store_sites],
+        sites=[store_sites], null_scale=kappa,
     )
     while True:
         check = lattice_check(
-            prior, fit.hyperparameters[0], Cavity(precision=fit.member_omega[:, 0], shift=fit.member_shift[:, 0]), share, draw_count,
+            prior, fit.hyperparameters[0],
+            Cavity(precision=fit.member_omega[:, 0], shift=fit.member_shift[:, 0]) if fit.member_omega is not None
+            else Cavity(precision=fit.cavity_precision[:, 0], shift=fit.cavity_shift[:, 0]),
+            share, draw_count,
         )
         log(f"stage2 wiring: lattice check on {prior.grid_size} nodes: {check.record()}")
         if not (check.refine or check.extend):
@@ -484,7 +491,7 @@ def _fit_one(
             refit = fit_full_data(
                 gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
                 sites=[store_sites], starts=[moved_hyperparameters], start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
-                start_mean=fit.member_mean,
+                start_mean=fit.member_mean, null_scale=kappa,
             )
         except FloatingPointError as error:
             # No certified fit on the checked lattice: the model keeps the fit it has, and the failed check is logged.

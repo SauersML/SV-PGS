@@ -143,7 +143,7 @@ def stage0_lattice(
 
 def block_grams(
     statistics: GenotypeSufficientStatistics, noise: float = 1.0, working_bytes: int | None = None, array_module: Any = np,
-    level: float | None = None,
+    level: float | None = None, null_scale: float = 1.0,
 ) -> BlockGrams:
     """Stage 0's projected Grams, R_b within each block and R_{b,b+1} between neighbours (zero across a chromosome's
     end), as the stored float32 arrays themselves: memory-mapped views, no copy. A model's metric W = training /
@@ -171,7 +171,7 @@ def block_grams(
     widest = max(block.shape[0] for block in blocks)
     if level is None:
         raise ValueError("cutting the blocks to the LD extent needs its test's level")
-    extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module)
+    extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module, null_scale)
     width = window_width(working_bytes, array_module, widest)
     log(f"leave-block-out windows: LD extent {extent} variants, memory width {width}, widest Stage 0 block {widest}")
     return refined_grams(grams, min(width, extent))
@@ -345,6 +345,10 @@ class FullDataFit:
     member_mean: F64Array | None = None
     member_shift: F64Array | None = None
     member_omega: F64Array | None = None
+    # The EP route's cavities at its returned fixed point (members x models), for the lattice check; None on the
+    # mean-field route, whose cavities are ``member_shift`` and ``member_omega``.
+    cavity_precision: F64Array | None = None
+    cavity_shift: F64Array | None = None
     covariate_coefficients: F64Array | None = None
     working_bytes: int = 0
     # The mean-field mixture's components (``fit_full_data``): each fixed point's (shift, omega), members x models, omega
@@ -609,6 +613,7 @@ class _FullDataFixedPoints:
         starts: Sequence[MixtureHyperparameters],
         noise: F64Array,
         start_sites: tuple[F64Array, F64Array] | None = None,
+        null_scale: float = 1.0,
     ) -> None:
         self.gaussian = gaussian
         covariates = np.asarray(_host(gaussian.covariates))
@@ -639,7 +644,9 @@ class _FullDataFixedPoints:
             else:
                 free, _total = xp.cuda.runtime.memGetInfo()
                 window_budget = min(window_budget, int(free) + int(xp.get_default_memory_pool().free_bytes()))
-        self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp, level=certificate_level(draw_count))
+        # The extent test reads the far pairs' r^2 against the measured kappa / n (``null_scale``: variance heterogeneity
+        # across a pooled cohort's groups puts unlinked pairs at kappa / n, 1.36 on bench-sim chr22 [sim]).
+        self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp, level=certificate_level(draw_count), null_scale=null_scale)
         gaussian.windows = _WindowLayout(self.grams, gaussian.source)
         window_bytes = window_working_bytes(self.grams, xp)
         log(f"ep: {len(self.grams.blocks)} leave-block-out windows of at most {max(block.shape[0] for block in self.grams.blocks)} columns, {window_bytes / 1e9:.1f} GB of {window_budget / 1e9:.1f} GB")
@@ -934,7 +941,11 @@ class _FullDataFixedPoints:
         (the dual solver's state is shared, so a refusal restores all of it); the reason is kept in ``refusals``."""
         snapshot = self._snapshot()
         try:
-            return list(self._solve(hyperparameters))
+            points = list(self._solve(hyperparameters))
+            # The last certified fixed point's cavities (members x models), which the fit reports for its lattice check.
+            self.cavity_precision = np.column_stack([point.cavity.precision for point in points])
+            self.cavity_shift = np.column_stack([point.cavity.shift for point in points])
+            return points
         except NoFixedPoint as error:
             self._restore(snapshot)
             self.refusals.append(str(error))
@@ -2580,6 +2591,7 @@ def fit_full_data(
     start_noise: F64Array | None = None,
     start_mean: F64Array | None = None,
     band: GramBand | None = None,
+    null_scale: float = 1.0,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -2693,7 +2705,7 @@ def fit_full_data(
         log(f"ep: warm start from the mean-field fixed point after {fixed_points.passes} sweeps")
         oracle = _FullDataFixedPoints(
             gaussian, statistics, prior, draw_count, working_bytes, seed, field_hyperparameters, np.asarray(fixed_points.noise, dtype=np.float64).copy(),
-            start_sites=(fixed_points.site_precision.copy(), fixed_points.site_shift.copy()),
+            start_sites=(fixed_points.site_precision.copy(), fixed_points.site_shift.copy()), null_scale=null_scale,
         )
         try:
             fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
@@ -2702,7 +2714,7 @@ def fit_full_data(
             # without the warm start.
             log(f"ep: no certified fixed point from the mean-field start ({warm_error}; {oracle.refusals}): EP from the prior")
             starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
-            oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise)
+            oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, null_scale=null_scale)
             try:
                 fits = fit_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
             except FloatingPointError as error:
@@ -2768,6 +2780,8 @@ def fit_full_data(
         component_weights=component_weights,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
+        cavity_precision=getattr(fixed_points, "cavity_precision", None) if mean_field is None else None,
+        cavity_shift=getattr(fixed_points, "cavity_shift", None) if mean_field is None else None,
         covariate_coefficients=covariate_coefficients,
         working_bytes=int(working_bytes),
         hyperparameters=hyperparameters,
