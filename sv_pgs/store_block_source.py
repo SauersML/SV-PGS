@@ -1,4 +1,4 @@
-"""Stage 2's genotype blocks streamed from the dosage store: ``exact_polish.GenotypeBlockSource``.
+"""Stage 2's genotype blocks streamed from the dosage store (the dual solver's `GenotypeBlockSource`).
 
 One Stage 2 read visits every LD block once. Three stages of it overlap:
 
@@ -76,7 +76,7 @@ class StoreGenotypeBlockSource:
     """A dosage store's LD blocks as Stage 2 tiles, streamed once per read.
 
     ``block_rows[b]`` holds block b's store rows, ascending; ``block_variant_indices[b]`` its
-    columns in the model's variant order (what ``exact_polish`` hands its local step); ``means``
+    columns in the model's variant order (what the dual solver hands its local step); ``means``
     and ``scales`` are per block row, in signed-code units, concatenated over blocks.
     ``workspace_bytes`` is each tile's product workspace from the caller's memory plan, and
     ``resident_bytes`` is what the source itself holds on the compute device.

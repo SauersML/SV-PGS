@@ -114,31 +114,6 @@ def test_cuda_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, c
     assert np.all(np.abs(cupy.asnumpy(image) - cupy.asnumpy(expected_image)) <= 2.0 * gamma * magnitude)
 
 
-def test_a_stage_2_read_over_streamed_tiles_equals_the_per_block_products(tmp_path: Path) -> None:
-    from sv_pgs.exact_polish import _Device, _Reads
-
-    _write_store(tmp_path / "store", _two_half_dosage(), "zstd")
-    source, signed, means, scales = _source(tmp_path / "store", "cpu")
-    rng = np.random.default_rng(3)
-    left = rng.standard_normal((source.sample_count, 4))
-    rights = [rng.standard_normal((block.shape[0], 4)) for block in BLOCK_ROWS]
-    seen = []
-
-    def local(block_index, variants, tile, products):
-        seen.append(products)
-        return rights[block_index]
-
-    image = _Reads(source, _Device(np)).sweep(left, local, 4)
-    offsets = np.cumsum([0] + [block.shape[0] for block in BLOCK_ROWS])
-    expected = np.zeros_like(image)
-    for block_index, rows in enumerate(BLOCK_ROWS):
-        columns = slice(int(offsets[block_index]), int(offsets[block_index + 1]))
-        tile = CodeBlockTile(signed[rows], means[columns], scales[columns], np, WORKSPACE_BYTES)
-        assert np.array_equal(_bits(seen[block_index]), _bits(tile.rmatmat(left)))
-        expected += tile.matmat(rights[block_index])
-    assert np.array_equal(_bits(image), _bits(expected))
-
-
 @pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
 @pytest.mark.parametrize("codec", ["zstd", "rowdict"])
 def test_cuda_reads_after_the_first_come_from_the_resident_codes(tmp_path: Path, codec: str, monkeypatch) -> None:

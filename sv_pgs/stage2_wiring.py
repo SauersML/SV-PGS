@@ -1,6 +1,6 @@
-"""RUN-ONLY (run/svpgs-bench-1, fit-api): store -> fitted models, until e2e's ``full_data_fit.fit_models`` replaces it.
+"""Store -> fitted models: the production wiring of Stage 0, the prior and Stage 2, run once per model.
 
-This is e2e's tests/test_full_data_fit wiring behind the agreed ``fit_models`` signature, run once per model:
+Each model gets:
 Stage 0 on the model's own training rows and covariate columns, the start lattice from its single-variant
 likelihoods, the prior with one class per variant class present, the records' unit offsets and frequency function from the
 store's unit contract (``store_measurement``), the store's other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed

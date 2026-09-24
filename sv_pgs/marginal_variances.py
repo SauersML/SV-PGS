@@ -846,7 +846,7 @@ def marginal_variances(
     # of Sigma^-1 is then Pi_S + Xt_S' (I + Xt_L Pi_L^-1 Xt_L')^-1 Xt_S with an indefinite middle factor
     # (verify-stage2's counterexample: Xt'Xt = [[1, 1], [1, 1]], Pi = (2, -1/2) gives Sigma_11 = 1 > 1/2). The
     # approximation can cross the bounds, e.g. when a window's resolved spikes over-subtract, so project onto
-    # the ones that hold, as exact_polish does for its estimates. The certificate still sees the error.
+    # the ones that hold. The certificate still sees the error.
     column_square_norms = grams.column_square_norms()
     lower = 1.0 / (column_square_norms + solve.site_precision)
     every_site_positive = bool(np.all(solve.site_precision > 0.0))
