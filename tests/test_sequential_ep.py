@@ -257,6 +257,7 @@ def test_a_cluster_step_by_woodbury_is_the_rebuilt_state():
     site = (np.diag(t[[0, 1, 4]]) + sweep.coupling[0]) / noise + 0.1 * (factor @ factor.T)
     site_shift = nu[[0, 1, 4]] + rng.standard_normal(3)
     assert sweep.step_cluster(0, site, site_shift, t, nu)
+    assert sweep.blocking.size == 0
     stepped = sweep.current_cluster_cavity(0, t, nu)
     stepped_informed = sweep.informed.copy()
     rebuilt = sweep.cluster_cavity(0, t, nu)

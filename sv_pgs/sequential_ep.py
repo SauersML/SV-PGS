@@ -580,6 +580,8 @@ class SequentialSweep:
         groups = self.clusters[index]
         slots = self.rest_slot[groups]
         size = groups.shape[0]
+        # The groups whose cavity the step would make improper (``blocking``): empty where the step fails on q itself.
+        self.blocking = np.zeros(0, dtype=np.int64)
         new_scaled = self.noise * np.asarray(site_precision, dtype=np.float64)
         old_scaled = np.diag(precision[groups]) + self.coupling[index]
         change = 0.5 * (new_scaled + new_scaled.T) - old_scaled
@@ -596,20 +598,19 @@ class SequentialSweep:
         schur_inverse = 0.5 * (schur_inverse + schur_inverse.T)
         projected = self.rows @ (self.rest_images.T @ images)
         informed = self.informed + np.einsum("ij,jk,ik->i", projected, core, projected)
-        bulk = ~self.is_rest
+        blocking = []
+        bulk = np.flatnonzero(~self.is_rest)
         with np.errstate(divide="ignore", invalid="ignore"):
             scaled = informed[bulk] / (1.0 - informed[bulk] / precision[bulk])
         cavity = scaled / self.noise
-        if not np.all(np.isfinite(cavity)) or np.any((cavity < 0.0) & ~(1.0 + self.largest[bulk] * cavity > 0.0)):
-            return False
+        blocking.append(bulk[~np.isfinite(cavity) | ((cavity < 0.0) & ~(1.0 + self.largest[bulk] * cavity > 0.0))])
         trial_t = precision.copy()
         trial_t[groups] = np.diag(new_scaled)
         single_rest = self.rest_rows[~self.clustered[self.rest_rows]]
         if single_rest.size:
             with np.errstate(divide="ignore"):
                 rest_cavity = (1.0 / np.diag(schur_inverse)[self.rest_slot[single_rest]] - trial_t[single_rest]) / self.noise
-            if not np.all(np.isfinite(rest_cavity)) or np.any((rest_cavity < 0.0) & ~(1.0 + self.largest[single_rest] * rest_cavity > 0.0)):
-                return False
+            blocking.append(single_rest[~np.isfinite(rest_cavity) | ((rest_cavity < 0.0) & ~(1.0 + self.largest[single_rest] * rest_cavity > 0.0))])
         couplings = [block.copy() for block in self.coupling]
         couplings[index] = new_scaled - np.diag(np.diag(new_scaled))
         for other, members in enumerate(self.clusters):
@@ -622,7 +623,12 @@ class SequentialSweep:
             with np.errstate(divide="ignore"):
                 bound = np.diag(1.0 / self.largest[members])
             if not np.linalg.eigvalsh(0.5 * (cavity_precision + cavity_precision.T) + bound)[0] > 0.0:
-                return False
+                if other == index:
+                    return False
+                blocking.append(members)
+        self.blocking = np.unique(np.concatenate(blocking)) if blocking else np.zeros(0, dtype=np.int64)
+        if self.blocking.size:
+            return False
         self.schur_inverse = np.ascontiguousarray(schur_inverse)
         self.informed = informed
         precision[groups] = np.diag(new_scaled)

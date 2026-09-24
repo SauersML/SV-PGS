@@ -15,7 +15,8 @@ within the resolution 1 / (2 K) (less each sampled cluster's own Monte Carlo flo
 expectation) and q has stopped moving (the sweep's summed KL move of the groups' marginals within the resolution). A unit breaks the contract where its update is refused (no damping keeps every cavity finite) or where
 its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
 unit joins the unit of the group whose column is most correlated with its own, all failing units at once with their
-joins closed transitively (the links' connected components), and the sweeps continue from the joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
+joins closed transitively (the links' connected components), and a cluster whose full step would make some cavity
+improper absorbs the units whose cavities block it; the sweeps continue from the joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
 leaves a residual above the resolution breaks it at once, the first sweep included: its step was damped because no
 single site that matches its tilted law keeps every cavity inside the domain, so one site cannot represent it (a
 near-flat cavity with a large pull [real, ENSG00000105612.9: residuals to 4e26]); joined to the block, its joint law
@@ -158,6 +159,8 @@ class AliasEP:
         self.calls = 0
         # Why cluster updates were refused, counted per sweep for the record.
         self.refusals: dict[str, int] = {}
+        # Per cluster, the groups whose cavities blocked its full step this sweep (``_update_cluster``).
+        self.blocking: dict[int, I64Array] = {}
 
     def _indicator(self, cluster: I64Array) -> tuple[I64Array, F64Array]:
         members = np.concatenate([self.members_of[g] for g in cluster])
@@ -279,6 +282,10 @@ class AliasEP:
             if sweep.step_cluster(index, old_precision + fraction * (target_precision - old_precision), old_shift + fraction * (target_shift - old_shift),
                                   precision, shift):
                 return residual, floor
+            if fraction == 1.0:
+                # The full step's blockers: the groups whose cavity it would make improper. The cluster absorbs them
+                # (``fit``), whether a damped step is then taken or not.
+                self.blocking[index] = sweep.blocking.copy()
             fraction *= 0.5
         return self._refuse("domain"), floor
 
@@ -332,6 +339,7 @@ class AliasEP:
                 raise FloatingPointError("the sites leave q's precision not positive definite")
             cluster_residual: dict[int, float] = {}
             refused_clusters: set[int] = set()
+            self.blocking = {}
             floors: dict[int, float] = {}
             for index in range(len(sweep.clusters)):
                 residual, floor = self._update_cluster(index, precision, shift, stamp)
@@ -384,6 +392,7 @@ class AliasEP:
             self.refusals = {}
             if progress is not None:
                 progress(record[-1])
+            failing |= {self.group_count + index for index, blockers in self.blocking.items() if blockers.size}
             if not failing and total <= self.resolution and move <= self.resolution and not refused_clusters:
                 converged = True
                 break
@@ -409,6 +418,10 @@ class AliasEP:
                 other = self._partner(members_of_unit[key], unit_of)
                 if other != key:
                     parent[root(key)] = root(other)
+            # A cluster whose full step left the domain absorbs the units whose cavities blocked it.
+            for index, blockers in self.blocking.items():
+                for group in blockers:
+                    parent[root(int(unit_of[group]))] = root(self.group_count + index)
             components: dict[int, list[int]] = {}
             for key in members_of_unit:
                 components.setdefault(root(key), []).append(key)
