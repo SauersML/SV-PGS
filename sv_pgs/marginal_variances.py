@@ -548,12 +548,12 @@ def window_width(working_bytes: int, array_module: Any = np, limit: int | None =
 
 
 def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
-    """The lag (in variants, along the block order) beyond which a variant's LD is not resolved: the smallest w whose
-    tail excess per variant (the summed r^2 over every within-block pair more than w apart, less its null expectation
-    1/n per pair, over the V variants) is at most one variant's tail LD score's null standard deviation
-    sqrt(2 N(w) / V) / n (N(w) the ordered pairs beyond w; r^2 of an unlinked pair has mean 1/n and variance 2/n^2 to
-    leading order). The marginal variances are per variant, so it is a variant's own LD beyond w that must be below
-    what one variant's data can resolve; summed over the whole genome, far LD is always detectable. Beyond it the Grams hold nothing a window could use, so blocks
+    """The lag (in variants, along the block order) beyond which the data show no LD: the smallest w whose tail
+    excess, the summed r^2 over every within-block pair more than w apart less its null expectation 1/n per pair, is
+    at most that sum's own null standard deviation sqrt(2 N(w)) / n (N(w) the ordered pairs beyond w; r^2 of an
+    unlinked pair has mean 1/n and variance 2/n^2 to leading order). A looser, per-variant reading of the same test
+    (a variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and
+    failed its cavity information certificate in 1 of 9 blocks, so the extent is the whole tail's. Beyond it the Grams hold nothing a window could use, so blocks
     need be no wider: the leave-block-out windows (the block and its two neighbours) then reach at least w on each
     side, and whatever the data do hold beyond is far field, which ``block_trace_certificate`` tests.
 
@@ -592,8 +592,7 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_mo
     pairs[0] = 0.0
     tail_excess = _to_host(xp.cumsum(excess[::-1])[::-1])
     tail_pairs = _to_host(xp.cumsum(pairs[::-1])[::-1])
-    variants = float(sum(int(members.shape[0]) for members in grams.blocks))
-    resolved = tail_excess / variants <= np.sqrt(2.0 * tail_pairs / variants) / sample_count
+    resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) / sample_count
     return max(1, int(np.argmax(resolved))) if resolved.any() else widest
 
 
@@ -673,6 +672,69 @@ def _block_terms(
         covariance[member_positions, :] = bulk_to_resolved.T
         covariance[np.ix_(member_positions, member_positions)] = core_inverse[np.ix_(local, local)]
     return _BlockTerms(columns=columns, rows=rows, quadratic=quadratic[diagonal], near=near, loadings=loadings, covariance=covariance)
+
+
+class _WindowTermsCache:
+    """Each block's window terms (``_block_terms``) formed once per refresh and read by every map of it: the marginal
+    variances, the certificate's control variate and the curvature's variance products all take the same window
+    algebra at the same solve, which each used to recompute (three cubic passes over every window per refresh [sim,
+    bench-sim 000 py-spy]). The terms are exact functions of (solve, grams at their scale, block), so a cached copy is
+    the recomputation. They are held on the host as cache leases of the fit's ledger (``memory_broker.admit``: from
+    what the mandatory leases leave, and dropped when a later mandatory lease needs the bytes); a block whose terms do
+    not fit, or were dropped, is recomputed. Outside every ledger scope (a caller with no budget) every block is kept.
+    A new solve or new Grams (a new refresh, another model) clears the cache."""
+
+    def __init__(self) -> None:
+        self._solve: BulkSolve | None = None
+        self._within: tuple | None = None
+        self._scale: float | None = None
+        self._terms: dict[int, _BlockTerms] = {}
+        self._leases: dict[int, Any] = {}
+
+    def clear(self) -> None:
+        for lease in self._leases.values():
+            lease.release()
+        self._leases.clear()
+        self._terms.clear()
+        self._solve = self._within = self._scale = None
+
+    def _drop(self, block: int) -> None:
+        self._terms.pop(block, None)
+        self._leases.pop(block, None)
+
+    def terms(
+        self, solve: BulkSolve, grams: BlockGrams, cross: WindowCross, bulk_variance: NDArray[np.float64], core_inverse: NDArray[np.float64], block: int,
+        array_module: Any,
+    ) -> _BlockTerms:
+        if self._solve is not solve or self._within is not grams.within or self._scale != grams.scale:
+            self.clear()
+            self._solve, self._within, self._scale = solve, grams.within, grams.scale
+        held = self._terms.get(block)
+        if held is not None:
+            return held
+        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        from sv_pgs.memory_broker import current_broker  # noqa: PLC0415 - the ledger imports the budget, not this module
+
+        broker = current_broker()
+        if broker is None:
+            self._terms[block] = terms
+            return terms
+        size = sum(int(array.nbytes) for array in (terms.rows, terms.covariance, terms.loadings, terms.quadratic, terms.columns, terms.near))
+        lease = broker.admit("host", size, f"window terms of block {block}", evict=lambda block=block: self._drop(block))
+        if lease is not None:
+            self._terms[block], self._leases[block] = terms, lease
+        return terms
+
+
+_WINDOW_TERMS = _WindowTermsCache()
+
+
+def _cached_block_terms(
+    solve: BulkSolve, grams: BlockGrams, cross: WindowCross, bulk_variance: NDArray[np.float64], core_inverse: NDArray[np.float64], block: int,
+    array_module: Any = np,
+) -> _BlockTerms:
+    """``_block_terms`` through the refresh's cache (``_WindowTermsCache``)."""
+    return _WINDOW_TERMS.terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
 
 
 def _prepare(solve: BulkSolve, grams: BlockGrams) -> tuple[WindowCross, NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
@@ -764,7 +826,7 @@ def marginal_variances(
     exact = {} if exact_quadratics is None else exact_quadratics
     is_exact = np.zeros(variant_count, dtype=bool)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        terms = _cached_block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         covariance = terms.covariance
         if block in exact:
             covariance = _exact_bulk_block(covariance, members, bulk_variance, is_resolved, exact[block])
@@ -1146,7 +1208,7 @@ def control_variate(solve: BulkSolve, grams: BlockGrams, probes: NDArray[np.floa
     column_square_norms = grams.column_square_norms()
     resolvable = resolvable_blocks(solve, grams.blocks, information_ceiling(solve, grams.blocks, column_square_norms))
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        terms = _cached_block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         own_variance = bulk_variance[members]
         products = terms.rows @ probes[terms.columns] - own_variance[:, None] * (terms.loadings @ probes[solve.resolved])
         bulk_rows = ~is_resolved[members]
@@ -1256,7 +1318,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     squared_variance = np.square(bulk_variance)
     sandwich = np.zeros(variant_count)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        terms = _cached_block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block), array_module)
     pair_scale = solve.kernel_square_trace / solve.sample_count
     chance_weight = sandwich[:, None] * direction
@@ -1280,7 +1342,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
         window_bulk_chance[block] = bulk_chance_weight[window_members].sum(axis=0)
         window_bulk_chance_square[block] = np.square(bulk_chance_weight[window_members]).sum(axis=0)
     for block, members in enumerate(grams.blocks):
-        terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
+        terms = _cached_block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
         window_sum = np.square(terms.rows) @ direction[terms.columns]
         loadings = terms.loadings  # (|b|, |L|)
         near = terms.near
