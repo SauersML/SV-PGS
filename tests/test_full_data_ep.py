@@ -90,7 +90,7 @@ def test_streamed_double_loop_reaches_the_dense_double_loops_fixed_point(tmp_pat
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), 1 << 26))
     gaussian = DualGaussian(
         source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
-        grams=block_grams(statistics, noise, working_bytes=working_bytes), probe_count=16, seed=11,
+        grams=block_grams(statistics, noise, working_bytes=working_bytes, level=1.0 / draw_count), probe_count=16, seed=11,
     )
     oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, 13, [start], np.array([noise]))
     monkeypatch.setattr(oracle, "_noise", lambda _variances: oracle.noise.copy())
@@ -162,7 +162,7 @@ def test_ld_extent_is_the_lag_where_the_excess_ld_is_unresolved() -> None:
             blocks=blocks, within=tuple(gram[np.ix_(block, block)].astype(np.float32) for block in blocks),
             next_cross=(gram[np.ix_(blocks[0], blocks[1])].astype(np.float32),),
         )
-        extent = ld_extent(grams, samples, 1 << 24)
+        extent = ld_extent(grams, samples, 1 << 24, 1.0 / 64)
         assert low <= extent <= high, extent
 
 
@@ -246,6 +246,6 @@ def test_ld_lag_profiles_give_each_region_its_own_extent() -> None:
     )
     excess, pairs = ld_lag_profiles(grams, samples, 1 << 24)
     assert excess.shape == pairs.shape == (2, count)
-    assert 3 <= extent_from_profile(excess[0], pairs[0], samples, count) <= 8
-    assert extent_from_profile(excess[1], pairs[1], samples, count) <= 2
-    assert ld_extent(grams, samples, 1 << 24) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples, 2 * count)
+    assert 3 <= extent_from_profile(excess[0], pairs[0], samples, count, 1.0 / 64) <= 8
+    assert extent_from_profile(excess[1], pairs[1], samples, count, 1.0 / 64) <= 2
+    assert ld_extent(grams, samples, 1 << 24, 1.0 / 64) == extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), samples, 2 * count, 1.0 / 64)

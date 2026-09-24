@@ -590,10 +590,15 @@ def ld_lag_profiles(
     return excess_rows, pair_rows
 
 
-def extent_from_profile(excess: NDArray[np.float64], pairs: NDArray[np.float64], sample_count: int, variants: int) -> int:
+def extent_from_profile(
+    excess: NDArray[np.float64], pairs: NDArray[np.float64], sample_count: int, variants: int, level: float,
+) -> int:
     """The LD extent of one lag profile (``ld_lag_profiles``, summed over a region's ``variants`` variants): the smallest
-    lag w whose tail excess, the summed excess r^2 over the pairs more than w apart, is within that sum's null standard
-    deviation. Under no LD beyond w, r^2 of a far pair has mean 1/n and, by Wick's theorem, Cov(r_ij^2, r_kl^2) =
+    lag w whose tail excess, the summed excess r^2 over the pairs more than w apart, is not significantly positive:
+    at most z times its null standard deviation, z the standard normal's upper 1 - ``level`` / L quantile over the L
+    lags tested (family-wise ``level``, Bonferroni over the lags; the tail sums are nested, so this is conservative).
+    Within one standard deviation alone, a null tail wanders past the bound at some lag with high probability, and
+    the extent then lands deep in the null tail (78 of 150 lags on an LD-3 region). Under no LD beyond w, r^2 of a far pair has mean 1/n and, by Wick's theorem, Cov(r_ij^2, r_kl^2) =
     2 rho_ik^2 rho_jl^2 / n^2 to leading order, so the sum over N(w) pairs has variance 2 N(w) l^2 / n^2 with l the
     region's mean LD score (1 + its summed excess over its variants): the near LD each variant carries makes neighbouring
     far pairs' r^2 move together (independent columns, l = 1, give 2 N / n^2). At least 1; the profile's length where
@@ -602,21 +607,24 @@ def extent_from_profile(excess: NDArray[np.float64], pairs: NDArray[np.float64],
     tail_excess = np.cumsum(excess[::-1])[::-1]
     tail_pairs = np.cumsum(np.asarray(pairs, dtype=np.float64)[::-1])[::-1]
     score = 1.0 + max(float(excess.sum()), 0.0) / max(int(variants), 1)
-    resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) * score / sample_count
+    lags = max(int(np.count_nonzero(tail_pairs > 0.0)), 1)
+    quantile = float(norm.isf(float(level) / lags))
+    resolved = tail_excess <= quantile * np.sqrt(2.0 * tail_pairs) * score / sample_count
     return max(1, int(np.argmax(resolved))) if resolved.any() else int(np.asarray(excess).shape[0])
 
 
-def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
+def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: float, array_module: Any = np) -> int:
     """The lag (in variants, along the block order) beyond which the data show no LD: the whole genome's lag profile
     (``ld_lag_profiles``) read by ``extent_from_profile``. A looser, per-variant reading of the same test (a
     variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and failed
     its cavity information certificate in 1 of 9 blocks, so the extent is the whole tail's. Beyond it the Grams hold
     nothing a window could use, so blocks need be no wider: the leave-block-out windows (the block and its two
     neighbours) then reach at least w on each side, and whatever the data do hold beyond is far field, which
-    ``block_trace_certificate`` tests."""
+    ``block_trace_certificate`` tests. ``level`` is the test's family-wise error (EP: its certificate's,
+    ``certificate_level``)."""
     excess, pairs = ld_lag_profiles(grams, sample_count, working_bytes, array_module)
     variants = sum(int(members.shape[0]) for members in grams.blocks)
-    return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count, variants)
+    return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count, variants, level)
 
 
 def refined_grams(grams: BlockGrams, width: int) -> BlockGrams:

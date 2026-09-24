@@ -143,6 +143,7 @@ def stage0_lattice(
 
 def block_grams(
     statistics: GenotypeSufficientStatistics, noise: float = 1.0, working_bytes: int | None = None, array_module: Any = np,
+    level: float | None = None,
 ) -> BlockGrams:
     """Stage 0's projected Grams, R_b within each block and R_{b,b+1} between neighbours (zero across a chromosome's
     end), as the stored float32 arrays themselves: memory-mapped views, no copy. A model's metric W = training /
@@ -168,7 +169,9 @@ def block_grams(
     if working_bytes is None:
         return grams
     widest = max(block.shape[0] for block in blocks)
-    extent = ld_extent(grams, statistics.sample_count, working_bytes, array_module)
+    if level is None:
+        raise ValueError("cutting the blocks to the LD extent needs its test's level")
+    extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module)
     width = window_width(working_bytes, array_module, widest)
     log(f"leave-block-out windows: LD extent {extent} variants, memory width {width}, widest Stage 0 block {widest}")
     return refined_grams(grams, min(width, extent))
@@ -614,7 +617,7 @@ class _FullDataFixedPoints:
             else:
                 free, _total = xp.cuda.runtime.memGetInfo()
                 window_budget = min(window_budget, int(free) + int(xp.get_default_memory_pool().free_bytes()))
-        self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp)
+        self.grams = block_grams(statistics, working_bytes=window_budget, array_module=xp, level=certificate_level(draw_count))
         gaussian.windows = _WindowLayout(self.grams, gaussian.source)
         window_bytes = window_working_bytes(self.grams, xp)
         log(f"ep: {len(self.grams.blocks)} leave-block-out windows of at most {max(block.shape[0] for block in self.grams.blocks)} columns, {window_bytes / 1e9:.1f} GB of {window_budget / 1e9:.1f} GB")
