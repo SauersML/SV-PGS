@@ -62,7 +62,7 @@ A variant is included if its interval overlaps TSS ± 1 Mb, the cis window of MA
 ## Scoring
 - **r²:** per gene and superpopulation, the squared Pearson correlation of prediction with adjusted held-out expression; 0 for a constant prediction.
 - **Pairs:** paired differences between arms, averaged over genes.
-- **SE:** the delete-one-chromosome jackknife, since genes on one chromosome share variants. On a single chromosome the SE is gene-level and labelled as such.
+- **SE:** the delete-one-chromosome jackknife, weighted for unequal chromosome sizes (Busing et al. 1999), since genes on one chromosome share variants. loco.py gives SNV vs SNV+SV means and gains with these intervals beside the gene-level bootstrap. On a single chromosome the SE is gene-level and labelled as such.
 
 ## Baselines
 - **top_variant:** the lead marginal variant, fitted by OLS.

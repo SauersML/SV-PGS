@@ -310,13 +310,28 @@ def mismatched_partners(chromosomes: np.ndarray) -> np.ndarray:
     return np.where(first < np.arange(count) + count, first % max(count, 1), -1)
 
 
+def weighted_jackknife(estimate: float, leave_out: np.ndarray, sizes: np.ndarray):
+    """The delete-m_j jackknife for g blocks of unequal sizes m_j out of n (Busing, Meijer & van der Leeden 1999):
+    with h_j = n / m_j, the pseudo-values h_j t - (h_j - 1) t_(-j), the estimate t_J = g t - sum_j (1 - m_j / n) t_(-j),
+    and the variance (1/g) sum_j (pseudo_j - t_J)^2 / (h_j - 1). Equal blocks give the ordinary delete-one-group
+    jackknife; for a mean over the n units t_J is the mean and pseudo_j is block j's own mean, so a large chromosome
+    counts for its size instead of equally with chr21."""
+    leave_out, sizes = np.asarray(leave_out, dtype=np.float64), np.asarray(sizes, dtype=np.float64)
+    total, count = sizes.sum(), len(sizes)
+    ratio = total / sizes
+    pseudo = ratio * estimate - (ratio - 1.0) * leave_out
+    centre = count * estimate - float(((1.0 - sizes / total) * leave_out).sum())
+    return centre, float(np.sqrt(((pseudo - centre) ** 2 / (ratio - 1.0)).sum() / count))
+
+
 def jackknife(differences: pd.Series, blocks: pd.Series):
-    labels = blocks.unique()
+    """The mean over genes and its delete-one-chromosome SE, weighted for unequal chromosome sizes."""
+    labels, sizes = np.unique(blocks.to_numpy(), return_counts=True)
     if len(labels) < 2:
         return float(differences.mean()), float(differences.std(ddof=1) / np.sqrt(len(differences))), "gene-level"
     estimates = np.array([differences[blocks != label].mean() for label in labels])
-    count = len(labels)
-    return float(differences.mean()), float(np.sqrt((count - 1) / count * ((estimates - estimates.mean()) ** 2).sum())), "chromosome jackknife"
+    _, error = weighted_jackknife(float(differences.mean()), estimates, sizes)
+    return float(differences.mean()), error, "chromosome jackknife"
 
 
 def paired(scores: pd.DataFrame, arm_a, arm_b):
@@ -405,11 +420,11 @@ def summarize_sv_credit(credit: pd.DataFrame):
         covariance_full=("covariance_full", "sum"), covariance_sv=("covariance_sv", "sum"), r2_drop=("r2_drop", "mean")).assign(superpopulation=POOLED)
     rows = []
     for key, group in pd.concat([pooled, credit], ignore_index=True).groupby(["method", "feature_set", "design", "superpopulation"], sort=False):
-        chromosomes = group["chrom"].unique()
+        chromosomes, sizes = np.unique(group["chrom"].to_numpy(), return_counts=True)
         share = group["covariance_sv"].sum() / group["covariance_full"].sum()
         if len(chromosomes) > 1:
             leave_out = np.array([group.loc[group["chrom"] != label, "covariance_sv"].sum() / group.loc[group["chrom"] != label, "covariance_full"].sum() for label in chromosomes])
-            share_se = float(np.sqrt((len(chromosomes) - 1) / len(chromosomes) * ((leave_out - leave_out.mean()) ** 2).sum()))
+            _, share_se = weighted_jackknife(share, leave_out, sizes)
         else:
             share_se = float("nan")
         drop, drop_se, kind = jackknife(group["r2_drop"], group["chrom"])
