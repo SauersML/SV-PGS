@@ -287,3 +287,29 @@ def test_each_steps_own_residual_is_the_tilted_laws_kl_from_the_new_marginal():
     swept = ~np.isnan(expected)
     np.testing.assert_allclose(sweep.own_residual[swept], expected[swept], rtol=1e-6, atol=1e-9)
     assert np.all(expected[swept] >= -1e-12)
+
+
+def test_the_largest_cluster_step_is_the_feasible_intervals_end():
+    """``largest_cluster_step`` toward a site that leaves some cavity improper takes the largest feasible fraction:
+    the state there is inside the domain (a fresh build agrees), and a step past it by a relative eps^(1/2) is not."""
+    rows, _members, priors, target = _problem(23, 30, 20, 1)
+    noise = 0.8
+    score = rows @ target
+    second = np.array([float(np.exp(_components(priors, g)[0]) @ np.exp(_components(priors, g)[1])) for g in range(rows.shape[0])])
+    t, nu = noise / second, np.zeros(rows.shape[0])
+    sweep = SequentialSweep(rows, np.einsum("ij,ij->i", rows, rows), score, priors, noise)
+    cluster = np.array([0, 1, 4])
+    sweep.set_clusters([cluster])
+    assert sweep.run(t, nu, np.arange(rows.shape[0], dtype=np.int64)) is not None
+    old = (np.diag(t[cluster]) + sweep.coupling[0]) / noise
+    # Toward a strongly negative site: some cavity must turn improper before the end.
+    far = old - 50.0 * np.abs(old).max() * np.eye(3)
+    move = sweep._cluster_move(0, t)
+    assert not sweep._cluster_trial(0, move, noise * far, t)[0]
+    fraction = sweep.largest_cluster_step(0, far, nu[cluster], t, nu)
+    assert 0.0 < fraction < 1.0
+    assert sweep.valid(t, nu)
+    reached = (np.diag(t[cluster]) + sweep.coupling[0]) / noise
+    np.testing.assert_allclose(reached, old + fraction * (far - old), rtol=1e-10, atol=1e-10 * np.abs(far).max())
+    move = sweep._cluster_move(0, t)
+    assert not sweep._cluster_trial(0, move, noise * (reached + np.sqrt(np.finfo(float).eps) * fraction * (far - old)), t)[0]

@@ -16,7 +16,11 @@ expectation) and q has stopped moving (the sweep's summed KL move of the groups'
 its residual, above the resolution, set no new low over two consecutive sweeps after the first (the sweep is not contracting there; the first sweeps are the start's transient, not evidence); such a
 unit joins the unit of the group whose column is most correlated with its own, all failing units at once with their
 joins closed transitively (the links' connected components), and a cluster whose full step would make some cavity
-improper absorbs the units whose cavities block it; the sweeps continue from the joined sites (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
+improper absorbs the units whose cavities block it (the move is taken to its largest feasible fraction,
+``SequentialSweep.largest_cluster_step``); the sweeps continue from the joined sites. A cluster whose cavity the other
+sites leave improper keeps its site (EP's fixed point is moment matching, and a site more precise than q's marginal is
+a legitimate state): it is held, not joined; its tilted law is not normalizable there, so it adds no residual; and
+the record counts the held clusters (the cluster's site starts as the block of its groups' sites). A single group whose own exact step
 leaves a residual above the resolution breaks it at once, the first sweep included: its step was damped because no
 single site that matches its tilted law keeps every cavity inside the domain, so one site cannot represent it (a
 near-flat cavity with a large pull [real, ENSG00000105612.9: residuals to 4e26]); joined to the block, its joint law
@@ -126,6 +130,8 @@ class AliasFixedPoint:
     converged: bool
     sweeps: int
     record: list[dict] = field(default_factory=list)
+    # Clusters whose sites were held at the end (their cavity improper under the other sites; ``AliasEP.fit``).
+    held_clusters: int = 0
 
 
 class AliasEP:
@@ -161,6 +167,8 @@ class AliasEP:
         self.refusals: dict[str, int] = {}
         # Per cluster, the groups whose cavities blocked its full step this sweep (``_update_cluster``).
         self.blocking: dict[int, I64Array] = {}
+        # Clusters whose cavity the other sites left improper this sweep: their sites are held (``fit``).
+        self.held: set[int] = set()
 
     def _indicator(self, cluster: I64Array) -> tuple[I64Array, F64Array]:
         members = np.concatenate([self.members_of[g] for g in cluster])
@@ -259,7 +267,10 @@ class AliasEP:
             return self._refuse("marginal"), 0.0
         with np.errstate(divide="ignore"):
             if not np.linalg.eigvalsh(cavity_precision + np.diag(1.0 / self.largest[cluster]))[0] > 0.0:
-                return self._refuse("cavity"), 0.0
+                # The other sites leave this cluster's cavity past what its prior's variances bound: its site is kept
+                # (``fit``: held), not refused, and its neighbours are not joined to it.
+                self.held.add(index)
+                return None, 0.0
         proper, tilted_mean, tilted_covariance, floor = self.cluster_tilted(cluster, cavity_precision, cavity_shift, stamp)
         # A covariance that is not positive definite to its rounding (nearly collinear sums, sampled) has no Gaussian
         # to match: the update is refused.
@@ -275,19 +286,14 @@ class AliasEP:
         residual = _gaussian_kl(tilted_mean, tilted_covariance, mean, covariance)
         inverse = np.linalg.inv(tilted_covariance)
         target_precision, target_shift = inverse - cavity_precision, inverse @ tilted_mean - cavity_shift
-        old_precision = (np.diag(precision[cluster]) + sweep.coupling[index]) / self.noise
-        old_shift = shift[cluster].copy()
-        fraction = 1.0
-        while fraction > _EPSILON:
-            if sweep.step_cluster(index, old_precision + fraction * (target_precision - old_precision), old_shift + fraction * (target_shift - old_shift),
-                                  precision, shift):
-                return residual, floor
-            if fraction == 1.0:
-                # The full step's blockers: the groups whose cavity it would make improper. The cluster absorbs them
-                # (``fit``), whether a damped step is then taken or not.
-                self.blocking[index] = sweep.blocking.copy()
-            fraction *= 0.5
-        return self._refuse("domain"), floor
+        fraction = sweep.largest_cluster_step(index, target_precision, target_shift, precision, shift)
+        if fraction < 1.0:
+            # The full step's blockers: the groups whose cavity it would make improper. The cluster absorbs them
+            # (``fit``), whether the largest feasible part of the step was taken or not.
+            self.blocking[index] = sweep.blocking.copy()
+        if fraction == 0.0:
+            return self._refuse("domain"), floor
+        return residual, floor
 
     def _single_residuals(self, precision: F64Array, shift: F64Array) -> tuple[F64Array, np.ndarray]:
         """Every group's residual KL (tilted law from q's marginal), and whether its tilted law is proper."""
@@ -340,10 +346,13 @@ class AliasEP:
             cluster_residual: dict[int, float] = {}
             refused_clusters: set[int] = set()
             self.blocking = {}
+            self.held = set()
             floors: dict[int, float] = {}
             for index in range(len(sweep.clusters)):
                 residual, floor = self._update_cluster(index, precision, shift, stamp)
                 floors[index] = floor
+                if residual is None and index in self.held:
+                    continue
                 if residual is None:
                     refused_clusters.add(index)
                 else:
@@ -387,7 +396,7 @@ class AliasEP:
                                            + np.log(after_variance / before_variance))))
             if not np.isfinite(move):
                 move = np.inf
-            record.append({"sweep": stamp, "refused": int(refused_count), "failing": len(failing), "residual": total, "move": move,
+            record.append({"sweep": stamp, "refused": int(refused_count), "failing": len(failing), "residual": total, "move": move, "held": len(self.held),
                            "clusters": sorted((int(c.shape[0]) for c in sweep.clusters), reverse=True), "cluster refusals": dict(self.refusals)})
             self.refusals = {}
             if progress is not None:
@@ -504,4 +513,4 @@ class AliasEP:
                 members = self.members_of[g]
                 mean[members], variance[members] = matched.mean[members], matched.variance[members]
         return AliasFixedPoint(precision=precision, shift=shift, clusters=[c.copy() for c in sweep.clusters], mean=mean, variance=variance,
-                               converged=converged, sweeps=sweeps, record=record)
+                               converged=converged, sweeps=sweeps, record=record, held_clusters=len(self.held))

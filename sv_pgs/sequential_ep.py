@@ -568,35 +568,34 @@ class SequentialSweep:
         site = (np.diag(precision[groups]) + self.coupling[index]) / self.noise
         return inverse - site, inverse @ mean - shift[groups], mean, covariance
 
-    def step_cluster(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> bool:
-        """Cluster ``index``'s site moved to (``site_precision``, ``site_shift``), unscaled, where every cavity stays
-        inside EP's domain, updating the state in place and returning True; the state is kept otherwise.
-
-        The cluster's groups are in the rest N, so the move is S <- S + E D E' on their slots (D the scaled site's
-        change, m x m): with U = S^-1 E and V = E'S^-1 E, S^-1 <- S^-1 - U (I + D V)^-1 D U' (Woodbury), and S stays
-        positive definite where I + L'DL is (V = LL'). Every group's I = x'W x moves by y' (I + D V)^-1 D y with
-        y = U'Q x (one G x n' x m product), which gives every bulk cavity; the rest's and the clusters' come from the
-        new S^-1 itself."""
+    def _cluster_move(self, index: int, precision: F64Array) -> dict:
+        """What every trial of cluster ``index``'s site needs, formed once: its slots' columns of S^-1 (U), their
+        block (V), and y = U'Q x for every group (one G x n' x m product); each trial then costs O(G m^2)."""
         groups = self.clusters[index]
         slots = self.rest_slot[groups]
-        size = groups.shape[0]
-        # The groups whose cavity the step would make improper (``blocking``): empty where the step fails on q itself.
-        self.blocking = np.zeros(0, dtype=np.int64)
-        new_scaled = self.noise * np.asarray(site_precision, dtype=np.float64)
-        old_scaled = np.diag(precision[groups]) + self.coupling[index]
-        change = 0.5 * (new_scaled + new_scaled.T) - old_scaled
         images = self.schur_inverse[:, slots]
-        block = images[slots]
+        return {
+            "groups": groups, "slots": slots, "images": images, "block": images[slots],
+            "projected": self.rows @ (self.rest_images.T @ images),
+            "old": np.diag(precision[groups]) + self.coupling[index],
+        }
+
+    def _cluster_trial(self, index: int, move: dict, new_scaled: F64Array, precision: F64Array):
+        """(feasible, blockers, core) of the cluster's scaled site ``new_scaled``: every cavity after the move and
+        whether it is proper (the cluster's own tilted law's included); ``blockers`` the other units' groups whose
+        cavity would be improper. Infeasible on q itself (not positive definite) gives no blockers."""
+        groups, slots, images, block = move["groups"], move["slots"], move["images"], move["block"]
+        size = groups.shape[0]
+        empty = np.zeros(0, dtype=np.int64)
+        change = 0.5 * (new_scaled + new_scaled.T) - move["old"]
         try:
             factor = np.linalg.cholesky(0.5 * (block + block.T))
         except np.linalg.LinAlgError:
-            return False
+            return False, empty, None
         if not np.linalg.eigvalsh(np.eye(size) + factor.T @ change @ factor)[0] > 0.0:
-            return False
+            return False, empty, None
         core = np.linalg.solve(np.eye(size) + change @ block, change)
-        schur_inverse = self.schur_inverse - images @ core @ images.T
-        schur_inverse = 0.5 * (schur_inverse + schur_inverse.T)
-        projected = self.rows @ (self.rest_images.T @ images)
+        projected = move["projected"]
         informed = self.informed + np.einsum("ij,jk,ik->i", projected, core, projected)
         blocking = []
         bulk = np.flatnonzero(~self.is_rest)
@@ -608,36 +607,98 @@ class SequentialSweep:
         trial_t[groups] = np.diag(new_scaled)
         single_rest = self.rest_rows[~self.clustered[self.rest_rows]]
         if single_rest.size:
+            rest_slots = self.rest_slot[single_rest]
+            rest_images = images[rest_slots]
+            diagonal = np.diag(self.schur_inverse)[rest_slots] - np.einsum("ij,jk,ik->i", rest_images, core, rest_images)
             with np.errstate(divide="ignore"):
-                rest_cavity = (1.0 / np.diag(schur_inverse)[self.rest_slot[single_rest]] - trial_t[single_rest]) / self.noise
+                rest_cavity = (1.0 / diagonal - trial_t[single_rest]) / self.noise
             blocking.append(single_rest[~np.isfinite(rest_cavity) | ((rest_cavity < 0.0) & ~(1.0 + self.largest[single_rest] * rest_cavity > 0.0))])
-        couplings = [block.copy() for block in self.coupling]
-        couplings[index] = new_scaled - np.diag(np.diag(new_scaled))
+        own_proper = True
         for other, members in enumerate(self.clusters):
             member_slots = self.rest_slot[members]
+            member_images = images[member_slots]
+            marginal = self.schur_inverse[np.ix_(member_slots, member_slots)] - member_images @ core @ member_images.T
+            coupling = new_scaled - np.diag(np.diag(new_scaled)) if other == index else self.coupling[other]
             try:
-                inverse = np.linalg.inv(self.noise * schur_inverse[np.ix_(member_slots, member_slots)])
+                inverse = np.linalg.inv(self.noise * marginal)
             except np.linalg.LinAlgError:
-                return False
-            cavity_precision = inverse - (np.diag(trial_t[members]) + couplings[other]) / self.noise
+                return False, empty, None
+            cavity_precision = inverse - (np.diag(trial_t[members]) + coupling) / self.noise
             with np.errstate(divide="ignore"):
                 bound = np.diag(1.0 / self.largest[members])
             if not np.linalg.eigvalsh(0.5 * (cavity_precision + cavity_precision.T) + bound)[0] > 0.0:
                 if other == index:
-                    return False
-                blocking.append(members)
-        self.blocking = np.unique(np.concatenate(blocking)) if blocking else np.zeros(0, dtype=np.int64)
-        if self.blocking.size:
-            return False
-        self.schur_inverse = np.ascontiguousarray(schur_inverse)
-        self.informed = informed
+                    own_proper = False
+                else:
+                    blocking.append(members)
+        blockers = np.unique(np.concatenate(blocking)) if blocking else empty
+        return own_proper and blockers.size == 0, blockers, core
+
+    def _apply_cluster(self, index: int, move: dict, new_scaled: F64Array, site_shift: F64Array, core: F64Array, precision: F64Array,
+                       shift: F64Array) -> None:
+        groups, images, projected = move["groups"], move["images"], move["projected"]
+        schur_inverse = self.schur_inverse - images @ core @ images.T
+        self.schur_inverse = np.ascontiguousarray(0.5 * (schur_inverse + schur_inverse.T))
+        self.informed = self.informed + np.einsum("ij,jk,ik->i", projected, core, projected)
         precision[groups] = np.diag(new_scaled)
-        self.coupling[index] = couplings[index]
+        self.coupling[index] = new_scaled - np.diag(np.diag(new_scaled))
         shift[groups] = site_shift
         self.shift_value[groups] = self.group_score[groups] + self.noise * np.asarray(site_shift, dtype=np.float64)
         _rest_mean(self.rest_rows.shape[0], self.rest_rows, self.rows, self.shift_value[self.rest_rows].copy(), self.solved, self.rest_images,
                    self.schur_inverse, self.rest_mean, self.combined)
+
+    def step_cluster(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> bool:
+        """Cluster ``index``'s site moved to (``site_precision``, ``site_shift``), unscaled, where every cavity stays
+        inside EP's domain, updating the state in place and returning True; the state is kept otherwise, with the
+        groups whose cavities block the move in ``blocking``.
+
+        The cluster's groups are in the rest N, so the move is S <- S + E D E' on their slots (D the scaled site's
+        change, m x m): with U = S^-1 E and V = E'S^-1 E, S^-1 <- S^-1 - U (I + D V)^-1 D U' (Woodbury), and S stays
+        positive definite where I + L'DL is (V = LL'). Every group's I = x'W x moves by y' (I + D V)^-1 D y with
+        y = U'Q x (one G x n' x m product), which gives every bulk cavity; the rest's and the clusters' come from the
+        new S^-1 itself."""
+        move = self._cluster_move(index, precision)
+        new_scaled = self.noise * np.asarray(site_precision, dtype=np.float64)
+        feasible, self.blocking, core = self._cluster_trial(index, move, new_scaled, precision)
+        if not feasible:
+            return False
+        self._apply_cluster(index, move, new_scaled, site_shift, core, precision, shift)
         return True
+
+    def largest_cluster_step(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> float:
+        """The largest fraction f in [0, 1] of the move of cluster ``index``'s site toward (``site_precision``,
+        ``site_shift``) that keeps every cavity proper, taken in place; returns f (0: no move is feasible). The
+        full move's blockers are left in ``blocking``.
+
+        Along the move q's precision is affine in f, so every unit's marginal precision (a Schur complement of it)
+        is matrix-concave in f, and so is its cavity's precision (its site is fixed, or affine for the moving
+        cluster) plus its tilted law's bound diag(1 / V_max): the least eigenvalue of each is concave in f, and the
+        feasible f form an interval containing 0. Its end is found by bisection on the trials, each O(G m^2) from
+        the one G x n' x m product (``_cluster_move``), to the resolution of f in double precision; the move is taken
+        at the interval's last feasible point found."""
+        move = self._cluster_move(index, precision)
+        target = self.noise * np.asarray(site_precision, dtype=np.float64)
+        old_scaled = move["old"]
+        old_shift = shift[move["groups"]].copy()
+        feasible, self.blocking, core = self._cluster_trial(index, move, target, precision)
+        if feasible:
+            self._apply_cluster(index, move, target, np.asarray(site_shift, dtype=np.float64), core, precision, shift)
+            return 1.0
+        full_blockers = self.blocking
+        low, high, low_core = 0.0, 1.0, None
+        while high - low > _EPSILON * high:
+            middle = 0.5 * (low + high)
+            ok, _blockers, trial_core = self._cluster_trial(index, move, old_scaled + middle * (target - old_scaled), precision)
+            if ok:
+                low, low_core = middle, trial_core
+            else:
+                high = middle
+        self.blocking = full_blockers
+        if low_core is None:
+            return 0.0
+        self._apply_cluster(index, move, old_scaled + low * (target - old_scaled), old_shift + low * (np.asarray(site_shift) - old_shift), low_core,
+                            precision, shift)
+        return low
 
     def set_cluster_site(self, index: int, site_precision: F64Array, site_shift: F64Array, precision: F64Array, shift: F64Array) -> None:
         """Cluster ``index``'s site (unscaled precision matrix and shift on its sums), into ``precision``, ``shift``
