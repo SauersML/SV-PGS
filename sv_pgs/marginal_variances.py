@@ -558,12 +558,20 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_mo
         for first in range(0, width, chunk):
             last = min(first + chunk, width)
             rows = xp.arange(first, last)
-            squared = xp.asarray(stored[first:last], dtype=xp.float64) ** 2 / (diagonal[first:last, None] * diagonal[None, :])
+            # In place, with no masks: the chunk's float32 rows, their excess r^2 in float64, and their lags.
+            squared = xp.asarray(stored[first:last], dtype=xp.float64)
+            squared *= squared
+            squared /= diagonal[first:last, None] * diagonal[None, :]
+            squared -= 1.0 / sample_count
             lags = xp.abs(columns[None, :] - rows[:, None])
-            above = lags > 0
-            excess += xp.bincount(lags[above], weights=squared[above] - 1.0 / sample_count, minlength=widest)[:widest]
-            pairs += xp.bincount(lags[above], minlength=widest)[:widest].astype(xp.float64)
-            del squared, lags, above
+            excess += xp.bincount(lags.ravel(), weights=squared.ravel(), minlength=widest)[:widest]
+            del squared, lags
+        # A block of w columns holds 2 (w - d) ordered pairs at lag d (lag 0 is each column with itself).
+        lag = xp.arange(widest)
+        pairs += xp.maximum(2.0 * (width - lag), 0.0)
+    # Lag 0 is no pair: its terms are the diagonal's own r^2 = 1.
+    excess[0] = 0.0
+    pairs[0] = 0.0
     tail_excess = _to_host(xp.cumsum(excess[::-1])[::-1])
     tail_pairs = _to_host(xp.cumsum(pairs[::-1])[::-1])
     resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) / sample_count
