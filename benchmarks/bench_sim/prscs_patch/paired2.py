@@ -1,6 +1,6 @@
 """Paired bootstrap 95% CIs (1,000 resamples of the test people) of method minus SV-PGS, bench-sim truth arm, on both the
 phenotype incremental r2 and genetic_r2 (squared partial correlation with the simulated genetic value beyond the
-covariates, main's harness.genetic_accuracy). The SV-PGS reference is the first of svpgs_v2, svpgs_main, svpgs_full that exists.
+covariates, main's harness.genetic_accuracy). The SV-PGS reference is the first of svpgs_v4, svpgs_v2, svpgs_main, svpgs_full that exists.
 usage: paired2.py <scenarios,> <methods,>"""
 import sys
 from pathlib import Path
@@ -33,7 +33,7 @@ cov = cov[test]
 for scenario in sys.argv[1].split(","):
     truth = np.load(D / f"scenario_{scenario}" / "truth.npz")
     y, g = truth["phenotype"][test], np.asarray(truth["genetic_value"][test], dtype=np.float64)
-    reference = next((LEAD / name / f"scenario_{scenario}" / "prediction.npz" for name in ("svpgs_v2", "svpgs_main", "svpgs_full")
+    reference = next((LEAD / name / f"scenario_{scenario}" / "prediction.npz" for name in ("svpgs_v4", "svpgs_v2", "svpgs_main", "svpgs_full")
                       if (LEAD / name / f"scenario_{scenario}" / "prediction.npz").exists()), None)
     if reference is None:
         print(f"scenario {scenario}: no SV-PGS prediction yet", flush=True)
