@@ -187,3 +187,20 @@ def test_factored_far_field_trace_matches_the_spectral_one() -> None:
 def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
     assert window_width(1 << 62, np, 41_984) == 41_984
     assert window_width(1 << 62, np, 1) == 1
+
+
+def test_factored_far_field_trace_from_a_warm_start_reaches_the_same_root() -> None:
+    """Newton from above the root (a neighbouring window's omega) lands on the same omega_F as from omega_S."""
+    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored, far_field_trace
+
+    generator = np.random.default_rng(11)
+    design = generator.standard_normal((50, 30))
+    whitened = design.T @ design * 0.01
+    solve = BulkSolve(
+        site_precision=np.ones(30), resolved=np.zeros(0, np.int64), resolved_core=np.zeros((0, 0)),
+        resolved_cross=WindowCross(positions=(), values=()), bulk_trace=0.7, bulk_square_trace=0.5, kernel_square_trace=0.5, sample_count=400,
+    )
+    expected = far_field_trace(0.7, 0.5, 400, np.linalg.eigvalsh(whitened))
+    for start in (0.7, 2.0 * expected, 0.9 * expected):
+        omega, _lower = _far_field_factored(whitened, solve, np, start)
+        assert omega == pytest.approx(expected, rel=1e-12)

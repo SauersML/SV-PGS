@@ -400,19 +400,26 @@ class _BlockTerms:
     covariance: NDArray[np.float64]
 
 
-def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any) -> tuple[float, Any]:
-    """omega_F (``far_field_trace``'s root, the same Newton from omega_S) with B's spectral sums from the Cholesky
-    factor L of M = I + w B: tr M^-1 = ||L^-1||_F^2 and ||M^-1||_F^2 = ||L^-T L^-1||_F^2, three |W|^3 / 3 products per
-    step. Newton stops once its step is within the deterministic equivalent's own relative error scale
-    (``approximation_scale``) of omega_F: the concave increasing equation keeps every step below the distance still to
-    the root, and that distance then falls quadratically, so a finer omega_F moves the map by less than its own
-    approximation. Returns omega_F and the factor of I + omega_F B, which the caller's solves reuse."""
+_WINDOW_ROOTS: dict[int, float] = {}
+"""The last window's omega_F, keyed by its refresh's solve: the next window's Newton start (a start only; any
+positive start reaches the same root, so a stale entry costs steps, never accuracy)."""
+
+
+def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any, start: float | None = None) -> tuple[float, Any]:
+    """omega_F (``far_field_trace``'s root, to float64) with B's spectral sums from the Cholesky factor L of
+    M = I + w B: tr M^-1 = ||L^-1||_F^2 and ||M^-1||_F^2 = ||L^-T L^-1||_F^2, three |W|^3 / 3 products per step.
+    Newton starts from omega_S, or from ``start`` (the previous window's root: neighbouring windows share most of
+    their far field, so their roots are close and one or two steps remain). The equation is increasing and concave,
+    so Newton from below the root rises monotonically and from above lands below it in one step and then rises; it
+    ends where a step no longer moves omega past float64's resolution, or no longer shrinks (rounding). Returns omega_F
+    and the factor of I + omega_F B, which the caller's solves reuse."""
     xp = array_module
     size = int(whitened.shape[0])
     diagonal = xp.arange(size)
     weight = solve.bulk_square_trace / solve.sample_count
-    current = solve.bulk_trace
+    current = solve.bulk_trace if start is None else float(start)
     identity = xp.eye(size)
+    previous_step = np.inf
 
     def factor(value: float) -> Any:
         matrix = whitened * value
@@ -431,10 +438,11 @@ def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any) -> t
         spectral_square = (size - 2.0 * inverse_trace + inverse_square) / (current * current)
         value = current - solve.bulk_trace - weight * spectral
         slope = 1.0 + weight * spectral_square
-        candidate = current - value / slope
-        if not candidate - current > approximation_scale(solve) * current:
+        step = abs(value / slope)
+        if not step > np.finfo(np.float64).eps * current or not step < previous_step:
             return current, lower
-        current = candidate
+        previous_step = step
+        current -= value / slope
         lower = factor(current)
 
 
@@ -482,7 +490,9 @@ def _window_quadratic(
             f"within- and cross-block Grams do not come from one design; {_inconsistency(whitened, own, xp)}"
         )
     del check
-    far_trace, lower = _far_field_factored(whitened, solve, xp)
+    far_trace, lower = _far_field_factored(whitened, solve, xp, _WINDOW_ROOTS.get(id(solve)))
+    _WINDOW_ROOTS.clear()
+    _WINDOW_ROOTS[id(solve)] = far_trace
     del whitened
     right = root[:, None] * device_gram[:, own]  # D^1/2 R[:, own]
     solved = _cholesky_solve(xp, lower, right)  # (I + omega_F B)^-1 D^1/2 R[:, own]
