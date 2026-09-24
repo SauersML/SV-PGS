@@ -96,6 +96,7 @@ from sv_pgs.marginal_variances import (
     window_working_bytes,
 )
 from sv_pgs.scale_mixture_ep import (
+    solve_key,
     Cavity,
     _DEVICE,
     _data_value,
@@ -373,10 +374,39 @@ def _norm_bounds(products: F64Array, bound: F64Array) -> tuple[F64Array, F64Arra
     return lower, upper
 
 
-def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None]) -> GaussianPosterior:
+def _hold_start(starts: dict, key: tuple, duals: Any) -> None:
+    """Keep ``duals`` as the warm start for ``key``: a cache lease of the current ledger (its device's pool, or the
+    host's), dropped when a mandatory lease needs the bytes; outside a ledger's scope only the latest per model."""
+    previous = starts.pop(key, None)
+    if previous is not None and previous[1] is not None:
+        previous[1].release()
+    broker = current_broker()
+    if broker is None:
+        for held in [held for held in starts if held[0] == key[0]]:
+            del starts[held]
+        starts[key] = (duals, None)
+        return
+    pool = device_pool(int(duals.device.id)) if hasattr(duals, "device") and hasattr(duals.device, "id") else HOST
+    if pool not in broker.capacities:
+        pool = HOST
+
+    def evict() -> None:
+        starts.pop(key, None)
+
+    lease = broker.admit(pool, int(duals.nbytes), "curvature solve warm start", evict, allocated=pool != HOST)
+    if lease is not None:
+        starts[key] = (duals, lease)
+
+
+def _posterior(
+    gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None], starts: dict | None = None
+) -> GaussianPosterior:
     """q's responses at this refresh for the total curvature: Sigma R by the dual solver, each column to a relative
     error in the posterior metric, and -(Sigma o Sigma) W by the leave-block-out map. ``ensure`` puts the dual
-    solver back at this refresh's sites before it is asked (a later trial may have moved it)."""
+    solver back at this refresh's sites before it is asked (a later trial may have moved it). ``starts`` (held across
+    fixed points by the oracle) warm-starts each solve from the last solve's duals for the same directions
+    (``scale_mixture_ep.solve_key``): the certified CG stops on its own certificate from any start, so this is exact,
+    and at nearby fixed points it starts close to the answer."""
     solve = gaussian.bulk_solves[model]
 
     def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
@@ -387,8 +417,18 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
         live = np.flatnonzero(np.any(values != 0.0, axis=0))
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
         ensure()
+        key = solve_key.get()
+        memory = None if starts is None or key is None else (model, key, values.shape[1])
+        held = None if memory is None or memory not in starts else starts[memory][0]
+        duals = None
         while live.size:
-            solved, certified = gaussian.posterior_solve(values[:, live], model, bound)
+            start = None if held is None else held[:, live]
+            solved, certified = gaussian.posterior_solve(values[:, live], model, bound, start)
+            if memory is not None:
+                last = gaussian.last_posterior_duals
+                if duals is None:
+                    duals = gaussian.array_module.zeros((last.shape[0], values.shape[1]))
+                duals[:, live] = last
             solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
             if not np.all(np.isfinite(certified)):
                 raise ValueError("a posterior solve has no certificate at float64's accuracy")
@@ -398,6 +438,8 @@ def _posterior(gaussian: DualGaussian, model: int, grams: BlockGrams, variances:
             solution[:, live[done]] = solved[:, done]
             bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
             live = live[~done]
+        if memory is not None and duals is not None:
+            _hold_start(starts, memory, duals)
         return solution
 
     return GaussianPosterior(
@@ -1480,6 +1522,8 @@ class _FullDataMeanField:
         self.reweights = 0
         self.passes = 0
         self.version = 0
+        # The curvature's posterior solves' last duals per (model, directions), their warm starts (``_posterior``).
+        self._solve_starts: dict = {}
         # Which state each model's column of the dual solver was last factored at (``_ensure``).
         self._solver_version = np.zeros(model_count, dtype=np.int64)
         self.undecided_blocks = 0
@@ -2059,7 +2103,8 @@ class _FullDataMeanField:
         grams = replace(self.grams, scale=1.0 / noise)
         group_variance = np.bincount(self.ties.group, weights=variance, minlength=self.ties.group_count)
         dual = _member_posterior(
-            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model)), self.ties, tau, group_variance, algebraic=True,
+            _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model), self._solve_starts), self.ties, tau, group_variance,
+            algebraic=True,
         )
         noise_solve: dict[str, object] = {}
 

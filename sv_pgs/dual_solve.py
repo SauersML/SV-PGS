@@ -1536,8 +1536,12 @@ class DualGaussian:
         self.count.note(width, 0.0, "block-products")
         return products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny), image_norms
 
-    def posterior_solve(self, right: Any, model: int, error_bound: Any) -> tuple[Any, Any]:
+    def posterior_solve(self, right: Any, model: int, error_bound: Any, start: Any = None) -> tuple[Any, Any]:
         """A_m^-1 right (p x r) at the last iterate's sites, and each column's certified ||x_hat - x||_A.
+
+        ``start`` (n x r, optional) starts the bulk duals' CG there instead of at zero (a previous solve's
+        ``last_posterior_duals`` for the same directions); the CG stops on its own certificate from wherever it starts,
+        so the answer's certificate is the same. The solve's final duals are left in ``last_posterior_duals``.
 
         It is the split mean with no data and shift `right`: the bulk dual solves
         S_S z_b = -Xt_S D_S v_S, the resolved rows are x_L = core^-1 (v_L + Xt_L'z_b), and
@@ -1566,7 +1570,7 @@ class DualGaussian:
         bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)
         block = state["blocks"].get(model)
-        start = array_module.zeros_like(rhs)
+        start = array_module.zeros_like(rhs) if start is None else array_module.asarray(start, dtype=array_module.float64).copy()
         # A column whose certificate did not fall across a round is at the accuracy float64 allows it: it stops,
         # and its certificate, above the request, says so. The certificate's own progress bounds the loop.
         final = np.zeros(columns, dtype=bool)
@@ -1608,6 +1612,7 @@ class DualGaussian:
                 tighten = array_module.asarray(np.flatnonzero(bulk_limited))
                 bound[tighten] = array_module.minimum(bound[tighten], result.residual_norm[tighten]) * (target[tighten] / certificate[tighten])
             start = result.solution
+        self.last_posterior_duals = result.solution
         left = models.sample_to_design(duals, column_models)
         solution = bulk_variances[:, None] * bulk_values
         for start, stop, tile in source.blocks():

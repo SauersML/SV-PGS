@@ -1054,6 +1054,11 @@ _STEP_CACHE: contextvars.ContextVar[dict | None] = contextvars.ContextVar("scale
 # than threading it through every caller.
 _DEVICE: contextvars.ContextVar[ModuleType] = contextvars.ContextVar("scale_mixture_ep_device", default=np)
 
+# The directions a curvature correction is solving for (a digest of their bytes), set around each lazy solve
+# (``curvature_correction``): a posterior that keeps its solves' answers per directions warm-starts the next fixed
+# point's solves for the same directions from them (``full_data_fit._posterior``).
+solve_key: contextvars.ContextVar[bytes | None] = contextvars.ContextVar("scale_mixture_ep_solve_key", default=None)
+
 
 def _host(values):
     """A host array for ``values`` (a device array's copy, a host array itself)."""
@@ -2030,10 +2035,14 @@ def curvature_correction(
         if "derivatives" not in formed:
             formed["derivatives"] = _variant_derivatives(prior, coefficients, cavity, working_bytes)
         formed_at = time.perf_counter()
-        total = _total_curvature_columns(
-            prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved,
-            derivatives=formed["derivatives"], fixed_cavity=fixed,
-        )
+        token = solve_key.set(_digest(directions))
+        try:
+            total = _total_curvature_columns(
+                prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions, achieved,
+                derivatives=formed["derivatives"], fixed_cavity=fixed,
+            )
+        finally:
+            solve_key.reset(token)
         log(
             f"eb curvature: {directions.shape[1]} directions over {prior.variant_count} variants, {prior.class_count} classes x "
             f"{prior.grid_size} nodes; derivatives {formed_at - started:.1f} s, response {time.perf_counter() - formed_at:.1f} s"

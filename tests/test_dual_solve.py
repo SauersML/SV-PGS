@@ -1029,3 +1029,37 @@ def test_an_indefinite_resolved_core_is_solved_exactly_on_the_linear_response_ro
     # A PD core keeps its Cholesky factor and no signs.
     positive = dual_solve.resolved_block(np, design, np.abs(precision) + 1.0, duals, residual, indefinite=True)
     assert positive.signs is None and not positive.indefinite
+
+
+def test_a_warm_started_posterior_solve_is_the_dense_inverse_and_takes_fewer_iterations() -> None:
+    """``posterior_solve`` started from a previous solve's duals (``last_posterior_duals``) for the same right-hand
+    sides at nearby sites: the answer meets its certificate against the dense inverse as a cold solve does, in no more
+    CG iterations than the cold one."""
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(57)
+    source = dual_solve.DenseDualSource(genotypes, bounds)
+    gaussian = dual_solve.DualGaussian(source=source, training=training, targets=response, offsets=offsets, covariates=covariates, grams=_grams(bounds, True), probe_count=2, seed=7)
+    rng = np.random.default_rng(58)
+    right = rng.standard_normal((genotypes.shape[1], 5))
+    gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    model = 0
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, precision, shift, response, offsets, model)[0]
+    exact = np.linalg.solve(posterior_precision, right)
+    bound = np.sqrt(EPS) * np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+    gaussian.posterior_solve(right, model, bound)
+    held = gaussian.last_posterior_duals.copy()
+    nearby = precision * (1.0 + 1e-3)
+    gaussian.iterate(site_precision=nearby, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)), probe_residual_ratio=np.sqrt(EPS))
+    posterior_precision = _dense_gaussian(genotypes, covariates, training, noise, nearby, shift, response, offsets, model)[0]
+    exact = np.linalg.solve(posterior_precision, right)
+    scale = np.sqrt(np.einsum("pc,pq,qc->c", exact, posterior_precision, exact))
+    bound = np.sqrt(EPS) * scale
+    passes = []
+    for start in (None, held):
+        before = gaussian.count.passes
+        solved, certificate = gaussian.posterior_solve(right, model, bound, start)
+        passes.append(gaussian.count.passes - before)
+        assert np.all(certificate <= bound)
+        error = solved - exact
+        energy = np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error))
+        assert np.all(energy <= certificate + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
+    assert passes[1] <= passes[0], passes
