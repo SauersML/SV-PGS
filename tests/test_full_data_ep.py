@@ -204,3 +204,24 @@ def test_factored_far_field_trace_from_a_warm_start_reaches_the_same_root() -> N
     for start in (0.7, 2.0 * expected, 0.9 * expected):
         omega, _lower = _far_field_factored(whitened, solve, np, start)
         assert omega == pytest.approx(expected, rel=1e-12)
+
+
+def test_warm_start_zeroes_negative_sites_and_every_cavity_is_proper() -> None:
+    """A mixed-sign start (as mean field leaves), after ``warm_start_sites``, becomes a start
+    whose every cavity precision 1/Sigma_jj - tau_j is non-negative (dense algebra), with the non-negative sites kept."""
+    from sv_pgs.full_data_fit import warm_start_sites
+
+    generator = np.random.default_rng(13)
+    design = generator.standard_normal((60, 20))
+    design[:, 1] = design[:, 0] + 0.05 * generator.standard_normal(60)
+    likelihood = design.T @ design / 0.8
+    precision = generator.uniform(0.5, 3.0, 20)
+    precision[[1, 4, 9]] = -0.4
+    shift = generator.standard_normal(20)
+    kept_precision, kept_shift = warm_start_sites(precision, shift)
+    assert np.all(kept_precision >= 0.0)
+    np.testing.assert_array_equal(kept_precision[precision >= 0.0], precision[precision >= 0.0])
+    np.testing.assert_array_equal(kept_shift[precision >= 0.0], shift[precision >= 0.0])
+    assert np.all(kept_shift[precision < 0.0] == 0.0)
+    covariance = np.linalg.inv(likelihood + np.diag(kept_precision))
+    assert np.all(1.0 / np.diag(covariance) - kept_precision >= 0.0)

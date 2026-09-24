@@ -533,6 +533,19 @@ class NoFixedPoint(FloatingPointError):
     certificate, or no positive definite precision): the outer loop refuses the trial. Any other error is a failure."""
 
 
+def warm_start_sites(site_precision: F64Array, site_shift: F64Array) -> tuple[F64Array, F64Array]:
+    """EP's start from mean-field sites: each negative site (tau_j < 0: a scale-mixture member's variance past 1/omega)
+    is set to zero with its shift, and every other site kept. With every tau >= 0 the precision
+    A = Xp'Xp / sigma^2 + diag(tau) dominates diag(tau), so A^-1 <= diag(tau)^-1 on the positive sites and
+    Sigma_jj <= 1/tau_j there: every cavity precision 1/Sigma_jj - tau_j is non-negative, and a zero site's is
+    1/Sigma_jj > 0. The first refresh's cavities are proper, where mean field's own negative sites left some improper
+    (bench-sim 000 [sim]: five refreshes, 9 minutes each, halving them)."""
+    precision = np.asarray(site_precision, dtype=np.float64)
+    shift = np.asarray(site_shift, dtype=np.float64)
+    negative = precision < 0.0
+    return np.where(negative, 0.0, precision), np.where(negative, 0.0, shift)
+
+
 class _NoDefinitePass(NoFixedPoint):
     """No damped frozen pass keeps the full-data precision positive definite: the refresh map cannot move from here."""
 
@@ -600,8 +613,9 @@ class _FullDataFixedPoints:
         if start_sites is not None:
             # A warm start (``fit_full_data``): the mean-field fixed point's sites, whose Gaussian has q's means and
             # precision; a member with no mean-field variance keeps the prior's moment-matched site.
-            precision, shift = (np.asarray(values, dtype=np.float64) for values in start_sites)
+            precision, shift = warm_start_sites(*start_sites)
             usable = np.isfinite(precision) & np.isfinite(shift)
+            log(f"ep: warm start keeps {int(np.count_nonzero(start_sites[0] >= 0.0))} mean-field sites, zeroes {int(np.count_nonzero(start_sites[0] < 0.0))} negative ones")
             self.site_precision = np.where(usable, precision, self.site_precision)
             self.site_shift = np.where(usable, shift, self.site_shift)
         self.noise = np.array(noise, dtype=np.float64, copy=True)
