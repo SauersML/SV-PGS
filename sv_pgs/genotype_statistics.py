@@ -578,6 +578,31 @@ def _largest_read() -> int:
     return int(np.iinfo(np.int32).max) & ~(os.sysconf("SC_PAGE_SIZE") - 1)
 
 
+def read_array(path: Path, offset: int, shape: tuple[int, int], dtype: np.dtype, out: NDArray | None = None) -> NDArray:
+    """``shape`` elements of ``dtype`` from ``path`` at element ``offset``, read into ``out`` (a new array by default), not
+    mapped: the caller owns (and charges) the bytes, each read call asks at most ``_largest_read`` bytes, and the pages
+    read are dropped from the page cache behind it."""
+    values = np.empty(shape, dtype=dtype) if out is None else out
+    if values.shape != tuple(shape) or values.dtype != dtype or not values.flags.c_contiguous:
+        raise ValueError(f"a read of {path.name} needs a C-contiguous {dtype} array of shape {shape}")
+    if values.size == 0:
+        return values
+    start = int(offset) * dtype.itemsize
+    view = memoryview(values.reshape(-1).view(np.uint8))
+    largest = _largest_read()
+    with open(path, "rb", buffering=0) as handle:
+        done = 0
+        while done < view.nbytes:
+            count = os.preadv(handle.fileno(), [view[done:done + largest]], start + done)
+            if count <= 0:
+                raise OSError(f"{path}: short read at byte {start + done}")
+            done += count
+        if hasattr(os, "posix_fadvise"):
+            # The bytes now live in the caller's buffer; their page-cache copy would only crowd the job's memory.
+            os.posix_fadvise(handle.fileno(), start, view.nbytes, os.POSIX_FADV_DONTNEED)
+    return values
+
+
 class LdGramStore:
     """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 2).
 
@@ -660,27 +685,7 @@ class LdGramStore:
         return self._read("adjacent", int(self._blocks[block_index].get("adjacent_offset", 0)), (rows, columns), out)
 
     def _read(self, name: str, offset: int, shape: tuple[int, int], out: NDArray | None) -> NDArray:
-        dtype = np.dtype(_LD_ARRAYS[name][1])
-        values = np.empty(shape, dtype=dtype) if out is None else out
-        if values.shape != shape or values.dtype != dtype or not values.flags.c_contiguous:
-            raise ValueError(f"a {name} read needs a C-contiguous {dtype} array of shape {shape}")
-        if values.size == 0:
-            return values
-        path = self.directory / _LD_ARRAYS[name][0]
-        start = offset * dtype.itemsize
-        view = memoryview(values.reshape(-1).view(np.uint8))
-        largest = _largest_read()
-        with open(path, "rb", buffering=0) as handle:
-            done = 0
-            while done < view.nbytes:
-                count = os.preadv(handle.fileno(), [view[done:done + largest]], start + done)
-                if count <= 0:
-                    raise OSError(f"{path}: short read at byte {start + done}")
-                done += count
-            if hasattr(os, "posix_fadvise"):
-                # The bytes now live in the caller's buffer; their page-cache copy would only crowd the job's memory.
-                os.posix_fadvise(handle.fileno(), start, view.nbytes, os.POSIX_FADV_DONTNEED)
-        return values
+        return read_array(self.directory / _LD_ARRAYS[name][0], offset, shape, np.dtype(_LD_ARRAYS[name][1]), out)
 
     def correlation_block(self, block_index: int) -> NDArray[np.float32]:
         """``R_b = X~_b^T X~_b / n`` (exactly symmetric, float32)."""
