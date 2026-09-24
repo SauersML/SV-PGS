@@ -70,6 +70,45 @@ def test_a_mandatory_lease_evicts_idle_caches_newest_first_and_never_one_in_use(
     assert broker.held(HOST) == 100
 
 
+def test_an_allocation_the_device_refuses_after_the_ledger_admitted_it_first_drops_every_idle_cache():
+    # The device holds what the ledger does not see (the CUDA context, library workspaces, the pool's fragments), so an
+    # allocation the ledger admits can still be refused by the device; the allocator then drops the device's idle caches
+    # (no cache may make a request fail), returns the pool's free blocks and lets the device decide once more.
+    from types import SimpleNamespace
+
+    from sv_pgs.memory_broker import _LedgerAllocator
+
+    class Refused(Exception):
+        pass
+
+    device = {"free": 0, "calls": 0}
+
+    class Pool:
+        def malloc(self, size):
+            device["calls"] += 1
+            if size > device["free"]:
+                raise Refused(size)
+            return size
+
+        def free_all_blocks(self):
+            pass
+
+    cupy = SimpleNamespace(
+        get_default_memory_pool=lambda: Pool(), cuda=SimpleNamespace(runtime=SimpleNamespace(getDevice=lambda: 0), memory=SimpleNamespace(OutOfMemoryError=Refused)),
+    )
+    broker = MemoryBroker({"device0": 1 << 20}, meters={"device0": lambda: 0})
+    dropped: list[str] = []
+    busy = broker.admit("device0", 1024, "busy", lambda: dropped.append("busy"), allocated=True)
+    broker.admit("device0", 1024, "idle", lambda: (dropped.append("idle"), device.update(free=4096)), allocated=True)
+    allocator = _LedgerAllocator(broker, cupy)
+    with busy.in_use():
+        assert allocator(2048) == 2048
+    assert dropped == ["idle"] and device["calls"] == 2
+    # With no idle cache left, the device's refusal stands.
+    with busy.in_use(), pytest.raises(Refused):
+        allocator(1 << 13)
+
+
 def test_a_metered_pool_counts_its_live_bytes_and_admits_caches_from_what_they_leave():
     live = {"bytes": 0}
     broker = MemoryBroker({"device0": 100}, meters={"device0": lambda: live["bytes"]})

@@ -261,6 +261,15 @@ class MemoryBroker:
             self._make_room(self._charged(pool), int(nbytes), purpose)
             self._note_peaks(self._charged(pool))
 
+    def evict_idle(self, pool: str) -> int:
+        """Drop every idle cache charged to ``pool``, newest first; returns how many. The allocator's answer to a device
+        that refuses an allocation the ledger admitted (``_LedgerAllocator``): no cache may make a request fail."""
+        with self._lock:
+            idle = [lease for lease in self.leases if lease.cache and not lease.users and pool in lease.pools]
+            for lease in reversed(idle):
+                self._evict(lease)
+            return len(idle)
+
     def admit(self, pool: str, nbytes: int, purpose: str, evict: Callable[[], None], allocated: bool = False) -> Lease | None:
         """A cache lease from what the pool has left (no eviction), or None where it does not fit. ``allocated``: the
         cache's arrays already exist (a metered pool then already counts them, and admits them while it is within its
@@ -313,7 +322,16 @@ class _LedgerAllocator:
                 self.broker.make_room(name, rounded, "a device allocation")
             except MemoryError as error:
                 raise self.cupy.cuda.memory.OutOfMemoryError(rounded, self.broker.capacities[name] - self.broker.held(name), 0) from error
-        return self.pool.malloc(size)
+        try:
+            return self.pool.malloc(size)
+        except self.cupy.cuda.memory.OutOfMemoryError:
+            # The ledger admitted it and the device did not: the device holds what the ledger does not see (the CUDA
+            # context, library workspaces, the pool's fragments). Every idle cache on the device is dropped, as the
+            # contract has it before any refusal, and the pool's free blocks returned; then the device decides once more.
+            if name not in self.broker.capacities or not self.broker.evict_idle(name):
+                raise
+            self.pool.free_all_blocks()
+            return self.pool.malloc(size)
 
 
 def _device_meter(cupy: Any, device_id: int, reserved: bool = False) -> Callable[[], int]:
