@@ -144,3 +144,42 @@ def test_cuda_rank_losing_covariates_and_tied_spikes_match_the_host() -> None:
         results.append((solution, np.asarray(bound.get() if hasattr(bound, "get") else bound)))
     (host, host_bound), (device, _device_bound) = results
     assert np.all(np.linalg.norm(host - device, axis=0) <= 2.0 * host_bound * (1.0 + genotypes.shape[0] * EPS))
+
+
+def test_the_operator_inside_a_tight_device_ledger_forms_its_complement_by_column_blocks() -> None:
+    """``apply_operator`` on a device whose ledger leaves room for a few columns' complement temporaries only: the
+    sample-side operand and the image's complement are formed a block of columns at a time (``DualModels.column_block``),
+    no allocation is refused, and S V is the host's (a genome fit's
+    block CG asked 1.87 GB of an A100-40GB with 40.26 GB held, forming it whole)."""
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import memory_scope
+
+    genotypes, bounds, covariates, weights, variances, _prior_mean, _response = _problem(47)
+    samples = genotypes.shape[0]
+    generator = np.random.default_rng(48)
+    columns = 400
+    values = generator.standard_normal((samples, columns))
+    column_models = np.arange(columns) % MODEL_COUNT
+    host_models = dual_solve.DualModels(weights, variances, covariates, np)
+    expected = dual_solve.apply_operator(dual_solve.DenseDualSource(genotypes, bounds, np), host_models, values, column_models, 0.0, dual_solve.PassCount(), "host")
+    source = dual_solve.DenseDualSource(cupy.asarray(genotypes), bounds, cupy)
+    models = dual_solve.DualModels(cupy.asarray(weights), cupy.asarray(variances), cupy.asarray(covariates), cupy)
+    device_values = cupy.asarray(values)
+    device_columns = cupy.asarray(column_models)
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    used = int(pool.used_bytes())
+    column_bytes = samples * np.dtype(np.float64).itemsize
+    # The operator's own outputs (the operand, the image and S V) and the tiles' products, whole, plus room for the
+    # complement's temporaries of a few columns: far below the seven whole samples x columns arrays it formed before.
+    capacity = used + 6 * columns * column_bytes + len(dual_solve._COMPLEMENT_ARRAYS) * 4 * column_bytes
+    budget = ComputeBudget(
+        device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(capacity,),
+        device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
+    )
+    # Every device allocation inside the scope is admitted by the ledger's allocator, which refuses any that would take
+    # the pool's live bytes past the capacity: the operator completing is the bound holding.
+    with memory_scope(budget):
+        assert models.column_block(samples, columns) < columns
+        got = dual_solve.apply_operator(source, models, device_values, device_columns, 0.0, dual_solve.PassCount(), "device")
+    np.testing.assert_allclose(cupy.asnumpy(got), expected, rtol=1e-10, atol=1e-10 * float(np.max(np.abs(expected))))

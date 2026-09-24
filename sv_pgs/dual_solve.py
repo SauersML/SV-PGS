@@ -44,7 +44,7 @@ from typing import Any, Callable, Iterator, Protocol
 import numpy as np
 
 from sv_pgs.marginal_variances import BlockGrams, BulkSolve, KernelFactor, WindowCross, exact_block_information
-from sv_pgs.memory_broker import HOST, current_broker
+from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.progress import log
 
 _DUAL_LIVE_COLUMN_ARRAYS = (
@@ -58,6 +58,10 @@ _DUAL_SAMPLE_ARRAYS = ("training", "targets", "offsets", "sample weights", "gene
 """``DualGaussian``'s samples x models arrays for its lifetime."""
 _DUAL_MEMBER_ARRAYS = ("mean", "unit squares")
 """``DualGaussian``'s variants x models arrays for its lifetime."""
+
+_COMPLEMENT_ARRAYS = ("root weights", "weighted values", "weighted root", "covariate image", "weighted covariate image", "projection", "weighted projection")
+"""The samples x columns temporaries ``DualModels._complement_block`` may hold at once: the gathered root weights, the
+weighted values, root times them for C'W v, the covariates' image, its weighting, the projection and its weighting."""
 
 DIGIT_BITS = 7
 """Bits per balanced base-128 operand digit of the int8 split."""
@@ -277,18 +281,56 @@ class DualModels:
         whitened = self.array_module.einsum("cab,ac->cb", factor, right)
         return self.array_module.einsum("cab,cb->ac", factor, whitened)
 
+    def _complement_block(self, values: Any, column_models: Any, before: bool, after: bool) -> Any:
+        """[W^1/2] (I - H) [W^1/2] v for one block of columns, each factor where asked."""
+        root = self.root_weights[:, column_models]
+        weighted = root * values if before else values
+        projected = weighted - root * (self.covariates @ self.covariate_solve(self.covariates.T @ (root * weighted), column_models))
+        return root * projected if after else projected
+
+    def column_block(self, rows: int, columns: int) -> int:
+        """Columns of a samples x columns operand the complement forms at once: all of them on the host, and on a device
+        as many as leave its temporaries (``_COMPLEMENT_ARRAYS``, rows x block float64 each) within what the shared ledger
+        can grant there (``memory_broker``: the remainder with every idle cache counted, since the allocator evicts them
+        first), at least one. The whole operand was formed at once before: seven samples x columns temporaries of the
+        dual solver's block CG on a genome fit asked 1.87 GB of an A100-40GB with 40.26 GB already held (bench-sim chr22
+        s005 [sim])."""
+        xp = self.array_module
+        if xp is np or columns == 0:
+            return max(columns, 1)
+        broker = current_broker()
+        if broker is None:
+            return columns
+        pool = device_pool(int(xp.cuda.runtime.getDevice()))
+        if pool not in broker.capacities:
+            return columns
+        per_column = len(_COMPLEMENT_ARRAYS) * int(rows) * np.dtype(np.float64).itemsize
+        return max(1, min(columns, broker.reclaimable(pool) // max(per_column, 1)))
+
+    def _blocked(self, values: Any, column_models: Any, before: bool, after: bool) -> Any:
+        """``_complement_block`` over blocks of ``column_block`` columns, into one output."""
+        xp = self.array_module
+        rows, columns = int(values.shape[0]), int(values.shape[1])
+        width = self.column_block(rows, columns)
+        if width >= columns:
+            return self._complement_block(values, column_models, before, after)
+        out = xp.empty((rows, columns), dtype=xp.float64)
+        for first in range(0, columns, width):
+            last = min(first + width, columns)
+            out[:, first:last] = self._complement_block(values[:, first:last], column_models[first:last], before, after)
+        return out
+
     def complement(self, values: Any, column_models: Any) -> Any:
         """(I - H_m) v per column, with H_m the weighted covariate projector of the column's model."""
-        root = self.root_weights[:, column_models]
-        return values - root * (self.covariates @ self.covariate_solve(self.covariates.T @ (root * values), column_models))
+        return self._blocked(values, column_models, False, False)
 
     def sample_to_design(self, values: Any, column_models: Any) -> Any:
         """The sample-side operand of X_b': Xt'v = X' [W^1/2 (I - H) v]."""
-        return self.root_weights[:, column_models] * self.complement(values, column_models)
+        return self._blocked(values, column_models, False, True)
 
     def design_to_sample(self, image: Any, column_models: Any) -> Any:
         """Xt u = (I - H) W^1/2 [X u]."""
-        return self.complement(self.root_weights[:, column_models] * image, column_models)
+        return self._blocked(image, column_models, True, False)
 
 
 @dataclass
