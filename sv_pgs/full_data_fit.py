@@ -168,7 +168,9 @@ def block_grams(
         return grams
     widest = max(block.shape[0] for block in blocks)
     extent = ld_extent(grams, statistics.sample_count, working_bytes, array_module)
-    return refined_grams(grams, min(window_width(working_bytes, array_module, widest), extent))
+    width = window_width(working_bytes, array_module, widest)
+    log(f"leave-block-out windows: LD extent {extent} variants, memory width {width}, widest Stage 0 block {widest}")
+    return refined_grams(grams, min(width, extent))
 
 
 def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior) -> list[MomentStart]:

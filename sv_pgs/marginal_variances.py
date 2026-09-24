@@ -338,13 +338,16 @@ def marginals_from_quadratics(
     return variances
 
 
-def sandwich_diagonal(covariance: NDArray[np.float64], gram: NDArray[np.float64]) -> NDArray[np.float64]:
-    """diag(S R S) as sum_k (S R)_ik S_ki: one BLAS product and an elementwise sum.
+def sandwich_diagonal(covariance: NDArray[np.float64], gram: NDArray[np.float64], array_module: Any = np) -> NDArray[np.float64]:
+    """diag(S R S) as sum_k (S R)_ik S_ki: one BLAS product and an elementwise sum, on ``array_module``'s device (a
+    bench-sim window's 5,870-column product on the host was 20% of a genome EP refresh [sim, py-spy]).
 
     Unoptimized three-operand einsum loops over all (i, j, k) without BLAS; on one 4,430-variant block it was 99.8%
     of a fit's time (engine's bench-real profile).
     """
-    return np.sum((covariance @ gram) * covariance.T, axis=1)
+    xp = array_module
+    device_covariance = xp.asarray(covariance)
+    return _to_host(xp.sum((device_covariance @ xp.asarray(gram)) * device_covariance.T, axis=1))
 
 
 def _block_index(grams: BlockGrams) -> NDArray[np.int64]:
@@ -400,7 +403,10 @@ class _BlockTerms:
 def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any) -> tuple[float, Any]:
     """omega_F (``far_field_trace``'s root, the same Newton from omega_S) with B's spectral sums from the Cholesky
     factor L of M = I + w B: tr M^-1 = ||L^-1||_F^2 and ||M^-1||_F^2 = ||L^-T L^-1||_F^2, three |W|^3 / 3 products per
-    step. Returns omega_F and the factor of I + omega_F B, which the caller's solves reuse."""
+    step. Newton stops once its step is within the deterministic equivalent's own relative error scale
+    (``approximation_scale``) of omega_F: the concave increasing equation keeps every step below the distance still to
+    the root, and that distance then falls quadratically, so a finer omega_F moves the map by less than its own
+    approximation. Returns omega_F and the factor of I + omega_F B, which the caller's solves reuse."""
     xp = array_module
     size = int(whitened.shape[0])
     diagonal = xp.arange(size)
@@ -426,7 +432,7 @@ def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any) -> t
         value = current - solve.bulk_trace - weight * spectral
         slope = 1.0 + weight * spectral_square
         candidate = current - value / slope
-        if not candidate > current:
+        if not candidate - current > approximation_scale(solve) * current:
             return current, lower
         current = candidate
         lower = factor(current)
@@ -532,10 +538,12 @@ def window_width(working_bytes: int, array_module: Any = np, limit: int | None =
 
 
 def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_module: Any = np) -> int:
-    """The lag (in variants, along the block order) beyond which the data show no LD: the smallest w whose tail
-    excess, the summed r^2 over every within-block pair more than w apart less its null expectation 1/n per pair, is
-    at most that sum's own null standard deviation sqrt(2 N(w)) / n (N(w) the pairs beyond w; r^2 of an unlinked pair
-    has mean 1/n and variance 2/n^2 to leading order). Beyond it the Grams hold nothing a window could use, so blocks
+    """The lag (in variants, along the block order) beyond which a variant's LD is not resolved: the smallest w whose
+    tail excess per variant (the summed r^2 over every within-block pair more than w apart, less its null expectation
+    1/n per pair, over the V variants) is at most one variant's tail LD score's null standard deviation
+    sqrt(2 N(w) / V) / n (N(w) the ordered pairs beyond w; r^2 of an unlinked pair has mean 1/n and variance 2/n^2 to
+    leading order). The marginal variances are per variant, so it is a variant's own LD beyond w that must be below
+    what one variant's data can resolve; summed over the whole genome, far LD is always detectable. Beyond it the Grams hold nothing a window could use, so blocks
     need be no wider: the leave-block-out windows (the block and its two neighbours) then reach at least w on each
     side, and whatever the data do hold beyond is far field, which ``block_trace_certificate`` tests.
 
@@ -574,7 +582,8 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, array_mo
     pairs[0] = 0.0
     tail_excess = _to_host(xp.cumsum(excess[::-1])[::-1])
     tail_pairs = _to_host(xp.cumsum(pairs[::-1])[::-1])
-    resolved = tail_excess <= np.sqrt(2.0 * tail_pairs) / sample_count
+    variants = float(sum(int(members.shape[0]) for members in grams.blocks))
+    resolved = tail_excess / variants <= np.sqrt(2.0 * tail_pairs / variants) / sample_count
     return max(1, int(np.argmax(resolved))) if resolved.any() else widest
 
 
@@ -751,7 +760,7 @@ def marginal_variances(
             covariance = _exact_bulk_block(covariance, members, bulk_variance, is_resolved, exact[block])
             is_exact[members] = True
         near_variance[members] = np.diag(covariance)
-        sandwich[members] = sandwich_diagonal(covariance, grams.within_block(block))
+        sandwich[members] = sandwich_diagonal(covariance, grams.within_block(block), array_module)
     resolved_weight = sandwich[solve.resolved] / resolved_variance if solve.resolved.shape[0] else np.zeros(0)
     for block in range(len(grams.blocks)):
         near_totals[block] = float(np.sum(resolved_weight[cross.positions[block]]))
@@ -1238,7 +1247,7 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     sandwich = np.zeros(variant_count)
     for block, members in enumerate(grams.blocks):
         terms = _block_terms(solve, grams, cross, bulk_variance, core_inverse, block, array_module)
-        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block))
+        sandwich[members] = sandwich_diagonal(terms.covariance, grams.within_block(block), array_module)
     pair_scale = solve.kernel_square_trace / solve.sample_count
     chance_weight = sandwich[:, None] * direction
     chance_total = chance_weight.sum(axis=0)
