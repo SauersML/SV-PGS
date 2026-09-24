@@ -483,3 +483,16 @@ def test_genetic_accuracy_is_the_partial_correlation_and_the_genetic_scale_slope
     # A prediction shrunk by any factor keeps its r2 and scales its slope by the inverse.
     shrunk_r2, shrunk_slope = genetic_accuracy(genetic, 0.1 * prediction, covariates)
     assert np.isclose(shrunk_r2, r2) and np.isclose(shrunk_slope, 10.0 * slope)
+
+
+def test_drop_classes_withholds_exactly_the_named_classes() -> None:
+    table = {"cls": np.array([0, 3, 1, 2, 3, 0]), "pos": np.arange(6) * 10, "class_names": np.array(["SNV", "INDEL", "TR", "SV"])}
+    records = np.array([2, 5, 7, 11, 13, 17])
+    kept, view = harness.drop_classes(records, table, ("TR", "SV"))
+    assert kept.tolist() == [2, 7, 17]
+    assert view["cls"].tolist() == [0, 1, 0] and view["pos"].tolist() == [0, 20, 50]
+    assert view["class_names"].tolist() == table["class_names"].tolist()
+    kept, _ = harness.drop_classes(records, table, ("SV",))
+    assert kept.tolist() == [2, 7, 11, 17]
+    kept, view = harness.drop_classes(records, table, ())
+    assert kept.tolist() == records.tolist() and view["pos"].tolist() == table["pos"].tolist()

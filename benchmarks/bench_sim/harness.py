@@ -11,6 +11,9 @@ training phenotype. Truth lives outside their reach.
 
     python harness.py run --method m.py --cohort <cohort/chr22> --scenario <dev/scenario_003> --out <results/...>
     python harness.py score --cohort ... --scenario ... --prediction <results/.../prediction.npz>
+
+--drop-classes TR,SV runs the method on the same measured records less those classes (the SV ablation: the method's
+all-variant fit against its fit on the identical record set without the structural records).
 """
 
 from __future__ import annotations
@@ -135,6 +138,13 @@ def public_variant_table(cohort: Path, arm: str) -> dict:
     return table
 
 
+def drop_classes(records: np.ndarray, table: dict, dropped: tuple) -> tuple[np.ndarray, dict]:
+    """The records and public table without the records of the classes named in ``dropped`` (table["class_names"])."""
+    codes = [int(np.flatnonzero(table["class_names"] == name)[0]) for name in dropped]
+    kept = ~np.isin(table["cls"], codes)
+    return records[kept], {name: values if name == "class_names" else values[kept] for name, values in table.items()}
+
+
 def covariate_matrix(cohort: Path, arm: str) -> tuple[np.ndarray, tuple]:
     samples = np.load(cohort / "samples.npz")
     pcs = np.load(cohort / f"pcs_{arm}.npz")["pcs"]
@@ -151,13 +161,15 @@ def load_method(path: Path):
     return module
 
 
-def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: str) -> None:
+def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: str, dropped: tuple = ()) -> None:
+    if dropped and arm in READ_ARMS:
+        raise ValueError(f"the {arm} arm's read channel is on structural records; it has no class-withheld run")
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     train_columns, test_columns = np.flatnonzero(~is_test), np.flatnonzero(is_test)
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     records = np.flatnonzero(measured_records(cohort))
-    table = public_variant_table(cohort, arm)
+    records, table = drop_classes(records, public_variant_table(cohort, arm), dropped)
     covariates, names = covariate_matrix(cohort, arm)
     params = json.loads((scenario / "scenario.json").read_text())["params"]
     phenotype = np.load(scenario / "truth.npz")["phenotype"]
@@ -186,6 +198,7 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
     np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
     meta = {
         "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
+        "dropped_classes": list(dropped),
         "fit_seconds": fitted - started, "score_seconds": finished - fitted,
         "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
     }
@@ -283,6 +296,7 @@ def main() -> None:
     run_parser.add_argument("--out", required=True)
     run_parser.add_argument("--cores", type=int, default=16)
     run_parser.add_argument("--arm", choices=tuple(ARMS), required=True)
+    run_parser.add_argument("--drop-classes", default="", help="comma-separated classes to withhold, e.g. TR,SV")
     score_parser = sub.add_parser("score")
     score_parser.add_argument("--cohort", required=True)
     score_parser.add_argument("--scenario", required=True)
@@ -290,7 +304,8 @@ def main() -> None:
     score_parser.add_argument("--arm", choices=tuple(ARMS), required=True)
     args = parser.parse_args()
     if args.command == "run":
-        run(Path(args.method), Path(args.cohort), Path(args.scenario), Path(args.out), args.cores, args.arm)
+        run(Path(args.method), Path(args.cohort), Path(args.scenario), Path(args.out), args.cores, args.arm,
+            tuple(name for name in args.drop_classes.split(",") if name))
     else:
         print(json.dumps(score(Path(args.cohort), Path(args.scenario), Path(args.prediction), args.arm), indent=1))
 
