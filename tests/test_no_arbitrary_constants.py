@@ -107,6 +107,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('full_data_fit.py', '_FullDataMeanField._moment_pieces'): ('derived', frozenset({3}), "byte accounting of the predictor-variance read: a piece's columns, their weighted copy and their projection live at once"),
     ('engine_kernels.py', '_tilted_row_bytes'): ('derived', frozenset({3}), "byte accounting of a chunk's device copies: its three float64 inputs (log u, P, h)"),
     ('scale_mixture_ep.py', '_moving_line_sum'): ('derived', frozenset({3}), "byte accounting of a (row, step) pair on the device: its three float64 outputs (log Z, mean, variance) beside its inputs"),
+    ('scale_mixture_ep.py', '_lines.values'): ('derived', frozenset({3}), "byte accounting of a piece of rows x steps: its products, their lost mask and their logs"),
     ('engine_kernels.py', 'derivative_row_bytes'): ('derived', frozenset({8, 3}), "byte accounting of a derivative chunk's device row: its eight fields and three float64 inputs beside its two K outputs"),
     ('engine_kernels.py', 'variant_derivatives'): ('derived', frozenset({8}), "the eight per-row fields of scale_mixture_ep._variant_derivatives (_DERIVATIVE_FIELDS)"),
     ('engine_kernels.py', '_objective_row_bytes'): ('derived', frozenset({6}), "byte accounting of a chunk's device arrays: three float64 inputs, two outputs and the |log Z| temporary per row"),

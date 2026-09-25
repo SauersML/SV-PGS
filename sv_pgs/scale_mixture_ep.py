@@ -1331,10 +1331,9 @@ class _Objective:
 
 
 @numba.njit(cache=True, error_model="numpy", inline="always")
-def _node_terms(log_scale_value, node, precision, shift_square, tiny):
-    """One effect's terms at one node, as ``engine_kernels``' node_terms computes them: (retained r, q r, v r,
-    a = h^2 v r, log sqrt(r), improper)."""
-    variance = np.exp(log_scale_value + node)
+def _variance_terms(variance, precision, shift_square, tiny):
+    """One effect's terms at a node of variance v, as ``engine_kernels``' node_terms computes them: (retained r,
+    q r, v r, a = h^2 v r)."""
     ratio = variance * precision
     retained = 1.0 / (1.0 + ratio)
     if abs(ratio) * tiny < 0.5:
@@ -1343,7 +1342,16 @@ def _node_terms(log_scale_value, node, precision, shift_square, tiny):
     else:
         ratio_retained = 1.0 / (1.0 + 1.0 / ratio)
         conditional = 1.0 / (1.0 / variance + precision)
-    signal = shift_square * conditional
+    return retained, ratio_retained, conditional, shift_square * conditional
+
+
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _node_terms(log_scale_value, node, precision, shift_square, tiny):
+    """One effect's terms at one node, as ``engine_kernels``' node_terms computes them: (retained r, q r, v r,
+    a = h^2 v r, log sqrt(r), improper)."""
+    variance = np.exp(log_scale_value + node)
+    ratio = variance * precision
+    retained, ratio_retained, conditional, signal = _variance_terms(variance, precision, shift_square, tiny)
     if np.isinf(variance) and precision > 0.0:
         log_root = -0.5 * (log_scale_value + node + np.log(precision))
     else:
@@ -1351,57 +1359,111 @@ def _node_terms(log_scale_value, node, precision, shift_square, tiny):
     return retained, ratio_retained, conditional, signal, log_root, ratio <= -1.0
 
 
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _objective_row_exact(row, log_density, density, grid, scale_value, cavity_precision, shift_square, tiny, deviations, centred, log_normalizer, curvature):
+    """One row of ``_objective_rows`` in log terms, with the device's running log-sum-exp and weighted Welford updates;
+    returns whether some 1 + v P <= 0."""
+    nodes = grid.shape[0]
+    bad = False
+    peak, total, first_mean, first_square, second_mean = -np.inf, 0.0, 0.0, 0.0, 0.0
+    for node in range(nodes):
+        retained, ratio_retained, _conditional, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+        if improper:
+            bad = True
+        exponent = log_density[node] + 0.5 * signal + log_root
+        first = 0.5 * (retained * signal - ratio_retained)
+        second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained
+        if np.isinf(exponent) or np.isnan(exponent):
+            continue
+        if exponent > peak:
+            rescale = np.exp(peak - exponent)
+            total *= rescale
+            first_square *= rescale
+            peak = exponent
+            weight = 1.0
+        else:
+            weight = np.exp(exponent - peak)
+        updated = total + weight
+        share = weight / updated
+        deviation = first - first_mean
+        step = deviation * share
+        first_mean += step
+        first_square += total * deviation * step
+        second_mean += (second - second_mean) * share
+        total = updated
+    inverse_total = 1.0 / total
+    for node in range(nodes):
+        retained, ratio_retained, _conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+        exponent = log_density[node] + 0.5 * signal + log_root
+        first = 0.5 * (retained * signal - ratio_retained)
+        responsibility = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak) * inverse_total
+        deviations[row, node] = responsibility - density[node]
+        centred[row, node] = responsibility * (first - first_mean)
+    deviations[row, nodes] = 1.0
+    centred[row, nodes] = first_mean
+    log_normalizer[row] = peak + np.log(total)
+    curvature[row] = first_square / total + second_mean
+    return bad
+
+
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _objective_rows(log_density, density, grid, log_scale_rows, precision, shift, deviations, centred, log_normalizer, curvature):
     """The host twin of ``engine_kernels``' objective_rows, one row per iteration, no row's terms held past its two
     passes: per row log Z and Var_r(d1) + E_r[d2] (``curvature``), and per node its deviation D = r - pi and centred
     G = r (d1 - mean d1), with a last column of ones under D and mean d1 under G (the Grams D'[D 1] and G'S then
-    carry sum D and the scale gradient). The running log-sum-exp and weighted Welford updates are the device's.
-    Returns whether some 1 + v P <= 0."""
+    carry sum D and the scale gradient). Returns whether some 1 + v P <= 0.
+
+    A row is summed in linear terms, pi_k sqrt(r_k) exp(h^2 c_k / 2 - m) with r = 1 / (1 + v P), c = v r, the node
+    variances v_k = u e^(g_k) from one exponential per row and m the largest h^2 c_k / 2 (the top node's: c grows with
+    v): one exponential and one square root a node, held for the second pass, in place of the log form's two
+    exponentials and a log in each of two passes (the whole kernel was 0.45 s a call, 40% of ENSG00000223725.6's fit
+    [real, loso/SAS, 30,788 variants]). The mean and variance of d1 are two-pass sums over the held weights. Where the
+    row's scales leave the normal range, or its sum falls below tiny / eps (where subnormal terms could matter), the
+    row is taken in log terms with the device's running log-sum-exp and Welford updates (``_objective_row_exact``)."""
     rows, nodes = log_scale_rows.shape[0], grid.shape[0]
     tiny = np.finfo(np.float64).tiny
+    lost_below = tiny / np.finfo(np.float64).eps
+    exp_grid = np.exp(grid)
     bad = np.zeros(rows, dtype=np.bool_)
     for row in numba.prange(rows):
         scale_value, cavity_precision = log_scale_rows[row], precision[row]
         shift_square = shift[row] * shift[row]
-        peak, total, first_mean, first_square, second_mean = -np.inf, 0.0, 0.0, 0.0, 0.0
-        for node in range(nodes):
-            retained, ratio_retained, _conditional, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
-            if improper:
-                bad[row] = True
-            exponent = log_density[node] + 0.5 * signal + log_root
-            first = 0.5 * (retained * signal - ratio_retained)
-            second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained
-            if np.isinf(exponent) or np.isnan(exponent):
+        base = np.exp(scale_value)
+        low, top = base * exp_grid[0], base * exp_grid[nodes - 1]
+        if base > 0.0 and low > 0.0 and np.isfinite(top * cavity_precision) and np.isfinite(top) and 1.0 + low * cavity_precision > 0.0 and 1.0 + top * cavity_precision > 0.0:
+            weights = np.empty(nodes)
+            firsts = np.empty(nodes)
+            m = 0.5 * shift_square * (top / (1.0 + top * cavity_precision))
+            total = 0.0
+            for node in range(nodes):
+                retained, ratio_retained, _conditional, signal = _variance_terms(base * exp_grid[node], cavity_precision, shift_square, tiny)
+                weight = density[node] * np.exp(0.5 * signal - m) * np.sqrt(retained)
+                weights[node] = weight
+                firsts[node] = 0.5 * (retained * signal - ratio_retained)
+                total += weight
+            if total >= lost_below and np.isfinite(total):
+                inverse_total = 1.0 / total
+                first_mean = 0.0
+                for node in range(nodes):
+                    first_mean += weights[node] * firsts[node]
+                first_mean *= inverse_total
+                first_square, second_mean = 0.0, 0.0
+                for node in range(nodes):
+                    retained, ratio_retained, _conditional, signal = _variance_terms(base * exp_grid[node], cavity_precision, shift_square, tiny)
+                    second = 0.5 * signal * retained * (2.0 * retained - 1.0) - 0.5 * ratio_retained * retained
+                    responsibility = weights[node] * inverse_total
+                    deviation = firsts[node] - first_mean
+                    first_square += responsibility * deviation * deviation
+                    second_mean += responsibility * second
+                    deviations[row, node] = responsibility - density[node]
+                    centred[row, node] = responsibility * deviation
+                deviations[row, nodes] = 1.0
+                centred[row, nodes] = first_mean
+                log_normalizer[row] = np.log(total) + m
+                curvature[row] = first_square + second_mean
                 continue
-            if exponent > peak:
-                rescale = np.exp(peak - exponent)
-                total *= rescale
-                first_square *= rescale
-                peak = exponent
-                weight = 1.0
-            else:
-                weight = np.exp(exponent - peak)
-            updated = total + weight
-            share = weight / updated
-            deviation = first - first_mean
-            step = deviation * share
-            first_mean += step
-            first_square += total * deviation * step
-            second_mean += (second - second_mean) * share
-            total = updated
-        inverse_total = 1.0 / total
-        for node in range(nodes):
-            retained, ratio_retained, _conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
-            exponent = log_density[node] + 0.5 * signal + log_root
-            first = 0.5 * (retained * signal - ratio_retained)
-            responsibility = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak) * inverse_total
-            deviations[row, node] = responsibility - density[node]
-            centred[row, node] = responsibility * (first - first_mean)
-        deviations[row, nodes] = 1.0
-        centred[row, nodes] = first_mean
-        log_normalizer[row] = peak + np.log(total)
-        curvature[row] = first_square / total + second_mean
+        if _objective_row_exact(row, log_density, density, grid, scale_value, cavity_precision, shift_square, tiny, deviations, centred, log_normalizer, curvature):
+            bad[row] = True
     improper = False
     for row in range(rows):
         if bad[row]:
@@ -2096,36 +2158,64 @@ class _VariantDerivatives:
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
 def _derivative_rows(log_density, grid, log_scale_rows, precision, shift, with_scale, fields, by_mean, by_second):
-    """The host twin of ``engine_kernels``' derivative_rows: per row, three passes over its nodes (the running
-    log-sum-exp, the weighted means, the centred moments and the per-node outputs), no row's terms held past them.
-    Returns whether some 1 + v P <= 0."""
+    """The host twin of ``engine_kernels``' derivative_rows: per row, the node weights, then two passes over its nodes
+    (the weighted means, the centred moments and the per-node outputs), no row's terms held past them. Returns whether
+    some 1 + v P <= 0.
+
+    The weights are ``_objective_rows``' linear terms, pi_k sqrt(r_k) exp(h^2 c_k / 2 - m) from one exponential per row
+    for the node variances, held for the two passes, which then take each node's terms from its variance by arithmetic
+    alone (``_variance_terms``): the log form recomputed exp and log1p in each of three passes. Where the row's scales
+    leave the normal range or its sum falls below tiny / eps, the weights are the log form's (a running log-sum-exp)."""
     rows, nodes = log_scale_rows.shape[0], grid.shape[0]
     tiny = np.finfo(np.float64).tiny
+    lost_below = tiny / np.finfo(np.float64).eps
+    exp_grid = np.exp(grid)
+    density = np.exp(log_density)
     bad = np.zeros(rows, dtype=np.bool_)
     for row in numba.prange(rows):
         scale_value, cavity_precision, h = log_scale_rows[row], precision[row], shift[row]
         shift_square = h * h
-        peak, total = -np.inf, 0.0
-        for node in range(nodes):
-            _r, _qr, _c, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
-            if improper:
-                bad[row] = True
-            exponent = log_density[node] + 0.5 * signal + log_root
-            if np.isinf(exponent) or np.isnan(exponent):
-                continue
-            if exponent > peak:
-                total = total * np.exp(peak - exponent) + 1.0
-                peak = exponent
-            else:
-                total += np.exp(exponent - peak)
+        weights = np.empty(nodes)
+        base = np.exp(scale_value)
+        low, top = base * exp_grid[0], base * exp_grid[nodes - 1]
+        fast = base > 0.0 and low > 0.0 and np.isfinite(top) and np.isfinite(top * cavity_precision)
+        fast = fast and 1.0 + low * cavity_precision > 0.0 and 1.0 + top * cavity_precision > 0.0
+        if fast:
+            m = 0.5 * shift_square * (top / (1.0 + top * cavity_precision))
+            total = 0.0
+            for node in range(nodes):
+                retained, _qr, _c, signal = _variance_terms(base * exp_grid[node], cavity_precision, shift_square, tiny)
+                weights[node] = density[node] * np.exp(0.5 * signal - m) * np.sqrt(retained)
+                total += weights[node]
+            fast = total >= lost_below and np.isfinite(total)
+        if not fast:
+            peak, total = -np.inf, 0.0
+            for node in range(nodes):
+                _r, _qr, _c, signal, log_root, improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
+                if improper:
+                    bad[row] = True
+                exponent = log_density[node] + 0.5 * signal + log_root
+                weights[node] = exponent
+                if np.isinf(exponent) or np.isnan(exponent):
+                    continue
+                if exponent > peak:
+                    total = total * np.exp(peak - exponent) + 1.0
+                    peak = exponent
+                else:
+                    total += np.exp(exponent - peak)
+            for node in range(nodes):
+                exponent = weights[node]
+                weights[node] = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak)
         inverse_total = 1.0 / total
+        for node in range(nodes):
+            weights[node] *= inverse_total
         m = s2 = mean_f = mu_c = c_terms = mu_r = raw_r = 0.0
         for node in range(nodes):
-            retained, ratio_retained, conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
-            exponent = log_density[node] + 0.5 * signal + log_root
-            if np.isinf(exponent) or np.isnan(exponent):
+            w = weights[node]
+            if w == 0.0:
                 continue
-            w = np.exp(exponent - peak) * inverse_total
+            variance = base * exp_grid[node] if fast else np.exp(scale_value + grid[node])
+            retained, ratio_retained, conditional, signal = _variance_terms(variance, cavity_precision, shift_square, tiny)
             mu = h * conditional
             raw = conditional + mu * mu
             m += w * mu
@@ -2139,9 +2229,9 @@ def _derivative_rows(log_density, grid, log_scale_rows, precision, shift, with_s
         mean_ell = -0.5 * s2
         third = c_dev = ell_mu = ell_raw = f_mu = f_raw = 0.0
         for node in range(nodes):
-            retained, ratio_retained, conditional, signal, log_root, _improper = _node_terms(scale_value, grid[node], cavity_precision, shift_square, tiny)
-            exponent = log_density[node] + 0.5 * signal + log_root
-            w = 0.0 if (np.isinf(exponent) or np.isnan(exponent)) else np.exp(exponent - peak) * inverse_total
+            w = weights[node]
+            variance = base * exp_grid[node] if fast else np.exp(scale_value + grid[node])
+            retained, ratio_retained, conditional, signal = _variance_terms(variance, cavity_precision, shift_square, tiny)
             mu = h * conditional
             raw = conditional + mu * mu
             deviation = mu - m
@@ -2606,38 +2696,81 @@ def _directional_derivatives(
     return third, fourth
 
 
+@numba.njit(cache=True, error_model="numpy", inline="always")
+def _moving_exact(log_density, step, eta, grid, P, h2, terms):
+    """log Z at one (row, step) with each node term exactly ``_kernel_terms``'s (its overflow limit included); and
+    whether some 1 + v P <= 0."""
+    nodes = grid.shape[0]
+    bad = False
+    peak = -np.inf
+    for k in range(nodes):
+        log_variance = eta + grid[k]
+        variance = np.exp(log_variance)
+        ratio = variance * P
+        if ratio <= -1.0:
+            bad = True
+        conditional = 1.0 / (1.0 / variance + P)
+        if not np.isfinite(variance) and P > 0.0:
+            log_one_plus = log_variance + np.log(P)
+        else:
+            log_one_plus = np.log1p(ratio)
+        terms[k] = log_density[step, k] - 0.5 * log_one_plus + 0.5 * (h2 * conditional)
+        if terms[k] > peak:
+            peak = terms[k]
+    shift_peak = peak if np.isfinite(peak) else 0.0
+    total = 0.0
+    for k in range(nodes):
+        total += np.exp(terms[k] - shift_peak)
+    return np.log(total) + shift_peak, bad
+
+
 @numba.njit(parallel=True, cache=True, error_model="numpy")
-def _moving_line_rows(log_density, log_scale_rows, slopes, steps, grid, precision, shift, out):
+def _moving_line_rows(log_density, log_scale_rows, slopes, steps, grid, precision, shift, lost_below, out):
     """log Z_j at every step for rows whose log scale moves along the line: out[j, s] = LSE_k(log_density[s, k] +
-    L(log u_j + slope_j t_s, k)), each node term exactly ``_kernel_terms``'s (its overflow limit included), fused over
-    (row, step, node) so no rows x steps x K array is formed. Returns whether some 1 + v P <= 0."""
+    L(log u_j + slope_j t_s, k)), fused over (row, step, node) so no rows x steps x K array is formed. Returns whether
+    some 1 + v P <= 0.
+
+    Each (row, step) is summed in linear terms, pi_k (1 + v_k P)^-1/2 exp(h^2 c_k / 2 - m) with pi_k the step's
+    density over its largest node (shared by every row), v_k = u e^(g_k) from one exponential per (row, step), and m
+    the largest h^2 c_k / 2 (c = v / (1 + v P) grows with v, so it is the top node's): one exponential and one square
+    root a node in place of two exponentials and a log (``_moving_exact``'s), each term to a few roundings as before.
+    Where a scale leaves the normal range, or the sum falls below ``lost_below`` (where subnormal terms could matter),
+    the (row, step) is taken by ``_moving_exact``."""
     rows, count, nodes = log_scale_rows.shape[0], steps.shape[0], grid.shape[0]
+    density_peak = np.empty(count)
+    weights = np.empty((count, nodes))
+    for step in range(count):
+        peak = -np.inf
+        for k in range(nodes):
+            if log_density[step, k] > peak:
+                peak = log_density[step, k]
+        density_peak[step] = peak if np.isfinite(peak) else 0.0
+        for k in range(nodes):
+            weights[step, k] = np.exp(log_density[step, k] - density_peak[step])
+    exp_grid = np.exp(grid)
     bad = np.zeros(rows, dtype=np.bool_)
     for row in numba.prange(rows):
         terms = np.empty(nodes)
         P, h2 = precision[row], shift[row] * shift[row]
         for step in range(count):
             eta = log_scale_rows[row] + slopes[row] * steps[step]
-            peak = -np.inf
-            for k in range(nodes):
-                log_variance = eta + grid[k]
-                variance = np.exp(log_variance)
-                ratio = variance * P
-                if ratio <= -1.0:
-                    bad[row] = True
-                conditional = 1.0 / (1.0 / variance + P)
-                if not np.isfinite(variance) and P > 0.0:
-                    log_one_plus = log_variance + np.log(P)
-                else:
-                    log_one_plus = np.log1p(ratio)
-                terms[k] = log_density[step, k] - 0.5 * log_one_plus + 0.5 * (h2 * conditional)
-                if terms[k] > peak:
-                    peak = terms[k]
-            shift_peak = peak if np.isfinite(peak) else 0.0
-            total = 0.0
-            for k in range(nodes):
-                total += np.exp(terms[k] - shift_peak)
-            out[row, step] = np.log(total) + shift_peak
+            base = np.exp(eta)
+            top = base * exp_grid[nodes - 1]
+            fast = base > 0.0 and np.isfinite(top) and np.isfinite(top * P) and base * exp_grid[0] > 0.0 and 1.0 + top * P > 0.0 and 1.0 + base * exp_grid[0] * P > 0.0
+            if fast:
+                m = 0.5 * h2 * (top / (1.0 + top * P))
+                total = 0.0
+                for k in range(nodes):
+                    variance = base * exp_grid[k]
+                    one_plus = 1.0 + variance * P
+                    total += weights[step, k] * np.exp(0.5 * h2 * (variance / one_plus) - m) / np.sqrt(one_plus)
+                if total >= lost_below and np.isfinite(total):
+                    out[row, step] = np.log(total) + m + density_peak[step]
+                    continue
+            value, improper = _moving_exact(log_density, step, eta, grid, P, h2, terms)
+            out[row, step] = value
+            if improper:
+                bad[row] = True
     improper = False
     for row in range(rows):
         if bad[row]:
@@ -2675,44 +2808,96 @@ def _moving_line_sum(
             continue
         out = np.empty((stop - start, count))
         if _moving_line_rows(np.ascontiguousarray(class_density), log_scale_rows[start:stop], slopes[start:stop], steps, grid, precision[start:stop],
-                             shift[start:stop], out):
+                             shift[start:stop], _LOST_BELOW, out):
             raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
         total += out.sum(axis=0)
     return total
 
 
+# A kernel product below tiny / eps is where its subnormal terms could matter at double precision (``_lines``).
+_LOST_BELOW = float(np.finfo(np.float64).tiny) / _EPSILON
+# The running products of ``_column_log_sums`` stay within the square root of the normal range, and so does every
+# factor they take: a product of two is then normal, never rounded to a subnormal or an overflow.
+_RUNNING_LOWER = float(np.sqrt(np.finfo(np.float64).tiny))
+_RUNNING_UPPER = float(np.sqrt(np.finfo(np.float64).max))
+
+
+@numba.njit(cache=True, error_model="numpy")
+def _column_log_sums(products, lost_below, out):
+    """out[s] += sum_j log products[j, s], by one running product per column that is logged and restarted where it
+    leaves [sqrt(tiny), sqrt(max)] (a factor below sqrt(tiny) is logged alone): a log per flush in place of a log per
+    term, each product of normal factors exact to one rounding per factor, as each log was to one. Returns whether
+    some term is below ``lost_below``, where the caller takes the terms exactly instead."""
+    rows, steps = products.shape
+    running = np.ones(steps)
+    lost = False
+    for row in range(rows):
+        for step in range(steps):
+            value = products[row, step]
+            if value < lost_below:
+                lost = True
+            if value < _RUNNING_LOWER:
+                out[step] += np.log(value)
+                continue
+            product = running[step] * value
+            if product < _RUNNING_LOWER or product > _RUNNING_UPPER:
+                out[step] += np.log(product)
+                product = 1.0
+            running[step] = product
+    for step in range(steps):
+        out[step] += np.log(running[step])
+    return lost
+
+
 def _line(
     prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int,
-    shared: dict | None = None,
 ) -> Callable[[F64Array], F64Array]:
-    """The penalized objective F(x + t b) - P(x + t b) as a function of the steps t, each call one pass over the
-    variants for all its steps.
+    """``_lines`` for one direction: the penalized objective F(x + t b) - P(x + t b) as a function of the steps t."""
+    evaluate = _lines(prior, log_smoothing, origin, direction[:, None], cavity, working_bytes)
+    return lambda steps: evaluate({0: np.asarray(steps, dtype=np.float64)})[0]
+
+
+def _lines(
+    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, directions: F64Array, cavity: Cavity, working_bytes: int,
+) -> Callable[[dict[int, F64Array]], dict[int, F64Array]]:
+    """The penalized objective F(x + t b) - P(x + t b) along each direction b (a column), as a function of each one's
+    steps t: every call one pass over the variants for all the directions' steps it is given.
 
     z = M x is affine in t, so every step's class log densities and log scales follow from those of x and b, and P
     is exactly quadratic in t. A variant whose log scale does not move along b keeps its kernel row L_jk, so its
     log Z_j(t) = LSE_k(L_jk + log pi_ck(t)) is one product of exp(L - max) with exp(log pi(t) - max) over the nodes
     for all its steps (a GEMM of positive terms: exact to K eps in relative terms), with the rows whose product
-    falls to where subnormal terms could matter taken exactly. The other variants' kernels are evaluated per step, in
-    one fused pass over (variant, step, node) (``_moving_line_sum``): with an annotation scale design every variant
-    moves, and forming their rows x steps x K terms was 0.5 s a point on ENSG00000105612.9 [real, 29,742 variants],
-    a correction 340-750 s."""
+    falls to where subnormal terms could matter taken exactly. Those rows' kernels depend on the origin, not the
+    direction: the directions with one set of such rows share them and one GEMM over all their steps (per direction
+    it was a GEMM of 30 columns and a log per variant and step through three temporaries: 60 ms of a 70 ms pass
+    [real, ENSG00000204859.13, 36,672 variants]). The other variants' kernels are evaluated per step, in one fused
+    pass over (variant, step, node) (``_moving_line_sum``): with an annotation scale design every variant moves, and
+    forming their rows x steps x K terms was 0.5 s a point on ENSG00000105612.9 [real, 29,742 variants], a
+    correction 340-750 s."""
+    count = directions.shape[1]
     density, _scale = _density_and_scale(prior, origin)
-    density_step, scale_step = _density_and_scale(prior, direction)
     scales = log_scale(prior, origin)
-    scale_slope = prior.scale_design @ scale_step
     penalty, penalty_gradient = _penalty_value(prior, log_smoothing, origin)
-    penalty_slope = float(penalty_gradient @ direction)
-    penalty_curvature = float(direction @ _penalty_matrix(prior, log_smoothing) @ direction)
+    penalty_matrix = _penalty_matrix(prior, log_smoothing)
     if prior.anchor is not None:
         # The local model's C term is quadratic in t too (``_Anchor``).
         anchor_value, anchor_gradient = _anchor_value(prior, origin)
         penalty += anchor_value
-        penalty_slope += float(anchor_gradient @ direction)
-        penalty_curvature += float(direction @ prior.anchor.matrix @ direction)
-    fixed_rows, moving_rows = [], []
-    for class_position, class_rows in enumerate(prior.class_rows):
-        fixed_rows.append(class_rows[scale_slope[class_rows] == 0.0])
-        moving_rows.append(class_rows[scale_slope[class_rows] != 0.0])
+        penalty_gradient = penalty_gradient + anchor_gradient
+        penalty_matrix = penalty_matrix + prior.anchor.matrix
+    density_steps, scale_slopes, penalty_slopes, penalty_curvatures = [], [], [], []
+    for column in range(count):
+        direction = directions[:, column]
+        density_step, scale_step = _density_and_scale(prior, direction)
+        density_steps.append(density_step)
+        scale_slopes.append(prior.scale_design @ scale_step)
+        penalty_slopes.append(float(penalty_gradient @ direction))
+        penalty_curvatures.append(float(direction @ penalty_matrix @ direction))
+    # Directions grouped by the rows whose log scale stays fixed along them (every direction of a prior without a
+    # scale design has every row fixed): one group's rows share their kernels and their GEMM.
+    groups: dict[bytes, list[int]] = {}
+    for column in range(count):
+        groups.setdefault(np.packbits(scale_slopes[column] == 0.0).tobytes(), []).append(column)
     budget = _device_budget(working_bytes)
     xp = _DEVICE.get()
 
@@ -2725,52 +2910,77 @@ def _line(
         peak = np.max(row_kernel, axis=1)
         return rows, peak, np.exp(row_kernel - peak[:, None]), row_kernel
 
-    # The fixed rows' kernels depend on the origin, not the direction: formed once for every direction of one origin
-    # (``shared``, the line integrals' own), and held only where two row sets (the held one and a pass's own) fit the
-    # device's budget; otherwise each pass forms them chunk by chunk.
-    held_bytes = 2 * prior.grid_size * np.dtype(np.float64).itemsize * sum(int(rows.shape[0]) for rows in fixed_rows)
-    key = ("fixed kernels", _digest(scales, cavity.precision, cavity.shift, scale_slope == 0.0))
-    kernels = None if shared is None else shared.get(key)
-    if kernels is None and 2 * held_bytes <= budget:
-        kernels = [[form(rows) for rows in _row_chunks(still, prior.grid_size, budget)] for still in fixed_rows]
-        if shared is not None:
-            shared[key] = kernels
+    held: dict[bytes, list] = {}
 
-    def fixed_chunks(class_position: int):
-        if kernels is not None:
-            yield from kernels[class_position]
+    def fixed_chunks(key: bytes, fixed: list[I64Array], class_position: int):
+        # Held where two row sets (the held one and a pass's own) fit the device's budget; otherwise each pass forms
+        # them chunk by chunk.
+        if key not in held:
+            held_bytes = 2 * prior.grid_size * np.dtype(np.float64).itemsize * sum(int(rows.shape[0]) for rows in fixed)
+            held[key] = [[form(rows) for rows in _row_chunks(still, prior.grid_size, budget)] for still in fixed] if 2 * held_bytes <= budget else None
+        if held[key] is not None:
+            yield from held[key][class_position]
             return
-        for rows in _row_chunks(fixed_rows[class_position], prior.grid_size, _device_budget(working_bytes)):
+        for rows in _row_chunks(fixed[class_position], prior.grid_size, budget):
             yield form(rows)
 
-    def values(steps: F64Array) -> F64Array:
-        count = steps.shape[0]
-        log_weights = density[None] + steps[:, None, None] * density_step[None]
-        log_density = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
-        total = -(penalty + steps * penalty_slope + 0.5 * np.square(steps) * penalty_curvature)
+    def values(requests: dict[int, F64Array]) -> dict[int, F64Array]:
+        steps_of = {column: np.asarray(steps, dtype=np.float64) for column, steps in requests.items()}
+        log_density_of = {}
+        totals = {}
+        for column, steps in steps_of.items():
+            log_weights = density[None] + steps[:, None, None] * density_steps[column][None]
+            log_density_of[column] = log_weights - _log_sum_exp(log_weights, axis=2, keepdims=True)
+            totals[column] = -(penalty + steps * penalty_slopes[column] + 0.5 * np.square(steps) * penalty_curvatures[column])
         xp = _DEVICE.get()
-        for class_position in range(prior.class_count):
-            class_density = log_density[:, class_position]
-            density_peak = np.max(class_density, axis=1)
-            scaled = xp.asarray(np.exp(class_density - density_peak[:, None]).T)
-            device_density = xp.asarray(class_density)
-            for rows, peak, exponentials, row_kernel in fixed_chunks(class_position):
-                products = exponentials @ scaled
-                # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
-                lost = products < np.finfo(np.float64).tiny / _EPSILON
-                with np.errstate(divide="ignore"):
-                    normalizers = np.log(products) + peak[:, None] + xp.asarray(density_peak)[None, :]
-                if np.any(lost):
-                    row_index, step_index = np.nonzero(lost)
-                    normalizers[row_index, step_index] = _log_sum_exp(row_kernel[row_index] + device_density[step_index], axis=1)
-                total += _host(normalizers.sum(axis=0))
-            moving = moving_rows[class_position]
-            if moving.shape[0]:
-                total += _moving_line_sum(
-                    class_density, scales[moving], scale_slope[moving], np.asarray(steps, dtype=np.float64), prior.log_variance_grid,
-                    cavity.precision[moving], cavity.shift[moving], working_bytes,
-                )
-        return total
+        for key, members in groups.items():
+            columns = [column for column in members if column in steps_of]
+            if not columns:
+                continue
+            still = scale_slopes[columns[0]] == 0.0
+            fixed = [class_rows[still[class_rows]] for class_rows in prior.class_rows]
+            bounds = np.cumsum([0] + [steps_of[column].shape[0] for column in columns])
+            for class_position in range(prior.class_count):
+                class_density = np.concatenate([log_density_of[column][:, class_position] for column in columns])
+                density_peak = np.max(class_density, axis=1)
+                scaled = xp.asarray(np.exp(class_density - density_peak[:, None]).T)
+                device_density = xp.asarray(class_density)
+                summed = np.zeros(class_density.shape[0])
+                for rows, peak, exponentials, row_kernel in fixed_chunks(key, fixed, class_position):
+                    # The rows x steps products and their logs, in pieces of rows that fit the budget.
+                    piece = max(1, budget // (3 * np.dtype(np.float64).itemsize * max(class_density.shape[0], 1)))
+                    for start in range(0, rows.shape[0], piece):
+                        stop = min(start + piece, rows.shape[0])
+                        products = exponentials[start:stop] @ scaled
+                        summed += float(_host(peak[start:stop].sum()))
+                        if xp is np:
+                            # One log per running product, not per variant and step: the logs were 55% of a pass, 22
+                            # ns each on the host [real, ENSG00000204859.13 on an EPYC 7702].
+                            logs = np.zeros(products.shape[1])
+                            if not _column_log_sums(products, _LOST_BELOW, logs):
+                                summed += logs
+                                continue
+                        # Past tiny / eps a product's subnormal terms could matter at double precision: taken exactly there.
+                        lost = products < _LOST_BELOW
+                        with np.errstate(divide="ignore"):
+                            logs = np.log(products)
+                        if np.any(lost):
+                            row_index, step_index = np.nonzero(lost)
+                            logs[row_index, step_index] = (
+                                _log_sum_exp(row_kernel[start + row_index] + device_density[step_index], axis=1)
+                                - peak[start + row_index] - xp.asarray(density_peak)[step_index]
+                            )
+                        summed += _host(logs.sum(axis=0))
+                    summed += rows.shape[0] * density_peak
+                for position, column in enumerate(columns):
+                    totals[column] += summed[bounds[position] : bounds[position + 1]]
+                    moving = prior.class_rows[class_position][~still[prior.class_rows[class_position]]]
+                    if moving.shape[0]:
+                        totals[column] += _moving_line_sum(
+                            log_density_of[column][:, class_position], scales[moving], scale_slopes[column][moving], steps_of[column],
+                            prior.log_variance_grid, cavity.precision[moving], cavity.shift[moving], working_bytes,
+                        )
+        return totals
 
     return values
 
@@ -2781,44 +2991,60 @@ def _line_log_integrals(
     """For each standardized direction b (a column, unit curvature at the maximum x): the log of the line integral
     of exp(F - P - value) over its Laplace term sqrt(2 pi), each to ``share`` in its log.
 
-    QUADPACK's rule for an infinite range, vectorized: QAGI folds both half-lines onto u in (0, 1] by
-    t = (1 - u) / u, and each interval takes QK15I's 15-point Kronrod rule with its embedded 7-point Gauss rule and
-    QUADPACK's own error estimate (Piessens et al. 1983). Every round evaluates the nodes of every open interval of
-    every direction in one pass over the variants per direction (``_line``), bisects the intervals whose error is
-    over their share of the target by width, and stops a direction once its errors sum to ``share`` of its integral
-    (or to half of double precision when rounding is what stops it). It raises when an interval can no longer be
-    halved, as QUADPACK reports a failure. (QUADPACK's epsilon extrapolation is not used: the integrands are
-    analytic, and bisection alone meets the tolerance.)
+    QUADPACK's rule for a half-infinite range on each half-line, vectorized: QAGI maps t in [0, inf) onto u in (0, 1]
+    by t = (1 - u) / u (and t in (-inf, 0] by its mirror), and each interval takes QK15I's 15-point Kronrod rule with
+    its embedded 7-point Gauss rule and QUADPACK's own error estimate (Piessens et al. 1983). Every round evaluates the
+    nodes of every open interval of every direction in one pass over the variants (``_lines``), subdivides the
+    intervals whose error is over their share of the target by width, and stops a direction once its errors sum to
+    ``share`` of its integral (or to half of double precision when rounding is what stops it). It raises when an
+    interval can no longer be halved, as QUADPACK reports a failure. (QUADPACK's epsilon extrapolation is not used:
+    the integrands are analytic, and subdivision alone meets the tolerance.)
+
+    Along the replaced directions the integrand falls off a cliff: the class density's mass switches between nodes
+    within a small step, and V drops by up to 4.5e5 nats past it on one side [real, ENSG00000204859.13]. Inside an
+    interval holding the cliff the rule cannot resolve it: QUADPACK's estimate saturates at the interval's absolute
+    deviation, which only halves with the interval, so bisection zoomed in over 8-12 rounds per cliff while the
+    integral was already within 1e-5 shares of its value. So an unsettled interval is cut at its midpoint and, where
+    its estimate is saturated, also at the two adjacent nodes between which the integrand changes most (the rule's
+    own bracket of the cliff, a fifteenth of the interval or less): every piece is at most half the interval, as in
+    bisection, and the cliff's bracket shrinks by the node spacing per round. The half-lines are integrated apart
+    (each QAGI's inf = 1 case), so zooming in on one side's cliff does not evaluate the other side's nodes.
 
     Gauss-Hermite rules were tried first and refused: along the replaced directions the integrand falls off a cliff
     on one side, and consecutive rules agreed to the share at values up to 560 shares from the integral in over a
     tenth of the cases [sim-only, e2e fastline diagnostic], so no agreement of fixed rules certifies it here.
     """
     count = directions.shape[1]
-    shared: dict = {}
-    lines = [_line(prior, log_smoothing, origin, directions[:, column], cavity, working_bytes, shared) for column in range(count)]
+    lines = _lines(prior, log_smoothing, origin, directions, cavity, working_bytes)
     tolerance = max(share, _HALF_PRECISION)
     nodes = np.concatenate([-_KRONROD_NODES[:-1], _KRONROD_NODES[::-1]])
     kronrod = np.concatenate([_KRONROD_WEIGHTS[:-1], _KRONROD_WEIGHTS[::-1]])
     gauss = np.concatenate([_GAUSS_WEIGHTS[:-1], _GAUSS_WEIGHTS[::-1]])
-    intervals = [(np.array([0.0]), np.array([1.0])) for _column in range(count)]
+    # Per direction: the open intervals' ends in u and the half-line each is on (+1: t >= 0, -1: t <= 0). The two
+    # half-lines' u ranges have total width 2, which an interval's share of the target is taken of.
+    intervals = [(np.zeros(2), np.ones(2), np.array([1.0, -1.0])) for _column in range(count)]
     done_value, done_error = np.zeros(count), np.zeros(count)
     logs = np.full(count, np.nan)
     open_ = list(range(count))
     while open_:
+        points_of, steps_of = {}, {}
+        for column in open_:
+            lows, highs, signs = intervals[column]
+            centres, halves = 0.5 * (lows + highs), 0.5 * (highs - lows)
+            points_of[column] = centres[:, None] + halves[:, None] * nodes[None, :]
+            steps_of[column] = (signs[:, None] * (1.0 - points_of[column]) / points_of[column]).ravel()
+        evaluated = lines({column: steps_of[column] for column in open_})
         still_open = []
         for column in open_:
-            lows, highs = intervals[column]
-            centres, halves = 0.5 * (lows + highs), 0.5 * (highs - lows)
-            points = centres[:, None] + halves[:, None] * nodes[None, :]
-            steps = (1.0 - points) / points
-            both = lines[column](np.concatenate([steps.ravel(), -steps.ravel()])) - value
+            lows, highs, signs = intervals[column]
+            halves = 0.5 * (highs - lows)
+            points = points_of[column]
             with np.errstate(over="ignore", invalid="ignore"):
-                folded = (np.exp(both[: steps.size]) + np.exp(both[steps.size :])).reshape(steps.shape) / np.square(points)
+                folded = np.exp(evaluated[column] - value).reshape(points.shape) / np.square(points)
             if not np.all(np.isfinite(folded)):
                 # The objective along this line rises past the maximum's value by more than double precision holds:
                 # x is not its maximum along it (an anchored model's indefinite C at a freed weight), and every error
-                # estimate below would be nan, which bisection would take for "unsettled" without end.
+                # estimate below would be nan, which subdivision would take for "unsettled" without end.
                 raise FloatingPointError("the exact integral along a direction is not finite: the objective rises past its value at x")
             kronrod_value = folded @ kronrod
             gauss_value = folded @ gauss
@@ -2828,6 +3054,7 @@ def _line_log_integrals(
             scale = deviation * halves
             with np.errstate(divide="ignore", invalid="ignore"):
                 ratio = np.where(scale > 0.0, np.minimum(1.0, (_QUADPACK_ERROR_SCALE * error / np.where(scale > 0.0, scale, 1.0)) ** _QUADPACK_ERROR_POWER), 1.0)
+            saturated = (scale > 0.0) & (ratio >= 1.0)
             error = np.where((scale > 0.0) & (error > 0.0), scale * ratio, error)
             error = np.maximum(error, _QUADPACK_RELATIVE_FLOOR * np.abs(folded) @ kronrod * halves)
             estimates = kronrod_value * halves
@@ -2836,18 +3063,26 @@ def _line_log_integrals(
             if done_error[column] + float(np.sum(error)) <= target:
                 logs[column] = float(np.log(total) - 0.5 * np.log(2.0 * np.pi))
                 continue
-            settled = error <= target * (highs - lows)
+            settled = error <= 0.5 * target * (highs - lows)
             done_value[column] += float(np.sum(estimates[settled]))
             done_error[column] += float(np.sum(error[settled]))
-            lows, highs = lows[~settled], highs[~settled]
-            if np.any((highs - lows) <= _EPSILON * np.maximum(highs, _EPSILON)):
+            if np.any((highs[~settled] - lows[~settled]) <= _EPSILON * np.maximum(highs[~settled], _EPSILON)):
                 raise FloatingPointError("the exact integral along a direction did not converge: an interval cannot be halved further")
-            middles = 0.5 * (lows + highs)
-            intervals[column] = (np.concatenate([lows, middles]), np.concatenate([middles, highs]))
-            if 2 * 2 * lows.shape[0] * nodes.shape[0] * prior.variant_count * np.dtype(np.float64).itemsize > working_bytes:
-                # The next round's pass (its normalizers, one per variant and step, for both half-lines) would not
-                # fit the working budget: the integrand is not resolved to the share within what the budget can
-                # evaluate, and bisection alone would grow the open intervals without end.
+            pieces_low, pieces_high, pieces_sign = [], [], []
+            for index in np.flatnonzero(~settled):
+                cuts = [lows[index], 0.5 * (lows[index] + highs[index]), highs[index]]
+                if saturated[index]:
+                    jump = int(np.argmax(np.abs(np.diff(folded[index]))))
+                    cuts += [points[index, jump], points[index, jump + 1]]
+                cuts = np.unique(np.asarray(cuts))
+                pieces_low.append(cuts[:-1])
+                pieces_high.append(cuts[1:])
+                pieces_sign.append(np.full(cuts.shape[0] - 1, signs[index]))
+            intervals[column] = (np.concatenate(pieces_low), np.concatenate(pieces_high), np.concatenate(pieces_sign))
+            if 2 * intervals[column][0].shape[0] * nodes.shape[0] * prior.variant_count * np.dtype(np.float64).itemsize > working_bytes:
+                # The next round's pass (its normalizers, one per variant and step) would not fit the working budget:
+                # the integrand is not resolved to the share within what the budget can evaluate, and subdivision
+                # alone would grow the open intervals without end.
                 raise FloatingPointError("the exact integral along a direction did not converge within the working budget")
             still_open.append(column)
         open_ = still_open

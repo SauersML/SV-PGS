@@ -39,6 +39,10 @@ from sv_pgs.scale_mixture_ep import (
     _laplace_corrections,
     _line_log_integral,
     _line,
+    _lines,
+    _column_log_sums,
+    _kernel_terms,
+    _moving_line_rows,
     _log_normal_start,
     _maximize_coefficients,
     _penalized,
@@ -1540,3 +1544,96 @@ def test_the_trust_radius_follows_the_models_measured_agreement():
     assert _next_radius(newton, proposal, 1.0, 1.0, predicted, 0.03) == pytest.approx(1.0 / (2.0 * 0.03 / predicted))
     assert _next_radius(newton, proposal, 4.0, 1.0, predicted, 1e-6) == 4.0
     assert _next_radius(newton, proposal, 1.0, 1.0, np.nan, np.nan) == 2.0
+
+
+def test_the_moving_rows_kernel_is_the_log_sum_exp_of_the_kernel_terms():
+    # The linear-term sum (one exponential and one square root a node) against the log-sum-exp of _kernel_terms, at
+    # ordinary rows and at the edges it hands to the exact form: overflowing and underflowing scales, a near-improper
+    # negative precision, a shift whose h^2 c / 2 dwarfs everything, and a density with -inf nodes.
+    generator = np.random.default_rng(71)
+    grid = np.linspace(-9.0, 4.0, 23)
+    steps = np.array([-40.0, -2.0, -0.3, 0.0, 0.7, 3.0, 40.0])
+    log_density = generator.normal(size=(steps.shape[0], grid.shape[0]))
+    log_density[:, :3] = -np.inf
+    log_density -= engine._log_sum_exp(log_density, axis=1, keepdims=True)
+    rows = 40
+    log_scales = generator.normal(scale=2.0, size=rows)
+    slopes = generator.normal(scale=3.0, size=rows)
+    precision = np.exp(generator.normal(scale=2.0, size=rows))
+    shift = generator.normal(scale=3.0, size=rows) * np.sqrt(precision)
+    log_scales[:3] = [700.0, -760.0, 40.0]
+    slopes[:3] = [0.0, 0.0, 30.0]
+    precision[3], log_scales[3], slopes[3] = -0.9 * np.exp(-grid[-1]), 0.0, 0.0
+    shift[4] = 1e4
+    out = np.empty((rows, steps.shape[0]))
+    assert not _moving_line_rows(log_density, log_scales, slopes, steps, grid, precision, shift, engine._LOST_BELOW, out)
+    for row in range(rows):
+        scales_at = log_scales[row] + slopes[row] * steps
+        for position, scale in enumerate(scales_at):
+            terms = _kernel_terms(log_density[position], np.array([scale]), grid, precision[row : row + 1], shift[row : row + 1])[3]
+            expected = float(engine._log_sum_exp(terms, axis=1)[0])
+            assert abs(out[row, position] - expected) <= 1e-13 * max(1.0, abs(expected)), (row, position, out[row, position], expected)
+    improper = precision.copy()
+    improper[5] = -2.0 * np.exp(-(log_scales[5] + grid[0]))
+    assert _moving_line_rows(log_density, log_scales, np.zeros(rows), steps, grid, improper, shift, engine._LOST_BELOW, out)
+
+
+def test_the_column_log_sums_are_the_sums_of_the_logs():
+    # Running products flushed at the square root of the normal range: the sums of the logs to rounding, with factors
+    # small enough to be logged alone, and the lost flag where a term is below the threshold.
+    generator = np.random.default_rng(72)
+    products = np.exp(generator.uniform(-20.0, 4.6, size=(5000, 17)))
+    products[7, 3] = 1e-200
+    products[8:40, 5] = 1e-150
+    out = np.zeros(products.shape[1])
+    assert not _column_log_sums(products, engine._LOST_BELOW, out)
+    expected = np.log(products).sum(axis=0)
+    np.testing.assert_allclose(out, expected, rtol=0.0, atol=64 * np.finfo(np.float64).eps * np.abs(np.log(products)).sum(axis=0).max())
+    products[9, 2] = 1e-300
+    assert _column_log_sums(products, engine._LOST_BELOW, np.zeros(products.shape[1]))
+
+
+def test_the_batched_lines_are_each_lines_own_values():
+    # Directions that share their fixed rows share one GEMM over all their steps; each direction's values are its own
+    # pass's, with a scale design (moving rows) and without, and in pieces of a small budget.
+    prior, cavity = _problem(variant_count=60, seed=51, node_count=12)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    generator = np.random.default_rng(73)
+    directions = 0.3 * generator.standard_normal((prior.coefficient_size, 4))
+    directions[prior.coefficient_size - prior.scale_size :, :2] = 0.0
+    requests = {column: generator.normal(scale=2.0, size=3 + column) for column in range(4)}
+    for working_bytes in (_WORKING_BYTES, 1 << 12):
+        batched = _lines(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, directions, cavity, working_bytes)(requests)
+        for column, steps in requests.items():
+            alone = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, directions[:, column], cavity, working_bytes)(steps)
+            np.testing.assert_allclose(batched[column], alone, rtol=1e-13, atol=1e-13 * float(np.max(np.abs(alone))))
+
+
+def test_the_objective_rows_linear_sum_is_the_log_form():
+    # Every output of the host objective kernel's linear-term rows against the device's log-form row, at ordinary rows
+    # and at the edges handed to the log form: overflowing and underflowing scales, a v P of 1e142, a
+    # near-improper negative precision, a shift whose h^2 c / 2 dwarfs everything and -inf density nodes.
+    from sv_pgs.scale_mixture_ep import _objective_row_exact, _objective_rows
+
+    generator = np.random.default_rng(74)
+    grid = np.linspace(-9.0, 4.0, 23)
+    log_density = generator.normal(size=grid.shape[0])
+    log_density[:3] = -np.inf
+    log_density -= float(engine._log_sum_exp(log_density, axis=0))
+    density = np.exp(log_density)
+    rows = 40
+    log_scales = generator.normal(scale=2.0, size=rows)
+    precision = np.exp(generator.normal(scale=2.0, size=rows))
+    shift = generator.normal(scale=3.0, size=rows) * np.sqrt(precision)
+    log_scales[:3] = [700.0, -760.0, 300.0]
+    precision[2] = 1e10
+    precision[3], log_scales[3] = -0.9 * np.exp(-grid[-1]), 0.0
+    shift[4] = 1e4
+    outputs = [np.empty((rows, grid.shape[0] + 1)), np.empty((rows, grid.shape[0] + 1)), np.empty(rows), np.empty(rows)]
+    expected = [np.empty_like(output) for output in outputs]
+    assert not _objective_rows(log_density, density, grid, log_scales, precision, shift, *outputs)
+    tiny = np.finfo(np.float64).tiny
+    for row in range(rows):
+        assert not _objective_row_exact(row, log_density, density, grid, log_scales[row], precision[row], shift[row] ** 2, tiny, *expected)
+    for got, want in zip(outputs, expected):
+        np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(want))))
