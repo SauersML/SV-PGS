@@ -64,6 +64,7 @@ from sv_pgs.dosage_store import (
 )
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel, ScoringPlan, score_genetic
 from sv_pgs.small_n import fit_small_n
+from sv_pgs.store_converter import overlap_group_first
 from sv_pgs.variant_typing import normalize_variant_token, structural_variant_class_from_token
 
 _CLASS_CODES = {variant_class: index for index, variant_class in enumerate(VariantClass)}
@@ -76,13 +77,6 @@ def _length_class(reference_length: np.ndarray, alternate_length: np.ndarray) ->
     classes[reference_length < alternate_length] = _CLASS_CODES[VariantClass.INSERTION]
     classes[(reference_length == 1) & (alternate_length == 1)] = _CLASS_CODES[VariantClass.SNV]
     return classes
-
-
-def _same_position_groups(position: np.ndarray) -> np.ndarray:
-    """Each row's first row with the same position: same-POS records form one unbreakable group."""
-    rows = np.arange(position.shape[0], dtype=np.int64)
-    starts = np.concatenate([[True], position[1:] != position[:-1]])
-    return np.maximum.accumulate(np.where(starts, rows, 0))
 
 
 def _informative_annotations(annotations: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
@@ -134,7 +128,9 @@ def write_store(
         ref_length=np.asarray(reference_length, dtype=np.int32),
         alt_length=np.asarray(alternate_length, dtype=np.int32),
         variant_class=np.asarray(variant_class, dtype=np.uint8),
-        group_first=_same_position_groups(np.asarray(position)),
+        # Records whose reference spans overlap, a same-POS set among them, are one unbreakable group: the site key
+        # (``store_converter.overlap_group_first``).
+        group_first=overlap_group_first(np.asarray(position), np.asarray(position) + np.asarray(reference_length)),
         sum_code=sums,
         sum_code2=squares,
         annotations=dict(annotations),

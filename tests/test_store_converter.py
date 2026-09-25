@@ -32,6 +32,7 @@ from sv_pgs.store_converter import (
     gene_overlap,
     linear_recalibration,
     no_call_fill,
+    overlap_group_first,
     refalt_digest,
     sv_kernel_features,
     tr_loci,
@@ -237,6 +238,18 @@ def test_linear_recalibration_clips_and_counts_and_needs_every_kappa() -> None:
     assert recalibrated.clipped.tolist() == [4]
     with pytest.raises(ValueError, match="positive finite kappa"):
         linear_recalibration(dosage_milli, np.zeros(4, dtype=np.int64), np.array([[np.nan]]))
+
+
+def test_overlap_group_first_joins_overlapping_spans_and_extra_groups() -> None:
+    # Spans [start, end): rows 0-1 overlap, row 2 shares row 1's start, row 3 stands alone, rows 4 and 6 share a locus
+    # (so row 5 between them joins it), row 7 stands alone; an empty span counts as one base.
+    starts = np.array([10, 12, 12, 30, 40, 45, 50, 60])
+    ends = np.array([15, 13, 12, 31, 41, 46, 51, 61])
+    locus = np.array([-1, -1, -1, -1, 7, -1, 7, -1])
+    assert overlap_group_first(starts, ends).tolist() == [0, 0, 0, 3, 4, 5, 6, 7]
+    assert overlap_group_first(starts, ends, locus).tolist() == [0, 0, 0, 3, 4, 4, 4, 7]
+    with pytest.raises(ValueError, match="position order"):
+        overlap_group_first(starts[::-1], ends[::-1])
 
 
 def test_unbreakable_group_first_merges_overlapping_group_spans() -> None:

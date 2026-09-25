@@ -33,11 +33,14 @@ from sv_pgs.fit_model import DRAW_COUNT
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import device_scope
 from sv_pgs.stage2_wiring import fit_models
+from sv_pgs.store_converter import overlap_group_first
 
 BLOCK_ROWS = 4096
 """Rows per read of the harness's observed codes: 4096 x 40,000 training samples is a 164 MB block."""
 CHROMOSOME = 22
 """bench-sim v1 is chr22 only (SUBMIT.md)."""
+TR_CLASS = 2
+"""bench-sim's TR class (``cls``): an indel in a repeat."""
 
 
 def variant_classes(cls: np.ndarray, len_change: np.ndarray) -> np.ndarray:
@@ -78,6 +81,18 @@ def store_annotations(variants) -> dict[str, np.ndarray]:
     return columns
 
 
+def site_group_first(position: np.ndarray, reference_length: np.ndarray, cls: np.ndarray, repeat_locus: np.ndarray) -> np.ndarray:
+    """Each store row's ``group_first`` (rows in position order): the records whose reference spans overlap, a
+    same-POS set among them, and each public repeat_locus's TR-class records (class 2, bench-sim's indels in a
+    repeat, the records its TR truths are drawn from) are one unbreakable group (``store_converter.overlap_group_first``),
+    the store's site key as a converted store's bubble, same-POS set and TR locus are. A locus's other records join
+    only by overlap: with them, records spanning several loci chained chr22 into groups of up to 18,610 records
+    (937 kb), past any LD block cap; the TR records alone give at most 1,305 (55 kb)."""
+    position = np.asarray(position, dtype=np.int64)
+    tr_locus = np.where(np.asarray(cls) == TR_CLASS, np.asarray(repeat_locus, dtype=np.int64), -1)
+    return overlap_group_first(position, position + np.asarray(reference_length, dtype=np.int64), tr_locus)
+
+
 def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
     """Write the training samples' codes as a one-half store in position order; returns (path, order) with
     order[store row] the harness row."""
@@ -108,7 +123,7 @@ def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
         variant_class=variant_classes(np.asarray(variants["cls"]), np.asarray(variants["len_change"]))[order],
         codes_per_unit=np.full(n_var, CODES_PER_DOSAGE, dtype=np.uint8),
         value_origin=np.zeros(n_var, dtype=np.int64),
-        group_first=np.arange(n_var, dtype=np.int64),
+        group_first=site_group_first(*(np.asarray(variants[name])[order] for name in ("pos", "ref_len", "cls", "repeat_locus"))),
         sum_code=sums,
         sum_code2=squares,
         annotations={name: values[order] for name, values in store_annotations(variants).items()},
@@ -136,7 +151,7 @@ def _store_key(train) -> str:
     variants = train.variants
     digest = hashlib.sha256()
     digest.update(np.int64(train.n_samples).tobytes())
-    for name in ("pos", "cls", "len_change", "imputation_info"):
+    for name in ("pos", "cls", "len_change", "imputation_info", "ref_len", "repeat_locus"):
         digest.update(np.ascontiguousarray(np.asarray(variants[name])).tobytes())
     probe = np.unique(np.concatenate([np.arange(0, train.n_variants, BLOCK_ROWS), [train.n_variants // 2, train.n_variants - 1]]))
     digest.update(np.ascontiguousarray(train.codes(probe)).tobytes())

@@ -110,6 +110,7 @@ def build_store(train, work: Path, derived: Derived) -> tuple[Path, np.ndarray, 
     record_classes = full.variant_classes(np.asarray(variants["cls"]), np.asarray(variants["len_change"]))
     classes = np.where(kind == 0, record_classes[np.where(kind == 0, index, 0)], np.array([VARIANT_CLASSES.index(name) for name in derived.variant_class])[np.where(kind == 1, index, 0)]).astype(np.uint8)
     count = kind.shape[0]
+    own_rows = np.where(kind == 0, index, 0)
 
     def blocks():
         for first in range(0, count, full.BLOCK_ROWS):
@@ -139,7 +140,10 @@ def build_store(train, work: Path, derived: Derived) -> tuple[Path, np.ndarray, 
         variant_class=classes,
         codes_per_unit=np.full(count, CODES_PER_DOSAGE, dtype=np.uint8),
         value_origin=np.zeros(count, dtype=np.int64),
-        group_first=np.arange(count, dtype=np.int64),
+        group_first=full.site_group_first(
+            rows["pos"], rows["ref_len"], np.where(kind == 0, np.asarray(variants["cls"])[own_rows], -1),
+            np.where(kind == 0, np.asarray(variants["repeat_locus"])[own_rows], -1),
+        ),
         sum_code=sums,
         sum_code2=squares,
         annotations=annotations,

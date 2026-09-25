@@ -111,7 +111,12 @@ def test_the_bench_sim_store_holds_the_training_codes_and_the_public_table(drive
     assert [_CLASSES[code] for code in table.variant_class] == [
         _expected_class(*row) for row in zip(variants["cls"][kept], variants["ref_len"][kept], variants["alt_len"][kept])
     ]
-    firsts = np.array([np.flatnonzero(table.position == position)[0] for position in table.position])
+    # Records whose reference spans [pos, pos + ref_len) overlap, a same-POS set among them, are one group.
+    firsts, first, reach = [], 0, -1
+    for row, (position, length) in enumerate(zip(table.position.tolist(), table.ref_length.tolist())):
+        first = first if position < reach else row
+        reach = max(reach, position + max(length, 1)) if position < reach else position + max(length, 1)
+        firsts.append(first)
     np.testing.assert_array_equal(table.group_first, firsts)
     assert sorted(table.annotations) == ["in_gene", "in_repeat", "len_change", "log_sv_length", "log_tss_distance", "quality"]
     np.testing.assert_array_equal(table.annotations["quality"], variants["imputation_info"][kept])

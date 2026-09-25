@@ -26,6 +26,7 @@ def _cohort(rng: np.random.Generator, n_var: int, n_samples: int):
         "in_gene": (rng.random(n_var) < 0.3).astype(np.float64),
         "in_exon": (rng.random(n_var) < 0.1).astype(np.float64),
         "in_repeat": (rng.random(n_var) < 0.2).astype(np.float64),
+        "repeat_locus": np.where(cls == 2, np.arange(n_var) // 8, -1),
         "log_tss_distance": rng.normal(9.0, 2.0, n_var),
         "log_sv_length": np.where(cls == 3, rng.normal(5.0, 1.0, n_var), 0.0),
         "class_names": np.array(["SNV", "INDEL", "TR", "SV"]),

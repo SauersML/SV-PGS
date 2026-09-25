@@ -421,6 +421,24 @@ def sv_kernel_features(
     return SvKernelFeatures(overlap=overlap, distance=distance, spacing=float(spacing))
 
 
+def overlap_group_first(starts: NDArray, ends: NDArray, *group_ids: NDArray) -> I64Array:
+    """Each record's ``group_first`` where no converted store gives one (bench-sim, bench-real), for one chromosome's
+    records in position order: the unbreakable groups (``unbreakable_group_first``) of the records whose reference
+    spans [start, max(end, start + 1)) overlap, a same-POS set among them, and of each grouping in ``group_ids`` (a TR
+    locus id per record, negative for none). A record's ``group_first`` is its site key, the one definition the site
+    annotations and the power screen read."""
+    starts = np.asarray(starts, dtype=np.int64)
+    ends = np.maximum(np.asarray(ends, dtype=np.int64), starts + 1)
+    if np.any(starts[1:] < starts[:-1]):
+        raise ValueError("overlap_group_first needs records in position order.")
+    if starts.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    # A record joins the span before it when it starts before the furthest end reached so far.
+    reach = np.maximum.accumulate(ends)
+    opens = np.concatenate([[True], starts[1:] >= reach[:-1]])
+    return unbreakable_group_first(np.cumsum(opens) - 1, *group_ids)
+
+
 def unbreakable_group_first(*group_ids: NDArray) -> I64Array:
     """Each row's ``group_first``: the first row of the contiguous span it must share a block with.
 

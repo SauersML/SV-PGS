@@ -54,7 +54,7 @@ def test_the_derived_columns_are_their_records_combinations() -> None:
     data = _data(observed, variants, np.arange(30))
     dosage = observed / 127.0
     loci = locus_columns(variants)
-    members = (variants["repeat_locus"] >= 0) & (variants["len_change"] != 0)
+    members = (variants["repeat_locus"] >= 0) & (variants["len_change"] != 0) & (variants["cls"] == 2)
     np.testing.assert_array_equal(np.sort(loci.replaced), np.flatnonzero(members))
     for row, locus in enumerate(np.unique(variants["repeat_locus"][members])):
         in_locus = members & (variants["repeat_locus"] == locus)
