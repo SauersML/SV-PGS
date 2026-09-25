@@ -1637,3 +1637,26 @@ def test_the_objective_rows_linear_sum_is_the_log_form():
         assert not _objective_row_exact(row, log_density, density, grid, log_scales[row], precision[row], shift[row] ** 2, tiny, *expected)
     for got, want in zip(outputs, expected):
         np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-12 * float(np.max(np.abs(want))))
+
+
+def test_a_state_is_itself_through_a_views_basis():
+    # The hyper step returns x through its view's basis, x = K K'x, which moves its last bits: the outer loop's
+    # zero-length test must read that as the state itself (its remainder then needs no trial), and a move of x or a
+    # weight above half precision, or another edge, as a step.
+    from sv_pgs.scale_mixture_ep import _same_point
+
+    prior, _cavity = _problem(variant_count=60, seed=51, node_count=12)
+    hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
+    _view, allowed = _restricted_prior(prior, frozenset({0}))
+    x = allowed @ (allowed.T @ hyperparameters.coefficients)
+    state = MixtureHyperparameters(coefficients=x, log_smoothing=np.where(np.arange(hyperparameters.log_smoothing.shape[0]) == 0, np.inf, hyperparameters.log_smoothing))
+    returned = replace(state, coefficients=allowed @ (allowed.T @ x))
+    assert _same_point(returned, state)
+    assert not _same_point(replace(state, coefficients=x + 1e-6 * (1.0 + np.max(np.abs(x)))), state)
+    moved = np.array(state.log_smoothing, copy=True)
+    assert np.any(np.isfinite(moved))
+    moved[np.flatnonzero(np.isfinite(moved))[0]] += 1e-6
+    assert not _same_point(replace(state, log_smoothing=moved), state)
+    freed = np.array(state.log_smoothing, copy=True)
+    freed[0] = 1.0
+    assert not _same_point(replace(state, log_smoothing=freed), state)

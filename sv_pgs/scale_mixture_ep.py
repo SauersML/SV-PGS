@@ -4474,6 +4474,21 @@ def _newton_b(
     )
 
 
+def _same_point(first: MixtureHyperparameters, second: MixtureHyperparameters) -> bool:
+    """Whether two outer states are one to double precision's resolution: the same edges, and x and the finite weights
+    within half precision of their size (the resolution every step test of the outer loop reads x at)."""
+    first_weights, second_weights = np.asarray(first.log_smoothing, dtype=np.float64), np.asarray(second.log_smoothing, dtype=np.float64)
+    if not np.array_equal(np.isfinite(first_weights), np.isfinite(second_weights)) or not np.array_equal(
+        first_weights[~np.isfinite(first_weights)], second_weights[~np.isfinite(second_weights)]
+    ):
+        return False
+    finite = np.isfinite(first_weights)
+    for one, other in ((first.coefficients, second.coefficients), (first_weights[finite], second_weights[finite])):
+        if one.size and float(np.max(np.abs(one - other))) > _HALF_PRECISION * (1.0 + float(np.max(np.abs(one)))):
+            return False
+    return True
+
+
 def _trial(newton: _NewtonB, step: F64Array) -> MixtureHyperparameters:
     return MixtureHyperparameters(coefficients=newton.allowed @ (newton.origin + step), log_smoothing=newton.log_smoothing)
 
@@ -4902,14 +4917,14 @@ def fit_hyperparameters(
             histories[model].append(np.inf)
             return _OuterTrial(step.hyperparameters, step, np.inf, False, enters=True)
         current = hyperparameters[model]
-        if (
-            not np.isfinite(remainders[model]) and np.array_equal(step.hyperparameters.coefficients, current.coefficients)
-            and np.array_equal(np.asarray(step.hyperparameters.log_smoothing), np.asarray(current.log_smoothing))
-        ):
+        if not np.isfinite(remainders[model]) and _same_point(step.hyperparameters, current):
             # A zero-length step: its joint trial would be the state itself, whose realized gain is 0 by definition, so
             # the model's remainder there is |0 - predicted| exactly, with no trial. Waiting for a trial to measure it
             # left an annotated search started at its optimum with no measured remainder, and it returned uncertified
-            # ("planned twice from one state") where it had nothing left to gain (bench-sim chr22 000 [sim]).
+            # ("planned twice from one state") where it had nothing left to gain (bench-sim chr22 000 [sim]). Zero to
+            # double precision's resolution of x and the weights, not bit for bit: the hyper step's x comes back
+            # through its view's basis (x = K K'x), which moves its last bits, so a search at its optimum never
+            # matched and paid a trial, a refusal and a polish for its remainder (bench-real, 8 h genes [real]).
             remainders[model] = abs(step.evidence - state.value)
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
@@ -5094,6 +5109,29 @@ def fit_hyperparameters(
                             displaced[model], pending[model] = False, None
                             iterations[model] += 1
                             continue
+                        measured = entry.predicted + remainders[model] + state.tail + state.error + entry.step.evidence_error + entry.step.stationarity_gain
+                        if entry.fraction == 1.0 and not entry.certifying and measured <= tolerance:
+                            # The plan could not certify only because the model's remainder was unmeasured, and this whole
+                            # trial measured it: with it the certificate holds at the state (the predicted gain, the
+                            # remainder and every error within the tolerance), and this trial is the one a certifying
+                            # plan would take. It is read here, at the trial's own fixed point, in place of a refusal
+                            # followed by a polish: from a state whose step predicted no gain, bench-real's refused
+                            # trials (realized 1e-7 against a resolution of 0.004) polished x along B + S's negative
+                            # curvature for hours [real, bench-finish loso runs, c4d92b29].
+                            current = points[model]
+                            moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
+                            allowed = np.full(moves.shape[0], 2.0 * tolerance)
+                            if bool(np.all(moves <= allowed)):
+                                worst = int(np.argmax(np.where(allowed > 0.0, moves / allowed, np.where(moves > 0.0, np.inf, 0.0))))
+                                histories[model].append(float(measured))
+                                hyperparameters[model], points[model], displaced[model] = trial, trial_point, False
+                                fits[model] = OuterFit(
+                                    hyperparameters=trial, step=entry.step, newton_decrement=state.decrement, remaining_gain=float(measured),
+                                    prediction_move=float(moves[worst]), prediction_tolerance=float(allowed[worst]), iterations=iterations[model],
+                                    halvings=halvings[model], unresolved=unresolved[model], history=tuple(histories[model]),
+                                )
+                                pending[model] = None
+                                continue
                         if state.polished and whole_uncertifiable[model] and gain + resolution + state.tail <= tolerance:
                             # The whole step's end has no certified value (on gene 1 [real] it lies along the width
                             # -> 0 ray where the curvature has saturated), so the model's prediction beyond this

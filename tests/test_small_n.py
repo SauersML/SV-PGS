@@ -1003,3 +1003,36 @@ def test_the_profile_reports_the_mixtures_own_elbo_and_evidence():
     assert profile["elbo"] <= logsumexp(elbos) + 1e-9
     np.testing.assert_allclose(profile["log_evidence"], logsumexp(evidences), rtol=1e-12)
     assert profile["log_evidence"] >= evidences.max()
+
+
+def test_starts_that_reach_one_mode_share_one_empirical_bayes(monkeypatch):
+    """The mixture is over distinct modes: two data starts whose first fixed points agree to the draws' resolution are
+    one mode, so their empirical Bayes runs once and both starts hold that one solve (``fit_small_n``)."""
+    import sv_pgs.small_n as small_n
+
+    sys.path.insert(0, "tests")
+    from test_mean_field import _WORKING_BYTES as working_bytes, _problem
+
+    codes, covariates, target, classes = _problem(9, samples=160, variants=50)
+    original_starts, original_solve = small_n.lasso_starts, small_n._solve_small_n
+    held = {}
+
+    def lasso_starts(statistics, seed, unit_scales):
+        first, _second = original_starts(statistics, seed, unit_scales)
+        # A second start one part in 1e9 from the first: the same fixed point to any resolution.
+        held["starts"] = (first, first * (1.0 + 1e-9))
+        return held["starts"]
+
+    calls = []
+
+    def solve(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, start_mean, sites=None):
+        calls.append(start_mean)
+        return original_solve(statistics, prior, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, start_mean, sites=sites)
+
+    monkeypatch.setattr(small_n, "lasso_starts", lasso_starts)
+    monkeypatch.setattr(small_n, "_solve_small_n", solve)
+    fit_small_n(codes=codes, covariates=covariates, target=target, variant_class=classes, log_variance_offset=None, draw_count=64,
+                working_bytes=working_bytes, seed=0, inference="mean_field")
+    first, second = held["starts"]
+    assert sum(1 for mean in calls if mean is first) == 1
+    assert not any(mean is second for mean in calls)

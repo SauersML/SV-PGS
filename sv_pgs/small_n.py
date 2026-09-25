@@ -1991,10 +1991,26 @@ def fit_small_n(
         # components, weighted by their evidence like the rest (``_mixture_weights``).
         units = np.ones(statistics.active_rows.shape[0]) if codes_per_unit is None else np.asarray(codes_per_unit, dtype=np.float64)[statistics.active_rows]
         starts = (*lasso_starts(working, seed, statistics.scales / units), ridge_start(working, base))
-        solves = [
-            nested(_solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means, sites=sites), means)
-            for means in starts
-        ]
+        # The mixture is over distinct modes (``_admit``): starts whose first fixed points are one mode, at the start's
+        # hyperparameters and to the draws' resolution, share one empirical Bayes, which from one fixed point is one
+        # computation (on genes without cis signal both lassos' starts reach one fixed point, and the base and annotated
+        # searches ran twice over, a third of the fit: ENSG00000204859.13 loso/EAS [real], identical outer logs).
+        from sv_pgs.mean_field import MeanFieldFixedPoints
+
+        firsts: list[tuple[object, _SmallNSolve]] = []
+        solves = []
+        for means in starts:
+            probe = MeanFieldFixedPoints(statistics, base, start_noise, draw_count, working_bytes, start_means=(means,), sites=sites)
+            with device_scope(array_module):
+                (point,) = probe([start])
+            shared = None if point is None else next((solve for first, solve in firsts if _same_mode(statistics, probe, first, draw_count)), None)
+            if shared is None:
+                shared = nested(
+                    _solve_small_n(statistics, base, start, start_noise, draw_count, working_bytes, tolerance, inference, array_module, means, sites=sites), means
+                )
+                if point is not None:
+                    firsts.append((probe, shared))
+            solves.append(shared)
     # The quadrature at the fitted states (review F17): the start lattice is derived from single-variant likelihoods at
     # the start, which certify nothing about a fitted density that concentrates more sharply or puts mass at a lattice
     # end. Each solve's normalizers and tilted moments are compared at its own fitted state on the refined and the
@@ -2003,13 +2019,16 @@ def fit_small_n(
     lattice_checks: list[list[dict]] = []
     lattice_unresolved: str | None = None
     while True:
-        checks = [lattice_check(prior, solve.hyperparameters, _fitted_cavity(solve), working_bytes, draw_count) for solve in solves]
+        # A solve shared by starts of one mode (above) is checked and continued once.
+        distinct = list({id(solve): solve for solve in solves}.values())
+        checked = {id(solve): lattice_check(prior, solve.hyperparameters, _fitted_cavity(solve), working_bytes, draw_count) for solve in distinct}
+        checks = [checked[id(solve)] for solve in solves]
         lattice_checks.append([check.record() for check in checks])
         refine, extend = any(check.refine for check in checks), any(check.extend for check in checks)
         if not (refine or extend):
             break
         moved = []
-        for solve in solves:
+        for solve in distinct:
             moved_prior, moved_hyperparameters = prior, solve.hyperparameters
             if extend:
                 moved_prior, moved_hyperparameters = extended_lattice(moved_prior, moved_hyperparameters)
@@ -2017,13 +2036,14 @@ def fit_small_n(
                 moved_prior, moved_hyperparameters = halved_lattice(moved_prior, moved_hyperparameters)
             moved.append((moved_prior, moved_hyperparameters))
         try:
-            continued = [
-                _solve_small_n(
+            continued_once = {
+                id(solve): _solve_small_n(
                     statistics, moved_prior, moved_hyperparameters, float(solve.oracle.noise), draw_count, working_bytes, tolerance, inference,
                     array_module, np.asarray(solve.oracle.mean, dtype=np.float64) if inference == "mean_field" else None, sites=sites,
                 )
-                for (moved_prior, moved_hyperparameters), solve in zip(moved, solves)
-            ]
+                for (moved_prior, moved_hyperparameters), solve in zip(moved, distinct)
+            }
+            continued = [continued_once[id(solve)] for solve in solves]
         except FloatingPointError as error:
             # The empirical Bayes found no certified step on the checked lattice: the fit keeps the solves it has, and
             # their failed check stays in the profile (``lattice_unresolved``), never read as passed.
@@ -2282,14 +2302,19 @@ def _admit(statistics: DenseStatistics, components: list, candidate: "_SmallNSol
     not k (weighted per run it would carry k times its mass, a property of the search and not of the posterior). Two
     fixed points are one mode when their fitted genetic values agree to the draws' resolution, ||Xp d||^2 / sigma^2
     <= 1/K (the mixture's own stopping scale); the one of the higher evidence is kept."""
-    noise = float(candidate.oracle.noise)
     for index, component in enumerate(components):
-        move = _metric(statistics, candidate.oracle).image(np.asarray(candidate.oracle.mean) - np.asarray(component.oracle.mean))
-        if float(move @ move) / noise <= 1.0 / draw_count:
+        if _same_mode(statistics, candidate.oracle, component.oracle, draw_count):
             if _component_log_evidence(candidate) > _component_log_evidence(component):
                 components[index] = candidate
             return
     components.append(candidate)
+
+
+def _same_mode(statistics: DenseStatistics, candidate: object, other: object, draw_count: int) -> bool:
+    """Whether two fixed points (oracles at them) are one mode: their fitted genetic values agree to the draws'
+    resolution, ||Xp d||^2 / sigma^2 <= 1/K, in the candidate's metric and noise (``_admit``)."""
+    move = _metric(statistics, candidate).image(np.asarray(candidate.mean) - np.asarray(other.mean))
+    return float(move @ move) / float(candidate.noise) <= 1.0 / draw_count
 
 
 def _metric(statistics: DenseStatistics, oracle: object) -> _Design:
