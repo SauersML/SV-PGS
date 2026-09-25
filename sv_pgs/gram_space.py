@@ -54,7 +54,7 @@ import numba
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
-from sv_pgs.memory_broker import HOST, current_broker, device_pool
+from sv_pgs.memory_broker import HOST, current_broker, device_pool, transient_device_arrays
 from sv_pgs.progress import log
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -336,16 +336,19 @@ class GramBand:
         step = self._chunk_rows(columns, xp, 2 if absolute else 1)
         for first in range(0, rows, step):
             last = min(first + step, rows)
-            chunk = xp.asarray(matrix[first:last], dtype=xp.float64)
+            # The promoted rows (and their magnitudes) are transient: reserved on their own and returned when freed.
+            with transient_device_arrays(xp):
+                chunk = xp.asarray(matrix[first:last], dtype=xp.float64)
+                sizes = xp.abs(chunk) if absolute else None
             if transposed:
                 out += chunk.T @ values[first:last]
                 if absolute:
-                    magnitude += xp.abs(chunk).T @ xp.abs(values[first:last])
+                    magnitude += sizes.T @ xp.abs(values[first:last])
             else:
                 out[first:last] = chunk @ values
                 if absolute:
-                    magnitude[first:last] = xp.abs(chunk) @ xp.abs(values)
-            del chunk
+                    magnitude[first:last] = sizes @ xp.abs(values)
+            del chunk, sizes
         return (out, magnitude) if absolute else out
 
     def product(self, values: Any, array_module: Any = np) -> Any:

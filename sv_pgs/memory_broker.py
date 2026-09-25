@@ -530,6 +530,38 @@ def memory_scope(budget: ComputeBudget) -> Iterator[MemoryBroker]:
             cupy.cuda.set_allocator(previous)
 
 
+@contextmanager
+def transient_device_arrays(array_module: Any) -> Iterator[None]:
+    """Device arrays made inside are reserved from the device each on its own, outside CuPy's pool, and returned to the
+    device when freed, each charged to the current ledger before it is made (its outside bytes, measured before and
+    after). A transient block freed into the pool lies there until a smaller array made later takes part of it, and the
+    rest cannot be returned for as long as that array lives (bench-sim v7 chr22 001 on a 40 GB device [bench]: 9.6 GB
+    of the pool's 41.1 GB reserved was such remainders of the Gram band's 1 GB promoted rows, split by 0.5 GB solve
+    vectors, and a promotion was refused). Nothing changes on the host or outside a ledger's scope."""
+    broker = current_broker()
+    if broker is None or not hasattr(array_module, "cuda"):
+        yield
+        return
+    cupy = array_module
+
+    def allocate(size: int) -> Any:
+        name = device_pool(int(cupy.cuda.runtime.getDevice()))
+        if name in broker.capacities:
+            rounded = -(-int(size) // _CUPY_ALLOCATION_ALIGNMENT) * _CUPY_ALLOCATION_ALIGNMENT
+            broker.held(name)
+            try:
+                broker.make_room(name, rounded, "a transient device array")
+            except MemoryError as error:
+                raise cupy.cuda.memory.OutOfMemoryError(rounded, broker.held(name), broker.capacities[name]) from error
+        pointer = cupy.cuda.memory.MemoryPointer(cupy.cuda.memory.Memory(size), 0)
+        if name in broker.capacities:
+            broker.held(name)
+        return pointer
+
+    with cupy.cuda.using_allocator(allocate):
+        yield
+
+
 def broker_for(budget: ComputeBudget) -> MemoryBroker:
     """The current scope's broker, or a fresh broker of ``budget`` outside every scope."""
     current = _CURRENT.get()

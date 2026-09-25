@@ -11,7 +11,7 @@ import pytest
 
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.gram_space import GramBand, GramGaussian
-from sv_pgs.memory_broker import device_pool, memory_scope
+from sv_pgs.memory_broker import device_pool, memory_scope, transient_device_arrays
 from tests.test_gram_space import _banded_design, _prior_arrays
 
 cupy = _try_import_cupy()
@@ -182,3 +182,23 @@ def test_the_device_ledger_holds_the_fragments_its_pool_cannot_return() -> None:
             cupy.empty(2 * size, dtype=cupy.uint8)
         del small
     pool.free_all_blocks()
+
+
+def test_a_transient_device_array_is_reserved_outside_the_pool_charged_first_and_returned_when_freed() -> None:
+    """``transient_device_arrays``: the array's bytes are the device's, not the pool's (so no free block of its size is
+    left in the pool for a smaller array to split), the ledger counts them while it lives and admits it only within the
+    budget, and freeing it returns them to the device."""
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    start = int(pool.total_bytes())
+    size = 64 << 20
+    with memory_scope(_device_budget(start + 2 * size)) as broker:
+        free = int(cupy.cuda.runtime.memGetInfo()[0])
+        with transient_device_arrays(cupy):
+            block = cupy.ones(size, dtype=cupy.uint8)
+        assert int(pool.total_bytes()) == start and broker.held(device_pool(0)) >= start + size
+        assert free - int(cupy.cuda.runtime.memGetInfo()[0]) >= size
+        del block
+        assert int(cupy.cuda.runtime.memGetInfo()[0]) >= free and int(pool.total_bytes()) == start
+        with pytest.raises(cupy.cuda.memory.OutOfMemoryError), transient_device_arrays(cupy):
+            cupy.empty(3 * size, dtype=cupy.uint8)
