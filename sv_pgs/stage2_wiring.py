@@ -65,6 +65,10 @@ _FAR_FIELD_KEY = len(("dual solver", "fit", "scoring"))
 RELIABILITY_COLUMNS = ("quality", "r2_truth")
 """Sidecar columns that are a measurement's reliability, read by the unit contract (``store_measurement``), never annotations."""
 
+IDENTIFIER_COLUMNS = ("tr_locus",)
+"""Sidecar columns that name a record's locus (the workspace pipeline's TR locus id): a label, never a quantity, so
+never a smooth's argument."""
+
 
 def store_log_reliability(store: DosageStore) -> F64Array:
     """Each record's log r^2 from the store's ``quality`` column, its reported imputation r^2.
@@ -380,7 +384,7 @@ def _fit_one(
         member_annotations,
         table.annotation_legends,
         class_index=class_index.astype(np.int64),
-        exclude=RELIABILITY_COLUMNS,
+        exclude=RELIABILITY_COLUMNS + IDENTIFIER_COLUMNS,
     )
     log(f"stage2 wiring: {annotations.design.shape[1]} annotation columns in {len(annotations.groups)} groups: {', '.join(annotations.names) or 'none'}")
     mask = np.zeros((store.n_samples, 1))
