@@ -369,7 +369,7 @@ def test_cuda_kernel_allocations_inside_a_ledger_evict_its_caches_rather_than_ru
     pool = cupy.get_default_memory_pool()
     pool.free_all_blocks()
     device = int(cupy.cuda.runtime.getDevice())
-    capacity = int(pool.used_bytes()) + (64 << 20)
+    capacity = int(pool.total_bytes()) + (64 << 20)
     budget = ComputeBudget(
         device_kind="cuda", device_ids=(device,), device_names=("test",), device_bytes=(capacity,), device_compute_capabilities=((8, 0),),
         host_bytes=1 << 34, cpu_threads=1,
@@ -401,9 +401,11 @@ def test_the_line_values_stay_inside_a_tight_device_ledger():
     host_bytes = 1 << 34
     for direction in (moving, still):
         expected = _line(prior, hyperparameters.log_smoothing, hyperparameters.coefficients, direction, cavity, _WORKING_BYTES)(steps)
-        used = int(cupy.get_default_memory_pool().used_bytes())
+        pool = cupy.get_default_memory_pool()
+        pool.free_all_blocks()
+        held = int(pool.total_bytes())
         budget = ComputeBudget(
-            device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(used + (32 << 20),),
+            device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(held + (32 << 20),),
             device_compute_capabilities=((0, 0),), host_bytes=host_bytes, cpu_threads=1,
         )
         with memory_scope(budget), device_scope(cupy):
@@ -421,9 +423,11 @@ def test_the_device_variant_derivatives_are_the_host_twins_within_a_tight_ledger
     prior, cavity = _problem(variant_count=20000, seed=51, node_count=40)
     hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)
     expected = _variant_derivatives(prior, hyperparameters.coefficients, cavity, _WORKING_BYTES)
-    used = int(cupy.get_default_memory_pool().used_bytes())
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    held = int(pool.total_bytes())
     budget = ComputeBudget(
-        device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(used + (32 << 20),),
+        device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(held + (32 << 20),),
         device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
     )
     with memory_scope(budget), device_scope(cupy):

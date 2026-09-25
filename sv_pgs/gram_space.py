@@ -315,16 +315,17 @@ class GramBand:
 
     # products
 
-    def _chunk_rows(self, columns: int, xp: Any = np) -> int:
-        """Rows of a stored block promoted at once: two float64 copies (the rows and their magnitudes) within the fit's
-        working set, and on a device within half of what its pool has left without evicting a cache (a promotion is
-        transient; the cached blocks are what the next pass reads)."""
+    def _chunk_rows(self, columns: int, xp: Any = np, copies: int = 1) -> int:
+        """Rows of a stored block promoted at once: ``copies`` float64 copies of them (the rows, and with the
+        magnitudes their absolute values) within the fit's working set, and on a device within what the ledger can
+        grant there (``memory_broker``: its capacity less every byte the device holds, with the idle caches counted as
+        reclaimable, since the allocator evicts them before it refuses)."""
         available = self.working_bytes
         if xp is not np and self._broker is not None:
             pool = device_pool(int(xp.cuda.runtime.getDevice()))
             if pool in self._broker.meters:
-                available = min(available, self._broker.remaining(pool) // 2)
-        return max(1, available // max(1, _FLOAT_BYTES * columns * 2))
+                available = min(available, self._broker.reclaimable(pool))
+        return max(1, available // max(1, _FLOAT_BYTES * columns * copies))
 
     def _times(self, matrix: Any, values: Any, xp: Any, transposed: bool = False, absolute: bool = False) -> Any:
         """matrix @ values (or matrix' @ values) in float64, the stored float32 promoted a row chunk at a time; with
@@ -332,7 +333,7 @@ class GramBand:
         rows, columns = int(matrix.shape[0]), int(matrix.shape[1])
         out = xp.zeros((columns if transposed else rows,) + tuple(values.shape[1:]))
         magnitude = xp.zeros_like(out) if absolute else None
-        step = self._chunk_rows(columns, xp)
+        step = self._chunk_rows(columns, xp, 2 if absolute else 1)
         for first in range(0, rows, step):
             last = min(first + step, rows)
             chunk = xp.asarray(matrix[first:last], dtype=xp.float64)
@@ -826,6 +827,7 @@ class GramGaussian:
         self._mean: F64Array | None = None
         self._resolved: dict | None = None
         self._factors: Callable[[Any], Any] | None = None
+        self._factor_storage: Any = None
         self.last_posterior_duals: Any = None
         self.iterations = 0
         self.solves = 0
@@ -899,29 +901,49 @@ class GramGaussian:
         xp = self.array_module
         band = self.band
         width = self._part_width()
-        if self.band._broker is not None and xp is np:
-            # The factors over every group: at most groups x width float64, for as long as these sites hold.
-            lease = self.band._broker.reserve(HOST, _FLOAT_BYTES * band.group_count * width, "the Gram-space preconditioner's factors")
-        else:
+        parts = [
+            (block, first, min(first + width, int(band.starts[block + 1])))
+            for block in range(band.block_count) for first in range(int(band.starts[block]), int(band.starts[block + 1]), width)
+        ]
+        # Every part's factor in one array, each in its own slice, the same array at every ``iterate`` (the parts are
+        # fixed): made one at a time between the fit's transient blocks (the band's promoted rows, its uploaded
+        # blocks), separate factors each took a free block larger than itself and left the rest of it unreturnable for
+        # as long as the factor lived (bench-sim v7 chr22 001 on a 40 GB device [bench]: 16.8 GB of the pool's 40.8 GB
+        # reserved was such free remainders beside 70 factors of 0.25 GB, and a 1.04 GB promotion was refused).
+        count = sum((last - first) ** 2 for _block, first, last in parts)
+        if self._factor_storage is None or int(self._factor_storage.shape[0]) != count:
+            self._factor_storage = None
             lease = None
+            if self.band._broker is not None and xp is np:
+                # The factors over every group, for as long as their array lives.
+                lease = self.band._broker.reserve(HOST, _FLOAT_BYTES * count, "the Gram-space preconditioner's factors")
+            self._factor_storage = xp.empty(count, dtype=xp.float64)
+            if lease is not None:
+                weakref.finalize(self._factor_storage, lease.release)
+        storage = self._factor_storage
         factors: list[tuple[slice, Any]] = []
-        for block in range(band.block_count):
-            own = band.span(block)
-            within = band.within(block, xp)
-            for first in range(own.start, own.stop, width):
-                last = min(first + width, own.stop)
-                local = slice(first - own.start, last - own.start)
-                part_root = root[first:last]
-                matrix = xp.asarray(within[local, local], dtype=xp.float64) * (part_root[:, None] * part_root[None, :]) / noise
-                matrix[xp.arange(last - first), xp.arange(last - first)] += 1.0
-                try:
-                    factor = xp.linalg.cholesky(matrix)
-                except np.linalg.LinAlgError:
-                    continue
-                if not bool(xp.all(xp.isfinite(factor))):
-                    continue
-                factors.append((slice(first, last), factor))
-            del within
+        offset = 0
+        within = None
+        for index, (block, first, last) in enumerate(parts):
+            if index == 0 or parts[index - 1][0] != block:
+                within = band.within(block, xp)
+            start = int(band.starts[block])
+            size = last - first
+            local = slice(first - start, last - start)
+            part_root = root[first:last]
+            matrix = xp.asarray(within[local, local], dtype=xp.float64) * (part_root[:, None] * part_root[None, :]) / noise
+            matrix[xp.arange(size), xp.arange(size)] += 1.0
+            factor = storage[offset:offset + size * size].reshape(size, size)
+            offset += size * size
+            try:
+                factor[...] = xp.linalg.cholesky(matrix)
+            except np.linalg.LinAlgError:
+                continue
+            del matrix
+            if not bool(xp.all(xp.isfinite(factor))):
+                continue
+            factors.append((slice(first, last), factor))
+        del within
 
         def apply(values: Any) -> Any:
             out = values.copy()
@@ -929,8 +951,6 @@ class GramGaussian:
                 out[rows] = _cholesky_solve(xp, factor, values[rows])
             return out
 
-        if lease is not None:
-            weakref.finalize(apply, lease.release)
         self._factors = apply
         return apply
 

@@ -168,17 +168,17 @@ def test_the_operator_inside_a_tight_device_ledger_forms_its_complement_by_colum
     device_columns = cupy.asarray(column_models)
     pool = cupy.get_default_memory_pool()
     pool.free_all_blocks()
-    used = int(pool.used_bytes())
+    held = int(pool.total_bytes())
     column_bytes = samples * np.dtype(np.float64).itemsize
     # The operator's own outputs (the operand, the image and S V) and the tiles' products, whole, plus room for the
     # complement's temporaries of a few columns: far below the seven whole samples x columns arrays it formed before.
-    capacity = used + 6 * columns * column_bytes + len(dual_solve._COMPLEMENT_ARRAYS) * 4 * column_bytes
+    capacity = held + 6 * columns * column_bytes + len(dual_solve._COMPLEMENT_ARRAYS) * 4 * column_bytes
     budget = ComputeBudget(
         device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(capacity,),
         device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
     )
     # Every device allocation inside the scope is admitted by the ledger's allocator, which refuses any that would take
-    # the pool's live bytes past the capacity: the operator completing is the bound holding.
+    # the device's held bytes past the capacity: the operator completing is the bound holding.
     with memory_scope(budget):
         assert models.column_block(samples, columns) < columns
         got = dual_solve.apply_operator(source, models, device_values, device_columns, 0.0, dual_solve.PassCount(), "device")

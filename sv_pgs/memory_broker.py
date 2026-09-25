@@ -20,14 +20,21 @@ A page-locked lease is charged to both the ``pinned`` and the ``host`` pool, sin
 pages; the ``pinned`` pool's capacity is the host's (CUDA pins its pages in the driver, not by ``mlock``, so
 RLIMIT_MEMLOCK does not bound them), and it keeps the page-locked bytes' own account.
 
-Device pools are metered: their held bytes are the bytes CuPy's memory pool has live on the device
-(``used_bytes``), read at every decision, and inside a CUDA scope every CuPy allocation goes through the ledger's
-allocator (``_LedgerAllocator``), which makes room for it (evicting idle device caches, newest first) or raises
-``MemoryError`` before the allocation is made. So on a device "every allocation is charged before it happens" holds
-for every array CuPy allocates, by construction rather than by each consumer's accounting. A device cache (the
-resident genotype codes, the panel Grams) is a cache lease that records what to drop; its arrays are already live
-bytes of the meter, so it adds nothing to the held bytes. ``reserve`` on a device pool makes room for bytes about to
-be allocated (the allocations themselves are then metered) and holds nothing.
+Device pools are metered (``_DeviceMeter``): their held bytes are every byte the device has given the process since
+the scope began, CuPy's reserved bytes (its live arrays, the free blocks its pool keeps, and the fragments of a
+partly used block, which it cannot return) plus what the device gave outside the pool (library workspaces, lazily
+loaded modules), measured from the device's free bytes against the scope's start. The pool's live bytes alone
+(``used_bytes``) were the meter before: they leave out the fragments and the outside bytes, so the ledger admitted
+allocations the device then refused (bench-sim v7 chr22 001 on a 40 GB A100 [bench]: 1.2 GB refused with 40.9 GB
+reserved, every cache already dropped). The pool's free blocks are held until returned: a decision the held bytes
+refuse first returns them (``settles``, the pool's ``free_all_blocks``), then evicts caches. Inside a CUDA scope every
+CuPy allocation goes through the ledger's allocator (``_LedgerAllocator``), which makes room for it (returning the
+free blocks, then evicting idle device caches, newest first) or raises ``MemoryError`` before the allocation is made.
+So on a device "every allocation is charged before it happens" holds for every array CuPy allocates, by construction
+rather than by each consumer's accounting. A device cache (the resident genotype codes, the panel Grams) is a cache
+lease that records what to drop; its arrays are already bytes of the meter, so it adds nothing to the held bytes.
+``reserve`` on a device pool makes room for bytes about to be allocated (the allocations themselves are then metered)
+and holds nothing.
 
 Invariant. For every pool P with capacity C_P, at every moment, H_P <= C_P, where H_P is the sum of P's live leases
 (host pools) or the device's live CuPy bytes (device pools).
@@ -36,21 +43,27 @@ Proof. Host pools: H_P changes only in three ways. (1) A release or an eviction 
 (2) ``reserve`` grants b bytes only after checking H_P' + b <= C_P, H_P' the holding after the evictions it made (each
 an instance of 1), with nothing else between the check and the grant (the ledger's lock). (3) ``admit`` grants b only
 if H_P + b <= C_P. A pinned lease applies (2) or (3) to both pools, checking both before charging either. Device
-pools: H_P rises only by an allocation, which the allocator makes only after checking H_P + b <= C_P (after evictions,
-each of which only frees); it falls when an array is freed. Every transition from a state that satisfies the
-invariant ends in one that does, and the empty ledger does: it holds at every moment. Caches enter a host pool only by
-(3), so from what the mandatory leases then leave; a mandatory request evicts every idle cache before it is refused,
-so caches never make a request fail that the mandatory leases alone would admit (unless a cache is in use at that
-moment, which the refusal names). On a device a cache is never in use in this sense: its holder reads it a block at a
-time and switches to recomputing once it is dropped (``store_block_source``, ``device_sweep``), so an eviction frees
-all of it but what the running step still references, which the meter counts as live.
+pools: H_P rises only by an allocation, which the allocator makes only after checking H_P + b <= C_P (after returning
+the pool's free blocks and evictions, each of which only frees), and which raises the reserved bytes by at most b (the
+pool serves it from a free block or reserves exactly b); it falls when the pool returns blocks. The outside bytes
+move without the ledger (a library's workspace): the bound reads them as last measured, and a device's refusal of an
+allocation the ledger admitted re-measures them and decides again. The device grants memory in whole pages, so a
+reservation can take more than its bytes: that rounding is outside bytes too, counted whenever the meter is read.
+Between reads the invariant holds for the reserved bytes and the outside bytes as last measured. Every transition
+from a state that satisfies the invariant ends in one that does, and the empty ledger does: it holds at every moment.
+Caches enter a host pool only by (3), so from what the mandatory leases then leave; a mandatory request evicts every
+idle cache before it is refused, so caches never make a request fail that the mandatory leases alone would
+admit (unless a cache is in use at that moment, which the refusal names). On a device a cache is never in use in this
+sense: its holder reads it a block at a time and switches to recomputing once it is dropped (``store_block_source``,
+``device_sweep``), so an eviction frees all of it but what the running step still references, which the meter counts
+as live.
 
 What the invariant covers. Host: the bytes the leases stand for, which is the process's memory exactly where every
 substantial allocation is charged before it is made and released no earlier than it is freed; each consumer's
 docstring states which arrays its leases cover. Allocations too small to charge (Python objects, per-block
-temporaries of O(block) bytes) are outside it. Device: every CuPy allocation inside a scope; memory CuPy does not
-allocate (the CUDA context and the libraries' own handles, measured before the budget was) is outside it, as is the
-pool's fragmentation (a request the meter admits can still find no contiguous block).
+temporaries of O(block) bytes) are outside it. Device: every byte the device gives the process inside a scope, the
+pool's (fragments included) and the libraries'; the CUDA context and the handles created before the budget was
+measured are outside the capacity already.
 
 Scope. ``memory_scope(budget)`` makes one broker current for the code under it (a ``ContextVar``; threads started
 inside inherit it only through ``contextvars.copy_context``) and, on CUDA, installs the ledger's allocator for its
@@ -146,10 +159,14 @@ class MemoryBroker:
 
     capacities: dict[str, int]
     meters: dict[str, Callable[[], int]] = field(default_factory=dict)
-    # A metered pool's O(1) upper bound on its meter (CuPy's reserved bytes >= its used bytes): where the bound
-    # already decides a question (a request fits, or no new peak), the meter, which walks the pool's free lists, is
-    # not read. Reading it on every device allocation was 92% of a genome fit's stage 2 (bench-sim 013 [sim], py-spy).
+    # A metered pool's O(1) bound on its meter (a device's reserved bytes and its outside bytes as last measured):
+    # where the bound already decides a question (a request fits, or no new peak), the meter, which asks the device, is
+    # not read. Reading the pool's live bytes on every device allocation was 92% of a genome fit's stage 2 (bench-sim
+    # 013 [sim], py-spy).
     bounds: dict[str, Callable[[], int]] = field(default_factory=dict)
+    # A metered pool's return of what it holds unused (a device pool's free blocks): the first answer to a request its
+    # held bytes refuse, before any cache is evicted.
+    settles: dict[str, Callable[[], None]] = field(default_factory=dict)
     leases: list[Lease] = field(default_factory=list)
     peaks: dict[str, int] = field(default_factory=dict)
 
@@ -179,13 +196,16 @@ class MemoryBroker:
             return sum(lease.nbytes for lease in self.leases if pool in lease.pools)
 
     def remaining(self, pool: str) -> int:
-        """What a new lease of ``pool`` could take without evicting anything."""
+        """What a new lease of ``pool`` could take without evicting anything (a metered pool's unused blocks returned
+        first: they are the pool's to reuse, not the lease's)."""
         with self._lock:
+            self._settle(self._charged(pool))
             return min(self.capacities[charged] - self.held(charged) for charged in self._charged(pool))
 
     def reclaimable(self, pool: str) -> int:
         """What a mandatory lease of ``pool`` could take: the remainder plus every idle cache charged to it."""
         with self._lock:
+            self._settle(self._charged(pool))
             return min(
                 self.capacities[charged] - self.held(charged)
                 + sum(lease.nbytes for lease in self.leases if lease.cache and not lease.users and charged in lease.pools)
@@ -219,34 +239,47 @@ class MemoryBroker:
         def fits(pool: str) -> bool:
             bound = self.bounds.get(pool)
             if bound is not None and int(bound()) + nbytes <= self.capacities[pool]:
-                return True  # held <= bound: the request fits whatever the pool's used bytes are
+                return True  # held <= bound: the request fits whatever the meter would read
             return self.held(pool) - (ignoring.nbytes if ignoring is not None and self._counted(ignoring, pool) else 0) + nbytes <= self.capacities[pool]
 
         return all(fits(pool) for pool in charged)
 
-    def _note_peaks(self, charged: tuple[str, ...]) -> None:
+    def _note_peaks(self, charged: tuple[str, ...], pending: int = 0) -> None:
+        """Each pool's peak, with ``pending`` bytes about to be allocated on a metered pool (its meter counts them only
+        once they are)."""
         for pool in charged:
             bound = self.bounds.get(pool)
             if bound is not None:
-                # A pool with an O(1) bound records the bound's peak, an upper bound on its held bytes' peak. Reading
-                # the meter whenever the bound was above the recorded peak (the pool's reserved bytes usually are
-                # above its used bytes' peak, so nearly always) was 74% of a genome fit's mean-field sweeps
-                # (bench-sim chr22 004 [sim], py-spy: used <- held <- _note_peaks on every device allocation).
-                self.peaks[pool] = max(self.peaks[pool], int(bound()))
+                # A pool with an O(1) bound records the bound's peak. Reading the meter whenever the bound was above the
+                # recorded peak (nearly always, when the meter was the pool's live bytes) was 74% of a genome fit's
+                # mean-field sweeps (bench-sim chr22 004 [sim], py-spy: used <- held <- _note_peaks on every device
+                # allocation).
+                self.peaks[pool] = max(self.peaks[pool], int(bound()) + pending)
                 continue
-            self.peaks[pool] = max(self.peaks[pool], self.held(pool))
+            self.peaks[pool] = max(self.peaks[pool], self.held(pool) + (pending if pool in self.meters else 0))
 
     def _make_room(self, charged: tuple[str, ...], nbytes: int, purpose: str, ignoring: Lease | None = None) -> None:
-        """Evict idle caches charged to ``charged``, newest first, until ``nbytes`` more fit; MemoryError if they cannot."""
+        """Return the metered pools' unused blocks, then evict idle caches charged to ``charged``, newest first (each
+        eviction's blocks returned in turn), until ``nbytes`` more fit; MemoryError if they cannot."""
+        if self._fits(charged, nbytes, ignoring):
+            return
+        self._settle(charged)
         if self._fits(charged, nbytes, ignoring):
             return
         for lease in reversed([lease for lease in self.leases if lease.cache and not lease.users and set(lease.pools) & set(charged)]):
             self._evict(lease)
+            self._settle(charged)
             if self._fits(charged, nbytes, ignoring):
                 return
         raise MemoryError(
             f"{purpose} needs {nbytes / 1e9:.3f} GB of {'+'.join(charged)} memory that the budget does not hold: {self.describe()}"
         )
+
+    def _settle(self, charged: tuple[str, ...]) -> None:
+        for pool in charged:
+            settle = self.settles.get(pool)
+            if settle is not None:
+                settle()
 
     def _evict(self, lease: Lease) -> None:
         self.leases.remove(lease)
@@ -272,11 +305,16 @@ class MemoryBroker:
             self._note_peaks(charged)
             return lease
 
+    def admits(self, pool: str, nbytes: int) -> bool:
+        """Whether ``nbytes`` more fit ``pool`` as it stands, nothing returned or evicted."""
+        with self._lock:
+            return self._fits(self._charged(pool), int(nbytes))
+
     def make_room(self, pool: str, nbytes: int, purpose: str) -> None:
         """Room for ``nbytes`` more on ``pool`` (a metered pool's allocation), evicting idle caches if it must."""
         with self._lock:
             self._make_room(self._charged(pool), int(nbytes), purpose)
-            self._note_peaks(self._charged(pool))
+            self._note_peaks(self._charged(pool), int(nbytes))
 
     def evict_idle(self, pool: str) -> int:
         """Drop every idle cache charged to ``pool``, newest first; returns how many. The allocator's answer to a device
@@ -285,6 +323,7 @@ class MemoryBroker:
             idle = [lease for lease in self.leases if lease.cache and not lease.users and pool in lease.pools]
             for lease in reversed(idle):
                 self._evict(lease)
+            self._settle(self._charged(pool))
             return len(idle)
 
     def admit(self, pool: str, nbytes: int, purpose: str, evict: Callable[[], None], allocated: bool = False) -> Lease | None:
@@ -295,8 +334,12 @@ class MemoryBroker:
         with self._lock:
             charged = self._charged(pool)
             needed = 0 if allocated and all(charged_pool in self.meters for charged_pool in charged) else size
-            if size < 0 or not self._fits(charged, needed):
+            if size < 0:
                 return None
+            if not self._fits(charged, needed):
+                self._settle(charged)
+                if not self._fits(charged, needed):
+                    return None
             lease = Lease(self, charged, size, purpose, evict=evict)
             self.leases.append(lease)
             self._note_peaks(charged)
@@ -331,39 +374,102 @@ class _LedgerAllocator:
         self.cupy = cupy
         self.pool = cupy.get_default_memory_pool()
 
-    def __call__(self, size: int) -> Any:
-        rounded = -(-int(size) // _CUPY_ALLOCATION_ALIGNMENT) * _CUPY_ALLOCATION_ALIGNMENT
-        name = device_pool(int(self.cupy.cuda.runtime.getDevice()))
-        if name in self.broker.capacities:
-            try:
-                self.broker.make_room(name, rounded, "a device allocation")
-            except MemoryError as error:
-                raise self.cupy.cuda.memory.OutOfMemoryError(rounded, self.broker.capacities[name] - self.broker.held(name), 0) from error
+    def _make_room(self, name: str, rounded: int) -> None:
+        try:
+            self.broker.make_room(name, rounded, "a device allocation")
+        except MemoryError as error:
+            raise self.cupy.cuda.memory.OutOfMemoryError(rounded, self.broker.held(name), self.broker.capacities[name]) from error
+
+    def _reuse(self, size: int, rounded: int) -> Any:
+        """The request from the pool's free blocks without growing the pool, or None: tried only where the free blocks
+        hold its bytes, with the pool limited to what it reserves while it serves it (a pool that cannot then returns
+        its free blocks and collects before it refuses, which is what making room does next)."""
+        if int(self.pool.free_bytes()) < rounded:
+            return None
+        limit = int(self.pool.get_limit())
+        self.pool.set_limit(size=int(self.pool.total_bytes()))
         try:
             return self.pool.malloc(size)
         except self.cupy.cuda.memory.OutOfMemoryError:
-            # The ledger admitted it and the device did not: the device holds what the ledger does not see (the CUDA
-            # context, library workspaces, the pool's fragments). Every idle cache on the device is dropped, as the
-            # contract has it before any refusal, and the pool's free blocks returned; then the device decides once more.
-            if name not in self.broker.capacities or not self.broker.evict_idle(name):
+            return None
+        finally:
+            self.pool.set_limit(size=limit)
+
+    def __call__(self, size: int) -> Any:
+        rounded = -(-int(size) // _CUPY_ALLOCATION_ALIGNMENT) * _CUPY_ALLOCATION_ALIGNMENT
+        name = device_pool(int(self.cupy.cuda.runtime.getDevice()))
+        if name not in self.broker.capacities:
+            return self.pool.malloc(size)
+        if not self.broker.admits(name, rounded):
+            # A request the pool serves from a free block leaves its reserved bytes, and so the held bytes, as they are.
+            reused = self._reuse(size, rounded)
+            if reused is not None:
+                return reused
+        self._make_room(name, rounded)
+        try:
+            return self.pool.malloc(size)
+        except self.cupy.cuda.memory.OutOfMemoryError:
+            # The ledger admitted it against the outside bytes as last measured and the device did not: the device gave
+            # bytes outside the pool since (a library's workspace, another process). The meter measures them again and
+            # the ledger decides against the device's own count.
+            self.broker.held(name)
+            self._make_room(name, rounded)
+        try:
+            return self.pool.malloc(size)
+        except self.cupy.cuda.memory.OutOfMemoryError:
+            # The device refuses what its own count admits (no contiguous range for the request): every idle cache is
+            # dropped, as the contract has it before any refusal, and the device decides once more.
+            if not self.broker.evict_idle(name):
                 raise
-            self.pool.free_all_blocks()
             return self.pool.malloc(size)
 
 
-def _device_meter(cupy: Any, device_id: int, reserved: bool = False) -> Callable[[], int]:
-    """The device pool's used bytes, or with ``reserved`` its reserved bytes (every block the pool holds, used or
-    free: an upper bound on the used bytes, read in O(1))."""
-    pool = cupy.get_default_memory_pool()
-    read = pool.total_bytes if reserved else pool.used_bytes
+class _DeviceMeter:
+    """A device's held bytes (the module docstring's device pools): CuPy's reserved bytes on it, plus the bytes the
+    device gave outside the pool since the meter was made, (free at the start - free now) - (reserved now - reserved
+    at the start). ``__call__`` measures them; ``bound`` reads the reserved bytes with the outside bytes as last
+    measured, in O(1); ``settle`` returns the pool's free blocks to the device."""
 
-    def used() -> int:
-        if int(cupy.cuda.runtime.getDevice()) == device_id:
-            return int(read())
-        with cupy.cuda.Device(device_id):
-            return int(read())
+    def __init__(self, cupy: Any, device_id: int) -> None:
+        self.cupy = cupy
+        self.device_id = int(device_id)
+        self.pool = cupy.get_default_memory_pool()
+        with self._on():
+            self.free_at_start = int(cupy.cuda.runtime.memGetInfo()[0])
+            self.reserved_at_start = int(self.pool.total_bytes())
+        self.outside = 0
 
-    return used
+    @contextmanager
+    def _on(self) -> Iterator[None]:
+        if int(self.cupy.cuda.runtime.getDevice()) == self.device_id:
+            yield
+            return
+        with self.cupy.cuda.Device(self.device_id):
+            yield
+
+    def __call__(self) -> int:
+        with self._on():
+            free = int(self.cupy.cuda.runtime.memGetInfo()[0])
+            reserved = int(self.pool.total_bytes())
+        self.outside = max(0, (self.free_at_start - free) - (reserved - self.reserved_at_start))
+        return reserved + self.outside
+
+    def bound(self) -> int:
+        with self._on():
+            return int(self.pool.total_bytes()) + self.outside
+
+    def settle(self) -> None:
+        with self._on():
+            self.pool.free_all_blocks()
+
+
+def meter_device(broker: MemoryBroker, cupy: Any, device_id: int) -> None:
+    """Meter CUDA device ``device_id``'s pool on ``broker`` (``_DeviceMeter``)."""
+    meter = _DeviceMeter(cupy, device_id)
+    name = device_pool(device_id)
+    broker.meters[name] = meter
+    broker.bounds[name] = meter.bound
+    broker.settles[name] = meter.settle
 
 
 _CURRENT: ContextVar[MemoryBroker | None] = ContextVar("svpgs_memory_broker", default=None)
@@ -411,8 +517,7 @@ def memory_scope(budget: ComputeBudget) -> Iterator[MemoryBroker]:
     previous = None
     if cupy is not None:
         for device_id in budget.device_ids:
-            broker.meters[device_pool(device_id)] = _device_meter(cupy, device_id)
-            broker.bounds[device_pool(device_id)] = _device_meter(cupy, device_id, reserved=True)
+            meter_device(broker, cupy, device_id)
         previous = cupy.cuda.get_allocator() if hasattr(cupy.cuda, "get_allocator") else cupy.get_default_memory_pool().malloc
         cupy.cuda.set_allocator(_LedgerAllocator(broker, cupy))
     token = _CURRENT.set(broker)

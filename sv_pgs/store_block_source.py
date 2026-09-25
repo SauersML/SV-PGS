@@ -30,7 +30,7 @@ from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.memory_broker import HOST, MemoryBroker, _device_meter, current_broker, device_pool
+from sv_pgs.memory_broker import HOST, MemoryBroker, current_broker, device_pool, meter_device
 
 _GATHER_SOURCE = r"""
 extern "C" __global__
@@ -158,10 +158,10 @@ class StoreGenotypeBlockSource:
             self._pool = device_pool(device_id)
             self._broker = current_broker()
             if self._broker is None or self._pool not in self._broker.meters:
-                # Outside a CUDA scope: this source's own ledger of its device, metered by CuPy's live bytes (no allocator
+                # Outside a CUDA scope: this source's own ledger of its device, metered as a scope meters it (no allocator
                 # is routed through it, so only the cache's admission reads it).
                 self._broker = MemoryBroker.from_budget(budget)
-                self._broker.meters[self._pool] = _device_meter(self._cupy, device_id)
+                meter_device(self._broker, self._cupy, device_id)
 
     def _admit_resident(self) -> bool:
         """Admit the resident set as a device cache from what the ledger has left (the class docstring)."""

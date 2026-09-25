@@ -173,7 +173,7 @@ def test_inside_a_cuda_scope_every_allocation_is_charged_before_it_is_made() -> 
 
     pool = cupy.get_default_memory_pool()
     pool.free_all_blocks()
-    capacity = int(pool.used_bytes()) + (64 << 20)
+    capacity = int(pool.total_bytes()) + (64 << 20)
     budget = ComputeBudget(
         device_kind="cuda", device_ids=(0,), device_names=("test",), device_bytes=(capacity,), device_compute_capabilities=((8, 6),),
         host_bytes=1 << 30, cpu_threads=2,

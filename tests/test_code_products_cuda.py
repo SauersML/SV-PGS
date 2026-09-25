@@ -188,16 +188,17 @@ def test_cuda_products_inside_a_tight_device_ledger_form_their_columns_by_blocks
     # A few columns' temporaries of the widest product (the array's: its copy, padding and digit split per sample).
     few_columns = 4 * (56 * samples + 56 * variants)
     for (call, outputs, fixed), bits in zip(calls, expected):
-        used = int(pool.used_bytes())
+        pool.free_all_blocks()
+        held = int(pool.total_bytes())
         # The call's outputs whole and its fixed buffers, and a few columns: below the 56 bytes per variant and column
         # the products of every column at once held.
-        capacity = used + outputs * output_bytes + fixed + few_columns
+        capacity = held + outputs * output_bytes + fixed + few_columns
         budget = ComputeBudget(
             device_kind="cuda", device_ids=(0,), device_names=("ledger test",), device_bytes=(capacity,),
             device_compute_capabilities=((0, 0),), host_bytes=1 << 34, cpu_threads=1,
         )
         # Every device allocation inside the scope is admitted by the ledger's allocator, which refuses any that
-        # would take the pool's live bytes past the capacity: the call completing is the bound holding.
+        # would take the device's held bytes past the capacity: the call completing is the bound holding.
         with memory_scope(budget):
             assert tile._column_block(columns, 56 * variants) < columns
             got = call()

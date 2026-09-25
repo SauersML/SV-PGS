@@ -70,43 +70,134 @@ def test_a_mandatory_lease_evicts_idle_caches_newest_first_and_never_one_in_use(
     assert broker.held(HOST) == 100
 
 
-def test_an_allocation_the_device_refuses_after_the_ledger_admitted_it_first_drops_every_idle_cache():
-    # The device holds what the ledger does not see (the CUDA context, library workspaces, the pool's fragments), so an
-    # allocation the ledger admits can still be refused by the device; the allocator then drops the device's idle caches
-    # (no cache may make a request fail), returns the pool's free blocks and lets the device decide once more.
+class _Refused(Exception):
+    pass
+
+
+# The fake device's unit: CuPy's allocation alignment, so every request is its own rounded size.
+_UNIT = 512
+
+
+def _fake_device(free: int):
+    """A device of ``free`` units with CuPy's pool on it: ``used`` live units, ``cached`` free blocks it can return,
+    ``fragments`` free parts of partly used blocks it cannot; lowering ``free`` is a library taking device bytes past
+    the pool. Every count is in units of ``_UNIT`` bytes."""
     from types import SimpleNamespace
 
-    from sv_pgs.memory_broker import _LedgerAllocator
-
-    class Refused(Exception):
-        pass
-
-    device = {"free": 0, "calls": 0}
+    state = {"free": free, "used": 0, "cached": 0, "fragments": 0, "calls": 0, "limit": 0}
 
     class Pool:
-        def malloc(self, size):
-            device["calls"] += 1
-            if size > device["free"]:
-                raise Refused(size)
-            return size
+        def total_bytes(self):
+            return (state["used"] + state["cached"] + state["fragments"]) * _UNIT
+
+        def free_bytes(self):
+            return (state["cached"] + state["fragments"]) * _UNIT
+
+        def get_limit(self):
+            return state["limit"]
+
+        def set_limit(self, size):
+            state["limit"] = size
 
         def free_all_blocks(self):
-            pass
+            state["free"] += state["cached"]
+            state["cached"] = 0
 
-    cupy = SimpleNamespace(
-        get_default_memory_pool=lambda: Pool(), cuda=SimpleNamespace(runtime=SimpleNamespace(getDevice=lambda: 0), memory=SimpleNamespace(OutOfMemoryError=Refused)),
-    )
-    broker = MemoryBroker({"device0": 1 << 20}, meters={"device0": lambda: 0})
-    dropped: list[str] = []
-    busy = broker.admit("device0", 1024, "busy", lambda: dropped.append("busy"), allocated=True)
-    broker.admit("device0", 1024, "idle", lambda: (dropped.append("idle"), device.update(free=4096)), allocated=True)
+        def malloc(self, size):
+            units = size // _UNIT
+            state["calls"] += 1
+            if state["cached"] >= units:
+                state["cached"] -= units
+            elif state["fragments"] >= units:
+                state["fragments"] -= units
+            elif units > state["free"] or (state["limit"] and self.total_bytes() + size > state["limit"]):
+                raise _Refused(size)
+            else:
+                state["free"] -= units
+            state["used"] += units
+            return units
+
+    pool = Pool()
+    runtime = SimpleNamespace(getDevice=lambda: 0, memGetInfo=lambda: (state["free"] * _UNIT, free * _UNIT))
+    cupy = SimpleNamespace(get_default_memory_pool=lambda: pool, cuda=SimpleNamespace(runtime=runtime, memory=SimpleNamespace(OutOfMemoryError=_Refused)))
+    return cupy, state
+
+
+def _metered_device(free: int):
+    from sv_pgs.memory_broker import _LedgerAllocator, meter_device
+
+    cupy, state = _fake_device(free)
+    broker = MemoryBroker({"device0": free * _UNIT})
+    meter_device(broker, cupy, 0)
     allocator = _LedgerAllocator(broker, cupy)
+    return broker, lambda units: allocator(units * _UNIT), state
+
+
+def test_the_device_meter_counts_the_pools_fragments_and_refuses_what_they_leave_no_room_for():
+    # bench-sim v7 chr22 001 on a 40 GB A100 [bench]: the pool's live bytes admitted 1.2 GB that the device, with 40.9 GB
+    # reserved, refused after every cache was dropped. The reserved bytes the pool cannot return are held.
+    broker, allocate, state = _metered_device(1000)
+    allocate(400)
+    # Most of the block freed, its rest still live: 300 units the pool keeps and cannot return.
+    state.update(used=100, fragments=300)
+    assert broker.held("device0") == 400 * _UNIT
+    calls = state["calls"]
+    with pytest.raises(_Refused):
+        allocate(700)
+    assert state["calls"] == calls, "the ledger refuses before the device is asked"
+    assert allocate(600) == 600 and broker.held("device0") == 1000 * _UNIT == broker.peak("device0")
+
+
+def test_a_full_ledger_still_admits_what_the_pool_serves_from_its_free_blocks():
+    # A request the pool serves from a free part of a partly used block leaves its reserved bytes where they are: the
+    # held bytes do not move, so the ledger admits it at capacity; one the free parts cannot serve is refused.
+    broker, allocate, state = _metered_device(1000)
+    allocate(1000)
+    state.update(used=700, fragments=300)
+    assert allocate(200) == 200 and state["free"] == 0 and broker.held("device0") == 1000 * _UNIT
+    assert state["limit"] == 0, "the pool's limit is put back"
+    calls = state["calls"]
+    with pytest.raises(_Refused):
+        allocate(200)
+    assert state["calls"] == calls
+
+
+def test_an_allocation_the_device_refuses_after_the_ledger_admitted_it_measures_the_outside_bytes_and_evicts_for_them():
+    # The ledger's bound reads the device's bytes outside the pool (a library's workspace) as last measured; when the
+    # device refuses what the bound admitted, the meter measures them again and the ledger makes room against the
+    # device's own count: the pool's free blocks returned, then idle caches evicted newest first.
+    broker, allocate, state = _metered_device(1000)
+    dropped: list[str] = []
+    allocate(300)
+
+    def evict() -> None:
+        dropped.append("idle")
+        state["used"] -= 300
+        state["cached"] += 300
+
+    busy = broker.admit("device0", 0, "busy", lambda: dropped.append("busy"), allocated=True)
+    broker.admit("device0", 300 * _UNIT, "idle", evict, allocated=True)
+    state["free"] -= 200  # a library's workspace
     with busy.in_use():
-        assert allocator(2048) == 2048
-    assert dropped == ["idle"] and device["calls"] == 2
-    # With no idle cache left, the device's refusal stands.
-    with busy.in_use(), pytest.raises(Refused):
-        allocator(1 << 13)
+        assert allocate(600) == 600
+    assert dropped == ["idle"] and broker.held("device0") == 800 * _UNIT and state["free"] == 200
+    calls = state["calls"]
+    with busy.in_use(), pytest.raises(_Refused):
+        allocate(300)
+    assert state["calls"] == calls
+
+
+def test_a_decision_the_held_bytes_refuse_first_returns_the_pools_free_blocks():
+    broker, allocate, state = _metered_device(1000)
+    dropped: list[str] = []
+    allocate(700)
+    state.update(used=0, cached=700)
+    assert broker.held("device0") == 700 * _UNIT and broker.remaining("device0") == 1000 * _UNIT
+    assert state["cached"] == 0
+    allocate(700)
+    assert broker.admit("device0", 400 * _UNIT, "a cache", lambda: dropped.append("cache")) is None
+    state.update(used=0, cached=700)
+    assert broker.admit("device0", 400 * _UNIT, "a cache", lambda: dropped.append("cache")) is not None and not dropped
 
 
 def test_a_metered_pool_counts_its_live_bytes_and_admits_caches_from_what_they_leave():
@@ -232,9 +323,10 @@ def test_a_budget_the_fit_cannot_run_in_ends_in_memory_error_not_a_kill(tmp_path
 
 
 def test_a_bounded_pools_allocations_under_its_bound_never_read_its_meter():
-    """A metered pool with an O(1) bound (a device's reserved bytes): allocations that fit under the bound record the
-    bound's peak and never read the meter (the meter walks CuPy's free lists: read on every allocation, it was 74% of a
-    genome fit's sweeps); one that does not fit under the bound reads it."""
+    """A metered pool with an O(1) bound (a device's reserved bytes and its outside bytes as last measured): allocations
+    that fit under the bound record the bound's peak with the allocation and never read the meter (the pool's live bytes,
+    the meter read on every allocation before, were 74% of a genome fit's sweeps); one that does not fit under the bound
+    reads it."""
     reads = {"meter": 0}
     state = {"used": 10, "reserved": 60}
 
@@ -245,7 +337,7 @@ def test_a_bounded_pools_allocations_under_its_bound_never_read_its_meter():
     broker = MemoryBroker({"device0": 100}, meters={"device0": meter}, bounds={"device0": lambda: state["reserved"]})
     for _ in range(50):
         broker.make_room("device0", 30, "an allocation under the bound")
-    assert reads["meter"] == 0 and broker.peak("device0") == 60 >= state["used"]
+    assert reads["meter"] == 0 and broker.peak("device0") == 60 + 30 >= state["used"]
     broker.make_room("device0", 60, "past the bound: the meter decides")
     assert reads["meter"] > 0
 
