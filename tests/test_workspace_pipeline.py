@@ -66,6 +66,9 @@ RECORDS = (
 # written with ',' and one with ':' between its IDs.
 BUBBLES = ((2000, ((1,), (1, 2), (2,))), (3000, ((3,), (4,)) + ((5,),) * 8 + ((3, 4), (3,))))
 REPEATS = ((3995, 4010),)
+# One GENCODE gene (1-based closed) over the 2000 and 3000 sites, with one exon over the 2000 site.
+GENE = (1500, 3500)
+EXON = (1990, 2010)
 HALVES = (("A", (("001", 20), ("002", 20))), ("B", (("001", 24),)))
 TRUTH = ("7001", "7002", "7003", "7004", "7005", "7006", "7099")
 # Imputed samples the crosswalk maps to truth persons (three per ancestry group, by parity); everyone
@@ -201,6 +204,11 @@ def _write_inputs(root: Path) -> _Synthetic:
         (root / "bubbles" / f"{chromosome}.bubble.split.vcf").write_text("\n".join(lines) + "\n")
     with gzip.open(root / "repeats.bed.gz", "wt") as handle:
         handle.write("".join(f"{chromosome}\t{start}\t{end}\tTR\n" for chromosome in CHROMOSOMES for start, end in REPEATS))
+    with gzip.open(root / "genes.gtf.gz", "wt") as handle:
+        handle.write("##description: synthetic\n" + "".join(
+            f"{chromosome}\tSYN\t{feature}\t{start}\t{end}\t.\t+\t.\tgene_id \"G1\";\n"
+            for chromosome in CHROMOSOMES for feature, (start, end) in (("gene", GENE), ("transcript", GENE), ("exon", EXON))
+        ))
 
     all_names = [name for half in names for batch in half for name in batch]
     (root / "crosswalk.tsv").write_text("research_id\tsequencing_id\n" + "".join(f"{_research_of(name)}\t{name}\n" for name in all_names))
@@ -221,6 +229,7 @@ def _write_inputs(root: Path) -> _Synthetic:
         "strata_directory": str(strata),
         "bubble_split": str(root / "bubbles" / "{chromosome}.bubble.split.vcf"),
         "tandem_repeats": str(root / "repeats.bed.gz"),
+        "gene_annotation": str(root / "genes.gtf.gz"),
         "crosswalk": str(root / "crosswalk.tsv"),
         "crosswalk_columns": ["research_id", "sequencing_id"],
         "ancestry": str(root / "ancestry.tsv"),
@@ -510,6 +519,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         assert classes == ["snv", "deletion", "insertion", "deletion", "insertion", "deletion", "str_vntr_repeat", "snv", "insertion"]
         assert table.group_first[: len(RECORDS)].tolist() == [0, 1, 1, 3, 3, 3, 6, 7, 8]
         assert table.annotations["n_paths_total"][: len(RECORDS)].tolist() == [record[4] for record in RECORDS]
+        assert table.annotations["in_gene"][: len(RECORDS)].tolist() == [0, 1, 1, 1, 1, 1, 0, 0, 0]
+        assert table.annotations["in_exon"][: len(RECORDS)].tolist() == [0, 1, 1, 0, 0, 0, 0, 0, 0]
     assert summaries["store"]["background_zeroed"] > 0 and summaries["store"]["no_calls"] == 1
     # The reported r^2 the measurement model falls back on is the batches' INFO/INFO, not a dosage-variance ratio.
     np.testing.assert_allclose(np.load(run / "store" / "reported" / "chr21.npy"), [_reported_info(record) for record in range(len(RECORDS))])

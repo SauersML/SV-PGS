@@ -276,6 +276,43 @@ def tr_loci(
     )
 
 
+def _covered(starts: NDArray, ends: NDArray, core_starts: I64Array, core_ends: I64Array) -> BoolArray:
+    """Whether each core [start, end) overlaps any of the intervals [starts, ends) (0-based half-open, overlapping
+    allowed): the intervals' union, sorted, with each union interval's end the running maximum."""
+    order = np.argsort(np.asarray(starts, dtype=np.int64), kind="stable")
+    if order.shape[0] == 0:
+        return np.zeros(core_starts.shape[0], dtype=bool)
+    starts = np.asarray(starts, dtype=np.int64)[order]
+    reach = np.maximum.accumulate(np.asarray(ends, dtype=np.int64)[order])
+    # The last interval starting before the core's end reaches furthest among them (the running maximum).
+    last = np.searchsorted(starts, core_ends, side="left") - 1
+    return (last >= 0) & (reach[np.clip(last, 0, None)] > core_starts)
+
+
+def gene_overlap(
+    gene_starts: NDArray, gene_ends: NDArray, exon_starts: NDArray, exon_ends: NDArray, tss: NDArray, core_starts: NDArray, core_ends: NDArray,
+) -> dict[str, F64Array]:
+    """Each record's gene annotations on one chromosome, from its core span: ``in_gene`` and ``in_exon`` (1 where the
+    core overlaps any gene body or exon, else 0) and ``log_tss_distance``, log1p of the distance in bases from the core to
+    the nearest transcription start (0 where the core covers one; missing on a chromosome without any). The
+    intervals are 0-based half-open and may overlap; ``tss`` are 0-based positions."""
+    core_starts = np.asarray(core_starts, dtype=np.int64)
+    core_ends = np.asarray(core_ends, dtype=np.int64)
+    starts = np.sort(np.asarray(tss, dtype=np.int64))
+    distance = np.full(core_starts.shape[0], np.nan)
+    if starts.shape[0]:
+        # The first start at or past the core's start, and the last before it.
+        after = np.searchsorted(starts, core_starts, side="left")
+        right = np.where(after < starts.shape[0], starts[np.clip(after, None, starts.shape[0] - 1)] - (core_ends - 1), np.iinfo(np.int64).max)
+        left = np.where(after > 0, core_starts - starts[np.clip(after - 1, 0, None)], np.iinfo(np.int64).max)
+        distance = np.log1p(np.minimum(np.maximum(right, 0), left).astype(np.float64))
+    return {
+        "in_gene": _covered(gene_starts, gene_ends, core_starts, core_ends).astype(np.float64),
+        "in_exon": _covered(exon_starts, exon_ends, core_starts, core_ends).astype(np.float64),
+        "log_tss_distance": distance,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SvKernelFeatures:
     """Every record's SV context on one chromosome (A4.12): the features of one learned kernel.

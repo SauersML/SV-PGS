@@ -29,6 +29,7 @@ from sv_pgs.store_converter import (
     core_spans,
     decode_batch,
     decode_called_batch,
+    gene_overlap,
     linear_recalibration,
     no_call_fill,
     refalt_digest,
@@ -114,6 +115,24 @@ def test_tr_loci_merge_intervals_a_record_bridges() -> None:
     assert loci.interval_counts.tolist() == [2, 1, 1]
     assert loci.record_counts.tolist() == [3, 1, 1]
     assert loci.length_changing_record_counts.tolist() == [1, 1, 1]
+
+
+def test_gene_overlap_reads_overlapping_genes_exons_and_the_nearest_start() -> None:
+    # Gene 1 lies inside gene 0 and reaches past its end; the union covers [100, 260).
+    genes = (np.array([100, 150]), np.array([200, 260]))
+    exons = (np.array([110, 240]), np.array([120, 250]))
+    tss = np.array([100, 259])
+    core_starts = np.array([50, 115, 205, 245, 300, 99])
+    core_ends = np.array([51, 116, 206, 247, 301, 101])
+
+    columns = gene_overlap(*genes, *exons, tss, core_starts, core_ends)
+
+    assert columns["in_gene"].tolist() == [0, 1, 1, 1, 0, 1]
+    assert columns["in_exon"].tolist() == [0, 1, 0, 1, 0, 0]
+    # The distance from the core to the nearest start: 100 - 50, 115 - 100, 259 - 205, 259 - 246, 300 - 259, 0.
+    np.testing.assert_allclose(columns["log_tss_distance"], np.log1p([50, 15, 54, 13, 41, 0]))
+    missing = gene_overlap(np.zeros(0), np.zeros(0), np.zeros(0), np.zeros(0), np.zeros(0), core_starts, core_ends)
+    assert not missing["in_gene"].any() and np.isnan(missing["log_tss_distance"]).all()
 
 
 def test_tr_loci_need_sorted_disjoint_intervals() -> None:

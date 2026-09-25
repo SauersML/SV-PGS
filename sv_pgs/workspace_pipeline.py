@@ -123,6 +123,7 @@ from sv_pgs.store_converter import (
     core_spans,
     decode_batch,
     decode_called_batch,
+    gene_overlap,
     no_call_fill,
     refalt_digest,
     tr_loci,
@@ -146,6 +147,7 @@ CONFIG_KEYS = (
     "strata_directory",
     "bubble_split",
     "tandem_repeats",
+    "gene_annotation",
     "crosswalk",
     "crosswalk_columns",
     "ancestry",
@@ -204,6 +206,7 @@ class WorkspaceConfig:
     strata_directory: Path
     bubble_split: str
     tandem_repeats: Path
+    gene_annotation: Path
     crosswalk: Path
     crosswalk_columns: tuple[str, str]
     ancestry: Path
@@ -265,6 +268,7 @@ class WorkspaceConfig:
             strata_directory=Path(raw["strata_directory"]),
             bubble_split=str(raw["bubble_split"]),
             tandem_repeats=Path(raw["tandem_repeats"]),
+            gene_annotation=Path(raw["gene_annotation"]),
             crosswalk=Path(raw["crosswalk"]),
             crosswalk_columns=(research_column, sequencing_column),
             ancestry=Path(raw["ancestry"]),
@@ -971,6 +975,42 @@ def read_tandem_repeats(path: Path) -> dict[str, tuple[I64Array, I64Array]]:
     return intervals
 
 
+@dataclass(frozen=True, slots=True)
+class GeneIntervals:
+    """One chromosome's genes from the public GENCODE GTF, 0-based half-open: gene bodies, exons (of every
+    transcript) and transcription starts (a transcript's 5' end on its strand)."""
+
+    gene_starts: I64Array
+    gene_ends: I64Array
+    exon_starts: I64Array
+    exon_ends: I64Array
+    tss: I64Array
+
+
+def _feature_spans(rows: pd.DataFrame, feature: str) -> tuple[I64Array, I64Array]:
+    """A GTF feature's spans, 0-based half-open."""
+    chosen = rows[rows["feature"] == feature]
+    return chosen["start"].to_numpy(dtype=np.int64) - 1, chosen["end"].to_numpy(dtype=np.int64)
+
+
+def read_gene_annotation(path: Path) -> dict[str, GeneIntervals]:
+    """The public GENCODE GTF (1-based closed; e.g. gencode.v38.basic.annotation.gtf.gz from EBI) as each
+    chromosome's ``GeneIntervals``: the store's in_gene, in_exon and log_tss_distance (``store_converter.gene_overlap``)."""
+    table = pd.read_csv(
+        path, sep="\t", header=None, usecols=[0, 2, 3, 4, 6], names=["chromosome", "feature", "start", "end", "strand"],
+        dtype={"chromosome": str, "feature": str, "start": np.int64, "end": np.int64, "strand": str}, comment="#",
+    )
+    genes = {}
+    for chromosome, rows in table.groupby("chromosome", sort=False):
+        gene_starts, gene_ends = _feature_spans(rows, "gene")
+        exon_starts, exon_ends = _feature_spans(rows, "exon")
+        transcripts = rows[rows["feature"] == "transcript"]
+        forward = transcripts["strand"].to_numpy() == "+"
+        tss = np.where(forward, transcripts["start"].to_numpy(dtype=np.int64) - 1, transcripts["end"].to_numpy(dtype=np.int64) - 1)
+        genes[str(chromosome)] = GeneIntervals(gene_starts, gene_ends, exon_starts, exon_ends, tss)
+    return genes
+
+
 def store_variant_classes(sites: PoppedSites, positions: NDArray, record_locus: NDArray) -> tuple[U8Array, F64Array]:
     """Each record's store class code (an index of VARIANT_CLASSES) and length, by STORE.md's first-match rules.
 
@@ -1123,7 +1163,10 @@ def _gather_calibration(tasks: Sequence[_DecodeTask], samples: _Samples, directo
     np.savez(directory / "calibration" / f"{chromosome}.npz", dosage=dosage, truth=truth)
 
 
-def _convert_chromosome(run: _Run, directory: Path, root: Path, chromosome: str, samples: _Samples, repeats: Mapping[str, tuple[I64Array, I64Array]]) -> dict[str, Any]:
+def _convert_chromosome(
+    run: _Run, directory: Path, root: Path, chromosome: str, samples: _Samples, repeats: Mapping[str, tuple[I64Array, I64Array]],
+    genes: Mapping[str, GeneIntervals],
+) -> dict[str, Any]:
     config = run.config
     strata = read_strata_sites(config.strata_directory, chromosome)
     first_half = config.imputed_halves[0]
@@ -1143,6 +1186,8 @@ def _convert_chromosome(run: _Run, directory: Path, root: Path, chromosome: str,
     classes, lengths = store_variant_classes(sites, strata.positions, loci.record_locus)
     locus_groups = np.where(loci.record_locus == NO_LOCUS, -1, loci.record_locus.astype(np.int64))
     group_first = unbreakable_group_first(counts.bubble, strata.positions, locus_groups)
+    gene = genes.get(chromosome, GeneIntervals(empty, empty, empty, empty, empty))
+    gene_columns = gene_overlap(gene.gene_starts, gene.gene_ends, gene.exon_starts, gene.exon_ends, gene.tss, core_starts, core_ends)
 
     tasks = _decode_tasks(config, directory, chromosome, samples)
     _decode_all(tasks, expected, len(samples.legend), run.budget)
@@ -1188,6 +1233,7 @@ def _convert_chromosome(run: _Run, directory: Path, root: Path, chromosome: str,
             "cx": strata.complexity,
             "tr_locus": loci.record_locus.astype(np.uint32),
             "sv_length": lengths,
+            **gene_columns,
         },
         annotation_legends=complexity_legends,
         id_bytes=np.frombuffer(b"".join(encoded_ids), dtype=np.uint8),
@@ -1214,6 +1260,7 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
         "strata": [_file_digest(config.strata_directory / "_done" / f"{chromosome}.json") for chromosome in config.chromosomes],
         "bubble_split": [Path(config.bubble_split.format(chromosome=chromosome)).stat().st_size for chromosome in config.chromosomes],
         "tandem_repeats": _file_digest(config.tandem_repeats),
+        "gene_annotation": _file_digest(config.gene_annotation),
         "codec": config.codec,
     }
 
@@ -1225,12 +1272,13 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
     for subdirectory in ("chromosomes", "fill", "calibration", "reported"):
         (directory / subdirectory).mkdir(exist_ok=True)
     repeats = read_tandem_repeats(config.tandem_repeats)
+    genes = read_gene_annotation(config.gene_annotation)
     facts = []
     for chromosome in config.chromosomes:
         done = directory / "chromosomes" / f"{chromosome}.json"
         if not done.is_file():
             _clear_chromosome(root, chromosome, len(samples.halves), directory)
-            _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats))
+            _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats, genes))
             _remove_own(directory / "batches" / chromosome, directory)
         facts.append(json.loads(done.read_text(encoding="utf-8")))
     measurements = ["imputed_dosage"] * len(config.imputed_halves) + (["long_read_calls"] if config.truth_calls is not None else [])
@@ -1566,7 +1614,7 @@ _STEPS = (
         _store_inputs,
         (
             store_converter, dosage_store, variant_typing, _store_step, _convert_chromosome, read_strata_sites, read_popped_sites,
-            read_bubble_paths, path_counts, read_tandem_repeats, store_variant_classes, _decode, _decode_tasks, _gather_calibration,
+            read_bubble_paths, path_counts, read_tandem_repeats, read_gene_annotation, store_variant_classes, _decode, _decode_tasks, _gather_calibration,
         ),
         _store_step,
     ),

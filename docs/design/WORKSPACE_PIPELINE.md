@@ -19,6 +19,7 @@ These are formats; the paths come from a run config supplied inside the workspac
 | Strata sidecar v2 | `chrK.strata.tsv.gz` (header line starting `#`) with idx, pos, id, refalt_md5, ref_len, alt_len, n_paths, n_paths_total, cx; `_done/chrK.json` with `sites_md5` and `ids_md5` | The contig is used only once `_done` exists. The popped records' md5 over `CHROM\tPOS\tREF\tALT\n` and over `INFO/ID\n` must equal the sidecar's |
 | bubble.split | One biallelic record per path, a bubble's paths consecutive at its POS; INFO/ID lists the path's atomic IDs split on `:` (`,` read as `:`) | For every multi-path record: one bubble carries it, with the sidecar's n_paths_total paths, n_paths of which carry its ID |
 | Tandem repeats | GIAB v3.6 AllTandemRepeatsandHomopolymers_slop5 BED | Sorted, non-overlapping (`tr_loci`) |
+| Genes | The public GENCODE GTF (gencode.v38.basic.annotation.gtf.gz, EBI): gene, transcript and exon features, 1-based closed | Each record's core span gives the store's `in_gene`, `in_exon` and `log_tss_distance` (`gene_overlap`); a chromosome the GTF lacks has none |
 | Truth calls | Long-read hard calls (GT) on the popped site list, one file per chromosome, samples named by research ID. **Or an explicit `null`** | The same lockstep gate as a batch |
 | Crosswalk | Research ID ↔ DRAGEN sequencing ID, one to one | `SampleCrosswalk` |
 | Ancestry | The CDR ancestry predictions TSV: `research_id`, `ancestry_pred`, `pca_features` | Every store sample has a label and PCs |
