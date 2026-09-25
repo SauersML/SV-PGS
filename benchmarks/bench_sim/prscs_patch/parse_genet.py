@@ -198,6 +198,20 @@ def _parse_ldblk(ldblk_dir, sst_dict, chrom):
     return prepare_ldblk(ld_blk, snp_blk, sst_dict)
 
 
+def _symmetrized(cp, host, flip):
+    """One block's sign flips and symmetrization on the GPU (baselines-genome addition): the same symmetrization in
+    float64, by the symmetric eigendecomposition: for symmetric A = Q L Q', the SVD's V' diag(s) V is Q |L| Q'
+    (cusolver's gesvd is far slower than its syevd at these sizes)."""
+    block = cp.asarray(host)
+    if np.any(flip != 1):
+        device_flip = cp.asarray(flip)
+        block = block*cp.outer(device_flip, device_flip)
+    w, q = cp.linalg.eigh(block)
+    block = (block+cp.dot(q*cp.abs(w)[None, :], q.T))/2
+    del w, q
+    return block
+
+
 def prepare_ldblk(ld_blk, snp_blk, sst_dict):
     """parse_ldblk's work after reading the reference (baselines-genome split): keep each block's summary-statistic
     SNPs, flip their signs, and symmetrize; callable on blocks held in memory. Overwrites ld_blk's entries."""
@@ -223,17 +237,25 @@ def prepare_ldblk(ld_blk, snp_blk, sst_dict):
                 if len(idx) != ld_blk[blk].shape[0]:
                     ld_blk[blk] = ld_blk[blk][np.ix_(idx,idx)]
                 flip = np.asarray(flip, dtype=np.float64)
-                block = cp.asarray(ld_blk[blk])
+                host = ld_blk[blk]
                 ld_blk[blk] = None
-                if np.any(flip != 1):
-                    device_flip = cp.asarray(flip)
-                    block = block*cp.outer(device_flip, device_flip)
-                # the same symmetrization in float64 on the GPU (baselines-genome addition), by the symmetric
-                # eigendecomposition: for symmetric A = Q L Q', the SVD's V' diag(s) V is Q |L| Q' (cusolver's
-                # gesvd is far slower than its syevd at these sizes)
-                w, q = cp.linalg.eigh(block)
-                block = (block+cp.dot(q*cp.abs(w)[None, :], q.T))/2
-                del w, q
+                try:
+                    block = _symmetrized(cp, host, flip)
+                except cp.cuda.memory.OutOfMemoryError:
+                    if not resident:
+                        raise
+                    block = None  # retried below, once the exception no longer holds the failed attempt's arrays
+                if block is None:
+                    # the blocks prepared so far, held on the device, leave too little for this one's
+                    # eigendecomposition: they move to the host (mcmc then streams each block to the device, or
+                    # holds them all again if they fit its working set) and the same computation is redone
+                    resident = False
+                    for kk in range(blk):
+                        if isinstance(ld_blk[kk], cp.ndarray):
+                            ld_blk[kk] = cp.asnumpy(ld_blk[kk])
+                    cp.get_default_memory_pool().free_all_blocks()
+                    block = _symmetrized(cp, host, flip)
+                del host
                 ld_blk[blk] = block if resident else cp.asnumpy(block)
                 del block
                 cp.get_default_memory_pool().free_all_blocks()
