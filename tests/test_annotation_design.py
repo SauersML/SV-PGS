@@ -242,3 +242,22 @@ def test_a_factor_prior_does_not_depend_on_which_level_comes_first() -> None:
     # the prior covariance of the per-variant contributions D theta, theta ~ N(0, P^-1), is the same
     covariances = [design.design @ np.linalg.inv(design.groups[0].penalty) @ design.design.T for design in (first, second)]
     np.testing.assert_allclose(covariances[0], covariances[1], atol=1e-12)
+
+
+def test_a_near_dependent_earlier_annotation_never_drops_a_later_independent_one():
+    """The screen drops a column for what it adds to the columns before it, never a later annotation's columns for an
+    earlier one's near-dependence: a length smooth observed on a few rows (its spline directions barely resolved) must
+    leave every column of a distance smooth observed everywhere (ENSG00000187605.16 [real] lost all of
+    log_tss_distance this way)."""
+    rng = np.random.default_rng(5)
+    rows = 20_000
+    length = np.full(rows, np.nan)
+    length[:40] = rng.lognormal(5.0, 2.0, 40)
+    distance = rng.uniform(0.0, 14.0, rows)
+    design = annotation_design({"a_length": np.log1p(length), "b_distance": distance}, {}, class_index=np.zeros(rows, dtype=np.int64))
+    distance_names = [name for name in design.names if name.startswith("b_distance:")]
+    assert "b_distance:linear" in distance_names
+    assert any(":spline" in name for name in distance_names)
+    centred = design.design - design.design.mean(axis=0)
+    eigenvalues = np.linalg.eigvalsh(centred.T @ centred)
+    assert eigenvalues[0] > np.finfo(float).eps * rows * max(eigenvalues[-1], 1.0)

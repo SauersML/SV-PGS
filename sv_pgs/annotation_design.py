@@ -42,7 +42,6 @@ from typing import Mapping, Sequence
 
 import numpy as np
 from scipy import sparse
-from scipy.linalg import solve_triangular
 from gamfit.basis import bspline_basis, smoothness_penalty
 
 from sv_pgs._typing import F64Array, I64Array
@@ -224,33 +223,20 @@ def annotation_design(
 
 
 def _screened(centred: F64Array) -> I64Array:
-    """The columns of the class-centred design kept in order: a column enters when its squared residual against the
-    kept ones (its Schur complement in their Gram) exceeds the Gram's own rounding, p eps times its squared norm, and
-    is nonzero beyond eps p max(|column|, 1); then the prior's exact test (the kept Gram's least eigenvalue above
-    eps p max(its largest, 1)) removes the latest columns until it passes, since a residual screen bounds the
-    singular values only up to the column count."""
-    count = centred.shape[0]
+    """The columns of the class-centred design kept in order: a column enters when the Gram of the kept columns with
+    it passes the prior's exact test (``scale_mixture_prior``: its least eigenvalue above eps p max(largest, 1)),
+    with the largest eigenvalue of the whole candidate Gram in the bound, which is at least that of every subset's, so
+    the kept design passes the prior's test. A column is dropped only for what it adds to the ones before it: a test
+    run once on the whole kept set and failed by removing the latest columns dropped whole later annotations for an
+    earlier one's near-dependence (every log_tss_distance column on ENSG00000187605.16 [real], for the SV length
+    smooths' few rows)."""
+    count, size = centred.shape
+    gram = centred.T @ centred
+    largest = float(np.linalg.eigvalsh(gram)[-1]) if size else 0.0
+    bound = _EPSILON * count * max(largest, 1.0)
     kept: list[int] = []
-    factor = np.zeros((0, 0))
-    for column in range(centred.shape[1]):
-        values = centred[:, column]
-        square = float(values @ values)
-        if np.sqrt(square) <= _EPSILON * count * max(float(np.max(np.abs(values))), 1.0):
-            continue
-        cross = centred[:, kept].T @ values if kept else np.zeros(0)
-        solved = solve_triangular(factor, cross, lower=True) if kept else cross
-        residual = square - float(solved @ solved)
-        if residual <= count * _EPSILON * square:
-            continue
-        kept.append(column)
-        grown = np.zeros((len(kept), len(kept)))
-        grown[:-1, :-1] = factor
-        grown[-1, :-1] = solved
-        grown[-1, -1] = np.sqrt(residual)
-        factor = grown
-    while kept:
-        eigenvalues = np.linalg.eigvalsh(centred[:, kept].T @ centred[:, kept])
-        if eigenvalues[0] > _EPSILON * count * max(float(eigenvalues[-1]), 1.0):
-            break
-        kept.pop()
+    for column in range(size):
+        trial = [*kept, column]
+        if float(np.linalg.eigvalsh(gram[np.ix_(trial, trial)])[0]) > bound:
+            kept.append(column)
     return np.asarray(kept, dtype=np.int64)
