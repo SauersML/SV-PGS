@@ -1040,6 +1040,16 @@ def store_variant_classes(sites: PoppedSites, positions: NDArray, record_locus: 
     return classes, lengths
 
 
+def store_group_first(bubble: NDArray, positions: NDArray, classes: NDArray, record_locus: NDArray) -> I64Array:
+    """Each record's ``group_first``, the store's site key: its bubble, its same-POS set and its TR locus are one
+    unsplittable group (``unbreakable_group_first``), a TR locus grouping only its TR-class records, as
+    ``store_converter.overlap_group_first`` groups bench-sim's: a locus's SNVs join a group only through a bubble or a
+    shared position, so a locus spans no more records than its repeat holds."""
+    tr_class = np.asarray(classes) == VARIANT_CLASSES.index(VariantClass.STR_VNTR_REPEAT)
+    locus_groups = np.where(tr_class, np.asarray(record_locus).astype(np.int64), -1)
+    return unbreakable_group_first(bubble, positions, locus_groups)
+
+
 @dataclass(frozen=True, slots=True)
 class _DecodeTask:
     half: int
@@ -1192,8 +1202,7 @@ def _convert_chromosome(
     interval_starts, interval_ends = repeats.get(chromosome, (empty, empty))
     loci = tr_loci(interval_starts, interval_ends, core_starts, core_ends, strata.alt_lengths - strata.ref_lengths)
     classes, lengths = store_variant_classes(sites, strata.positions, loci.record_locus)
-    locus_groups = np.where(loci.record_locus == NO_LOCUS, -1, loci.record_locus.astype(np.int64))
-    group_first = unbreakable_group_first(counts.bubble, strata.positions, locus_groups)
+    group_first = store_group_first(counts.bubble, strata.positions, classes, loci.record_locus)
     gene = genes.get(chromosome, GeneIntervals(empty, empty, empty, empty, empty))
     gene_columns = gene_overlap(gene.gene_starts, gene.gene_ends, gene.exon_starts, gene.exon_ends, gene.tss, core_starts, core_ends)
 
@@ -1622,7 +1631,7 @@ _STEPS = (
         _store_inputs,
         (
             store_converter, dosage_store, variant_typing, _store_step, _convert_chromosome, read_strata_sites, read_popped_sites,
-            read_bubble_paths, path_counts, read_tandem_repeats, read_gene_annotation, store_variant_classes, _decode, _decode_tasks, _gather_calibration,
+            read_bubble_paths, path_counts, read_tandem_repeats, read_gene_annotation, store_variant_classes, store_group_first, _decode, _decode_tasks, _gather_calibration,
         ),
         _store_step,
     ),

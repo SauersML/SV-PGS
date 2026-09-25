@@ -40,7 +40,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 ## Sidecar `variants/chrK` (one row per record)
 - **Keys:** pos, ref_len, alt_len, refalt_md5, atomic IDs.
 - **variant_class:** SNV → snv. Every other record is typed by kind at any size, so a 1 bp indel and a 1 kb SV of the same kind share a class, and length is a continuous annotation. The first match wins:
-  1. VNTR/STR context → str_vntr_repeat;
+  1. VNTR/STR context (the record's core inside a repeat interval, `tr_loci`) → str_vntr_repeat;
   2. INS/DUP with an MEI TE class → insertion_mei;
   3. DEL → deletion;
   4. other INS → insertion;
@@ -54,8 +54,9 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
 - **Reliability keys:** sv_ctx, cx, has_pl.
 - **r2_truth (f32):** corr²(stored D, G), triad-corrected. The pipeline fits the r̂ model and fills this column inside the AoU workspace. The coefficients never leave it, and outside the workspace the column stays NaN.
 - **tr_locus (u32):**
-  - the connected component of GIAB v3.6 "AllTandemRepeatsandHomopolymers_slop5" intervals that the record's trimmed core overlaps;
-  - a record bridging intervals merges them;
+  - the GIAB v3.6 "AllTandemRepeatsandHomopolymers_slop5" interval that contains the record's trimmed core (`tr_loci`);
+  - a record whose core reaches past an interval (a deletion of a repeat and its flank, or one spanning several repeats) belongs to no locus and is typed by its kind, so no record bridges loci. Merging the intervals a record bridged, with every record of a locus in one unsplittable group, chained the public chr22 panel sites into a 34,180-record group over 1.35 Mb;
+  - `group_first` joins a locus's TR-class records only (`store_group_first`), the same rule as the benchmarks' stores (`overlap_group_first`);
   - homopolymers are included, and there is no padding.
 - **SV context** (`store_converter.sv_kernel_features`): the features of one learned distance kernel over every SV allele of the chromosome outside the record's own bubble. There is no window, no K and no frequency cutoff.
   - Each allele weighs 2f(1 − f), its genotype-variance share; this equals H_locus = 1 − Σ f_a² for a biallelic locus.

@@ -207,8 +207,8 @@ class TrLoci:
     """One chromosome's tandem-repeat loci (A4.7) and each record's locus.
 
     ``record_locus[r]`` indexes the loci table (in coordinate order), ``NO_LOCUS`` for a record
-    that overlaps no repeat interval. A locus is a connected component of repeat intervals under
-    "a record's core overlaps both"; ``starts``/``ends`` span its intervals.
+    whose core no repeat interval contains. A locus is one repeat interval (``tr_loci``);
+    ``starts``/``ends`` are its interval.
     """
 
     record_locus: NDArray
@@ -229,9 +229,14 @@ def tr_loci(
     """Assign records to tandem-repeat loci on one chromosome.
 
     ``interval_starts``/``interval_ends`` are the repeat BED (0-based half-open, sorted and
-    non-overlapping, as the GIAB AllTandemRepeatsandHomopolymers_slop5 file is); a record joins
-    every interval its core overlaps, and intervals a record bridges merge into one locus, so each
-    record, and each haplotype's length change, counts in exactly one locus.
+    non-overlapping, as the GIAB AllTandemRepeatsandHomopolymers_slop5 file is), and each interval
+    is one locus. A record belongs to the locus whose interval contains its core: a change inside
+    the repeat and its slop. A record whose core reaches past an interval (a deletion of a repeat
+    and its flank, or one spanning several repeats) changes more than a repeat's length and belongs
+    to none, so no record bridges loci. Merging the intervals a record bridged chained the loci: on
+    the public 1kGP/HGSVC panel sites of chr22 (bench-real's), with every record of a locus in one
+    unsplittable group, the largest group held 34,180 records over 1.35 Mb, past any LD block cap;
+    with containment and only the TR-class records grouped, 2,897 over 119 kb.
     """
     interval_starts = np.asarray(interval_starts, dtype=np.int64)
     interval_ends = np.asarray(interval_ends, dtype=np.int64)
@@ -241,38 +246,23 @@ def tr_loci(
         raise ValueError("repeat intervals must be non-empty, sorted and non-overlapping.")
     if np.any(core_ends <= core_starts):
         raise ValueError("record cores must be non-empty.")
-    # Intervals overlapping [start, end): those with end > start and start < end.
-    first_interval = np.searchsorted(interval_ends, core_starts, side="right")
-    past_interval = np.searchsorted(interval_starts, core_ends, side="left")
-    overlaps = past_interval > first_interval
-    # A record bridging intervals [first, past) links each to the next: one union of a run.
     interval_count = interval_starts.shape[0]
-    links = np.zeros(interval_count, dtype=np.int64)
-    bridging = overlaps & (past_interval - first_interval > 1)
-    np.add.at(links, first_interval[bridging], 1)
-    np.add.at(links, past_interval[bridging] - 1, -1)
-    # links[i] > 0 over a run means interval i joins interval i + 1.
-    joins_next = np.cumsum(links)[:-1] > 0 if interval_count else np.zeros(0, dtype=bool)
-    component_of_interval = np.concatenate([[0], np.cumsum(~joins_next)]).astype(np.int64) if interval_count else np.zeros(0, dtype=np.int64)
+    # The one interval that can contain a core is the last starting at or before it.
+    candidate = np.searchsorted(interval_starts, core_starts, side="right") - 1
+    inside = np.zeros(core_starts.shape[0], dtype=bool)
+    if interval_count:
+        inside = (candidate >= 0) & (core_ends <= interval_ends[np.clip(candidate, 0, None)])
     record_locus = np.full(core_starts.shape[0], NO_LOCUS, dtype=np.uint32)
-    record_locus[overlaps] = component_of_interval[first_interval[overlaps]]
-    component_count = int(component_of_interval[-1]) + 1 if interval_count else 0
-    starts = np.full(component_count, np.iinfo(np.int64).max, dtype=np.int64)
-    ends = np.full(component_count, np.iinfo(np.int64).min, dtype=np.int64)
-    np.minimum.at(starts, component_of_interval, interval_starts)
-    np.maximum.at(ends, component_of_interval, interval_ends)
-    interval_counts = np.bincount(component_of_interval, minlength=component_count).astype(np.int64)
-    loci_of_records = record_locus[overlaps].astype(np.int64)
-    record_counts = np.bincount(loci_of_records, minlength=component_count).astype(np.int64)
-    changing = np.asarray(length_changes)[overlaps] != 0
-    length_changing = np.bincount(loci_of_records[changing], minlength=component_count).astype(np.int64)
+    record_locus[inside] = candidate[inside]
+    loci_of_records = candidate[inside]
+    changing = np.asarray(length_changes)[inside] != 0
     return TrLoci(
         record_locus=record_locus,
-        starts=starts,
-        ends=ends,
-        interval_counts=interval_counts,
-        record_counts=record_counts,
-        length_changing_record_counts=length_changing,
+        starts=interval_starts.copy(),
+        ends=interval_ends.copy(),
+        interval_counts=np.ones(interval_count, dtype=np.int64),
+        record_counts=np.bincount(loci_of_records, minlength=interval_count).astype(np.int64),
+        length_changing_record_counts=np.bincount(loci_of_records[changing], minlength=interval_count).astype(np.int64),
     )
 
 

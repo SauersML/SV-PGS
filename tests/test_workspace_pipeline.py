@@ -26,8 +26,8 @@ import pytest
 from sv_pgs.all_of_us import MEASUREMENT_EXCLUSION_REASONS, build_all_of_us_measurement_sql
 from sv_pgs.cohort import pipeline_half_levels
 from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.config import TraitType
-from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, DosageStore, HalfSamples, encode_dosage_milli
+from sv_pgs.config import TraitType, VariantClass
+from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, VARIANT_CLASSES, DosageStore, HalfSamples, encode_dosage_milli
 from sv_pgs.fast_scoring import (
     ScoringModel,
     ScoringPlan,
@@ -37,7 +37,8 @@ from sv_pgs.fast_scoring import (
 )
 from sv_pgs.fit_model import FitRequest
 from sv_pgs.phenotype_measurement import fit_at_exponent
-from sv_pgs.store_converter import linear_recalibration, refalt_digest, value_matched_background
+from sv_pgs.ld_partition import cut_allowed_from_groups, validate_cut_allowed
+from sv_pgs.store_converter import linear_recalibration, refalt_digest, tr_loci, value_matched_background
 from sv_pgs import workspace_pipeline
 from sv_pgs.workspace_pipeline import (
     STEP_NAMES,
@@ -47,6 +48,7 @@ from sv_pgs.workspace_pipeline import (
     check_exportable,
     path_counts,
     run_pipeline,
+    store_group_first,
 )
 
 CHROMOSOMES = ("chr21", "chr22")
@@ -695,3 +697,26 @@ def test_the_launcher_sends_nothing_outside_the_workspace() -> None:
     text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.name != "README.md")
     # The service account's "email" key names an identity inside the workspace; it sends nothing.
     assert not re.search(r"https?://|curl|wget|webhook|notif|sendmail|smtp|\bmail\b|slack|pubsub|scp |rsync", text)
+
+
+def test_a_record_spanning_several_repeats_chains_no_unsplittable_group_past_the_block_cap() -> None:
+    """Three repeats of 40 TR indels each with SNVs between them, and one long deletion over all three: the deletion
+    is inside no repeat (``tr_loci``), so it is a deletion, not a TR, and bridges nothing; each locus groups its TR
+    records alone, and every unsplittable group fits a block cap of one repeat's records. Merging bridged intervals
+    and grouping every record of a locus chained the public chr22 panel sites into a 34,180-record group."""
+    repeats = (np.array([1_000, 3_000, 5_000]), np.array([1_200, 3_200, 5_200]))
+    tr_positions = np.concatenate([start + 5 + 4 * np.arange(40) for start in repeats[0]])
+    snv_positions = np.arange(1_500, 5_000, 500)
+    positions = np.sort(np.concatenate([tr_positions, snv_positions, [900]]))
+    is_tr = np.isin(positions, tr_positions)
+    deletion = positions == 900
+    core_starts = positions - 1
+    core_ends = np.where(deletion, 5_500, core_starts + np.where(is_tr, 2, 1))
+    changes = np.where(is_tr, -2, np.where(deletion, -4_600, 0))
+    loci = tr_loci(*repeats, core_starts, core_ends, changes)
+    assert loci.record_locus[deletion][0] == np.iinfo(np.uint32).max
+    code = {variant_class: index for index, variant_class in enumerate(VARIANT_CLASSES)}
+    classes = np.where(is_tr, code[VariantClass.STR_VNTR_REPEAT], np.where(deletion, code[VariantClass.DELETION], code[VariantClass.SNV]))
+    group_first = store_group_first(np.full(positions.shape[0], -1), positions, classes, loci.record_locus)
+    validate_cut_allowed(cut_allowed_from_groups(group_first), 40)
+    assert np.unique(group_first[is_tr]).shape[0] == 3

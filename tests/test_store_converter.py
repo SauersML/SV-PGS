@@ -101,7 +101,7 @@ def test_value_matched_background_rejects_impossible_path_counts() -> None:
         value_matched_background(dosage.astype(np.float64), np.array([1]), np.array([1]))
 
 
-def test_tr_loci_merge_intervals_a_record_bridges() -> None:
+def test_tr_loci_hold_the_records_their_interval_contains_and_no_bridge() -> None:
     intervals = (np.array([0, 20, 40, 100]), np.array([10, 30, 50, 110]))
     core_starts = np.array([5, 8, 45, 60, 95, 25])
     core_ends = np.array([6, 22, 46, 61, 105, 26])
@@ -109,13 +109,14 @@ def test_tr_loci_merge_intervals_a_record_bridges() -> None:
 
     loci = tr_loci(*intervals, core_starts, core_ends, length_changes)
 
-    # Record 1 spans intervals 0 and 1, so they are one locus.
-    assert loci.record_locus.tolist() == [0, 0, 1, int(NO_LOCUS), 2, 0]
-    assert loci.starts.tolist() == [0, 40, 100]
-    assert loci.ends.tolist() == [30, 50, 110]
-    assert loci.interval_counts.tolist() == [2, 1, 1]
-    assert loci.record_counts.tolist() == [3, 1, 1]
-    assert loci.length_changing_record_counts.tolist() == [1, 1, 1]
+    # Record 1 spans intervals 0 and 1 and record 4 reaches into interval 3 from outside: neither is inside a repeat,
+    # and no interval merges.
+    assert loci.record_locus.tolist() == [0, int(NO_LOCUS), 2, int(NO_LOCUS), int(NO_LOCUS), 1]
+    assert loci.starts.tolist() == [0, 20, 40, 100]
+    assert loci.ends.tolist() == [10, 30, 50, 110]
+    assert loci.interval_counts.tolist() == [1, 1, 1, 1]
+    assert loci.record_counts.tolist() == [1, 1, 1, 0]
+    assert loci.length_changing_record_counts.tolist() == [0, 0, 1, 0]
 
 
 def test_gene_overlap_reads_overlapping_genes_exons_and_the_nearest_start() -> None:
