@@ -22,8 +22,8 @@ the eigen step LDstep3, the merge LDstep4 and sbayesrc() are the package's):
   statistics it is paired with (see ldpred2_auto.py: the cohort's five ancestry groups make raw correlations carry
   the structure the PCs remove from the phenotype).
 - Annotations (sbayesrc.py): an intercept, in_gene, in_exon, log_tss_distance, in_repeat, log_sv_length and the
-  INDEL / TR / SV class indicators, the public per-record annotations the benchmark provides. sbayesrc_annotfree.py
-  runs the same fit with no annotation file.
+  INDEL / TR / SV class indicators, the public per-record annotations the benchmark provides, less any constant on the
+  fitted records (annotation_table). sbayesrc_annotfree.py runs the same fit with no annotation file.
 
 Quantitative traits (a binary one is fitted as its 0/1 values). Needs R with SBayesRC (module R/4.4.2-openblas-rocky8;
 R_LIBS_USER listing the library SBayesRC is installed in, then the compete library).
@@ -100,6 +100,20 @@ def common_rows(train) -> np.ndarray:
     return rows[np.argsort(cm, kind="stable")]
 
 
+def annotation_table(variants, rows: np.ndarray) -> tuple[tuple[str, ...], np.ndarray]:
+    """The annotation columns (ANNOTATIONS, then the CLASSES indicators) on ``rows``, less every column constant on them.
+
+    A column with no variance among the fitted records carries no information about them and duplicates the intercept,
+    which SBayesRC rejects ("too small XPX"). The SV ablation's runs without the TR and SV classes are the case:
+    log_sv_length and the TR and SV indicators are all zero on the records left."""
+    cls = np.asarray(variants["cls"])[rows]
+    columns = [np.asarray(variants[name], dtype=np.float64)[rows] for name in ANNOTATIONS]
+    columns += [(cls == code).astype(np.float64) for code, _ in enumerate(CLASSES, start=1)]
+    table = np.column_stack(columns)
+    varies = np.ptp(table, axis=0) > 0
+    return tuple(name for name, kept in zip((*ANNOTATIONS, *CLASSES), varies) if kept), table[:, varies]
+
+
 def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool) -> np.ndarray:
     """The GWAS (.ma), the per-block full LD in GCTB's .ldm.full format, ldm.info, and the annotation file.
 
@@ -152,12 +166,9 @@ def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool)
         handle.write("SNP\tA1\tA2\tfreq\tb\tse\tp\tN\n")
         handle.writelines(gwas)
     if annotated:
-        cls = np.asarray(variants["cls"])[rows]
-        columns = [np.asarray(variants[name], dtype=np.float64)[rows] for name in ANNOTATIONS]
-        columns += [(cls == code).astype(np.float64) for code, _ in enumerate(CLASSES, start=1)]
-        table = np.column_stack(columns)
+        header, table = annotation_table(variants, rows)
         with open(folder / "annot.txt", "w") as handle:
-            handle.write("\t".join(("SNP", "Intercept", *ANNOTATIONS, *CLASSES)) + "\n")
+            handle.write("\t".join(("SNP", "Intercept", *header)) + "\n")
             for name, values in zip(names, table):
                 handle.write(name + "\t1\t" + "\t".join(f"{value:.6g}" for value in values) + "\n")
     return means
