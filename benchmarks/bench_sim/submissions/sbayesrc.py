@@ -15,7 +15,8 @@ the eigen step LDstep3, the merge LDstep4 and sbayesrc() are the package's):
 
 - Variants: every measured record of minor allele frequency at least 1% of every class (SNV, INDEL, TR, SV), as the
   published method uses its densest variant set (7.3M imputed common variants in the paper, rather than HapMap3);
-  the LD blocks are 4 cM windows of genetic position, the width of the package's default block file (ref4cM_v37).
+  the LD blocks are 4 cM windows of genetic position, the width of the package's default block file (ref4cM_v37), a
+  window too large for the package's block reader split in equal parts (ld_blocks).
 - Marginal statistics: the GWAS with covariates, by Frisch-Waugh-Lovell b_j = <P x_j, P y>/|P x_j|^2 with P the
   projection off [1, covariates], and se_j with n - k - 1 degrees of freedom.
 - LD: the correlations of the same projected dosages of the training people, in-sample, so the LD matches the
@@ -30,6 +31,7 @@ R_LIBS_USER listing the library SBayesRC is installed in, then the compete libra
 """
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 import subprocess
@@ -41,6 +43,9 @@ MINOR_ALLELE_FLOOR = 0.01
 """The published SBayesRC variant set's minor allele frequency floor (common imputed variants, MAF > 1%)."""
 BLOCK_CM = 4.0
 """Width of the package's default LD blocks (ref4cM_v37.pos: 4 cM windows)."""
+BLOCK_RECORDS = math.isqrt(2**31 - 1)
+"""The most records one LD block can hold: the package's LDstep3 reads a block's n x n matrix with readBin(n = n * n),
+and R's integer product n * n overflows to NA past 2^31 - 1."""
 ANNOTATIONS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")
 CLASSES = ("INDEL", "TR", "SV")
 """Class indicators (codes 1, 2, 3); SNVs are the intercept's baseline."""
@@ -100,6 +105,20 @@ def common_rows(train) -> np.ndarray:
     return rows[np.argsort(cm, kind="stable")]
 
 
+def ld_blocks(cm: np.ndarray) -> np.ndarray:
+    """Each record's LD block (records in genetic-position order): the 4 cM windows, each one holding more than
+    BLOCK_RECORDS records (a window of low recombination) split into the fewest contiguous near-equal parts that fit."""
+    window = np.floor((cm - cm[0]) / BLOCK_CM).astype(np.int64)
+    block = np.empty_like(window)
+    first = 0
+    for value in np.unique(window):
+        members = np.flatnonzero(window == value)
+        parts = -(-members.shape[0] // BLOCK_RECORDS)
+        block[members] = first + np.arange(members.shape[0]) * parts // members.shape[0]
+        first += parts
+    return block
+
+
 def annotation_table(variants, rows: np.ndarray) -> tuple[tuple[str, ...], np.ndarray]:
     """The annotation columns (ANNOTATIONS, then the CLASSES indicators) on ``rows``, less every column constant on them.
 
@@ -128,7 +147,7 @@ def write_inputs(train, rows: np.ndarray, folder: pathlib.Path, annotated: bool)
     variants = train.variants
     cm = np.asarray(variants["cm"], dtype=np.float64)[rows]
     position = np.asarray(variants["pos"])[rows]
-    block_of = np.floor((cm - cm[0]) / BLOCK_CM).astype(np.int64)
+    block_of = ld_blocks(cm)
     ld = folder / "ld"
     ld.mkdir()
     means = np.empty(rows.shape[0])

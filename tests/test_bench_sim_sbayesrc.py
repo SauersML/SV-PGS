@@ -38,3 +38,18 @@ def test_columns_constant_without_the_structural_classes_are_left_out() -> None:
     assert header == ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "INDEL")
     assert np.all(np.ptp(table, axis=0) > 0)
     np.testing.assert_array_equal(table[:, header.index("log_tss_distance")], variants["log_tss_distance"][rows])
+
+
+def test_ld_blocks_are_the_4cm_windows_when_each_fits() -> None:
+    cm = np.sort(np.random.default_rng(2).uniform(0.0, 20.0, 1000))
+    np.testing.assert_array_equal(sbayesrc.ld_blocks(cm), np.floor((cm - cm[0]) / sbayesrc.BLOCK_CM))
+
+
+def test_a_window_past_the_reader_limit_is_split_in_near_equal_contiguous_parts(monkeypatch) -> None:
+    assert sbayesrc.BLOCK_RECORDS**2 <= 2**31 - 1 < (sbayesrc.BLOCK_RECORDS + 1) ** 2
+    monkeypatch.setattr(sbayesrc, "BLOCK_RECORDS", 10)
+    cm = np.concatenate([np.linspace(0.0, 1.0, 25), np.linspace(4.5, 5.0, 7), np.linspace(8.1, 9.0, 10)])
+    blocks = sbayesrc.ld_blocks(cm)
+    assert np.all(np.diff(blocks) >= 0)
+    counts = np.bincount(blocks)
+    np.testing.assert_array_equal(counts, [9, 8, 8, 7, 10])
