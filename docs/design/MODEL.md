@@ -136,6 +136,7 @@ A rejection resting only on a lane's own simulation (`[sim-only]`) is provisiona
 - Per-class free tails estimated from each class's own columns: they cost more than they returned [sim-only: idea-bigcausal, at n·h²/p ≈ 4.2 against production's ≈ 0.009].
 - Sparse arithmetic kernels for rare columns in Stage 2: they lose to dense tensor cores at ~1,800 right-hand sides [sim-only: synthetic store; timing]. Rare variants are sparse in storage only.
 - gamfit for the r² calibration model: it failed REML certification, and only tied the linear model [in-workspace: measured in-workspace; value not reproduced here].
+- A power screen dropping whole sites (`group_first`) whose summed per-member prior-predictive risk B_j ≥ E[m_j²] (read from the learned prior, frequency function included) stays within (1/K) Σ_j E[Var(β_j | y)]. No MAF cutoff falls out of the learned prior: the members it drops are mostly common (s000) or span every MAF (s008). The per-member sum is not a certificate under LD. On s000 it drops 3.0% of members, with genetic r² −2.7e-5 [−4.4e-5, −0.9e-5]. On s008 it drops 80%, and the slice's genetic r² falls from 0.0022 to 0.0001: the dropped part carries 34% of the prediction's variance but only 1.6% of Σ s_j m_j². A valid screen needs the dropped set's LD-aware risk E‖X_D m_D‖²/n against the predictor's posterior variance. The code was removed [bench: bench-sim v7 chr22, 60k-record slices].
 
 ## 7. Related work and evidence
 
