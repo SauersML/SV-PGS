@@ -20,6 +20,12 @@ A site is one unbreakable group of records, the store's ``VariantTable.group_fir
 same-POS sets, bubbles and TR loci; ``store_converter.overlap_group_first`` where no converted store gives one): a
 common multiallelic locus split into rare allele records is one site, and its alleles' risks add. A site is dropped
 whole or kept whole, smallest total risk first.
+
+Not wired into the fit: the risks add per member, without the LD cross terms between sites, so a dropped set's
+correlated posterior means can move the prediction far more than sum_j B_j. On bench-sim v7 scenario 008 (a 60k-record
+chr22 slice) the screen dropped 80% of members, their part carried 34% of the prediction's variance against 1.6% of
+sum_j s_j m_j^2, and the slice's genetic r2 fell from 0.0022 to 0.0001. A valid screen needs the LD-aware risk
+E||X_D m_D||^2 / n of the dropped set.
 """
 
 from __future__ import annotations
