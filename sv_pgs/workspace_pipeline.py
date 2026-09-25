@@ -983,6 +983,11 @@ def read_tandem_repeats(path: Path) -> dict[str, tuple[I64Array, I64Array]]:
     return intervals
 
 
+GTF_COLUMNS = ("chromosome", "source", "feature", "start", "end", "score", "strand", "frame", "attributes")
+"""The GTF's nine tab-separated fields in order (GENCODE and Ensembl GTF 2.2: seqname, source, feature, start, end, score,
+strand, frame, attributes); the reader keeps the chromosome, feature, span and strand."""
+
+
 @dataclass(frozen=True, slots=True)
 class GeneIntervals:
     """One chromosome's genes from the public GENCODE GTF, 0-based half-open: gene bodies, exons (of every
@@ -1005,7 +1010,7 @@ def read_gene_annotation(path: Path) -> dict[str, GeneIntervals]:
     """The public GENCODE GTF (1-based closed; e.g. gencode.v38.basic.annotation.gtf.gz from EBI) as each
     chromosome's ``GeneIntervals``: the store's in_gene, in_exon and log_tss_distance (``store_converter.gene_overlap``)."""
     table = pd.read_csv(
-        path, sep="\t", header=None, usecols=[0, 2, 3, 4, 6], names=["chromosome", "feature", "start", "end", "strand"],
+        path, sep="\t", header=None, names=GTF_COLUMNS, usecols=["chromosome", "feature", "start", "end", "strand"],
         dtype={"chromosome": str, "feature": str, "start": np.int64, "end": np.int64, "strand": str}, comment="#",
     )
     genes = {}
