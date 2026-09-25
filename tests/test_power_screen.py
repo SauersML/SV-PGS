@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from sv_pgs.power_screen import power_screen, site_index
+from sv_pgs.power_screen import power_screen
 from sv_pgs.scale_mixture_ep import (
     Cavity, class_log_density, derived_lattice, initial_hyperparameters, log_scale, scale_mixture_prior, tilted_moments,
 )
@@ -25,14 +25,16 @@ def _prior(offsets: np.ndarray, precision: float):
     return prior, initial_hyperparameters(prior, 1.0 / precision)
 
 
-def test_sites_join_split_alleles_overlaps_and_groups() -> None:
-    # Three alleles at one position; an SNV alone; a 50 bp deletion with an SNV inside it; two records joined only by
-    # their unbreakable group; a record on the next chromosome at an overlapping coordinate.
-    chromosome = np.array([22, 22, 22, 22, 22, 22, 22, 22, 23])
-    position = np.array([100, 100, 100, 200, 300, 310, 500, 600, 300])
-    ref_length = np.array([1, 4, 9, 1, 50, 1, 1, 1, 1])
-    group_first = np.array([0, 1, 2, 3, 4, 5, 6, 6, 8])
-    assert site_index(chromosome, position, ref_length, group_first).tolist() == [0, 0, 0, 1, 2, 2, 3, 3, 4]
+def test_sites_are_the_records_group_first() -> None:
+    # Members keyed by their records' group_first (three alleles at one locus, a deletion with an SNV inside it, an
+    # SNV alone): a site per key, numbered in record order, its risk the sum of its members'.
+    precision = 400.0
+    group_first = np.array([10, 10, 10, 13, 13, 15])
+    prior, hyperparameters = _prior(np.zeros(6), precision)
+    screen = power_screen(prior, hyperparameters, np.full(6, precision), np.ones(6), group_first, _DRAWS, _BYTES)
+    assert screen.site.tolist() == [0, 0, 0, 1, 1, 2]
+    np.testing.assert_allclose(screen.site_risk, np.bincount(screen.site, weights=screen.risk))
+    assert screen.record()["sites"] == 3
 
 
 def test_the_bounds_hold_over_the_prior_predictive() -> None:

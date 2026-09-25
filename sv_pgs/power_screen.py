@@ -16,9 +16,10 @@ the prior's, 0. The scorer's K posterior draws resolve its mean only to the post
 certificate's level, ``marginal_variances.certificate_level``), so a set D whose total risk is within
 (1/K) sum_j E_j moves the prediction by less than the draws can see.
 
-A site is one unbreakable group of records (its bubble, same-POS set or TR locus, ``VariantTable.group_first``) joined
-with every record whose reference span overlaps it: a common multiallelic locus split into rare allele records is
-one site, and its alleles' risks add. A site is dropped whole or kept whole, smallest total risk first.
+A site is one unbreakable group of records, the store's ``VariantTable.group_first`` (overlapping reference spans,
+same-POS sets, bubbles and TR loci; ``store_converter.overlap_group_first`` where no converted store gives one): a
+common multiallelic locus split into rare allele records is one site, and its alleles' risks add. A site is dropped
+whole or kept whole, smallest total risk first.
 """
 
 from __future__ import annotations
@@ -26,8 +27,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
-from scipy.sparse import coo_matrix
-from scipy.sparse.csgraph import connected_components
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, ScaleMixturePrior, class_log_density, log_scale
@@ -55,50 +54,20 @@ class PowerScreen:
         }
 
 
-def site_index(chromosome: np.ndarray, position: I64Array, ref_length: np.ndarray, group_first: I64Array) -> I64Array:
-    """A site per record (0..S-1, in record order): records sharing ``group_first`` or whose reference spans
-    [position, position + max(ref_length, 1)) overlap on one chromosome are one site. Records must be sorted by
-    (chromosome, position), as a store's are."""
-    chromosome = np.asarray(chromosome)
-    position = np.asarray(position, dtype=np.int64)
-    end = position + np.maximum(np.asarray(ref_length, dtype=np.int64), 1)
-    count = position.shape[0]
-    if count == 0:
-        return np.zeros(0, dtype=np.int64)
-    if np.any((chromosome[1:] == chromosome[:-1]) & (position[1:] < position[:-1])):
-        raise ValueError("records must be sorted by chromosome and position")
-    # A record overlaps the span before it when it begins before the furthest end reached so far on its chromosome:
-    # the running maximum of the ends, restarted at each chromosome.
-    chromosome_start = np.r_[True, chromosome[1:] != chromosome[:-1]]
-    reach = np.empty(count, dtype=np.int64)
-    for first, stop in zip(np.flatnonzero(chromosome_start), np.r_[np.flatnonzero(chromosome_start)[1:], count]):
-        reach[first:stop] = np.maximum.accumulate(end[first:stop])
-    joined = np.zeros(count, dtype=bool)
-    joined[1:] = ~chromosome_start[1:] & (position[1:] < reach[:-1])
-    # Edges: each overlapping record to the one before it, and each record to its group's first record.
-    rows = np.r_[np.flatnonzero(joined), np.arange(count)]
-    columns = np.r_[np.flatnonzero(joined) - 1, np.asarray(group_first, dtype=np.int64)]
-    graph = coo_matrix((np.ones(rows.shape[0]), (rows, columns)), shape=(count, count))
-    _count, label = connected_components(graph, directed=False)
-    # Sites numbered in order of their first record.
-    _labels, first_record = np.unique(label, return_index=True)
-    rank = np.empty(first_record.shape[0], dtype=np.int64)
-    rank[np.argsort(first_record, kind="stable")] = np.arange(first_record.shape[0])
-    return rank[label]
-
-
 def power_screen(
     prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, precision: F64Array, column_variance: F64Array,
-    site: I64Array, draw_count: int, working_bytes: int,
+    group_first: I64Array, draw_count: int, working_bytes: int,
 ) -> PowerScreen:
     """The screen at ``hyperparameters`` for members with data precision ``precision`` (w_j) and column variance
-    ``column_variance`` (s_j, x_j'x_j / n), grouped by ``site`` (``site_index`` over the members)."""
+    ``column_variance`` (s_j, x_j'x_j / n), grouped into sites by their records' ``group_first``."""
     precision = np.asarray(precision, dtype=np.float64)
     column_variance = np.asarray(column_variance, dtype=np.float64)
-    site = np.asarray(site, dtype=np.int64)
+    group_first = np.asarray(group_first, dtype=np.int64)
     count = prior.variant_count
-    if precision.shape != (count,) or column_variance.shape != (count,) or site.shape != (count,):
-        raise ValueError("precision, column variance and site need one entry per prior member")
+    if precision.shape != (count,) or column_variance.shape != (count,) or group_first.shape != (count,):
+        raise ValueError("precision, column variance and group_first need one entry per prior member")
+    # Sites numbered 0..S-1 in order of their group's first record.
+    site = np.unique(group_first, return_inverse=True)[1].reshape(count)
     grid = np.asarray(prior.log_variance_grid, dtype=np.float64)
     log_density = class_log_density(prior, hyperparameters.coefficients)
     scales = log_scale(prior, hyperparameters.coefficients)
