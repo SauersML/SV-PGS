@@ -217,3 +217,6 @@ The sv_gene_dosage copy-change rule, summed over genes:
   - a public dev draw (seed 20260919·10) serves dev scenarios;
   - a sealed draw, sha256("<master>:readcn"), stored under sealed/, serves sealed scenarios.
   - The sealed parameter file's hash goes into COMMITMENTS.txt.
+
+## Amendment 11 (2026-09-25): the repeat locus in the public variant table
+- **repeat_locus** joins the public variant table: the index of the merged UCSC simpleRepeat interval a record overlaps (-1 for none), from annotations.npz, the same public intervals in_repeat reads. It is a label, not a quantity. A method may group a locus's records by it (MODEL.md section 1's TR locus column); the truth draws and every scenario are unchanged.

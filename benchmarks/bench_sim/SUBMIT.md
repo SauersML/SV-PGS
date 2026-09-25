@@ -15,7 +15,7 @@ class Model:
 
 - **`train`:**
   - `train.codes(rows)`: uint8 observed codes, shape [len(rows), n_train_samples]; dosage = code / 127, the arm's observed value per record;
-  - `train.variants`: a dict of public per-record arrays: pos, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV), len_change (signed), ref_len, alt_len, in_gene, in_exon, log_tss_distance, in_repeat, log_sv_length, and imputation_info (GLIMPSE2 INFO or Beagle DR2 for imputed records, per arm);
+  - `train.variants`: a dict of public per-record arrays: pos, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV), len_change (signed), ref_len, alt_len, in_gene, in_exon, log_tss_distance, in_repeat, repeat_locus (the index of the merged simpleRepeat interval a record overlaps, -1 for none; a label, not a quantity), log_sv_length, and imputation_info (GLIMPSE2 INFO or Beagle DR2 for imputed records, per arm);
   - `train.covariates` [n_train, 13], with names in `train.covariate_names`: sex, age (standardized), batch, pc1–pc10;
   - `train.truth_half` (a bool per training sample);
   - `train.phenotype`, `train.trait_type` ("quantitative" or "binary"), `train.prevalence` (binary only), and `train.cores`.

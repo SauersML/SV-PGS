@@ -73,7 +73,7 @@ def read_evidence(cohort: Path, scenario: Path, arm: str, records: np.ndarray, c
     return ReadEvidence(rows=np.searchsorted(records, channel["rows"]), _pl=np.load(directory / f"readcn_{draw}_pl.npy", mmap_mode="r"),
                         _columns=columns)
 VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
-ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "log_sv_length")
+ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "repeat_locus", "log_sv_length")
 
 
 @dataclass
