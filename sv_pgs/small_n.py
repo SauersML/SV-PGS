@@ -48,6 +48,7 @@ from types import ModuleType
 import numpy as np
 import scipy.optimize
 from scipy import linalg, sparse
+from scipy.special import logsumexp
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.binary_likelihood import BernoulliSites
@@ -2125,8 +2126,21 @@ def fit_small_n(
     remaining = max(outer.remaining_gain for outer in outers)
     move = max(outer.prediction_move for outer in outers)
     move_tolerance = min(outer.prediction_tolerance for outer in outers)
-    elbos = [float(component.oracle.profile["elbo"]) for component in components if "elbo" in component.oracle.profile]
-    profile = dict(oracles[0].profile) | ({"mixture_elbos": elbos, "elbo": float(np.mean(elbos)), "mixture_components": len(components)} if elbos else {}) | {
+    # The mixture q = sum_m w_m q_m over distinct modes (``_admit``): its ELBO, sum_m w_m (ELBO_m - log w_m) at its weights,
+    # and its log evidence, log sum_m Z_m over the modes' evidences (``_component_log_evidence``, which set the weights),
+    # with each component's own. The components' arithmetic mean, reported as the ELBO before, read -12,928 on
+    # ENSG00000279334.1 [real] for modes at -526.9 and near -25,000, a number no fit had.
+    mixture = {}
+    if all("elbo" in component.oracle.profile for component in components):
+        elbos = np.array([float(component.oracle.profile["elbo"]) for component in components])
+        log_evidences = np.array([_component_log_evidence(component) for component in components])
+        present = weights > 0.0
+        mixture = {
+            "mixture_elbos": elbos.tolist(), "mixture_log_evidences": log_evidences.tolist(), "mixture_weights": weights.tolist(),
+            "elbo": float(np.sum(weights[present] * (elbos[present] - np.log(weights[present])))),
+            "log_evidence": float(logsumexp(log_evidences)), "mixture_components": len(components),
+        }
+    profile = dict(oracles[0].profile) | mixture | {
         "stage0_seconds": stage0_seconds,
         "total_seconds": time.perf_counter() - started,
         "samples": statistics.sample_count,

@@ -981,3 +981,25 @@ def test_the_order_of_the_variants_does_not_change_a_prediction():
     reference = _fit_and_score(dosage, target, samples)
     order = np.random.default_rng(7).permutation(dosage.shape[1])
     np.testing.assert_allclose(_fit_and_score(dosage[:, order], target, samples), reference, rtol=1e-6, atol=1e-8 * float(np.max(np.abs(reference))))
+
+
+def test_the_profile_reports_the_mixtures_own_elbo_and_evidence():
+    """The profile's ELBO is the mode mixture's own, sum_m w_m (ELBO_m - log w_m) at its weights, at most
+    log sum_m e^ELBO_m (Gibbs), and its log evidence is log sum_m Z_m over the modes' evidences, each component listed;
+    the arithmetic mean of the components' ELBOs it replaced read -12,928 on ENSG00000279334.1 [real] for modes at
+    -526.9 and far below."""
+    sys.path.insert(0, "tests")
+    from test_mean_field import _WORKING_BYTES as working_bytes, _problem
+    codes, covariates, target, classes = _problem(9, samples=100, variants=30)
+    fit = fit_small_n(codes=codes, covariates=covariates, target=target, variant_class=classes, log_variance_offset=None, draw_count=16,
+                      working_bytes=working_bytes, seed=0, inference="mean_field")
+    from scipy.special import logsumexp
+    profile = fit.profile
+    elbos, weights = np.asarray(profile["mixture_elbos"]), np.asarray(profile["mixture_weights"])
+    evidences = np.asarray(profile["mixture_log_evidences"])
+    assert elbos.shape == weights.shape == evidences.shape == (profile["mixture_components"],)
+    kept = weights > 0.0
+    np.testing.assert_allclose(profile["elbo"], np.sum(weights[kept] * (elbos[kept] - np.log(weights[kept]))), rtol=1e-12)
+    assert profile["elbo"] <= logsumexp(elbos) + 1e-9
+    np.testing.assert_allclose(profile["log_evidence"], logsumexp(evidences), rtol=1e-12)
+    assert profile["log_evidence"] >= evidences.max()
