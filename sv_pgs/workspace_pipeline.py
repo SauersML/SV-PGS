@@ -160,6 +160,13 @@ CONFIG_KEYS = (
     "codec",
     "export",
 )
+KEY_HINTS = {
+    "gene_annotation": (
+        "gene_annotation is the public GENCODE v38 basic annotation GTF, gencode.v38.basic.annotation.gtf.gz from "
+        "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/ (GRCh38, chr-prefixed contigs)."
+    ),
+}
+"""What to point a key at, for the keys whose file is a public download."""
 STRATA_COLUMNS = ("idx", "pos", "id", "refalt_md5", "ref_len", "alt_len", "n_paths", "n_paths_total", "cx")
 """The strata sidecar v2 columns the store needs (the imputation's chrK.strata.tsv.gz, header after '#')."""
 SEX_COLUMN = "sex_at_birth_concept_id"
@@ -228,7 +235,8 @@ class WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
         unknown = sorted(set(raw) - set(CONFIG_KEYS))
         if missing or unknown:
-            raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required.")
+            hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
+            raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
         halves = tuple(
             ImputedHalfInput(label=str(half["label"]), batches=tuple(str(batch) for batch in half["batches"]), batch_path=str(half["batch_path"]))
             for half in raw["imputed_halves"]

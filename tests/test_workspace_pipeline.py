@@ -664,6 +664,9 @@ def test_the_config_names_every_key_and_canonical_phenotypes(workspace) -> None:
     synthetic, _client = workspace
     with pytest.raises(ValueError, match="every key is required"):
         WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "truth_calls"})
+    # A missing gene_annotation says which public file to point it at.
+    with pytest.raises(ValueError, match=r"gencode\.v38\.basic\.annotation\.gtf\.gz"):
+        WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "gene_annotation"})
     with pytest.raises(ValueError, match="canonical name"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "diseases": ["afib"]})
 
