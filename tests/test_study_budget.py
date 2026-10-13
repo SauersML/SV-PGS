@@ -1,8 +1,10 @@
 """Budget validation and duplicate submission protection, with no cloud calls."""
 import copy
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -113,3 +115,51 @@ def test_render_preserves_runtime_variables_and_refuses_shell_injection(tmp_path
     monkeypatch.setenv("RUN_ID", "$(cat /private)")
     with pytest.raises(ValueError, match="unsafe"):
         guard.render(template, output, ["RUN_ID"])
+
+
+def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
+    """Exercise the real shell/CLI integration against a local fake gcloud, never a cloud account."""
+    executable = tmp_path / "gcloud"
+    executable.write_text(f"#!{sys.executable}\n" + '''
+import json, os, sys
+from pathlib import Path
+root = Path(os.environ["FAKE_CLOUD"])
+database = root / "objects.json"
+objects = json.loads(database.read_text()) if database.exists() else {}
+args = sys.argv[1:]
+if args[:2] == ["storage", "cp"]:
+    source, target = args[2:4]
+    if "--if-generation-match=0" in args and target in objects:
+        sys.exit(1)
+    objects[target] = Path(source).read_text()
+    database.write_text(json.dumps(objects))
+elif args[:2] == ["storage", "cat"]:
+    print(objects[args[2]])
+elif args[:3] == ["batch", "jobs", "submit"]:
+    spec = next(value.split("=", 1)[1] for value in args if value.startswith("--config="))
+    with (root / "submitted.jsonl").open("a") as output:
+        output.write(json.dumps(json.loads(Path(spec).read_text())) + "\\n")
+else:
+    raise RuntimeError(args)
+''')
+    executable.chmod(0o755)
+    launcher = Path(__file__).parents[1] / "launcher/workspace/submit.sh"
+    environment = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"], FAKE_CLOUD=str(tmp_path))
+    environment.update(
+        PROJECT_ID="test-project", REGION="us-central1", ZONE="us-central1-a", OPS_BUCKET="workspace",
+        RUN_ID="study", RUN_DISK="disk", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
+        WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu",
+        MACHINE_TYPE="a2-highgpu-1g", PROVISIONING_MODEL="SPOT", GPU_TYPE="nvidia-tesla-a100",
+        GPU_COUNT="1", NETWORK="network", SUBNETWORK="subnetwork", SERVICE_ACCOUNT="account@example.test",
+        MAX_RETRIES="0", STUDY_BUDGET=str(launcher.with_name("study_budget.template.json")),
+    )
+    first = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert first.returncode == 0, first.stderr
+    second = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert second.returncode != 0 and "already used" in second.stderr
+    submitted = (tmp_path / "submitted.jsonl").read_text().splitlines()
+    assert len(submitted) == 1
+    spec = json.loads(submitted[0])
+    guard.validate_job(spec, 146400, 0)
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
+    assert "$RUN/venv/bin/sv-pgs" in script and "${status}" in script and "${RUN_ID}" not in script
