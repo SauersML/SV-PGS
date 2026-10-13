@@ -9,7 +9,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
 
 | Arm | Columns | Prior inputs |
 |---|---|---|
-| A (SNV) | SNVs and indels | class, r̂², SNV-derived annotations and external SNV z² only; no SV information |
+| A (SNV/indel) | SNVs and short indels | class, r̂², SNV-derived annotations and external SNV z² only; no SV information |
 | B (SV prior) | A's columns | A's inputs, plus SV-context features and external SV z² |
 | C (SV-PGS) | A's columns + SV alleles + TR length columns + fused GATK-SV rows | B's inputs |
 | C-null | C with the SV and TR-length columns permuted within ancestry | the same EB as C |
@@ -21,6 +21,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - The forecast comes from the exact identity Δ_j = r²_j(1 − ρ²_j), where ρ² is how predictable an SV column is from local SNVs.
   - Imputed SVs' ρ² [in-workspace: measured in-workspace; value not reproduced here].
 - **Total gain** = C − A.
+- **What the workspace run implements** (WORKSPACE_PIPELINE.md): two arms with one prior design, `snv_indel` (every record under 50 bp: A's columns) and `with_sv` (every record); no B arm, no fused GATK-SV rows and no null arms. Its fold-combined comparison omits the cross-fit pair term, so it is descriptive, not test (a) below.
 
 ## Claims and their tests
 α = 0.05 is split 0.025 / 0.0125 / 0.0125 across (a) / (b) / (c).

@@ -2,7 +2,7 @@
 
 - **Code:** `sv_pgs/workspace_pipeline.py`, run as `sv-pgs workspace-run --config RUN_CONFIG.json [--through STEP]`.
 - **Test:** `tests/test_workspace_pipeline.py`, a synthetic dry run of every step on a synthetic store and synthetic OMOP.
-- **Launcher:** `launcher/workspace/`, templates only. Launching is the user's decision.
+- **Launcher:** `launcher/workspace/`: `submit.sh` submits each job straight to Google Batch from a terminal inside the workspace, after reserving a slot in the study's budget ledger (launcher/workspace/README.md). Launching is the user's decision.
 
 **Data class.** Everything the pipeline reads or writes is participant-derived and stays in the AoU workspace (STORE.md, "Data class"):
 - Nothing is ever sent anywhere: no notifications, webhooks, uploads or messages.
@@ -53,9 +53,9 @@ With `strata_directory` and `bubble_split` both `null`, each batch file is one i
 | Step | Reads | Writes | Restart grain |
 |---|---|---|---|
 | samples | batch headers, crosswalk, ancestry, relatedness | typed half manifests, cohort rows (`resolve_cohort_rows`), ancestry groups, calibration pairs, trait-agnostic folds (`kinship_folds`, strata half × ancestry) | step |
+| store | the samples step's half manifests and groups, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes; the store summary counts the records the 8-bit codes made monomorphic (`encoding_flattened`) | each batch's decode; each chromosome |
 | phenotypes | the CDR | one sample table per disease and trait (`all_of_us`) | step |
 | cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |
-| store | samples, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes | each batch's decode; each chromosome |
 | measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the one model the fit reads, pooled over the fit rows' ancestry groups (`pooled_measurement_model`); the store rewritten with D* where pairs exist | step |
 | fit | cohort, measurement, final store | both arms of every trait (below): per (arm, trait) one `fit_model.fit` call holding the trait's fold models and its all-rows model, each projecting out its own trait's columns (`covariate_columns`), saved by `artifact.save_model` | each (arm, trait) |
 | score | fit, cohort | every model of both arms scored for the cohort from one store read (`artifact.predict_models`), and each person's own-fold held-out linear predictor, genetic score and predictive mean | step |
@@ -71,10 +71,18 @@ The arms differ by exactly the structural variation of the study's definition (�
 
 **Models.** Per trait, one model per fold (trained without that fold and scored on it) and one model on every observed row (`<trait>/all`). The all-rows model is the released score and the effects step's source; the fold models only measure held-out accuracy (SPEC: the fit itself never holds rows out). A run of T traits fits 2 · T · (folds + 1) models.
 
+**Likelihood.** Every model is fitted on the Gaussian likelihood (`FIT_TRAIT_TYPE`), a disease's 0/1 status included: a linear probability working model. A disease's coefficients are per-allele changes in the probability of recorded status, not log odds, and its raw fitted values (linear predictor, predictive mean) are not probabilities and can leave [0, 1]. The logistic likelihood's Polya-Gamma route (`binary_likelihood`, a binary trait type in `fit_model.fit`) exists, but the workspace run does not use it: its weights move with its sites, so every sweep re-reads the whole store, hundreds of store passes per model, which the study's compute budget does not hold at All of Us scale.
+
+**LD route.** A quantitative model's mean-field fit takes one of two approximations, chosen per model by which pass is measured cheaper on this store and device (`stage2_wiring._fit_one`, `gram_space.pass_costs`):
+- the sample route (`DualGaussian`): every pass reads the store, so the likelihood is the full data's;
+- the summary band (`GramGaussian`): every step after Stage 0 reads only Stage 0's banded Gram, and the LD beyond the band (blocks two apart, other chromosomes) enters as extra per-block noise (the tempered band), its measured size in the certificate (`far_field`, `far_field_scale`; `far_field` is 0 on the sample route).
+
+They are different approximations and can give different fits, so two models of one run need not share a route. A binary or EP model always takes the sample route.
+
 **Report.**
-- `accuracy.tsv` (trait, arm, cell, level, n, cases, metric, value). A disease gets the AUC of its linear predictor (`auc`), the AUC of its genetic score alone (`pgs_auc`) and the log loss of its predictive probability. A quantitative trait gets the r² of its linear predictor and the partial r² of its genetic score given the trait's covariates.
-- `comparison.tsv` (trait, cell, level, n, cases, metric, estimate, standard_error, z, p_value), with positive values favouring `with_sv`, per cell of all held-out rows and per ancestry group. A disease gets the DeLong paired delta AUC of the linear predictors and of the genetic scores, and the family-clustered gain in recalibrated log likelihood. A quantitative trait gets the family-clustered delta partial r² of the genetic scores (`held_out_comparison`).
-- Every value is each fold's own model on its own fold, weighted by the fold's rows: never one pooled correlation of the folds' differently scaled predictors. The comparison's standard error adds the folds' in quadrature; it leaves out the cross-fold pair term (their shared training rows), which needs each arm's posterior covariance.
+- `accuracy.tsv` (trait, arm, cell, level, n, cases, metric, value). A disease gets the AUC of its linear predictor (`auc`) and the AUC of its genetic score alone (`pgs_auc`). A quantitative trait gets the r² of its linear predictor and the partial r² of its genetic score given the trait's covariates.
+- `comparison.tsv` (trait, cell, level, n, cases, metric, estimate, standard_error, z, p_value, inference), with positive values favouring `with_sv`, per cell of all held-out rows and per ancestry group. A disease gets the DeLong paired delta AUC of the linear predictors and of the genetic scores, and the family-clustered gain in log likelihood after each arm's linear predictor is recalibrated by a two-parameter logistic fit on the same held-out rows. A quantitative trait gets the family-clustered delta partial r² of the genetic scores (`held_out_comparison`).
+- Every value is each fold's own model on its own fold, weighted by the fold's rows: never one pooled correlation of the folds' differently scaled predictors. The comparison's standard error adds the folds' in quadrature, conditional on the fitted models; it leaves out the cross-fold pair term (their shared training rows), which needs each arm's posterior covariance. So a comparison over more than one fold leaves z and p empty, with inference `descriptive_cross_fit`.
 - A cell shows values only with at least 21 rows and, for a disease, at least 21 cases and 21 controls. A case count is written only where neither it nor the controls it implies is 1 to 20.
 
 **Effects summaries** count records, never participants. `effects_by_class.tsv` gives, per (trait, arm, class, length bin), the records, how many have a positive and a negative posterior mean, the posterior-expected counts of positive and negative effects (Σ P(β > 0), Σ P(β < 0)), the mean, median and root-mean-square effect per unit, and the summed standardized second moment. Length bins are `<50` and then decades from 50 bp. `effect_length_correlation.tsv` gives Spearman's ρ between log length and the root-mean-square effect per structural class. Every moment is under the law the model's draws come from: the fitted product approximation on the mean-field route (`fast_scoring`).
@@ -88,6 +96,18 @@ The arms differ by exactly the structural variation of the study's definition (�
 **Where the steps run.** HANDOFF.md plans to build the store inside the imputation workspace and copy only the store into the SV-PGS workspace.
 - `--through store` builds it where the BCFs are.
 - A run directory that already holds a completed `samples` and `store` resumes from them after the copy, as long as the config and code keys match.
+
+## Interpreting the outputs
+
+- **The disease target** is the 0/1 `target`: ever-recorded EHR status, a case on evidence at any age up to the end of observation (prevalent and incident alike) against a control with none (PHENOTYPES.md). It is not incident risk over a horizon.
+- **Scale.** A disease coefficient is a per-allele (per-copy) change in the probability of recorded status on the working likelihood (above), not a log odds ratio, and raw fitted values are not probabilities.
+- **Signs.** Each effect is per ALT allele, so its sign follows which allele the input calls ALT. The prior is symmetric in sign, so a class's balance of positive and negative effects (`effects_by_class.tsv`) is what the prior predicts whatever the biology: weak evidence either way.
+- **Not causal.** A coefficient is the joint fit's share of the signal among correlated records under the prior, not a causal effect; under LD a large effect can stand for a neighbour.
+- **What a `with_sv` gain means.** An imputed SV dosage is a function of the nearby SNVs and indels the imputation read, so it carries no genetic information the `snv_indel` arm's data lack. A gain means the SV columns represent the haplotypes better in a linear model. New information needs SVs called from reads (the long-read half's hard calls, or the direct channel below, which is not built).
+- **The baseline** is `snv_indel`: SNVs, short indels and short repeat-length changes (every record under 50 bp), not SNVs alone.
+- **Folds share training rows** (with K folds, any two training sets share (K − 2)/(K − 1) of each), so their held-out errors are correlated. Fold-combined comparisons are descriptive: their standard error leaves that covariance out, and z and p are left empty. The log-likelihood gain recalibrates on the rows it scores, so it compares discrimination and shape, not probabilities.
+- **Certificate terms** (`outer_criterion_met` and the rest) say the outer loop met its numerical stopping criterion on the computed objective, a directional Laplace approximation with leading-order corrections (CAPABILITIES.md). They do not bound the error of the evidence or of the posterior, and posterior SDs and P(effect > 0) are under the law the draws come from (Effects summaries).
+- **Encoding.** A record whose only nonzero dosages are 0.003 or less is stored monomorphic and is in neither arm; the store summary counts these (`encoding_flattened`).
 
 ## Resource plan
 

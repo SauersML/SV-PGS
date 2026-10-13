@@ -2,6 +2,8 @@
 
 This is the single entry point for the project's state. The model is in [MODEL.md](MODEL.md), the rulings in [DECISIONS.md](DECISIONS.md), compute and the landing gate in [COMPUTE.md](COMPUTE.md), and evaluation and benchmark results in [EVALUATION.md](EVALUATION.md). Evidence tags are defined in MODEL.md.
 
+**"Certified" on this page** means a fit met its numerical stopping criterion on the computed objective: remaining gain at most 1/(2K) nats on V, the Laplace evidence with the leading Tierney–Kadane term along each standardized direction (the largest replaced by line quadratures). That term has no remainder bound and leaves out the mixed cumulants between directions, so a certified V is not within 1/(2K) of the exact evidence, and nothing here bounds the posterior's error (CAPABILITIES.md). The artifact records the criterion as `outer_criterion_met`.
+
 ## On main
 - **Store:** `dosage_store`, `store_converter` (per-half manifest, typed sample IDs), `store_block_source` (the streamed reader; rowdict stores decoded on the device), `rowdict_codec`, `resident_codes`, `copy_number` (integer copy number as a first-class column) and `synthetic_store` (public 1kGP haplotype mosaics, with reliability targets from bench-sim's v7 cohort).
 - **Stage 0:** `genotype_statistics` (adjacent-block Grams, rank-deficient covariate projection, exact ties merged) and `code_products` (code-domain products with derived digit counts).

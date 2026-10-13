@@ -2578,9 +2578,11 @@ class _Evidence:
     """V and dV/drho at x_rho; ``responses`` is dx_rho/drho (coefficients x weights), the first-order predictor of x.
 
     ``laplace_value`` is the Laplace form, whose exact rho-gradient ``gradient`` is; ``value`` is what every
-    comparison uses: the Laplace form from ``_evidence``, and after ``_corrected`` the Tierney-Kadane-certified V.
-    ``error`` bounds |value - V| by the sum of its sources' certified bounds: the inner maximizer, the determinant's
-    rounding and B's linear response (``_evidence``), and after ``_corrected`` the Tierney-Kadane remainder too.
+    comparison uses: the Laplace form from ``_evidence``, and after ``_corrected`` the Tierney-Kadane-corrected V.
+    ``error`` sums its sources' numerical bounds: the inner maximizer, the determinant's rounding and B's linear
+    response (``_evidence``), and after ``_corrected`` the unreplaced directions' leading Tierney-Kadane terms and the
+    line quadratures' errors. Those terms are an estimate, not a remainder bound, and the mixed cumulants between
+    directions are left out (``_laplace_corrections_once``), so ``error`` does not bound |value - log Z|.
     """
 
     value: float
@@ -4664,9 +4666,11 @@ class _OuterTrial:
 def fit_hyperparameters(
     prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], fixed_points: FixedPoints, working_bytes: int, tolerance: float
 ) -> list[OuterFit]:
-    """Every model's empirical Bayes at its EP fixed point, certified to ``tolerance`` nats (lead ruling: Newton-B,
-    never plain EP-EM), as the ascent of one function: V(rho), the certified EP-Laplace evidence of the weights,
-    with x its inner solve (theory-ep).
+    """Every model's empirical Bayes at its EP fixed point, run until its remaining gain on the computed V is within
+    ``tolerance`` nats (lead ruling: Newton-B, never plain EP-EM), as the ascent of one function: V(rho), the
+    EP-Laplace evidence of the weights with its directional Tierney-Kadane corrections, with x its inner solve
+    (theory-ep). The tolerance is a numerical convergence criterion on that computed V, not a bound on its error
+    against the exact evidence (``_laplace_corrections_once``).
 
     At an EP fixed point x_k the EP evidence's x-gradient is the fixed-cavity g and its negative Hessian the total
     curvature B = A + C, so its local model there is F_k - 1/2 (x - x_k)'C(x - x_k), which ``hyper_step`` searches

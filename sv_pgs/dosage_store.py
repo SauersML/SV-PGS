@@ -9,7 +9,9 @@ Layout ("svpgs-store v1", target-format REPORT §2 with addenda A1/A2)::
     stats/half{h}/{chrom}/{column}/      exact integer per-record sums over the half's samples
 
 Encoding: ``code = (DS_milli * 127 + 500) // 1000`` in [0, 254] and DS = code / 127, so 0, 1
-and 2 are exact and the error is at most 1/254.  Code 255 is the Zarr fill value and is never
+and 2 are exact and the error is at most 1/254.  DS 0.000 to 0.003 all encode to 0, so a record
+whose only non-zero dosages are that small is stored monomorphic (counted by
+``store_converter.encoding_flattened``).  Code 255 is the Zarr fill value and is never
 written.  Dosages count the ALT allele.  Every record's value is ``code / codes_per_unit +
 value_origin`` (two variant columns): an ALT-count record has 127 and 0, a copy-number record
 (``VariantClass.COPY_NUMBER``) floor(254 / its maximum copy number) and minus its modal copy

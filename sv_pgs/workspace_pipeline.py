@@ -1980,8 +1980,8 @@ def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str
 
 FIT_TRAIT_TYPE = TraitType.QUANTITATIVE
 """The likelihood every workspace model is fitted on: a disease's 0/1 outcome on the Gaussian working likelihood
-(README, "a Gaussian working likelihood on a liability target"), as a quantitative trait is. Its models then take the
-summary band (``stage2_wiring``: Stage 0 reads the store once, and every later pass is over the LD summaries), where the
+(WORKSPACE_PIPELINE.md, "Likelihood"), as a quantitative trait is. Its models can then take the summary band where it
+is cheaper (``stage2_wiring``: Stage 0 reads the store once, and every later pass is over the LD summaries), where the
 Polya-Gamma route re-reads every genotype on each sweep because its weights move with its sites: hundreds of passes of
 the whole store per model, which the study's compute budget does not hold at All of Us scale. The report reads a disease
 by rank (AUC) and by a recalibrated logistic likelihood of its linear predictor, both of which the working likelihood's

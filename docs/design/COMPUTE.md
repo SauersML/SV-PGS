@@ -64,7 +64,7 @@ End to end: about 1,000× with the old Stage 1, and 10–40× without it.
   - m1/m3 ultramem VMs (~3.8 TB RAM).
 - **Launch path (proven with synthetic data):**
   1. The laptop cannot call compute, Batch or storage APIs on the workspace project, because of VPC-SC.
-  2. A single-node Workbench Dataproc cluster's initialization action runs inside the perimeter and submits Google Batch jobs, on the workspace network with no external IP, under the workspace service account.
+  2. Google Batch jobs run on the workspace network with no external IP, under the workspace service account. The launcher is `launcher/workspace/submit.sh`, run from a terminal inside the workspace (a Workbench app or VM): it reserves a slot in the study's budget ledger, then submits the job straight to Batch, with no WDL, Cromwell or Dataproc step (launcher/workspace/README.md). The synthetic proofs below were submitted by an earlier route, a single-node Workbench Dataproc cluster's initialization action.
   3. Progress is visible only as empty marker objects whose names carry non-sensitive facts: event, timing, machine, exit class.
 - **Proven so far:**
   - spot CPU + local SSD, with checkpoint and resume on retry;

@@ -14,7 +14,7 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
 - **Codes.** Every rule reads codes by root concept, and each root's `concept_ancestor` descendants count too:
   - diagnoses by SNOMED root;
   - drugs by ATC class;
-  - procedures by SNOMED root;
+  - procedures by SNOMED root, and by CPT-4 code where the disease lists them (coronary artery disease, cataract), since CPT-4 concepts are not SNOMED descendants;
   - labs through the measurement query below.
 - **A case,** at an onset age of at least the disease's minimum case age, and of the required sex if the disease has one, has any of:
   - diagnoses on 2 or more distinct dates;
@@ -25,13 +25,13 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
 - **Ambiguous codes** remove a person from both groups.
 - **The abstract's five,** where the definitions make a judgment call (the code comments give every code):
   - hypertension: a lab case needs two systolic readings of 160 mmHg or more (JNC 7 stage 2), not the guidelines' 140, which defines the mean over visits: a criterion counts any two occasions, and in the many readings an EHR holds two at 140 or more are common in normotensive people. Every obstetric hypertension code, secondary hypertension and white-coat, transient or postoperative hypertension are ambiguous. Only first-line antihypertensives (thiazide-type diuretics, renin-angiotensin agents, dihydropyridine calcium channel blockers) confirm one diagnosis date; any blood-pressure-lowering drug excludes a control;
-  - coronary artery disease: coronary atherosclerosis or ischemic heart disease, or a revascularization (bypass, PCI, angioplasty or stent; by SNOMED root, so a CPT4-coded procedure, a standard concept outside the SNOMED hierarchy, is not seen, as for cataract extraction). Ischemia without obstructive atherosclerosis (vasospasm, microvascular dysfunction, MINOCA, type 2 infarction) is ambiguous; antianginals exclude a control but confirm nothing;
+  - coronary artery disease: coronary atherosclerosis or ischemic heart disease, or a revascularization (bypass, PCI, angioplasty or stent; by SNOMED root and by CPT-4 code, as for cataract extraction). Ischemia without obstructive atherosclerosis (vasospasm, microvascular dysfunction, MINOCA, type 2 infarction) is ambiguous; antianginals exclude a control but confirm nothing;
   - asthma: COPD (emphysema included) and chronic bronchitis are ambiguous, the copd definition taking the overlap. A controller on two dates confirms one diagnosis date; any obstructive-airway drug excludes a control;
   - hyperlipidemia: hypercholesterolemia, mixed hyperlipidemia or hypertriglyceridemia, or two LDL values of 160 mg/dL or more (NCEP ATP III "high"). LDL-lowering drugs confirm one diagnosis date; any lipid-modifying drug excludes a control;
   - breast cancer: invasive, in women; carcinoma in situ alone is neither case nor control, and non-carcinoma breast malignancies and hereditary breast and ovarian cancer syndrome are ambiguous.
 - **EHR depth.** Cases and controls alike need 5 or more distinct condition dates by the first observation-period start plus 365 days.
 - **Targets:**
-  - the binary status;
+  - the binary status, ever recorded: a case's evidence can fall at any age up to the end of observation, before or after enrolment, so cases are prevalent and incident alike, with no prediction horizon. The workspace fits this one (WORKSPACE_PIPELINE.md);
   - the liability target E[l | status, age] under the age-of-onset threshold model, with each person's age at first evidence or at censoring, and the cohort's own Kaplan–Meier cumulative incidence within sex at birth.
 - **Covariates:** age at the end of observation, its square, its product with female sex, sex at birth, and log(1 + pre-landmark condition dates).
 

@@ -24,10 +24,12 @@ rounding (BLAS kernels may order a panel's sums by its width).
 
 Posterior draws. A model carries K draws beta^(k) of its effects from the law
 its fitting route represents the posterior by, which is not the same law for
-every route. Stage 2's full-data route draws exactly from its Gaussian
-posterior q by perturb-and-solve on its own genotype passes. The small-n
-mean-field route (``mean_field.MeanFieldFixedPoints.draws``) draws instead
-from the fitted product approximation prod_j q_j, conditional on the fitted
+every route. Stage 2's EP route draws exactly from its Gaussian
+approximation q by perturb-and-solve on its own genotype passes. The
+mean-field routes, Stage 2's default (``full_data_fit``) and small-n's
+(``mean_field.MeanFieldFixedPoints.draws``), draw instead from the fitted
+product approximation prod_j q_j (a mixture of such products,
+``draw_laws.ProductMixtureDraws``), conditional on the fitted
 hyperparameters: a direction that mixes members in LD has a variance under
 the product that is neither an upper nor a lower bound on the posterior's,
 and hyperparameter uncertainty is left out. Everything below is a statement
