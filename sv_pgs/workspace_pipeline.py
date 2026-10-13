@@ -288,6 +288,10 @@ class WorkspaceConfig:
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
+        for key, minimum in (("fold_count", 2), ("seed", 0)):
+            value = raw[key]
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
+                raise ValueError(f"{key} must be an integer >= {minimum}; it is never rounded or coerced.")
         halves = tuple(
             ImputedHalfInput(label=str(half["label"]), batches=tuple(str(batch) for batch in half["batches"]), batch_path=str(half["batch_path"]))
             for half in raw["imputed_halves"]
@@ -310,7 +314,7 @@ class WorkspaceConfig:
         chromosomes = tuple(str(chromosome) for chromosome in raw["chromosomes"])
         for chromosome in chromosomes:
             chromosome_number(chromosome)
-        if not chromosomes or len(set(chromosomes)) != len(chromosomes):
+        if not chromosomes or len({chromosome_number(chromosome) for chromosome in chromosomes}) != len(chromosomes):
             raise ValueError("chromosomes must list each store chromosome once.")
         try:
             research_column, sequencing_column = (str(column) for column in raw["crosswalk_columns"])
@@ -2202,7 +2206,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 
 ACCURACY_COLUMNS = ("trait", "arm", "cell", "level", "n", "cases", "metric", "value")
-COMPARISON_COLUMNS = ("trait", "cell", "level", "n", "cases", "metric", "estimate", "standard_error", "z", "p_value")
+COMPARISON_COLUMNS = ("trait", "cell", "level", "n", "cases", "metric", "estimate", "standard_error", "z", "p_value", "inference")
 PARTICIPANT_COUNT_COLUMNS = ("n", "cases")
 """The report columns that count participants, which the All of Us rule never lets show 1 to 20."""
 
@@ -2261,15 +2265,17 @@ def _fold_weighted(values: Sequence[tuple[int, float]]) -> float:
 
 
 def _fold_combined(comparisons: Sequence[tuple[int, PairedComparison]]) -> PairedComparison:
-    """Per-fold paired comparisons combined with weights n_f / n; the folds' held-out sets are disjoint, so their
-    standard errors add in quadrature. The cross-fold pair term (``cross_fit_delta_r2``) needs each arm's design and
+    """Per-fold paired estimates combined with weights n_f / n and conditional variance in quadrature.
+
+    Disjoint held-out sets do not make the fitted predictors independent. The cross-fold pair term
+    (``cross_fit_delta_r2``) needs each arm's design and
     posterior covariance, which a biobank-scale fit never forms, and is left out: the folds' shared training rows make
     that term the part of the variance this standard error does not hold."""
     counts = np.array([count for count, _comparison in comparisons], dtype=np.float64)
     weights = counts / counts.sum()
     estimate = float(np.dot(weights, [comparison.estimate for _count, comparison in comparisons]))
     standard_error = float(np.sqrt(np.dot(weights**2, [comparison.standard_error**2 for _count, comparison in comparisons])))
-    return PairedComparison(estimate, standard_error, estimate / standard_error)
+    return held_out_comparison.comparison_from_estimate(estimate, standard_error)
 
 
 def _shown(count: int, cases: int | None) -> bool:
@@ -2320,11 +2326,16 @@ def _paired(metric: str, targets: F64Array, scores: _Scores, rows: I64Array, tra
     linear = scores.held_out_linear_predictor[:, rows, trait]
     genetic = scores.held_out_genetic[:, rows, trait]
     if metric == "delta_auc":
-        return paired_delta_auc(targets, linear[baseline], linear[candidate])
+        return paired_delta_auc(targets, linear[baseline], linear[candidate], families)
     if metric == "delta_pgs_auc":
-        return paired_delta_auc(targets, genetic[baseline], genetic[candidate])
+        return paired_delta_auc(targets, genetic[baseline], genetic[candidate], families)
     if metric == "log_likelihood_gain":
-        return paired_delta_log_loss(targets, linear[baseline], linear[candidate], families)
+        try:
+            return paired_delta_log_loss(targets, linear[baseline], linear[candidate], families)
+        except held_out_comparison.RecalibrationSeparationError:
+            # A valid held-out score can perfectly separate a small cell. Its AUC
+            # remains reportable, but recalibration has no finite maximum.
+            return PairedComparison(float("nan"), float("nan"), float("nan"))
     if metric == "delta_pgs_partial_r2":
         return paired_delta_r2(
             _residualized(targets, covariates), _residualized(genetic[baseline], covariates), _residualized(genetic[candidate], covariates), families
@@ -2340,8 +2351,11 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     scored by the AUC of its linear predictor, the AUC of its genetic score alone and the log loss of its predictive
     probability; a quantitative trait by the r^2 of its linear predictor and the partial r^2 of its genetic score
     given the trait's covariates. The comparison is paired on the same people: a disease's DeLong delta AUC of the
-    linear predictors and of the genetic scores and its family-clustered gain in recalibrated log likelihood; a
+    linear predictors and of the genetic scores (with family-clustered variance) and its family-clustered gain in
+    recalibrated log likelihood; a
     quantitative trait's family-clustered delta partial r^2 of the genetic scores. Positive favours ``with_sv``.
+    Across multiple folds the estimate and conditional standard error are descriptive:
+    shared-training covariance is not estimated, so no combined z or p-value is emitted.
     """
     cohort = _read_cohort(run)
     scores = _read_scores(run)
@@ -2373,19 +2387,33 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
             for metric in comparison_names:
                 per_fold = [(rows.shape[0], _paired(metric, targets[rows], scores, rows, trait, covariates[rows], cohort.families[rows])) for rows in folds]
                 if not per_fold:
-                    comparison.append((name, cell, level, *counts, "", "", "", "", ""))
+                    comparison.append((name, cell, level, *counts, "", "", "", "", "", ""))
                     continue
                 combined = _fold_combined(per_fold)
+                if len(per_fold) > 1:
+                    z_text, p_text, inference = "", "", "descriptive_cross_fit"
+                elif np.isfinite(combined.z_score):
+                    z_text = f"{combined.z_score:.6g}"
+                    p_text = f"{2.0 * stats.norm.sf(abs(combined.z_score)):.6g}"
+                    inference = "conditional_on_fitted_models"
+                else:
+                    z_text, p_text, inference = "", "", "undefined"
                 comparison.append((
                     name, cell, level, *counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
-                    f"{combined.z_score:.6g}", f"{2.0 * stats.norm.sf(abs(combined.z_score)):.6g}",
+                    z_text, p_text, inference,
                 ))
     for file_name, lines in (("accuracy.tsv", accuracy), ("comparison.tsv", comparison)):
         with (directory / file_name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
     exportable = ["accuracy.tsv", "comparison.tsv"]
     _write_json(directory / EXPORTABLE_FILE, exportable)
-    return {"files": exportable}
+    return {
+        "files": exportable,
+        "comparison_inference": (
+            "Standard errors are conditional on fitted models. Multi-fold comparisons are descriptive: "
+            "shared-training covariance is not estimated, so combined z and p-values are omitted."
+        ),
+    }
 
 
 def check_exportable(path: Path) -> None:

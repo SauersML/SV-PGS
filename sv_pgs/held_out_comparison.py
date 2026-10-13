@@ -44,6 +44,30 @@ class PairedComparison:
     z_score: float
 
 
+def comparison_from_estimate(estimate: float, standard_error: float) -> PairedComparison:
+    """A zero observed variance cannot establish infinite evidence of improvement.
+
+    Identical scores have zero difference and z=0. A nonzero difference with no
+    estimated sampling variance has undefined inference (for example, two AUCs
+    with constant DeLong components); retain its estimate but return NaN for z.
+    """
+    if standard_error == 0.0:
+        z_score = 0.0 if estimate == 0.0 else math.nan
+    else:
+        z_score = estimate / standard_error
+    return PairedComparison(estimate, standard_error, z_score)
+
+
+def _binary_inputs(labels: NDArray, score: NDArray) -> tuple[NDArray, NDArray]:
+    labels = np.asarray(labels, dtype=np.float64)
+    score = np.asarray(score, dtype=np.float64)
+    if labels.ndim != 1 or score.shape != labels.shape or not labels.size:
+        raise ValueError("labels and scores must be nonempty, aligned one-dimensional arrays")
+    if not np.all(np.isfinite(score)) or not np.all((labels == 0.0) | (labels == 1.0)):
+        raise ValueError("scores must be finite and labels must be binary (0 or 1)")
+    return labels, score
+
+
 @dataclass(frozen=True)
 class CrossFitArm:
     """One arm's cross-fitted linear predictor, fold by fold.
@@ -67,7 +91,8 @@ def cluster_totals(values: NDArray, clusters: NDArray | None) -> NDArray:
 
 def _standardized(values: NDArray) -> NDArray:
     centered = np.asarray(values, dtype=np.float64) - float(np.mean(values))
-    return centered / float(np.std(centered))
+    spread = float(np.std(centered))
+    return centered / spread if spread > 0.0 else np.full_like(centered, np.nan)
 
 
 def _correlation_influence(outcome: NDArray, score: NDArray) -> tuple[float, NDArray]:
@@ -100,7 +125,7 @@ def paired_delta_r2(
     delta, influence = delta_r2_influence(outcome, baseline, candidate)
     totals = cluster_totals(influence, clusters)
     standard_error = math.sqrt(float(totals @ totals)) / outcome.shape[0]
-    return PairedComparison(delta, standard_error, delta / standard_error)
+    return comparison_from_estimate(delta, standard_error)
 
 
 def cross_fit_delta_r2(
@@ -166,14 +191,19 @@ def cross_fit_delta_r2(
                     pair += float(np.sum(left * right.T))
     totals = cluster_totals(influence, clusters)
     standard_error = math.sqrt(float(totals @ totals) + pair) / sample_count
-    return PairedComparison(estimate, standard_error, estimate / standard_error)
+    return comparison_from_estimate(estimate, standard_error)
+
+
+class RecalibrationSeparationError(ValueError):
+    """A logistic recalibration has no finite maximum because its score separates the labels."""
 
 
 def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDArray:
     """Maximum-likelihood (a, b) of logit P(y=1) = a + b*score.
 
     The maximum is finite and unique unless the score separates the labels (Albert and Anderson 1984),
-    which is refused. Damped Newton ascends the strictly concave log-likelihood and stops once the
+    which is refused. A constant score has an intercept-only fit with slope zero.
+    Damped Newton ascends the strictly concave log-likelihood and stops once the
     Newton decrement, half of which estimates the remaining gain, is below the fp64 resolution of the
     log-likelihood. The maximum is equivariant under an affine map of the score, and the Newton decrement
     is invariant under it, so the fit runs on the standardized score, where the linear predictor carries
@@ -181,13 +211,18 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
     log-likelihood; when every trial length down to the coefficients' own resolution fails to, the
     remaining gain is below the rounding of the log-likelihood sum and the coefficients are returned.
     """
-    score = np.asarray(score, dtype=np.float64)
+    labels, score = _binary_inputs(labels, score)
     positive = labels == 1.0
     if not positive.any() or positive.all():
         raise ValueError("recalibration needs both cases and controls")
+    prevalence = float(np.mean(positive))
+    if np.ptp(score) == 0.0:
+        # Only the intercept is identifiable. The zero slope represents the
+        # unique fitted probability, the observed prevalence.
+        return np.array([math.log(prevalence / (1.0 - prevalence)), 0.0])
     positive_scores, negative_scores = score[positive], score[~positive]
     if positive_scores.min() >= negative_scores.max() or positive_scores.max() <= negative_scores.min():
-        raise ValueError("the score separates the labels, so its logistic recalibration has no finite maximum")
+        raise RecalibrationSeparationError("the score separates the labels, so its logistic recalibration has no finite maximum")
     location = float(np.mean(score))
     spread = float(np.std(score))
     design = np.column_stack([np.ones_like(score), (score - location) / spread])
@@ -196,7 +231,6 @@ def logistic_recalibration_coefficients(score: NDArray, labels: NDArray) -> NDAr
         linear = design @ coefficients
         return float(np.sum(labels * linear - np.logaddexp(0.0, linear)))
 
-    prevalence = float(np.mean(positive))
     coefficients = np.array([math.log(prevalence / (1.0 - prevalence)), 0.0])
     current = log_likelihood(coefficients)
     ascending = True
@@ -244,7 +278,7 @@ def paired_delta_log_loss(
     sample_count = labels.shape[0]
     standard_error = math.sqrt(float(totals @ totals)) / sample_count
     estimate = float(np.mean(difference))
-    return PairedComparison(estimate, standard_error, estimate / standard_error)
+    return comparison_from_estimate(estimate, standard_error)
 
 
 @dataclass(frozen=True)
@@ -259,7 +293,8 @@ class AucComponents:
 
 def auc_components(labels: NDArray, score: NDArray) -> AucComponents:
     """The AUC of ``score`` for the 0/1 ``labels`` and its DeLong components, ties counted half."""
-    positive = np.asarray(labels) == 1
+    labels, score = _binary_inputs(labels, score)
+    positive = labels == 1
     positive_count = int(positive.sum())
     negative_count = positive.shape[0] - positive_count
     if positive_count == 0 or negative_count == 0:
@@ -277,18 +312,42 @@ def auc_components(labels: NDArray, score: NDArray) -> AucComponents:
     )
 
 
-def paired_delta_auc(labels: NDArray, baseline: NDArray, candidate: NDArray) -> PairedComparison:
-    """DeLong paired delta AUC (Sun and Xu 2014 midrank form, positives ranked first)."""
+def paired_delta_auc(
+    labels: NDArray, baseline: NDArray, candidate: NDArray, clusters: NDArray | None = None,
+) -> PairedComparison:
+    """DeLong paired delta AUC, optionally with family-clustered influence variance.
+
+    The clustered form sums the case/control influences within each family and
+    applies the C/(C-1) cluster correction. It includes covariance between related
+    cases and controls, which the independent-participant DeLong variance omits.
+    """
     baseline_components = auc_components(labels, baseline)
     candidate_components = auc_components(labels, candidate)
     positive_difference = candidate_components.positive - baseline_components.positive
     negative_difference = candidate_components.negative - baseline_components.negative
-    variance = float(np.var(positive_difference, ddof=1)) / positive_difference.shape[0] + float(
-        np.var(negative_difference, ddof=1)
-    ) / negative_difference.shape[0]
     estimate = candidate_components.auc - baseline_components.auc
+    positive_count, negative_count = positive_difference.size, negative_difference.size
+    if min(positive_count, negative_count) < 2:
+        return comparison_from_estimate(estimate, math.nan)
+    if clusters is None:
+        variance = float(np.var(positive_difference, ddof=1)) / positive_count + float(
+            np.var(negative_difference, ddof=1)
+        ) / negative_count
+    else:
+        clusters = np.asarray(clusters)
+        if clusters.shape != np.asarray(labels).shape:
+            raise ValueError("clusters must be aligned with labels")
+        _families, dense_clusters = np.unique(clusters, return_inverse=True)
+        if _families.size < 2:
+            return comparison_from_estimate(estimate, math.nan)
+        positive = np.asarray(labels) == 1
+        influence = np.empty(positive.shape[0], dtype=np.float64)
+        influence[positive] = (positive_difference - positive_difference.mean()) / positive_count
+        influence[~positive] = (negative_difference - negative_difference.mean()) / negative_count
+        totals = cluster_totals(influence, dense_clusters)
+        variance = float(totals @ totals) * _families.size / (_families.size - 1)
     standard_error = math.sqrt(variance)
-    return PairedComparison(estimate, standard_error, estimate / standard_error)
+    return comparison_from_estimate(estimate, standard_error)
 
 
 def permute_within_groups(group_labels: NDArray, rng: np.random.Generator) -> NDArray:

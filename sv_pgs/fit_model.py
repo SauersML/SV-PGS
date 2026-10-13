@@ -134,12 +134,20 @@ class FitRequest:
         set_field = object.__setattr__
         set_field(self, "covariate_names", tuple(str(name) for name in self.covariate_names))
         set_field(self, "model_names", tuple(str(name) for name in self.model_names))
-        set_field(self, "trait_types", tuple(self.trait_types))
+        try:
+            trait_types = tuple(TraitType(value) for value in self.trait_types)
+        except (TypeError, ValueError) as error:
+            raise ValueError("trait_types must contain only 'binary' or 'quantitative'.") from error
+        set_field(self, "trait_types", trait_types)
         set_field(self, "research_ids", tuple(str(research_id) for research_id in self.research_ids))
         set_field(self, "work_dir", Path(self.work_dir))
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
             raise ValueError("seed must be an integer.")
+        if self.seed < 0:
+            raise ValueError("seed must be non-negative.")
         set_field(self, "seed", int(self.seed))
+        if len(set(self.covariate_names)) != len(self.covariate_names):
+            raise ValueError("covariate_names must be distinct.")
         model_count = len(self.model_names)
         if model_count == 0 or len(set(self.model_names)) != model_count:
             raise ValueError("a fit needs at least one model, with distinct model names.")
