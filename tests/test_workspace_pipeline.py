@@ -744,14 +744,15 @@ def _filled(text: str) -> str:
 def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None:
     raw = json.loads(_filled((LAUNCHER / "run_config.template.json").read_text()))
     config = WorkspaceConfig.from_mapping(raw)
-    assert (len(config.diseases), len(config.traits), config.fold_count) == (10, 11, 5) and config.truth_calls is None
+    # The study's panel is its diseases; the quantitative traits are left out of the template to keep the fit in budget.
+    assert (len(config.diseases), len(config.traits), config.fold_count) == (10, 0, 5) and config.truth_calls is None
     for job in ("job_store.json.template", "job_fit.json.template"):
         network = json.loads(_filled((LAUNCHER / job).read_text()))["allocationPolicy"]["network"]["networkInterfaces"][0]
         assert network["noExternalIpAddress"] is True
 
 
 def test_the_launcher_sends_nothing_outside_the_workspace() -> None:
-    text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.name != "README.md")
+    text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.is_file() and path.name != "README.md")
     # The service account's "email" key names an identity inside the workspace; it sends nothing.
     assert not re.search(r"https?://|curl|wget|webhook|notif|sendmail|smtp|\bmail\b|slack|pubsub|scp |rsync", text)
 
