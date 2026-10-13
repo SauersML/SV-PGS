@@ -57,6 +57,7 @@ import zstandard
 
 from sv_pgs import rowdict_codec
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
+from sv_pgs.content_identity import tree_digest
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
 from sv_pgs.memory_broker import HOST, PINNED, broker_for, current_broker
@@ -1769,7 +1770,6 @@ CACHE_MARKER = "CACHE_COMPLETE.json"
 
 def store_digest(root: str | Path) -> str:
     """Complete store content identity, including shard interiors."""
-    from sv_pgs.content_identity import tree_digest
     return tree_digest(root)
 
 

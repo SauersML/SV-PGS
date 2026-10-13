@@ -7,7 +7,7 @@ Jobs go straight to Google Batch: `submit.sh` runs `gcloud batch jobs submit` fr
 | File | What it is |
 |---|---|
 | `submit.sh` | Fills a job template and `run_step.sh.template` from the environment, copies `run_step.sh` to the ops bucket, and submits the job with its spend ceiling |
-| `run_config.template.json` | The pipeline's run config. Every key is required. `truth_calls` is a path pattern or an explicit `null`. `export` lists the report files the user approves for staging |
+| `run_config.template.json` | The pipeline's run config. Every key is required. `truth_calls` is a path pattern or an explicit `null`. `imputation_reference_ids` is the file of the imputation reference panel's research IDs, or an explicit `null`, under which truth calls give no calibration pair. `export` lists the report files the user approves for staging |
 | `job_store.json.template` | The CPU job: steps samples through measurement, on spot CPUs with a persistent run disk |
 | `job_fit.json.template` | The GPU job: steps fit through export |
 | `run_step.sh.template` | The task script: builds the locked environment offline with uv from the staged files, then runs `sv-pgs workspace-run --through ${THROUGH}` |

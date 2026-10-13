@@ -25,9 +25,11 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.compute_budget import ComputeBudget
+from sv_pgs.content_identity import file_digest, tree_digest
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import MANIFEST_FILE, DosageStore, read_manifest
 from sv_pgs.draw_laws import law_from_arrays
+from sv_pgs.feature_identity import layout_digest, portable
 from sv_pgs.fast_scoring import (
     GeneticScores,
     ScoringModel,
@@ -36,6 +38,7 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
+from sv_pgs.model_acceptance import acceptance, require_accepted
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
 MODEL_FORMAT = "svpgs-model v3"
@@ -92,13 +95,11 @@ def code_digest() -> str:
 
 def store_digest(store_root: str | Path) -> str:
     """SHA-256 binding the complete store, including data and annotation shards."""
-    from sv_pgs.content_identity import tree_digest
     return tree_digest(store_root)
 
 
 def sites_digest(store_root: str | Path) -> str:
     """Versioned exact feature identities and decoding units, independent of new samples."""
-    from sv_pgs.feature_identity import layout_digest
     return layout_digest(store_root, read_manifest(Path(store_root)))
 
 
@@ -276,7 +277,6 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         arrays[f"hyperparameters/{index}/log_smoothing"] = hyperparameters.log_smoothing
     for name, values in model.certificate.items():
         arrays[f"certificate/{name}"] = np.asarray(values)
-    from sv_pgs.model_acceptance import acceptance
     metadata = {
         "acceptance": acceptance(model),
         "likelihoods": ["bernoulli" if t == TraitType.BINARY else "gaussian" for t in model.trait_types],
@@ -309,7 +309,6 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         np.savez(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
-    from sv_pgs.content_identity import file_digest
     metadata["arrays_sha256"] = file_digest(staging / _ARRAYS)
     with open(staging / _METADATA, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=1, sort_keys=True)
@@ -355,7 +354,6 @@ def load_model(path: str | Path) -> FittedModel:
         arrays = {name: np.array(archive[name]) for name in archive.files}
     # Legacy v3 artifacts have no checksum; new artifacts bind every saved numerical value.
     if "arrays_sha256" in metadata:
-        from sv_pgs.content_identity import file_digest
         if metadata["arrays_sha256"] != file_digest(directory / _ARRAYS):
             raise ValueError("arrays.npz content checksum does not match model.json")
     scoring = tuple(
@@ -456,8 +454,6 @@ def predict_models(
         raise ValueError("scoring needs at least one fitted model.")
     covariate_names = models[0].covariate_names
     layout = sites_digest(store.root)
-    from sv_pgs.model_acceptance import require_accepted
-    from sv_pgs.feature_identity import portable
     complete_store_digest = None
     for model in models:
         require_accepted(model)

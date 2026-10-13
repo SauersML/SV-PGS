@@ -171,3 +171,16 @@ def test_artifact_detects_finite_array_corruption(tmp_path):
     np.savez(path / 'arrays.npz', **arrays)
     with pytest.raises(ValueError, match='checksum'):
         load_model(path)
+
+
+def test_a_band_accelerated_full_data_fit_is_accepted_and_only_the_pure_summary_route_is_truncated():
+    from sv_pgs.model_acceptance import acceptance
+    certificate = dict(outer_criterion_met=np.array([True]), unresolved=np.array([0]), budget_unresolved=np.array([0]),
+                       restored_best=np.array([False]))
+    # The band-accelerated full-data route records the band's far-field diagnostic and a far-field scale of 0.
+    accelerated = SimpleNamespace(model_names=('model',), scoring=(), refusals=(),
+                                  certificate=certificate | {'far_field': np.array([0.03]), 'far_field_scale': np.array([0.0])})
+    assert acceptance(accelerated)['accepted']
+    # The pure summary route left its far field out of the likelihood and records the measured scale.
+    summary = SimpleNamespace(**(vars(accelerated) | {'certificate': accelerated.certificate | {'far_field_scale': np.array([1.2])}}))
+    assert not acceptance(summary)['accepted'] and 'truncated_ld' in {issue['code'] for issue in acceptance(summary)['issues']}

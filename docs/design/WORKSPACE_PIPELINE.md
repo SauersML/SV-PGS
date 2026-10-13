@@ -22,6 +22,7 @@ These are formats; the paths come from a run config supplied inside the workspac
 | Tandem repeats | GIAB v3.6 AllTandemRepeatsandHomopolymers_slop5 BED | Sorted, non-overlapping (`tr_loci`) |
 | Genes | The public GENCODE GTF (gencode.v38.basic.annotation.gtf.gz, EBI): gene, transcript and exon features, 1-based closed | Each record's core span gives the store's `in_gene`, `in_exon` and `log_tss_distance` (`gene_overlap`); a chromosome the GTF lacks has none |
 | Truth calls | Long-read hard calls (GT) on the imputed site list, one file per chromosome, samples named by research ID. **Or an explicit `null`** | The same per-record lockstep gate as a batch, its records named as the batches' are |
+| Imputation reference IDs | `imputation_reference_ids`: one column headed `research_id`, everyone whose genome was in the imputation's reference panel. **Or an explicit `null`**, which it must be without truth calls | No blank or repeated ID. A listed person's imputed row is a leave-in imputation, so the calibration pairs leave out every listed person and everyone closer than second degree (KING, the folds' bound) to one (`calibrating_pairs`). With truth calls and `null` the overlap is unchecked, so no pair is used: the measurement model takes its no-truth form, and the samples and measurement summaries and the certificate say why |
 | Crosswalk | Research ID ↔ DRAGEN sequencing ID, one to one | `SampleCrosswalk` |
 | Ancestry | The CDR ancestry predictions TSV: `research_id`, `ancestry_pred`, `pca_features` | Every store sample has a label and PCs |
 | Relatedness | The CDR KING pairs TSV (research IDs, kinship) | Finite kinship |
@@ -52,7 +53,7 @@ With `strata_directory` and `bubble_split` both `null`, each batch file is one i
 
 | Step | Reads | Writes | Restart grain |
 |---|---|---|---|
-| samples | batch headers, crosswalk, ancestry, relatedness | typed half manifests, cohort rows (`resolve_cohort_rows`), ancestry groups, calibration pairs, trait-agnostic folds (`kinship_folds`, strata half × ancestry) | step |
+| samples | batch headers, crosswalk, ancestry, relatedness, imputation reference IDs | typed half manifests, cohort rows (`resolve_cohort_rows`), ancestry groups, calibration pairs and the ones the measurement model uses (`calibrating_pairs`), trait-agnostic folds (`kinship_folds`, strata half × ancestry) | step |
 | store | the samples step's half manifests and groups, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes; the store summary counts the records the 8-bit codes made monomorphic (`encoding_flattened`) | each batch's decode; each chromosome |
 | phenotypes | the CDR | one sample table per disease and trait (`all_of_us`) | step |
 | cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |

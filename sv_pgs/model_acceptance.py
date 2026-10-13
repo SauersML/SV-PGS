@@ -27,7 +27,10 @@ def acceptance(model) -> dict:
     for key in ("remaining_gain", "mean_error", "mean_move", "noise_gain", "prediction_move", "far_field"):
         if key in terms and not np.all(np.isfinite(terms[key])):
             issue(key, "fatal", "Non-finite returned-state diagnostic")
-    if "far_field" in terms and np.any(np.asarray(terms["far_field"]) != 0):
+    # The pure summary route (a GramGaussian, whose far field is left out of the likelihood) records its measured
+    # far-field scale; the band-accelerated full-data route records 0 there, and its ``far_field`` is a diagnostic of
+    # the chance LD beyond the band that its full-data fields include, never a truncation.
+    if "far_field_scale" in terms and np.any(np.asarray(terms["far_field_scale"]) != 0):
         issue("truncated_ld", "fatal", "Summary-only LD approximation is not validated for primary results")
     for reason in model.refusals:
         fatal = "lattice check unresolved" in reason
