@@ -37,7 +37,7 @@ from sv_pgs.all_of_us import (
     resolve_disease_definition,
     resolve_measurement_definition,
 )
-from sv_pgs.phenotype_measurement import fit_at_exponent
+from tests.oracles import fit_at_exponent
 from tests.phenotype_bounds import sampling_bound, within_rounding
 
 WORKING_BYTES = 1 << 28

@@ -4,12 +4,11 @@ The mixture law's own moments are checked on its draws [own-sim: math only]; the
 published known-answer vectors."""
 from __future__ import annotations
 
-from pathlib import Path
 
 import numpy as np
 from scipy import stats
 
-from sv_pgs.draw_laws import COMPONENT_STREAM, DenseDraws, ProductMixtureDraws, export_draws, philox4x32, tile_rows
+from sv_pgs.draw_laws import COMPONENT_STREAM, DenseDraws, ProductMixtureDraws, philox4x32, tile_rows
 from sv_pgs.scale_mixture_ep import _components
 
 
@@ -125,9 +124,3 @@ def test_the_component_counter_stream_is_its_own():
     assert COMPONENT_STREAM != 0
     law = _law(np.random.default_rng(3), rows=5, draws=64, weights=(1.0,))
     assert np.all(law.components_of_draws() == 0)
-
-
-def test_an_export_streams_the_draws_to_disk_a_tile_at_a_time(tmp_path: Path):
-    law = _law(np.random.default_rng(4), rows=53, draws=7)
-    export_draws(law, tmp_path / "draws.npy", working_bytes=law.tile_row_bytes() * 5)
-    np.testing.assert_array_equal(np.load(tmp_path / "draws.npy"), law.tile(0, 53))

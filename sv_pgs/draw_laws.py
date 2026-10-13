@@ -371,16 +371,3 @@ def tile_rows(law: DrawLaw, working_bytes: int) -> int:
     """Rows per tile whose draws and working intermediates fit ``working_bytes`` (at least one)."""
     per_row = law.tile_row_bytes() + _FLOAT64_BYTES * law.shape[1]
     return max(1, int(working_bytes) // max(per_row, 1))
-
-
-def export_draws(law: DrawLaw, path, working_bytes: int) -> None:
-    """Write every draw (rows x K float64) to the ``.npy`` file ``path`` a tile at a time, so the export never holds
-    more than a tile of rows (``tile_rows`` of ``working_bytes``)."""
-    rows, count = law.shape
-    target = np.lib.format.open_memmap(path, mode="w+", dtype=np.float64, shape=(rows, count))
-    step = tile_rows(law, working_bytes)
-    for start in range(0, rows, step):
-        stop = min(start + step, rows)
-        target[start:stop] = law.tile(start, stop)
-    target.flush()
-    del target

@@ -520,37 +520,6 @@ def _run_chromosome(
     )
 
 
-def run_cross_product_pass(
-    source: GenotypeTileSource,
-    buffers: Sequence[GenotypeBuffer],
-    tile_rows: int,
-    sink: Callable[[str, int, int, Any], None],
-) -> float:
-    """Stream the store once more for cross-product columns that arrive after the Stage 0 pass.
-
-    Each buffer must be built with the columns and room for ``tile_rows`` rows.
-    ``sink(chromosome, start, stop, products)`` receives ``(G, stop - start, columns)``
-    ``sum_{i in g} s_i y_i^T`` per tile, on the device thread inside the buffer's context
-    (thread-safe, as for ``run_genotype_pass``). Returns the wall time in seconds.
-    """
-    started = time.monotonic()
-
-    def chromosome_work(buffer: GenotypeBuffer, chromosome: str, stop: threading.Event) -> None:
-        stream = _TileStream(source, chromosome, buffer, tile_rows)
-        while stream.current is not None:
-            _check_running(stop)
-            start, tile_stop, staging = stream.current
-            buffer.load_staged_tile(staging, tile_stop - start, 0)
-            stream.advance()
-            products = buffer.cross_products(0, tile_stop - start)
-            buffer.check_codes()
-            with buffer.context():
-                sink(chromosome, start, tile_stop, products)
-
-    _run_on_devices(source, buffers, chromosome_work)
-    return time.monotonic() - started
-
-
 _UNIT_ROUNDOFF = float(np.finfo(np.float64).eps) / 2.0
 TIE_CORRELATION_SCREEN = 1.0 - 6.0 * _UNIT_ROUNDOFF / (1.0 - 6.0 * _UNIT_ROUNDOFF)
 """An exact tie has ``|r| = 1``. ``N_jk`` is an exact integer in fp64, and the correlation rounds six

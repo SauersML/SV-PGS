@@ -24,7 +24,6 @@ from sv_pgs.fast_scoring import (
     ScoringPlan,
     _cpu_panels,
     _batch_bytes,
-    _host_bytes,
     _output_bytes,
     _trapezoid_rule,
     posterior_predictive_probability,
@@ -32,6 +31,13 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
+
+
+def _host_bytes(plan: ScoringPlan, store_samples: int, selected_samples: int, rows: int, device_kind: str, draws: str = "keep") -> int:
+    """Host bytes of scoring every model in one batch with reads of ``rows`` rows: the result's arrays and the batch's
+    read (``_batch_bytes``)."""
+    batch = list(range(plan.model_count))
+    return _output_bytes(plan, selected_samples, draws) + _batch_bytes(plan, batch, store_samples, selected_samples, rows, device_kind, draws)
 
 
 class InMemoryCodes:

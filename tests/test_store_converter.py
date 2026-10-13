@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from scipy.interpolate import BSpline
 
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
@@ -34,7 +33,6 @@ from sv_pgs.store_converter import (
     no_call_fill,
     overlap_group_first,
     refalt_digest,
-    sv_kernel_features,
     tr_loci,
     unbreakable_group_first,
     value_matched_background,
@@ -140,85 +138,6 @@ def test_gene_overlap_reads_overlapping_genes_exons_and_the_nearest_start() -> N
 def test_tr_loci_need_sorted_disjoint_intervals() -> None:
     with pytest.raises(ValueError, match="non-overlapping"):
         tr_loci(np.array([0, 5]), np.array([10, 20]), np.array([1]), np.array([2]), np.array([0]))
-
-
-def _naive_kernel(starts, ends, bubbles, is_sv, frequencies, classes, lengths, class_count, spacing):
-    """Pair by pair, with scipy's cubic B-spline design matrix on the same uniform knots."""
-    extent = int(ends.max() - starts.min())
-    basis_count = int(np.floor(np.log1p(extent) / spacing)) + 4
-    knots = spacing * np.arange(-3, basis_count + 1, dtype=np.float64)
-    overlap = np.zeros((starts.size, class_count))
-    distance = np.zeros((starts.size, class_count, basis_count, 2))
-    for record in range(starts.size):
-        for allele in np.flatnonzero(is_sv):
-            if bubbles[allele] == bubbles[record]:
-                continue
-            weight = 2 * frequencies[allele] * (1 - frequencies[allele])
-            if starts[allele] < ends[record] and starts[record] < ends[allele]:
-                overlap[record, classes[allele]] += weight
-                continue
-            gap = max(0, starts[allele] - ends[record], starts[record] - ends[allele])
-            basis = BSpline.design_matrix(np.array([np.log1p(gap)]), knots, 3).toarray()[0]
-            distance[record, classes[allele], :, 0] += weight * basis
-            distance[record, classes[allele], :, 1] += weight * np.log(lengths[allele]) * basis
-    return overlap, distance
-
-
-def _kernel_scenario(generator):
-    count = 120
-    starts = np.sort(generator.integers(0, 3_000_000, count))
-    ends = starts + generator.integers(1, 20_000, count)
-    bubbles = np.repeat(np.arange(count), generator.integers(1, 4, count))[:count]
-    is_sv = generator.random(count) < 0.4
-    frequencies = generator.uniform(0.0, 1.0, count)
-    classes = generator.integers(0, 3, count)
-    lengths = generator.integers(50, 20_000, count).astype(np.float64)
-    return starts, ends, bubbles, is_sv, frequencies, classes, lengths
-
-
-def test_sv_kernel_features_match_a_pairwise_bspline_reference() -> None:
-    starts, ends, bubbles, is_sv, frequencies, classes, lengths = _kernel_scenario(np.random.default_rng(3))
-    spacing = np.log(2.0)
-
-    features = sv_kernel_features(starts, ends, bubbles, is_sv, frequencies, classes, lengths, 3, spacing, _BUDGET)
-    one_row = sv_kernel_features(starts, ends, bubbles, is_sv, frequencies, classes, lengths, 3, spacing, _ONE_ROW_BUDGET)
-
-    overlap, distance = _naive_kernel(starts, ends, bubbles, is_sv, frequencies, classes, lengths, 3, spacing)
-    # Both sides sum the same terms in different orders: each term rounds a few times at most,
-    # and a record sums at most one term per SV allele per basis function.
-    eps = np.finfo(np.float64).eps
-    scale = int(is_sv.sum()) * 16 * eps * max(1.0, float(np.log(lengths.max())))
-    np.testing.assert_allclose(features.overlap, overlap, rtol=0.0, atol=scale)
-    np.testing.assert_allclose(features.distance, distance, rtol=0.0, atol=scale)
-    np.testing.assert_array_equal(one_row.overlap, features.overlap)
-    np.testing.assert_allclose(one_row.distance, features.distance, rtol=0.0, atol=scale)
-    assert features.distance[..., 0].sum() > 0 and features.overlap.sum() > 0
-
-
-def test_sv_kernel_features_skip_the_own_bubble_and_separate_nesting() -> None:
-    # Record 0 is an SV; record 1 sits inside it; record 2 is 10 bases past its end; record 3
-    # is another allele of record 0's bubble.
-    starts = np.array([100, 150, 510, 100])
-    ends = np.array([500, 151, 511, 300])
-    bubbles = np.array([0, 1, 2, 0])
-    is_sv = np.array([True, False, False, True])
-    frequencies = np.array([0.5, 0.0, 0.0, 0.1])
-    classes = np.array([1, 0, 0, 0])
-    lengths = np.array([400.0, 1.0, 1.0, 200.0])
-
-    features = sv_kernel_features(starts, ends, bubbles, is_sv, frequencies, classes, lengths, 2, np.log(2.0), _BUDGET)
-
-    # Record 0 and record 3 share a bubble, so neither counts the other.
-    assert features.overlap[0].tolist() == [0.0, 0.0] and features.distance[0].sum() == 0.0
-    assert features.overlap[3].tolist() == [0.0, 0.0] and features.distance[3].sum() == 0.0
-    # Record 1 is nested in both alleles: weights 2 * 0.1 * 0.9 (class 0) and 2 * 0.5 * 0.5 (class 1).
-    np.testing.assert_allclose(features.overlap[1], [0.18, 0.5], rtol=4 * np.finfo(np.float64).eps)
-    assert features.distance[1].sum() == 0.0
-    # Record 2: gap 10 to record 0 and 210 to record 3; each allele's basis weights sum to 1
-    # (partition of unity), times its weight, and times its log length in the second slot.
-    np.testing.assert_allclose(features.distance[2, 1, :, 0].sum(), 0.5, rtol=8 * np.finfo(np.float64).eps)
-    np.testing.assert_allclose(features.distance[2, 0, :, 0].sum(), 0.18, rtol=8 * np.finfo(np.float64).eps)
-    np.testing.assert_allclose(features.distance[2, 0, :, 1].sum(), 0.18 * np.log(200.0), rtol=8 * np.finfo(np.float64).eps)
 
 
 def test_linear_recalibration_keeps_group_means_and_scales_deviations() -> None:

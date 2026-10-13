@@ -1,6 +1,6 @@
 # Evaluation: how an SV gain is claimed
 
-Code: `sv_pgs/held_out_comparison.py` (`cross_fit_delta_r2`, `panel_z`, `power_weights`, `influence_correlation`, `size_gate`, `null_cost_gate`), tested on synthetic data.
+Code: `sv_pgs/held_out_comparison.py`, tested on synthetic data.
 
 Measurements carry the evidence tags defined in MODEL.md. Accuracy claims are adopted only on the neutral benchmarks, bench-real (`benchmarks/bench_real/`, real public phenotypes) and bench-sim (`benchmarks/bench_sim/`, a sealed real-haplotype suite with a pre-registered, misspecified truth family), or on in-workspace held-out data. A lane's own simulation calibrates the tests' size and checks the math.
 

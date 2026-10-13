@@ -56,7 +56,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - a record whose core reaches past an interval (a deletion of a repeat and its flank, or one spanning several repeats) belongs to no locus and is typed by its kind, so no record bridges loci. Merging the intervals a record bridged, with every record of a locus in one unsplittable group, chained the public chr22 panel sites into a 34,180-record group over 1.35 Mb;
   - `group_first` joins a locus's TR-class records only (`store_group_first`), the same rule as the benchmarks' stores (`overlap_group_first`);
   - homopolymers are included, and there is no padding.
-- **SV context** (`store_converter.sv_kernel_features`): the features of one learned distance kernel over every SV allele of the chromosome outside the record's own bubble. There is no window, no K and no frequency cutoff.
+- **SV context**: the features of one learned distance kernel over every SV allele of the chromosome outside the record's own bubble. There is no window, no K and no frequency cutoff.
   - Each allele weighs 2f(1 − f), its genotype-variance share; this equals H_locus = 1 − Σ f_a² for a biallelic locus.
   - Nesting (the record's core inside the allele's) is its own feature per class: the sum of weights.
   - Every other allele adds weight × B_m(log(1 + gap)) per class, with the gap in bases between the cores and B_m cubic B-splines uniform in log(1 + gap) over [0, log(1 + the chromosome's extent)], once plain and once times log length.

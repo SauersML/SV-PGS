@@ -2614,9 +2614,8 @@ def _fold_weighted(values: Sequence[tuple[int, float]]) -> float:
 def _fold_combined(comparisons: Sequence[tuple[int, PairedComparison]]) -> PairedComparison:
     """Per-fold paired estimates combined with weights n_f / n and conditional variance in quadrature.
 
-    Disjoint held-out sets do not make the fitted predictors independent. The cross-fold pair term
-    (``cross_fit_delta_r2``) needs each arm's design and
-    posterior covariance, which a biobank-scale fit never forms, and is left out: the folds' shared training rows make
+    Disjoint held-out sets do not make the fitted predictors independent. The cross-fold pair term needs each arm's
+    design and posterior covariance, which a biobank-scale fit never forms, and is left out: the folds' shared training rows make
     that term the part of the variance this standard error does not hold."""
     counts = np.array([count for count, _comparison in comparisons], dtype=np.float64)
     weights = counts / counts.sum()

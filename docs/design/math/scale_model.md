@@ -39,7 +39,7 @@ What this means for our column construction:
   - classical $D=G+e$;
   - exact posterior mean;
   - a posterior draw;
-  - a draw recalibrated with `calibrated_scale`.
+  - a recalibrated draw.
 - $b/(r\gamma)$ = 1.000 ± 0.01 in all 36 cells. The largest deviation, 0.977–0.992, comes where r² < 0.06 and the Monte Carlo error is largest.
 - The **per-allele** slope differs by column type:
   - it is 1.00 for posterior means and recalibrated draws;

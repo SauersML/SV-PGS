@@ -24,12 +24,11 @@ from sv_pgs.phenotype_measurement import (
     _density_prior,
     _log_modulus_bound,
     box_cox,
-    fit_at_exponent,
     level_posterior,
-    level_posterior_at,
     person_tolerance,
 )
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters, ScaleMixturePrior, class_log_density
+from tests.oracles import fit_at_exponent, level_posterior_at
 from tests.phenotype_bounds import rounding_gamma, sampling_bound, variance_component_standard_errors
 
 WORKING_BYTES = 1 << 28

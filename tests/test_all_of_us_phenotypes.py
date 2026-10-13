@@ -63,7 +63,8 @@ from sv_pgs.all_of_us import (
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
-from sv_pgs.phenotype_measurement import Occasions, box_cox, fit_at_exponent, marginal_transform
+from sv_pgs.phenotype_measurement import Occasions, box_cox, marginal_transform
+from tests.oracles import fit_at_exponent
 from tests.phenotype_bounds import (
     rounding_gamma,
     sampling_bound,

@@ -37,7 +37,7 @@ from sv_pgs.fast_scoring import (
     score_linear_predictor,
 )
 from sv_pgs.fit_model import FitRequest
-from sv_pgs.phenotype_measurement import fit_at_exponent
+from tests.oracles import fit_at_exponent
 from sv_pgs.ld_partition import cut_allowed_from_groups, validate_cut_allowed
 from sv_pgs.store_converter import linear_recalibration, refalt_digest, tr_loci, value_matched_background
 from sv_pgs import workspace_pipeline

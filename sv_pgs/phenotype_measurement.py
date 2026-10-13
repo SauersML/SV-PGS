@@ -1233,11 +1233,6 @@ def _carried(start: _State, model: _Model, previous: _Model) -> _State:
     return _State(fresh.fixed_effects, fresh.level_variance, prior, hyperparameters)
 
 
-def fit_at_exponent(occasions: Occasions, exponent: float, working_bytes: int) -> OccasionModelFit:
-    model = _Model(occasions, exponent, working_bytes)
-    return _result(model, *model.fit(model.start()))
-
-
 def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionModelFit:
     """The fit at the Box-Cox exponent maximizing the profile evidence (``bracketed_maximum`` from the identity,
     one unit to the log), each exponent's EM starting from the nearest one already fitted."""
@@ -1294,15 +1289,3 @@ def marginal_transform(values: F64Array, design: F64Array) -> tuple[float, F64Ar
 
     exponent = bracketed_maximum(profile, 1.0, -np.inf, np.inf)
     return exponent, box_cox(values, exponent)[0]
-
-
-def level_posterior_at(
-    occasions: Occasions, exponent: float, fixed_effects: F64Array, level_variance: float, prior: ScaleMixturePrior,
-    hyperparameters: MixtureHyperparameters, working_bytes: int,
-) -> OccasionModelFit:
-    """Every person's exact level posterior at given model parameters, learning nothing: the levels of people
-    outside the fit, and the exactness checks. ``prior`` supplies the lattice of ``hyperparameters``."""
-    model = _Model(occasions, exponent, working_bytes)
-    state = _State(np.asarray(fixed_effects, dtype=np.float64), float(level_variance), prior, hyperparameters)
-    expectation = model.expectation(state, louis=False)
-    return _result(model, state, expectation, expectation.log_likelihood)

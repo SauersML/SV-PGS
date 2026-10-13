@@ -7,19 +7,15 @@ import pytest
 from sv_pgs.measurement_model import (
     BlockPairs,
     LdBlock,
+    LeakageMap,
     MeasurementModel,
-    apply_leakage_map,
     calibration_moments,
     calibration_pairs,
     concatenate_calibration_moments,
-    engine_blocks,
-    octave_spline_basis,
-    fit_ancestry_measurement_models,
     fit_leakage_map,
     fit_measurement_model,
     leakage_transform,
     log_reliability_offsets,
-    mapped_gram,
     pooled_calibration,
     pooled_log_reliability,
     pooled_measurement_model,
@@ -27,6 +23,32 @@ from sv_pgs.measurement_model import (
 )
 from sv_pgs.sample_ids import ResearchId
 from tests.phenotype_bounds import rounding_gamma, sampling_bound
+
+
+def apply_leakage_map(calibrated_block: np.ndarray, leakage: LeakageMap) -> np.ndarray:
+    """The mapped columns of a calibrated block [samples, columns]: targets corrected, others unchanged."""
+    block = np.asarray(calibrated_block, dtype=np.float64)
+    mapped = block.copy()
+    mapped[:, leakage.targets] += (block - leakage.column_means) @ leakage.coefficients
+    return mapped
+
+
+def octave_spline_basis(log2_values: np.ndarray) -> np.ndarray:
+    """Cubic B-splines uniform in log2 of a positive feature, one knot per octave over the data's range; the columns
+    sum to 1, so the basis spans the intercept."""
+    values = np.asarray(log2_values, dtype=np.float64)
+    low = float(np.floor(values.min()))
+    segments = max(int(np.ceil(values.max())) - int(low), 1)
+    position = values - low
+    segment = np.minimum(np.floor(position), segments - 1).astype(np.int64)
+    offset = position - segment
+    weights = ((1.0 - offset) ** 3 / 6.0, (3.0 * offset**3 - 6.0 * offset**2 + 4.0) / 6.0,
+               (-3.0 * offset**3 + 3.0 * offset**2 + 3.0 * offset + 1.0) / 6.0, offset**3 / 6.0)
+    basis = np.zeros((values.shape[0], segments + len(weights) - 1))
+    rows = np.arange(values.shape[0])
+    for shift, weight in enumerate(weights):
+        basis[rows, segment + shift] = weight
+    return basis
 
 
 def _draw_type_column(genotype: np.ndarray, frequency: np.ndarray, keep: float, rng: np.random.Generator) -> np.ndarray:
@@ -225,7 +247,7 @@ def test_a_joint_posterior_mean_column_gets_no_leakage_correction() -> None:
     assert np.all(np.abs(leakage.coefficients) <= bound)
 
 
-def test_the_mapped_gram_is_the_gram_of_the_mapped_columns() -> None:
+def test_the_leakage_transform_maps_the_centred_columns() -> None:
     rng = np.random.default_rng(9)
     block = rng.normal(size=(500, 6))
     truth = block[:, [1, 4]] + 0.3 * block[:, [0, 5]] + rng.normal(0.0, 0.5, (500, 2))
@@ -235,8 +257,6 @@ def test_the_mapped_gram_is_the_gram_of_the_mapped_columns() -> None:
     transform = leakage_transform(leakage)
     product_bound = 2 * rounding_gamma(2 * block.shape[1]) * (np.abs(centred) @ np.abs(transform))
     assert np.all(np.abs(centred @ transform - mapped_centred) <= product_bound)
-    gram_bound = 2 * rounding_gamma(4 * block.shape[0]) * (np.abs(transform.T) @ np.abs(centred.T) @ np.abs(centred) @ np.abs(transform))
-    assert np.all(np.abs(mapped_gram(centred.T @ centred, leakage) - mapped_centred.T @ mapped_centred) <= gram_bound)
 
 
 def test_the_map_recovers_a_known_leak_from_the_cohort_covariance() -> None:
@@ -400,17 +420,6 @@ def test_the_model_saves_and_loads_every_array_and_map(tmp_path) -> None:
     np.testing.assert_array_equal(loaded.leakage_maps[0].records, [0, 1])
 
 
-def test_engine_blocks_fold_fused_pairs_into_their_block_and_refuse_a_split_pair() -> None:
-    starts, stops = np.array([0, 10, 25]), np.array([10, 25, 40])
-    blocks = engine_blocks(starts, stops, np.array([3, 12, 30]), np.array([4, 31]), np.array([3, 30]))
-    assert [block.records[0] for block in blocks] == [0, 10, 25]
-    assert blocks[0].targets.tolist() == [3] and blocks[0].absorbed.tolist() == [4]
-    assert blocks[1].targets.tolist() == [2] and blocks[1].absorbed.tolist() == []
-    assert blocks[2].targets.tolist() == [5] and blocks[2].absorbed.tolist() == [6]
-    with pytest.raises(ValueError, match="straddles"):
-        engine_blocks(starts, stops, np.array([9]), np.array([10]), np.array([9]))
-
-
 def test_the_pooled_model_pools_the_groups_and_fits_the_maps_once() -> None:
     rng = np.random.default_rng(61)
     models, means, variances, counts = [], [], [], np.array([1500, 500])
@@ -438,35 +447,6 @@ def test_the_pooled_model_pools_the_groups_and_fits_the_maps_once() -> None:
     assert mapped.log_reliability[1] == -np.inf and mapped.certificate["direct_calls_fused"] == 1
     assert mapped.leakage_maps[0].ridge_ratio > 0.0
     assert mapped.log_reliability[0] > unmapped.log_reliability[0]
-
-
-def test_ancestry_pooling_borrows_each_records_kappa_from_the_other_groups() -> None:
-    rng = np.random.default_rng(67)
-    records, cohort = 300, 20000
-    keep = rng.uniform(0.3, 0.95, records)
-    frequency = rng.uniform(0.1, 0.5, records)
-
-    def group(size: int) -> tuple[object, np.ndarray]:
-        genotype = rng.binomial(2, frequency[:, None], size=(records, size)).astype(float)
-        dosage = np.where(rng.random(genotype.shape) < keep[:, None], genotype, rng.binomial(2, frequency[:, None], size=genotype.shape))
-        return calibration_pairs(tuple(ResearchId(f"s{index}") for index in range(size)), dosage, genotype), 2 * frequency * (1 - frequency)
-
-    (dense, variance), (sparse, _) = group(3000), group(60)
-    strata, reported = np.zeros(records, dtype=int), np.full(records, 0.5)
-    models = fit_ancestry_measurement_models([dense, sparse, None], np.column_stack([variance] * 3), strata, reported)
-    alone = fit_measurement_model(sparse, variance, strata, reported)
-    # Every group shares each record's kappa, so the sparse group gains from the dense one's pairs.
-    assert np.mean((models[1].scales - keep) ** 2) < np.mean((alone.scales - keep) ** 2)
-    # A group without pairs borrows each record's pooled kappa, never 1.
-    assert np.mean((models[2].scales - keep) ** 2) < np.mean((1.0 - keep) ** 2)
-    assert "between_ancestry_variance_by_stratum" in models[0].certificate["ancestry_pooling"]
-
-def test_the_octave_basis_is_a_partition_of_unity_with_one_knot_per_octave() -> None:
-    values = np.linspace(5.6, 17.2, 500)
-    basis = octave_spline_basis(values)
-    assert basis.shape[1] == (18 - 5) + 3
-    np.testing.assert_allclose(basis.sum(axis=1), 1.0, rtol=rounding_gamma(16))
-    assert np.all(basis >= 0.0)
 
 
 def test_records_without_pairs_take_the_calibration_curve_of_their_features() -> None:

@@ -77,7 +77,6 @@ import numpy as np
 from sv_pgs._typing import F64Array, I64Array, NDArray
 from sv_pgs.progress import log
 from sv_pgs.sample_ids import ResearchId
-from sv_pgs.store_converter import _uniform_cubic_weights
 
 
 @dataclass(frozen=True)
@@ -148,27 +147,6 @@ def _bisect_to_exhaustion(score, low: float, high: float) -> float:
             low = middle
         else:
             high = middle
-
-
-def octave_spline_basis(log2_values: NDArray) -> F64Array:
-    """Cubic B-splines uniform in log2 of a positive feature, one knot per octave over the data's range.
-
-    The one-per-octave spacing is the convention of the store's SV-context kernel
-    (docs/design/STORE.md), and the basis polynomials are its ``_uniform_cubic_weights``.
-    The columns sum to 1 on the range, so the basis spans the intercept.
-    """
-    values = np.asarray(log2_values, dtype=np.float64)
-    low = float(np.floor(values.min()))
-    segments = max(int(np.ceil(values.max())) - int(low), 1)
-    position = values - low
-    segment = np.minimum(np.floor(position), segments - 1).astype(np.int64)
-    weights = _uniform_cubic_weights(position - segment)
-    # A spline of degree d has segments + d basis functions, d + 1 of them nonzero on each segment.
-    basis = np.zeros((values.shape[0], segments + len(weights) - 1))
-    rows = np.arange(values.shape[0])
-    for shift, weight in enumerate(weights):
-        basis[rows, segment + shift] = weight
-    return basis
 
 
 @dataclass(frozen=True)
@@ -486,30 +464,11 @@ def fit_leakage_map(cohort_covariance: NDArray, calibrated_pairs: NDArray, targe
     return LeakageMap(target_index, column_means, coefficients, ratio, bool(np.isfinite(limit) and ratio == limit))
 
 
-def apply_leakage_map(calibrated_block: NDArray, leakage: LeakageMap) -> F64Array:
-    """The mapped columns for any samples' calibrated block [samples, columns]: targets corrected, others unchanged."""
-    block = np.asarray(calibrated_block, dtype=np.float64)
-    if block.ndim != 2 or block.shape[1] != leakage.column_means.shape[0]:
-        raise ValueError("apply_leakage_map needs the block the map was fitted on.")
-    mapped = block.copy()
-    mapped[:, leakage.targets] += (block - leakage.column_means) @ leakage.coefficients
-    return mapped
-
-
 def leakage_transform(leakage: LeakageMap) -> F64Array:
     """A = I + E with E[:, targets] = coefficients, so the centred mapped block is X A."""
     transform = np.eye(leakage.column_means.shape[0])
     transform[:, leakage.targets] += leakage.coefficients
     return transform
-
-
-def mapped_gram(gram: NDArray, leakage: LeakageMap) -> F64Array:
-    """A' G A: the Stage 0 Gram of the mapped block from the Gram G of its centred calibrated columns."""
-    transform = leakage_transform(leakage)
-    matrix = np.asarray(gram, dtype=np.float64)
-    if matrix.shape != (transform.shape[0], transform.shape[0]):
-        raise ValueError("mapped_gram needs the Gram of the block the map was fitted on.")
-    return transform.T @ matrix @ transform
 
 
 @dataclass(frozen=True)
@@ -633,47 +592,6 @@ def fit_block_map(pairs: BlockPairs, scales: NDArray) -> LeakageMap:
     means = dosage.mean(axis=0)
     leakage = fit_leakage_map(_calibrated_block_covariance(pairs, scales), means + block_scales * (dosage - means), pairs.truth, pairs.block.targets)
     return replace(leakage, records=np.asarray(pairs.block.records, dtype=np.int64))
-
-
-def engine_blocks(
-    block_starts: NDArray, block_stops: NDArray, target_rows: NDArray, absorbed_rows: NDArray, absorbing_rows: NDArray
-) -> tuple[LdBlock, ...]:
-    """One LdBlock per engine LD block [start, stop) that holds a target, so every engine block has one A.
-
-    ``target_rows`` are the store rows to map (imputed SV/TR records); ``absorbed_rows[i]``
-    is a direct-call row fused into target ``absorbing_rows[i]``. The engine's sources
-    read each block's own records, so a fused pair must lie inside one engine block:
-    the store keeps them in one unbreakable group, and a pair that straddles a
-    boundary is refused here rather than silently split.
-    """
-    starts = np.asarray(block_starts, dtype=np.int64)
-    stops = np.asarray(block_stops, dtype=np.int64)
-    targets = np.unique(np.asarray(target_rows, dtype=np.int64))
-    absorbed = np.asarray(absorbed_rows, dtype=np.int64)
-    absorbing = np.asarray(absorbing_rows, dtype=np.int64)
-    if starts.shape != stops.shape or np.any(stops <= starts) or np.any(starts[1:] < stops[:-1]):
-        raise ValueError("engine_blocks needs ordered, disjoint, non-empty blocks.")
-    if absorbed.shape != absorbing.shape or not np.all(np.isin(absorbing, targets)):
-        raise ValueError("every absorbed row needs the target row it is fused into.")
-
-    def block_of(rows: I64Array) -> I64Array:
-        index = np.searchsorted(stops, rows, side="right")
-        inside = (index < starts.shape[0]) & (starts[np.minimum(index, starts.shape[0] - 1)] <= rows)
-        if not np.all(inside):
-            raise ValueError("a target or absorbed row lies outside every engine block.")
-        return index
-
-    if np.any(block_of(absorbed) != block_of(absorbing)):
-        raise ValueError("a fused pair straddles an engine block boundary; keep its rows in one unbreakable group.")
-    target_blocks = block_of(targets)
-    absorbed_blocks = block_of(absorbed)
-    blocks = []
-    for index in np.unique(target_blocks).tolist():
-        records = np.arange(starts[index], stops[index], dtype=np.int64)
-        blocks.append(
-            LdBlock(records, targets[target_blocks == index] - starts[index], absorbed[absorbed_blocks == index] - starts[index])
-        )
-    return tuple(blocks)
 
 
 def mapped_signal_variances(pairs: BlockPairs, scales: NDArray, leakage: LeakageMap) -> F64Array:
@@ -864,128 +782,6 @@ def fit_measurement_model(
     for key in ("recalibration", "leakage_correction", "reliability_source", "direct_calls_fused"):
         log(f"measurement model: {key}: {certificate[key]}")
     return MeasurementModel(scales, residual, offsets, tuple(maps), certificate)
-
-
-def within_group_moments(group_moments: Sequence[CalibrationMoments]) -> CalibrationMoments:
-    """Each record's moments within its groups, pooled: sum_a n_a M_a / sum_a n_a for every central moment.
-
-    Every group keeps its own mean (the recalibration is per group), so the pooled
-    regression is the within-group one; the means are the pooled means, reported
-    only for completeness.
-    """
-    counts = np.stack([moments.pair_counts for moments in group_moments]).astype(np.float64)
-    total = counts.sum(axis=0)
-
-    def pooled(name: str) -> F64Array:
-        values = np.stack([getattr(moments, name) for moments in group_moments])
-        return np.divide((counts * values).sum(axis=0), total, out=np.zeros_like(total), where=total > 0)
-
-    return CalibrationMoments(
-        pair_counts=total.astype(np.int64),
-        **{field.name: pooled(field.name) for field in fields(CalibrationMoments) if field.name != "pair_counts"},
-    )
-
-
-def fit_ancestry_measurement_models(
-    calibrations: Sequence[CalibrationPairs | None],
-    cohort_dosage_variance: NDArray,
-    strata: NDArray,
-    reported_reliability: NDArray,
-) -> tuple[MeasurementModel, ...]:
-    """One model per ancestry group, each group's kappa pooled toward the record's all-group kappa by EB.
-
-    ``calibrations[a]`` holds group a's truth pairs (None when it has none) and
-    ``cohort_dosage_variance`` is [records, groups]. A group's own ~n_a pairs give
-    each record a noisy slope, so kappa_{j,a} ~ N(kappa_j, tau^2): kappa_j is the
-    record's pooled within-group kappa (``pooled_calibration`` on
-    ``within_group_moments``, the design [1, reported r^2, log V] per stratum), and
-    tau^2, the between-ancestry variance of a stratum, is the energy-weighted moment
-    estimate from the groups' slopes and their robust sampling variances at kappa_j.
-    Each group keeps its own lambda (its own genotype variance), so v and the offsets
-    follow from its pooled kappa. A group without pairs gets kappa_j itself.
-    """
-    variance = np.asarray(cohort_dosage_variance, dtype=np.float64)
-    labels = np.asarray(strata)
-    reported = np.asarray(reported_reliability, dtype=np.float64)
-    if variance.ndim != 2 or variance.shape[1] != len(calibrations):
-        raise ValueError("fit_ancestry_measurement_models needs cohort variances [records, groups], one column per group.")
-    models = [fit_measurement_model(calibration, variance[:, group], labels, reported) for group, calibration in enumerate(calibrations)]
-    present = [group for group, calibration in enumerate(calibrations) if calibration is not None]
-    if not present:
-        return tuple(models)
-    group_moments = [calibrations[group].moments for group in present]  # type: ignore[union-attr]
-    combined = within_group_moments(group_moments)
-    counts = np.stack([moments.pair_counts for moments in group_moments])
-    combined_variance = np.divide((counts * variance[:, present].T).sum(axis=0), counts.sum(axis=0),
-                                  out=variance[:, present].mean(axis=1), where=counts.sum(axis=0) > 0)
-    calibrated = (combined.pair_counts > 2) & (combined.dosage_variance > 0.0) & (combined_variance > 0.0)
-    if not np.any(calibrated):
-        return tuple(models)
-    design = np.column_stack([np.ones(int(calibrated.sum())), reported[calibrated], np.log(combined_variance[calibrated])])
-    shared = np.ones_like(reported)
-    shared_ratio = np.ones_like(reported)
-    combined_fit = pooled_calibration(combined.subset(calibrated), combined_variance[calibrated], labels[calibrated], design)
-    shared[calibrated], shared_ratio[calibrated] = combined_fit.scales, combined_fit.variance_ratios
-    pooled_models = list(models)
-    between_by_stratum: dict[str, float] = {}
-    for stratum in np.unique(labels[calibrated]):
-        members = calibrated & (labels == stratum)
-        slopes, energies, residuals = [], [], []
-        for moments in group_moments:
-            energy = moments.pair_counts[members] * moments.dosage_variance[members]
-            informative = energy > 0.0
-            prior = shared[members]
-            slopes.append(np.divide(moments.pair_counts[members] * moments.covariance[members], energy,
-                                    out=prior.copy(), where=informative))
-            residuals.append(np.maximum(np.divide(
-                moments.dosage_squared_truth_squared[members] - 2.0 * prior * moments.dosage_cubed_truth[members]
-                + prior**2 * moments.dosage_fourth[members],
-                moments.dosage_variance[members], out=np.zeros_like(energy), where=informative), 0.0))
-            energies.append(energy)
-        slope, energy, residual = np.stack(slopes), np.stack(energies), np.stack(residuals)
-        excess = np.sum(energy * (slope - shared[members]) ** 2)
-        between = max(float((excess - residual[energy > 0].sum()) / energy.sum()), 0.0) if energy.sum() > 0 else 0.0
-        between_by_stratum[str(stratum)] = between
-        with np.errstate(divide="ignore", invalid="ignore"):
-            weight = np.where(residual > 0.0, between * energy / (between * energy + residual), 1.0)
-        weight = np.where(energy > 0.0, weight, 0.0)
-        for position, group in enumerate(present):
-            rows = np.flatnonzero(members)
-            model = pooled_models[group]
-            kappa = np.maximum(shared[members] + weight[position] * (slope[position] - shared[members]), 0.0)
-            # The group's own genotype variance where its model calibrated the record, else lambda_j V_a.
-            own_fit = (group_moments[position].pair_counts[rows] > 2) & (group_moments[position].dosage_variance[rows] > 0.0)
-            genotype_variance = np.where(
-                own_fit,
-                model.residual_variance[rows] + model.scales[rows] ** 2 * variance[rows, group],
-                shared_ratio[rows] * variance[rows, group],
-            )
-            scales = model.scales.copy()
-            residual_variance = model.residual_variance.copy()
-            offsets = model.log_reliability.copy()
-            scales[rows] = kappa
-            residual_variance[rows] = np.maximum(genotype_variance - kappa**2 * variance[rows, group], 0.0)
-            offsets[rows] = _log_signal_share(kappa**2 * variance[rows, group], residual_variance[rows])
-            pooled_models[group] = MeasurementModel(scales, residual_variance, offsets, model.leakage_maps, model.certificate)
-    for group in range(len(calibrations)):
-        model = pooled_models[group]
-        if group not in present:
-            # No pairs of its own: kappa_j and lambda_j borrowed from the other groups.
-            borrowed = calibrated & (variance[:, group] > 0.0)
-            scales, residual_variance, offsets = model.scales.copy(), model.residual_variance.copy(), model.log_reliability.copy()
-            scales[borrowed] = shared[borrowed]
-            residual_variance[borrowed] = variance[borrowed, group] * np.maximum(shared_ratio[borrowed] - shared[borrowed] ** 2, 0.0)
-            offsets[borrowed] = _log_signal_share(shared[borrowed] ** 2 * variance[borrowed, group], residual_variance[borrowed])
-            pooled_models[group] = MeasurementModel(scales, residual_variance, offsets, model.leakage_maps, model.certificate)
-        certificate = dict(pooled_models[group].certificate)
-        certificate["ancestry_pooling"] = {
-            "records": int(calibrated.sum()),
-            "groups_with_pairs": len(present),
-            "between_ancestry_variance_by_stratum": between_by_stratum,
-        }
-        pooled_models[group] = replace(pooled_models[group], certificate=certificate)
-    log(f"measurement model: ancestry pooling over {len(present)} groups; between-ancestry kappa variance by stratum {between_by_stratum}")
-    return tuple(pooled_models)
 
 
 def pooled_measurement_model(

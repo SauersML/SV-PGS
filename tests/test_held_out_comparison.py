@@ -1,9 +1,6 @@
-"""Held-out comparison tests and evaluation gates (sv_pgs.held_out_comparison).
+"""Held-out comparison tests (sv_pgs.held_out_comparison), with the size gate that checks their null calibration.
 
-The null-calibration checks simulate the two situations the primary SV-PGS
-claim meets: frozen scores on a held-out set, and cross-fitted scores. There,
-each fold's separately tuned predictor makes pooled scores miscalibrated, and
-shared training samples make the naive fold-stratified variance too small.
+The null-calibration checks simulate frozen scores on a held-out set, the situation the primary SV-PGS claim meets.
 """
 from __future__ import annotations
 
@@ -12,22 +9,22 @@ import pytest
 from scipy import special, stats
 from sklearn.metrics import roc_auc_score
 
+from sv_pgs._typing import NDArray
 from sv_pgs.held_out_comparison import (
-    CrossFitArm,
-    cross_fit_delta_r2,
-    delta_r2_influence,
-    hommel_adjusted,
-    influence_correlation,
     logistic_recalibration_coefficients,
-    null_cost_gate,
     paired_delta_auc,
     paired_delta_r2,
-    panel_z,
-    permute_within_groups,
-    power_weights,
-    size_gate,
 )
 from sv_pgs.probability_calibration import FrozenCalibration, paired_frozen_gain, proper_scores
+
+
+def size_gate(null_z: NDArray, alpha: float = 0.05) -> bool:
+    """Gate G13: the one-sided test's rejections at `alpha` among the null replicates are not
+    significantly more than an `alpha` share of them, by the exact one-sided binomial test at the
+    same `alpha`."""
+    null_z = np.asarray(null_z)
+    rejections = int(np.sum(null_z > stats.norm.isf(alpha)))
+    return float(stats.binom.sf(rejections - 1, null_z.shape[0], alpha)) > alpha
 
 
 def test_paired_delta_r2_estimate_is_the_difference_of_squared_correlations():
@@ -65,45 +62,6 @@ def test_family_clusters_widen_the_standard_error_when_scores_share_family_noise
     unclustered = paired_delta_r2(outcome, baseline, candidate)
     clustered = paired_delta_r2(outcome, baseline, candidate, clusters=families)
     assert clustered.standard_error > unclustered.standard_error
-
-
-def _cross_fitted_ridge(designs, outcome, folds, penalties):
-    fold_count = int(folds.max()) + 1
-    scores = np.zeros(outcome.shape[0])
-    fold_designs, inverses = [], []
-    grams = [designs[folds == fold].T @ designs[folds == fold] for fold in range(fold_count)]
-    cross = [designs[folds == fold].T @ outcome[folds == fold] for fold in range(fold_count)]
-    total_gram, total_cross = sum(grams), sum(cross)
-    for fold in range(fold_count):
-        inverse = np.linalg.inv(total_gram - grams[fold] + penalties[fold] * np.eye(designs.shape[1]))
-        rows = folds == fold
-        scores[rows] = designs[rows] @ (inverse @ (total_cross - cross[fold]))
-        fold_designs.append(designs[rows])
-        inverses.append(inverse)
-    return scores, CrossFitArm(fold_designs=fold_designs, training_inverses=inverses)
-
-
-def test_cross_fit_delta_r2_is_calibrated_where_pooling_is_not():
-    rng = np.random.default_rng(3)
-    sample_count, feature_count, fold_count = 1000, 30, 5
-    folds = np.arange(sample_count) % fold_count
-    pooled, stratified = [], []
-    for _ in range(300):
-        baseline_features = rng.standard_normal((sample_count, feature_count))
-        candidate_features = rng.standard_normal((sample_count, feature_count))
-        effects = rng.standard_normal(feature_count) * np.sqrt(0.05 / feature_count)
-        outcome = baseline_features @ effects + candidate_features @ effects + rng.standard_normal(sample_count)
-        penalties = np.full(fold_count, 300.0)
-        baseline, baseline_arm = _cross_fitted_ridge(baseline_features, outcome, folds, penalties)
-        candidate, candidate_arm = _cross_fitted_ridge(candidate_features, outcome, folds, penalties)
-        pooled.append(paired_delta_r2(outcome, baseline, candidate).z_score)
-        stratified.append(
-            cross_fit_delta_r2(outcome, baseline, candidate, folds, baseline_arm, candidate_arm).z_score
-        )
-    pooled, stratified = np.asarray(pooled), np.asarray(stratified)
-    assert 0.85 < float(np.std(stratified)) < 1.15
-    assert size_gate(stratified)
-    assert float(np.std(pooled)) > float(np.std(stratified))
 
 
 def _held_out_disease(rng: np.random.Generator, people: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -239,69 +197,7 @@ def test_paired_delta_auc_matches_mann_whitney_and_ranks_positives_first():
     assert comparison.z_score > 0.0
 
 
-def test_permute_within_groups_never_moves_a_sample_across_groups():
-    rng = np.random.default_rng(6)
-    groups = rng.integers(0, 3, size=300)
-    permutation = permute_within_groups(groups, rng)
-    assert np.array_equal(groups[permutation], groups)
-    assert sorted(permutation.tolist()) == list(range(300))
-    assert not np.array_equal(permutation, np.arange(300))
-
-
-def test_power_weights_are_non_negative_and_refuse_a_powerless_panel():
-    weights = power_weights(np.array([2.0, -1.0, 0.5, 0.0]))
-    assert np.all(weights >= 0.0)
-    assert weights.sum() == pytest.approx(1.0)
-    assert weights[1] == 0.0
-    with pytest.raises(ValueError):
-        power_weights(np.array([-1.0, 0.0]))
-
-
-def test_panel_z_holds_size_across_correlated_traits():
-    rng = np.random.default_rng(7)
-    trait_count = 21
-    correlation = np.full((trait_count, trait_count), 0.3) + np.eye(trait_count) * 0.7
-    weights = power_weights(rng.uniform(0.2, 3.0, size=trait_count))
-    draws = rng.multivariate_normal(np.zeros(trait_count), correlation, size=20000)
-    panel = np.array([panel_z(draw, weights, correlation) for draw in draws])
-    assert float(np.std(panel)) == pytest.approx(1.0, abs=0.03)
-    assert abs(float(np.mean(panel > stats.norm.isf(0.05))) - 0.05) < 0.01
-    with pytest.raises(ValueError):
-        panel_z(draws[0], -weights, correlation)
-
-
-def test_influence_correlation_matches_the_correlation_of_shared_scores():
-    rng = np.random.default_rng(8)
-    genetic = rng.standard_normal(4000)
-    first_outcome = genetic + rng.standard_normal(4000)
-    second_outcome = genetic + rng.standard_normal(4000)
-    baseline = genetic + rng.standard_normal(4000) * 2.0
-    candidate = genetic + rng.standard_normal(4000)
-    first_influence = delta_r2_influence(first_outcome, baseline, candidate)[1]
-    second_influence = delta_r2_influence(second_outcome, baseline, candidate)[1]
-    correlation = influence_correlation([first_influence, second_influence], clusters=None)
-    assert correlation[0, 0] == pytest.approx(1.0)
-    assert 0.0 < correlation[0, 1] < 1.0
-
-
-def test_hommel_adjusts_a_hand_worked_example_in_any_input_order():
-    expected = np.array([0.03, 0.04, 0.04])
-    assert np.allclose(hommel_adjusted(np.array([0.01, 0.02, 0.04])), expected)
-    assert np.allclose(hommel_adjusted(np.array([0.04, 0.01, 0.02])), expected[[2, 0, 1]])
-
-
 def test_gates_accept_calibrated_nulls_and_reject_inflated_ones():
     rng = np.random.default_rng(9)
     assert size_gate(rng.standard_normal(2000))
     assert not size_gate(rng.standard_normal(2000) + 0.5)
-
-
-def test_null_cost_gate_is_the_exact_one_sided_sign_test_at_alpha():
-    baseline = np.full(10, 0.2)
-    # 8 of 10 replicates losing R^2 is not significant (P = 56/1024 = 0.055); 9 is (P = 11/1024 = 0.011)
-    for losses, passes in ((8, True), (9, False)):
-        with_columns = np.where(np.arange(10) < losses, 0.1999, 0.2001)
-        assert null_cost_gate(baseline, with_columns) is passes
-    # ties carry no evidence of a loss and leave the test to the untied replicates
-    assert null_cost_gate(baseline, baseline)
-    assert not null_cost_gate(np.full(12, 0.2), np.concatenate([np.full(9, 0.1999), np.full(3, 0.2)]))
