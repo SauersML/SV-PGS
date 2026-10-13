@@ -35,6 +35,17 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
     samples = store.n_samples
     training = np.arange(samples) < samples * 4 // 5
+    original_gaussian = stage2_wiring.DualGaussian
+    fitted_sample_counts = []
+
+    def training_only_gaussian(**arguments):
+        fitted_sample_counts.append(arguments["source"].sample_count)
+        assert arguments["training"].shape == (int(training.sum()), 1)
+        assert np.all(arguments["training"] == 1)
+        np.testing.assert_array_equal(arguments["probe_sample_indices"], np.flatnonzero(training))
+        return original_gaussian(**arguments)
+
+    monkeypatch.setattr(stage2_wiring, "DualGaussian", training_only_gaussian)
     model = fit_model.fit(
         fit_model.FitRequest(
             store=store,
@@ -61,6 +72,8 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
     loaded = load_model(tmp_path / "model")
     prediction = predict(loaded, store, np.arange(samples), covariate[:, None], _budget())
     assert np.all(np.isfinite(prediction.predictive_mean)) and np.all(prediction.predictive_variance > 0.0)
+    assert fitted_sample_counts == [int(training.sum())]
+    assert prediction.predictive_mean.shape == (samples, 1)
 
 
 def test_the_bench_real_adapter_fits_a_synthetic_gene_with_the_engine() -> None:

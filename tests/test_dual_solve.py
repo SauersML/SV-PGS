@@ -533,6 +533,38 @@ def test_the_dual_gaussian_is_the_dense_posterior_with_strong_and_negative_sites
         assert abs(rss[model] - residual_sum) <= np.sqrt(EPS) * residual_sum * np.linalg.cond(posterior_precision)
 
 
+def test_compact_training_rows_preserve_probes_and_posterior():
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _ = _gaussian_problem(51)
+    # Compare the same one-model likelihood and site parameters with
+    # zero-weight people present versus physically omitted from the operator.
+    model = 1
+    selected = np.flatnonzero(training[:, model])
+    fitted = []
+    for indices in (np.arange(training.shape[0]), selected):
+        gaussian = dual_solve.DualGaussian(
+            source=dual_solve.DenseDualSource(genotypes[indices], bounds), training=training[indices, model:model + 1],
+            targets=response[indices, model:model + 1], offsets=offsets[indices, model:model + 1], covariates=covariates[indices],
+            grams=_grams(bounds, True), probe_count=4, seed=3,
+            probe_sample_indices=indices if indices.size != training.shape[0] else None,
+        )
+        gaussian.iterate(site_precision=precision[:, model:model + 1], site_shift=shift[:, model:model + 1],
+                         noise_variance=noise[model:model + 1], error_bound=np.array([np.sqrt(EPS)]), probe_residual_ratio=np.sqrt(EPS))
+        fitted.append(gaussian)
+    full, compact = fitted
+    np.testing.assert_array_equal(compact.probes, full.probes[selected])
+    np.testing.assert_allclose(compact.mean, full.mean, rtol=np.sqrt(EPS), atol=np.sqrt(EPS))
+    np.testing.assert_allclose(compact.alpha, full.alpha, rtol=np.sqrt(EPS), atol=np.sqrt(EPS))
+    np.testing.assert_allclose(compact.unit_squares, full.unit_squares, rtol=genotypes.shape[0] * EPS)
+    np.testing.assert_allclose(compact.residual_sum_of_squares(), full.residual_sum_of_squares(), rtol=np.sqrt(EPS))
+
+
+def test_selected_probe_prefix_keeps_original_sample_random_numbers():
+    selected = np.array([0, 4, 19, 31, 67])
+    for columns in (1, 7, 64):
+        full = dual_solve._probe_signs(123, 100, columns)
+        np.testing.assert_array_equal(dual_solve._probe_signs(123, selected.size, columns, selected), full[selected])
+
+
 def test_the_dual_gaussian_refresh_quantities_match_the_dense_bulk_operator() -> None:
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(52)
     halves = [piece for start, stop in bounds for piece in ((start, (start + stop) // 2), ((start + stop) // 2, stop))]

@@ -419,17 +419,16 @@ def _fit_one(
         exclude=RELIABILITY_COLUMNS + IDENTIFIER_COLUMNS,
     )
     log(f"stage2 wiring: {annotations.design.shape[1]} annotation columns in {len(annotations.groups)} groups: {', '.join(annotations.names) or 'none'}")
-    mask = np.zeros((store.n_samples, 1))
-    mask[training_columns, 0] = 1.0
-    store_targets = np.zeros((store.n_samples, 1))
-    store_targets[training_columns, 0] = targets
-    store_covariates = np.zeros((store.n_samples, covariates.shape[1]))
-    store_covariates[training_columns] = covariates
+    # This is one model: rows outside its training set have zero likelihood
+    # weight. Keep only training rows in every iterative genotype product and
+    # sample-space buffer. Scoring still reads the original full store.
+    fitted_samples = training_columns.size
+    mask = np.ones((fitted_samples, 1))
+    store_targets = targets[:, None]
+    store_covariates = covariates
     store_sites = None
     if binary:
-        store_labels = np.zeros(store.n_samples)
-        store_labels[training_columns] = labels
-        store_sites = BernoulliSites.start(store_labels, mask[:, 0] > 0.0)
+        store_sites = BernoulliSites.start(labels)
         # The start's equal-weight problem has noise 1 / omega(0) = 4 exactly, in the response's units.
         start_noise = 1.0 / POLYA_GAMMA_MEAN_AT_ZERO
     else:
@@ -447,7 +446,7 @@ def _fit_one(
     )
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
-    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share))
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share, sample_indices=training_columns))
     # Timing may select a band accelerator, never a different likelihood. Every route
     # retains DualGaussian and recomputes the omitted fields from the full sample operator.
     band = None
@@ -482,11 +481,12 @@ def _fit_one(
         source=source,
         training=mask,
         targets=store_targets,
-        offsets=np.zeros((store.n_samples, 1)),
+        offsets=np.zeros((fitted_samples, 1)),
         covariates=store_covariates,
         grams=block_grams(statistics, start_noise),
         probe_count=draw_count,
         seed=_seed(seed, 0),
+        probe_sample_indices=training_columns if fitted_samples != store.n_samples else None,
         # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
         sample_weights=None if store_sites is None else store_sites.weights[:, None],
     )

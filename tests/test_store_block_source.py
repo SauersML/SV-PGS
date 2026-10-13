@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sv_pgs.code_products import CodeBlockTile
+from sv_pgs.code_products import INT8_GEMM_ALIGNMENT, CodeBlockTile
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore, encode_dosage_milli
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
@@ -38,14 +38,16 @@ def _signed_store_codes(milli_by_half: list[dict[str, np.ndarray]]) -> np.ndarra
     return (codes.astype(np.int16) - SIGNED_CODE_OFFSET).astype(np.int8)
 
 
-def _source(root: Path, device_kind: str) -> tuple[StoreGenotypeBlockSource, np.ndarray, np.ndarray, np.ndarray]:
+def _source(root: Path, device_kind: str, sample_indices=None) -> tuple[StoreGenotypeBlockSource, np.ndarray, np.ndarray, np.ndarray]:
     store = DosageStore.open(root)
     signed = _signed_store_codes(_two_half_dosage())
     rows = np.concatenate(BLOCK_ROWS)
     values = signed[rows].astype(np.float64)
+    if sample_indices is not None:
+        values = values[:, sample_indices]
     means, scales = values.mean(axis=1), values.std(axis=1)
     indices = np.split(np.arange(rows.shape[0]), np.cumsum([block.shape[0] for block in BLOCK_ROWS])[:-1])
-    source = StoreGenotypeBlockSource(store, BLOCK_ROWS, indices, means, scales, _budget(device_kind), WORKSPACE_BYTES)
+    source = StoreGenotypeBlockSource(store, BLOCK_ROWS, indices, means, scales, _budget(device_kind), WORKSPACE_BYTES, sample_indices)
     return source, signed, means, scales
 
 
@@ -71,6 +73,42 @@ def test_cpu_streamed_tiles_equal_tiles_of_the_gathered_codes(tmp_path: Path, co
         seen.append(block_index)
     assert seen == [0, 1, 2]
     assert source.sample_count == signed.shape[1]
+
+
+@pytest.mark.parametrize("codec", ["raw", "zstd", "rowdict"])
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_training_sample_tiles_keep_exact_codes_and_products(tmp_path, codec, device):
+    if device == "cuda" and cupy is None:
+        pytest.skip("needs a CUDA device")
+    _write_store(tmp_path / "store", _two_half_dosage(), codec)
+    all_signed = _signed_store_codes(_two_half_dosage())
+    selected = np.arange(all_signed.shape[1], dtype=np.int64)[::2]
+    source, signed, means, scales = _source(tmp_path / "store", device, selected)
+    xp = source.array_module
+    rng = np.random.default_rng(56)
+    left = xp.asarray(rng.normal(size=(selected.size, 3)))
+    offsets = np.cumsum([0] + [block.size for block in BLOCK_ROWS])
+    assert source.sample_count == selected.size
+    padded_samples = -(-selected.size // INT8_GEMM_ALIGNMENT) * INT8_GEMM_ALIGNMENT
+    assert all(slot.shape[1] == padded_samples for slot in source._signed)
+    for _ in range(2):  # also exercise a resident CUDA read after the initial upload
+        for block, tile in source.iter_tiles():
+            span = slice(offsets[block], offsets[block + 1])
+            expected = CodeBlockTile(xp.asarray(signed[BLOCK_ROWS[block]][:, selected]), xp.asarray(means[span]),
+                                     xp.asarray(scales[span]), xp, WORKSPACE_BYTES)
+            right = xp.asarray(rng.normal(size=(tile.variant_count, 2)))
+            assert np.array_equal(_bits(tile.rmatmat(left)), _bits(expected.rmatmat(left)))
+            assert np.array_equal(_bits(tile.matmat(right)), _bits(expected.matmat(right)))
+    source._store.close()
+
+
+@pytest.mark.parametrize("indices", [[], [1, 1], [2, 0], [-1], [0.5], [10**6]])
+def test_sample_selection_rejects_ambiguous_or_invalid_columns(tmp_path, indices):
+    _write_store(tmp_path / "store", _two_half_dosage(), "raw")
+    with DosageStore.open(tmp_path / "store") as store, pytest.raises(ValueError, match="sample_indices"):
+        StoreGenotypeBlockSource(store, BLOCK_ROWS, [np.arange(len(rows)) for rows in BLOCK_ROWS],
+                                 np.zeros(sum(map(len, BLOCK_ROWS))), np.ones(sum(map(len, BLOCK_ROWS))),
+                                 _budget("cpu"), WORKSPACE_BYTES, np.asarray(indices))
 
 
 def test_blocks_must_hold_ascending_distinct_rows(tmp_path: Path) -> None:

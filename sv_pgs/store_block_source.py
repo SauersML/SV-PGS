@@ -35,15 +35,16 @@ from sv_pgs.memory_broker import HOST, MemoryBroker, current_broker, device_pool
 _GATHER_SOURCE = r"""
 extern "C" __global__
 void gather_signed_codes(const unsigned char* __restrict__ span, const long long* __restrict__ rows_in_span,
-                         signed char* __restrict__ target, long long rows, long long samples,
+                         const long long* __restrict__ sample_columns,
+                         signed char* __restrict__ target, long long rows, long long samples, long long source_samples,
                          long long padded_rows, long long padded_samples) {
-    // target[r, c] = span[rows_in_span[r], c] - SIGNED_CODE_OFFSET inside [rows, samples], 0 in the padding
+    // Gather selected rows and samples, subtract SIGNED_CODE_OFFSET, and zero padding.
     long long total = padded_rows * padded_samples;
     for (long long at = (long long)blockIdx.x * blockDim.x + threadIdx.x; at < total; at += (long long)gridDim.x * blockDim.x) {
         long long row = at / padded_samples;
         long long column = at - row * padded_samples;
         target[at] = (row < rows && column < samples)
-            ? (signed char)((int)span[rows_in_span[row] * samples + column] - SIGNED_CODE_OFFSET) : (signed char)0;
+            ? (signed char)((int)span[rows_in_span[row] * source_samples + sample_columns[column]] - SIGNED_CODE_OFFSET) : (signed char)0;
     }
 }
 """
@@ -80,6 +81,9 @@ class StoreGenotypeBlockSource:
     and ``scales`` are per block row, in signed-code units, concatenated over blocks.
     ``workspace_bytes`` is each tile's product workspace from the caller's memory plan, and
     ``resident_bytes`` is what the source itself holds on the compute device.
+    ``sample_indices`` optionally restricts all products to those store samples;
+    means and scales still come from the caller's training statistics. GPU rowdict
+    staging decodes full rows before gathering selected samples into compact tiles.
     """
 
     def __init__(
@@ -91,8 +95,18 @@ class StoreGenotypeBlockSource:
         scales: NDArray[np.float64],
         budget: ComputeBudget,
         workspace_bytes: int,
+        sample_indices: NDArray[np.int64] | None = None,
     ) -> None:
         self._store = store
+        self._sample_indices = None
+        if sample_indices is not None:
+            selected = np.asarray(sample_indices)
+            if (selected.ndim != 1 or not selected.size or selected.dtype.kind not in "iu"
+                    or np.any(selected >= store.n_samples) or np.any(selected < 0)
+                    or np.any(selected[1:] <= selected[:-1])):
+                raise ValueError("sample_indices must be ascending, distinct, nonempty store sample indices")
+            if selected.size != store.n_samples:
+                self._sample_indices = selected.astype(np.int64, copy=True)
         self._block_rows = [np.asarray(rows, dtype=np.int64) for rows in block_rows]
         self._block_variant_indices = [np.asarray(indices, dtype=np.int64) for indices in block_variant_indices]
         if len(self._block_rows) != len(self._block_variant_indices):
@@ -106,7 +120,7 @@ class StoreGenotypeBlockSource:
         self._spans = [(int(rows[0]), int(rows[-1]) + 1) for rows in self._block_rows]
         self._budget = budget
         self._workspace_bytes = int(workspace_bytes)
-        self._samples = int(store.n_samples)
+        self._samples = int(store.n_samples if self._sample_indices is None else self._sample_indices.size)
         self._padded_samples = _aligned(self._samples)
         widest_span = max(stop - start for start, stop in self._spans)
         widest_block = _aligned(max(rows.shape[0] for rows in self._block_rows))
@@ -130,14 +144,19 @@ class StoreGenotypeBlockSource:
         if self._cupy is not None:
             cupy = self._cupy
             self._decoder = rowdict_codec.GpuRowDecoder(cupy) if store.codecs == frozenset({"rowdict"}) else None
+            # Rowdict decoding stays on the GPU; gather just the selected samples
+            # into the smaller signed tile. Other codecs select before uploading.
+            self._input_samples = int(store.n_samples) if self._decoder is not None else self._samples
+            self._sample_columns = (cupy.asarray(self._sample_indices) if self._decoder is not None and self._sample_indices is not None
+                                    else cupy.arange(self._samples, dtype=cupy.int64))
             # a rowdict read lands the block's rows compactly, so the gather is the identity there
             staged_rows = widest_block if self._decoder is not None else widest_span
-            self._spans_on_device = [cupy.empty((staged_rows, self._samples), dtype=cupy.uint8) for _ in range(2)]
+            self._spans_on_device = [cupy.empty((staged_rows, self._input_samples), dtype=cupy.uint8) for _ in range(2)]
             self._rows_in_span = [
                 cupy.arange(rows.shape[0], dtype=cupy.int64) if self._decoder is not None else cupy.asarray(rows - rows[0])
                 for rows in self._block_rows
             ]
-            self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span)
+            self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span) + int(self._sample_columns.nbytes)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
         # Every block's signed codes held on the device after the first read, as a cache of the shared ledger
@@ -203,12 +222,13 @@ class StoreGenotypeBlockSource:
 
     @classmethod
     def from_statistics(
-        cls, store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int
+        cls, store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int,
+        sample_indices: NDArray[np.int64] | None = None,
     ) -> StoreGenotypeBlockSource:
         """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
         group's representative, whose store row, mean and scale Stage 0 recorded."""
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
-        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes)
+        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices)
 
     @property
     def sample_count(self) -> int:
@@ -252,7 +272,7 @@ class StoreGenotypeBlockSource:
         if self._cupy is not None and self._decoder is not None:
             yield from self._iter_decoded_tiles(first_block)
             return
-        spans = self._store.iter_codes(self._spans[first_block:], None, self._budget)
+        spans = self._store.iter_codes(self._spans[first_block:], self._sample_indices, self._budget)
         if self._cupy is None:
             for position, (start, _stop, codes) in enumerate(spans):
                 block_index = first_block + position
@@ -307,8 +327,8 @@ class StoreGenotypeBlockSource:
         self._gather(
             (min(-(-padded_rows * self._padded_samples // threads), resident_blocks),), (threads,),
             (
-                self._spans_on_device[slot], self._rows_in_span[block_index], self._signed[slot],
-                np.int64(rows), np.int64(self._samples), np.int64(padded_rows), np.int64(self._padded_samples),
+                self._spans_on_device[slot], self._rows_in_span[block_index], self._sample_columns, self._signed[slot],
+                np.int64(rows), np.int64(self._samples), np.int64(self._input_samples), np.int64(padded_rows), np.int64(self._padded_samples),
             ),
         )
 

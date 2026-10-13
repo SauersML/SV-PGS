@@ -36,6 +36,7 @@ digit split, exact zeros kept); relative_error 0 means the exact products.
 
 from __future__ import annotations
 
+import contextlib
 import time
 import weakref
 from dataclasses import dataclass, field
@@ -1192,6 +1193,28 @@ class _WindowLayout:
         )
 
 
+def _probe_signs(seed: int, sample_count: int, columns: int, sample_indices: Any = None) -> np.ndarray:
+    """Preserve each store sample's seeded probes when zero-weight rows are removed.
+
+    Only the prefix through the last retained row is needed. Its temporary host
+    allocation is charged separately; the returned compact probes belong to the
+    Gaussian's existing array reservation.
+    """
+    generator = np.random.default_rng(seed)
+    if sample_indices is None:
+        return generator.choice(np.array([-1.0, 1.0]), size=(sample_count, columns))
+    indices = np.asarray(sample_indices)
+    if (indices.shape != (sample_count,) or indices.dtype.kind not in "iu" or not indices.size
+            or np.any(indices < 0) or np.any(indices[1:] <= indices[:-1])):
+        raise ValueError("probe sample indices must be ascending, distinct nonnegative indices, one per source sample")
+    prefix_rows = int(indices[-1]) + 1
+    broker = current_broker()
+    lease = (broker.reserve(HOST, prefix_rows * columns * np.dtype(np.float64).itemsize, "original-sample probe prefix")
+             if broker is not None else contextlib.nullcontext())
+    with lease:
+        return generator.choice(np.array([-1.0, 1.0]), size=(prefix_rows, columns))[indices]
+
+
 class DualGaussian:
     """Stage 2's Gaussian q(beta) for every model in dual form: the mean, its certificate, the refresh
     quantities for the leave-block-out marginal variances, the covariates and posterior draws.
@@ -1214,7 +1237,7 @@ class DualGaussian:
 
     def __init__(
         self, *, source: DualTileSource, training: Any, targets: Any, offsets: Any, covariates: Any, grams: BlockGrams, probe_count: int, seed: int,
-        sample_weights: Any = None,
+        sample_weights: Any = None, probe_sample_indices: Any = None,
     ) -> None:
         array_module = source.array_module
         broker = current_broker()
@@ -1252,10 +1275,10 @@ class DualGaussian:
             raise ValueError("sample weights must be non-negative and zero off a model's training rows.")
         self.unit_squares = column_squares(source, DualModels(self.sample_weights, array_module.zeros((source.variant_count, self.model_count)), self.covariates, array_module), self.count)
         self.metric_key: Any = None
-        generator = np.random.default_rng(seed)
-        signs = generator.choice(np.array([-1.0, 1.0]), size=(source.sample_count, self.model_count * probe_count))
+        signs = _probe_signs(seed, source.sample_count, self.model_count * probe_count, probe_sample_indices)
         self.probe_models = np.repeat(np.arange(self.model_count), probe_count)
-        self.probes = array_module.asarray(signs) * self.training[:, array_module.asarray(self.probe_models)]
+        self.probes = array_module.asarray(signs)
+        self.probes *= self.training[:, array_module.asarray(self.probe_models)]
         self.probe_count = int(probe_count)
         self.mean = array_module.zeros((source.variant_count, self.model_count))
         self.genetic_image = array_module.zeros((source.sample_count, self.model_count))
