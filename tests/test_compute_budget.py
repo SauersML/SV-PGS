@@ -1,5 +1,8 @@
+import contextlib
 from pathlib import Path
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import sv_pgs.compute_budget as compute_budget
@@ -147,6 +150,32 @@ def test_exposed_device_without_usable_cupy_raises(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     with pytest.raises(RuntimeError, match="CuPy cannot use them"):
         compute_budget.detect_compute_budget()
+
+
+def _cupy_seeing(device_count: int) -> SimpleNamespace:
+    """A CuPy stand-in whose runtime enumerates ``device_count`` devices (a driver that dropped the rest)."""
+    runtime = SimpleNamespace(
+        getDeviceCount=lambda: device_count,
+        memGetInfo=lambda: (1 << 30, 1 << 31),
+        getDeviceProperties=lambda device_id: {"name": b"A40", "major": 8, "minor": 6},
+    )
+    cuda = SimpleNamespace(runtime=runtime, Device=lambda device_id: contextlib.nullcontext(),
+                           get_current_stream=lambda: SimpleNamespace(synchronize=lambda: None))
+    pool = SimpleNamespace(free_all_blocks=lambda: None)
+    return SimpleNamespace(cuda=cuda, eye=np.eye, float64=np.float64, linalg=np.linalg, get_default_memory_pool=lambda: pool)
+
+
+@pytest.mark.parametrize(("visible", "enumerated", "raises"), [("0,1", 2, False), ("0,1", 1, True)])
+def test_every_exposed_device_must_be_usable_when_the_budget_is_detected(
+    monkeypatch: pytest.MonkeyPatch, visible: str, enumerated: int, raises: bool
+) -> None:
+    monkeypatch.setattr(compute_budget, "_try_import_cupy", lambda: _cupy_seeing(enumerated))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    if raises:
+        with pytest.raises(RuntimeError, match="2 CUDA device\\(s\\) are exposed to this process but 1 are usable"):
+            compute_budget.detect_compute_budget()
+    else:
+        assert compute_budget.detect_compute_budget().device_ids == (0, 1)
 
 
 def test_the_address_space_limit_caps_the_host_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

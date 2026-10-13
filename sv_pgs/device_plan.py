@@ -11,8 +11,8 @@ scoring spreads its blocks over the devices (``fast_scoring``). This module shar
   on the block's device, with the home device's operands moved there and the results moved back.
   Its ``map_reduce`` runs a read's blocks on all devices at once, each into its own sample-side
   image, and sums the images in device order, so the result is deterministic.
-* :func:`check_visible_devices` makes an exposed device that CUDA cannot use an error, and
-  :func:`log_device_plan` records the decision when a fit starts.
+* :func:`log_device_plan` records the decision. An exposed device that CUDA cannot use is an error when the budget
+  is detected (``compute_budget.check_visible_devices``).
 
 Integer products are computed wholly on one device, so they are the same bits whichever device ran
 them. Any association of a fp64 sum over ``B`` block images is within ``gamma_(B-1) * sum_b |image_b|``
@@ -22,11 +22,8 @@ eq. 4.4), so the devices' sum and the single-device sum differ by at most twice 
 """
 from __future__ import annotations
 
-import os
-import re
 import threading
 from dataclasses import dataclass, replace
-from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
 
 import numpy as np
@@ -34,30 +31,6 @@ from numpy.typing import NDArray
 
 from sv_pgs.compute_budget import ComputeBudget, _cupy_device_context
 from sv_pgs.progress import log
-
-
-def exposed_device_count() -> int | None:
-    """Devices exposed to this process: the entries of ``CUDA_VISIBLE_DEVICES``, else the
-    ``/dev/nvidia<N>`` device nodes, else None when neither says anything."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    if visible is not None:
-        entries = [entry for entry in visible.split(",") if entry.strip() not in ("", "-1")]
-        return len(entries)
-    nodes = [path for path in Path("/dev").glob("nvidia*") if re.fullmatch(r"nvidia\d+", path.name)]
-    return len(nodes) if nodes else None
-
-
-def check_visible_devices(budget: ComputeBudget) -> None:
-    """Raise if a device is exposed to this process but the budget cannot use it."""
-    exposed = exposed_device_count()
-    if exposed is None:
-        return
-    usable = len(budget.device_ids) if budget.device_kind == "cuda" else 0
-    if usable != exposed:
-        raise RuntimeError(
-            f"{exposed} CUDA device(s) are exposed to this process but {usable} are usable; "
-            "every exposed device must work, or be hidden with CUDA_VISIBLE_DEVICES."
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -257,7 +230,6 @@ class ShardedDualSource:
         cupy = _try_import_cupy()
         if cupy is None:
             raise RuntimeError("the compute budget names CUDA devices but CuPy cannot be imported")
-        check_visible_devices(budget)
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
         plan = plan_blocks(budget.device_ids, [rows.shape[0] for rows in block_rows], int(store.n_samples))
         log_device_plan(budget, plan)

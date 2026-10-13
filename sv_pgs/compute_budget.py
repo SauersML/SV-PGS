@@ -7,7 +7,8 @@ hardcoded constant.
 
 The CPU is a first-class device: CUDA is used iff CuPy sees at least one
 device. A node that exposes NVIDIA devices but whose CuPy runtime cannot use
-them raises instead of silently running on the CPU.
+them, or can use only some of them, raises instead of silently running on the
+CPU or on the rest.
 
 Memory is measured, never taken as a hand-set share: host bytes are the
 kernel's MemAvailable, capped by every memory cgroup the process sits in and by
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import os
+import re
 import resource
 from dataclasses import dataclass
 from pathlib import Path
@@ -287,11 +289,28 @@ def _initialize_device_libraries(cupy: Any) -> None:
     cupy.cuda.get_current_stream().synchronize()
 
 
-def _nvidia_devices_exposed() -> bool:
+def exposed_device_count() -> int | None:
+    """Devices exposed to this process: the entries of ``CUDA_VISIBLE_DEVICES``, else the
+    ``/dev/nvidia<N>`` device nodes, else None when neither says anything."""
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible is not None:
-        return visible.strip() not in ("", "-1")
-    return Path("/dev/nvidiactl").exists()
+        entries = [entry for entry in visible.split(",") if entry.strip() not in ("", "-1")]
+        return len(entries)
+    nodes = [path for path in Path("/dev").glob("nvidia*") if re.fullmatch(r"nvidia\d+", path.name)]
+    return len(nodes) if nodes else None
+
+
+def check_visible_devices(budget: ComputeBudget) -> None:
+    """Raise if a device is exposed to this process but the budget cannot use it."""
+    exposed = exposed_device_count()
+    if exposed is None:
+        return
+    usable = len(budget.device_ids) if budget.device_kind == "cuda" else 0
+    if usable != exposed:
+        raise RuntimeError(
+            f"{exposed} CUDA device(s) are exposed to this process but {usable} are usable; "
+            "every exposed device must work, or be hidden with CUDA_VISIBLE_DEVICES."
+        )
 
 
 def detect_compute_budget() -> ComputeBudget:
@@ -299,7 +318,7 @@ def detect_compute_budget() -> ComputeBudget:
     host_bytes = _usable_host_bytes()
     cupy = _try_import_cupy()
     if cupy is None:
-        if _nvidia_devices_exposed():
+        if exposed_device_count():
             raise RuntimeError(
                 "NVIDIA devices are exposed to this process but CuPy cannot use them: "
                 + _cupy_runtime_diagnostic()
@@ -340,5 +359,6 @@ def detect_compute_budget() -> ComputeBudget:
         host_bytes=host_bytes,
         cpu_threads=cpu_threads,
     )
+    check_visible_devices(budget)
     log("  compute budget: " + budget.describe())
     return budget
