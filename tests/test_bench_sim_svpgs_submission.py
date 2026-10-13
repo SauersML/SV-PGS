@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from benchmarks.bench_sim import harness, measurement_truth
 
@@ -34,7 +35,8 @@ def _cohort(rng: np.random.Generator, n_var: int, n_samples: int):
     return observed, variants
 
 
-def test_the_submission_fits_and_scores_a_small_cohort(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("annotated_prior", [True, False])
+def test_the_submission_scores_only_accepted_synthetic_fits(tmp_path: Path, monkeypatch, annotated_prior) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     rng = np.random.default_rng(3)
     n_var, n_train, n_test = 60, 240, 80
@@ -57,7 +59,17 @@ def test_the_submission_fits_and_scores_a_small_cohort(tmp_path: Path, monkeypat
         _observed=observed, _columns=columns[n_train:], _records=records,
     )
     module = harness.load_method(SUBMISSION)
-    model = module.fit(train)
+    if annotated_prior:
+        # This architecture reaches an unresolved annotated-prior stationarity state.
+        # It previously scored despite that failure. Keep the real failure visible and
+        # enforce quarantine; do not weaken the numerical tolerance to obtain predictions.
+        with pytest.raises(ValueError, match="Model quarantined.*outer_criterion_met"):
+            module.fit_with(train, "mean_field", annotated_prior=True)
+        assert not any(path.name.startswith("svpgs_full_") for path in tmp_path.iterdir())
+        return
+    model = module.fit_with(train, "mean_field", annotated_prior=annotated_prior)
+    assert model.profile["acceptance"]["accepted"]
+    assert model.profile["annotated_prior"] is annotated_prior
     prediction = model.score(test)
     assert set(prediction) == {"total", "structural"}
     assert prediction["total"].shape == (n_test,) and np.all(np.isfinite(prediction["total"]))
@@ -106,9 +118,19 @@ def test_the_store_cache_builds_once_and_is_reused(tmp_path: Path, monkeypatch) 
     assert built == [1]
     # another arm's codes are another store
     other = observed.copy()
-    other[0] = 254 - other[0]
+    other[7] = 254 - other[7]  # An interior row absent from the former sampled cache key.
     train_other = harness.TrainData(**{**{name: getattr(train, name) for name in train.__dataclass_fields__}, "_observed": other})
     work = tmp_path / "work_other"
     work.mkdir()
     module.cached_store(train_other, work)
     assert len(list((tmp_path / "cache").iterdir())) == 2
+
+
+def test_cache_identity_binds_annotation_values(tmp_path):
+    from types import SimpleNamespace
+    from benchmarks.bench_sim.submissions.svpgs_full import _store_key
+    codes, variants = _cohort(np.random.default_rng(12), 100, 10)
+    train = SimpleNamespace(n_samples=10, n_variants=100, variants=variants, codes=lambda rows: codes[rows])
+    before = _store_key(train)
+    variants['in_gene'][17] = 1 - variants['in_gene'][17]
+    assert _store_key(train) != before

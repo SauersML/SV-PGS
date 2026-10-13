@@ -1660,3 +1660,21 @@ def test_a_state_is_itself_through_a_views_basis():
     freed = np.array(state.log_smoothing, copy=True)
     freed[0] = 1.0
     assert not _same_point(replace(state, log_smoothing=freed), state)
+
+
+def test_inner_trust_agreement_uses_the_mode_objective_without_laplace_offsets():
+    from types import SimpleNamespace
+    from sv_pgs.scale_mixture_ep import _inner_step_agreement, _next_radius
+    hessian = np.array([[2., .3], [.3, 4.]])
+    gradient = np.array([.2, -.1])
+    step = np.array([1e-4, -1e-4])
+    end_gradient = gradient - hessian @ step
+    exact = float(gradient @ step - .5 * step @ hessian @ step)
+    gain, rounding = _inner_step_agreement(gradient, end_gradient, step)
+    assert gain == pytest.approx(exact, rel=1e-14)
+    assert rounding < 1e-14 * abs(gain)
+    length = float(np.linalg.norm(step))
+    newton = SimpleNamespace(gradient=gradient, total=hessian)
+    # A separate absolute evidence diagnostic must not freeze this accurately modelled local step.
+    assert _next_radius(newton, step, length, length, gain, rounding) > length
+    assert _next_radius(newton, step, length, length, gain, .02) == length

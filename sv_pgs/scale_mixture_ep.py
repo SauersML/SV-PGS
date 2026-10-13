@@ -4538,6 +4538,24 @@ def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: fl
     return max(2.0 * radius, radius / (2.0 * error)) if error > 0.0 else 2.0 * radius
 
 
+def _inner_step_agreement(start_gradient: F64Array, end_gradient: F64Array, proposal: F64Array) -> tuple[float, float]:
+    """Local trapezoid gain for the objective whose gradient defines the inner Newton step.
+
+    This is a trust-region diagnostic, not an evidence-error bound. Inner mode polishing
+    optimizes the penalized profile objective; its gradient omits the Laplace determinant
+    and directional corrections. Comparing that quadratic prediction with corrected V
+    mixes objectives. V's absolute error can also dwarf a valid local step indefinitely.
+    Endpoint gradients give the exact gain for a quadratic and a local approximation
+    otherwise; final acceptance continues to use the separate corrected objective.
+    """
+    terms = (np.asarray(start_gradient) + np.asarray(end_gradient)) * np.asarray(proposal) / 2.0
+    gain = float(np.sum(terms))
+    operations = terms.size + 2
+    rounding = operations * np.finfo(np.float64).eps
+    scale = float(np.sum((np.abs(start_gradient) + np.abs(end_gradient)) * np.abs(proposal) / 2.0))
+    return gain, rounding / (1.0 - rounding) * scale
+
+
 def _cauchy_radius(newton: _NewtonB) -> float:
     """The first trust radius: the Cauchy step's length on |B + S|, ||g||^3 / g'|B + S| g, the model's steepest-ascent
     maximizer. Newton's step on |B + S| divides each direction's gradient by its own curvature, which the rounding
@@ -5332,7 +5350,8 @@ def fit_hyperparameters(
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model] = False
                 iterations[model] += 1
-                radii[model] = _next_radius(newton, proposal, entry.radius, length, float(inner_gain), float(inner_resolution))
+                mode_gain, mode_rounding = _inner_step_agreement(newton.gradient, gradient, proposal)
+                radii[model] = _next_radius(newton, proposal, entry.radius, length, mode_gain, mode_rounding)
                 # A polishing step continues at the same weights; one that left a saddle leads to a new plan.
                 pending[model] = inner(model, entry.step, entry.remaining, True) if entry.polishes else None
                 continue

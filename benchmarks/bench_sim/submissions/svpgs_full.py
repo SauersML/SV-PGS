@@ -8,13 +8,14 @@ of the learned scale-mixture prior with one mixing density per variant class), o
 finds. The test samples are scored from the fit's standardized-column coefficients, and the structural part is the
 score carried by TR and SV records.
 
-A binary trait is fitted as a quantitative one on its 0/1 phenotype (``fit_models`` has no binary likelihood), and
+A binary trait uses the Gaussian working likelihood on its 0/1 phenotype in this submission, and
 the harness scores its total on the liability scale.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import resource
 import shutil
@@ -146,16 +147,25 @@ and public fields only (no phenotype), the same for every scenario on the arm.""
 
 
 def _store_key(train) -> str:
-    """The training store's identity: the table's public fields, the training sample count and the codes of a
-    spread of rows (the first, middle and last of every 4096), so another arm's or cohort's codes never match."""
+    """Bind every public variant field and every training code, in bounded tiles.
+
+    Sampled rows cannot identify a cache: a changed unsampled dosage or annotation
+    must not silently reuse a previous simulation's training store.
+    """
     variants = train.variants
     digest = hashlib.sha256()
-    digest.update(np.int64(train.n_samples).tobytes())
-    for name in ("pos", "cls", "len_change", "imputation_info", "ref_len", "repeat_locus"):
-        digest.update(np.ascontiguousarray(np.asarray(variants[name])).tobytes())
-    probe = np.unique(np.concatenate([np.arange(0, train.n_variants, BLOCK_ROWS), [train.n_variants // 2, train.n_variants - 1]]))
-    digest.update(np.ascontiguousarray(train.codes(probe)).tobytes())
-    return digest.hexdigest()[:24]
+    digest.update(f"svpgs-simulation-store-v2:{train.n_samples}:{train.n_variants}".encode())
+    for name in sorted(variants):
+        values = np.ascontiguousarray(np.asarray(variants[name]))
+        if values.dtype.hasobject:
+            raise ValueError("Public variant metadata must use portable numeric or string arrays")
+        digest.update(json.dumps([name, values.dtype.str, values.shape]).encode())
+        digest.update(values.tobytes())
+    for start in range(0, train.n_variants, BLOCK_ROWS):
+        codes = np.ascontiguousarray(train.codes(np.arange(start, min(start + BLOCK_ROWS, train.n_variants))))
+        digest.update(json.dumps([codes.dtype.str, codes.shape]).encode())
+        digest.update(codes.tobytes())
+    return digest.hexdigest()
 
 
 def cached_store(train, work: Path) -> tuple[Path, np.ndarray]:
@@ -170,6 +180,8 @@ def cached_store(train, work: Path) -> tuple[Path, np.ndarray]:
         staging = Path(tempfile.mkdtemp(prefix=f"{root.name}.", dir=cache))
         built, _order = build_store(train, staging)
         (built / "COMPLETE").write_text("")
+        from sv_pgs.content_identity import tree_digest
+        (built / "CACHE_COMPLETE.json").write_text(json.dumps({"sha256": tree_digest(built)}))
         try:
             staging.rename(root)
         except OSError:
@@ -179,12 +191,10 @@ def cached_store(train, work: Path) -> tuple[Path, np.ndarray]:
     started = time.time()
     shutil.copytree(root / "store", work / "store")
     log(f"svpgs_full: cached store {root.name} copied in {time.time() - started:.0f} s")
-    # The copy is the arm's training codes: a spread of rows read afresh must equal the store's.
-    with DosageStore.open(work / "store") as store:
-        probe = np.unique(np.linspace(0, train.n_variants - 1, 64).astype(np.int64))
-        for row in probe:
-            if not np.array_equal(store.read_codes(int(row), int(row) + 1)[0], np.asarray(train.codes(order[[row]]))[0]):
-                raise ValueError(f"the cached store {root} differs from the training codes at store row {row}")
+    from sv_pgs.content_identity import tree_digest
+    receipt = json.loads((work / "store" / "CACHE_COMPLETE.json").read_text())
+    if tree_digest(work / "store") != receipt["sha256"]:
+        raise ValueError(f"the cached store {root} has changed since conversion")
     return work / "store", order
 
 
@@ -241,7 +251,7 @@ def fit(train) -> Model:
     return fit_with(train, "mean_field")
 
 
-def fit_with(train, inference: str) -> Model:
+def fit_with(train, inference: str, *, annotated_prior: bool = True) -> Model:
     """The fit by ``inference``'s fixed points (``stage2_wiring.fit_models``), with its profile: time, the process's
     peak resident set and the device pool's bytes at the end."""
     work = Path(tempfile.mkdtemp(prefix="svpgs_full_", dir=os.environ.get("TMPDIR")))
@@ -267,6 +277,7 @@ def fit_with(train, inference: str) -> Model:
                 seed=20260922,
                 draw_count=DRAW_COUNT,
                 inference=inference,
+                annotated_prior=annotated_prior,
             )
         (scoring,) = fitted.scoring
         certificate = fitted.certificate
@@ -276,7 +287,7 @@ def fit_with(train, inference: str) -> Model:
             "rows": int(np.asarray(scoring.store_rows).shape[0]),
             "noise_variance": float(fitted.noise_variance[0]),
             "phenotype_variance": float(phenotype.var()),
-            "certified": None if certificate.outer_criterion_met is None else bool(np.all(certificate.outer_criterion_met)),
+            "outer_criterion_met": None if certificate.outer_criterion_met is None else bool(np.all(certificate.outer_criterion_met)),
             "remaining_gain": float(np.max(certificate.remaining_gain)) if np.asarray(certificate.remaining_gain).size else None,
             "inference": inference,
             "refusals": len(certificate.refusals),
@@ -289,7 +300,16 @@ def fit_with(train, inference: str) -> Model:
             "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
             "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
         }
+        from types import SimpleNamespace
+        from sv_pgs.fit_model import certificate_parts
+        from sv_pgs.model_acceptance import acceptance, require_accepted
+        parts = certificate_parts(certificate, 1)
+        state = SimpleNamespace(model_names=("simulation",), certificate=parts.terms, refusals=parts.refusals,
+                                scoring=fitted.scoring)
+        profile["acceptance"] = acceptance(state)
+        profile["annotated_prior"] = annotated_prior
         log(f"svpgs_full: {profile}")
+        require_accepted(state)
         return Model(scoring, order, np.asarray(train.variants["cls"]) >= 2, profile)
     finally:
         shutil.rmtree(work, ignore_errors=True)
