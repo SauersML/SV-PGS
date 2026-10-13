@@ -556,12 +556,15 @@ class CudaGenotypeBuffer:
             function(start, min(start + _HOST_PANEL, rows))
 
     def to_host(self, array: Any) -> NDArray:
-        """Copy a device array into pinned host memory (recycled by CuPy's pinned pool) at full link speed."""
+        """Copy a device array into ordinary (pageable) host memory, complete on return.
+
+        Never pinned: CuPy's pinned pool keeps every freed block in its exact-size bin until ``free_all_blocks``, and
+        Stage 0's per-block Grams and couplings come back at a new size for nearly every block (4 w^2 bytes, up to ~10
+        GB at an 80 GB device's cap), so pinned copies held host memory without bound, outside the ledger, until the
+        VM's memory was gone partway through a genome. The fixed-size upload tiles stay pinned (``host_tile``)."""
         with self.context():
-            source = self._cupy.ascontiguousarray(array)
-            memory = self._cupy.cuda.alloc_pinned_memory(max(source.nbytes, 1))
-            host = np.frombuffer(memory, dtype=source.dtype, count=source.size).reshape(source.shape)
-            source.get(stream=self._compute, out=host)
+            host = self._cupy.ascontiguousarray(array).get(stream=self._compute)
+            self._compute.synchronize()
         return host
 
     def host_tile(self, tile_rows: int) -> NDArray[np.uint8]:

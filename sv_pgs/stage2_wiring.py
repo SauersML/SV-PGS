@@ -36,7 +36,7 @@ from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
-from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, stage0_block_cap
+from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, largest_block_cap, stage0_block_cap
 from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
 from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.progress import log
@@ -132,17 +132,35 @@ def stage0_candidates(store: DosageStore, training_columns: I64Array, log_reliab
     return rows[keep]
 
 
-def _block_cap(store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget) -> int:
-    """The memory's largest cap, but no larger than a chromosome's candidate count (in cap steps): Stage 0's buffers
-    grow with the cap, and a block never holds more than its chromosome's candidates.
+LD_STORE_BYTES_PER_VARIANT_AND_CAP = 2 * np.dtype(np.float32).itemsize
+"""Stage 0's LD store per candidate and unit of block cap: each variant's float32 row of its block's Gram and of its
+coupling to the block before, each at most the cap wide."""
+
+
+def _block_cap(
+    store: DosageStore, candidates: I64Array, training_columns: I64Array, covariate_count: int, budget: ComputeBudget, work_dir: Path,
+) -> int:
+    """The largest cap the memory and the disk allow, but no larger than a chromosome's candidate count (in cap steps):
+    Stage 0's buffers grow with the cap, a block never holds more than its chromosome's candidates, and the LD store
+    Stage 0 writes under ``work_dir`` is about candidates x cap x LD_STORE_BYTES_PER_VARIANT_AND_CAP bytes. The summary
+    band is cut from that store and written beside it, never larger than it, so the store may take half the disk's
+    free space. The memory alone set the cap before, which at 20M candidates on an A100 VM asked 3.6 TB of disk per
+    model and failed when the disk filled, hours into Stage 0.
 
     There is at least one candidate: ``_fit_one`` returns the null genetic model before Stage 0 when there is none."""
     sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
     sample_groups[training_columns] = 0
     memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
+    free_bytes = shutil.disk_usage(work_dir).free
+    try:
+        disk_cap = largest_block_cap(free_bytes // 2, lambda cap: int(candidates.shape[0]) * cap * LD_STORE_BYTES_PER_VARIANT_AND_CAP)
+    except MemoryError as error:
+        raise OSError(f"{work_dir}'s {free_bytes / 1e9:.1f} GB free cannot hold Stage 0's LD store and band for {candidates.shape[0]:,} candidates: {error}") from error
     chromosome_of_row = np.searchsorted(np.asarray(store.chromosome_starts), candidates, side="right") - 1
     largest = int(np.bincount(chromosome_of_row).max())
-    return min(memory_cap, -(-largest // BLOCK_CAP_STEP) * BLOCK_CAP_STEP)
+    cap = min(memory_cap, disk_cap, -(-largest // BLOCK_CAP_STEP) * BLOCK_CAP_STEP)
+    log(f"stage2 wiring: block cap {cap:,} (memory {memory_cap:,}, disk {disk_cap:,} of {free_bytes / 1e9:.0f} GB free, largest chromosome {largest:,} candidates)")
+    return cap
 
 
 def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificate:
@@ -367,7 +385,7 @@ def _fit_one(
     candidates = stage0_candidates(store, training_columns, measurement.log_reliability, config)
     if candidates.shape[0] == 0:
         return null_model("no store record carries signal on these training rows")
-    block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget)
+    block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget, work_dir)
     statistics = compute_genotype_statistics(
         DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
     )
