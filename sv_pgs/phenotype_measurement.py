@@ -56,7 +56,7 @@ import scipy.linalg
 from scipy.special import digamma, log_ndtr, logsumexp, polygamma
 from scipy.stats import chi2
 
-from sv_pgs._typing import F64Array, I64Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.scale_mixture_ep import (
     ROUGHNESS_ORDER,
     MixtureHyperparameters,
@@ -105,6 +105,18 @@ def box_cox(values: F64Array, exponent: float) -> tuple[F64Array, F64Array]:
     return np.expm1(exponent * log_values) / exponent, (exponent - 1.0) * log_values
 
 
+READING_ROUNDINGS = 8
+"""The rounded float64 operations a reading carries before it reaches the model, bounded: a unit conversion, a
+treatment correction, and a same-day mean's sum and division (all_of_us), each at most half an ulp of the reading, with
+margin. Two readings closer than this many ulps of the larger are one reading written two ways ((0.1 + 0.2) / 2 against
+0.15, 66 x 2.54 against 167.64), never a recording resolution: that gap set the lattice's floor at a variance near 1e-30."""
+
+
+def _resolvable_gaps(distinct: F64Array) -> BoolArray:
+    """For sorted distinct readings, which consecutive gaps exceed READING_ROUNDINGS ulps of the larger reading."""
+    return np.diff(distinct) > READING_ROUNDINGS * np.finfo(np.float64).eps * np.abs(distinct[1:])
+
+
 @dataclass(frozen=True)
 class Occasions:
     """Every occasion's person (0..m-1, each present), positive reading and fixed-effect design row."""
@@ -122,7 +134,7 @@ class Occasions:
             raise ValueError("the design needs one row per occasion")
         if np.linalg.matrix_rank(self.design) < self.design.shape[1]:
             raise ValueError("the fixed-effect design must have full column rank")
-        if np.unique(self.values).shape[0] < 2:
+        if not np.any(_resolvable_gaps(np.unique(self.values))):
             raise ValueError("the readings need two distinct values to show their recording resolution")
 
     @property
@@ -131,8 +143,10 @@ class Occasions:
 
     @property
     def resolution(self) -> float:
-        """The recording resolution: the smallest gap between distinct readings (§3.2)."""
-        return float(np.min(np.diff(np.unique(self.values))))
+        """The recording resolution: the smallest gap between distinct readings (§3.2), two readings within float64's
+        rounding of each other counting as one (``_resolvable_gaps``)."""
+        distinct = np.unique(self.values)
+        return float(np.min(np.diff(distinct)[_resolvable_gaps(distinct)]))
 
 
 @dataclass(frozen=True)
@@ -815,13 +829,13 @@ class _Model:
         repeated = counts[occasions.person_index] > 1
         if not np.any(repeated):
             # Only tau^2 + E[s] is identified: the target is then the transformed reading (``marginal_transform``).
-            raise ValueError("no person has a repeated occasion, so the level and the noise are not separable")
+            raise SplitNotIdentified("no person has a repeated occasion, so the level and the noise are not separable")
         largest = float(np.max(np.square(deviations[repeated])))
         # The person means' variance by their median absolute deviation, which gross errors barely move: it
         # overstates tau^2 by the noise of a mean, which the EM removes.
         level_variance = float(np.median(np.square(person_mean - np.median(person_mean)))) / float(chi2.median(1))
         if not level_variance > 0.0:
-            raise ValueError("no between-person variance: most persons' mean readings are equal")
+            raise SplitNotIdentified("no between-person variance: most persons' mean readings are equal")
         floor = float(np.log(self.resolution_variance))
         top = float(np.log(max(largest, self.resolution_variance)))
         spacing = spacing_bound(float(occasions.values.shape[0]), EVIDENCE_TOLERANCE)
@@ -1231,9 +1245,9 @@ def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionMode
                 else:
                     start = model.start()
                 fits[exponent] = (model, model.fit(start))
-            except (FloatingPointError, MemoryError):
-                # No certified maximum at this exponent, or none evaluable within the memory budget: it counts as
-                # the lowest evidence.
+            except (FloatingPointError, MemoryError, SplitNotIdentified):
+                # No certified maximum at this exponent, none evaluable within the memory budget, or no split the
+                # occasions identify: it counts as the lowest evidence.
                 fits[exponent] = (model, None)
         fit = fits[exponent][1]
         return -np.inf if fit is None else fit[2]
@@ -1241,9 +1255,14 @@ def fit_occasion_model(occasions: Occasions, working_bytes: int) -> OccasionMode
     bracketed_maximum(evidence, 1.0, -np.inf, np.inf)
     middle = max(fits, key=evidence)
     if evidence(middle) == -np.inf:
-        raise FloatingPointError("no Box-Cox exponent reaches a certified maximum")
+        raise SplitNotIdentified("no Box-Cox exponent reaches a certified maximum of the per-occasion model")
     model, (state, expectation, evidence_value) = fits[middle]
     return _result(model, state, expectation, evidence_value)
+
+
+class SplitNotIdentified(ValueError):
+    """The occasions do not certify the level/noise split (no repeated occasion, no between-person variance, or no
+    Box-Cox exponent with a certified maximum): the target is then the transformed reading (``marginal_transform``)."""
 
 
 def marginal_transform(values: F64Array, design: F64Array) -> tuple[float, F64Array]:

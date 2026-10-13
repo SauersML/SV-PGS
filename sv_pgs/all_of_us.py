@@ -19,7 +19,7 @@ from scipy.special import ndtri
 from scipy.stats import norm
 
 from sv_pgs.compute_budget import detect_compute_budget
-from sv_pgs.phenotype_measurement import Occasions, fit_occasion_model, marginal_transform
+from sv_pgs.phenotype_measurement import Occasions, SplitNotIdentified, fit_occasion_model, marginal_transform
 
 if TYPE_CHECKING:
     from google.cloud import bigquery
@@ -1612,12 +1612,17 @@ def build_all_of_us_measurement_targets(
     )
     # The lead's ruling on replicates: the level and the noise are separable only through within-person replicates
     # and only when the data certify it; otherwise the target is the transformed reading, with reliability 1.
-    fit = fit_occasion_model(occasions, working_bytes) if np.any(counts > 1) else None
+    fit, reason = None, "no person has a repeated occasion"
+    if np.any(counts > 1):
+        try:
+            fit = fit_occasion_model(occasions, working_bytes)
+            reason = "the data do not certify the level/noise split"
+        except SplitNotIdentified as error:
+            reason = f"the per-occasion model has no certified fit ({error})"
     if fit is not None and fit.split_identified:
         measurement_model, exponent = "per-occasion model", fit.exponent
         targets, reliabilities = fit.level_mean, fit.reliability
     else:
-        reason = "no person has a repeated occasion" if fit is None else "the data do not certify the level/noise split"
         measurement_model = f"transformed reading: {reason}"
         LOGGER.info("All of Us trait %s: %s, so the target is the Box-Cox-transformed reading with reliability 1", definition.canonical_name, reason)
         exponent, transformed = marginal_transform(occasions.values, occasions.design)

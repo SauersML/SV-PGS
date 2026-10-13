@@ -430,3 +430,14 @@ def test_gross_errors_are_downweighted_by_the_learned_density():
     counts = np.bincount(person_index, minlength=persons)
     gaussian_mean = np.bincount(person_index, weights=residuals, minlength=persons) / noise / (1.0 / fit.level_variance + counts / noise)
     np.testing.assert_array_less(without_sd[affected], np.abs(gaussian_mean[affected] - without_mean[affected]))
+
+
+def test_readings_a_rounding_apart_are_one_reading_for_the_recording_resolution() -> None:
+    # A same-day mean and a unit conversion write 0.15 and 167.64 a rounding away from the recorded values; those gaps
+    # (3e-17, 3e-14) are not a recording resolution, which would put the lattice's floor near a variance of 1e-30.
+    values = np.array([0.15, (0.1 + 0.2) / 2, 0.2, 0.25, 66 * 2.54, 167.64, 170.0])
+    occasions = Occasions(person_index=np.arange(values.size) % 3, values=values, design=np.ones((values.size, 1)))
+    assert occasions.resolution == pytest.approx(0.05)
+    # Readings that differ only by rounding have no resolution to show.
+    with pytest.raises(ValueError, match="two distinct values"):
+        Occasions(person_index=np.array([0, 1]), values=np.array([0.15, (0.1 + 0.2) / 2]), design=np.ones((2, 1)))

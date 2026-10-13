@@ -261,3 +261,21 @@ def test_a_near_dependent_earlier_annotation_never_drops_a_later_independent_one
     centred = design.design - design.design.mean(axis=0)
     eigenvalues = np.linalg.eigvalsh(centred.T @ centred)
     assert eigenvalues[0] > np.finfo(float).eps * rows * max(eigenvalues[-1], 1.0)
+
+
+def test_a_point_mass_at_the_minimum_leaves_the_spline_its_interior_knots() -> None:
+    # Most records are SNVs at length 1: every row quartile sits at the minimum, the distinct values' quartiles do not.
+    lengths = np.concatenate([np.ones(9_000), np.arange(2, 50, dtype=np.float64), np.geomspace(50, 2e6, 1_000)])
+    knots, _basis, _penalty = spline_basis(np.log(lengths))
+    interior = knots[4:-4]
+    assert interior.shape[0] == 3 and np.all((interior > 0.0) & (interior < np.log(2e6)))
+
+
+def test_a_length_enters_on_its_log_scale() -> None:
+    lengths = np.concatenate([np.ones(50), np.geomspace(50, 1e6, 50)])
+    classes = np.zeros(lengths.shape[0], dtype=np.int64)
+    from_lengths = annotation_design({"sv_length": lengths}, {}, class_index=classes)
+    from_logs = annotation_design({"length_log": np.log(lengths)}, {}, class_index=classes)
+    np.testing.assert_allclose(from_lengths.design, from_logs.design)
+    with pytest.raises(ValueError, match="must be positive"):
+        annotation_design({"sv_length": np.array([0.0, 1.0, 2.0])}, {}, class_index=np.zeros(3, dtype=np.int64))

@@ -58,6 +58,11 @@ _ROUGHNESS_DERIVATIVE = 2
 
 
 FREQUENCY = "log_genotype_variance"
+LOG_SCALE_ANNOTATIONS = ("sv_length",)
+"""Annotations that enter the prior on their log scale: a record's length (bp, at least 1) is a learned smooth of log
+length (MODEL.md, section 3; STORE.md), which spans 1 bp to megabases evenly. On raw base pairs the smooth was one
+cubic over [1, the longest SV], effectively linear across every SV a cohort has, so a length effect fitted between 50 bp
+and 5 kb gave a 2 Mb record hundreds of times its log-variance shift."""
 """The frequency function's annotation: each member's log true-genotype variance log Var(G_j), from the unit contract
 (``imputation_reliability.ColumnMeasurement.standardized_terms``)."""
 
@@ -113,11 +118,13 @@ def _factor_candidate(name: str, level_of_row: I64Array, labels: Sequence[str]) 
 
 
 def spline_basis(standardized: F64Array) -> tuple[F64Array, F64Array, F64Array]:
-    """(knots, B, S) of a cubic B-spline on ``standardized``'s range with its interior quartile knots: the basis at
-    those points (n x K, local support: at most 4 nonzero per row) and the exact roughness penalty S_ik = integral of
-    B_i''(x) B_k''(x) dx (K x K), both from gamfit (``gamfit.basis``)."""
+    """(knots, B, S) of a cubic B-spline on ``standardized``'s range with interior knots at the quartiles of its
+    distinct values: the basis at those points (n x K, local support: at most 4 nonzero per row) and the exact roughness
+    penalty S_ik = integral of B_i''(x) B_k''(x) dx (K x K), both from gamfit (``gamfit.basis``). The knots follow the
+    distinct values, not the rows: a point mass (the millions of SNVs at length 1) put every row quartile at the range's
+    minimum and left the spline with no interior knot at all."""
     low, high = float(np.min(standardized)), float(np.max(standardized))
-    interior = np.asarray(_continuous_spline_knots(standardized), dtype=np.float64)
+    interior = np.asarray(_continuous_spline_knots(np.unique(standardized)), dtype=np.float64)
     knots = np.concatenate([np.full(_SPLINE_DEGREE + 1, low), interior, np.full(_SPLINE_DEGREE + 1, high)])
     basis = np.asarray(bspline_basis(np.clip(standardized, low, high), knots, degree=_SPLINE_DEGREE), dtype=np.float64)
     penalty, _null_basis = smoothness_penalty(knots, degree=_SPLINE_DEGREE, order=_ROUGHNESS_DERIVATIVE)
@@ -182,6 +189,17 @@ def _class_sums(columns: F64Array, classes: I64Array, class_count: int) -> F64Ar
     return np.asarray(incidence @ columns)
 
 
+def _on_its_scale(name: str, values: np.ndarray) -> np.ndarray:
+    """An annotation's values on the scale its smooth is learned on: log for LOG_SCALE_ANNOTATIONS, as stored otherwise."""
+    if name not in LOG_SCALE_ANNOTATIONS:
+        return values
+    lengths = np.asarray(values, dtype=np.float64)
+    observed = np.isfinite(lengths)
+    if np.any(lengths[observed] <= 0.0):
+        raise ValueError(f"annotation {name!r} is a length, so every observed value must be positive")
+    return np.where(observed, np.log(np.where(observed, lengths, 1.0)), np.nan)
+
+
 def annotation_design(
     annotations: Mapping[str, np.ndarray],
     annotation_legends: Mapping[str, Sequence[str]],
@@ -196,7 +214,7 @@ def annotation_design(
     variant_count = classes.shape[0]
     class_count = int(classes.max()) + 1 if variant_count else 0
     candidates = [
-        _candidate(name, annotations[name], annotation_legends.get(name), variant_count)
+        _candidate(name, _on_its_scale(name, annotations[name]), annotation_legends.get(name), variant_count)
         for name in sorted(annotations) if name not in exclude
     ]
     flat = [(position, index) for position, candidate in enumerate(candidates) for index in range(len(candidate.columns))]
