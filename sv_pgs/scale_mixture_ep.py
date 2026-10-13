@@ -3722,7 +3722,8 @@ def _ascend_evidence(
             radius = 0.25 * step_norm
         elif ratio > 0.75 and step_norm >= radius * (1.0 - _HALF_PRECISION):
             radius = 2.0 * radius
-        if trial is None or actual <= 0.0:
+        # A NaN realized change is no rise (``actual <= 0`` is False on NaN, which accepted it).
+        if trial is None or not actual > 0.0:
             continue
         trial_gradient = trial.gradient
         gradient_change = gradient - trial_gradient
@@ -4237,8 +4238,10 @@ def hyper_step(
         if band is not None:
             if check.better is None and not check.gain < band[2].gain:
                 # The band move did not lower the weights' Newton decrement (natural monotonicity): it is undone, and
-                # the search ends at the weights before it.
+                # the search ends at the weights before it, with their own interior (the moved weights' mask leaves out
+                # a weight the move clipped to its range's end, whose stationarity the certificate then never reads).
                 weights, evidence, check = band
+                interior = (weights > lower) & (weights < upper)
                 break
             band = None
         moved = check.better
@@ -4515,14 +4518,19 @@ def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: fl
     L' on the boundary of the trust region, is largest at L' = L / (2 e). So the radius goes to L / (2 e) where that is
     past doubling (the polish on bench-sim chr22 [sim] spent four fixed points doubling from the Cauchy radius 4 to 32
     before Newton's step fitted), and doubles otherwise, as an accepted step always did: shrinking the radius after an
-    accepted step left three certificate tests uncertified. Without a measured gain (a state with no certified value
-    at either end) the radius doubles."""
+    accepted step left three certificate tests uncertified. A measured error of one half or more (the model
+    mispredicted the step by half, or the realized gain fell) supports no longer step, L / (2 e) <= L, so the radius
+    holds. Without a measured gain (a state with no certified value at either end) the radius doubles: such a walk
+    stops where the density collapses or the fixed point stops moving, and doubling reaches either in logarithmically
+    many fixed points."""
     if length < radius * (1.0 - _HALF_PRECISION):
         return radius
     predicted = float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
     if not (np.isfinite(realized) and np.isfinite(resolution) and predicted > 0.0):
         return 2.0 * radius
     error = max(abs(1.0 - realized / predicted), resolution / predicted)
+    if not error < 0.5:
+        return radius
     return max(2.0 * radius, radius / (2.0 * error)) if error > 0.0 else 2.0 * radius
 
 
@@ -5030,8 +5038,9 @@ def fit_hyperparameters(
                 else:
                     trial_correction, trial_state = solve_state(trial, trial_point)
                     if trial_state is not None:
+                        # A new state: its polish starts from its own Cauchy radius, not one grown at the state it left.
                         hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
-                        displaced[model], pending[model] = False, None
+                        displaced[model], pending[model], radii[model] = False, None, None
                         iterations[model] += 1
                         continue
                 halvings[model] += 1
@@ -5105,8 +5114,9 @@ def fit_hyperparameters(
                             remainders[model] = abs(gain - entry.predicted)
                         report("accepted" if gain - resolution > tolerance else "refused", trial_state, resolution)
                         if gain - resolution > tolerance:
+                            # A new state: its polish starts from its own Cauchy radius (as at an entered trial).
                             hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
-                            displaced[model], pending[model] = False, None
+                            displaced[model], pending[model], radii[model] = False, None, None
                             iterations[model] += 1
                             continue
                         measured = entry.predicted + remainders[model] + state.tail + state.error + entry.step.evidence_error + entry.step.stationarity_gain
@@ -5132,14 +5142,22 @@ def fit_hyperparameters(
                                 )
                                 pending[model] = None
                                 continue
-                        if state.polished and whole_uncertifiable[model] and gain + resolution + state.tail <= tolerance:
+                        # The remaining gain to any certifiable point along the step: the most any fraction up to this
+                        # one reaches (``segment_reach``: the quadratic through the state's slope and this fraction's
+                        # gain peaks before it where the gain fell, and a measured fall never certifies by itself), its
+                        # resolution, the polish's tail, and the step's own stationarity gain and evidence error (the
+                        # whole-trial certificate's terms).
+                        fraction_remaining = (
+                            max(segment_reach(model, entry.step.hyperparameters.coefficients - hyperparameters[model].coefficients, entry.fraction, gain), 0.0)
+                            + resolution + state.tail + entry.step.evidence_error + entry.step.stationarity_gain
+                        )
+                        if state.polished and whole_uncertifiable[model] and fraction_remaining <= tolerance:
                             # The whole step's end has no certified value (on gene 1 [real] it lies along the width
                             # -> 0 ray where the curvature has saturated), so the model's prediction beyond this
                             # fraction is void and its remainder cannot be measured; the fraction's own certified
-                            # gain bound, G + its resolution (both states' errors and the end correction), with
-                            # the polish's tail, is the remaining gain to any certifiable point along the step,
-                            # and the fit certifies where it is within the tolerance and the fraction's trial
-                            # moves q's mean within the certificate's budget.
+                            # gain bound is the remaining gain to any certifiable point along the step, and the fit
+                            # certifies where it is within the tolerance and the fraction's trial moves q's mean within
+                            # the certificate's budget.
                             current = points[model]
                             moves = np.atleast_1d(np.asarray(current.precision_norm(trial_point.mean - current.mean), dtype=np.float64))
                             allowed = np.full(moves.shape[0], 2.0 * tolerance)
@@ -5147,7 +5165,7 @@ def fit_hyperparameters(
                                 worst = int(np.argmax(np.where(allowed > 0.0, moves / allowed, 0.0)))
                                 fits[model] = OuterFit(
                                     hyperparameters=hyperparameters[model], step=entry.step, newton_decrement=state.decrement,
-                                    remaining_gain=gain + resolution + state.tail, prediction_move=float(moves[worst]),
+                                    remaining_gain=fraction_remaining, prediction_move=float(moves[worst]),
                                     prediction_tolerance=float(allowed[worst]), iterations=iterations[model], halvings=halvings[model],
                                     unresolved=unresolved[model], history=tuple(histories[model]),
                                 )
@@ -5228,6 +5246,12 @@ def fit_hyperparameters(
                     # factor). x is at its maximum to double precision from here on, and V has no Laplace value there
                     # (the fixed-cavity curvature is singular), so the trial is the fit's state and the fit returns
                     # uncertified with its last evaluated step; the boundary model is the open work (MODEL.md).
+                    if anchors[model] is not None:
+                        # A release's polish that walked to the boundary: the release is judged against the certified
+                        # state it left (``settle_release``), never returned as the fit's answer in its place.
+                        settle_release(model)
+                        pending[model] = None
+                        continue
                     hyperparameters[model], points[model] = trial, trial_point
                     displaced[model] = False
                     iterations[model] += 1
@@ -5257,6 +5281,11 @@ def fit_hyperparameters(
                         # -611.7085 (a released block's weight at its range's lower end let the density collapse), until
                         # the run was killed. x stands as its maximum to the data's resolution and the fit returns
                         # uncertified with its last evaluated step, as at the boundary below.
+                        if anchors[model] is not None:
+                            # As at the boundary: a release's polish is judged against the state it left.
+                            settle_release(model)
+                            pending[model] = None
+                            continue
                         hyperparameters[model], points[model] = trial, trial_point
                         displaced[model] = False
                         iterations[model] += 1

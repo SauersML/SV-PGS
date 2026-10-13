@@ -172,7 +172,10 @@ def block_gcro_dr(
             residual -= image @ coefficients
             residual_is_true = False
     columns_available = int(working_bytes) // (_ITEM_BYTES * size)
-    while (before := float(np.linalg.norm(residual))) > target:
+    while not (before := float(np.linalg.norm(residual))) <= target:
+        if not np.isfinite(before):
+            # A residual that is not a number would end ``while before > target`` as if solved; it is a failed solve.
+            raise FloatingPointError(f"the block linear response's residual is not finite after {counts['applications']} applications")
         counts["cycles"] += 1
         kept_at_start = kept
         first, coordinates = _orthonormal(residual)
@@ -241,7 +244,10 @@ def block_gcro_dr(
     if recycled is not None and kept is not None:
         recycled.vectors = kept[0]
     true_residual = residual if residual_is_true else right - operator(solution)
-    return KrylovSolve(solution, float(np.linalg.norm(true_residual)), target, counts["applications"], counts["columns"], counts["cycles"])
+    true_norm = float(np.linalg.norm(true_residual))
+    if not np.isfinite(true_norm):
+        raise FloatingPointError("the block linear response's true residual is not finite")
+    return KrylovSolve(solution, true_norm, target, counts["applications"], counts["columns"], counts["cycles"])
 
 
 def local_response(solve: BulkSolve, grams: BlockGrams) -> Callable[[F64, F64, F64, F64], Callable[[F64], F64]]:

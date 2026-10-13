@@ -1031,19 +1031,16 @@ class GramGaussian:
         duals, residual, _norms = self._bulk_solve(root_device, noise, design, xp.full(resolved.shape[0], bound))
         core = core_data - design.T @ duals
         core = 0.5 * (core + core.T)
-        try:
-            factor = xp.linalg.cholesky(core)
-            signs = None if bool(xp.all(xp.isfinite(factor))) else False
-        except np.linalg.LinAlgError:
-            signs = False
+        from sv_pgs.dual_solve import ResolvedBlock, positive_cholesky
+
+        factor = positive_cholesky(xp, core)
+        signs = None if factor is not None else False
         if signs is False:
             values, vectors = xp.linalg.eigh(core)
             magnitude = xp.abs(values)
             if not float(xp.min(magnitude)) > _EPSILON * core.shape[0] * float(xp.max(magnitude)):
                 raise np.linalg.LinAlgError("the resolved sites' core is singular: the linear response has no solution.")
             factor, signs = vectors * xp.sqrt(magnitude)[None, :], xp.sign(values)
-        from sv_pgs.dual_solve import ResolvedBlock
-
         return {"block": ResolvedBlock(design, None, duals, residual, core, factor, signs), "core_data": core_data, "rows": resolved}
 
     def posterior_solve(self, right: Any, model: int, error_bound: Any, start: Any = None) -> tuple[F64Array, F64Array]:

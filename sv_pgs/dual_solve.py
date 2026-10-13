@@ -921,6 +921,27 @@ class ResolvedBlock:
         return self.signs is not None and bool(np.any(_host(self.signs) < 0.0))
 
 
+def _unbounded_where_nan(array_module: Any, certificate: Any) -> Any:
+    """A certificate with every NaN entry read as unbounded (+inf): an error that is not a number certifies nothing,
+    and as +inf it stays above every target (never read as converged) and stops at the stall rule (inf >= inf)."""
+    return array_module.where(array_module.isnan(certificate), np.inf, certificate)
+
+
+def positive_cholesky(array_module: Any, core: Any) -> Any | None:
+    """The Cholesky factor of a symmetric ``core``, or None where it is not positive definite to the factorization.
+
+    NumPy raises on a non-positive pivot; CuPy's cuSOLVER does not (its linalg checks are off unless the caller sets
+    ``cupyx.errstate``) and leaves the non-positive pivot, finite, on the factor's diagonal, or NaN past it. A factor is
+    taken only with every diagonal entry finite and positive, so an indefinite core never passes as positive definite on
+    either device."""
+    try:
+        factor = array_module.linalg.cholesky(core)
+    except np.linalg.LinAlgError:
+        return None
+    diagonal = array_module.diagonal(factor)
+    return factor if bool(array_module.all(array_module.isfinite(factor))) and bool(array_module.all(diagonal > 0.0)) else None
+
+
 def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, residual: Any, indefinite: bool = False) -> ResolvedBlock:
     """The core of a model's resolved sites; LinAlgError when it, hence the global precision, is not PD (the bulk S_S
     is, so the core carries the global precision's inertia, Sylvester). With ``indefinite`` (a linear response's
@@ -929,12 +950,8 @@ def resolved_block(array_module: Any, design: Any, precision: Any, duals: Any, r
     eps |L| max |lambda|)."""
     core = array_module.diag(precision) + design.T @ duals
     core = 0.5 * (core + core.T)
-    try:
-        factor = array_module.linalg.cholesky(core)
-        positive = bool(array_module.all(array_module.isfinite(factor)))
-    except np.linalg.LinAlgError:
-        positive = False
-    if positive:
+    factor = positive_cholesky(array_module, core)
+    if factor is not None:
         return ResolvedBlock(design, precision, duals, residual, core, factor)
     if not indefinite:
         raise np.linalg.LinAlgError("the resolved sites' core is not positive definite: the global precision is not.")
@@ -964,6 +981,10 @@ def core_bounds(array_module: Any, block: ResolvedBlock) -> tuple[float, float, 
     lowest = float(array_module.min(array_module.abs(eigenvalues))) if block.signs is not None else float(eigenvalues[0])
     residual_gram = block.residual.T @ block.residual
     residual_norm = float(np.sqrt(max(float(array_module.linalg.eigvalsh(0.5 * (residual_gram + residual_gram.T))[-1]), 0.0)))
+    if not lowest > 0.0:
+        # A core whose lowest eigenvalue is not positive (or not a number) bounds nothing: delta is infinite, which every
+        # caller reads as an infinite certificate, never as a converged one.
+        return lowest, residual_norm, np.inf
     coupling = block.duals.T @ block.residual
     whitened = array_module.linalg.solve(block.factor, array_module.linalg.solve(block.factor, 0.5 * (coupling + coupling.T)).T)
     delta = float(array_module.max(array_module.abs(array_module.linalg.eigvalsh(0.5 * (whitened + whitened.T))))) + residual_norm**2 / lowest
@@ -1012,11 +1033,11 @@ def split_columns(array_module: Any, block: ResolvedBlock, shift: Any, duals: An
     bulk_residual = residual - block.residual @ resolved_mean
     stationarity = shift + block.design.T @ mean_duals - block.precision[:, None] * resolved_mean
     lowest, residual_norm, core_error = core_bounds(array_module, block)
-    # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
-    inverse_factor_norm = float(np.sqrt(1.0 / lowest))
     bulk_norms = array_module.linalg.norm(bulk_residual, axis=0)
     if core_error >= 1.0:
         return resolved_mean, mean_duals, array_module.full(bulk_norms.shape, np.inf)
+    # ||L^-1||_2^2 = 1 / lambda_min(core_hat).
+    inverse_factor_norm = float(np.sqrt(1.0 / lowest))
     projected = array_module.linalg.solve(block.factor, stationarity + block.duals.T @ bulk_residual)
     quadratic = (array_module.linalg.norm(projected, axis=0) + inverse_factor_norm * residual_norm * bulk_norms) ** 2 / (1.0 - core_error)
     return resolved_mean, mean_duals, array_module.sqrt(bulk_norms * bulk_norms + quadratic)
@@ -1369,6 +1390,7 @@ class DualGaussian:
                 blocks_by_model[model] = block
                 resolved_means[model] = resolved_mean[:, 0]
             state: dict = {"designs": designs, "order": order, "offsets": offsets, "blocks": blocks_by_model, "resolved_mean": resolved_means}
+            certificate = _unbounded_where_nan(array_module, certificate)
             open_models = _host(certificate > target)
             if not open_models.any():
                 break
@@ -1495,6 +1517,10 @@ class DualGaussian:
         bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)
         start = array_module.zeros_like(image)
+        # A column whose error did not fall across a round is at the accuracy float64 allows it: it stops, and its
+        # error, above the request, is returned for the caller to judge (posterior_solve's rule).
+        final = np.zeros(columns, dtype=bool)
+        previous, open_mask = None, None
         while True:
             result = certified_block_cg(source, models, image, start, column_models, bound, self.count, deflation=spike_free, label="information")
             block = state["blocks"].get(model)
@@ -1507,10 +1533,14 @@ class DualGaussian:
                 correction = _core_solve(array_module, block, shifted)
                 duals = duals - block.duals @ correction
                 error = error + resolved_correction_error(array_module, block, correction, shifted, image_norms)
+            error = _unbounded_where_nan(array_module, error)
+            if previous is not None:
+                final |= open_mask & _host(error >= previous)
             # the certificate's bound scales with ||u||, so a column with no bulk image asks nothing of it
-            open_mask = _host((error > target) & (image_norms > 0.0))
+            open_mask = _host((error > target) & (image_norms > 0.0)) & ~final
             if not open_mask.any():
                 break
+            previous = error
             finite = array_module.isfinite(error)
             shortfall = array_module.where(finite, target / array_module.where(finite & (error > 0.0), error, 1.0), tolerance)
             open_columns = array_module.asarray(np.flatnonzero(open_mask))
@@ -1627,6 +1657,7 @@ class DualGaussian:
             else:
                 resolved_values, duals, certificate = split_columns(array_module, block, values[resolved], result.solution, result.residual)
                 exact = exact_resolved_certificate(array_module, block, values[resolved], result.solution, result.residual)
+            certificate = _unbounded_where_nan(array_module, certificate)
             if previous is not None:
                 final |= open_mask & _host(certificate >= previous)
             open_mask = _host(certificate > target) & ~final
@@ -1726,6 +1757,10 @@ class DualGaussian:
         bound = target.copy()
         spike_free = Deflation({}, {}, {}, self._resolved)
         start = array_module.zeros_like(rhs)
+        # A column whose certificate did not fall across a round is at the accuracy float64 allows it: it stops, and its
+        # certificate, above the request, is returned (posterior_solve's rule).
+        final = np.zeros(int(rhs.shape[1]), dtype=bool)
+        previous, open_mask = None, None
         while True:
             # the split made S_S spike-free, so the relaxed operand error applies (an empty deflation says so)
             result = certified_block_cg(source, models, rhs, start, device_models, bound, self.count, deflation=spike_free, label="draws")
@@ -1750,9 +1785,13 @@ class DualGaussian:
                 # 1 - sqrt(1 - delta), written without the cancellation
                 spread = delta / (1.0 + np.sqrt(1.0 - delta)) * array_module.linalg.norm(array_module.asarray(resolved_noise[model]), axis=0)
                 certificate[device_columns] = array_module.sqrt(bulk * bulk + spread * spread)
-            open_mask = _host(certificate > target)
+            certificate = _unbounded_where_nan(array_module, certificate)
+            if previous is not None:
+                final |= open_mask & _host(certificate >= previous)
+            open_mask = _host(certificate > target) & ~final
             if not open_mask.any():
                 break
+            previous = certificate
             finite = array_module.isfinite(certificate)
             fallback = target / array_module.maximum(array_module.linalg.norm(rhs, axis=0), np.finfo(np.float64).tiny)
             # an open column's certificate exceeds its positive target, so it is positive
