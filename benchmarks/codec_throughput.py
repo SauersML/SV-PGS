@@ -1,19 +1,22 @@
-"""CPU rowdict decoding at 50k/100k samples, checked against original codes.
+"""CPU rowdict data handling at 50k/100k samples, checked against original codes.
 
-Compares the original array decoder with direct compiled decoding. Timings
-exclude encoding/JIT warmup. Traced memory covers Python/NumPy allocations,
+Compares array and compiled histograms, decoding, and warm checksum-checked
+file reads. Timings exclude JIT warmup. Traced memory covers Python/NumPy allocations,
 not whole-process RSS. No real participant data are used.
 """
 from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
+import tempfile
 import time
 import tracemalloc
 
 import numpy as np
 
 from sv_pgs import rowdict_codec as codec
+from sv_pgs.dosage_store import CodeArray, CodeShardWriter, create_code_array
 
 
 def array_decode(buffer, frames, samples, out):
@@ -71,6 +74,39 @@ def benchmark_histograms(codes, repeats):
                       "peak_traced_bytes_including_result": peaks}), flush=True)
 
 
+def benchmark_store_reads(codes, repeats):
+    """Warm file reads including frame parsing and the store's checksum checks."""
+    methods = [("array", array_decode), ("compiled", codec.decode_rows)]
+    times = {name: [] for name, _ in methods}
+    output = np.empty_like(codes)
+    with tempfile.TemporaryDirectory(prefix="svpgs-codec-") as directory:
+        root = Path(directory)
+        layout = create_code_array(root, *codes.shape, codec="rowdict", inner_rows=codes.shape[0])
+        with CodeShardWriter(root, layout, 0) as writer:
+            writer.write_rows(codes)
+        array = CodeArray(root)
+        original = codec.decode_rows
+        try:
+            for _, method in methods:
+                codec.decode_rows = method
+                array.read_rows_into(0, codes.shape[0], output)
+                np.testing.assert_array_equal(output, codes)
+            for repeat in range(repeats):
+                for name, method in methods[::1 if repeat % 2 == 0 else -1]:
+                    codec.decode_rows = method
+                    start = time.perf_counter()
+                    array.read_rows_into(0, codes.shape[0], output)
+                    times[name].append(time.perf_counter() - start)
+                    np.testing.assert_array_equal(output, codes)
+        finally:
+            codec.decode_rows = original
+            array.close()
+    medians = {name: float(np.median(values)) for name, values in times.items()}
+    print(json.dumps({"stage": "warm_store_read", "samples": codes.shape[1], "rows": codes.shape[0],
+                      "repeats": repeats, "bitwise_equal": True, "median_seconds": medians,
+                      "speedup": medians["array"] / medians["compiled"]}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, nargs="+", default=[50_000, 100_000])
@@ -112,6 +148,7 @@ def main():
                           "bitwise_equal": True, "median_seconds": medians,
                           "speedup": medians["array"] / medians["compiled"],
                           "peak_traced_scratch_bytes": peaks}), flush=True)
+        benchmark_store_reads(codes, args.repeats)
 
 
 if __name__ == "__main__":
