@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+import numba
 from scipy.special import ndtri
 
 from sv_pgs._typing import F64Array, I64Array
@@ -88,6 +89,40 @@ def _uniform(high: np.ndarray, low: np.ndarray, open_below: bool) -> np.ndarray:
     if open_below:
         value += 0.5
     return value / float(1 << _MANTISSA_BITS)
+
+
+@numba.njit(cache=True, nogil=True)
+def _member_uniforms(ids: np.ndarray, draws: np.ndarray, key: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """The member stream's two uniforms with Philox words held in scalar registers.
+
+    Same counters, integer rounds and float64 conversions as ``philox4x32`` and
+    ``_uniform``. No fast-math or parallel pool: the scorer already owns its CPU
+    workers, and this avoids ten rounds of tile-sized temporary word arrays.
+    """
+    node = np.empty((ids.size, draws.size), dtype=np.float64)
+    normal = np.empty_like(node)
+    first, second = np.uint64(_PHILOX_MULTIPLIERS[0]), np.uint64(_PHILOX_MULTIPLIERS[1])
+    for row in range(ids.size):
+        for column in range(draws.size):
+            c0, c1 = ids[row] & _WORD_MASK, ids[row] >> np.uint64(_WORD_BITS)
+            c2, c3 = draws[column] & _WORD_MASK, np.uint64(MEMBER_STREAM)
+            k0, k1 = np.uint64(key[0]) & _WORD_MASK, np.uint64(key[1]) & _WORD_MASK
+            for round_index in range(_PHILOX_ROUNDS):
+                if round_index:
+                    k0 = (k0 + np.uint64(_PHILOX_WEYL[0])) & _WORD_MASK
+                    k1 = (k1 + np.uint64(_PHILOX_WEYL[1])) & _WORD_MASK
+                product0, product1 = first * c0, second * c2
+                c0, c1, c2, c3 = (
+                    (product1 >> np.uint64(_WORD_BITS)) ^ c1 ^ k0,
+                    product1 & _WORD_MASK,
+                    (product0 >> np.uint64(_WORD_BITS)) ^ c3 ^ k1,
+                    product0 & _WORD_MASK,
+                )
+            node_mantissa = (c0 >> np.uint64(_HIGH_SHIFT)) * np.uint64(1 << _LOW_BITS) + (c1 >> np.uint64(_LOW_SHIFT))
+            normal_mantissa = (c2 >> np.uint64(_HIGH_SHIFT)) * np.uint64(1 << _LOW_BITS) + (c3 >> np.uint64(_LOW_SHIFT))
+            node[row, column] = np.float64(node_mantissa) / float(1 << _MANTISSA_BITS)
+            normal[row, column] = (np.float64(normal_mantissa) + 0.5) / float(1 << _MANTISSA_BITS)
+    return node, normal
 
 
 def seed_key(*keys: int) -> tuple[int, int]:
@@ -267,16 +302,12 @@ class ProductMixtureDraws:
             return out
         components = self.components_of_draws()
         ids = (rows if self.row_ids is None else np.asarray(self.row_ids, dtype=np.int64)[rows]).astype(np.uint64)
-        low = (ids & _WORD_MASK)[:, None]
-        high = (ids >> np.uint64(_WORD_BITS))[:, None]
         grid = np.asarray(self.log_variance_grid, dtype=np.float64)
         classes = np.asarray(self.class_index)[rows]
         for component in np.unique(components):
             draws = np.flatnonzero(components == component)
-            counter = np.asarray(draws, dtype=np.uint64)[None, :]
-            words = philox4x32((low, high, counter, np.full_like(counter, MEMBER_STREAM)), self.key)
-            node_uniform = _uniform(words[0], words[1], open_below=False)
-            normal = ndtri(_uniform(words[2], words[3], open_below=True))
+            node_uniform, normal = _member_uniforms(ids, np.asarray(draws, dtype=np.uint64), self.key)
+            ndtri(normal, out=normal)
             omega = np.asarray(self.omega)[component, rows]
             shift = np.asarray(self.shift)[component, rows]
             values = np.empty((rows.shape[0], draws.shape[0]))

@@ -25,6 +25,38 @@ def test_philox_matches_the_random123_known_answers():
         assert tuple(int(word[0]) for word in words) == expected
 
 
+def test_fused_member_uniforms_are_bitwise_equal_to_vector_philox():
+    from sv_pgs.draw_laws import MEMBER_STREAM, _member_uniforms, _uniform
+
+    generator = np.random.default_rng(921)
+    ids = np.r_[np.array([0, 1, 2**32 - 1, 2**32, 2**64 - 1], dtype=np.uint64),
+                generator.integers(0, 2**64 - 1, size=100, dtype=np.uint64)]
+    draws = np.array([0, 1, 63, 2**32 - 1, 2**32 + 3], dtype=np.uint64)
+    for key in ((0, 0), (17, 29), (0xFFFFFFFF, 0xFFFFFFFF)):
+        words = philox4x32((ids[:, None] & np.uint64(0xFFFFFFFF), ids[:, None] >> np.uint64(32),
+                          draws[None, :], np.full((1, draws.size), MEMBER_STREAM, dtype=np.uint64)), key)
+        actual = _member_uniforms(ids, draws, key)
+        np.testing.assert_array_equal(actual[0], _uniform(words[0], words[1], False))
+        np.testing.assert_array_equal(actual[1], _uniform(words[2], words[3], True))
+    assert _member_uniforms(ids[:0], draws, (0, 0))[0].shape == (0, draws.size)
+    assert _member_uniforms(ids, draws[:0], (0, 0))[0].shape == (ids.size, 0)
+
+
+def test_fused_draw_tiles_equal_the_previous_generator(monkeypatch):
+    from sv_pgs import draw_laws
+
+    law = _law(np.random.default_rng(892), rows=127, draws=67)
+    actual = law.tile(0, 127)
+
+    def reference(ids, draws, key):
+        words = philox4x32((ids[:, None] & np.uint64(0xFFFFFFFF), ids[:, None] >> np.uint64(32),
+                          draws[None, :], np.zeros((1, draws.size), dtype=np.uint64)), key)
+        return draw_laws._uniform(words[0], words[1], False), draw_laws._uniform(words[2], words[3], True)
+
+    monkeypatch.setattr(draw_laws, "_member_uniforms", reference)
+    np.testing.assert_array_equal(actual, law.tile(0, 127))
+
+
 def _law(generator: np.random.Generator, rows: int = 300, draws: int = 4000, weights=(0.6, 0.4)) -> ProductMixtureDraws:
     grid = np.linspace(-7.0, 1.0, 9)
     density = generator.normal(size=(2, grid.shape[0]))
