@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sv_pgs.all_of_us import MEASUREMENT_EXCLUSION_REASONS, build_all_of_us_measurement_sql
+from sv_pgs.all_of_us import DISEASE_DEFINITIONS, MEASUREMENT_EXCLUSION_REASONS, build_all_of_us_measurement_sql
 from sv_pgs.cohort import pipeline_half_levels
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType, VariantClass
@@ -745,7 +745,9 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
     raw = json.loads(_filled((LAUNCHER / "run_config.template.json").read_text()))
     config = WorkspaceConfig.from_mapping(raw)
     # The study's panel is its diseases; the quantitative traits are left out of the template to keep the fit in budget.
-    assert (len(config.diseases), len(config.traits), config.fold_count) == (10, 0, 5) and config.truth_calls is None
+    assert (len(config.diseases), len(config.traits), config.fold_count) == (15, 0, 5) and config.truth_calls is None
+    # Every catalogued disease, in the catalogue's order (the study abstract's five first, hypertension leading).
+    assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS)
     for job in ("job_store.json.template", "job_fit.json.template"):
         network = json.loads(_filled((LAUNCHER / job).read_text()))["allocationPolicy"]["network"]["networkInterfaces"][0]
         assert network["noExternalIpAddress"] is True

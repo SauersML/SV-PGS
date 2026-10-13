@@ -44,14 +44,14 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - Gated on a calibration check in the long-read truth subset: any nonzero tag coefficient blocks PIP claims.
 - **(f) Across traits.** The pre-registered panel test below, plus Hommel-adjusted per-trait tests.
 
-## The pre-registered panel (21 traits)
+## The pre-registered panel (26 traits)
 - **11 quantitative:** height, BMI, SBP, heart rate, MCV, platelets, WBC, eGFR (CKD-EPI 2021), total bilirubin, LDL (pre-statin), HbA1c (non-diabetic).
-- **10 diseases:** T2D, atrial fibrillation, hypothyroidism, COPD, depression, gout, cataract, CKD (lab-defined), psoriasis, prostate cancer.
+- **15 diseases:** hypertension, coronary artery disease, asthma, hyperlipidemia, breast cancer (the study abstract's five), T2D, atrial fibrillation, hypothyroidism, COPD, depression, gout, cataract, CKD (lab-defined), psoriasis, prostate cancer.
 - **Statistic:** z = wᵀz / √(wᵀRw).
   - w ∝ E[z] from a power model. The weights are non-negative and use no SV biology, only h², n, K, misclassification and repeatability. Correlation-inverse weights would have made most diseases negative [sim-only: power model].
   - R is the correlation of per-trait family-block influences.
 - **Frozen** before any test phenotype is touched: weights, trait list, case definitions, code hash and α plan.
-- **Power** (conservative: calibration slope 1, full pair term): panel z 5.2 at 50k and 9.9 at 100k [sim-only: power model].
+- **Power** (conservative: calibration slope 1, full pair term): panel z 5.2 at 50k and 9.9 at 100k [sim-only: power model], computed for the 21-trait panel before the abstract's five diseases joined it.
 - **The diseases-only sub-panel** is secondary: 0.14 / 0.31 power [sim-only: power model]. Family-history liability targets are the planned lift.
 - Trait choice uses power and phenotype quality only, never known SV biology.
 

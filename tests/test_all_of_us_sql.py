@@ -190,6 +190,56 @@ SYNTHETIC_CONCEPTS = (
     (91000011, "THYROID PREPARATIONS", "Drug", "ATC", "ATC 3rd", "C", "H03A"),
     (91000012, "Chronic kidney disease stage 3", "Condition", "SNOMED", "Clinical Finding", "S", "433144002"),
     (91000013, "Chronic kidney disease", "Condition", "SNOMED", "Clinical Finding", "S", "709044004"),
+    # Hypertension.
+    (91000014, "Hypertensive heart disease", "Condition", "SNOMED", "Clinical Finding", "S", "64715009"),
+    (91000015, "Maternal hypertension", "Condition", "SNOMED", "Clinical Finding", "S", "288250001"),
+    (91000016, "Pre-eclampsia", "Condition", "SNOMED", "Clinical Finding", "S", "398254007"),
+    (91000017, "Secondary hypertension", "Condition", "SNOMED", "Clinical Finding", "S", "31992008"),
+    (91000018, "Elevated blood-pressure reading without diagnosis of hypertension", "Condition", "SNOMED",
+     "Clinical Finding", "S", "371622005"),
+    (91000019, "AGENTS ACTING ON THE RENIN-ANGIOTENSIN SYSTEM", "Drug", "ATC", "ATC 2nd", "C", "C09"),
+    (91000020, "lisinopril", "Drug", "RxNorm", "Ingredient", "S", "29046"),
+    # Coronary artery disease.
+    (91000021, "Ischemic heart disease", "Condition", "SNOMED", "Clinical Finding", "S", "414545008"),
+    (91000022, "Myocardial infarction", "Condition", "SNOMED", "Clinical Finding", "S", "22298006"),
+    (91000023, "Myocardial infarction due to demand ischemia", "Condition", "SNOMED", "Clinical Finding", "S",
+     "16837681000119104"),
+    (91000024, "Disorder of coronary artery", "Condition", "SNOMED", "Clinical Finding", "S", "414024009"),
+    (91000025, "Coronary arteriosclerosis", "Condition", "SNOMED", "Clinical Finding", "S", "53741008"),
+    (91000026, "Coronary artery stenosis", "Condition", "SNOMED", "Clinical Finding", "S", "233970002"),
+    (91000027, "Percutaneous coronary intervention", "Procedure", "SNOMED", "Procedure", "S", "415070008"),
+    (91000028, "Organic nitrates", "Drug", "ATC", "ATC 4th", "C", "C01DA"),
+    (91000029, "isosorbide mononitrate", "Drug", "RxNorm", "Ingredient", "S", "6058"),
+    # Asthma.
+    (91000030, "Asthma", "Condition", "SNOMED", "Clinical Finding", "S", "195967001"),
+    (91000031, "Allergic asthma", "Condition", "SNOMED", "Clinical Finding", "S", "389145006"),
+    (91000032, "Chronic obstructive pulmonary disease", "Condition", "SNOMED", "Clinical Finding", "S", "13645005"),
+    (91000033, "Asthma-chronic obstructive pulmonary disease overlap syndrome", "Condition", "SNOMED",
+     "Clinical Finding", "S", "10692761000119107"),
+    (91000034, "DRUGS FOR OBSTRUCTIVE AIRWAY DISEASES", "Drug", "ATC", "ATC 2nd", "C", "R03"),
+    (91000035, "Glucocorticoids", "Drug", "ATC", "ATC 4th", "C", "R03BA"),
+    (91000036, "fluticasone", "Drug", "RxNorm", "Ingredient", "S", "41126"),
+    (91000037, "Selective beta-2-adrenoreceptor agonists", "Drug", "ATC", "ATC 4th", "C", "R03AC"),
+    (91000038, "albuterol", "Drug", "RxNorm", "Ingredient", "S", "435"),
+    # Hyperlipidemia.
+    (91000039, "Hyperlipidemia", "Condition", "SNOMED", "Clinical Finding", "S", "55822004"),
+    (91000040, "Mixed hyperlipidemia", "Condition", "SNOMED", "Clinical Finding", "S", "267434003"),
+    (91000041, "Hypercholesterolemia", "Condition", "SNOMED", "Clinical Finding", "S", "13644009"),
+    (91000042, "Hyperalphalipoproteinemia", "Condition", "SNOMED", "Clinical Finding", "S", "238080004"),
+    (91000043, "Dyslipidemia", "Condition", "SNOMED", "Clinical Finding", "S", "370992007"),
+    (91000044, "Fibrates", "Drug", "ATC", "ATC 4th", "C", "C10AB"),
+    (91000045, "fenofibrate", "Drug", "RxNorm", "Ingredient", "S", "8703"),
+    # Breast cancer.
+    (91000046, "Malignant neoplasm of breast", "Condition", "SNOMED", "Clinical Finding", "S", "254837009"),
+    (91000047, "Infiltrating duct carcinoma of breast", "Condition", "SNOMED", "Clinical Finding", "S", "408643008"),
+    (91000048, "Malignant lymphoma of breast", "Condition", "SNOMED", "Clinical Finding", "S", "278052009"),
+    (91000049, "Carcinoma in situ of breast", "Condition", "SNOMED", "Clinical Finding", "S", "189336000"),
+    (91000050, "Ductal carcinoma in situ of breast", "Condition", "SNOMED", "Clinical Finding", "S", "109889007"),
+    # CPT-4 procedures, which concept_ancestor does not file under any SNOMED procedure.
+    (91000051, "Percutaneous transcatheter placement of intracoronary stent(s), single major coronary artery or branch",
+     "Procedure", "CPT4", "CPT4", "S", "92928"),
+    (91000052, "Extracapsular cataract removal with insertion of intraocular lens prosthesis", "Procedure", "CPT4", "CPT4", "S",
+     "66984"),
 )
 SYNTHETIC_CONCEPT_ANCESTORS = (
     *((concept[0], concept[0], 0, 0) for concept in SYNTHETIC_CONCEPTS),
@@ -197,6 +247,23 @@ SYNTHETIC_CONCEPT_ANCESTORS = (
     (91000005, 91000007, 1, 1),
     (91000011, 91000008, 1, 1), (91000011, 91000009, 2, 2), (91000008, 91000009, 1, 1),
     (91000013, 91000012, 1, 1),
+    # Hypertensive disorder over pre-eclampsia (by maternal hypertension) and secondary hypertension; hypertensive
+    # heart disease is filed apart from it.
+    (316866, 91000015, 1, 1), (316866, 91000016, 2, 2), (91000015, 91000016, 1, 1), (316866, 91000017, 1, 1),
+    (91000019, 91000020, 2, 2),
+    # Myocardial infarction (type 2 included) under ischemic heart disease; coronary arteriosclerosis and stenosis
+    # under disorder of coronary artery.
+    (91000021, 91000022, 1, 1), (91000021, 91000023, 2, 2), (91000022, 91000023, 1, 1),
+    (91000024, 91000025, 1, 1), (91000024, 91000026, 1, 1),
+    (91000028, 91000029, 1, 1),
+    # The overlap syndrome under both asthma and COPD; fluticasone and albuterol under their R03 classes.
+    (91000030, 91000031, 1, 1), (91000030, 91000033, 1, 1), (91000032, 91000033, 1, 1),
+    (91000034, 91000035, 2, 2), (91000034, 91000036, 3, 3), (91000035, 91000036, 1, 1),
+    (91000034, 91000037, 2, 2), (91000034, 91000038, 3, 3), (91000037, 91000038, 1, 1),
+    # Mixed hyperlipidemia and hypercholesterolemia under hyperlipidemia, raised HDL under hypercholesterolemia.
+    (91000039, 91000040, 1, 1), (91000039, 91000041, 1, 1), (91000039, 91000042, 3, 3), (91000041, 91000042, 2, 2),
+    (21601853, 91000044, 2, 2), (21601853, 91000045, 3, 3), (91000044, 91000045, 1, 1),
+    (91000046, 91000047, 2, 2), (91000046, 91000048, 1, 1), (91000049, 91000050, 1, 1),
 )
 FEMALE = 45878463
 MALE = 45880669
@@ -648,6 +715,7 @@ def test_diagnosis_roots_distinct_drug_dates_and_case_procedures(cdr: _Cdr):
     cdr.condition(4, 91000005, "2018-01-01")
     cdr.condition(4, 91000005, "2019-01-01")
     cdr.condition(4, 91000007, "2019-01-01")  # congenital cataract: ambiguous
+    cdr.procedure(5, 91000052, "2020-06-01")  # a CPT-4 cataract extraction alone
 
     atrial_fibrillation = cdr.disease_rows(resolve_disease_definition("afib"))
     assert atrial_fibrillation["1"]["phenotype_occurrence_count"] == 2
@@ -661,8 +729,8 @@ def test_diagnosis_roots_distinct_drug_dates_and_case_procedures(cdr: _Cdr):
     assert cataract["4"]["has_ambiguous_code"] is True
 
     training_rows, _columns, counts = _prepare_training_rows(cataract_definition, list(cataract.values()), [])
-    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 0, "2": 0, "3": 1, "5": 0}
-    assert counts["n_cases_by_procedure"] == 1 and counts["n_excluded_ambiguous_code"] == 1
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 0, "2": 0, "3": 1, "5": 1}
+    assert counts["n_cases_by_procedure"] == 2 and counts["n_excluded_ambiguous_code"] == 1
 
 
 def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
@@ -702,6 +770,165 @@ def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1, "4": 0}
     assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
     assert albuminuria_criterion.measurement == "urine_albumin_creatinine_ratio"
+
+
+def test_hypertension_cases_need_codes_first_line_support_or_repeated_systolic_readings_of_160(cdr: _Cdr):
+    hypertension = resolve_disease_definition("hypertension")
+    for person_id in range(1, 12):
+        _observed_with_early_ehr(cdr, person_id, 1950 + person_id, FEMALE if person_id % 2 else MALE)
+    cdr.condition(1, 320128, "2015-01-01")
+    cdr.condition(1, 320128, "2016-01-01")  # essential hypertension on two dates: a case
+    cdr.condition(2, 91000014, "2015-01-01")
+    cdr.drug(2, 91000020, "2015-02-01")  # hypertensive heart disease (filed apart) + lisinopril: a case
+    cdr.condition(3, 320128, "2015-01-01")
+    cdr.drug(3, 1307046, "2015-02-01")  # one code + metoprolol, a beta blocker that confirms nothing: neither
+    cdr.drug(4, 1307046, "2015-02-01")  # metoprolol without a code: not a control
+    cdr.condition(5, 320128, "2015-01-01")
+    cdr.condition(5, 320128, "2019-01-01")
+    cdr.condition(5, 91000016, "2016-03-01")  # pre-eclampsia: ambiguous, whatever else is coded
+    cdr.condition(6, 91000017, "2015-01-01")
+    cdr.condition(6, 91000017, "2016-01-01")  # secondary hypertension: ambiguous
+    cdr.condition(7, 91000018, "2015-01-01")  # an elevated reading without a diagnosis: not a control
+    # Systolic readings (mmHg): person 8's two of 160 or more make a case; person 9's 150 and 155 are past the
+    # guidelines' 140 but not this criterion's 160, so person 9 is a control; person 10's single 162 is no case
+    # and no control.
+    for person_id, readings in ((8, (165.0, 172.0)), (9, (150.0, 155.0)), (10, (162.0, 128.0))):
+        for date, value in zip(("2016-04-01", "2017-04-01"), readings, strict=True):
+            cdr.measurement(person_id, date, value, concept_id=3004249, unit_concept_id=8876)
+    [systolic] = hypertension.lab_criteria
+    evidence = cdr.lab_evidence(systolic)
+    assert {person: row["qualifying_occasion_count"] for person, row in evidence.items()} == {"8": 2, "10": 1}
+
+    rows = cdr.disease_rows(hypertension)
+    assert rows["2"]["phenotype_occurrence_count"] == 1 and rows["2"]["case_medication_dates"] == 1
+    assert rows["3"]["case_medication_dates"] == 0 and rows["3"]["has_control_exclusion_medication"] is True
+    assert rows["5"]["has_ambiguous_code"] is True and rows["6"]["has_ambiguous_code"] is True
+    assert rows["7"]["has_control_exclusion_code"] is True
+
+    training_rows, _columns, counts = _prepare_training_rows(hypertension, list(rows.values()), [evidence])
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "8": 1, "9": 0, "11": 0}
+    assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
+    assert counts["n_excluded_ambiguous_code"] == 2 and counts["n_excluded_one_date"] == 1
+    assert counts["n_excluded_control_exclusion"] == 2
+
+
+def test_coronary_artery_disease_cases_come_from_codes_or_revascularization(cdr: _Cdr):
+    coronary = resolve_disease_definition("coronary_artery_disease")
+    for person_id in range(1, 10):
+        _observed_with_early_ehr(cdr, person_id, 1945 + person_id, MALE if person_id % 2 else FEMALE)
+    cdr.condition(1, 91000025, "2015-01-01")
+    cdr.condition(1, 91000025, "2016-01-01")  # coronary arteriosclerosis, filed apart from ischemic heart disease
+    cdr.condition(2, 91000022, "2015-01-01")
+    cdr.condition(2, 91000025, "2015-06-01")  # myocardial infarction, then arteriosclerosis: two dates of the disease
+    cdr.procedure(3, 91000027, "2018-03-01")  # percutaneous coronary intervention alone: a case
+    cdr.condition(4, 91000022, "2015-01-01")  # one date: neither
+    cdr.condition(5, 91000026, "2015-01-01")  # coronary artery stenosis: not a control
+    cdr.drug(6, 91000029, "2015-01-01")  # isosorbide mononitrate without a code: not a control
+    cdr.condition(7, 91000023, "2015-01-01")
+    cdr.condition(7, 91000023, "2015-01-03")  # type 2 (demand) myocardial infarction: ambiguous
+    cdr.procedure(9, 91000051, "2019-05-01")  # a CPT-4 coronary stent alone: a case
+
+    rows = cdr.disease_rows(coronary)
+    assert rows["2"]["phenotype_occurrence_count"] == 2
+    assert rows["3"]["case_procedure_dates"] == 1
+    assert rows["7"]["phenotype_occurrence_count"] == 2 and rows["7"]["has_ambiguous_code"] is True
+
+    training_rows, _columns, counts = _prepare_training_rows(coronary, list(rows.values()), [])
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "3": 1, "8": 0, "9": 1}
+    assert counts["n_cases_by_procedure"] == 2 and counts["n_excluded_one_date"] == 1
+    assert counts["n_excluded_control_exclusion"] == 2 and counts["n_excluded_ambiguous_code"] == 1
+
+
+def test_asthma_cases_need_two_dates_or_repeated_controllers_and_copd_is_ambiguous(cdr: _Cdr):
+    asthma = resolve_disease_definition("asthma")
+    for person_id in range(1, 8):
+        _observed_with_early_ehr(cdr, person_id, 1960 + person_id, FEMALE if person_id % 2 else MALE)
+    cdr.condition(1, 91000030, "2015-01-01")
+    cdr.condition(1, 91000030, "2016-01-01")
+    cdr.condition(2, 91000031, "2015-01-01")
+    cdr.drug(2, 91000036, "2015-01-01")
+    cdr.drug(2, 91000036, "2015-04-01")  # allergic asthma + fluticasone on two dates: a case
+    cdr.condition(3, 91000030, "2015-01-01")
+    cdr.drug(3, 91000036, "2015-01-01")  # one controller date: neither
+    cdr.drug(4, 91000038, "2015-01-01")  # albuterol alone: no controller, and not a control
+    cdr.condition(5, 91000030, "2015-01-01")
+    cdr.condition(5, 91000030, "2016-01-01")
+    cdr.condition(5, 91000032, "2019-01-01")  # COPD as well: ambiguous
+    cdr.condition(6, 91000033, "2015-01-01")
+    cdr.condition(6, 91000033, "2016-01-01")  # the asthma-COPD overlap syndrome: ambiguous
+
+    rows = cdr.disease_rows(asthma)
+    assert rows["2"]["case_medication_dates"] == 2
+    assert rows["3"]["case_medication_dates"] == 1
+    assert rows["4"]["case_medication_dates"] == 0 and rows["4"]["has_control_exclusion_medication"] is True
+
+    training_rows, _columns, counts = _prepare_training_rows(asthma, list(rows.values()), [])
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "7": 0}
+    assert counts["n_excluded_one_date"] == 1 and counts["n_excluded_control_exclusion"] == 1
+    assert counts["n_excluded_ambiguous_code"] == 2
+
+
+def test_hyperlipidemia_cases_come_from_codes_ldl_lowering_support_or_repeated_ldl_of_160(cdr: _Cdr):
+    hyperlipidemia = resolve_disease_definition("hyperlipidemia")
+    for person_id in range(1, 11):
+        _observed_with_early_ehr(cdr, person_id, 1955 + person_id, FEMALE if person_id % 2 else MALE)
+    cdr.condition(1, 91000040, "2015-01-01")
+    cdr.condition(1, 91000040, "2016-01-01")  # mixed hyperlipidemia on two dates
+    cdr.condition(2, 91000039, "2015-01-01")
+    cdr.drug(2, 1545958, "2015-02-01")  # one code + atorvastatin: a case
+    cdr.condition(3, 91000039, "2015-01-01")
+    cdr.drug(3, 91000045, "2015-02-01")  # one code + fenofibrate, which barely moves LDL: neither
+    cdr.drug(4, 91000045, "2015-02-01")  # fenofibrate without a code: not a control
+    cdr.condition(5, 91000042, "2015-01-01")
+    cdr.condition(5, 91000042, "2016-01-01")  # raised HDL, filed under hypercholesterolemia: ambiguous
+    cdr.condition(6, 91000043, "2015-01-01")  # dyslipidemia: not a control
+    # LDL cholesterol (mg/dL): person 7's two values of 160 or more make a case, person 8's single one is no case
+    # and no control, and person 9's values below 160 leave a control.
+    for person_id, values in ((7, (175.0, 182.0)), (8, (165.0, 120.0)), (9, (150.0, 155.0))):
+        for date, value in zip(("2016-04-01", "2017-04-01"), values, strict=True):
+            cdr.measurement(person_id, date, value, concept_id=3028437)
+    [ldl] = hyperlipidemia.lab_criteria
+    evidence = cdr.lab_evidence(ldl)
+    assert {person: row["qualifying_occasion_count"] for person, row in evidence.items()} == {"7": 2, "8": 1}
+
+    rows = cdr.disease_rows(hyperlipidemia)
+    assert rows["2"]["case_medication_dates"] == 1
+    assert rows["3"]["case_medication_dates"] == 0 and rows["3"]["has_control_exclusion_medication"] is True
+
+    training_rows, _columns, counts = _prepare_training_rows(hyperlipidemia, list(rows.values()), [evidence])
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "7": 1, "9": 0, "10": 0}
+    assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
+    assert counts["n_excluded_one_date"] == 1 and counts["n_excluded_control_exclusion"] == 2
+    assert counts["n_excluded_ambiguous_code"] == 1
+
+
+def test_breast_cancer_cases_are_invasive_and_female_and_controls_are_women_of_40_or_more(cdr: _Cdr):
+    breast = resolve_disease_definition("breast_cancer")
+    for person_id, year_of_birth, sex in (
+        (1, 1950, FEMALE), (2, 1950, MALE), (3, 1955, FEMALE), (4, 1955, FEMALE),
+        (5, 1960, FEMALE), (6, 1960, FEMALE), (7, 1990, FEMALE), (8, 1960, MALE),
+    ):
+        _observed_with_early_ehr(cdr, person_id, year_of_birth, sex)
+    for person_id in (1, 2):
+        cdr.condition(person_id, 91000047, "2015-01-01")
+        cdr.condition(person_id, 91000047, "2015-03-01")  # infiltrating duct carcinoma on two dates
+    cdr.condition(3, 91000050, "2015-01-01")
+    cdr.condition(3, 91000050, "2016-01-01")  # ductal carcinoma in situ alone: neither
+    cdr.condition(4, 91000050, "2014-01-01")
+    cdr.condition(4, 91000046, "2016-01-01")
+    cdr.condition(4, 91000046, "2017-01-01")  # in situ, then invasive: a case
+    cdr.condition(5, 91000048, "2015-01-01")
+    cdr.condition(5, 91000048, "2016-01-01")  # lymphoma of the breast: ambiguous
+
+    rows = cdr.disease_rows(breast)
+    assert rows["3"]["phenotype_occurrence_count"] == 0 and rows["3"]["has_control_exclusion_code"] is True
+    assert rows["5"]["phenotype_occurrence_count"] == 2 and rows["5"]["has_ambiguous_code"] is True
+
+    training_rows, _columns, counts = _prepare_training_rows(breast, list(rows.values()), [])
+    # Person 7 is 33 at the end of observation, under the controls' 40; persons 2 and 8 are men.
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "4": 1, "6": 0}
+    assert counts["n_excluded_sex"] == 2 and counts["n_excluded_age"] == 1
+    assert counts["n_excluded_control_exclusion"] == 1 and counts["n_excluded_ambiguous_code"] == 1
 
 
 # ---------------------------------------------------------------------------

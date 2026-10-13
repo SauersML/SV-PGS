@@ -18,6 +18,7 @@
   "relatedness": "${CDR_COPY}/relatedness.tsv",
   "relatedness_columns": ["i.s", "j.s", "kin"],
   "diseases": [
+    "hypertension", "coronary_artery_disease", "asthma", "hyperlipidemia", "breast_cancer",
     "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression",
     "gout", "cataract", "chronic_kidney_disease", "psoriasis", "prostate_cancer"
   ],

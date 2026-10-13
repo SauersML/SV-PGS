@@ -38,7 +38,7 @@ SCENARIO_MODULES = frozenset({"synthetic_store.py"})
 
 # (module path relative to sv_pgs/, symbol) -> (class, allowed values, citation)
 REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
-    ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria'): ('spec', frozenset({6.5, 60.0, 90, 30.0}), 'ADA Standards of Care (HbA1c >= 6.5%); KDIGO 2012 CKD (GFR < 60 or ACR >= 30 mg/g for > 90 days)'),
+    ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria'): ('spec', frozenset({160.0, 6.5, 60.0, 90, 30.0}), 'JNC 7 stage 2 hypertension (systolic >= 160 mmHg; Chobanian et al. 2003, JAMA 289:2560); NCEP ATP III high LDL cholesterol (>= 160 mg/dL; Circulation 2002, 106:3143); ADA Standards of Care (HbA1c >= 6.5%); KDIGO 2012 CKD (GFR < 60 or ACR >= 30 mg/g for > 90 days)'),
     ('all_of_us.py', 'DISEASE_DEFINITIONS.minimum_case_age_years'): ('spec', frozenset({40.0}), 'GOLD report: COPD diagnosis from age 40'),
     ('all_of_us.py', 'PREGNANCY_WINDOW_DAYS_BEFORE'): ('spec', frozenset({294}), '42 weeks, where post-term begins; ACOG Committee Opinion 736 (2018): postpartum through 12 weeks'),
     ('all_of_us.py', 'PREGNANCY_WINDOW_DAYS_AFTER'): ('spec', frozenset({294, 84}), '42 weeks, where post-term begins; ACOG Committee Opinion 736 (2018): postpartum through 12 weeks'),
@@ -273,7 +273,7 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('all_of_us.py', 'TRANSFUSION'): ('phenotypes', frozenset({120}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component (PHENOTYPES.md)'),
     ('all_of_us.py', 'ANTIBACTERIAL_COURSE'): ('phenotypes', frozenset({7, 14}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component (PHENOTYPES.md)'),
     ('all_of_us.py', 'ACUTE_HEPATOBILIARY'): ('phenotypes', frozenset({30}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component (PHENOTYPES.md)'),
-    ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria.plausible_range'): ('phenotypes', frozenset({3.0, 20.0, 0.2, 0.1, 30000.0}), 'kept on the lab-criterion path only (lead ruling): the disease measurement model (PHENOTYPES.md item 1, part 2) replaces it with a learned unit-confusion component'),
+    ('all_of_us.py', 'DISEASE_DEFINITIONS.lab_criteria.plausible_range'): ('phenotypes', frozenset({50.0, 300.0, 1500.0, 3.0, 20.0, 0.2, 0.1, 30000.0}), 'kept on the lab-criterion path only (lead ruling): the disease measurement model (PHENOTYPES.md item 1, part 2) replaces it with a learned unit-confusion component'),
     ('all_of_us.py', 'MEASUREMENT_DEFINITIONS.treatment'): ('phenotypes', frozenset({15.0, 0.7}), 'within-person learned treatment effect (PHENOTYPES.md item 3)'),
     ('config.py', 'ModelConfig.minimum_scale'): ('e2e', frozenset({1e-06}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),
     ('config.py', 'ModelConfig.minimum_minor_allele_frequency'): ('e2e', frozenset({0.01}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),

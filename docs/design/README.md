@@ -9,7 +9,7 @@ These documents describe SV-PGS: the one model, its dosage store, its phenotypes
 | [MODEL.md](MODEL.md) | The one generative model, its prior, its inference and certificate, the Stage 0 → Stage 2 pipeline, and the evidence tags |
 | [STORE.md](STORE.md) | The 8-bit dosage store: arrays, halves, sidecar, loci, external annotations, gates |
 | [EVALUATION.md](EVALUATION.md) | How an SV gain is claimed: arms, tests, the trait panel, simulation gates, red-team checks |
-| [PHENOTYPES.md](PHENOTYPES.md) | The 21-trait All of Us panel as built: disease and trait rules, targets, which values are standards, and the rules still to be replaced |
+| [PHENOTYPES.md](PHENOTYPES.md) | The 26-trait All of Us panel as built: disease and trait rules, targets, which values are standards, and the rules still to be replaced |
 | [COMPUTE.md](COMPUTE.md) | Cost model, cloud launch path, MSI task runners, the landing gate |
 | [CUTOVER.md](CUTOVER.md) | The ordered deletion of the old path (C2–C8, done): files, tests, blockers, verification; a historical record |
 | [CDR_LAYOUT.md](CDR_LAYOUT.md) | Where the All of Us CDR inputs live |

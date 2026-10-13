@@ -446,11 +446,23 @@ def test_liability_target_uses_sex_specific_incidence_and_pools_unknown_sex():
     assert liabilities[5] == _control_liability_within_rounding(5.0 / 6.0)
 
 
-def test_the_disease_panel_is_the_ten_mixed_panel_diseases():
-    assert available_disease_names() == sorted([
+def test_the_disease_panel_is_the_fifteen_preregistered_diseases():
+    # The study abstract's five (hypertension first), then the ten of mixed_panel_v1.
+    assert [definition.canonical_name for definition in DISEASE_DEFINITIONS] == [
+        "hypertension", "coronary_artery_disease", "asthma", "hyperlipidemia", "breast_cancer",
         "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression", "gout", "cataract",
         "chronic_kidney_disease", "psoriasis", "prostate_cancer",
-    ])
+    ]
+
+
+def test_a_case_support_drug_always_excludes_a_control():
+    # A drug that confirms a single diagnosis date lies inside the class that excludes a control, so no clean
+    # control takes a drug that supports a case.
+    for definition in DISEASE_DEFINITIONS:
+        if definition.case_medication is None or definition.control_exclusion_medication is None:
+            continue
+        for code in definition.case_medication.atc_codes:
+            assert code.startswith(definition.control_exclusion_medication.atc_codes), definition.canonical_name
 
 
 def test_panel_diseases_parameterize_their_case_and_control_rules():
@@ -473,6 +485,29 @@ def test_panel_diseases_parameterize_their_case_and_control_rules():
     prostate = resolve_disease_definition("prostate_cancer")
     assert prostate.required_sex == "male" and prostate.minimum_control_age_years == 50.0
     assert resolve_disease_definition("copd").minimum_case_age_years == 40.0
+
+    hypertension = build_all_of_us_disease_query_parameters(resolve_disease_definition("htn"))
+    # Beta blockers alone (C07A), loop diuretics (C03C) and non-dihydropyridine calcium channel blockers (C08D)
+    # treat atrial fibrillation, angina and heart failure: they exclude a control but confirm no diagnosis.
+    case_drugs = hypertension["case_medication_atc_codes"][1]
+    assert not any(code.startswith(("C07A", "C03C", "C08D", "C02")) for code in case_drugs)
+    assert hypertension["control_exclusion_medication_atc_codes"] == ("STRING", ["C02", "C03", "C07", "C08", "C09"])
+    # Secondary and obstetric hypertension are ambiguous.
+    assert {"31992008", "367390009", "15938005"} <= set(hypertension["ambiguous_snomed_codes"][1])
+    [systolic] = resolve_disease_definition("hypertension").lab_criteria
+    assert (systolic.measurement, systolic.qualifies_at_or_above, systolic.threshold) == ("systolic_blood_pressure", True, 160.0)
+    coronary = build_all_of_us_disease_query_parameters(resolve_disease_definition("cad"))
+    assert coronary["case_medication_atc_codes"] == ("STRING", [])
+    assert {"232717009", "415070008"} <= set(coronary["case_procedure_snomed_codes"][1])
+    asthma = resolve_disease_definition("asthma")
+    assert asthma.case_medication_minimum_dates == 2
+    assert asthma.ambiguous_snomed_codes == ("13645005", "63480004")
+    [ldl] = resolve_disease_definition("high_cholesterol").lab_criteria
+    assert (ldl.measurement, ldl.qualifies_at_or_above, ldl.threshold) == ("ldl_cholesterol", True, 160.0)
+    assert resolve_disease_definition("hyperlipidemia").case_medication == LDL_LOWERING
+    breast = resolve_disease_definition("breast_cancer")
+    assert breast.required_sex == "female" and breast.minimum_control_age_years == 40.0
+    assert breast.control_exclusion_snomed_codes == ("189336000",)
 
 
 def test_every_lab_criterion_reads_a_known_measurement():

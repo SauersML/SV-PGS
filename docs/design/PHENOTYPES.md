@@ -6,9 +6,9 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
 - **Execution:** everything runs inside the workspace. Only counts of at least 21 participants leave it.
 
 ## The panel
-21 traits, chosen by power and phenotype quality, never by SV biology (DECISIONS.md):
+26 traits. 21 were chosen by power and phenotype quality, never by SV biology (DECISIONS.md); five diseases come from the study abstract, which applies the model to 15 diseases with hypertension first: hypertension, and four of the eMERGE / All of Us set of ten clinical polygenic scores (Lennon 2024).
 - **11 quantitative:** height, body mass index, systolic blood pressure, heart rate, mean corpuscular volume, platelet count, white blood cell count, total bilirubin, creatinine eGFR (CKD-EPI 2021), LDL cholesterol, and HbA1c in people without diabetes.
-- **10 diseases:** type 2 diabetes, atrial fibrillation, hypothyroidism, COPD, depression, gout, cataract, chronic kidney disease, psoriasis, prostate cancer.
+- **15 diseases:** hypertension, coronary artery disease, asthma, hyperlipidemia, breast cancer (the abstract's five); type 2 diabetes, atrial fibrillation, hypothyroidism, COPD, depression, gout, cataract, chronic kidney disease, psoriasis, prostate cancer.
 
 ## Diseases
 - **Codes.** Every rule reads codes by root concept, and each root's `concept_ancestor` descendants count too:
@@ -20,9 +20,15 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
   - diagnoses on 2 or more distinct dates;
   - a diagnosis on one date, plus the case medication on at least the disease's minimum number of dates;
   - a case procedure;
-  - a met lab criterion: 2 or more qualifying occasions, the first and last at least the criterion's span apart. A criterion counts only rows inside its plausible range (HbA1c 3–20%, creatinine 0.2–20 mg/dL, UACR 0.1–30,000 mg/g), a hand-set rule kept on this path alone until the disease measurement model replaces it (item 1 below).
+  - a met lab criterion: 2 or more qualifying occasions, the first and last at least the criterion's span apart. A criterion counts only rows inside its plausible range (systolic blood pressure 50–300 mmHg, LDL 1–1,500 mg/dL, HbA1c 3–20%, creatinine 0.2–20 mg/dL, UACR 0.1–30,000 mg/g), a hand-set rule kept on this path alone until the disease measurement model replaces it (item 1 below).
 - **A control** has none of those evidence types. It also has no control-exclusion code or drug, and no qualifying lab occasion. Its age at the end of observation is at least the disease's minimum control age.
 - **Ambiguous codes** remove a person from both groups.
+- **The abstract's five,** where the definitions make a judgment call (the code comments give every code):
+  - hypertension: a lab case needs two systolic readings of 160 mmHg or more (JNC 7 stage 2), not the guidelines' 140, which defines the mean over visits: a criterion counts any two occasions, and in the many readings an EHR holds two at 140 or more are common in normotensive people. Every obstetric hypertension code, secondary hypertension and white-coat, transient or postoperative hypertension are ambiguous. Only first-line antihypertensives (thiazide-type diuretics, renin-angiotensin agents, dihydropyridine calcium channel blockers) confirm one diagnosis date; any blood-pressure-lowering drug excludes a control;
+  - coronary artery disease: coronary atherosclerosis or ischemic heart disease, or a revascularization (bypass, PCI, angioplasty or stent; by SNOMED root, so a CPT4-coded procedure, a standard concept outside the SNOMED hierarchy, is not seen, as for cataract extraction). Ischemia without obstructive atherosclerosis (vasospasm, microvascular dysfunction, MINOCA, type 2 infarction) is ambiguous; antianginals exclude a control but confirm nothing;
+  - asthma: COPD (emphysema included) and chronic bronchitis are ambiguous, the copd definition taking the overlap. A controller on two dates confirms one diagnosis date; any obstructive-airway drug excludes a control;
+  - hyperlipidemia: hypercholesterolemia, mixed hyperlipidemia or hypertriglyceridemia, or two LDL values of 160 mg/dL or more (NCEP ATP III "high"). LDL-lowering drugs confirm one diagnosis date; any lipid-modifying drug excludes a control;
+  - breast cancer: invasive, in women; carcinoma in situ alone is neither case nor control, and non-carcinoma breast malignancies and hereditary breast and ovarian cancer syndrome are ambiguous.
 - **EHR depth.** Cases and controls alike need 5 or more distinct condition dates by the first observation-period start plus 365 days.
 - **Targets:**
   - the binary status;
@@ -69,6 +75,8 @@ Kept, and cited where they are defined:
 - **Clinical criteria:**
   - KDIGO 2012 chronic kidney disease: GFR < 60 or ACR ≥ 30 mg/g for more than 3 months;
   - the ADA HbA1c diagnosis: ≥ 6.5%, confirmed by a second test;
+  - JNC 7 stage 2 hypertension: systolic ≥ 160 mmHg;
+  - NCEP ATP III high LDL cholesterol: ≥ 160 mg/dL;
   - the GOLD report's age of 40 for a COPD diagnosis.
 - **Physiology and definitions:**
   - growth complete by 20, where the CDC growth charts end;
@@ -82,10 +90,10 @@ None of these values is a published standard for these data. They must be replac
 
 1. **Disease evidence rules.** The values:
    - 2 diagnosis dates;
-   - 2 levothyroxine dates for hypothyroidism;
+   - 2 levothyroxine dates for hypothyroidism and 2 controller dates for asthma;
    - the exclusion of a person with one diagnosis date;
    - the EHR-depth floor (5 dates, 365 days);
-   - the minimum control ages (COPD 40, prostate cancer 50).
+   - the minimum control ages (COPD 40, prostate cancer 50, breast cancer 40).
 
    **Replacement:** a latent-class measurement model of EHR evidence.
    - Diagnosis dates, case-medication dates, case procedures and qualifying lab occasions are counts, conditionally independent given the true status Z and the person's EHR exposure.

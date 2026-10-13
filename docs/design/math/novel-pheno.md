@@ -146,12 +146,12 @@ where $E_{im}$ is the product over channels of beta-binomial terms for the pre-o
 
 | Rule | Replacement |
 |---|---|
-| 2 diagnosis dates; 2 levothyroxine dates; excluding one unsupported date | channel rates and the onset posterior |
+| 2 diagnosis dates; 2 levothyroxine or asthma-controller dates; excluding one unsupported date | channel rates and the onset posterior |
 | EHR-depth floor (5 dates by entry + 365 days) | visits as exposures ($R_i \approx 0$ when sparse) |
-| minimum control ages (COPD 40, prostate cancer 50) | $t_s(a)$ (young people without disease carry score ≈ 0) |
+| minimum control ages (COPD 40, prostate cancer 50, breast cancer 40) | $t_s(a)$ (young people without disease carry score ≈ 0) |
 | minimum case age | an age-varying false-positive rate |
 | ambiguous codes | a competing class |
-| KDIGO/ADA thresholds | kept, as the cited definition of the lab channel |
+| KDIGO/ADA/JNC 7/ATP III thresholds | kept, as the cited definition of the lab channel |
 
 **4.6 Visits and engagement.**
 - **(a) Informative visits.** Conditioning on visit ages is exact when visits are ancillary for $L$. A post-onset rise in the visit rate ($e^\psi$) needs the visit-intensity factor: a Poisson process with gamma frailty, which integrates in closed form to a negative-binomial ratio per gap. *Not yet in the prototype.*

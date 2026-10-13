@@ -124,6 +124,9 @@ class DiseaseDefinition:
     case_medication_minimum_dates: int = 1
     control_exclusion_medication: MedicationClass | None = None
     case_procedure_snomed_codes: tuple[str, ...] = ()
+    # CPT-4 procedure roots beside the SNOMED ones: US EHRs code most procedures in CPT-4, whose concepts are not
+    # SNOMED descendants in concept_ancestor, so a SNOMED root alone never sees a CPT-coded cataract extraction or stent.
+    case_procedure_cpt4_codes: tuple[str, ...] = ()
     lab_criteria: tuple[LabCriterion, ...] = ()
     # "female" or "male" (sex at birth); None admits everyone.
     required_sex: str | None = None
@@ -170,13 +173,200 @@ ANTIGOUT = MedicationClass("antigout preparations", ("M04A",))
 # antipsoriatics (acitretin), and interleukin and TNF-alpha inhibitors; one
 # psoriasis diagnosis must accompany them.
 PSORIASIS_THERAPY = MedicationClass("psoriasis-specific therapy", ("D05AX", "D05B", "L04AC", "L04AB"))
+# The antihypertensives whose main use is hypertension: thiazide and
+# thiazide-like diuretics, alone or with a potassium-sparing agent or a beta
+# blocker, dihydropyridine calcium channel blockers and renin-angiotensin
+# system agents, the first-line classes of the 2017 ACC/AHA guideline (Whelton
+# et al. 2018, Hypertension 71:e13). Beta blockers alone, non-dihydropyridine
+# calcium channel blockers, loop diuretics, aldosterone antagonists and C02 are
+# left out: they also treat atrial fibrillation, angina, heart failure, edema,
+# benign prostatic hyperplasia (alpha blockers), pulmonary arterial
+# hypertension (C02KX), migraine and tremor. Renin-angiotensin agents also
+# treat heart failure (sacubitril/valsartan, C09DX04, comes with C09) and
+# diabetic kidney disease, but beside a hypertension code they are its
+# first-line treatment.
+FIRST_LINE_ANTIHYPERTENSIVE = MedicationClass(
+    "first-line antihypertensive therapy", ("C03A", "C03BA", "C03EA", "C07B", "C08CA", "C09")
+)
+# Organic nitrates and ranolazine, the drugs for angina. Nitrates also treat
+# heart failure and esophageal spasm, and a chest-pain rule-out gets one dose,
+# so they do not confirm a single coronary code; they only exclude controls.
+ANTIANGINAL = MedicationClass("antianginal therapy", ("C01DA", "C01EB18"))
+# Asthma controllers: inhaled corticosteroids, alone or combined with a beta
+# agonist (R03AK), leukotriene receptor antagonists, and the anti-IgE, anti-IL-5
+# and anti-TSLP antibodies (omalizumab, reslizumab, mepolizumab, benralizumab,
+# tezepelumab, depemokimab). Short-acting beta agonists, anticholinergics and
+# roflumilast are left out: they also treat acute bronchitis and COPD.
+ASTHMA_CONTROLLER = MedicationClass(
+    "asthma controller therapy",
+    ("R03BA", "R03AK", "R03DC", "R03DX05", "R03DX08", "R03DX09", "R03DX10", "R03DX11", "R03DX12"),
+)
+OBSTRUCTIVE_AIRWAY_DRUGS = MedicationClass("drugs for obstructive airway diseases", ("R03",))
+LIPID_MODIFYING = MedicationClass("lipid-modifying agents", ("C10",))
 
-# The disease panel: design-traits' mixed_panel_v1 (10 diseases over 9 organ
-# systems, chosen by power and phenotype quality, never by SV biology). SNOMED
-# and ATC codes were checked against the SNOMED CT International release
-# (2025-02-01) and the WHO ATC index; OMOP concept ids are resolved at query
-# time through `concept` and `concept_ancestor`.
+# The disease panel, 15 diseases. Ten are design-traits' mixed_panel_v1 (over 9
+# organ systems, chosen by power and phenotype quality, never by SV biology).
+# Five come from the study abstract, which applies the model to 15 diseases with
+# hypertension first: hypertension, and four standard high-power PGS targets
+# from the eMERGE / All of Us set of ten clinical polygenic scores (Lennon et
+# al. 2024, Nat Med 30:480), coronary heart disease, asthma,
+# hypercholesterolemia and breast cancer. SNOMED and ATC codes were checked
+# against the SNOMED CT International release (2025-02-01; the five added
+# diseases' codes, on the HL7 terminology server tx.fhir.org, which also
+# carries the US Extension's 1000119-namespace codes) and the WHO ATC index;
+# OMOP concept ids are resolved at query time through `concept` and
+# `concept_ancestor`.
 DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
+    DiseaseDefinition(
+        canonical_name="hypertension",
+        aliases=("htn", "high_blood_pressure", "essential_hypertension", "primary_hypertension"),
+        description=(
+            "Essential hypertension from EHR diagnoses, first-line antihypertensives and repeated systolic "
+            "readings of 160 mmHg or more."
+        ),
+        # Hypertensive disorder, and hypertensive heart and renal disease, which
+        # SNOMED files under "Hypertensive complication" instead (ICD-10 I11-I13).
+        case_snomed_codes=("38341003", "64715009", "38481006"),
+        # Controls exclude elevated readings without a hypertension diagnosis
+        # (ICD-10 R03.0) and increased-blood-pressure findings, ACC/AHA stages 1
+        # and 2 included.
+        control_exclusion_snomed_codes=("24184005", "371622005"),
+        # Ambiguous for both groups:
+        # - every hypertension code in an obstetric context (hypertension in the
+        #   obstetric context; complicating pregnancy, childbirth and the
+        #   puerperium; maternal hypertension; eclampsia; hypertensive heart and
+        #   renal disease in an obstetric context; pre-existing hypertensive CKD in
+        #   pregnancy). SNOMED does not separate chronic from pregnancy-induced
+        #   hypertension there (it files "Chronic hypertension complicating
+        #   pregnancy" under "Pregnancy-induced hypertension"), so gestational
+        #   hypertension and pre-eclampsia cannot be told apart from it;
+        # - secondary hypertension, with hypertension due to dialysis-treated
+        #   end-stage renal disease and to congenital adrenal hyperplasia, which
+        #   SNOMED does not file under it;
+        # - elevations that are not sustained hypertension: white-coat ("due to
+        #   being in a clinical environment"), transient and postoperative.
+        ambiguous_snomed_codes=(
+            "367390009", "198941007", "288250001", "15938005", "79355007", "73030000", "118781000119108",
+            "31992008", "704667004", "1204139007",
+            "697930002", "52698002", "5501000119106",
+        ),
+        case_medication=FIRST_LINE_ANTIHYPERTENSIVE,
+        # Any blood-pressure-lowering drug, whatever it was given for, excludes
+        # a control: it masks the readings that would show hypertension.
+        control_exclusion_medication=ANTIHYPERTENSIVE,
+        # Two systolic readings of at least 160 mmHg on different days, JNC 7
+        # stage 2 (Chobanian et al. 2003, JAMA 289:2560). The 140 of JNC 7 and
+        # ESC/ESH bounds the mean of readings over two or more visits, but a lab
+        # criterion counts any two occasions: among the dozens of readings an
+        # EHR holds, with a visit-to-visit SD near 10 mmHg, two at 140 or more
+        # are common in normotensive people, and the single reading at 140 that
+        # removes a person from the controls would remove most people. Treated
+        # readings count as measured (on treatment they are, if anything, low);
+        # readings of an inpatient or emergency stay, of a pregnancy and before
+        # 18 never count, since the systolic blood pressure trait drops them.
+        lab_criteria=(LabCriterion("systolic_blood_pressure", True, 160.0, 1, plausible_range=(50.0, 300.0)),),
+    ),
+    DiseaseDefinition(
+        canonical_name="coronary_artery_disease",
+        aliases=("cad", "chd", "coronary_heart_disease", "coronary artery disease", "ischemic_heart_disease"),
+        description=(
+            "Coronary artery disease from EHR diagnoses of coronary atherosclerosis or ischemic heart disease "
+            "(myocardial infarction, angina) and coronary revascularization."
+        ),
+        # Coronary arteriosclerosis (ICD-10 I25.1), which SNOMED does not file
+        # under ischemic heart disease, and ischemic heart disease (I20-I25:
+        # myocardial infarction, angina, acute coronary syndrome, chronic
+        # ischemic heart disease).
+        case_snomed_codes=("53741008", "414545008"),
+        # Controls exclude any disorder of a coronary artery (stenosis,
+        # occlusion, spasm, aneurysm, dissection, anomalies).
+        control_exclusion_snomed_codes=("414024009",),
+        # Ischemia without obstructive coronary atherosclerosis is ambiguous for
+        # both groups: Prinzmetal angina, silent coronary vasospastic disease,
+        # coronary microvascular dysfunction, myocardial infarction with
+        # non-obstructive coronary arteries, and type 2 myocardial infarction
+        # (demand ischemia; Fourth Universal Definition).
+        ambiguous_snomed_codes=("87343002", "703214003", "697976003", "879955009", "16837681000119104"),
+        control_exclusion_medication=ANTIANGINAL,
+        # Coronary artery bypass grafting (off-pump and minimally invasive
+        # direct bypass are filed apart from it), percutaneous coronary
+        # intervention, and coronary angioplasty and stent placement, which
+        # SNOMED does not file under percutaneous coronary intervention.
+        case_procedure_snomed_codes=("232717009", "418824004", "419132001", "415070008", "41339005", "36969009"),
+        # The same procedures in CPT-4 (AMA CPT 2024): coronary bypass with venous grafts (33510-33516), combined
+        # arterial-venous grafts (33517-33523) and arterial grafts (33533-33536); percutaneous coronary angioplasty,
+        # atherectomy, stenting and their additional-vessel and recanalization codes (92920-92944), and the codes they
+        # replaced in 2013 (92980-92982, 92984, 92995, 92996), which older EHR records carry.
+        case_procedure_cpt4_codes=(
+            "33510", "33511", "33512", "33513", "33514", "33516", "33517", "33518", "33519", "33521", "33522", "33523",
+            "33533", "33534", "33535", "33536",
+            "92920", "92921", "92924", "92925", "92928", "92929", "92933", "92934", "92937", "92938", "92941", "92943",
+            "92944", "92980", "92981", "92982", "92984", "92995", "92996",
+        ),
+    ),
+    DiseaseDefinition(
+        canonical_name="asthma",
+        aliases=("bronchial_asthma",),
+        description="Asthma from EHR diagnoses and repeated asthma controller therapy.",
+        case_snomed_codes=("195967001",),
+        # COPD (emphysema included) and chronic bronchitis are ambiguous for
+        # both groups: in an adult with fixed airflow obstruction the two
+        # diseases are coded interchangeably, and SNOMED files asthma-COPD
+        # overlap under both. The copd definition counts a person with both
+        # codes as a COPD case; this one leaves them out.
+        ambiguous_snomed_codes=("13645005", "63480004"),
+        case_medication=ASTHMA_CONTROLLER,
+        # A controller on two dates, a repeat prescription rather than one trial
+        # course for a post-viral cough.
+        case_medication_minimum_dates=2,
+        # Any obstructive-airway drug, a rescue inhaler included, excludes a
+        # control: mild asthma is often treated with a short-acting beta
+        # agonist alone.
+        control_exclusion_medication=OBSTRUCTIVE_AIRWAY_DRUGS,
+    ),
+    DiseaseDefinition(
+        canonical_name="hyperlipidemia",
+        aliases=("high_cholesterol", "hypercholesterolemia", "hld"),
+        description=(
+            "Hyperlipidemia (hypercholesterolemia, mixed hyperlipidemia or hypertriglyceridemia) from EHR "
+            "diagnoses, LDL-lowering therapy and repeated LDL cholesterol of 160 mg/dL or more."
+        ),
+        case_snomed_codes=("55822004",),
+        # Controls exclude raised serum lipid and LDL findings,
+        # hyperlipoproteinemia (lipoprotein(a), Fredrickson types III-V) and any
+        # dyslipidemia.
+        control_exclusion_snomed_codes=("166816003", "445445006", "3744001", "370992007"),
+        # Hyperalphalipoproteinemia (raised HDL), which SNOMED files under
+        # hypercholesterolemia, is ambiguous for both groups.
+        ambiguous_snomed_codes=("238080004",),
+        case_medication=LDL_LOWERING,
+        control_exclusion_medication=LIPID_MODIFYING,
+        # LDL cholesterol of at least 160 mg/dL on two dates: NCEP ATP III's
+        # "high" (Circulation 2002, 106:3143), from which the 2018 AHA/ACC
+        # guideline (Grundy et al. 2019, Circulation 139:e1082) counts primary
+        # hypercholesterolemia. Within-person LDL varies far less than blood
+        # pressure, so two such occasions mark a high level. Treated values count
+        # as measured: on LDL-lowering therapy a value this high is stronger
+        # evidence still.
+        lab_criteria=(LabCriterion("ldl_cholesterol", True, 160.0, 1, plausible_range=(1.0, 1500.0)),),
+    ),
+    DiseaseDefinition(
+        canonical_name="breast_cancer",
+        aliases=("breast cancer", "breast_carcinoma"),
+        description="Invasive breast cancer in women from EHR diagnoses; controls are women aged 40 and over.",
+        case_snomed_codes=("254837009",),
+        # Carcinoma in situ alone is neither a case nor a control.
+        control_exclusion_snomed_codes=("189336000",),
+        # Breast malignancies that are not breast carcinoma are ambiguous for
+        # both groups: melanoma, sarcoma, lymphoma and malignant phyllodes
+        # tumor of the breast, and hereditary breast and ovarian cancer
+        # syndrome, filed under breast cancer although unaffected carriers are
+        # coded with it too.
+        ambiguous_snomed_codes=("188050009", "278050001", "278052009", "254844000", "718220008"),
+        required_sex="female",
+        # USPSTF (2024) screening mammography starts at 40.
+        minimum_control_age_years=40.0,
+    ),
     DiseaseDefinition(
         canonical_name="type2_diabetes",
         aliases=("t2d", "type_2_diabetes", "type 2 diabetes", "diabetes_type_2", "t2dm"),
@@ -256,6 +446,12 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         # are not age-related and are ambiguous for both groups.
         ambiguous_snomed_codes=("79410001", "34361001", "404647000", "43959009"),
         case_procedure_snomed_codes=("54885007",),
+        # Cataract extraction in CPT-4 (AMA CPT 2024): removal of lens material (66840-66940), intracapsular (66983) and
+        # extracapsular extraction with lens insertion (66982, 66984), and with endocyclophotocoagulation or a drainage
+        # device (66987, 66988, 66989, 66991).
+        case_procedure_cpt4_codes=(
+            "66840", "66850", "66852", "66920", "66930", "66940", "66982", "66983", "66984", "66987", "66988", "66989", "66991",
+        ),
     ),
     DiseaseDefinition(
         canonical_name="chronic_kidney_disease",
@@ -867,6 +1063,8 @@ control_exclusion_medication_concepts AS (
 ),
 case_procedure_concepts AS (
   {_descendant_concepts_sql(dataset, "SNOMED", "case_procedure_snomed_codes")}
+  UNION DISTINCT
+  {_descendant_concepts_sql(dataset, "CPT4", "case_procedure_cpt4_codes")}
 ),
 condition_summaries AS (
   -- One pass over condition_occurrence. Occurrences are distinct diagnosis
@@ -982,6 +1180,7 @@ def build_all_of_us_disease_query_parameters(disease_definition: DiseaseDefiniti
             _medication_codes(disease_definition.control_exclusion_medication),
         ),
         "case_procedure_snomed_codes": ("STRING", list(disease_definition.case_procedure_snomed_codes)),
+        "case_procedure_cpt4_codes": ("STRING", list(disease_definition.case_procedure_cpt4_codes)),
     }
 
 
@@ -1108,6 +1307,7 @@ def prepare_all_of_us_disease_sample_table(
                 "case_medication_minimum_dates": disease_definition.case_medication_minimum_dates,
                 "control_exclusion_medication": _medication_metadata(disease_definition.control_exclusion_medication),
                 "case_procedure_snomed_codes": list(disease_definition.case_procedure_snomed_codes),
+                "case_procedure_cpt4_codes": list(disease_definition.case_procedure_cpt4_codes),
                 "lab_criteria": [
                     {
                         "measurement": criterion.measurement,
