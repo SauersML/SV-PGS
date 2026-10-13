@@ -966,19 +966,6 @@ def _positive_definite(design: _Design, noise: float, site_precision: F64Array) 
     return True
 
 
-def _in_domain(
-    design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted, largest_variance: F64Array
-) -> bool:
-    """Whether the sites lie in EP's domain: A' positive definite, and every cavity at q's own marginals proper."""
-    try:
-        kernel = _Kernel(design, noise * site_precision)
-    except np.linalg.LinAlgError:
-        return False
-    mean = kernel.solve(data_score + noise * site_shift)
-    variance = noise * kernel.variances()
-    return _loop_point(design, noise, data_score, site_precision, site_shift, 1.0 / variance, mean / variance, tilted, largest_variance) is not None
-
-
 def _site_blocks(point: _LoopPoint) -> tuple[F64Array, F64Array, F64Array]:
     """Each site's 2 x 2 block of Cov_r of the statistics (beta, -beta^2 / 2) under its tilted law: (a, b, c) =
     (v, -(k3 + 2 m v) / 2, (k4 + 2 v^2 + 4 m k3 + 4 m^2 v) / 4), from the central moments m, v, k3 and mu4 = k4 + 3 v^2."""

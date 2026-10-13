@@ -407,28 +407,3 @@ def null_cost_gate(r2_without: NDArray, r2_with: NDArray, alpha: float = 0.05) -
     losses = int(np.sum(difference < 0.0))
     untied = int(np.sum(difference != 0.0))
     return float(stats.binom.sf(losses - 1, untied, 0.5)) > alpha
-
-
-def paired_delta_log_loss(
-    labels: NDArray,
-    baseline: NDArray,
-    candidate: NDArray,
-    clusters: NDArray | None = None,
-) -> PairedComparison:
-    """Paired log-loss improvement of the recalibrated candidate over the recalibrated baseline.
-
-    Legacy descriptive statistic: each score is recalibrated on the same evaluation labels.
-    This is not an out-of-sample proper-score comparison. Primary evaluation must use
-    independently trained, frozen calibrators and probability_calibration.paired_frozen_gain.
-    """
-    labels = np.asarray(labels, dtype=np.float64)
-    def fitted_log_likelihood(score):
-        intercept, slope = logistic_recalibration_coefficients(score, labels)
-        logits = intercept + slope * np.asarray(score)
-        return labels * logits - np.logaddexp(0.0, logits)
-    difference = fitted_log_likelihood(candidate) - fitted_log_likelihood(baseline)
-    totals = cluster_totals(difference - float(np.mean(difference)), clusters)
-    sample_count = labels.shape[0]
-    standard_error = math.sqrt(float(totals @ totals)) / sample_count
-    estimate = float(np.mean(difference))
-    return comparison_from_estimate(estimate, standard_error)

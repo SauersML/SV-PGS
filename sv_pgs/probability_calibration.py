@@ -5,7 +5,7 @@ calibration maps it to one, and is fitted on labels other than the ones its prob
 each score on the evaluated labels themselves credits a reversed score as fully as the score it reverses.
 Primary evaluation reserves independent development families for ``FrozenCalibration.fit``. Other-fold
 out-of-fold predictions depend on an outer fold's labels through their training; they are not independent
-calibration data for that fold. ``cross_fitted_logits`` is only a descriptive secondary calculation.
+calibration data for that fold.
 """
 from __future__ import annotations
 
@@ -60,34 +60,6 @@ class FrozenCalibration:
         if not np.all(np.isfinite(scores)):
             raise ValueError("Calibration scores must be finite")
         return self.intercept + self.slope * scores
-
-
-def cross_fitted_logits(labels: NDArray, scores: NDArray, folds: NDArray) -> F64Array:
-    """Each row's frozen calibrated logit: its score through the calibration (``FrozenCalibration.fit``) of its fold,
-    fitted on every other fold's rows.
-
-    The rows are one trait's held-out rows, each scored by its own fold's model, which never trained on it. Fold k's
-    calibration is fitted on the other folds' held-out scores and labels and only then applied to fold k's scores, so no
-    label of fold k enters fold k's probabilities, and the calibration maps held-out scores, the kind it is applied to.
-    Fold k's labels did train the other folds' models, so they reach its calibration only through those models' fitted
-    effects, as in any cross-fit. A fold whose calibration has no maximum is NaN: one with no other fold, whose other
-    folds lack cases or controls, or whose other folds' scores separate their labels.
-    """
-    labels = np.asarray(labels, dtype=np.float64)
-    scores = np.asarray(scores, dtype=np.float64)
-    folds = np.asarray(folds)
-    logits = np.full(labels.shape, np.nan)
-    for fold in np.unique(folds):
-        own = folds == fold
-        other_labels = labels[~own]
-        if not 0.0 < float(other_labels.sum()) < other_labels.size:
-            continue
-        try:
-            calibration = FrozenCalibration.fit(scores[~own], other_labels)
-        except RecalibrationSeparationError:
-            continue
-        logits[own] = calibration.logits(scores[own])
-    return logits
 
 
 def proper_scores(labels: NDArray, logits: NDArray) -> dict[str, F64Array]:

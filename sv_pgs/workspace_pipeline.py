@@ -482,10 +482,6 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-BGZF_MAXIMUM_BLOCK_BYTES = 65536
-"""The largest BGZF block, compressed (SAMv1 section 4.1: BSIZE is a 16-bit block size minus one)."""
-
-
 def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
     """Size and complete content hash, including same-size interior edits."""
     from sv_pgs.content_identity import file_digest

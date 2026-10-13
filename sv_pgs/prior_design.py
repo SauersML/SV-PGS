@@ -734,17 +734,6 @@ def _metadata_baseline_scales_from_log_predictions(
     return np.exp(bounded_log_scales).astype(np.float64)
 
 
-def _scale_model_penalty(
-    feature_names: Sequence[str],
-    config: ModelConfig,
-) -> NDArray:
-    penalty_values = np.full(len(feature_names), config.scale_model_ridge_penalty, dtype=np.float64)
-    for feature_index, feature_name in enumerate(feature_names):
-        if feature_name.startswith("type_offset::"):
-            penalty_values[feature_index] = config.type_offset_penalty
-    return penalty_values
-
-
 def collapse_tie_groups(
     records: Sequence[VariantRecord],
     tie_map: TieMap,

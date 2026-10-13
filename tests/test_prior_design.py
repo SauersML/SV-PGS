@@ -18,9 +18,8 @@ from sv_pgs.prior_design import (
 class TestMetadataScaleModel:
     """The metadata scale model uses only stable, training-safe features."""
 
-    def test_scale_model_ridge_penalty_exists(self):
+    def test_type_offset_penalty_exists(self):
         config = ModelConfig()
-        assert config.scale_model_ridge_penalty > 0.0
         assert config.type_offset_penalty > 0.0
 
     def test_vcf_fields_do_not_enter_scale_design_as_annotations(self):

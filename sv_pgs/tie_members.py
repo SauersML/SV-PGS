@@ -48,13 +48,6 @@ class TieGroups:
         return int(self.group.shape[0])
 
 
-def _group_sum(ties: TieGroups, values: F64Array) -> F64Array:
-    values = np.asarray(values, dtype=np.float64)
-    total = np.zeros((ties.group_count,) + values.shape[1:])
-    np.add.at(total, ties.group, values)
-    return total
-
-
 def tied_groups(ties: TieGroups) -> list[I64Array]:
     """The members of every group with more than one member (singletons pass through exactly)."""
     sizes = np.bincount(ties.group, minlength=ties.group_count)

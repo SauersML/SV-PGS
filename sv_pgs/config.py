@@ -33,7 +33,6 @@ class ModelConfig:
     prior_scale_floor: float = 1e-6
     prior_scale_ceiling: float = 10.0
     local_scale_floor: float = 1e-8
-    scale_model_ridge_penalty: float = 1.0
     type_offset_penalty: float = 2.0
 
     def __post_init__(self) -> None:

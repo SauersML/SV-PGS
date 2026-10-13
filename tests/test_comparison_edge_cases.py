@@ -10,7 +10,7 @@ from scipy.special import expit
 
 from sv_pgs import held_out_comparison as comparison, workspace_pipeline as pipeline
 from sv_pgs.config import TraitType
-from sv_pgs.probability_calibration import FrozenCalibration, cross_fitted_logits, paired_frozen_gain, proper_scores
+from sv_pgs.probability_calibration import FrozenCalibration, paired_frozen_gain, proper_scores
 
 
 @pytest.mark.parametrize("metric", [comparison.paired_delta_auc, comparison.paired_delta_r2, paired_frozen_gain])
@@ -138,7 +138,6 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
     monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
-    monkeypatch.setattr(pipeline.probability_calibration, 'cross_fitted_logits', lambda *args: (_ for _ in ()).throw(AssertionError('outer calibration must not use other-fold labels')))
     pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1)), tmp_path)
     with (tmp_path / 'accuracy.tsv').open() as handle:
         rows = [row for row in csv.DictReader(handle, delimiter='\t') if row['cell'] == 'all' and row['arm'] == 'with_sv']

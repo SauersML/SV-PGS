@@ -59,7 +59,6 @@ from sv_pgs.progress import log
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
-_STORED_BYTES = np.dtype(np.float32).itemsize
 
 
 def _host(values: Any) -> np.ndarray:

@@ -127,6 +127,7 @@ from scipy.special import erfcx
 
 from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.host_kernels import row_kernel
 from sv_pgs.memory_broker import current_broker, device_pool
 from sv_pgs.krylov_recycle import block_gcro_dr
 from sv_pgs.progress import log
@@ -939,12 +940,6 @@ def _kernel_terms(
     return conditional, retained, ratio_retained, log_component, signal
 
 
-def _log_normalizers(
-    log_density: F64Array, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array
-) -> F64Array:
-    return _log_sum_exp(_kernel_terms(log_density, log_scale_rows, grid, precision, shift)[3], axis=1)
-
-
 class _KernelRows:
     """One chunk's kernel at a cavity and its log scales: every per-node quantity of ``_components`` except the class
     density's part, which enters log Z_jk = log pi_ck + L_jk additively (L the kernel's log with a flat density).
@@ -1502,7 +1497,7 @@ def _host_objective(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Ca
             centred = np.empty((count, grid_size + 1))
             log_normalizer = np.empty(count)
             curvature = np.empty(count)
-            if _objective_rows(log_density[class_position], mass, prior.log_variance_grid, scales[rows], cavity.precision[rows], cavity.shift[rows],
+            if row_kernel(_objective_rows, count * grid_size, log_density[class_position], mass, prior.log_variance_grid, scales[rows], cavity.precision[rows], cavity.shift[rows],
                                deviations, centred, log_normalizer, curvature):
                 raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
             value += float(np.sum(log_normalizer))
@@ -2809,7 +2804,7 @@ def _moving_line_sum(
             total += _host(log_normalizer.reshape(size, count).sum(axis=0))
             continue
         out = np.empty((stop - start, count))
-        if _moving_line_rows(np.ascontiguousarray(class_density), log_scale_rows[start:stop], slopes[start:stop], steps, grid, precision[start:stop],
+        if row_kernel(_moving_line_rows, (stop - start) * count * grid.size, np.ascontiguousarray(class_density), log_scale_rows[start:stop], slopes[start:stop], steps, grid, precision[start:stop],
                              shift[start:stop], _LOST_BELOW, out):
             raise FloatingPointError("a cavity is improper on the lattice: 1 + v P <= 0")
         total += out.sum(axis=0)
