@@ -15,6 +15,9 @@ effects with equal per-SD variance, no annotation or non-additive effects and ho
 - ``length_positive``: as ``sv_20pct``, with an SV's log effect variance rising LENGTH_SLOPE per SD of log length.
   ``sv_20pct`` is its null: the same architecture with no length effect.
 - ``deletion_positive``: as ``sv_20pct``, with a deletion's effect SD DELETION_FOLD times an insertion's.
+- ``multi_feature_positive`` combines length, type and annotation-scale effects; ``sv_heavy_tail`` and
+  ``sv_two_point`` stress the effect distribution. ``sparse_sv``/``polygenic_sv`` vary expected causal counts,
+  while ``rare_disease`` and ``low_heritability`` probe outcome imbalance and weak signal.
 
 Arms follow the workspace (``workspace_pipeline.ARMS``): ``with_sv`` fits every record; ``snv_indel`` is refitted without
 bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels and short repeat indels.
@@ -59,6 +62,16 @@ POINTS = {
     "sv_20pct_fold3": {"sv_causal_fraction": 0.2, "sv_effect_fold": 3.0},
     "length_positive": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "sv_log_length_slope": LENGTH_SLOPE},
     "deletion_positive": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "sv_deletion_scale_fold": DELETION_FOLD},
+    "multi_feature_positive": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "sv_log_length_slope": LENGTH_SLOPE,
+                               "sv_deletion_scale_fold": DELETION_FOLD, "truth": {"annotation_mode": "scale"}},
+    "sv_heavy_tail": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0,
+                      "truth": {"sv_own_shape": True, "sv_shape": "student_t", "sv_shape_params": {"nu": 3.0}}},
+    "sv_two_point": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0,
+                     "truth": {"sv_own_shape": True, "sv_shape": "two_point"}},
+    "sparse_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "causal_variants": 50},
+    "polygenic_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "causal_variants": 2000},
+    "rare_disease": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"prevalence": 0.01}},
+    "low_heritability": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"h2": 0.01}},
 }
 
 
@@ -76,8 +89,9 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
     if min(structural_count, small_count) == 0 or replicate < 0:
         raise ValueError("The grid needs both variant classes and a nonnegative replicate index")
     fraction = setting["sv_causal_fraction"]
-    small_probability = CAUSAL_VARIANTS * (1.0 - fraction) / small_count
-    structural_probability = CAUSAL_VARIANTS * fraction / structural_count
+    causal_count = setting.get("causal_variants", CAUSAL_VARIANTS)
+    small_probability = causal_count * (1.0 - fraction) / small_count
+    structural_probability = causal_count * fraction / structural_count
     if not 0 < small_probability < 1 or not 0 <= structural_probability < 1:
         raise ValueError("Causal count exceeds the available records in a variant class")
     seeds = np.random.SeedSequence([list(POINTS).index(point), replicate]).generate_state(2)
@@ -99,6 +113,7 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
         "binary": True, "prevalence": PREVALENCE, "effect_seed": int(seeds[1]),
         "sv_log_length_slope": setting.get("sv_log_length_slope", 0.0),
         "sv_deletion_scale_fold": setting.get("sv_deletion_scale_fold", 1.0),
+        **setting.get("truth", {}),
     }
 
 

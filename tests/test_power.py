@@ -179,3 +179,17 @@ def test_unshared_arm_error_lowers_the_paired_power_and_leaves_the_expected_aucs
     assert unshared.power <= shared.power
     with pytest.raises(ValueError, match="correlation"):
         expected.expectation(architecture, 4, 3, .05, 15, arm_error_correlation=1.5)
+
+
+def test_grid_varies_polygenicity_and_includes_joint_and_off_distribution_controls(tmp_path):
+    classes, _ = _cohort(tmp_path, variant_count=4000, size=20)
+    for point, expected_count in (('sparse_sv', 50), ('polygenic_sv', 2000)):
+        params = grid.scenario_parameters(point, 0, tmp_path)
+        odds = grid._odds(params['pi']) * params['sv_probability_fold']
+        count = params['pi'] * (classes != truth.SV).sum() + odds / (1 + odds) * (classes == truth.SV).sum()
+        assert count == pytest.approx(expected_count)
+    joint = grid.scenario_parameters('multi_feature_positive', 0, tmp_path)
+    assert joint['sv_log_length_slope'] > 0 and joint['sv_deletion_scale_fold'] > 1 and joint['annotation_mode'] == 'scale'
+    heavy = grid.scenario_parameters('sv_heavy_tail', 0, tmp_path)
+    assert heavy['sv_shape'] == 'student_t' and heavy['sv_own_shape']
+    assert grid.scenario_parameters('rare_disease', 0, tmp_path)['prevalence'] == .01
