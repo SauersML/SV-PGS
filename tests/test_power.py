@@ -113,3 +113,45 @@ def test_the_positive_controls_move_sv_effects_with_length_and_class(tmp_path) -
     rows, magnitude = structural_effects({**parameters, "sv_deletion_scale_fold": 4.0})
     deletion = change[rows] < 0
     assert np.median(magnitude[deletion]) > 2.0 * np.median(magnitude[~deletion])
+
+
+@pytest.mark.parametrize('changes', [
+    {'training_people': 0}, {'test_people': 2.5}, {'causal_variants': 0},
+    {'effective_segments': float('inf')}, {'sv_share': float('nan')},
+])
+def test_planning_rejects_invalid_architectures(changes):
+    with pytest.raises(ValueError):
+        _architecture(**changes)
+
+
+def test_planning_handles_zero_captured_baseline_and_counts_unusable_replicates():
+    result = expected.expectation(_architecture(sv_share=1.0, tagged_by_small=0.0), 3, 11, .05, 15)
+    assert result.small_auc == .5 and result.sv_auc > .5
+    assert result.valid_replicates + result.invalid_replicates == 3
+    result = expected.expectation(_architecture(prevalence=1e-12, test_people=2), 4, 1, .05, 15)
+    assert result.invalid_replicates == 4 and np.isnan(result.power)
+
+
+def test_monte_carlo_interval_is_informative_at_zero_successes():
+    from benchmarks.power.uncertainty import rejection_summary
+    result = rejection_summary(0, 20)
+    assert result['rate'] == 0 and result['lower'] == pytest.approx(0)
+    assert .1 < result['upper'] < .2
+    result = rejection_summary(20, 20)
+    assert .8 < result['lower'] < .9 and result['upper'] == pytest.approx(1)
+
+
+def test_summary_reports_invalid_comparisons_separately(tmp_path):
+    import csv
+    import json
+    for replicate, z in enumerate([2.0, 0.0, float('nan')]):
+        path = tmp_path / 'tasks' / 'null' / 'n5000' / f'replicate{replicate}'
+        path.mkdir(parents=True)
+        (path / 'result.json').write_text(json.dumps(dict(
+            point='null', train_count=5000, replicate=replicate, z=z, delta_auc=.01,
+            snv_indel_auc=.6, with_sv_auc=.61, length_rho=0., deletion_over_insertion=1.)))
+    with grid.summarize(tmp_path).open() as handle:
+        row, = list(csv.DictReader(handle, delimiter='\t'))
+    assert row['valid_comparisons'] == '2' and row['invalid_comparisons'] == '1'
+    assert float(row['share_favouring_sv']) == .5
+    assert float(row['rate_lower_95']) < .5 < float(row['rate_upper_95'])

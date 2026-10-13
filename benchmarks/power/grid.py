@@ -7,9 +7,10 @@ threshold disease of liability heritability HERITABILITY on the simulated chromo
 CAUSAL_VARIANTS causal records, a given fraction of them SVs and an SV effect size relative to small variants, Gaussian
 effects with equal per-SD variance, no annotation or non-additive effects and homoscedastic noise. Points:
 
-- ``null``: no causal SV. SVs carry signal only through their LD with causal small variants: the conditional
-  added-value null (SVs refitted on real SNV-SV correlations, not shuffled), so the SV arm's gain is noise, and its
-  length trend in effect magnitude shows what the pipeline produces with no true length effect.
+- ``null`` (legacy name): no causal SV. SVs retain their LD with causal small variants. This is a no-SV-causality
+  control, NOT necessarily a null of equal predictive accuracy: tagging, representation and regularization can
+  change performance. Its rejection rate is not automatically a type I error rate. Its length readout shows what
+  the pipeline produces with no true length effect.
 - ``sv_5pct``, ``sv_5pct_fold3``, ``sv_20pct``, ``sv_20pct_fold3``: power, by SV causal fraction and SV effect SD fold.
 - ``length_positive``: as ``sv_20pct``, with an SV's log effect variance rising LENGTH_SLOPE per SD of log length.
   ``sv_20pct`` is its null: the same architecture with no length effect.
@@ -20,7 +21,7 @@ bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels an
 
 One task is one (point, training size, replicate), both arms fitted (``run``); ``summarize`` collects every finished task
 into ``summary.tsv``: per point and size, the mean SV-arm gain in AUC and its SE over replicates, the share of replicates
-whose paired DeLong test favours the SV arm at one-sided 0.05 (power, or the type I error at ``null``), and the
+whose paired DeLong test favours the SV arm at one-sided 0.05, its Monte Carlo uncertainty, and the
 positive controls' readouts. Tasks are independent, so the grid runs as one task each (bench-sim's runq, or Batch).
 """
 from __future__ import annotations
@@ -38,6 +39,7 @@ from benchmarks.bench_sim import harness, truth
 from benchmarks.bench_sim.records import measured_records
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.held_out_comparison import paired_delta_auc
+from benchmarks.power.uncertainty import rejection_summary
 
 HERITABILITY = 0.1
 PREVALENCE = 0.1
@@ -70,9 +72,13 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
     classes = np.load(cohort / "variants.npz")["cls"]
     structural_count = int(np.sum(classes == truth.SV))
     small_count = int(classes.size - structural_count)
+    if min(structural_count, small_count) == 0 or replicate < 0:
+        raise ValueError("The grid needs both variant classes and a nonnegative replicate index")
     fraction = setting["sv_causal_fraction"]
     small_probability = CAUSAL_VARIANTS * (1.0 - fraction) / small_count
     structural_probability = CAUSAL_VARIANTS * fraction / structural_count
+    if not 0 < small_probability < 1 or not 0 <= structural_probability < 1:
+        raise ValueError("Causal count exceeds the available records in a variant class")
     seeds = np.random.SeedSequence([list(POINTS).index(point), replicate]).generate_state(2)
     return {
         "seed": int(seeds[0]),
@@ -141,13 +147,15 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
 
 SUMMARY_COLUMNS = (
     "point", "train_count", "replicates", "snv_indel_auc", "with_sv_auc", "mean_delta_auc", "delta_auc_se",
-    "share_favouring_sv", "length_rho", "deletion_over_insertion",
+    "share_favouring_sv", "valid_comparisons", "invalid_comparisons", "rate_mcse", "rate_lower_95", "rate_upper_95",
+    "length_rho", "deletion_over_insertion",
 )
 
 
 def summarize(out: Path) -> Path:
     """Every finished task's result, per (point, training size): the replicates' means, the SE of the mean gain, and the
-    share whose one-sided paired DeLong test favours the SV arm at 0.05 (power; the type I error at ``null``)."""
+    share whose one-sided paired DeLong test favours the SV arm at 0.05. Conditions on completed tasks;
+    invalid comparisons are counted explicitly and excluded from the rejection-rate denominator."""
     results = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/result.json"))]
     critical = stats.norm.isf(0.05)
     lines = [SUMMARY_COLUMNS]
@@ -155,11 +163,14 @@ def summarize(out: Path) -> Path:
         for train_count in sorted({result["train_count"] for result in results if result["point"] == point}):
             group = [result for result in results if result["point"] == point and result["train_count"] == train_count]
             deltas = np.array([result["delta_auc"] for result in group])
+            valid = [result for result in group if np.isfinite(result["delta_auc"]) and np.isfinite(result["z"])]
+            rate = rejection_summary(sum(result["z"] > critical for result in valid), len(valid))
             lines.append((
                 point, train_count, len(group), f"{np.mean([result['snv_indel_auc'] for result in group]):.4f}",
                 f"{np.mean([result['with_sv_auc'] for result in group]):.4f}", f"{deltas.mean():.5f}",
                 f"{deltas.std(ddof=1) / math.sqrt(deltas.size):.5f}" if deltas.size > 1 else "",
-                f"{np.mean([np.nan_to_num(result['z']) > critical for result in group]):.3f}",
+                f"{rate['rate']:.3f}", len(valid), len(group) - len(valid), f"{rate['mcse']:.4f}",
+                f"{rate['lower']:.4f}", f"{rate['upper']:.4f}",
                 f"{np.nanmean([result['length_rho'] for result in group]):.3f}",
                 f"{np.nanmean([result['deletion_over_insertion'] for result in group]):.3f}",
             ))

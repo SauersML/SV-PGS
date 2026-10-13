@@ -31,6 +31,7 @@ import numpy as np
 from scipy import stats
 
 from sv_pgs.held_out_comparison import paired_delta_auc
+from benchmarks.power.uncertainty import rejection_summary
 
 
 @dataclass(frozen=True)
@@ -54,11 +55,18 @@ class Architecture:
         for value in (self.sv_share, self.tagged_by_small, self.sv_imputation_r2):
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{self.name}: shares and r2 lie in [0, 1]")
+        if any(not math.isfinite(value) or value <= 0 for value in (self.causal_variants, self.effective_segments)):
+            raise ValueError("causal variants and effective segments must be finite and positive")
+        if any(isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < 2
+               for value in (self.training_people, self.test_people)):
+            raise ValueError("training and test counts must be integers of at least two")
 
 
 def sv_share_of(sv_causal_fraction: float, sv_effect_fold: float) -> float:
     """The share of h2 carried by SVs when that fraction of causal variants are SVs and an SV's effect SD is
     ``sv_effect_fold`` times a small variant's (equal per-SD variance otherwise): p f^2 / (p f^2 + 1 - p)."""
+    if not 0 <= sv_causal_fraction <= 1 or not math.isfinite(sv_effect_fold) or sv_effect_fold <= 0:
+        raise ValueError("causal fraction must be in [0, 1] and effect fold finite and positive")
     weighted = sv_causal_fraction * sv_effect_fold**2
     return weighted / (weighted + 1.0 - sv_causal_fraction)
 
@@ -111,11 +119,18 @@ class Expectation:
     power: float
     power_after_correction: float
     mean_delta_auc_simulated: float
+    valid_replicates: int
+    invalid_replicates: int
+    power_mcse: float
+    power_lower_95: float
+    power_upper_95: float
 
 
 def expectation(architecture: Architecture, replicates: int, seed: int, significance: float, tests: int) -> Expectation:
     """Analytic accuracies of both arms, and the power of the paired held-out DeLong test of their AUCs by a Monte Carlo
     of ``replicates`` test sets: one-sided at ``significance``, and Bonferroni-corrected over ``tests`` diseases."""
+    if not isinstance(replicates, int) or replicates <= 0 or not isinstance(tests, int) or tests <= 0 or not 0 < significance < 1:
+        raise ValueError("replicates and tests must be positive integers, significance in (0, 1)")
     small_captured, sv_captured = captured_heritability(architecture)
     small_r2, sv_r2 = estimation_accuracy(small_captured, architecture), estimation_accuracy(sv_captured, architecture)
     generator = np.random.default_rng(seed)
@@ -123,8 +138,9 @@ def expectation(architecture: Architecture, replicates: int, seed: int, signific
     extra = sv_captured - small_captured
     # The estimation noise of each arm, so corr^2(PGS, captured value) is its accuracy; the SV arm's noise extends the
     # SNV/indel arm's (the same small-variant effects, estimated from the same people).
-    small_noise = small_captured * (1.0 - small_r2) / small_r2
-    sv_noise = max(sv_captured * (1.0 - sv_r2) / sv_r2 - small_noise, 0.0)
+    small_noise = small_captured * (1.0 - small_r2) / small_r2 if small_r2 > 0 else 0.0
+    total_sv_noise = sv_captured * (1.0 - sv_r2) / sv_r2 if sv_r2 > 0 else 0.0
+    sv_noise = max(total_sv_noise - small_noise, 0.0)
     critical = stats.norm.isf(significance)
     corrected = stats.norm.isf(significance / tests)
     z_scores, deltas = [], []
@@ -134,20 +150,27 @@ def expectation(architecture: Architecture, replicates: int, seed: int, signific
         extra_value = generator.normal(0.0, math.sqrt(extra), size)
         remainder = generator.normal(0.0, math.sqrt(1.0 - sv_captured), size)
         cases = (small_value + extra_value + remainder > threshold).astype(np.float64)
+        if cases.min() == cases.max():
+            z_scores.append(math.nan)
+            continue
         small_score = small_value + generator.normal(0.0, math.sqrt(small_noise), size)
         sv_score = small_score + extra_value + generator.normal(0.0, math.sqrt(sv_noise), size)
         comparison = paired_delta_auc(cases, small_score, sv_score)
         z_scores.append(comparison.z_score)
         deltas.append(comparison.estimate)
-    z_values = np.nan_to_num(np.asarray(z_scores), nan=0.0)
+    z_values = np.asarray(z_scores)
+    z_values = z_values[np.isfinite(z_values)]
+    rate = rejection_summary(int(np.sum(z_values > critical)), len(z_values))
     return Expectation(
         small_auc=auc_of(liability_r2(small_captured, architecture), architecture.prevalence),
         sv_auc=auc_of(liability_r2(sv_captured, architecture), architecture.prevalence),
         small_liability_r2=liability_r2(small_captured, architecture),
         sv_liability_r2=liability_r2(sv_captured, architecture),
-        power=float(np.mean(z_values > critical)),
-        power_after_correction=float(np.mean(z_values > corrected)),
-        mean_delta_auc_simulated=float(np.mean(deltas)),
+        power=rate['rate'],
+        power_after_correction=float(np.mean(z_values > corrected)) if z_values.size else math.nan,
+        mean_delta_auc_simulated=float(np.mean(deltas)) if deltas else math.nan,
+        valid_replicates=int(z_values.size), invalid_replicates=replicates - int(z_values.size),
+        power_mcse=rate['mcse'], power_lower_95=rate['lower'], power_upper_95=rate['upper'],
     )
 
 
@@ -167,6 +190,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--people", type=int, default=100_000, help="genotyped cohort size")
     parser.add_argument("--folds", type=int, default=5, help="cross-validation folds (training share 1 - 1/folds)")
+    parser.add_argument("--calibration-fraction", type=float, default=0.1, help="fraction of each development fold reserved from fitting")
     parser.add_argument("--sv-causal-fractions", type=float, nargs="+", default=[0.01, 0.05, 0.1])
     parser.add_argument("--sv-effect-folds", type=float, nargs="+", default=[1.0, 2.0, 3.0])
     parser.add_argument("--tagged-by-small", type=float, nargs="+", default=[0.3, 0.6])
@@ -177,15 +201,18 @@ def main() -> None:
     parser.add_argument("--significance", type=float, default=0.05)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
+    if arguments.folds < 2 or not 0 <= arguments.calibration_fraction < 1:
+        parser.error("folds must be at least two and calibration-fraction in [0, 1)")
     rows = []
     for name, prevalence, heritability, eligible in PANEL:
         people = int(arguments.people * eligible)
         base = Architecture(
             name=name, prevalence=prevalence, heritability=heritability, sv_share=0.0, tagged_by_small=0.0,
             sv_imputation_r2=arguments.sv_imputation_r2, causal_variants=arguments.causal_variants,
-            effective_segments=arguments.effective_segments, training_people=people - people // arguments.folds,
-            # Every person is held out once across the folds; the report weights the folds by their rows.
-            test_people=people,
+            effective_segments=arguments.effective_segments,
+            training_people=int((people - people // arguments.folds) * (1 - arguments.calibration_fraction)),
+            # A fixed-predictor planning calculation for ONE outer holdout, not a pooled CV power claim.
+            test_people=people // arguments.folds,
         )
         for sv_causal_fraction in arguments.sv_causal_fractions:
             for fold in arguments.sv_effect_folds:
@@ -200,6 +227,11 @@ def main() -> None:
                         "expected_delta_auc": round(result.sv_auc - result.small_auc, 5),
                         "simulated_delta_auc": round(result.mean_delta_auc_simulated, 5),
                         "power": round(result.power, 3), "power_bonferroni_15": round(result.power_after_correction, 3),
+                        "valid_replicates": result.valid_replicates, "invalid_replicates": result.invalid_replicates,
+                        "power_mcse": result.power_mcse, "power_lower_95": result.power_lower_95,
+                        "power_upper_95": result.power_upper_95,
+                        "training_people": architecture.training_people, "test_people": architecture.test_people,
+                        "evaluation_scope": "one_outer_holdout_conditional_on_assumed_predictors",
                     })
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
     with arguments.output.open("w", newline="") as handle:
