@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+import numba
 
 from sv_pgs._typing import I64Array, U8Array
 
@@ -210,32 +211,48 @@ def row_frames(
 
 
 def decode_rows(buffer: U8Array, frames: RowFrames, sample_count: int, out: U8Array) -> None:
-    """Decode located row frames into ``out`` [rows, n] on the CPU (the reference decoder)."""
-    sample_dtype = exception_sample_dtype(sample_count)
-    for bits in np.unique(frames.depth).tolist():
-        members = np.flatnonzero(frames.depth == bits)
-        dictionary_size = 1 << bits
-        dictionaries = buffer[frames.dictionary_offset[members, None] + np.arange(dictionary_size)[None, :]]
-        if not bits:
-            out[members] = dictionaries
-            continue
-        width = int(slot_bytes(sample_count, bits))
-        packed = np.zeros((members.shape[0], width + 1), dtype=np.uint16)
-        packed[:, :width] = buffer[frames.slot_offset[members, None] + np.arange(width)[None, :]]
-        byte, shift = np.divmod(np.arange(sample_count, dtype=np.int64) * bits, BITS_PER_CODE)
-        window = packed[:, byte] | (packed[:, byte + 1] << np.uint16(BITS_PER_CODE))
-        slot = (window >> shift.astype(np.uint16)) & np.uint16(dictionary_size - 1)
-        out[members] = np.take_along_axis(dictionaries, slot.astype(np.intp), axis=1)
-    counts = frames.exception_count
-    exception_rows = np.repeat(np.arange(counts.shape[0]), counts)
-    if exception_rows.shape[0] == 0:
-        return
-    within = np.arange(exception_rows.shape[0]) - (np.cumsum(counts) - counts)[exception_rows]
-    samples = _gather_uint(buffer, frames.exception_offset[exception_rows] + within * sample_dtype.itemsize, sample_dtype)
-    if np.any(samples >= sample_count):
+    """Decode CPU rows directly into ``out``, without sample-sized scratch arrays.
+
+    The compiled loop releases the GIL so the store's existing reader pool can
+    decode separate chunks concurrently; it creates no additional worker pool.
+    Headers and frame bounds are validated by ``row_frames`` before this call.
+    """
+    if out.dtype != np.uint8 or out.shape != (frames.depth.size, sample_count):
+        raise ValueError("rowdict output must be uint8 [rows, samples]")
+    if not _decode_rows_cpu(buffer, frames.depth, frames.exception_count, frames.dictionary_offset,
+                            frames.slot_offset, frames.exception_offset, sample_count,
+                            exception_sample_dtype(sample_count).itemsize, out):
         raise ValueError("a rowdict exception names a sample outside the row.")
-    code_at = frames.exception_offset[exception_rows] + counts[exception_rows] * sample_dtype.itemsize + within
-    out[exception_rows, samples] = buffer[code_at]
+
+
+@numba.njit(cache=True, nogil=True)
+def _decode_rows_cpu(buffer, depths, counts, dictionaries, slots, exceptions, samples, sample_bytes, out):
+    for row in range(depths.size):
+        bits = depths[row]
+        dictionary = dictionaries[row]
+        mask = (1 << bits) - 1
+        if bits == 0:
+            out[row, :] = buffer[dictionary]
+        else:
+            for sample in range(samples):
+                bit = sample * bits
+                byte = bit // BITS_PER_CODE
+                shift = bit % BITS_PER_CODE
+                window = int(buffer[slots[row] + byte])
+                # A second byte is needed only for slots crossing its boundary.
+                # The last slot never reads past the frame's packed payload.
+                if shift + bits > BITS_PER_CODE:
+                    window |= int(buffer[slots[row] + byte + 1]) << BITS_PER_CODE
+                out[row, sample] = buffer[dictionary + ((window >> shift) & mask)]
+        codes = exceptions[row] + counts[row] * sample_bytes
+        for index in range(counts[row]):
+            sample = 0
+            for byte in range(sample_bytes):
+                sample |= int(buffer[exceptions[row] + index * sample_bytes + byte]) << (BITS_PER_CODE * byte)
+            if sample >= samples:
+                return False
+            out[row, sample] = buffer[codes + index]
+    return True
 
 
 _GPU_SOURCE = r"""

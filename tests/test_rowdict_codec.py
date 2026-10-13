@@ -80,6 +80,37 @@ def test_wide_rows_store_exception_samples_as_uint32() -> None:
     assert np.array_equal(_decode_chunk(payload, 3, samples), codes)
 
 
+@pytest.mark.parametrize("samples", [7, 50_000, 100_000])
+def test_direct_decoder_handles_biobank_rows_and_strided_outputs(samples):
+    codes = _rows_of_every_depth(np.random.default_rng(samples), samples)
+    payload = rowdict_codec.encode_chunk(codes)
+    # No trailing CRC bytes: the decoder must stay inside the packed slots.
+    buffer = np.frombuffer(payload, dtype=np.uint8)
+    wanted = np.arange(codes.shape[0])[::-2]
+    frames = rowdict_codec.row_frames(buffer, np.array([0]), np.array([len(payload)]),
+                                     codes.shape[0], samples, wanted)
+    backing = np.full((wanted.size, samples * 2 + 2), 255, dtype=np.uint8)
+    output = backing[:, 1:-1:2][:, ::-1]
+    rowdict_codec.decode_rows(buffer, frames, samples, output)
+    np.testing.assert_array_equal(output, codes[wanted])
+    assert np.all(backing[:, ::2] == 255) and np.all(backing[:, -1] == 255)
+
+
+@pytest.mark.parametrize("samples", [31, 50_000, 65_537, 100_000])
+def test_direct_decoder_rejects_out_of_range_exception_before_writing(samples):
+    codes = np.zeros((1, samples), dtype=np.uint8)
+    codes[0, -1] = 254
+    buffer = np.frombuffer(rowdict_codec.encode_chunk(codes), dtype=np.uint8).copy()
+    frames = rowdict_codec.row_frames(buffer, np.array([0]), np.array([buffer.size]), 1, samples, np.array([0]))
+    assert frames.exception_count[0] == 1
+    width = rowdict_codec.exception_sample_dtype(samples).itemsize
+    first = int(frames.exception_offset[0])
+    buffer[first:first + width] = np.frombuffer(samples.to_bytes(width, "little"), dtype=np.uint8)
+    output = np.zeros_like(codes)
+    with pytest.raises(ValueError, match="outside the row"):
+        rowdict_codec.decode_rows(buffer, frames, samples, output)
+
+
 def test_a_size_table_that_disagrees_with_the_chunk_is_refused() -> None:
     codes = np.random.default_rng(2).integers(0, 3, size=(4, 50)).astype(np.uint8)
     payload = bytearray(rowdict_codec.encode_chunk(codes))
