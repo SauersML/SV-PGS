@@ -2040,17 +2040,47 @@ class _Scores:
     held_out_genetic: F64Array
 
 
+def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
+    """Consecutive runs of the saved fitted models whose files together hold at most a quarter of ``host_bytes`` (each
+    run at least one model): loaded together, they are scored from one read of the store, and the scorer's plan and
+    accumulators take the rest of the host. Every model at once held some 200 GB at All of Us scale (2 arms x 15
+    diseases x 6 models, each ~20M records of means, scales, coefficients and draw-law parameters)."""
+    batches: list[range] = []
+    start, held = 0, 0
+    for position, size in enumerate(model_bytes):
+        if position > start and held + size > host_bytes // 4:
+            batches.append(range(start, position))
+            start, held = position, 0
+        held += size
+    batches.append(range(start, len(model_bytes)))
+    return batches
+
+
 def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
-    """Every model of both arms scored for the whole cohort from one read of the store (``predict_models``)."""
+    """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
+    host's memory allows the saved models to be held together (``score_batches``)."""
     cohort = _read_cohort(run)
-    fitted = [run.bindings.load_model(_fitted_model_directory(run, arm, trait_name)) for arm in ARMS for trait_name in cohort.trait_names]
-    for arm_index, arm in enumerate(ARMS):
-        names = tuple(name for model in fitted[arm_index * len(cohort.trait_names) : (arm_index + 1) * len(cohort.trait_names)] for name in model.model_names)
-        if names != cohort.model_names:
-            raise ValueError(f"the {arm} arm's saved models are not the cohort's models in order.")
-    with DosageStore.open(_final_store(run)) as store:
-        prediction = run.bindings.predict(fitted, store, cohort.store_columns, cohort.covariates[:, 1:], run.budget)
+    directories = [_fitted_model_directory(run, arm, trait_name) for arm in ARMS for trait_name in cohort.trait_names]
     shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
+    columns = {name: np.empty((shape[1], shape[0] * shape[2])) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
+    names: list[str] = []
+    batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
+    with DosageStore.open(_final_store(run)) as store:
+        for batch in batches:
+            fitted = [run.bindings.load_model(directories[position]) for position in batch]
+            prediction = run.bindings.predict(fitted, store, cohort.store_columns, cohort.covariates[:, 1:], run.budget)
+            first = len(names)
+            names.extend(name for model in fitted for name in model.model_names)
+            for name, values in (
+                ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
+                ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
+            ):
+                columns[name][:, first : len(names)] = np.asarray(values, dtype=np.float64)
+            del fitted, prediction
+    for arm_index, arm in enumerate(ARMS):
+        if tuple(names[arm_index * shape[2] : (arm_index + 1) * shape[2]]) != cohort.model_names:
+            raise ValueError(f"the {arm} arm's saved models are not the cohort's models in order.")
+    LOGGER.info("workspace pipeline: scored %d models in %d reads of the store", len(names), len(batches))
 
     def by_arm(values: Any) -> F64Array:
         # [rows, arms x models] in arm-major model order, as [arms, rows, models].
@@ -2063,22 +2093,22 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             own[:, rows, trait] = values[:, rows, model]
         return own
 
-    predictive_mean = by_arm(prediction.predictive_mean)
-    linear_predictor = by_arm(prediction.linear_predictor)
-    genetic_mean = by_arm(prediction.genetic.means)
+    predictive_mean = by_arm(columns["predictive_mean"])
+    linear_predictor = by_arm(columns["linear_predictor"])
+    genetic_mean = by_arm(columns["genetic_mean"])
     np.savez(
         directory / "predictions.npz",
         arms=np.array(ARMS),
         model_names=np.array(cohort.model_names),
         predictive_mean=predictive_mean,
-        predictive_variance=by_arm(prediction.predictive_variance),
+        predictive_variance=by_arm(columns["predictive_variance"]),
         linear_predictor=linear_predictor,
         genetic_mean=genetic_mean,
         held_out_predictive_mean=held_out(predictive_mean),
         held_out_linear_predictor=held_out(linear_predictor),
         held_out_genetic=held_out(genetic_mean),
     )
-    return {"arms": list(ARMS), "models": len(ARMS) * len(cohort.model_names), "scored_rows": int(cohort.store_columns.shape[0])}
+    return {"arms": list(ARMS), "models": len(names), "store_reads": len(batches), "scored_rows": int(cohort.store_columns.shape[0])}
 
 
 def _read_scores(run: _Run) -> _Scores:
@@ -2503,7 +2533,7 @@ _STEPS = (
         _measurement_step,
     ),
     _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, code_digest()), (_fit_step, arm_log_reliability, trait_request, trait_seed), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step,), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches), _score_step),
     _Step("effects", ("cohort", "fit"), lambda config: None, (_effects_step, variant_effects, length_bins), _effects_step),
     _Step(
         "report",

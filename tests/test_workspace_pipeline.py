@@ -778,3 +778,10 @@ def test_a_record_spanning_several_repeats_chains_no_unsplittable_group_past_the
     group_first = store_group_first(np.full(positions.shape[0], -1), positions, classes, loci.record_locus)
     validate_cut_allowed(cut_allowed_from_groups(group_first), 40)
     assert np.unique(group_first[is_tr]).shape[0] == 3
+
+
+def test_scoring_holds_at_most_a_quarter_of_the_host_in_saved_models_per_store_read() -> None:
+    # A quarter of 80 bytes is 20: two 10-byte models share a read; a model past the quarter is read alone.
+    assert workspace_pipeline.score_batches([10, 10, 10], 80) == [range(0, 2), range(2, 3)]
+    assert workspace_pipeline.score_batches([30, 5, 5], 80) == [range(0, 1), range(1, 3)]
+    assert workspace_pipeline.score_batches([5], 1) == [range(0, 1)]
