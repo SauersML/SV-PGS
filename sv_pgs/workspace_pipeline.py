@@ -144,6 +144,7 @@ from sv_pgs.store_converter import (
     MAXIMUM_KEPT_PATHS,
     NO_LOCUS,
     ExpectedSites,
+    encoding_flattened,
     PlainExpectedSites,
     TrLoci,
     assemble_half,
@@ -1503,6 +1504,8 @@ def _decode(task: _DecodeTask) -> None:
         sample_ids=np.array(decoded.sample_ids),
         reported_info=decoded.reported_info,
         sites_md5=np.array(decoded.sites_md5),
+        dosage_range=decoded.dosage_range,
+        code_range=decoded.code_range,
     )
     os.replace(temporary, task.statistics_path)
 
@@ -1678,6 +1681,8 @@ def _convert_chromosome(
         "sites_md5": sites_md5(positions, ref_lengths, alt_lengths),
         "background_zeroed": int(sum(int(values["zeroed"].sum()) for values in statistics)),
         "no_calls": int(sum(int(values["no_calls"].sum()) for values in statistics)),
+        # Records whose dosages vary but whose 8-bit codes do not (DS 0.001-0.003 all store as 0): stored monomorphic.
+        "encoding_flattened": int(encoding_flattened([values["dosage_range"] for values in statistics], [values["code_range"] for values in statistics]).shape[0]),
         "reported_r2_above_one": int(sum(int((info > 1.0).sum()) for _width, info in imputed)),
         "reported_r2_largest": max(float(info.max(initial=0.0)) for _width, info in imputed),
         **sites.facts,
@@ -1783,6 +1788,7 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
         "recalibrated": False,
         "background_zeroed": int(sum(fact["background_zeroed"] for fact in facts)),
         "no_calls": int(sum(fact["no_calls"] for fact in facts)),
+        "encoding_flattened": int(sum(fact["encoding_flattened"] for fact in facts)),
         "gates": gates,
         "genetic_position": {chromosome: fact["genetic_position"] for chromosome, fact in zip(config.chromosomes, facts)},
         "reported_r2_fields": sorted({field for fact in facts for field in fact["reported_r2_fields"]}),

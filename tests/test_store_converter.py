@@ -569,3 +569,15 @@ def test_a_record_no_sample_measured_fails(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="record 1: no sample has a measurement"):
         _fill_of([batch])
+
+
+def test_records_the_8_bit_codes_make_monomorphic_are_counted_across_batches() -> None:
+    from sv_pgs.store_converter import encoding_flattened
+
+    # Record 0: dosages 0.000-0.003 in one batch and 0 in the other, every code 0: flattened. Record 1: dosages to 1.000,
+    # codes to 127: kept. Record 2: constant dosage: not flattened. Record 3: no called sample in batch two (empty range).
+    first_dosage = np.array([[0, 3], [0, 1000], [500, 500], [0, 2]])
+    first_code = np.array([[0, 0], [0, 127], [64, 64], [0, 0]])
+    second_dosage = np.array([[0, 0], [0, 0], [500, 500], [2001, 0]])
+    second_code = np.array([[0, 0], [0, 0], [64, 64], [255, 0]])
+    np.testing.assert_array_equal(encoding_flattened([first_dosage, second_dosage], [first_code, second_code]), [0, 3])

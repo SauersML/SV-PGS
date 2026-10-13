@@ -613,7 +613,10 @@ class DecodedBatch:
     until ``assemble_half`` fills it; ``no_calls`` counts them per record. ``reported_info`` is an
     imputed batch's reported r^2 per record (INFO/INFO, or the field a plain batch declares: the
     imputation's own r^2 over the batch's samples), and empty for a hard-call batch.
-    ``sites_md5`` is the md5 of the file's site lines (``expected.site_line``)."""
+    ``sites_md5`` is the md5 of the file's site lines (``expected.site_line``). ``dosage_range`` and ``code_range``
+    [records, 2] are each record's lowest and highest measured dosage (thousandths, after background removal) and
+    stored code over the batch's called samples (an empty range, lowest above highest, where none is called): the
+    store step reads from them which records the 8-bit codes made monomorphic (``encoding_flattened``)."""
 
     codes: U8Array
     group_sums: I64Array
@@ -624,6 +627,19 @@ class DecodedBatch:
     sample_ids: tuple[str, ...]
     reported_info: F64Array
     sites_md5: str
+    dosage_range: NDArray
+    code_range: NDArray
+
+
+def encoding_flattened(dosage_ranges: Sequence[NDArray], code_ranges: Sequence[NDArray]) -> I64Array:
+    """The records whose measured dosages vary over the store's samples but whose stored codes do not, from every
+    batch's ranges: the 8-bit code (1/127 of a dosage) holds DS 0.000 to 0.003 as 0, so a record whose only non-zero
+    dosages are that small is stored monomorphic and no model sees it. Counted, never hidden."""
+    lowest_dosage = np.min([ranges[:, 0] for ranges in dosage_ranges], axis=0).astype(np.int64)
+    highest_dosage = np.max([ranges[:, 1] for ranges in dosage_ranges], axis=0).astype(np.int64)
+    lowest_code = np.min([ranges[:, 0] for ranges in code_ranges], axis=0).astype(np.int64)
+    highest_code = np.max([ranges[:, 1] for ranges in code_ranges], axis=0).astype(np.int64)
+    return np.flatnonzero((highest_dosage > lowest_dosage) & (highest_code == lowest_code)).astype(np.int64)
 
 
 def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
@@ -730,6 +746,9 @@ def _decode_records(
         zeroed = np.zeros(record_count, dtype=np.int64)
         unmatched_low = np.zeros(record_count, dtype=np.int64)
         no_calls = np.zeros(record_count, dtype=np.int64)
+        # Empty ranges (lowest above highest) until a record's called samples fill them.
+        dosage_range = np.tile(np.array([MAXIMUM_DOSAGE_MILLI + 1, 0], dtype=np.int64), (record_count, 1))
+        code_range = np.tile(np.array([np.iinfo(np.uint8).max, 0], dtype=np.int64), (record_count, 1))
         # Only an imputed batch, the one with a background to remove, carries the imputation's own r^2.
         imputed = record_reported_r2 is not None
         reported_info = np.empty(record_count if imputed else 0, dtype=np.float64)
@@ -747,8 +766,14 @@ def _decode_records(
                 dosage_milli = corrected.dosage_milli
                 zeroed[start:stop] = corrected.zeroed
                 unmatched_low[start:stop] = corrected.unmatched_low
-            codes[start:stop] = np.where(called, encode_dosage_milli(dosage_milli), MISSING_CODE)
+            encoded = encode_dosage_milli(dosage_milli)
+            codes[start:stop] = np.where(called, encoded, MISSING_CODE)
             no_calls[start:stop] = (~called).sum(axis=1)
+            values = dosage_milli.astype(np.int64)
+            dosage_range[start:stop, 0] = np.where(called, values, MAXIMUM_DOSAGE_MILLI + 1).min(axis=1)
+            dosage_range[start:stop, 1] = np.where(called, values, 0).max(axis=1)
+            code_range[start:stop, 0] = np.where(called, encoded, np.iinfo(np.uint8).max).min(axis=1)
+            code_range[start:stop, 1] = np.where(called, encoded, 0).max(axis=1)
             for group, mask in enumerate(members):
                 group_sums[start:stop, group] = dosage_milli[:, mask].sum(axis=1, dtype=np.int64)
                 group_counts[start:stop, group] = called[:, mask].sum(axis=1)
@@ -782,6 +807,8 @@ def _decode_records(
         sample_ids=sample_ids,
         reported_info=reported_info,
         sites_md5=sites.hexdigest(),
+        dosage_range=dosage_range,
+        code_range=code_range,
     )
 
 
