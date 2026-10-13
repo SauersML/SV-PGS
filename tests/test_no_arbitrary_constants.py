@@ -55,6 +55,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('cli.py', 'main'): ('spec', frozenset({130}), 'POSIX exit status 128 + SIGINT'),
     ('phenotype_measurement.py', 'READING_ROUNDINGS'): ('derived', frozenset({8}), "a reading's rounded float64 operations before the model (unit conversion, treatment correction, a same-day mean's sum and division), each at most half an ulp, with margin; Higham 2002 section 2.2"),
     ('workspace_pipeline.py', 'BGZF_MAXIMUM_BLOCK_BYTES'): ('spec', frozenset({65536}), 'SAMv1 section 4.1: a BGZF block is at most 64 KiB (BSIZE is 16 bits)'),
+    ('workspace_pipeline.py', '_fit_step'): ('unit', frozenset({3600.0}), 'seconds per hour'),
     ('workspace_pipeline.py', 'LENGTH_DECADE'): ('definitional', frozenset({10}), 'decades of SV length from the 50 bp SV definition: the effects summary display bins, never a fit input'),
     ('code_products.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('code_products.py', 'OPERAND_DIGITS'): ('derived', frozenset({8}), '7 x 8 - 2 >= 53 fp64 mantissa bits (math-epeb)'),

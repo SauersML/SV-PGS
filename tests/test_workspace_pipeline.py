@@ -549,7 +549,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     design = json.loads((run / "cohort" / "cohort.json").read_text())
     traits = ["atrial_fibrillation", "total_bilirubin"]
     assert design["model_names"] == [f"{trait}/{fold}" for trait in traits for fold in ("fold0", "fold1", "all")]
-    assert [(call.model_names[0].split("/")[0]) for call in recorder.fit_calls] == traits * len(ARMS)
+    # Trait by trait, both arms of a trait back to back, so a budget that stops the fit leaves complete comparisons.
+    assert [(call.model_names[0].split("/")[0]) for call in recorder.fit_calls] == [trait for trait in traits for _arm in ARMS]
     names = design["covariate_names"]
     structure = {"intercept", "pipeline_half=B", "genotype_source=long_read", "PC1", "PC2", "PC3"}
     own = {
@@ -575,17 +576,12 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         observed = np.isfinite(cohort["targets"][:, traits.index(trait)])
         assert call.covariates.shape[1] == len(call.covariate_names) == len(names) - 1
         assert len(call.research_ids) == len(call.store_columns) == observed.sum()
-        arm = ARMS[call_index // len(traits)]
-        # A disease's model leaves out the covariates that separate its own training labels (here the long-read
-        # indicator, on the folds whose long-read training rows hold no case), and the fit record says which.
-        left_out = json.loads((run / "fit" / "models" / arm / f"{trait}.json").read_text())["separating_covariates_left_out"]
-        if trait == "atrial_fibrillation":
-            assert ["genotype_source=long_read"] in left_out and all(set(dropped) <= {"genotype_source=long_read"} for dropped in left_out)
-        else:
-            assert left_out == [[]] * 3
+        arm = ARMS[call_index % len(ARMS)]
+        # Every model, a disease's included, is fitted on the Gaussian working likelihood (FIT_TRAIT_TYPE).
+        assert call.trait_types == (TraitType.QUANTITATIVE,) * 3
         for model in range(3):
             used = {name for name, used in zip(names[1:], call.covariate_columns[model]) if used}
-            assert used == (structure | own[trait]) - {"intercept"} - set(left_out[model])
+            assert used == (structure | own[trait]) - {"intercept"}
             assert np.all(np.isnan(call.targets[~call.training[:, model], model]))
         folds = cohort["folds"][observed]
         assert all(not np.any(call.training[:, fold] & (folds == fold)) for fold in range(2)) and call.training[:, 2].all()
@@ -593,7 +589,7 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         np.testing.assert_array_equal(call.log_variance_offset, expected)
     # Both arms of a trait share a seed (common random numbers); the traits' seeds differ.
     seeds = [call.seed for call in recorder.fit_calls]
-    assert seeds[: len(traits)] == seeds[len(traits) :] and len(set(seeds)) == len(traits)
+    assert seeds[0::2] == seeds[1::2] and len(set(seeds)) == len(traits)
     # A trait's own columns are 0 on the rows it does not observe.
     bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
     assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)

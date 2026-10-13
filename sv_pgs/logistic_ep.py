@@ -48,7 +48,7 @@ from scipy import linalg
 from scipy.optimize import linprog
 from scipy.special import log_expit, ndtr
 
-from sv_pgs._typing import BoolArray, F64Array, I64Array
+from sv_pgs._typing import F64Array, I64Array
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _LOG_SIGMOID_CURVATURE_BOUND = 0.25
@@ -318,25 +318,6 @@ def assert_no_separation(covariates: F64Array, labels: F64Array) -> None:
             f"the covariates (quasi-)separate the labels along direction {direction.tolist()};"
             " restrict the cohort to the at-risk group or drop the separating covariate."
         )
-
-
-def unseparated_columns(covariates: F64Array, labels: F64Array) -> BoolArray:
-    """The covariate columns (column 0 the intercept) a binary model keeps so that no direction separates its labels.
-
-    A quasi-separating covariate has an infinite maximum-likelihood coefficient (typically an indicator whose group
-    holds no case of the disease), so the model cannot adjust for it. Every column other than the intercept on a
-    separating direction's support is dropped, and the test repeats on the columns left, until no direction
-    separates. A direction on the intercept alone means every label is the same, which no covariate choice fixes,
-    and raises.
-    """
-    design = np.asarray(covariates, dtype=np.float64)
-    kept = np.ones(design.shape[1], dtype=bool)
-    while (direction := separating_direction(design[:, kept], labels)) is not None:
-        support = np.flatnonzero(kept)[direction != 0.0]
-        if np.all(support == 0):
-            raise SeparatedLabels("every training label is the same, so no binary model can be fitted.")
-        kept[support[support != 0]] = False
-    return kept
 
 
 def _joint_precision(design: F64Array, covariates: F64Array, prior_precision: F64Array, sites: SampleSites) -> tuple[F64Array, F64Array]:

@@ -116,7 +116,6 @@ from sv_pgs.draw_laws import tile_rows
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.fit_model import FitRequest
 from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_log_loss, paired_delta_r2
-from sv_pgs.logistic_ep import unseparated_columns
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -1899,6 +1898,16 @@ def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str
     return np.where(structural & (not ARM_KEEPS_STRUCTURAL[arm]), -np.inf, np.asarray(log_reliability, dtype=np.float64))
 
 
+FIT_TRAIT_TYPE = TraitType.QUANTITATIVE
+"""The likelihood every workspace model is fitted on: a disease's 0/1 outcome on the Gaussian working likelihood
+(README, "a Gaussian working likelihood on a liability target"), as a quantitative trait is. Its models then take the
+summary band (``stage2_wiring``: Stage 0 reads the store once, and every later pass is over the LD summaries), where the
+Polya-Gamma route re-reads every genotype on each sweep because its weights move with its sites: hundreds of passes of
+the whole store per model, which the study's compute budget does not hold at All of Us scale. The report reads a disease
+by rank (AUC) and by a recalibrated logistic likelihood of its linear predictor, both of which the working likelihood's
+linear predictor serves; its effects are per-allele changes in the outcome's probability scale."""
+
+
 def trait_seed(seed: int, trait: int) -> int:
     """One trait's fit seed from the run's: both arms of a trait share it, so their probes and draws are common random
     numbers and the arms' difference carries none of their Monte Carlo noise."""
@@ -1912,19 +1921,14 @@ def trait_request(
 
     Every model adjusts for its own trait's covariates and the structure columns, never another trait's; the
     covariate names are the cohort's whole union, so every trait's fitted model scores with the same covariates
-    (``artifact.predict_models``). A disease's model leaves out the covariates that (quasi-)separate its training
-    labels (``logistic_ep.unseparated_columns``: typically an indicator whose group holds none of its cases), whose
-    coefficients have no finite maximum. A row's target is read only where its model trains on it.
+    (``artifact.predict_models``). A row's target is read only where its model trains on it.
+
+    Every model is fitted on the Gaussian likelihood (FIT_TRAIT_TYPE), a disease's 0/1 outcome included.
     """
     models = cohort.trait_models(trait)
     training = cohort.training[:, models]
     rows = training.any(axis=1)
     adjusted = cohort.covariate_columns[np.full(models.size, trait)]
-    if cohort.trait_types[trait] == TraitType.BINARY:
-        for index, model in enumerate(models.tolist()):
-            own = np.flatnonzero(adjusted[index])
-            trained = cohort.training[:, model]
-            adjusted[index, own] = unseparated_columns(cohort.covariates[trained][:, own], cohort.targets[trained, trait])
     return FitRequest(
         store=store,
         store_columns=cohort.store_columns[rows],
@@ -1934,7 +1938,7 @@ def trait_request(
         targets=np.where(training, cohort.targets[:, [trait]], np.nan)[rows],
         training=training[rows],
         model_names=tuple(cohort.model_names[model] for model in models),
-        trait_types=(cohort.trait_types[trait],) * models.size,
+        trait_types=(FIT_TRAIT_TYPE,) * models.size,
         research_ids=tuple(np.asarray(cohort.research_ids)[rows].tolist()),
         log_variance_offset=log_variance_offset,
         budget=budget,
@@ -1950,17 +1954,25 @@ def _fitted_model_directory(run: _Run, arm: str, trait_name: str) -> Path:
 def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every (arm, trait) fit, each saved on its own as it finishes: a rerun after a preemption resumes at the first
     (arm, trait) whose model is not on disk (``artifact.save_model`` renames a complete model into place, so a model
-    directory that exists is whole). Each saved model's outcome is recorded beside it, from the saved model."""
+    directory that exists is whole). Each saved model's outcome is recorded beside it, from the saved model.
+
+    The fits run trait by trait in the config's order, both arms of a trait back to back, so a run its budget stops
+    (``launcher/workspace``: each job's runtime is bounded) holds complete arm comparisons for the traits it reached.
+    After each trait the log gives the hours its fits took and the step's projected total."""
     cohort = _read_cohort(run)
     # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote the store's
     # dosages in the measurement step). The fit has no term for its residual variances or its leakage maps, and none for
     # a target variance, so it is not handed either.
     measurement = run.bindings.load_measurement_model(run.output("measurement") / MEASUREMENT_MODEL_FILE)
     records: dict[str, dict[str, Any]] = {arm: {} for arm in ARMS}
+    fitted_seconds: list[float] = []
     with DosageStore.open(_final_store(run)) as store:
-        for arm in ARMS:
-            offsets = arm_log_reliability(store.variant_table, measurement.log_reliability, arm)
-            for trait, trait_name in enumerate(cohort.trait_names):
+        offsets_of = {arm: arm_log_reliability(store.variant_table, measurement.log_reliability, arm) for arm in ARMS}
+        for trait, trait_name in enumerate(cohort.trait_names):
+            started = time.perf_counter()
+            fitted_here = False
+            for arm in ARMS:
+                offsets = offsets_of[arm]
                 target = directory / "models" / arm / trait_name
                 record = target.with_name(target.name + ".json")
                 if not record.is_file():
@@ -1973,19 +1985,15 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         LOGGER.info("workspace pipeline: fitting %s / %s", arm, trait_name)
                         run.bindings.save_model(target, run.bindings.fit(request))
+                        fitted_here = True
                     fitted = run.bindings.load_model(target)
                     if tuple(fitted.model_names) != request.model_names:
                         raise ValueError(f"the {arm} fit of {trait_name} returned other models than the trait's training sets.")
-                    wanted = cohort.covariate_columns[trait, 1:]
                     _write_json(
                         record,
                         {
                             "models": list(fitted.model_names),
                             "completed_fold_timings": checkpoint_timings(work),
-                            "separating_covariates_left_out": [
-                                [name for name, own, used in zip(request.covariate_names, wanted, columns) if own and not used]
-                                for columns in request.covariate_columns
-                            ],
                             "fitted_records": [int(scoring.store_rows.shape[0]) for scoring in fitted.scoring],
                             CERTIFICATE_STATUS: [bool(met) for met in np.asarray(fitted.certificate[CERTIFICATE_STATUS])],
                             "refusals": [str(refusal) for refusal in fitted.refusals],
@@ -1993,6 +2001,14 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                     )
                     _remove_own(work, directory)
                 records[arm][trait_name] = json.loads(record.read_text(encoding="utf-8"))
+            if fitted_here:
+                fitted_seconds.append(time.perf_counter() - started)
+                remaining = len(cohort.trait_names) - trait - 1
+                LOGGER.info(
+                    "workspace pipeline: %s's fits took %.2f h in this run; at this run's mean of %.2f h a trait, the %d traits "
+                    "left need %.1f h more", trait_name, fitted_seconds[-1] / 3600.0, np.mean(fitted_seconds) / 3600.0, remaining,
+                    remaining * np.mean(fitted_seconds) / 3600.0,
+                )
     _remove_own(directory / "work", directory)
     return {
         "arms": {
@@ -2237,11 +2253,6 @@ def _partial_r2(target: F64Array, score: F64Array, covariates: F64Array) -> floa
     return float(np.corrcoef(target_residual, score_residual)[0, 1] ** 2)
 
 
-def _log_loss(labels: F64Array, probabilities: F64Array) -> float:
-    with np.errstate(divide="ignore"):
-        return float(-np.mean(np.where(labels > 0.5, np.log(probabilities), np.log1p(-probabilities))))
-
-
 @dataclass(frozen=True, slots=True)
 class _HeldOutCell:
     """One report cell of one trait, split by fold: each fold's held-out rows in the cell (its own model scored them)."""
@@ -2318,14 +2329,12 @@ def _scored_folds(held: _HeldOutCell, targets: F64Array, binary: bool) -> list[I
     return [rows for rows in held.folds if rows.shape[0] and np.ptp(targets[rows]) > 0.0]
 
 
-def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, probability: F64Array, covariates: F64Array) -> float:
+def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, covariates: F64Array) -> float:
     """One arm's held-out metric on one fold's rows (``_report_step``)."""
     if metric == "auc":
         return auc_components(targets, linear).auc
     if metric == "pgs_auc":
         return auc_components(targets, genetic).auc
-    if metric == "log_loss":
-        return _log_loss(targets, probability)
     if metric == "r2":
         return _partial_r2(targets, linear, np.ones((targets.shape[0], 1)))
     if metric == "pgs_partial_r2":
@@ -2361,8 +2370,8 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     (``comparison.tsv``), per trait in cells of all held-out rows, fold, ancestry and half.
 
     Every value is each fold's own model evaluated on its own fold, then weighted by the fold's rows. A disease is
-    scored by the AUC of its linear predictor, the AUC of its genetic score alone and the log loss of its predictive
-    probability; a quantitative trait by the r^2 of its linear predictor and the partial r^2 of its genetic score
+    scored by the AUC of its linear predictor and the AUC of its genetic score alone (its working likelihood's
+    predictive mean is not a probability, FIT_TRAIT_TYPE); a quantitative trait by the r^2 of its linear predictor and the partial r^2 of its genetic score
     given the trait's covariates. The comparison is paired on the same people: a disease's DeLong delta AUC of the
     linear predictors and of the genetic scores (with family-clustered variance) and its family-clustered gain in
     recalibrated log likelihood; a
@@ -2379,7 +2388,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
         binary = cohort.trait_types[trait] == TraitType.BINARY
         covariates = cohort.covariates[:, cohort.covariate_columns[trait]]
         targets = cohort.targets[:, trait]
-        metric_names = ("auc", "pgs_auc", "log_loss") if binary else ("r2", "pgs_partial_r2")
+        metric_names = ("auc", "pgs_auc") if binary else ("r2", "pgs_partial_r2")
         comparison_names = ("delta_auc", "delta_pgs_auc", "log_likelihood_gain") if binary else ("delta_pgs_partial_r2",)
         for cell, level, held in _cells(cohort, trait, fold_count):
             count = held.count
@@ -2389,9 +2398,8 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
             for arm_index, arm in enumerate(ARMS):
                 linear = scores.held_out_linear_predictor[arm_index, :, trait]
                 genetic = scores.held_out_genetic[arm_index, :, trait]
-                probability = scores.held_out_predictive_mean[arm_index, :, trait]
                 for metric in metric_names:
-                    values = [(rows.shape[0], _held_out_metric(metric, targets[rows], linear[rows], genetic[rows], probability[rows], covariates[rows])) for rows in folds]
+                    values = [(rows.shape[0], _held_out_metric(metric, targets[rows], linear[rows], genetic[rows], covariates[rows])) for rows in folds]
                     accuracy.append((name, arm, cell, level, *counts, *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
             # The paired comparison per cell of all held-out rows and per ancestry group (a fold is one term of
             # every cell's sum, and the halves are a measurement split rather than a population).
@@ -2494,7 +2502,7 @@ _STEPS = (
         (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store),
         _measurement_step,
     ),
-    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, code_digest()), (_fit_step, arm_log_reliability, trait_request, trait_seed, unseparated_columns), _fit_step),
+    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, code_digest()), (_fit_step, arm_log_reliability, trait_request, trait_seed), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step,), _score_step),
     _Step("effects", ("cohort", "fit"), lambda config: None, (_effects_step, variant_effects, length_bins), _effects_step),
     _Step(
