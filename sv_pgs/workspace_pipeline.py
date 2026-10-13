@@ -99,6 +99,7 @@ from sv_pgs.all_of_us import (
     phenotype_fingerprint,
     prepare_all_of_us_disease_sample_table,
     prepare_all_of_us_measurement_sample_table,
+    reportable_count,
     resolve_disease_definition,
     resolve_measurement_definition,
 )
@@ -113,7 +114,6 @@ from sv_pgs.cohort import (
     pipeline_half_levels,
     read_kinship_pairs,
     read_predicted_ancestry,
-    reportable_count,
     resolve_cohort_rows,
 )
 from sv_pgs.artifact import CERTIFICATE_STATUS, model_part

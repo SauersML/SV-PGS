@@ -766,7 +766,7 @@ def test_diagnosis_roots_distinct_drug_dates_and_case_procedures(cdr: _Cdr):
 
     training_rows, _columns, counts = _prepare_training_rows(cataract_definition, list(cataract.values()), [])
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 0, "2": 0, "3": 1, "5": 1}
-    assert counts["n_cases_by_procedure"] == 2 and counts["n_excluded_ambiguous_code"] == 1
+    assert counts["n_cases_by_evidence"] == {"procedure": 2} and counts["n_excluded_ambiguous_code"] == 1
 
 
 def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
@@ -813,7 +813,7 @@ def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     rows = list(cdr.disease_rows(kidney).values())
     training_rows, _columns, counts = _prepare_training_rows(kidney, rows, [egfr_evidence, {}])
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1, "4": 0, "6": 1}
-    assert counts["n_cases_by_lab"] == 2 and counts["n_excluded_lab_evidence"] == 2
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 1, "lab": 2} and counts["n_excluded_lab_evidence"] == 2
     assert albuminuria_criterion.measurement == "urine_albumin_creatinine_ratio"
 
 
@@ -852,7 +852,7 @@ def test_hypertension_cases_need_codes_first_line_support_or_repeated_systolic_r
 
     training_rows, _columns, counts = _prepare_training_rows(hypertension, list(rows.values()), [evidence])
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "8": 1, "9": 0, "11": 0}
-    assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 2, "lab": 1} and counts["n_excluded_lab_evidence"] == 1
     assert counts["n_excluded_ambiguous_code"] == 2 and counts["n_excluded_one_date"] == 1
     assert counts["n_excluded_control_exclusion"] == 2
 
@@ -880,7 +880,7 @@ def test_coronary_artery_disease_cases_come_from_codes_or_revascularization(cdr:
 
     training_rows, _columns, counts = _prepare_training_rows(coronary, list(rows.values()), [])
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "3": 1, "8": 0, "9": 1}
-    assert counts["n_cases_by_procedure"] == 2 and counts["n_excluded_one_date"] == 1
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 2, "procedure": 2} and counts["n_excluded_one_date"] == 1
     assert counts["n_excluded_control_exclusion"] == 2 and counts["n_excluded_ambiguous_code"] == 1
 
 
@@ -942,7 +942,7 @@ def test_hyperlipidemia_cases_come_from_codes_ldl_lowering_support_or_repeated_l
 
     training_rows, _columns, counts = _prepare_training_rows(hyperlipidemia, list(rows.values()), [evidence])
     assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "2": 1, "7": 1, "9": 0, "10": 0}
-    assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 2, "lab": 1} and counts["n_excluded_lab_evidence"] == 1
     assert counts["n_excluded_one_date"] == 1 and counts["n_excluded_control_exclusion"] == 2
     assert counts["n_excluded_ambiguous_code"] == 1
 

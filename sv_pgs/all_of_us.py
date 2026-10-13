@@ -1283,11 +1283,8 @@ def prepare_all_of_us_disease_sample_table(
     training_rows, encoded_categorical_columns, phenotype_counts = _prepare_training_rows(
         disease_definition, rows, lab_evidence
     )
-    LOGGER.info(
-        "Prepared All of Us phenotype rows: n_cases=%d n_controls=%d",
-        phenotype_counts["n_cases"],
-        phenotype_counts["n_controls"],
-    )
+    reported = _reported_disease_counts(len(rows), len(training_rows), phenotype_counts)
+    LOGGER.info("Prepared All of Us phenotype rows: n_cases=%s n_controls=%s", reported["n_cases"], reported["n_controls"])
 
     header = (
         "sample_id",
@@ -1352,9 +1349,7 @@ def prepare_all_of_us_disease_sample_table(
                 "cdr_dataset_env": "WORKSPACE_CDR",
                 "billing_project": billing_project,
                 "cdr_dataset": _require_env("WORKSPACE_CDR"),
-                "raw_row_count": len(rows),
-                "row_count": len(training_rows),
-                **phenotype_counts,
+                **reported,
                 "encoded_categorical_covariates": encoded_categorical_columns,
             },
             indent=2,
@@ -1366,6 +1361,21 @@ def prepare_all_of_us_disease_sample_table(
         sql_path=sql_path,
         metadata_path=metadata_path,
     )
+
+
+def _reported_disease_counts(raw_row_count: int, row_count: int, phenotype_counts: Mapping[str, Any]) -> dict[str, Any]:
+    """The disease's participant counts as its metadata and log write them: the participants the query returned split
+    into the sample table's rows and each exclusion reason, the rows into cases and controls, and the cases by their
+    evidence, each split by reportable_partition, so no count of 1 to 20 is written or follows from those written."""
+    raw = reportable_count(raw_row_count)
+    reported: dict[str, Any] = {"raw_row_count": raw} | reportable_partition(
+        raw, {"row_count": row_count, **{name: phenotype_counts[name] for name in _PHENOTYPE_EXCLUSION_COUNTS}}
+    )
+    reported |= reportable_partition(
+        reported["row_count"], {name: phenotype_counts[name] for name in ("n_cases", "n_controls")}
+    )
+    reported["n_cases_by_evidence"] = reportable_partition(reported["n_cases"], phenotype_counts["n_cases_by_evidence"])
+    return reported
 
 
 def _medication_metadata(medication: MedicationClass | None) -> dict[str, Any] | None:
@@ -1908,6 +1918,9 @@ def build_all_of_us_measurement_targets(
         "excluded_row_counts": {
             reason: sum(person.excluded_row_counts[reason] for person in people) for reason in MEASUREMENT_EXCLUSION_REASONS
         },
+        "excluded_row_person_counts": {
+            reason: sum(person.excluded_row_counts[reason] > 0 for person in people) for reason in MEASUREMENT_EXCLUSION_REASONS
+        },
         "unrecognized_unit_person_counts": dict(unrecognized_unit_persons.most_common()),
         "n_occasions": int(counts.sum()),
         "occasions_per_person_quartiles": [float(value) for value in np.quantile(counts, (0.25, 0.5, 0.75))],
@@ -1991,10 +2004,11 @@ def prepare_all_of_us_measurement_sample_table(
     training_rows, encoded_categorical_columns, summary = build_all_of_us_measurement_targets(
         definition, rows, detect_compute_budget().host_bytes
     )
+    reported = _reported_trait_counts(summary)
     LOGGER.info(
-        "Prepared All of Us trait %s: n_persons=%d measurement model: %s; repeatability=%s mean_reliability=%.3f",
+        "Prepared All of Us trait %s: n_persons=%s measurement model: %s; repeatability=%s mean_reliability=%.3f",
         definition.canonical_name,
-        summary["n_persons"],
+        reported["n_persons"],
         summary["measurement_model"],
         summary["repeatability"],
         summary["mean_target_reliability"],
@@ -2073,6 +2087,7 @@ def prepare_all_of_us_measurement_sample_table(
                 "billing_project": billing_project,
                 "cdr_dataset": _require_env("WORKSPACE_CDR"),
                 **summary,
+                **reported,
                 "encoded_categorical_covariates": encoded_categorical_columns,
             },
             indent=2,
@@ -2089,6 +2104,55 @@ def prepare_all_of_us_measurement_sample_table(
 # The All of Us Data and Statistics Dissemination Policy releases no count of
 # 1 to 20 participants: a reported cell needs at least 21.
 MINIMUM_REPORTED_PARTICIPANTS = 21
+
+
+def reportable_count(count: int) -> str:
+    """The All of Us dissemination rule: a count of 1 to 20 participants is never written out."""
+    return str(count) if count == 0 or count >= MINIMUM_REPORTED_PARTICIPANTS else "1-20 (suppressed)"
+
+
+def reportable_partition(total: str, parts: Mapping[str, int]) -> dict[str, str]:
+    """Participant counts that partition a total, as written beside it (``total`` as written, reportable_count).
+
+    A part of 1 to 20 is suppressed, and with it the smallest other parts until the suppressed parts together hold
+    MINIMUM_REPORTED_PARTICIPANTS or more, so no count of 1 to 20 follows from the total less the written parts.
+    Under a suppressed total every part but a 0 is suppressed, so the parts never give the total back.
+    """
+    suppressed = {name for name, count in parts.items() if count and (count < MINIMUM_REPORTED_PARTICIPANTS or not total.isdigit())}
+    complements = sorted((count, name) for name, count in parts.items() if count and name not in suppressed)
+    while total.isdigit() and 0 < sum(parts[name] for name in suppressed) < MINIMUM_REPORTED_PARTICIPANTS:
+        suppressed.add(complements.pop(0)[1])
+    return {name: "suppressed" if name in suppressed else str(count) for name, count in parts.items()}
+
+
+def _reported_trait_counts(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """The trait summary's participant counts as its metadata and log write them: the persons with analyte rows split
+    by what became of them and the kept ones by their occasions' source (reportable_partition), and each exclusion
+    reason's and unit label's persons on their own (reportable_count). A count of rows or occasions is written only
+    beside a written count of the participants it belongs to, as the census writes neither below it."""
+    persons = reportable_count(summary["n_persons_with_analyte_rows"])
+    reported: dict[str, Any] = {"n_persons_with_analyte_rows": persons} | reportable_partition(persons, {
+        name: summary[name]
+        for name in ("n_persons", "n_persons_without_retained_occasion", "n_persons_sex_at_birth_unknown", "n_persons_treated_only_excluded")
+    })
+    reported["n_persons_by_source"] = reportable_partition(reported["n_persons"], summary["n_persons_by_source"])
+    reported["n_measurement_rows"] = _beside(persons, summary["n_measurement_rows"])
+    reported["n_occasions"] = _beside(reported["n_persons"], summary["n_occasions"])
+    reported["excluded_row_person_counts"] = {
+        reason: reportable_count(count) for reason, count in summary["excluded_row_person_counts"].items()
+    }
+    reported["excluded_row_counts"] = {
+        reason: _beside(reported["excluded_row_person_counts"][reason], count) for reason, count in summary["excluded_row_counts"].items()
+    }
+    reported["unrecognized_unit_person_counts"] = {
+        label: reportable_count(count) for label, count in summary["unrecognized_unit_person_counts"].items()
+    }
+    return reported
+
+
+def _beside(participants: str, count: int) -> str:
+    """A count of rows or occasions, written only beside a written count of the participants it belongs to."""
+    return str(count) if participants.isdigit() else "suppressed"
 
 
 def build_all_of_us_measurement_census_sql() -> str:
@@ -2255,7 +2319,7 @@ def _prepare_training_rows(
     disease_definition: DiseaseDefinition,
     rows: list[dict[str, Any]],
     lab_evidence: Sequence[dict[str, dict[str, Any]]],
-) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, int]]:
+) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, Any]]:
     """Apply DiseaseDefinition's case and control rules to the disease query's rows.
 
     ``lab_evidence`` holds, per lab criterion, fetch_all_of_us_lab_criterion_rows.
@@ -2265,7 +2329,8 @@ def _prepare_training_rows(
     evidence, qualifying lab values short of the criterion, or a control
     exclusion code or drug. A case's age of onset is its earliest evidence:
     first diagnosis, first case procedure or first qualifying lab occasion of a
-    met criterion.
+    met criterion. Cases are counted by their evidence, the kinds they have
+    joined by "+" ("diagnosis+lab"), so the counts partition them.
     """
     criteria = disease_definition.lab_criteria
     if len(lab_evidence) != len(criteria):
@@ -2311,15 +2376,8 @@ def _prepare_training_rows(
             if onset_age < disease_definition.minimum_case_age_years:
                 exclusion_counts["n_excluded_age"] += 1
                 continue
-            case_evidence_counts.update(
-                name
-                for name, present in (
-                    ("n_cases_by_diagnosis", diagnosed),
-                    ("n_cases_by_procedure", procedure_case),
-                    ("n_cases_by_lab", bool(met_lab_ages)),
-                )
-                if present
-            )
+            evidence = (("diagnosis", diagnosed), ("procedure", procedure_case), ("lab", bool(met_lab_ages)))
+            case_evidence_counts["+".join(name for name, present in evidence if present)] += 1
             training_rows.append(dict(row, target=1, age_at_onset=onset_age))
         elif occurrence_count >= 1:
             # One diagnosis date without supporting evidence: neither a clean
@@ -2357,7 +2415,7 @@ def _prepare_training_rows(
         {
             "n_cases": int(targets.sum()),
             "n_controls": int(len(targets) - targets.sum()),
-            **{name: case_evidence_counts[name] for name in ("n_cases_by_diagnosis", "n_cases_by_procedure", "n_cases_by_lab")},
+            "n_cases_by_evidence": dict(sorted(case_evidence_counts.items())),
             **{name: exclusion_counts[name] for name in _PHENOTYPE_EXCLUSION_COUNTS},
         },
     )

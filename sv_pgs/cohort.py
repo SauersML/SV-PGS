@@ -20,7 +20,7 @@ from typing import Mapping, Sequence
 import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
-from sv_pgs.all_of_us import MINIMUM_REPORTED_PARTICIPANTS
+from sv_pgs.all_of_us import reportable_count
 from sv_pgs.dosage_store import HalfSamples
 from sv_pgs.sample_crosswalk import SampleCrosswalk, store_research_ids
 from sv_pgs.sample_ids import ResearchId, SequencingId
@@ -148,11 +148,6 @@ def _research_id_values(research_ids: Sequence[ResearchId]) -> list[str]:
     if not all(isinstance(research_id, ResearchId) for research_id in research_ids):
         raise TypeError("the cohort is keyed by ResearchId; map imputed samples through the crosswalk first.")
     return [research_id.value for research_id in research_ids]
-
-
-def reportable_count(count: int) -> str:
-    """The All of Us dissemination rule: a count of 1 to 20 participants is never written out."""
-    return str(count) if count == 0 or count >= MINIMUM_REPORTED_PARTICIPANTS else "1-20 (suppressed)"
 
 
 @dataclass(frozen=True, slots=True)

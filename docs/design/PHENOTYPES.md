@@ -67,6 +67,11 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
   - Otherwise the target is the mean of each person's Box–Cox-transformed readings, the exponent learned from their Gaussian marginal, with reliability 1. The noise then stays in the genetic model's residual. The run logs this, and the metadata's `measurement_model` records it (lead ruling).
 - **Covariates:** mean age, its square, its product with female sex, and sex at birth. The occasion count is not a covariate: how often a trait is measured depends on its level, so adjusting for it attenuates every genetic effect (novel-pheno Theorem 5). Each person's precision enters through the target's reliability instead.
 
+## Counts written out
+The sample tables' metadata and the run's log write no participant count of 1 to 20 (the All of Us dissemination rule), nor one that follows from those written:
+- Counts that split a written total are suppressed together: a count of 1 to 20 takes the smallest other counts with it until the suppressed ones hold 21 or more, and under a suppressed total every count but a 0 is suppressed. For a disease, the participants the query returned split into the table's rows and each exclusion reason, the rows into cases and controls, and the cases by their evidence (diagnosis, procedure, lab, or a combination). For a trait, the persons with analyte rows split by what became of them, and the kept persons by their occasions' source.
+- A count of rows or occasions is written only beside a written count of the participants it belongs to, as in the census. The persons per exclusion reason and per unrecognized unit, which split no written total, are each written only when 0 or 21 or more.
+
 ## Which values are standards
 Kept, and cited where they are defined:
 - **Codes and concept ids:** SNOMED, LOINC, ATC and CPT codes, OMOP concept ids, and the All of Us physical-measurement concepts.

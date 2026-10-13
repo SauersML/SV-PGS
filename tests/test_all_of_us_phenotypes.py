@@ -60,6 +60,7 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_measurement_sample_table,
     resolve_disease_definition,
     resolve_lab_criterion_measurement,
+    reportable_partition,
     resolve_measurement_definition,
 )
 from sv_pgs.cli import main
@@ -383,8 +384,10 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert float(rows[0]["liability_target"]) > 0.0 > float(rows[1]["liability_target"])
     assert rows[0]["sex_at_birth_concept_id_45880669"] == "1"
     metadata_payload = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
-    assert metadata_payload["row_count"] == 2
-    assert metadata_payload["n_excluded_one_date"] == 1
+    # Three participants: each of their counts is 1 to 20, so none is written (All of Us dissemination rule).
+    assert metadata_payload["raw_row_count"] == "1-20 (suppressed)"
+    assert metadata_payload["row_count"] == metadata_payload["n_excluded_one_date"] == "suppressed"
+    assert metadata_payload["n_excluded_sex"] == "0"
     assert metadata_payload["covariate_columns"] == list(disease_covariate_columns())
     assert metadata_payload["phenotype_fingerprint"] == phenotype_fingerprint(resolve_disease_definition("afib"))
     assert metadata_payload["disease"] == "atrial_fibrillation"
@@ -395,6 +398,54 @@ def test_prepare_all_of_us_disease_sample_table_writes_outputs(tmp_path: Path, m
     assert "icd9_prefixes" not in metadata_payload
     assert metadata_payload["min_occurrences"] == 2
     assert metadata_payload["cdr_dataset"] == "aou_workspace.cdr_dataset"
+
+
+def test_a_count_partition_suppresses_every_count_of_one_to_twenty_and_what_would_give_it_back():
+    # One part of 1 to 20 takes the smallest other with it; two take others until they hold 21 or more together.
+    assert reportable_partition("1000", {"few": 5, "some": 30, "most": 965}) == {"few": "suppressed", "some": "suppressed", "most": "965"}
+    assert reportable_partition("1000", {"few": 5, "fewer": 3, "half": 500, "rest": 492}) == {
+        "few": "suppressed", "fewer": "suppressed", "half": "500", "rest": "suppressed",
+    }
+    assert reportable_partition("1000", {"none": 0, "all": 1000}) == {"none": "0", "all": "1000"}
+    # Under a suppressed total every part but a 0 is suppressed, so the parts never give the total back.
+    assert reportable_partition("suppressed", {"many": 50, "none": 0, "more": 30}) == {"many": "suppressed", "none": "0", "more": "suppressed"}
+
+
+def _written_counts(value: object) -> list[str]:
+    """Every count a metadata value writes (nested in dicts), as written."""
+    return [count for item in value.values() for count in _written_counts(item)] if isinstance(value, dict) else [str(value)]
+
+
+def _participant_counts_are_reportable(counts: list[str]) -> bool:
+    return all(not count.isdigit() or int(count) == 0 or int(count) >= 21 for count in counts)
+
+
+def test_disease_metadata_and_log_write_no_count_of_one_to_twenty(tmp_path: Path, monkeypatch, caplog):
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    # 40 cases, 100 controls, 25 with sparse early EHR and 3 with one diagnosis date: the 3 is suppressed, and with it
+    # the 25, the smallest other count, so that 168 - 140 - 25 does not give it back.
+    rows = [_disease_row(person_id, occurrence_count=3) for person_id in range(40)]
+    rows += [_disease_row(person_id, occurrence_count=0) for person_id in range(40, 140)]
+    rows += [_disease_row(person_id, occurrence_count=0, pre_landmark_condition_dates=2) for person_id in range(140, 165)]
+    rows += [_disease_row(person_id, occurrence_count=1) for person_id in range(165, 168)]
+    with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
+        outputs = prepare_all_of_us_disease_sample_table("afib", tmp_path / "afib.tsv", client=_FakeBigQueryClient(rows))
+    metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert (metadata["raw_row_count"], metadata["row_count"], metadata["n_cases"], metadata["n_controls"]) == ("168", "140", "40", "100")
+    assert metadata["n_excluded_one_date"] == metadata["n_excluded_sparse_ehr"] == "suppressed"
+    assert metadata["n_cases_by_evidence"] == {"diagnosis": "40"}
+    assert "n_cases=40 n_controls=100" in caplog.text
+
+    # Five cases: they and the controls, which would give them back, are suppressed, in the log as well.
+    caplog.clear()
+    with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
+        outputs = prepare_all_of_us_disease_sample_table("afib", tmp_path / "few.tsv", client=_FakeBigQueryClient(rows[35:]))
+    metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["row_count"] == "105" and metadata["n_cases"] == metadata["n_controls"] == "suppressed"
+    assert metadata["n_cases_by_evidence"] == {"diagnosis": "suppressed"}
+    assert "n_cases=suppressed n_controls=suppressed" in caplog.text
+    count_fields = ("raw_row_count", "row_count", "n_cases", "n_controls", "n_cases_by_evidence", *(name for name in metadata if name.startswith("n_excluded")))
+    assert _participant_counts_are_reportable([count for name in count_fields for count in _written_counts(metadata[name])])
 
 
 def _case_liability_within_rounding(probability: float):
@@ -542,7 +593,7 @@ def test_kidney_disease_cases_come_from_repeated_labs_or_staged_codes():
     assert {person: row["target"] for person, row in by_person.items()} == {"201": 1, "203": 1, "204": 1, "205": 0}
     # A lab case's onset is its first qualifying occasion (mid-year 1975 birthday).
     assert by_person["201"]["age_at_onset"] == (datetime.date(2019, 1, 1) - datetime.date(1975, 7, 1)).days / 365.25
-    assert counts["n_cases_by_lab"] == 2 and counts["n_cases_by_diagnosis"] == 1
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 1, "lab": 2}
     assert counts["n_excluded_lab_evidence"] == 1 and counts["n_excluded_control_exclusion"] == 1
 
 
@@ -564,7 +615,7 @@ def test_case_support_medication_procedures_sex_and_age_rules():
     assert [(row["person_id"], row["target"], row["age_at_onset"]) for row in training_rows] == [
         ("401", 1, 50.0), ("402", 0, None)
     ]
-    assert counts["n_cases_by_procedure"] == 1
+    assert counts["n_cases_by_evidence"] == {"procedure": 1}
 
     prostate = resolve_disease_definition("prostate_cancer")
     men_and_women = [
@@ -605,8 +656,10 @@ def test_sparse_early_ehr_excludes_cases_and_controls_alike(monkeypatch, tmp_pat
         client=_FakeBigQueryClient(rows),
     )
     assert [row["person_id"] for row in _read_tsv_rows(outputs.sample_table_path)] == ["101", "103"]
+    assert _prepare_training_rows(resolve_disease_definition("gout"), rows, [])[2]["n_excluded_sparse_ehr"] == 2
     metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
-    assert metadata["n_excluded_sparse_ehr"] == 2
+    # Two of four participants: the metadata writes no count of 1 to 20.
+    assert metadata["n_excluded_sparse_ehr"] == "suppressed"
     assert metadata["min_pre_landmark_condition_dates"] == 5
 
 
@@ -1197,8 +1250,32 @@ def test_prepare_measurement_sample_table_writes_table_sql_and_metadata(tmp_path
     assert [window["name"] for window in metadata["clinical_windows"]] == ["acute_hepatobiliary", "cirrhosis"]
     assert metadata["query_parameters"]["loinc_codes"] == ["1975-2"]
     assert metadata["cdr_dataset"] == DATASET
-    assert metadata["n_persons"] == 120
+    assert metadata["n_persons"] == metadata["n_persons_with_analyte_rows"] == "120"
     assert 0.0 < metadata["repeatability"] < 1.0
+
+
+def test_trait_metadata_and_log_write_no_count_of_one_to_twenty(tmp_path: Path, monkeypatch, caplog):
+    _identity_transform_fit(monkeypatch)
+    monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    rows, _levels = _synthetic_person_rows(120, level_variance=1.0, noise_variance=1.0, seed=2)
+    # Three persons whose only rows are censored, in a unit the trait does not know: their count is suppressed, and
+    # with it the 120 kept, which 123 less it would give back; so are the rows of theirs.
+    for person_id in (900, 901, 902):
+        rows += _person_days(person_id, excluded={"censored": 2, "unrecognized_unit": 1}, unrecognized_unit_labels=["percent"])
+    with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
+        outputs = prepare_all_of_us_measurement_sample_table("total_bilirubin", tmp_path / "bilirubin.tsv", client=_FakeBigQueryClient(rows))
+    metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
+    assert metadata["n_persons_with_analyte_rows"] == "123"
+    assert metadata["n_persons"] == metadata["n_persons_without_retained_occasion"] == "suppressed"
+    assert metadata["n_persons_sex_at_birth_unknown"] == metadata["n_persons_treated_only_excluded"] == "0"
+    assert metadata["n_persons_by_source"] == {"untreated": "suppressed"} and metadata["n_occasions"] == "suppressed"
+    assert metadata["excluded_row_person_counts"]["censored"] == "1-20 (suppressed)"
+    assert metadata["excluded_row_counts"]["censored"] == "suppressed" and metadata["excluded_row_counts"]["nonpositive"] == "0"
+    assert metadata["unrecognized_unit_person_counts"] == {"percent": "1-20 (suppressed)"}
+    assert metadata["n_measurement_rows"] == str(sum(int(row["row_count"]) for row in rows))
+    assert "n_persons=suppressed" in caplog.text
+    count_fields = [name for name in metadata if name.startswith("n_") or name.endswith("_counts")]
+    assert _participant_counts_are_reportable([count for name in count_fields for count in _written_counts(metadata[name])])
 
 
 def test_prepare_measurement_sample_table_requires_workspace_cdr(tmp_path: Path, monkeypatch):
