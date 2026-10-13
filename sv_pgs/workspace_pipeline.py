@@ -109,7 +109,7 @@ from sv_pgs.cohort import (
     reportable_count,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS
+from sv_pgs.artifact import CERTIFICATE_STATUS, code_digest
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -2494,7 +2494,7 @@ _STEPS = (
         (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store),
         _measurement_step,
     ),
-    _Step("fit", ("cohort", "measurement"), lambda config: config.seed, (_fit_step, arm_log_reliability, trait_request, trait_seed, unseparated_columns), _fit_step),
+    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, code_digest()), (_fit_step, arm_log_reliability, trait_request, trait_seed, unseparated_columns), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step,), _score_step),
     _Step("effects", ("cohort", "fit"), lambda config: None, (_effects_step, variant_effects, length_bins), _effects_step),
     _Step(
