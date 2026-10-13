@@ -2077,6 +2077,11 @@ def _final_store(run: _Run) -> Path:
     return run.config.run_directory / run.summary("measurement")["store"]
 
 
+def _final_measurement_model(run: _Run) -> Path:
+    """The measurement model over the final store's records, the one the fit reads."""
+    return run.output("measurement") / MEASUREMENT_MODEL_FILE
+
+
 # ---------------------------------------------------------------------------
 # Steps 6-7: fit and score
 # ---------------------------------------------------------------------------
@@ -2164,7 +2169,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote the store's
     # dosages in the measurement step). The fit has no term for its residual variances or its leakage maps, and none for
     # a target variance, so it is not handed either.
-    measurement = run.bindings.load_measurement_model(run.output("measurement") / MEASUREMENT_MODEL_FILE)
+    measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     records: dict[str, dict[str, Any]] = {arm: {} for arm in ARMS}
     fitted_seconds: list[float] = []
     with DosageStore.open(_final_store(run)) as store:
@@ -2901,7 +2906,7 @@ _STEPS = (
         _measurement_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
+    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
