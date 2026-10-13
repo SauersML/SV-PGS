@@ -41,6 +41,36 @@ def array_decode(buffer, frames, samples, out):
     out[rows, columns] = buffer[frames.exception_offset[rows] + counts[rows] * sample_dtype.itemsize + within]
 
 
+def array_histograms(codes):
+    offsets = codes.astype(np.int64) + codec.CODE_VALUES * np.arange(codes.shape[0])[:, None]
+    return np.bincount(offsets.ravel(), minlength=codec.CODE_VALUES * codes.shape[0]).reshape(codes.shape[0], codec.CODE_VALUES)
+
+
+def benchmark_histograms(codes, repeats):
+    methods = [("array", array_histograms), ("compiled", codec._histograms)]
+    expected = np.stack([np.bincount(row, minlength=codec.CODE_VALUES) for row in codes])
+    peaks, times = {}, {name: [] for name, _ in methods}
+    for name, method in methods:
+        np.testing.assert_array_equal(method(codes), expected)
+        tracemalloc.start()
+        result = method(codes)
+        _, peaks[name] = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        del result
+    for repeat in range(repeats):
+        for name, method in methods[::1 if repeat % 2 == 0 else -1]:
+            start = time.perf_counter()
+            result = method(codes)
+            times[name].append(time.perf_counter() - start)
+            np.testing.assert_array_equal(result, expected)
+            del result
+    medians = {name: float(np.median(values)) for name, values in times.items()}
+    print(json.dumps({"stage": "histogram", "samples": codes.shape[1], "rows": codes.shape[0],
+                      "repeats": repeats, "bitwise_equal": True, "median_seconds": medians,
+                      "speedup": medians["array"] / medians["compiled"],
+                      "peak_traced_bytes_including_result": peaks}), flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--samples", type=int, nargs="+", default=[50_000, 100_000])
@@ -56,6 +86,7 @@ def main():
             levels = min(1 << (row % (codec.MAXIMUM_DEPTH + 1)), 255)
             codes[row] = rng.integers(0, levels, size=samples, dtype=np.uint8)
             codes[row, [0, samples - 1]] = 254
+        benchmark_histograms(codes, args.repeats)
         payload = codec.encode_chunk(codes)
         buffer = np.frombuffer(payload, dtype=np.uint8)
         frames = codec.row_frames(buffer, np.array([0]), np.array([len(payload)]), args.rows, samples, np.arange(args.rows))
@@ -77,7 +108,7 @@ def main():
                 times[name].append(time.perf_counter() - start)
                 np.testing.assert_array_equal(out, codes)
         medians = {name: float(np.median(values)) for name, values in times.items()}
-        print(json.dumps({"samples": samples, "rows": args.rows, "repeats": args.repeats,
+        print(json.dumps({"stage": "decode", "samples": samples, "rows": args.rows, "repeats": args.repeats,
                           "bitwise_equal": True, "median_seconds": medians,
                           "speedup": medians["array"] / medians["compiled"],
                           "peak_traced_scratch_bytes": peaks}), flush=True)

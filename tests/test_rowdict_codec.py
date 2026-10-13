@@ -38,6 +38,17 @@ def _frame_sizes(payload: bytes, chunk_rows: int) -> np.ndarray:
     return np.frombuffer(payload[: chunk_rows * rowdict_codec.ROW_SIZE_DTYPE.itemsize], dtype=rowdict_codec.ROW_SIZE_DTYPE)
 
 
+@pytest.mark.parametrize("samples", [1, 50_000, 100_000])
+def test_compiled_histograms_match_exact_counts_for_strided_and_repeated_codes(samples):
+    rng = np.random.default_rng(samples)
+    codes = rng.integers(0, 256, size=(5, samples), dtype=np.uint8)
+    codes[0] = 0
+    codes[1] = 255
+    for view in (codes, codes[::-1, ::-2]):
+        expected = np.stack([np.bincount(row, minlength=256) for row in view])
+        np.testing.assert_array_equal(rowdict_codec._histograms(view), expected)
+
+
 @pytest.mark.parametrize("samples", [1, 7, 4099])
 def test_chunks_round_trip_exactly_at_every_depth(samples: int) -> None:
     rng = np.random.default_rng(samples)

@@ -103,10 +103,18 @@ def slot_bytes(sample_count: int, depth: Any) -> Any:
     return -(-(sample_count * depth) // BITS_PER_CODE)
 
 
+@numba.njit(cache=True, nogil=True)
 def _histograms(codes: U8Array) -> I64Array:
-    rows = codes.shape[0]
-    offsets = codes.astype(np.int64) + CODE_VALUES * np.arange(rows, dtype=np.int64)[:, None]
-    return np.bincount(offsets.ravel(), minlength=CODE_VALUES * rows).reshape(rows, CODE_VALUES)
+    """Exact counts with one small table per row, without an int64 code expansion.
+
+    Writer threads already distribute chunks; release the GIL without starting
+    another pool or retaining any state between chunks.
+    """
+    counts = np.zeros((codes.shape[0], CODE_VALUES), dtype=np.int64)
+    for row in range(codes.shape[0]):
+        for sample in range(codes.shape[1]):
+            counts[row, codes[row, sample]] += 1
+    return counts
 
 
 def encode_chunk(codes: U8Array) -> bytes:
