@@ -178,3 +178,11 @@ def test_tree_digest_matches_serial_definition_without_trusting_timestamp_resolu
     assert tree_digest(tmp_path) == before
     (tmp_path / 'annotation').write_bytes(b'2')
     assert tree_digest(tmp_path) != before
+
+
+def test_exact_zero_draws_are_neither_positive_nor_negative_effects():
+    model = SimpleNamespace(store_rows=np.array([0]), signed_scales=np.array([127.]), coefficients=np.array([0.]),
+                            posterior_draws=DenseDraws(np.array([[0., 0., -1., 1.]])))
+    effects = variant_effects(model, np.array([127]), 1 << 20)
+    assert effects.probability_positive[0] == .25
+    assert effects.probability_negative[0] == .25

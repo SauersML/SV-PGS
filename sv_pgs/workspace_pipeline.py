@@ -2387,6 +2387,7 @@ class VariantEffects:
     mean: F64Array
     standard_deviation: F64Array
     probability_positive: F64Array
+    probability_negative: F64Array
 
 
 def variant_effects(scoring: Any, codes_per_unit: NDArray, working_bytes: int) -> VariantEffects:
@@ -2398,21 +2399,25 @@ def variant_effects(scoring: Any, codes_per_unit: NDArray, working_bytes: int) -
     variance = np.empty(rows.shape[0])
     coefficients = np.asarray(scoring.coefficients, dtype=np.float64)
     positive = np.empty(rows.shape[0])
+    negative = np.empty(rows.shape[0])
     step = tile_rows(law, working_bytes)
     for start in range(0, rows.shape[0], step):
         stop = min(start + step, rows.shape[0])
         if hasattr(law, "marginal_summary"):
-            variance[start:stop], positive[start:stop] = law.marginal_summary(start, stop, coefficients[start:stop])
+            variance[start:stop], positive[start:stop], negative[start:stop] = law.marginal_summary(
+                start, stop, coefficients[start:stop], include_negative=True)
         else:
             draws = law.tile(start, stop)
             variance[start:stop] = np.mean((draws - coefficients[start:stop, None]) ** 2, axis=1)
             positive[start:stop] = np.mean(draws > 0.0, axis=1)
+            negative[start:stop] = np.mean(draws < 0.0, axis=1)
     coefficients = np.asarray(scoring.coefficients, dtype=np.float64)
     return VariantEffects(
         store_rows=rows,
         mean=coefficients * unit,
         standard_deviation=np.sqrt(variance) * unit,
         probability_positive=positive,
+        probability_negative=negative,
     )
 
 
@@ -2518,6 +2523,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                         "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
                         "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
                         "probability_positive": effects.probability_positive,
+                        "probability_negative": effects.probability_negative,
                     }
                 ).to_csv(
                     directory / f"{trait_name}.{arm}.tsv.gz", sep="\t", index=False, float_format="%.6g",
@@ -2527,14 +2533,15 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                 frame = pd.DataFrame(
                     {
                         "variant_class": classes[rows], "length_bin": bins[rows], "mean": effects.mean,
-                        "probability_positive": effects.probability_positive, "root_mean_square": root_mean_square,
+                        "probability_positive": effects.probability_positive, "probability_negative": effects.probability_negative,
+                        "root_mean_square": root_mean_square,
                     }
                 )
                 for (variant_class, length_bin), group in frame.groupby(["variant_class", "length_bin"], sort=True):
                     absolute = np.abs(group["mean"].to_numpy())
                     summary_lines.append((
                         trait_name, arm, variant_class, length_bin, len(group), int((group["mean"] > 0.0).sum()), int((group["mean"] < 0.0).sum()),
-                        f"{group['probability_positive'].sum():.6g}", f"{(1.0 - group['probability_positive']).sum():.6g}",
+                        f"{group['probability_positive'].sum():.6g}", f"{group['probability_negative'].sum():.6g}",
                         f"{absolute.mean():.6g}", f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(group['root_mean_square'].to_numpy() ** 2)):.6g}",
                     ))
                 structural = lengths[rows] >= COMMUNITY_SV_MINIMUM_LENGTH

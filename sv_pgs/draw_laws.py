@@ -219,7 +219,7 @@ class ProductMixtureDraws:
         grid = int(np.shape(self.log_variance_grid)[0])
         return _FLOAT64_BYTES * (_ROW_INTERMEDIATES * grid + len(_DRAW_INTERMEDIATES) * int(self.draw_count))
 
-    def marginal_summary(self, start: int, stop: int, center: F64Array) -> tuple[F64Array, F64Array]:
+    def marginal_summary(self, start: int, stop: int, center: F64Array, *, include_negative: bool = False):
         """Analytic E[(beta-center)^2] and P(beta>0) of the represented mixture.
 
         Integrates every mixture component and lattice node, including components too
@@ -233,7 +233,7 @@ class ProductMixtureDraws:
         center = np.asarray(center, dtype=np.float64)
         if center.shape != rows.shape:
             raise ValueError("center must have one value per requested row")
-        variance, positive = np.zeros(rows.size), np.zeros(rows.size)
+        variance, positive, negative = np.zeros(rows.size), np.zeros(rows.size), np.zeros(rows.size)
         classes = np.asarray(self.class_index)[rows]
         for component, weight in enumerate(self.weights):
             if weight == 0:
@@ -249,7 +249,9 @@ class ProductMixtureDraws:
                 variance[local] += weight * np.sum(terms.responsibility * (conditional + (means - center[local, None]) ** 2), axis=1)
                 probability = np.where(conditional > 0, ndtr(shift[:, None] * np.sqrt(conditional)), 0.0)
                 positive[local] += weight * np.sum(terms.responsibility * probability, axis=1)
-        return variance, positive
+                probability_negative = np.where(conditional > 0, ndtr(-shift[:, None] * np.sqrt(conditional)), 0.0)
+                negative[local] += weight * np.sum(terms.responsibility * probability_negative, axis=1)
+        return (variance, positive, negative) if include_negative else (variance, positive)
 
     def tile(self, start: int, stop: int) -> F64Array:
         """Rows start..stop-1 of every draw: per component present among the draws and per class present in the rows,
