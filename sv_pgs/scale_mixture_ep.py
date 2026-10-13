@@ -4744,6 +4744,8 @@ def fit_hyperparameters(
     last_steps: list[HyperStep | None] = [None] * count
     # The realized gains of each model's consecutive accepted inner steps at its current weights (``_State.tail``).
     inner_gains: list[list[float]] = [[] for _model in range(count)]
+    # A provisional release has its own polish; a refused release restores the anchor's gain history.
+    anchor_gains: list[list[float]] = [[] for _model in range(count)]
     # Whether the model's last whole joint trial had no certified state at its own fixed point.
     whole_uncertifiable: list[bool] = [False] * count
 
@@ -4827,6 +4829,7 @@ def fit_hyperparameters(
         ))
         hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
         displaced[model], radii[model] = True, None
+        inner_gains[model] = anchor_gains[model]
 
     def inner(model: int, step: HyperStep | None, remaining: float, polishes: bool) -> _OuterTrial | None:
         newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
@@ -4855,20 +4858,23 @@ def fit_hyperparameters(
         tightened where they, not the decision's fixed part, stop it.
 
         remaining = predicted + fixed + S, with fixed the model's measured remainder at its last whole joint trial
-        and S the resolvable pieces: the state's certified V error, the step's, and the weights' remaining gain. Where
+        and S the resolvable pieces: the polish's remaining tail, the state's certified V error, the step's, and the
+        weights' remaining gain. The tail can fall through more inner steps, so it is never treated as fixed. Where
         predicted + fixed < tolerance < remaining, every piece is scaled by theta = M / S, M = tolerance - predicted -
         fixed (theory-ep's per-decision tightening: no fixed shares): each V is re-certified to theta times its
         error (``_outer_state`` and ``HyperStep.resolve``: more directions integrated exactly) and the weights' bound
         is tightened to theta times their gain (``HyperStep.tighten``), and the certificate is read again. A piece
         that cannot reach its share stays as measured, so a decision fails only on what no resolution removes."""
-        fixed = remainders[model] + state.tail
+        fixed = remainders[model]
         predicted = step.evidence - state.value
-        pieces = (state.error, step.evidence_error, step.stationarity_gain)
+        pieces = (state.tail, state.error, step.evidence_error, step.stationarity_gain)
         resolvable = float(sum(pieces))
         remaining = predicted + fixed + resolvable
         if not (predicted + fixed < tolerance < remaining) or not 0.0 < resolvable < np.inf:
             return state, step, predicted, remaining
         theta = (tolerance - predicted - fixed) / resolvable
+        if state.tail > 0.0:
+            polish_tolerances[model] = min(polish_tolerances[model], theta * state.tail)
         if state.error > 0.0:
             share = theta * state.error
             resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, share)
@@ -4894,13 +4900,13 @@ def fit_hyperparameters(
                 # further, to the resolution their share asks (a continued search, warm from these weights).
                 weight_tolerances[model] = min(weight_tolerances[model], share)
         predicted = step.evidence - state.value
-        return state, step, predicted, predicted + fixed + state.error + step.evidence_error + step.stationarity_gain
+        return state, step, predicted, predicted + fixed + state.tail + state.error + step.evidence_error + step.stationarity_gain
 
     def plan(model: int) -> _OuterTrial | None:
         state = states[model]
         planned = weight_tolerances[model]
-        # A polish's geometric sequence of gains belongs to one plan.
-        inner_gains[model] = []
+        # Keep the polish's contraction history when planning again at the same state. A new
+        # accepted joint state or a provisional release starts a new history below.
         # A release is judged from a polished state (below), so every other state's hyper step holds every edge: its
         # release trials (three maximizations per block at the range's centre) would be discarded. That includes a
         # state with no certified value yet (the fit's first plans, and every plan after a joint trial left the
@@ -4936,6 +4942,16 @@ def fit_hyperparameters(
             remainders[model] = abs(step.evidence - state.value)
         state, step, predicted, remaining = decide(model, state, step)
         states[model] = state
+        if (
+            remaining > tolerance and state.polished and not state.at_resolution
+            and max(state.decrement, state.tail) > polish_tolerances[model]
+        ):
+            # Tightening can ask for more inner work at the same coefficients. Do that before
+            # the repeated-plan guard declares the state stuck; keep the convergence target unchanged.
+            reopened = inner(model, step, remaining, True)
+            if reopened is not None:
+                states[model] = replace(states[model], polished=False)
+                return reopened
         previous = planned_at[model]
         planned_at[model] = (hyperparameters[model].coefficients.copy(), np.array(hyperparameters[model].log_smoothing, dtype=np.float64, copy=True))
         if (
@@ -4987,6 +5003,7 @@ def fit_hyperparameters(
         # end correction alone is 10 nats, and a halving cannot keep the weights at their edge. So the trial is
         # taken at its own fixed point without a gain test, x is polished there by inner steps (accepted on the
         # model as always), and the polished certified V against the state's here decides the release (``anchors``).
+        anchor_gains[model] = inner_gains[model].copy()
         anchors[model] = (hyperparameters[model], points[model], corrections[model], state, predicted)
         return entry
 
@@ -5041,6 +5058,7 @@ def fit_hyperparameters(
                         # A new state: its polish starts from its own Cauchy radius, not one grown at the state it left.
                         hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                         displaced[model], pending[model], radii[model] = False, None, None
+                        inner_gains[model] = []
                         iterations[model] += 1
                         continue
                 halvings[model] += 1
@@ -5057,10 +5075,12 @@ def fit_hyperparameters(
                     ))
                     hyperparameters[model], points[model], corrections[model], states[model] = anchor_hyperparameters, anchor_point, anchor_correction, anchor_state
                     anchors[model], radii[model], pending[model] = None, None, None
+                    inner_gains[model] = anchor_gains[model]
                     continue
                 trial_correction, trial_state = solve_state(trial, trial_point)
                 hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                 displaced[model], radii[model] = False, None
+                inner_gains[model] = []
                 iterations[model] += 1
                 pending[model] = inner(model, entry.step, entry.remaining, True)
                 continue
@@ -5117,6 +5137,7 @@ def fit_hyperparameters(
                             # A new state: its polish starts from its own Cauchy radius (as at an entered trial).
                             hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                             displaced[model], pending[model], radii[model] = False, None, None
+                            inner_gains[model] = []
                             iterations[model] += 1
                             continue
                         measured = entry.predicted + remainders[model] + state.tail + state.error + entry.step.evidence_error + entry.step.stationarity_gain
@@ -5207,7 +5228,7 @@ def fit_hyperparameters(
                 elif newly_refused_edge:
                     pending[model] = None
                 elif (
-                    state.polished and not state.at_resolution and state.decrement > polish_tolerances[model]
+                    state.polished and not state.at_resolution and max(state.decrement, state.tail) > polish_tolerances[model]
                     and (reopened := inner(model, entry.step, entry.remaining, True)) is not None
                 ):
                     # The decision asked a smaller decrement of x than the polish reached (``polish_tolerances``): the

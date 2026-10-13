@@ -1046,7 +1046,6 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
     """Damped parallel EP on the dense Gaussian likelihood exp(-b' Lambda b / 2 + l' b), run to machine precision."""
     site_precision, site_shift = (np.array(part, copy=True) for part in sites)
     hyperparameters = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
-    previous_change = np.inf
     for _sweep in range(20000):
         covariance = np.linalg.inv(likelihood_precision + np.diag(site_precision))
         mean = covariance @ (linear_term + site_shift)
@@ -1055,11 +1054,10 @@ def _dense_ep(prior, coefficients, likelihood_precision, linear_term, sites):
         change = max(np.max(np.abs(target_precision - site_precision) / (1.0 + np.abs(site_precision))), np.max(np.abs(target_shift - site_shift) / (1.0 + np.abs(site_shift))))
         site_precision += 0.5 * (target_precision - site_precision)
         site_shift += 0.5 * (target_shift - site_shift)
-        # Machine precision: the damped map contracts until its targets' rounding, where the change stops falling;
-        # past half of double precision a change that no longer falls is that floor.
-        if change < 1e-14 or (change >= previous_change and change < float(np.finfo(np.float64).eps) ** 0.5):
+        # The finite-difference derivative divides gradient error by 1e-5. A transient
+        # stall below sqrt(eps) is not precise enough for this reference calculation.
+        if change < 1e-14:
             return (site_precision, site_shift), covariance, cavity
-        previous_change = change
     raise AssertionError("dense EP did not converge")
 
 
@@ -1530,8 +1528,8 @@ def test_the_fused_variant_derivatives_are_the_dense_components_moments():
 
 def test_the_trust_radius_follows_the_models_measured_agreement():
     """``_next_radius``: a step that reached the radius goes to L / (2 e), e the model's relative error along it (at
-    least the realized gain's resolution over the prediction), where that is past doubling, and doubles otherwise; a
-    step short of the radius keeps it; an unmeasured gain doubles it."""
+    least the realized gain's resolution over the prediction), where that is past doubling. An error >= 1/2 supports
+    no longer step; a step short of the radius keeps it; an unmeasured gain doubles it."""
     from types import SimpleNamespace
 
     from sv_pgs.scale_mixture_ep import _next_radius
@@ -1540,7 +1538,9 @@ def test_the_trust_radius_follows_the_models_measured_agreement():
     proposal = np.array([1.0, 0.0])
     predicted = 2.0 - 0.5
     assert _next_radius(newton, proposal, 1.0, 1.0, predicted * 0.99, 1e-6) == pytest.approx(1.0 / (2.0 * 0.01))
-    assert _next_radius(newton, proposal, 1.0, 1.0, predicted * 0.2, 1e-6) == 2.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted * 0.2, 1e-6) == 1.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, -predicted, 1e-6) == 1.0
+    assert _next_radius(newton, proposal, 1.0, 1.0, predicted, predicted / 2) == 1.0
     assert _next_radius(newton, proposal, 1.0, 1.0, predicted, 0.03) == pytest.approx(1.0 / (2.0 * 0.03 / predicted))
     assert _next_radius(newton, proposal, 4.0, 1.0, predicted, 1e-6) == 4.0
     assert _next_radius(newton, proposal, 1.0, 1.0, np.nan, np.nan) == 2.0
