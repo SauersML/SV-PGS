@@ -12,6 +12,7 @@ noise variance is its whitened problem's known unit noise, which its predictive 
 from __future__ import annotations
 
 import dataclasses
+import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.artifact import named_digest
+from sv_pgs.fit_checkpoint import load_checkpoint, save_checkpoint
 from sv_pgs.binary_likelihood import POLYA_GAMMA_MEAN_AT_ZERO, BernoulliSites, calibrated_shift, fit_binary_covariates
 from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.compute_budget import ComputeBudget
@@ -29,7 +31,7 @@ from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.gram_space import GramBand, GramGaussian, build_band_store, far_field_scale, pass_costs
-from sv_pgs.full_data_fit import FitCertificate, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
+from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.genotype_buffers import build_sample_layout
@@ -317,6 +319,11 @@ def _null_binary_model(covariates: F64Array, labels: F64Array, draw_count: int, 
     return dataclasses.replace(base, scoring=scoring, noise=1.0, certificate=certificate)
 
 
+def _with_refusal(fit: FullDataFit, reason: str) -> FullDataFit:
+    """``fit`` with ``reason`` appended to its certificate's refusals."""
+    return dataclasses.replace(fit, certificate=dataclasses.replace(fit.certificate, refusals=(*fit.certificate.refusals, reason)))
+
+
 def _fit_one(
     store: DosageStore,
     training_columns: I64Array,
@@ -498,8 +505,16 @@ def _fit_one(
                 start_mean=fit.member_mean, null_scale=kappa,
             )
         except FloatingPointError as error:
-            # No certified fit on the checked lattice: the model keeps the fit it has, and the failed check is logged.
-            log(f"stage2 wiring: lattice check unresolved, the fit on {prior.grid_size} nodes stands: {error}")
+            # No fit on the checked lattice: the model keeps the fit it has, and its certificate says the quadrature
+            # check that fit failed was never resolved, so the artifact never reads as a passed check.
+            fit = _with_refusal(fit, f"lattice check unresolved ({check.record()}): the fit on {prior.grid_size} nodes stands; the refit on {moved.grid_size} nodes failed: {error}")
+            log(f"stage2 wiring: {fit.certificate.refusals[-1]}")
+            break
+        if np.all(fit.certificate.outer_criterion_met) and not np.all(refit.certificate.outer_criterion_met):
+            # The refit ended without its outer criterion (an uncertified walk) where the fit it continued had met it:
+            # the certified fit stands, and its certificate records the quadrature check left open.
+            fit = _with_refusal(fit, f"lattice check unresolved ({check.record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {prior.grid_size} nodes stands")
+            log(f"stage2 wiring: {fit.certificate.refusals[-1]}")
             break
         prior, nodes, fit = moved, moved.log_variance_grid, refit
     (scoring,) = scoring_models(fit, prior, statistics, [trait_type], draw_count, seed=_seed(seed, 2))
@@ -534,6 +549,7 @@ def fit_models(
     seed: int,
     draw_count: int,
     inference: str = "mean_field",
+    checkpoint_key: str | None = None,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, one at a time (see the module docstring); ``inference`` names the fixed
     point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's genome-scale
@@ -548,22 +564,40 @@ def fit_models(
         rows = rows[order]
         adjusted = np.asarray(covariate_columns[model], dtype=bool)
         model_dir = Path(work_dir) / f"model{model}"
-        model_dir.mkdir()
-        # One ledger per model's fit (``memory_broker``): its host leases and, on CUDA, every device allocation.
-        with memory_scope(budget):
-            fit = _fit_one(
-                store,
-                np.asarray(store_columns[rows], dtype=np.int64),
-                np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
-                np.asarray(targets[rows, model], dtype=np.float64),
-                measurement,
-                budget,
-                model_dir,
-                _seed(seed, model),
-                draw_count,
-                trait_types[model],
-                inference,
-            )
+        checkpoint = None if checkpoint_key is None else Path(work_dir) / "checkpoints" / checkpoint_key / f"model{model}.npz"
+        if checkpoint is not None and checkpoint.is_file():
+            fit = load_checkpoint(checkpoint, checkpoint_key)
+            log(f"stage2 wiring: resumed completed model {model}")
+        else:
+            # Incomplete scratch is disposable; completed folds live outside this directory.
+            if model_dir.exists():
+                shutil.rmtree(model_dir)
+            model_dir.mkdir(parents=True)
+            started = time.perf_counter()
+            # One ledger per model's fit: its host leases and every device allocation.
+            with memory_scope(budget):
+                fit = _fit_one(
+                    store,
+                    np.asarray(store_columns[rows], dtype=np.int64),
+                    np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
+                    np.asarray(targets[rows, model], dtype=np.float64),
+                    measurement,
+                    budget,
+                    model_dir,
+                    _seed(seed, model),
+                    draw_count,
+                    trait_types[model],
+                    inference,
+                )
+            elapsed = time.perf_counter() - started
+            if checkpoint is not None:
+                save_checkpoint(checkpoint, fit, checkpoint_key, elapsed)
+            log(f"stage2 wiring: completed model {model} in {elapsed:.3f} seconds")
+        # The model's Stage 0 LD blocks and band (its projected Grams, O(p x block cap) bytes on disk) are read by no
+        # later model and not by scoring, which the fit already ran: each is removed as its model ends, so the work
+        # directory never holds more than one model's.
+        if model_dir.exists():
+            shutil.rmtree(model_dir)
         alpha = np.zeros(adjusted.shape[0])
         alpha[adjusted] = fit.scoring.alpha
         covariate_draws = np.zeros((adjusted.size, fit.scoring.draw_count))

@@ -1,0 +1,16 @@
+{
+  "total_usd": 3000,
+  "non_task_reserve_usd": 750,
+  "startup_hours_per_attempt": 1,
+  "slots": {
+    "prepare": 100,
+    "pilot": 100,
+    "train-1": 325,
+    "train-2": 325,
+    "train-3": 325,
+    "train-4": 325,
+    "train-5": 325,
+    "train-6": 325,
+    "evaluate": 100
+  }
+}

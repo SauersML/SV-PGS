@@ -76,7 +76,17 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from sv_pgs import all_of_us, cohort as cohort_module, dosage_store, held_out_comparison, sample_crosswalk, store_converter, variant_typing
+from sv_pgs import (
+    all_of_us,
+    cohort as cohort_module,
+    dosage_store,
+    held_out_comparison,
+    phenotype_measurement,
+    sample_crosswalk,
+    scale_mixture_ep,
+    store_converter,
+    variant_typing,
+)
 from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
 from sv_pgs.all_of_us import (
     MINIMUM_REPORTED_PARTICIPANTS,
@@ -149,6 +159,7 @@ from sv_pgs.store_converter import (
     write_store_manifest,
 )
 from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, variant_class_and_length
+from sv_pgs.fit_checkpoint import checkpoint_timings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1954,14 +1965,14 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 record = target.with_name(target.name + ".json")
                 if not record.is_file():
                     work = directory / "work" / arm / trait_name
-                    _remove_own(work, directory)
-                    work.mkdir(parents=True)
+                    # A Spot restart keeps completed fold checkpoints; the engine discards only
+                    # the interrupted model's scratch and verifies each checkpoint's input digest.
+                    work.mkdir(parents=True, exist_ok=True)
                     request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait))
                     if not target.is_dir():
                         target.parent.mkdir(parents=True, exist_ok=True)
                         LOGGER.info("workspace pipeline: fitting %s / %s", arm, trait_name)
                         run.bindings.save_model(target, run.bindings.fit(request))
-                    _remove_own(work, directory)
                     fitted = run.bindings.load_model(target)
                     if tuple(fitted.model_names) != request.model_names:
                         raise ValueError(f"the {arm} fit of {trait_name} returned other models than the trait's training sets.")
@@ -1970,6 +1981,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                         record,
                         {
                             "models": list(fitted.model_names),
+                            "completed_fold_timings": checkpoint_timings(work),
                             "separating_covariates_left_out": [
                                 [name for name, own, used in zip(request.covariate_names, wanted, columns) if own and not used]
                                 for columns in request.covariate_columns
@@ -1979,6 +1991,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                             "refusals": [str(refusal) for refusal in fitted.refusals],
                         },
                     )
+                    _remove_own(work, directory)
                 records[arm][trait_name] = json.loads(record.read_text(encoding="utf-8"))
     _remove_own(directory / "work", directory)
     return {
@@ -2458,7 +2471,9 @@ def _export_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 _STEPS = (
     _Step("samples", (), _samples_inputs, (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs), _samples_step),
-    _Step("phenotypes", (), _phenotype_inputs, (all_of_us, _phenotypes_step), _phenotypes_step),
+    # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
+    # to either is a change to the phenotypes, not only a change to ``all_of_us``.
+    _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
     _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, trait_table), _cohort_step),
     _Step(
         "store",

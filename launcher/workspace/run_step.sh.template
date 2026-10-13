@@ -1,7 +1,10 @@
 #!/bin/bash
-# TEMPLATE, never launched by an agent: launching is the user's decision.
-# The Batch task. It installs the staged wheelhouse into a venv on the run disk, then runs the pipeline
-# through ${THROUGH}. Status goes only to empty marker files in the workspace's ops bucket mount.
+# TEMPLATE, never launched by an agent: launching is the user's decision (submit.sh fills and submits it).
+# The Batch task. It builds the locked environment offline with uv from what the user staged under
+# svpgs/${RUN_ID}/ in the ops bucket (README.md, "Staging": the source tree, the uv binary, a uv cache holding every
+# locked wheel, and a uv-installed CPython 3.12), then runs the pipeline through ${THROUGH}. The VM has no external IP,
+# and the image's own Python is not the 3.12 sv-pgs needs, so nothing is fetched and the image's Python is never used.
+# Status goes only to empty marker files in the workspace's ops bucket mount.
 set -uo pipefail
 OPS=/mnt/disks/ops/svpgs/${RUN_ID}
 RUN=/mnt/disks/run
@@ -9,7 +12,13 @@ mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)
 trap 'mark "terminated"; exit 75' TERM
 mark started
 if [ ! -x "$RUN/venv/bin/sv-pgs" ]; then
-  python3 -m venv "$RUN/venv" && "$RUN/venv/bin/pip" install --no-index --find-links "$OPS/wheels" sv-pgs || { mark "exit-install"; exit 1; }
+  # The bucket mount gives no file an execute bit, so uv and Python are copied to the run disk first.
+  mkdir -p "$RUN/tools" && cp "$OPS/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" \
+    && rm -rf "$RUN/python" "$RUN/uv-cache" && cp -r "$OPS/python" "$RUN/python" && cp -r "$OPS/uv-cache" "$RUN/uv-cache" \
+    && chmod +x "$RUN"/python/*/bin/* \
+    && UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
+       "$RUN/tools/uv" sync --project "$OPS/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
+    || { mark "exit-install"; exit 1; }
 fi
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
 mkdir -p "$TMPDIR"

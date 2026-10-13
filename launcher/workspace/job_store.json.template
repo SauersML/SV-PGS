@@ -5,6 +5,7 @@
       "taskSpec": {
         "runnables": [{"script": {"path": "/mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
         "maxRetryCount": ${MAX_RETRIES},
+        "maxRunDuration": "${MAX_RUN_SECONDS}s",
         "lifecyclePolicies": [
           {"action": "RETRY_TASK", "actionCondition": {"exitCodes": [50001, 75]}},
           {"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}

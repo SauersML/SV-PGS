@@ -21,10 +21,7 @@
     "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression",
     "gout", "cataract", "chronic_kidney_disease", "psoriasis", "prostate_cancer"
   ],
-  "traits": [
-    "height", "body_mass_index", "systolic_blood_pressure", "heart_rate", "mean_corpuscular_volume", "platelet_count",
-    "white_blood_cell_count", "egfr_ckd_epi_2021", "total_bilirubin", "ldl_cholesterol", "hemoglobin_a1c"
-  ],
+  "traits": [],
   "fold_count": 5,
   "seed": ${FOLD_SEED},
   "codec": "zstd",

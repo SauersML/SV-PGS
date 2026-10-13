@@ -219,6 +219,17 @@ class FitRequest:
 def fit(request: FitRequest) -> FittedModel:
     """Fit every model of ``request`` on its training rows and return the artifact."""
     row_count, model_count = request.store_columns.shape[0], request.model_count
+    source_key = code_digest()
+    store_key = store_digest(request.store.root)
+    offset_key = offset_digest(request.log_variance_offset)
+    problem_key = problem_digest(
+        research_ids=request.research_ids, store_columns=request.store_columns,
+        model_names=request.model_names, trait_types=request.trait_types,
+        covariate_names=request.covariate_names, covariate_columns=request.covariate_columns,
+        covariates=request.covariates, targets=request.targets, training=request.training,
+        draw_count=DRAW_COUNT, seed=request.seed,
+    )
+    checkpoint_key = hashlib.sha256("\n".join((source_key, store_key, offset_key, problem_key)).encode()).hexdigest()
     fitted = fit_models(
         store=request.store,
         store_columns=request.store_columns,
@@ -232,6 +243,7 @@ def fit(request: FitRequest) -> FittedModel:
         work_dir=request.work_dir,
         seed=request.seed,
         draw_count=DRAW_COUNT,
+        checkpoint_key=checkpoint_key,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)
@@ -255,24 +267,12 @@ def fit(request: FitRequest) -> FittedModel:
         fit_counts=parts.counts,
         refusals=parts.refusals,
         provenance=Provenance(
-            code_digest=code_digest(),
-            store_digest=store_digest(request.store.root),
+            code_digest=source_key,
+            store_digest=store_key,
             sites_digest=sites_digest(request.store.root),
             cohort_digest=cohort_digest([research_id for research_id, kept in zip(request.research_ids, trained) if kept]),
-            offset_digest=offset_digest(request.log_variance_offset),
-            problem_digest=problem_digest(
-                research_ids=request.research_ids,
-                store_columns=request.store_columns,
-                model_names=request.model_names,
-                trait_types=request.trait_types,
-                covariate_names=request.covariate_names,
-                covariate_columns=request.covariate_columns,
-                covariates=request.covariates,
-                targets=request.targets,
-                training=request.training,
-                draw_count=DRAW_COUNT,
-                seed=request.seed,
-            ),
+            offset_digest=offset_key,
+            problem_digest=problem_key,
             # One digest over the models' own prior schemas, in model order.
             prior_digest=hashlib.sha256("\n".join(fitted.prior_digests).encode()).hexdigest(),
         ),
