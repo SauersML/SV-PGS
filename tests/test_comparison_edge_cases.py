@@ -153,3 +153,36 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
     )
     slopes = [comparison.logistic_recalibration_coefficients(frozen[fold == index], labels[fold == index])[1] for index in (1, 2)]
     assert float(metrics['calibration_slope']['value']) == pytest.approx(np.mean(slopes), rel=1e-5)
+
+
+def test_a_cells_rows_show_no_small_count_by_their_difference_and_stay_exportable(tmp_path, monkeypatch):
+    def group(fold_cases, fold_size):
+        labels = np.concatenate([np.r_[np.ones(cases), np.zeros(fold_size - cases)] for cases in fold_cases])
+        return labels, np.repeat(np.arange(len(fold_cases)), fold_size)
+    big_labels = np.tile([0., 1.], 222)
+    # "small": its fold 0 has one case, so AUC leaves it out; frozen probabilities reading it would show one more
+    # case than AUC in the same cell. "thin": the folds AUC reads hold 20 cases, too few to show.
+    small_labels, small_folds = group((1, 10, 12), 30)
+    thin_labels, thin_folds = group((1, 9, 11), 22)
+    labels = np.r_[big_labels, small_labels, thin_labels]
+    fold = np.r_[np.arange(444) % 3, small_folds, thin_folds]
+    ancestry = ['big'] * 444 + ['small'] * 90 + ['thin'] * 66
+    n = labels.shape[0]
+    linear = labels + np.random.default_rng(8).normal(size=n)
+    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
+        covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
+        ancestry=ancestry, half=['imputed'] * n)
+    both = np.stack([linear, linear])[:, :, None]
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
+    monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
+    monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
+    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1)), tmp_path)
+    for name in ('accuracy.tsv', 'comparison.tsv'):
+        pipeline.check_exportable(tmp_path / name)
+        with (tmp_path / name).open() as handle:
+            rows = list(csv.DictReader(handle, delimiter='\t'))
+        for level in ('small', 'thin'):
+            cell = [row for row in rows if row['level'] == level]
+            assert cell and len({(row['n'], row['cases']) for row in cell}) == 1
+        assert {row['n'] for row in rows if row['level'] == 'small'} == {'60'}
+        assert not any(row.get('value') or row.get('estimate') for row in rows if row['level'] == 'thin')

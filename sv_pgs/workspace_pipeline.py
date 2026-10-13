@@ -2660,6 +2660,25 @@ PROPER_SCORES = ("log_loss", "brier", "log_likelihood_gain", "brier_reduction")
 """The metrics of a disease's frozen probabilities, which a fold with one outcome class still has (``_report_step``)."""
 
 
+def _evaluated_counts(selected: Sequence[I64Array], targets: F64Array, binary: bool) -> tuple[int, int | None]:
+    """The rows, and a disease's cases, of the folds a metric is read on."""
+    return sum(rows.shape[0] for rows in selected), int(sum(targets[rows].sum() for rows in selected)) if binary else None
+
+
+def _proper_folds(nonempty: Sequence[I64Array], scored: Sequence[I64Array], targets: F64Array, binary: bool) -> Sequence[I64Array]:
+    """The folds a cell's frozen-probability metrics are read on: every nonempty fold where the folds that leaves beside
+    ``scored`` (its subset, the other metrics') differ from ``scored`` by no count of 1 to 20 in rows, cases or
+    controls; ``scored`` otherwise. Each row of a cell shows its metric's own counts, so two rows' counts differ by the
+    folds between them, and that difference is a count the report shows by subtraction."""
+    wide_rows, wide_cases = _evaluated_counts(nonempty, targets, binary)
+    narrow_rows, narrow_cases = _evaluated_counts(scored, targets, binary)
+    left_out = [wide_rows - narrow_rows]
+    if binary:
+        assert wide_cases is not None and narrow_cases is not None
+        left_out += [wide_cases - narrow_cases, (wide_rows - wide_cases) - (narrow_rows - narrow_cases)]
+    return nonempty if all(part == 0 or part >= MINIMUM_REPORTED_PARTICIPANTS for part in left_out) else scored
+
+
 def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, frozen: F64Array, covariates: F64Array) -> float:
     """One arm's held-out metric on one fold's rows (``_report_step``). ``frozen`` holds the rows' frozen calibrated
     logits (the score step's independent development calibration); a metric of them on a fold whose calibration has no
@@ -2754,32 +2773,36 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
             counts = (reportable_count(count), _cases_text(count, cases))
             shown = _shown(count, cases)
             scored = _scored_folds(held, targets, binary) if shown else []
-            nonempty = [rows for rows in held.folds if rows.shape[0]] if shown else []
+            proper = _proper_folds([rows for rows in held.folds if rows.shape[0]], scored, targets, binary) if shown else []
 
-            def evaluated_counts(selected):
+            def evaluated(metric: str) -> tuple[Sequence[I64Array], tuple[str, str]]:
+                # The folds a metric is read on and the counts its row shows; none where those counts are not
+                # themselves shown (a metric read on fewer than MINIMUM_REPORTED_PARTICIPANTS rows, cases or controls).
                 if not shown:
-                    return counts
-                used = sum(rows.size for rows in selected)
-                used_cases = int(sum(targets[rows].sum() for rows in selected)) if binary else None
-                return reportable_count(used), _cases_text(used, used_cases)
+                    return [], counts
+                selected = proper if metric in PROPER_SCORES else scored
+                used, used_cases = _evaluated_counts(selected, targets, binary)
+                return (selected if _shown(used, used_cases) else []), (reportable_count(used), _cases_text(used, used_cases))
             for arm_index, arm in enumerate(ARMS):
                 for metric in metric_names:
+                    selected, metric_counts = evaluated(metric)
                     values = [
                         (rows.shape[0], _held_out_metric(metric, targets[rows], linear[arm_index, rows], genetic[arm_index, rows], frozen[arm_index, rows], covariates[rows]))
-                        for rows in (nonempty if metric in PROPER_SCORES else scored)
+                        for rows in selected
                     ]
-                    accuracy.append((name, arm, cell, level, *evaluated_counts(nonempty if metric in PROPER_SCORES else scored), *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
+                    accuracy.append((name, arm, cell, level, *metric_counts, *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
             # The paired comparison per cell of all held-out rows and per ancestry group (a fold is one term of
             # every cell's sum, and the halves are a measurement split rather than a population).
             if cell not in ("all", "ancestry"):
                 continue
             for metric in comparison_names:
+                selected, metric_counts = evaluated(metric)
                 per_fold = [
                     (rows.shape[0], _paired(metric, targets[rows], linear[:, rows], genetic[:, rows], frozen[:, rows], covariates[rows], cohort.families[rows]))
-                    for rows in (nonempty if metric in PROPER_SCORES else scored)
+                    for rows in selected
                 ]
                 if not per_fold:
-                    comparison.append((name, cell, level, *counts, "", "", "", "", "", ""))
+                    comparison.append((name, cell, level, *metric_counts, "", "", "", "", "", ""))
                     continue
                 combined = _fold_combined(per_fold)
                 if len(per_fold) > 1:
@@ -2791,7 +2814,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                 else:
                     z_text, p_text, inference = "", "", "undefined"
                 comparison.append((
-                    name, cell, level, *evaluated_counts(nonempty if metric in PROPER_SCORES else scored), metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
+                    name, cell, level, *metric_counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
                     z_text, p_text, inference,
                 ))
     for file_name, lines in (("accuracy.tsv", accuracy), ("comparison.tsv", comparison)):
