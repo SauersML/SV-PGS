@@ -41,10 +41,12 @@ CuPy is passed in by the caller as the array module; this module never imports i
 from __future__ import annotations
 
 import math
+from functools import cache
 from types import ModuleType
 from typing import Any
 
 import numpy as np
+import numba
 
 from sv_pgs.genotype_buffers import (
     SIGNED_CODE_OFFSET,
@@ -74,9 +76,11 @@ _INT32_BYTES = 4
 
 
 def _digit_working_bytes(digit_count: int) -> int:
-    """Peak bytes ``operand_digits`` holds per operand entry: the int8 digits plus four live 8-byte
-    temporaries while one digit is split off (the remaining integers, the digit, and two
-    intermediate expressions)."""
+    """Conservative bytes per entry for digits and fp64 scaling/reduction buffers.
+
+    Keep the existing workspace allowance; the fused split itself holds no
+    dense integer scratch, leaving more headroom for the surrounding solve.
+    """
     return digit_count + 4 * _FLOAT64_BYTES
 
 
@@ -119,18 +123,60 @@ def operand_digits(dense: Any, array_module: ModuleType, digit_count: int = OPER
     ``sum_d digits[:, d * K + k] * 128^d == rint(dense[:, k] * scale[k])`` exactly. ``scale`` is a
     power of two per column that puts the column maximum in (2^(7m-3), 2^(7m-2)].
     """
+    if not isinstance(digit_count, (int, np.integer)) or not 1 <= digit_count <= OPERAND_DIGITS:
+        raise ValueError(f"digit_count must be an integer in [1, {OPERAND_DIGITS}]")
     values = array_module.asarray(dense, dtype=array_module.float64)
     rows, columns = values.shape
     magnitude = _column_max(array_module.abs(values), array_module) if rows else array_module.zeros(columns)
     exponent = (DIGIT_BITS * digit_count - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0)))
     scale = array_module.exp2(exponent)
-    integers = array_module.rint(values * scale[None, :]).astype(array_module.int64)
     digits = array_module.empty((rows, digit_count * columns), dtype=array_module.int8, order="F")
-    for digit_index in range(digit_count):
-        low = ((integers + _DIGIT_HALF) & _DIGIT_MASK) - _DIGIT_HALF
-        digits[:, digit_index * columns : (digit_index + 1) * columns] = low.astype(array_module.int8)
-        integers = (integers - low) >> DIGIT_BITS
+    if array_module is np:
+        _split_digits_cpu(values, scale, digits, digit_count)
+    elif values.size:
+        # One float64 layout copy makes input loads and all digit stores
+        # coalesced. Avoid a strided store for each digit of a C-order operand.
+        by_column = array_module.asfortranarray(values)
+        _split_digits_cuda(array_module)(by_column.T, scale, np.int64(rows), np.int64(columns), np.int32(digit_count), digits)
     return digits, scale
+
+
+@numba.njit(cache=True, nogil=True, fastmath=False)
+def _split_digits_cpu(values, scale, digits, digit_count):
+    """The balanced integer recurrence, with each entry's temporaries in registers."""
+    rows, columns = values.shape
+    for column in range(columns):
+        for row in range(rows):
+            integer = np.int64(np.rint(values[row, column] * scale[column]))
+            for digit in range(digit_count):
+                low = ((integer + _DIGIT_HALF) & _DIGIT_MASK) - _DIGIT_HALF
+                digits[row, digit * columns + column] = low
+                integer = (integer - low) >> DIGIT_BITS
+
+
+@cache
+def _split_digits_cuda(cupy):
+    """One CUDA launch replaces the per-digit array expressions; no dense int64 scratch.
+
+    Input is traversed column first, matching the column-major cuBLAS output.
+    Explicit round-to-nearest operations
+    preserve the reference multiply, rint, and signed integer recurrence.
+    """
+    return cupy.ElementwiseKernel(
+        "float64 value, raw float64 scale, int64 rows, int64 columns, int32 count",
+        "raw int8 digits",
+        f"""
+        const long long row = i % rows;
+        const long long column = i / rows;
+        long long integer = __double2ll_rn(__dmul_rn(value, scale[column]));
+        for (int digit = 0; digit < count; ++digit) {{
+            const long long low = ((integer + {_DIGIT_HALF}) & {_DIGIT_MASK}) - {_DIGIT_HALF};
+            digits[row + (digit * columns + column) * rows] = (signed char)low;
+            integer = (integer - low) >> {DIGIT_BITS};
+        }}
+        """,
+        "svpgs_split_balanced_digits",
+    )
 
 
 def recombine_digit_products(products: Any, scale: Any, array_module: ModuleType) -> Any:

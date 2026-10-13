@@ -17,6 +17,46 @@ from sv_pgs.code_products import (
 FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
 
 
+def _reference_digits(dense, count):
+    """Independent unfused array implementation of the original digit contract."""
+    magnitude = np.abs(dense).max(axis=0) if dense.shape[0] else np.zeros(dense.shape[1])
+    scale = np.exp2((DIGIT_BITS * count - 2) - np.ceil(np.log2(np.where(magnitude > 0, magnitude, 1.))))
+    integers = np.rint(dense * scale).astype(np.int64)
+    digits = np.empty((dense.shape[0], count * dense.shape[1]), dtype=np.int8, order="F")
+    half = 1 << (DIGIT_BITS - 1)
+    for digit in range(count):
+        low = ((integers + half) & ((1 << DIGIT_BITS) - 1)) - half
+        digits[:, digit * dense.shape[1]:(digit + 1) * dense.shape[1]] = low
+        integers = (integers - low) >> DIGIT_BITS
+    return digits, scale
+
+
+@pytest.mark.parametrize("count", range(1, OPERAND_DIGITS + 1))
+@pytest.mark.parametrize("layout", ["c", "f", "strided", "empty"])
+def test_fused_digits_preserve_reference_bits(count, layout):
+    rng = np.random.default_rng(71)
+    values = rng.normal(size=(103, 7)) * np.exp2(np.arange(-200, 201, 200 / 3))
+    values[:, 2] = 0.
+    values[:5, 0] = np.array([-.5, .5, 1.5, -1.5, 0.])
+    if layout == "f":
+        values = np.asfortranarray(values)
+    elif layout == "strided":
+        values = values[::-2, ::2]
+    elif layout == "empty":
+        values = values[:0]
+    actual, scales = operand_digits(values, np, count)
+    expected, expected_scales = _reference_digits(values, count)
+    np.testing.assert_array_equal(actual, expected)
+    np.testing.assert_array_equal(scales, expected_scales)
+    assert actual.flags.f_contiguous
+
+
+@pytest.mark.parametrize("count", [0, -1, OPERAND_DIGITS + 1, 1.5])
+def test_invalid_digit_counts_are_refused(count):
+    with pytest.raises(ValueError, match="digit_count"):
+        operand_digits(np.ones((2, 1)), np, count)
+
+
 def _gamma(term_count: int) -> float:
     """Higham's gamma_n = n u / (1 - n u), the relative error bound of an fp64 sum of n terms."""
     unit_roundoff = np.finfo(np.float64).eps / 2.0

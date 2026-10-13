@@ -6,7 +6,7 @@ import pytest
 
 from sv_pgs.code_products import DIGIT_BITS, OPERAND_DIGITS, CodeBlockTile, operand_digits, recombine_digit_products
 from sv_pgs.compute_budget import _try_import_cupy
-from tests.test_code_products import _signed_codes
+from tests.test_code_products import _signed_codes, _reference_digits
 
 cupy = _try_import_cupy()
 FLOAT64_ROUNDING = float(np.finfo(np.float64).eps) / 2
@@ -49,11 +49,16 @@ def test_cuda_tile_products_match_the_cpu_tile(workspace_bytes: int) -> None:
         assert float(column_error.max()) < 1e-10
 
 
-def test_cuda_digits_match_the_numpy_digits() -> None:
+@pytest.mark.parametrize("count", range(1, OPERAND_DIGITS + 1))
+@pytest.mark.parametrize("strided", [False, True])
+def test_cuda_digits_match_the_numpy_digits(count, strided) -> None:
     rng = np.random.default_rng(8)
     dense = rng.standard_normal((333, 4)) * np.exp(rng.uniform(-10, 10, 4))[None, :]
-    cpu_digits, cpu_scale = operand_digits(dense, np)
-    cuda_digits, cuda_scale = operand_digits(cupy.asarray(dense), cupy)
+    device = cupy.asarray(dense)
+    if strided:
+        dense, device = dense[::-2, ::2], device[::-2, ::2]
+    cpu_digits, cpu_scale = _reference_digits(dense, count)
+    cuda_digits, cuda_scale = operand_digits(device, cupy, count)
 
     np.testing.assert_array_equal(cupy.asnumpy(cuda_digits), cpu_digits)
     np.testing.assert_array_equal(cupy.asnumpy(cuda_scale), cpu_scale)
