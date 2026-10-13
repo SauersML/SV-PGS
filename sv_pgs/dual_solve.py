@@ -358,13 +358,15 @@ def _accumulate(tile: DualTile, right: Any, image: Any, relative_error: float) -
 def _operator_block(relative_error: float) -> Callable[..., None]:
     """One block of S V's read: X_b' L, scaled by D_b per column, back through X_b into the image.
 
-    With a relaxed error the read's sample operand is prepared at a device's first block and reused
-    by its other blocks (code_products.CodeBlockTile.sample_operand)."""
+    Prepare the sample operand once per device, including full-precision reads.
+    Repeating its padding, column sums and digit split for every LD block is
+    unnecessary. Zero-error reads use the existing fp64 product representation.
+    """
 
     def work(_start: int, _stop: int, tile: DualTile, shared: dict, rows: dict, image: Any) -> None:
-        if relative_error > 0.0 and "operand" not in shared:
-            shared["operand"] = tile.sample_operand(shared["left"], relative_error)
-        products = tile.rmatmat(shared["operand"] if relative_error > 0.0 else shared["left"])
+        if "operand" not in shared:
+            shared["operand"] = tile.sample_operand(shared["left"], max(relative_error, np.finfo(np.float64).eps / 2))
+        products = tile.rmatmat(shared["operand"])
         scaled = rows["variances"][:, shared["column_models"]] * products
         _accumulate(tile, scaled if scaled.flags.c_contiguous else scaled.copy(order="C"), image, relative_error)
 
@@ -1864,7 +1866,7 @@ class DualGaussian:
     def kernel_factor(self, model: int) -> KernelFactor:
         """Model m's bulk kernel K_S = I + Xt_S D_S Xt_S' factored densely at the last iterate's sites (host).
 
-        For shapes whose n x n kernel fits (marginal_variances.exact_route_is_cheaper): one read forms K_S
+        For shapes whose n x n kernel fits: one read forms K_S
         (n^2 p flops), its Cholesky factor gives Z_L = K_S^-1 Xt_L and core = Pi_L + Xt_L'Z_L (Pi_L of any
         sign). Raises LinAlgError when the core, hence A, is not positive definite.
         """
