@@ -533,12 +533,14 @@ def test_the_dual_gaussian_is_the_dense_posterior_with_strong_and_negative_sites
         assert abs(rss[model] - residual_sum) <= np.sqrt(EPS) * residual_sum * np.linalg.cond(posterior_precision)
 
 
-def test_compact_training_rows_preserve_probes_and_posterior():
+@pytest.mark.parametrize("weighted", [False, True])
+def test_compact_training_rows_preserve_probes_and_posterior(weighted):
     genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _ = _gaussian_problem(51)
     # Compare the same one-model likelihood and site parameters with
     # zero-weight people present versus physically omitted from the operator.
     model = 1
     selected = np.flatnonzero(training[:, model])
+    weights = training[:, model:model + 1] * np.random.default_rng(52).uniform(0.01, 0.25, (training.shape[0], 1))
     fitted = []
     for indices in (np.arange(training.shape[0]), selected):
         gaussian = dual_solve.DualGaussian(
@@ -546,6 +548,7 @@ def test_compact_training_rows_preserve_probes_and_posterior():
             targets=response[indices, model:model + 1], offsets=offsets[indices, model:model + 1], covariates=covariates[indices],
             grams=_grams(bounds, True), probe_count=4, seed=3,
             probe_sample_indices=indices if indices.size != training.shape[0] else None,
+            sample_weights=weights[indices] if weighted else None,
         )
         gaussian.iterate(site_precision=precision[:, model:model + 1], site_shift=shift[:, model:model + 1],
                          noise_variance=noise[model:model + 1], error_bound=np.array([np.sqrt(EPS)]), probe_residual_ratio=np.sqrt(EPS))
