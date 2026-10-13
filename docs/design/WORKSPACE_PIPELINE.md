@@ -54,7 +54,7 @@ With `strata_directory` and `bubble_split` both `null`, each batch file is one i
 | Step | Reads | Writes | Restart grain |
 |---|---|---|---|
 | samples | batch headers, crosswalk, ancestry, relatedness, imputation reference IDs | typed half manifests, cohort rows (`resolve_cohort_rows`), ancestry groups, calibration pairs and the ones the measurement model uses (`calibrating_pairs`), trait-agnostic folds (`kinship_folds`, strata half × ancestry) | step |
-| store | the samples step's half manifests and groups, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes; the store summary counts the records the 8-bit codes made monomorphic (`encoding_flattened`) | each batch's decode; each chromosome |
+| store | the samples step's half manifests, groups and calibration pairs, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes; the store summary counts the records the 8-bit codes made monomorphic (`encoding_flattened`) | each batch's decode; each chromosome |
 | phenotypes | the CDR | one sample table per disease and trait (`all_of_us`) | step |
 | cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |
 | measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the one model the fit reads, pooled over the fit rows' ancestry groups (`pooled_measurement_model`); the store rewritten with D* where pairs exist | step |
