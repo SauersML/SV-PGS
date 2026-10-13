@@ -412,6 +412,17 @@ def test_decode_batch_returns_info_from_the_same_read_and_needs_it(tmp_path) -> 
         decode_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
 
 
+def test_decode_batch_names_the_fields_a_popped_header_does_not_declare(tmp_path) -> None:
+    # A batch whose header has no GP (plain imputation output given as popped) is refused by name before any record
+    # is read, never with htslib's bare KeyError from the first record's FORMAT lookup.
+    path = tmp_path / "batch.vcf"
+    _write_batch(path, _BATCH_DOSAGES[1])
+    text = path.read_text()
+    path.write_text("\n".join(line for line in text.splitlines() if not line.startswith("##FORMAT=<ID=GP")).replace("GT:DS:GP", "GT:DS") + "\n")
+    with pytest.raises(ValueError, match=r"declares no \['FORMAT/GP'\]"):
+        decode_batch(path, _expected_sites(), np.zeros(2, dtype=np.int64), 1, tmp_path / "codes.npy", _BUDGET)
+
+
 def test_assemble_half_applies_the_linear_recalibration(tmp_path) -> None:
     expected = _expected_sites()
     path = tmp_path / "batch.vcf"

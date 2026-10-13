@@ -429,6 +429,27 @@ def _file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+BGZF_MAXIMUM_BLOCK_BYTES = 65536
+"""The largest BGZF block, compressed (SAMv1 section 4.1: BSIZE is a 16-bit block size minus one)."""
+
+
+def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
+    """A genotype file's size and the digest of its first and last BGZF_MAXIMUM_BLOCK_BYTES, the key a step reads it by.
+
+    A step's key must change when a batch is imputed again, and hashing every byte of a genome's BCFs would read them
+    once more for the key alone. The span covers the file's first block (its header: the tool's command line, version
+    and date) and its last block (the last records' genotypes and the EOF marker), so a re-imputed file of the same
+    size changes the key, while a copy of the same file does not.
+    """
+    size = path.stat().st_size
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        digest.update(handle.read(BGZF_MAXIMUM_BLOCK_BYTES))
+        handle.seek(max(size - BGZF_MAXIMUM_BLOCK_BYTES, 0))
+        digest.update(handle.read(BGZF_MAXIMUM_BLOCK_BYTES))
+    return size, digest.hexdigest()
+
+
 def _source_digest(code: Sequence[Any]) -> str:
     digest = hashlib.sha256()
     for item in code:
@@ -601,10 +622,10 @@ def _samples_inputs(config: WorkspaceConfig) -> Any:
     return {
         "chromosomes": config.chromosomes,
         "halves": [
-            (half.label, half.batches, [half.path(chromosome, batch).stat().st_size for chromosome in config.chromosomes for batch in half.batches])
+            (half.label, half.batches, [genotype_file_fingerprint(half.path(chromosome, batch)) for chromosome in config.chromosomes for batch in half.batches])
             for half in config.imputed_halves
         ],
-        "truth": None if config.truth_calls is None else [config.truth_path(chromosome).stat().st_size for chromosome in config.chromosomes],
+        "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
         "crosswalk": (_file_digest(config.crosswalk), config.crosswalk_columns),
         "ancestry": _file_digest(config.ancestry),
         "relatedness": (_file_digest(config.relatedness), config.relatedness_columns),
@@ -1604,12 +1625,12 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
         "input": "plain" if popped is None else "popped",
         "chromosomes": config.chromosomes,
         "halves": [
-            (half.label, half.batches, [half.path(chromosome, batch).stat().st_size for chromosome in config.chromosomes for batch in half.batches])
+            (half.label, half.batches, [genotype_file_fingerprint(half.path(chromosome, batch)) for chromosome in config.chromosomes for batch in half.batches])
             for half in config.imputed_halves
         ],
-        "truth": None if config.truth_calls is None else [config.truth_path(chromosome).stat().st_size for chromosome in config.chromosomes],
+        "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
         "strata": None if popped is None else [_file_digest(popped.strata_directory / "_done" / f"{chromosome}.json") for chromosome in config.chromosomes],
-        "bubble_split": None if popped is None else [popped.bubble_split_path(chromosome).stat().st_size for chromosome in config.chromosomes],
+        "bubble_split": None if popped is None else [genotype_file_fingerprint(popped.bubble_split_path(chromosome)) for chromosome in config.chromosomes],
         "genetic_map": None if config.genetic_map is None else [_file_digest(config.genetic_map_path(chromosome)) for chromosome in config.chromosomes],
         "tandem_repeats": _file_digest(config.tandem_repeats),
         "gene_annotation": _file_digest(config.gene_annotation),

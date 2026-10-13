@@ -578,13 +578,23 @@ class PlainBatchFields:
     probabilities: bool
 
 
-def plain_batch_fields(path: str | Path) -> PlainBatchFields:
-    """The fields a plain batch's header declares (``PlainBatchFields``); it must declare FORMAT/DS and one r^2 field."""
+def declared_header_fields(path: str | Path) -> set[tuple[str, str]]:
+    """The (kind, ID) pairs a VCF/BCF header declares, e.g. ("FORMAT", "GP") or ("INFO", "DR2")."""
     reader = VCF(str(path))
     try:
-        declared = {(str(header.type), str(header.info().get("ID"))) for header in reader.header_iter()}
+        return {(str(header.type), str(header.info().get("ID"))) for header in reader.header_iter()}
     finally:
         reader.close()
+
+
+POPPED_BATCH_FIELDS = (("FORMAT", "DS"), ("FORMAT", "GP"), ("INFO", "ID"), ("INFO", "INFO"))
+"""The header fields every popped batch declares (GT:DS:GP, its atomic ID and its reported r^2): a record's missing
+value is a gate failure, a field the header never declares is the wrong input format."""
+
+
+def plain_batch_fields(path: str | Path) -> PlainBatchFields:
+    """The fields a plain batch's header declares (``PlainBatchFields``); it must declare FORMAT/DS and one r^2 field."""
+    declared = declared_header_fields(path)
     reported = [field for field in REPORTED_R2_FIELDS if ("INFO", field) in declared]
     if len(reported) != 1:
         raise ValueError(
@@ -791,8 +801,16 @@ def decode_batch(
     value-matched background is removed before encoding. ``codes_path``
     receives the codes as an .npy; ``sample_groups`` gives each of the file's samples, in header
     order, its ancestry group in 0..group_count-1. Records are decoded in steps whose working
-    set fits ``budget``'s host memory.
+    set fits ``budget``'s host memory. A header that does not declare every POPPED_BATCH_FIELDS
+    field is refused before any record is read.
     """
+    declared = declared_header_fields(vcf_path)
+    undeclared = [f"{kind}/{field}" for kind, field in POPPED_BATCH_FIELDS if (kind, field) not in declared]
+    if undeclared:
+        raise ValueError(
+            f"{vcf_path}: the header declares no {undeclared}; a popped batch is GT:DS:GP with INFO/ID and INFO/INFO "
+            "(plain imputation output takes strata_directory and bubble_split null)."
+        )
     return _decode_records(
         vcf_path, expected, sample_groups, group_count, codes_path, _imputed_dosage_milli,
         functools.partial(_reported_r2, field="INFO", ceiling=1.0), budget,
