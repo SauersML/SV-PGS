@@ -157,6 +157,19 @@ def test_summary_reports_invalid_comparisons_separately(tmp_path):
     assert float(row['rate_lower_95']) < .5 < float(row['rate_upper_95'])
 
 
+def test_failed_tasks_are_counted_even_if_no_fit_completes(tmp_path, monkeypatch):
+    import csv
+    def failed(*args):
+        raise ValueError('synthetic rejected fit')
+    monkeypatch.setattr(grid, '_run_task', failed)
+    with pytest.raises(ValueError, match='rejected fit'):
+        grid.run(tmp_path / 'method.py', tmp_path / 'cohort', tmp_path, 'null', 5000, 0, 1)
+    with grid.summarize(tmp_path).open() as handle:
+        row, = list(csv.DictReader(handle, delimiter='\t'))
+    assert row['failed_tasks'] == '1' and row['replicates'] == '0'
+    assert row['valid_comparisons'] == '0' and row['share_favouring_sv'] == 'nan'
+
+
 def test_unshared_arm_error_lowers_the_paired_power_and_leaves_the_expected_aucs():
     architecture = _architecture(sv_share=0.05, tagged_by_small=0.3)
     shared = expected.expectation(architecture, 40, 3, .05, 15)

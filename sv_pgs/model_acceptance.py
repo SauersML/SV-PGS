@@ -16,14 +16,23 @@ def acceptance(model) -> dict:
     def issue(code, severity, detail):
         issues.append({"code": code, "severity": severity, "detail": detail})
 
-    for key, required in (("outer_criterion_met", True), ("unresolved", False),
-                          ("budget_unresolved", False), ("restored_best", False)):
+    for key, required in (("outer_criterion_met", True),
+                          ("budget_unresolved", False), ("restored_best", False), ("far_field_scale", False)):
         if key not in terms:
             issue("missing_" + key, "fatal", "Returned-state diagnostic is absent")
             continue
         values = np.asarray(terms[key])
         if values.shape != (count,) or not np.all(np.isfinite(values)) or np.any(values != int(required)):
             issue(key, "fatal", "At least one returned model failed this check")
+    # This is a historical count of refused trials without a fixed point, not the
+    # convergence status of the returned state (OuterFit.unresolved). Legitimate
+    # failed line-search trials must not quarantine a later accepted model.
+    if "unresolved" in terms:
+        values = np.asarray(terms["unresolved"])
+        if values.shape != (count,) or not np.all(np.isfinite(values)) or np.any(values < 0):
+            issue("invalid_trial_count", "fatal", "Invalid unresolved-trial history")
+        elif np.any(values):
+            issue("unresolved_trials", "info", "Some refused trial states had no fixed point")
     for key in ("remaining_gain", "mean_error", "mean_move", "noise_gain", "prediction_move", "far_field"):
         if key in terms and not np.all(np.isfinite(terms[key])):
             issue(key, "fatal", "Non-finite returned-state diagnostic")

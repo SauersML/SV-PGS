@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import struct
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 
@@ -12,10 +14,8 @@ def _stamp(path: Path) -> tuple[int, ...]:
 
 
 def _hashed(path: str, stamp: tuple[int, ...]) -> str:
-    digest = hashlib.sha256()
     with open(path, "rb") as handle:
-        for block in iter(lambda: handle.read(8 << 20), b""):
-            digest.update(block)
+        digest = hashlib.file_digest(handle, "sha256")
     if _stamp(Path(path)) != stamp:
         raise RuntimeError(f"{path} changed while its content was hashed")
     return digest.hexdigest()
@@ -32,12 +32,21 @@ def file_digest(path: str | Path) -> str:
 
 
 def tree_digest(root: str | Path) -> str:
-    """Bind paths and complete contents, including samples, annotations and genotype shards."""
-    root = Path(root)
+    """Bind paths and complete contents, including samples, annotations and genotype shards.
+
+    Hash files concurrently but do not reuse mutable metadata as a content identity.
+    In particular, a guest kernel clock does not certify host/remote filesystem ctime
+    granularity or clock alignment. Reuse requires an immutable generation contract.
+    """
+    root = Path(root).resolve()
+    paths = sorted(p for p in root.rglob("*") if p.is_file() and p.name != "CACHE_COMPLETE.json")
+    stamps = [_stamp(path) for path in paths]
+    with ThreadPoolExecutor(thread_name_prefix="tree-digest") as pool:
+        contents = list(pool.map(lambda pair: _hashed(str(pair[0]), pair[1]), zip(paths, stamps)))
     digest = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file() and p.name != "CACHE_COMPLETE.json"):
+    for path, content in zip(paths, contents):
         name = path.relative_to(root).as_posix().encode()
-        digest.update(len(name).to_bytes(8, "little"))
+        digest.update(struct.pack("<Q", len(name)))
         digest.update(name)
-        digest.update(bytes.fromhex(file_digest(path)))
+        digest.update(bytes.fromhex(content))
     return digest.hexdigest()

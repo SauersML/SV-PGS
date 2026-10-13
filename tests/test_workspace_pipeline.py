@@ -418,7 +418,7 @@ class _Recorder:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0,
                                       np.repeat(alpha[:, None], draws.shape[1], axis=1), np.zeros((alpha.size, alpha.size)), True))
-        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool), "unresolved": np.zeros(len(models)), "budget_unresolved": np.zeros(len(models)), "restored_best": np.zeros(len(models))})
+        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool), "unresolved": np.zeros(len(models)), "budget_unresolved": np.zeros(len(models)), "restored_best": np.zeros(len(models)), "far_field_scale": np.zeros(len(models))})
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -721,6 +721,8 @@ def test_the_calibration_pairs_leave_out_the_imputation_reference_and_its_member
     assert {record["calibration_pairs"][position][0] for position in record["calibrating"]} == {"7002", "7003", "7005", "7006"}
     account = summaries["samples"]["calibration"]
     assert summaries["samples"]["calibration_pairs"] == 4 and account["reference_overlap"].startswith("checked")
+    # The list states the panel; the run cannot see which genomes the imputation read, and says so.
+    assert "cannot verify" in account["reference_overlap"]
     # One member and one relative: a count of 1 to 20 is never written.
     assert account["reference_members_left_out"] == account["relatives_left_out"] == "1-20 (suppressed)"
 
@@ -892,11 +894,21 @@ def test_scoring_holds_at_most_a_quarter_of_the_host_in_saved_models_per_store_r
     assert workspace_pipeline.score_batches([5], 1) == [range(0, 1)]
 
 
+def test_the_simpler_prior_reaches_every_fit_call(workspace):
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, 'annotated_prior': False})
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through='fit')
+    assert recorder.fit_calls and all(not call.annotated_prior for call in recorder.fit_calls)
+
+
 def test_frozen_probability_calibration_uses_only_reserved_development_families(workspace):
     from sv_pgs.probability_calibration import FrozenCalibration
     synthetic, client = workspace
-    config = WorkspaceConfig.from_mapping({**synthetic.raw, 'calibration_fraction': .3})
-    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through='score')
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, 'calibration_fraction': .3, 'annotated_prior': False})
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through='score')
+    assert all(not call.annotated_prior for call in recorder.fit_calls)
     cohort = np.load(config.run_directory / 'cohort' / 'cohort.npz')
     predictions = np.load(config.run_directory / 'score' / 'predictions.npz')
     records = json.loads((config.run_directory / 'score' / 'calibrators.json').read_text())

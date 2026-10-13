@@ -1,13 +1,111 @@
-"""Independent calibration and frozen proper scores. Never fit on evaluation labels."""
+"""Frozen probability calibration of held-out scores, and the proper scores of its probabilities.
+
+A disease model fitted on the Gaussian working likelihood has a linear predictor that is not a probability. A logistic
+calibration maps it to one, and is fitted on labels other than the ones its probabilities are scored on: recalibrating
+each score on the evaluated labels themselves credits a reversed score as fully as the score it reverses.
+Primary evaluation reserves independent development families for ``FrozenCalibration.fit``. Other-fold
+out-of-fold predictions depend on an outer fold's labels through their training; they are not independent
+calibration data for that fold. ``cross_fitted_logits`` is only a descriptive secondary calculation.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+
 import numpy as np
 from scipy.special import expit
 
+from sv_pgs._typing import F64Array, NDArray
 from sv_pgs.held_out_comparison import (
-    _binary_inputs, cluster_totals, comparison_from_estimate, logistic_recalibration_coefficients,
+    PairedComparison,
+    RecalibrationSeparationError,
+    _binary_inputs,
+    cluster_totals,
+    comparison_from_estimate,
+    logistic_recalibration_coefficients,
 )
+
+
+@dataclass(frozen=True)
+class FrozenCalibration:
+    """A logistic map from a score to a logit, intercept + slope * score, fitted once and then applied unchanged."""
+
+    intercept: float
+    slope: float
+
+    @classmethod
+    def fit(cls, scores: NDArray, labels: NDArray) -> FrozenCalibration:
+        """The maximum-likelihood map whose probability never falls as the score rises (slope >= 0).
+
+        The log-likelihood is concave in (intercept, slope), so its profile in the slope is too, and the profile's
+        derivative at slope 0 is n p (1 - p) times the cases' mean score less the controls' (p the prevalence). Where
+        that difference is not positive the maximum over slope >= 0 is at slope 0, the prevalence for everyone: a score
+        that ranks the calibration rows' cases below their controls gets no credit, where a free slope would reverse it
+        and credit it in full. Elsewhere it is the unconstrained maximum (``logistic_recalibration_coefficients``),
+        whose slope is then positive, or none where the score separates the labels (``RecalibrationSeparationError``).
+        """
+        labels, scores = _binary_inputs(labels, scores)
+        positive = labels == 1.0
+        if not positive.any() or positive.all():
+            raise ValueError("a calibration needs both cases and controls")
+        if np.mean(scores[positive]) <= np.mean(scores[~positive]):
+            prevalence = float(np.mean(positive))
+            return cls(math.log(prevalence / (1.0 - prevalence)), 0.0)
+        intercept, slope = logistic_recalibration_coefficients(scores, labels)
+        return cls(float(intercept), float(slope))
+
+    def logits(self, scores: NDArray) -> F64Array:
+        """The frozen logits of ``scores``."""
+        scores = np.asarray(scores, dtype=np.float64)
+        if not np.all(np.isfinite(scores)):
+            raise ValueError("Calibration scores must be finite")
+        return self.intercept + self.slope * scores
+
+
+def cross_fitted_logits(labels: NDArray, scores: NDArray, folds: NDArray) -> F64Array:
+    """Each row's frozen calibrated logit: its score through the calibration (``FrozenCalibration.fit``) of its fold,
+    fitted on every other fold's rows.
+
+    The rows are one trait's held-out rows, each scored by its own fold's model, which never trained on it. Fold k's
+    calibration is fitted on the other folds' held-out scores and labels and only then applied to fold k's scores, so no
+    label of fold k enters fold k's probabilities, and the calibration maps held-out scores, the kind it is applied to.
+    Fold k's labels did train the other folds' models, so they reach its calibration only through those models' fitted
+    effects, as in any cross-fit. A fold whose calibration has no maximum is NaN: one with no other fold, whose other
+    folds lack cases or controls, or whose other folds' scores separate their labels.
+    """
+    labels = np.asarray(labels, dtype=np.float64)
+    scores = np.asarray(scores, dtype=np.float64)
+    folds = np.asarray(folds)
+    logits = np.full(labels.shape, np.nan)
+    for fold in np.unique(folds):
+        own = folds == fold
+        other_labels = labels[~own]
+        if not 0.0 < float(other_labels.sum()) < other_labels.size:
+            continue
+        try:
+            calibration = FrozenCalibration.fit(scores[~own], other_labels)
+        except RecalibrationSeparationError:
+            continue
+        logits[own] = calibration.logits(scores[own])
+    return logits
+
+
+def proper_scores(labels: NDArray, logits: NDArray) -> dict[str, F64Array]:
+    """Each row's log loss and Brier score of the probability expit(logit)."""
+    labels, logits = _binary_inputs(labels, logits)
+    return {"log_loss": np.logaddexp(0, logits) - labels * logits,
+            "brier": (expit(logits) - labels) ** 2}
+
+
+def paired_frozen_gain(
+    labels: NDArray, baseline_logits: NDArray, candidate_logits: NDArray, clusters: NDArray | None = None, *, metric: str = "log_loss"
+) -> PairedComparison:
+    """The mean per-person reduction in ``metric`` (``proper_scores``) from the baseline's frozen probabilities to the
+    candidate's, positive favouring the candidate (for log loss, the gain in log likelihood), with a family-clustered
+    standard error conditional on the fitted models and their frozen calibrations."""
+    difference = proper_scores(labels, baseline_logits)[metric] - proper_scores(labels, candidate_logits)[metric]
+    totals = cluster_totals(difference - difference.mean(), clusters)
+    return comparison_from_estimate(float(difference.mean()), float(np.linalg.norm(totals) / difference.size))
 
 
 def calibration_mask(training, families, fraction, seed):
@@ -26,33 +124,3 @@ def calibration_mask(training, families, fraction, seed):
     chosen = np.random.default_rng(seed).permutation(groups)[:count]
     result = training & np.isin(families, chosen)
     return result
-
-
-@dataclass(frozen=True)
-class FrozenCalibration:
-    intercept: float
-    slope: float
-
-    @classmethod
-    def fit(cls, scores, labels):
-        intercept, slope = logistic_recalibration_coefficients(scores, labels)
-        return cls(float(intercept), float(slope))
-
-    def logits(self, scores):
-        scores = np.asarray(scores, dtype=float)
-        if not np.all(np.isfinite(scores)):
-            raise ValueError("Calibration scores must be finite")
-        return self.intercept + self.slope * scores
-
-
-def proper_scores(labels, logits):
-    labels, logits = _binary_inputs(labels, logits)
-    return {"log_loss": np.logaddexp(0, logits) - labels * logits,
-            "brier": (expit(logits) - labels) ** 2}
-
-
-def paired_frozen_gain(labels, baseline_logits, candidate_logits, clusters=None, *, metric="log_loss"):
-    """Positive favours candidate. Conditions on frozen fitted models and calibrators."""
-    difference = proper_scores(labels, baseline_logits)[metric] - proper_scores(labels, candidate_logits)[metric]
-    totals = cluster_totals(difference - difference.mean(), clusters)
-    return comparison_from_estimate(float(difference.mean()), float(np.linalg.norm(totals) / difference.size))

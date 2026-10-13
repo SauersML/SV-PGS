@@ -10,9 +10,10 @@ from scipy.special import expit
 
 from sv_pgs import held_out_comparison as comparison, workspace_pipeline as pipeline
 from sv_pgs.config import TraitType
+from sv_pgs.probability_calibration import FrozenCalibration, cross_fitted_logits, paired_frozen_gain, proper_scores
 
 
-@pytest.mark.parametrize("metric", [comparison.paired_delta_auc, comparison.paired_delta_r2, comparison.paired_delta_log_loss])
+@pytest.mark.parametrize("metric", [comparison.paired_delta_auc, comparison.paired_delta_r2, paired_frozen_gain])
 def test_identical_nonconstant_scores_have_no_evidence_of_improvement(metric):
     labels = np.array([0., 1., 0., 1., 0., 1.])
     score = np.array([0., 2., 1., 3., 4., 5.])
@@ -26,7 +27,9 @@ def test_constant_binary_score_fits_prevalence_and_compares_without_crashing():
     intercept, slope = comparison.logistic_recalibration_coefficients(score, labels)
     assert slope == 0.
     assert expit(intercept) == pytest.approx(labels.mean())
-    assert comparison.paired_delta_log_loss(labels, score, score).z_score == 0.
+    calibration = FrozenCalibration.fit(score, labels)
+    assert calibration.slope == 0. and expit(calibration.intercept) == pytest.approx(labels.mean())
+    assert paired_frozen_gain(labels, calibration.logits(score), calibration.logits(score)).z_score == 0.
     assert comparison.paired_delta_auc(labels, score, score).estimate == 0.
 
 
@@ -104,22 +107,49 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
         ancestry=["group"] * n, half=["imputed"] * n,
     )
     both = np.stack([score, score])[:, :, None]
-    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=None)
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=both)
     monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
-    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count, calibration_fraction=0.0)), tmp_path)
+    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count, calibration_fraction=.1)), tmp_path)
     with (tmp_path / "comparison.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
-    assert len(rows) == 6
+    assert len(rows) == 8
     assert "shared-training covariance" in summary["comparison_inference"]
     for row in rows:
         if fold_count > 1:
             assert row["inference"] == "descriptive_cross_fit"
             assert row["z"] == row["p_value"] == ""
-        elif separated and row["metric"] == "test_recalibrated_log_likelihood_gain":
-            assert row["inference"] == "undefined"
-            assert row["z"] == row["p_value"] == ""
         else:
             assert float(row["estimate"]) == 0.
             assert float(row["z"]) == 0.
             assert float(row["p_value"]) == 1.
+
+
+def test_frozen_probabilities_include_single_class_folds_without_refitting_calibration(tmp_path, monkeypatch):
+    n = 300
+    # Fold 0 has no cases: its frozen probabilities are still scored (log loss, Brier), while its AUC is not.
+    labels = np.r_[np.zeros(100), np.tile([0., 1.], 100)]
+    fold = np.repeat(np.arange(3), 100)
+    linear = labels + np.random.default_rng(3).normal(size=n)
+    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
+        covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
+        ancestry=['group'] * n, half=['imputed'] * n)
+    both = np.stack([linear, linear])[:, :, None]
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
+    monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
+    monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
+    monkeypatch.setattr(pipeline.probability_calibration, 'cross_fitted_logits', lambda *args: (_ for _ in ()).throw(AssertionError('outer calibration must not use other-fold labels')))
+    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1)), tmp_path)
+    with (tmp_path / 'accuracy.tsv').open() as handle:
+        rows = [row for row in csv.DictReader(handle, delimiter='\t') if row['cell'] == 'all' and row['arm'] == 'with_sv']
+    metrics = {row['metric']: row for row in rows}
+    assert metrics['log_loss']['n'] == str(n) and metrics['auc']['n'] == '200'
+    frozen = linear.copy()
+    assert np.isfinite(frozen).all()
+    for metric in ('log_loss', 'brier'):
+        assert float(metrics[metric]['value']) == pytest.approx(proper_scores(labels, frozen)[metric].mean(), rel=1e-5)
+    assert float(metrics['auc']['value']) == pytest.approx(
+        np.mean([comparison.auc_components(labels[fold == index], linear[fold == index]).auc for index in (1, 2)]), rel=1e-5
+    )
+    slopes = [comparison.logistic_recalibration_coefficients(frozen[fold == index], labels[fold == index])[1] for index in (1, 2)]
+    assert float(metrics['calibration_slope']['value']) == pytest.approx(np.mean(slopes), rel=1e-5)

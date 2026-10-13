@@ -87,6 +87,7 @@ from sv_pgs import (
     held_out_comparison,
     measurement_model,
     phenotype_measurement,
+    probability_calibration,
     sample_crosswalk,
     scale_mixture_ep,
     store_converter,
@@ -121,7 +122,7 @@ from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.fit_model import FitRequest
-from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_log_loss, paired_delta_r2
+from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_r2
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
@@ -310,7 +311,7 @@ class WorkspaceConfig:
     genome_build: str = "unspecified"
     disease_likelihood: str = "gaussian_working"
     calibration_fraction: float = 0.0
-    reference_exclusion_manifest: Path | None = None
+    annotated_prior: bool = True
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -319,7 +320,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "reference_exclusion_manifest"})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior"})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -327,6 +328,8 @@ class WorkspaceConfig:
             raise ValueError("calibration_fraction must be in [0, 1)")
         if raw.get("disease_likelihood", "gaussian_working") not in ("gaussian_working", "bernoulli"):
             raise ValueError("disease_likelihood must be gaussian_working or bernoulli")
+        if not isinstance(raw.get("annotated_prior", True), bool):
+            raise ValueError("annotated_prior must be a boolean")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -394,7 +397,7 @@ class WorkspaceConfig:
             genome_build=str(raw.get("genome_build", "unspecified")),
             disease_likelihood=str(raw.get("disease_likelihood", "gaussian_working")),
             calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
-            reference_exclusion_manifest=Path(raw["reference_exclusion_manifest"]) if raw.get("reference_exclusion_manifest") else None,
+            annotated_prior=raw.get("annotated_prior", True),
         )
 
     def truth_path(self, chromosome: str) -> Path:
@@ -702,9 +705,10 @@ def calibrating_pairs(
     The long-read people come from the assembly panel the imputation used as its reference. A panel member's imputed row
     is a leave-in imputation, and a close relative's is partly one: the panel holds the haplotypes they share (a KING
     pair above SECOND_DEGREE_KINSHIP, the bound the folds group relatives by). Calibrating on either makes the
-    imputation look better than it is for a new person, so both are left out. With truth calls and no reference list
-    that overlap is unchecked, so no pair is used: the measurement model takes its no-truth form rather than an
-    optimistic calibration. Counts of 1 to 20 are suppressed.
+    imputation look better than it is for a new person, so both are left out. The list is the user's statement of the
+    panel: the run cannot see which genomes the imputation read, and the account says so. With truth calls and no
+    reference list that overlap is unchecked, so no pair is used: the measurement model takes its no-truth form rather
+    than an optimistic calibration. Counts of 1 to 20 are suppressed.
     """
     if config.truth_calls is None:
         return [], {"reference_overlap": "not applicable: no long-read half"}
@@ -728,7 +732,10 @@ def calibrating_pairs(
     research_ids = [ResearchId(pair[0]) for pair in pairs]
     left_out = reference | relatives
     return [position for position, research_id in enumerate(research_ids) if research_id not in left_out], {
-        "reference_overlap": "checked: reference panel members, and their relatives closer than second degree (KING), left out",
+        "reference_overlap": (
+            "checked: the members of the panel imputation_reference_ids lists, and their relatives closer than second degree "
+            "(KING), left out; that the imputation read this panel is the list's statement, which the run cannot verify"
+        ),
         "reference_members_left_out": reportable_count(sum(research_id in reference for research_id in research_ids)),
         "relatives_left_out": reportable_count(sum(research_id in relatives for research_id in research_ids)),
     }
@@ -2010,17 +2017,6 @@ def rewrite_recalibrated_store(
 
 def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
     samples = _read_samples(run)
-    validation = {"status": "not_established", "external_imputation_execution_verified": False}
-    if run.config.reference_exclusion_manifest is not None:
-        from sv_pgs.reference_validation import validate_reference_exclusion
-        manifest = json.loads(run.config.reference_exclusion_manifest.read_text())
-        if manifest.get("genome_build") != run.config.genome_build:
-            raise ValueError("Reference-exclusion manifest has a different genome build")
-        validation = validate_reference_exclusion(
-            manifest, [samples.pairs[position][0] for position in samples.calibrating],
-            [half.path(chromosome, batch) for half in run.config.imputed_halves for chromosome in run.config.chromosomes for batch in half.batches],
-        )
-    _write_json(directory / "reference_validation.json", validation)
     cohort = _read_cohort(run)
     store_directory = run.output("store")
     source_root = store_directory / "store"
@@ -2111,7 +2107,8 @@ FIT_TRAIT_TYPE = TraitType.QUANTITATIVE
 """Default working likelihood. ``disease_likelihood=bernoulli`` selects the binary likelihood explicitly.
 Gaussian disease coefficients are in observed 0/1 status units, not log odds or liability units. Both execution
 routes retain the full-data operator; an LD band accelerates it without dropping realized far-field correlations.
-Probability calibrators use reserved development families. Their proper scores use untouched evaluation labels."""
+A disease's linear predictor is made a probability by a logistic calibration fitted only on reserved development
+families, whose scores and labels are independent of the outer evaluation labels."""
 
 
 def trait_seed(seed: int, trait: int) -> int:
@@ -2121,7 +2118,8 @@ def trait_seed(seed: int, trait: int) -> int:
 
 
 def trait_request(
-    cohort: _Cohort, trait: int, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int, disease_likelihood: str = "gaussian_working"
+    cohort: _Cohort, trait: int, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int,
+    disease_likelihood: str = "gaussian_working", annotated_prior: bool = True,
 ) -> FitRequest:
     """One trait's models (its folds' and its all-rows model) as one fit, on the rows any of them trains on.
 
@@ -2150,6 +2148,7 @@ def trait_request(
         budget=budget,
         work_dir=work_dir,
         seed=seed,
+        annotated_prior=annotated_prior,
     )
 
 
@@ -2186,7 +2185,8 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                     # A Spot restart keeps completed fold checkpoints; the engine discards only
                     # the interrupted model's scratch and verifies each checkpoint's input digest.
                     work.mkdir(parents=True, exist_ok=True)
-                    request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait), run.config.disease_likelihood)
+                    request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait),
+                                            run.config.disease_likelihood, run.config.annotated_prior)
                     if not target.is_dir():
                         target.parent.mkdir(parents=True, exist_ok=True)
                         LOGGER.info("workspace pipeline: fitting %s / %s", arm, trait_name)
@@ -2649,14 +2649,28 @@ def _scored_folds(held: _HeldOutCell, targets: F64Array, binary: bool) -> list[I
     return [rows for rows in held.folds if rows.shape[0] and np.ptp(targets[rows]) > 0.0]
 
 
-def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, covariates: F64Array, calibrated_logits: F64Array | None = None) -> float:
-    """One arm's held-out metric on one fold's rows (``_report_step``)."""
+PROPER_SCORES = ("log_loss", "brier", "log_likelihood_gain", "brier_reduction")
+"""The metrics of a disease's frozen probabilities, which a fold with one outcome class still has (``_report_step``)."""
+
+
+def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, frozen: F64Array, covariates: F64Array) -> float:
+    """One arm's held-out metric on one fold's rows (``_report_step``). ``frozen`` holds the rows' frozen calibrated
+    logits (the score step's independent development calibration); a metric of them on a fold whose calibration has no
+    maximum is NaN."""
+    if metric in ("log_loss", "brier", "calibration_intercept", "calibration_slope") and not np.all(np.isfinite(frozen)):
+        return float("nan")
     if metric in ("log_loss", "brier"):
-        from sv_pgs.probability_calibration import proper_scores
-        return float(proper_scores(targets, calibrated_logits)[metric].mean())
+        return float(np.mean(probability_calibration.proper_scores(targets, frozen)[metric]))
+    if metric in ("calibration_intercept", "calibration_slope"):
+        # Descriptive: the outcome's logistic fit on the frozen logit over the evaluated rows (intercept 0 and slope 1
+        # where the frozen probabilities are calibrated there). It never changes a frozen probability or a proper score.
+        try:
+            intercept, slope = held_out_comparison.logistic_recalibration_coefficients(frozen, targets)
+        except held_out_comparison.RecalibrationSeparationError:
+            return float("nan")
+        return float(intercept if metric == "calibration_intercept" else slope)
     if metric == "auc":
-        score = calibrated_logits if calibrated_logits is not None and np.all(np.isfinite(calibrated_logits)) else linear
-        return auc_components(targets, score).auc
+        return auc_components(targets, linear).auc
     if metric == "pgs_auc":
         return auc_components(targets, genetic).auc
     if metric == "r2":
@@ -2666,31 +2680,23 @@ def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: 
     raise ValueError(f"unknown metric {metric!r}")
 
 
-def _paired(metric: str, targets: F64Array, scores: _Scores, rows: I64Array, trait: int, covariates: F64Array, families: I64Array) -> PairedComparison:
-    """One fold's paired comparison of the arms on its held-out ``rows`` (positive favours ``with_sv``)."""
+def _paired(
+    metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, frozen: F64Array, covariates: F64Array, families: I64Array
+) -> PairedComparison:
+    """One fold's paired comparison of the arms on its held-out rows, from their linear predictors, genetic scores and
+    frozen calibrated logits, each [arms, rows] (positive favours ``with_sv``). A comparison of the frozen probabilities
+    on a fold whose calibration has no maximum (the score step's independent development calibration) is NaN."""
     baseline, candidate = ARMS.index("snv_indel"), ARMS.index("with_sv")
-    linear = scores.held_out_linear_predictor[:, rows, trait]
-    genetic = scores.held_out_genetic[:, rows, trait]
-    if metric in ("frozen_log_loss_gain", "frozen_brier_gain"):
-        from sv_pgs.probability_calibration import paired_frozen_gain
-        logits = scores.held_out_calibrated_logits[:, rows, trait]
-        return paired_frozen_gain(targets, logits[baseline], logits[candidate], families,
-                                  metric="log_loss" if metric == "frozen_log_loss_gain" else "brier")
+    if metric in ("log_likelihood_gain", "brier_reduction"):
+        if not np.all(np.isfinite(frozen)):
+            return PairedComparison(float("nan"), float("nan"), float("nan"))
+        return probability_calibration.paired_frozen_gain(
+            targets, frozen[baseline], frozen[candidate], families, metric="log_loss" if metric == "log_likelihood_gain" else "brier"
+        )
     if metric == "delta_auc":
-        if scores.held_out_calibrated_logits is not None:
-            calibrated = scores.held_out_calibrated_logits[:, rows, trait]
-            if np.all(np.isfinite(calibrated)):
-                linear = calibrated
         return paired_delta_auc(targets, linear[baseline], linear[candidate], families)
     if metric == "delta_pgs_auc":
         return paired_delta_auc(targets, genetic[baseline], genetic[candidate], families)
-    if metric == "test_recalibrated_log_likelihood_gain":
-        try:
-            return paired_delta_log_loss(targets, linear[baseline], linear[candidate], families)
-        except held_out_comparison.RecalibrationSeparationError:
-            # A valid held-out score can perfectly separate a small cell. Its AUC
-            # remains reportable, but recalibration has no finite maximum.
-            return PairedComparison(float("nan"), float("nan"), float("nan"))
     if metric == "delta_pgs_partial_r2":
         return paired_delta_r2(
             _residualized(targets, covariates), _residualized(genetic[baseline], covariates), _residualized(genetic[candidate], covariates), families
@@ -2702,15 +2708,18 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Held-out accuracy of both arms (``accuracy.tsv``) and the paired SNV+SV against SNV/indel comparison
     (``comparison.tsv``), per trait in cells of all held-out rows, fold, ancestry and half.
 
-    Every value is each fold's own model evaluated on its own fold, then weighted by the fold's rows. A disease is
-    scored by the AUC of its linear predictor and the AUC of its genetic score alone (its working likelihood's
-    predictive mean is not a probability, FIT_TRAIT_TYPE); a quantitative trait by the r^2 of its linear predictor and the partial r^2 of its genetic score
-    given the trait's covariates. The comparison is paired on the same people: a disease's DeLong delta AUC of the
-    linear predictors and of the genetic scores (with family-clustered variance) and its family-clustered gain in
-    recalibrated log likelihood; a
-    quantitative trait's family-clustered delta partial r^2 of the genetic scores. Positive favours ``with_sv``.
-    Across multiple folds the estimate and conditional standard error are descriptive:
-    shared-training covariance is not estimated, so no combined z or p-value is emitted.
+    Every value is each fold's own model evaluated on its own fold, then weighted by the fold's rows. A disease's linear
+    predictor is not a probability (FIT_TRAIT_TYPE): each arm's is made one by a frozen logistic calibration, fold k's
+    fitted only on its reserved development families. Neither those labels nor their scores depend on outer test labels. A disease is scored by the AUC of its linear predictor, the AUC
+    of its genetic score alone, the log loss and Brier score of its frozen probabilities, and the calibration intercept
+    and slope of the outcome on its frozen logit over the evaluated rows (descriptive); a quantitative trait by the r^2
+    of its linear predictor and the partial r^2 of its genetic score given the trait's covariates. The comparison is
+    paired on the same people: a disease's DeLong delta AUC of the linear predictors and of the genetic scores (with
+    family-clustered variance) and its family-clustered gain in log likelihood and reduction in Brier score of the
+    frozen probabilities; a quantitative trait's family-clustered delta partial r^2 of the genetic scores. Positive
+    favours ``with_sv``. A frozen-probability metric is read on every fold of a cell, one with a single outcome class
+    included; the others on the folds ``_scored_folds`` keeps. Across multiple folds the estimate and conditional
+    standard error are descriptive: shared-training covariance is not estimated, so no combined z or p-value is emitted.
     """
     cohort = _read_cohort(run)
     scores = _read_scores(run)
@@ -2721,28 +2730,47 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
         binary = cohort.trait_types[trait] == TraitType.BINARY
         covariates = cohort.covariates[:, cohort.covariate_columns[trait]]
         targets = cohort.targets[:, trait]
-        metric_names = ("auc", "pgs_auc") if binary else ("r2", "pgs_partial_r2")
-        comparison_names = ("delta_auc", "delta_pgs_auc", "test_recalibrated_log_likelihood_gain") if binary else ("delta_pgs_partial_r2",)
-        if binary and run.config.calibration_fraction:
-            metric_names = ("log_loss", "brier", *metric_names)
-            comparison_names = ("frozen_log_loss_gain", "frozen_brier_gain", *comparison_names)
+        linear = scores.held_out_linear_predictor[:, :, trait]
+        genetic = scores.held_out_genetic[:, :, trait]
+        # Frozen probabilities are produced by this outer model's reserved development families.
+        # Other folds' out-of-fold models trained on this fold's labels: calibrating from
+        # those models would indirectly reuse evaluation labels and is not outer validation.
+        frozen = np.full(linear.shape, np.nan) if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[:, :, trait]
+        metric_names = ("auc", "pgs_auc", "log_loss", "brier", "calibration_intercept", "calibration_slope") if binary else ("r2", "pgs_partial_r2")
+        comparison_names = ("delta_auc", "delta_pgs_auc", "log_likelihood_gain", "brier_reduction") if binary else ("delta_pgs_partial_r2",)
+        if binary and not run.config.calibration_fraction:
+            metric_names = ("auc", "pgs_auc")
+            comparison_names = ("delta_auc", "delta_pgs_auc")
         for cell, level, held in _cells(cohort, trait, fold_count):
             count = held.count
             cases = int(sum(int(targets[rows].sum()) for rows in held.folds)) if binary else None
             counts = (reportable_count(count), _cases_text(count, cases))
-            folds = _scored_folds(held, targets, binary) if _shown(count, cases) else []
+            shown = _shown(count, cases)
+            scored = _scored_folds(held, targets, binary) if shown else []
+            nonempty = [rows for rows in held.folds if rows.shape[0]] if shown else []
+
+            def evaluated_counts(selected):
+                if not shown:
+                    return counts
+                used = sum(rows.size for rows in selected)
+                used_cases = int(sum(targets[rows].sum() for rows in selected)) if binary else None
+                return reportable_count(used), _cases_text(used, used_cases)
             for arm_index, arm in enumerate(ARMS):
-                linear = scores.held_out_linear_predictor[arm_index, :, trait]
-                genetic = scores.held_out_genetic[arm_index, :, trait]
                 for metric in metric_names:
-                    values = [(rows.shape[0], _held_out_metric(metric, targets[rows], linear[rows], genetic[rows], covariates[rows], None if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[arm_index, rows, trait])) for rows in folds]
-                    accuracy.append((name, arm, cell, level, *counts, *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
+                    values = [
+                        (rows.shape[0], _held_out_metric(metric, targets[rows], linear[arm_index, rows], genetic[arm_index, rows], frozen[arm_index, rows], covariates[rows]))
+                        for rows in (nonempty if metric in PROPER_SCORES else scored)
+                    ]
+                    accuracy.append((name, arm, cell, level, *evaluated_counts(nonempty if metric in PROPER_SCORES else scored), *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
             # The paired comparison per cell of all held-out rows and per ancestry group (a fold is one term of
             # every cell's sum, and the halves are a measurement split rather than a population).
             if cell not in ("all", "ancestry"):
                 continue
             for metric in comparison_names:
-                per_fold = [(rows.shape[0], _paired(metric, targets[rows], scores, rows, trait, covariates[rows], cohort.families[rows])) for rows in folds]
+                per_fold = [
+                    (rows.shape[0], _paired(metric, targets[rows], linear[:, rows], genetic[:, rows], frozen[:, rows], covariates[rows], cohort.families[rows]))
+                    for rows in (nonempty if metric in PROPER_SCORES else scored)
+                ]
                 if not per_fold:
                     comparison.append((name, cell, level, *counts, "", "", "", "", "", ""))
                     continue
@@ -2756,7 +2784,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                 else:
                     z_text, p_text, inference = "", "", "undefined"
                 comparison.append((
-                    name, cell, level, *counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
+                    name, cell, level, *evaluated_counts(nonempty if metric in PROPER_SCORES else scored), metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
                     z_text, p_text, inference,
                 ))
     for file_name, lines in (("accuracy.tsv", accuracy), ("comparison.tsv", comparison)):
@@ -2842,13 +2870,13 @@ _STEPS = (
     _Step(
         "measurement",
         ("samples", "cohort", "store"),
-        lambda config: None if config.reference_exclusion_manifest is None else _file_digest(config.reference_exclusion_manifest),
+        lambda config: None,
         # The measurement model it fits and loads (workspace_bindings) is measurement_model's, which the key covers.
         (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store, *module_closure(measurement_model)),
         _measurement_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood), (_fit_step, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
+    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
@@ -2858,7 +2886,10 @@ _STEPS = (
         "report",
         ("cohort", "score"),
         lambda config: None,
-        (_report_step, _cells, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text, held_out_comparison),
+        (
+            _report_step, _cells, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text,
+            held_out_comparison, probability_calibration,
+        ),
         _report_step,
     ),
     _Step("export", ("report", "effects"), lambda config: config.export, (_export_step, check_exportable), _export_step),

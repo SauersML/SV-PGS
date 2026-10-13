@@ -4,7 +4,22 @@ Code: `sv_pgs/held_out_comparison.py` (`cross_fit_delta_r2`, `panel_z`, `power_w
 
 Measurements carry the evidence tags defined in MODEL.md. Accuracy claims are adopted only on the neutral benchmarks, bench-real (`benchmarks/bench_real/`, real public phenotypes) and bench-sim (`benchmarks/bench_sim/`, a sealed real-haplotype suite with a pre-registered, misspecified truth family), or on in-workspace held-out data. A lane's own simulation calibrates the tests' size and checks the math.
 
-## Arms
+## Current readiness protocol (13 October 2026)
+
+This section describes the implemented primary workflow and supersedes conflicting proposals below. Older forecasts and simulation results below are historical, not evidence that the current production gates have passed.
+
+- Retain five kinship-grouped outer folds. In the example config, reserve 10% of each fold's development families for probability calibration; fit on approximately 72% of people, calibrate on 8%, evaluate on 20%. The final deployment fit also reserves calibration families. Family sizes make exact fractions vary.
+- Compare separately refitted `snv_indel` and `with_sv` predictors using the same people, annotations on retained small variants, covariates, folds and full-data operator. Timing selects band acceleration, not a truncated-LD likelihood. `disease_likelihood` records either `gaussian_working` on 0/1 status or `bernoulli`; Gaussian coefficients are not log odds.
+- Primary disease endpoints are frozen probability log loss and Brier score, with AUC and diagnostic calibration intercept/slope. Calibration coefficients come only from development families. The legacy test-label recalibration statistic is secondary and is omitted from the primary report; diagnostic slope estimates never replace frozen probabilities.
+- Five-fold aggregated estimates and conditional standard errors are descriptive. Shared-training covariance is not estimated; do not turn these standard errors into confirmatory cross-validation confidence intervals or P values. A fixed final predictor on an independent test cohort supports paired family-level inference conditional on training. Full retraining simulation/resampling is needed to assess learning-pipeline variability.
+- `annotated_prior=false` enables the simpler class/frequency prior. Run both settings with identical inputs in distinct output directories for the 2×2 feature/prior pilot; this doubles fits and is not automatically included in the production budget. The bench-sim submissions `svpgs_full.py` and `svpgs_simple_prior.py` provide the same contrast.
+- The power grid reuses the existing real-haplotype simulator and imputed measurement arm. Vary training size, causal SV fraction, SV effect SD, length effects and deletion/insertion effects. No-SV-causality is a tagging/regularization control, not automatically an equal-prediction null. Preserve SNV–SV LD. Add off-prior and ancestry/batch measurement-error scenarios from the existing truth families. Report actual causal counts and realized variance, not only requested probabilities.
+- Run matched replicates through the full pipeline. Report failed and completed fits, distributions of paired accuracy gains, and rejection-rate Monte Carlo precision. The planning calculator uses assumed predictors on one outer holdout and excludes training variability; its numbers are not measured All of Us accuracy or five-fold power.
+- Length readouts separate absolute posterior mean from posterior SD. They are descriptive and prior/LD dependent. Validate enrichment with length-independent full-pipeline controls, a no-length-feature ablation and held-out loci or independent data. Genetic score variance reports the SNV/SV covariance cross term; an allocation of that cross term is a convention, not a uniquely identified causal heritability fraction.
+
+Production remains pending a representative Gaussian/Bernoulli comparison, out-of-reference-family imputation validation, higher-precision genotype refits, near-collinear posterior coverage checks, and a complete matched-arm GPU pilot measuring memory, disk, passes, restart and cost. The existing 8-bit representation is lossy; flattened-record counts do not validate its prediction error. Fifteen diseases × two arms × (five folds + final fit) is 180 fits before ablations. Keep the $3,000 stop budget; no cost guarantee follows from CPU unit tests. No imputation rerun is part of the PGS cost plan.
+
+## Arms (earlier proposed extensions)
 All arms share the same samples, folds, covariates and inference; only the columns and prior inputs differ.
 
 | Arm | Columns | Prior inputs |
@@ -94,3 +109,5 @@ All arms share the same samples, folds, covariates and inference; only the colum
 - The operator (Hutchinson) form of the pair term at p ≈ 17M.
 - The claim (b) and (c) machinery in the repo; prototypes exist in the simulation code.
 - The validity simulations and the red-team sweep, to be rerun on bench-sim's v7 cohort through the task runners.
+
+Known solver regression: the 60-record/240-person annotated synthetic benchmark in `test_bench_sim_svpgs_submission.py` currently ends without outer convergence and must be quarantined. The simpler-prior version and the separate real-engine wiring tests pass. An inner trust-radius update now compares the local mode objective with its own gradient model; it must not use a corrected evidence difference and its absolute uncertainty to judge that different local quadratic. This avoids a demonstrated tiny-step stall but does not resolve the annotated case's remaining stationarity failure. Do not count its rejected fit as evidence of accuracy.

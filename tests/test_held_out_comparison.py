@@ -21,13 +21,13 @@ from sv_pgs.held_out_comparison import (
     logistic_recalibration_coefficients,
     null_cost_gate,
     paired_delta_auc,
-    paired_delta_log_loss,
     paired_delta_r2,
     panel_z,
     permute_within_groups,
     power_weights,
     size_gate,
 )
+from sv_pgs.probability_calibration import FrozenCalibration, cross_fitted_logits, paired_frozen_gain, proper_scores
 
 
 def test_paired_delta_r2_estimate_is_the_difference_of_squared_correlations():
@@ -106,20 +106,68 @@ def test_cross_fit_delta_r2_is_calibrated_where_pooling_is_not():
     assert float(np.std(pooled)) > float(np.std(stratified))
 
 
-def test_paired_delta_log_loss_favours_the_more_informative_score_and_holds_size():
+def _held_out_disease(rng: np.random.Generator, people: int, fold_count: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A liability, the disease it thresholds with noise, and each person's fold."""
+    liability = rng.standard_normal(people)
+    labels = (liability + rng.standard_normal(people) > 1.0).astype(float)
+    return liability, labels, np.arange(people) % fold_count
+
+
+def test_the_frozen_log_likelihood_gain_favours_the_more_informative_score_and_holds_size():
     rng = np.random.default_rng(4)
     null_z = []
     for _ in range(200):
-        liability = rng.standard_normal(3000)
-        labels = (liability + rng.standard_normal(3000) > 1.0).astype(float)
-        baseline = liability + rng.standard_normal(3000)
-        candidate = liability + rng.standard_normal(3000)
-        null_z.append(paired_delta_log_loss(labels, baseline, candidate).z_score)
+        liability, labels, folds = _held_out_disease(rng, 3000, 5)
+        baseline = cross_fitted_logits(labels, liability + rng.standard_normal(3000), folds)
+        candidate = cross_fitted_logits(labels, liability + rng.standard_normal(3000), folds)
+        null_z.append(paired_frozen_gain(labels, baseline, candidate).z_score)
     assert size_gate(np.asarray(null_z))
-    liability = rng.standard_normal(5000)
-    labels = (liability + rng.standard_normal(5000) > 1.0).astype(float)
-    better = paired_delta_log_loss(labels, liability + rng.standard_normal(5000) * 2.0, liability)
+    liability, labels, folds = _held_out_disease(rng, 5000, 5)
+    better = paired_frozen_gain(
+        labels, cross_fitted_logits(labels, liability + rng.standard_normal(5000) * 2.0, folds), cross_fitted_logits(labels, liability, folds)
+    )
     assert better.z_score > 3.0
+
+
+def test_a_negated_candidate_loses_log_likelihood_under_frozen_calibration():
+    """Recalibrating each score on the labels it is scored on gave a candidate that negates the baseline exactly the
+    baseline's log likelihood. Calibrated on the other folds, with a slope that cannot reverse a score, it keeps none of
+    the baseline's information, and a candidate negated in the evaluated fold alone loses there as well."""
+    rng = np.random.default_rng(12)
+    liability, labels, folds = _held_out_disease(rng, 5000, 5)
+    baseline = liability + rng.standard_normal(5000)
+
+    def recalibrated_on_its_own_labels(score: np.ndarray) -> float:
+        intercept, slope = logistic_recalibration_coefficients(score, labels)
+        return float(np.mean(proper_scores(labels, intercept + slope * score)["log_loss"]))
+
+    assert recalibrated_on_its_own_labels(-baseline) == pytest.approx(recalibrated_on_its_own_labels(baseline), rel=1e-12)
+    baseline_logits = cross_fitted_logits(labels, baseline, folds)
+    negated = paired_frozen_gain(labels, baseline_logits, cross_fitted_logits(labels, -baseline, folds))
+    assert negated.estimate < 0.0 and negated.z_score < -5.0
+    calibration = FrozenCalibration.fit(-baseline, labels)
+    assert calibration.slope == 0.0 and special.expit(calibration.intercept) == pytest.approx(labels.mean())
+    flipped = np.where(folds == 0, -baseline, baseline)
+    evaluated = folds == 0
+    in_fold = paired_frozen_gain(labels[evaluated], baseline_logits[evaluated], cross_fitted_logits(labels, flipped, folds)[evaluated])
+    assert in_fold.estimate < 0.0 and in_fold.z_score < -5.0
+
+
+def test_a_fold_s_frozen_probabilities_never_read_its_own_labels():
+    rng = np.random.default_rng(13)
+    liability, labels, folds = _held_out_disease(rng, 2000, 4)
+    score = liability + rng.standard_normal(2000)
+    logits = cross_fitted_logits(labels, score, folds)
+    own = folds == 2
+    changed = np.where(own, 1.0 - labels, labels)
+    moved = cross_fitted_logits(changed, score, folds)
+    np.testing.assert_array_equal(moved[own], logits[own])
+    assert not np.allclose(moved[~own], logits[~own])
+    # With no other fold, or other folds whose scores separate their labels, a fold has no calibration: here only fold
+    # 2's scores overlap between cases and controls, so every other fold's calibration reads them and fold 2's cannot.
+    assert np.all(np.isnan(cross_fitted_logits(labels, score, np.zeros(2000, dtype=np.int64))))
+    separated = cross_fitted_logits(labels, labels + np.where(own, score, 0.0), folds)
+    assert np.all(np.isnan(separated[own])) and np.all(np.isfinite(separated[~own]))
 
 
 def _within_the_stopping_rule(score, labels, intercept, slope):

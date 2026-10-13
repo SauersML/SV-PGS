@@ -90,7 +90,7 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
             "negative_sites": np.array([0, 3]),
             "outer_iterations": np.array([4, 6]),
             "outer_criterion_met": np.array([True, True]),
-            "unresolved": np.zeros(2), "budget_unresolved": np.zeros(2), "restored_best": np.zeros(2),
+            "unresolved": np.zeros(2), "budget_unresolved": np.zeros(2), "restored_best": np.zeros(2), "far_field_scale": np.zeros(2),
         },
         fit_counts={"refreshes": 3, "passes": 41},
         refusals=("model 1: no damped EP pass keeps the full-data precision positive definite",),

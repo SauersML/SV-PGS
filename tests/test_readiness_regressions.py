@@ -62,13 +62,15 @@ def test_acceptance_quarantines_unresolved_fits_but_allows_null_notes():
     import pytest
     model = SimpleNamespace(model_names=('null',), scoring=(), refusals=('no variable genetic columns',),
                             certificate=dict(outer_criterion_met=np.array([True]), unresolved=np.array([0]),
-                                             budget_unresolved=np.array([0]), restored_best=np.array([False])))
+                                             budget_unresolved=np.array([0]), restored_best=np.array([False]), far_field_scale=np.array([0.])))
     assert acceptance(model)['accepted']
     assert not acceptance(model)['deployment_validated']
-    for term, value in (('outer_criterion_met', False), ('unresolved', 1), ('budget_unresolved', 1), ('restored_best', True)):
+    for term, value in (('outer_criterion_met', False), ('budget_unresolved', 1), ('restored_best', True)):
         bad = SimpleNamespace(**(vars(model) | {'certificate': model.certificate | {term: np.array([value])}}))
         with pytest.raises(ValueError, match='quarantined'):
             require_accepted(bad)
+    model.certificate['unresolved'] = np.array([3])
+    assert acceptance(model)['accepted']  # Failed trials do not invalidate a converged final state.
     model.refusals = ('lattice check unresolved: refit failed',)
     assert not acceptance(model)['accepted']
 
@@ -84,17 +86,6 @@ def test_frozen_calibration_cannot_hide_a_reversed_evaluation_predictor():
     reversed_score = calibrator.logits(-scores[2000:])
     assert paired_frozen_gain(y[2000:], baseline, reversed_score).estimate < -.2
     assert paired_frozen_gain(y[2000:], baseline, baseline).estimate == 0
-
-
-def test_calibration_families_are_disjoint_from_training_and_evaluation():
-    from sv_pgs.probability_calibration import calibration_mask
-    families = np.repeat(np.arange(100), 2)
-    eligible = families % 5 != 0
-    reserved = calibration_mask(eligible, families, .1, 13)
-    assert reserved.any() and not np.any(reserved & ~eligible)
-    training = eligible & ~reserved
-    assert not set(families[training]) & set(families[reserved])
-    assert np.array_equal(reserved, calibration_mask(eligible, families, .1, 13))
 
 
 def test_portable_layout_accepts_new_people_but_refuses_wrong_equal_length_allele(tmp_path):
@@ -123,23 +114,6 @@ def test_portable_layout_accepts_new_people_but_refuses_wrong_equal_length_allel
     (second / IDENTITY_FILE).write_text(json.dumps({'chr22': chromosome_identity(**args)}))
     with DosageStore.open(second) as store, pytest.raises(ValueError, match='variant layout'):
         predict(model, store, np.arange(4), np.zeros((4, 2)), _budget())
-
-
-def test_reference_manifest_rejects_people_relatives_and_unbound_inputs(tmp_path):
-    import pytest
-    from sv_pgs.reference_validation import validate_reference_exclusion
-    path = tmp_path / 'imputed.bcf'
-    path.write_bytes(b'synthetic')
-    manifest = dict(schema='svpgs-reference-exclusion-v1', genome_build='GRCh38', reference_callset='synthetic-v1',
-                    family_definition='joint connected components', reference_people=[dict(id='r', family='rf')],
-                    validation_people=[dict(id='v', family='vf')], imputed_sha256={str(path): file_digest(path)})
-    assert validate_reference_exclusion(manifest, ['v'], [path])['status'] == 'manifest_consistent'
-    for row in (dict(id='r', family='vf'), dict(id='v', family='rf')):
-        with pytest.raises(ValueError, match='overlap'):
-            validate_reference_exclusion(manifest | dict(validation_people=[row]), ['v'], [path])
-    path.write_bytes(b'different')
-    with pytest.raises(ValueError, match='bound'):
-        validate_reference_exclusion(manifest, ['v'], [path])
 
 
 def test_mixture_effect_summaries_include_rare_components_without_draw_noise():
@@ -184,3 +158,23 @@ def test_a_band_accelerated_full_data_fit_is_accepted_and_only_the_pure_summary_
     # The pure summary route left its far field out of the likelihood and records the measured scale.
     summary = SimpleNamespace(**(vars(accelerated) | {'certificate': accelerated.certificate | {'far_field_scale': np.array([1.2])}}))
     assert not acceptance(summary)['accepted'] and 'truncated_ld' in {issue['code'] for issue in acceptance(summary)['issues']}
+
+
+def test_tree_digest_matches_serial_definition_without_trusting_timestamp_resolution(tmp_path, monkeypatch):
+    import hashlib
+    import struct
+    from sv_pgs import content_identity
+    for name, data in (('MANIFEST.json', b'{}'), ('dosage/shard', b'abcd' * 1000), ('annotation', b'1')):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_bytes(data)
+    expected = hashlib.sha256()
+    for path in sorted(p for p in tmp_path.rglob('*') if p.is_file()):
+        name = path.relative_to(tmp_path).as_posix().encode()
+        expected.update(struct.pack('<Q', len(name)) + name + hashlib.sha256(path.read_bytes()).digest())
+    before = tree_digest(tmp_path)
+    assert before == expected.hexdigest()
+    # Simulate coarse/remote metadata with unchanged stamps. Content still determines the key.
+    monkeypatch.setattr(content_identity, '_stamp', lambda path: (1, 1, 1, 1, 1))
+    assert tree_digest(tmp_path) == before
+    (tmp_path / 'annotation').write_bytes(b'2')
+    assert tree_digest(tmp_path) != before
