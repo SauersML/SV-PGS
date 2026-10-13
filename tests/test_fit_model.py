@@ -61,7 +61,7 @@ def _certificate(model_count: int, generator: np.random.Generator) -> FitCertifi
             values[field.name] = generator.uniform(size=model_count)
     values.update(outer_criterion_met=np.ones(model_count, dtype=bool), unresolved=np.zeros(model_count, dtype=np.int64),
                   budget_unresolved=np.zeros(model_count, dtype=np.int64), restored_best=np.zeros(model_count, dtype=bool),
-                  far_field=np.zeros(model_count))
+                  far_field=np.zeros(model_count), far_field_scale=np.zeros(model_count), far_field_scale_error=np.zeros(model_count))
     return FitCertificate(**values)
 
 
