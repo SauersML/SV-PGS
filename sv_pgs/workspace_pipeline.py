@@ -28,8 +28,9 @@ Steps:
    sidecar's sites and ids md5; or plain imputed VCF/BCFs (GLIMPSE2, Beagle 5, Minimac4, IMPUTE5),
    every batch checked in lockstep against the first batch's records. Each half's sample manifest
    is typed by its namespace.
-5. ``measurement``: the measurement model, fitted on the calibration pairs from the truth rows, or
-   its explicit no-truth form, and the fit's prior offset from it. Where it recalibrates, the store
+5. ``measurement``: the measurement model, fitted on the calibration pairs from the truth rows
+   outside the imputation reference panel and its members' close relatives (``calibrating_pairs``),
+   or its explicit no-truth form, and the fit's prior offset from it. Where it recalibrates, the store
    is rewritten with D*.
 6. ``fit``: both arms (``ARMS``: SNVs and short indels alone, then with every structural record)
    of every trait, each trait's fold models and its all-rows model in one call, each projecting
@@ -102,6 +103,7 @@ from sv_pgs.all_of_us import (
 )
 from sv_pgs.cohort import (
     LONG_READ_SOURCE,
+    SECOND_DEGREE_KINSHIP,
     AncestryPcs,
     TraitTable,
     build_cohort,
@@ -113,7 +115,7 @@ from sv_pgs.cohort import (
     reportable_count,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS
+from sv_pgs.artifact import CERTIFICATE_STATUS, model_part
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -178,6 +180,9 @@ ARM_KEEPS_STRUCTURAL = {"snv_indel": False, "with_sv": True}
 ALL_ROWS_MODEL = "all"
 """The model of a trait trained on every person who has the trait: the released score and the effects step's source.
 SPEC: the fit itself never holds rows out; the folds' models exist only to measure held-out accuracy."""
+STRUCTURAL_PART = "structural"
+"""The name suffix of an all-rows model's structural part (``artifact.model_part`` on ``structural_records``), whose
+genetic score the score step writes beside the model's own for the effects step's variance decomposition."""
 COMPLETE_FILE = "_COMPLETE.json"
 KEY_FILE = "_KEY"
 EXPORTABLE_FILE = "_EXPORTABLE.json"
@@ -187,6 +192,7 @@ CONFIG_KEYS = (
     "chromosomes",
     "imputed_halves",
     "truth_calls",
+    "imputation_reference_ids",
     "strata_directory",
     "bubble_split",
     "genetic_map",
@@ -215,8 +221,12 @@ KEY_HINTS = {
         "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh38.map.zip, unzipped: e.g. "
         "<dir>/no_chr_in_chrom_field/plink.{chromosome}.GRCh38.map."
     ),
+    "imputation_reference_ids": (
+        "imputation_reference_ids is a one-column file headed research_id listing everyone whose genome was in the "
+        "imputation's reference panel, or null; with truth_calls set and it null, no calibration pair is used."
+    ),
 }
-"""What to point a key at, for the keys whose file is a public download."""
+"""What to point a key at, for the keys whose file is a public download or whose null changes what the run does."""
 STRATA_COLUMNS = ("idx", "pos", "id", "refalt_md5", "ref_len", "alt_len", "n_paths", "n_paths_total", "cx")
 """The strata sidecar v2 columns the store needs (the imputation's chrK.strata.tsv.gz, header after '#')."""
 SEX_COLUMN = "sex_at_birth_concept_id"
@@ -265,6 +275,11 @@ class WorkspaceConfig:
     long-read half, no calibration pairs, no D*, and each step's summary says so. ``export`` lists
     the report files the user has approved for staging, by name.
 
+    ``imputation_reference_ids`` is the file of research IDs whose genomes were in the imputation's
+    reference panel, which the calibration pairs leave out with their close relatives
+    (``calibrating_pairs``), or null. It is read only with truth calls; with truth calls and null,
+    no calibration pair is used.
+
     ``strata_directory`` and ``bubble_split`` are set together for popped batches (``popped``), or
     null together for plain imputed VCF/BCFs (``popped`` None). ``genetic_map`` is a path pattern
     over ``{chromosome}`` to a PLINK-format map, read for a plain chromosome whose records lack
@@ -276,6 +291,7 @@ class WorkspaceConfig:
     chromosomes: tuple[str, ...]
     imputed_halves: tuple[ImputedHalfInput, ...]
     truth_calls: str | None
+    imputation_reference_ids: Path | None
     popped: PoppedSidecars | None
     genetic_map: str | None
     tandem_repeats: Path
@@ -291,6 +307,10 @@ class WorkspaceConfig:
     seed: int
     codec: Codec
     export: tuple[str, ...]
+    genome_build: str = "unspecified"
+    disease_likelihood: str = "gaussian_working"
+    calibration_fraction: float = 0.0
+    reference_exclusion_manifest: Path | None = None
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -299,10 +319,14 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS))
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "reference_exclusion_manifest"})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
+        if not isinstance(raw.get("calibration_fraction", 0.0), (int, float)) or not 0 <= raw.get("calibration_fraction", 0.0) < 1:
+            raise ValueError("calibration_fraction must be in [0, 1)")
+        if raw.get("disease_likelihood", "gaussian_working") not in ("gaussian_working", "bernoulli"):
+            raise ValueError("disease_likelihood must be gaussian_working or bernoulli")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -342,6 +366,8 @@ class WorkspaceConfig:
             )
         if raw["strata_directory"] is not None and raw["genetic_map"] is not None:
             raise ValueError("popped batches carry INFO/CM, so genetic_map is read only for plain input; set it null.")
+        if raw["truth_calls"] is None and raw["imputation_reference_ids"] is not None:
+            raise ValueError("imputation_reference_ids is read only for the calibration pairs of truth_calls; set it null.")
         marker_directory = raw["marker_directory"]
         return cls(
             run_directory=Path(raw["run_directory"]),
@@ -349,6 +375,7 @@ class WorkspaceConfig:
             chromosomes=chromosomes,
             imputed_halves=halves,
             truth_calls=None if raw["truth_calls"] is None else str(raw["truth_calls"]),
+            imputation_reference_ids=None if raw["imputation_reference_ids"] is None else Path(raw["imputation_reference_ids"]),
             popped=None if raw["strata_directory"] is None else PoppedSidecars(Path(raw["strata_directory"]), str(raw["bubble_split"])),
             genetic_map=None if raw["genetic_map"] is None else str(raw["genetic_map"]),
             tandem_repeats=Path(raw["tandem_repeats"]),
@@ -364,6 +391,10 @@ class WorkspaceConfig:
             seed=int(raw["seed"]),
             codec=raw["codec"],
             export=tuple(str(name) for name in raw["export"]),
+            genome_build=str(raw.get("genome_build", "unspecified")),
+            disease_likelihood=str(raw.get("disease_likelihood", "gaussian_working")),
+            calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
+            reference_exclusion_manifest=Path(raw["reference_exclusion_manifest"]) if raw.get("reference_exclusion_manifest") else None,
         )
 
     def truth_path(self, chromosome: str) -> Path:
@@ -453,20 +484,10 @@ BGZF_MAXIMUM_BLOCK_BYTES = 65536
 
 
 def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
-    """A genotype file's size and the digest of its first and last BGZF_MAXIMUM_BLOCK_BYTES, the key a step reads it by.
+    """Size and complete content hash, including same-size interior edits."""
+    from sv_pgs.content_identity import file_digest
 
-    A step's key must change when a batch is imputed again, and hashing every byte of a genome's BCFs would read them
-    once more for the key alone. The span covers the file's first block (its header: the tool's command line, version
-    and date) and its last block (the last records' genotypes and the EOF marker), so a re-imputed file of the same
-    size changes the key, while a copy of the same file does not.
-    """
-    size = path.stat().st_size
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        digest.update(handle.read(BGZF_MAXIMUM_BLOCK_BYTES))
-        handle.seek(max(size - BGZF_MAXIMUM_BLOCK_BYTES, 0))
-        digest.update(handle.read(BGZF_MAXIMUM_BLOCK_BYTES))
-    return size, digest.hexdigest()
+    return path.stat().st_size, file_digest(path)
 
 
 def module_closure(*roots: ModuleType) -> tuple[ModuleType, ...]:
@@ -642,7 +663,8 @@ def _half_research_ids(half: HalfSamples, crosswalk: SampleCrosswalk) -> tuple[s
 
 
 def _calibration_pairs(halves: Sequence[HalfSamples], crosswalk: SampleCrosswalk) -> list[tuple[str, int, int, int]]:
-    """(research ID, imputed half, its column there, its long-read column) for every long-read person with an imputed row."""
+    """(research ID, imputed half, its column there, its long-read column) for every long-read person with an imputed row:
+    the pairs whose codes the store gathers, of which ``calibrating_pairs`` picks those the measurement model is fitted on."""
     if not halves or halves[-1].namespace != "research_id":
         return []
     sequencing_of = dict(zip(crosswalk.research_ids, crosswalk.sequencing_ids))
@@ -660,6 +682,58 @@ def _calibration_pairs(halves: Sequence[HalfSamples], crosswalk: SampleCrosswalk
     return pairs
 
 
+def read_imputation_reference_ids(path: Path) -> frozenset[ResearchId]:
+    """The research IDs whose genomes were in the imputation's reference panel: one column headed ``research_id``."""
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle, delimiter="\t"))
+    if not rows or rows[0] != ["research_id"] or any(len(row) != 1 for row in rows[1:]):
+        raise ValueError(f"{path}: imputation_reference_ids is one column headed research_id, one research ID per line.")
+    research_ids = [ResearchId(row[0]) for row in rows[1:]]
+    if len(set(research_ids)) != len(research_ids):
+        raise ValueError(f"{path}: imputation_reference_ids lists a research ID more than once.")
+    return frozenset(research_ids)
+
+
+def calibrating_pairs(
+    config: WorkspaceConfig, pairs: Sequence[tuple[str, int, int, int]], kinship_pairs: Sequence[tuple[ResearchId, ResearchId, float]]
+) -> tuple[list[int], dict[str, str]]:
+    """The positions of ``pairs`` the measurement model is fitted on, and the account of the others.
+
+    The long-read people come from the assembly panel the imputation used as its reference. A panel member's imputed row
+    is a leave-in imputation, and a close relative's is partly one: the panel holds the haplotypes they share (a KING
+    pair above SECOND_DEGREE_KINSHIP, the bound the folds group relatives by). Calibrating on either makes the
+    imputation look better than it is for a new person, so both are left out. With truth calls and no reference list
+    that overlap is unchecked, so no pair is used: the measurement model takes its no-truth form rather than an
+    optimistic calibration. Counts of 1 to 20 are suppressed.
+    """
+    if config.truth_calls is None:
+        return [], {"reference_overlap": "not applicable: no long-read half"}
+    if config.imputation_reference_ids is None:
+        LOGGER.warning("workspace pipeline: imputation_reference_ids is null, so no calibration pair is used")
+        return [], {
+            "reference_overlap": (
+                "unchecked: imputation_reference_ids is null, so any pair may be a leave-in imputation of a reference "
+                "genome; no calibration pair is used, and the measurement model takes its no-truth form"
+            ),
+            "pairs_withheld": reportable_count(len(pairs)),
+        }
+    reference = read_imputation_reference_ids(config.imputation_reference_ids)
+    relatives = {
+        candidate
+        for first, second, kinship in kinship_pairs
+        if kinship > SECOND_DEGREE_KINSHIP
+        for member, candidate in ((first, second), (second, first))
+        if member in reference
+    } - reference
+    research_ids = [ResearchId(pair[0]) for pair in pairs]
+    left_out = reference | relatives
+    return [position for position, research_id in enumerate(research_ids) if research_id not in left_out], {
+        "reference_overlap": "checked: reference panel members, and their relatives closer than second degree (KING), left out",
+        "reference_members_left_out": reportable_count(sum(research_id in reference for research_id in research_ids)),
+        "relatives_left_out": reportable_count(sum(research_id in relatives for research_id in research_ids)),
+    }
+
+
 def _samples_inputs(config: WorkspaceConfig) -> Any:
     return {
         "chromosomes": config.chromosomes,
@@ -668,6 +742,7 @@ def _samples_inputs(config: WorkspaceConfig) -> Any:
             for half in config.imputed_halves
         ],
         "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
+        "imputation_reference_ids": None if config.imputation_reference_ids is None else _file_digest(config.imputation_reference_ids),
         "crosswalk": (_file_digest(config.crosswalk), config.crosswalk_columns),
         "ancestry": _file_digest(config.ancestry),
         "relatedness": (_file_digest(config.relatedness), config.relatedness_columns),
@@ -709,19 +784,23 @@ def _samples_step(run: _Run, directory: Path) -> dict[str, Any]:
                 (research_id, rows.genotype_source[row], row_labels[row], store_column, ancestry[research_id], int(folds[row]), int(components[row]))
             )
     pairs = _calibration_pairs(halves, crosswalk)
+    calibrating, calibration = calibrating_pairs(config, pairs, rows.kinship_pairs)
     _write_json(
         directory / "samples.json",
         {
             "halves": [{"label": label, "namespace": half.namespace, "names": list(half.names)} for label, half in zip(labels, halves)],
             "groups": legend,
             "calibration_pairs": [list(pair) for pair in pairs],
+            "calibrating": calibrating,
+            "calibration": calibration,
         },
     )
     return {
         "cohort_rows": len(research_ids),
         "half_samples": [len(half.names) for half in halves],
         "ancestry_groups": legend,
-        "calibration_pairs": len(pairs),
+        "calibration_pairs": len(calibrating),
+        "calibration": calibration,
         "truth": "long-read half stacked" if config.truth_calls is not None else "absent: no long-read half, no calibration pairs",
     }
 
@@ -733,6 +812,8 @@ class _Samples:
     groups: tuple[I64Array, ...]
     legend: tuple[str, ...]
     pairs: tuple[tuple[str, int, int, int], ...]
+    calibrating: tuple[int, ...]
+    calibration: dict[str, str]
 
 
 def _read_samples(run: _Run) -> _Samples:
@@ -745,6 +826,8 @@ def _read_samples(run: _Run) -> _Samples:
         groups=tuple(np.load(directory / f"groups_half{index}.npy") for index in range(len(halves))),
         legend=tuple(record["groups"]),
         pairs=tuple((str(pair[0]), int(pair[1]), int(pair[2]), int(pair[3])) for pair in record["calibration_pairs"]),
+        calibrating=tuple(int(position) for position in record["calibrating"]),
+        calibration=dict(record["calibration"]),
     )
 
 
@@ -829,6 +912,12 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
     observed = cohort.observed[:, model_traits]
     training = observed & (folds[:, None] != model_folds[None, :])
     held_out = observed & (folds[:, None] == model_folds[None, :])
+    from sv_pgs.probability_calibration import calibration_mask
+    calibration = np.zeros_like(training)
+    for model, trait in enumerate(model_traits):
+        if trait < len(config.diseases):
+            calibration[:, model] = calibration_mask(training[:, model], families, config.calibration_fraction, [config.seed, int(trait), int(model_folds[model])])
+    training &= ~calibration
     np.savez(
         directory / "cohort.npz",
         research_ids=np.array([research_id.value for research_id in research_ids]),
@@ -840,6 +929,7 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         families=families,
         training=training,
         held_out=held_out,
+        calibration=calibration,
         model_traits=model_traits,
         model_folds=model_folds,
     )
@@ -886,6 +976,7 @@ class _Cohort:
     trait_types: tuple[TraitType, ...]
     ancestry: tuple[str, ...]
     half: tuple[str, ...]
+    calibration: BoolArray | None = None
 
     @property
     def fit_rows(self) -> BoolArray:
@@ -894,6 +985,10 @@ class _Cohort:
     def trait_models(self, trait: int) -> I64Array:
         """The models of one trait, in model order: its fold models, then its all-rows model."""
         return np.flatnonzero(self.model_traits == trait)
+
+    def all_rows_model(self, trait: int) -> int:
+        """The all-rows model of one trait (ALL_ROWS_MODEL), the last of its models."""
+        return int(self.trait_models(trait)[-1])
 
 
 def _read_cohort(run: _Run) -> _Cohort:
@@ -911,6 +1006,7 @@ def _read_cohort(run: _Run) -> _Cohort:
         families=arrays["families"],
         training=arrays["training"],
         held_out=arrays["held_out"],
+        calibration=arrays["calibration"] if "calibration" in arrays else np.zeros_like(arrays["training"]),
         model_traits=arrays["model_traits"],
         model_folds=arrays["model_folds"],
         model_names=tuple(record["model_names"]),
@@ -1461,7 +1557,8 @@ def _plain_chromosome_sites(config: WorkspaceConfig, chromosome: str) -> Chromos
         annotation_legends={},
         facts={
             "genetic_position": source,
-            "reported_r2_fields": sorted({batch.reported_r2 for batch in fields}),
+            "reported_r2_aggregation": "sample_weighted_batch_quality_not_pooled_INFO",
+        "reported_r2_fields": sorted({batch.reported_r2 for batch in fields}),
             "probability_checked_batches": sum(batch.probabilities for batch in fields),
             "imputed_batches": len(fields),
         },
@@ -1638,7 +1735,7 @@ def _convert_chromosome(
             raise ValueError(f"{task.path}: its records' site lines differ from the site list's; every imputed batch holds the same records in order.")
     fill = no_call_fill(sum(values["group_sums"] for values in statistics), sum(values["group_counts"] for values in statistics))
     np.save(directory / "fill" / f"{chromosome}.npy", fill)
-    # The imputation's reported r^2 over every imputed sample: the batches' values weighted by their sample counts, each
+    # Descriptive sample-weighted batch quality, NOT pooled IMPUTE INFO (its denominator is not additive). Each
     # above 1 (Minimac4's R2, a variance ratio, exceeds it) set to 1 and counted in the facts.
     imputed = [(len(values["sample_ids"]), values["reported_info"]) for task, values in zip(tasks, statistics) if not task.called]
     np.save(
@@ -1676,7 +1773,15 @@ def _convert_chromosome(
     )
     write_variant_columns(root, chromosome, table, slice(0, record_count))
     _write_loci(root, chromosome, loci)
+    from sv_pgs.feature_identity import chromosome_identity
+    identity = chromosome_identity(
+        genome_build=config.genome_build, chromosome=chromosome, positions=positions,
+        refs=sites.records.refs, alts=sites.records.alts, identifiers=sites.expected.identifiers,
+        ends=sites.records.ends, sv_types=sites.records.sv_types, sv_lengths=sites.records.sv_lengths,
+        codes_per_unit=table.codes_per_unit, value_origin=table.value_origin,
+    )
     return {
+        "feature_identity": identity,
         "records": int(record_count),
         "sites_md5": sites_md5(positions, ref_lengths, alt_lengths),
         "background_zeroed": int(sum(int(values["zeroed"].sum()) for values in statistics)),
@@ -1693,6 +1798,7 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
     popped = config.popped
     return {
         "input": "plain" if popped is None else "popped",
+        "genome_build": config.genome_build,
         "chromosomes": config.chromosomes,
         "halves": [
             (half.label, half.batches, [genotype_file_fingerprint(half.path(chromosome, batch)) for chromosome in config.chromosomes for batch in half.batches])
@@ -1710,14 +1816,16 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
 
 
 def _store_sample_layout(config: WorkspaceConfig) -> str:
-    """The samples step's outputs the store reads (each half's typed manifest and its samples' ancestry groups), by
-    content: the store depends on those alone, not on the whole samples key, whose folds, seed and relatedness file
-    would otherwise rebuild a genome's store when they change."""
+    """The samples step's outputs the store reads (each half's typed manifest, its samples' ancestry groups, and the
+    calibration pairs whose codes it gathers), by content: the store depends on those alone, not on the whole samples
+    key, whose folds, seed, relatedness file and reference list would otherwise rebuild a genome's store when they
+    change."""
     directory = config.run_directory / "samples"
     record = json.loads((directory / "samples.json").read_text(encoding="utf-8"))
     return _digest({
         "halves": record["halves"],
         "groups": record["groups"],
+        "calibration_pairs": record["calibration_pairs"],
         "group_files": [_file_digest(directory / f"groups_half{index}.npy") for index in range(len(record["halves"]))],
     })
 
@@ -1765,6 +1873,8 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
             _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats, genes, complexity_legend))
             _remove_own(directory / "batches" / chromosome, directory)
         facts.append(json.loads(done.read_text(encoding="utf-8")))
+    from sv_pgs.feature_identity import IDENTITY_FILE
+    _write_json(root / IDENTITY_FILE, {chromosome: fact["feature_identity"] for chromosome, fact in zip(config.chromosomes, facts)})
     measurements = ["imputed_dosage"] * len(config.imputed_halves) + (["long_read_calls"] if config.truth_calls is not None else [])
     gates = _store_gates(config, facts)
     write_store_manifest(
@@ -1880,6 +1990,9 @@ def rewrite_recalibrated_store(
                 )
     # A resumed measurement step rewrites into the same partial directory, so a copy an interrupted attempt left is
     # overwritten (copytree raised FileExistsError on every resume).
+    from sv_pgs.feature_identity import IDENTITY_FILE
+    if (source_root / IDENTITY_FILE).exists():
+        shutil.copy2(source_root / IDENTITY_FILE, target_root / IDENTITY_FILE)
     shutil.copytree(source_root / "variants", target_root / "variants", dirs_exist_ok=True)
     shutil.copytree(source_root / "loci", target_root / "loci", dirs_exist_ok=True)
     write_store_manifest(
@@ -1897,6 +2010,17 @@ def rewrite_recalibrated_store(
 
 def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
     samples = _read_samples(run)
+    validation = {"status": "not_established", "external_imputation_execution_verified": False}
+    if run.config.reference_exclusion_manifest is not None:
+        from sv_pgs.reference_validation import validate_reference_exclusion
+        manifest = json.loads(run.config.reference_exclusion_manifest.read_text())
+        if manifest.get("genome_build") != run.config.genome_build:
+            raise ValueError("Reference-exclusion manifest has a different genome build")
+        validation = validate_reference_exclusion(
+            manifest, [samples.pairs[position][0] for position in samples.calibrating],
+            [half.path(chromosome, batch) for half in run.config.imputed_halves for chromosome in run.config.chromosomes for batch in half.batches],
+        )
+    _write_json(directory / "reference_validation.json", validation)
     cohort = _read_cohort(run)
     store_directory = run.output("store")
     source_root = store_directory / "store"
@@ -1920,7 +2044,7 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         variance = np.maximum(second - mean * mean, 0.0) / CODES_PER_DOSAGE**2
         group_means.append(mean / CODES_PER_DOSAGE)
         group_variances.append(variance)
-        members = [position for position, pair_group in enumerate(pair_groups) if pair_group == group]
+        members = [position for position in samples.calibrating if pair_groups[position] == group]
         calibration = None
         if members:
             calibrated.append(label)
@@ -1930,7 +2054,7 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
             )
         result = run.bindings.fit_measurement_model(calibration, variance, strata, reported_reliability=reported)
         results.append(result)
-        certificates[label] = {"pairs_supplied": len(members), **dict(result.certificate)}
+        certificates[label] = {"pairs_supplied": len(members), "calibration": samples.calibration, **dict(result.certificate)}
     scales = np.column_stack([np.asarray(result.scales, dtype=np.float64) for result in results])
     residual_variance = np.column_stack([np.asarray(result.residual_variance, dtype=np.float64) for result in results])
     np.savez(
@@ -1952,6 +2076,7 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
         "store": "measurement/store" if calibrated else "store/store",
         "recalibrated": bool(calibrated),
         "groups_with_calibration_pairs": calibrated,
+        "calibration": samples.calibration,
         "leakage_maps": "not built: the LD blocks are the fit's, so no mapped block pairs are passed",
     }
 
@@ -1965,37 +2090,38 @@ def _final_store(run: _Run) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str) -> F64Array:
-    """The records' log reliability as ``arm`` (ARMS) fits them: unchanged where the arm fits a record, -inf where it
-    leaves the record out. A record is structural when its typed length (the store's ``sv_length``, written by the store
-    step for every record) is at least COMMUNITY_SV_MINIMUM_LENGTH, or when it is a copy number."""
+def structural_records(table: VariantTable) -> BoolArray:
+    """Whether each store record is structural: its typed length (the store's ``sv_length``, written by the store step
+    for every record) is at least COMMUNITY_SV_MINIMUM_LENGTH, or it is a copy number."""
     if "sv_length" not in table.annotations:
         raise ValueError("the store has no sv_length column, so its structural records cannot be told apart for the arms.")
     lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
     if not np.all(np.isfinite(lengths)):
         raise ValueError("every store record needs a finite sv_length to be assigned to an arm.")
-    structural = (lengths >= COMMUNITY_SV_MINIMUM_LENGTH) | (np.asarray(table.variant_class) == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER))
-    return np.where(structural & (not ARM_KEEPS_STRUCTURAL[arm]), -np.inf, np.asarray(log_reliability, dtype=np.float64))
+    return (lengths >= COMMUNITY_SV_MINIMUM_LENGTH) | (np.asarray(table.variant_class) == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER))
+
+
+def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str) -> F64Array:
+    """The records' log reliability as ``arm`` (ARMS) fits them: unchanged where the arm fits a record, -inf where it
+    leaves a structural record (``structural_records``) out."""
+    return np.where(structural_records(table) & (not ARM_KEEPS_STRUCTURAL[arm]), -np.inf, np.asarray(log_reliability, dtype=np.float64))
 
 
 FIT_TRAIT_TYPE = TraitType.QUANTITATIVE
-"""The likelihood every workspace model is fitted on: a disease's 0/1 outcome on the Gaussian working likelihood
-(WORKSPACE_PIPELINE.md, "Likelihood"), as a quantitative trait is. Its models can then take the summary band where it
-is cheaper (``stage2_wiring``: Stage 0 reads the store once, and every later pass is over the LD summaries), where the
-Polya-Gamma route re-reads every genotype on each sweep because its weights move with its sites: hundreds of passes of
-the whole store per model, which the study's compute budget does not hold at All of Us scale. The report reads a disease
-by rank (AUC) and by a recalibrated logistic likelihood of its linear predictor, both of which the working likelihood's
-linear predictor serves; its effects are per-allele changes in the outcome's probability scale."""
+"""Default working likelihood. ``disease_likelihood=bernoulli`` selects the binary likelihood explicitly.
+Gaussian disease coefficients are in observed 0/1 status units, not log odds or liability units. Both execution
+routes retain the full-data operator; an LD band accelerates it without dropping realized far-field correlations.
+Probability calibrators use reserved development families. Their proper scores use untouched evaluation labels."""
 
 
 def trait_seed(seed: int, trait: int) -> int:
     """One trait's fit seed from the run's: both arms of a trait share it, so their probes and draws are common random
-    numbers and the arms' difference carries none of their Monte Carlo noise."""
+    numbers where the models' layouts permit it; this does not eliminate their Monte Carlo error."""
     return int(np.random.SeedSequence([seed, trait]).generate_state(1, dtype=np.uint64)[0])
 
 
 def trait_request(
-    cohort: _Cohort, trait: int, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int
+    cohort: _Cohort, trait: int, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int, disease_likelihood: str = "gaussian_working"
 ) -> FitRequest:
     """One trait's models (its folds' and its all-rows model) as one fit, on the rows any of them trains on.
 
@@ -2003,7 +2129,7 @@ def trait_request(
     covariate names are the cohort's whole union, so every trait's fitted model scores with the same covariates
     (``artifact.predict_models``). A row's target is read only where its model trains on it.
 
-    Every model is fitted on the Gaussian likelihood (FIT_TRAIT_TYPE), a disease's 0/1 outcome included.
+    The configured disease likelihood is explicit; quantitative traits always use Gaussian regression.
     """
     models = cohort.trait_models(trait)
     training = cohort.training[:, models]
@@ -2018,7 +2144,7 @@ def trait_request(
         targets=np.where(training, cohort.targets[:, [trait]], np.nan)[rows],
         training=training[rows],
         model_names=tuple(cohort.model_names[model] for model in models),
-        trait_types=(FIT_TRAIT_TYPE,) * models.size,
+        trait_types=((TraitType.BINARY if disease_likelihood == "bernoulli" and cohort.trait_types[trait] == TraitType.BINARY else TraitType.QUANTITATIVE),) * models.size,
         research_ids=tuple(np.asarray(cohort.research_ids)[rows].tolist()),
         log_variance_offset=log_variance_offset,
         budget=budget,
@@ -2060,7 +2186,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                     # A Spot restart keeps completed fold checkpoints; the engine discards only
                     # the interrupted model's scratch and verifies each checkpoint's input digest.
                     work.mkdir(parents=True, exist_ok=True)
-                    request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait))
+                    request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait), run.config.disease_likelihood)
                     if not target.is_dir():
                         target.parent.mkdir(parents=True, exist_ok=True)
                         LOGGER.info("workspace pipeline: fitting %s / %s", arm, trait_name)
@@ -2109,8 +2235,10 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 @dataclass(frozen=True, slots=True)
 class _Scores:
-    """The score step's arrays: [arms, cohort rows, models] over every model, and each person's own-fold held-out
-    values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait)."""
+    """The score step's arrays: [arms, cohort rows, models] over every model, each person's own-fold held-out
+    values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait), and
+    ``structural_genetic`` [cohort rows, traits], the genetic score of the structural part (STRUCTURAL_PART) of each
+    trait's all-rows ``with_sv`` model."""
 
     predictive_mean: F64Array
     linear_predictor: F64Array
@@ -2118,6 +2246,8 @@ class _Scores:
     held_out_predictive_mean: F64Array
     held_out_linear_predictor: F64Array
     held_out_genetic: F64Array
+    structural_genetic: F64Array
+    held_out_calibrated_logits: F64Array | None = None
 
 
 def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
@@ -2139,24 +2269,38 @@ def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
 def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
     host's memory allows the saved models to be held together (``score_batches``)."""
+    from sv_pgs.model_acceptance import require_accepted
     cohort = _read_cohort(run)
     directories = [_fitted_model_directory(run, arm, trait_name) for arm in ARMS for trait_name in cohort.trait_names]
     shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
     columns = {name: np.empty((shape[1], shape[0] * shape[2])) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
     names: list[str] = []
+    trait_count = len(cohort.trait_names)
+    structural_genetic = np.empty((shape[1], trait_count))
     batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
     with DosageStore.open(_final_store(run)) as store:
+        structural = structural_records(store.variant_table)
         for batch in batches:
             fitted = [run.bindings.load_model(directories[position]) for position in batch]
-            prediction = run.bindings.predict(fitted, store, cohort.store_columns, cohort.covariates[:, 1:], run.budget)
+            for model in fitted:
+                require_accepted(model)
+            # The structural part of each trait's all-rows with_sv model, by trait, scored in the same read as the
+            # models themselves, after them.
+            parts = {}
+            for position, model in zip(batch, fitted):
+                if ARMS[position // trait_count] == "with_sv":
+                    all_rows_name = cohort.model_names[cohort.all_rows_model(position % trait_count)]
+                    parts[position % trait_count] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
+            prediction = run.bindings.predict([*fitted, *parts.values()], store, cohort.store_columns, cohort.covariates[:, 1:], run.budget)
             first = len(names)
             names.extend(name for model in fitted for name in model.model_names)
             for name, values in (
                 ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
                 ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
             ):
-                columns[name][:, first : len(names)] = np.asarray(values, dtype=np.float64)
-            del fitted, prediction
+                columns[name][:, first : len(names)] = np.asarray(values, dtype=np.float64)[:, : len(names) - first]
+            structural_genetic[:, list(parts)] = np.asarray(prediction.genetic.means, dtype=np.float64)[:, len(names) - first :]
+            del fitted, parts, prediction
     for arm_index, arm in enumerate(ARMS):
         if tuple(names[arm_index * shape[2] : (arm_index + 1) * shape[2]]) != cohort.model_names:
             raise ValueError(f"the {arm} arm's saved models are not the cohort's models in order.")
@@ -2176,6 +2320,22 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     predictive_mean = by_arm(columns["predictive_mean"])
     linear_predictor = by_arm(columns["linear_predictor"])
     genetic_mean = by_arm(columns["genetic_mean"])
+    calibrated_logits = np.full_like(linear_predictor, np.nan)
+    calibrators = []
+    from sv_pgs.probability_calibration import FrozenCalibration
+    if run.config.calibration_fraction:
+        for model, trait in enumerate(cohort.model_traits):
+            if cohort.trait_types[trait] != TraitType.BINARY:
+                continue
+            reserved = cohort.calibration[:, model]
+            if np.any(reserved & (cohort.training[:, model] | cohort.held_out[:, model])):
+                raise ValueError("Calibration overlaps training or evaluation")
+            for arm_index, arm in enumerate(ARMS):
+                calibration = FrozenCalibration.fit(linear_predictor[arm_index, reserved, model], cohort.targets[reserved, trait])
+                calibrated_logits[arm_index, :, model] = calibration.logits(linear_predictor[arm_index, :, model])
+                calibrators.append({"arm": arm, "model": cohort.model_names[model], **dataclasses.asdict(calibration),
+                                    "source": "independent_development_families", "evaluation_labels_used": False})
+    _write_json(directory / "calibrators.json", calibrators)
     np.savez(
         directory / "predictions.npz",
         arms=np.array(ARMS),
@@ -2187,6 +2347,9 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
         held_out_predictive_mean=held_out(predictive_mean),
         held_out_linear_predictor=held_out(linear_predictor),
         held_out_genetic=held_out(genetic_mean),
+        structural_genetic=structural_genetic,
+        calibrated_logits=calibrated_logits,
+        held_out_calibrated_logits=held_out(calibrated_logits),
     )
     return {"arms": list(ARMS), "models": len(names), "store_reads": len(batches), "scored_rows": int(cohort.store_columns.shape[0])}
 
@@ -2213,7 +2376,7 @@ SHORT_RECORDS = "<50"
 @dataclass(frozen=True, slots=True)
 class VariantEffects:
     """One fitted model's effects per fitted store record, in the record's own units (one ALT allele, or one copy for a
-    copy number), on the model's linear-predictor scale (trait units, or log odds for a disease).
+    copy number), on the fitted likelihood's scale: trait/status units for Gaussian fits, log odds only for binary-likelihood fits.
 
     The effect per unit is beta / sigma x codes_per_unit (``fast_scoring``: beta multiplies the standardized signed
     code, whose SD is sigma). Every moment is under the law the model's draws come from (``fast_scoring``: the
@@ -2224,8 +2387,6 @@ class VariantEffects:
     mean: F64Array
     standard_deviation: F64Array
     probability_positive: F64Array
-    standardized_second_moment: F64Array
-    """E[beta^2] of the standardized column: the record's share of the genetic variance were it in no LD."""
 
 
 def variant_effects(scoring: Any, codes_per_unit: NDArray, working_bytes: int) -> VariantEffects:
@@ -2234,21 +2395,24 @@ def variant_effects(scoring: Any, codes_per_unit: NDArray, working_bytes: int) -
     rows = np.asarray(scoring.store_rows, dtype=np.int64)
     unit = np.asarray(codes_per_unit, dtype=np.float64)[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
     law = scoring.posterior_draws
-    second = np.empty(rows.shape[0])
+    variance = np.empty(rows.shape[0])
+    coefficients = np.asarray(scoring.coefficients, dtype=np.float64)
     positive = np.empty(rows.shape[0])
     step = tile_rows(law, working_bytes)
     for start in range(0, rows.shape[0], step):
         stop = min(start + step, rows.shape[0])
-        draws = law.tile(start, stop)
-        second[start:stop] = np.mean(draws * draws, axis=1)
-        positive[start:stop] = np.mean(draws > 0.0, axis=1)
+        if hasattr(law, "marginal_summary"):
+            variance[start:stop], positive[start:stop] = law.marginal_summary(start, stop, coefficients[start:stop])
+        else:
+            draws = law.tile(start, stop)
+            variance[start:stop] = np.mean((draws - coefficients[start:stop, None]) ** 2, axis=1)
+            positive[start:stop] = np.mean(draws > 0.0, axis=1)
     coefficients = np.asarray(scoring.coefficients, dtype=np.float64)
     return VariantEffects(
         store_rows=rows,
         mean=coefficients * unit,
-        standard_deviation=np.sqrt(np.maximum(second - coefficients * coefficients, 0.0)) * unit,
+        standard_deviation=np.sqrt(variance) * unit,
         probability_positive=positive,
-        standardized_second_moment=second,
     )
 
 
@@ -2263,23 +2427,63 @@ def length_bins(lengths: F64Array) -> NDArray:
 
 EFFECT_SUMMARY_COLUMNS = (
     "trait", "arm", "variant_class", "length_bin", "variants", "positive_mean", "negative_mean", "expected_positive",
-    "expected_negative", "mean_absolute_effect", "median_absolute_effect", "root_mean_square_effect", "standardized_second_moment",
+    "expected_negative", "mean_absolute_effect", "median_absolute_effect", "root_mean_square_effect",
 )
 """The effects summary: per (trait, arm, class, length bin) the fitted records, how many have a positive and a negative
 posterior mean, the posterior-expected counts of positive and negative effects (sum of P(beta > 0) and of P(beta < 0)),
-the mean, median and root-mean-square posterior effect per unit, and the summed standardized second moment (the bin's
-share of genetic variance, were its records in no LD). Records, not participants, are counted."""
-LENGTH_CORRELATION_COLUMNS = ("trait", "arm", "variant_class", "variants", "spearman_rho", "p_value")
+and the mean, median and root-mean-square posterior effect per unit. Records, not participants, are counted. A bin's
+share of the genetic variance is not a sum over its records under LD; GENETIC_VARIANCE_COLUMNS gives the structural
+records' share from the scores themselves."""
+GENETIC_VARIANCE_COLUMNS = ("trait", "n", "quantity", "value")
+"""Per trait, the variance of its all-rows ``with_sv`` model's genetic score over the trait's observed cohort rows (n of
+them), split between the score's structural part and the rest (``genetic_variance_decomposition``), one quantity a
+row. Every value is an aggregate over the n rows; a trait observed on 1 to 20 rows shows neither its count nor a value."""
+LENGTH_CORRELATION_COLUMNS = ("trait", "arm", "variant_class", "variants", "quantity", "spearman_rho", "interpretation")
 """Per (trait, arm, structural class, and every structural record together), Spearman's rho between log length and
-the posterior root-mean-square effect per allele, sqrt(mean^2 + sd^2), with its two-sided p-value."""
+the absolute fitted mean and uncertainty separately. Descriptive only: LD and prior features invalidate an independent-record significance claim."""
+
+
+def genetic_variance_decomposition(total: F64Array, structural: F64Array) -> dict[str, float]:
+    """The variance of the genetic score ``total`` over its rows, split between its ``structural`` part and the rest.
+
+    A genetic score is g = X beta over standardized columns, so Var(g) = beta' Sigma beta for Sigma the rows' genotype
+    covariance. Its structural part s = X_S beta_S and its small part r = g - s split it as
+    Var(g) = Var(s) + Var(r) + 2 Cov(s, r), whose cross term (``covariance_term``) is the LD between structural and small
+    records that a sum over records misses. The structural share is Cov(s, g) / Var(g) = (Var(s) + Cov(s, r)) / Var(g),
+    the part of Var(g) the structural records carry: the two parts' shares sum to one, and either leaves [0, 1] when the
+    parts are negatively correlated. Moments are population moments over the rows, as the scores' standardization is
+    (``fast_scoring``); a score without variance has no share (NaN).
+    """
+    small = total - structural
+    covariance = np.cov(np.vstack([structural, small]), bias=True)
+    total_variance = float(np.var(total))
+    return {
+        "total_variance": total_variance,
+        "structural_variance": float(covariance[0, 0]),
+        "small_variance": float(covariance[1, 1]),
+        "covariance_term": 2.0 * float(covariance[0, 1]),
+        "structural_share": float(covariance[0, 0] + covariance[0, 1]) / total_variance if total_variance > 0.0 else float("nan"),
+    }
 
 
 def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Each trait's all-rows model, in both arms: every fitted record's effect (``effects/<trait>.<arm>.tsv.gz``, kept in
-    the workspace: it carries each record's mean dosage, from which a rare record's carrier count follows) and two
+    the workspace: it carries each record's mean dosage, from which a rare record's carrier count follows), two
     summaries by variant class and length that carry no participant count (``effects_by_class.tsv``,
-    ``effect_length_correlation.tsv``)."""
+    ``effect_length_correlation.tsv``), and the structural records' share of the ``with_sv`` score's variance over each
+    trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS)."""
     cohort = _read_cohort(run)
+    scores = _read_scores(run)
+    variance_lines: list[tuple[Any, ...]] = [GENETIC_VARIANCE_COLUMNS]
+    for trait, trait_name in enumerate(cohort.trait_names):
+        observed = np.flatnonzero(np.isfinite(cohort.targets[:, trait]))
+        count = observed.shape[0]
+        decomposition = genetic_variance_decomposition(
+            scores.genetic_mean[ARMS.index("with_sv"), observed, cohort.all_rows_model(trait)], scores.structural_genetic[observed, trait]
+        )
+        variance_lines.extend(
+            (trait_name, reportable_count(count), quantity, f"{value:.6g}" if _shown(count, None) else "") for quantity, value in decomposition.items()
+        )
     summary_lines: list[tuple[Any, ...]] = [EFFECT_SUMMARY_COLUMNS]
     correlation_lines: list[tuple[Any, ...]] = [LENGTH_CORRELATION_COLUMNS]
     with DosageStore.open(_final_store(run)) as store:
@@ -2292,8 +2496,9 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         for arm in ARMS:
             for trait, trait_name in enumerate(cohort.trait_names):
                 fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
-                (all_rows_model,) = [model for model in cohort.trait_models(trait) if cohort.model_folds[model] == run.config.fold_count]
-                scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[all_rows_model])]
+                from sv_pgs.model_acceptance import require_accepted
+                require_accepted(fitted)
+                scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
                 effects = variant_effects(scoring, codes_per_unit, working_bytes)
                 rows = effects.store_rows
                 root_mean_square = np.sqrt(effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation)
@@ -2307,6 +2512,11 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                         "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
                         "effect": effects.mean,
                         "posterior_sd": effects.standard_deviation,
+                        "likelihood": "bernoulli" if scoring.trait_type == TraitType.BINARY else "gaussian",
+                        "effect_scale": "log_odds" if scoring.trait_type == TraitType.BINARY else ("observed_status" if cohort.trait_types[trait] == TraitType.BINARY else "trait_units"),
+                        "sign_method": "analytic_represented_mixture" if hasattr(scoring.posterior_draws, "marginal_summary") else "monte_carlo",
+                        "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
+                        "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
                         "probability_positive": effects.probability_positive,
                     }
                 ).to_csv(
@@ -2318,7 +2528,6 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                     {
                         "variant_class": classes[rows], "length_bin": bins[rows], "mean": effects.mean,
                         "probability_positive": effects.probability_positive, "root_mean_square": root_mean_square,
-                        "second": effects.standardized_second_moment,
                     }
                 )
                 for (variant_class, length_bin), group in frame.groupby(["variant_class", "length_bin"], sort=True):
@@ -2327,19 +2536,20 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                         trait_name, arm, variant_class, length_bin, len(group), int((group["mean"] > 0.0).sum()), int((group["mean"] < 0.0).sum()),
                         f"{group['probability_positive'].sum():.6g}", f"{(1.0 - group['probability_positive']).sum():.6g}",
                         f"{absolute.mean():.6g}", f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(group['root_mean_square'].to_numpy() ** 2)):.6g}",
-                        f"{group['second'].sum():.6g}",
                     ))
                 structural = lengths[rows] >= COMMUNITY_SV_MINIMUM_LENGTH
                 for variant_class in [*sorted(set(classes[rows][structural])), "all_structural"]:
                     member = structural & ((classes[rows] == variant_class) | (variant_class == "all_structural"))
                     if np.unique(lengths[rows][member]).shape[0] < 2:
                         continue
-                    rho, p_value = stats.spearmanr(np.log(lengths[rows][member]), root_mean_square[member])
-                    correlation_lines.append((trait_name, arm, variant_class, int(member.sum()), f"{rho:.6g}", f"{p_value:.6g}"))
-    for name, lines in (("effects_by_class.tsv", summary_lines), ("effect_length_correlation.tsv", correlation_lines)):
+                    for quantity, values in (("absolute_mean", np.abs(effects.mean)), ("posterior_sd", effects.standard_deviation)):
+                        selected = values[member]
+                        rho = stats.spearmanr(np.log(lengths[rows][member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
+                        correlation_lines.append((trait_name, arm, variant_class, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
+    for name, lines in (("effects_by_class.tsv", summary_lines), ("effect_length_correlation.tsv", correlation_lines), ("genetic_variance.tsv", variance_lines)):
         with (directory / name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
-    exportable = ["effects_by_class.tsv", "effect_length_correlation.tsv"]
+    exportable = ["effects_by_class.tsv", "effect_length_correlation.tsv", "genetic_variance.tsv"]
     _write_json(directory / EXPORTABLE_FILE, exportable)
     return {"files": exportable, "variant_tables": f"{len(ARMS) * len(cohort.trait_names)} per-record effect tables, kept in the workspace"}
 
@@ -2439,10 +2649,14 @@ def _scored_folds(held: _HeldOutCell, targets: F64Array, binary: bool) -> list[I
     return [rows for rows in held.folds if rows.shape[0] and np.ptp(targets[rows]) > 0.0]
 
 
-def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, covariates: F64Array) -> float:
+def _held_out_metric(metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, covariates: F64Array, calibrated_logits: F64Array | None = None) -> float:
     """One arm's held-out metric on one fold's rows (``_report_step``)."""
+    if metric in ("log_loss", "brier"):
+        from sv_pgs.probability_calibration import proper_scores
+        return float(proper_scores(targets, calibrated_logits)[metric].mean())
     if metric == "auc":
-        return auc_components(targets, linear).auc
+        score = calibrated_logits if calibrated_logits is not None and np.all(np.isfinite(calibrated_logits)) else linear
+        return auc_components(targets, score).auc
     if metric == "pgs_auc":
         return auc_components(targets, genetic).auc
     if metric == "r2":
@@ -2457,11 +2671,20 @@ def _paired(metric: str, targets: F64Array, scores: _Scores, rows: I64Array, tra
     baseline, candidate = ARMS.index("snv_indel"), ARMS.index("with_sv")
     linear = scores.held_out_linear_predictor[:, rows, trait]
     genetic = scores.held_out_genetic[:, rows, trait]
+    if metric in ("frozen_log_loss_gain", "frozen_brier_gain"):
+        from sv_pgs.probability_calibration import paired_frozen_gain
+        logits = scores.held_out_calibrated_logits[:, rows, trait]
+        return paired_frozen_gain(targets, logits[baseline], logits[candidate], families,
+                                  metric="log_loss" if metric == "frozen_log_loss_gain" else "brier")
     if metric == "delta_auc":
+        if scores.held_out_calibrated_logits is not None:
+            calibrated = scores.held_out_calibrated_logits[:, rows, trait]
+            if np.all(np.isfinite(calibrated)):
+                linear = calibrated
         return paired_delta_auc(targets, linear[baseline], linear[candidate], families)
     if metric == "delta_pgs_auc":
         return paired_delta_auc(targets, genetic[baseline], genetic[candidate], families)
-    if metric == "log_likelihood_gain":
+    if metric == "test_recalibrated_log_likelihood_gain":
         try:
             return paired_delta_log_loss(targets, linear[baseline], linear[candidate], families)
         except held_out_comparison.RecalibrationSeparationError:
@@ -2499,7 +2722,10 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
         covariates = cohort.covariates[:, cohort.covariate_columns[trait]]
         targets = cohort.targets[:, trait]
         metric_names = ("auc", "pgs_auc") if binary else ("r2", "pgs_partial_r2")
-        comparison_names = ("delta_auc", "delta_pgs_auc", "log_likelihood_gain") if binary else ("delta_pgs_partial_r2",)
+        comparison_names = ("delta_auc", "delta_pgs_auc", "test_recalibrated_log_likelihood_gain") if binary else ("delta_pgs_partial_r2",)
+        if binary and run.config.calibration_fraction:
+            metric_names = ("log_loss", "brier", *metric_names)
+            comparison_names = ("frozen_log_loss_gain", "frozen_brier_gain", *comparison_names)
         for cell, level, held in _cells(cohort, trait, fold_count):
             count = held.count
             cases = int(sum(int(targets[rows].sum()) for rows in held.folds)) if binary else None
@@ -2509,7 +2735,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                 linear = scores.held_out_linear_predictor[arm_index, :, trait]
                 genetic = scores.held_out_genetic[arm_index, :, trait]
                 for metric in metric_names:
-                    values = [(rows.shape[0], _held_out_metric(metric, targets[rows], linear[rows], genetic[rows], covariates[rows])) for rows in folds]
+                    values = [(rows.shape[0], _held_out_metric(metric, targets[rows], linear[rows], genetic[rows], covariates[rows], None if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[arm_index, rows, trait])) for rows in folds]
                     accuracy.append((name, arm, cell, level, *counts, *((metric, f"{_fold_weighted(values):.6g}") if values else ("", ""))))
             # The paired comparison per cell of all held-out rows and per ancestry group (a fold is one term of
             # every cell's sum, and the halves are a measurement split rather than a population).
@@ -2588,7 +2814,13 @@ def _export_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 
 _STEPS = (
-    _Step("samples", (), _samples_inputs, (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs), _samples_step),
+    _Step(
+        "samples",
+        (),
+        _samples_inputs,
+        (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs, calibrating_pairs, read_imputation_reference_ids),
+        _samples_step,
+    ),
     # The store reads only the samples step's half manifests and groups (``_store_sample_layout``), so it follows samples
     # directly and is keyed by them, not by phenotypes, cohort or the folds.
     _Step(
@@ -2606,19 +2838,22 @@ _STEPS = (
     # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
     # to either is a change to the phenotypes, not only a change to ``all_of_us``.
     _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
-    _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, trait_table), _cohort_step),
+    _Step("cohort", ("samples", "phenotypes"), lambda config: config.calibration_fraction, (cohort_module, _cohort_step, trait_table), _cohort_step),
     _Step(
         "measurement",
         ("samples", "cohort", "store"),
-        lambda config: None,
+        lambda config: None if config.reference_exclusion_manifest is None else _file_digest(config.reference_exclusion_manifest),
         # The measurement model it fits and loads (workspace_bindings) is measurement_model's, which the key covers.
         (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store, *module_closure(measurement_model)),
         _measurement_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement"), lambda config: config.seed, (_fit_step, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches), _score_step),
-    _Step("effects", ("cohort", "fit"), lambda config: None, (_effects_step, variant_effects, length_bins), _effects_step),
+    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood), (_fit_step, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches, structural_records, model_part), _score_step),
+    _Step(
+        "effects", ("cohort", "fit", "score"), lambda config: None,
+        (_effects_step, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,
+    ),
     _Step(
         "report",
         ("cohort", "score"),

@@ -198,7 +198,7 @@ def test_a_glimpse2_style_plain_store_reads_gp_cm_and_sv_fields(workspace) -> No
     """GT:DS:GP with INFO and INFO/CM on every record, some IDs set, SV records carrying SVTYPE/SVLEN/END: G4 runs, the
     genetic positions are INFO/CM, a symbolic deletion is typed and spanned from its INFO, and IDs name their records."""
     synthetic, client = workspace
-    plain = _plain(synthetic, {"A": GLIMPSE2, "B": GLIMPSE2}, truth_calls=None, genetic_map=None)
+    plain = _plain(synthetic, {"A": GLIMPSE2, "B": GLIMPSE2}, truth_calls=None, imputation_reference_ids=None, genetic_map=None)
     # Two decode processes: the plain site list reaches each through its initializer.
     two_threads = dataclasses.replace(BUDGET, cpu_threads=2)
     summaries = run_pipeline(WorkspaceConfig.from_mapping(plain.raw), _bindings(_Recorder(), client), two_threads, through="store")

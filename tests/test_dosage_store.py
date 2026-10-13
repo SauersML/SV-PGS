@@ -510,12 +510,14 @@ def test_the_local_cache_follows_the_store_digest(tmp_path: Path, codec: str) ->
     built = (first / "MANIFEST.json").stat().st_mtime_ns
     assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
     assert (first / "MANIFEST.json").stat().st_mtime_ns == built
-    # a rewritten statistic column (same size, later mtime) is a new store
+    # Identical content with a later mtime reuses the content-addressed store.
     column = next((tmp_path / "store" / "stats").rglob("sum_code*"))
     path = next(item for item in column.rglob("*") if item.is_file() and item.name != "zarr.json")
     status = path.stat()
     path.write_bytes(path.read_bytes())
     os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1))
+    assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
+    (tmp_path / "store" / "provenance.json").write_text('{"source":"changed"}')
     second = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
     assert second != first and not first.exists()
     assert [item.name for item in (tmp_path / "cache").iterdir()] == [second.name]

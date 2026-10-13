@@ -18,9 +18,11 @@ from sv_pgs.artifact import (
     cohort_digest,
     code_digest,
     load_model,
+    model_part,
     named_digest,
     offset_digest,
     predict,
+    predict_models,
     save_model,
     sites_digest,
     store_digest,
@@ -87,7 +89,8 @@ def _model(generator: np.random.Generator, store_root: Path) -> FittedModel:
             "remaining_gain": np.array([0.01, 0.02]),
             "negative_sites": np.array([0, 3]),
             "outer_iterations": np.array([4, 6]),
-            "outer_criterion_met": np.array([True, False]),
+            "outer_criterion_met": np.array([True, True]),
+            "unresolved": np.zeros(2), "budget_unresolved": np.zeros(2), "restored_best": np.zeros(2),
         },
         fit_counts={"refreshes": 3, "passes": 41},
         refusals=("model 1: no damped EP pass keeps the full-data precision positive definite",),
@@ -251,6 +254,23 @@ def test_prediction_equals_the_standardized_scores_read_from_the_store(tmp_path:
             np.testing.assert_array_equal(
                 prediction.predictive_variance[:, index], prediction.genetic.variances[:, index] + model.noise_variance[index]
             )
+
+
+def test_a_model_part_scores_exactly_the_share_of_the_genetic_score_its_records_carry(store_root: Path) -> None:
+    generator = np.random.default_rng(8)
+    model = _model(generator, store_root)
+    kept = generator.random(_VARIANTS) < 0.5
+    part, rest = (model_part(model, "t2d/fold0", records, f"t2d/fold0/{name}") for name, records in (("kept", kept), ("rest", ~kept)))
+    whole = model.scoring[1]
+    assert part.model_names == ("t2d/fold0/kept",) and part.provenance == model.provenance
+    assert part.trait_types == (TraitType.BINARY,) and np.array_equal(part.covariate_columns, model.covariate_columns[[1]])
+    assert np.array_equal(part.scoring[0].store_rows, whole.store_rows[kept[whole.store_rows]])
+    np.testing.assert_array_equal(np.asarray(part.scoring[0].posterior_draws), np.asarray(whole.posterior_draws)[kept[whole.store_rows]])
+    assert {term: values.tolist() for term, values in part.certificate.items()} == {term: [values[1]] for term, values in model.certificate.items()}
+    covariates = generator.normal(size=(_SAMPLES, _COVARIATES))
+    prediction = predict_models((model, part, rest), DosageStore.open(store_root), np.arange(_SAMPLES), covariates, _budget())
+    means = prediction.genetic.means
+    np.testing.assert_allclose(means[:, 2] + means[:, 3], means[:, 1], rtol=0.0, atol=1e-12 * float(np.max(np.abs(means[:, 1]))))
 
 
 def test_prediction_refuses_covariates_of_the_wrong_shape(store_root: Path) -> None:

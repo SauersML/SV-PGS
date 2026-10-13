@@ -1768,28 +1768,9 @@ CACHE_MARKER = "CACHE_COMPLETE.json"
 
 
 def store_digest(root: str | Path) -> str:
-    """A sha256 that changes whenever any file of the store is rewritten.
-
-    It covers every file's relative path, size and modification time (a rewrite of any array,
-    column, map or manifest changes one of them), plus the bytes of the MANIFEST, every array's
-    zarr.json and every shard's crc32c-checked index, which holds each inner chunk's offset and
-    size. It reads no code bytes, so it costs one stat per file and a small read per shard.
-    """
-    root = Path(root)
-    digest = hashlib.sha256()
-    for path in sorted(item for item in root.rglob("*") if item.is_file()):
-        relative = path.relative_to(root).as_posix()
-        status = path.stat()
-        digest.update(f"{relative}\0{status.st_size}\0{status.st_mtime_ns}\0".encode())
-        if path.name in (MANIFEST_FILE, _ZARR_METADATA_FILE):
-            digest.update(path.read_bytes())
-    for directory in sorted(item.parent for item in (root / "dosage").rglob(_ZARR_METADATA_FILE)):
-        layout = _layout_from_metadata(_read_metadata(directory), directory)
-        for shard_index in range(layout.shard_count):
-            with open(_shard_path(directory, shard_index), "rb") as handle:
-                handle.seek(-layout.shard_index_bytes, os.SEEK_END)
-                digest.update(handle.read(layout.shard_index_bytes))
-    return digest.hexdigest()
+    """Complete store content identity, including shard interiors."""
+    from sv_pgs.content_identity import tree_digest
+    return tree_digest(root)
 
 
 def local_cache(source: str | Path, cache_root: str | Path, *, codec: Codec, budget: ComputeBudget) -> Path:

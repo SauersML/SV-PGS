@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -57,7 +57,7 @@ class Provenance:
     exact problem each model was fitted on, and the prior schema its hyperparameters are written on.
 
     ``code_digest`` is the SHA-256 of the ``sv_pgs`` sources, ``store_digest`` that of the training store's
-    ``MANIFEST.json``, ``sites_digest`` that of its chromosomes, record counts and site digests (the layout the
+    complete contents, ``sites_digest`` that of its versioned allele identities and transformations (the layout the
     scoring models' store rows index; any store scored with the model must have the same one),
     ``cohort_digest`` that of the training research IDs, and ``offset_digest`` that of the records' log reliabilities
     the prior was given (``offset_digest(None)`` when it read the store's own ``quality`` column).
@@ -91,19 +91,15 @@ def code_digest() -> str:
 
 
 def store_digest(store_root: str | Path) -> str:
-    """SHA-256 of the store's manifest file."""
-    return hashlib.sha256((Path(store_root) / MANIFEST_FILE).read_bytes()).hexdigest()
+    """SHA-256 binding the complete store, including data and annotation shards."""
+    from sv_pgs.content_identity import tree_digest
+    return tree_digest(store_root)
 
 
 def sites_digest(store_root: str | Path) -> str:
-    """SHA-256 of the store's variant layout: its chromosomes in order, their record counts and site digests."""
-    manifest = read_manifest(Path(store_root))
-    layout = {
-        "chromosomes": manifest["chromosomes"],
-        "record_counts": manifest["record_counts"],
-        "sites_md5": [manifest["sites_md5"][chromosome] for chromosome in manifest["chromosomes"]],
-    }
-    return hashlib.sha256(json.dumps(layout, sort_keys=True).encode()).hexdigest()
+    """Versioned exact feature identities and decoding units, independent of new samples."""
+    from sv_pgs.feature_identity import layout_digest
+    return layout_digest(store_root, read_manifest(Path(store_root)))
 
 
 def cohort_digest(research_ids: Sequence[str]) -> str:
@@ -232,6 +228,38 @@ class FittedModel:
         return tuple(model.trait_type for model in self.scoring)
 
 
+def model_part(model: FittedModel, name: str, kept_records: BoolArray, part_name: str) -> FittedModel:
+    """Model ``name`` of ``model`` restricted to the store records ``kept_records`` marks (one entry per store record),
+    as a fitted model of its own named ``part_name``.
+
+    The part keeps the model's posterior means, scales, coefficients and draw law (``DrawLaw.subset``, which draws for
+    each kept record the numbers the whole law draws for it) on the kept records, and its covariates, noise variance,
+    hyperparameters, certificate terms, refusals and provenance unchanged. A genetic score is a sum over its records
+    (``fast_scoring``), so the part's genetic score is exactly the share of ``name``'s that the kept records carry, and
+    ``predict_models`` scores both from the same read of the store.
+    """
+    index = model.model_names.index(name)
+    scoring = model.scoring[index]
+    kept = np.asarray(kept_records, dtype=bool)[scoring.store_rows]
+    part = replace(
+        scoring,
+        store_rows=scoring.store_rows[kept],
+        signed_means=scoring.signed_means[kept],
+        signed_scales=scoring.signed_scales[kept],
+        coefficients=scoring.coefficients[kept],
+        posterior_draws=scoring.posterior_draws.subset(kept),
+    )
+    return replace(
+        model,
+        model_names=(part_name,),
+        covariate_columns=np.asarray(model.covariate_columns)[[index]],
+        scoring=(part,),
+        noise_variance=np.asarray(model.noise_variance)[[index]],
+        hyperparameters=(model.hyperparameters[index],),
+        certificate={term: np.asarray(values)[[index]] for term, values in model.certificate.items()},
+    )
+
+
 def save_model(path: str | Path, model: FittedModel) -> None:
     """Write ``model`` to the new directory ``path``, atomically."""
     target = Path(path)
@@ -248,7 +276,12 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         arrays[f"hyperparameters/{index}/log_smoothing"] = hyperparameters.log_smoothing
     for name, values in model.certificate.items():
         arrays[f"certificate/{name}"] = np.asarray(values)
+    from sv_pgs.model_acceptance import acceptance
     metadata = {
+        "acceptance": acceptance(model),
+        "likelihoods": ["bernoulli" if t == TraitType.BINARY else "gaussian" for t in model.trait_types],
+        "effect_scales": ["log_odds" if t == TraitType.BINARY else "outcome_units" for t in model.trait_types],
+        "evidence_guarantee": "directional_approximation_with_local_diagnostics_not_joint_error_bound",
         "format": MODEL_FORMAT,
         "model_names": list(model.model_names),
         "trait_types": [trait_type.value for trait_type in model.trait_types],
@@ -276,6 +309,8 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         np.savez(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
+    from sv_pgs.content_identity import file_digest
+    metadata["arrays_sha256"] = file_digest(staging / _ARRAYS)
     with open(staging / _METADATA, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=1, sort_keys=True)
         handle.flush()
@@ -318,6 +353,11 @@ def load_model(path: str | Path) -> FittedModel:
         if sorted(archive.files) != sorted(names):
             raise ValueError("arrays.npz does not hold exactly the arrays model.json lists.")
         arrays = {name: np.array(archive[name]) for name in archive.files}
+    # Legacy v3 artifacts have no checksum; new artifacts bind every saved numerical value.
+    if "arrays_sha256" in metadata:
+        from sv_pgs.content_identity import file_digest
+        if metadata["arrays_sha256"] != file_digest(directory / _ARRAYS):
+            raise ValueError("arrays.npz content checksum does not match model.json")
     scoring = tuple(
         ScoringModel(
             **{field_name: arrays[f"scoring/{index}/{field_name}"] for field_name in _SCORING_FIELDS},
@@ -416,9 +456,18 @@ def predict_models(
         raise ValueError("scoring needs at least one fitted model.")
     covariate_names = models[0].covariate_names
     layout = sites_digest(store.root)
+    from sv_pgs.model_acceptance import require_accepted
+    from sv_pgs.feature_identity import portable
+    complete_store_digest = None
     for model in models:
+        require_accepted(model)
         if layout != model.provenance.sites_digest:
             raise ValueError(f"{store.root} has a different variant layout than the store the model was fitted on.")
+        if not portable(store.root, read_manifest(store.root)):
+            if complete_store_digest is None:
+                complete_store_digest = store_digest(store.root)
+            if complete_store_digest != model.provenance.store_digest:
+                raise ValueError("Legacy or build-unspecified store cannot score new samples: reconvert with exact allele identities and a genome build")
         if model.covariate_names != covariate_names:
             raise ValueError("models scored in one read must share their covariate names.")
     names = [name for model in models for name in model.model_names]
@@ -459,6 +508,8 @@ def predict_models(
         else:
             predictive_mean[:, index] = linear_predictor[:, index]
             predictive_variance[:, index] = linear_variance_values + noise_variance[index]
+    if not all(np.all(np.isfinite(values)) for values in (genetic.means, linear_predictor, predictive_mean, predictive_variance)) or np.any(predictive_variance < 0):
+        raise ValueError("Non-finite predictions or invalid predictive variances; scoring result quarantined")
     return Prediction(genetic=genetic, linear_predictor=linear_predictor, predictive_mean=predictive_mean, predictive_variance=predictive_variance)
 
 

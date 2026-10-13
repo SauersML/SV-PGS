@@ -301,7 +301,7 @@ class HyperStep:
     tighten: Callable[[float], "HyperStep | None"] | None = None
     # ``resolve(budget)``: this step with V at its returned weights certified to ``budget``, where a decision needs it.
     resolve: Callable[[float], "HyperStep | None"] | None = None
-    # The certified error of ``evidence`` (``_Evidence.error``): the outer loop's predicted gain carries it.
+    # Local numerical diagnostic for approximate evidence, not a joint log-normalizer error bound.
     evidence_error: float = 0.0
 
 
@@ -3327,14 +3327,16 @@ def _correction_slopes(
 def _corrected(
     prior: ScaleMixturePrior, log_smoothing: F64Array, evidence: _Evidence | None, cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float
 ) -> _Evidence | None:
-    """``evidence`` with its value certified to ``tolerance``: the Laplace terms replaced by exact one-dimensional
+    """Directional approximation to the evidence, with selected Laplace terms replaced by one-dimensional
     integrals along every standardized direction whose Tierney-Kadane term exceeds the tolerance (lead ruling for
     basins, and for every comparison of V: where that term is large the Laplace value is not V to the tolerance).
 
     It matters most at a fold of the inner maximum, where the data's negative curvature nearly cancels the penalty:
     there -1/2 log|B + S| rises without bound while the integral stays finite, so the Laplace value draws the search
     to the fold [sim-only: 9e10 TK term and a 10-nat correction where the neighbouring basin was 3.6 nats better].
-    None when the evidence is None or a line integral cannot be certified.
+    The recorded error is a local numerical diagnostic, not a bound on the joint log normalizer.
+    Higher-order tails and mixed-direction cumulants are not bounded by these line integrals.
+    None when the evidence is None or a line quadrature cannot meet its numerical tolerance.
     """
     if evidence is None:
         return None

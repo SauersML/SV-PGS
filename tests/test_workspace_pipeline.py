@@ -79,6 +79,8 @@ TRUTH = ("7001", "7002", "7003", "7004", "7005", "7006", "7099")
 # else is research ID 5000 + index. 7099 has only a truth row.
 TRUTH_OF_SEQUENCING = {"SA001": "7001", "SA002": "7003", "SA003": "7005", "SB001": "7002", "SB002": "7004", "SB003": "7006"}
 KINSHIP = (("7003", "5010", 0.45), ("5020", "5021", 0.25), ("5030", "5031", 0.05))
+# The imputation reference panel: 7099 has no imputed row and 5030 is no truth person's relative, so every pair calibrates.
+IMPUTATION_REFERENCE = ("7099", "5030")
 FEMALE, MALE = 45878463, 45880669
 BUDGET = ComputeBudget(
     device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(), host_bytes=1 << 29, cpu_threads=1
@@ -221,6 +223,7 @@ def _write_inputs(root: Path) -> _Synthetic:
         + "".join(f"{person}\t{('afr', 'eur')[int(person) % 2]}\t{json.dumps(rng.normal(size=3).round(4).tolist())}\n" for person in persons)
     )
     (root / "relatedness.tsv").write_text("i.s\tj.s\tkin\n" + "".join(f"{first}\t{second}\t{kinship}\n" for first, second, kinship in KINSHIP))
+    (root / "reference_ids.tsv").write_text("research_id\n" + "".join(f"{person}\n" for person in IMPUTATION_REFERENCE))
     raw = {
         "run_directory": str(root.parent / "run"),
         "marker_directory": str(root.parent / "markers"),
@@ -230,6 +233,7 @@ def _write_inputs(root: Path) -> _Synthetic:
             for label, batches in HALVES
         ],
         "truth_calls": str(root / "truth" / "{chromosome}.vcf"),
+        "imputation_reference_ids": str(root / "reference_ids.tsv"),
         "strata_directory": str(strata),
         "bubble_split": str(root / "bubbles" / "{chromosome}.bubble.split.vcf"),
         "genetic_map": None,
@@ -245,7 +249,7 @@ def _write_inputs(root: Path) -> _Synthetic:
         "fold_count": 2,
         "seed": 7,
         "codec": "zstd",
-        "export": ["accuracy.tsv", "comparison.tsv", "effects_by_class.tsv"],
+        "export": ["accuracy.tsv", "comparison.tsv", "effects_by_class.tsv", "genetic_variance.tsv"],
     }
     return _Synthetic(root=root, raw=raw, genotypes=genotypes, dosages=dosages)
 
@@ -368,6 +372,14 @@ class _Fitted:
     noise_variance: np.ndarray
     certificate: dict[str, np.ndarray]
     refusals: tuple[str, ...] = ()
+    covariate_columns: np.ndarray | None = None
+    hyperparameters: tuple = ()
+
+    def __post_init__(self):
+        if self.covariate_columns is None:
+            self.covariate_columns = np.ones((len(self.model_names), len(self.covariate_names)), dtype=bool)
+        if not self.hyperparameters:
+            self.hyperparameters = (None,) * len(self.model_names)
 
 
 class _Recorder:
@@ -406,7 +418,7 @@ class _Recorder:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0,
                                       np.repeat(alpha[:, None], draws.shape[1], axis=1), np.zeros((alpha.size, alpha.size)), True))
-        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool)})
+        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool), "unresolved": np.zeros(len(models)), "budget_unresolved": np.zeros(len(models)), "restored_best": np.zeros(len(models))})
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -504,6 +516,7 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     # Second-degree relatives form one family; a pair below the KING second-degree bound does not.
     assert rows["5020"][6] == rows["5021"][6] and rows["5030"][6] != rows["5031"][6]
     assert summaries["samples"]["calibration_pairs"] == len(TRUTH_OF_SEQUENCING)
+    assert summaries["samples"]["calibration"]["reference_members_left_out"] == summaries["samples"]["calibration"]["relatives_left_out"] == "0"
 
     # The store: typed half manifests, background-corrected imputed codes, long-read hard calls.
     with DosageStore.open(run / "store" / "store") as store:
@@ -617,6 +630,30 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     by_class = pd.read_csv(run / "effects" / "effects_by_class.tsv", sep="\t")
     assert set(by_class["length_bin"]) == {"<50", "50-499"} and set(by_class["arm"]) == set(ARMS)
     assert by_class[by_class["length_bin"] == "50-499"]["arm"].eq("with_sv").all()
+    # The structural records' share of each with_sv score's variance over the trait's observed rows is the split of
+    # beta' Sigma beta, Sigma the covariance of the standardized genotypes the all-rows model scores, LD terms included.
+    variance = pd.read_csv(run / "effects" / "genetic_variance.tsv", sep="\t")
+    assert list(variance.columns) == list(workspace_pipeline.GENETIC_VARIANCE_COLUMNS)
+    with DosageStore.open(run / "measurement" / "store") as store:
+        for trait_index, trait in enumerate(traits):
+            observed = np.isfinite(cohort["targets"][:, trait_index])
+            fitted = _load_model(run / "fit" / "models" / "with_sv" / trait)
+            scoring = fitted.scoring[fitted.model_names.index(f"{trait}/all")]
+            signed = store.read_codes(0, store.n_variants, cohort["store_columns"][observed]).astype(np.float64) - 127.0
+            standardized = (signed[scoring.store_rows] - scoring.signed_means[:, None]) / scoring.signed_scales[:, None]
+            covariance = np.cov(standardized, bias=True)
+            in_part = structural[scoring.store_rows]
+            assert in_part.any() and not in_part.all()
+            whole = scoring.coefficients
+            part, rest = np.where(in_part, whole, 0.0), np.where(in_part, 0.0, whole)
+            expected = {
+                "total_variance": whole @ covariance @ whole, "structural_variance": part @ covariance @ part,
+                "small_variance": rest @ covariance @ rest, "covariance_term": 2.0 * part @ covariance @ rest,
+                "structural_share": part @ covariance @ whole / (whole @ covariance @ whole),
+            }
+            rows = variance[variance["trait"] == trait].set_index("quantity")
+            assert rows["n"].tolist() == [int(observed.sum())] * len(expected)
+            np.testing.assert_allclose(rows.loc[list(expected), "value"], list(expected.values()), rtol=1e-5, atol=1e-5 * expected["total_variance"])
 
     # The report suppresses cells of 1-20 people; export stages the approved files and nothing is sent.
     report = [line.split("\t") for line in (run / "report" / "accuracy.tsv").read_text().splitlines()]
@@ -629,7 +666,7 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     assert comparison[0] == list(workspace_pipeline.COMPARISON_COLUMNS)
     assert any(line[0] == "total_bilirubin" and line[5] == "delta_pgs_partial_r2" and line[6] for line in comparison[1:])
     for name in synthetic.raw["export"]:
-        source = run / ("effects" if name.startswith("effect") else "report") / name
+        source = run / ("report" if name in ("accuracy.tsv", "comparison.tsv") else "effects") / name
         assert (run / "export" / name).read_text() == source.read_text()
 
 
@@ -659,7 +696,7 @@ def test_a_rerun_skips_completed_steps_and_resumes_after_a_failure(workspace) ->
 def test_without_truth_calls_the_run_says_so_and_keeps_the_stored_dosages(workspace) -> None:
     synthetic, client = workspace
     two_threads = dataclasses.replace(BUDGET, cpu_threads=2)
-    config = WorkspaceConfig.from_mapping({**synthetic.raw, "truth_calls": None})
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "truth_calls": None, "imputation_reference_ids": None})
     summaries = run_pipeline(config, _bindings(_Recorder(), client), two_threads, through="measurement")
     run = config.run_directory
     assert summaries["samples"]["calibration_pairs"] == 0 and summaries["store"]["halves"] == ["imputed_dosage", "imputed_dosage"]
@@ -668,6 +705,42 @@ def test_without_truth_calls_the_run_says_so_and_keeps_the_stored_dosages(worksp
     assert all(entry["pairs_supplied"] == 0 and entry["recalibration"].startswith("not applied") for entry in certificate.values())
     rows = (run / "samples" / "rows.tsv").read_text()
     assert "long_read" not in rows and "\n5010\t" in rows
+
+
+def test_the_calibration_pairs_leave_out_the_imputation_reference_and_its_members_close_relatives(workspace) -> None:
+    """7001's genome was in the imputation reference, and 7004 is a first-degree relative of 5004, whose genome was too:
+    both imputed rows are leave-in imputations, so neither calibrates. 7006, only third-degree to 5004, does."""
+    synthetic, client = workspace
+    (synthetic.root / "reference_ids.tsv").write_text("research_id\n7001\n5004\n")
+    with (synthetic.root / "relatedness.tsv").open("a") as handle:
+        handle.write("5004\t7004\t0.25\n7006\t5004\t0.05\n")
+    summaries = run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="samples")
+    record = json.loads((Path(synthetic.raw["run_directory"]) / "samples" / "samples.json").read_text())
+    # The store still gathers every pair's codes; the measurement model is fitted on the others.
+    assert len(record["calibration_pairs"]) == len(TRUTH_OF_SEQUENCING)
+    assert {record["calibration_pairs"][position][0] for position in record["calibrating"]} == {"7002", "7003", "7005", "7006"}
+    account = summaries["samples"]["calibration"]
+    assert summaries["samples"]["calibration_pairs"] == 4 and account["reference_overlap"].startswith("checked")
+    # One member and one relative: a count of 1 to 20 is never written.
+    assert account["reference_members_left_out"] == account["relatives_left_out"] == "1-20 (suppressed)"
+
+
+def test_with_truth_calls_and_no_reference_list_no_pair_calibrates_and_the_run_says_why(workspace) -> None:
+    """Without the reference list, whether a truth person's imputed row is a leave-in imputation is unchecked, so the
+    measurement model takes its no-truth form. The list, once given, recalibrates without rebuilding the store."""
+    synthetic, client = workspace
+    unchecked = WorkspaceConfig.from_mapping({**synthetic.raw, "imputation_reference_ids": None})
+    summaries = run_pipeline(unchecked, _bindings(_Recorder(), client), BUDGET, through="measurement")
+    run = unchecked.run_directory
+    account = summaries["samples"]["calibration"]
+    assert summaries["samples"]["calibration_pairs"] == 0 and account["reference_overlap"].startswith("unchecked")
+    assert account["pairs_withheld"] == "1-20 (suppressed)" and summaries["store"]["halves"][-1] == "long_read_calls"
+    assert not summaries["measurement"]["recalibrated"] and summaries["measurement"]["calibration"] == account
+    certificate = json.loads((run / "measurement" / "certificate.json").read_text())
+    assert all(entry["pairs_supplied"] == 0 and entry["calibration"] == account for entry in certificate.values())
+    stored = _completed_at(run, "store")
+    summaries = run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="measurement")
+    assert summaries["measurement"]["recalibrated"] and _completed_at(run, "store") == stored
 
 
 def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(workspace) -> None:
@@ -726,6 +799,11 @@ def test_the_config_names_every_key_and_canonical_phenotypes(workspace) -> None:
     # A missing gene_annotation says which public file to point it at.
     with pytest.raises(ValueError, match=r"gencode\.v38\.basic\.annotation\.gtf\.gz"):
         WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "gene_annotation"})
+    with pytest.raises(ValueError, match="reference panel"):
+        WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "imputation_reference_ids"})
+    # The reference list is read only for the truth calls' calibration pairs.
+    with pytest.raises(ValueError, match="imputation_reference_ids"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "truth_calls": None})
     with pytest.raises(ValueError, match="canonical name"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "diseases": ["afib"]})
 
@@ -782,8 +860,55 @@ def test_a_record_spanning_several_repeats_chains_no_unsplittable_group_past_the
     assert np.unique(group_first[is_tr]).shape[0] == 3
 
 
+def test_the_genetic_variance_decomposition_is_beta_sigma_beta_under_ld() -> None:
+    """On synthetic genotypes where each structural column tags a small one, the decomposition of the scores' variance
+    is beta' Sigma beta split by part, and the per-record sum of squared effects (no LD) is not the variance."""
+    rng = np.random.default_rng(11)
+    small = rng.binomial(2, 0.3, (4000, 6)).astype(np.float64)
+    structural = np.clip(small[:, :2] + rng.binomial(1, 0.1, (4000, 2)), 0.0, 2.0)
+    genotypes = np.column_stack([structural, small])
+    standardized = (genotypes - genotypes.mean(axis=0)) / genotypes.std(axis=0)
+    covariance = np.cov(standardized, rowvar=False, bias=True)
+    whole = np.array([0.4, -0.3, 0.5, 0.2, -0.1, 0.3, 0.2, -0.4])
+    in_part = np.arange(whole.shape[0]) < 2
+    part, rest = np.where(in_part, whole, 0.0), np.where(in_part, 0.0, whole)
+    result = workspace_pipeline.genetic_variance_decomposition(standardized @ whole, standardized @ part)
+    assert result["total_variance"] == pytest.approx(whole @ covariance @ whole)
+    assert result["structural_variance"] == pytest.approx(part @ covariance @ part)
+    assert result["small_variance"] == pytest.approx(rest @ covariance @ rest)
+    assert result["covariance_term"] == pytest.approx(2.0 * part @ covariance @ rest)
+    assert result["structural_share"] == pytest.approx(part @ covariance @ whole / (whole @ covariance @ whole))
+    assert result["total_variance"] == pytest.approx(result["structural_variance"] + result["small_variance"] + result["covariance_term"])
+    # The structural columns' LD with the small ones moves the share away from their sum of squared effects.
+    assert abs(result["covariance_term"]) > 0.1 * result["total_variance"]
+    assert result["structural_share"] != pytest.approx(np.sum(part**2) / np.sum(whole**2), rel=0.05)
+    assert np.isnan(workspace_pipeline.genetic_variance_decomposition(np.ones(30), np.ones(30))["structural_share"])
+
+
 def test_scoring_holds_at_most_a_quarter_of_the_host_in_saved_models_per_store_read() -> None:
     # A quarter of 80 bytes is 20: two 10-byte models share a read; a model past the quarter is read alone.
     assert workspace_pipeline.score_batches([10, 10, 10], 80) == [range(0, 2), range(2, 3)]
     assert workspace_pipeline.score_batches([30, 5, 5], 80) == [range(0, 1), range(1, 3)]
     assert workspace_pipeline.score_batches([5], 1) == [range(0, 1)]
+
+
+def test_frozen_probability_calibration_uses_only_reserved_development_families(workspace):
+    from sv_pgs.probability_calibration import FrozenCalibration
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, 'calibration_fraction': .3})
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through='score')
+    cohort = np.load(config.run_directory / 'cohort' / 'cohort.npz')
+    predictions = np.load(config.run_directory / 'score' / 'predictions.npz')
+    records = json.loads((config.run_directory / 'score' / 'calibrators.json').read_text())
+    names = json.loads((config.run_directory / 'cohort' / 'cohort.json').read_text())['model_names']
+    assert records
+    assert not np.any(cohort['calibration'] & (cohort['training'] | cohort['held_out']))
+    for entry in records:
+        model = names.index(entry['model'])
+        arm = ARMS.index(entry['arm'])
+        rows = cohort['calibration'][:, model]
+        trait = cohort['model_traits'][model]
+        assert not set(cohort['families'][rows]) & set(cohort['families'][cohort['training'][:, model]])
+        frozen = FrozenCalibration.fit(predictions['linear_predictor'][arm, rows, model], cohort['targets'][rows, trait])
+        np.testing.assert_allclose([entry['intercept'], entry['slope']], [frozen.intercept, frozen.slope])
+        np.testing.assert_allclose(predictions['calibrated_logits'][arm, :, model], frozen.logits(predictions['linear_predictor'][arm, :, model]))

@@ -104,10 +104,10 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
         ancestry=["group"] * n, half=["imputed"] * n,
     )
     both = np.stack([score, score])[:, :, None]
-    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both))
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=None)
     monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
-    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count)), tmp_path)
+    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count, calibration_fraction=0.0)), tmp_path)
     with (tmp_path / "comparison.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     assert len(rows) == 6
@@ -116,7 +116,7 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
         if fold_count > 1:
             assert row["inference"] == "descriptive_cross_fit"
             assert row["z"] == row["p_value"] == ""
-        elif separated and row["metric"] == "log_likelihood_gain":
+        elif separated and row["metric"] == "test_recalibrated_log_likelihood_gain":
             assert row["inference"] == "undefined"
             assert row["z"] == row["p_value"] == ""
         else:

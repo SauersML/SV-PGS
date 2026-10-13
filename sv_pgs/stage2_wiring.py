@@ -339,7 +339,11 @@ def _null_binary_model(covariates: F64Array, labels: F64Array, draw_count: int, 
 
 def _with_refusal(fit: FullDataFit, reason: str) -> FullDataFit:
     """``fit`` with ``reason`` appended to its certificate's refusals."""
-    return dataclasses.replace(fit, certificate=dataclasses.replace(fit.certificate, refusals=(*fit.certificate.refusals, reason)))
+    return dataclasses.replace(fit, certificate=dataclasses.replace(
+        fit.certificate, refusals=(*fit.certificate.refusals, reason),
+        outer_criterion_met=np.zeros_like(fit.certificate.outer_criterion_met, dtype=bool),
+        unresolved=np.asarray(fit.certificate.unresolved) + 1,
+    ))
 
 
 def _fit_one(
@@ -444,11 +448,8 @@ def _fit_one(
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
     source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share))
-    # The route (``gram_space``): a quantitative model is fitted on the summary band, every step after Stage 0 on the
-    # summaries alone (the band cut by each region's measured LD extent, its far field in the likelihood as measured
-    # field noise, the tempered band), wherever a pass over the band costs less than a pass over the samples, measured on
-    # this store and device (``pass_costs``); otherwise on the samples. A binary model's metric moves with its sites,
-    # so its passes are over the samples.
+    # Timing may select a band accelerator, never a different likelihood. Every route
+    # retains DualGaussian and recomputes the omitted fields from the full sample operator.
     band = None
     kappa = 1.0
     if not binary:
@@ -472,26 +473,23 @@ def _fit_one(
         log(
             f"stage2 wiring: a pass costs {sample_seconds:.3g} s over the samples and {gram_seconds:.3g} s over the summary band "
             f"({band.group_count:,} columns, {band.block_count:,} parts, band {band.band_width:,}; built in {time.perf_counter() - started:.0f} s): "
-            f"{'summary' if gram_seconds < sample_seconds else 'sample'} route"
+            f"{'band-accelerated full-data' if gram_seconds < sample_seconds else 'full-data'} route"
         )
         if not gram_seconds < sample_seconds:
             band.release()
             band = None
-    if band is not None:
-        gaussian = GramGaussian(band, training=mask, targets=store_targets, covariates=store_covariates, array_module=source.array_module, probe_count=draw_count)
-    else:
-        gaussian = DualGaussian(
-            source=source,
-            training=mask,
-            targets=store_targets,
-            offsets=np.zeros((store.n_samples, 1)),
-            covariates=store_covariates,
-            grams=block_grams(statistics, start_noise),
-            probe_count=draw_count,
-            seed=_seed(seed, 0),
-            # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
-            sample_weights=None if store_sites is None else store_sites.weights[:, None],
-        )
+    gaussian = DualGaussian(
+        source=source,
+        training=mask,
+        targets=store_targets,
+        offsets=np.zeros((store.n_samples, 1)),
+        covariates=store_covariates,
+        grams=block_grams(statistics, start_noise),
+        probe_count=draw_count,
+        seed=_seed(seed, 0),
+        # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
+        sample_weights=None if store_sites is None else store_sites.weights[:, None],
+    )
     # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
     # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
     # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
@@ -499,7 +497,7 @@ def _fit_one(
     # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
     fit = fit_full_data(
         gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-        sites=[store_sites], null_scale=kappa,
+        sites=[store_sites], null_scale=kappa, band=band,
     )
     while True:
         check = lattice_check(
@@ -523,7 +521,7 @@ def _fit_one(
             refit = fit_full_data(
                 gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
                 sites=[store_sites], starts=[moved_hyperparameters], start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
-                start_mean=fit.member_mean, null_scale=kappa,
+                start_mean=fit.member_mean, null_scale=kappa, band=band,
             )
         except FloatingPointError as error:
             # No fit on the checked lattice: the model keeps the fit it has, and its certificate says the quadrature
@@ -578,6 +576,11 @@ def fit_models(
     EP) is measured on bench-sim, which then replaces it."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
+    # Stage 0 runs a buffer on every device; Stage 2's reads run on CuPy's current device, since the multi-device
+    # source (device_plan.ShardedDualSource) is not wired in (docs/design/CAPABILITIES.md).
+    stage2_device = f"CUDA device {budget.device_ids[0]}" if budget.device_kind == "cuda" else "the CPU"
+    log(f"stage2 wiring: Stage 0 runs on every device of the budget, Stage 2 on {stage2_device} alone "
+        f"({len(budget.device_ids)} CUDA device(s) visible)")
     measurement = store_measurement(store, log_variance_offset)
     scoring, noise, hyperparameters, certificates, prior_digests = [], [], [], [], []
     for model in range(training.shape[1]):

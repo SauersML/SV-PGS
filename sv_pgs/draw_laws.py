@@ -110,6 +110,9 @@ class DrawLaw(Protocol):
     def tile_row_bytes(self) -> int:
         """Working bytes per row of a tile beyond the tile itself."""
 
+    def subset(self, rows: np.ndarray) -> "DrawLaw":
+        """The law of ``rows`` (indices or a mask), drawing for each the numbers the whole law draws for it."""
+
     def arrays(self) -> dict[str, np.ndarray]:
         """The law's parameters, by name (``artifact``)."""
 
@@ -215,6 +218,38 @@ class ProductMixtureDraws:
 
         grid = int(np.shape(self.log_variance_grid)[0])
         return _FLOAT64_BYTES * (_ROW_INTERMEDIATES * grid + len(_DRAW_INTERMEDIATES) * int(self.draw_count))
+
+    def marginal_summary(self, start: int, stop: int, center: F64Array) -> tuple[F64Array, F64Array]:
+        """Analytic E[(beta-center)^2] and P(beta>0) of the represented mixture.
+
+        Integrates every mixture component and lattice node, including components too
+        rare to appear among K draws. This is exact for the represented approximate law,
+        not a claim that the law is the true joint posterior.
+        """
+        from scipy.special import ndtr
+        from sv_pgs.scale_mixture_ep import _components
+
+        rows = np.arange(start, stop, dtype=np.int64)
+        center = np.asarray(center, dtype=np.float64)
+        if center.shape != rows.shape:
+            raise ValueError("center must have one value per requested row")
+        variance, positive = np.zeros(rows.size), np.zeros(rows.size)
+        classes = np.asarray(self.class_index)[rows]
+        for component, weight in enumerate(self.weights):
+            if weight == 0:
+                continue
+            for cls in np.unique(classes):
+                local = np.flatnonzero(classes == cls)
+                members = rows[local]
+                shift = np.asarray(self.shift)[component, members]
+                terms = _components(np.asarray(self.log_density)[cls], np.asarray(self.log_scale)[members],
+                                    np.asarray(self.log_variance_grid), np.asarray(self.omega)[component, members], shift)
+                conditional = terms.conditional_variance
+                means = shift[:, None] * conditional
+                variance[local] += weight * np.sum(terms.responsibility * (conditional + (means - center[local, None]) ** 2), axis=1)
+                probability = np.where(conditional > 0, ndtr(shift[:, None] * np.sqrt(conditional)), 0.0)
+                positive[local] += weight * np.sum(terms.responsibility * probability, axis=1)
+        return variance, positive
 
     def tile(self, start: int, stop: int) -> F64Array:
         """Rows start..stop-1 of every draw: per component present among the draws and per class present in the rows,
