@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -126,11 +127,22 @@ class Expectation:
     power_upper_95: float
 
 
-def expectation(architecture: Architecture, replicates: int, seed: int, significance: float, tests: int) -> Expectation:
+def expectation(
+    architecture: Architecture, replicates: int, seed: int, significance: float, tests: int, arm_error_correlation: float = 1.0,
+) -> Expectation:
     """Analytic accuracies of both arms, and the power of the paired held-out DeLong test of their AUCs by a Monte Carlo
-    of ``replicates`` test sets: one-sided at ``significance``, and Bonferroni-corrected over ``tests`` diseases."""
+    of ``replicates`` test sets: one-sided at ``significance``, and Bonferroni-corrected over ``tests`` diseases.
+
+    ``arm_error_correlation`` is the correlation of the two arms' small-variant estimation errors. The arms are separate
+    fits: their small-variant effects come from the same people (most of each error is shared) but under different
+    priors and columns, with their own approximation and draws. At 1 the error is shared exactly and cancels in the
+    paired difference, so the power is an upper bound; below 1 each arm's error carries an unshared part, which the
+    paired test must see through. A real study's value is measured from the two arms' fitted scores.
+    """
     if not isinstance(replicates, int) or replicates <= 0 or not isinstance(tests, int) or tests <= 0 or not 0 < significance < 1:
         raise ValueError("replicates and tests must be positive integers, significance in (0, 1)")
+    if not 0 <= arm_error_correlation <= 1:
+        raise ValueError("the arms' error correlation must be in [0, 1]")
     small_captured, sv_captured = captured_heritability(architecture)
     small_r2, sv_r2 = estimation_accuracy(small_captured, architecture), estimation_accuracy(sv_captured, architecture)
     generator = np.random.default_rng(seed)
@@ -153,8 +165,13 @@ def expectation(architecture: Architecture, replicates: int, seed: int, signific
         if cases.min() == cases.max():
             z_scores.append(math.nan)
             continue
-        small_score = small_value + generator.normal(0.0, math.sqrt(small_noise), size)
-        sv_score = small_score + extra_value + generator.normal(0.0, math.sqrt(sv_noise), size)
+        small_error = generator.normal(0.0, math.sqrt(small_noise), size)
+        sv_small_error = small_error
+        if arm_error_correlation < 1:
+            unshared = generator.normal(0.0, math.sqrt(small_noise), size)
+            sv_small_error = arm_error_correlation * small_error + math.sqrt(1.0 - arm_error_correlation**2) * unshared
+        small_score = small_value + small_error
+        sv_score = small_value + sv_small_error + extra_value + generator.normal(0.0, math.sqrt(sv_noise), size)
         comparison = paired_delta_auc(cases, small_score, sv_score)
         z_scores.append(comparison.z_score)
         deltas.append(comparison.estimate)
@@ -197,6 +214,10 @@ def main() -> None:
     parser.add_argument("--sv-imputation-r2", type=float, default=0.8)
     parser.add_argument("--causal-variants", type=float, default=10_000)
     parser.add_argument("--effective-segments", type=float, default=60_000)
+    parser.add_argument(
+        "--arm-error-correlations", type=float, nargs="+", default=[1.0, 0.99, 0.95, 0.9],
+        help="correlations of the two arms' small-variant estimation errors (1: shared exactly, the upper bound on power)",
+    )
     parser.add_argument("--replicates", type=int, default=200)
     parser.add_argument("--significance", type=float, default=0.05)
     parser.add_argument("--output", type=Path, required=True)
@@ -216,13 +237,14 @@ def main() -> None:
         )
         for sv_causal_fraction in arguments.sv_causal_fractions:
             for fold in arguments.sv_effect_folds:
-                for tagged in arguments.tagged_by_small:
+                for tagged, correlation in itertools.product(arguments.tagged_by_small, arguments.arm_error_correlations):
                     architecture = replace(base, sv_share=sv_share_of(sv_causal_fraction, fold), tagged_by_small=tagged)
-                    result = expectation(architecture, arguments.replicates, len(rows), arguments.significance, len(PANEL))
+                    result = expectation(architecture, arguments.replicates, len(rows), arguments.significance, len(PANEL), correlation)
                     rows.append({
                         "disease": name, "prevalence": prevalence, "heritability": heritability, "people": people,
                         "cases": int(people * prevalence), "sv_causal_fraction": sv_causal_fraction, "sv_effect_fold": fold,
                         "sv_share_of_h2": round(architecture.sv_share, 4), "tagged_by_small": tagged,
+                        "arm_error_correlation": correlation,
                         "snv_indel_auc": round(result.small_auc, 4), "with_sv_auc": round(result.sv_auc, 4),
                         "expected_delta_auc": round(result.sv_auc - result.small_auc, 5),
                         "simulated_delta_auc": round(result.mean_delta_auc_simulated, 5),

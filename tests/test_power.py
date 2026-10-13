@@ -155,3 +155,14 @@ def test_summary_reports_invalid_comparisons_separately(tmp_path):
     assert row['valid_comparisons'] == '2' and row['invalid_comparisons'] == '1'
     assert float(row['share_favouring_sv']) == .5
     assert float(row['rate_lower_95']) < .5 < float(row['rate_upper_95'])
+
+
+def test_unshared_arm_error_lowers_the_paired_power_and_leaves_the_expected_aucs():
+    architecture = _architecture(sv_share=0.05, tagged_by_small=0.3)
+    shared = expected.expectation(architecture, 40, 3, .05, 15)
+    assert expected.expectation(architecture, 40, 3, .05, 15, arm_error_correlation=1.0) == shared
+    unshared = expected.expectation(architecture, 40, 3, .05, 15, arm_error_correlation=0.5)
+    assert (unshared.small_auc, unshared.sv_auc) == (shared.small_auc, shared.sv_auc)
+    assert unshared.power <= shared.power
+    with pytest.raises(ValueError, match="correlation"):
+        expected.expectation(architecture, 4, 3, .05, 15, arm_error_correlation=1.5)
