@@ -48,7 +48,7 @@ from scipy import linalg
 from scipy.optimize import linprog
 from scipy.special import log_expit, ndtr
 
-from sv_pgs._typing import F64Array, I64Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _LOG_SIGMOID_CURVATURE_BOUND = 0.25
@@ -285,8 +285,8 @@ def working_model(sites: SampleSites) -> tuple[F64Array, F64Array]:
     return sites.precision.copy(), response
 
 
-def assert_no_separation(covariates: F64Array, labels: F64Array) -> None:
-    """Raise SeparatedLabels if some direction alpha != 0 has sign_i c_i' alpha >= 0 for every sample.
+def separating_direction(covariates: F64Array, labels: F64Array) -> F64Array | None:
+    """A direction alpha != 0 with sign_i c_i' alpha >= 0 for every sample, or None where there is none.
 
     A linear program maximizes sum_i sign_i c_i' alpha over those alpha in the unit box. The
     objective is homogeneous, so the box only normalizes it. The maximum is zero exactly when no
@@ -295,7 +295,7 @@ def assert_no_separation(covariates: F64Array, labels: F64Array) -> None:
     design = np.asarray(covariates, dtype=np.float64)
     signed = _signs(labels)[:, None] * design
     if signed.shape[1] == 0:
-        return
+        return None
     result = linprog(
         c=-signed.sum(axis=0),
         A_ub=-signed,
@@ -306,11 +306,37 @@ def assert_no_separation(covariates: F64Array, labels: F64Array) -> None:
     if result.status != 0:
         raise ArithmeticError(f"the separation linear program did not solve: {result.message}")
     rounding = signed.shape[0] * _EPSILON * float(np.abs(signed).sum())
-    if -result.fun > rounding:
+    return np.asarray(result.x, dtype=np.float64) if -result.fun > rounding else None
+
+
+def assert_no_separation(covariates: F64Array, labels: F64Array) -> None:
+    """Raise SeparatedLabels if some direction alpha != 0 has sign_i c_i' alpha >= 0 for every sample
+    (``separating_direction``)."""
+    direction = separating_direction(covariates, labels)
+    if direction is not None:
         raise SeparatedLabels(
-            f"the covariates (quasi-)separate the labels along direction {result.x.tolist()};"
+            f"the covariates (quasi-)separate the labels along direction {direction.tolist()};"
             " restrict the cohort to the at-risk group or drop the separating covariate."
         )
+
+
+def unseparated_columns(covariates: F64Array, labels: F64Array) -> BoolArray:
+    """The covariate columns (column 0 the intercept) a binary model keeps so that no direction separates its labels.
+
+    A quasi-separating covariate has an infinite maximum-likelihood coefficient (typically an indicator whose group
+    holds no case of the disease), so the model cannot adjust for it. Every column other than the intercept on a
+    separating direction's support is dropped, and the test repeats on the columns left, until no direction
+    separates. A direction on the intercept alone means every label is the same, which no covariate choice fixes,
+    and raises.
+    """
+    design = np.asarray(covariates, dtype=np.float64)
+    kept = np.ones(design.shape[1], dtype=bool)
+    while (direction := separating_direction(design[:, kept], labels)) is not None:
+        support = np.flatnonzero(kept)[direction != 0.0]
+        if np.all(support == 0):
+            raise SeparatedLabels("every training label is the same, so no binary model can be fitted.")
+        kept[support[support != 0]] = False
+    return kept
 
 
 def _joint_precision(design: F64Array, covariates: F64Array, prior_precision: F64Array, sites: SampleSites) -> tuple[F64Array, F64Array]:

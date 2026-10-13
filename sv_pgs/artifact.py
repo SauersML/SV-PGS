@@ -399,33 +399,56 @@ class Prediction:
 def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, covariates: F64Array, budget: ComputeBudget) -> Prediction:
     """Score ``model`` on the store samples ``sample_indices``, whose covariates are ``covariates`` in the model's
     ``covariate_names`` order without the intercept, from one read of the store."""
-    if sites_digest(store.root) != model.provenance.sites_digest:
-        raise ValueError(f"{store.root} has a different variant layout than the store the model was fitted on.")
+    return predict_models((model,), store, sample_indices, covariates, budget)
+
+
+def predict_models(
+    models: Sequence[FittedModel], store: DosageStore, sample_indices: np.ndarray, covariates: F64Array, budget: ComputeBudget
+) -> Prediction:
+    """Score every model of every fitted model in ``models`` from one read of the store: the columns of the returned
+    arrays are the models' ``model_names`` in order, ``models[0]``'s first.
+
+    The fitted models were saved separately (each its own fit, certificate and provenance) but must share the
+    covariates (the same ``covariate_names``, which ``covariates`` follows without the intercept) and the store's
+    variant layout; the store read, the dominant cost of scoring, is then paid once for all of them.
+    """
+    if not models:
+        raise ValueError("scoring needs at least one fitted model.")
+    covariate_names = models[0].covariate_names
+    layout = sites_digest(store.root)
+    for model in models:
+        if layout != model.provenance.sites_digest:
+            raise ValueError(f"{store.root} has a different variant layout than the store the model was fitted on.")
+        if model.covariate_names != covariate_names:
+            raise ValueError("models scored in one read must share their covariate names.")
+    names = [name for model in models for name in model.model_names]
+    scorings = tuple(scoring for model in models for scoring in model.scoring)
+    noise_variance = np.concatenate([np.asarray(model.noise_variance, dtype=np.float64) for model in models])
     samples = np.asarray(sample_indices, dtype=np.int64)
     covariate_matrix = np.asarray(covariates, dtype=np.float64)
-    if covariate_matrix.shape != (samples.shape[0], len(model.covariate_names)):
+    if covariate_matrix.shape != (samples.shape[0], len(covariate_names)):
         raise ValueError("covariates must be [samples, the model's covariates].")
-    for index, scoring in enumerate(model.scoring):
+    for index, scoring in enumerate(scorings):
         if not scoring.draw_count:
-            raise ValueError(f"model {model.model_names[index]!r} has no posterior draws, so no predictive variance.")
+            raise ValueError(f"model {names[index]!r} has no posterior draws, so no predictive variance.")
     fixed_design = np.column_stack([np.ones(samples.size), covariate_matrix])
-    linear_variances = np.empty((samples.size, len(model.scoring)))
+    linear_variances = np.empty((samples.size, len(scorings)))
 
     def linear_variance(index: int, mean_scores: F64Array, draw_scores: F64Array) -> None:
         # Each draw's move of the linear predictor, its genetic score's and its covariate coefficients' together, formed
         # while the draw scores are in the scorer's accumulator (none is kept).
-        scoring = model.scoring[index]
+        scoring = scorings[index]
         deviations = draw_scores - mean_scores[:, None]
         deviations += fixed_design @ (scoring.covariate_draws - scoring.alpha[:, None])
         linear_variances[:, index] = np.mean(deviations * deviations, axis=1) + np.einsum(
             "ij,jk,ik->i", fixed_design, scoring.covariate_covariance, fixed_design
         )
 
-    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(model.scoring), budget, samples, draws="variance", reduce=linear_variance)
-    linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, model.scoring)
+    genetic = score_genetic(StoreCodeBlocks(store, budget), ScoringPlan.from_models(scorings), budget, samples, draws="variance", reduce=linear_variance)
+    linear_predictor = score_linear_predictor(genetic.means, covariate_matrix, scorings)
     predictive_mean = np.empty_like(linear_predictor)
     predictive_variance = np.empty_like(linear_predictor)
-    for index, scoring in enumerate(model.scoring):
+    for index, scoring in enumerate(scorings):
         linear_variance_values = linear_variances[:, index]
         if scoring.trait_type == TraitType.BINARY:
             probability = posterior_predictive_probability(
@@ -435,7 +458,7 @@ def predict(model: FittedModel, store: DosageStore, sample_indices: np.ndarray, 
             predictive_variance[:, index] = probability * (1.0 - probability)
         else:
             predictive_mean[:, index] = linear_predictor[:, index]
-            predictive_variance[:, index] = linear_variance_values + model.noise_variance[index]
+            predictive_variance[:, index] = linear_variance_values + noise_variance[index]
     return Prediction(genetic=genetic, linear_predictor=linear_predictor, predictive_mean=predictive_mean, predictive_variance=predictive_variance)
 
 

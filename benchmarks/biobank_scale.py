@@ -8,8 +8,9 @@ is 127 times the dosage. A quantitative trait of ``--causal`` causal records and
 is drawn with it (the genetic value accumulated as the codes are written), with two standard normal covariates.
 
 ``fit`` runs ``stage2_wiring.fit_models`` on it, timing Stage 0 (``compute_genotype_statistics``) and the rest of the
-fit separately, and reports the route the measured pass costs chose, the peak resident set and the device pool's
-peak. Nothing here is an accuracy claim: the trait is this script's own simulation [own-sim], and the run measures
+fit separately, and reports the route the measured pass costs chose, the fit's store passes, the peak resident set and
+the device pool's peak. ``--trait-type binary`` fits the trait's top fifth as cases instead, the route a disease takes
+(its passes are over the samples), so the two runs on one store measure what a disease costs against a trait. Nothing here is an accuracy claim: the trait is this script's own simulation [own-sim], and the run measures
 time and memory only.
 """
 from __future__ import annotations
@@ -100,7 +101,11 @@ def generate(root: Path, samples: int, variants: int, causal: int, heritability:
     log(f"biobank scale: store written in {time.time() - started:.0f} s")
 
 
-def fit(root: Path, work: Path, seed: int) -> dict:
+CASE_QUANTILE = 0.8
+"""``--trait-type binary``: the trait's values above this quantile are the cases (a prevalence of one fifth)."""
+
+
+def fit(root: Path, work: Path, seed: int, trait_type: TraitType) -> dict:
     from benchmarks.bench_sim.submissions.svpgs_full import _array_module, task_budget
     from sv_pgs import stage2_wiring
     from sv_pgs.fit_model import DRAW_COUNT
@@ -140,6 +145,8 @@ def fit(root: Path, work: Path, seed: int) -> dict:
     stage2_wiring.pass_costs = recorded
     trait = np.load(root / "trait.npz")
     phenotype = np.asarray(trait["phenotype"], dtype=np.float64)
+    if trait_type == TraitType.BINARY:
+        phenotype = (phenotype > np.quantile(phenotype, CASE_QUANTILE)).astype(np.float64)
     samples = phenotype.shape[0]
     covariates = np.column_stack([np.ones(samples), trait["covariates"]])
     budget = task_budget()
@@ -152,7 +159,7 @@ def fit(root: Path, work: Path, seed: int) -> dict:
         fitted = stage2_wiring.fit_models(
             store=store, store_columns=np.arange(samples, dtype=np.int64), covariates=covariates,
             covariate_columns=np.ones((1, covariates.shape[1]), dtype=bool), targets=phenotype[:, None],
-            training=np.ones((samples, 1), dtype=bool), trait_types=[TraitType.QUANTITATIVE], log_variance_offset=None, budget=budget,
+            training=np.ones((samples, 1), dtype=bool), trait_types=[trait_type], log_variance_offset=None, budget=budget,
             work_dir=work, seed=seed, draw_count=DRAW_COUNT,
         )
     total = time.time() - started
@@ -160,6 +167,7 @@ def fit(root: Path, work: Path, seed: int) -> dict:
     certificate = fitted.certificate
     report = {
         "samples": samples,
+        "trait_type": trait_type.value,
         "records": int(np.asarray(scoring.store_rows).shape[0]),
         "device": budget.device_kind,
         "total_seconds": total,
@@ -171,6 +179,8 @@ def fit(root: Path, work: Path, seed: int) -> dict:
         "far_field": np.asarray(certificate.far_field).tolist(),
         "budget_unresolved": np.asarray(certificate.budget_unresolved).tolist(),
         "outer_iterations": np.asarray(certificate.outer_iterations).tolist(),
+        "outer_criterion_met": np.asarray(certificate.outer_criterion_met).tolist(),
+        "store_passes": int(certificate.passes),
         "stage0_peak_rss_bytes": timings.get("stage0_rss_bytes"),
         "peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
         "device_pool_peak_bytes": peaks["pool_bytes"],
@@ -192,16 +202,17 @@ def main() -> None:
     parser.add_argument("--segment", type=int, nargs=2)
     parser.add_argument("--flip", type=float)
     parser.add_argument("--seed", type=int, default=20260923)
+    parser.add_argument("--trait-type", choices=[TraitType.QUANTITATIVE.value, TraitType.BINARY.value], default=TraitType.QUANTITATIVE.value)
     arguments = parser.parse_args()
     if arguments.command == "generate":
         generate(arguments.root, arguments.samples, arguments.variants, arguments.causal, arguments.heritability, arguments.founders, tuple(arguments.segment), arguments.flip, arguments.seed)
     else:
         work = arguments.work or arguments.root / "work"
         try:
-            report = fit(arguments.root, work, arguments.seed)
+            report = fit(arguments.root, work, arguments.seed, TraitType(arguments.trait_type))
         finally:
             shutil.rmtree(work, ignore_errors=True)
-        (arguments.root / "report.json").write_text(json.dumps(report, indent=1))
+        (arguments.root / f"report.{arguments.trait_type}.json").write_text(json.dumps(report, indent=1))
 
 
 if __name__ == "__main__":

@@ -41,10 +41,27 @@ These are formats; the paths come from a run config supplied inside the workspac
 | cohort | samples, phenotypes | each trait's own covariates beside the structure columns every trait shares (below), the target matrix, every (trait, fold) training and held-out mask | step |
 | store | samples, the genotype inputs | the dosage store: typed per-half manifests, background-corrected codes, no-call fill, variant columns, TR loci, and the calibration pairs' codes | each batch's decode; each chromosome |
 | measurement | store, cohort | per-group κ, residual variances and reliability offsets (`measurement_model`); the one model the fit reads, pooled over the fit rows' ancestry groups (`pooled_measurement_model`); the store rewritten with D* where pairs exist | step |
-| fit | cohort, measurement, final store | every (trait, fold) model in one `fit_model.fit` call, each projecting out its own trait's columns (`covariate_columns`), saved by `artifact.save_model` | step |
-| score | fit, cohort | every model's predictions of the cohort from one store read (`artifact.predict`), and each person's own-fold held-out prediction | step |
-| report | score, cohort | held-out accuracy per trait by fold, ancestry and half; counts of 1 to 20 suppressed | step |
-| export | report | the approved report files in `<run>/export` | step |
+| fit | cohort, measurement, final store | both arms of every trait (below): per (arm, trait) one `fit_model.fit` call holding the trait's fold models and its all-rows model, each projecting out its own trait's columns (`covariate_columns`), saved by `artifact.save_model` | each (arm, trait) |
+| score | fit, cohort | every model of both arms scored for the cohort from one store read (`artifact.predict_models`), and each person's own-fold held-out linear predictor, genetic score and predictive mean | step |
+| effects | fit, cohort, final store | each trait's all-rows model in both arms: every fitted record's effect per allele (or per copy), posterior SD and P(effect > 0) (`effects/<trait>.<arm>.tsv.gz`, workspace only), and summaries by class and length (`effects_by_class.tsv`, `effect_length_correlation.tsv`) | step |
+| report | score, cohort | held-out accuracy of both arms (`accuracy.tsv`) and their paired comparison (`comparison.tsv`) per trait, by fold, ancestry and half; counts of 1 to 20 suppressed | step |
+| export | report, effects | the approved report and effects summaries in `<run>/export` | step |
+
+**Arms.** Every trait is fitted twice on the same people, folds and seeds (`workspace_pipeline.ARMS`):
+- `snv_indel`: every record shorter than 50 bp (SNVs, short indels, short repeat-length changes), and no copy-number record. The other records get a −inf log reliability, which the fit drops exactly.
+- `with_sv`: every record.
+
+The arms differ by exactly the structural variation of the study's definition (≥ 50 bp, by the store's `sv_length`, plus copy number). Both arms of a trait share its seed, so their probes and posterior draws are common random numbers.
+
+**Models.** Per trait, one model per fold (trained without that fold and scored on it) and one model on every observed row (`<trait>/all`). The all-rows model is the released score and the effects step's source; the fold models only measure held-out accuracy (SPEC: the fit itself never holds rows out). A run of T traits fits 2 · T · (folds + 1) models.
+
+**Report.**
+- `accuracy.tsv` (trait, arm, cell, level, n, cases, metric, value). A disease gets the AUC of its linear predictor (`auc`), the AUC of its genetic score alone (`pgs_auc`) and the log loss of its predictive probability. A quantitative trait gets the r² of its linear predictor and the partial r² of its genetic score given the trait's covariates.
+- `comparison.tsv` (trait, cell, level, n, cases, metric, estimate, standard_error, z, p_value), with positive values favouring `with_sv`, per cell of all held-out rows and per ancestry group. A disease gets the DeLong paired delta AUC of the linear predictors and of the genetic scores, and the family-clustered gain in recalibrated log likelihood. A quantitative trait gets the family-clustered delta partial r² of the genetic scores (`held_out_comparison`).
+- Every value is each fold's own model on its own fold, weighted by the fold's rows: never one pooled correlation of the folds' differently scaled predictors. The comparison's standard error adds the folds' in quadrature; it leaves out the cross-fold pair term (their shared training rows), which needs each arm's posterior covariance.
+- A cell shows values only with at least 21 rows and, for a disease, at least 21 cases and 21 controls. A case count is written only where neither it nor the controls it implies is 1 to 20.
+
+**Effects summaries** count records, never participants. `effects_by_class.tsv` gives, per (trait, arm, class, length bin), the records, how many have a positive and a negative posterior mean, the posterior-expected counts of positive and negative effects (Σ P(β > 0), Σ P(β < 0)), the mean, median and root-mean-square effect per unit, and the summed standardized second moment. Length bins are `<50` and then decades from 50 bp. `effect_length_correlation.tsv` gives Spearman's ρ between log length and the root-mean-square effect per structural class. Every moment is under the law the model's draws come from: the fitted product approximation on the mean-field route (`fast_scoring`).
 
 **Keys and restarts.**
 - A step's key digests the config it reads (small tables by content, batch files by size), its upstream keys, and the source of the modules and functions it runs.

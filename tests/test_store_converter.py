@@ -237,8 +237,18 @@ def test_linear_recalibration_clips_and_counts_and_needs_every_kappa() -> None:
     # Mean 500; 500 + 1.5 (2000 - 500) = 2750 clips to 2000; 500 + 1.5 (0 - 500) = -250 clips to 0.
     np.testing.assert_array_equal(recalibrated.dosage_milli, [[0, 0, 0, 2000]])
     assert recalibrated.clipped.tolist() == [4]
-    with pytest.raises(ValueError, match="positive finite kappa"):
+    with pytest.raises(ValueError, match="finite nonnegative kappa"):
         linear_recalibration(dosage_milli, np.zeros(4, dtype=np.int64), np.array([[np.nan]]))
+    with pytest.raises(ValueError, match="finite nonnegative kappa"):
+        linear_recalibration(dosage_milli, np.zeros(4, dtype=np.int64), np.array([[-0.5]]))
+
+
+def test_a_zero_kappa_writes_the_group_mean() -> None:
+    # The measurement model's kappa = 0 (no signal in a group) makes E[G | D] the group's mean, in that group only.
+    dosage_milli = np.array([[0, 1000, 2000, 400, 600, 800]], dtype=np.uint16)
+    groups = np.array([0, 0, 0, 1, 1, 1], dtype=np.int64)
+    recalibrated = linear_recalibration(dosage_milli, groups, np.array([[0.0, 1.0]]))
+    np.testing.assert_array_equal(recalibrated.dosage_milli, [[1000, 1000, 1000, 400, 600, 800]])
 
 
 def test_overlap_group_first_joins_overlapping_spans_and_extra_groups() -> None:

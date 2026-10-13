@@ -247,31 +247,46 @@ def paired_delta_log_loss(
     return PairedComparison(estimate, standard_error, estimate / standard_error)
 
 
-def paired_delta_auc(labels: NDArray, baseline: NDArray, candidate: NDArray) -> PairedComparison:
-    """DeLong paired delta AUC (Sun and Xu 2014 midrank form, positives ranked first)."""
+@dataclass(frozen=True)
+class AucComponents:
+    """One score's AUC and its DeLong structural components (Sun and Xu 2014 midrank form): ``positive`` per case, the
+    fraction of controls it outranks, and ``negative`` per control, the fraction of cases that outrank it."""
+
+    auc: float
+    positive: NDArray
+    negative: NDArray
+
+
+def auc_components(labels: NDArray, score: NDArray) -> AucComponents:
+    """The AUC of ``score`` for the 0/1 ``labels`` and its DeLong components, ties counted half."""
     positive = np.asarray(labels) == 1
     positive_count = int(positive.sum())
     negative_count = positive.shape[0] - positive_count
-    components = []
-    aucs = []
-    for score in (baseline, candidate):
-        score = np.asarray(score, dtype=np.float64)
-        positive_scores = score[positive]
-        negative_scores = score[~positive]
-        combined_ranks = stats.rankdata(np.concatenate([positive_scores, negative_scores]))
-        positive_ranks = stats.rankdata(positive_scores)
-        negative_ranks = stats.rankdata(negative_scores)
-        auc = (combined_ranks[:positive_count].sum() / positive_count - (positive_count + 1.0) / 2.0) / negative_count
-        positive_component = (combined_ranks[:positive_count] - positive_ranks) / negative_count
-        negative_component = 1.0 - (combined_ranks[positive_count:] - negative_ranks) / positive_count
-        aucs.append(auc)
-        components.append((positive_component, negative_component))
-    positive_difference = components[1][0] - components[0][0]
-    negative_difference = components[1][1] - components[0][1]
-    variance = float(np.var(positive_difference, ddof=1)) / positive_count + float(
+    if positive_count == 0 or negative_count == 0:
+        raise ValueError("an AUC needs both cases and controls")
+    score = np.asarray(score, dtype=np.float64)
+    positive_scores = score[positive]
+    negative_scores = score[~positive]
+    combined_ranks = stats.rankdata(np.concatenate([positive_scores, negative_scores]))
+    positive_ranks = stats.rankdata(positive_scores)
+    negative_ranks = stats.rankdata(negative_scores)
+    return AucComponents(
+        auc=float((combined_ranks[:positive_count].sum() / positive_count - (positive_count + 1.0) / 2.0) / negative_count),
+        positive=(combined_ranks[:positive_count] - positive_ranks) / negative_count,
+        negative=1.0 - (combined_ranks[positive_count:] - negative_ranks) / positive_count,
+    )
+
+
+def paired_delta_auc(labels: NDArray, baseline: NDArray, candidate: NDArray) -> PairedComparison:
+    """DeLong paired delta AUC (Sun and Xu 2014 midrank form, positives ranked first)."""
+    baseline_components = auc_components(labels, baseline)
+    candidate_components = auc_components(labels, candidate)
+    positive_difference = candidate_components.positive - baseline_components.positive
+    negative_difference = candidate_components.negative - baseline_components.negative
+    variance = float(np.var(positive_difference, ddof=1)) / positive_difference.shape[0] + float(
         np.var(negative_difference, ddof=1)
-    ) / negative_count
-    estimate = aucs[1] - aucs[0]
+    ) / negative_difference.shape[0]
+    estimate = candidate_components.auc - baseline_components.auc
     standard_error = math.sqrt(variance)
     return PairedComparison(estimate, standard_error, estimate / standard_error)
 

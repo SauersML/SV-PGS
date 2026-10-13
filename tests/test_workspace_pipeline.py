@@ -21,6 +21,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from sv_pgs.all_of_us import MEASUREMENT_EXCLUSION_REASONS, build_all_of_us_measurement_sql
@@ -41,6 +42,7 @@ from sv_pgs.ld_partition import cut_allowed_from_groups, validate_cut_allowed
 from sv_pgs.store_converter import linear_recalibration, refalt_digest, tr_loci, value_matched_background
 from sv_pgs import workspace_pipeline
 from sv_pgs.workspace_pipeline import (
+    ARMS,
     STEP_NAMES,
     StrataSites,
     WorkspaceBindings,
@@ -242,7 +244,7 @@ def _write_inputs(root: Path) -> _Synthetic:
         "fold_count": 2,
         "seed": 7,
         "codec": "zstd",
-        "export": ["accuracy.tsv"],
+        "export": ["accuracy.tsv", "comparison.tsv", "effects_by_class.tsv"],
     }
     return _Synthetic(root=root, raw=raw, genotypes=genotypes, dosages=dosages)
 
@@ -363,18 +365,20 @@ class _Fitted:
     covariate_names: tuple[str, ...]
     scoring: tuple[ScoringModel, ...]
     noise_variance: np.ndarray
+    certificate: dict[str, np.ndarray]
     refusals: tuple[str, ...] = ()
 
 
 class _Recorder:
-    def __init__(self, failing_fit: bool = False) -> None:
+    def __init__(self, fits_before_failing: int | None = None) -> None:
         self.fit_calls: list[FitRequest] = []
-        self.failing_fit = failing_fit
+        self.fits_before_failing = fits_before_failing
 
     def fit(self, request: FitRequest) -> _Fitted:
         """A stand-in for the engine behind the real ``fit_model.FitRequest``: each model's own covariates by least
-        squares, then marginal effects of the standardized codes on the training rows."""
-        if self.failing_fit:
+        squares, then marginal effects of the standardized codes on the training rows, over the records the request's
+        offsets give any signal (a -inf offset leaves a record out, as the real fit does)."""
+        if self.fits_before_failing is not None and len(self.fit_calls) >= self.fits_before_failing:
             raise RuntimeError("preempted")
         assert isinstance(request, FitRequest)
         self.fit_calls.append(request)
@@ -389,7 +393,7 @@ class _Recorder:
             rows, own = training[:, model], covariate_columns[model]
             signed = codes[:, rows]
             means, scales = signed.mean(axis=1), signed.std(axis=1)
-            active = np.flatnonzero(scales > 0.0)
+            active = np.flatnonzero((scales > 0.0) & np.isfinite(offset))
             target = targets[rows, model]
             design = np.column_stack([np.ones(rows.sum()), covariates[rows][:, own]])
             coefficients = np.linalg.lstsq(design, target, rcond=None)[0]
@@ -401,7 +405,7 @@ class _Recorder:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0,
                                       np.repeat(alpha[:, None], draws.shape[1], axis=1), np.zeros((alpha.size, alpha.size)), True))
-        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)))
+        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool)})
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -425,11 +429,12 @@ class _StoreBlocks:
         yield from self.store.iter_codes(variant_ranges, None, self.budget)
 
 
-def _predict(model: _Fitted, store: DosageStore, sample_indices, covariates, budget):
-    genetic = score_genetic(_StoreBlocks(store, budget), ScoringPlan.from_models(model.scoring), budget, np.asarray(sample_indices))
-    linear = score_linear_predictor(genetic.means, covariates, model.scoring)
+def _predict(models: list[_Fitted], store: DosageStore, sample_indices, covariates, budget):
+    scorings = tuple(scoring for model in models for scoring in model.scoring)
+    genetic = score_genetic(_StoreBlocks(store, budget), ScoringPlan.from_models(scorings), budget, np.asarray(sample_indices))
+    linear = score_linear_predictor(genetic.means, covariates, scorings)
     mean = linear.copy()
-    for index, scoring in enumerate(model.scoring):
+    for index, scoring in enumerate(scorings):
         if scoring.trait_type == TraitType.BINARY:
             mean[:, index] = posterior_predictive_probability(linear[:, index], genetic.variances[:, index], 0.0)
     return SimpleNamespace(genetic=genetic, linear_predictor=linear, predictive_mean=mean, predictive_variance=np.ones_like(mean))
@@ -474,7 +479,7 @@ def test_the_production_bindings_hand_the_fit_step_s_request_to_the_real_fitter(
 
     bindings = workspace_bindings()
     assert bindings.fit is fit_model.fit and bindings.save_model is artifact.save_model
-    assert bindings.load_model is artifact.load_model and bindings.predict is artifact.predict
+    assert bindings.load_model is artifact.load_model and bindings.predict is artifact.predict_models
     assert bindings.load_measurement_model == measurement_model.MeasurementModel.load
     (parameter,) = inspect.signature(fit_model.fit).parameters.values()
     assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD and parameter.default is inspect.Parameter.empty
@@ -537,12 +542,13 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         np.testing.assert_array_equal(after.read_codes(0, after.n_variants), encode_dosage_milli(expected))
         assert after.manifest_attributes["recalibrated"] is True
 
-    # The fit saw every (trait, fold) training set, with no held-out row, no intercept column, and each
-    # model's own trait's covariates only.
-    (call,) = recorder.fit_calls
+    # The fit saw, per arm and trait, the trait's fold training sets and its all-rows set, with no held-out row, no
+    # intercept column, and the trait's own covariates only.
     cohort = np.load(run / "cohort" / "cohort.npz")
     design = json.loads((run / "cohort" / "cohort.json").read_text())
-    assert design["model_names"] == ["atrial_fibrillation/fold0", "atrial_fibrillation/fold1", "total_bilirubin/fold0", "total_bilirubin/fold1"]
+    traits = ["atrial_fibrillation", "total_bilirubin"]
+    assert design["model_names"] == [f"{trait}/{fold}" for trait in traits for fold in ("fold0", "fold1", "all")]
+    assert [(call.model_names[0].split("/")[0]) for call in recorder.fit_calls] == traits * len(ARMS)
     names = design["covariate_names"]
     structure = {"intercept", "pipeline_half=B", "genotype_source=long_read", "PC1", "PC2", "PC3"}
     own = {
@@ -558,50 +564,84 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     }
     assert set(names) == structure | own["atrial_fibrillation"] | own["total_bilirubin"]
     assert summaries["cohort"]["covariates"] == {trait: [name for name in names if name in structure | columns] for trait, columns in own.items()}
-    assert call.covariates.shape[1] == len(call.covariate_names) == len(names) - 1
-    for model, trait in enumerate(["atrial_fibrillation"] * 2 + ["total_bilirubin"] * 2):
-        assert {name for name, used in zip(names[1:], call.covariate_columns[model]) if used} == (structure | own[trait]) - {"intercept"}
+    saved = _MeasurementModel.load(run / "measurement" / "measurement_model.npz")
+    with DosageStore.open(run / "measurement" / "store") as store:
+        structural = np.asarray(store.variant_table.annotations["sv_length"]) >= 50
+    # The SNV/indel arm leaves out exactly the structural records (the 52 bp insertion), through a -inf offset.
+    assert structural.sum() == len(CHROMOSOMES)
+    for call_index, call in enumerate(recorder.fit_calls):
+        trait = call.model_names[0].split("/")[0]
+        observed = np.isfinite(cohort["targets"][:, traits.index(trait)])
+        assert call.covariates.shape[1] == len(call.covariate_names) == len(names) - 1
+        assert len(call.research_ids) == len(call.store_columns) == observed.sum()
+        for model in range(3):
+            assert {name for name, used in zip(names[1:], call.covariate_columns[model]) if used} == (structure | own[trait]) - {"intercept"}
+            assert np.all(np.isnan(call.targets[~call.training[:, model], model]))
+        folds = cohort["folds"][observed]
+        assert all(not np.any(call.training[:, fold] & (folds == fold)) for fold in range(2)) and call.training[:, 2].all()
+        arm = ARMS[call_index // len(traits)]
+        expected = np.where(structural, -np.inf, saved.log_reliability) if arm == "snv_indel" else saved.log_reliability
+        np.testing.assert_array_equal(call.log_variance_offset, expected)
+    # Both arms of a trait share a seed (common random numbers); the traits' seeds differ.
+    seeds = [call.seed for call in recorder.fit_calls]
+    assert seeds[: len(traits)] == seeds[len(traits) :] and len(set(seeds)) == len(traits)
     # A trait's own columns are 0 on the rows it does not observe.
     bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
     assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)
     families = cohort["families"]
     assert np.array_equal(np.unique(families), np.arange(families.max() + 1)) and len(set(families.tolist())) == len(families) - 1
-    fitted_rows = cohort["training"].any(axis=1)
-    folds = cohort["folds"][fitted_rows]
-    for model in range(4):
-        assert not np.any(call.training[:, model] & (folds == model % 2))
-        assert np.all(np.isnan(call.targets[~call.training[:, model], model]))
     # 5049 is genotyped but in no table: a cohort row with no target and no fit row.
+    fitted_rows = cohort["training"].any(axis=1)
     untabled = list(cohort["research_ids"]).index("5049")
     assert np.all(np.isnan(cohort["targets"][untabled])) and not fitted_rows[untabled] and "7099" in cohort["research_ids"]
-    assert len(call.research_ids) == len(call.store_columns)
-    saved = _MeasurementModel.load(run / "measurement" / "measurement_model.npz")
-    np.testing.assert_array_equal(call.log_variance_offset, saved.log_reliability)
+    assert all(json.loads((run / "fit" / "models" / arm / f"{trait}.json").read_text())["outer_criterion_met"] == [True] * 3 for arm in ARMS for trait in traits)
 
-    # Scores: every observed target has its own fold's held-out prediction.
-    held_out = np.load(run / "score" / "predictions.npz")["held_out"]
-    assert np.array_equal(np.isfinite(held_out), np.isfinite(cohort["targets"]))
+    # Scores: in both arms every observed target has its own fold's held-out prediction, and the arms differ.
+    predictions = np.load(run / "score" / "predictions.npz")
+    assert tuple(predictions["arms"]) == ARMS and predictions["predictive_mean"].shape == (len(ARMS), len(cohort["research_ids"]), 6)
+    for name in ("held_out_predictive_mean", "held_out_linear_predictor", "held_out_genetic"):
+        assert all(np.array_equal(np.isfinite(predictions[name][arm]), np.isfinite(cohort["targets"])) for arm in range(len(ARMS)))
+    assert not np.allclose(predictions["genetic_mean"][0], predictions["genetic_mean"][1])
 
-    # The report suppresses cells of 1-20 people; export stages the approved file and nothing is sent.
+    # Effects: each trait's all-rows model in both arms, record by record, and summaries by class and length.
+    for arm in ARMS:
+        for trait in traits:
+            effects = pd.read_csv(run / "effects" / f"{trait}.{arm}.tsv.gz", sep="\t")
+            assert (effects["length"] >= 50).any() == (arm == "with_sv")
+            assert np.all((effects["probability_positive"] >= 0.0) & (effects["probability_positive"] <= 1.0))
+    by_class = pd.read_csv(run / "effects" / "effects_by_class.tsv", sep="\t")
+    assert set(by_class["length_bin"]) == {"<50", "50-499"} and set(by_class["arm"]) == set(ARMS)
+    assert by_class[by_class["length_bin"] == "50-499"]["arm"].eq("with_sv").all()
+
+    # The report suppresses cells of 1-20 people; export stages the approved files and nothing is sent.
     report = [line.split("\t") for line in (run / "report" / "accuracy.tsv").read_text().splitlines()]
-    long_read = [line for line in report if line[1:3] == ["half", "long_read"]]
-    assert all(line[3] == "1-20 (suppressed)" and line[5] == "" for line in long_read)
-    assert any(line[1] == "fold" and line[5] for line in report[1:])
-    assert (run / "export" / "accuracy.tsv").read_text() == (run / "report" / "accuracy.tsv").read_text()
+    assert report[0] == list(workspace_pipeline.ACCURACY_COLUMNS)
+    long_read = [line for line in report if line[2:4] == ["half", "long_read"]]
+    assert long_read and all(line[4] == "1-20 (suppressed)" and line[7] == "" for line in long_read)
+    assert any(line[2] == "fold" and line[7] for line in report[1:])
+    assert {line[1] for line in report[1:]} == set(ARMS)
+    comparison = [line.split("\t") for line in (run / "report" / "comparison.tsv").read_text().splitlines()]
+    assert comparison[0] == list(workspace_pipeline.COMPARISON_COLUMNS)
+    assert any(line[0] == "total_bilirubin" and line[5] == "delta_pgs_partial_r2" and line[6] for line in comparison[1:])
+    for name in synthetic.raw["export"]:
+        source = run / ("effects" if name.startswith("effect") else "report") / name
+        assert (run / "export" / name).read_text() == source.read_text()
 
 
 def test_a_rerun_skips_completed_steps_and_resumes_after_a_failure(workspace) -> None:
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
     with pytest.raises(RuntimeError, match="preempted"):
-        run_pipeline(config, _bindings(_Recorder(failing_fit=True), client), BUDGET)
+        run_pipeline(config, _bindings(_Recorder(fits_before_failing=1), client), BUDGET)
     run = config.run_directory
     assert (run / "fit.partial").is_dir() and any(path.name.endswith("_fit_failed-RuntimeError") for path in config.marker_directory.iterdir())
+    # The first (arm, trait) fit finished before the preemption and was saved; the rerun resumes after it.
+    assert (run / "fit.partial" / "models" / ARMS[0] / "atrial_fibrillation.json").is_file()
     finished = {step: _completed_at(run, step) for step in STEP_NAMES[:5]}
     recorder = _Recorder()
     run_pipeline(config, _bindings(recorder, client), BUDGET)
     assert {step: _completed_at(run, step) for step in STEP_NAMES[:5]} == finished
-    assert len(recorder.fit_calls) == 1 and (run / "export" / "_COMPLETE.json").is_file()
+    assert len(recorder.fit_calls) == 2 * len(ARMS) - 1 and (run / "export" / "_COMPLETE.json").is_file()
 
     # A changed phenotype set re-runs the steps that read it and keeps the store.
     fewer = WorkspaceConfig.from_mapping({**synthetic.raw, "traits": []})
@@ -656,6 +696,18 @@ def test_export_refuses_a_count_of_one_to_twenty(tmp_path: Path) -> None:
     table.write_text("trait\tcell\tlevel\tn\tmetric\tvalue\nldl\thalf\tlong_read\t7\tr2\t0.3\n")
     with pytest.raises(ValueError, match="below 21"):
         check_exportable(table)
+    # A disease cell's case count is a participant count too.
+    table.write_text("trait\tarm\tcell\tlevel\tn\tcases\tmetric\tvalue\naf\twith_sv\tall\tall\t400\t12\tauc\t0.7\n")
+    with pytest.raises(ValueError, match="below 21"):
+        check_exportable(table)
+
+
+def test_a_case_count_is_shown_only_where_neither_it_nor_the_controls_it_implies_is_one_to_twenty() -> None:
+    assert workspace_pipeline._cases_text(400, 30) == "30" and workspace_pipeline._cases_text(400, 0) == "0"
+    # 25 cases of 30 imply 5 controls; 400 rows with 390 cases imply 10.
+    assert workspace_pipeline._cases_text(30, 25) == "suppressed" and workspace_pipeline._cases_text(400, 390) == "suppressed"
+    assert workspace_pipeline._cases_text(400, 12) == "suppressed" and workspace_pipeline._cases_text(50, None) == ""
+    assert not workspace_pipeline._shown(30, 25) and workspace_pipeline._shown(60, 30) and workspace_pipeline._shown(21, None)
 
 
 def test_a_long_read_row_takes_the_reference_half_so_the_indicators_differ() -> None:

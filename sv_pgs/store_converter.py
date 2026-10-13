@@ -177,6 +177,10 @@ def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: 
     r^2, never a regression slope on one noisy truth). mu_g is the record's mean over the
     group's samples, so the group means are unchanged. Results are rounded half up and clipped
     to [0, 2000]; ``clipped`` counts the entries the clip changed.
+
+    kappa = 0 is a calibration, not a missing one: ``measurement_model`` projects a negative
+    Cov(G, D) to 0 (the column carries no signal in that group, and its log reliability there is
+    -inf), and E[G | D] is then the group mean, which D* = mu_g writes.
     """
     milli = np.asarray(dosage_milli)
     groups = np.asarray(sample_groups, dtype=np.int64)
@@ -186,8 +190,8 @@ def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: 
     if groups.size and int(groups.min()) < 0:
         raise ValueError("ancestry groups must be 0..G-1.")
     group_count = int(groups.max()) + 1 if groups.size else 0
-    if kappa.shape != (milli.shape[0], group_count) or not np.all(np.isfinite(kappa)) or np.any(kappa <= 0.0):
-        raise ValueError("linear_recalibration needs a positive finite kappa per record and ancestry group.")
+    if kappa.shape != (milli.shape[0], group_count) or not np.all(np.isfinite(kappa)) or np.any(kappa < 0.0):
+        raise ValueError("linear_recalibration needs a finite nonnegative kappa per record and ancestry group.")
     values = milli.astype(np.float64)
     recalibrated = np.empty_like(values)
     for group in range(group_count):

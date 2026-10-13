@@ -126,6 +126,26 @@ def test_separating_covariates_are_refused() -> None:
     logistic_ep.assert_no_separation(complete, mixed)
 
 
+def test_a_quasi_separating_indicator_is_left_out_and_the_rest_kept() -> None:
+    generator = np.random.default_rng(11)
+    sample_count = 400
+    age = generator.standard_normal(sample_count)
+    # A small group (say, the long-read panel) that holds none of the disease's cases.
+    panel = (np.arange(sample_count) % 40 == 0).astype(np.float64)
+    labels = np.where(panel == 1.0, 0.0, (generator.random(sample_count) < 0.3).astype(np.float64))
+    design = np.column_stack([np.ones(sample_count), age, panel])
+    with pytest.raises(logistic_ep.SeparatedLabels):
+        logistic_ep.assert_no_separation(design, labels)
+    kept = logistic_ep.unseparated_columns(design, labels)
+    np.testing.assert_array_equal(kept, [True, True, False])
+    logistic_ep.assert_no_separation(design[:, kept], labels)
+    # Nothing separates: every column stays.
+    np.testing.assert_array_equal(logistic_ep.unseparated_columns(design[:, :2], labels), [True, True])
+    # Every label the same: no choice of covariates gives a fit.
+    with pytest.raises(logistic_ep.SeparatedLabels, match="every training label is the same"):
+        logistic_ep.unseparated_columns(design, np.zeros(sample_count))
+
+
 def test_an_improper_cavity_raises() -> None:
     sites = logistic_ep.SampleSites(precision=np.array([2.0]), shift=np.array([0.0]))
     with pytest.raises(logistic_ep.ImproperCavity):
