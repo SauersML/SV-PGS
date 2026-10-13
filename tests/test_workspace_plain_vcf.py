@@ -16,7 +16,7 @@ import pytest
 
 from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, DosageStore, encode_dosage_milli
 from sv_pgs.store_converter import plain_batch_fields
-from sv_pgs.workspace_pipeline import STEP_NAMES, WorkspaceConfig, read_plain_sites, run_pipeline
+from sv_pgs.workspace_pipeline import ARMS, STEP_NAMES, WorkspaceConfig, read_plain_sites, run_pipeline
 from tests.test_workspace_pipeline import (
     BUDGET,
     CHROMOSOMES,
@@ -167,7 +167,8 @@ def test_a_beagle_style_plain_run_builds_every_step(workspace) -> None:
     np.testing.assert_allclose(
         np.load(run / "store" / "reported" / "chr22.npy"), [round(_reported_info(record), 2) for record in range(len(RECORDS))], rtol=np.finfo(np.float32).eps
     )
-    assert summaries["measurement"]["recalibrated"] and len(recorder.fit_calls) == 1
+    # One fit per (arm, trait): the run's one disease and one trait in both arms.
+    assert summaries["measurement"]["recalibrated"] and len(recorder.fit_calls) == 2 * len(ARMS)
 
 
 GLIMPSE2 = _Tool(
