@@ -57,6 +57,19 @@ def test_invalid_digit_counts_are_refused(count):
         operand_digits(np.ones((2, 1)), np, count)
 
 
+@pytest.mark.parametrize("count", range(1, OPERAND_DIGITS + 1))
+def test_fused_digits_keep_half_even_rounding_and_signed_carries(count):
+    # The last entry forces scale=1, so the half integers reach rint unchanged.
+    maximum = float(2 ** (DIGIT_BITS * count - 2))
+    halves = np.arange(-maximum, maximum) + .5 if count == 1 else np.arange(-130., 131.) + .5
+    values = np.concatenate([halves, np.nextafter(halves, -np.inf), np.nextafter(halves, np.inf), [maximum]])[:, None]
+    actual, scale = operand_digits(values, np, count)
+    expected, reference_scale = _reference_digits(values, count)
+    np.testing.assert_array_equal(scale, reference_scale)
+    np.testing.assert_array_equal(scale, [1.])
+    np.testing.assert_array_equal(actual, expected)
+
+
 def _gamma(term_count: int) -> float:
     """Higham's gamma_n = n u / (1 - n u), the relative error bound of an fp64 sum of n terms."""
     unit_roundoff = np.finfo(np.float64).eps / 2.0
