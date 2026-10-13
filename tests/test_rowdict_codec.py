@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 
 from sv_pgs import rowdict_codec
-from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.dosage_store import CodeArray, CodeShardWriter, DosageStore, create_code_array, transcode_store
+from sv_pgs.dosage_store import CodeArray, CodeShardWriter, DosageStore, create_code_array
 from tests.test_dosage_store import _all_codes, _two_half_dosage, _write_store
 
 
@@ -94,17 +93,9 @@ def test_a_size_table_that_disagrees_with_the_chunk_is_refused() -> None:
         _decode_chunk(bytes(payload), 4, 50)
 
 
-def _cpu_budget() -> ComputeBudget:
-    return ComputeBudget(
-        device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(),
-        host_bytes=1 << 30, cpu_threads=4,
-    )
-
-
 def test_a_rowdict_store_reads_every_range_exactly(tmp_path: Path) -> None:
     milli_by_half = _two_half_dosage()
-    _write_store(tmp_path / "zstd", milli_by_half, "zstd")
-    transcode_store(tmp_path / "zstd", tmp_path / "rowdict", codec="rowdict", budget=_cpu_budget())
+    _write_store(tmp_path / "rowdict", milli_by_half, "rowdict")
     expected = _all_codes(milli_by_half)
     rng = np.random.default_rng(8)
     with DosageStore.open(tmp_path / "rowdict") as store:

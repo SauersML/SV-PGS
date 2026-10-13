@@ -47,7 +47,6 @@ import mmap
 import os
 from pathlib import Path
 import resource
-import shutil
 import threading
 from typing import Any, Iterable, Iterator, Literal, Mapping, Sequence, get_args
 
@@ -57,7 +56,6 @@ import zstandard
 
 from sv_pgs import rowdict_codec
 from sv_pgs._typing import F64Array, I64Array, NDArray, U8Array
-from sv_pgs.content_identity import tree_digest
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import VariantClass
 from sv_pgs.memory_broker import HOST, PINNED, broker_for, current_broker
@@ -1739,155 +1737,8 @@ def write_dosage_store(
     )
 
 
-def transcode_store(source: str | Path, destination: str | Path, *, codec: Codec, budget: ComputeBudget) -> None:
-    """Copy a store with every half's code arrays re-encoded with ``codec``.
-
-    This builds the local cache: the bucket store (zstd) as raw arrays on NVMe or in RAM, whose
-    ranges are zero-copy views. Everything else (the MANIFEST with its half measurements and
-    gates, the variant sidecar, every per-half statistic, the external maps and the loci) is
-    copied unchanged, so the cache is the same store. Each array's code sums are recomputed as
-    it is written and must equal its half's stored sums. Reads are sized to ``budget``.
-    """
-    source_root, target_root = Path(source), Path(destination)
-    manifest = read_manifest(source_root)
-    shutil.copytree(source_root, target_root, ignore=lambda directory, _names: ["dosage"] if Path(directory) == source_root else [])
-    for half in range(len(manifest["half_sample_counts"])):
-        for chromosome in manifest["chromosomes"]:
-            array = CodeArray(dosage_array_directory(source_root, half, chromosome))
-            try:
-                sums, squares = _transcode_array(array, dosage_array_directory(target_root, half, chromosome), codec, budget)
-            finally:
-                array.close()
-            for name, written in (("sum_code", sums), ("sum_code2", squares)):
-                stored, _ = open_column(statistic_column_directory(source_root, half, chromosome, name))
-                if not np.array_equal(np.asarray(stored, dtype=np.int64), written):
-                    raise ValueError(f"half{half}/{chromosome}: the stored {name} disagrees with the codes.")
-
-
-CACHE_MARKER = "CACHE_COMPLETE.json"
-"""Written last into a finished local cache: the source store, its digest and the cache's codec."""
-
-
-def store_digest(root: str | Path) -> str:
-    """Complete store content identity, including shard interiors."""
-    return tree_digest(root)
-
-
-def local_cache(source: str | Path, cache_root: str | Path, *, codec: Codec, budget: ComputeBudget) -> Path:
-    """The local ``codec`` copy of the store at ``source``, rebuilt whenever the store's digest changes.
-
-    A cache lives at ``cache_root/<codec>-<digest>`` and counts as built only once its
-    ``CACHE_MARKER`` names that digest. Otherwise the store is transcoded into a private
-    partial directory, checked against a second digest of the source taken after the copy
-    (so a store rewritten mid-copy is never cached), and renamed into place. Caches of the same
-    source under other digests are then removed, so a stale copy never outlives its store.
-    """
-    source_root, cache_directory = Path(source).resolve(), Path(cache_root)
-    digest = store_digest(source_root)
-    target = cache_directory / f"{codec}-{digest}"
-    marker = {"source": str(source_root), "digest": digest, "codec": codec}
-    if not _cache_is_complete(target, marker):
-        cache_directory.mkdir(parents=True, exist_ok=True)
-        partial = cache_directory / f".{codec}-{digest}.partial-{os.getpid()}-{threading.get_ident()}"
-        shutil.rmtree(partial, ignore_errors=True)
-        transcode_store(source_root, partial, codec=codec, budget=budget)
-        if store_digest(source_root) != digest:
-            shutil.rmtree(partial, ignore_errors=True)
-            raise RuntimeError(f"{source_root} changed while its local cache was being built.")
-        (partial / CACHE_MARKER).write_text(json.dumps(marker))
-        if target.exists() and not _cache_is_complete(target, marker):
-            # only a finished cache is ever renamed into place, so an unmarked one is debris
-            shutil.rmtree(target, ignore_errors=True)
-        try:
-            os.rename(partial, target)
-        except OSError:
-            # another process finished the same cache first; theirs is identical
-            shutil.rmtree(partial, ignore_errors=True)
-            if not _cache_is_complete(target, marker):
-                raise
-    for other in cache_directory.iterdir():
-        if other != target and not other.name.startswith(".") and _cache_marker(other).get("source") == str(source_root):
-            shutil.rmtree(other, ignore_errors=True)
-    return target
-
-
-def _cache_marker(directory: Path) -> dict[str, Any]:
-    try:
-        return json.loads((directory / CACHE_MARKER).read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def _cache_is_complete(directory: Path, marker: Mapping[str, Any]) -> bool:
-    return _cache_marker(directory) == dict(marker)
-
-
-def _transcode_array(array: CodeArray, directory: Path, codec: Codec, budget: ComputeBudget) -> tuple[I64Array, I64Array]:
-    """Re-encode one code array shard by shard, returning the exact code sums it wrote."""
-    layout = array.layout
-    target = create_code_array(directory, layout.row_count, layout.sample_count, codec=codec, inner_rows=layout.inner_rows)
-    sums = np.zeros(layout.row_count, dtype=np.int64)
-    squares = np.zeros(layout.row_count, dtype=np.int64)
-    buffer = np.empty(0, dtype=np.uint8)
-    for shard_index in range(target.shard_count):
-        shard_start = shard_index * target.shard_rows
-        with CodeShardWriter(directory, target, shard_index) as writer:
-            for start, stop in _block_ranges(shard_start, shard_start + target.shard_row_count(shard_index), layout.sample_count, budget.host_bytes):
-                if buffer.size < (stop - start) * layout.sample_count:
-                    buffer = np.empty((stop - start) * layout.sample_count, dtype=np.uint8)
-                piece = buffer[: (stop - start) * layout.sample_count].reshape(stop - start, layout.sample_count)
-                array.read_rows_into(start, stop, piece)
-                writer.write_rows(piece)
-                sums[start:stop], squares[start:stop] = code_sums(piece)
-    return sums, squares
-
-
 def code_sums(codes: U8Array) -> tuple[I64Array, I64Array]:
     """Exact per-row sums of code and code**2 (code**2 <= 64516 fits uint16)."""
     squares = codes.astype(np.uint16)
     np.multiply(squares, squares, out=squares)
     return np.add.reduce(codes, axis=1, dtype=np.int64), np.add.reduce(squares, axis=1, dtype=np.int64)
-
-
-def _block_ranges(start: int, stop: int, bytes_per_row: int, budget_bytes: int) -> list[tuple[int, int]]:
-    """Contiguous row ranges whose working set, at ``bytes_per_row``, fits ``budget_bytes``."""
-    rows = max(1, budget_bytes // max(bytes_per_row, 1))
-    return [(block_start, min(stop, block_start + rows)) for block_start in range(start, stop, rows)]
-
-
-class StoreTileSource:
-    """A store seen one chromosome at a time: ``genotype_statistics.GenotypeTileSource``.
-
-    Every record of every chromosome streams, in store order; ``unsplittable_groups`` is the
-    variant table's ``group_first``, so a block never splits a bubble, same-POS set, duplicate
-    group or TR locus.
-    """
-
-    def __init__(self, store: DosageStore) -> None:
-        self._store = store
-
-    @property
-    def sample_count(self) -> int:
-        return self._store.n_samples
-
-    def chromosomes(self) -> list[str]:
-        return list(self._store.chromosomes)
-
-    def _rows(self, chromosome: str) -> slice:
-        index = self._store.chromosomes.index(chromosome)
-        return slice(int(self._store.chromosome_starts[index]), int(self._store.chromosome_starts[index + 1]))
-
-    def variant_count(self, chromosome: str) -> int:
-        rows = self._rows(chromosome)
-        return rows.stop - rows.start
-
-    def unsplittable_groups(self, chromosome: str) -> I64Array:
-        return self._store.variant_table.group_first[self._rows(chromosome)]
-
-    def read_rows(self, chromosome: str, start: int, stop: int, out: U8Array) -> None:
-        offset = self._rows(chromosome).start
-        self._store.read_codes(offset + start, offset + stop, None, out)
-
-    def store_rows(self, chromosome: str) -> I64Array:
-        rows = self._rows(chromosome)
-        return np.arange(rows.start, rows.stop, dtype=np.int64)

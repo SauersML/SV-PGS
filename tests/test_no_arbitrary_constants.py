@@ -284,7 +284,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('config.py', 'ModelConfig.prior_scale_ceiling'): ('e2e', frozenset({10.0}), "B7: the engine's EB replaces the fixed prior-scale clamps"),
     ('config.py', 'ModelConfig.local_scale_floor'): ('e2e', frozenset({1e-08}), "B7: the engine's EB replaces the fixed prior-scale clamps"),
     ('data.py', 'VariantRecord.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
-    ('data.py', 'normalize_variant_record.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
     ('external_annotations.py', 'KMER_LENGTH'): ('deslop-store', frozenset({11}), 'match tiers bin continuous evidence; store similarity, ratio and proximity as continuous columns (lead/engine ruling)'),
     ('fast_scoring.py', '_READ_AHEAD_BUFFERS'): ('speed-io', frozenset({3}), 'I/O concurrency from a measurement'),
     ('genotype_buffers.py', 'LAYOUT_ALIGNMENT'): ('speed-io', frozenset({64}), 'cite the cuBLAS int8 tensor-core alignment requirement, or derive from it'),

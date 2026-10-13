@@ -21,28 +21,21 @@ from sv_pgs.dosage_store import (
     CodeArray,
     CodeShardWriter,
     DosageStore,
-    StoreTileSource,
     VariantTable,
     create_code_array,
     dosage_array_directory,
     encode_dosage_milli,
     open_column,
-    read_manifest,
     shard_rows_for,
     sites_md5,
     statistic_column_directory,
-    local_cache,
-    store_digest,
-    transcode_store,
     variant_column_directory,
     write_column,
     write_dosage_store,
     write_manifest,
     write_variant_ids,
 )
-from sv_pgs.genotype_buffers import FLOAT32_EXACT_ROWS, INT32_EXACT_ROWS, SIGNED_CODE_OFFSET, HostGenotypeBuffer, build_sample_layout
-from sv_pgs.genotype_statistics import plan_genotype_pass, run_genotype_pass
-from tests.stage0_support import InMemoryTileSource
+from sv_pgs.genotype_buffers import FLOAT32_EXACT_ROWS, INT32_EXACT_ROWS, SIGNED_CODE_OFFSET
 
 SHARD_ROWS = 128
 INNER_ROWS = 16
@@ -340,31 +333,6 @@ def test_write_dosage_store_round_trips_table_and_codes(tmp_path: Path, codec: s
         write_dosage_store(tmp_path / "bad", 29, bad, blocks, codec=codec, shard_rows=32, inner_rows=8)
 
 
-def test_transcoding_copies_the_whole_store_with_zero_copy_raw_halves(two_half_store: tuple[Path, list[dict[str, np.ndarray]]]) -> None:
-    root, milli_by_half = two_half_store
-    expected_codes = _all_codes(milli_by_half)
-    cache_root = root.parent / "cache"
-    # A budget of 50 rows per read cuts every shard into several pieces.
-    transcode_store(root, cache_root, codec="raw", budget=_budget(50 * expected_codes.shape[1]))
-    with DosageStore.open(root) as store, DosageStore.open(cache_root) as cache:
-        assert cache.half_indices == store.half_indices and cache.n_samples == store.n_samples
-        assert np.array_equal(cache.read_codes(0, cache.n_variants), expected_codes)
-        assert np.array_equal(cache.variant_table.sum_code, store.variant_table.sum_code)
-        assert cache.variant_table.annotation_legends == store.variant_table.annotation_legends
-        assert cache.manifest_attributes == store.manifest_attributes
-    assert read_manifest(cache_root) == read_manifest(root)
-    for half in range(len(milli_by_half)):
-        for chromosome in milli_by_half[half]:
-            for name in ("sum_code", "sum_code2"):
-                cached, _ = open_column(statistic_column_directory(cache_root, half, chromosome, name))
-                stored, _ = open_column(statistic_column_directory(root, half, chromosome, name))
-                assert np.array_equal(cached, stored)
-    with DosageStore.open(cache_root, half_indices=(0,)) as first_half:
-        view = first_half.read_codes(3, 90)
-        assert not view.flags.owndata
-        assert np.array_equal(view, expected_codes[3:90, : first_half.n_samples])
-
-
 def test_opening_a_store_raises_the_soft_file_limit_to_the_hard_limit(
     two_half_store: tuple[Path, list[dict[str, np.ndarray]]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -440,48 +408,6 @@ def test_standardizing_signed_codes_equals_standardizing_the_decoded_dosage(
     assert np.all(np.abs(standardized - reference) <= bound)
 
 
-def test_transcoding_rejects_a_sidecar_that_disagrees_with_the_codes(
-    two_half_store: tuple[Path, list[dict[str, np.ndarray]]],
-) -> None:
-    root, _ = two_half_store
-    sums, _ = open_column(statistic_column_directory(root, 1, "chr22", "sum_code"), writable=True)
-    sums[7] += 1
-    sums.flush()
-    with pytest.raises(ValueError, match="sum_code"):
-        transcode_store(root, root.parent / "cache", codec="raw", budget=_budget())
-
-
-def test_stage0_streams_a_store_exactly_like_the_in_memory_source(
-    two_half_store: tuple[Path, list[dict[str, np.ndarray]]],
-) -> None:
-    root, milli_by_half = two_half_store
-    codes = _all_codes(milli_by_half)
-    with DosageStore.open(root) as store:
-        source = StoreTileSource(store)
-        assert source.chromosomes() == ["chr21", "chr22"] and source.sample_count == 60
-        assert np.array_equal(source.store_rows("chr22"), np.arange(300, 450))
-        reference = InMemoryTileSource(
-            codes={"chr21": codes[:300], "chr22": codes[300:]},
-            groups={name: source.unsplittable_groups(name) for name in source.chromosomes()},
-        )
-        results = []
-        for tile_source in (source, reference):
-            layout = build_sample_layout(np.arange(60) % 2)
-            plan = plan_genotype_pass(64)
-            buffer = HostGenotypeBuffer(layout, plan.capacity_rows, None, worker_count=2)
-            blocks = []
-            summary = run_genotype_pass(tile_source, layout, [buffer], plan, lambda block, _: blocks.append(block))
-            buffer.close()
-            results.append((summary, blocks))
-    (store_summary, store_blocks), (memory_summary, memory_blocks) = results
-    for chromosome in ("chr21", "chr22"):
-        assert np.array_equal(store_summary.chromosomes[chromosome].boundaries, memory_summary.chromosomes[chromosome].boundaries)
-    assert len(store_blocks) == len(memory_blocks)
-    for from_store, from_memory in zip(store_blocks, memory_blocks):
-        assert (from_store.chromosome, from_store.start, from_store.stop) == (from_memory.chromosome, from_memory.start, from_memory.stop)
-        assert np.array_equal(from_store.grams, from_memory.grams) and np.array_equal(from_store.sums, from_memory.sums)
-
-
 def test_stage0_accumulation_bounds_are_exact_and_tight() -> None:
     """|s| <= 127 for every stored code, so int32 sums of s_i s_j are exact over INT32_EXACT_ROWS
     samples and fp32 sums over FLOAT32_EXACT_ROWS, and one more sample breaks each."""
@@ -496,43 +422,6 @@ def test_stage0_accumulation_bounds_are_exact_and_tight() -> None:
     float_running = np.add.accumulate(float_products, dtype=np.float32)
     assert float(float_running[FLOAT32_EXACT_ROWS - 1]) == worst_product * FLOAT32_EXACT_ROWS
     assert float(float_running[FLOAT32_EXACT_ROWS]) != worst_product * (FLOAT32_EXACT_ROWS + 1)
-
-
-@pytest.mark.parametrize("codec", ["raw", "rowdict"])
-def test_the_local_cache_follows_the_store_digest(tmp_path: Path, codec: str) -> None:
-    milli_by_half = _two_half_dosage()
-    _write_store(tmp_path / "store", milli_by_half, "zstd")
-    expected = _all_codes(milli_by_half)
-    first = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
-    with DosageStore.open(first) as cached:
-        assert cached.codecs == frozenset({codec})
-        np.testing.assert_array_equal(cached.read_codes(0, cached.n_variants, None, np.empty_like(expected)), expected)
-    built = (first / "MANIFEST.json").stat().st_mtime_ns
-    assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
-    assert (first / "MANIFEST.json").stat().st_mtime_ns == built
-    # Identical content with a later mtime reuses the content-addressed store.
-    column = next((tmp_path / "store" / "stats").rglob("sum_code*"))
-    path = next(item for item in column.rglob("*") if item.is_file() and item.name != "zarr.json")
-    status = path.stat()
-    path.write_bytes(path.read_bytes())
-    os.utime(path, ns=(status.st_atime_ns, status.st_mtime_ns + 1))
-    assert local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget()) == first
-    (tmp_path / "store" / "provenance.json").write_text('{"source":"changed"}')
-    second = local_cache(tmp_path / "store", tmp_path / "cache", codec=codec, budget=_budget())
-    assert second != first and not first.exists()
-    assert [item.name for item in (tmp_path / "cache").iterdir()] == [second.name]
-
-
-def test_an_unfinished_cache_is_never_used(tmp_path: Path) -> None:
-    _write_store(tmp_path / "store", _two_half_dosage(), "zstd")
-    digest = store_digest(tmp_path / "store")
-    stale = tmp_path / "cache" / f"raw-{digest}"
-    stale.mkdir(parents=True)
-    (stale / "MANIFEST.json").write_text("{}")
-    built = local_cache(tmp_path / "store", tmp_path / "cache", codec="raw", budget=_budget())
-    assert built == stale
-    with DosageStore.open(built) as cached:
-        assert cached.n_variants == 450
 
 
 def test_shard_rows_are_the_fewest_shards_that_keep_every_writer_busy() -> None:

@@ -5,9 +5,9 @@ import pytest
 
 from sv_pgs import dosage_store, rowdict_codec
 from sv_pgs.compute_budget import _try_import_cupy
-from sv_pgs.dosage_store import CodeArray, CodeShardWriter, DosageStore, create_code_array, transcode_store
+from sv_pgs.dosage_store import CodeArray, CodeShardWriter, DosageStore, create_code_array
 from tests.test_dosage_store import _all_codes, _two_half_dosage, _write_store
-from tests.test_rowdict_codec import _cpu_budget, _rows_of_every_depth
+from tests.test_rowdict_codec import _rows_of_every_depth
 
 cupy = _try_import_cupy()
 pytestmark = pytest.mark.skipif(cupy is None, reason="needs a CUDA device")
@@ -38,7 +38,7 @@ def test_the_gpu_decoder_matches_the_cpu_reference_at_every_depth(tmp_path: Path
 def test_a_two_half_rowdict_store_decodes_on_the_device(tmp_path: Path) -> None:
     milli_by_half = _two_half_dosage()
     _write_store(tmp_path / "zstd", milli_by_half, "zstd")
-    transcode_store(tmp_path / "zstd", tmp_path / "rowdict", codec="rowdict", budget=_cpu_budget())
+    _write_store(tmp_path / "rowdict", milli_by_half, "rowdict")
     expected = _all_codes(milli_by_half)
     decoder = rowdict_codec.GpuRowDecoder(cupy)
     with DosageStore.open(tmp_path / "rowdict") as store:
@@ -119,8 +119,7 @@ def test_a_selective_read_through_many_windows_matches_the_codes(tmp_path: Path)
 
 def test_store_selective_reads_span_chromosomes_and_halves(tmp_path: Path) -> None:
     milli_by_half = _two_half_dosage()
-    _write_store(tmp_path / "zstd", milli_by_half, "zstd")
-    transcode_store(tmp_path / "zstd", tmp_path / "rowdict", codec="rowdict", budget=_cpu_budget())
+    _write_store(tmp_path / "rowdict", milli_by_half, "rowdict")
     expected = _all_codes(milli_by_half)
     decoder = rowdict_codec.GpuRowDecoder(cupy)
     rng = np.random.default_rng(33)

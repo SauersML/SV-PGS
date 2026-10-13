@@ -58,7 +58,6 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_disease_sample_table,
     prepare_all_of_us_measurement_census,
     prepare_all_of_us_measurement_sample_table,
-    resolve_all_of_us_phenotype,
     resolve_disease_definition,
     resolve_lab_criterion_measurement,
     resolve_measurement_definition,
@@ -711,9 +710,12 @@ def test_every_disease_and_trait_name_resolves_to_exactly_its_own_definition():
     ]
     all_names = [name for names in names_per_definition for name in names]
     assert len(set(all_names)) == len(all_names)
-    for definition in definitions:
-        for name in (definition.canonical_name, *definition.aliases):
-            assert resolve_all_of_us_phenotype(name) is definition
+    for disease in DISEASE_DEFINITIONS:
+        for name in (disease.canonical_name, *disease.aliases):
+            assert resolve_disease_definition(name) is disease
+    for measurement in MEASUREMENT_DEFINITIONS:
+        for name in (measurement.canonical_name, *measurement.aliases):
+            assert resolve_measurement_definition(name) is measurement
 
 
 def test_catalogue_is_the_panels_eleven_quantitative_traits():
@@ -1190,7 +1192,7 @@ def test_phenotype_fingerprint_changes_with_the_definition_and_the_cdr(monkeypat
     fingerprint = phenotype_fingerprint(height)
     assert fingerprint == phenotype_fingerprint(height)
     assert fingerprint != phenotype_fingerprint(dataclasses.replace(height, minimum_age_years=21.0))
-    assert fingerprint != phenotype_fingerprint(resolve_all_of_us_phenotype("gout"))
+    assert fingerprint != phenotype_fingerprint(resolve_disease_definition("gout"))
     monkeypatch.setenv("WORKSPACE_CDR", "fc-aou-cdr-prod-ct.C2025Q4R5")
     assert fingerprint != phenotype_fingerprint(height)
 

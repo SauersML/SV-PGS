@@ -1387,24 +1387,6 @@ def resolve_measurement_definition(trait: str) -> MeasurementDefinition:
     return definition
 
 
-def resolve_all_of_us_phenotype(phenotype: str) -> DiseaseDefinition | MeasurementDefinition:
-    """Resolve a disease or quantitative trait name (the two name sets are disjoint)."""
-    disease_definition = _find_named_definition(DISEASE_DEFINITIONS, phenotype)
-    if disease_definition is not None:
-        return disease_definition
-    measurement_definition = _find_named_definition(MEASUREMENT_DEFINITIONS, phenotype)
-    if measurement_definition is not None:
-        return measurement_definition
-    raise ValueError(
-        "Unsupported phenotype: "
-        + phenotype
-        + ". Available diseases: "
-        + ", ".join(available_disease_names())
-        + ". Available traits: "
-        + ", ".join(available_measurement_names())
-    )
-
-
 # CKD-EPI 2021 creatinine equation (Inker et al. 2021 NEJM 385:1737), serum
 # creatinine Scr in mg/dL:
 #   eGFR = 142 * min(Scr/kappa, 1)^alpha * max(Scr/kappa, 1)^-1.200 * 0.9938^age * sex_factor

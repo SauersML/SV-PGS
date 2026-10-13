@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.config import VariantClass
-from sv_pgs.data import VariantRecord, normalize_variant_record
+from sv_pgs.data import VariantRecord
 from sv_pgs.prior_design import _build_prior_design
 
 
@@ -126,17 +126,7 @@ def test_prior_design_accumulates_duplicate_class_members():
     ],
 )
 def test_boolean_tokens_are_parsed_strictly(raw_value, expected):
-    record = normalize_variant_record(
-        {
-            "variant_id": "v1",
-            "variant_class": "snv",
-            "chromosome": "1",
-            "position": 100,
-            "is_repeat": raw_value,
-            "is_copy_number": raw_value,
-            "prior_binary_features": {"in_gene": raw_value},
-        }
-    )
+    record = _record(is_repeat=raw_value, is_copy_number=raw_value, prior_binary_features={"in_gene": raw_value})
     assert record.is_repeat is expected
     assert record.is_copy_number is expected
     assert record.prior_binary_features["in_gene"] is expected
@@ -145,15 +135,7 @@ def test_boolean_tokens_are_parsed_strictly(raw_value, expected):
 @pytest.mark.parametrize("raw_value", ["maybe", "", "2", "TRUEISH", 2, -1, 0.5, None, [], object()])
 def test_invalid_boolean_tokens_are_rejected(raw_value):
     with pytest.raises(ValueError, match="is_repeat"):
-        normalize_variant_record(
-            {
-                "variant_id": "v1",
-                "variant_class": "snv",
-                "chromosome": "1",
-                "position": 100,
-                "is_repeat": raw_value,
-            }
-        )
+        _record(is_repeat=raw_value)
 
 
 @pytest.mark.parametrize("raw_value", ["maybe", "2", 2, None])
