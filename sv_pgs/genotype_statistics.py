@@ -304,21 +304,38 @@ def assign_chromosomes(variant_counts: dict[str, int], device_count: int) -> lis
     return assignment
 
 
+class _AnotherDeviceFailed(Exception):
+    """Raised on a device thread between tiles once another device has failed; that device's error is reported."""
+
+
+def _check_running(stop: threading.Event) -> None:
+    if stop.is_set():
+        raise _AnotherDeviceFailed
+
+
 def _run_on_devices(
     source: GenotypeTileSource,
     buffers: Sequence[GenotypeBuffer],
-    work: Callable[[GenotypeBuffer, str], None],
+    work: Callable[[GenotypeBuffer, str, threading.Event], None],
 ) -> None:
-    """Run ``work(buffer, chromosome)`` for every chromosome, one thread per buffer."""
+    """Run ``work(buffer, chromosome, stop)`` for every chromosome, one thread per buffer.
+
+    The first device to fail sets ``stop``, which ``work`` checks between tiles (``_check_running``), and its error is
+    raised once every thread has returned: a CUDA error on one device used to surface only after the others had
+    streamed their whole share of the genome."""
     counts = {chromosome: source.variant_count(chromosome) for chromosome in source.chromosomes()}
     failures: list[BaseException] = []
+    stop = threading.Event()
 
     def device_worker(buffer: GenotypeBuffer, chromosomes: list[str]) -> None:
         try:
             for chromosome in chromosomes:
-                work(buffer, chromosome)
+                work(buffer, chromosome, stop)
+        except _AnotherDeviceFailed:
+            return
         except BaseException as error:
             failures.append(error)
+            stop.set()
 
     workers = [
         threading.Thread(target=device_worker, args=(buffer, chromosomes), name=f"stage0-device-{index}")
@@ -410,8 +427,8 @@ def run_genotype_pass(
     summary = GenotypePassSummary()
     summary_lock = threading.Lock()
 
-    def chromosome_work(buffer: GenotypeBuffer, chromosome: str) -> None:
-        result = _run_chromosome(source, layout, buffer, plan, chromosome, sink)
+    def chromosome_work(buffer: GenotypeBuffer, chromosome: str, stop: threading.Event) -> None:
+        result = _run_chromosome(source, layout, buffer, plan, chromosome, sink, stop)
         with summary_lock:
             summary.chromosomes[chromosome] = result
 
@@ -427,6 +444,7 @@ def _run_chromosome(
     plan: GenotypePassPlan,
     chromosome: str,
     sink: Callable[[BlockStatistics, GenotypeBuffer], None],
+    stop: threading.Event,
 ) -> ChromosomeSummary:
     started = time.monotonic()
     variant_count = source.variant_count(chromosome)
@@ -470,9 +488,10 @@ def _run_chromosome(
             boundaries.append(cut)
 
     while stream.current is not None:
-        start, stop, staging = stream.current
-        rows = stop - start
-        while stop - base > plan.capacity_rows:
+        _check_running(stop)
+        start, tile_stop, staging = stream.current
+        rows = tile_stop - start
+        while tile_stop - base > plan.capacity_rows:
             # the last emitted block stays: the next block's adjacent Gram needs its rows
             keep = boundaries[-2] if len(boundaries) > 1 else 0
             if keep > base:
@@ -487,7 +506,7 @@ def _run_chromosome(
         row_weights, column_weights = buffer.pair_weights(window_start - base, start - base, rows, maximum_distance)
         buffer.check_codes()
         partitioner.add_pair_weights(window_start, row_weights, start, column_weights)
-        emit(partitioner.advance(stop - maximum_distance))
+        emit(partitioner.advance(tile_stop - maximum_distance))
     emit(partitioner.finish())
     seconds = time.monotonic() - started
     log(
@@ -518,16 +537,17 @@ def run_cross_product_pass(
     """
     started = time.monotonic()
 
-    def chromosome_work(buffer: GenotypeBuffer, chromosome: str) -> None:
+    def chromosome_work(buffer: GenotypeBuffer, chromosome: str, stop: threading.Event) -> None:
         stream = _TileStream(source, chromosome, buffer, tile_rows)
         while stream.current is not None:
-            start, stop, staging = stream.current
-            buffer.load_staged_tile(staging, stop - start, 0)
+            _check_running(stop)
+            start, tile_stop, staging = stream.current
+            buffer.load_staged_tile(staging, tile_stop - start, 0)
             stream.advance()
-            products = buffer.cross_products(0, stop - start)
+            products = buffer.cross_products(0, tile_stop - start)
             buffer.check_codes()
             with buffer.context():
-                sink(chromosome, start, stop, products)
+                sink(chromosome, start, tile_stop, products)
 
     _run_on_devices(source, buffers, chromosome_work)
     return time.monotonic() - started

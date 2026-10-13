@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -145,6 +147,37 @@ def test_several_devices_give_the_single_device_blocks() -> None:
         np.testing.assert_array_equal(
             single_summary.chromosomes[name].boundaries, multi_summary.chromosomes[name].boundaries
         )
+
+
+def test_a_failing_device_stops_the_other_devices_between_tiles() -> None:
+    # Device 0 streams the long chromosome and device 1 the short one, whose first block fails. Device 0's reads past
+    # its second tile wait for that failure, so without the stop it would go on to stream all of its tiles.
+    source = _dataset(17, {"long": 2600, "short": 300})
+    plan = plan_genotype_pass(BLOCK_CAP)
+    failed = threading.Event()
+    long_reads: list[int] = []
+    read_rows = source.read_rows
+
+    def gated_read(chromosome: str, start: int, stop: int, out: np.ndarray) -> None:
+        if chromosome == "long":
+            long_reads.append(start)
+            if len(long_reads) > 2:
+                assert failed.wait(timeout=60)
+        read_rows(chromosome, start, stop, out)
+
+    def sink(block, buffer) -> None:
+        if block.chromosome == "short":
+            failed.set()
+            raise RuntimeError("device 1 failed")
+
+    source.read_rows = gated_read
+    layout = build_sample_layout(_sample_groups(18))
+    buffers = [HostGenotypeBuffer(layout, plan.capacity_rows, None, worker_count=2) for _ in range(2)]
+    with pytest.raises(RuntimeError, match="device 1 failed"):
+        run_genotype_pass(source, layout, buffers, plan, sink)
+    for buffer in buffers:
+        buffer.close()
+    assert len(long_reads) < -(-2600 // plan.tile_rows) // 2
 
 
 def test_missing_codes_are_rejected_only_for_included_samples() -> None:
