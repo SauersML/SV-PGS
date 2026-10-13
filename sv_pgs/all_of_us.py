@@ -75,7 +75,11 @@ class LabCriterion:
     and last at least ``minimum_span_days`` apart; any single qualifying
     occasion removes the person from the controls. Occasions are the
     measurement's own retained person-days (build_all_of_us_measurement_sql),
-    on the linear scale of its canonical unit, treated or not.
+    read through its value formula (eGFR from the day's creatinine), treated
+    or not. A formula whose value needs a sex at birth the person lacks gives
+    each occasion a value under either sex: the occasion meets the criterion
+    when both do and removes the person from the controls when either does
+    (lab_criterion_evidence).
 
     ``plausible_range`` bounds the canonical value of a row the criterion may
     count. It is a hand-set rule of the disease definitions, kept until their
@@ -510,9 +514,12 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
 #    inside the trait's clinical exclusion windows; flag values taken on or
 #    after the person's first exposure to the trait's medication class. Rows
 #    are then collapsed to one occasion per person-day (same-day repeats are
-#    one occasion, as for disease codes), averaged on the linear scale.
-# 2. Python (build_all_of_us_measurement_targets), per person: keep the
-#    untreated occasions when there are any, otherwise the treated ones by the
+#    one occasion, as for disease codes), averaged on the linear scale of the
+#    canonical unit.
+# 2. Python (build_all_of_us_measurement_targets), per person: apply the
+#    trait's value formula (eGFR from the day's creatinine, at the person's
+#    sex at birth, so a person without one is dropped); keep the untreated
+#    occasions when there are any, otherwise the treated ones by the
 #    trait's TreatmentRule; then the target is E[T_i | occasions] under the
 #    per-occasion measurement model of phenotype_measurement (a learned
 #    Box-Cox transform, a random person level T_i and a learned continuous
@@ -569,7 +576,6 @@ MEASUREMENT_EXCLUSION_REASONS = (
     "acute_care",
     "pregnancy",
     "clinical_exclusion",
-    "sex_unknown",
 )
 MEASUREMENT_VALUE_FORMULAS = ("identity", "ckd_epi_2021")
 WINDOW_DOMAINS = ("condition", "procedure", "drug")
@@ -659,7 +665,7 @@ class MeasurementDefinition:
     clinical_windows: tuple[ClinicalWindow, ...] = ()
     minimum_age_years: float = ADULT_AGE_YEARS
     # "identity" models the measured analyte; "ckd_epi_2021" models the
-    # race-free CKD-EPI 2021 eGFR computed per measurement from creatinine.
+    # race-free CKD-EPI 2021 eGFR computed per occasion from creatinine.
     value_formula: str = "identity"
 
     def __post_init__(self) -> None:
@@ -909,7 +915,7 @@ MEASUREMENT_DEFINITIONS: tuple[MeasurementDefinition, ...] = (
         aliases=("egfr", "egfr_creatinine", "creatinine"),
         description=(
             "Creatinine eGFR, race-free CKD-EPI 2021 (Inker 2021 NEJM 385:1737), mL/min/1.73m2, "
-            "computed per measurement from serum creatinine, age and sex at birth."
+            "computed per occasion from serum creatinine, age and sex at birth."
         ),
         # 2160-0; 14682-9. Whole-blood point-of-care creatinine
         # (38483-4) is left out. The "micromole per liter" rows of 14682-9
@@ -1215,7 +1221,7 @@ def fetch_all_of_us_lab_criterion_rows(
     criterion: LabCriterion,
     client: bigquery.Client | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Per person (by person_id) with a qualifying occasion: LAB_CRITERION_COLUMNS."""
+    """Per person (by person_id) with an occasion that may qualify: LAB_CRITERION_COLUMNS (lab_criterion_evidence)."""
     rows = _query_rows(
         _active_bigquery_client(client),
         build_all_of_us_measurement_sql(),
@@ -1225,13 +1231,26 @@ def fetch_all_of_us_lab_criterion_rows(
 
 
 def lab_criterion_evidence(criterion: LabCriterion, people: Sequence[PersonOccasions]) -> dict[str, dict[str, Any]]:
-    """LAB_CRITERION_COLUMNS for every person with a retained occasion on the criterion's qualifying side."""
+    """LAB_CRITERION_COLUMNS for every person with a retained occasion that may be on the criterion's qualifying side,
+    the count and dates being those of the occasions that surely are.
+
+    The two differ only for an eGFR whose sex at birth is unknown: the CKD-EPI 2021 equation needs it, so such an
+    occasion's eGFR is known only to lie between the female and male equations' values (_possible_readings). It counts
+    toward a case when both are on the qualifying side, and removes the person from the controls when either is
+    (_prepare_training_rows): an unknown sex at birth never makes a control of a repeatedly low eGFR.
+    """
     evidence: dict[str, dict[str, Any]] = {}
+    definition = resolve_lab_criterion_measurement(criterion)
     for person in people:
-        qualifying = person.values >= criterion.threshold if criterion.qualifies_at_or_above else person.values < criterion.threshold
-        dates = [date for date, qualifies in zip(person.dates, qualifying, strict=True) if qualifies]
-        if dates:
-            evidence[person.person_id] = dict(zip(LAB_CRITERION_COLUMNS, (len(dates), min(dates), max(dates)), strict=True))
+        qualifying = np.array([
+            readings >= criterion.threshold if criterion.qualifies_at_or_above else readings < criterion.threshold
+            for readings, _slopes in _possible_readings(definition, person)
+        ])
+        if qualifying.any():
+            dates = [date for date, qualifies in zip(person.dates, qualifying.all(axis=0), strict=True) if qualifies]
+            evidence[person.person_id] = dict(
+                zip(LAB_CRITERION_COLUMNS, (len(dates), min(dates, default=None), max(dates, default=None)), strict=True)
+            )
     return evidence
 
 
@@ -1394,7 +1413,20 @@ CKD_EPI_2021_SEX_COEFFICIENTS: dict[str, tuple[float, float, float]] = {
     "female": (0.7, -0.241, 1.012),
     "male": (0.9, -0.302, 1.0),
 }
+CKD_EPI_2021_SCALE = 142.0
+CKD_EPI_2021_UPPER_EXPONENT = -1.2
+CKD_EPI_2021_AGE_FACTOR = 0.9938
 LAB_CRITERION_COLUMNS = ("qualifying_occasion_count", "first_qualifying_date", "last_qualifying_date")
+
+
+def ckd_epi_2021(creatinine: np.ndarray, ages: np.ndarray, sex_at_birth: str) -> tuple[np.ndarray, np.ndarray]:
+    """The race-free CKD-EPI 2021 eGFR (mL/min/1.73m2) of serum creatinine in mg/dL at the given ages, and its
+    derivative in creatinine: on either side of kappa the equation is a power of creatinine, so the derivative is that
+    power's exponent times eGFR over creatinine (the right derivative at kappa)."""
+    kappa, alpha, sex_factor = CKD_EPI_2021_SEX_COEFFICIENTS[sex_at_birth]
+    exponents = np.where(creatinine < kappa, alpha, CKD_EPI_2021_UPPER_EXPONENT)
+    egfr = CKD_EPI_2021_SCALE * np.power(creatinine / kappa, exponents) * np.power(CKD_EPI_2021_AGE_FACTOR, ages) * sex_factor
+    return egfr, exponents * egfr / creatinine
 
 
 def build_all_of_us_measurement_sql() -> str:
@@ -1405,7 +1437,9 @@ def build_all_of_us_measurement_sql() -> str:
     per-reason exclusion counts, and when any row is retained, the occasion's
     value on the linear scale of the canonical unit (same-day repeats
     averaged), its age and whether it is on treatment. person_occasions
-    groups the rows by person.
+    groups the rows by person, and a value formula (the CKD-EPI 2021 eGFR of
+    the day's creatinine) is applied to a person's occasions in Python
+    (_possible_readings), which knows the person's sex at birth.
 
     Each CTE downstream of the measurement scan is referenced once, so
     BigQuery scans `measurement` once (it re-executes a non-recursive CTE at
@@ -1419,11 +1453,6 @@ def build_all_of_us_measurement_sql() -> str:
         for reason in MEASUREMENT_EXCLUSION_REASONS
     )
     selected_counts = ",\n".join(f"  person_days.{reason}_row_count" for reason in MEASUREMENT_EXCLUSION_REASONS)
-    egfr_branches = "\n".join(
-        f"          WHEN '{sex}' THEN 142 * POW(LEAST(canonical_value / {kappa}, 1), {alpha})"
-        f" * POW(GREATEST(canonical_value / {kappa}, 1), -1.2) * POW(0.9938, age_years) * {sex_factor}"
-        for sex, (kappa, alpha, sex_factor) in CKD_EPI_2021_SEX_COEFFICIENTS.items()
-    )
     return f"""
 WITH analyte_concepts AS (
   SELECT concept_id
@@ -1537,10 +1566,6 @@ measurement_rows AS (
     -- year_of_birth is the only birth field OMOP requires; a mid-year birthday
     -- makes the age unbiased with error at most half a year.
     DATE_DIFF(measurement.measurement_date, DATE(person.year_of_birth, 7, 1), DAY) / 365.25 AS age_years,
-    CASE LOWER(sex_concept.concept_name)
-      WHEN 'female' THEN 'female'
-      WHEN 'male' THEN 'male'
-    END AS biological_sex,
     CASE
       WHEN measurement.unit_concept_id IS NULL OR measurement.unit_concept_id = 0 THEN '{NO_UNIT_LABEL}'
       ELSE COALESCE(
@@ -1562,8 +1587,6 @@ measurement_rows AS (
   FROM `{dataset}.measurement` AS measurement
   JOIN `{dataset}.person` AS person
     ON person.person_id = measurement.person_id
-  LEFT JOIN `{dataset}.concept` AS sex_concept
-    ON sex_concept.concept_id = person.sex_at_birth_concept_id
   LEFT JOIN `{dataset}.concept` AS unit
     ON unit.concept_id = measurement.unit_concept_id
   LEFT JOIN `{dataset}.concept` AS operator
@@ -1601,28 +1624,13 @@ classified_rows AS (
       WHEN exclusion_window = 1 THEN 'acute_care'
       WHEN exclusion_window = 2 THEN 'pregnancy'
       WHEN exclusion_window = 3 THEN 'clinical_exclusion'
-      WHEN @value_formula = 'ckd_epi_2021' AND biological_sex IS NULL THEN 'sex_unknown'
     END AS exclusion_reason
   FROM analyte_rows
 ),
-valued_rows AS (
-  -- BigQuery never evaluates an untaken CASE branch, so POW below only
-  -- ever sees retained (positive) values.
-  SELECT
-    *,
-    CASE
-      WHEN exclusion_reason IS NOT NULL THEN NULL
-      WHEN @value_formula = 'identity' THEN canonical_value
-      WHEN @value_formula = 'ckd_epi_2021' THEN
-        CASE biological_sex
-{egfr_branches}
-        END
-    END AS linear_value
-  FROM classified_rows
-),
 person_days AS (
   -- One occasion per person-day: same-day repeats are averaged on the linear
-  -- scale. age_years and on_treatment are functions of the day.
+  -- scale of the canonical unit. age_years and on_treatment are functions of
+  -- the day.
   SELECT
     person_id,
     measurement_date,
@@ -1631,11 +1639,11 @@ person_days AS (
     COUNT(*) AS row_count,
 {day_exclusion_counts},
     COUNTIF(exclusion_reason IS NULL) AS retained_row_count,
-    AVG(IF(exclusion_reason IS NULL, linear_value, NULL)) AS occasion_value,
+    AVG(IF(exclusion_reason IS NULL, canonical_value, NULL)) AS occasion_value,
     ARRAY_AGG(
       DISTINCT IF(exclusion_reason = 'unrecognized_unit', unit_label, NULL) IGNORE NULLS
     ) AS unrecognized_unit_labels
-  FROM valued_rows
+  FROM classified_rows
   GROUP BY person_id, measurement_date, age_years, on_treatment
 )
 SELECT
@@ -1677,7 +1685,6 @@ def build_all_of_us_measurement_query_parameters(definition: MeasurementDefiniti
         "plausible_low": ("FLOAT64", None),
         "plausible_high": ("FLOAT64", None),
         "minimum_age_years": ("FLOAT64", definition.minimum_age_years),
-        "value_formula": ("STRING", definition.value_formula),
         "treatment_atc_codes": ("STRING", list(treatment_atc_codes)),
         "acute_care_visit_codes": ("STRING", list(ACUTE_CARE_VISIT_CODES)),
         "pregnancy_snomed_codes": ("STRING", list(PREGNANCY_SNOMED_CODES)),
@@ -1758,6 +1765,17 @@ def person_occasions(rows: Sequence[dict[str, Any]]) -> list[PersonOccasions]:
     return people
 
 
+def _possible_readings(definition: MeasurementDefinition, person: PersonOccasions) -> list[tuple[np.ndarray, np.ndarray]]:
+    """The person's occasion readings, with each one's derivative in its recorded value, under each sex at birth they
+    may have: the recorded values, or the CKD-EPI 2021 eGFR of the recorded creatinine at their sex at birth, under
+    each sex when it is unknown (a skipped answer is not guessed). More than one pair means the readings are not
+    determined."""
+    if definition.value_formula == "identity":
+        return [(person.values, np.ones_like(person.values))]
+    sexes = (person.sex_at_birth_name,) if person.sex_at_birth_name in CKD_EPI_2021_SEX_COEFFICIENTS else tuple(CKD_EPI_2021_SEX_COEFFICIENTS)
+    return [ckd_epi_2021(person.values, person.ages, sex) for sex in sexes]
+
+
 def build_all_of_us_measurement_targets(
     definition: MeasurementDefinition,
     rows: Sequence[dict[str, Any]],
@@ -1766,7 +1784,9 @@ def build_all_of_us_measurement_targets(
     """Turn the measurement query's person-day rows into one training row per person.
 
     Returns (training rows, one-hot covariate columns, summary for the metadata).
-    A person's occasions are the untreated ones when there are any, otherwise
+    A person's readings are their occasions through the trait's value formula,
+    so a person whose eGFR needs the sex at birth they lack is dropped. Their
+    occasions are the untreated ones when there are any, otherwise
     the treated ones corrected to their untreated equivalent (DIVIDE/ADD), or
     none (EXCLUDE). Persons with no occasion left are dropped. The target is
     E[T_i | occasions] under phenotype_measurement's per-occasion model, with
@@ -1777,38 +1797,47 @@ def build_all_of_us_measurement_targets(
     measurement_model says which (the lead's ruling on replicates).
     """
     people = person_occasions(rows)
-    kept: list[tuple[PersonOccasions, np.ndarray, np.ndarray, str]] = []
+    # Each kept person with the mask of their occasions kept, those occasions' readings and the readings' derivatives
+    # in their recorded values, and the readings' source.
+    kept: list[tuple[PersonOccasions, np.ndarray, np.ndarray, np.ndarray, str]] = []
     n_without_retained_occasion = 0
+    n_sex_at_birth_unknown = 0
     n_treated_only_excluded = 0
     for person in people:
         if person.treated.any() and definition.treatment is None:
             raise ValueError(
                 f"{definition.canonical_name}: treated occasions returned for a trait without a medication rule"
             )
+        possible = _possible_readings(definition, person)
         if not person.values.size:
             n_without_retained_occasion += 1
+        elif len(possible) > 1:
+            n_sex_at_birth_unknown += 1
         elif not person.treated.all():
             untreated = ~person.treated
-            kept.append((person, person.ages[untreated], person.values[untreated], "untreated"))
+            readings, slopes = possible[0]
+            kept.append((person, untreated, readings[untreated], slopes[untreated], "untreated"))
         elif definition.treatment is None or definition.treatment.correction is TreatmentCorrection.EXCLUDE:
             n_treated_only_excluded += 1
         else:
-            kept.append((person, person.ages, _untreated_equivalent(person.values, definition.treatment), "treated_corrected"))
+            kept.append((person, person.treated, *_untreated_equivalent(*possible[0], definition.treatment), "treated_corrected"))
     if not kept:
         raise ValueError(f"{definition.canonical_name}: no person has a retained measurement occasion")
 
-    counts = np.array([values.shape[0] for _person, _ages, values, _source in kept])
+    counts = np.array([readings.shape[0] for _person, _selected, readings, _slopes, _source in kept])
     person_index = np.repeat(np.arange(len(kept)), counts)
-    ages = np.concatenate([occasion_ages for _person, occasion_ages, _values, _source in kept])
-    female = np.repeat([person.sex_at_birth_name == "female" for person, _ages, _values, _source in kept], counts)
+    ages = np.concatenate([person.ages[selected] for person, selected, *_rest in kept])
+    female = np.repeat([person.sex_at_birth_name == "female" for person, *_rest in kept], counts)
     sex_levels = np.repeat(
         ["missing" if person.sex_at_birth_concept_id in (None, "") else str(person.sex_at_birth_concept_id) for person, *_rest in kept],
         counts,
     )
     occasions = Occasions(
         person_index=person_index,
-        values=np.concatenate([values for _person, _ages, values, _source in kept]),
+        values=np.concatenate([readings for _person, _selected, readings, _slopes, _source in kept]),
         design=_occasion_design(ages, female.astype(np.float64), list(sex_levels)),
+        recorded=np.concatenate([person.values[selected] for person, selected, *_rest in kept]),
+        slopes=np.concatenate([slopes for _person, _selected, _readings, slopes, _source in kept]),
     )
     # The lead's ruling on replicates: the level and the noise are separable only through within-person replicates
     # and only when the data certify it; otherwise the target is the transformed reading, with reliability 1.
@@ -1829,7 +1858,8 @@ def build_all_of_us_measurement_targets(
         targets = np.bincount(person_index, weights=transformed) / counts
         reliabilities = np.ones(len(kept))
     training_rows = []
-    for position, (person, occasion_ages, _values, source) in enumerate(kept):
+    for position, (person, selected, _readings, _slopes, source) in enumerate(kept):
+        occasion_ages = person.ages[selected]
         is_female = person.sex_at_birth_name == "female"
         mean_age = float(occasion_ages.mean())
         training_rows.append({
@@ -1855,6 +1885,7 @@ def build_all_of_us_measurement_targets(
         "n_persons": len(training_rows),
         "n_persons_by_source": dict(Counter(source for *_rest, source in kept)),
         "n_persons_without_retained_occasion": n_without_retained_occasion,
+        "n_persons_sex_at_birth_unknown": n_sex_at_birth_unknown,
         "n_persons_treated_only_excluded": n_treated_only_excluded,
         "n_measurement_rows": sum(person.row_count for person in people),
         "excluded_row_counts": {
@@ -1876,13 +1907,14 @@ def build_all_of_us_measurement_targets(
     return training_rows, encoded_categorical_columns, summary
 
 
-def _untreated_equivalent(values: np.ndarray, treatment: TreatmentRule) -> np.ndarray:
-    """Each treated occasion's untreated equivalent on the linear scale: value / amount or value + amount."""
+def _untreated_equivalent(values: np.ndarray, slopes: np.ndarray, treatment: TreatmentRule) -> tuple[np.ndarray, np.ndarray]:
+    """Each treated occasion's untreated equivalent on the linear scale, value / amount or value + amount, and its
+    derivative in the recorded value (the reading's, divided by the amount or not)."""
     if treatment.amount is None:
         raise ValueError(f"{treatment.medication.name}: no treatment correction to apply")
     if treatment.correction is TreatmentCorrection.ADD:
-        return values + treatment.amount
-    return values / treatment.amount
+        return values + treatment.amount, slopes
+    return values / treatment.amount, slopes / treatment.amount
 
 
 def _occasion_design(ages: np.ndarray, female: np.ndarray, sex_levels: list[str]) -> np.ndarray:
@@ -2231,15 +2263,14 @@ def _prepare_training_rows(
         has_qualifying_lab = False
         for criterion, evidence in zip(criteria, lab_evidence, strict=True):
             lab_row = evidence.get(person_id)
-            if lab_row is None or int(lab_row["qualifying_occasion_count"]) == 0:
+            if lab_row is None:
                 continue
+            # A listed person has an occasion that may qualify; the count and dates are of those that surely do.
             has_qualifying_lab = True
+            if int(lab_row["qualifying_occasion_count"]) < 2:
+                continue
             first_date = _as_date(lab_row["first_qualifying_date"])
-            last_date = _as_date(lab_row["last_qualifying_date"])
-            if (
-                int(lab_row["qualifying_occasion_count"]) >= 2
-                and (last_date - first_date).days >= criterion.minimum_span_days
-            ):
+            if (_as_date(lab_row["last_qualifying_date"]) - first_date).days >= criterion.minimum_span_days:
                 met_lab_ages.append(_age_on(first_date, int(row["year_of_birth"])))
         medication_supported = (
             disease_definition.case_medication is not None

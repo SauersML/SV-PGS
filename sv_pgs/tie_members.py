@@ -40,9 +40,7 @@ class TieGroups:
         group = np.asarray(tie_map.original_to_reduced, dtype=np.int64)
         if np.any(group < 0):
             raise ValueError("every member must be active: the tie map covers the active rows")
-        sign = np.ones(group.shape[0])
-        for tie_group in tie_map.reduced_to_group:
-            sign[np.asarray(tie_group.member_indices, dtype=np.int64)] = np.asarray(tie_group.signs, dtype=np.float64)
+        sign = np.asarray(tie_map.signs, dtype=np.float64)
         return cls(group=group, sign=sign, group_count=int(np.asarray(tie_map.kept_indices).shape[0]))
 
     @property
@@ -91,6 +89,20 @@ def tied_weights(precision: F64Array, algebraic: bool = False) -> tuple[F64Array
     if total == 0.0 or (not algebraic and (negative > 1 or (negative == 1 and not total < 0.0))):
         raise np.linalg.LinAlgError("a tie group's member sites are not positive definite on their difference directions")
     return ratios / total, reference / total, total
+
+
+def prior_variance_weights(ties: TieGroups, prior_variance: F64Array) -> F64Array:
+    """s_j v_j / sum_k v_k over each member's group: the share of its group's effect a member takes in proportion to the
+    members' prior variances v (a singleton's is its sign), as a scoring model built from one effect per group
+    (``fast_scoring.ScoringModel.from_reduced_fit``) splits it."""
+    variances = np.asarray(prior_variance, dtype=np.float64)
+    weights = np.array(ties.sign, copy=True)
+    for members in tied_groups(ties):
+        total = np.sum(variances[members])
+        if not total > 0:
+            raise ValueError("a tie group's member prior variances must have a positive sum.")
+        weights[members] = ties.sign[members] * (variances[members] / total)
+    return weights
 
 
 def member_weights(ties: TieGroups, precision: F64Array, algebraic: bool = False) -> F64Array:

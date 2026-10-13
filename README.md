@@ -8,7 +8,7 @@ The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings b
   - A Gaussian likelihood for quantitative traits.
   - For diseases, a logistic likelihood (its Polya-Gamma bound) or a Gaussian working likelihood. The workspace template selects the Gaussian working likelihood on observed 0/1 status, for cost: a coefficient is a per-allele change in the probability of the recorded outcome, not a log odds ratio, and a raw fitted value is not a probability ([WORKSPACE_PIPELINE.md](docs/design/WORKSPACE_PIPELINE.md), "Likelihood"). `disease_likelihood: "bernoulli"` selects the binary likelihood. Neither choice implies calibrated prospective risk.
   - Covariates are projected out exactly before anything else is computed.
-- **Measurement.** A stored dosage is a measurement of the true genotype, with a truth-calibrated reliability r². GATK-SV short-read calls are a second measurement of the same genotype, and the two are fused.
+- **Measurement.** The workspace uses imputed dosages and optional truth calibration. It does not currently pass the richer fusion model’s leakage maps or residual variances into the fit. Leave-family-out reference validation remains a separate requirement.
 - **Prior.** Each effect is a continuous Gaussian scale mixture.
   - Its mixing density is learned nonparametrically by empirical Bayes for each variant class, with no point mass.
   - Each variant's scale depends on r² and on its annotations, including its structural-variant context, through smooth functions with learned smoothness.

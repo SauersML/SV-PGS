@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 import numpy as np
 
@@ -279,6 +279,40 @@ class TieGroup:
     signs: F32Array
 
 
+@dataclass(frozen=True, slots=True)
+class TieGroupTable:
+    """Every reduced variant's ``TieGroup``, made on demand from a ``TieMap``'s arrays (``signs[j]`` is member j's).
+
+    A genome's map has a group per active variant (about 20M) and exact ties among them, and a Python object per group
+    held gigabytes and took minutes to build and to walk: the map holds arrays, and a group is an object only when one
+    is asked for (members in ascending order).
+    """
+
+    kept_indices: I32Array
+    original_to_reduced: I32Array
+    signs: F32Array
+
+    def __len__(self) -> int:
+        return int(self.kept_indices.shape[0])
+
+    def __getitem__(self, reduced_index: int) -> TieGroup:
+        index = range(len(self))[reduced_index]
+        return self._group(index, np.flatnonzero(self.original_to_reduced == index))
+
+    def __iter__(self) -> Iterator[TieGroup]:
+        order = np.argsort(self.original_to_reduced, kind="stable")
+        bounds = np.searchsorted(self.original_to_reduced[order], np.arange(len(self) + 1))
+        for index in range(len(self)):
+            yield self._group(index, order[bounds[index] : bounds[index + 1]])
+
+    def _group(self, index: int, members: NDArray) -> TieGroup:
+        return TieGroup(
+            representative_index=int(self.kept_indices[index]),
+            member_indices=members.astype(np.int32),
+            signs=self.signs[members],
+        )
+
+
 @dataclass(slots=True)
 class TieMap:
     """Maps between the full variant set and the de-duplicated (reduced) set.
@@ -289,59 +323,25 @@ class TieMap:
     the results back to all variants.
 
     kept_indices: which original variants were kept as representatives
-    original_to_reduced: for each original variant, its reduced-space index (-1 if not active)
-    reduced_to_group: for each reduced variant, the full group of tied members.
-        Empty when kept_indices/original_to_reduced encode a compact no-ties map.
+    original_to_reduced: for each original variant, its reduced-space index
+    reduced_to_group: every reduced variant's group of tied members, as the ``TieGroupTable`` of these arrays and each
+        member's sign; a list of every group's ``TieGroup`` is taken into the table of the same groups
     """
     kept_indices: I32Array
     original_to_reduced: I32Array
-    reduced_to_group: list[TieGroup]
+    reduced_to_group: TieGroupTable
 
-    def prior_variance_group_weights(self, member_prior_variances: NDArray) -> list[NDArray]:
-        """Each tie group's member weights, proportional to the members' prior variances.
+    def __post_init__(self) -> None:
+        if not isinstance(self.reduced_to_group, TieGroupTable):
+            signs = np.ones(self.original_to_reduced.shape[0], dtype=np.float32)
+            for tie_group in self.reduced_to_group:
+                signs[tie_group.member_indices] = tie_group.signs
+            self.reduced_to_group = TieGroupTable(self.kept_indices, self.original_to_reduced, signs)
 
-        Computed in the dtype of ``member_prior_variances``; empty for a compact
-        no-ties map.
-        """
-        variances = np.asarray(member_prior_variances)
-        group_weights: list[NDArray] = []
-        for tie_group in self.reduced_to_group:
-            member_variances = variances[tie_group.member_indices]
-            total = np.sum(member_variances)
-            if not total > 0:
-                raise ValueError("a tie group's member prior variances must have a positive sum.")
-            group_weights.append(member_variances / total)
-        return group_weights
-
-    def expand_coefficients(
-        self,
-        reduced_beta: NDArray,
-        group_weights: Sequence[NDArray],
-    ) -> NDArray:
-        """Distribute each group's single fitted effect back to all its members.
-
-        Each member gets: beta_member = beta_group * weight_member * sign_member
-        where weights are proportional to prior variance and signs handle negation.
-        The result keeps the precision of ``reduced_beta`` (float32 at the least), so an
-        fp64 posterior mean expands without rounding.
-        """
-        coefficient_dtype = np.result_type(np.asarray(reduced_beta).dtype, np.float32)
-        reduced_beta_array = np.asarray(reduced_beta, dtype=coefficient_dtype)
-        if not self.reduced_to_group:
-            expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=coefficient_dtype)
-            if self.kept_indices.shape[0] != reduced_beta_array.shape[0]:
-                raise ValueError("reduced_beta must align with compact tie-map representatives.")
-            # self.kept_indices is already int32 (dataclass invariant via callers);
-            # use it directly to avoid an unnecessary np.asarray copy.
-            expanded_coefficients[self.kept_indices] = reduced_beta_array
-            return expanded_coefficients
-        expanded_coefficients = np.zeros(self.original_to_reduced.shape[0], dtype=coefficient_dtype)
-        for reduced_index, tie_group in enumerate(self.reduced_to_group):
-            group_weight_vector = np.asarray(group_weights[reduced_index], dtype=coefficient_dtype)
-            expanded_coefficients[tie_group.member_indices] = (
-                reduced_beta_array[reduced_index] * group_weight_vector * tie_group.signs
-            )
-        return expanded_coefficients
+    @property
+    def signs(self) -> F32Array:
+        """Each member's sign: +1 for a copy of its group's representative, -1 for a negated copy."""
+        return self.reduced_to_group.signs
 
 
 def _coerce_variant_class(value: Any) -> VariantClass:

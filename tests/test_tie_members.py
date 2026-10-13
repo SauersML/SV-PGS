@@ -98,3 +98,52 @@ def test_the_drivers_member_posterior_is_the_dense_member_posterior():
     right = generator.standard_normal((group.shape[0], 3))
     np.testing.assert_allclose(posterior.solve(right, 1e-12), member_covariance @ right, rtol=1e-9, atol=1e-12)
     np.testing.assert_allclose(posterior.variance_jvp(right), -(np.square(member_covariance) @ right), rtol=1e-9, atol=1e-12)
+
+
+def test_a_genome_scale_tie_map_is_built_and_read_in_linear_numpy():
+    # Stage 0's map over millions of active variants with exact ties among them (rare variants carried by the same
+    # samples tie under standardization). A Python object per group held about 530 bytes per member and took about 20 s
+    # for these 2M; the arrays hold 24 bytes per member at their peak and take a fraction of one sort of the members.
+    import time
+    import tracemalloc
+
+    from sv_pgs.tie_map import tie_map_from_representatives
+
+    count = 2_000_000
+    generator = np.random.default_rng(5)
+    representative = np.arange(count, dtype=np.int64)
+    tied = np.arange(1, count, 4)
+    representative[tied] = tied - 1
+    sign = np.ones(count, dtype=np.float32)
+    sign[tied] = generator.choice([-1.0, 1.0], size=tied.shape[0])
+
+    def build() -> TieGroups:
+        return TieGroups.from_tie_map(tie_map_from_representatives(representative, sign))
+
+    def seconds(work) -> float:
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            work()
+            times.append(time.perf_counter() - started)
+        return min(times)
+
+    shuffled = generator.permutation(count)
+    assert seconds(build) < seconds(lambda: np.sort(shuffled))
+    tracemalloc.start()
+    try:
+        before = len(tracemalloc.take_snapshot().traces)
+        tracemalloc.reset_peak()
+        ties = build()
+        _current, peak = tracemalloc.get_traced_memory()
+        objects = len(tracemalloc.take_snapshot().traces) - before
+    finally:
+        tracemalloc.stop()
+    assert peak <= 32 * count and objects < 100
+    assert ties.group_count == count - tied.shape[0]
+    np.testing.assert_array_equal(ties.group[tied], ties.group[tied - 1])
+    np.testing.assert_array_equal(ties.sign, sign)
+    group = tie_map_from_representatives(representative, sign).reduced_to_group[int(ties.group[tied[-1]])]
+    assert group.representative_index == tied[-1] - 1
+    np.testing.assert_array_equal(group.member_indices, [tied[-1] - 1, tied[-1]])
+    np.testing.assert_array_equal(group.signs, [1.0, sign[tied[-1]]])

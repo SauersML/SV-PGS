@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import threading
+import tracemalloc
 
 import numpy as np
 import pytest
 
-from sv_pgs.genotype_buffers import HostGenotypeBuffer, build_sample_layout
+from sv_pgs.genotype_buffers import HostGenotypeBuffer, build_sample_layout, host_buffer_bytes
 from sv_pgs.genotype_statistics import (
     TIE_CORRELATION_SCREEN,
     assign_chromosomes,
@@ -322,6 +323,33 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     boundaries = statistics.boundaries
     assert boundaries.block_count == statistics.ld.block_count
     assert len(boundaries.signature_sha256()) == 64
+
+
+def test_the_host_memory_estimate_bounds_what_the_pass_allocates(tmp_path) -> None:
+    # Strong LD without recombination hotspots makes every block about the cap wide, and few samples make the
+    # block-square arrays outweigh the buffer. tracemalloc sees every NumPy allocation, from every thread.
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.genotype_statistics import compute_genotype_statistics
+
+    samples, variants, cap = 200, 8000, 2048
+    rng = np.random.default_rng(23)
+    codes = mosaic_codes(rng, samples, variants, hotspot_spacing=10**9)
+    source = InMemoryTileSource(codes={"chr1": codes}, groups={"chr1": np.arange(variants, dtype=np.int64)})
+    covariates = np.column_stack([np.ones(samples), rng.normal(size=(samples, 2))])
+    targets = rng.normal(size=(samples, 2))
+    budget = _cpu_budget()
+    plan = plan_genotype_pass(cap)
+    estimate = host_buffer_bytes(build_sample_layout(np.zeros(samples, dtype=np.int64)), plan.capacity_rows, cap,
+                                 covariates.shape[1] + targets.shape[1], budget.cpu_threads)
+    tracemalloc.start()
+    try:
+        statistics = compute_genotype_statistics(source, np.arange(samples), covariates, targets, ModelConfig(),
+                                                 budget, cap, tmp_path / "ld")
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert np.diff(statistics.ld.block_boundaries).max() >= 0.9 * cap
+    assert peak <= estimate
 
 
 def test_covariates_that_lose_rank_on_the_training_set_project_onto_their_column_space(tmp_path) -> None:

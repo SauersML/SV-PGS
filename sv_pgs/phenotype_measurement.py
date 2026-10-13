@@ -14,9 +14,10 @@ Occasion j of person i is a positive reading y_ij in the trait's canonical unit,
   engine's own one-class prior (``scale_mixture_ep``). A gross error (a typo, a unit confusion) is
   downweighted by the density, not cut at a hand-set range.
 
-The lattice starts at the recording resolution's variance. Readings are rounded to a resolution delta (the
-smallest gap between distinct readings, §3.2), so the rounded-data likelihood convolves the noise with the
-rounding error, of variance (y^(lambda - 1) delta)^2 / 12 on the transformed scale: no smaller noise variance
+The lattice starts at the recording resolution's variance. Recorded values are rounded to a resolution delta (the
+smallest gap between distinct recorded values, §3.2), so the rounded-data likelihood convolves the noise with the
+rounding error, of variance (y^(lambda - 1) c delta)^2 / 12 on the transformed scale, c the reading's derivative in its
+recorded value (1 for a reading that is one; an eGFR is computed from recorded creatinine): no smaller noise variance
 is resolvable. The lattice reaches the largest squared within-person deviation, past it by its own width,
 and its spacing is halved until its quadrature in t meets the evidence tolerance. PENDING (lead ruling): the
 extent past the largest deviation is generous, not derived; math-density's R2 rule (the fitted mass beyond the
@@ -106,24 +107,29 @@ def box_cox(values: F64Array, exponent: float) -> tuple[F64Array, F64Array]:
 
 
 READING_ROUNDINGS = 8
-"""The rounded float64 operations a reading carries before it reaches the model, bounded: a unit conversion, a
-treatment correction, and a same-day mean's sum and division (all_of_us), each at most half an ulp of the reading, with
-margin. Two readings closer than this many ulps of the larger are one reading written two ways ((0.1 + 0.2) / 2 against
-0.15, 66 x 2.54 against 167.64), never a recording resolution: that gap set the lattice's floor at a variance near 1e-30."""
+"""The rounded float64 operations a recorded value carries before it reaches the model, bounded: a unit conversion and
+a same-day mean's sum and division (all_of_us), each at most half an ulp of the value, with margin. Two values closer
+than this many ulps of the larger are one value written two ways ((0.1 + 0.2) / 2 against 0.15, 66 x 2.54 against
+167.64), never a recording resolution: that gap set the lattice's floor at a variance near 1e-30."""
 
 
 def _resolvable_gaps(distinct: F64Array) -> BoolArray:
-    """For sorted distinct readings, which consecutive gaps exceed READING_ROUNDINGS ulps of the larger reading."""
+    """For sorted distinct values, which consecutive gaps exceed READING_ROUNDINGS ulps of the larger value."""
     return np.diff(distinct) > READING_ROUNDINGS * np.finfo(np.float64).eps * np.abs(distinct[1:])
 
 
 @dataclass(frozen=True)
 class Occasions:
-    """Every occasion's person (0..m-1, each present), positive reading and fixed-effect design row."""
+    """Every occasion's person (0..m-1, each present), positive reading and fixed-effect design row, the value the
+    reading was computed from as recorded, and the reading's derivative in it: the value itself and 1 for a reading
+    that is the recorded value; recorded creatinine and the CKD-EPI 2021 equation's derivative for an eGFR; the treated
+    value and the correction's derivative for an untreated equivalent."""
 
     person_index: I64Array
     values: F64Array
     design: F64Array
+    recorded: F64Array
+    slopes: F64Array
 
     def __post_init__(self) -> None:
         if not np.all(self.values > 0.0):
@@ -134,8 +140,12 @@ class Occasions:
             raise ValueError("the design needs one row per occasion")
         if np.linalg.matrix_rank(self.design) < self.design.shape[1]:
             raise ValueError("the fixed-effect design must have full column rank")
-        if not np.any(_resolvable_gaps(np.unique(self.values))):
-            raise ValueError("the readings need two distinct values to show their recording resolution")
+        if self.recorded.shape != self.values.shape or self.slopes.shape != self.values.shape:
+            raise ValueError("every reading needs its recorded value and its derivative in it")
+        if not np.all(np.isfinite(self.slopes) & (self.slopes != 0.0)):
+            raise ValueError("a reading's derivative in its recorded value must be finite and nonzero")
+        if not np.any(_resolvable_gaps(np.unique(self.recorded))):
+            raise ValueError("the recorded values need two distinct values to show their recording resolution")
 
     @property
     def person_count(self) -> int:
@@ -143,9 +153,9 @@ class Occasions:
 
     @property
     def resolution(self) -> float:
-        """The recording resolution: the smallest gap between distinct readings (§3.2), two readings within float64's
-        rounding of each other counting as one (``_resolvable_gaps``)."""
-        distinct = np.unique(self.values)
+        """The recording resolution: the smallest gap between distinct recorded values (§3.2), two values within
+        float64's rounding of each other counting as one (``_resolvable_gaps``). A reading's own is its slope times it."""
+        distinct = np.unique(self.recorded)
         return float(np.min(np.diff(distinct)[_resolvable_gaps(distinct)]))
 
 
@@ -802,7 +812,7 @@ class _Model:
         self.working_bytes = working_bytes
         self.transformed, log_jacobian = box_cox(occasions.values, exponent)
         self.log_jacobian = float(log_jacobian.sum())
-        self.resolution_variance = float(np.min(np.square(np.exp(log_jacobian) * occasions.resolution))) / 12.0
+        self.resolution_variance = float(np.min(np.square(np.exp(log_jacobian) * occasions.slopes * occasions.resolution))) / 12.0
         counts = np.bincount(occasions.person_index)
         order = np.argsort(occasions.person_index, kind="stable")
         sorted_persons = occasions.person_index[order]

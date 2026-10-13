@@ -22,6 +22,7 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
   - a case procedure;
   - a met lab criterion: 2 or more qualifying occasions, the first and last at least the criterion's span apart. A criterion counts only rows inside its plausible range (systolic blood pressure 50–300 mmHg, LDL 1–1,500 mg/dL, HbA1c 3–20%, creatinine 0.2–20 mg/dL, UACR 0.1–30,000 mg/g), a hand-set rule kept on this path alone until the disease measurement model replaces it (item 1 below).
 - **A control** has none of those evidence types. It also has no control-exclusion code or drug, and no qualifying lab occasion. Its age at the end of observation is at least the disease's minimum control age.
+- **eGFR without a sex at birth.** The CKD-EPI 2021 equation needs sex at birth, so for a person without one each occasion's eGFR is known only to lie between the female and male equations' values. An occasion counts toward a case when both are below 60, and removes the person from the controls when either is: a skipped answer never makes a control of a repeatedly low eGFR.
 - **Ambiguous codes** remove a person from both groups.
 - **The abstract's five,** where the definitions make a judgment call (the code comments give every code):
   - hypertension: a lab case needs two systolic readings of 160 mmHg or more (JNC 7 stage 2), not the guidelines' 140, which defines the mean over visits: a criterion counts any two occasions, and in the many readings an EHR holds two at 140 or more are common in normotensive people. Every obstetric hypertension code, secondary hypertension and white-coat, transient or postoperative hypertension are ambiguous. Only first-line antihypertensives (thiazide-type diuretics, renin-angiotensin agents, dihydropyridine calcium channel blockers) confirm one diagnosis date; any blood-pressure-lowering drug excludes a control;
@@ -51,6 +52,7 @@ The All of Us phenotypes live in `sv_pgs/all_of_us.py`.
   - flag a row as treated on or after the first exposure to the trait's medication class.
   - No plausible range: a gross error (a typo, a unit confusion) is downweighted by the learned noise density below, not cut.
 - **Occasions.** Rows collapse to one occasion per person-day, the same-day mean of its retained rows. The SQL returns every occasion with its age and treatment flag, and each person's row counts by exclusion reason.
+  - eGFR is computed in Python from each occasion's creatinine (the same-day mean), its age and the person's sex at birth, by the CKD-EPI 2021 equation. A person without a recorded sex at birth has no eGFR and is left out of the trait.
 - **Treatment.** A person's untreated occasions are used when there are any.
   - Otherwise the treated occasions are corrected: LDL is divided by 0.7, and systolic blood pressure has 15 mmHg added.
   - For BMI and heart rate the treated occasions are dropped.

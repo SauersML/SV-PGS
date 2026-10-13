@@ -23,6 +23,7 @@ from google.cloud import bigquery
 from scipy.stats import norm, truncnorm
 
 from sv_pgs.all_of_us import (
+    CKD_EPI_2021_SEX_COEFFICIENTS,
     DIABETES,
     DISEASE_DEFINITIONS,
     LDL_LOWERING,
@@ -49,6 +50,7 @@ from sv_pgs.all_of_us import (
     build_all_of_us_measurement_query_parameters,
     build_all_of_us_measurement_sql,
     build_all_of_us_measurement_targets,
+    ckd_epi_2021,
     person_occasions,
     disease_covariate_columns,
     measurement_covariate_columns,
@@ -851,25 +853,34 @@ def test_measurement_sql_scans_the_measurement_table_once(monkeypatch):
     monkeypatch.setenv("WORKSPACE_CDR", DATASET)
     sql = build_all_of_us_measurement_sql()
     assert sql.count(f"`{DATASET}.measurement`") == 1
-    for common_table in (
-        "exclusion_windows", "measurement_rows", "analyte_rows", "classified_rows", "valued_rows",
-        "person_days",
-    ):
+    for common_table in ("exclusion_windows", "measurement_rows", "analyte_rows", "classified_rows", "person_days"):
         assert f"{common_table} AS (" in sql
         assert len(re.findall(rf"\b(?:FROM|JOIN) {common_table}\b", sql)) == 1, common_table
 
 
-def test_measurement_sql_uses_the_race_free_ckd_epi_2021_constants(monkeypatch):
-    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
-    sql = build_all_of_us_measurement_sql()
-    assert (
-        "WHEN 'female' THEN 142 * POW(LEAST(canonical_value / 0.7, 1), -0.241)"
-        " * POW(GREATEST(canonical_value / 0.7, 1), -1.2) * POW(0.9938, age_years) * 1.012"
-    ) in sql
-    assert (
-        "WHEN 'male' THEN 142 * POW(LEAST(canonical_value / 0.9, 1), -0.302)"
-        " * POW(GREATEST(canonical_value / 0.9, 1), -1.2) * POW(0.9938, age_years) * 1.0"
-    ) in sql
+def test_egfr_is_the_race_free_ckd_epi_2021_equation():
+    # Inker et al. 2021 (NEJM 385:1737), piecewise: 142 (Scr / kappa)^a 0.9938^age (x 1.012 for women), with
+    # kappa 0.7 and a = -0.241 for women, kappa 0.9 and a = -0.302 for men, and a = -1.200 above kappa.
+    ages = np.array([40.0, 75.0])
+    for sex, kappa, below, sex_factor in (("female", 0.7, -0.241, 1.012), ("male", 0.9, -0.302, 1.0)):
+        for creatinine in (0.5, kappa, 1.4):
+            exponent = below if creatinine <= kappa else -1.2
+            egfr, slopes = ckd_epi_2021(np.full(2, creatinine), ages, sex)
+            # A ratio, two powers and three products on either side.
+            for value, target in zip(egfr, 142.0 * (creatinine / kappa) ** exponent * 0.9938**ages * sex_factor, strict=True):
+                assert value == within_rounding(target, 8)
+            if creatinine != kappa:
+                # The derivative in creatinine against a central difference. With f = c S^a, f' = a f / S and the third
+                # derivative is a (a - 1) (a - 2) f / S^3, so relative to f' the truncation is step^2 |(a - 1) (a - 2)|
+                # / (6 S^2), and the rounding, each side within 10 roundings of f (the shifted argument's included),
+                # gamma_10 S / (|a| step).
+                step = np.finfo(np.float64).eps ** (1.0 / 3.0)
+                shifted = [ckd_epi_2021(np.full(2, creatinine + sign * step), ages, sex)[0] for sign in (1.0, -1.0)]
+                truncation = step**2 * abs((exponent - 1.0) * (exponent - 2.0)) / (6.0 * creatinine**2)
+                rounding = rounding_gamma(10) * creatinine / (abs(exponent) * step)
+                np.testing.assert_allclose(slopes, (shifted[0] - shifted[1]) / (2.0 * step), rtol=truncation + rounding)
+    # No race coefficient, and no sex at birth but these two.
+    assert set(CKD_EPI_2021_SEX_COEFFICIENTS) == {"female", "male"}
 
 
 def test_measurement_query_config_types_every_parameter():
@@ -974,6 +985,11 @@ def test_treatment_corrections_apply_to_every_treated_occasion(monkeypatch, trai
     # One division or addition each.
     for value, target in zip(corrected, expected, strict=True):
         assert value == within_rounding(target, 2)
+    # The recorded values stay the treated ones, so the recording resolution is theirs; a division scales the
+    # corrected reading's rounding by its derivative, 1 / 0.7.
+    np.testing.assert_array_equal(occasions.recorded[occasions.person_index == 0], treated)
+    slope = 1.0 / 0.7 if trait == "ldl_cholesterol" else 1.0
+    np.testing.assert_array_equal(occasions.slopes, np.where(occasions.person_index == 0, slope, 1.0))
 
 
 def test_treated_only_persons_are_dropped_when_no_correction_exists(monkeypatch):

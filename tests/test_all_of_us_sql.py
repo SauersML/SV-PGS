@@ -53,9 +53,9 @@ DATASET = "aou_workspace.cdr_dataset"
 
 # A plain trait's occasion value: the unit conversion (2) and the same-day mean (2).
 _IDENTITY_OPERATIONS = 4
-# An eGFR occasion: the conversion (2), the ratio (1), two powers (4), the age term's power (2) and age (1),
-# four products (4) and the same-day mean (2).
-_EGFR_OPERATIONS = 16
+# An eGFR reading of given creatinine and age: the ratio (1), two powers (4), the age term's power (2) and four
+# products (4).
+_EGFR_OPERATIONS = 11
 
 
 OMOP_TABLES = {
@@ -450,16 +450,11 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
     assert first.row_count == 10
     assert _excluded(first) == {"censored": 2, "unrecognized_unit": 2, "nonpositive": 1, "self_reported": 1}
     assert sorted(first.unrecognized_unit_labels) == ["millimole per liter", "percent"]
-    # 2015-03-01 has two rows (mg/dL and no unit): one occasion, the mean of their eGFRs on the linear scale.
+    # 2015-03-01 has two rows (mg/dL and no unit): one occasion, the mean of their creatinine on the linear scale.
     ages = [_age(date, 1960) for date in ("2015-03-01", "2016-05-10", "2017-01-01")]
-    expected = [
-        np.mean([_ckd_epi_2021(0.8, ages[0], female=True), _ckd_epi_2021(0.9, ages[0], female=True)]),
-        _ckd_epi_2021(1.0, ages[1], female=True),
-        _ckd_epi_2021(25.0, ages[2], female=True),
-    ]
     assert first.dates == (_date("2015-03-01"), _date("2016-05-10"), _date("2017-01-01"))
-    for value, target in zip(first.values, expected, strict=True):
-        assert value == within_rounding(target, _EGFR_OPERATIONS)
+    for value, target in zip(first.values, (0.85, 1.0, 25.0), strict=True):
+        assert value == within_rounding(target, _IDENTITY_OPERATIONS)
     for age, target in zip(first.ages, ages, strict=True):
         assert age == within_rounding(target, 1)
     assert not first.treated.any()
@@ -467,14 +462,55 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
 
     second = people["2"]
     assert _excluded(second) == {"under_minimum_age": 1}
-    male_values = [_ckd_epi_2021(value, _age(date, 2000), female=False) for date, value in (("2020-06-01", 1.1), ("2021-06-01", 0.9))]
-    for value, target in zip(second.values, male_values, strict=True):
-        assert value == within_rounding(target, _EGFR_OPERATIONS)
+    for value, target in zip(second.values, (1.1, 0.9), strict=True):
+        assert value == within_rounding(target, _IDENTITY_OPERATIONS)
 
-    # eGFR needs sex at birth; a skipped answer is not guessed.
+    # The query keeps creatinine whatever the sex at birth; the eGFR equation, which needs it, is applied in Python.
     third = people["3"]
-    assert _excluded(third) == {"sex_unknown": 1}
-    assert third.values.size == 0
+    assert _excluded(third) == {}
+    assert third.values.size == 1
+
+
+def test_egfr_readings_are_the_ckd_epi_2021_equation_of_each_days_creatinine(cdr: _Cdr, monkeypatch):
+    egfr = resolve_measurement_definition("egfr_ckd_epi_2021")
+    for person_id, sex, creatinine in ((1, FEMALE, (0.6, 1.3)), (2, MALE, (0.8, 1.5)), (3, 903096, (1.0, 2.0))):
+        cdr.person(person_id, 1960, sex)
+        for year, value in zip((2015, 2016), creatinine, strict=True):
+            cdr.measurement(person_id, f"{year}-03-01", value)
+    cdr.measurement(1, "2015-03-01", 0.7, unit_concept_id=None)
+    captured: dict[str, object] = {}
+
+    def stand_in(occasions, working_bytes):
+        captured["occasions"] = occasions
+        persons = occasions.person_count
+        return type("Fit", (), {
+            "exponent": 1.0, "level_variance": 1.0, "noise_second_moment": 1.0, "log_evidence": 0.0, "split_identified": True,
+            "level_mean": np.zeros(persons), "reliability": np.full(persons, 0.5),
+        })()
+
+    monkeypatch.setattr("sv_pgs.all_of_us.fit_occasion_model", stand_in)
+    rows = cdr.measurement_rows(egfr)
+    training_rows, _columns, summary = build_all_of_us_measurement_targets(egfr, rows, WORKING_BYTES)
+    # A skipped sex at birth is not guessed: the eGFR is not one value, so the trait leaves the person out.
+    assert [row["person_id"] for row in training_rows] == ["1", "2"]
+    assert summary["n_persons_sex_at_birth_unknown"] == 1
+    # Each day's creatinine (the same-day mean of 0.6 and 0.7 on the first) through the person's own equation.
+    people = {person.person_id: person for person in person_occasions(rows)}
+    expected = [
+        _ckd_epi_2021(creatinine, age, female=person_id == "1")
+        for person_id in ("1", "2")
+        for creatinine, age in zip(people[person_id].values, people[person_id].ages, strict=True)
+    ]
+    assert people["1"].values[0] == within_rounding(0.65, _IDENTITY_OPERATIONS)
+    occasions = captured["occasions"]
+    for value, target in zip(occasions.values, expected, strict=True):
+        assert value == within_rounding(target, _EGFR_OPERATIONS)
+    # The recording resolution is creatinine's, the smallest gap between 0.65, 0.8, 1.3 and 1.5 mg/dL, carried to each
+    # eGFR by the equation's derivative: the exponent of creatinine on its side of kappa times eGFR over creatinine.
+    np.testing.assert_array_equal(occasions.recorded, np.concatenate([people["1"].values, people["2"].values]))
+    assert occasions.resolution == within_rounding(0.15, _IDENTITY_OPERATIONS, (0.65 + 0.8) / 0.15)
+    for slope, exponent, value, creatinine in zip(occasions.slopes, (-0.241, -1.2, -0.302, -1.2), occasions.values, occasions.recorded, strict=True):
+        assert slope == within_rounding(exponent * value / creatinine, 2)
 
 
 def test_acute_care_windows_span_thirty_days_around_each_stay(cdr: _Cdr):
@@ -757,6 +793,13 @@ def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     _observed_with_early_ehr(cdr, 4, 1960, FEMALE)
     cdr.measurement(4, "2015-01-10", 25.0)
     cdr.measurement(4, "2015-06-10", 25.0)
+    # Sex at birth skipped: each eGFR lies between the female and male equations' values. Person 5's creatinine of
+    # 1.2 mg/dL at 54 is an eGFR of about 54 by the female equation and 72 by the male one, so it may be below 60
+    # but need not be: never a control, nor a case. Person 6's 2.0 mg/dL is below 60 by both: a case.
+    for person_id, creatinine in ((5, 1.2), (6, 2.0)):
+        _observed_with_early_ehr(cdr, person_id, 1960, 903096)
+        cdr.measurement(person_id, "2015-01-10", creatinine)
+        cdr.measurement(person_id, "2015-06-10", creatinine)
     egfr_evidence = cdr.lab_evidence(egfr_criterion)
     assert egfr_evidence["1"] == {
         "qualifying_occasion_count": 2, "first_qualifying_date": _date("2015-01-10"), "last_qualifying_date": _date("2015-06-10"),
@@ -764,11 +807,13 @@ def test_egfr_lab_criterion_counts_retained_occasions_below_sixty(cdr: _Cdr):
     assert egfr_evidence["2"]["qualifying_occasion_count"] == 1
     assert "3" not in egfr_evidence and "4" not in egfr_evidence
     assert cdr.measurement_people(resolve_measurement_definition("egfr"))["4"].values.shape == (2,)
+    assert egfr_evidence["5"] == {"qualifying_occasion_count": 0, "first_qualifying_date": None, "last_qualifying_date": None}
+    assert egfr_evidence["6"]["qualifying_occasion_count"] == 2
 
     rows = list(cdr.disease_rows(kidney).values())
     training_rows, _columns, counts = _prepare_training_rows(kidney, rows, [egfr_evidence, {}])
-    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1, "4": 0}
-    assert counts["n_cases_by_lab"] == 1 and counts["n_excluded_lab_evidence"] == 1
+    assert {row["person_id"]: row["target"] for row in training_rows} == {"1": 1, "3": 1, "4": 0, "6": 1}
+    assert counts["n_cases_by_lab"] == 2 and counts["n_excluded_lab_evidence"] == 2
     assert albuminuria_criterion.measurement == "urine_albumin_creatinine_ratio"
 
 

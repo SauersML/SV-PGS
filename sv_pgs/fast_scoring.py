@@ -105,6 +105,7 @@ from sv_pgs.data import TieMap
 from sv_pgs.draw_laws import DenseDraws, DrawLaw
 from sv_pgs.memory_broker import HOST, PINNED, broker_for, device_pool
 from sv_pgs.progress import log
+from sv_pgs.tie_members import TieGroups, prior_variance_weights
 
 SIGNED_CODE_OFFSET = 127.0
 _READ_AHEAD_BUFFERS = 3
@@ -213,30 +214,25 @@ class ScoringModel:
 
         ``tie_map`` is over the active rows. Each member of a tie group gets
         weight * sign * beta_group, with weights proportional to the members'
-        prior variances (``TieMap.prior_variance_group_weights``); every posterior
+        prior variances (``tie_members.prior_variance_weights``); every posterior
         draw [reduced, K] expands with the same weights.
         """
-        group_weights = tie_map.prior_variance_group_weights(np.asarray(member_prior_variances, dtype=np.float64))
+        ties = TieGroups.from_tie_map(tie_map)
+        weights = prior_variance_weights(ties, np.asarray(member_prior_variances, dtype=np.float64))
         law = posterior_draws_reduced if hasattr(posterior_draws_reduced, "tile") else DenseDraws(np.asarray(posterior_draws_reduced, dtype=np.float64))
         beta = np.asarray(beta_reduced, dtype=np.float64)
-        if len(law.shape) != 2 or law.shape[0] != beta.shape[0]:
-            raise ValueError("posterior_draws_reduced must be [reduced coefficients, draws].")
-        coefficients = np.asarray(tie_map.expand_coefficients(beta, group_weights), dtype=np.float64)
-        identity = (
-            not tie_map.reduced_to_group and tie_map.original_to_reduced.shape[0] == law.shape[0]
-            and np.array_equal(tie_map.kept_indices, np.arange(law.shape[0]))
-        )
-        if identity:
+        if len(law.shape) != 2 or law.shape[0] != beta.shape[0] or beta.shape[0] != ties.group_count:
+            raise ValueError("posterior_draws_reduced must be [reduced coefficients, draws], one row per group of tie_map.")
+        coefficients = weights * beta[ties.group]
+        if ties.group_count == ties.member_count and np.all(weights == 1.0):
             # Every member is its own effect: the law is the members' already, held as it is (a p x K copy is the
             # scoring route's largest array at biobank scale).
             draws = law
         else:
             # Expanding groups to members mixes rows, so the law is drawn whole here: the routes with ties to expand
             # (the full-data EP route and the small-n routes) hold their draws as a matrix already.
-            reduced = np.asarray(law, dtype=np.float64)
-            expanded = np.empty((coefficients.shape[0], law.shape[1]), dtype=np.float64)
-            for draw_index in range(law.shape[1]):
-                expanded[:, draw_index] = tie_map.expand_coefficients(reduced[:, draw_index], group_weights)
+            expanded = np.asarray(law, dtype=np.float64)[ties.group]
+            expanded *= weights[:, None]
             draws = DenseDraws(expanded)
         return cls(
             store_rows=np.asarray(active_rows, dtype=np.int64),

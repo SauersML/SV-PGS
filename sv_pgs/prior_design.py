@@ -15,6 +15,7 @@ import numpy as np
 from sv_pgs._typing import F64Array, NDArray
 from sv_pgs.config import ModelConfig, VariantClass
 from sv_pgs.data import NESTED_PATH_DELIMITER, TieMap, VariantRecord
+from sv_pgs.tie_members import TieGroups, tied_groups
 
 
 @dataclass(slots=True)
@@ -733,75 +734,6 @@ def _metadata_baseline_scales_from_log_predictions(
     return np.exp(bounded_log_scales).astype(np.float64)
 
 
-def _support_bounded_member_log_scale_predictions(
-    *,
-    member_design_matrix: NDArray,
-    reduced_design_matrix: NDArray,
-    scale_model_coefficients: NDArray,
-) -> NDArray:
-    member_design = np.asarray(member_design_matrix, dtype=np.float64)
-    reduced_design = np.asarray(reduced_design_matrix, dtype=np.float64)
-    coefficients = np.asarray(scale_model_coefficients, dtype=np.float64)
-    if member_design.ndim != 2 or reduced_design.ndim != 2:
-        raise ValueError("Member and reduced scale-model designs must be two-dimensional.")
-    if reduced_design.shape[0] == 0:
-        raise ValueError("The reduced scale-model design must contain at least one fitted row.")
-    if member_design.shape[1] != reduced_design.shape[1] or coefficients.shape != (reduced_design.shape[1],):
-        raise ValueError("Scale-model designs and coefficients must share one feature dimension.")
-
-    member_predictions = member_design @ coefficients
-    reduced_predictions = reduced_design @ coefficients
-    return np.asarray(
-        np.clip(
-            member_predictions,
-            float(np.min(reduced_predictions)),
-            float(np.max(reduced_predictions)),
-        ),
-        dtype=np.float64,
-    )
-
-
-def _effective_prior_variances(
-    baseline_prior_variances: NDArray,
-    local_scale: NDArray,
-    config: ModelConfig,
-) -> NDArray:
-    return np.asarray(
-        np.maximum(
-            baseline_prior_variances * np.maximum(local_scale, config.local_scale_floor),
-            1e-8,
-        ),
-        dtype=np.float64,
-    )
-
-
-def _scale_state_reduced_prior_variances(
-    *,
-    global_scale: float,
-    scale_model_coefficients: NDArray,
-    local_scale: NDArray,
-    design_matrix: NDArray,
-    config: ModelConfig,
-) -> NDArray:
-    """Return the identifiable prior operator induced by the scale state.
-
-    ``global_scale`` and ``local_scale`` can move in opposite directions
-    without changing the Gaussian prior seen by the posterior solve. Outer
-    convergence therefore tracks their effective product instead of treating
-    that harmless reparameterization as hyperparameter movement.
-    """
-    metadata_baseline_scales = _metadata_baseline_scales_from_coefficients(
-        scale_model_coefficients,
-        design_matrix,
-        config,
-    )
-    return _effective_prior_variances(
-        baseline_prior_variances=(float(global_scale) * metadata_baseline_scales) ** 2,
-        local_scale=local_scale,
-        config=config,
-    )
-
-
 def _scale_model_penalty(
     feature_names: Sequence[str],
     config: ModelConfig,
@@ -813,163 +745,18 @@ def _scale_model_penalty(
     return penalty_values
 
 
-def _member_prior_variances_from_reduced_state(
-    member_records: Sequence[VariantRecord],
-    tie_map: TieMap,
-    scale_model_coefficients: NDArray,
-    scale_model_feature_specs: Sequence[ScaleModelFeatureSpec],
-    reduced_design_matrix: NDArray,
-    global_scale: float,
-    local_scale: NDArray,
-    config: ModelConfig,
-) -> NDArray:
-    reduced_design = np.asarray(reduced_design_matrix, dtype=np.float64)
-    reduced_local_scale = np.asarray(local_scale, dtype=np.float64)
-    expected_reduced_shape = (reduced_local_scale.shape[0], len(scale_model_feature_specs))
-    if reduced_design.shape != expected_reduced_shape:
-        raise ValueError(
-            "reduced_design_matrix must align with the reduced local-scale state and feature specs."
-        )
-    feature_variant_classes = {
-        feature_spec.variant_class
-        for feature_spec in scale_model_feature_specs
-        if feature_spec.variant_class is not None
-    }
-    member_design_matrix = _design_matrix_for_feature_specs(
-        records=member_records,
-        feature_specs=scale_model_feature_specs,
-        annotation_tables=_prior_annotation_tables(member_records),
-        class_membership_by_class=_class_membership_by_class(member_records, feature_variant_classes),
-    )
-    coefficients = np.asarray(scale_model_coefficients, dtype=np.float64)
-    # A mixed exact-tie record can carry fractional memberships even though its
-    # individual members are pure levels. Reapplying a standardized contrast to
-    # those members can extrapolate the fitted scalar log scale far outside the
-    # support seen by the reduced model (for example, fitted predictions in
-    # [-0.43, +0.43] becoming +2.14 for one pure member). Neither the genotype
-    # likelihood nor the reduced prior fit identifies that extrapolation. Bound
-    # the allocation coordinate to the convex hull of fitted reduced log-scale
-    # predictions. Unlike per-feature clipping, this is invariant to any
-    # invertible recoding of the full-rank prior design.
-    supported_member_log_scales = _support_bounded_member_log_scale_predictions(
-        member_design_matrix=member_design_matrix,
-        reduced_design_matrix=reduced_design,
-        scale_model_coefficients=coefficients,
-    )
-    member_baseline_scales = _metadata_baseline_scales_from_log_predictions(
-        log_predictions=supported_member_log_scales,
-        config=config,
-    )
-    member_baseline_prior_variances = (float(global_scale) * member_baseline_scales) ** 2
-    member_local_scale = _expand_group_values_to_members(
-        reduced_values=reduced_local_scale,
-        tie_map=tie_map,
-    )
-    provisional_member_variances = _effective_prior_variances(
-        baseline_prior_variances=member_baseline_prior_variances,
-        local_scale=member_local_scale,
-        config=config,
-    )
-    reduced_prior_variances = _scale_state_reduced_prior_variances(
-        global_scale=global_scale,
-        scale_model_coefficients=coefficients,
-        local_scale=reduced_local_scale,
-        design_matrix=reduced_design,
-        config=config,
-    )
-    return _normalize_member_variances_to_reduced_groups(
-        provisional_member_variances=provisional_member_variances,
-        reduced_prior_variances=reduced_prior_variances,
-        tie_map=tie_map,
-    )
-
-
-def _normalize_member_variances_to_reduced_groups(
-    *,
-    provisional_member_variances: NDArray,
-    reduced_prior_variances: NDArray,
-    tie_map: TieMap,
-) -> NDArray:
-    member_variances = np.asarray(provisional_member_variances, dtype=np.float64)
-    reduced_variances = np.asarray(reduced_prior_variances, dtype=np.float64)
-    if member_variances.shape != tie_map.original_to_reduced.shape:
-        raise ValueError("provisional_member_variances must align with the tie-map member space.")
-    if reduced_variances.shape != (tie_map.kept_indices.shape[0],):
-        raise ValueError("reduced_prior_variances must align with the tie-map reduced space.")
-
-    normalized_variances = np.zeros_like(member_variances)
-    if not tie_map.reduced_to_group:
-        normalized_variances[tie_map.kept_indices] = reduced_variances
-        return normalized_variances
-    if len(tie_map.reduced_to_group) != reduced_variances.shape[0]:
-        raise ValueError("tie-map groups must align with reduced_prior_variances.")
-
-    for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
-        group_member_indices = np.asarray(tie_group.member_indices, dtype=np.int32)
-        group_variances = member_variances[group_member_indices]
-        group_total = float(np.sum(group_variances))
-        if not np.isfinite(group_total) or group_total <= 0.0:
-            raise FloatingPointError("Exact-tie member prior variances must have a finite positive sum.")
-        normalized_variances[group_member_indices] = (
-            group_variances * (float(reduced_variances[reduced_index]) / group_total)
-        )
-    return normalized_variances
-
-
-def _tie_map_is_identity(tie_map: TieMap, *, member_count: int) -> bool:
-    if (
-        tie_map.kept_indices.shape != (int(member_count),)
-        or tie_map.original_to_reduced.shape != (int(member_count),)
-    ):
-        return False
-    if not np.array_equal(tie_map.kept_indices, np.arange(int(member_count), dtype=np.int32)):
-        return False
-    if not np.array_equal(tie_map.original_to_reduced, np.arange(int(member_count), dtype=np.int32)):
-        return False
-    return True
-
-
-def _expand_group_values_to_members(
-    reduced_values: NDArray,
-    tie_map: TieMap,
-) -> NDArray:
-    reduced_array = np.asarray(reduced_values, dtype=np.float64)
-    if not tie_map.reduced_to_group:
-        member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
-        if tie_map.kept_indices.shape[0] != reduced_array.shape[0]:
-            raise ValueError("reduced_values must align with compact tie-map representatives.")
-        member_values[np.asarray(tie_map.kept_indices, dtype=np.int32)] = reduced_array
-        return member_values
-    member_values = np.zeros(tie_map.original_to_reduced.shape[0], dtype=np.float64)
-    for reduced_index, tie_group in enumerate(tie_map.reduced_to_group):
-        member_values[tie_group.member_indices] = float(reduced_values[reduced_index])
-    return member_values
-
-
 def collapse_tie_groups(
     records: Sequence[VariantRecord],
     tie_map: TieMap,
 ) -> list[VariantRecord]:
     """Create one merged record per tie group for use in the reduced model."""
-    if not tie_map.reduced_to_group:
-        kept_indices = np.asarray(tie_map.kept_indices, dtype=np.int32)
-        if kept_indices.shape[0] == len(records) and np.array_equal(kept_indices, np.arange(len(records), dtype=np.int32)):
-            return cast(list[VariantRecord], records) if isinstance(records, list) else list(records)
-        return [records[int(record_index)] for record_index in kept_indices]
-    if len(tie_map.reduced_to_group) == len(records):
-        record_indices = np.arange(len(records), dtype=np.int32)
-        if (
-            np.array_equal(tie_map.kept_indices, record_indices)
-            and np.array_equal(tie_map.original_to_reduced, record_indices)
-        ):
-            return cast(list[VariantRecord], records) if isinstance(records, list) else list(records)
+    ties = TieGroups.from_tie_map(tie_map)
+    kept_indices = np.asarray(tie_map.kept_indices, dtype=np.int64)
+    if ties.group_count == len(records) and np.array_equal(kept_indices, np.arange(len(records))):
+        return cast(list[VariantRecord], records) if isinstance(records, list) else list(records)
 
-    collapsed_records: list[VariantRecord] = []
-    for tie_group in tie_map.reduced_to_group:
-        member_indices = tie_group.member_indices
-        if member_indices.shape[0] == 1:
-            collapsed_records.append(records[int(member_indices[0])])
-            continue
+    collapsed_records = [records[int(record_index)] for record_index in kept_indices]
+    for member_indices in tied_groups(ties):
         member_records = [records[int(member_index)] for member_index in member_indices]
         unique_variant_classes, class_membership = _class_membership(member_records)
         latent_variant_class = unique_variant_classes[0] if len(unique_variant_classes) == 1 else VariantClass.OTHER_COMPLEX_SV
@@ -1074,7 +861,7 @@ def collapse_tie_groups(
                 for feature_path in sorted(set(observed_feature_paths))
             }
 
-        collapsed_records.append(
+        collapsed_records[int(ties.group[member_indices[0]])] = (
             VariantRecord(
                 variant_id=member_records[0].variant_id,
                 variant_class=latent_variant_class,

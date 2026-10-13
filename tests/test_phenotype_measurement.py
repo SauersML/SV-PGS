@@ -37,6 +37,11 @@ WORKING_BYTES = 1 << 28
 _ABSENT = -2.0 * np.log(1.0 / np.finfo(np.float64).eps)
 
 
+def _as_recorded(person_index: np.ndarray, values: np.ndarray, design: np.ndarray) -> Occasions:
+    """Occasions whose readings are their recorded values."""
+    return Occasions(person_index=person_index, values=values, design=design, recorded=values, slopes=np.ones_like(values))
+
+
 def _lattice(floor_variance: float, top_variance: float, count: int, occasions: int) -> ScaleMixturePrior:
     nodes = np.linspace(np.log(floor_variance), np.log(top_variance), count)
     return _density_prior(nodes, float(nodes[-1]), occasions)
@@ -161,7 +166,7 @@ def test_a_one_point_noise_density_gives_the_dense_henderson_solution_and_eviden
     person_index = np.repeat(np.arange(40), counts)
     values = np.round(50.0 + generator.normal(0.0, 2.0, 40)[person_index] + generator.normal(0.0, 1.0, person_index.shape[0]), 1)
     design = np.ones((values.shape[0], 1))
-    occasions = Occasions(person_index=person_index, values=values, design=design)
+    occasions = _as_recorded(person_index, values, design)
     level_variance = 4.0
     fixed_effects = np.array([np.mean(values) - 1.0])
     prior = _lattice(0.1**2 / 12.0, 100.0, 50, values.shape[0])
@@ -297,7 +302,7 @@ def test_a_lattice_past_the_memory_budget_raises_instead_of_allocating():
     person_index, values, _gross_values, design, _gross = _simulated(60, 4.0, 1.0, seed=15)
     # Four kibibytes cannot hold the noise lattice's matrices, however few its nodes.
     with pytest.raises(LatticeTooLarge):
-        fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, 1 << 12)
+        fit_at_exponent(_as_recorded(person_index, values, design), 1.0, 1 << 12)
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS caps the address space on Linux")
@@ -321,7 +326,7 @@ def test_the_profile_fit_stays_within_its_memory_budget():
         levels = generator.normal(0.0, 1.0, 150)
         values = np.round(90.0 + 0.03 * (ages - 50.0) + levels[person_index] + generator.normal(0.0, np.sqrt(2.0), person_index.shape[0]), 1)
         design = np.column_stack([np.ones_like(ages), ages - ages.mean()])
-        fit = fit_occasion_model(Occasions(person_index=person_index, values=values, design=design), budget)
+        fit = fit_occasion_model(Occasions(person_index=person_index, values=values, design=design, recorded=values, slopes=np.ones_like(values)), budget)
         print(fit.exponent, fit.prior.grid_size)
     """)
     threads = {name: "1" for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")}
@@ -363,7 +368,7 @@ def test_the_fit_needs_repeated_occasions():
     person_index = np.arange(50)
     values = np.round(50.0 + np.random.default_rng(14).normal(0.0, 2.0, 50), 1)
     with pytest.raises(ValueError, match="repeated occasion"):
-        fit_at_exponent(Occasions(person_index=person_index, values=values, design=np.ones((50, 1))), 1.0, WORKING_BYTES)
+        fit_at_exponent(_as_recorded(person_index, values, np.ones((50, 1))), 1.0, WORKING_BYTES)
 
 
 def _simulated(persons: int, level_variance: float, noise: float, seed: int, gross_share: float = 0.0):
@@ -385,7 +390,7 @@ def test_the_start_scales_the_deviations_of_the_repeated_occasions_only():
     """A singleton's J / (J - 1) is a division by zero, warning over a value the start never uses."""
     person_index, values, _gross, design, _mask = _simulated(60, 4.0, 1.0, 15)
     assert np.any(np.bincount(person_index) == 1)
-    model = _Model(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
+    model = _Model(_as_recorded(person_index, values, design), 1.0, WORKING_BYTES)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         state = model.start()
@@ -395,7 +400,7 @@ def test_the_start_scales_the_deviations_of_the_repeated_occasions_only():
 def test_the_fit_recovers_gaussian_data_within_sampling_error():
     level_variance, noise = 4.0, 1.0
     person_index, values, _gross_values, design, _gross = _simulated(300, level_variance, noise, seed=3)
-    fit = fit_at_exponent(Occasions(person_index=person_index, values=values, design=design), 1.0, WORKING_BYTES)
+    fit = fit_at_exponent(_as_recorded(person_index, values, design), 1.0, WORKING_BYTES)
     # One to five occasions per person: the replicates certify the level/noise split.
     assert fit.split_identified
     # Maximum likelihood is efficient, so the Henderson III moment estimators' standard errors bound its own.
@@ -407,7 +412,7 @@ def test_the_fit_recovers_gaussian_data_within_sampling_error():
 def test_gross_errors_are_downweighted_by_the_learned_density():
     noise = 1.0
     person_index, values, gross_values, design, gross = _simulated(300, 4.0, noise, seed=4, gross_share=0.04)
-    occasions = Occasions(person_index=person_index, values=gross_values, design=design)
+    occasions = _as_recorded(person_index, gross_values, design)
     fit = fit_at_exponent(occasions, 1.0, WORKING_BYTES)
     affected = np.unique(person_index[gross])
     assert affected.shape[0] > 0
@@ -419,7 +424,7 @@ def test_gross_errors_are_downweighted_by_the_learned_density():
     remaining = np.unique(person_index[kept])
     without_mean, without_sd = np.zeros(persons), np.full(persons, np.sqrt(fit.level_variance))
     without = level_posterior_at(
-        Occasions(person_index=np.searchsorted(remaining, person_index[kept]), values=values[kept], design=design[kept]),
+        _as_recorded(np.searchsorted(remaining, person_index[kept]), values[kept], design[kept]),
         1.0, fit.fixed_effects, fit.level_variance, fit.prior, fit.hyperparameters, WORKING_BYTES,
     )
     without_mean[remaining], without_sd[remaining] = without.level_mean, np.sqrt(without.level_posterior_variance)
@@ -432,12 +437,27 @@ def test_gross_errors_are_downweighted_by_the_learned_density():
     np.testing.assert_array_less(without_sd[affected], np.abs(gaussian_mean[affected] - without_mean[affected]))
 
 
+def test_a_computed_reading_carries_its_recorded_values_resolution_through_its_derivative() -> None:
+    # eGFR-like readings, a power of a value recorded to 0.01 times a term in a continuous age: the readings differ in
+    # every digit, but the noise they resolve is the recorded rounding times the reading's derivative (§3.2).
+    generator = np.random.default_rng(16)
+    person_index = np.repeat(np.arange(40), 3)
+    recorded = np.round(generator.uniform(0.6, 2.0, person_index.size), 2)
+    values = 142.0 * recorded**-1.2 * 0.9938 ** generator.uniform(30.0, 80.0, person_index.size)
+    occasions = Occasions(
+        person_index=person_index, values=values, design=np.ones((values.size, 1)), recorded=recorded, slopes=-1.2 * values / recorded
+    )
+    assert occasions.resolution == pytest.approx(0.01)
+    # At the log transform a reading's rounding is |dy/dx| delta / y = 1.2 delta / x, smallest at the largest x.
+    assert _Model(occasions, 0.0, WORKING_BYTES).resolution_variance == pytest.approx(np.square(1.2 * 0.01 / recorded.max()) / 12.0)
+
+
 def test_readings_a_rounding_apart_are_one_reading_for_the_recording_resolution() -> None:
     # A same-day mean and a unit conversion write 0.15 and 167.64 a rounding away from the recorded values; those gaps
     # (3e-17, 3e-14) are not a recording resolution, which would put the lattice's floor near a variance of 1e-30.
     values = np.array([0.15, (0.1 + 0.2) / 2, 0.2, 0.25, 66 * 2.54, 167.64, 170.0])
-    occasions = Occasions(person_index=np.arange(values.size) % 3, values=values, design=np.ones((values.size, 1)))
+    occasions = _as_recorded(np.arange(values.size) % 3, values, np.ones((values.size, 1)))
     assert occasions.resolution == pytest.approx(0.05)
     # Readings that differ only by rounding have no resolution to show.
     with pytest.raises(ValueError, match="two distinct values"):
-        Occasions(person_index=np.array([0, 1]), values=np.array([0.15, (0.1 + 0.2) / 2]), design=np.ones((2, 1)))
+        _as_recorded(np.array([0, 1]), np.array([0.15, (0.1 + 0.2) / 2]), np.ones((2, 1)))

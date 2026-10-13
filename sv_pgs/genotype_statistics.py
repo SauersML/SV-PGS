@@ -45,7 +45,6 @@ from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import ModelConfig
 from sv_pgs.data import TieMap
 from sv_pgs.genotype_buffers import (
-    INT32_EXACT_ROWS,
     SIGNED_CODE_OFFSET,
     CudaGenotypeBuffer,
     HostGenotypeBuffer,
@@ -56,7 +55,7 @@ from sv_pgs.genotype_buffers import (
 )
 from sv_pgs.ld_partition import LdBlockBoundaries, OnlineBlockPartitioner, cut_allowed_from_groups
 from sv_pgs.progress import log
-from sv_pgs.tie_map import _compact_identity_tie_map, tie_map_from_groups
+from sv_pgs.tie_map import tie_map_from_representatives
 
 LAG_BLOCKS = 2
 """Blocks a boundary decision may trail the stream before ``force_cut`` commits one. It sets the
@@ -197,10 +196,10 @@ class BlockStatistics:
     """Exact statistics of the variants ``[start, stop)`` of one chromosome (source order).
 
     Arrays live in ``array_module`` (NumPy, or CuPy on the buffer's device): ``grams``
-    ``(G, width, width)`` int32 when every group has at most ``INT32_EXACT_ROWS`` samples,
-    else int64; ``sums`` ``(G, width)`` int64; ``cross_products`` ``(G, width, columns)``
-    float64 ``sum_{i in g} s_i y_i^T``, or ``None``. ``group_counts`` is NumPy.
-    ``previous_grams`` ``(G, previous width, width)``, of the grams' dtype, is the exact Gram
+    ``(G, width, width)`` int32 when every group has at most ``genotype_buffers.INT32_EXACT_ROWS``
+    samples, else int64 (``SampleLayout.gram_dtype``); ``sums`` ``(G, width)`` int64;
+    ``cross_products`` ``(G, width, columns)`` float64 ``sum_{i in g} s_i y_i^T``, or ``None``.
+    ``group_counts`` is NumPy. ``previous_grams`` ``(G, previous width, width)``, of the grams' dtype, is the exact Gram
     against the chromosome's previous block ``[previous_start, start)``; both are ``None`` for a
     chromosome's first block.
     """
@@ -453,7 +452,6 @@ def _run_chromosome(
         raise ValueError(f"{chromosome}: {groups.shape[0]} unsplittable group ids for {variant_count} variants")
     partitioner = OnlineBlockPartitioner(cut_allowed_from_groups(groups), plan.block_cap)
     maximum_distance = plan.block_cap - 1
-    gram_dtype = "int32" if int(layout.group_counts.max()) <= INT32_EXACT_ROWS else "int64"
     stream = _TileStream(source, chromosome, buffer, plan.tile_rows)
     boundaries = [0]
     forced = 0
@@ -477,11 +475,11 @@ def _run_chromosome(
                         stop=cut,
                         group_counts=layout.group_counts.copy(),
                         sums=sums,
-                        grams=grams.astype(gram_dtype, copy=False),
+                        grams=grams.astype(layout.gram_dtype, copy=False),
                         cross_products=cross,
                         array_module=buffer.array_module,
                         previous_start=previous_start,
-                        previous_grams=None if previous_grams is None else previous_grams.astype(gram_dtype, copy=False),
+                        previous_grams=None if previous_grams is None else previous_grams.astype(layout.gram_dtype, copy=False),
                     ),
                     buffer,
                 )
@@ -579,9 +577,6 @@ class ProjectedLdBlock:
 
 
 _LD_INDEX = "ld_blocks.json"
-_PENDING_BLOCK_WRITES = 1
-"""One queued block lets the writer thread overlap the pass; in steady state a deeper queue holds more
-host memory without raising the throughput, max(compute, write) per block."""
 _LD_ARRAYS = {
     "gram": ("ld_grams.f32", np.float32),
     "score": ("ld_projected_scores.f64", np.float64),
@@ -735,7 +730,12 @@ class LdGramStore:
 
 class _LdGramWriter:
     """Appends projected blocks as they arrive from any device, on its own thread so the disk
-    overlaps the devices; the index is written in store order."""
+    overlaps the devices; the index is written in store order.
+
+    One block is in flight: ``append`` waits until the previous block is written. The writer still
+    overlaps the next block's computation, so the pass takes max(compute, write) per block, and a
+    deeper queue would only hold more blocks' arrays in host memory (``host_buffer_bytes`` counts one).
+    """
 
     def __init__(self, directory: Path, sample_count: int, target_count: int, covariate_count: int) -> None:
         self.directory = Path(directory)
@@ -745,7 +745,8 @@ class _LdGramWriter:
         self._offsets = {name: 0 for name in _LD_ARRAYS}
         self._target_count = target_count
         self._covariate_count = covariate_count
-        self._pending: queue.Queue = queue.Queue(maxsize=_PENDING_BLOCK_WRITES)
+        self._pending: queue.Queue = queue.Queue()
+        self._in_flight = threading.Semaphore()
         self._failures: list[BaseException] = []
         self._thread = threading.Thread(target=self._write_all, name="stage0-ld-writer", daemon=True)
         self._thread.start()
@@ -755,6 +756,7 @@ class _LdGramWriter:
         """Queue one block (the arrays must stay unchanged until written)."""
         if self._failures:
             raise self._failures[0]
+        self._in_flight.acquire()
         self._pending.put((chromosome, start, arrays))
 
     def _write_all(self) -> None:
@@ -775,6 +777,8 @@ class _LdGramWriter:
                 self.entries[(chromosome, start)] = entry
             except BaseException as error:
                 self._failures.append(error)
+            finally:
+                self._in_flight.release()
 
     def finish(self, ordered_blocks: list[tuple[str, int, int, int]]) -> LdGramStore:
         """Write the index for ``(chromosome, start, reduced_start, reduced_stop)`` in store order."""
@@ -955,6 +959,8 @@ def _project_block(
         gram[start:stop] = panel
 
     buffer.parallel_rows(project, kept.shape[0])
+    # the w x w fp64 correlation is the projection's largest array; nothing after this reads it
+    del correlation
     ld_score = xp.empty(kept.shape[0], dtype=xp.float64)
 
     def mirror_lower(start: int, stop: int) -> None:
@@ -975,15 +981,23 @@ def _project_block(
     if block.previous_grams is not None:
         if previous is None or (previous.chromosome, previous.start) != (block.chromosome, block.previous_start):
             raise RuntimeError(f"{block.chromosome}: the block at {block.start} arrived without its predecessor's projection")
-        # the same steps as the block's own Gram: standardized correlations, times n, less the covariate part
-        coupling = block.previous_grams[0][previous.kept][:, kept_device].astype(xp.float64)
-        coupling *= count
-        coupling -= xp.outer(previous.sums[previous.kept], sums[kept_device])
-        coupling *= previous.inverse_root[previous.kept][:, None]
-        coupling *= inverse_root[kept_device][None, :]
-        coupling *= count
-        coupling -= previous.loading @ covariate_cross.T
-        adjacent = coupling.astype(xp.float32)
+        adjacent = xp.empty((previous.kept.shape[0], kept.shape[0]), dtype=xp.float32)
+        kept_sums, kept_inverse_root = sums[kept_device], inverse_root[kept_device]
+
+        def couple(start: int, stop: int) -> None:
+            """The same steps as the block's own Gram, in row panels: standardized correlations, times n, less the
+            covariate part."""
+            rows = previous.kept[start:stop]
+            panel = block.previous_grams[0][rows][:, kept_device].astype(xp.float64)
+            panel *= count
+            panel -= xp.outer(previous.sums[rows], kept_sums)
+            panel *= previous.inverse_root[rows][:, None]
+            panel *= kept_inverse_root[None, :]
+            panel *= count
+            panel -= previous.loading[start:stop] @ covariate_cross.T
+            adjacent[start:stop] = panel
+
+        buffer.parallel_rows(couple, previous.kept.shape[0])
     summary = _BlockSummary(
         active=active_host,
         means=buffer.to_host(means),
@@ -1124,17 +1138,6 @@ def compute_genotype_statistics(
                                 covariate_target, target_matrix.T @ target_matrix)
 
 
-def _tie_map(representative: NDArray[np.int64], sign: NDArray[np.float32]) -> TieMap:
-    """The TieMap of the active variants from each one's representative and sign."""
-    members = np.arange(representative.shape[0], dtype=np.int64)
-    if np.array_equal(representative, members):
-        return _compact_identity_tie_map(representative.shape[0])
-    groups: dict[int, list[tuple[int, float]]] = {}
-    for member, (root, member_sign) in enumerate(zip(representative.tolist(), sign.tolist())):
-        groups.setdefault(root, []).append((member, member_sign))
-    return tie_map_from_groups(representative.shape[0], groups)
-
-
 def _assemble_statistics(
     source: GenotypeTileSource,
     summary: GenotypePassSummary,
@@ -1175,7 +1178,7 @@ def _assemble_statistics(
             block_stops.append(int(store_rows[stop - 1]) + 1)
             active_cursor += local_active.shape[0]
             reduced_cursor += block_summary.reduced_count
-    tie_map = _tie_map(np.concatenate(representatives), np.concatenate(signs))
+    tie_map = tie_map_from_representatives(np.concatenate(representatives), np.concatenate(signs))
     boundaries = LdBlockBoundaries(
         block_cap=block_cap,
         chromosomes=chromosomes,

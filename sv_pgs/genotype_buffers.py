@@ -101,6 +101,11 @@ class SampleLayout:
         start = int(self.group_offsets[group])
         return start, start + _aligned(int(self.profile_counts[group]))
 
+    @property
+    def gram_dtype(self) -> np.dtype:
+        """int32 when every group's Gram is exact in it (at most ``INT32_EXACT_ROWS`` samples), else int64."""
+        return np.dtype(np.int32 if int(self.group_counts.max()) <= INT32_EXACT_ROWS else np.int64)
+
 
 def _aligned(count: int) -> int:
     return -(-count // LAYOUT_ALIGNMENT) * LAYOUT_ALIGNMENT
@@ -175,15 +180,30 @@ def _store_chunked(target: NDArray[np.float32], rows: slice, values: NDArray[np.
 
 
 def host_buffer_bytes(layout: SampleLayout, capacity_rows: int, block_cap: int, cross_columns: int, workers: int) -> int:
-    """Host bytes a ``HostGenotypeBuffer`` holds at its peak (one block's products in flight)."""
+    """Host bytes the Stage 0 pass holds at its peak on a ``HostGenotypeBuffer`` (``genotype_statistics``: one block's
+    products and projection in flight while the LD writer holds the previous block's).
+
+    Besides the buffer, its upload staging and its cross-product columns, a block of width ``w`` holds its Grams and its
+    Grams with the previous block (``layout.gram_dtype``), and then either both blocks' float32 sample rows while the
+    adjacent Gram forms, or the projection's fp64 correlation and float32 projected Gram with two fp64
+    ``_HOST_PANEL x w`` temporaries per worker (the correlation is dropped before the coupling is built in panels).
+    The writer holds the previous block's float32 projected and adjacent Grams. Every other array is a column of width
+    ``w``: ``G + 7`` fp64 arrays ``cross_columns`` wide (the block's cross-products per group; their raw, centred and
+    standardized rows; the covariate loading, the projected score and its temporary; the previous block's loading and
+    the writer's copy) and at most 24 vectors (moments, scales, the tie screen's positions and signs), or a constant
+    per worker (its GEMM and cross-product panels).
+    """
     rows = capacity_rows + _ROW_ALIGNMENT
     buffer = rows * (layout.width + 4 * _chunks(layout.profile_width) * _HOST_SAMPLE_CHUNK + 16)
     staging = (_STAGING_BUFFERS + 1) * (block_cap // 2 + LAYOUT_ALIGNMENT) * layout.store_width
-    block = block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4 + 3 * block_cap * block_cap * 8
-    # the Gram against the previous block: its float32 rows and the int64 result per group
-    adjacent = block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4 + (layout.group_count + 1) * block_cap * block_cap * 8
-    workers_scratch = workers * (_HOST_PANEL * _HOST_PANEL * 8 + 2 * _HOST_PANEL * _HOST_SAMPLE_CHUNK * 4)
-    return buffer + staging + block + adjacent + workers_scratch + layout.width * cross_columns * 8
+    square = block_cap * block_cap
+    grams = 2 * layout.group_count * layout.gram_dtype.itemsize * square
+    sample_rows = 2 * block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4
+    projection = (8 + 4) * square + workers * 2 * _HOST_PANEL * block_cap * 8
+    written = (4 + 4) * square
+    columns = block_cap * 8 * ((layout.group_count + 7) * cross_columns + 24)
+    workers_scratch = workers * (_HOST_PANEL * _HOST_PANEL * (8 + 4) + _HOST_CROSS_ROWS * _CROSS_SAMPLE_CHUNK * 8)
+    return buffer + staging + grams + max(sample_rows, projection) + written + columns + workers_scratch + layout.width * cross_columns * 8
 
 
 def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, block_cap: int, cross_columns: int) -> int:
@@ -199,9 +219,9 @@ def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, 
     adjacent = gram
     cross = layout.width * cross_columns * 8 + block_cap * _CROSS_SAMPLE_CHUNK * 8
     # the projection step's own block-square arrays, live together with the Grams: the fp64 correlation matrix, the
-    # float32 projected Gram, the fp64 coupling to the previous block and its float32 copy; plus its per-panel
+    # float32 projected Gram and the float32 coupling to the previous block (built in panels); plus its per-panel
     # temporaries (two fp64 and two boolean panel x width arrays for the rank-one update and the tie screen)
-    projection = gram_rows * gram_rows * (8 + 4 + 8 + 4) + _HOST_PANEL * gram_rows * (8 + 8 + 1 + 1)
+    projection = gram_rows * gram_rows * (8 + 4 + 4) + _HOST_PANEL * gram_rows * (8 + 8 + 1 + 1)
     return resident + max(band, gram + adjacent + cross + projection)
 
 
@@ -298,9 +318,10 @@ class HostGenotypeBuffer:
         """Row and column sums of the fixed-point pair weights of window ``[window_slot, tile end)``
         against tile ``[tile_slot, tile_slot + tile_rows)``."""
         window_stop = tile_slot + tile_rows
-        band = _host_exact_products(
+        band = np.empty((window_stop - window_slot, tile_rows), dtype=np.int64)
+        _host_exact_products(
             self._profile[:, window_slot:window_stop], self._profile[:, tile_slot:window_stop], self._parallel,
-            self._worker_count, symmetric=False,
+            self._worker_count, symmetric=False, out=band,
         )
         row_panels = self._row_ranges(band.shape[0], _HOST_PANEL)
         column_panels = self._row_ranges(tile_rows, _HOST_PANEL // 2)
@@ -344,24 +365,24 @@ class HostGenotypeBuffer:
 
     def block_statistics(
         self, slot: int, rows: int
-    ) -> tuple[NDArray[np.int64], NDArray[np.int64], NDArray[np.float64] | None]:
-        """Exact per-group sums ``(G, rows)``, Grams ``(G, rows, rows)`` and cross-products."""
+    ) -> tuple[NDArray[np.int64], NDArray, NDArray[np.float64] | None]:
+        """Exact per-group sums ``(G, rows)``, Grams ``(G, rows, rows)`` (``layout.gram_dtype``) and cross-products."""
         groups = self.layout.group_count
         sums = np.zeros((groups, rows), dtype=np.int64)
-        grams = np.zeros((groups, rows, rows), dtype=np.int64)
+        grams = np.empty((groups, rows, rows), dtype=self.layout.gram_dtype)
         for group in range(groups):
             values = self._group_values(slot, rows, group, sums[group])
-            grams[group] = _host_exact_products(values, values, self._parallel, self._worker_count, symmetric=True)
+            _host_exact_products(values, values, self._parallel, self._worker_count, symmetric=True, out=grams[group])
         return sums, grams, None if self._cross is None else self.cross_products(slot, rows)
 
-    def cross_block_grams(self, first_slot: int, first_rows: int, second_slot: int, second_rows: int) -> NDArray[np.int64]:
+    def cross_block_grams(self, first_slot: int, first_rows: int, second_slot: int, second_rows: int) -> NDArray:
         """Exact per-group Grams between two blocks' rows, ``sum_{i in g} s_i^(1) s_i^(2)T``
         ``(G, first_rows, second_rows)``: adjacent LD blocks' coupling."""
-        grams = np.zeros((self.layout.group_count, first_rows, second_rows), dtype=np.int64)
+        grams = np.empty((self.layout.group_count, first_rows, second_rows), dtype=self.layout.gram_dtype)
         for group in range(self.layout.group_count):
             first = self._group_values(first_slot, first_rows, group, None)
             second = self._group_values(second_slot, second_rows, group, None)
-            grams[group] = _host_exact_products(first, second, self._parallel, self._worker_count, symmetric=False)
+            _host_exact_products(first, second, self._parallel, self._worker_count, symmetric=False, out=grams[group])
         return grams
 
     def cross_products(self, slot: int, rows: int) -> NDArray[np.float64]:
@@ -403,17 +424,18 @@ def _host_exact_products(
     parallel: Callable[[Callable[[Any], None], list[Any]], None],
     workers: int,
     symmetric: bool,
-) -> NDArray[np.int64]:
-    """``left @ right.T`` over all chunks for chunk-major integer-valued float32 operands
-    ``[chunk, rows, _HOST_SAMPLE_CHUNK]`` with ``|value| <= 127``, exactly.
+    out: NDArray,
+) -> None:
+    """``out = left @ right.T`` over all chunks for chunk-major integer-valued float32 operands
+    ``[chunk, rows, _HOST_SAMPLE_CHUNK]`` with ``|value| <= 127``, exactly (``out``'s integer dtype must hold the
+    products).
 
     Output panels shrink from ``_HOST_PANEL`` until every worker has two; ``symmetric``
-    (``left is right``) computes the panels on and above the diagonal and mirrors them.
-    NumPy's matmul releases the GIL (SciPy's BLAS wrappers do not), so the workers overlap,
-    and it calls SYRK for the diagonal panels.
+    (``left is right``) computes the panels on and above the diagonal, and each one above it also
+    writes its transpose below, so no full-size temporary exists. NumPy's matmul releases the GIL
+    (SciPy's BLAS wrappers do not), so the workers overlap, and it calls SYRK for the diagonal panels.
     """
     rows, columns = left.shape[1], right.shape[1]
-    result = np.zeros((rows, columns), dtype=np.int64)
     size = _HOST_PANEL
     while size > _ROW_ALIGNMENT and -(-rows // size) * -(-columns // size) < 2 * workers * (2 if symmetric else 1):
         size //= 2
@@ -430,12 +452,11 @@ def _host_exact_products(
         total = np.zeros((row_stop - row_start, column_stop - column_start), dtype=np.float64)
         for chunk in range(left.shape[0]):
             total += left[chunk, row_start:row_stop] @ right[chunk, column_start:column_stop].T
-        result[row_start:row_stop, column_start:column_stop] = total
+        out[row_start:row_stop, column_start:column_stop] = total
+        if symmetric and column_start > row_start:
+            out[column_start:column_stop, row_start:row_stop] = total.T
 
     parallel(panel, panels)
-    if symmetric:
-        result = np.triu(result) + np.triu(result, 1).T
-    return result
 
 
 _CUDA_SHIFT_GATHER = r"""
