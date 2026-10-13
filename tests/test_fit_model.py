@@ -59,6 +59,9 @@ def _certificate(model_count: int, generator: np.random.Generator) -> FitCertifi
             values[field.name] = generator.uniform(size=model_count) < 0.5
         else:
             values[field.name] = generator.uniform(size=model_count)
+    values.update(outer_criterion_met=np.ones(model_count, dtype=bool), unresolved=np.zeros(model_count, dtype=np.int64),
+                  budget_unresolved=np.zeros(model_count, dtype=np.int64), restored_best=np.zeros(model_count, dtype=bool),
+                  far_field=np.zeros(model_count))
     return FitCertificate(**values)
 
 
@@ -403,3 +406,17 @@ def test_the_fit_command_refuses_a_cohort_file_with_other_arrays(tmp_path: Path,
     with pytest.raises(ValueError, match="must hold exactly"):
         main(["fit", str(store_root), str(tmp_path / "extra.npz"), str(tmp_path / "model")])
     assert not (tmp_path / "model").exists() and driver.calls == []
+
+
+def test_the_prior_form_reaches_the_driver_and_its_checkpoints(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    # The 2 x 2 comparison's simpler prior (annotated_prior False) is passed through to the fit, and its checkpoints
+    # never stand in for the annotation-aware prior's.
+    cohort = _cohort(np.random.default_rng(1))
+    fit_model.fit(_request(store_root, cohort.arguments(), tmp_path / "annotated", 11))
+    request = dataclasses.replace(_request(store_root, cohort.arguments(), tmp_path / "simpler", 11), annotated_prior=False)
+    fit_model.fit(request)
+    annotated, simpler = driver.calls
+    assert annotated["annotated_prior"] is True and simpler["annotated_prior"] is False
+    assert annotated["checkpoint_key"] != simpler["checkpoint_key"]
+    with pytest.raises(ValueError, match="annotated_prior"):
+        dataclasses.replace(request, annotated_prior=1)

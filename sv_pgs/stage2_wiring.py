@@ -354,6 +354,7 @@ def _fit_one(
     draw_count: int,
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "mean_field",
+    annotated_prior: bool = True,
 ) -> _ModelFit:
     """One model on the sorted store columns ``training_columns``, whose covariates (intercept first) and targets follow
     them; the null genetic model where the training set has no genetic column to fit.
@@ -403,7 +404,9 @@ def _fit_one(
     table = store.variant_table
     # The store's annotations per member and the frequency function; ``fit_full_data`` nests them on the prior without
     # annotations, so each enters where the evidence rises.
-    member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()}
+    # The simpler prior (``annotated_prior`` False, the 2 x 2 comparison's) keeps the frequency function and drops the
+    # store's annotations.
+    member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()} if annotated_prior else {}
     member_annotations.update(frequency_annotation(log_genotype_variance))
     annotations = annotation_design(
         member_annotations,
@@ -568,6 +571,7 @@ def fit_models(
     draw_count: int,
     inference: str = "mean_field",
     checkpoint_key: str | None = None,
+    annotated_prior: bool = True,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, one at a time (see the module docstring); ``inference`` names the fixed
     point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's genome-scale
@@ -606,6 +610,7 @@ def fit_models(
                     draw_count,
                     trait_types[model],
                     inference,
+                    annotated_prior,
                 )
             elapsed = time.perf_counter() - started
             if checkpoint is not None:

@@ -123,6 +123,10 @@ class FitRequest:
     # case-control sample of it (None: the training rows are the population's sample; ``binary_likelihood``: the logit
     # offset logit(K) - logit(p) moves the predictive's intercept). None for every quantitative model.
     population_prevalence: tuple[float | None, ...] | None = None
+    # The prior's form (the study's 2 x 2 comparison of features by prior): True, the annotation-aware prior (the
+    # store's annotations as learned smooths, beside the class densities, the frequency function and each record's
+    # reliability); False, the simpler prior of the class densities, the frequency function and the reliability alone.
+    annotated_prior: bool = True
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -141,6 +145,8 @@ class FitRequest:
         set_field(self, "trait_types", trait_types)
         set_field(self, "research_ids", tuple(str(research_id) for research_id in self.research_ids))
         set_field(self, "work_dir", Path(self.work_dir))
+        if not isinstance(self.annotated_prior, bool):
+            raise ValueError("annotated_prior must be True or False.")
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
             raise ValueError("seed must be an integer.")
         if self.seed < 0:
@@ -229,7 +235,8 @@ def fit(request: FitRequest) -> FittedModel:
         covariates=request.covariates, targets=request.targets, training=request.training,
         draw_count=DRAW_COUNT, seed=request.seed,
     )
-    checkpoint_key = hashlib.sha256("\n".join((source_key, store_key, offset_key, problem_key)).encode()).hexdigest()
+    prior_form = f"annotated_prior={request.annotated_prior}"
+    checkpoint_key = hashlib.sha256("\n".join((source_key, store_key, offset_key, problem_key, prior_form)).encode()).hexdigest()
     fitted = fit_models(
         store=request.store,
         store_columns=request.store_columns,
@@ -244,6 +251,7 @@ def fit(request: FitRequest) -> FittedModel:
         seed=request.seed,
         draw_count=DRAW_COUNT,
         checkpoint_key=checkpoint_key,
+        annotated_prior=request.annotated_prior,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)
