@@ -1,4 +1,4 @@
-"""The pipeline that runs inside the All of Us workspace: popped BCFs to held-out scores.
+"""The pipeline that runs inside the All of Us workspace: imputed batches to held-out scores.
 
 One driver, restartable step by step (docs/design/WORKSPACE_PIPELINE.md). A step writes into
 ``<run>/<step>.partial`` and is complete once that directory, holding ``_COMPLETE.json`` with the
@@ -23,9 +23,11 @@ Steps:
 3. ``cohort``: over the cohort rows, the structure covariates every trait shares, each trait's own
    covariates from its own table, one target column per trait (``cohort.build_cohort``), and every
    (trait, fold) training set.
-4. ``store``: the dosage store from the popped batches (``store_converter``). Every batch is
-   checked in lockstep against the strata sidecar, and the popped records against the sidecar's
-   sites and ids md5. Each half's sample manifest is typed by its namespace.
+4. ``store``: the dosage store from the imputed batches (``store_converter``): popped BCFs, every
+   batch checked in lockstep against the strata sidecar and the popped records against the
+   sidecar's sites and ids md5; or plain imputed VCF/BCFs (GLIMPSE2, Beagle 5, Minimac4, IMPUTE5),
+   every batch checked in lockstep against the first batch's records. Each half's sample manifest
+   is typed by its namespace.
 5. ``measurement``: the measurement model, fitted on the calibration pairs from the truth rows, or
    its explicit no-truth form, and the fit's prior offset from it. Where it recalibrates, the store
    is rewritten with D*.
@@ -50,6 +52,7 @@ hold the step and the event.
 
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
 import csv
 import dataclasses
@@ -128,19 +131,24 @@ from sv_pgs.store_converter import (
     MAXIMUM_KEPT_PATHS,
     NO_LOCUS,
     ExpectedSites,
+    PlainExpectedSites,
     TrLoci,
     assemble_half,
     core_spans,
     decode_batch,
     decode_called_batch,
+    decode_plain_batch,
     gene_overlap,
+    info_sv_length,
     no_call_fill,
+    plain_batch_fields,
+    plain_record_site,
     refalt_digest,
     tr_loci,
     unbreakable_group_first,
     write_store_manifest,
 )
-from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, variant_class_and_length
+from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, variant_class_and_length
 
 LOGGER = logging.getLogger(__name__)
 
@@ -166,6 +174,7 @@ CONFIG_KEYS = (
     "truth_calls",
     "strata_directory",
     "bubble_split",
+    "genetic_map",
     "tandem_repeats",
     "gene_annotation",
     "crosswalk",
@@ -184,6 +193,12 @@ KEY_HINTS = {
     "gene_annotation": (
         "gene_annotation is the public GENCODE v38 basic annotation GTF, gencode.v38.basic.annotation.gtf.gz from "
         "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/ (GRCh38, chr-prefixed contigs)."
+    ),
+    "genetic_map": (
+        "genetic_map is null for popped batches, which carry INFO/CM. For plain imputed batches without INFO/CM it is a path "
+        "pattern over {chromosome} to the public Beagle GRCh38 PLINK maps, plink.GRCh38.map.zip from "
+        "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh38.map.zip, unzipped: e.g. "
+        "<dir>/no_chr_in_chrom_field/plink.{chromosome}.GRCh38.map."
     ),
 }
 """What to point a key at, for the keys whose file is a public download."""
@@ -204,7 +219,7 @@ _FLOAT64_BYTES = np.dtype(np.float64).itemsize
 
 @dataclass(frozen=True, slots=True)
 class ImputedHalfInput:
-    """One imputation half: its popped batches in batch order, and each (chromosome, batch) file's path pattern."""
+    """One imputation half: its imputed batches in batch order, and each (chromosome, batch) file's path pattern."""
 
     label: str
     batches: tuple[str, ...]
@@ -215,14 +230,30 @@ class ImputedHalfInput:
 
 
 @dataclass(frozen=True, slots=True)
+class PoppedSidecars:
+    """The popped batches' sidecars: the strata directory, and bubble.split's path pattern over ``{chromosome}``."""
+
+    strata_directory: Path
+    bubble_split: str
+
+    def bubble_split_path(self, chromosome: str) -> Path:
+        return Path(self.bubble_split.format(chromosome=chromosome))
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceConfig:
     """The run's inputs, from the JSON config supplied inside the workspace.
 
     Every key is required, so nothing runs on a default nobody chose. ``truth_calls`` is either a
-    path pattern over ``{chromosome}`` for the long-read hard calls on the popped site list
+    path pattern over ``{chromosome}`` for the long-read hard calls on the imputed site list
     (samples named by research ID), or an explicit null. Null runs without truth rows: no stacked
     long-read half, no calibration pairs, no D*, and each step's summary says so. ``export`` lists
     the report files the user has approved for staging, by name.
+
+    ``strata_directory`` and ``bubble_split`` are set together for popped batches (``popped``), or
+    null together for plain imputed VCF/BCFs (``popped`` None). ``genetic_map`` is a path pattern
+    over ``{chromosome}`` to a PLINK-format map, read for a plain chromosome whose records lack
+    INFO/CM, or null; popped batches carry INFO/CM, so it is null for them.
     """
 
     run_directory: Path
@@ -230,8 +261,8 @@ class WorkspaceConfig:
     chromosomes: tuple[str, ...]
     imputed_halves: tuple[ImputedHalfInput, ...]
     truth_calls: str | None
-    strata_directory: Path
-    bubble_split: str
+    popped: PoppedSidecars | None
+    genetic_map: str | None
     tandem_repeats: Path
     gene_annotation: Path
     crosswalk: Path
@@ -286,6 +317,12 @@ class WorkspaceConfig:
             first_column, second_column, kinship_column = (str(column) for column in raw["relatedness_columns"])
         except ValueError as error:
             raise ValueError("crosswalk_columns names (research, sequencing); relatedness_columns (first, second, kinship).") from error
+        if (raw["strata_directory"] is None) != (raw["bubble_split"] is None):
+            raise ValueError(
+                "strata_directory and bubble_split are set together (popped batches) or null together (plain imputed VCF/BCFs)."
+            )
+        if raw["strata_directory"] is not None and raw["genetic_map"] is not None:
+            raise ValueError("popped batches carry INFO/CM, so genetic_map is read only for plain input; set it null.")
         marker_directory = raw["marker_directory"]
         return cls(
             run_directory=Path(raw["run_directory"]),
@@ -293,8 +330,8 @@ class WorkspaceConfig:
             chromosomes=chromosomes,
             imputed_halves=halves,
             truth_calls=None if raw["truth_calls"] is None else str(raw["truth_calls"]),
-            strata_directory=Path(raw["strata_directory"]),
-            bubble_split=str(raw["bubble_split"]),
+            popped=None if raw["strata_directory"] is None else PoppedSidecars(Path(raw["strata_directory"]), str(raw["bubble_split"])),
+            genetic_map=None if raw["genetic_map"] is None else str(raw["genetic_map"]),
             tandem_repeats=Path(raw["tandem_repeats"]),
             gene_annotation=Path(raw["gene_annotation"]),
             crosswalk=Path(raw["crosswalk"]),
@@ -314,6 +351,14 @@ class WorkspaceConfig:
         if self.truth_calls is None:
             raise ValueError("this run has no truth calls.")
         return Path(self.truth_calls.format(chromosome=chromosome))
+
+    def genetic_map_path(self, chromosome: str) -> Path:
+        if self.genetic_map is None:
+            raise ValueError(
+                f"{chromosome}: the plain batches' records lack INFO/CM, so their genetic positions come from genetic_map, which is "
+                f"null; nothing assumes a rate of cM per Mb. {KEY_HINTS['genetic_map']}"
+            )
+        return Path(self.genetic_map.format(chromosome=chromosome))
 
     def half_labels(self) -> tuple[str, ...]:
         """Each store half's label: the imputed halves in config order, then the long-read half if there is one."""
@@ -878,21 +923,32 @@ def read_strata_sites(directory: Path, chromosome: str) -> StrataSites:
 
 
 @dataclass(frozen=True, slots=True)
-class PoppedSites:
-    """REF, ALT, genetic position (INFO/CM) and |INFO/SVLEN| (NaN where absent) of every popped record."""
+class RecordSites:
+    """Every record's REF, ALT, INFO/SVTYPE (None where absent), |INFO/SVLEN| (NaN where absent), INFO/END (None where
+    absent) and genetic position (cM), in batch-file order: what the store's classes, cores and variant table read."""
 
     refs: tuple[str, ...]
     alts: tuple[str, ...]
-    genetic_position_cm: F64Array
+    sv_types: tuple[str | None, ...]
     sv_lengths: F64Array
+    ends: tuple[int | None, ...]
+    genetic_position_cm: F64Array
 
 
-def read_popped_sites(path: Path, strata: StrataSites) -> PoppedSites:
+def _checked_genetic_positions(path: Path, centimorgans: F64Array, source: str) -> F64Array:
+    if not np.all(np.isfinite(centimorgans)) or np.any(np.diff(centimorgans) < 0):
+        raise ValueError(f"{path}: {source} must be finite and non-decreasing along the chromosome.")
+    return centimorgans
+
+
+def read_popped_sites(path: Path, strata: StrataSites) -> RecordSites:
     """One popped batch file's site fields, checked against the strata sidecar.
 
     Each record is checked against its sidecar row (POS, INFO/ID, REF/ALT md5, allele lengths).
     The whole file is then checked against the sidecar's sites md5 (the md5 of the records'
-    "CHROM\\tPOS\\tREF\\tALT\\n" lines) and ids md5 (the same over "INFO/ID\\n").
+    "CHROM\\tPOS\\tREF\\tALT\\n" lines) and ids md5 (the same over "INFO/ID\\n"). The popped
+    records are sequence-resolved atomic alleles, typed from their alleles and |SVLEN|, so no
+    SVTYPE or END is read.
     """
     sites = hashlib.md5()
     ids = hashlib.md5()
@@ -907,8 +963,8 @@ def read_popped_sites(path: Path, strata: StrataSites) -> PoppedSites:
             if row >= count:
                 raise ValueError(f"{path}: more records than the strata sidecar's {count}.")
             alt = ",".join(record.ALT)
-            identifier = str(record.INFO.get("ID"))
-            sites.update(f"{record.CHROM}\t{record.POS}\t{record.REF}\t{alt}\n".encode())
+            identifier = ExpectedSites.record_identifier(record)
+            sites.update(ExpectedSites.site_line(record).encode())
             ids.update(f"{identifier}\n".encode())
             if (
                 record.POS != int(strata.positions[row])
@@ -920,21 +976,24 @@ def read_popped_sites(path: Path, strata: StrataSites) -> PoppedSites:
             centimorgans = record.INFO.get("CM")
             if centimorgans is None:
                 raise ValueError(f"{path} record {row}: no INFO/CM, so the record has no genetic position.")
-            sv_length = record.INFO.get("SVLEN")
             refs.append(record.REF)
             alts.append(alt)
             genetic.append(float(centimorgans))
-            lengths.append(np.nan if sv_length is None else float(np.abs(np.atleast_1d(sv_length)).max()))
+            lengths.append(info_sv_length(record))
     finally:
         reader.close()
     if len(refs) != count:
         raise ValueError(f"{path}: {len(refs)} records, not the strata sidecar's {count}.")
     if sites.hexdigest() != strata.sites_md5 or ids.hexdigest() != strata.ids_md5:
         raise ValueError(f"{path}: the popped records' sites or ids md5 differs from the strata sidecar's.")
-    centimorgan_array = np.array(genetic, dtype=np.float64)
-    if not np.all(np.isfinite(centimorgan_array)) or np.any(np.diff(centimorgan_array) < 0):
-        raise ValueError(f"{path}: INFO/CM must be finite and non-decreasing along the chromosome.")
-    return PoppedSites(tuple(refs), tuple(alts), centimorgan_array, np.array(lengths, dtype=np.float64))
+    return RecordSites(
+        refs=tuple(refs),
+        alts=tuple(alts),
+        sv_types=(None,) * count,
+        sv_lengths=np.array(lengths, dtype=np.float64),
+        ends=(None,) * count,
+        genetic_position_cm=_checked_genetic_positions(path, np.array(genetic, dtype=np.float64), "INFO/CM"),
+    )
 
 
 def read_bubble_paths(path: Path) -> list[list[frozenset[str]]]:
@@ -1006,6 +1065,124 @@ def path_counts(strata: StrataSites, bubbles: Sequence[Sequence[frozenset[str]]]
     return PathCounts(bubble=bubble, kept=kept, carrying=carrying)
 
 
+def _chromosome_spellings(chromosome: str) -> tuple[str, str]:
+    """The two names a plain batch's CHROM or a genetic map's chromosome field may give a store chromosome: as the store
+    writes it ('chr21') and by its number ('21')."""
+    return chromosome, str(chromosome_number(chromosome))
+
+
+@dataclass(frozen=True, slots=True)
+class PlainSites:
+    """One plain batch file's site list: the keys every batch is decoded against, each record's site fields with its
+    INFO/CM (NaN where absent), and the md5 of its site lines (``PlainExpectedSites.site_line``)."""
+
+    expected: PlainExpectedSites
+    records: RecordSites
+    sites_md5: str
+
+
+def read_plain_sites(path: Path, chromosome: str) -> PlainSites:
+    """The site list of a plain imputed batch file: every record's POS, identifier (``plain_record_identifier``: its ID,
+    or CHROM:POS:REF:ALT where that is '.'), REF, ALT, INFO/SVTYPE, |INFO/SVLEN|, INFO/END and INFO/CM where present.
+
+    Every record must have one ALT allele, lie on ``chromosome`` (CHROM as ``_chromosome_spellings`` names it) in POS
+    order, and carry an identifier no other record of the chromosome has.
+    """
+    spellings = _chromosome_spellings(chromosome)
+    positions: list[int] = []
+    identifiers: list[str] = []
+    refs: list[str] = []
+    alts: list[str] = []
+    sv_types: list[str | None] = []
+    sv_lengths: list[float] = []
+    ends: list[int | None] = []
+    genetic: list[float] = []
+    sites = hashlib.md5()
+    reader = VCF(str(path))
+    try:
+        for record in reader:
+            if len(record.ALT) != 1:
+                raise ValueError(
+                    f"{path}: the record at {record.CHROM}:{record.POS} has {len(record.ALT)} ALT alleles; the store reads biallelic "
+                    "records, so split multiallelic ones first with `bcftools norm -m-any`."
+                )
+            if record.CHROM not in spellings:
+                raise ValueError(f"{path}: a record lies on {record.CHROM}, not on {chromosome} (named {' or '.join(spellings)}).")
+            _chromosome, position, identifier, ref, alt, sv_type, sv_length, end = plain_record_site(record)
+            sites.update(PlainExpectedSites.site_line(record).encode())
+            centimorgans = record.INFO.get("CM")
+            positions.append(position)
+            identifiers.append(identifier)
+            refs.append(ref)
+            alts.append(alt)
+            sv_types.append(sv_type)
+            sv_lengths.append(sv_length)
+            ends.append(end)
+            genetic.append(np.nan if centimorgans is None else float(centimorgans))
+    finally:
+        reader.close()
+    position_array = np.array(positions, dtype=np.int64)
+    if np.any(np.diff(position_array) < 0):
+        raise ValueError(f"{path}: the records must be in POS order.")
+    repeated = sorted(identifier for identifier, count in Counter(identifiers).items() if count > 1)
+    if repeated:
+        raise ValueError(
+            f"{path}: {len(repeated)} identifiers name more than one record, the first {repeated[0]!r}. Give every record its own ID "
+            "(e.g. `bcftools annotate --set-id '%CHROM:%POS:%REF:%FIRST_ALT'`), or '.' to name it CHROM:POS:REF:ALT."
+        )
+    return PlainSites(
+        expected=PlainExpectedSites.from_records(position_array, refs, alts, identifiers),
+        records=RecordSites(
+            refs=tuple(refs),
+            alts=tuple(alts),
+            sv_types=tuple(sv_types),
+            sv_lengths=np.array(sv_lengths, dtype=np.float64),
+            ends=tuple(ends),
+            genetic_position_cm=np.array(genetic, dtype=np.float64),
+        ),
+        sites_md5=sites.hexdigest(),
+    )
+
+
+GENETIC_MAP_COLUMNS = ("chromosome", "identifier", "centimorgans", "position")
+"""A PLINK-format genetic map's four whitespace-separated fields in order (the Beagle maps': chromosome, variant ID, cM,
+bp)."""
+
+
+def read_genetic_map(path: Path, chromosome: str) -> tuple[I64Array, F64Array]:
+    """One store chromosome's PLINK-format genetic map (the public Beagle GRCh38 maps) as positions (bp, strictly
+    increasing) and genetic positions (cM, finite and non-decreasing), at least two rows.
+
+    The chromosome field names the store chromosome as ``_chromosome_spellings`` does: the Beagle zip ships both
+    spellings, plink.chrchr21.GRCh38.map under chr_in_chrom_field/ and plink.chr21.GRCh38.map under
+    no_chr_in_chrom_field/. A row naming any other chromosome is an error.
+    """
+    table = pd.read_csv(
+        path, sep=r"\s+", header=None, names=GENETIC_MAP_COLUMNS,
+        dtype={"chromosome": str, "identifier": str, "centimorgans": np.float64, "position": np.int64}, comment="#",
+    )
+    spellings = _chromosome_spellings(chromosome)
+    foreign = sorted(set(table["chromosome"]) - set(spellings))
+    if foreign:
+        raise ValueError(f"{path}: rows name the chromosomes {foreign}; a map of {chromosome} names it {' or '.join(spellings)}.")
+    positions = table["position"].to_numpy(dtype=np.int64)
+    centimorgans = table["centimorgans"].to_numpy(dtype=np.float64)
+    if positions.shape[0] < 2 or np.any(np.diff(positions) <= 0) or not np.all(np.isfinite(centimorgans)) or np.any(np.diff(centimorgans) < 0):
+        raise ValueError(f"{path}: a genetic map needs at least two rows, bp strictly increasing and cM finite and non-decreasing.")
+    return positions, centimorgans
+
+
+def interpolated_genetic_positions(map_positions: I64Array, map_centimorgans: F64Array, positions: NDArray) -> F64Array:
+    """Each position's genetic position (cM): linear in bp between the map's positions, and before its first or after
+    its last position along its first or last segment's rate."""
+    positions = np.asarray(positions, dtype=np.int64)
+    rates = np.diff(map_centimorgans) / np.diff(map_positions)
+    before = map_centimorgans[0] + rates[0] * (positions - map_positions[0])
+    after = map_centimorgans[-1] + rates[-1] * (positions - map_positions[-1])
+    inside = np.interp(positions, map_positions, map_centimorgans)
+    return np.where(positions < map_positions[0], before, np.where(positions > map_positions[-1], after, inside))
+
+
 def read_tandem_repeats(path: Path) -> dict[str, tuple[I64Array, I64Array]]:
     """The repeat BED (GIAB AllTandemRepeatsandHomopolymers_slop5; 0-based half-open) as (starts, ends) per chromosome."""
     table = pd.read_csv(path, sep="\t", header=None, usecols=[0, 1, 2], names=["chromosome", "start", "end"], dtype={"chromosome": str}, comment="#")
@@ -1057,11 +1234,31 @@ def read_gene_annotation(path: Path) -> dict[str, GeneIntervals]:
     return genes
 
 
-def store_variant_classes(sites: PoppedSites, positions: NDArray, record_locus: NDArray) -> tuple[U8Array, F64Array]:
+def store_core_spans(positions: NDArray, sites: RecordSites) -> tuple[I64Array, I64Array]:
+    """Each record's core, the reference bases it changes (``core_spans``, 0-based half-open).
+
+    A symbolic or breakend ALT (a plain record's; a popped record is sequence-resolved) carries no
+    bases to trim: its core is the bases after its padding base through INFO/END, [POS, END), where
+    END passes POS, and otherwise, as an insertion's, the two bases around its padding base.
+    """
+    positions = np.asarray(positions, dtype=np.int64)
+    starts, ends = core_spans(positions, sites.refs, sites.alts)
+    symbolic = np.array([alt_is_symbolic_or_breakend(alt) for alt in sites.alts], dtype=bool)
+    info_ends = np.array([-1 if end is None else end for end in sites.ends], dtype=np.int64)
+    spanning = symbolic & (info_ends > positions)
+    point = symbolic & ~spanning
+    starts[spanning], ends[spanning] = positions[spanning], info_ends[spanning]
+    starts[point], ends[point] = positions[point] - 1, positions[point] + 1
+    return starts, ends
+
+
+def store_variant_classes(sites: RecordSites, positions: NDArray, record_locus: NDArray) -> tuple[U8Array, F64Array]:
     """Each record's store class code (an index of VARIANT_CLASSES) and length, by STORE.md's first-match rules.
 
     A record that is not an SNV and whose core overlaps a tandem-repeat locus is str_vntr_repeat.
-    Every other record is typed from its alleles and |SVLEN| by variant_typing.
+    Every other record is typed from its alleles, INFO/SVTYPE, |SVLEN| and INFO/END by
+    variant_typing. A record typed copy_number is refused: that class's stored value is a copy
+    number, and the store holds every record's DS as an ALT count.
     """
     code = {variant_class: index for index, variant_class in enumerate(VARIANT_CLASSES)}
     classes = np.empty(len(sites.refs), dtype=np.uint8)
@@ -1069,8 +1266,14 @@ def store_variant_classes(sites: PoppedSites, positions: NDArray, record_locus: 
     for row, (ref, alt) in enumerate(zip(sites.refs, sites.alts, strict=True)):
         sv_length = float(sites.sv_lengths[row])
         variant_class, length = variant_class_and_length(
-            pos=int(positions[row]), ref=ref, alt=alt, svtype=None, svlen=None if np.isnan(sv_length) else sv_length, info_end=None
+            pos=int(positions[row]), ref=ref, alt=alt, svtype=sites.sv_types[row], svlen=None if np.isnan(sv_length) else sv_length,
+            info_end=sites.ends[row],
         )
+        if variant_class == VariantClass.COPY_NUMBER:
+            raise ValueError(
+                f"the record at {int(positions[row])} ({ref}>{alt}) types as copy_number, a copy number's class; its DS is an ALT "
+                "count, so give it the SVTYPE or ALT of a deletion or duplication."
+            )
         if variant_class != VariantClass.SNV and record_locus[row] != NO_LOCUS:
             variant_class = VariantClass.STR_VNTR_REPEAT
         classes[row] = code[variant_class]
@@ -1089,14 +1292,107 @@ def store_group_first(bubble: NDArray, positions: NDArray, classes: NDArray, rec
 
 
 @dataclass(frozen=True, slots=True)
+class ChromosomeSites:
+    """One chromosome's store records as either input gives them, in batch-file order.
+
+    ``expected`` holds the keys every batch is decoded against by ``decoder`` (or, for the
+    long-read half, by ``decode_called_batch``), and ``sites_md5`` the md5 every imputed batch's
+    site lines must give. ``records`` are each record's site fields and ``bubble`` its bubble (-1
+    outside one). ``annotations`` are the variant-table columns only this input carries, and
+    ``facts`` what the store step reports of it: the genetic positions' source, the reported r^2
+    fields, and how many imputed batch files gate G4 checked of all of them.
+    """
+
+    expected: ExpectedSites
+    sites_md5: str
+    decoder: Callable[..., Any]
+    records: RecordSites
+    bubble: I64Array
+    annotations: dict[str, NDArray]
+    annotation_legends: dict[str, tuple[str, ...]]
+    facts: dict[str, Any]
+
+
+def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, chromosome: str) -> ChromosomeSites:
+    """The popped site list: the strata sidecar's rows, the first batch's records checked against them, and each
+    record's bubble, K and m from bubble.split; the sidecar's n_paths, n_paths_total and cx are its annotations."""
+    strata = read_strata_sites(popped.strata_directory, chromosome)
+    first_half = config.imputed_halves[0]
+    records = read_popped_sites(first_half.path(chromosome, first_half.batches[0]), strata)
+    counts = path_counts(strata, read_bubble_paths(popped.bubble_split_path(chromosome)))
+    batch_count = sum(len(half.batches) for half in config.imputed_halves)
+    return ChromosomeSites(
+        expected=ExpectedSites(
+            positions=strata.positions,
+            refalt_digests=strata.refalt_digests,
+            identifiers=strata.identifiers,
+            kept_paths=counts.kept,
+            carrying_paths=counts.carrying,
+        ),
+        sites_md5=strata.sites_md5,
+        decoder=decode_batch,
+        records=records,
+        bubble=counts.bubble,
+        annotations={
+            "n_paths": strata.n_paths.astype(np.float64),
+            "n_paths_total": strata.n_paths_total.astype(np.float64),
+            "cx": strata.complexity,
+        },
+        annotation_legends={} if strata.complexity_legend is None else {"cx": strata.complexity_legend},
+        facts={"genetic_position": "INFO/CM", "reported_r2_fields": ["INFO"], "probability_checked_batches": batch_count, "imputed_batches": batch_count},
+    )
+
+
+def _plain_chromosome_sites(config: WorkspaceConfig, chromosome: str) -> ChromosomeSites:
+    """The plain site list: the first half's first batch's records (``read_plain_sites``), each its own single path.
+
+    The genetic position is INFO/CM where every record carries it, and is otherwise interpolated
+    from ``genetic_map``. Every batch's header must declare DS and one r^2 field
+    (``plain_batch_fields``), read here before any batch is decoded. A plain record has no strata
+    annotations: its own are its TR locus, length and gene columns.
+    """
+    first_half = config.imputed_halves[0]
+    path = first_half.path(chromosome, first_half.batches[0])
+    listed = read_plain_sites(path, chromosome)
+    fields = [plain_batch_fields(half.path(chromosome, batch)) for half in config.imputed_halves for batch in half.batches]
+    record_count = len(listed.expected.identifiers)
+    carried = int(np.isfinite(listed.records.genetic_position_cm).sum())
+    if carried == record_count:
+        centimorgans, source = listed.records.genetic_position_cm, "INFO/CM"
+    else:
+        map_path = config.genetic_map_path(chromosome)
+        centimorgans = interpolated_genetic_positions(*read_genetic_map(map_path, chromosome), listed.expected.positions)
+        source = f"genetic_map {map_path.name}, as INFO/CM is on {carried} of {record_count} records"
+    return ChromosomeSites(
+        expected=listed.expected,
+        sites_md5=listed.sites_md5,
+        decoder=decode_plain_batch,
+        records=dataclasses.replace(listed.records, genetic_position_cm=_checked_genetic_positions(path, centimorgans, source)),
+        bubble=np.full(record_count, -1, dtype=np.int64),
+        annotations={},
+        annotation_legends={},
+        facts={
+            "genetic_position": source,
+            "reported_r2_fields": sorted({batch.reported_r2 for batch in fields}),
+            "probability_checked_batches": sum(batch.probabilities for batch in fields),
+            "imputed_batches": len(fields),
+        },
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class _DecodeTask:
     half: int
     batch: int
     path: Path
-    called: bool
+    decoder: Callable[..., Any]
     groups: I64Array
     codes_path: Path
     statistics_path: Path
+
+    @property
+    def called(self) -> bool:
+        return self.decoder is decode_called_batch
 
 
 _DECODER: dict[str, Any] = {}
@@ -1108,8 +1404,7 @@ def _start_decoder(expected: ExpectedSites, group_count: int, budget: ComputeBud
 
 def _decode(task: _DecodeTask) -> None:
     """Decode one batch file and write its codes, then its statistics, whose presence marks the batch done."""
-    decode = decode_called_batch if task.called else decode_batch
-    decoded = decode(task.path, _DECODER["expected"], task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
+    decoded = task.decoder(task.path, _DECODER["expected"], task.groups, _DECODER["group_count"], task.codes_path, _DECODER["budget"])
     temporary = task.statistics_path.with_name(task.statistics_path.stem + ".partial.npz")
     np.savez(
         temporary,
@@ -1120,6 +1415,7 @@ def _decode(task: _DecodeTask) -> None:
         no_calls=decoded.no_calls,
         sample_ids=np.array(decoded.sample_ids),
         reported_info=decoded.reported_info,
+        sites_md5=np.array(decoded.sites_md5),
     )
     os.replace(temporary, task.statistics_path)
 
@@ -1145,7 +1441,11 @@ def _decode_all(tasks: Sequence[_DecodeTask], expected: ExpectedSites, group_cou
         list(pool.map(_decode, pending))
 
 
-def _decode_tasks(config: WorkspaceConfig, directory: Path, chromosome: str, samples: _Samples) -> list[_DecodeTask]:
+def _decode_tasks(
+    config: WorkspaceConfig, directory: Path, chromosome: str, samples: _Samples, decoder: Callable[..., Any]
+) -> list[_DecodeTask]:
+    """Every batch file of the chromosome, each imputed batch decoded by ``decoder`` and the long-read calls by
+    ``decode_called_batch``."""
     batches = directory / "batches" / chromosome
     batches.mkdir(parents=True, exist_ok=True)
     tasks = []
@@ -1156,7 +1456,7 @@ def _decode_tasks(config: WorkspaceConfig, directory: Path, chromosome: str, sam
             width = len(_header_samples(path))
             tasks.append(
                 _DecodeTask(
-                    half_index, batch_index, path, False, samples.groups[half_index][start : start + width],
+                    half_index, batch_index, path, decoder, samples.groups[half_index][start : start + width],
                     batches / f"half{half_index}.batch{batch_index}.npy", batches / f"half{half_index}.batch{batch_index}.statistics.npz",
                 )
             )
@@ -1165,7 +1465,7 @@ def _decode_tasks(config: WorkspaceConfig, directory: Path, chromosome: str, sam
         half_index = len(config.imputed_halves)
         tasks.append(
             _DecodeTask(
-                half_index, 0, config.truth_path(chromosome), True, samples.groups[half_index],
+                half_index, 0, config.truth_path(chromosome), decode_called_batch, samples.groups[half_index],
                 batches / f"half{half_index}.batch0.npy", batches / f"half{half_index}.batch0.statistics.npz",
             )
         )
@@ -1224,39 +1524,38 @@ def _convert_chromosome(
     genes: Mapping[str, GeneIntervals],
 ) -> dict[str, Any]:
     config = run.config
-    strata = read_strata_sites(config.strata_directory, chromosome)
-    first_half = config.imputed_halves[0]
-    sites = read_popped_sites(first_half.path(chromosome, first_half.batches[0]), strata)
-    counts = path_counts(strata, read_bubble_paths(Path(config.bubble_split.format(chromosome=chromosome))))
-    expected = ExpectedSites(
-        positions=strata.positions,
-        refalt_digests=strata.refalt_digests,
-        identifiers=strata.identifiers,
-        kept_paths=counts.kept,
-        carrying_paths=counts.carrying,
-    )
-    core_starts, core_ends = core_spans(strata.positions, sites.refs, sites.alts)
+    sites = _plain_chromosome_sites(config, chromosome) if config.popped is None else _popped_chromosome_sites(config.popped, config, chromosome)
+    positions = sites.expected.positions
+    ref_lengths = np.array([len(ref) for ref in sites.records.refs], dtype=np.int64)
+    alt_lengths = np.array([len(alt) for alt in sites.records.alts], dtype=np.int64)
+    core_starts, core_ends = store_core_spans(positions, sites.records)
     empty = np.zeros(0, dtype=np.int64)
     interval_starts, interval_ends = repeats.get(chromosome, (empty, empty))
-    loci = tr_loci(interval_starts, interval_ends, core_starts, core_ends, strata.alt_lengths - strata.ref_lengths)
-    classes, lengths = store_variant_classes(sites, strata.positions, loci.record_locus)
-    group_first = store_group_first(counts.bubble, strata.positions, classes, loci.record_locus)
+    loci = tr_loci(interval_starts, interval_ends, core_starts, core_ends, alt_lengths - ref_lengths)
+    classes, lengths = store_variant_classes(sites.records, positions, loci.record_locus)
+    group_first = store_group_first(sites.bubble, positions, classes, loci.record_locus)
     gene = genes.get(chromosome, GeneIntervals(empty, empty, empty, empty, empty))
     gene_columns = gene_overlap(gene.gene_starts, gene.gene_ends, gene.exon_starts, gene.exon_ends, gene.tss, core_starts, core_ends)
 
-    tasks = _decode_tasks(config, directory, chromosome, samples)
-    _decode_all(tasks, expected, len(samples.legend), run.budget)
+    tasks = _decode_tasks(config, directory, chromosome, samples, sites.decoder)
+    _decode_all(tasks, sites.expected, len(samples.legend), run.budget)
     statistics = [np.load(task.statistics_path) for task in tasks]
     for half_index, half in enumerate(samples.halves):
         decoded_names = tuple(name for task, values in zip(tasks, statistics) if task.half == half_index for name in values["sample_ids"].tolist())
         if decoded_names != half.names:
             raise ValueError(f"{chromosome}: half {half_index}'s batches list other samples than its manifest.")
+    for task, values in zip(tasks, statistics):
+        if not task.called and str(values["sites_md5"]) != sites.sites_md5:
+            raise ValueError(f"{task.path}: its records' site lines differ from the site list's; every imputed batch holds the same records in order.")
     fill = no_call_fill(sum(values["group_sums"] for values in statistics), sum(values["group_counts"] for values in statistics))
     np.save(directory / "fill" / f"{chromosome}.npy", fill)
-    # The imputation's reported r^2 over every imputed sample: the batches' INFO weighted by their sample counts.
+    # The imputation's reported r^2 over every imputed sample: the batches' values weighted by their sample counts, each
+    # above 1 (Minimac4's R2, a variance ratio, exceeds it) set to 1 and counted in the facts.
     imputed = [(len(values["sample_ids"]), values["reported_info"]) for task, values in zip(tasks, statistics) if not task.called]
-    np.save(directory / "reported" / f"{chromosome}.npy", sum(width * info for width, info in imputed) / sum(width for width, _info in imputed))
-    record_count = strata.positions.shape[0]
+    np.save(
+        directory / "reported" / f"{chromosome}.npy", sum(width * np.minimum(info, 1.0) for width, info in imputed) / sum(width for width, _info in imputed)
+    )
+    record_count = positions.shape[0]
     sums = np.zeros(record_count, dtype=np.int64)
     squares = np.zeros(record_count, dtype=np.int64)
     for half_index in range(len(samples.halves)):
@@ -1267,30 +1566,22 @@ def _convert_chromosome(
         sums += half_sums
         squares += half_squares
     _gather_calibration(tasks, samples, directory, chromosome)
-    encoded_ids = [identifier.encode() for identifier in strata.identifiers]
-    complexity_legends = {} if strata.complexity_legend is None else {"cx": strata.complexity_legend}
+    encoded_ids = [identifier.encode() for identifier in sites.expected.identifiers]
     table = VariantTable(
         chromosome=np.full(record_count, chromosome_number(chromosome), dtype=np.int8),
-        position=strata.positions,
-        genetic_position_cm=sites.genetic_position_cm,
-        ref_length=strata.ref_lengths.astype(np.int32),
-        alt_length=strata.alt_lengths.astype(np.int32),
+        position=positions,
+        genetic_position_cm=sites.records.genetic_position_cm,
+        ref_length=ref_lengths.astype(np.int32),
+        alt_length=alt_lengths.astype(np.int32),
         variant_class=classes,
-        # Every record the driver stores is an ALT count from the popped BCFs: its value is code / 127.
+        # Every record the driver stores is an ALT count from the imputed batches: its value is code / 127.
         codes_per_unit=allele_count_decode(record_count)[0],
         value_origin=allele_count_decode(record_count)[1],
         group_first=group_first,
         sum_code=sums.astype(np.uint64),
         sum_code2=squares.astype(np.uint64),
-        annotations={
-            "n_paths": strata.n_paths.astype(np.float64),
-            "n_paths_total": strata.n_paths_total.astype(np.float64),
-            "cx": strata.complexity,
-            "tr_locus": loci.record_locus.astype(np.uint32),
-            "sv_length": lengths,
-            **gene_columns,
-        },
-        annotation_legends=complexity_legends,
+        annotations={**sites.annotations, "tr_locus": loci.record_locus.astype(np.uint32), "sv_length": lengths, **gene_columns},
+        annotation_legends=dict(sites.annotation_legends),
         id_bytes=np.frombuffer(b"".join(encoded_ids), dtype=np.uint8),
         id_offsets=np.concatenate([[0], np.cumsum([len(identifier) for identifier in encoded_ids])]).astype(np.int64),
     )
@@ -1298,25 +1589,51 @@ def _convert_chromosome(
     _write_loci(root, chromosome, loci)
     return {
         "records": int(record_count),
-        "sites_md5": sites_md5(strata.positions, strata.ref_lengths, strata.alt_lengths),
+        "sites_md5": sites_md5(positions, ref_lengths, alt_lengths),
         "background_zeroed": int(sum(int(values["zeroed"].sum()) for values in statistics)),
         "no_calls": int(sum(int(values["no_calls"].sum()) for values in statistics)),
+        "reported_r2_above_one": int(sum(int((info > 1.0).sum()) for _width, info in imputed)),
+        "reported_r2_largest": max(float(info.max(initial=0.0)) for _width, info in imputed),
+        **sites.facts,
     }
 
 
 def _store_inputs(config: WorkspaceConfig) -> Any:
+    popped = config.popped
     return {
+        "input": "plain" if popped is None else "popped",
         "chromosomes": config.chromosomes,
         "halves": [
             (half.label, half.batches, [half.path(chromosome, batch).stat().st_size for chromosome in config.chromosomes for batch in half.batches])
             for half in config.imputed_halves
         ],
         "truth": None if config.truth_calls is None else [config.truth_path(chromosome).stat().st_size for chromosome in config.chromosomes],
-        "strata": [_file_digest(config.strata_directory / "_done" / f"{chromosome}.json") for chromosome in config.chromosomes],
-        "bubble_split": [Path(config.bubble_split.format(chromosome=chromosome)).stat().st_size for chromosome in config.chromosomes],
+        "strata": None if popped is None else [_file_digest(popped.strata_directory / "_done" / f"{chromosome}.json") for chromosome in config.chromosomes],
+        "bubble_split": None if popped is None else [popped.bubble_split_path(chromosome).stat().st_size for chromosome in config.chromosomes],
+        "genetic_map": None if config.genetic_map is None else [_file_digest(config.genetic_map_path(chromosome)) for chromosome in config.chromosomes],
         "tandem_repeats": _file_digest(config.tandem_repeats),
         "gene_annotation": _file_digest(config.gene_annotation),
         "codec": config.codec,
+    }
+
+
+def _store_gates(config: WorkspaceConfig, facts: Sequence[Mapping[str, Any]]) -> dict[str, str]:
+    """The MANIFEST's gate results, each saying what it checked: G4 only where a batch file writes GP, the strata md5s
+    only for popped input, and the reported r^2 values above 1 that were set to 1."""
+    checked = sum(fact["probability_checked_batches"] for fact in facts)
+    batch_files = sum(fact["imputed_batches"] for fact in facts)
+    above_one = sum(fact["reported_r2_above_one"] for fact in facts)
+    strata = "PASS" if config.popped is not None else "NOT_APPLICABLE: plain input has no strata sidecar"
+    return {
+        "G2_lockstep": "PASS",
+        "G4_format": "PASS" if checked == batch_files else (
+            f"NOT_CHECKED on {batch_files - checked} of {batch_files} imputed batch files, which write no FORMAT/GP; PASS on the other {checked}"
+        ),
+        "strata_sites_md5": strata,
+        "strata_ids_md5": strata,
+        "reported_r2": "PASS" if above_one == 0 else (
+            f"TRUNCATED: {above_one} reported r^2 values above 1 (largest {max(fact['reported_r2_largest'] for fact in facts):.6g}) set to 1"
+        ),
     }
 
 
@@ -1337,6 +1654,7 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
             _remove_own(directory / "batches" / chromosome, directory)
         facts.append(json.loads(done.read_text(encoding="utf-8")))
     measurements = ["imputed_dosage"] * len(config.imputed_halves) + (["long_read_calls"] if config.truth_calls is not None else [])
+    gates = _store_gates(config, facts)
     write_store_manifest(
         root,
         chromosomes=config.chromosomes,
@@ -1345,18 +1663,23 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
         half_sample_counts=[len(half.names) for half in samples.halves],
         half_samples=samples.halves,
         half_measurements=measurements,
-        gates={"G2_lockstep": "PASS", "G4_format": "PASS", "strata_sites_md5": "PASS", "strata_ids_md5": "PASS"},
+        gates=gates,
         recalibrated=False,
     )
     with DosageStore.open(root) as store:
         if store.half_samples() != samples.halves:
             raise ValueError("the written store's sample manifests differ from the samples step's.")
     return {
+        "input": "plain" if config.popped is None else "popped",
         "records": int(sum(fact["records"] for fact in facts)),
         "halves": measurements,
         "recalibrated": False,
         "background_zeroed": int(sum(fact["background_zeroed"] for fact in facts)),
         "no_calls": int(sum(fact["no_calls"] for fact in facts)),
+        "gates": gates,
+        "genetic_position": {chromosome: fact["genetic_position"] for chromosome, fact in zip(config.chromosomes, facts)},
+        "reported_r2_fields": sorted({field for fact in facts for field in fact["reported_r2_fields"]}),
+        "reported_r2_above_one": int(sum(fact["reported_r2_above_one"] for fact in facts)),
     }
 
 
@@ -2093,8 +2416,10 @@ _STEPS = (
         ("samples",),
         _store_inputs,
         (
-            store_converter, dosage_store, variant_typing, _store_step, _convert_chromosome, read_strata_sites, read_popped_sites,
-            read_bubble_paths, path_counts, read_tandem_repeats, read_gene_annotation, store_variant_classes, store_group_first, _decode, _decode_tasks, _gather_calibration,
+            store_converter, dosage_store, variant_typing, _store_step, _store_gates, _convert_chromosome, _popped_chromosome_sites,
+            _plain_chromosome_sites, read_strata_sites, read_popped_sites, _checked_genetic_positions, read_bubble_paths, path_counts,
+            _chromosome_spellings, read_plain_sites, read_genetic_map, interpolated_genetic_positions, read_tandem_repeats,
+            read_gene_annotation, store_core_spans, store_variant_classes, store_group_first, _decode, _decode_tasks, _gather_calibration,
         ),
         _store_step,
     ),

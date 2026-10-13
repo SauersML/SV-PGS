@@ -232,6 +232,7 @@ def _write_inputs(root: Path) -> _Synthetic:
         "truth_calls": str(root / "truth" / "{chromosome}.vcf"),
         "strata_directory": str(strata),
         "bubble_split": str(root / "bubbles" / "{chromosome}.bubble.split.vcf"),
+        "genetic_map": None,
         "tandem_repeats": str(root / "repeats.bed.gz"),
         "gene_annotation": str(root / "genes.gtf.gz"),
         "crosswalk": str(root / "crosswalk.tsv"),

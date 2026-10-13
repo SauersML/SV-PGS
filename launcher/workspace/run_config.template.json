@@ -9,6 +9,7 @@
   "truth_calls": null,
   "strata_directory": "${STRATA_ROOT}",
   "bubble_split": "${BUBBLE_ROOT}/{chromosome}.bubble.split.bcf",
+  "genetic_map": null,
   "tandem_repeats": "${REFERENCE_ROOT}/GRCh38_AllTandemRepeatsandHomopolymers_slop5.bed.gz",
   "gene_annotation": "${REFERENCE_ROOT}/gencode.v38.basic.annotation.gtf.gz",
   "crosswalk": "${CDR_COPY}/crosswalk.tsv",

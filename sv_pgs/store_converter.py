@@ -17,11 +17,12 @@ pieces; each is a pure function of sites-only inputs or of one record block:
   features of one learned distance kernel; docs/design/math/scale_model.md).
 - ``unbreakable_group_first``: the store's ``group_first``, merging bubbles, same-POS sets and
   TR loci into contiguous row spans a Stage 0 block may never cut.
-- ``decode_batch`` / ``decode_called_batch`` / ``no_call_fill`` / ``assemble_half``: one batch
-  file, checked in lockstep against the sidecar (gate G2), read as imputed DS (FORMAT gate G4,
-  background removed) or as hard calls (the long-read panel members' half), and encoded; then a
-  half's batches side by side in batch order, no-calls filled with the ancestry group's measured
-  mean over the whole store, optionally recalibrated, written as the half's shards.
+- ``decode_batch`` / ``decode_plain_batch`` / ``decode_called_batch`` / ``no_call_fill`` /
+  ``assemble_half``: one batch file, checked in lockstep against the site list (gate G2), read as
+  popped imputed DS (FORMAT gate G4, background removed), as a plain imputation tool's DS (G4
+  where the file writes GP), or as hard calls (the long-read panel members' half), and encoded;
+  then a half's batches side by side in batch order, no-calls filled with the ancestry group's
+  measured mean over the whole store, optionally recalibrated, written as the half's shards.
 - ``write_store_manifest``: the MANIFEST with each half's measurement and the gate results.
 
 Everything here is AoU panel-derived site structure or genotype-derived data once applied
@@ -31,6 +32,7 @@ to the panel, so its outputs are workspace-only (A4.9).
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
@@ -81,6 +83,12 @@ GENOTYPE_PROBABILITY_SUM_SLACK_MILLI = 1
 # of GP1 and GP2, DS rounds a + 2b while GP1 + 2 GP2 rounds a and b separately; every case
 # away from exact halves puts the two within one thousandth.
 DOSAGE_FROM_PROBABILITY_SLACK_MILLI = 1
+# The INFO fields in which the plain imputation tools report their own r^2: GLIMPSE2 and IMPUTE5
+# write INFO, Beagle 5 DR2, Minimac4 R2. A plain batch's header declares exactly one of them.
+REPORTED_R2_FIELDS = ("INFO", "DR2", "R2")
+# One unit of a dosage written to 2 decimals, in thousandths. Beagle 5 writes DS and GP to 2
+# decimals; GLIMPSE2, Minimac4 and IMPUTE5 write 3.
+TWO_DECIMAL_UNIT_MILLI = 10
 
 
 def _block_rows(budget: ComputeBudget, sample_count: int, bytes_per_entry: int, row_count: int) -> int:
@@ -480,9 +488,35 @@ def refalt_digest(ref: str, alt: str) -> int:
     return int(hashlib.md5(f"{ref}\t{alt}".encode()).hexdigest()[:16], 16)
 
 
+def info_sv_length(record: Any) -> float:
+    """A record's |INFO/SVLEN| (the largest of its values), NaN where it has none."""
+    sv_length = record.INFO.get("SVLEN")
+    return np.nan if sv_length is None else float(np.abs(np.atleast_1d(sv_length)).max())
+
+
+def plain_record_identifier(record: Any) -> str:
+    """A plain record's identifier: its VCF ID, or CHROM:POS:REF:ALT where the ID column is '.'."""
+    return str(record.ID) if record.ID is not None else f"{record.CHROM}:{record.POS}:{record.REF}:{','.join(record.ALT)}"
+
+
+def plain_record_site(record: Any) -> tuple[str, int, str, str, str, str | None, float, int | None]:
+    """A plain record's site as the store reads it: CHROM, POS, identifier (``plain_record_identifier``), REF, ALT,
+    INFO/SVTYPE (None where absent), |INFO/SVLEN| (NaN where absent) and INFO/END (None where absent)."""
+    sv_type = record.INFO.get("SVTYPE")
+    end = record.INFO.get("END")
+    return (
+        str(record.CHROM), int(record.POS), plain_record_identifier(record), str(record.REF), ",".join(record.ALT),
+        None if sv_type is None else str(sv_type), info_sv_length(record), None if end is None else int(end),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ExpectedSites:
-    """One chromosome's sidecar keys, which every batch's records must match in order (gate G2)."""
+    """One chromosome's sidecar keys, which every batch's records must match in order (gate G2).
+
+    A popped record names itself by its atomic ID, INFO/ID. Its site line is the sidecar's
+    "CHROM\\tPOS\\tREF\\tALT\\n", whose md5 over a batch file is the sidecar's sites md5.
+    """
 
     positions: I64Array
     refalt_digests: NDArray
@@ -495,14 +529,81 @@ class ExpectedSites:
         if not (self.refalt_digests.shape == self.kept_paths.shape == self.carrying_paths.shape == (count,)) or len(self.identifiers) != count:
             raise ValueError("ExpectedSites needs one digest, id, kept-path and carrying-path count per position.")
 
+    @staticmethod
+    def record_identifier(record: Any) -> str:
+        return str(record.INFO.get("ID"))
+
+    @staticmethod
+    def site_line(record: Any) -> str:
+        return f"{record.CHROM}\t{record.POS}\t{record.REF}\t{','.join(record.ALT)}\n"
+
+
+@dataclass(frozen=True, slots=True)
+class PlainExpectedSites(ExpectedSites):
+    """A plain imputed site list (one imputation tool's output: GLIMPSE2, Beagle 5, Minimac4 or IMPUTE5), which every
+    batch's records must match in order (gate G2).
+
+    A plain record names itself by ``plain_record_identifier``, and its site line holds every field of
+    ``plain_record_site``, so a batch file's md5 over them covers all the store reads from the site list. Each record
+    is its own single path (K = 1), and no path of it carries an imputation floor (m = 0): a plain tool's DS is its
+    posterior, with no popped background to remove, so ``value_matched_background`` changes nothing (q = 0).
+    """
+
+    @classmethod
+    def from_records(cls, positions: NDArray, refs: Sequence[str], alts: Sequence[str], identifiers: Sequence[str]) -> PlainExpectedSites:
+        count = len(identifiers)
+        return cls(
+            positions=np.asarray(positions, dtype=np.int64),
+            refalt_digests=np.array([refalt_digest(ref, alt) for ref, alt in zip(refs, alts, strict=True)], dtype=np.uint64),
+            identifiers=tuple(identifiers),
+            kept_paths=np.ones(count, dtype=np.int64),
+            carrying_paths=np.zeros(count, dtype=np.int64),
+        )
+
+    @staticmethod
+    def record_identifier(record: Any) -> str:
+        return plain_record_identifier(record)
+
+    @staticmethod
+    def site_line(record: Any) -> str:
+        return "\t".join(str(field) for field in plain_record_site(record)) + "\n"
+
+
+@dataclass(frozen=True, slots=True)
+class PlainBatchFields:
+    """What a plain imputed batch's header declares that the decode reads: the INFO field of the imputation's own r^2
+    (exactly one of REPORTED_R2_FIELDS), and whether its records carry FORMAT/GP for gate G4."""
+
+    reported_r2: str
+    probabilities: bool
+
+
+def plain_batch_fields(path: str | Path) -> PlainBatchFields:
+    """The fields a plain batch's header declares (``PlainBatchFields``); it must declare FORMAT/DS and one r^2 field."""
+    reader = VCF(str(path))
+    try:
+        declared = {(str(header.type), str(header.info().get("ID"))) for header in reader.header_iter()}
+    finally:
+        reader.close()
+    reported = [field for field in REPORTED_R2_FIELDS if ("INFO", field) in declared]
+    if len(reported) != 1:
+        raise ValueError(
+            f"{path}: the header declares the r^2 fields {reported} of {list(REPORTED_R2_FIELDS)} (GLIMPSE2 and IMPUTE5 write "
+            "INFO, Beagle 5 DR2, Minimac4 R2); a plain batch needs exactly one, the imputation's own r^2."
+        )
+    if ("FORMAT", "DS") not in declared:
+        raise ValueError(f"{path}: the header declares no FORMAT/DS; the store reads each sample's imputed ALT dosage.")
+    return PlainBatchFields(reported_r2=reported[0], probabilities=("FORMAT", "GP") in declared)
+
 
 @dataclass(frozen=True, slots=True)
 class DecodedBatch:
     """One batch's codes [records, batch samples] and its exact per-record, per-group sums and
     counts of measured dosages [records, groups]. A hard-call half's no-call is MISSING_CODE here
     until ``assemble_half`` fills it; ``no_calls`` counts them per record. ``reported_info`` is an
-    imputed batch's INFO/INFO per record (the imputation's own r^2 over the batch's samples), and
-    empty for a hard-call batch."""
+    imputed batch's reported r^2 per record (INFO/INFO, or the field a plain batch declares: the
+    imputation's own r^2 over the batch's samples), and empty for a hard-call batch.
+    ``sites_md5`` is the md5 of the file's site lines (``expected.site_line``)."""
 
     codes: U8Array
     group_sums: I64Array
@@ -512,6 +613,7 @@ class DecodedBatch:
     no_calls: I64Array
     sample_ids: tuple[str, ...]
     reported_info: F64Array
+    sites_md5: str
 
 
 def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
@@ -519,24 +621,64 @@ def _gate(condition: bool, path: Path, record: int, detail: str) -> None:
         raise ValueError(f"{path} record {record}: {detail}")
 
 
-def _imputed_dosage_milli(record: Any, path: Path, row: int) -> NDArray:
-    """DS in thousandths, gated on GP (gate G4): none missing, DS in [0, 2], GP summing to 1, DS = GP1 + 2 GP2."""
+def _dosage_milli(record: Any, path: Path, row: int) -> NDArray:
+    """DS in thousandths: none missing, and in [0, 2]. A plain batch without GP is read this way."""
     dosage = record.format("DS")
-    probabilities = record.format("GP")
-    _gate(dosage is not None and probabilities is not None, path, row, "DS or GP missing")
+    _gate(dosage is not None, path, row, "DS missing")
     dosage_milli = np.rint(np.asarray(dosage, dtype=np.float64)[:, 0] * 1000.0)
-    probability_milli = np.rint(np.asarray(probabilities, dtype=np.float64) * 1000.0)
-    _gate(bool(np.all(np.isfinite(dosage_milli)) and np.all(np.isfinite(probability_milli))), path, row, "a DS or GP is missing")
+    _gate(bool(np.all(np.isfinite(dosage_milli))), path, row, "a DS is missing")
     _gate(bool(np.all((dosage_milli >= 0) & (dosage_milli <= MAXIMUM_DOSAGE_MILLI))), path, row, "DS outside [0, 2]")
-    _gate(
-        bool(np.all(np.abs(probability_milli.sum(axis=1) - 1000.0) <= GENOTYPE_PROBABILITY_SUM_SLACK_MILLI)),
-        path,
-        row,
-        "GP does not sum to 1",
-    )
-    implied = probability_milli[:, 1] + 2.0 * probability_milli[:, 2]
-    _gate(bool(np.all(np.abs(dosage_milli - implied) <= DOSAGE_FROM_PROBABILITY_SLACK_MILLI)), path, row, "DS differs from GP1 + 2 GP2")
     return dosage_milli
+
+
+def _probability_milli(record: Any, path: Path, row: int) -> NDArray:
+    """GP in thousandths [samples, 3], none missing."""
+    probabilities = record.format("GP")
+    _gate(probabilities is not None, path, row, "GP missing")
+    probability_milli = np.rint(np.asarray(probabilities, dtype=np.float64) * 1000.0)
+    _gate(bool(np.all(np.isfinite(probability_milli))), path, row, "a GP is missing")
+    return probability_milli
+
+
+def _gate_probabilities(dosage_milli: NDArray, probability_milli: NDArray, sum_slack_milli: int, dosage_slack_milli: int, path: Path, row: int) -> None:
+    """Gate G4: GP sums to 1, and DS = GP1 + 2 GP2, each to within its slack in thousandths."""
+    _gate(bool(np.all(np.abs(probability_milli.sum(axis=1) - 1000.0) <= sum_slack_milli)), path, row, "GP does not sum to 1")
+    implied = probability_milli[:, 1] + 2.0 * probability_milli[:, 2]
+    _gate(bool(np.all(np.abs(dosage_milli - implied) <= dosage_slack_milli)), path, row, "DS differs from GP1 + 2 GP2")
+
+
+def _imputed_dosage_milli(record: Any, path: Path, row: int) -> NDArray:
+    """DS in thousandths, gated on GP (gate G4): none missing, DS in [0, 2], GP summing to 1, DS = GP1 + 2 GP2, to the
+    thousandth the popped batches write them to."""
+    dosage_milli = _dosage_milli(record, path, row)
+    _gate_probabilities(
+        dosage_milli, _probability_milli(record, path, row), GENOTYPE_PROBABILITY_SUM_SLACK_MILLI, DOSAGE_FROM_PROBABILITY_SLACK_MILLI, path, row
+    )
+    return dosage_milli
+
+
+def _probability_gated_dosage_milli(record: Any, path: Path, row: int) -> NDArray:
+    """A plain record's DS in thousandths, gated on its GP (gate G4) to one unit of the grid its values are written on.
+
+    The unit is 0.01 where every DS and GP of the record lies on that grid (Beagle 5's 2 decimals),
+    else 0.001 (3 decimals, or finer, read to the thousandth). On either grid the popped slacks'
+    argument holds in units: DS and GP rounded from one unrounded GP differ by at most one unit, and
+    three rounded GP sum to 1 within one.
+    """
+    dosage_milli = _dosage_milli(record, path, row)
+    probability_milli = _probability_milli(record, path, row)
+    two_decimals = bool(np.all(dosage_milli % TWO_DECIMAL_UNIT_MILLI == 0) and np.all(probability_milli % TWO_DECIMAL_UNIT_MILLI == 0))
+    unit_milli = TWO_DECIMAL_UNIT_MILLI if two_decimals else 1
+    _gate_probabilities(dosage_milli, probability_milli, unit_milli, unit_milli, path, row)
+    return dosage_milli
+
+
+def _reported_r2(record: Any, path: Path, row: int, field: str, ceiling: float) -> float:
+    """The record's INFO/<field>, the imputation's own r^2: present, and in [0, ceiling]."""
+    value = record.INFO.get(field)
+    if value is None or not 0.0 <= float(value) <= ceiling:
+        raise ValueError(f"{path} record {row}: INFO/{field} missing or outside [0, {ceiling:g}]")
+    return float(value)
 
 
 # A hard-call half's no-call in the uint16 decode block.
@@ -558,9 +700,11 @@ def _decode_records(
     group_count: int,
     codes_path: str | Path,
     record_dosage_milli: Callable[[Any, Path, int], NDArray],
-    remove_background: bool,
+    record_reported_r2: Callable[[Any, Path, int], float] | None,
     budget: ComputeBudget,
 ) -> DecodedBatch:
+    """Decode one batch file against ``expected``. ``record_reported_r2`` reads an imputed record's own r^2, and is
+    None for a hard-call batch, which reports none and has no background to remove."""
     path = Path(vcf_path)
     groups = np.asarray(sample_groups, dtype=np.int64)
     reader = VCF(str(path))
@@ -576,8 +720,10 @@ def _decode_records(
         zeroed = np.zeros(record_count, dtype=np.int64)
         unmatched_low = np.zeros(record_count, dtype=np.int64)
         no_calls = np.zeros(record_count, dtype=np.int64)
-        # Only an imputed batch, the one with a background to remove, carries the imputation's INFO/INFO.
-        reported_info = np.empty(record_count if remove_background else 0, dtype=np.float64)
+        # Only an imputed batch, the one with a background to remove, carries the imputation's own r^2.
+        imputed = record_reported_r2 is not None
+        reported_info = np.empty(record_count if imputed else 0, dtype=np.float64)
+        sites = hashlib.md5()
         block_rows = _block_rows(budget, sample_count, DECODE_STEP_BYTES_PER_ENTRY, record_count)
         block = np.empty((block_rows, sample_count), dtype=np.uint16)
         members = [groups == group for group in range(group_count)]
@@ -586,7 +732,7 @@ def _decode_records(
             start = (stop - 1) // block_rows * block_rows
             called = block[: stop - start] != NO_CALL_MILLI
             dosage_milli = np.where(called, block[: stop - start], 0).astype(np.uint16)
-            if remove_background:
+            if imputed:
                 corrected = value_matched_background(dosage_milli, expected.kept_paths[start:stop], expected.carrying_paths[start:stop])
                 dosage_milli = corrected.dosage_milli
                 zeroed[start:stop] = corrected.zeroed
@@ -599,19 +745,18 @@ def _decode_records(
 
         row = 0
         for record in reader:
-            _gate(row < record_count, path, row, "more records than the sidecar")
-            _gate(record.POS == int(expected.positions[row]), path, row, "POS differs from the sidecar")
+            _gate(row < record_count, path, row, "more records than the site list")
+            _gate(record.POS == int(expected.positions[row]), path, row, "POS differs from the site list")
             _gate(refalt_digest(record.REF, ",".join(record.ALT)) == int(expected.refalt_digests[row]), path, row, "REF/ALT differ")
-            _gate(str(record.INFO.get("ID")) == expected.identifiers[row], path, row, "INFO/ID differs")
-            if remove_background:
-                info = record.INFO.get("INFO")
-                _gate(info is not None and 0.0 <= float(info) <= 1.0, path, row, "INFO/INFO missing or outside [0, 1]")
-                reported_info[row] = float(info)
+            _gate(expected.record_identifier(record) == expected.identifiers[row], path, row, "its identifier differs from the site list's")
+            sites.update(expected.site_line(record).encode())
+            if record_reported_r2 is not None:
+                reported_info[row] = record_reported_r2(record, path, row)
             block[row % block_rows] = record_dosage_milli(record, path, row).astype(np.uint16)
             row += 1
             if row % block_rows == 0:
                 flush(row)
-        _gate(row == record_count, path, row, f"fewer records than the sidecar's {record_count}")
+        _gate(row == record_count, path, row, f"fewer records than the site list's {record_count}")
         if row % block_rows:
             flush(row)
         codes.flush()
@@ -626,6 +771,7 @@ def _decode_records(
         no_calls=no_calls,
         sample_ids=sample_ids,
         reported_info=reported_info,
+        sites_md5=sites.hexdigest(),
     )
 
 
@@ -647,7 +793,38 @@ def decode_batch(
     order, its ancestry group in 0..group_count-1. Records are decoded in steps whose working
     set fits ``budget``'s host memory.
     """
-    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _imputed_dosage_milli, True, budget)
+    return _decode_records(
+        vcf_path, expected, sample_groups, group_count, codes_path, _imputed_dosage_milli,
+        functools.partial(_reported_r2, field="INFO", ceiling=1.0), budget,
+    )
+
+
+def decode_plain_batch(
+    vcf_path: str | Path,
+    expected: ExpectedSites,
+    sample_groups: NDArray,
+    group_count: int,
+    codes_path: str | Path,
+    budget: ComputeBudget,
+) -> DecodedBatch:
+    """Decode one plain imputed batch file (GLIMPSE2, Beagle 5, Minimac4 or IMPUTE5 output) of one chromosome into
+    store codes.
+
+    Records must match ``expected``, a ``PlainExpectedSites``, one for one (POS, md5 of REF/ALT,
+    identifier; gate G2). Every sample needs DS in [0, 2]. Where the header declares FORMAT/GP,
+    every record carries it, and G4 checks it against DS to one unit of the written precision
+    (``_probability_gated_dosage_milli``); without GP, G4 has nothing to check. Every record needs
+    the r^2 field the header declares (``plain_batch_fields``), nonnegative. A value above 1 is
+    returned as written, for the store step to set to 1 and count: Minimac4's R2 is a ratio of
+    dosage variances whose estimate exceeds 1. ``expected`` gives no path a background (m = 0), so
+    nothing is removed.
+    """
+    fields = plain_batch_fields(vcf_path)
+    return _decode_records(
+        vcf_path, expected, sample_groups, group_count, codes_path,
+        _probability_gated_dosage_milli if fields.probabilities else _dosage_milli,
+        functools.partial(_reported_r2, field=fields.reported_r2, ceiling=np.inf), budget,
+    )
 
 
 def decode_called_batch(
@@ -660,10 +837,11 @@ def decode_called_batch(
 ) -> DecodedBatch:
     """Decode hard genotype calls (the long-read panel members' half) on the same site list.
 
-    The same lockstep gate as ``decode_batch``; each sample's dosage is its called ALT count, with
-    no imputation background to remove. A no-call stays MISSING_CODE until ``assemble_half``.
+    The same lockstep gate as ``decode_batch``, each record named as ``expected`` names its records;
+    each sample's dosage is its called ALT count, with no imputation background to remove. A no-call
+    stays MISSING_CODE until ``assemble_half``.
     """
-    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _called_dosage_milli, False, budget)
+    return _decode_records(vcf_path, expected, sample_groups, group_count, codes_path, _called_dosage_milli, None, budget)
 
 
 def no_call_fill(group_sums: I64Array, group_counts: I64Array) -> NDArray:
