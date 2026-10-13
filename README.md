@@ -6,23 +6,25 @@ Bayesian polygenic scores in which structural variants, tandem repeats and SNVs 
 The full model is in [docs/design/MODEL.md](docs/design/MODEL.md); the rulings behind it are in [DECISIONS.md](docs/design/DECISIONS.md). This is the model the code is built to; [docs/design/CAPABILITIES.md](docs/design/CAPABILITIES.md) lists the parts the public routes do not reach yet.
 - **Likelihood.**
   - A Gaussian likelihood for quantitative traits.
-  - A logistic likelihood for diseases, or a Gaussian working likelihood on a liability target where one exists.
+  - For diseases, a logistic likelihood (its Polya-Gamma bound) or a Gaussian working likelihood. The workspace run fits each disease's 0/1 status on the Gaussian working likelihood, for cost: a coefficient is a per-allele change in the probability of the recorded outcome, not a log odds ratio, and a raw fitted value is not a probability ([WORKSPACE_PIPELINE.md](docs/design/WORKSPACE_PIPELINE.md), "Likelihood").
   - Covariates are projected out exactly before anything else is computed.
 - **Measurement.** A stored dosage is a measurement of the true genotype, with a truth-calibrated reliability r². GATK-SV short-read calls are a second measurement of the same genotype, and the two are fused.
 - **Prior.** Each effect is a continuous Gaussian scale mixture.
   - Its mixing density is learned nonparametrically by empirical Bayes for each variant class, with no point mass.
   - Each variant's scale depends on r² and on its annotations, including its structural-variant context, through smooth functions with learned smoothness.
   - No prior is chosen by hand.
-- **Inference.** Empirical Bayes: type-II maximum likelihood of the prior's hyperparameters at a fixed point of the approximate posterior. Two fixed points are implemented, expectation propagation and mean-field coordinate ascent; which one the project keeps is still being measured. Every fit carries its convergence certificate, whether or not it certified.
+- **Inference.** Empirical Bayes: type-II maximum likelihood of the prior's hyperparameters at a fixed point of the approximate posterior. Two fixed points are implemented, expectation propagation and mean-field coordinate ascent; which one the project keeps is still being measured. Every fit records its convergence terms, whether or not its criteria were met. A fit's convergence criterion (remaining gain at most 1/(2K) nats) is numerical, on the computed evidence: the Laplace value with leading-order Tierney–Kadane corrections, which bound neither the evidence's error nor the posterior's ([CAPABILITIES.md](docs/design/CAPABILITIES.md)). A full-data likelihood is not an exact posterior: the mean-field route's draws come from its product approximation.
 - **Pipeline:**
   1. an 8-bit dosage store;
-  2. Stage 0, one phenotype-independent genotype pass;
-  3. Stage 2, EP-EB on the full data from the prior, with certified marginals and a Newton-B outer loop;
+  2. Stage 0 training statistics for each fitted problem;
+  3. Stage 2, empirical Bayes from the prior at mean-field fixed points by default (EP behind an option), on the samples or on Stage 0's LD summary band, whichever pass is measured cheaper (the band takes the LD beyond it as noise: a different approximation, [WORKSPACE_PIPELINE.md](docs/design/WORKSPACE_PIPELINE.md), "LD route");
   4. one-pass scoring with posterior draws.
+
+What the workspace's outputs mean, and what they do not (the target, the effect scale, signs, LD, what an SV-arm gain can show): [WORKSPACE_PIPELINE.md](docs/design/WORKSPACE_PIPELINE.md), "Interpreting the outputs".
 
 ## Status
 [docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps; [docs/design/CAPABILITIES.md](docs/design/CAPABILITIES.md) has the requirements the public routes do not meet yet, each with the test that pins today's behaviour.
-- **On main:** the dosage store and its streamed reader, Stage 0, the EP-EB engine (`scale_mixture_ep.py`, with its certified outer loop), the Stage 2 solves (`dual_solve.py`) and certified marginal variances (`marginal_variances.py`), the Stage 2 driver (`full_data_fit.py`), the small-n dense route (`small_n.py`) and the pooled fit (`pooled_fit.py`), the fit/score API and its model artifact (`fit_model.py`, `artifact.py`, `cli.py`), scoring, the reliability and fusion models, the prior design, the cohort builder with typed sample IDs, the phenotypes and their measurement model, the evaluation tests, and two neutral benchmarks (`benchmarks/bench_real`, `benchmarks/bench_sim`) with SV-PGS's own method entry (`benchmarks/svpgs_method.py`).
+- **On main:** the dosage store and its streamed reader, Stage 0, the EP-EB engine (`scale_mixture_ep.py`, with its local outer-loop diagnostics), the Stage 2 solves (`dual_solve.py`) and certified marginal variances (`marginal_variances.py`), the Stage 2 driver (`full_data_fit.py`), the small-n dense route (`small_n.py`), the fit/score API and its model artifact (`fit_model.py`, `artifact.py`, `cli.py`), scoring, the reliability and fusion models, the prior design, the cohort builder with typed sample IDs, the phenotypes and their measurement model, the evaluation tests, and two neutral benchmarks (`benchmarks/bench_real`, `benchmarks/bench_sim`) with SV-PGS's own method entry (`benchmarks/svpgs_method.py`).
 - **Deleted:** the old fitting path, in cutover steps C2–C8 ([CUTOVER.md](docs/design/CUTOVER.md)); it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## Install
