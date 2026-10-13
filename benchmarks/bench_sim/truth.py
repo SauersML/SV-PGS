@@ -137,6 +137,17 @@ def genetic_value(params: dict, root: Path) -> tuple[np.ndarray, dict]:
     for name, members in (("sv", cls == SV), ("tr", cls == TR)):
         if params[f"{name}_mode"] in ("scale", "both"):
             log_scale[members] += 2.0 * np.log(params[f"{name}_scale_fold"])
+    # The power study's controlled architectures (benchmarks/power/grid.py), absent from every pre-registered scenario:
+    # an SV's log effect variance rising by ``sv_log_length_slope`` per SD of its log length (the length positive
+    # control), and a deletion's effect SD ``sv_deletion_scale_fold`` times an insertion's (the class positive control).
+    structural_variant_rows = cls == SV
+    length_slope = params.get("sv_log_length_slope", 0.0)
+    if length_slope and structural_variant_rows.any():
+        log_length = annotations["log_sv_length"][structural_variant_rows]
+        log_scale[structural_variant_rows] += length_slope * (log_length - log_length.mean()) / log_length.std()
+    deletion_fold = params.get("sv_deletion_scale_fold", 1.0)
+    if deletion_fold != 1.0:
+        log_scale[structural_variant_rows & (variants["len_change"] < 0)] += 2.0 * np.log(deletion_fold)
     binary_annotations = {"in_gene": annotations["in_gene"], "in_exon": annotations["in_exon"], "in_repeat": annotations["in_repeat"]}
     continuous_annotations = {"log_tss_distance": annotations["log_tss_distance"], "log_sv_length": annotations["log_sv_length"]}
     if params["annotation_mode"] in ("scale", "both"):

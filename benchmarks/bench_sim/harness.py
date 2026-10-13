@@ -161,12 +161,22 @@ def load_method(path: Path):
     return module
 
 
-def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: str, dropped: tuple = ()) -> None:
+def run(
+    method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: str, dropped: tuple = (), train_count: int | None = None,
+    train_seed: int = 0,
+):
+    """Fit ``method`` on the scenario's training samples, score the test samples, write the prediction and meta, and
+    return the fitted model. ``train_count`` fits on that many training samples, drawn without replacement by
+    ``train_seed`` (the power study's sample-size sweep, benchmarks/power/grid.py); None fits on every one."""
     if dropped and arm in READ_ARMS:
         raise ValueError(f"the {arm} arm's read channel is on structural records; it has no class-withheld run")
     samples = np.load(cohort / "samples.npz")
     is_test = samples["is_test"]
     train_columns, test_columns = np.flatnonzero(~is_test), np.flatnonzero(is_test)
+    if train_count is not None:
+        if not 0 < train_count <= train_columns.size:
+            raise ValueError(f"train_count must lie in 1..{train_columns.size}")
+        train_columns = np.sort(np.random.default_rng(train_seed).choice(train_columns, size=train_count, replace=False))
     observed = np.load(cohort / ARMS[arm][0], mmap_mode="r")
     records = np.flatnonzero(measured_records(cohort))
     records, table = drop_classes(records, public_variant_table(cohort, arm), dropped)
@@ -198,11 +208,12 @@ def run(method: Path, cohort: Path, scenario: Path, out: Path, cores: int, arm: 
     np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
     meta = {
         "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
-        "dropped_classes": list(dropped),
+        "dropped_classes": list(dropped), "train_count": int(train_columns.size), "train_seed": train_seed,
         "fit_seconds": fitted - started, "score_seconds": finished - fitted,
         "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
     }
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
+    return model
 
 
 def incremental_r2(outcome: np.ndarray, prediction: np.ndarray, covariates: np.ndarray) -> tuple[float, float]:

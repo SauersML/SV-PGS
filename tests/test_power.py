@@ -1,0 +1,115 @@
+"""The power study's planning calculator (benchmarks/power/expected.py) and its simulation grid's controlled scenarios
+(benchmarks/power/grid.py, on bench-sim's truth generator)."""
+from __future__ import annotations
+
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from benchmarks.bench_sim import truth
+from benchmarks.power import expected, grid
+
+
+def _architecture(**changes) -> expected.Architecture:
+    base = expected.Architecture(
+        name="disease", prevalence=0.1, heritability=0.2, sv_share=0.0, tagged_by_small=0.0, sv_imputation_r2=0.8,
+        causal_variants=10_000, effective_segments=60_000, training_people=80_000, test_people=20_000,
+    )
+    return replace(base, **changes)
+
+
+def test_the_auc_rises_with_the_variance_explained_from_one_half() -> None:
+    assert expected.auc_of(0.0, 0.1) == 0.5
+    values = [expected.auc_of(variance, 0.1) for variance in (0.01, 0.05, 0.1, 0.2)]
+    assert all(0.5 < value < 1.0 for value in values) and values == sorted(values)
+
+
+def test_the_sv_share_follows_the_causal_fraction_and_effect_fold() -> None:
+    assert expected.sv_share_of(0.0, 3.0) == 0.0 and expected.sv_share_of(1.0, 1.0) == 1.0
+    # 10% of causal variants at three times the effect SD: 0.9 / (0.9 + 0.9) of the heritability.
+    assert expected.sv_share_of(0.1, 3.0) == pytest.approx(0.5)
+
+
+def test_without_sv_heritability_the_arms_capture_the_same_and_the_test_holds_its_size() -> None:
+    architecture = _architecture()
+    small, with_sv = expected.captured_heritability(architecture)
+    assert small == with_sv == pytest.approx(0.2)
+    result = expected.expectation(architecture, replicates=40, seed=1, significance=0.05, tests=15)
+    assert result.small_auc == result.sv_auc and abs(result.mean_delta_auc_simulated) < 1e-3 and result.power <= 0.2
+
+
+def test_untagged_sv_heritability_gives_the_sv_arm_more_accuracy_and_power() -> None:
+    architecture = _architecture(sv_share=0.3, tagged_by_small=0.2, test_people=50_000)
+    small, with_sv = expected.captured_heritability(architecture)
+    assert with_sv - small == pytest.approx(0.2 * 0.3 * (0.8 - 0.2))
+    result = expected.expectation(architecture, replicates=20, seed=2, significance=0.05, tests=15)
+    assert result.sv_auc > result.small_auc and result.mean_delta_auc_simulated > 0.0 and result.power > 0.5
+    # SVs the small variants already tag better than they are imputed add nothing.
+    assert expected.captured_heritability(replace(architecture, tagged_by_small=0.9))[0] == expected.captured_heritability(replace(architecture, tagged_by_small=0.9))[1]
+
+
+def _cohort(directory, variant_count=400, size=300, seed=0):
+    """A tiny bench-sim cohort chromosome: a quarter of the records SVs (half deletions), the rest SNVs."""
+    generator = np.random.default_rng(seed)
+    classes = np.where(np.arange(variant_count) % 4 == 0, truth.SV, truth.SNV)
+    frequency = generator.uniform(0.05, 0.5, variant_count)
+    genotypes = generator.binomial(2, frequency[:, None], size=(variant_count, size)).astype(np.int8)
+    length_change = np.where(classes == truth.SV, np.where(np.arange(variant_count) % 8 == 0, -1, 1) * generator.integers(50, 50_000, variant_count), 0)
+    np.savez(directory / "variants.npz", cls=classes, len_change=length_change, superpop_af=np.tile(frequency, (5, 1)), donor_an=np.int64(1000))
+    np.savez(
+        directory / "annotations.npz", in_gene=np.zeros(variant_count, bool), in_exon=np.zeros(variant_count, bool),
+        in_repeat=np.zeros(variant_count, bool), log_tss_distance=np.zeros(variant_count),
+        log_sv_length=np.where(classes == truth.SV, np.log(np.maximum(np.abs(length_change), 1)), 0.0), ld_score=np.ones(variant_count),
+        repeat_locus=np.full(variant_count, -1),
+    )
+    np.save(directory / "truth_G.npy", genotypes)
+    np.savez(directory / "samples.npz", age=generator.uniform(18, 80, size), sex=generator.integers(0, 2, size), batch=generator.integers(0, 2, size),
+             realized_proportions=np.tile([1.0, 0, 0, 0, 0], (size, 1)))
+    return classes, length_change
+
+
+def test_a_point_sets_the_expected_causal_count_and_sv_fraction(tmp_path) -> None:
+    classes, _change = _cohort(tmp_path)
+    parameters = grid.scenario_parameters("sv_20pct", 0, tmp_path)
+    small_probability = parameters["pi"]
+    odds = small_probability / (1 - small_probability) * parameters["sv_probability_fold"]
+    structural_probability = odds / (1 + odds)
+    expected_structural = structural_probability * np.sum(classes == truth.SV)
+    expected_small = small_probability * np.sum(classes != truth.SV)
+    assert expected_structural + expected_small == pytest.approx(grid.CAUSAL_VARIANTS)
+    assert expected_structural / (expected_structural + expected_small) == pytest.approx(0.2)
+    null = grid.scenario_parameters("null", 0, tmp_path)
+    assert null["sv_probability_fold"] == 0.0
+
+
+def test_the_null_point_makes_no_sv_causal_and_the_controls_leave_pre_registered_scenarios_unchanged(tmp_path) -> None:
+    classes, _change = _cohort(tmp_path)
+    parameters = grid.scenario_parameters("null", 3, tmp_path)
+    with np.errstate(divide="ignore"):
+        _value, result = truth.genetic_value(parameters, tmp_path)
+    assert not np.any(classes[result["effects"]["causal"]] == truth.SV)
+    # The power study's knobs at their defaults are the pre-registered generator exactly.
+    drawn = truth.draw_parameters(5)
+    original, _ = truth.genetic_value(drawn, tmp_path)
+    with_defaults, _ = truth.genetic_value({**drawn, "sv_log_length_slope": 0.0, "sv_deletion_scale_fold": 1.0}, tmp_path)
+    np.testing.assert_array_equal(original, with_defaults)
+
+
+def test_the_positive_controls_move_sv_effects_with_length_and_class(tmp_path) -> None:
+    classes, change = _cohort(tmp_path, variant_count=4_000, size=200)
+    parameters = {**grid.scenario_parameters("sv_20pct", 0, tmp_path), "pi": 0.5, "sv_probability_fold": 1.0}
+    lengths = np.log(np.maximum(np.abs(change), 1))
+
+    def structural_effects(settings):
+        _value, result = truth.genetic_value(settings, tmp_path)
+        causal = result["effects"]["causal"]
+        rows = classes[causal] == truth.SV
+        return causal[rows], np.abs(result["effects"]["per_allele"][rows])
+
+    rows, magnitude = structural_effects({**parameters, "sv_log_length_slope": 2.0})
+    flat_rows, flat_magnitude = structural_effects(parameters)
+    assert np.corrcoef(lengths[rows], np.log(magnitude))[0, 1] > np.corrcoef(lengths[flat_rows], np.log(flat_magnitude))[0, 1] + 0.3
+    rows, magnitude = structural_effects({**parameters, "sv_deletion_scale_fold": 4.0})
+    deletion = change[rows] < 0
+    assert np.median(magnitude[deletion]) > 2.0 * np.median(magnitude[~deletion])
