@@ -7,7 +7,9 @@ plus a no-call mask:
 - **Copy-number records** (``SVTYPE=CNV`` or FILTER ``MULTIALLELIC``) carry the
   integer copy number from FORMAT/CN, falling back per sample to FORMAT/RD_CN.
   Their GT is not a genotype: AoU writes ``.``, the 1kGP freeze a placeholder
-  ``0/1``. They get class ``COPY_NUMBER``.
+  ``0/1``. They get class ``COPY_NUMBER``. Each sample's copy number keeps the
+  phred quality of the field it came from, CNQ for CN and RD_GQ for RD_CN, for
+  the measurement model's CNQ bound (``gatksv_store_rows``).
 - **Every other record** carries its ALT allele count 0/1/2 from GT. A call with
   any missing allele (``./.``, ``./1``) is a no-call.
 
@@ -38,13 +40,17 @@ from typing import Any, Iterator
 import numpy as np
 from cyvcf2 import VCF
 
-from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array
+from sv_pgs._typing import BoolArray, F64Array, I64Array, NDArray, U8Array, U16Array
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import MAXIMUM_CODE
 from sv_pgs.variant_typing import variant_class_and_length
 
 PASSING_FILTER = "PASS"
 COPY_NUMBER_FILTER = "MULTIALLELIC"
+# Each copy-number field with the FORMAT field holding its phred quality, in the order a sample's copy number is taken.
+COPY_NUMBER_FIELDS = (("CN", "CNQ"), ("RD_CN", "RD_GQ"))
+MISSING_QUALITY = int(np.iinfo(np.uint16).max)
+"""``GatksvBlock.quality`` where a sample's copy number has no quality, and on every ALT-count record."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,8 +59,11 @@ class GatksvBlock:
 
     ``values[r, i]`` is the ALT allele count (0..2) or, where
     ``is_copy_number[r]``, the integer copy number (0..254) of sample ``i``;
-    it is 0 wherever ``no_call[r, i]``. ``svtypes`` is the token each record
-    was typed with: its SVTYPE, ``CNV`` for every copy-number record.
+    it is 0 wherever ``no_call[r, i]``. ``quality[r, i]`` is the phred quality
+    of a copy number (CNQ, or RD_GQ where RD_CN gave it), MISSING_QUALITY where
+    the field holds none and on every ALT-count record. ``svtypes`` is the
+    token each record was typed with: its SVTYPE, ``CNV`` for every
+    copy-number record.
     """
 
     chromosomes: tuple[str, ...]
@@ -67,6 +76,7 @@ class GatksvBlock:
     is_copy_number: BoolArray
     values: U8Array
     no_call: BoolArray
+    quality: U16Array
 
     @property
     def record_count(self) -> int:
@@ -81,8 +91,10 @@ class GatksvBlock:
         present = source_columns >= 0
         values = np.zeros((self.record_count, source_columns.shape[0]), dtype=np.uint8)
         no_call = np.ones((self.record_count, source_columns.shape[0]), dtype=bool)
+        quality = np.full((self.record_count, source_columns.shape[0]), MISSING_QUALITY, dtype=np.uint16)
         values[:, present] = self.values[:, source_columns[present]]
         no_call[:, present] = self.no_call[:, source_columns[present]]
+        quality[:, present] = self.quality[:, source_columns[present]]
         return GatksvBlock(
             chromosomes=self.chromosomes,
             positions=self.positions,
@@ -94,6 +106,7 @@ class GatksvBlock:
             is_copy_number=self.is_copy_number,
             values=values,
             no_call=no_call,
+            quality=quality,
         )
 
 
@@ -139,7 +152,9 @@ class GatksvSource:
         self.region = region
         reader = VCF(str(self.vcf_path))
         self.sample_ids: tuple[str, ...] = tuple(str(sample) for sample in reader.samples)
-        self._format_fields = tuple(field for field in ("CN", "RD_CN") if reader.contains(field))
+        self._format_fields = tuple(
+            (field, quality if reader.contains(quality) else None) for field, quality in COPY_NUMBER_FIELDS if reader.contains(field)
+        )
         reader.close()
         self.skipped_records: Counter[str] = Counter()
         self.kept_record_count = 0
@@ -155,20 +170,28 @@ class GatksvSource:
             return "multi-allelic " + (svtype if svtype is not None else "untyped")
         return None
 
-    def _copy_numbers(self, record: Any) -> tuple[I64Array, BoolArray]:
+    def _copy_numbers(self, record: Any) -> tuple[I64Array, BoolArray, U16Array]:
+        """Each sample's copy number from CN, else RD_CN, whether it has none, and the phred quality of the field taken."""
         if not self._format_fields:
             raise ValueError(f"{self.vcf_path} has copy-number record {record.ID} but no FORMAT/CN or FORMAT/RD_CN.")
         numbers = np.zeros(len(self.sample_ids), dtype=np.int64)
         missing = np.ones(len(self.sample_ids), dtype=bool)
-        for field in self._format_fields:
+        quality = np.full(len(self.sample_ids), MISSING_QUALITY, dtype=np.uint16)
+        for field, quality_field in self._format_fields:
             parsed = _copy_number_values(record, field)
             if parsed is None:
                 continue
             field_numbers, field_missing = parsed
             take = missing & ~field_missing
             numbers[take] = field_numbers[take]
+            qualities = None if quality_field is None else _copy_number_values(record, quality_field)
+            if qualities is not None:
+                field_quality, quality_missing = qualities
+                known = take & ~quality_missing
+                # A phred quality past the uint16 range is a miscall probability of 0 in float64 either way.
+                quality[known] = np.minimum(field_quality[known], MISSING_QUALITY - 1)
             missing &= field_missing
-        return numbers, missing
+        return numbers, missing, quality
 
     def _allele_counts(self, record: Any) -> tuple[U8Array, BoolArray]:
         alleles = record.genotype.array()[:, :-1]
@@ -182,7 +205,7 @@ class GatksvSource:
             raise ValueError("block_records must be positive.")
         reader = VCF(str(self.vcf_path))
         records = reader(self.region) if self.region is not None else reader
-        pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray]] = []
+        pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]] = []
         try:
             for record in records:
                 svtype_value = record.INFO.get("SVTYPE")
@@ -208,13 +231,14 @@ class GatksvSource:
                     info_end=end,
                 )
                 if copy_number:
-                    copy_numbers, no_call = self._copy_numbers(record)
+                    copy_numbers, no_call, quality = self._copy_numbers(record)
                     if int(copy_numbers.max(initial=0)) > MAXIMUM_CODE:
                         self.skipped_records[f"copy number above {MAXIMUM_CODE}"] += 1
                         continue
                     values = copy_numbers.astype(np.uint8)
                 else:
                     values, no_call = self._allele_counts(record)
+                    quality = np.full(len(self.sample_ids), MISSING_QUALITY, dtype=np.uint16)
                 pending.append(
                     (
                         str(record.CHROM),
@@ -227,6 +251,7 @@ class GatksvSource:
                         copy_number,
                         values,
                         no_call,
+                        quality,
                     )
                 )
                 self.kept_record_count += 1
@@ -240,9 +265,9 @@ class GatksvSource:
 
 
 def _block_from_records(
-    pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray]],
+    pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]],
 ) -> GatksvBlock:
-    chromosomes, positions, ends, lengths, variant_ids, svtypes, variant_classes, copy_numbers, values, no_calls = zip(*pending)
+    chromosomes, positions, ends, lengths, variant_ids, svtypes, variant_classes, copy_numbers, values, no_calls, qualities = zip(*pending)
     return GatksvBlock(
         chromosomes=tuple(chromosomes),
         positions=np.asarray(positions, dtype=np.int64),
@@ -254,4 +279,5 @@ def _block_from_records(
         is_copy_number=np.asarray(copy_numbers, dtype=bool),
         values=np.stack(values),
         no_call=np.stack(no_calls),
+        quality=np.stack(qualities),
     )

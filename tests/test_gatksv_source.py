@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from sv_pgs.config import VariantClass
-from sv_pgs.gatksv_source import GatksvSource
+from sv_pgs.gatksv_source import MISSING_QUALITY, GatksvSource
 from sv_pgs.dosage_store import HalfSamples
 from sv_pgs.sample_crosswalk import SampleCrosswalk, source_columns_for_store_samples
 
@@ -134,3 +134,22 @@ def test_blocks_align_to_store_samples_through_the_crosswalk(tmp_path: Path) -> 
     np.testing.assert_array_equal(aligned.values, [[0, 0, 2, 5], [0, 0, 1, 0]])
     np.testing.assert_array_equal(aligned.no_call, [[False, True, False, False], [False, True, False, False]])
     assert aligned.variant_ids == blocks[0].variant_ids
+
+
+def test_a_copy_number_keeps_the_quality_of_the_field_it_came_from(tmp_path: Path) -> None:
+    """CNQ with CN, RD_GQ where RD_CN gave the copy number; none where the field is absent, and none on an ALT count."""
+    text = (
+        _HEADER_START
+        + '##FORMAT=<ID=CN,Number=1,Type=Integer,Description="copy number">\n'
+        + '##FORMAT=<ID=CNQ,Number=1,Type=Integer,Description="copy number quality">\n'
+        + '##FORMAT=<ID=RD_GQ,Number=1,Type=Integer,Description="read-depth genotype quality">\n'
+        + _SAMPLES
+        + "chr1\t1000\tcnv\tN\t<CNV>\t.\tPASS\tSVTYPE=CNV;SVLEN=1064;END=2064\tGT:CN:CNQ:RD_CN:RD_GQ\t.:2:30:2:99\t.:.:.:3:17\t.:4:.:4:40\t.:.:.:.:.\n"
+        + "chr1\t5000\tdel\tN\t<DEL>\t.\tPASS\tSVTYPE=DEL;SVLEN=1500;END=6500\tGT:CN:CNQ:RD_CN:RD_GQ\t0/1:.:.:1:50\t0/0:.:.:2:50\t1/1:.:.:0:50\t0/0:.:.:2:50\n"
+    )
+    _source, (block,) = _read_all(tmp_path, text, block_records=10)
+    np.testing.assert_array_equal(block.values[0], [2, 3, 4, 0])
+    np.testing.assert_array_equal(block.no_call[0], [False, False, False, True])
+    # R3's CN has no CNQ: its copy number keeps no quality rather than RD_CN's.
+    np.testing.assert_array_equal(block.quality[0], [30, 17, MISSING_QUALITY, MISSING_QUALITY])
+    assert np.all(block.quality[1] == MISSING_QUALITY)

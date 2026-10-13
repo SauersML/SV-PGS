@@ -7,7 +7,7 @@ truth instead of sprinkling ``ndarray[Any, np.dtype[...]]`` everywhere.
 
 Conventions:
 - ``F32Array``, ``F64Array``, ``I32Array``, ``I64Array``, ``U8Array``,
-  ``BoolArray`` are 1-D-or-N-D ``np.ndarray`` with the named dtype.
+  ``U16Array``, ``BoolArray`` are 1-D-or-N-D ``np.ndarray`` with the named dtype.
 - ``NDArray`` (= ``np.typing.NDArray[np.generic]``) is the broadest
   "some numpy array" alias; reach for it only when a function genuinely
   accepts any dtype.
@@ -32,6 +32,7 @@ F64Array: TypeAlias = npt.NDArray[np.float64]
 I32Array: TypeAlias = npt.NDArray[np.int32]
 I64Array: TypeAlias = npt.NDArray[np.int64]
 U8Array: TypeAlias = npt.NDArray[np.uint8]
+U16Array: TypeAlias = npt.NDArray[np.uint16]
 BoolArray: TypeAlias = npt.NDArray[np.bool_]
 
 __all__ = [
@@ -41,5 +42,6 @@ __all__ = [
     "I32Array",
     "I64Array",
     "NDArray",
+    "U16Array",
     "U8Array",
 ]

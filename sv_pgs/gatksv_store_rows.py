@@ -22,6 +22,19 @@ with their store codes:
    z, E[B | DS] = m_B + (C_AB / V_A)(DS - m_A) over the called samples; a record
    with no such candidate takes the mean of its observed calls.
 
+4. Each row's reported r^2, the measurement model's no-truth reliability for a
+   direct call (WORKSPACE_PIPELINE.md, "A direct row with no truth"), over its
+   called samples. A hard-call ALT-count row takes 1, the call set's own claim of
+   exactness. A copy-number row takes the CNQ bound: each called sample's
+   miscall probability is e_i = 10^(-Q_i / 10) from the phred quality of its copy
+   number (CNQ, or RD_GQ where RD_CN gave it), a miscall moves the copy number by
+   at least one copy, so r^2 <= 1 - sum_i e_i / (n Var(called CN)). A row with no
+   reliability takes 0, which the model turns into a -inf offset, never 1: one
+   whose called samples all share one value (its variation would come only from
+   its fills), a copy-number row whose bound is at or below 0, and one with a
+   called sample whose copy number has no quality. ``reliability_sources`` names
+   which rule gave each row's value (RELIABILITY_SOURCES).
+
 Fill statistics run over every store sample. They use genotypes only, never a
 phenotype, and SPEC trains on all samples, so they are the training statistics.
 ``observed_fractions`` keeps the share of each row that was called. Codes follow
@@ -30,6 +43,11 @@ number c is round(c k) with k = floor(254 / its maximum called copy number), its
 value c - its modal called copy number (``copy_number``); each row carries its
 ``codes_per_unit`` and ``value_origin``. A predicted call outside the stored range
 is clipped to it, and every entry whose code the clip changed is counted.
+
+A chromosome's records can be read in blocks (``gatksv_block_rows``): each block's
+rows and its candidate pairs' evidence need only the imputed records it pairs
+with, and the pairs of every block are resolved one to one together
+(``one_to_one``), so no imputed record pairs twice across blocks.
 """
 
 from __future__ import annotations
@@ -40,10 +58,16 @@ import numpy as np
 from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
 from sv_pgs.copy_number import copy_number_codes_per_unit, modal_copy_numbers
 from sv_pgs.dosage_store import CODES_PER_DOSAGE
-from sv_pgs.gatksv_source import GatksvBlock
+from sv_pgs.gatksv_source import MISSING_QUALITY, GatksvBlock
 from sv_pgs.sv_fusion import MINIMUM_CALIBRATION_SAMPLES, MINIMUM_PAIRING_Z, SvSites, _fisher_z, candidate_pairs
 
 MAXIMUM_ALLELE_COUNT = 2
+PHRED_SCALE = 10.0
+"""A phred quality is Q = -10 log10 P(miscall)."""
+RELIABILITY_SOURCES = ("hard_call", "cnq_bound", "no_called_variation", "bound_not_positive", "no_quality")
+"""Which rule gave a row's reported r^2 (``GatksvRows.reliability_sources`` indexes it): 1 for a hard-call ALT count,
+the CNQ bound for a copy number, and 0 for a row whose called samples share one value, a copy-number row whose bound
+is at or below 0, or one with a called sample whose copy number has no quality."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +95,18 @@ class FusionPairs:
 
 
 @dataclass(frozen=True, slots=True)
+class PairEvidence:
+    """Every candidate pair of an imputed record and a GATK-SV record (an index into its block), with the Fisher z of
+    the correlation of the imputed DS with the call over the record's called samples (0 where undefined) and the
+    least-squares slope of the call on the DS there (NaN where undefined)."""
+
+    imputed_records: I64Array
+    gatksv_records: I64Array
+    pairing_z: F64Array
+    slopes: F64Array
+
+
+@dataclass(frozen=True, slots=True)
 class GatksvRows:
     """The GATK-SV records that stay rows of their own, every no-call filled.
 
@@ -78,8 +114,10 @@ class GatksvRows:
     from a paired imputed DS. ``lengths`` are the records' SV lengths (|SVLEN|
     or END span), which a symbolic record's REF/ALT do not carry, for the
     store's length annotation. A row's value is ``codes / codes_per_unit +
-    value_origin``. ``unobserved_records`` are the block records no store
-    sample has a call for, dropped.
+    value_origin``. ``reported_reliability`` is each row's no-truth r^2 and
+    ``reliability_sources`` the rule that gave it (RELIABILITY_SOURCES).
+    ``unobserved_records`` are the block records no store sample has a call
+    for, dropped.
     """
 
     gatksv_records: I64Array
@@ -91,6 +129,8 @@ class GatksvRows:
     filled_from_imputed: BoolArray
     clipped_counts: I64Array
     unobserved_records: I64Array
+    reported_reliability: F64Array
+    reliability_sources: U8Array
 
 
 def gatksv_sites(block: GatksvBlock) -> SvSites:
@@ -142,46 +182,85 @@ def _pairing(dosage: F64Array, calls: F64Array) -> tuple[float, float]:
     return _fisher_z(correlation, dosage.shape[0]), float(covariance[0, 1] / covariance[0, 0])
 
 
-def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, FusionPairs]:
-    """Every called GATK-SV record as a row, each no-call filled, and the pairs the measurement model fuses.
+def _imputed_dosage(imputed: ImputedSvRecords, record: int) -> F64Array:
+    """One imputed record's DS over the store's samples, decoded on its own: a chromosome's records at once in float64
+    are eight times its codes."""
+    return imputed.codes[record] / float(CODES_PER_DOSAGE)
 
-    ``gatksv`` holds one chromosome's kept records aligned to the store's samples
-    and ``imputed`` the same chromosome's imputed SV records.
-    """
-    sample_count = gatksv.values.shape[1]
-    if imputed.codes.shape[1] != sample_count:
+
+def pairing_evidence(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> PairEvidence:
+    """The candidate pairs (``sv_fusion.candidate_pairs``) of the block's records with the imputed records, each with
+    its evidence over the GATK-SV record's called samples."""
+    if imputed.codes.shape[1] != gatksv.values.shape[1]:
         raise ValueError("the GATK-SV block and the imputed codes need the store's samples.")
     observed = ~gatksv.no_call
-    dosage = imputed.codes / float(CODES_PER_DOSAGE)
     pairs = candidate_pairs(imputed.sites, gatksv_sites(gatksv))
     evidence = [
-        _pairing(dosage[first, observed[second]], gatksv.values[second, observed[second]].astype(np.float64))
+        _pairing(_imputed_dosage(imputed, first)[observed[second]], gatksv.values[second, observed[second]].astype(np.float64))
         for first, second in zip(pairs.first_rows.tolist(), pairs.second_rows.tolist())
     ]
+    return PairEvidence(
+        imputed_records=pairs.first_rows.astype(np.int64),
+        gatksv_records=pairs.second_rows.astype(np.int64),
+        pairing_z=np.array([z for z, _slope in evidence], dtype=np.float64),
+        slopes=np.array([slope for _z, slope in evidence], dtype=np.float64),
+    )
+
+
+def reported_reliability(gatksv: GatksvBlock, record: int) -> tuple[float, int]:
+    """One record's no-truth r^2 over its called samples and its source's index in RELIABILITY_SOURCES (module
+    docstring, item 4)."""
+    called = ~gatksv.no_call[record]
+    calls = gatksv.values[record, called].astype(np.float64)
+    variance = float(np.var(calls))
+    if variance == 0.0:
+        return 0.0, RELIABILITY_SOURCES.index("no_called_variation")
+    if not gatksv.is_copy_number[record]:
+        return 1.0, RELIABILITY_SOURCES.index("hard_call")
+    quality = gatksv.quality[record, called]
+    if np.any(quality == MISSING_QUALITY):
+        return 0.0, RELIABILITY_SOURCES.index("no_quality")
+    miscalls = float(np.sum(np.power(PHRED_SCALE, -quality.astype(np.float64) / PHRED_SCALE)))
+    bound = 1.0 - miscalls / (calls.shape[0] * variance)
+    if bound <= 0.0:
+        return 0.0, RELIABILITY_SOURCES.index("bound_not_positive")
+    return bound, RELIABILITY_SOURCES.index("cnq_bound")
+
+
+def gatksv_block_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, PairEvidence]:
+    """Every called record of one block of GATK-SV records as a row, each no-call filled, and every candidate pair's
+    evidence, unresolved (``one_to_one`` resolves a chromosome's pairs together).
+
+    ``gatksv`` holds the block's records aligned to the store's samples and ``imputed`` the imputed SV records of
+    the same chromosome it may pair with.
+    """
+    sample_count = gatksv.values.shape[1]
+    evidence = pairing_evidence(gatksv, imputed)
+    observed = ~gatksv.no_call
     observed_counts = observed.sum(axis=1)
     kept_records = np.flatnonzero(observed_counts > 0)
-    row_of_record = np.full(gatksv.record_count, -1, dtype=np.int64)
-    row_of_record[kept_records] = np.arange(kept_records.shape[0])
 
     # The candidate with a defined slope and the largest Fisher z of each GATK-SV record fills its no-calls.
     strongest_pair = np.full(gatksv.record_count, -1, dtype=np.int64)
-    for pair, (z, slope) in enumerate(evidence):
-        second = int(pairs.second_rows[pair])
+    for pair in range(evidence.pairing_z.shape[0]):
+        second = int(evidence.gatksv_records[pair])
         current = int(strongest_pair[second])
-        if np.isfinite(slope) and (current < 0 or z > evidence[current][0]):
+        if np.isfinite(evidence.slopes[pair]) and (current < 0 or evidence.pairing_z[pair] > evidence.pairing_z[current]):
             strongest_pair[second] = pair
     row_codes = np.empty((kept_records.shape[0], sample_count), dtype=np.uint8)
     row_clipped = np.zeros(kept_records.shape[0], dtype=np.int64)
     row_codes_per_unit = np.full(kept_records.shape[0], CODES_PER_DOSAGE, dtype=np.uint8)
     row_origins = np.zeros(kept_records.shape[0], dtype=np.int64)
     filled_from_imputed = np.zeros(kept_records.shape[0], dtype=bool)
+    reliability = np.zeros(kept_records.shape[0], dtype=np.float64)
+    sources = np.zeros(kept_records.shape[0], dtype=np.uint8)
     for row, record in enumerate(kept_records.tolist()):
         calls = gatksv.values[record].astype(np.float64)
         called = observed[record]
         pair = int(strongest_pair[record])
         if pair >= 0:
-            first = int(pairs.first_rows[pair])
-            prediction = calls[called].mean() + evidence[pair][1] * (dosage[first] - dosage[first, called].mean())
+            dosage = _imputed_dosage(imputed, int(evidence.imputed_records[pair]))
+            prediction = calls[called].mean() + evidence.slopes[pair] * (dosage - dosage[called].mean())
             filled_from_imputed[row] = True
         else:
             prediction = np.full(sample_count, calls[called].mean())
@@ -192,6 +271,7 @@ def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[G
             )
         else:
             row_codes[row], row_clipped[row] = _dosage_codes(values)
+        reliability[row], sources[row] = reported_reliability(gatksv, record)
     rows = GatksvRows(
         gatksv_records=kept_records.astype(np.int64),
         lengths=gatksv.lengths[kept_records],
@@ -202,24 +282,42 @@ def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[G
         filled_from_imputed=filled_from_imputed,
         clipped_counts=row_clipped,
         unobserved_records=np.flatnonzero(observed_counts == 0).astype(np.int64),
+        reported_reliability=reliability,
+        reliability_sources=sources,
     )
+    return rows, evidence
 
-    # One to one, in order of decreasing evidence; weaker candidates stay separate columns.
-    accepted = sorted((pair for pair, (z, _) in enumerate(evidence) if z >= MINIMUM_PAIRING_Z), key=lambda pair: -evidence[pair][0])
+
+def one_to_one(evidence: PairEvidence) -> I64Array:
+    """The pairs with z >= MINIMUM_PAIRING_Z, resolved one to one in order of decreasing z (a weaker candidate of a
+    record already paired stays a separate column), as positions into ``evidence`` in ascending order."""
+    accepted = sorted(np.flatnonzero(evidence.pairing_z >= MINIMUM_PAIRING_Z).tolist(), key=lambda pair: -evidence.pairing_z[pair])
     taken_first: set[int] = set()
     taken_second: set[int] = set()
     chosen: list[int] = []
     for pair in accepted:
-        first, second = int(pairs.first_rows[pair]), int(pairs.second_rows[pair])
+        first, second = int(evidence.imputed_records[pair]), int(evidence.gatksv_records[pair])
         if first in taken_first or second in taken_second:
             continue
         taken_first.add(first)
         taken_second.add(second)
         chosen.append(pair)
-    chosen.sort()
+    return np.array(sorted(chosen), dtype=np.int64)
+
+
+def gatksv_store_rows(gatksv: GatksvBlock, imputed: ImputedSvRecords) -> tuple[GatksvRows, FusionPairs]:
+    """Every called GATK-SV record as a row, each no-call filled, and the pairs the measurement model fuses.
+
+    ``gatksv`` holds one chromosome's kept records aligned to the store's samples
+    and ``imputed`` the same chromosome's imputed SV records.
+    """
+    rows, evidence = gatksv_block_rows(gatksv, imputed)
+    row_of_record = np.full(gatksv.record_count, -1, dtype=np.int64)
+    row_of_record[rows.gatksv_records] = np.arange(rows.gatksv_records.shape[0])
+    chosen = one_to_one(evidence)
     fusion = FusionPairs(
-        imputed_records=pairs.first_rows[chosen].astype(np.int64),
-        gatksv_rows=row_of_record[pairs.second_rows[chosen]],
-        pairing_z=np.array([evidence[pair][0] for pair in chosen], dtype=np.float64),
+        imputed_records=evidence.imputed_records[chosen],
+        gatksv_rows=row_of_record[evidence.gatksv_records[chosen]],
+        pairing_z=evidence.pairing_z[chosen],
     )
     return rows, fusion
