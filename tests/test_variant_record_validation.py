@@ -1,15 +1,11 @@
-"""Regression tests for three VariantRecord public-API validation bugs.
+"""Regression tests for VariantRecord public-API validation bugs.
 
 1. ``VariantRecord.__post_init__`` only checked that ``prior_class_members`` and
    ``prior_class_membership`` had equal length, so NaN, negative, zero-sum,
    non-unit-sum and duplicate class memberships were accepted and propagated an
    invalid (or NaN) prior design matrix into inference.
 
-2. ``_build_prior_design`` filled the class-membership matrix with ``=``, so a
-   record carrying a duplicated class member silently dropped mixture mass
-   ((snv: 0.4, snv: 0.6) yielded 0.6 instead of 1.0).
-
-3. Boolean fields were coerced with ``bool(...)``, so the strings "false" and
+2. Boolean fields were coerced with ``bool(...)``, so the strings "false" and
    "0" — as ingested from TSV/CSV — evaluated to True and inverted the
    annotation.
 """
@@ -20,7 +16,6 @@ import pytest
 
 from sv_pgs.config import VariantClass
 from sv_pgs.data import VariantRecord
-from sv_pgs.prior_design import _build_prior_design
 
 
 def _record(**overrides) -> VariantRecord:
@@ -83,22 +78,6 @@ def test_omitted_class_membership_defaults_to_own_class():
     record = _record(variant_class=VariantClass.DELETION)
     assert record.prior_class_members == (VariantClass.DELETION,)
     assert record.prior_class_membership == (1.0,)
-
-
-def test_prior_design_has_no_nan_for_valid_records():
-    design = _build_prior_design([_record()])
-    assert not np.isnan(design.class_membership_matrix).any()
-    np.testing.assert_allclose(design.class_membership_matrix.sum(axis=1), [1.0])
-
-
-def test_prior_design_accumulates_duplicate_class_members():
-    """Belt-and-braces: even a record that bypassed VariantRecord validation
-    (fields assigned post-construction) must not lose mixture mass."""
-    record = _record()
-    record.prior_class_members = (VariantClass.SNV, VariantClass.SNV)
-    record.prior_class_membership = (0.4, 0.6)
-    design = _build_prior_design([record])
-    np.testing.assert_allclose(design.class_membership_matrix, [[1.0]])
 
 
 @pytest.mark.parametrize(

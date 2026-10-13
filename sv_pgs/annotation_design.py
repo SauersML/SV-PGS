@@ -13,7 +13,7 @@ the rest of the hyperparameters. Nothing here is chosen by hand:
   linear term is a free column; the penalized part is the basis rotated onto the penalty's eigenvectors, so its
   penalty is diagonal there and is the same function-space penalty, transformed with the basis (a change of basis
   that drops the penalty's null directions changes no function's roughness). x is the annotation standardized over
-  its observed values; the knots are its interior quartiles (``prior_design._continuous_spline_knots``), where the
+  its observed values; the knots are its interior quartiles (``_continuous_spline_knots``), where the
   spline space refines toward the full smoothing spline as knots are added, and the penalty, not the knot count,
   sets the smoothness.
 - A factor (a legend-coded annotation, or a numeric one whose observed values are all 0 or 1) is a level per
@@ -44,8 +44,7 @@ import numpy as np
 from scipy import sparse
 from gamfit.basis import bspline_basis, smoothness_penalty
 
-from sv_pgs._typing import F64Array, I64Array
-from sv_pgs.prior_design import _continuous_spline_knots
+from sv_pgs._typing import F64Array, I64Array, NDArray
 from sv_pgs.scale_mixture_ep import AnnotationGroup, _sum_to_zero_rows
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -115,6 +114,20 @@ def _factor_candidate(name: str, level_of_row: I64Array, labels: Sequence[str]) 
     contrasts = _sum_to_zero_rows(level, present.shape[0])
     names = [f"{name}:contrast({labels[int(present[position + 1])]})" for position in range(present.shape[0] - 1)]
     return _Candidate(name, [np.ascontiguousarray(contrasts[:, position]) for position in range(contrasts.shape[1])], names, np.eye(contrasts.shape[1]))
+
+
+def _continuous_spline_knots(standardized_values: NDArray) -> tuple[float, ...]:
+    """Distinct quartile knots strictly inside the data range; the rank screen drops any hinge a
+    nearby knot makes numerically dependent."""
+    candidate_knots = np.quantile(standardized_values, [0.25, 0.5, 0.75])
+    minimum_value = float(np.min(standardized_values))
+    maximum_value = float(np.max(standardized_values))
+    knot_values: list[float] = []
+    for knot_value in candidate_knots:
+        knot_float = float(knot_value)
+        if minimum_value < knot_float < maximum_value and (not knot_values or knot_float != knot_values[-1]):
+            knot_values.append(knot_float)
+    return tuple(knot_values)
 
 
 def spline_basis(standardized: F64Array) -> tuple[F64Array, F64Array, F64Array]:

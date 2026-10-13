@@ -30,19 +30,9 @@ class ModelConfig:
     trait_type: TraitType = TraitType.BINARY
     minimum_scale: float = 1e-6                    # variants with std < this are treated as monomorphic
     minimum_minor_allele_frequency: float = 1e-2
-    prior_scale_floor: float = 1e-6
-    prior_scale_ceiling: float = 10.0
-    local_scale_floor: float = 1e-8
-    type_offset_penalty: float = 2.0
 
     def __post_init__(self) -> None:
         if self.minimum_scale <= 0.0:
             raise ValueError("minimum_scale must be positive.")
         if not 0.0 <= self.minimum_minor_allele_frequency < 0.5:
             raise ValueError("minimum_minor_allele_frequency must lie in [0.0, 0.5).")
-        if self.prior_scale_floor <= 0.0:
-            raise ValueError("prior_scale_floor must be positive.")
-        if self.prior_scale_ceiling <= self.prior_scale_floor:
-            raise ValueError("prior_scale_ceiling must exceed prior_scale_floor.")
-        if self.local_scale_floor <= 0.0:
-            raise ValueError("local_scale_floor must be positive.")
