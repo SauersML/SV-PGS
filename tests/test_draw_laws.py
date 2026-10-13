@@ -42,6 +42,17 @@ def test_fused_member_uniforms_are_bitwise_equal_to_vector_philox():
     assert _member_uniforms(ids, draws[:0], (0, 0))[0].shape == (ids.size, 0)
 
 
+def test_normal_uniform_endpoints_stay_open_after_float64_rounding():
+    from scipy.special import ndtri
+    from sv_pgs.draw_laws import _uniform
+
+    words = np.array([0, 0xFFFFFFFF], dtype=np.uint64)
+    uniforms = _uniform(words, words, True)
+    assert np.all((uniforms > 0.) & (uniforms < 1.))
+    assert np.all(np.isfinite(ndtri(uniforms)))
+    np.testing.assert_array_equal(_uniform(words, words, False), [0., 1. - 2.**-53])
+
+
 def test_fused_draw_tiles_equal_the_previous_generator(monkeypatch):
     from sv_pgs import draw_laws
 

@@ -55,6 +55,7 @@ _HIGH_SHIFT = 5
 _LOW_SHIFT = 6
 _LOW_BITS = 26
 _MANTISSA_BITS = 53
+_OPEN_UNIFORM_UPPER = float(np.nextafter(1.0, 0.0))
 
 MEMBER_STREAM = 0
 COMPONENT_STREAM = 1
@@ -88,6 +89,8 @@ def _uniform(high: np.ndarray, low: np.ndarray, open_below: bool) -> np.ndarray:
     value = mantissa.astype(np.float64)
     if open_below:
         value += 0.5
+        # The largest midpoint rounds up to 1 in float64; ndtri(1) is infinite.
+        return np.minimum(value / float(1 << _MANTISSA_BITS), _OPEN_UNIFORM_UPPER)
     return value / float(1 << _MANTISSA_BITS)
 
 
@@ -121,7 +124,7 @@ def _member_uniforms(ids: np.ndarray, draws: np.ndarray, key: tuple[int, int]) -
             node_mantissa = (c0 >> np.uint64(_HIGH_SHIFT)) * np.uint64(1 << _LOW_BITS) + (c1 >> np.uint64(_LOW_SHIFT))
             normal_mantissa = (c2 >> np.uint64(_HIGH_SHIFT)) * np.uint64(1 << _LOW_BITS) + (c3 >> np.uint64(_LOW_SHIFT))
             node[row, column] = np.float64(node_mantissa) / float(1 << _MANTISSA_BITS)
-            normal[row, column] = (np.float64(normal_mantissa) + 0.5) / float(1 << _MANTISSA_BITS)
+            normal[row, column] = min((np.float64(normal_mantissa) + 0.5) / float(1 << _MANTISSA_BITS), _OPEN_UNIFORM_UPPER)
     return node, normal
 
 
