@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
+import ast
 import csv
 import dataclasses
 from dataclasses import dataclass
@@ -69,6 +70,7 @@ import os
 from pathlib import Path
 import shutil
 import time
+from types import ModuleType
 from typing import Any, Callable, Mapping, Sequence
 
 from cyvcf2 import VCF
@@ -80,7 +82,9 @@ from sv_pgs import (
     all_of_us,
     cohort as cohort_module,
     dosage_store,
+    fit_model,
     held_out_comparison,
+    measurement_model,
     phenotype_measurement,
     sample_crosswalk,
     scale_mixture_ep,
@@ -109,7 +113,7 @@ from sv_pgs.cohort import (
     reportable_count,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS, code_digest
+from sv_pgs.artifact import CERTIFICATE_STATUS
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -162,7 +166,7 @@ from sv_pgs.fit_checkpoint import checkpoint_timings
 
 LOGGER = logging.getLogger(__name__)
 
-STEP_NAMES = ("samples", "phenotypes", "cohort", "store", "measurement", "fit", "score", "effects", "report", "export")
+STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "fit", "score", "effects", "report", "export")
 ARMS = ("snv_indel", "with_sv")
 """The study's two arms, fitted on the same people, folds and seeds so that their held-out predictions are paired.
 ``snv_indel`` fits every record shorter than a structural variant (``COMMUNITY_SV_MINIMUM_LENGTH``: SNVs, short indels
@@ -462,6 +466,29 @@ def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
         handle.seek(max(size - BGZF_MAXIMUM_BLOCK_BYTES, 0))
         digest.update(handle.read(BGZF_MAXIMUM_BLOCK_BYTES))
     return size, digest.hexdigest()
+
+
+def module_closure(*roots: ModuleType) -> tuple[ModuleType, ...]:
+    """The ``roots`` and every ``sv_pgs`` module they import, transitively, in name order: the package code a step
+    that runs the roots executes, read from their import statements (function-level ones included), and none it does
+    not. A step keyed by the whole package refitted every model on an edit to the report or a docstring; a step keyed
+    by its own functions alone reused a fit across a change to the engine underneath."""
+    found: dict[str, ModuleType] = {}
+    pending = list(roots)
+    while pending:
+        module = pending.pop()
+        if module.__name__ in found:
+            continue
+        found[module.__name__] = module
+        for node in ast.walk(ast.parse(inspect.getsource(module))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.module is not None and node.level == 0:
+                names = [f"{node.module}.{alias.name}" for alias in node.names] if node.module == "sv_pgs" else [node.module]
+            else:
+                continue
+            pending.extend(importlib.import_module(name) for name in names if name.startswith("sv_pgs."))
+    return tuple(found[name] for name in sorted(found))
 
 
 def _source_digest(code: Sequence[Any]) -> str:
@@ -915,16 +942,23 @@ class StrataSites:
     ids_md5: str
 
 
-def read_strata_sites(directory: Path, chromosome: str) -> StrataSites:
-    """The STRATA_COLUMNS of ``chrK.strata.tsv.gz``, once ``_done/chrK.json`` marks the contig complete.
+def strata_complexity_legend(directory: Path, chromosomes: Sequence[str]) -> tuple[str, ...] | None:
+    """The store's one legend for the sidecar's ``cx``: None where every chromosome's ``cx`` is numeric, else the sorted
+    levels of every chromosome's together. A legend per chromosome either failed the finished store's read (a legend
+    that changes at a chromosome) or, where one chromosome's ``cx`` alone held a non-numeric token, cast every later
+    chromosome's numbers to that legend's codes beside the earlier ones' values."""
+    columns = [
+        pd.read_csv(directory / f"{chromosome}.strata.tsv.gz", sep="\t", comment=None, skiprows=1, header=None,
+                    names=_strata_names(directory / f"{chromosome}.strata.tsv.gz"), usecols=["cx"], keep_default_na=False)["cx"]
+        for chromosome in chromosomes
+    ]
+    if all(pd.api.types.is_numeric_dtype(column) for column in columns):
+        return None
+    return tuple(sorted({str(value) for column in columns for value in column.astype(str)}))
 
-    ``cx`` stays numeric when it is, and is otherwise coded by its sorted levels.
-    """
-    done = directory / "_done" / f"{chromosome}.json"
-    if not done.is_file():
-        raise ValueError(f"the strata sidecar of {chromosome} is not complete: {done} does not exist.")
-    manifest = json.loads(done.read_text(encoding="utf-8"))
-    path = directory / f"{chromosome}.strata.tsv.gz"
+
+def _strata_names(path: Path) -> list[str]:
+    """A strata sidecar's column names, from its '#' header line, which must hold every STRATA_COLUMNS name."""
     with gzip.open(path, "rt", encoding="utf-8") as handle:
         header = handle.readline().rstrip("\n")
     if not header.startswith("#"):
@@ -933,6 +967,21 @@ def read_strata_sites(directory: Path, chromosome: str) -> StrataSites:
     missing = [column for column in STRATA_COLUMNS if column not in names]
     if missing:
         raise ValueError(f"{path} lacks the columns {missing}.")
+    return names
+
+
+def read_strata_sites(directory: Path, chromosome: str, complexity_legend: tuple[str, ...] | None) -> StrataSites:
+    """The STRATA_COLUMNS of ``chrK.strata.tsv.gz``, once ``_done/chrK.json`` marks the contig complete.
+
+    ``cx`` is numeric where ``complexity_legend`` is None, and is otherwise coded by that legend, the store's one legend
+    over every chromosome (``strata_complexity_legend``).
+    """
+    done = directory / "_done" / f"{chromosome}.json"
+    if not done.is_file():
+        raise ValueError(f"the strata sidecar of {chromosome} is not complete: {done} does not exist.")
+    manifest = json.loads(done.read_text(encoding="utf-8"))
+    path = directory / f"{chromosome}.strata.tsv.gz"
+    names = _strata_names(path)
     table = pd.read_csv(
         path, sep="\t", skiprows=1, header=None, names=names, usecols=list(STRATA_COLUMNS), dtype={"id": str, "refalt_md5": str}, keep_default_na=False
     )
@@ -940,8 +989,9 @@ def read_strata_sites(directory: Path, chromosome: str) -> StrataSites:
     if index.size and np.any(np.diff(index) != 1):
         raise ValueError(f"{path}: idx must count the popped records in file order.")
     complexity = table["cx"]
-    numeric = pd.api.types.is_numeric_dtype(complexity)
-    legend = None if numeric else tuple(sorted(set(complexity.astype(str))))
+    legend = complexity_legend
+    if legend is None and not pd.api.types.is_numeric_dtype(complexity):
+        raise ValueError(f"{path}: cx is not numeric although every chromosome's was when the store's legend was read.")
     return StrataSites(
         positions=table["pos"].to_numpy(dtype=np.int64),
         identifiers=tuple(table["id"].astype(str)),
@@ -1322,7 +1372,9 @@ def store_group_first(bubble: NDArray, positions: NDArray, classes: NDArray, rec
     ``store_converter.overlap_group_first`` groups bench-sim's: a locus's SNVs join a group only through a bubble or a
     shared position, so a locus spans no more records than its repeat holds."""
     tr_class = np.asarray(classes) == VARIANT_CLASSES.index(VariantClass.STR_VNTR_REPEAT)
-    locus_groups = np.where(tr_class, np.asarray(record_locus).astype(np.int64), -1)
+    # A TR-class record outside every repeat interval (typed by its SVTYPE or ALT token) has no locus: NO_LOCUS, a valid
+    # non-negative id, grouped every such record of a chromosome into one span past any block cap.
+    locus_groups = np.where(tr_class & (np.asarray(record_locus) != NO_LOCUS), np.asarray(record_locus).astype(np.int64), -1)
     return unbreakable_group_first(bubble, positions, locus_groups)
 
 
@@ -1348,10 +1400,10 @@ class ChromosomeSites:
     facts: dict[str, Any]
 
 
-def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, chromosome: str) -> ChromosomeSites:
+def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, chromosome: str, complexity_legend: tuple[str, ...] | None) -> ChromosomeSites:
     """The popped site list: the strata sidecar's rows, the first batch's records checked against them, and each
     record's bubble, K and m from bubble.split; the sidecar's n_paths, n_paths_total and cx are its annotations."""
-    strata = read_strata_sites(popped.strata_directory, chromosome)
+    strata = read_strata_sites(popped.strata_directory, chromosome, complexity_legend)
     first_half = config.imputed_halves[0]
     records = read_popped_sites(first_half.path(chromosome, first_half.batches[0]), strata)
     counts = path_counts(strata, read_bubble_paths(popped.bubble_split_path(chromosome)))
@@ -1556,20 +1608,19 @@ def _gather_calibration(tasks: Sequence[_DecodeTask], samples: _Samples, directo
 
 def _convert_chromosome(
     run: _Run, directory: Path, root: Path, chromosome: str, samples: _Samples, repeats: Mapping[str, tuple[I64Array, I64Array]],
-    genes: Mapping[str, GeneIntervals],
+    genes: Mapping[str, GeneIntervals], complexity_legend: tuple[str, ...] | None,
 ) -> dict[str, Any]:
     config = run.config
-    sites = _plain_chromosome_sites(config, chromosome) if config.popped is None else _popped_chromosome_sites(config.popped, config, chromosome)
+    sites = _plain_chromosome_sites(config, chromosome) if config.popped is None else _popped_chromosome_sites(config.popped, config, chromosome, complexity_legend)
     positions = sites.expected.positions
     ref_lengths = np.array([len(ref) for ref in sites.records.refs], dtype=np.int64)
     alt_lengths = np.array([len(alt) for alt in sites.records.alts], dtype=np.int64)
     core_starts, core_ends = store_core_spans(positions, sites.records)
-    empty = np.zeros(0, dtype=np.int64)
-    interval_starts, interval_ends = repeats.get(chromosome, (empty, empty))
+    interval_starts, interval_ends = repeats[chromosome]
     loci = tr_loci(interval_starts, interval_ends, core_starts, core_ends, alt_lengths - ref_lengths)
     classes, lengths = store_variant_classes(sites.records, positions, loci.record_locus)
     group_first = store_group_first(sites.bubble, positions, classes, loci.record_locus)
-    gene = genes.get(chromosome, GeneIntervals(empty, empty, empty, empty, empty))
+    gene = genes[chromosome]
     gene_columns = gene_overlap(gene.gene_starts, gene.gene_ends, gene.exon_starts, gene.exon_ends, gene.tss, core_starts, core_ends)
 
     tasks = _decode_tasks(config, directory, chromosome, samples, sites.decoder)
@@ -1649,7 +1700,21 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
         "tandem_repeats": _file_digest(config.tandem_repeats),
         "gene_annotation": _file_digest(config.gene_annotation),
         "codec": config.codec,
+        "samples": _store_sample_layout(config),
     }
+
+
+def _store_sample_layout(config: WorkspaceConfig) -> str:
+    """The samples step's outputs the store reads (each half's typed manifest and its samples' ancestry groups), by
+    content: the store depends on those alone, not on the whole samples key, whose folds, seed and relatedness file
+    would otherwise rebuild a genome's store when they change."""
+    directory = config.run_directory / "samples"
+    record = json.loads((directory / "samples.json").read_text(encoding="utf-8"))
+    return _digest({
+        "halves": record["halves"],
+        "groups": record["groups"],
+        "group_files": [_file_digest(directory / f"groups_half{index}.npy") for index in range(len(record["halves"]))],
+    })
 
 
 def _store_gates(config: WorkspaceConfig, facts: Sequence[Mapping[str, Any]]) -> dict[str, str]:
@@ -1680,12 +1745,19 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
         (directory / subdirectory).mkdir(exist_ok=True)
     repeats = read_tandem_repeats(config.tandem_repeats)
     genes = read_gene_annotation(config.gene_annotation)
+    # Every store chromosome must be in both by the store's own spelling: a chr-less file (Ensembl's "21") converted
+    # every chromosome with no TR loci, no gene and a NaN TSS distance, in silence.
+    for name, table in (("tandem_repeats", repeats), ("gene_annotation", genes)):
+        absent = [chromosome for chromosome in config.chromosomes if chromosome not in table]
+        if absent:
+            raise ValueError(f"{name} has no record on {absent}; its chromosomes are named {sorted(table)[:3]}..., the store's {list(config.chromosomes[:3])}...")
+    complexity_legend = None if config.popped is None else strata_complexity_legend(config.popped.strata_directory, config.chromosomes)
     facts = []
     for chromosome in config.chromosomes:
         done = directory / "chromosomes" / f"{chromosome}.json"
         if not done.is_file():
             _clear_chromosome(root, chromosome, len(samples.halves), directory)
-            _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats, genes))
+            _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats, genes, complexity_legend))
             _remove_own(directory / "batches" / chromosome, directory)
         facts.append(json.loads(done.read_text(encoding="utf-8")))
     measurements = ["imputed_dosage"] * len(config.imputed_halves) + (["long_read_calls"] if config.truth_calls is not None else [])
@@ -1800,8 +1872,10 @@ def rewrite_recalibrated_store(
                     scales[start:stop, :half_groups] if measurement == "imputed_dosage" else None,
                     np.load(fill_directory / f"{chromosome}.npy"), codec=codec, budget=budget,
                 )
-    shutil.copytree(source_root / "variants", target_root / "variants")
-    shutil.copytree(source_root / "loci", target_root / "loci")
+    # A resumed measurement step rewrites into the same partial directory, so a copy an interrupted attempt left is
+    # overwritten (copytree raised FileExistsError on every resume).
+    shutil.copytree(source_root / "variants", target_root / "variants", dirs_exist_ok=True)
+    shutil.copytree(source_root / "loci", target_root / "loci", dirs_exist_ok=True)
     write_store_manifest(
         target_root,
         chromosomes=chromosomes,
@@ -2509,30 +2583,34 @@ def _export_step(run: _Run, directory: Path) -> dict[str, Any]:
 
 _STEPS = (
     _Step("samples", (), _samples_inputs, (cohort_module, sample_crosswalk, dosage_store, _samples_step, store_half_samples, _calibration_pairs), _samples_step),
-    # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
-    # to either is a change to the phenotypes, not only a change to ``all_of_us``.
-    _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
-    _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, trait_table), _cohort_step),
+    # The store reads only the samples step's half manifests and groups (``_store_sample_layout``), so it follows samples
+    # directly and is keyed by them, not by phenotypes, cohort or the folds.
     _Step(
         "store",
-        ("samples",),
+        (),
         _store_inputs,
         (
             store_converter, dosage_store, variant_typing, _store_step, _store_gates, _convert_chromosome, _popped_chromosome_sites,
-            _plain_chromosome_sites, read_strata_sites, read_popped_sites, _checked_genetic_positions, read_bubble_paths, path_counts,
+            _plain_chromosome_sites, strata_complexity_legend, _strata_names, read_strata_sites, read_popped_sites, _checked_genetic_positions, read_bubble_paths, path_counts,
             _chromosome_spellings, read_plain_sites, read_genetic_map, interpolated_genetic_positions, read_tandem_repeats,
             read_gene_annotation, store_core_spans, store_variant_classes, store_group_first, _decode, _decode_tasks, _gather_calibration,
         ),
         _store_step,
     ),
+    # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
+    # to either is a change to the phenotypes, not only a change to ``all_of_us``.
+    _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
+    _Step("cohort", ("samples", "phenotypes"), lambda config: None, (cohort_module, _cohort_step, trait_table), _cohort_step),
     _Step(
         "measurement",
         ("samples", "cohort", "store"),
         lambda config: None,
-        (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store),
+        # The measurement model it fits and loads (workspace_bindings) is measurement_model's, which the key covers.
+        (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store, *module_closure(measurement_model)),
         _measurement_step,
     ),
-    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, code_digest()), (_fit_step, arm_log_reliability, trait_request, trait_seed), _fit_step),
+    # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
+    _Step("fit", ("cohort", "measurement"), lambda config: config.seed, (_fit_step, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches), _score_step),
     _Step("effects", ("cohort", "fit"), lambda config: None, (_effects_step, variant_effects, length_bins), _effects_step),
     _Step(

@@ -475,7 +475,8 @@ def write_predictions(model_path: str | Path, store_path: str | Path, people_pat
             raise ValueError("the people file must hold exactly sample_indices and covariates.")
         sample_indices = np.array(people["sample_indices"])
         covariates = np.array(people["covariates"])
-    prediction = predict(model, DosageStore.open(store_path), sample_indices, covariates, budget)
+    with DosageStore.open(store_path) as store:
+        prediction = predict(model, store, sample_indices, covariates, budget)
     with open(output, "xb") as handle:
         np.savez(
             handle,
