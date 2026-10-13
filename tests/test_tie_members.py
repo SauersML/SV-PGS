@@ -4,7 +4,27 @@ from __future__ import annotations
 import numpy as np
 
 from sv_pgs.data import TieGroup, TieMap
-from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments
+from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, tied_groups
+
+
+def test_tied_members_preserve_group_and_member_order_with_gaps_and_mutation():
+    groups = np.array([7, 2, 7, 0, 2, 9, 7, 4], dtype=np.int64)
+    ties = TieGroups(groups, np.ones(groups.size), 11)
+    expected = [[1, 4], [0, 2, 6]]
+    assert [members.tolist() for members in tied_groups(ties)] == expected
+    groups[4] = 9
+    assert [members.tolist() for members in tied_groups(ties)] == [[0, 2, 6], [4, 5]]
+
+
+def test_tied_members_match_direct_membership_for_sparse_and_dense_ties():
+    generator = np.random.default_rng(408)
+    for group_count, members in ((0, 0), (100, 100), (100, 120), (3, 200)):
+        groups = (generator.permutation(group_count) if members == group_count else
+                  generator.integers(group_count, size=members))
+        ties = TieGroups(groups, np.ones(members), group_count)
+        expected = [np.flatnonzero(groups == group).tolist() for group in range(group_count)
+                    if np.count_nonzero(groups == group) > 1]
+        assert [indices.tolist() for indices in tied_groups(ties)] == expected
 
 
 def _problem(seed: int):

@@ -530,8 +530,9 @@ def _score_cuda(
             device_codes = cupy.asarray(codes)
             for start in range(0, sample_count, tile_columns):
                 stop = min(sample_count, start + tile_columns)
-                signed = device_codes[:, start:stop].astype(cupy.float64)
-                signed -= SIGNED_CODE_OFFSET
+                # One elementwise kernel converts and centers the integer codes;
+                # all signed values remain exact, and the GEMM stays float64.
+                signed = cupy.subtract(device_codes[:, start:stop], SIGNED_CODE_OFFSET, dtype=cupy.float64)
                 device_accumulators[device_position][:, start:stop] += block_weights @ signed
     for device_position, device_id in enumerate(budget.device_ids):
         with _cupy_device_context(cupy, device_id):
