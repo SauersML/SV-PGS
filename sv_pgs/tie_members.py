@@ -58,13 +58,14 @@ def _group_sum(ties: TieGroups, values: F64Array) -> F64Array:
 def tied_groups(ties: TieGroups) -> list[I64Array]:
     """The members of every group with more than one member (singletons pass through exactly)."""
     sizes = np.bincount(ties.group, minlength=ties.group_count)
-    repeated = np.flatnonzero(sizes > 1)
+    is_tied = sizes > 1
+    repeated = np.flatnonzero(is_tied)
     if not repeated.size:
         return []
     # A genome is mostly singleton groups. Sort only tied members, retaining both
     # ascending group order and ascending member order within each group. Do not
     # cache this index: callers can still mutate the arrays held by TieGroups.
-    members = np.flatnonzero(sizes[ties.group] > 1)
+    members = np.flatnonzero(is_tied[ties.group])
     order = members[np.argsort(ties.group[members], kind="stable")]
     bounds = np.concatenate([[0], np.cumsum(sizes[repeated])])
     return [order[start:stop] for start, stop in zip(bounds[:-1], bounds[1:])]
