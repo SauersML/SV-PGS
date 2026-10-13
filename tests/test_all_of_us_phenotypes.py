@@ -153,7 +153,8 @@ class _FakeQueryJob:
         self._rows = rows
 
     def result(self):
-        return [_FakeRow(row) for row in self._rows]
+        # BigQuery's RowIterator pages its rows in once.
+        return iter([_FakeRow(row) for row in self._rows])
 
 
 class _FakeRow:
@@ -1009,6 +1010,28 @@ def test_treated_occasions_for_a_trait_without_a_medication_rule_raise():
     height = resolve_measurement_definition("height")
     with pytest.raises(ValueError, match="without a medication rule"):
         build_all_of_us_measurement_targets(height, _person_days(1, treated_occasions=[(50.0, 170.0)]), 1 << 28)
+
+
+def test_person_occasions_reads_the_rows_once_in_any_order():
+    # The measurement query's rows stream from BigQuery once, never held; their order does not matter.
+    rows = _person_days(1, [(50.0, 1.0), (51.0, 2.0)], excluded={"censored": 2}, unrecognized_unit_labels=["percent"])
+    rows += _person_days(2, [(40.0, 3.0)], treated_occasions=[(41.0, 4.0)], sex_at_birth_concept_id=45880669)
+    rows += _person_days(3, excluded={"nonpositive": 1})
+    forward = {person.person_id: person for person in person_occasions(iter(rows))}
+    backward = {person.person_id: person for person in person_occasions(iter(rows[::-1]))}
+    assert set(forward) == set(backward) == {"1", "2", "3"}
+    for person_id, person in forward.items():
+        other = backward[person_id]
+        assert person.dates.tolist() == other.dates.tolist() == sorted(person.dates.tolist())
+        for field in ("ages", "values", "treated"):
+            np.testing.assert_array_equal(getattr(person, field), getattr(other, field))
+        assert (person.row_count, person.excluded_row_counts, person.unrecognized_unit_labels) == (
+            other.row_count, other.excluded_row_counts, other.unrecognized_unit_labels,
+        )
+    assert forward["1"].values.tolist() == [1.0, 2.0] and forward["1"].row_count == 4
+    assert forward["1"].excluded_row_counts["censored"] == 2 and forward["1"].unrecognized_unit_labels == {"percent"}
+    assert forward["2"].treated.tolist() == [False, True] and forward["2"].sex_at_birth_name == "male"
+    assert forward["3"].values.size == 0 and forward["3"].excluded_row_counts["nonpositive"] == 1
 
 
 def test_occasion_design_models_age_by_sex_and_drops_columns_that_add_no_rank():

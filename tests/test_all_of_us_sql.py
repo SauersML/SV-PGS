@@ -452,7 +452,7 @@ def test_row_rules_units_and_same_day_collapse(cdr: _Cdr):
     assert sorted(first.unrecognized_unit_labels) == ["millimole per liter", "percent"]
     # 2015-03-01 has two rows (mg/dL and no unit): one occasion, the mean of their creatinine on the linear scale.
     ages = [_age(date, 1960) for date in ("2015-03-01", "2016-05-10", "2017-01-01")]
-    assert first.dates == (_date("2015-03-01"), _date("2016-05-10"), _date("2017-01-01"))
+    assert first.dates.tolist() == [_date("2015-03-01"), _date("2016-05-10"), _date("2017-01-01")]
     for value, target in zip(first.values, (0.85, 1.0, 25.0), strict=True):
         assert value == within_rounding(target, _IDENTITY_OPERATIONS)
     for age, target in zip(first.ages, ages, strict=True):

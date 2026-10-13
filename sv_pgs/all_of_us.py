@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import array
 import csv
 import datetime
 import hashlib
@@ -12,7 +13,7 @@ from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Sequence, TypeVar
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence, TypeVar
 
 import numpy as np
 from scipy.special import ndtri
@@ -1202,11 +1203,11 @@ def fetch_all_of_us_disease_rows(
     disease_definition: DiseaseDefinition,
     client: bigquery.Client | None = None,
 ) -> list[dict[str, Any]]:
-    return _query_rows(
+    return list(_query_rows(
         _active_bigquery_client(client),
         build_all_of_us_disease_sql(disease_definition),
         build_all_of_us_disease_query_config(disease_definition),
-    )
+    ))
 
 
 def resolve_lab_criterion_measurement(criterion: LabCriterion) -> MeasurementDefinition:
@@ -1247,7 +1248,7 @@ def lab_criterion_evidence(criterion: LabCriterion, people: Sequence[PersonOccas
             for readings, _slopes in _possible_readings(definition, person)
         ])
         if qualifying.any():
-            dates = [date for date, qualifies in zip(person.dates, qualifying.all(axis=0), strict=True) if qualifies]
+            dates = person.dates[qualifying.all(axis=0)].tolist()
             evidence[person.person_id] = dict(
                 zip(LAB_CRITERION_COLUMNS, (len(dates), min(dates, default=None), max(dates, default=None)), strict=True)
             )
@@ -1695,7 +1696,8 @@ def build_all_of_us_measurement_query_config(definition: MeasurementDefinition) 
 def fetch_all_of_us_measurement_rows(
     definition: MeasurementDefinition,
     client: bigquery.Client | None = None,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
+    """The trait's person-day rows, streamed (_query_rows): person_occasions reads them once."""
     active_client = _active_bigquery_client(client)
     return _query_rows(
         active_client,
@@ -1706,13 +1708,14 @@ def fetch_all_of_us_measurement_rows(
 
 @dataclass(frozen=True, slots=True)
 class PersonOccasions:
-    """One person's measurement query rows: the retained occasions (linear scale, by date) and the row counts."""
+    """One person's measurement query rows: the retained occasions (linear scale, by date, dates as datetime64[D])
+    and the row counts."""
 
     sample_id: str
     person_id: str
     sex_at_birth_concept_id: Any
     sex_at_birth_name: str | None
-    dates: tuple[datetime.date, ...]
+    dates: np.ndarray
     ages: np.ndarray
     values: np.ndarray
     treated: np.ndarray
@@ -1721,30 +1724,62 @@ class PersonOccasions:
     unrecognized_unit_labels: frozenset[str]
 
 
-def person_occasions(rows: Sequence[dict[str, Any]]) -> list[PersonOccasions]:
-    """Group the measurement query's person-day rows by person, keeping the days with a retained row."""
-    days_by_person: dict[str, list[dict[str, Any]]] = {}
+def person_occasions(rows: Iterable[Mapping[str, Any]]) -> list[PersonOccasions]:
+    """Group the measurement query's person-day rows, in any order, by person, keeping the days with a retained row.
+
+    The rows stream through once and none is kept: each retained day goes into typed columns and each person's counts
+    into running totals, so memory follows the occasions, not the rows. A vital sign has tens of millions of
+    person-days, which held as one dict each would not fit.
+    """
+    positions: dict[str, int] = {}
+    identities: list[tuple[str, Any, str | None]] = []
+    row_counts = array.array("q")
+    excluded = {reason: array.array("q") for reason in MEASUREMENT_EXCLUSION_REASONS}
+    unit_labels: dict[int, set[str]] = {}
+    occasion_persons, occasion_days = array.array("q"), array.array("q")
+    occasion_ages, occasion_values, occasion_treated = array.array("d"), array.array("d"), array.array("b")
     for row in rows:
-        days_by_person.setdefault(str(row["person_id"]), []).append(row)
-    people = []
-    for person_id, days in days_by_person.items():
-        retained = sorted((day for day in days if int(day["retained_row_count"]) > 0), key=lambda day: _as_date(day["measurement_date"]))
-        people.append(PersonOccasions(
-            sample_id=str(days[0]["sample_id"]),
+        position = positions.setdefault(str(row["person_id"]), len(positions))
+        if position == len(identities):
+            identities.append((str(row["sample_id"]), row.get("sex_at_birth_concept_id"), row.get("sex_at_birth_name")))
+            row_counts.append(0)
+            for counts in excluded.values():
+                counts.append(0)
+        row_counts[position] += int(row["row_count"])
+        for reason, counts in excluded.items():
+            counts[position] += int(row[f"{reason}_row_count"])
+        if row.get("unrecognized_unit_labels"):
+            unit_labels.setdefault(position, set()).update(row["unrecognized_unit_labels"])
+        if int(row["retained_row_count"]) > 0:
+            occasion_persons.append(position)
+            occasion_days.append(int(np.datetime64(_as_date(row["measurement_date"]), "D").astype(np.int64)))
+            occasion_ages.append(float(row["age_at_occasion"]))
+            occasion_values.append(float(row["occasion_value"]))
+            occasion_treated.append(bool(row["treated"]))
+    persons = np.asarray(occasion_persons, dtype=np.int64)
+    days = np.asarray(occasion_days, dtype=np.int64)
+    order = np.lexsort((days, persons))
+    bounds = np.searchsorted(persons[order], np.arange(len(identities) + 1))
+    dates = days[order].astype("datetime64[D]")
+    ages = np.asarray(occasion_ages, dtype=np.float64)[order]
+    values = np.asarray(occasion_values, dtype=np.float64)[order]
+    treated = np.asarray(occasion_treated, dtype=np.int8)[order].astype(bool)
+    return [
+        PersonOccasions(
+            sample_id=sample_id,
             person_id=person_id,
-            sex_at_birth_concept_id=days[0].get("sex_at_birth_concept_id"),
-            sex_at_birth_name=days[0].get("sex_at_birth_name"),
-            dates=tuple(_as_date(day["measurement_date"]) for day in retained),
-            ages=np.array([float(day["age_at_occasion"]) for day in retained], dtype=np.float64),
-            values=np.array([float(day["occasion_value"]) for day in retained], dtype=np.float64),
-            treated=np.array([bool(day["treated"]) for day in retained], dtype=bool),
-            row_count=sum(int(day["row_count"]) for day in days),
-            excluded_row_counts={
-                reason: sum(int(day[f"{reason}_row_count"]) for day in days) for reason in MEASUREMENT_EXCLUSION_REASONS
-            },
-            unrecognized_unit_labels=frozenset(label for day in days for label in day.get("unrecognized_unit_labels") or ()),
-        ))
-    return people
+            sex_at_birth_concept_id=sex_at_birth_concept_id,
+            sex_at_birth_name=sex_at_birth_name,
+            dates=dates[bounds[position]:bounds[position + 1]],
+            ages=ages[bounds[position]:bounds[position + 1]],
+            values=values[bounds[position]:bounds[position + 1]],
+            treated=treated[bounds[position]:bounds[position + 1]],
+            row_count=row_counts[position],
+            excluded_row_counts={reason: counts[position] for reason, counts in excluded.items()},
+            unrecognized_unit_labels=frozenset(unit_labels.get(position, ())),
+        )
+        for position, (person_id, (sample_id, sex_at_birth_concept_id, sex_at_birth_name)) in enumerate(zip(positions, identities, strict=True))
+    ]
 
 
 def _possible_readings(definition: MeasurementDefinition, person: PersonOccasions) -> list[tuple[np.ndarray, np.ndarray]]:
@@ -1760,10 +1795,10 @@ def _possible_readings(definition: MeasurementDefinition, person: PersonOccasion
 
 def build_all_of_us_measurement_targets(
     definition: MeasurementDefinition,
-    rows: Sequence[dict[str, Any]],
+    rows: Iterable[Mapping[str, Any]],
     working_bytes: int,
 ) -> tuple[list[dict[str, Any]], tuple[str, ...], dict[str, Any]]:
-    """Turn the measurement query's person-day rows into one training row per person.
+    """Turn the measurement query's person-day rows, read once, into one training row per person.
 
     Returns (training rows, one-hot covariate columns, summary for the metadata).
     A person's readings are their occasions through the trait's value formula,
@@ -2150,11 +2185,11 @@ def prepare_all_of_us_measurement_census(
     """Write the census as TSV. Cells below MINIMUM_REPORTED_PARTICIPANTS
     participants keep their labels but report neither count."""
     active_client = _active_bigquery_client(client)
-    rows = _query_rows(
+    rows = list(_query_rows(
         active_client,
         build_all_of_us_measurement_census_sql(),
         _query_config(build_all_of_us_measurement_census_query_parameters()),
-    )
+    ))
     for row in rows:
         suppressed = int(row["participant_count"]) < MINIMUM_REPORTED_PARTICIPANTS
         row["suppressed_below_minimum"] = suppressed
@@ -2421,9 +2456,11 @@ def _query_rows(
     client: bigquery.Client,
     sql: str,
     job_config: bigquery.QueryJobConfig,
-) -> list[dict[str, Any]]:
+) -> Iterator[dict[str, Any]]:
+    """Run the query and stream its rows as BigQuery pages them in, one dict at a time: a measurement query returns a
+    row per person-day, which a caller reads once (person_occasions) rather than holds."""
     query_job = client.query(sql, job_config=job_config)
-    return [dict(row.items()) for row in query_job.result()]
+    return (dict(row.items()) for row in query_job.result())
 
 
 def _write_tsv(path: Path, header: tuple[str, ...], rows: list[dict[str, Any]]) -> None:
