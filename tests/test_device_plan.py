@@ -64,3 +64,80 @@ def test_two_summation_orders_differ_within_the_reassociation_bound() -> None:
     for index, image in enumerate(images):
         by_halves[index % 2] += image
     assert np.all(np.abs(forward - (by_halves[0] + by_halves[1])) <= reassociation_bound(images, np))
+
+
+def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stage 2's reads are sharded over a budget's CUDA devices by LD block (``stage2_wiring.stage2_source``), on a model's
+    training samples. Checked on the host: numpy stands in for CuPy (``compute_budget._cupy_device_context`` needs no
+    device there) and each device's shard is a host source, so the plan, the sample selection, the peer tiles and the
+    threads of ``map_reduce`` run as on two devices. Every block's products are the streamed source's bit for bit, a
+    read summed over the devices is within the reassociation bound of the streamed one, and a mean-field fit is the
+    streamed source's to its tolerance."""
+    from sv_pgs import compute_budget, dual_solve, stage2_wiring, store_block_source
+    from sv_pgs.config import ModelConfig
+    from sv_pgs.device_plan import ShardedDualSource
+    from sv_pgs.full_data_fit import block_grams, covariate_residual_variance, fit_full_data, stage0_lattice
+    from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
+    from sv_pgs.scale_mixture_ep import scale_mixture_prior
+    from tests.test_full_data_fit import _BLOCK_CAP, _DRAWS, _SAMPLES, _TRAINING, _WORKSPACE_BYTES, _store
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = np.arange(_TRAINING, dtype=np.int64)
+    covariates = np.column_stack([np.ones(_TRAINING), covariate[training]])
+    host = _budget(())
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, covariates, targets[training, None], ModelConfig(), host,
+        _BLOCK_CAP, tmp_path / "ld",
+    )
+    host_source = store_block_source.StoreGenotypeBlockSource
+
+    def host_shard(store, block_rows, block_indices, means, scales, _device_budget, workspace_bytes, sample_indices=None):
+        return host_source(store, block_rows, block_indices, means, scales, host, workspace_bytes, sample_indices)
+
+    monkeypatch.setattr(compute_budget, "_try_import_cupy", lambda: np)
+    monkeypatch.setattr(store_block_source, "StoreGenotypeBlockSource", host_shard)
+    streamed = stage2_wiring.stage2_source(store, statistics, host, _WORKSPACE_BYTES, training)
+    sharded = stage2_wiring.stage2_source(store, statistics, _budget((0, 1)), _WORKSPACE_BYTES, training)
+    assert isinstance(sharded, ShardedDualSource) and isinstance(streamed, dual_solve.StreamedDualSource)
+    assert sharded.sample_count == streamed.sample_count == _TRAINING and sharded.variant_count == streamed.variant_count
+    assert len(set(sharded.plan.block_devices.tolist())) == 2 and sharded.block_bounds == streamed.block_bounds
+
+    generator = np.random.default_rng(5)
+    right = generator.standard_normal((sharded.variant_count, 2))
+    left = generator.standard_normal((_TRAINING, 2))
+    images = []
+    for (start, stop, single), (sharded_start, sharded_stop, peer) in zip(streamed.blocks(), sharded.blocks(), strict=True):
+        assert (start, stop) == (sharded_start, sharded_stop)
+        np.testing.assert_array_equal(peer.matmat(right[start:stop]), single.matmat(right[start:stop]))
+        np.testing.assert_array_equal(peer.rmatmat(left), single.rmatmat(left))
+        np.testing.assert_array_equal(peer.columns(np.arange(stop - start)), single.columns(np.arange(stop - start)))
+        images.append(single.matmat(right[start:stop] * single.rmatmat(left)))
+
+    def work(start, stop, tile, shared, rows, image):
+        image += tile.matmat(rows["right"] * tile.rmatmat(shared["left"]))
+
+    total = sharded.map_reduce(work, {"left": left}, {"right": right}, tuple(left.shape))
+    sequential = streamed.map_reduce(work, {"left": left}, {"right": right}, tuple(left.shape))
+    assert np.all(np.abs(total - sequential) <= reassociation_bound(images, np))
+
+    # A mean-field fit on each source: the sharded one's reads differ from the streamed one's only by the order a read's
+    # devices are summed in.
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    members = statistics.active_rows.shape[0]
+    noise = float(covariate_residual_variance(targets[:, None], mask, store_covariates)[0])
+    nodes, floor, top = stage0_lattice(statistics, 0, noise, np.zeros(members), 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(members, dtype=np.int64), log_variance_offset=np.zeros(members), annotation_design=np.zeros((members, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    means = []
+    for source in (streamed, sharded):
+        gaussian = dual_solve.DualGaussian(
+            source=source, training=np.ones((_TRAINING, 1)), targets=targets[training, None], offsets=np.zeros((_TRAINING, 1)),
+            covariates=covariates, grams=block_grams(statistics), probe_count=_DRAWS, seed=11, probe_sample_indices=training,
+        )
+        fit = fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field")
+        means.append(fit.member_mean[:, 0])
+    assert np.corrcoef(*means)[0, 1] > 0.999

@@ -35,6 +35,7 @@ from sv_pgs.binary_likelihood import POLYA_GAMMA_MEAN_AT_ZERO, BernoulliSites, c
 from sv_pgs.logistic_ep import assert_no_separation
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import ModelConfig, TraitType, VariantClass
+from sv_pgs.device_plan import ShardedDualSource
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
@@ -432,6 +433,17 @@ def _quarantine_codes(fit: _ModelFit) -> list[str]:
     return [issue["code"] for issue in decision["issues"] if issue["severity"] == "fatal"]
 
 
+def stage2_source(
+    store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int, training_columns: I64Array,
+) -> StreamedDualSource | ShardedDualSource:
+    """Stage 2's reads of the store on a model's training samples: sharded by LD block over every CUDA device of the
+    budget where it has several (``device_plan.ShardedDualSource``: each block's products on its own device, a read's
+    images summed on the first), else streamed on the one device or the host."""
+    if budget.device_kind == "cuda" and len(budget.device_ids) > 1:
+        return ShardedDualSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns)
+    return StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns))
+
+
 def _fitted_cavity(fit: FullDataFit, model: int) -> Cavity:
     """Model ``model``'s cavity at the fitted state: mean field's pseudo-likelihoods, or EP's own cavities."""
     if fit.member_omega is not None:
@@ -560,7 +572,7 @@ def _fit_group(
     )
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
-    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, share, sample_indices=training_columns))
+    source = stage2_source(store, statistics, budget, share, training_columns)
     # Timing may select a band accelerator, never a different likelihood. Every route
     # retains DualGaussian and recomputes the omitted fields from the full sample operator.
     band = None
@@ -786,11 +798,9 @@ def fit_models(
     one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same way."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
-    # Stage 0 runs a buffer on every device; Stage 2's reads run on CuPy's current device, since the multi-device
-    # source (device_plan.ShardedDualSource) is not wired in (docs/design/CAPABILITIES.md).
-    stage2_device = f"CUDA device {budget.device_ids[0]}" if budget.device_kind == "cuda" else "the CPU"
-    log(f"stage2 wiring: Stage 0 runs on every device of the budget, Stage 2 on {stage2_device} alone "
-        f"({len(budget.device_ids)} CUDA device(s) visible)")
+    # Stage 0 runs a buffer on every device, and Stage 2's reads are sharded over them by LD block (``stage2_source``).
+    stage2_devices = f"CUDA devices {', '.join(str(device) for device in budget.device_ids)}" if budget.device_kind == "cuda" else "the CPU"
+    log(f"stage2 wiring: Stage 0 and Stage 2's reads run on {stage2_devices}")
     measurement = store_measurement(store, log_variance_offset)
     groups = model_groups(store_columns, covariate_columns, training, trait_types)
     log(f"stage2 wiring: {training.shape[1]} models in {len(groups)} groups fitted together (models sharing training rows, covariates and likelihood)")

@@ -131,6 +131,14 @@ def moved(cupy: Any, values: Any, device_id: int) -> Any:
     return target
 
 
+def _synchronize(cupy: Any) -> None:
+    """Wait for the current device's stream; nothing on an array module with no streams (numpy, which stands in for
+    CuPy where the sharded source is checked on the host, as ``compute_budget._cupy_device_context`` lets it)."""
+    stream = getattr(getattr(cupy, "cuda", None), "get_current_stream", None)
+    if stream is not None:
+        stream().synchronize()
+
+
 class _PeerOperand:
     """A read's sample-side operand, prepared once per device on first use there."""
 
@@ -218,10 +226,13 @@ class ShardedDualSource:
         self.home_id = plan.device_ids[0]
 
     @classmethod
-    def from_statistics(cls, store: Any, statistics: Any, budget: ComputeBudget, workspace_bytes: int) -> ShardedDualSource:
+    def from_statistics(
+        cls, store: Any, statistics: Any, budget: ComputeBudget, workspace_bytes: int, sample_indices: NDArray[np.int64] | None = None,
+    ) -> ShardedDualSource:
         """One Stage 0 pass's reduced LD blocks over every device of ``budget``, each device streaming
-        its own blocks from ``store``. The devices read at once, so each shard's read-ahead plans
-        against an equal share of the host memory."""
+        its own blocks from ``store``, on the store samples ``sample_indices`` only (a model's training
+        samples; ``store_block_source.StoreGenotypeBlockSource``'s). The devices read at once, so each
+        shard's read-ahead plans against an equal share of the host memory."""
         from sv_pgs.compute_budget import _try_import_cupy
         from sv_pgs.store_block_source import StoreGenotypeBlockSource, reduced_block_layout
 
@@ -231,7 +242,8 @@ class ShardedDualSource:
         if cupy is None:
             raise RuntimeError("the compute budget names CUDA devices but CuPy cannot be imported")
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
-        plan = plan_blocks(budget.device_ids, [rows.shape[0] for rows in block_rows], int(store.n_samples))
+        sample_count = int(store.n_samples if sample_indices is None else np.asarray(sample_indices).shape[0])
+        plan = plan_blocks(budget.device_ids, [rows.shape[0] for rows in block_rows], sample_count)
         log_device_plan(budget, plan)
         shard_host_bytes = budget.host_bytes // len(budget.device_ids)
         shards = []
@@ -254,9 +266,10 @@ class ShardedDualSource:
                     np.concatenate([scales[block] for block in blocks]),
                     shard_budget,
                     workspace_bytes,
+                    sample_indices,
                 ))
         bounds = [(int(indices[0]), int(indices[-1]) + 1) for indices in block_indices]
-        return cls(shards, plan, bounds, int(store.n_samples), cupy)
+        return cls(shards, plan, bounds, shards[0].sample_count, cupy)
 
     def blocks(self) -> Iterator[tuple[int, int, Any]]:
         """Every block in variant order, as a tile that takes and returns home-device arrays."""
@@ -285,7 +298,7 @@ class ShardedDualSource:
                         start, stop = self.block_bounds[int(block)]
                         block_rows = {name: moved(self._cupy, values[start:stop], device_id) for name, values in rows.items()}
                         work(start, stop, tile, device_shared, block_rows, image)
-                    self._cupy.cuda.get_current_stream().synchronize()
+                    _synchronize(self._cupy)
                     images[position] = image
             except BaseException as error:
                 failures.append(error)
