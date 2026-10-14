@@ -849,7 +849,6 @@ class _FullDataFixedPoints:
                     f"model {model}: the marginal variances fail the cavity information certificate in "
                     f"{int(np.count_nonzero(certificate.violated))} of {len(blocks)} blocks (stage {stage}, {probe_count} probes)"
                 )
-            final = certificate
             undecided = undecided[~certificate.certified]
             if not undecided.shape[0] or probe_count >= variant_count:
                 self.undecided_blocks += int(undecided.shape[0])
@@ -1037,7 +1036,6 @@ class _FullDataFixedPoints:
                 rate = np.sqrt(upper / previous[0]) if previous is not None else np.full(model_count, np.inf)
                 # Twice the certified distance's KL, against 1 / K (the certificate's units).
                 self.mean_move = np.where(rate < 1.0, 2.0 * fraction * fraction * upper / np.square(1.0 - rate), np.inf)
-            draw_tolerance = np.full(model_count, 2.0 * budget)
             noise = self._noise(variances)
             self.noise_gain = np.array([
                 noise_gain(float(noise[model]), float(self.noise[model]), int(gaussian.training_counts[model]), int(self.covariate_ranks[model]))
@@ -1266,7 +1264,6 @@ class _FullDataFixedPoints:
                     ]
                 self.noise = noise
                 continue
-            start_precision, start_shift = self.site_precision.copy(), self.site_shift.copy()
             while True:
                 precision, shift, steps = self._inner(hyperparameters, 1.0 / variances, mean / variances, inner_tolerance)
                 log(f"ep double loop: inner problem {steps} steps at tolerance {inner_tolerance:.3e}")
