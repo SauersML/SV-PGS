@@ -28,6 +28,26 @@
   "disease_likelihood": "gaussian_working",
   "annotated_prior": true,
   "calibration_fraction": 0.1,
+  "panel": {
+    "primary_fold": 0,
+    "weights": {
+      "hypertension": 0.130686,
+      "coronary_artery_disease": 0.077257,
+      "asthma": 0.072754,
+      "hyperlipidemia": 0.104734,
+      "breast_cancer": 0.026914,
+      "type2_diabetes": 0.108541,
+      "atrial_fibrillation": 0.061164,
+      "hypothyroidism": 0.070565,
+      "copd": 0.035349,
+      "depression": 0.053163,
+      "gout": 0.063326,
+      "cataract": 0.063223,
+      "chronic_kidney_disease": 0.042467,
+      "psoriasis": 0.039939,
+      "prostate_cancer": 0.049917
+    }
+  },
   "fold_count": 5,
   "seed": ${FOLD_SEED},
   "codec": "zstd",

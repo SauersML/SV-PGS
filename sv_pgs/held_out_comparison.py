@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Sequence
 
 import numpy as np
 from scipy import special, stats
@@ -201,6 +202,20 @@ def auc_components(labels: NDArray, score: NDArray) -> AucComponents:
     )
 
 
+def delta_auc_influence(labels: NDArray, baseline: NDArray, candidate: NDArray) -> tuple[float, NDArray]:
+    """DeLong's delta AUC (candidate less baseline) and its per-sample influence: each case's and each control's
+    centred placement difference over their count."""
+    baseline_components = auc_components(labels, baseline)
+    candidate_components = auc_components(labels, candidate)
+    positive_difference = candidate_components.positive - baseline_components.positive
+    negative_difference = candidate_components.negative - baseline_components.negative
+    positive = np.asarray(labels) == 1
+    influence = np.empty(positive.shape[0], dtype=np.float64)
+    influence[positive] = (positive_difference - positive_difference.mean()) / positive_difference.size
+    influence[~positive] = (negative_difference - negative_difference.mean()) / negative_difference.size
+    return candidate_components.auc - baseline_components.auc, influence
+
+
 def paired_delta_auc(
     labels: NDArray, baseline: NDArray, candidate: NDArray, clusters: NDArray | None = None,
 ) -> PairedComparison:
@@ -210,18 +225,16 @@ def paired_delta_auc(
     applies the C/(C-1) cluster correction. It includes covariance between related
     cases and controls, which the independent-participant DeLong variance omits.
     """
-    baseline_components = auc_components(labels, baseline)
-    candidate_components = auc_components(labels, candidate)
-    positive_difference = candidate_components.positive - baseline_components.positive
-    negative_difference = candidate_components.negative - baseline_components.negative
-    estimate = candidate_components.auc - baseline_components.auc
-    positive_count, negative_count = positive_difference.size, negative_difference.size
+    positive = np.asarray(labels) == 1
+    positive_count, negative_count = int(positive.sum()), int((~positive).sum())
     if min(positive_count, negative_count) < 2:
-        return comparison_from_estimate(estimate, math.nan)
+        return comparison_from_estimate(auc_components(labels, candidate).auc - auc_components(labels, baseline).auc, math.nan)
+    estimate, influence = delta_auc_influence(labels, baseline, candidate)
     if clusters is None:
-        variance = float(np.var(positive_difference, ddof=1)) / positive_count + float(
-            np.var(negative_difference, ddof=1)
-        ) / negative_count
+        # DeLong's variance: each class's placement differences' sample variance over its count.
+        variance = sum(
+            float(np.var(influence[members], ddof=1)) * members.sum() for members in (positive, ~positive)
+        )
     else:
         clusters = np.asarray(clusters)
         if clusters.shape != np.asarray(labels).shape:
@@ -229,11 +242,54 @@ def paired_delta_auc(
         _families, dense_clusters = np.unique(clusters, return_inverse=True)
         if _families.size < 2:
             return comparison_from_estimate(estimate, math.nan)
-        positive = np.asarray(labels) == 1
-        influence = np.empty(positive.shape[0], dtype=np.float64)
-        influence[positive] = (positive_difference - positive_difference.mean()) / positive_count
-        influence[~positive] = (negative_difference - negative_difference.mean()) / negative_count
         totals = cluster_totals(influence, dense_clusters)
         variance = float(totals @ totals) * _families.size / (_families.size - 1)
     standard_error = math.sqrt(variance)
     return comparison_from_estimate(estimate, standard_error)
+
+
+def power_weights(expected_z: NDArray) -> NDArray:
+    """Pre-registered panel weights: proportional to each trait's expected z, never negative."""
+    clipped = np.clip(np.asarray(expected_z, dtype=np.float64), 0.0, None)
+    total = float(clipped.sum())
+    if total <= 0.0:
+        raise ValueError("every trait has non-positive expected z; the panel has no power")
+    return clipped / total
+
+
+def influence_correlation(per_trait_influence: Sequence[NDArray], clusters: NDArray | None) -> NDArray:
+    """Correlation of per-trait statistics from their family-block summed influences.
+
+    Every trait is scored on the same people (an unobserved person's influence is 0), so the joint family-block
+    resampling distribution is captured exactly by the covariance of the cluster-summed influence functions, with no
+    bootstrap needed."""
+    totals = np.stack([cluster_totals(influence, clusters) for influence in per_trait_influence])
+    covariance = totals @ totals.T
+    scale = np.sqrt(np.diag(covariance))
+    return covariance / np.outer(scale, scale)
+
+
+def panel_z(per_trait_z: NDArray, weights: NDArray, correlation: NDArray) -> float:
+    """Pre-registered weighted Stouffer statistic across traits, correlation-aware: w'z / sqrt(w'Rw)."""
+    if np.any(weights < 0.0):
+        raise ValueError("panel weights must be non-negative")
+    spread = float(weights @ correlation @ weights)
+    return float(weights @ per_trait_z) / math.sqrt(spread)
+
+
+def hommel_adjusted(p_values: NDArray) -> NDArray:
+    """Hommel family-wise adjusted p-values (valid under positive dependence)."""
+    p_values = np.asarray(p_values, dtype=np.float64)
+    count = p_values.shape[0]
+    order = np.argsort(p_values)
+    sorted_p = p_values[order]
+    adjusted = sorted_p.copy()
+    for subset_size in range(count, 1, -1):
+        simes_tail = float(np.min(subset_size * sorted_p[-subset_size:] / np.arange(1, subset_size + 1)))
+        adjusted[-subset_size:] = np.maximum(adjusted[-subset_size:], simes_tail)
+        head = count - subset_size
+        adjusted[:head] = np.maximum(adjusted[:head], np.minimum(subset_size * sorted_p[:head], simes_tail))
+    adjusted = np.maximum(adjusted, sorted_p)
+    result = np.empty(count)
+    result[order] = np.minimum(adjusted, 1.0)
+    return result

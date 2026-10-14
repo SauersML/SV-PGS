@@ -110,7 +110,7 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=both)
     monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
-    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count, calibration_fraction=.1)), tmp_path)
+    summary = pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=fold_count, calibration_fraction=.1, panel=None)), tmp_path)
     with (tmp_path / "comparison.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     assert len(rows) == 8
@@ -138,7 +138,7 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
     monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
-    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1)), tmp_path)
+    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1, panel=None)), tmp_path)
     with (tmp_path / 'accuracy.tsv').open() as handle:
         rows = [row for row in csv.DictReader(handle, delimiter='\t') if row['cell'] == 'all' and row['arm'] == 'with_sv']
     metrics = {row['metric']: row for row in rows}
@@ -175,7 +175,7 @@ def test_a_cells_rows_show_no_small_count_by_their_difference_and_stay_exportabl
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
     monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
-    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1)), tmp_path)
+    pipeline._report_step(SimpleNamespace(config=SimpleNamespace(fold_count=3, calibration_fraction=.1, panel=None)), tmp_path)
     for name in ('accuracy.tsv', 'comparison.tsv'):
         pipeline.check_exportable(tmp_path / name)
         with (tmp_path / name).open() as handle:

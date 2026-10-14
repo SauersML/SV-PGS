@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import csv
 import itertools
+import json
 import math
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -31,7 +32,7 @@ from pathlib import Path
 import numpy as np
 from scipy import stats
 
-from sv_pgs.held_out_comparison import paired_delta_auc
+from sv_pgs.held_out_comparison import paired_delta_auc, power_weights
 from benchmarks.power.uncertainty import rejection_summary
 
 
@@ -125,6 +126,8 @@ class Expectation:
     power_mcse: float
     power_lower_95: float
     power_upper_95: float
+    # The mean z of the paired test over the valid replicates: E[z], which the pre-registered panel weights follow.
+    mean_z: float
 
 
 def expectation(
@@ -188,6 +191,7 @@ def expectation(
         mean_delta_auc_simulated=float(np.mean(deltas)) if deltas else math.nan,
         valid_replicates=int(z_values.size), invalid_replicates=replicates - int(z_values.size),
         power_mcse=rate['mcse'], power_lower_95=rate['lower'], power_upper_95=rate['upper'],
+        mean_z=float(np.mean(z_values)) if z_values.size else math.nan,
     )
 
 
@@ -221,10 +225,17 @@ def main() -> None:
     parser.add_argument("--replicates", type=int, default=200)
     parser.add_argument("--significance", type=float, default=0.05)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--panel-weights", action="store_true",
+        help="write the run config's frozen panel block instead: weights proportional to each disease's E[z] at one common "
+        "SV architecture (the first of each scenario list, the first arm error correlation), so they follow h2, n and "
+        "prevalence and no SV biology (EVALUATION.md, the pre-registered panel)",
+    )
     arguments = parser.parse_args()
     if arguments.folds < 2 or not 0 <= arguments.calibration_fraction < 1:
         parser.error("folds must be at least two and calibration-fraction in [0, 1)")
     rows = []
+    expected_z = {}
     for name, prevalence, heritability, eligible in PANEL:
         people = int(arguments.people * eligible)
         base = Architecture(
@@ -235,6 +246,13 @@ def main() -> None:
             # A fixed-predictor planning calculation for ONE outer holdout, not a pooled CV power claim.
             test_people=people // arguments.folds,
         )
+        if arguments.panel_weights:
+            architecture = replace(
+                base, sv_share=sv_share_of(arguments.sv_causal_fractions[0], arguments.sv_effect_folds[0]), tagged_by_small=arguments.tagged_by_small[0]
+            )
+            result = expectation(architecture, arguments.replicates, len(expected_z), arguments.significance, len(PANEL), arguments.arm_error_correlations[0])
+            expected_z[name] = result.mean_z
+            continue
         for sv_causal_fraction in arguments.sv_causal_fractions:
             for fold in arguments.sv_effect_folds:
                 for tagged, correlation in itertools.product(arguments.tagged_by_small, arguments.arm_error_correlations):
@@ -256,6 +274,12 @@ def main() -> None:
                         "evaluation_scope": "one_outer_holdout_conditional_on_assumed_predictors",
                     })
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    if arguments.panel_weights:
+        weights = power_weights(np.array([expected_z[name] for name, *_rest in PANEL]))
+        block = {"primary_fold": 0, "weights": {name: round(float(weight), 6) for (name, *_rest), weight in zip(PANEL, weights)}}
+        arguments.output.write_text(json.dumps(block, indent=2) + "\n")
+        print(f"wrote the panel block for {len(PANEL)} diseases to {arguments.output}")
+        return
     with arguments.output.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]), delimiter="\t")
         writer.writeheader()

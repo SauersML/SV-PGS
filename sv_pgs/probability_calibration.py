@@ -75,9 +75,18 @@ def paired_frozen_gain(
     """The mean per-person reduction in ``metric`` (``proper_scores``) from the baseline's frozen probabilities to the
     candidate's, positive favouring the candidate (for log loss, the gain in log likelihood), with a family-clustered
     standard error conditional on the fitted models and their frozen calibrations."""
+    estimate, influence = frozen_gain_influence(labels, baseline_logits, candidate_logits, metric=metric)
+    totals = cluster_totals(influence, clusters)
+    return comparison_from_estimate(estimate, float(np.linalg.norm(totals)))
+
+
+def frozen_gain_influence(
+    labels: NDArray, baseline_logits: NDArray, candidate_logits: NDArray, *, metric: str = "log_loss"
+) -> tuple[float, F64Array]:
+    """``paired_frozen_gain``'s estimate, the mean per-person reduction in ``metric``, and its per-person influence:
+    each person's reduction, centred, over the people."""
     difference = proper_scores(labels, baseline_logits)[metric] - proper_scores(labels, candidate_logits)[metric]
-    totals = cluster_totals(difference - difference.mean(), clusters)
-    return comparison_from_estimate(float(difference.mean()), float(np.linalg.norm(totals) / difference.size))
+    return float(difference.mean()), (difference - difference.mean()) / difference.size
 
 
 def calibration_mask(training, families, fraction, seed):

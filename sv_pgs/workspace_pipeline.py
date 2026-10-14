@@ -291,6 +291,35 @@ the one source implemented, then the optional sources, each of which must be nul
 
 
 @dataclass(frozen=True, slots=True)
+class PanelInputs:
+    """The pre-registered panel test (EVALUATION.md, "The pre-registered panel"), frozen before any test phenotype is
+    read: the outer fold its per-trait tests are read on, and each trait's non-negative weight, proportional to the
+    trait's expected z under a power model that uses no SV biology."""
+
+    primary_fold: int
+    weights: tuple[tuple[str, float], ...]
+
+    @classmethod
+    def from_mapping(cls, raw: Any, phenotypes: Sequence[str], fold_count: int) -> PanelInputs | None:
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) != {"primary_fold", "weights"}:
+            raise ValueError("panel is null or {primary_fold, weights}.")
+        fold = raw["primary_fold"]
+        if isinstance(fold, bool) or not isinstance(fold, (int, np.integer)) or not 0 <= fold < fold_count:
+            raise ValueError(f"panel primary_fold must be an integer fold in [0, {fold_count}).")
+        weights = raw["weights"]
+        if not isinstance(weights, Mapping) or set(weights) != set(phenotypes):
+            raise ValueError("panel weights name every disease and trait of the run, each once.")
+        values = [weights[name] for name in phenotypes]
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not np.isfinite(value) or value < 0 for value in values):
+            raise ValueError("panel weights are finite and non-negative.")
+        if not sum(values) > 0:
+            raise ValueError("panel weights cannot all be 0.")
+        return cls(primary_fold=int(fold), weights=tuple((name, float(weights[name])) for name in phenotypes))
+
+
+@dataclass(frozen=True, slots=True)
 class DirectSvInputs:
     """The ``direct_sv`` config: the GATK-SV call set as a path pattern over ``{chromosome}``, one VCF per store
     chromosome (samples named by research ID), or None, which adds no direct row."""
@@ -371,6 +400,7 @@ class WorkspaceConfig:
     disease_likelihood: str = "gaussian_working"
     calibration_fraction: float = 0.0
     annotated_prior: bool = True
+    panel: PanelInputs | None = None
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -379,7 +409,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior"})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel"})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -458,6 +488,7 @@ class WorkspaceConfig:
             disease_likelihood=str(raw.get("disease_likelihood", "gaussian_working")),
             calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
             annotated_prior=raw.get("annotated_prior", True),
+            panel=PanelInputs.from_mapping(raw.get("panel"), diseases + traits, int(raw["fold_count"])),
         )
 
     def truth_path(self, chromosome: str) -> Path:
@@ -3418,6 +3449,85 @@ def _paired(
     raise ValueError(f"unknown comparison {metric!r}")
 
 
+def _primary_influence(
+    metric: str, targets: F64Array, linear: F64Array, genetic: F64Array, frozen: F64Array, covariates: F64Array
+) -> F64Array:
+    """The per-person influence of ``_paired``'s ``metric`` on one fold's rows, whose family-summed squares are its
+    variance (``held_out_comparison.cluster_totals``)."""
+    baseline, candidate = ARMS.index("snv_indel"), ARMS.index("with_sv")
+    if metric == "log_likelihood_gain":
+        return probability_calibration.frozen_gain_influence(targets, frozen[baseline], frozen[candidate], metric="log_loss")[1]
+    if metric == "delta_auc":
+        return held_out_comparison.delta_auc_influence(targets, linear[baseline], linear[candidate])[1]
+    if metric == "delta_pgs_partial_r2":
+        outcome = _residualized(targets, covariates)
+        _delta, influence = held_out_comparison.delta_r2_influence(
+            outcome, _residualized(genetic[baseline], covariates), _residualized(genetic[candidate], covariates)
+        )
+        return influence / outcome.shape[0]
+    raise ValueError(f"no primary influence for {metric!r}")
+
+
+PANEL_COLUMNS = ("trait", "n", "cases", "metric", "estimate", "standard_error", "z", "p_one_sided", "p_hommel", "weight")
+"""``panel.tsv``: each trait's pre-registered test on the panel's primary fold, then the panel's weighted z."""
+
+
+def _panel_rows(run: _Run, cohort: _Cohort, scores: Any) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
+    """The pre-registered panel test (EVALUATION.md (a) and (f)) on the config's frozen primary fold.
+
+    Each trait's test is one-sided (the with_sv arm predicts better), paired on the primary fold's held-out people:
+    a disease's gain in log likelihood of its frozen probabilities (Delta log loss; its delta AUC where the run has no
+    frozen calibration), a quantitative trait's delta partial r^2 of its genetic scores. One outer fold, so each z is
+    exact conditional on that fold's fitted models: the pre-registered cross-fit pair term that would let every fold
+    enter needs each arm's posterior covariance, which a biobank-scale fit never forms. The panel's statistic is
+    w'z / sqrt(w'Rw), one-sided, with the frozen weights and R the correlation of the traits' family-summed influences
+    (``held_out_comparison.panel_z``, ``influence_correlation``); the per-trait p-values are Hommel-adjusted across the
+    panel. A trait whose statistic is undefined on the fold (one outcome class, no variance) leaves the panel, and the
+    summary names it."""
+    panel = run.config.panel
+    assert panel is not None
+    weights = dict(panel.weights)
+    tested: list[tuple[str, float, F64Array]] = []
+    table: list[list[Any]] = []
+    for trait, name in enumerate(cohort.trait_names):
+        binary = cohort.trait_types[trait] == TraitType.BINARY
+        targets = cohort.targets[:, trait]
+        rows = np.flatnonzero(np.isfinite(targets) & (cohort.folds == panel.primary_fold))
+        cases = int(targets[rows].sum()) if binary else None
+        metric = ("log_likelihood_gain" if run.config.calibration_fraction else "delta_auc") if binary else "delta_pgs_partial_r2"
+        linear = scores.held_out_linear_predictor[:, rows, trait]
+        genetic = scores.held_out_genetic[:, rows, trait]
+        frozen = np.full(linear.shape, np.nan) if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[:, rows, trait]
+        covariates = cohort.covariates[np.ix_(rows, np.flatnonzero(cohort.covariate_columns[trait]))]
+        row: list[Any] = [name, reportable_count(rows.shape[0]), _cases_text(rows.shape[0], cases), metric, "", "", "", "", "", f"{weights[name]:.6g}"]
+        both_classes = cases is None or min(cases, rows.shape[0] - cases) >= 2
+        calibrated = metric != "log_likelihood_gain" or bool(np.all(np.isfinite(frozen)))
+        if rows.shape[0] and both_classes and calibrated:
+            comparison = _paired(metric, targets[rows], linear, genetic, frozen, covariates, cohort.families[rows])
+            if np.isfinite(comparison.z_score) and comparison.standard_error > 0:
+                influence = np.zeros(cohort.targets.shape[0])
+                influence[rows] = _primary_influence(metric, targets[rows], linear, genetic, frozen, covariates)
+                tested.append((name, comparison.z_score, influence))
+                if _shown(rows.shape[0], cases):
+                    row[4:8] = [f"{comparison.estimate:.6g}", f"{comparison.standard_error:.6g}", f"{comparison.z_score:.6g}", f"{stats.norm.sf(comparison.z_score):.6g}"]
+        table.append(row)
+    names = [entry[0] for entry in tested]
+    summary: dict[str, Any] = {"primary_fold": panel.primary_fold, "left_out": [name for name in cohort.trait_names if name not in names]}
+    if tested:
+        z = np.array([entry[1] for entry in tested])
+        for name, adjusted in zip(names, held_out_comparison.hommel_adjusted(stats.norm.sf(z))):
+            row = table[cohort.trait_names.index(name)]
+            if row[6]:
+                row[8] = f"{adjusted:.6g}"
+        weight = np.array([weights[name] for name in names])
+        if weight.sum() > 0:
+            correlation = held_out_comparison.influence_correlation([entry[2] for entry in tested], cohort.families)
+            statistic = held_out_comparison.panel_z(z, weight, correlation)
+            summary.update(panel_z=statistic, panel_p_one_sided=float(stats.norm.sf(statistic)), traits_in_panel=names)
+            table.append(["panel", "", "", "weighted_z", "", "", f"{statistic:.6g}", f"{stats.norm.sf(statistic):.6g}", "", ""])
+    return [PANEL_COLUMNS, *(tuple(row) for row in table)], summary
+
+
 def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Held-out accuracy of both arms (``accuracy.tsv``) and the paired SNV+SV against SNV/indel comparison
     (``comparison.tsv``), per trait in cells of all held-out rows, fold, ancestry and half.
@@ -3505,13 +3615,19 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                     name, cell, level, *metric_counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
                     z_text, p_text, inference,
                 ))
-    for file_name, lines in (("accuracy.tsv", accuracy), ("comparison.tsv", comparison)):
+    tables = [("accuracy.tsv", accuracy), ("comparison.tsv", comparison)]
+    panel_summary: dict[str, Any] | str = "no pre-registered panel in the run config"
+    if run.config.panel is not None:
+        panel_lines, panel_summary = _panel_rows(run, cohort, scores)
+        tables.append(("panel.tsv", panel_lines))
+    for file_name, lines in tables:
         with (directory / file_name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
-    exportable = ["accuracy.tsv", "comparison.tsv"]
+    exportable = [file_name for file_name, _lines in tables]
     _write_json(directory / EXPORTABLE_FILE, exportable)
     return {
         "files": exportable,
+        "panel": panel_summary,
         "comparison_inference": (
             "Standard errors are conditional on fitted models. Multi-fold comparisons are descriptive: "
             "shared-training covariance is not estimated, so combined z and p-values are omitted."
@@ -3616,9 +3732,10 @@ _STEPS = (
     _Step(
         "report",
         ("cohort", "score"),
-        lambda config: None,
+        lambda config: None if config.panel is None else [config.panel.primary_fold, [list(weight) for weight in config.panel.weights]],
         (
             _report_step, _cells, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text,
+            _primary_influence, _panel_rows,
             held_out_comparison, probability_calibration,
         ),
         _report_step,
