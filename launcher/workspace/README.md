@@ -73,7 +73,7 @@ The staging machine and the Batch VMs must be the same platform (Linux x86-64). 
 Exported before `submit.sh`:
 - `PROJECT_ID`, `REGION`, `ZONE`, `NETWORK`, `SUBNETWORK`, `SERVICE_ACCOUNT`;
 - `OPS_BUCKET` (the workspace bucket), `RUN_ID`, `RUN_DISK_GB` (each job's new disk, in GB);
-- `WORKSPACE_CDR`, `GOOGLE_PROJECT`, and for the store job `CDR_STORAGE_PATH` (the workspace's own `gs://` CDR path, which the job mounts read-only at `/mnt/disks/cdr`, billed to `GOOGLE_PROJECT`);
+- `WORKSPACE_CDR`, `GOOGLE_PROJECT`, and `CDR_STORAGE_PATH` (the workspace's own `gs://` CDR path, which both jobs mount read-only at `/mnt/disks/cdr`, billed to `GOOGLE_PROJECT`: the store job reads the GATK-SV call set there, and every job hashes each step's inputs, the call set's included, to key the steps it skips);
 - `MACHINE_TYPE`, `PROVISIONING_MODEL`, `GPU_TYPE`, `GPU_COUNT`, `THROUGH`, `UV_EXTRAS` (`--extra gpu` for the fit job);
 - `BUDGET_SLOT`, `HOURLY_USD`; optional `STUDY_BUDGET` and `MAX_RETRIES` (default 0).
 

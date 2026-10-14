@@ -149,7 +149,7 @@ else:
     environment.update(
         PROJECT_ID="test-project", REGION="us-central1", ZONE="us-central1-a", OPS_BUCKET="workspace",
         RUN_ID="study", RUN_DISK_GB="2000", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
-        WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu",
+        WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu", CDR_STORAGE_PATH="gs://cdr-bucket/v8",
         MACHINE_TYPE="a2-highgpu-1g", PROVISIONING_MODEL="SPOT", GPU_TYPE="nvidia-tesla-a100",
         GPU_COUNT="1", NETWORK="network", SUBNETWORK="subnetwork", SERVICE_ACCOUNT="account@example.test",
         MAX_RETRIES="0", STUDY_BUDGET=str(launcher.with_name("study_budget.template.json")),
@@ -195,14 +195,16 @@ def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     assert refused.returncode != 0 and "RUN_DISK_GB" in refused.stderr and not (tmp_path / "submitted.jsonl").exists()
 
 
-def test_the_store_job_mounts_the_workspace_cdr_read_only(tmp_path):
+@pytest.mark.parametrize("job, slot, through", [("store", "prepare", "direct_sv"), ("fit", "pilot", "fit")])
+def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, through):
+    """The store job reads the GATK-SV call set there; the fit job hashes it to key the direct_sv step it skips."""
     launcher, environment = _fake_cloud(tmp_path)
-    environment.update(THROUGH="direct_sv", BUDGET_SLOT="prepare", MACHINE_TYPE="n2d-standard-32")
+    environment.update(THROUGH=through, BUDGET_SLOT=slot)
     environment.pop("CDR_STORAGE_PATH", None)
-    refused = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    refused = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
     assert refused.returncode != 0 and "CDR_STORAGE_PATH" in refused.stderr
     environment["CDR_STORAGE_PATH"] = "gs://fc-aou-datasets-controlled/v8/"
-    submitted = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    submitted = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
     assert submitted.returncode == 0, submitted.stderr
     spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
     volumes = {volume["mountPath"]: volume for volume in spec["taskGroups"][0]["taskSpec"]["volumes"]}

@@ -31,17 +31,16 @@ python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" -
   --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
-if [ "$job" = store ]; then
-  # The store job reads the CDR's GATK-SV call set (run config direct_sv) through a read-only mount of the workspace's
-  # CDR bucket, CDR_STORAGE_PATH (gs://<bucket>/<release>), billed to the workspace project.
-  : "${CDR_STORAGE_PATH:?}" "${GOOGLE_PROJECT:?}"
-  if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
-    echo "CDR_STORAGE_PATH must be the workspace's gs:// CDR path" >&2; exit 2
-  fi
-  CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
-  export CDR_BUCKET="${CDR_BUCKET%/}"
-  variables+=(CDR_BUCKET GOOGLE_PROJECT)
+# Both jobs mount the workspace's CDR bucket read-only, CDR_STORAGE_PATH (gs://<bucket>/<release>), billed to the
+# workspace project: the store job reads the CDR's GATK-SV call set (run config direct_sv) there, and every job keys each
+# step by its inputs' contents, the call set's included, before it skips a completed step.
+: "${CDR_STORAGE_PATH:?}" "${GOOGLE_PROJECT:?}"
+if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
+  echo "CDR_STORAGE_PATH must be the workspace's gs:// CDR path" >&2; exit 2
 fi
+CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
+export CDR_BUCKET="${CDR_BUCKET%/}"
+variables+=(CDR_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${job}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
 # running job.
