@@ -2144,7 +2144,7 @@ class _FullDataMeanField:
             nu = np.where(live, self.mean[:, model] / np.where(live, variance, 1.0) - self.shift[:, model], 0.0)
         return omega, tau, nu, live
 
-    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
+    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters], models: Sequence[int] | None = None) -> list[FixedPoint | None]:
         """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
         start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x).
 
@@ -2152,16 +2152,18 @@ class _FullDataMeanField:
         point unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a
         model whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``), and a model fitted
         alone is not solved again there. A call where every model is so solves them all, as before: the outer loop's last
-        call, which leaves the oracle at the returned points by solving there once more."""
+        call, which leaves the oracle at the returned points by solving there once more. ``models`` solves those models
+        alone and leaves every other one as it is, with no point (the mode mixture's later orders, which a model that has
+        settled no longer joins, ``_mode_mixture``)."""
         held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
-            if point is not None and state is point[1]
+            if models is None and point is not None and state is point[1]
             and np.array_equal(point[0].coefficients, hyperparameters[model].coefficients)
             and np.array_equal(point[0].log_smoothing, hyperparameters[model].log_smoothing)
         ]
         if len(held) == self.model_count:
             held = []
-        solving = [model for model in range(self.model_count) if model not in held]
+        solving = [model for model in range(self.model_count) if model not in held and (models is None or model in models)]
         if held:
             log(f"mean-field oracle: models {', '.join(str(model) for model in held)} keep their fixed points; solving {', '.join(str(model) for model in solving)}")
         entry = [self._state(model) for model in solving]
@@ -2209,7 +2211,20 @@ class _FullDataMeanField:
         for model in solving:
             if self.elbo[model] > self.best_elbo[model]:
                 self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
-        return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+        return [
+            self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) if model in solving else None
+            for model in range(self.model_count)
+        ]
+
+    def _take(self, other: "_FullDataMeanField", model: int) -> None:
+        """Model ``model`` at ``other``'s state, ``other`` an oracle of the same fit (the mode mixture's main fixed point,
+        held by a later order's oracle for a model that has settled, so its dual solver factors at that model's sites)."""
+        self._restore_state(_ModelState(
+            mean=other.mean[:, model], variance=other.variance[:, model], shift=other.shift[:, model], third=other.third[:, model],
+            fourth=other.fourth[:, model], residual=other.residual[model], noise=float(other.noise[model]), effective=float(other.effective[model]),
+            mean_move=float(other.mean_move[model]), noise_gain=float(other.noise_gain[model]), elbo=float(other.elbo[model]), version=other.version,
+            sites=other.sites[model],
+        ), model)
 
     def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[tuple[MixtureHyperparameters, ...], BoolArray]:
         """Each model back at its highest-ELBO refreshed state where that is above where the outer loop ended by more than
@@ -2771,7 +2786,7 @@ def fit_full_data(
         mixture = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments)
         member_mean, components, component_weights, binary_parts = mixture.mean, mixture.components, mixture.weights, mixture.binaries
         mean_move, noise_gains = mixture.mean_move, mixture.noise_gain
-        component_count = np.full(model_count, len(components), dtype=np.int64)
+        component_count = mixture.counts
         budget_unresolved += np.asarray(mean_field.unresolved, dtype=np.int64) + mixture.unresolved
         refusals.extend(mixture.refusals)
     covariate_coefficients = None if mean_field is None else np.column_stack(
@@ -2883,14 +2898,16 @@ def _ridge_mean(
 @dataclass(frozen=True)
 class _Mixture:
     """``_mode_mixture``'s result: the weighted mean (members x models), each component's (shift h, omega), members x
-    models, the weights (components x models), each component's ``BinaryComponent`` per binary model (None per
-    quantitative one), the largest mean move and noise gain over the components (each at its own fixed point), per
-    model, and whether the search ended at its budget unsettled (1) with why."""
+    models, the weights (components x models; a model with fewer components than the most has the rest at weight zero),
+    each component's ``BinaryComponent`` per binary model (None per quantitative one), each model's count of components,
+    the largest mean move and noise gain over its components (each at its own fixed point), per model, and whether its
+    search ended at its budget unsettled (1) with why."""
 
     mean: F64Array
     components: tuple[tuple[F64Array, F64Array], ...]
     weights: F64Array
     binaries: tuple
+    counts: I64Array
     mean_move: F64Array
     noise_gain: F64Array
     unresolved: I64Array
@@ -2917,47 +2934,58 @@ def _mode_mixture(
     Work budget: at most K random orders are tried. The mixture reaches the scorer through its K draws, each from one
     component (``draw_laws.ProductMixtureDraws``), so no more than K components are ever represented; a search that has
     tried K orders (a refused order counts: it consumed the attempt) without settling ends there, unresolved, and says
-    so rather than run on."""
-    def pieces(oracle: "_FullDataMeanField") -> tuple[F64Array, F64Array, F64Array]:
-        return oracle.mean.copy(), oracle.shift.copy(), oracle.member_squares / oracle.noise[None, :]
+    so rather than run on.
 
-    def binary_of(oracle: "_FullDataMeanField") -> tuple:
-        return tuple(None if model_sites is None else oracle.binary_component(model) for model, model_sites in enumerate(oracle.sites))
+    Each model's mixture is its own, as when it is fitted alone: its components, their weights, the repeat test, the
+    settling test and the budget are its own, and once it has settled the later orders solve only the models that have
+    not (``__call__``'s ``models``), the settled ones held at the main fixed point. A model with fewer components than
+    its group's most has the rest at weight zero."""
+    count = main.model_count
+    # Per model, per component: its mean, (shift, omega), ELBO, ``BinaryComponent`` (None for a quantitative model),
+    # mean move and noise gain.
+    means: list[list[F64Array]] = [[] for _model in range(count)]
+    parts: list[list[tuple[F64Array, F64Array]]] = [[] for _model in range(count)]
+    elbos: list[list[F64Array]] = [[] for _model in range(count)]
+    binaries: list[list] = [[] for _model in range(count)]
+    moves: list[list[float]] = [[] for _model in range(count)]
+    gains: list[list[float]] = [[] for _model in range(count)]
 
-    means, components, elbos, binaries, moves, gains = [], [], [], [], [], []
+    def pieces(oracle: "_FullDataMeanField", model: int) -> tuple:
+        return (
+            oracle.mean[:, model].copy(), (oracle.shift[:, model].copy(), oracle.member_squares[:, model] / oracle.noise[model]),
+            np.array(oracle.elbo[model:model + 1], dtype=np.float64), None if oracle.sites[model] is None else oracle.binary_component(model),
+            float(oracle.mean_move[model]), float(oracle.noise_gain[model]),
+        )
 
-    def held(oracle: "_FullDataMeanField") -> None:
-        mean, shift, omega = pieces(oracle)
-        means.append(mean); components.append((shift, omega)); elbos.append(np.array(oracle.elbo, dtype=np.float64)); binaries.append(binary_of(oracle))
-        moves.append(np.array(oracle.mean_move, dtype=np.float64)); gains.append(np.array(oracle.noise_gain, dtype=np.float64))
+    def held(oracle: "_FullDataMeanField", model: int) -> None:
+        for values, piece in zip((means, parts, elbos, binaries, moves, gains), pieces(oracle, model)):
+            values[model].append(piece)
 
-    held(main)
+    for model in range(count):
+        held(main, model)
 
-    def weighted() -> tuple[F64Array, F64Array]:
-        values = np.array(elbos)
+    def weighted(model: int) -> tuple[F64Array, F64Array]:
+        values = np.array(elbos[model])
         weights = np.exp(values - values.max(axis=0))
         weights /= weights.sum(axis=0)
-        return np.einsum("cm,cjm->jm", weights, np.array(means)), weights
+        return np.einsum("cm,cjm->jm", weights, np.array(means[model])[:, :, None])[:, 0], weights[:, 0]
 
-    def admit(oracle: "_FullDataMeanField") -> None:
-        """A new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture is over distinct
-        modes, each weighted by its own mass once); the repeat of the higher evidence is kept. The component's panel
-        Grams are released: its order's panels are no other component's."""
+    def admit(oracle: "_FullDataMeanField", models: Sequence[int]) -> None:
+        """For each of ``models``, a new mode, or a repeat of a held one merged into it (``small_n._admit``: the mixture
+        is over distinct modes, each weighted by its own mass once); the repeat of the higher evidence is kept. The
+        component's panel Grams are released: its order's panels are no other component's."""
         oracle._panel_grams.clear()
-        elbo = np.array(oracle.elbo, dtype=np.float64)
-        for index, kept in enumerate(means):
-            if all(
-                main._fitted_square((oracle.mean - kept)[:, model], model) / float(main.noise[model]) <= 1.0 / draw_count
-                for model in range(main.model_count)
-            ):
-                if float(np.sum(elbo)) > float(np.sum(elbos[index])):
-                    mean, shift, omega = pieces(oracle)
-                    means[index], components[index], elbos[index], binaries[index] = mean, (shift, omega), elbo, binary_of(oracle)
-                    moves[index], gains[index] = np.array(oracle.mean_move, dtype=np.float64), np.array(oracle.noise_gain, dtype=np.float64)
-                return
-        held(oracle)
+        for model in models:
+            for index, kept in enumerate(means[model]):
+                if main._fitted_square(oracle.mean[:, model] - kept, model) / float(main.noise[model]) <= 1.0 / draw_count:
+                    if float(oracle.elbo[model]) > float(elbos[model][index][0]):
+                        for values, piece in zip((means, parts, elbos, binaries, moves, gains), pieces(oracle, model)):
+                            values[model][index] = piece
+                    break
+            else:
+                held(oracle, model)
 
-    average, _weights = weighted()
+    average = [weighted(model)[0] for model in range(count)]
     if moments:
         # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
         # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
@@ -2973,43 +3001,62 @@ def _mode_mixture(
         )
         points = ridge(list(hyperparameters))
         if not any(point is None for point in points):
-            admit(ridge)
-            average, _weights = weighted()
+            admit(ridge, range(count))
+            average = [weighted(model)[0] for model in range(count)]
         del ridge, points
-    settled = False
-    unresolved = np.zeros(main.model_count, dtype=np.int64)
+    settled = np.zeros(count, dtype=bool)
+    unresolved = np.zeros(count, dtype=np.int64)
     refusals: list[str] = []
     for component in range(1, draw_count + 1):
+        searching = [model for model in range(count) if not settled[model]]
+        if not searching:
+            break
         oracle = type(main)(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component, **main._siblings,
             sites=list(main.sites),
         )
-        points = oracle(list(hyperparameters))
+        for model in np.flatnonzero(settled):
+            oracle._take(main, int(model))
+        points = oracle(list(hyperparameters), models=searching)
         unresolved += oracle.unresolved
-        if any(point is None for point in points):
+        if any(points[model] is None for model in searching):
             continue
-        admit(oracle)
+        admit(oracle, searching)
         del oracle, points
-        updated, _weights = weighted()
-        settled = all(
-            main._fitted_square((updated - average)[:, model], model) / float(main.noise[model]) <= 1.0 / draw_count
-            for model in range(main.model_count)
-        )
-        average = updated
-        if settled:
-            break
-    if not settled:
-        unresolved += 1
+        for model in searching:
+            updated = weighted(model)[0]
+            settled[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model]) <= 1.0 / draw_count
+            average[model] = updated
+    for model in np.flatnonzero(~settled):
+        unresolved[model] += 1
         refusals.append(
-            f"the mode mixture tried its budget of {draw_count} orders (one per draw that can represent a component) without settling: "
-            f"{len(components)} components, unresolved"
+            f"model {int(model)}: the mode mixture tried its budget of {draw_count} orders (one per draw that can represent a component) "
+            f"without settling: {len(means[model])} components, unresolved"
         )
     main._iterate(main.site_precision, main.site_shift, main.noise)
     main._panel_grams.clear()
-    average, weights = weighted()
+    counts = np.array([len(means[model]) for model in range(count)], dtype=np.int64)
+    weights = np.zeros((int(counts.max()), count))
+    for model in range(count):
+        average[model], weights[: counts[model], model] = weighted(model)
+
+    def padded(model: int, index: int) -> int:
+        """A component of ``model``'s, or its first where it has fewer than ``index + 1``, at weight zero there."""
+        return min(index, int(counts[model]) - 1)
+
     return _Mixture(
-        mean=average, components=tuple(components), weights=weights, binaries=tuple(binaries), mean_move=np.max(np.array(moves), axis=0),
-        noise_gain=np.max(np.array(gains), axis=0), unresolved=unresolved, refusals=tuple(refusals),
+        mean=np.column_stack(average),
+        components=tuple(
+            tuple(np.column_stack([parts[model][padded(model, index)][part] for model in range(count)]) for part in range(2))
+            for index in range(int(counts.max()))
+        ),
+        weights=weights,
+        binaries=tuple(tuple(binaries[model][padded(model, index)] for model in range(count)) for index in range(int(counts.max()))),
+        counts=counts,
+        mean_move=np.array([np.max(moves[model]) for model in range(count)]),
+        noise_gain=np.array([np.max(gains[model]) for model in range(count)]),
+        unresolved=unresolved,
+        refusals=tuple(refusals),
     )
 
 

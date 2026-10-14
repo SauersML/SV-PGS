@@ -323,7 +323,8 @@ def test_stage2_by_mean_field_carries_tie_members(tmp_path: Path) -> None:
 
 def _two_trait_oracle(tmp_path: Path):
     """Two traits on the same training rows (a group's models, ``stage2_wiring.model_groups``), Stage 0 over both: a
-    function building the mean-field oracle of any of them in order, and the moment starts of each."""
+    function building the mean-field oracle of any of them in order, the moment starts of each, Stage 0's statistics and
+    the prior."""
     from sv_pgs.full_data_fit import _FullDataMeanField
     from sv_pgs.scale_mixture_ep import initial_hyperparameters
 
@@ -356,7 +357,7 @@ def _two_trait_oracle(tmp_path: Path):
         )
         return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [starts[column] for column in columns], noise[columns])
 
-    return oracle, starts
+    return oracle, starts, statistics, prior
 
 
 def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> None:
@@ -365,7 +366,7 @@ def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> N
     included; fitted alone it is not solved again); a call where every model is so solves them all."""
     from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
-    oracle_of, starts = _two_trait_oracle(tmp_path)
+    oracle_of, starts, _statistics, _prior = _two_trait_oracle(tmp_path)
     oracle = oracle_of([0, 1])
     first = oracle(list(starts))
     assert all(point is not None for point in first)
@@ -384,3 +385,26 @@ def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> N
     # Every model at its held point: the call solves them all.
     third = oracle([starts[0], moved])
     assert third[0] is not first[0] and third[1] is not second[1]
+
+
+def test_a_group_s_mode_mixture_is_each_model_s_own(tmp_path: Path) -> None:
+    """The mode mixture of a group's oracle gives each model the mixture it gets alone: its own components, weights,
+    repeat and settling tests, the later orders solving only the models still searching."""
+    from sv_pgs.full_data_fit import _mode_mixture
+
+    oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
+
+    def mixture(columns: list[int]):
+        oracle = oracle_of(columns)
+        assert all(point is not None for point in oracle([starts[column] for column in columns]))
+        return _mode_mixture(oracle, oracle.gaussian, statistics, prior, _DRAWS, 1 << 22, 13, tuple(starts[column] for column in columns))
+
+    together = mixture([0, 1])
+    for column in range(2):
+        alone = mixture([column])
+        count = int(alone.counts[0])
+        assert together.counts[column] == count
+        np.testing.assert_allclose(together.weights[:count, column], alone.weights[:, 0], rtol=1e-10, atol=1e-12)
+        assert np.all(together.weights[count:, column] == 0.0)
+        np.testing.assert_allclose(together.mean[:, column], alone.mean[:, 0], rtol=1e-10, atol=1e-12)
+        assert together.unresolved[column] == alone.unresolved[0]
