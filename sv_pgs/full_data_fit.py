@@ -2316,8 +2316,8 @@ class _FullDataMeanField:
 class _GramMeanField(_FullDataMeanField):
     """``_FullDataMeanField`` with its sweeps on Stage 0's banded Gram (``gram_space``): the same fixed points, ELBO, noise
     updates, responses and certificate. A model's residual is carried as its fields c = Xp'r over the groups (the
-    sample-space oracle's r, seen through Xp'). A quantitative model only (one target: Stage 0's statistics are one
-    model's).
+    sample-space oracle's r, seen through Xp'). Quantitative models only, each Stage 0's target of its own index (the
+    band's scores, y'Py and C'y are per target; its Grams are every model's).
 
     Exact route (the dual solver ``dual_solve.DualGaussian`` and the ``band``): the posterior solves are the dual
     solver's own, over the samples (on bench-sim-like stores a band-preconditioned flexible CG on the exact operator took
@@ -2401,12 +2401,12 @@ class _GramMeanField(_FullDataMeanField):
         return fields, float(residual @ residual)
 
     def _start_residual(self, model: int) -> F64Array:
-        return self.band.scores.copy()
+        return self.band.scores[:, model].copy()
 
     def _residual_of(self, model: int) -> F64Array:
         if self.exact:
             return self._exact_fields(model)[0]
-        return self.band.scores - self._band_product(self._grouped(self.mean[:, model]))
+        return self.band.scores[:, model] - self._band_product(self._grouped(self.mean[:, model]))
 
     def _gram_product(self, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
         if self.exact:
@@ -2448,7 +2448,7 @@ class _GramMeanField(_FullDataMeanField):
         result = self.band.sweep(
             self.gaussian.array_module, member_blocks=self.member_blocks, group=self.ties.group, sign=self.sign, class_index=self.class_index,
             log_density=np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), scales=log_scale(prior, hyperparameters.coefficients),
-            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, field_shift=far, **arrays,
+            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, field_shift=far, target=model, **arrays,
         )
         for name in names:
             getattr(self, name)[:, model] = arrays[name]
@@ -2518,7 +2518,7 @@ class _GramMeanField(_FullDataMeanField):
         rounds = 0
         while True:
             grouped = self._grouped(self.mean[:, model])
-            far = fields - (self.band.scores - self._band_product(grouped))
+            far = fields - (self.band.scores[:, model] - self._band_product(grouped))
             if rounds:
                 noise = float(self.noise[model])
                 change = (far - self._far[:, model])[self.ties.group]
@@ -2556,7 +2556,7 @@ class _GramMeanField(_FullDataMeanField):
         sample-space oracle forms it by a read of the store."""
         band = self.band
         grouped = self._grouped(self.mean[:, model] if mean is None else mean)
-        return band.covariate_pseudo_inverse @ (band.covariate_target - band.covariate_cross.T @ grouped)
+        return band.covariate_pseudo_inverse @ (band.covariate_target[:, model] - band.covariate_cross.T @ grouped)
 
     def far_field(self, model: int, mean: F64Array | None = None) -> float:
         """``GramBand.far_field_ratio`` at this state (E beta_g^2 = mbar_g^2 + its members' variances): what the pure band

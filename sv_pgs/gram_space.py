@@ -151,15 +151,16 @@ class SweepResult:
 
 
 class GramBand:
-    """Stage 0's banded Gram of one target, read block by block on demand: R_b within each block and R_{b,b+1} between
-    genome-adjacent blocks (float32, as stored), the projected scores s (float64), the groups' squares ||x_g||^2 (R's
-    diagonal, float32-exact), y'Py, and the covariates' cross-products X'C for the covariate coefficients.
+    """Stage 0's banded Gram, read block by block on demand: R_b within each block and R_{b,b+1} between genome-adjacent
+    blocks (float32, as stored), the groups' squares ||x_g||^2 (R's diagonal, float32-exact) and the covariates'
+    cross-products X'C, which every target of Stage 0 shares, and per target (a column each) the projected scores s
+    (float64, groups x targets), y'Py and C'y for the covariate coefficients.
 
     ``working_bytes`` sizes the float64 row chunks a stored block is promoted in for a product. Each block read is
     charged to the shared ledger for as long as its array lives, and kept for later passes only as a ledger cache
     (the device's when the fit runs on one, else the host's), admitted from what the ledger has left."""
 
-    def __init__(self, statistics: Any, working_bytes: int, target: int = 0, store: Any = None) -> None:
+    def __init__(self, statistics: Any, working_bytes: int, store: Any = None) -> None:
         # The Grams from ``store`` where given (a ``BandStore``: the summary band's parts, in the reduced columns' order),
         # else Stage 0's own blocks; the scores, squares and covariate products are Stage 0's either way.
         ld = statistics.ld
@@ -175,16 +176,21 @@ class GramBand:
         self.residual_dimension = float(statistics.sample_count - statistics.covariate_rank)
         self.working_bytes = int(working_bytes)
         blocks = [ld.block(block) for block in range(int(ld.block_count))]
-        self.scores = np.concatenate([np.asarray(block.projected_score[:, target], dtype=np.float64) for block in blocks]) if blocks else np.zeros(0)
+        target_count = int(np.shape(statistics.target_gram)[0])
+        self.scores = np.concatenate([np.asarray(block.projected_score, dtype=np.float64) for block in blocks]) if blocks else np.zeros((0, target_count))
         self.covariate_cross = np.concatenate([np.asarray(block.covariate_cross, dtype=np.float64) for block in blocks], axis=0)
         del blocks
         # R_jj stored in float32, kept as R_jj / n in float64: n times it rounds back to the stored float32 exactly (its
         # relative error, two float64 roundings, is far below float32's half unit).
         self.squares = (np.asarray(ld.ld_diagonal(), dtype=np.float64) * statistics.sample_count).astype(np.float32).astype(np.float64)
-        covariate_target = np.asarray(statistics.covariate_target, dtype=np.float64)[:, target]
+        covariate_target = np.asarray(statistics.covariate_target, dtype=np.float64)
         self.covariate_target = covariate_target
         self.covariate_pseudo_inverse = np.asarray(statistics.covariate_gram_pseudo_inverse, dtype=np.float64)
-        self.target_square = float(np.asarray(statistics.target_gram, dtype=np.float64)[target, target] - covariate_target @ self.covariate_pseudo_inverse @ covariate_target)
+        target_gram = np.asarray(statistics.target_gram, dtype=np.float64)
+        self.target_square = np.array([
+            float(target_gram[target, target] - covariate_target[:, target] @ self.covariate_pseudo_inverse @ covariate_target[:, target])
+            for target in range(target_count)
+        ])
         self.band_width = max(
             (int(widths[block]) + (int(widths[block - 1]) if block and self.linked[block - 1] else 0)
              + (int(widths[block + 1]) if block + 1 < self.block_count and self.linked[block] else 0)
@@ -214,7 +220,7 @@ class GramBand:
         self.temper = np.asarray(temper, dtype=np.float64).copy()
         per_group = np.repeat(self.temper, np.diff(self.starts))
         self.squares = self._raw_squares * per_group
-        self.scores = self._raw_scores * per_group
+        self.scores = self._raw_scores * per_group[:, None]
 
     def _group_temper(self) -> F64Array:
         return np.repeat(self.temper, np.diff(self.starts))
@@ -225,7 +231,7 @@ class GramBand:
         covariate_cross: F64Array | None = None, covariate_target: F64Array | None = None, covariate_pseudo_inverse: F64Array | None = None,
     ) -> "GramBand":
         """A band held in memory: ``within[b]`` R_b and ``cross[b]`` R_{b,b+1} (None where no Gram links the blocks),
-        the rest as ``__init__`` reads it from Stage 0 (tests, and callers with their own Grams)."""
+        the rest as ``__init__`` reads it from Stage 0 for one target (tests, and callers with their own Grams)."""
         band = cls.__new__(cls)
         widths = np.array([np.shape(values)[0] for values in within], dtype=np.int64)
         band.ld = None
@@ -236,11 +242,11 @@ class GramBand:
         band.sample_count = int(sample_count)
         band.residual_dimension = float(residual_dimension)
         band.working_bytes = int(working_bytes)
-        band.scores = np.asarray(scores, dtype=np.float64)
+        band.scores = np.asarray(scores, dtype=np.float64)[:, None]
         band.squares = np.concatenate([np.asarray(_host(values.diagonal()), dtype=np.float64) for values in within])
-        band.target_square = float(target_square)
+        band.target_square = np.array([target_square], dtype=np.float64)
         band.covariate_cross = np.zeros((band.group_count, 0)) if covariate_cross is None else np.asarray(covariate_cross, dtype=np.float64)
-        band.covariate_target = np.zeros(0) if covariate_target is None else np.asarray(covariate_target, dtype=np.float64)
+        band.covariate_target = np.zeros((0, 1)) if covariate_target is None else np.asarray(covariate_target, dtype=np.float64)[:, None]
         band.covariate_pseudo_inverse = np.zeros((0, 0)) if covariate_pseudo_inverse is None else np.asarray(covariate_pseudo_inverse, dtype=np.float64)
         band.band_width = max(
             (int(widths[block]) + (int(widths[block - 1]) if block and band.linked[block - 1] else 0)
@@ -380,12 +386,13 @@ class GramBand:
     def sweep(
         self, xp: Any, *, member_blocks: tuple, group: I64Array, sign: F64Array, class_index: I64Array, log_density: F64Array,
         scales: F64Array, grid: F64Array, noise: float, mean: F64Array, variance: F64Array, shift: F64Array, third: F64Array,
-        fourth: F64Array, field_shift: F64Array | None = None,
+        fourth: F64Array, field_shift: F64Array | None = None, target: int = 0,
     ) -> SweepResult:
-        """One coordinate-ascent sweep over every block's members in ``member_blocks``' order, in place on the members'
-        moments (host arrays), on ``xp`` (numpy, or cupy with ``device_sweep``'s panel kernel). ``field_shift`` (groups)
-        is added to every field and to the residual square's linear term, s -> s + field_shift: the far field held fixed
-        through a round of the exact refinement (``full_data_fit._GramMeanField``)."""
+        """One coordinate-ascent sweep of Stage 0's target ``target`` over every block's members in ``member_blocks``'
+        order, in place on the members' moments (host arrays), on ``xp`` (numpy, or cupy with ``device_sweep``'s panel
+        kernel). ``field_shift`` (groups) is added to every field and to the residual square's linear term,
+        s -> s + field_shift: the far field held fixed through a round of the exact refinement
+        (``full_data_fit._GramMeanField``)."""
         if len(member_blocks) != self.block_count or any(
             members.size and not (self.starts[block] <= int(group[members].min()) and int(group[members].max()) < self.starts[block + 1])
             for block, members in enumerate(member_blocks)
@@ -397,7 +404,9 @@ class GramBand:
         np.add.at(grouped, group, sign * mean)
         # The raw scores: the tempered field of block b is lambda_b times the raw one with its neighbours' terms scaled
         # by sqrt(lambda_c / lambda_b) (``_block_field``), and its noise sigma^2 / lambda_b.
-        self._linear = self._raw_scores if field_shift is None else self._raw_scores + np.asarray(field_shift, dtype=np.float64)
+        scores = self._raw_scores[:, target]
+        self._linear = scores if field_shift is None else scores + np.asarray(field_shift, dtype=np.float64)
+        self._target_square = float(self.target_square[target])
         if xp is np:
             return self._host_sweep(member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped)
         return self._device_sweep(xp, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped)
@@ -438,8 +447,8 @@ class GramBand:
     def _finish(self, divergence: float, weighted_variance: float, sizes: float, grouped: np.ndarray, quadratic: float, quadratic_size: float) -> SweepResult:
         weighted = self._linear * self._group_temper()
         linear = float(grouped @ weighted)
-        residual_square = self.target_square - 2.0 * linear + quadratic
-        residual_size = abs(self.target_square) + 2.0 * float(np.abs(grouped) @ np.abs(weighted)) + quadratic_size
+        residual_square = self._target_square - 2.0 * linear + quadratic
+        residual_size = abs(self._target_square) + 2.0 * float(np.abs(grouped) @ np.abs(weighted)) + quadratic_size
         return SweepResult(divergence, weighted_variance, residual_square, sizes, residual_size)
 
     def _host_sweep(self, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped) -> SweepResult:
@@ -802,9 +811,9 @@ class GramGaussian:
     groups' squares from the band, and A = G_band / sigma^2 + diag(tau) at the sites of the last ``iterate``, whose
     solves (``posterior_solve``) and mean are conjugate gradients on the band.
 
-    One model (Stage 0's statistics are one target's). ``mean`` is solved when first read after an ``iterate``, so a
-    fixed point's refresh (the mean-field route never reads it) costs nothing. Every product is the band's: the pure
-    band route, exact only where the band is the whole Gram (the exact route solves over the samples:
+    One model, Stage 0's first target (the band's first column of scores). ``mean`` is solved when first read after an
+    ``iterate``, so a fixed point's refresh (the mean-field route never reads it) costs nothing. Every product is the
+    band's: the pure band route, exact only where the band is the whole Gram (the exact route solves over the samples:
     ``full_data_fit._GramMeanField``)."""
 
     def __init__(self, band: GramBand, *, training: Any, targets: Any, covariates: Any, array_module: Any = np, probe_count: int = 0) -> None:
@@ -813,7 +822,7 @@ class GramGaussian:
         xp = array_module
         self.training = xp.asarray(training, dtype=xp.float64)
         if int(self.training.shape[1]) != 1:
-            raise ValueError("a Gram-space fit is one model's: Stage 0's statistics hold one target")
+            raise ValueError("the pure band route fits one model, Stage 0's first target")
         self.targets = xp.where(self.training == 0.0, 0.0, xp.asarray(targets, dtype=xp.float64))
         self.covariates = xp.asarray(covariates, dtype=xp.float64)
         self.model_count = 1
@@ -859,7 +868,7 @@ class GramGaussian:
     def mean(self) -> F64Array:
         if self._mean is None:
             assert self._precision is not None and self._shift is not None
-            right = (self.band.scores / float(self.noise_variance[0]) + np.where(np.isfinite(self._precision), self._shift, 0.0))[:, None]
+            right = (self.band.scores[:, 0] / float(self.noise_variance[0]) + np.where(np.isfinite(self._precision), self._shift, 0.0))[:, None]
             # The mean to the fit's resolution: ||mu_hat - mu||_A <= sqrt(1/K) for the scorer's K draws, the dual solver's.
             bound = np.full(1, np.sqrt(1.0 / self.probe_count)) if self.probe_count else np.full(1, np.sqrt(_EPSILON))
             solution, _certificate = self.posterior_solve(right, 0, bound)
