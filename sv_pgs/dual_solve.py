@@ -868,7 +868,6 @@ class DualCertificate:
 
     error_bound: Any
     residual_bound: Any
-    resolved_counts: np.ndarray
     iterations: int
     restarts: int
 
@@ -1187,7 +1186,7 @@ class DualGaussian:
         self._resolved = resolved
         self._state = state | {"models": models, "bulk_mean": bulk_mean, "bulk_variances": bulk_variances, "precision": precision}
         self._finish(result, mean_duals, bulk_mean, bulk_variances, precision, models, state, resolved)
-        return DualCertificate(certificate, target, np.array([resolved[model].size for model in range(self.model_count)]), iterations, restarts)
+        return DualCertificate(certificate, target, iterations, restarts)
 
     def _finish(self, result: SolveResult, mean_duals: Any, bulk_mean: Any, bulk_variances: Any, precision: Any, models: DualModels, state: dict, resolved: dict) -> None:
         """One read: the bulk mean m + D Xt'z, its genetic image X mu, and C = Xt' Z_L on the LD windows."""

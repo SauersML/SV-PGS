@@ -60,7 +60,6 @@ class KrylovSolve:
     residual_norm: float
     target: float
     applications: int
-    applied_columns: int
     cycles: int
 
 
@@ -147,11 +146,10 @@ def block_gcro_dr(
     right = np.asarray(right, dtype=np.float64)
     size, width = right.shape
     target = max(float(absolute_tolerance), float(relative_tolerance) * float(np.linalg.norm(right)))
-    counts = {"applications": 0, "columns": 0, "cycles": 0}
+    counts = {"applications": 0, "cycles": 0}
 
     def operator(values: F64) -> F64:
         counts["applications"] += 1
-        counts["columns"] += int(values.shape[1])
         return np.asarray(apply(values), dtype=np.float64)
 
     if start is None or not bool(np.any(start != 0.0)):
@@ -247,7 +245,7 @@ def block_gcro_dr(
     true_norm = float(np.linalg.norm(true_residual))
     if not np.isfinite(true_norm):
         raise FloatingPointError("the block linear response's true residual is not finite")
-    return KrylovSolve(solution, true_norm, target, counts["applications"], counts["columns"], counts["cycles"])
+    return KrylovSolve(solution, true_norm, target, counts["applications"], counts["cycles"])
 
 
 def local_response(solve: BulkSolve, grams: BlockGrams) -> Callable[[F64, F64, F64, F64], Callable[[F64], F64]]:
