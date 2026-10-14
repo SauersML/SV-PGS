@@ -2,10 +2,19 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
+import os
 import struct
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+GCS_MOUNTS = "SVPGS_GCS_MOUNTS"
+"""The environment variable naming the Cloud Storage buckets mounted on this machine: a JSON object from mount path to
+the ``gs://bucket[/prefix]`` it shows (launcher/workspace sets it for its gcsfuse mounts). A file under one is identified
+by its object's generation, an immutable generation contract the storage provider supplies: GCS gives every write of an
+object a new generation and never reuses one for other content."""
 
 
 def _stamp(path: Path) -> tuple[int, ...]:
@@ -25,10 +34,39 @@ def file_digest(path: str | Path) -> str:
     """Hash every byte on each call. Size, mtime and ctime alone cannot certify contents.
 
     Immutable object generations may replace this pass when explicitly supplied by the
-    storage provider; mutable local files cannot safely use that optimization.
+    storage provider; mutable local files cannot safely use that optimization. A file on a
+    mounted bucket (GCS_MOUNTS) is identified by its object's generation and checksum.
     """
     path = Path(path).resolve()
+    located = _mounted_object(path)
+    if located is not None:
+        return _generation_identity(*located)
     return _hashed(str(path), _stamp(path))
+
+
+def _mounted_object(path: Path) -> tuple[str, str] | None:
+    """The (bucket, object name) of a file under one of GCS_MOUNTS, or None."""
+    for mount, url in json.loads(os.environ.get(GCS_MOUNTS) or "{}").items():
+        if path.is_relative_to(Path(mount)):
+            bucket, _, prefix = url.removeprefix("gs://").partition("/")
+            return bucket, "/".join(part for part in (prefix.strip("/"), path.relative_to(mount).as_posix()) if part)
+    return None
+
+
+@functools.cache
+def _storage_client():
+    from google.cloud import storage
+
+    return storage.Client(project=os.environ.get("GOOGLE_PROJECT"))
+
+
+def _generation_identity(bucket: str, name: str) -> str:
+    """The object's generation, size and CRC32C, read from its metadata (billed to GOOGLE_PROJECT, as a requester-pays
+    bucket such as the CDR's requires)."""
+    blob = _storage_client().bucket(bucket, user_project=os.environ.get("GOOGLE_PROJECT")).get_blob(name)
+    if blob is None:
+        raise FileNotFoundError(f"gs://{bucket}/{name} does not exist")
+    return f"gs://{bucket}/{name}#{blob.generation}:{blob.size}:{blob.crc32c}"
 
 
 def tree_digest(root: str | Path) -> str:

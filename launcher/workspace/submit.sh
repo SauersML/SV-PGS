@@ -27,10 +27,6 @@ MAX_RUN_SECONDS="$(python3 "$here/budget_guard.py" duration --plan "$STUDY_BUDGE
 export MAX_RUN_SECONDS MAX_RETRIES
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
-python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET
-variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
-if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
 # Both jobs mount the workspace's CDR bucket read-only, CDR_STORAGE_PATH (gs://<bucket>/<release>), billed to the
 # workspace project: the store job reads the CDR's GATK-SV call set (run config direct_sv) there, and every job keys each
 # step by its inputs' contents, the call set's included, before it skips a completed step.
@@ -40,6 +36,10 @@ if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
 fi
 CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
 export CDR_BUCKET="${CDR_BUCKET%/}"
+python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET
+variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
+if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
 variables+=(CDR_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${job}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a

@@ -179,6 +179,8 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     # before the driver and pushed back after it.
     assert script.index("mirror restore") < script.index("workspace-run") < script.rindex("mirror push")
     assert '--mirror "gs://workspace/svpgs/study/run"' in script
+    # Input files on the bucket mounts are keyed by their objects' generations, not a pass over their bytes.
+    assert """SVPGS_GCS_MOUNTS='{"/mnt/disks/ops": "gs://workspace", "/mnt/disks/cdr": "gs://cdr-bucket/v8"}'""" in script
     task = spec["taskGroups"][0]["taskSpec"]
     assert task["runnables"][0]["script"]["text"] == "bash /mnt/disks/ops/svpgs/study/launcher/pilot/run_step.sh"
     assert spec["logsPolicy"]["logsPath"] == "/mnt/disks/ops/svpgs/study/launcher/pilot/batch.log"

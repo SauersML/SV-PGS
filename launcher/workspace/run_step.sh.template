@@ -30,6 +30,9 @@ case "${UV_EXTRAS}" in
            || { mark "exit-no-gpu"; exit 1; } ;;
 esac
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
+# The job's bucket mounts (the job templates' volumes): an input file there is keyed by its object's generation instead
+# of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
+export SVPGS_GCS_MOUNTS='{"/mnt/disks/ops": "gs://${OPS_BUCKET}", "/mnt/disks/cdr": "gs://${CDR_BUCKET}"}'
 mkdir -p "$TMPDIR"
 # Batch cannot write to an existing disk, so this job's disk is new and the run lives in the workspace bucket
 # (sv_pgs/run_mirror.py): restored before the driver starts, pushed every 15 minutes while it runs (each push sends
