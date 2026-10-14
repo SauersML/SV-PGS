@@ -59,16 +59,10 @@ def test_the_submission_scores_only_accepted_synthetic_fits(tmp_path: Path, monk
         _observed=observed, _columns=columns[n_train:], _records=records,
     )
     module = harness.load_method(SUBMISSION)
-    if annotated_prior:
-        # This architecture reaches an unresolved annotated-prior stationarity state.
-        # It previously scored despite that failure. Keep the real failure visible and
-        # enforce quarantine; do not weaken the numerical tolerance to obtain predictions.
-        with pytest.raises(ValueError, match="Model quarantined.*outer_criterion_met"):
-            module.fit_with(train, "mean_field", annotated_prior=True)
-        assert not any(path.name.startswith("svpgs_full_") for path in tmp_path.iterdir())
-        return
     model = module.fit_with(train, "mean_field", annotated_prior=annotated_prior)
-    assert model.profile["acceptance"]["accepted"]
+    # The annotated prior once walked its annotations' unpenalized linear terms to no maximum here and was quarantined
+    # uncertified; with their null-space ridge (scale_mixture_prior) it certifies.
+    assert model.profile["outer_criterion_met"] and model.profile["acceptance"]["accepted"]
     assert model.profile["annotated_prior"] is annotated_prior
     prediction = model.score(test)
     assert set(prediction) == {"total", "structural"}

@@ -518,15 +518,22 @@ def scale_mixture_prior(
     for position, group in enumerate(annotation_groups):
         eigenvalues, eigenvectors = np.linalg.eigh(np.asarray(group.penalty, dtype=np.float64))
         kept = eigenvalues > _EPSILON * eigenvalues.shape[0] * max(float(eigenvalues[-1]), np.finfo(np.float64).tiny)
-        if not kept.any():
-            # Every column of the group is unpenalized (a smooth's fixed part): there is no weight to learn, and its
-            # coefficients are free, in the penalty's null space like the densities' locations and widths.
-            continue
-        blocks.append(SmoothingBlock(
-            f"annotation group {position}" + (f" ({group.name})" if group.name else ""),
-            annotation_start + np.asarray(group.columns, dtype=np.int64),
-            np.sqrt(eigenvalues[kept])[:, None] * eigenvectors[:, kept].T,
-        ))
+        name = f"annotation group {position}" + (f" ({group.name})" if group.name else "")
+        coordinates = annotation_start + np.asarray(group.columns, dtype=np.int64)
+        if kept.any():
+            blocks.append(SmoothingBlock(name, coordinates, np.sqrt(eigenvalues[kept])[:, None] * eigenvectors[:, kept].T))
+        if not kept.all():
+            # The group's penalty null space (a smooth's linear term, a free missing state, a group the penalty leaves
+            # whole) has a Gaussian prior with mean zero and its own learned precision, as the class deviations'
+            # location and width do (the double penalty: Marra and Wood, "Practical variable selection for generalized
+            # additive models", 2011). Under a flat prior there, a direction along which the evidence rises without
+            # bound, such as a scale shrinking a group of signal-free variants' variance to zero (for each, log Z_j
+            # climbs as its variance falls wherever its z^2 < 1), had no maximum: the empirical Bayes walked log
+            # tss-distance's linear coefficient to 5e4 and its maximizations to 1e15, minutes per step
+            # (tests/test_bench_sim_derived.py). With a proper prior the evidence's Occam term, (1/2) log lambda per
+            # direction, falls without bound as the precision does, so the weight has a maximum or its lambda = infinity
+            # edge, where the term is removed (the start, as for every block).
+            blocks.append(SmoothingBlock(f"{name} null space", coordinates, eigenvectors[:, ~kept].T))
     level_size = design.shape[1] - annotation_size
     if level_size:
         blocks.append(SmoothingBlock("offset group levels", annotation_start + annotation_size + np.arange(level_size), np.eye(level_size)))

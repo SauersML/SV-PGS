@@ -337,16 +337,18 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
         np.testing.assert_allclose(density[class_position], pooled + basis @ coefficients[start : start + prior.pooled_size], atol=1e-12)
     theta = coefficients[prior.pooled_size * (prior.class_count + 1) :]
     np.testing.assert_allclose(log_scale(prior, coefficients), prior.log_variance_offset + prior.scale_design @ theta, atol=1e-12)
-    # Profiled: eta_bar's location and width (inside its coordinates) and the smooth annotation's
-    # second-difference null space (two of its three columns); the deviations are fully penalized.
-    assert prior.null_basis.shape[1] == 4
-    deviations = slice(prior.pooled_size, prior.pooled_size * (prior.class_count + 1))
-    np.testing.assert_allclose(prior.null_basis[deviations], 0.0, atol=1e-10)
+    # Profiled: eta_bar's location and width (inside its coordinates) only; the deviations are fully penalized, and
+    # the smooth annotation's second-difference null space (two of its three columns) has its own learned ridge.
+    assert prior.null_basis.shape[1] == 2
+    np.testing.assert_allclose(prior.null_basis[prior.pooled_size :], 0.0, atol=1e-10)
     names = [block.name for block in prior.smoothing_blocks]
     assert names == [
         "pooled roughness", "class 0 deviation roughness", "class 1 deviation roughness",
-        "deviation location and width", "annotation group 0", "annotation group 1",
+        "deviation location and width", "annotation group 0", "annotation group 1", "annotation group 1 null space",
     ]
+    (null_block,) = (block for block in prior.smoothing_blocks if block.name == "annotation group 1 null space")
+    assert null_block.factor.shape[0] == 2
+    np.testing.assert_allclose(null_block.factor @ _second_difference(3), 0.0, atol=1e-12)
 
 
 @pytest.mark.parametrize("offset_group_count", [0, 3])

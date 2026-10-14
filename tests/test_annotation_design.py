@@ -79,7 +79,7 @@ def test_an_annotation_with_the_wrong_length_is_refused() -> None:
         annotation_design({"x": np.zeros(3)}, {}, class_index=np.zeros(4, dtype=np.int64))
 
 
-def test_a_group_with_no_penalized_column_is_free_and_has_no_smoothing_weight() -> None:
+def test_a_group_with_no_penalized_column_has_one_learned_ridge() -> None:
     rng = np.random.default_rng(4)
     classes = rng.choice(2, size=200).astype(np.int64)
     # two distinct values that are not 0/1: a linear term, and no spline direction two values can support
@@ -87,10 +87,13 @@ def test_a_group_with_no_penalized_column_is_free_and_has_no_smoothing_weight() 
     (group,) = result.groups
     assert not np.any(group.penalty)
     prior = _prior(classes, result)
-    assert not any(block.name.startswith("annotation group") for block in prior.smoothing_blocks)
+    (block,) = (block for block in prior.smoothing_blocks if block.name.startswith("annotation group"))
+    assert block.name.endswith("(binary_level) null space")
     annotation_coordinates = prior.coefficient_size - result.design.shape[1] + np.arange(result.design.shape[1])
-    # the free coefficient is in the penalty's null space
-    assert np.linalg.matrix_rank(prior.null_basis[annotation_coordinates]) == result.design.shape[1]
+    np.testing.assert_array_equal(np.sort(block.coordinates), annotation_coordinates)
+    assert np.linalg.matrix_rank(block.factor) == result.design.shape[1]
+    # a proper prior with its own weight: none of the group's coefficients is left in the profiled null space
+    np.testing.assert_allclose(prior.null_basis[annotation_coordinates], 0.0, atol=1e-10)
 
 
 def test_a_nearly_dependent_column_is_dropped_by_the_priors_own_rank_test() -> None:

@@ -10,7 +10,8 @@ the rest of the hyperparameters. Nothing here is chosen by hand:
   "On semiparametric regression with O'Sullivan penalized splines", 2008), the basis and its exact penalty built by
   gamfit (``gamfit.basis.bspline_basis``, ``smoothness_penalty``). The penalty's null space, the
   linear functions, is handled explicitly: the constant is the class densities' (class centring removes it) and the
-  linear term is a free column; the penalized part is the basis rotated onto the penalty's eigenvectors, so its
+  linear term is its own column, with a zero entry in the group's penalty (the prior gives the group's penalty null
+  space a ridge of its own learned weight, ``scale_mixture_prior``); the penalized part is the basis rotated onto the penalty's eigenvectors, so its
   penalty is diagonal there and is the same function-space penalty, transformed with the basis (a change of basis
   that drops the penalty's null directions changes no function's roughness). x is the annotation standardized over
   its observed values; the knots are its interior quartiles (``_continuous_spline_knots``), where the
@@ -21,7 +22,7 @@ the rest of the hyperparameters. Nothing here is chosen by hand:
   times the closed-form orthonormal sum-to-zero (Helmert) basis, penalty identity, so the prior does not depend on
   which level comes first and no dense level-by-level change of basis is formed (the rows are gathered from it).
 - A missing value is its own state, built apart from the numeric basis and kept whenever it is identified: the
-  numeric columns are 0 on a missing row, a continuous annotation gets a free missing-state column, and a factor gets
+  numeric columns are 0 on a missing row, a continuous annotation gets a missing-state column, and a factor gets
   a missing level. So an annotation constant where observed but missing elsewhere keeps its missing state (its
   observed level is the missing state's complement after class centring), and a binary annotation's unknown stays
   apart from its false (review F19).
@@ -52,7 +53,7 @@ _EPSILON = float(np.finfo(np.float64).eps)
 # whose penalty null space is exactly the linear functions.
 _SPLINE_DEGREE = 3
 # The roughness is the integral of the squared second derivative: its null space, the linear functions, is the
-# smooth's free fixed part (the constant going to the class densities).
+# smooth's fixed part (the constant going to the class densities).
 _ROUGHNESS_DERIVATIVE = 2
 
 
@@ -145,8 +146,8 @@ def spline_basis(standardized: F64Array) -> tuple[F64Array, F64Array, F64Array]:
 
 
 def _continuous_candidate(name: str, values: F64Array) -> _Candidate:
-    """A continuous annotation's free linear term, its penalized spline directions (the basis on the penalty's range
-    space, penalty diagonal there) and, where it has missing values, a free missing-state column; every numeric column
+    """A continuous annotation's linear term, its penalized spline directions (the basis on the penalty's range
+    space, penalty diagonal there) and, where it has missing values, a missing-state column; every numeric column
     is 0 on a missing row, and the missing state is built whatever the observed values are."""
     observed = np.isfinite(values)
     columns: list[F64Array] = []
