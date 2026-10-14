@@ -1703,7 +1703,7 @@ def small_n_prior(
     annotations: Mapping[str, np.ndarray] | None = None, codes_per_unit: np.ndarray | None = None,
     calibration_slope: np.ndarray | None = None,
 ) -> ScaleMixturePrior:
-    """The run wiring's prior (``stage2_wiring._fit_one``) over every member (review-mathbugs T1: an exact-tie member
+    """The run wiring's prior (``stage2_wiring._fit_group``) over every member (review-mathbugs T1: an exact-tie member
     keeps its own class and offset, so an SV tied to SNVs keeps the SV prior): one class per variant class present,
     each member's unit offset log(kappa^2 Var(D)) from the unit contract of its input column
     (``imputation_reliability.ColumnMeasurement``: ``log_variance_offset`` is each column's log reliability log r^2,

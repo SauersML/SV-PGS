@@ -64,8 +64,9 @@ def test_preemption_resumes_completed_folds_with_original_seeds(tmp_path, monkey
         if len(calls) == 2:
             (args[6] / "partial-scratch").write_text("incomplete")
             raise RuntimeError("preempted")
-        return _fit(seed)
-    monkeypatch.setattr(stage2_wiring, "_fit_one", engine)
+        # Each binary model is a group of its own (``stage2_wiring.model_groups``), fitted alone.
+        return [_fit(seed)]
+    monkeypatch.setattr(stage2_wiring, "_fit_group", engine)
     arguments = dict(
         store=SimpleNamespace(), store_columns=np.arange(6), covariates=np.ones((6, 1)),
         covariate_columns=np.ones((3, 1), dtype=bool), targets=np.zeros((6, 3)),
@@ -81,7 +82,7 @@ def test_preemption_resumes_completed_folds_with_original_seeds(tmp_path, monkey
     assert not (tmp_path / "model1").exists()
     for index, scoring in enumerate(resumed.scoring):
         np.testing.assert_array_equal(scoring.coefficients, _fit(seeds[index]).scoring.coefficients)
-    monkeypatch.setattr(stage2_wiring, "_fit_one", lambda *args: pytest.fail("recomputed a completed fold"))
+    monkeypatch.setattr(stage2_wiring, "_fit_group", lambda *args: pytest.fail("recomputed a completed fold"))
     repeated = stage2_wiring.fit_models(**arguments)
     for a, b in zip(resumed.scoring, repeated.scoring):
         np.testing.assert_array_equal(a.posterior_draws.tile(0, 3), b.posterior_draws.tile(0, 3))
