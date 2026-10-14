@@ -54,9 +54,8 @@ def far_field_trace(bulk_trace: float, bulk_square_trace: float, sample_count: i
 def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
     """diag(K_S^-1), exactly: the column sums of squares of L^-1, with K_S = L L'. The cost is n^3 / 3.
 
-    This is the bulk diagonal only. The resolved sites' correction (Z_L core^-1 Z_L')_ii and the covariate
-    leverage are added once, by ``dual_solve.SampleDiagonal.predictor_variance``, the single assembler for the
-    exact and the windowed routes alike (binary-ep). Subtracting them here too would count them twice.
+    This is the bulk diagonal only: the resolved sites' correction (Z_L core^-1 Z_L')_ii and the covariate leverage
+    are its callers'.
     """
     inverse_lower = solve_triangular(factor.lower, np.eye(factor.lower.shape[0]), lower=True)
     return np.sum(np.square(inverse_lower), axis=0)

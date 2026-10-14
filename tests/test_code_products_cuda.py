@@ -36,13 +36,11 @@ def test_cuda_tile_products_match_the_cpu_tile(workspace_bytes: int) -> None:
     right = rng.standard_normal((variants, 5)) * np.exp(rng.uniform(-6, 6, 5))[None, :]
     left = rng.standard_normal((samples, 3))
     weights = rng.uniform(0.05, 0.25, samples)
-    covariates = np.column_stack([np.ones(samples), rng.standard_normal((samples, 2))])
 
     for cpu_value, cuda_value in (
         (cpu_tile.matmat(right), cuda_tile.matmat(cupy.asarray(right))),
         (cpu_tile.rmatmat(left), cuda_tile.rmatmat(cupy.asarray(left))),
         (cpu_tile.weighted_gram(weights), cuda_tile.weighted_gram(cupy.asarray(weights))),
-        (cpu_tile.weighted_cross(weights, covariates), cuda_tile.weighted_cross(cupy.asarray(weights), cupy.asarray(covariates))),
     ):
         produced = cupy.asnumpy(cuda_value)
         column_error = np.abs(produced - cpu_value).max(axis=0) / np.abs(cpu_value).max(axis=0)

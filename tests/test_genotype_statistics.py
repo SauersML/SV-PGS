@@ -302,7 +302,6 @@ def test_projected_ld_matches_a_dense_float64_reference(tmp_path) -> None:
     assert firsts == 2
     boundaries = statistics.boundaries
     assert boundaries.block_count == statistics.ld.block_count
-    assert len(boundaries.signature_sha256()) == 64
 
 
 def test_the_host_memory_estimate_bounds_what_the_pass_allocates(tmp_path) -> None:

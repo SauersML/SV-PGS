@@ -28,7 +28,6 @@ on every backend.
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -247,11 +246,3 @@ class LdBlockBoundaries:
     def block_count(self) -> int:
         return int(self.block_starts.shape[0])
 
-    def signature_sha256(self) -> str:
-        """Digest of the cap and every block, for cache keys downstream."""
-        digest = hashlib.sha256()
-        digest.update(np.int64(self.block_cap).tobytes())
-        digest.update("\0".join(self.chromosomes).encode("utf-8"))
-        for values in (self.block_chromosomes, self.block_starts, self.block_stops):
-            digest.update(np.ascontiguousarray(values).tobytes())
-        return digest.hexdigest()

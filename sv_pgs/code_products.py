@@ -410,16 +410,6 @@ class CodeBlockTile:
             raise ValueError("means and scales need one entry per variant")
         self._workspace_bytes = int(workspace_bytes)
 
-    def held_copy(self) -> CodeBlockTile:
-        """This tile over its own copy of the codes, valid after the read that yielded it moves on (a streamed read
-        reuses a tile's buffer for the block after next); the copy is variant-major only."""
-        tile = CodeBlockTile.__new__(CodeBlockTile)
-        tile._hold(
-            self._codes.copy(), self._variant_count, self._sample_count, self._means, self._scales, self._scale_spread,
-            self._array_module, self._workspace_bytes,
-        )
-        return tile
-
     @property
     def variant_count(self) -> int:
         return self._variant_count
@@ -616,12 +606,6 @@ class CodeBlockTile:
             + float(weight_vector.sum()) * self._means[:, None] * self._means[None, :]
         )
         return centered / (self._scales[:, None] * self._scales[None, :])
-
-    def weighted_cross(self, weights: Any, covariates: Any) -> Any:
-        """X_b.T diag(weights) C for C of shape (n, k); returns (p_b, k)."""
-        xp = self._array_module
-        weighted = xp.asarray(weights, dtype=xp.float64)[:, None] * xp.asarray(covariates, dtype=xp.float64)
-        return self.rmatmat(weighted)
 
     def _sample_chunk(self, fixed_bytes: int, bytes_per_sample: int, exact_rows: int) -> int:
         """Samples per chunk: the largest multiple of ``INT8_GEMM_ALIGNMENT`` whose buffers fit the workspace."""

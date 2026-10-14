@@ -134,15 +134,11 @@ def test_cpu_tile_products_match_the_dense_standardized_reference(workspace_byte
     right = rng.standard_normal((variants, 4))
     left = rng.standard_normal((samples, 3))
     weights = rng.uniform(0.05, 0.25, samples)
-    covariates = np.column_stack([np.ones(samples), rng.standard_normal((samples, 2))])
 
     np.testing.assert_allclose(tile.matmat(right), standardized.T @ right, rtol=1e-12, atol=1e-10)
     np.testing.assert_allclose(tile.rmatmat(left), standardized @ left, rtol=1e-12, atol=1e-10)
     np.testing.assert_allclose(
         tile.weighted_gram(weights), standardized @ (weights[:, None] * standardized.T), rtol=1e-11, atol=1e-9
-    )
-    np.testing.assert_allclose(
-        tile.weighted_cross(weights, covariates), standardized @ (weights[:, None] * covariates), rtol=1e-12, atol=1e-10
     )
 
 

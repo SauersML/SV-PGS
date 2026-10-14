@@ -839,44 +839,6 @@ def exact_resolved_certificate(array_module: Any, block: ResolvedBlock, shift: A
 
 
 @dataclass(frozen=True)
-class SampleDiagonal:
-    """The exact parts of one model's per-sample posterior variance of the linear predictor.
-
-    Var(eta_i) = (1 - [(I - H) S^-1 (I - H)]_ii) / w_i on the training rows, with S the model's full
-    dual operator. Two identities make every part but one exact:
-    - S H = H (Xt'H = 0), so S^-1 = H + (I - H) S^-1 (I - H) and
-      [(I - H) S^-1 (I - H)]_ii = [S^-1]_ii - H_ii, with H_ii = `covariate_leverage`;
-    - with the resolved sites eliminated, I - Xt A^-1 Xt' = S_S^-1 - Z_L core^-1 Z_L' (Woodbury on L,
-      valid for any-sign Pi_L while core > 0), so [S^-1]_ii = [S_S^-1]_ii - resolved_i with
-      resolved_i = z_L,i' core^-1 z_L,i.
-    The one convention: the bulk diagonal [S_S^-1]_ii is of the spike-free bulk operator only, the
-    deterministic-equivalent map's to supply; `predictor_variance` is the one place that adds the
-    resolved term and H_ii to it.
-
-    `resolved_term` is resolved_i from the computed Z_L and core; `resolved_lower` and
-    `resolved_upper` bound the exact value row by row. With a_i = ||L^-1 z_hat_L,i|| (core_hat = L L')
-    and E = S_S^-1 R_L the error of Z_L (R_L its exact residuals), row i of E is e_i' S_S^-1 R_L, so
-    ||E_i|| <= ||S_S^-1 e_i|| ||R_L||_2 <= ||R_L||_2 (S_S >= I), and ||L^-1 E_i|| <= b = ||R_L||_2 /
-    sqrt(lambda_min(core_hat)). The core satisfies (1 - delta) core_hat <= core <= (1 + delta) core_hat
-    (core_bounds), so resolved_i lies in [max(a_i - b, 0)^2 / (1 + delta), (a_i + b)^2 / (1 - delta)];
-    the bounds are infinite when delta is not below 1.
-    """
-
-    weights: Any
-    covariate_leverage: Any
-    resolved_term: Any
-    resolved_lower: Any
-    resolved_upper: Any
-
-    def predictor_variance(self, bulk_diagonal: Any, array_module: Any) -> tuple[Any, Any, Any]:
-        """(training rows, lower, upper) of Var(eta_i) = (1 - [S_S^-1]_ii + resolved_i + H_ii) / w_i, given
-        the bulk diagonal [S_S^-1]_ii (n,); the interval carries only the resolved term's bound."""
-        rows = array_module.flatnonzero(self.weights > 0.0)
-        base = 1.0 - bulk_diagonal[rows] + self.covariate_leverage[rows]
-        return rows, (base + self.resolved_lower[rows]) / self.weights[rows], (base + self.resolved_upper[rows]) / self.weights[rows]
-
-
-@dataclass(frozen=True)
 class DualCertificate:
     """Per model, the certified bound on the mean's error ||mu_hat - mu||_A, and the bound asked for.
 
@@ -1357,51 +1319,6 @@ class DualGaussian:
         """The last iterate's resolved block of `model` (Xt_L, Z_hat, R_L, core_hat and its factor), or None."""
         return self._state["blocks"].get(model)
 
-    def block_products(self, model: int, columns: np.ndarray, coefficients: Any, rows: np.ndarray, residual_tolerance: float) -> tuple[Any, Any, Any, Any]:
-        """Xt_rows' w for directions u = Xt_columns C of a few bulk columns, at the last iterate's sites.
-
-        `columns` are sorted bulk variants, `coefficients` C is (|columns|, r) and `rows` are sorted variants.
-        With w = K_S^-1 u - Z_L core^-1 Z_L'u (Q u, every resolved site eliminated), the K_S solve runs to the
-        relative residual `residual_tolerance` of each u. Returns (Xt_rows' w (|rows|, r), t = Z_L'u (|L|, r),
-        the exact relative residuals (r,), ||u|| (r,)). Unlike information_solve it holds no p x r array: the
-        image reads only the columns' tiles and the back product keeps only the rows' tiles. One read for the
-        image, the CG passes, one read for the back product.
-        """
-        array_module = self.array_module
-        state = self._state
-        models = state["models"]
-        columns = np.asarray(columns, dtype=np.int64)
-        rows = np.asarray(rows, dtype=np.int64)
-        values = array_module.asarray(coefficients, dtype=array_module.float64)
-        width = int(values.shape[1])
-        column_models = array_module.full(width, model)
-        image = array_module.zeros((self.source.sample_count, width))
-        for start, stop, tile in self.source.blocks():
-            inside = np.flatnonzero((columns >= start) & (columns < stop))
-            if inside.size:
-                image += tile.columns(columns[inside] - start) @ values[array_module.asarray(inside)]
-        self.count.note(width, 0.0, "block-image")
-        image = models.design_to_sample(image, column_models)
-        image_norms = array_module.linalg.norm(image, axis=0)
-        tolerance = array_module.broadcast_to(array_module.asarray(residual_tolerance, dtype=array_module.float64), (width,))
-        bound = array_module.where(image_norms > 0.0, tolerance, 0.0) * image_norms
-        spike_free = Deflation({}, {}, {}, self._resolved)
-        result = certified_block_cg(self.source, models, image, array_module.zeros_like(image), column_models, bound, self.count, deflation=spike_free, label="block-products")
-        duals = result.solution
-        block = state["blocks"].get(model)
-        coupling = array_module.zeros((0, width))
-        if block is not None:
-            coupling = block.duals.T @ image
-            duals = duals - block.duals @ _core_solve(array_module, block, coupling)
-        left = models.sample_to_design(duals, column_models)
-        products = array_module.zeros((rows.size, width))
-        for start, stop, tile in self.source.blocks():
-            inside = np.flatnonzero((rows >= start) & (rows < stop))
-            if inside.size:
-                products[array_module.asarray(inside)] = tile.rmatmat(left)[array_module.asarray(rows[inside] - start)]
-        self.count.note(width, 0.0, "block-products")
-        return products, coupling, result.residual_norm / array_module.maximum(image_norms, np.finfo(np.float64).tiny), image_norms
-
     def posterior_solve(self, right: Any, model: int, error_bound: Any, start: Any = None) -> tuple[Any, Any]:
         """A_m^-1 right (p x r) at the last iterate's sites, and each column's certified ||x_hat - x||_A.
 
@@ -1488,32 +1405,6 @@ class DualGaussian:
         if resolved_values is not None:
             solution[resolved] = resolved_values
         return solution, certificate
-
-    def sample_diagonal(self, model: int) -> SampleDiagonal:
-        """The exact parts of model m's per-sample predictor variance at the last iterate (SampleDiagonal); no read."""
-        array_module = self.array_module
-        state = self._state
-        models = state["models"]
-        weights = models.weights[:, model]
-        # H_ii = w_i c_i'(C'WC)^+ c_i = w_i ||F'c_i||^2 with F F' = (C'WC)^+ (covariate_whitener).
-        whitened_covariates = self.covariates @ models.covariate_factor[model]
-        covariate_leverage = weights * array_module.sum(whitened_covariates * whitened_covariates, axis=1)
-        block = state["blocks"].get(model)
-        if block is None:
-            zeros = array_module.zeros(self.source.sample_count)
-            return SampleDiagonal(weights, covariate_leverage, zeros, zeros, zeros)
-        if block.indefinite:
-            raise np.linalg.LinAlgError("an indefinite resolved core is a linear response's, not a Gaussian's: it has no variances.")
-        whitened = array_module.linalg.solve(block.factor, block.duals.T)
-        resolved_term = array_module.sum(whitened * whitened, axis=0)
-        lowest, residual_norm, core_error = core_bounds(array_module, block)
-        if core_error >= 1.0:
-            return SampleDiagonal(weights, covariate_leverage, resolved_term, array_module.zeros_like(resolved_term), array_module.full_like(resolved_term, np.inf))
-        root = array_module.sqrt(resolved_term)
-        reach = residual_norm / float(np.sqrt(lowest))
-        lower = array_module.maximum(root - reach, 0.0) ** 2 / (1.0 + core_error)
-        upper = (root + reach) ** 2 / (1.0 - core_error)
-        return SampleDiagonal(weights, covariate_leverage, resolved_term, lower, upper)
 
     def residual_sum_of_squares(self) -> np.ndarray:
         """(M,): each model's training sum of (y - linear predictor)^2 at the current mean."""

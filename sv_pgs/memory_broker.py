@@ -130,10 +130,6 @@ class Lease:
     def release(self) -> None:
         self.broker._release(self)
 
-    def resize(self, nbytes: int) -> None:
-        """Grow (as a mandatory request, evicting caches if it must) or shrink the lease in place."""
-        self.broker._resize(self, int(nbytes))
-
     @contextmanager
     def in_use(self) -> Iterator["Lease"]:
         """While inside, a cache lease is not evicted: its holder is reading what it holds."""
@@ -350,20 +346,6 @@ class MemoryBroker:
             if lease.live:
                 self.leases.remove(lease)
                 lease.live = False
-
-    def _resize(self, lease: Lease, nbytes: int) -> None:
-        with self._lock:
-            if not lease.live:
-                raise ValueError(f"{lease.purpose}: a released lease cannot be resized")
-            if nbytes > lease.nbytes:
-                if lease.cache:
-                    if not self._fits(lease.pools, nbytes, ignoring=lease):
-                        raise MemoryError(f"{lease.purpose}: a cache lease grows only into free bytes: {self.describe()}")
-                else:
-                    self._make_room(lease.pools, nbytes, lease.purpose, ignoring=lease)
-            lease.nbytes = int(nbytes)
-            self._note_peaks(lease.pools)
-
 
 class _LedgerAllocator:
     """CuPy's allocator inside a CUDA scope: every device allocation makes room on the ledger before the default pool
