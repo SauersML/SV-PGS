@@ -4824,7 +4824,11 @@ def fit_hyperparameters(
             share = theta * state.error
             resolved_state = _outer_state(prior, hyperparameters[model], points[model], corrections[model], working_bytes, share)
             if resolved_state is not None:
-                state = replace(resolved_state, polished=state.polished, tail=state.tail)
+                # Re-certified at the same x: x's polish, its contraction and whether it ended below x's resolution
+                # stand (a state that dropped ``at_resolution`` here re-opened its polish at the radius that had just
+                # ended below resolution, and plan, re-certification and refusal cycled without end: bench-sim's
+                # derived refstate arm, 177 cycles a minute for over an hour).
+                state = replace(resolved_state, polished=state.polished, tail=state.tail, at_resolution=state.at_resolution)
             if state.error > share and state.decrement > share:
                 # The state's error cannot reach its share by re-certification alone: its floor is x's own decrement
                 # there (on ENSG00000254709.8 [real] a polished state's error 0.0029 was its decrement, and the
