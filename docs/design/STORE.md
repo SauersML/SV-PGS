@@ -48,6 +48,7 @@ One consolidated spec. It replaces the numbered addenda A4 through A4.15. Code: 
   - The class legend is stored with the column, and a store with another legend is refused. Stores written before the class merges (s1M_100k, mini and build-lead/synth on MSI) must be converted again; one conversion covers both merges.
   - GATK-SV adds copy_number (multiallelic CNVs, read from FORMAT/CN) and inversion. Breakends are dropped.
   - Length is not a class; it enters the prior as a smooth of log length. A GATK-SV row's symbolic REF/ALT carry no length, so its sv_length annotation comes from |SVLEN| or the END span (`GatksvRows.lengths`).
+- **row_source** (written by the workspace's `direct_sv` step): legend `imputed`, `direct`. A direct row is a GATK-SV record the step added beside the imputed site list, in coordinate order after the imputed records at its POS (WORKSPACE_PIPELINE.md, "Direct read-based SV/CNV channel"). It keeps its GATK-SV class, joins no TR locus (`tr_locus` is the no-locus value), and has the imputed input's own annotations (`n_paths`, `n_paths_total`, `cx`) missing.
 - **Grouping:** bubble_idx, same_pos_first.
 - **Reliability keys:** sv_ctx, cx, has_pl.
 - **r2_truth (f32):** corr²(stored D, G), triad-corrected. The pipeline fits the r̂ model and fills this column inside the AoU workspace. The coefficients never leave it, and outside the workspace the column stays NaN.
@@ -93,4 +94,4 @@ tr_start, tr_end, n_intervals, n_records, n_dlen_nonzero, tr_motif_len (the majo
   - **S1 sites, S2 FORMAT, S3 floor:** pending until that half's data arrives.
 
 ## MANIFEST
-It records, per half, the measurement type, GLIMPSE2 image digest and pop binary md5; the BED names and md5s; the r² model version, target, covariates, coefficient md5 and CV error; each column's data class; and the gate results.
+It records, per half, the measurement type, GLIMPSE2 image digest and pop binary md5; the BED names and md5s; the r² model version, target, covariates, coefficient md5 and CV error; each column's data class; and the gate results. A store with direct rows also records `direct_calls`: the caller, each chromosome's call-set file name and size, the FILTER policy and the row count.

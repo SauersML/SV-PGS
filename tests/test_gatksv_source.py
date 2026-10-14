@@ -79,6 +79,8 @@ def test_aou_layout_filter_policy_classes_and_copy_number(tmp_path: Path) -> Non
         VariantClass.DUPLICATION,
     ]
     assert [svtype for block in blocks for svtype in block.svtypes] == ["DEL", "INS", "CNV", "INV", "CPX", "DUP"]
+    assert [alt for block in blocks for alt in block.alts] == ["<DEL>", "<INS:ME:ALU>", "<CN=0>,<CN=2>,<CN=3>", "<INV>", "<CPX>", "<DUP>"]
+    assert {ref for block in blocks for ref in block.refs} == {"N"}
     assert np.concatenate([block.is_copy_number for block in blocks]).tolist() == [False, False, True, False, False, False]
     assert np.concatenate([block.lengths for block in blocks]).tolist() == [500.0, 300.0, 9000.0, 400.0, 2500.0, 5000.0]
     values = np.vstack([block.values for block in blocks])

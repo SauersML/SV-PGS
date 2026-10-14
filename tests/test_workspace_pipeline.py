@@ -82,6 +82,21 @@ KINSHIP = (("7003", "5010", 0.45), ("5020", "5021", 0.25), ("5030", "5031", 0.05
 # The imputation reference panel: 7099 has no imputed row and 5030 is no truth person's relative, so every pair calibrates.
 IMPUTATION_REFERENCE = ("7099", "5030")
 FEMALE, MALE = 45878463, 45880669
+# The GATK-SV call set per chromosome: (POS, ID, ALT, FILTER, INFO, kind). A deletion at an imputed record's POS, an
+# insertion that is imputed record 8's own event (it pairs with it), a breakend and a HIGH_NCR deletion (both dropped), a
+# multi-allelic copy number, and a duplication shorter than 50 bp (a direct row, so structural whatever its length).
+GATKSV_RECORDS = (
+    (1000, "gsv_del_1000", "<DEL>", "PASS", "SVTYPE=DEL;SVLEN=300;END=1300", "deletion"),
+    (6000, "gsv_ins_6000", "<INS>", "PASS", "SVTYPE=INS;SVLEN=52;END=6001", "paired"),
+    (6500, "gsv_bnd_6500", "N[chr21:90000[", "UNRESOLVED", "SVTYPE=BND", "deletion"),
+    (7000, "gsv_cnv_7000", "<CN=0>,<CN=2>,<CN=3>,<CN=4>", "MULTIALLELIC", "SVTYPE=CNV;SVLEN=5000;END=12000", "copy_number"),
+    (8000, "gsv_del_8000", "<DEL>", "HIGH_NCR", "SVTYPE=DEL;SVLEN=700;END=8700", "deletion"),
+    (9000, "gsv_dup_9000", "<DUP>", "PASS", "SVTYPE=DUP;SVLEN=40;END=9040", "deletion"),
+)
+# People the call set does not carry: their store columns are no-calls, filled like any other.
+GATKSV_ABSENT = ("5001", "5045")
+GATKSV_QUALITY = 30
+DIRECT_SV_NULL = {"gatksv_calls": None, "read_depth_cnv_calls": None, "ctyper_copy_numbers": None, "cn_estimator_copy_numbers": None, "truth_copy_numbers": None}
 BUDGET = ComputeBudget(
     device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(), host_bytes=1 << 29, cpu_threads=1
 )
@@ -142,6 +157,55 @@ class _Synthetic:
     raw: dict
     genotypes: dict[tuple[str, str], np.ndarray]
     dosages: dict[tuple[str, str], np.ndarray]
+    gatksv_calls: dict[tuple[str, str], tuple[int | None, ...]]
+    gatksv_pattern: str
+
+
+def _write_gatksv(root: Path, persons: list[str], genotypes: dict[tuple[str, str], np.ndarray], rng: np.random.Generator) -> dict:
+    """The synthetic GATK-SV VCFs (GATKSV_RECORDS), samples named by research ID, and each (chromosome, person)'s calls
+    per record: an ALT count or copy number, None at a no-call. FORMAT is AoU's GT:CN:CNQ, GT '.' on a copy number."""
+    (root / "gatksv").mkdir()
+    called = [person for person in persons if person not in GATKSV_ABSENT]
+    calls: dict[tuple[str, str], tuple[int | None, ...]] = {}
+    for chromosome in CHROMOSOMES:
+        per_record = []
+        for _position, _identifier, _alt, _filter, _info, kind in GATKSV_RECORDS:
+            if kind == "paired":
+                values = [int(genotypes[(chromosome, person)][8]) for person in called]
+            elif kind == "copy_number":
+                values = rng.choice([1, 2, 3, 4], size=len(called), p=[0.1, 0.6, 0.2, 0.1]).tolist()
+            else:
+                values = rng.binomial(2, 0.25, len(called)).tolist()
+            missing = rng.random(len(called)) < 0.1
+            per_record.append([None if gap else int(value) for value, gap in zip(values, missing)])
+        for column, person in enumerate(called):
+            calls[(chromosome, person)] = tuple(record[column] for record in per_record)
+        lines = [
+            "##fileformat=VCFv4.2",
+            *(f"##contig=<ID={name},length=50000000>" for name in CHROMOSOMES),
+            '##FILTER=<ID=UNRESOLVED,Description="unresolved">',
+            '##FILTER=<ID=HIGH_NCR,Description="high no-call rate">',
+            '##FILTER=<ID=MULTIALLELIC,Description="multi-allelic CNV">',
+            '##INFO=<ID=SVTYPE,Number=1,Type=String,Description="type">',
+            '##INFO=<ID=SVLEN,Number=1,Type=Integer,Description="length">',
+            '##INFO=<ID=END,Number=1,Type=Integer,Description="end">',
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="genotype">',
+            '##FORMAT=<ID=CN,Number=1,Type=Integer,Description="copy number">',
+            '##FORMAT=<ID=CNQ,Number=1,Type=Integer,Description="copy number quality">',
+            "\t".join(["#CHROM", "POS", "ID", "REF", "ALT", "QUAL", "FILTER", "INFO", "FORMAT", *called]),
+        ]
+        for record, (position, identifier, alt, filter_value, info, kind) in enumerate(GATKSV_RECORDS):
+            fields = []
+            for person in called:
+                value = calls[(chromosome, person)][record]
+                if kind == "copy_number":
+                    fields.append(".:.:." if value is None else f".:{value}:{GATKSV_QUALITY}")
+                else:
+                    fields.append("./.:.:." if value is None else f"{('0/0', '0/1', '1/1')[value]}:.:.")
+            row_alt = alt.replace("chr21", chromosome)
+            lines.append("\t".join([chromosome, str(position), f"{identifier}_{chromosome}", "N", row_alt, ".", filter_value, info, "GT:CN:CNQ", *fields]))
+        (root / "gatksv" / f"{chromosome}.vcf").write_text("\n".join(lines) + "\n")
+    return calls
 
 
 def _write_inputs(root: Path) -> _Synthetic:
@@ -250,8 +314,12 @@ def _write_inputs(root: Path) -> _Synthetic:
         "seed": 7,
         "codec": "zstd",
         "export": ["accuracy.tsv", "comparison.tsv", "effects_by_class.tsv", "genetic_variance.tsv"],
+        "direct_sv": None,
     }
-    return _Synthetic(root=root, raw=raw, genotypes=genotypes, dosages=dosages)
+    gatksv_calls = _write_gatksv(root, persons, genotypes, rng)
+    return _Synthetic(
+        root=root, raw=raw, genotypes=genotypes, dosages=dosages, gatksv_calls=gatksv_calls, gatksv_pattern=str(root / "gatksv" / "{chromosome}.vcf"),
+    )
 
 
 def _omop_rows(persons: list[str]) -> tuple[list[dict], list[dict]]:
@@ -336,19 +404,23 @@ def _fit_measurement_model(calibration, cohort_dosage_variance, strata, design=N
 
 @dataclasses.dataclass(frozen=True)
 class _MeasurementModel:
-    """A stand-in for measurement_model.MeasurementModel's arrays and its npz save and load."""
+    """A stand-in for measurement_model.MeasurementModel's arrays, its maps and certificate, and its npz save and load."""
 
     scales: np.ndarray
     residual_variance: np.ndarray
     log_reliability: np.ndarray
+    leakage_maps: tuple = ()
+    certificate: dict = dataclasses.field(default_factory=dict)
 
     def save(self, path: Path) -> None:
-        np.savez(path, **dataclasses.asdict(self))
+        assert not self.leakage_maps
+        np.savez(path, scales=self.scales, residual_variance=self.residual_variance, log_reliability=self.log_reliability,
+                 certificate=json.dumps(self.certificate))
 
     @classmethod
     def load(cls, path: Path) -> _MeasurementModel:
         with np.load(path) as archive:
-            return cls(**{name: archive[name] for name in archive.files})
+            return cls(archive["scales"], archive["residual_variance"], archive["log_reliability"], (), json.loads(str(archive["certificate"])))
 
 
 def _pooled_measurement_model(models, cohort_dosage_mean, cohort_dosage_variance, group_counts) -> _MeasurementModel:
@@ -555,6 +627,9 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         expected = linear_recalibration(stored_milli, groups, measurement["scales"][:, : groups.max() + 1]).dosage_milli
         np.testing.assert_array_equal(after.read_codes(0, after.n_variants), encode_dosage_milli(expected))
         assert after.manifest_attributes["recalibrated"] is True
+    # direct_sv is null here: the step adds no row, and the fit reads the measurement step's store and model.
+    assert summaries["direct_sv"]["direct_rows"] == 0 and summaries["direct_sv"]["store"] == "measurement/store"
+    assert summaries["direct_sv"]["measurement_model"] == "measurement/measurement_model.npz" and "direct_sv is null" in summaries["direct_sv"]["gatksv_calls"]
 
     # The fit saw, per arm and trait, the trait's fold training sets and its all-rows set, with no held-out row, no
     # intercept column, and the trait's own covariates only.
@@ -745,6 +820,130 @@ def test_with_truth_calls_and_no_reference_list_no_pair_calibrates_and_the_run_s
     assert summaries["measurement"]["recalibrated"] and _completed_at(run, "store") == stored
 
 
+def _store_research_ids() -> list[str]:
+    """Each store sample's research ID in store column order: the imputed halves' through the crosswalk, then TRUTH."""
+    return [_research_of(name) for half in _sequencing_names() for batch in half for name in batch] + list(TRUTH)
+
+
+def test_a_gatksv_call_set_adds_direct_rows_that_only_with_sv_fits(workspace) -> None:
+    """The direct read-based channel on the dry-run cohort: every kept GATK-SV record a store row in coordinate order,
+    filled no-calls, its reported r^2 from the hard-call rule or the CNQ bound, left out of snv_indel and fitted by
+    with_sv, and carried by the effects tables with its class and length; a rerun skips every completed step."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": {**DIRECT_SV_NULL, "gatksv_calls": synthetic.gatksv_pattern}})
+    recorder = _Recorder()
+    # Two threads: the chromosomes are merged in two processes.
+    summaries = run_pipeline(config, _bindings(recorder, client), dataclasses.replace(BUDGET, cpu_threads=2), through="effects")
+    run = config.run_directory
+    direct = summaries["direct_sv"]
+    kept = [record for record in GATKSV_RECORDS if record[3] in ("PASS", "MULTIALLELIC")]
+    assert direct["store"] == "direct_sv/store" and direct["measurement_model"] == "direct_sv/measurement_model.npz"
+    assert direct["direct_rows"] == len(kept) * len(CHROMOSOMES)
+    assert direct["skipped_records"] == {"FILTER UNRESOLVED": len(CHROMOSOMES), "FILTER HIGH_NCR": len(CHROMOSOMES)}
+    # The insertion is imputed record 8's own event: it pairs one to one and fills its no-calls from that DS.
+    assert direct["pairs"] == len(CHROMOSOMES) and direct["filled_from_paired_imputed_ds"] == len(CHROMOSOMES)
+    assert direct["reliability_rules"]["hard_call"] == 3 * len(CHROMOSOMES) and direct["reliability_rules"]["cnq_bound"] == len(CHROMOSOMES)
+    assert all(value == "null: not implemented, not read" for value in direct["optional_sources"].values())
+    certificate = json.loads((run / "direct_sv" / "certificate.json").read_text())
+    assert certificate["uncalibrated_records"] == direct["direct_rows"] and certificate["direct_calls_fused"] == 0
+    assert "hard-call ALT count" in certificate["reliability_source"] and "CNQ" in certificate["reliability_source"]
+
+    store_ids = _store_research_ids()
+    with DosageStore.open(run / "measurement" / "store") as before, DosageStore.open(run / "direct_sv" / "store") as after:
+        table = after.variant_table
+        assert after.n_variants == before.n_variants + direct["direct_rows"]
+        assert after.manifest_attributes["direct_calls"]["rows"] == direct["direct_rows"]
+        assert after.manifest_attributes["half_measurements"] == before.manifest_attributes["half_measurements"]
+        assert table.annotation_legends["row_source"] == ("imputed", "direct")
+        is_direct = np.asarray(table.annotations["row_source"]) == 1
+        # Each direct row after the imputed records at its POS: on chr21, after record 0 (POS 1000) and record 8 (POS 6000).
+        assert np.flatnonzero(is_direct[: len(RECORDS) + len(kept)]).tolist() == [1, 10, 11, 12]
+        assert np.all(np.diff(table.position[: len(RECORDS) + len(kept)]) >= 0)
+        # The imputed records keep their codes, classes and annotations.
+        np.testing.assert_array_equal(after.read_codes(0, after.n_variants)[~is_direct], before.read_codes(0, before.n_variants))
+        np.testing.assert_array_equal(table.variant_class[~is_direct], before.variant_table.variant_class)
+        np.testing.assert_array_equal(table.annotations["sv_length"][~is_direct], before.variant_table.annotations["sv_length"])
+        rows = np.flatnonzero(is_direct)[: len(kept)]
+        assert [VARIANT_CLASS_LEGEND[code] for code in table.variant_class[rows]] == ["deletion", "insertion", "copy_number", "duplication"]
+        assert table.annotations["sv_length"][rows].tolist() == [300.0, 52.0, 5000.0, 40.0]
+        assert table.variant_ids(rows) == [f"{record[1]}_chr21" for record in kept]
+        # The pair is one unbreakable group with imputed record 8.
+        assert table.group_first[rows[1]] == table.group_first[9]
+        codes = after.read_codes(0, after.n_variants)[rows]
+        for row, (_position, _identifier, _alt, _filter, _info, kind) in enumerate(kept):
+            record = GATKSV_RECORDS.index(kept[row])
+            calls = [synthetic.gatksv_calls.get(("chr21", person), (None,) * len(GATKSV_RECORDS))[record] for person in store_ids]
+            called = np.array([value is not None for value in calls])
+            values = np.array([0 if value is None else value for value in calls])
+            unit = int(table.codes_per_unit[rows[row]])
+            # A called entry is stored exactly; a copy number at floor(254 / its largest called copy number) per copy.
+            assert unit == (254 // values[called].max() if kind == "copy_number" else 127)
+            np.testing.assert_array_equal(codes[row][called], values[called] * unit)
+            if kind != "paired":
+                # An unpaired record's no-calls (absent people's included) take its observed mean, never zero.
+                assert set(codes[row][~called].tolist()) == {int(np.floor(values[called].mean() * unit + 0.5))}
+        assert int(table.value_origin[rows[2]]) == -2
+        # The copy number's reported r^2 is the CNQ bound over the store's called samples.
+        record = GATKSV_RECORDS.index(kept[2])
+        calls = np.array([value for person in store_ids if (value := synthetic.gatksv_calls.get(("chr21", person), (None,) * 6)[record]) is not None])
+        reported = np.load(run / "direct_sv" / "rows" / "chr21.npz")["reported_reliability"]
+        assert reported.tolist()[:2] == [1.0, 1.0] and reported[3] == 1.0
+        assert reported[2] == pytest.approx(1.0 - 10.0 ** (-GATKSV_QUALITY / 10.0) / calls.var())
+
+    # snv_indel leaves every direct row out, the 40 bp duplication included; with_sv fits them.
+    model = _MeasurementModel.load(run / "direct_sv" / "measurement_model.npz")
+    imputed_model = _MeasurementModel.load(run / "measurement" / "measurement_model.npz")
+    np.testing.assert_array_equal(model.log_reliability[~is_direct], imputed_model.log_reliability)
+    assert np.all(np.isfinite(model.log_reliability[is_direct]))
+    arms = set()
+    for call in recorder.fit_calls:
+        assert call.log_variance_offset.shape == (is_direct.shape[0],)
+        arm = "snv_indel" if np.all(np.isneginf(call.log_variance_offset[is_direct])) else "with_sv"
+        arms.add(arm)
+        if arm == "with_sv":
+            np.testing.assert_array_equal(call.log_variance_offset, model.log_reliability)
+    assert arms == set(ARMS)
+    for trait in ("atrial_fibrillation", "total_bilirubin"):
+        for arm in ARMS:
+            effects = pd.read_csv(run / "effects" / f"{trait}.{arm}.tsv.gz", sep="\t")
+            own = effects[effects["row_source"] == "direct"]
+            if arm == "snv_indel":
+                assert own.empty
+            else:
+                assert set(own["variant_class"]) == {"deletion", "insertion", "copy_number", "duplication"}
+                assert set(own["length"]) == {300.0, 52.0, 5000.0, 40.0}
+
+    # A rerun skips every completed step.
+    finished = {step: _completed_at(run, step) for step in STEP_NAMES[: STEP_NAMES.index("effects") + 1]}
+    rerun = _Recorder()
+    run_pipeline(config, _bindings(rerun, client), BUDGET, through="effects")
+    assert {step: _completed_at(run, step) for step in finished} == finished and not rerun.fit_calls
+
+
+def test_a_null_gatksv_call_set_adds_no_row_and_says_so(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": DIRECT_SV_NULL})
+    summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="direct_sv")
+    direct = summaries["direct_sv"]
+    assert direct["direct_rows"] == 0 and direct["store"] == summaries["measurement"]["store"]
+    assert direct["measurement_model"] == "measurement/measurement_model.npz" and "gatksv_calls is null" in direct["gatksv_calls"]
+    certificate = json.loads((config.run_directory / "direct_sv" / "certificate.json").read_text())
+    assert certificate["gatksv_calls"] == direct["gatksv_calls"] and not (config.run_directory / "direct_sv" / "store").exists()
+
+
+def test_direct_sv_refuses_a_source_it_does_not_read(workspace) -> None:
+    synthetic, _client = workspace
+    with pytest.raises(ValueError, match="ctyper_copy_numbers is not implemented"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": {**DIRECT_SV_NULL, "ctyper_copy_numbers": "ctyper.tsv"}})
+    with pytest.raises(ValueError, match="names exactly"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": {"gatksv_calls": None}})
+    with pytest.raises(ValueError, match=r"over \{chromosome\}"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "direct_sv": {**DIRECT_SV_NULL, "gatksv_calls": "calls.vcf.gz"}})
+    # A missing direct_sv says where the CDR keeps the call set.
+    with pytest.raises(ValueError, match=r"AoU_srWGS_SV\.v8\.\{chromosome\}\.vcf\.gz"):
+        WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "direct_sv"})
+
+
 def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(workspace) -> None:
     synthetic, client = workspace
     done = synthetic.root / "strata" / "_done" / "chr22.json"
@@ -826,6 +1025,10 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
     config = WorkspaceConfig.from_mapping(raw)
     # The study's panel is its diseases; the quantitative traits are left out of the template to keep the fit in budget.
     assert (len(config.diseases), len(config.traits), config.fold_count) == (15, 0, 5) and config.truth_calls is None
+    # The direct channel reads the CDR's GATK-SV call set, one VCF per chromosome (CDR_LAYOUT.md).
+    assert config.direct_sv is not None and config.direct_sv.gatksv_calls == (
+        "cdr_storage_path/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
+    )
     # Every catalogued disease, in the catalogue's order (the study abstract's five first, hypertension leading).
     assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS)
     for job in ("job_store.json.template", "job_fit.json.template"):

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import functools
 import hashlib
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from cyvcf2 import VCF
 import numpy as np
@@ -881,13 +881,15 @@ def write_store_manifest(
     half_measurements: Sequence[str],
     gates: dict[str, str],
     recalibrated: bool,
+    direct_calls: Mapping[str, Any] | None = None,
 ) -> None:
     """The store MANIFEST: halves with their measurement kind, gate results, whether D* was applied,
     and each half's sample manifest (its batches' sample names in batch order, each once, with
     the namespace they are written in).
 
     A long-read half shares the imputed halves' verified site list; the fit gives every half its
-    own covariate.
+    own covariate. ``direct_calls`` records the call set whose direct read-based rows the store
+    holds beside the imputed ones (its files and FILTER policy), where it holds any.
     """
     if len(half_measurements) != len(half_sample_counts) or any(kind not in HALF_MEASUREMENTS for kind in half_measurements):
         raise ValueError(f"every half needs a measurement in {HALF_MEASUREMENTS}.")
@@ -901,5 +903,10 @@ def write_store_manifest(
         record_counts=record_counts,
         half_sample_counts=half_sample_counts,
         chromosome_sites_md5=chromosome_sites_md5,
-        attributes={"half_measurements": list(half_measurements), "gates": dict(gates), "recalibrated": recalibrated},
+        attributes={
+            "half_measurements": list(half_measurements),
+            "gates": dict(gates),
+            "recalibrated": recalibrated,
+            **({} if direct_calls is None else {"direct_calls": dict(direct_calls)}),
+        },
     )

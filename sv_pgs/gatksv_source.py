@@ -57,7 +57,8 @@ MISSING_QUALITY = int(np.iinfo(np.uint16).max)
 class GatksvBlock:
     """Kept records of one read, columnar, in file order.
 
-    ``values[r, i]`` is the ALT allele count (0..2) or, where
+    ``refs`` and ``alts`` are each record's REF and its ALT alleles joined by
+    commas, as the file writes them. ``values[r, i]`` is the ALT allele count (0..2) or, where
     ``is_copy_number[r]``, the integer copy number (0..254) of sample ``i``;
     it is 0 wherever ``no_call[r, i]``. ``quality[r, i]`` is the phred quality
     of a copy number (CNQ, or RD_GQ where RD_CN gave it), MISSING_QUALITY where
@@ -71,6 +72,8 @@ class GatksvBlock:
     ends: I64Array
     lengths: F64Array
     variant_ids: tuple[str, ...]
+    refs: tuple[str, ...]
+    alts: tuple[str, ...]
     svtypes: tuple[str, ...]
     variant_classes: tuple[VariantClass, ...]
     is_copy_number: BoolArray
@@ -101,6 +104,8 @@ class GatksvBlock:
             ends=self.ends,
             lengths=self.lengths,
             variant_ids=self.variant_ids,
+            refs=self.refs,
+            alts=self.alts,
             svtypes=self.svtypes,
             variant_classes=self.variant_classes,
             is_copy_number=self.is_copy_number,
@@ -205,7 +210,7 @@ class GatksvSource:
             raise ValueError("block_records must be positive.")
         reader = VCF(str(self.vcf_path))
         records = reader(self.region) if self.region is not None else reader
-        pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]] = []
+        pending: list[tuple[str, int, int, float, str, str, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]] = []
         try:
             for record in records:
                 svtype_value = record.INFO.get("SVTYPE")
@@ -246,6 +251,8 @@ class GatksvSource:
                         int(record.end) if end is None else end,
                         length,
                         str(record.ID),
+                        str(record.REF),
+                        ",".join(str(alt) for alt in record.ALT),
                         "" if typed_svtype is None else typed_svtype,
                         variant_class,
                         copy_number,
@@ -265,15 +272,19 @@ class GatksvSource:
 
 
 def _block_from_records(
-    pending: list[tuple[str, int, int, float, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]],
+    pending: list[tuple[str, int, int, float, str, str, str, str, VariantClass, bool, U8Array, BoolArray, U16Array]],
 ) -> GatksvBlock:
-    chromosomes, positions, ends, lengths, variant_ids, svtypes, variant_classes, copy_numbers, values, no_calls, qualities = zip(*pending)
+    (
+        chromosomes, positions, ends, lengths, variant_ids, refs, alts, svtypes, variant_classes, copy_numbers, values, no_calls, qualities,
+    ) = zip(*pending)
     return GatksvBlock(
         chromosomes=tuple(chromosomes),
         positions=np.asarray(positions, dtype=np.int64),
         ends=np.asarray(ends, dtype=np.int64),
         lengths=np.asarray(lengths, dtype=np.float64),
         variant_ids=tuple(variant_ids),
+        refs=tuple(refs),
+        alts=tuple(alts),
         svtypes=tuple(svtypes),
         variant_classes=tuple(variant_classes),
         is_copy_number=np.asarray(copy_numbers, dtype=bool),

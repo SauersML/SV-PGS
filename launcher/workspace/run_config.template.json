@@ -31,5 +31,12 @@
   "fold_count": 5,
   "seed": ${FOLD_SEED},
   "codec": "zstd",
-  "export": []
+  "export": [],
+  "direct_sv": {
+    "gatksv_calls": "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz",
+    "read_depth_cnv_calls": null,
+    "ctyper_copy_numbers": null,
+    "cn_estimator_copy_numbers": null,
+    "truth_copy_numbers": null
+  }
 }

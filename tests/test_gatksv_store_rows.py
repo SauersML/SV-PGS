@@ -60,6 +60,8 @@ def _scenario() -> tuple[GatksvBlock, ImputedSvRecords, dict[str, np.ndarray]]:
         ends=np.array([12_000, 30_001, 51_000, 12_000, 72_000], dtype=np.int64),
         lengths=np.array([2_000.0, 800.0, 1_000.0, 2_000.0, 2_000.0]),
         variant_ids=("gatksv_del", "gatksv_ins", "gatksv_del_contradicted", "gatksv_cnv", "gatksv_dup_uncalled"),
+        refs=("N",) * 5,
+        alts=("<DEL>", "<INS>", "<DEL>", "<CN=1>,<CN=3>", "<DUP>"),
         svtypes=("DEL", "INS", "DEL", "CNV", "DUP"),
         variant_classes=(
             VariantClass.DELETION,

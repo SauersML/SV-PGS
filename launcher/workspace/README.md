@@ -7,8 +7,8 @@ Jobs go straight to Google Batch: `submit.sh` runs `gcloud batch jobs submit` fr
 | File | What it is |
 |---|---|
 | `submit.sh` | Fills a job template and `run_step.sh.template` from the environment, copies `run_step.sh` to the ops bucket, and submits the job with its spend ceiling |
-| `run_config.template.json` | The pipeline's run config. Every key is required. `truth_calls` is a path pattern or an explicit `null`. `imputation_reference_ids` is the file of the imputation reference panel's research IDs, or an explicit `null`, under which truth calls give no calibration pair. `export` lists the report files the user approves for staging |
-| `job_store.json.template` | The CPU job: steps samples through measurement, on spot CPUs with a persistent run disk |
+| `run_config.template.json` | The pipeline's run config. Every key is required. `truth_calls` is a path pattern or an explicit `null`. `imputation_reference_ids` is the file of the imputation reference panel's research IDs, or an explicit `null`, under which truth calls give no calibration pair. `direct_sv.gatksv_calls` is the CDR's GATK-SV call set, a path pattern over `{chromosome}` under `${CDR_STORAGE_PATH}`, or `null` for no direct rows; the job must be able to open it (a mounted copy of the CDR bucket, or a copy on the run disk), and every other `direct_sv` key must stay `null`. `export` lists the report files the user approves for staging |
+| `job_store.json.template` | The CPU job: steps samples through direct_sv (`THROUGH=direct_sv`), on spot CPUs with a persistent run disk |
 | `job_fit.json.template` | The GPU job: steps fit through export |
 | `run_step.sh.template` | The task script: builds the locked environment offline with uv from the staged files, then runs `sv-pgs workspace-run --through ${THROUGH}` |
 
@@ -55,7 +55,7 @@ Under `gs://${OPS_BUCKET}/svpgs/${RUN_ID}/`:
 - `bin/uv`: the uv binary (`cp "$(command -v uv)"`).
 - `python/`: CPython 3.12, `UV_PYTHON_INSTALL_DIR=python uv python install 3.12`.
 - `uv-cache/`: every locked wheel, `UV_CACHE_DIR=uv-cache UV_PYTHON_INSTALL_DIR=python uv sync --frozen --no-dev --extra gpu --python 3.12` in the source tree (the CPU job's `UV_EXTRAS` is empty and uses a subset).
-- `run_config.json`: the filled `run_config.template.json`.
+- `run_config.json`: the filled `run_config.template.json`, its `${CDR_STORAGE_PATH}` the path the job reads the CDR's GATK-SV VCFs from.
 
 The staging machine and the Batch VMs must be the same platform (Linux x86-64). The inputs the config points at are read where they sit inside the workspace, through a mounted bucket or the run disk.
 

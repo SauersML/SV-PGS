@@ -36,7 +36,7 @@ All arms share the same samples, folds, covariates and inference; only the colum
   - The forecast comes from the exact identity Δ_j = r²_j(1 − ρ²_j), where ρ² is how predictable an SV column is from local SNVs.
   - Imputed SVs' ρ² [in-workspace: measured in-workspace; value not reproduced here].
 - **Total gain** = C − A.
-- **What the workspace run implements** (WORKSPACE_PIPELINE.md): two arms with one prior design, `snv_indel` (every record under 50 bp: A's columns) and `with_sv` (every record); no B arm, no fused GATK-SV rows and no null arms. Its fold-combined comparison omits the cross-fit pair term, so it is descriptive, not test (a) below.
+- **What the workspace run implements** (WORKSPACE_PIPELINE.md): two arms with one prior design, `snv_indel` (every record under 50 bp: A's columns) and `with_sv` (every record, with the `direct_sv` step's GATK-SV rows when the config names the call set); no B arm, no fused GATK-SV rows (a GATK-SV row is a column of its own beside the imputed record it pairs with) and no null arms. Its fold-combined comparison omits the cross-fit pair term, so it is descriptive, not test (a) below.
 
 ## Claims and their tests
 α = 0.05 is split 0.025 / 0.0125 / 0.0125 across (a) / (b) / (c).

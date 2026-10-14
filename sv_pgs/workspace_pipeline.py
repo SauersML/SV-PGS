@@ -10,8 +10,8 @@ reads, the keys of the steps it depends on, and the source of the code it runs. 
   chromosomes);
 - moves a step whose key changed aside as ``<step>.superseded-<key>``.
 
-Nothing is deleted except the store step's own decoded batch files, once their chromosome is
-written.
+Nothing is deleted except the store step's own decoded batch files and the direct_sv step's blocks
+of rows, once their chromosome is written.
 
 Steps:
 
@@ -32,6 +32,10 @@ Steps:
    outside the imputation reference panel and its members' close relatives (``calibrating_pairs``),
    or its explicit no-truth form, and the fit's prior offset from it. Where it recalibrates, the store
    is rewritten with D*.
+5b. ``direct_sv``: the direct read-based channel. Every kept record of the GATK-SV call set becomes
+   a store row of its own beside the imputed records, its no-calls filled from a paired imputed DS
+   or its observed mean, with the measurement model's no-truth reliability; the store and the model
+   the fit reads cover the merged rows. With ``direct_sv`` null the step adds nothing and says so.
 6. ``fit``: both arms (``ARMS``: SNVs and short indels alone, then with every structural record)
    of every trait, each trait's fold models and its all-rows model in one call, each projecting
    out its own trait's covariates. Each (arm, trait) model is saved as it finishes, so a rerun
@@ -72,7 +76,7 @@ from pathlib import Path
 import shutil
 import time
 from types import ModuleType
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 from cyvcf2 import VCF
 import numpy as np
@@ -84,6 +88,7 @@ from sv_pgs import (
     cohort as cohort_module,
     dosage_store,
     fit_model,
+    gatksv_store_rows,
     held_out_comparison,
     measurement_model,
     phenotype_measurement,
@@ -126,6 +131,7 @@ from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
+    DEFAULT_INNER_CHUNK_ROWS,
     MISSING_CODE,
     VARIANT_CLASS_LEGEND,
     VARIANT_CLASSES,
@@ -135,13 +141,17 @@ from sv_pgs.dosage_store import (
     VariantTable,
     chromosome_number,
     dosage_array_directory,
+    open_column,
     read_manifest,
     sites_md5,
     statistic_column_directory,
     write_column,
+    write_half_codes,
     write_variant_columns,
 )
-from sv_pgs.sample_crosswalk import SampleCrosswalk, store_research_ids
+from sv_pgs.gatksv_source import GatksvSource
+from sv_pgs.gatksv_store_rows import RELIABILITY_SOURCES, ImputedSvRecords, PairEvidence, gatksv_block_rows, gatksv_sites, one_to_one
+from sv_pgs.sample_crosswalk import ABSENT_COLUMN, SampleCrosswalk, source_columns_for_store_samples, store_research_ids
 from sv_pgs.sample_ids import ResearchId
 from sv_pgs.store_converter import (
     MAXIMUM_KEPT_PATHS,
@@ -165,12 +175,13 @@ from sv_pgs.store_converter import (
     unbreakable_group_first,
     write_store_manifest,
 )
-from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, variant_class_and_length
+from sv_pgs.sv_fusion import MINIMUM_SIZE_RATIO, SvSites, candidate_pairs, sequence_resolved_sites
+from sv_pgs.variant_typing import COMMUNITY_SV_MINIMUM_LENGTH, alt_is_symbolic_or_breakend, is_sequence_allele, variant_class_and_length
 from sv_pgs.fit_checkpoint import checkpoint_timings
 
 LOGGER = logging.getLogger(__name__)
 
-STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "fit", "score", "effects", "report", "export")
+STEP_NAMES = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv", "fit", "score", "effects", "report", "export")
 ARMS = ("snv_indel", "with_sv")
 """The study's two arms, fitted on the same people, folds and seeds so that their held-out predictions are paired.
 ``snv_indel`` fits every record shorter than a structural variant (``COMMUNITY_SV_MINIMUM_LENGTH``: SNVs, short indels
@@ -210,6 +221,7 @@ CONFIG_KEYS = (
     "seed",
     "codec",
     "export",
+    "direct_sv",
 )
 KEY_HINTS = {
     "gene_annotation": (
@@ -225,6 +237,13 @@ KEY_HINTS = {
     "imputation_reference_ids": (
         "imputation_reference_ids is a one-column file headed research_id listing everyone whose genome was in the "
         "imputation's reference panel, or null; with truth_calls set and it null, no calibration pair is used."
+    ),
+    "direct_sv": (
+        "direct_sv is null (no direct read-based rows) or {\"gatksv_calls\": a path pattern over {chromosome} to the CDR's "
+        "GATK-SV call set, one VCF per chromosome, e.g. "
+        "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz (CDR_LAYOUT.md), "
+        "or null; \"read_depth_cnv_calls\", \"ctyper_copy_numbers\", \"cn_estimator_copy_numbers\" and "
+        "\"truth_copy_numbers\": null, as none of them is implemented}."
     ),
 }
 """What to point a key at, for the keys whose file is a public download or whose null changes what the run does."""
@@ -266,6 +285,42 @@ class PoppedSidecars:
         return Path(self.bubble_split.format(chromosome=chromosome))
 
 
+DIRECT_SV_KEYS = ("gatksv_calls", "read_depth_cnv_calls", "ctyper_copy_numbers", "cn_estimator_copy_numbers", "truth_copy_numbers")
+"""The ``direct_sv`` config's keys (WORKSPACE_PIPELINE.md, "Direct read-based SV/CNV channel"): the GATK-SV call set,
+the one source implemented, then the optional sources, each of which must be null."""
+
+
+@dataclass(frozen=True, slots=True)
+class DirectSvInputs:
+    """The ``direct_sv`` config: the GATK-SV call set as a path pattern over ``{chromosome}``, one VCF per store
+    chromosome (samples named by research ID), or None, which adds no direct row."""
+
+    gatksv_calls: str | None
+
+    @classmethod
+    def from_mapping(cls, raw: Any) -> DirectSvInputs | None:
+        """None for a null ``direct_sv``; otherwise every DIRECT_SV_KEYS key is required, and every source but the
+        GATK-SV call set must be null: a non-null one is refused, never ignored."""
+        if raw is None:
+            return None
+        if not isinstance(raw, Mapping) or set(raw) != set(DIRECT_SV_KEYS):
+            raise ValueError(f"direct_sv is null or names exactly {list(DIRECT_SV_KEYS)}. {KEY_HINTS['direct_sv']}")
+        for key in DIRECT_SV_KEYS[1:]:
+            if raw[key] is not None:
+                raise ValueError(
+                    f"direct_sv.{key} is not implemented: the driver reads only the GATK-SV call set (gatksv_calls); set {key} to null."
+                )
+        calls = raw["gatksv_calls"]
+        if calls is not None and "{chromosome}" not in str(calls):
+            raise ValueError("direct_sv.gatksv_calls is a path pattern over {chromosome}: the call set is one VCF per chromosome.")
+        return cls(None if calls is None else str(calls))
+
+    def gatksv_path(self, chromosome: str) -> Path:
+        if self.gatksv_calls is None:
+            raise ValueError("this run reads no GATK-SV call set.")
+        return Path(self.gatksv_calls.format(chromosome=chromosome))
+
+
 @dataclass(frozen=True, slots=True)
 class WorkspaceConfig:
     """The run's inputs, from the JSON config supplied inside the workspace.
@@ -285,6 +340,9 @@ class WorkspaceConfig:
     null together for plain imputed VCF/BCFs (``popped`` None). ``genetic_map`` is a path pattern
     over ``{chromosome}`` to a PLINK-format map, read for a plain chromosome whose records lack
     INFO/CM, or null; popped batches carry INFO/CM, so it is null for them.
+
+    ``direct_sv`` is the direct read-based channel's sources (``DirectSvInputs``), or None. With it None or its
+    GATK-SV call set None, the ``direct_sv`` step adds no row and says so.
     """
 
     run_directory: Path
@@ -308,6 +366,7 @@ class WorkspaceConfig:
     seed: int
     codec: Codec
     export: tuple[str, ...]
+    direct_sv: DirectSvInputs | None
     genome_build: str = "unspecified"
     disease_likelihood: str = "gaussian_working"
     calibration_fraction: float = 0.0
@@ -394,6 +453,7 @@ class WorkspaceConfig:
             seed=int(raw["seed"]),
             codec=raw["codec"],
             export=tuple(str(name) for name in raw["export"]),
+            direct_sv=DirectSvInputs.from_mapping(raw["direct_sv"]),
             genome_build=str(raw.get("genome_build", "unspecified")),
             disease_likelihood=str(raw.get("disease_likelihood", "gaussian_working")),
             calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
@@ -2073,13 +2133,630 @@ def _measurement_step(run: _Run, directory: Path) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Step 6: the direct read-based SV/CNV channel
+# ---------------------------------------------------------------------------
+
+
+ROW_SOURCE = "row_source"
+ROW_SOURCES = ("imputed", "direct")
+"""The ``row_source`` annotation's legend: a record of the imputed site list (popped or plain batches, with the long-read
+half's calls on it), or a direct read-based row, a GATK-SV record called from the cohort's short reads."""
+GATKSV_FILTER_POLICY = (
+    "gatksv_source.GatksvSource: a record is kept where every FILTER value is PASS (or '.'), with MULTIALLELIC also allowed "
+    "on copy-number records; breakends, multi-ALT records that are not copy numbers and copy numbers above the code range "
+    "are dropped, each counted by reason"
+)
+DIRECT_RELIABILITY = (
+    "no truth pairs, so every direct row takes the measurement model's no-truth form (fit_measurement_model without "
+    "calibration, per ancestry group, pooled over the fit rows' groups) from its reported r^2 (gatksv_store_rows): 1 for "
+    "a hard-call ALT count, the call set's own claim of exactness; the CNQ bound 1 - sum e_i / (n Var(called CN)), "
+    "e_i = 10^(-CNQ_i / 10), for a copy number (CN reliability from CNQ, at least one copy per miscall: an upper bound); "
+    "0, a -inf offset that leaves the row out, for a row whose called samples share one value, a bound at or below 0, or "
+    "a called copy number without a quality"
+)
+DIRECT_FUSION = (
+    "not applied: fit_model.fit takes no leakage map, so each one-to-one pair stays two columns, kept in one unbreakable "
+    "group (group_first) so that no engine block splits it"
+)
+_CALL_SET_BYTES_PER_ENTRY = np.dtype(np.uint8).itemsize + np.dtype(np.bool_).itemsize + np.dtype(np.uint16).itemsize
+"""A call-set entry's bytes in a ``GatksvBlock``: its value, its no-call flag and its quality."""
+_MERGED_COPIES = 3
+"""A merged code block's copies of one byte per entry: the imputed rows read, the direct rows read and the block."""
+
+
+def call_set_columns(halves: Sequence[HalfSamples], call_set_ids: Sequence[str], crosswalk: SampleCrosswalk) -> I64Array:
+    """For every store sample, in store column order over the halves, its column in a call set named by research ID,
+    or ABSENT_COLUMN.
+
+    An imputed half's samples reach it through the crosswalk (``source_columns_for_store_samples``). The long-read
+    half is named by research ID, the call set's own namespace, so its names are looked up there directly: no name is
+    compared across namespaces."""
+    if len(set(call_set_ids)) != len(call_set_ids):
+        raise ValueError("the call set repeats a research ID.")
+    column_of = {research_id: column for column, research_id in enumerate(call_set_ids)}
+    parts = []
+    for half in halves:
+        if half.namespace == "research_id":
+            parts.append(np.array([column_of.get(name, ABSENT_COLUMN) for name in half.names], dtype=np.int64))
+        else:
+            parts.append(source_columns_for_store_samples(half, call_set_ids, crosswalk))
+    return np.concatenate(parts).astype(np.int64)
+
+
+def _imputed_site_list(config: WorkspaceConfig, chromosome: str, complexity_legend: tuple[str, ...] | None) -> tuple[tuple[str, ...], RecordSites]:
+    """The imputed site list's identifiers and site fields, read as the store step read them (``read_plain_sites``, or
+    the strata sidecar and ``read_popped_sites``): the store keeps neither the records' REF/ALT sequences nor INFO/END."""
+    first_half = config.imputed_halves[0]
+    path = first_half.path(chromosome, first_half.batches[0])
+    if config.popped is None:
+        listed = read_plain_sites(path, chromosome)
+        return tuple(listed.expected.identifiers), listed.records
+    strata = read_strata_sites(config.popped.strata_directory, chromosome, complexity_legend)
+    return tuple(strata.identifiers), read_popped_sites(path, strata)
+
+
+def imputed_sv_sites(chromosome: str, positions: NDArray, records: RecordSites, classes: NDArray) -> tuple[I64Array, SvSites]:
+    """The imputed records a direct row may pair with, as rows of the chromosome and ``sv_fusion`` sites: every record
+    that is not an SNV and whose REF and ALT are both sequence (``sequence_resolved_sites``). A symbolic imputed record
+    carries no changed sequence to place on those coordinates, so it pairs with no direct row."""
+    snv = VARIANT_CLASSES.index(VariantClass.SNV)
+    rows = np.array(
+        [
+            row for row, (ref, alt) in enumerate(zip(records.refs, records.alts))
+            if int(classes[row]) != snv and is_sequence_allele(ref) and is_sequence_allele(alt)
+        ],
+        dtype=np.int64,
+    )
+    sites = sequence_resolved_sites(
+        np.full(rows.shape[0], chromosome), np.asarray(positions, dtype=np.int64)[rows],
+        [records.refs[row] for row in rows.tolist()], [records.alts[row] for row in rows.tolist()],
+    )
+    return rows, sites
+
+
+def _site_rows(sites: SvSites, rows: I64Array) -> SvSites:
+    return SvSites(
+        chromosomes=sites.chromosomes[rows], starts=sites.starts[rows], ends=sites.ends[rows], sizes=sites.sizes[rows],
+        kinds=sites.kinds[rows], duplications_are_insertions=sites.duplications_are_insertions,
+    )
+
+
+def _store_rows(store: DosageStore, rows: I64Array, host_bytes: int) -> U8Array:
+    """The codes of ``rows`` (ascending store rows) over every store sample. Rows within an inner chunk
+    (DEFAULT_INNER_CHUNK_ROWS) of each other share one read, as their chunks are decoded either way, and a read spans
+    at most ``host_bytes``."""
+    codes = np.empty((rows.shape[0], store.n_samples), dtype=np.uint8)
+    span = max(1, int(host_bytes // max(store.n_samples, 1)))
+    first = 0
+    while first < rows.shape[0]:
+        last = first
+        while last + 1 < rows.shape[0] and rows[last + 1] - rows[last] <= DEFAULT_INNER_CHUNK_ROWS and rows[last + 1] - rows[first] < span:
+            last += 1
+        read = store.read_codes(int(rows[first]), int(rows[last]) + 1)
+        codes[first : last + 1] = read[rows[first : last + 1] - rows[first]]
+        first = last + 1
+    return codes
+
+
+class _StackedRows:
+    """Row blocks saved one .npy file each, read as one array [rows, columns] by row ranges."""
+
+    def __init__(self, paths: Sequence[Path], width: int) -> None:
+        self._arrays = [np.load(path, mmap_mode="r") for path in paths]
+        self._starts = np.concatenate([[0], np.cumsum([array.shape[0] for array in self._arrays])]).astype(np.int64)
+        self._width = width
+
+    def rows(self, first: int, last: int, columns: slice) -> U8Array:
+        pieces = [
+            array[max(first - start, 0) : min(last, stop) - start, columns]
+            for array, start, stop in zip(self._arrays, self._starts[:-1].tolist(), self._starts[1:].tolist())
+            if start < last and stop > first
+        ]
+        return np.concatenate(pieces) if pieces else np.empty((0, self._width), dtype=np.uint8)[:, columns]
+
+
+def _merged_code_blocks(
+    source: DosageStore, start: int, is_direct: BoolArray, direct_codes: _StackedRows, columns: slice, block_rows: int
+) -> Iterator[U8Array]:
+    """One half's codes of a merged chromosome in row blocks: the imputed rows read from the source store (rows
+    ``start`` onward), the direct rows from their saved blocks, each in merged order."""
+    direct_merged = np.flatnonzero(is_direct)
+    half_columns = np.arange(columns.start, columns.stop)
+    for first in range(0, is_direct.shape[0], block_rows):
+        last = min(first + block_rows, is_direct.shape[0])
+        piece = is_direct[first:last]
+        direct_first = int(np.searchsorted(direct_merged, first))
+        direct_last = direct_first + int(piece.sum())
+        imputed_first = first - direct_first
+        imputed_last = imputed_first + (last - first) - (direct_last - direct_first)
+        codes = np.empty((last - first, half_columns.shape[0]), dtype=np.uint8)
+        if imputed_last > imputed_first:
+            codes[~piece] = source.read_codes(start + imputed_first, start + imputed_last, half_columns)
+        if direct_last > direct_first:
+            codes[piece] = direct_codes.rows(direct_first, direct_last, columns)
+        yield codes
+
+
+def merged_measurement_model(imputed: Any, direct: Any, is_direct: BoolArray) -> Any:
+    """The measurement model over a store holding direct rows: ``imputed``'s values at the imputed records, in their
+    order, and ``direct``'s at the direct rows, both models of one class (``measurement_model.MeasurementModel``). A
+    leakage map's records are renumbered to the merged rows, and the certificate keeps both models'."""
+    imputed_rows = np.flatnonzero(~is_direct)
+    direct_rows = np.flatnonzero(is_direct)
+    if np.asarray(imputed.log_reliability).shape != imputed_rows.shape or np.asarray(direct.log_reliability).shape != direct_rows.shape:
+        raise ValueError("the imputed and direct measurement models need one record per imputed and per direct row.")
+
+    def merged(name: str) -> F64Array:
+        values = np.empty(is_direct.shape[0], dtype=np.float64)
+        values[imputed_rows] = getattr(imputed, name)
+        values[direct_rows] = getattr(direct, name)
+        return values
+
+    maps = tuple(
+        dataclasses.replace(leakage, records=rows[np.asarray(leakage.records, dtype=np.int64)])
+        for model, rows in ((imputed, imputed_rows), (direct, direct_rows))
+        for leakage in model.leakage_maps
+    )
+    return dataclasses.replace(
+        imputed,
+        scales=merged("scales"),
+        residual_variance=merged("residual_variance"),
+        log_reliability=merged("log_reliability"),
+        leakage_maps=maps,
+        certificate={"imputed_records": imputed.certificate, "direct_rows": direct.certificate},
+    )
+
+
+def _direct_chromosome(
+    config: WorkspaceConfig, budget: ComputeBudget, directory: Path, source: DosageStore, source_root: Path, root: Path, chromosome: str,
+    crosswalk: SampleCrosswalk, gene: GeneIntervals, complexity_legend: tuple[str, ...] | None, fit_columns: I64Array, fit_groups: I64Array,
+    group_count: int,
+) -> dict[str, Any]:
+    """One chromosome of the store with its GATK-SV rows merged in (WORKSPACE_PIPELINE.md, "Conversion into store
+    columns"), and the direct rows' reported r^2 and fitted-cohort moments for the measurement model.
+
+    The call set is read in blocks of records that hold half the host (``gatksv_block_rows``), each block's rows saved
+    as they are built; the pairs of every block are resolved one to one together (``one_to_one``). The direct rows go in
+    coordinate order after the imputed records at their POS, and ``group_first`` keeps each imputed group, each same-POS
+    set and each pair unbroken (``unbreakable_group_first``).
+    """
+    assert config.direct_sv is not None
+    index = source.chromosomes.index(chromosome)
+    start, stop = int(source.chromosome_starts[index]), int(source.chromosome_starts[index + 1])
+    table = source.variant_table
+    positions = np.asarray(table.position[start:stop], dtype=np.int64)
+    if np.any(np.diff(positions) < 0):
+        raise ValueError(f"{chromosome}: the store's records are not in position order, so direct rows have no place among them.")
+    identifiers, records = _imputed_site_list(config, chromosome, complexity_legend)
+    if identifiers != tuple(table.variant_ids(np.arange(start, stop))):
+        raise ValueError(f"{chromosome}: the imputed site list names other records than the store holds.")
+    candidate_rows, candidate_sites = imputed_sv_sites(chromosome, positions, records, table.variant_class[start:stop])
+
+    path = config.direct_sv.gatksv_path(chromosome)
+    call_set = GatksvSource(path)
+    halves = source.half_samples()
+    columns = call_set_columns(halves, call_set.sample_ids, crosswalk)
+    sample_count = columns.shape[0]
+    per_record = len(call_set.sample_ids) * _CALL_SET_BYTES_PER_ENTRY + sample_count * (_CALL_SET_BYTES_PER_ENTRY + np.dtype(np.uint8).itemsize)
+    # Half the host holds a block of records with its aligned copy and its rows; the other half the imputed codes the
+    # block pairs with and the reads behind them.
+    block_records = max(1, int(budget.host_bytes // 2 // per_record))
+    blocks = directory / "blocks" / chromosome
+    blocks.mkdir(parents=True, exist_ok=True)
+    spellings = _chromosome_spellings(chromosome)
+    half_starts = np.asarray(source.half_sample_starts, dtype=np.int64)
+    kept: dict[str, list[Any]] = {name: [] for name in (
+        "records", "positions", "ends", "lengths", "ids", "refs", "alts", "svtypes", "classes", "codes_per_unit", "value_origin",
+        "filled", "clipped", "reliability", "sources", "no_calls", "sums", "squares",
+    )}
+    evidence_parts: list[PairEvidence] = []
+    block_count = offset = unobserved = 0
+    for block in call_set.blocks(block_records):
+        foreign = sorted(set(block.chromosomes) - set(spellings))
+        if foreign:
+            raise ValueError(f"{path}: records lie on {foreign}, not on {chromosome}.")
+        aligned = block.aligned_to_store_samples(columns)
+        sites = gatksv_sites(aligned)
+        # A pair needs sizes within a factor of MINIMUM_SIZE_RATIO, so no smaller imputed record pairs with this block.
+        reachable = np.flatnonzero(candidate_sites.sizes >= MINIMUM_SIZE_RATIO * sites.sizes.min())
+        needed = reachable[np.unique(candidate_pairs(_site_rows(candidate_sites, reachable), sites).first_rows)]
+        imputed = ImputedSvRecords(
+            sites=_site_rows(candidate_sites, needed),
+            codes=_store_rows(source, start + candidate_rows[needed], budget.host_bytes // 2),
+        )
+        rows, evidence = gatksv_block_rows(aligned, imputed)
+        np.save(blocks / f"block{block_count}.npy", rows.codes)
+        block_count += 1
+        evidence_parts.append(dataclasses.replace(
+            evidence, imputed_records=candidate_rows[needed[evidence.imputed_records]], gatksv_records=offset + evidence.gatksv_records,
+        ))
+        own = rows.gatksv_records
+        kept["records"].append(offset + own)
+        kept["positions"].append(aligned.positions[own])
+        kept["ends"].append(aligned.ends[own])
+        kept["lengths"].append(rows.lengths)
+        for name, values in (("ids", aligned.variant_ids), ("refs", aligned.refs), ("alts", aligned.alts), ("svtypes", aligned.svtypes)):
+            kept[name].extend(values[record] for record in own.tolist())
+        kept["classes"].append(np.array([VARIANT_CLASSES.index(aligned.variant_classes[record]) for record in own.tolist()], dtype=np.uint8))
+        kept["codes_per_unit"].append(rows.codes_per_unit)
+        kept["value_origin"].append(rows.value_origin)
+        kept["filled"].append(rows.filled_from_imputed)
+        kept["clipped"].append(rows.clipped_counts)
+        kept["reliability"].append(rows.reported_reliability)
+        kept["sources"].append(rows.reliability_sources)
+        kept["no_calls"].append(np.column_stack([
+            aligned.no_call[own, int(half_starts[half]) : int(half_starts[half + 1])].sum(axis=1) for half in range(len(halves))
+        ]).reshape(own.shape[0], len(halves)))
+        sums = np.zeros((own.shape[0], group_count))
+        squares = np.zeros((own.shape[0], group_count))
+        for row in range(own.shape[0]):
+            # The fitted cohort's moments in the row's own units (copies for a copy number): code / codes_per_unit + origin.
+            values = rows.codes[row, fit_columns] / float(rows.codes_per_unit[row]) + float(rows.value_origin[row])
+            sums[row] = np.bincount(fit_groups, weights=values, minlength=group_count)
+            squares[row] = np.bincount(fit_groups, weights=values * values, minlength=group_count)
+        kept["sums"].append(sums)
+        kept["squares"].append(squares)
+        unobserved += int(rows.unobserved_records.shape[0])
+        offset += block.record_count
+        del aligned, imputed, rows
+
+    def joined(name: str, dtype: Any, width: int | None = None) -> NDArray:
+        parts = kept[name]
+        if parts:
+            return np.concatenate(parts).astype(dtype)
+        return np.zeros((0,) if width is None else (0, width), dtype=dtype)
+
+    direct_records = joined("records", np.int64)
+    direct_positions = joined("positions", np.int64)
+    if np.any(np.diff(direct_positions) < 0):
+        raise ValueError(f"{path}: the call set's records are not in position order.")
+    direct_count = direct_positions.shape[0]
+    evidence = PairEvidence(*(
+        np.concatenate([getattr(part, field.name) for part in evidence_parts]) if evidence_parts else np.zeros(0)
+        for field in dataclasses.fields(PairEvidence)
+    ))
+    chosen = one_to_one(evidence)
+    pair_imputed = evidence.imputed_records[chosen].astype(np.int64)
+    pair_direct = np.searchsorted(direct_records, evidence.gatksv_records[chosen].astype(np.int64))
+
+    # The merged order: each direct row after the imputed records at or before its POS.
+    record_count = positions.shape[0]
+    merged_count = record_count + direct_count
+    direct_merged = np.searchsorted(positions, direct_positions, side="right") + np.arange(direct_count)
+    is_direct = np.zeros(merged_count, dtype=bool)
+    is_direct[direct_merged] = True
+    imputed_merged = np.flatnonzero(~is_direct)
+
+    def merged(imputed_values: Any, direct_values: Any, dtype: Any) -> NDArray:
+        values = np.empty(merged_count, dtype=dtype)
+        values[imputed_merged] = imputed_values
+        values[direct_merged] = direct_values
+        return values
+
+    direct_lengths = joined("lengths", np.float64)
+    direct_refs, direct_alts, direct_svtypes = tuple(kept["refs"]), tuple(kept["alts"]), tuple(kept["svtypes"])
+    direct_ends = tuple(int(end) for end in joined("ends", np.int64).tolist())
+    unique_positions, first_of_position = np.unique(positions, return_index=True)
+    if direct_count and unique_positions.shape[0] < 2:
+        raise ValueError(f"{chromosome}: a direct row's genetic position is interpolated between the imputed records', which needs two positions.")
+    direct_centimorgans = (
+        interpolated_genetic_positions(unique_positions, table.genetic_position_cm[start:stop][first_of_position], direct_positions)
+        if direct_count else np.zeros(0)
+    )
+    direct_sites = RecordSites(
+        refs=direct_refs, alts=direct_alts, sv_types=direct_svtypes, sv_lengths=direct_lengths, ends=direct_ends,
+        genetic_position_cm=direct_centimorgans,
+    )
+    core_starts, core_ends = store_core_spans(direct_positions, direct_sites)
+    gene_columns = gene_overlap(gene.gene_starts, gene.gene_ends, gene.exon_starts, gene.exon_ends, gene.tss, core_starts, core_ends)
+    annotations: dict[str, NDArray] = {}
+    legends = dict(table.annotation_legends)
+    for name, values in table.annotations.items():
+        own_values = np.asarray(values[start:stop])
+        if name == ROW_SOURCE:
+            raise ValueError(f"{source_root} already holds direct rows.")
+        if name == "sv_length":
+            direct_values: NDArray = direct_lengths
+        elif name == "tr_locus":
+            # A direct row joins no repeat locus: it keeps its GATK-SV class.
+            direct_values = np.full(direct_count, NO_LOCUS)
+        elif name in gene_columns:
+            direct_values = gene_columns[name]
+        elif name in legends:
+            # The legend's missing state (annotation_design): the imputed sidecar's own fields say nothing of a direct row.
+            direct_values = np.full(direct_count, -1)
+        else:
+            direct_values = np.full(direct_count, np.nan)
+        annotations[name] = merged(own_values, direct_values, own_values.dtype)
+    annotations[ROW_SOURCE] = is_direct.astype(np.int32)
+    legends[ROW_SOURCE] = ROW_SOURCES
+    merged_positions = merged(positions, direct_positions, np.int64)
+    pair_groups = np.full(merged_count, -1, dtype=np.int64)
+    pair_groups[imputed_merged[pair_imputed]] = np.arange(chosen.shape[0])
+    pair_groups[direct_merged[pair_direct]] = np.arange(chosen.shape[0])
+    group_first = unbreakable_group_first(
+        merged(np.asarray(table.group_first[start:stop], dtype=np.int64) - start, np.full(direct_count, -1), np.int64), merged_positions, pair_groups,
+    )
+
+    direct_codes = _StackedRows([blocks / f"block{block}.npy" for block in range(block_count)], sample_count)
+    widest = int(np.diff(half_starts).max())
+    merge_rows = max(1, int(budget.host_bytes // 2 // (_MERGED_COPIES * widest)))
+    direct_no_calls = joined("no_calls", np.uint32, len(halves))
+    sums_total = np.zeros(merged_count, dtype=np.uint64)
+    squares_total = np.zeros(merged_count, dtype=np.uint64)
+    for half in range(len(halves)):
+        half_columns = slice(int(half_starts[half]), int(half_starts[half + 1]))
+        sums, squares = write_half_codes(
+            root, half, chromosome, merged_count, half_columns.stop - half_columns.start,
+            _merged_code_blocks(source, start, is_direct, direct_codes, half_columns, merge_rows), codec=config.codec,
+        )
+        sums_total += sums.astype(np.uint64)
+        squares_total += squares.astype(np.uint64)
+        imputed_no_calls, _ = open_column(statistic_column_directory(source_root, half, chromosome, "no_calls"))
+        write_column(
+            statistic_column_directory(root, half, chromosome, "no_calls"), merged(np.asarray(imputed_no_calls), direct_no_calls[:, half], np.uint32)
+        )
+    del direct_codes
+
+    direct_ids = tuple(kept["ids"])
+    merged_ids = merged(np.array(identifiers, dtype=object), np.array(direct_ids, dtype=object), object).tolist()
+    encoded = [identifier.encode() for identifier in merged_ids]
+    direct_classes = joined("classes", np.uint8)
+    merged_table = VariantTable(
+        chromosome=np.full(merged_count, chromosome_number(chromosome), dtype=np.int8),
+        position=merged_positions,
+        genetic_position_cm=merged(table.genetic_position_cm[start:stop], direct_centimorgans, np.float64),
+        ref_length=merged(table.ref_length[start:stop], [len(ref) for ref in direct_refs], np.int32),
+        alt_length=merged(table.alt_length[start:stop], [len(alt) for alt in direct_alts], np.int32),
+        variant_class=merged(table.variant_class[start:stop], direct_classes, np.uint8),
+        codes_per_unit=merged(table.codes_per_unit[start:stop], joined("codes_per_unit", np.uint8), np.uint8),
+        value_origin=merged(table.value_origin[start:stop], joined("value_origin", np.int64), np.int64),
+        group_first=group_first,
+        sum_code=sums_total,
+        sum_code2=squares_total,
+        annotations=annotations,
+        annotation_legends=legends,
+        id_bytes=np.frombuffer(b"".join(encoded), dtype=np.uint8),
+        id_offsets=np.concatenate([[0], np.cumsum([len(identifier) for identifier in encoded])]).astype(np.int64),
+    )
+    write_variant_columns(root, chromosome, merged_table, slice(0, merged_count))
+    shutil.copytree(source_root / "loci" / chromosome, root / "loci" / chromosome, dirs_exist_ok=True)
+    from sv_pgs.feature_identity import chromosome_identity
+    identity = chromosome_identity(
+        genome_build=config.genome_build, chromosome=chromosome, positions=merged_positions,
+        refs=merged(np.array(records.refs, dtype=object), np.array(direct_refs, dtype=object), object).tolist(),
+        alts=merged(np.array(records.alts, dtype=object), np.array(direct_alts, dtype=object), object).tolist(),
+        identifiers=merged_ids,
+        ends=merged(np.array(records.ends, dtype=object), np.array(direct_ends, dtype=object), object).tolist(),
+        sv_types=merged(np.array(records.sv_types, dtype=object), np.array(direct_svtypes, dtype=object), object).tolist(),
+        sv_lengths=merged(records.sv_lengths, direct_lengths, np.float64),
+        codes_per_unit=merged_table.codes_per_unit, value_origin=merged_table.value_origin,
+    )
+    sources = joined("sources", np.uint8)
+    filled = joined("filled", bool)
+    np.savez(
+        directory / "rows" / f"{chromosome}.npz",
+        merged_rows=direct_merged.astype(np.int64),
+        classes=direct_classes,
+        reported_reliability=joined("reliability", np.float64),
+        sums=joined("sums", np.float64, group_count),
+        squares=joined("squares", np.float64, group_count),
+    )
+    return {
+        "feature_identity": identity,
+        "records": int(merged_count),
+        "sites_md5": sites_md5(merged_positions, merged_table.ref_length, merged_table.alt_length),
+        "call_set": {"file": path.name, "bytes": int(path.stat().st_size)},
+        "direct_rows": int(direct_count),
+        "kept_records": int(call_set.kept_record_count),
+        "skipped_records": dict(call_set.skipped_records),
+        "uncalled_records": int(unobserved),
+        "candidate_pairs": int(evidence.pairing_z.shape[0]),
+        "pairs": int(chosen.shape[0]),
+        "filled_from_paired_imputed_ds": int(filled.sum()),
+        "filled_from_observed_mean": int(direct_count - filled.sum()),
+        "clipped_entries": int(joined("clipped", np.int64).sum()),
+        "reliability_sources": {name: int(np.sum(sources == code)) for code, name in enumerate(RELIABILITY_SOURCES)},
+    }
+
+
+def _direct_chromosome_task(task: tuple[Any, ...]) -> str:
+    """One chromosome of the direct_sv step in its own process (``_direct_chromosome``), written with its fact file,
+    whose presence marks it done, and its blocks of rows removed."""
+    config, budget, directory, source_root, root, chromosome, *rest = task
+    with DosageStore.open(source_root) as source:
+        fact = _direct_chromosome(config, budget, directory, source, source_root, root, chromosome, *rest)
+    _write_json(directory / "chromosomes" / f"{chromosome}.json", fact)
+    _remove_own(directory / "blocks" / chromosome, directory)
+    return chromosome
+
+
+def _direct_sv_inputs(config: WorkspaceConfig) -> Any:
+    """The call set's files by size and content (``genotype_file_fingerprint``) and the codec the merged store is
+    written with; the crosswalk, the store's inputs and the measurement model enter through the upstream keys."""
+    if config.direct_sv is None:
+        return {"direct_sv": None}
+    if config.direct_sv.gatksv_calls is None:
+        return {"gatksv_calls": None}
+    return {
+        "gatksv_calls": [
+            (config.direct_sv.gatksv_path(chromosome).name, genotype_file_fingerprint(config.direct_sv.gatksv_path(chromosome)))
+            for chromosome in config.chromosomes
+        ],
+        "codec": config.codec,
+        "genome_build": config.genome_build,
+    }
+
+
+def _direct_sv_step(run: _Run, directory: Path) -> dict[str, Any]:
+    """The direct read-based SV/CNV channel (WORKSPACE_PIPELINE.md): every kept GATK-SV record a store row of its own
+    beside the imputed records, and the measurement model over the merged store's rows.
+
+    Each chromosome is a sub-checkpoint, merged in a process of its own with its share of the host, its blocks of rows
+    removed once it is written. A direct row's reliability is
+    the measurement model's no-truth form from its reported r^2 (DIRECT_RELIABILITY); no pair is fused (DIRECT_FUSION).
+    With ``direct_sv`` or its call set null the step adds nothing: the measurement step's store and model pass through
+    unchanged, and the summary and certificate say so.
+    """
+    config = run.config
+    measured = run.summary("measurement")["store"]
+    optional = {key: "null: not implemented, not read" for key in DIRECT_SV_KEYS[1:]}
+    if config.direct_sv is None or config.direct_sv.gatksv_calls is None:
+        absent = "direct_sv is null" if config.direct_sv is None else "direct_sv.gatksv_calls is null"
+        statement = (
+            f"not read: {absent}, so no direct row is added; the measurement step's store and measurement model pass "
+            "through unchanged"
+        )
+        _write_json(directory / "certificate.json", {"gatksv_calls": statement, "optional_sources": optional})
+        return {
+            "store": measured,
+            "measurement_model": (Path("measurement") / MEASUREMENT_MODEL_FILE).as_posix(),
+            "direct_rows": 0,
+            "gatksv_calls": statement,
+            "optional_sources": optional,
+        }
+    samples = _read_samples(run)
+    cohort = _read_cohort(run)
+    crosswalk = SampleCrosswalk.read(config.crosswalk, *config.crosswalk_columns)
+    source_root = config.run_directory / measured
+    root = directory / "store"
+    for subdirectory in ("chromosomes", "rows", "blocks"):
+        (directory / subdirectory).mkdir(exist_ok=True)
+    genes = read_gene_annotation(config.gene_annotation)
+    complexity_legend = None if config.popped is None else strata_complexity_legend(config.popped.strata_directory, config.chromosomes)
+    group_count = len(samples.legend)
+    fit_columns = np.sort(cohort.store_columns[cohort.fit_rows])
+    fit_groups = np.concatenate(samples.groups)[fit_columns]
+    with DosageStore.open(source_root) as source:
+        halves = source.half_samples()
+        attributes = dict(source.manifest_attributes)
+        half_sample_counts = [int(count) for count in np.diff(source.half_sample_starts)]
+    pending = [chromosome for chromosome in config.chromosomes if not (directory / "chromosomes" / f"{chromosome}.json").is_file()]
+    for chromosome in pending:
+        _clear_chromosome(root, chromosome, len(halves), directory)
+    # The chromosomes are independent: one process each, every one with its share of the host and the threads.
+    workers = max(1, min(run.budget.cpu_threads, len(pending)))
+    worker_budget = dataclasses.replace(
+        run.budget, device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(),
+        host_bytes=run.budget.host_bytes // workers, cpu_threads=max(1, run.budget.cpu_threads // workers),
+    )
+    tasks = [
+        (config, worker_budget, directory, source_root, root, chromosome, crosswalk, genes[chromosome], complexity_legend, fit_columns, fit_groups, group_count)
+        for chromosome in pending
+    ]
+    if workers == 1:
+        for task in tasks:
+            _direct_chromosome_task(task)
+    else:
+        with ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn")) as pool:
+            list(pool.map(_direct_chromosome_task, tasks))
+    facts = [json.loads((directory / "chromosomes" / f"{chromosome}.json").read_text(encoding="utf-8")) for chromosome in config.chromosomes]
+    from sv_pgs.feature_identity import IDENTITY_FILE
+    _write_json(root / IDENTITY_FILE, {chromosome: fact["feature_identity"] for chromosome, fact in zip(config.chromosomes, facts)})
+    call_set = {
+        "caller": "GATK-SV",
+        "files": {chromosome: fact["call_set"] for chromosome, fact in zip(config.chromosomes, facts)},
+        "filter_policy": GATKSV_FILTER_POLICY,
+        "rows": int(sum(fact["direct_rows"] for fact in facts)),
+    }
+    write_store_manifest(
+        root,
+        chromosomes=config.chromosomes,
+        record_counts=[fact["records"] for fact in facts],
+        chromosome_sites_md5=[fact["sites_md5"] for fact in facts],
+        half_sample_counts=half_sample_counts,
+        half_samples=halves,
+        half_measurements=attributes["half_measurements"],
+        gates=attributes["gates"],
+        recalibrated=bool(attributes["recalibrated"]),
+        direct_calls=call_set,
+    )
+    with DosageStore.open(root) as store:
+        if store.half_samples() != halves:
+            raise ValueError("the merged store's sample manifests differ from the measurement step's store.")
+
+    # The direct rows' measurement model: the no-truth form per ancestry group from their reported r^2 and the fitted
+    # cohort's moments in their own units, pooled over the groups as the measurement step pools the imputed records'.
+    rows = [np.load(directory / "rows" / f"{chromosome}.npz") for chromosome in config.chromosomes]
+    chromosome_starts = np.concatenate([[0], np.cumsum([fact["records"] for fact in facts])]).astype(np.int64)
+    is_direct = np.zeros(int(chromosome_starts[-1]), dtype=bool)
+    for chromosome_start, arrays in zip(chromosome_starts[:-1].tolist(), rows):
+        is_direct[chromosome_start + arrays["merged_rows"]] = True
+    reliability = np.concatenate([arrays["reported_reliability"] for arrays in rows])
+    strata = np.asarray(VARIANT_CLASS_LEGEND)[np.concatenate([arrays["classes"] for arrays in rows]).astype(np.int64)]
+    sums = np.concatenate([arrays["sums"] for arrays in rows])
+    squares = np.concatenate([arrays["squares"] for arrays in rows])
+    counts = np.bincount(fit_groups, minlength=group_count).astype(np.int64)
+    pooled = sums.sum(axis=1) / fit_columns.shape[0], squares.sum(axis=1) / fit_columns.shape[0]
+    results, group_means, group_variances = [], [], []
+    for group in range(group_count):
+        # A group with no fitted rows takes the pooled moments, as in the measurement step.
+        mean, second = (sums[:, group] / counts[group], squares[:, group] / counts[group]) if counts[group] else pooled
+        variance = np.maximum(second - mean * mean, 0.0)
+        group_means.append(mean)
+        group_variances.append(variance)
+        results.append(run.bindings.fit_measurement_model(None, variance, strata, reported_reliability=reliability))
+    direct_model = run.bindings.pooled_measurement_model(
+        results, np.column_stack(group_means).reshape(-1, group_count), np.column_stack(group_variances).reshape(-1, group_count), counts
+    )
+    imputed_model = run.bindings.load_measurement_model(run.output("measurement") / MEASUREMENT_MODEL_FILE)
+    merged_measurement_model(imputed_model, direct_model, is_direct).save(directory / MEASUREMENT_MODEL_FILE)
+
+    total = {
+        name: int(sum(fact[name] for fact in facts))
+        for name in (
+            "direct_rows", "kept_records", "uncalled_records", "candidate_pairs", "pairs", "filled_from_paired_imputed_ds",
+            "filled_from_observed_mean", "clipped_entries",
+        )
+    }
+    skipped: Counter[str] = Counter()
+    sources: Counter[str] = Counter()
+    for fact in facts:
+        skipped.update(fact["skipped_records"])
+        sources.update(fact["reliability_sources"])
+    excluded = int(sum(count for name, count in sources.items() if name not in ("hard_call", "cnq_bound")))
+    certificate = {
+        "caller": "GATK-SV",
+        "call_set": call_set,
+        "uncalibrated_records": total["direct_rows"],
+        "reliability_source": DIRECT_RELIABILITY,
+        "reliability_rules": dict(sources),
+        "excluded_without_reliability": excluded,
+        "direct_calls_fused": 0,
+        "fusion": DIRECT_FUSION,
+        "optional_sources": optional,
+        "measurement_model": direct_model.certificate,
+    }
+    _write_json(directory / "certificate.json", certificate)
+    return {
+        "store": (Path("direct_sv") / "store").as_posix(),
+        "measurement_model": (Path("direct_sv") / MEASUREMENT_MODEL_FILE).as_posix(),
+        **total,
+        "records": int(chromosome_starts[-1]),
+        "skipped_records": dict(skipped),
+        "filter_policy": GATKSV_FILTER_POLICY,
+        "reliability": DIRECT_RELIABILITY,
+        "reliability_rules": dict(sources),
+        "excluded_without_reliability": excluded,
+        "fusion": DIRECT_FUSION,
+        "no_call_fill": (
+            "E_lin[B | DS] from the paired imputed DS with the largest Fisher z (a defined slope), else the record's observed "
+            "mean; never zero. E[B | SL] is not built"
+        ),
+        "arms": "snv_indel leaves every direct row out (-inf log reliability); with_sv fits them",
+        "optional_sources": optional,
+    }
+
+
 def _final_store(run: _Run) -> Path:
-    return run.config.run_directory / run.summary("measurement")["store"]
+    """The store the fit, score and effects read: the direct_sv step's (the measurement step's when it adds no row)."""
+    return run.config.run_directory / run.summary("direct_sv")["store"]
 
 
 def _final_measurement_model(run: _Run) -> Path:
     """The measurement model over the final store's records, the one the fit reads."""
-    return run.output("measurement") / MEASUREMENT_MODEL_FILE
+    return run.config.run_directory / run.summary("direct_sv")["measurement_model"]
 
 
 # ---------------------------------------------------------------------------
@@ -2089,13 +2766,19 @@ def _final_measurement_model(run: _Run) -> Path:
 
 def structural_records(table: VariantTable) -> BoolArray:
     """Whether each store record is structural: its typed length (the store's ``sv_length``, written by the store step
-    for every record) is at least COMMUNITY_SV_MINIMUM_LENGTH, or it is a copy number."""
+    for every record) is at least COMMUNITY_SV_MINIMUM_LENGTH, it is a copy number, or it is a direct read-based row
+    (ROW_SOURCE), whatever its length: a GATK-SV insertion of unknown length writes SVLEN -1."""
     if "sv_length" not in table.annotations:
         raise ValueError("the store has no sv_length column, so its structural records cannot be told apart for the arms.")
     lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
     if not np.all(np.isfinite(lengths)):
         raise ValueError("every store record needs a finite sv_length to be assigned to an arm.")
-    return (lengths >= COMMUNITY_SV_MINIMUM_LENGTH) | (np.asarray(table.variant_class) == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER))
+    structural = (lengths >= COMMUNITY_SV_MINIMUM_LENGTH) | (np.asarray(table.variant_class) == VARIANT_CLASSES.index(VariantClass.COPY_NUMBER))
+    if ROW_SOURCE in table.annotations:
+        if tuple(table.annotation_legends.get(ROW_SOURCE, ())) != ROW_SOURCES:
+            raise ValueError(f"the store's {ROW_SOURCE} legend is not {ROW_SOURCES}.")
+        structural |= np.asarray(table.annotations[ROW_SOURCE]) == ROW_SOURCES.index("direct")
+    return structural
 
 
 def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str) -> F64Array:
@@ -2497,6 +3180,10 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         classes = np.asarray(VARIANT_CLASS_LEGEND, dtype=object)[np.asarray(table.variant_class)]
         lengths = np.asarray(table.annotations["sv_length"], dtype=np.float64)
         bins = length_bins(lengths)
+        # A store without direct rows holds imputed records only.
+        row_sources = np.asarray(ROW_SOURCES, dtype=object)[
+            np.asarray(table.annotations[ROW_SOURCE], dtype=np.int64) if ROW_SOURCE in table.annotations else np.zeros(lengths.shape[0], dtype=np.int64)
+        ]
         codes_per_unit = np.asarray(table.codes_per_unit, dtype=np.float64)
         working_bytes = run.budget.host_bytes // 2
         for arm in ARMS:
@@ -2515,6 +3202,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                         "id": table.variant_ids(rows),
                         "variant_class": classes[rows],
                         "length": lengths[rows],
+                        "row_source": row_sources[rows],
                         "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
                         "effect": effects.mean,
                         "posterior_sd": effects.standard_deviation,
@@ -2905,12 +3593,25 @@ _STEPS = (
         (store_converter, dosage_store, _measurement_step, _group_code_moments, _group_calibration, rewrite_recalibrated_store, *module_closure(measurement_model)),
         _measurement_step,
     ),
+    _Step(
+        "direct_sv",
+        ("samples", "cohort", "store", "measurement"),
+        _direct_sv_inputs,
+        # The direct rows' measurement model is measurement_model's (workspace_bindings), which the key covers.
+        (
+            _direct_sv_step, _direct_chromosome_task, _direct_chromosome, call_set_columns, _imputed_site_list, imputed_sv_sites, _site_rows, _store_rows, _StackedRows,
+            _merged_code_blocks, merged_measurement_model, read_plain_sites, read_strata_sites, read_popped_sites, store_core_spans,
+            read_gene_annotation, interpolated_genetic_positions, _clear_chromosome,
+            *module_closure(gatksv_store_rows, store_converter, measurement_model),
+        ),
+        _direct_sv_step,
+    ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, score_batches, structural_records, model_part), _score_step),
+    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
-        (_effects_step, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,
+        (_effects_step, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,
     ),
     _Step(
         "report",

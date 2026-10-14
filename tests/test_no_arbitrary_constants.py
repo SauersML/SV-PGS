@@ -60,6 +60,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('workspace_pipeline.py', '_fit_step'): ('unit', frozenset({3600.0}), 'seconds per hour'),
     ('workspace_pipeline.py', 'score_batches'): ('derived', frozenset({4}), "the host shared four ways: the loaded models, the scorer's per-model plan positions, its accumulators, and its read-ahead buffers"),
     ('gatksv_store_rows.py', 'PHRED_SCALE'): ('definitional', frozenset({10.0}), 'the phred scale of a genotype quality: Q = -10 log10 P(miscall) (Ewing and Green 1998, Genome Res 8:186)'),
+    ('workspace_pipeline.py', '_MERGED_COPIES'): ('derived', frozenset({3}), "byte accounting of a merged code block: the imputed rows read, the direct rows read and the block itself, one byte per entry each"),
     ('workspace_pipeline.py', 'LENGTH_DECADE'): ('definitional', frozenset({10}), 'decades of SV length from the 50 bp SV definition: the effects summary display bins, never a fit input'),
     ('code_products.py', 'DIGIT_BITS'): ('derived', frozenset({7}), 'the widest balanced digit that fits int8 with room for the sign'),
     ('code_products.py', 'OPERAND_DIGITS'): ('derived', frozenset({8}), '7 x 8 - 2 >= 53 fp64 mantissa bits (math-epeb)'),
