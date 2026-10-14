@@ -1,5 +1,5 @@
 """``gram_space`` on a CUDA device: the band's sweep (``device_sweep``'s panel kernel on the band's panels) and its
-posterior solves agree with the host's.
+products agree with the host's, and its reads stay within the device ledger's budget.
 
 The sweep's two sides differ only in summation order: each member's field is s_g less a product over the band
 (<= band width terms, float64), and its node sums run over the lattice (``mean_field._sweep``'s own terms), so each
@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
-from sv_pgs.gram_space import GramBand, GramGaussian
+from sv_pgs.gram_space import GramBand
 from sv_pgs.memory_broker import device_pool, memory_scope, transient_device_arrays
 from tests.test_gram_space import _banded_design, _prior_arrays
 
@@ -67,26 +67,6 @@ def test_device_band_sweep_is_the_host_band_sweep(dtype, tempered) -> None:
         np.testing.assert_allclose(results["device"].divergence, results["host"].divergence, rtol=bound)
 
 
-def test_device_band_posterior_solve_is_the_host_solve() -> None:
-    generator = np.random.default_rng(12)
-    band, _starts = _band(generator, [30, 50, 40])
-    count = band.group_count
-    precision = generator.uniform(0.05, 2.0, size=count)
-    precision[[5, 60]] = [-0.02, 0.0]
-    samples = 4 * 40
-    right = generator.normal(size=(count, 3))
-    solutions = []
-    for xp in (np, cupy):
-        solver = GramGaussian(band, training=np.ones((samples, 1)), targets=np.zeros((samples, 1)), covariates=np.ones((samples, 1)), array_module=xp)
-        solver.iterate(site_precision=precision[:, None], site_shift=np.zeros((count, 1)), noise_variance=np.array([1.1]))
-        solution, certificate = solver.posterior_solve(right, 0, np.full(3, 1e-10))
-        assert np.all(np.isfinite(certificate))
-        solutions.append(solution)
-    exact = np.linalg.solve(band.product(np.eye(count)) / 1.1 + np.diag(precision), right)
-    for solution in solutions:
-        np.testing.assert_allclose(solution, exact, rtol=0, atol=1e-7 * float(np.max(np.abs(exact))))
-
-
 class _ReservedPeak(cupy.cuda.memory_hook.MemoryHook if cupy is not None else object):
     """The pool's reserved bytes after every allocation it makes: the device's own count, beside the ledger's."""
 
@@ -103,10 +83,11 @@ def _device_budget(device_bytes: int) -> ComputeBudget:
     return ComputeBudget("cuda", (0,), ("capped",), (int(device_bytes),), ((0, 0),), 1 << 34, 1)
 
 
-def _capped_solve(generator_seed: int, device_bytes: int | None, keep: bool = True):
-    """A device band solve (resolved sites included) inside a scope of ``device_bytes`` beyond what the pool holds at
-    its start (None: the device's own), its Gram blocks cached on the device where ``keep``; returns (solution, exact, the ledger's peak, the pool's reserved peak, the pool
-    at the start, the band's float32 bytes, the blocks the ledger did not keep)."""
+def _capped_product(generator_seed: int, device_bytes: int | None, keep: bool = True):
+    """Two device reads of the band (``GramBand.product``, the second able to read the blocks the first left cached)
+    inside a scope of ``device_bytes`` beyond what the pool holds at its start (None: the device's own), its Gram blocks
+    cached on the device where ``keep``; returns (the product, the host's, the ledger's peak, the pool's reserved peak,
+    the pool at the start, the band's float32 bytes, the blocks the ledger did not keep)."""
     generator = np.random.default_rng(generator_seed)
     pool = cupy.get_default_memory_pool()
     pool.free_all_blocks()
@@ -131,32 +112,26 @@ def _capped_solve(generator_seed: int, device_bytes: int | None, keep: bool = Tr
         if not keep:
             band._keep = lambda *_arguments, **_keywords: None
         band.working_bytes = 1 << 30
-        count = band.group_count
-        precision = generator.uniform(0.05, 2.0, size=count)
-        precision[[5, 6000]] = [-0.02, 0.0]
-        samples = 4 * 40
-        right = generator.normal(size=(count, 3))
-        solver = GramGaussian(band, training=np.ones((samples, 1)), targets=np.zeros((samples, 1)), covariates=np.ones((samples, 1)), array_module=cupy)
-        solver.iterate(site_precision=precision[:, None], site_shift=np.zeros((count, 1)), noise_variance=np.array([1.1]))
-        solution, certificate = solver.posterior_solve(right, 0, np.full(3, 1e-10))
-        assert np.all(np.isfinite(certificate))
+        right = generator.normal(size=(band.group_count, 3))
+        for _read in range(2):
+            solution = cupy.asnumpy(band.product(cupy.asarray(right), cupy))
         stored = sum(int(values.nbytes) for values in band._arrays.values())
         peak = broker.peak(device_pool(0))
         band.release()
-    exact = np.linalg.solve(band.product(np.eye(count)) / 1.1 + np.diag(precision), right)
+    exact = band.product(right)
     return solution, exact, peak, hook.peak, start, stored, dropped.count("a cached Stage 0 Gram block")
 
 
-def test_a_device_band_solve_under_a_budget_below_its_unconstrained_peak_completes_within_it() -> None:
-    """The ledger's own mechanism caps the device below the solve's unconstrained peak, at its peak with no Gram block
-    kept past its use. The solve completes, the ledger's peak and the pool's reserved bytes after every allocation stay
-    within the budget, and the solution is the unconstrained one's."""
-    free_solution, exact, free_peak, _reserved, free_start, _stored, dropped = _capped_solve(21, None)
+def test_device_band_reads_under_a_budget_below_their_unconstrained_peak_complete_within_it() -> None:
+    """The ledger's own mechanism caps the device below the reads' unconstrained peak, at their peak with no Gram block
+    kept past its use. The reads complete, the ledger's peak and the pool's reserved bytes after every allocation stay
+    within the budget, and the product is the unconstrained one's."""
+    free_solution, exact, free_peak, _reserved, free_start, _stored, dropped = _capped_product(21, None)
     assert dropped == 0
-    _solution, _exact, working_peak, _reserved, working_start, _stored, _dropped = _capped_solve(21, None, keep=False)
+    _solution, _exact, working_peak, _reserved, working_start, _stored, _dropped = _capped_product(21, None, keep=False)
     budget = working_peak - working_start
-    assert budget < free_peak - free_start, "the budget binds: below the unconstrained solve's peak"
-    solution, capped_exact, peak, reserved, start, _stored, _dropped = _capped_solve(21, budget)
+    assert budget < free_peak - free_start, "the budget binds: below the unconstrained reads' peak"
+    solution, capped_exact, peak, reserved, start, _stored, _dropped = _capped_product(21, budget)
     assert peak <= start + budget and reserved <= start + budget
     for values in (free_solution, solution):
         np.testing.assert_allclose(values, capped_exact, rtol=0, atol=1e-7 * float(np.max(np.abs(capped_exact))))

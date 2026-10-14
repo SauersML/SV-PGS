@@ -13,7 +13,7 @@ from sv_pgs.config import ModelConfig
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.full_data_fit import block_grams, covariate_residual_variance, fit_full_data, stage0_lattice
 from sv_pgs.genotype_statistics import DosageStoreTileSource, compute_genotype_statistics
-from sv_pgs.gram_space import GramBand, GramGaussian, pass_costs
+from sv_pgs.gram_space import GramBand, pass_costs
 from sv_pgs.mean_field import _sweep as sample_sweep
 from sv_pgs.scale_mixture_ep import scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -90,53 +90,6 @@ def test_band_sweep_is_the_sample_sweep_where_the_band_holds_all_the_ld() -> Non
         np.testing.assert_allclose(result.weighted_variance, weighted, rtol=64 * band.band_width * _EPSILON)
 
 
-def _solver(generator: np.random.Generator, precision: np.ndarray) -> tuple[GramGaussian, np.ndarray, float]:
-    widths = [6, 9, 5]
-    design = _banded_design(generator, widths, 10)
-    gram = design.T @ design
-    starts = np.concatenate([[0], np.cumsum(widths)])
-    band = GramBand.from_arrays(
-        within=[gram[starts[b]:starts[b + 1], starts[b]:starts[b + 1]] for b in range(len(widths))],
-        cross=[gram[starts[b]:starts[b + 1], starts[b + 1]:starts[b + 2]] for b in range(len(widths) - 1)],
-        scores=np.zeros(gram.shape[0]), target_square=0.0, sample_count=design.shape[0], residual_dimension=float(design.shape[0]),
-        working_bytes=8 * gram.shape[0] * 4,
-    )
-    samples = design.shape[0]
-    solver = GramGaussian(band, training=np.ones((samples, 1)), targets=np.zeros((samples, 1)), covariates=np.ones((samples, 1)))
-    noise = 1.3
-    solver.iterate(site_precision=precision[:, None], site_shift=np.zeros((gram.shape[0], 1)), noise_variance=np.array([noise]))
-    return solver, gram, noise
-
-
-def test_band_posterior_solve_is_the_dense_solve_within_its_certificate() -> None:
-    generator = np.random.default_rng(5)
-    count = 20
-    precision = generator.uniform(0.05, 2.0, size=count)
-    solver, gram, noise = _solver(generator, precision)
-    matrix = gram / noise + np.diag(precision)
-    right = generator.normal(size=(count, 3))
-    bound = np.array([1e-3, 1e-6, 1e-9])
-    solution, certificate = solver.posterior_solve(right, 0, bound)
-    exact = np.linalg.solve(matrix, right)
-    errors = np.sqrt(np.einsum("ik,ij,jk->k", solution - exact, matrix, solution - exact))
-    assert np.all(errors <= certificate * (1 + 1e-6) + 1e-12)
-    assert np.all((certificate <= bound) | (certificate <= 1e3 * _EPSILON * np.linalg.norm(right, axis=0)))
-
-
-def test_band_posterior_solve_eliminates_non_positive_sites_exactly() -> None:
-    generator = np.random.default_rng(6)
-    count = 20
-    precision = generator.uniform(0.5, 2.0, size=count)
-    # A linear response's sites: two of them non-positive, with A still nonsingular.
-    precision[[3, 11]] = [-0.05, 0.0]
-    solver, gram, noise = _solver(generator, precision)
-    matrix = gram / noise + np.diag(precision)
-    right = generator.normal(size=(count, 2))
-    solution, certificate = solver.posterior_solve(right, 0, np.array([1e-9, 1e-9]))
-    np.testing.assert_allclose(solution, np.linalg.solve(matrix, right), rtol=0, atol=1e-6 * np.max(np.abs(np.linalg.solve(matrix, right))))
-    assert np.all(np.isfinite(certificate))
-
-
 def test_store_block_reads_are_the_mapped_blocks(tmp_path: Path) -> None:
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
     training = np.arange(_TRAINING)
@@ -193,7 +146,6 @@ def _fits(tmp_path: Path, block_cap: int, seed: int = 7):
         grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
     )
     band = GramBand(statistics, 1 << 22)
-    gram_space = GramGaussian(band, training=mask, targets=targets[:, None], covariates=store_covariates, probe_count=_DRAWS)
     exact_space = DualGaussian(
         source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
         grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
@@ -202,7 +154,7 @@ def _fits(tmp_path: Path, block_cap: int, seed: int = 7):
     assert sample_seconds > 0.0 and gram_seconds > 0.0
     fits = [
         fit_full_data(gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field", band=route_band)
-        for gaussian, route_band in ((sample_space, None), (gram_space, None), (exact_space, band))
+        for gaussian, route_band in ((sample_space, None), (exact_space, band))
     ]
     return fits, statistics, store, genetic
 
@@ -225,30 +177,23 @@ def _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store) -> None:
     assert np.corrcoef(sample, exact)[0, 1] > 0.99
 
 
-@pytest.mark.slow  # three mean-field fits of the synthetic store: about two minutes on acl42
-def test_band_fit_is_near_the_sample_fit_with_one_block_per_chromosome(tmp_path: Path) -> None:
+@pytest.mark.slow  # two mean-field fits of the synthetic store: about a minute on acl42
+def test_band_fit_is_the_sample_fit_with_one_block_per_chromosome(tmp_path: Path) -> None:
     # One block per chromosome, and the chromosomes' cross-Gram is chance LD only: the band is G but for the chance
-    # coupling of the two chromosomes and float32's rounding of the stored Gram.
-    (sample_fit, band_fit, exact_fit), statistics, _store_, _genetic = _fits(tmp_path, 256)
+    # coupling of the two chromosomes and float32's rounding of the stored Gram, which the refinement corrects.
+    (sample_fit, exact_fit), statistics, store, _genetic = _fits(tmp_path, 256)
     assert statistics.ld.block_count == 2
-    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, _store_)
-    for fit in (sample_fit, band_fit):
-        assert fit.certificate.budget_unresolved[0] == 0
-        assert fit.certificate.mean_move[0] <= fit.certificate.draw_tolerance[0]
-    assert band_fit.certificate.far_field[0] > 0.0 and sample_fit.certificate.far_field[0] == 0.0
-    # The band fit leaves the chromosomes' chance coupling out of its fields and tempers each block's likelihood by the
-    # noise it adds (kappa 1 here, chance alone): its predictions are the sample fit's up to that approximation.
-    sample, band_prediction = _held_out_predictions([sample_fit, band_fit], statistics, _store_)
-    assert np.corrcoef(sample, band_prediction)[0, 1] > 0.95
+    _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store)
+    assert sample_fit.certificate.budget_unresolved[0] == 0 and sample_fit.certificate.far_field[0] == 0.0
 
 
-@pytest.mark.slow  # three mean-field fits of the synthetic store: about two minutes on acl42
+@pytest.mark.slow  # two mean-field fits of the synthetic store: about a minute on acl42
 def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> None:
-    (sample_fit, band_fit, exact_fit), statistics, store, genetic = _fits(tmp_path, _BLOCK_CAP)
+    (sample_fit, exact_fit), statistics, store, genetic = _fits(tmp_path, _BLOCK_CAP)
     assert statistics.ld.block_count > 2
     _exact_is_the_sample_fit(sample_fit, exact_fit, statistics, store)
     held_out = np.arange(_TRAINING, _SAMPLES)
-    predictions = _held_out_predictions([sample_fit, band_fit], statistics, store)
+    predictions = _held_out_predictions([sample_fit, exact_fit], statistics, store)
     accuracy = [np.corrcoef(values, genetic[held_out])[0, 1] for values in predictions]
     assert accuracy[1] > 0.5
     assert np.corrcoef(predictions[0], predictions[1])[0, 1] > 0.9
