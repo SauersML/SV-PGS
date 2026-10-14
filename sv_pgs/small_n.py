@@ -1105,7 +1105,10 @@ def double_loop_sites(
     representable step along Newton's direction lowers Phi by half its quadratic model's decrease; below Phi's rounding,
     where values cannot tell a decrease, full Newton steps continue while Newton's decrement (from the gradient) falls. Each outer step is
     majorize-minimize (the free energy is at most Phi plus a constant, with equality at q's current marginals), so every
-    accepted inner step lowers the free energy. The loop ends at small_n's own EP check, the undamped
+    accepted inner step lowers the free energy. Where EP's own undamped update keeps the precision definite and lowers
+    the free energy too, it is taken in place of the outer step (monotone in the same quantity), which moves a site whose
+    precision dwarfs its cavity's in one step where the outer bound moves it by about the cavity's precision a step.
+    The loop ends at small_n's own EP check, the undamped
     update's KL 1/2 r' Sigma r at most 1/(2K) nats, or when an outer step leaves the sites unchanged, which is EP's fixed
     point: at an outer step's start (P_s, h_s) are q's own marginals, so Phi's gradient there, (mu - E_r[beta],
     -(z + mu^2 - E_r[beta^2]) / 2) at EP's own cavities, is exactly EP's moment-matching residual. An unchanged step
@@ -1145,6 +1148,18 @@ def double_loop_sites(
             target_shift = tilted_mean / tilted_variance - (mean / variance - shift)
             if kernel.update_divergence(noise, target_precision - precision, target_shift - shift, mean) <= 0.5 / draw_count:
                 return precision, shift
+            # EP's own undamped update, taken where it keeps the precision definite and lowers the EC free energy, the
+            # quantity each outer step lowers, so the loop stays monotone in it. The outer step's bound is loose where a
+            # site's precision dwarfs its cavity's (a density at its lattice's bottom node, tau ~ 3e9 against a cavity
+            # of ~1e2: q's marginal there is the site's own), and it moves such a site by about its cavity's precision
+            # per step: tests/test_small_n.py's recoding test crawled 6,000 steps with the free energy flat to 1e-9 and
+            # the update's KL at 0.78 nats, while the update moves the site to its fixed point in one step.
+            if _positive_definite(design, noise, target_precision):
+                updated = _ec_free_energy(design, noise, data_score, target_precision, target_shift, tilted, largest_variance)
+                if updated < _ec_free_energy(design, noise, data_score, precision, shift, tilted, largest_variance):
+                    profile["double_loop_ep_updates"] += 1
+                    precision, shift = target_precision, target_shift
+                    continue
             reseeded = False
         else:
             reseeded = True
@@ -1330,7 +1345,7 @@ def _best_double_loop(
 def _new_profile() -> dict:
     return {name: 0 for name in (
         "factorizations", "refreshes", "passes", "fixed_point_calls", "solve_columns", "jvp_columns", "responses", "response_factorizations",
-        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates",
+        "double_loops", "double_loop_outer", "double_loop_newton", "double_loop_cg", "double_loop_stationary", "double_loop_candidates", "double_loop_ep_updates",
         "double_loop_reseeds", "double_loop_projected_starts", "segment_evaluations", "repairs", "repair_rounds", "repair_active_max",
     )} | {name: 0.0 for name in (
         "factor_seconds", "variance_seconds", "solve_seconds", "jvp_seconds", "form_seconds", "tilted_seconds", "response_seconds",
