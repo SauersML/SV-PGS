@@ -32,6 +32,7 @@ at biobank scale; measure a full-genome pilot before spending the training slots
 calculates a task timeout from that slot, including every retry and a startup
 allowance. The default is no automatic retries. The six `train-1` through `train-6`
 slots allow bounded successive jobs to resume the same run from its mirror.
+The three `gpucheck` slots ($45 in all, taken evenly from the training slots) are for the GPU check below.
 Use `prepare` for conversion, `pilot` for a bounded benchmark, and `evaluate` for
 remaining scoring/report work. Customize allocations before the first submission,
 keeping their sum plus the reserve at or below $3,000. `STUDY_BUDGET` can point to
@@ -70,7 +71,7 @@ The staging machine and the Batch VMs must be the same platform (Linux x86-64). 
 
 ## The GPU check (once, before the fit)
 
-No CI or local machine has a CUDA device, so the CUDA paths first run on the fit job's machine. `submit.sh gpucheck` runs there, in a slot of its own (the `pilot` slot fits it), with the fit job's placeholders less `THROUGH`. It runs every `tests/*_cuda.py`, the CUDA cases of the other test files, and the bench-sim submissions' fits, which take the machine's devices, so Stage 0 and Stage 2 run on them end to end. It neither reads nor writes the run. The report is `launcher/<slot>/gpu_check.log`, with `gpu_check.xml` and `nvidia-smi.txt` beside it; the task fails if any test fails. Use the fit job's `MACHINE_TYPE` and `GPU_COUNT`, so the multi-device cases (two or more devices) run too.
+No CI or local machine has a CUDA device, so the CUDA paths first run here. `submit.sh gpucheck` takes the fit job's placeholders less `THROUGH`, in one of the `gpucheck-1` to `gpucheck-3` slots ($15 each, so a fix can be checked again). It runs every `tests/*_cuda.py`, the CUDA cases of the other test files, and the bench-sim submissions' fits, which take the machine's devices, so Stage 0 and Stage 2 run on them end to end. It neither reads nor writes the run. The report is `launcher/<slot>/gpu_check.log`, with `gpu_check.xml` and `nvidia-smi.txt` beside it; the task fails if any test fails. Use the fit job's `GPU_TYPE` on its two-GPU machine (`a2-highgpu-2g` for A100s) with `GPU_COUNT=2`, Spot: the multi-device cases need two devices, and $15 covers the startup allowance and about two hours at Spot prices.
 
 ## Placeholders
 
