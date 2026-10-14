@@ -1594,6 +1594,7 @@ class _FullDataMeanField:
         self.elbo = np.full(model_count, -np.inf)
         self.refusals: list[str] = []
         self.refreshes = 0
+        self.reweights = 0
         self.passes = 0
         self.version = 0
         # The curvature's posterior solves' last duals per (model, directions), their warm starts (``_posterior``).
@@ -1703,6 +1704,7 @@ class _FullDataMeanField:
         self._install_metric()
         self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
         self._panel_grams.clear()
+        self.reweights += 1
 
     def _moment_pieces(self, count: int) -> Iterator[tuple[int, int]]:
         """Column ranges of a block for the predictor-variance read: its three dense (n x width) float64 arrays (the
