@@ -4450,16 +4450,21 @@ def _next_radius(newton: _NewtonB, proposal: F64Array, radius: float, length: fl
     mispredicted the step by half, or the realized gain fell) supports no longer step, L / (2 e) <= L, so the radius
     holds. Without a measured gain (a state with no certified value at either end) the radius doubles: such a walk
     stops where the density collapses or the fixed point stops moving, and doubling reaches either in logarithmically
-    many fixed points."""
+    many fixed points. The extrapolation needs the error measured: where the model's deviation from the realized gain is
+    within the gain's resolution, the cubic term is unseen and L / (2 e) at e = resolution / m is no bound (the mode
+    objective's gain is resolved to rounding, so that radius was some 1e13 L, and the next Newton step on the weak
+    directions ran thousands of units to where the EP double loop has no fixed point: tests/test_small_n.py's recoding
+    test, which had taken 3 s, never ended), so the radius doubles."""
     if length < radius * (1.0 - _HALF_PRECISION):
         return radius
     predicted = float(newton.gradient @ proposal) - 0.5 * float(proposal @ newton.total @ proposal)
     if not (np.isfinite(realized) and np.isfinite(resolution) and predicted > 0.0):
         return 2.0 * radius
-    error = max(abs(1.0 - realized / predicted), resolution / predicted)
+    deviation = abs(1.0 - realized / predicted)
+    error = max(deviation, resolution / predicted)
     if not error < 0.5:
         return radius
-    return max(2.0 * radius, radius / (2.0 * error)) if error > 0.0 else 2.0 * radius
+    return max(2.0 * radius, radius / (2.0 * deviation)) if deviation * predicted > resolution else 2.0 * radius
 
 
 def _inner_step_agreement(start_gradient: F64Array, end_gradient: F64Array, proposal: F64Array) -> tuple[float, float]:
