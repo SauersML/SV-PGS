@@ -170,6 +170,11 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     guard.validate_job(spec, 146400, 0)
     script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
     assert "$RUN/venv/bin/sv-pgs" in script and "${status}" in script and "${RUN_ID}" not in script
+    # The fit job shares the store job's run disk and venv, so its sync with the GPU extras runs on every start, outside
+    # the one-time staging copy, and a GPU it cannot reach stops it before the pipeline starts.
+    staging_end = script.index("\nfi\n", script.index('if [ ! -f "$RUN/tools/staged" ]'))
+    assert script.index("sync --project") > staging_end and "sync --project" in script and "--extra gpu" in script
+    assert script.index("exit-no-gpu") < script.index("workspace-run")
 
 
 def test_the_store_job_mounts_the_workspace_cdr_read_only(tmp_path):

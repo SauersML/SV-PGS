@@ -11,15 +11,24 @@ RUN=/mnt/disks/run
 mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_$1"; }
 trap 'mark "terminated"; exit 75' TERM
 mark started
-if [ ! -x "$RUN/venv/bin/sv-pgs" ]; then
-  # The bucket mount gives no file an execute bit, so uv and Python are copied to the run disk first.
+if [ ! -f "$RUN/tools/staged" ]; then
+  # The bucket mount gives no file an execute bit, so uv and Python are copied to the run disk first. The marker is
+  # written last, so a copy a preemption cut short is redone.
   mkdir -p "$RUN/tools" && cp "$OPS/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" \
     && rm -rf "$RUN/python" "$RUN/uv-cache" && cp -r "$OPS/python" "$RUN/python" && cp -r "$OPS/uv-cache" "$RUN/uv-cache" \
-    && chmod +x "$RUN"/python/*/bin/* \
-    && UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
-       "$RUN/tools/uv" sync --project "$OPS/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
+    && chmod +x "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
     || { mark "exit-install"; exit 1; }
 fi
+# Every job syncs, since the CPU and GPU jobs share the run disk and its venv but not their extras: the GPU job's
+# --extra gpu adds CuPy and the CUDA wheels to the venv the CPU job built, and an exact sync is quick when nothing changes.
+UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
+  "$RUN/tools/uv" sync --project "$OPS/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
+  || { mark "exit-install"; exit 1; }
+case "${UV_EXTRAS}" in
+  # A fit job that cannot reach its GPU would fit on the CPUs at the GPU VM's price until its timeout: it stops here.
+  *gpu*) "$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1)" \
+           || { mark "exit-no-gpu"; exit 1; } ;;
+esac
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
 mkdir -p "$TMPDIR"
 "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" &
