@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from benchmarks.bench_sim import harness
 from benchmarks.bench_sim.submissions.svpgs_full_derived import derived_values
@@ -69,6 +70,11 @@ def test_the_derived_columns_are_their_records_combinations() -> None:
         np.testing.assert_allclose(values[row], 2.0 - dosage[variants["pos"] == position].sum(axis=0))
 
 
+# Slow: 240 people and 60 records under the annotated prior. Its empirical Bayes ends uncertified on a lattice the check
+# extends (the density's mass above the lattice's top), and the refit's walk through states with no certified value
+# can plan a hyper step at each, minutes apiece: about 50 s on one route and past 10 minutes on the other, the route
+# chosen by measured timing (HANDOFF.md, open engine work).
+@pytest.mark.slow
 def test_the_derived_arms_fit_and_score_a_small_cohort(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     rng = np.random.default_rng(3)
