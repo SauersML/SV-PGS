@@ -2374,8 +2374,13 @@ class _GramMeanField(_FullDataMeanField):
     its field alone, as the sweeps' own remainder is each coordinate's). Where f stops changing, the band's fields plus
     f are the exact fields, so the fixed point is the sample-space oracle's; the final state's residual and ELBO are
     the exact ones. Every other read of the design (the responses' Gram products, the mixture's move test) is the
-    sample-space oracle's own. A round whose exact ELBO falls, or whose pending gain does not shrink, refuses the solve
-    (the refinement does not contract there), counted in ``unresolved``.
+    sample-space oracle's own. A round holds the far field at its start m0, a stale field rather than a minorizer, so it
+    can lower the exact ELBO, by d'F d / 2 sigma^2 for its step d on the group sums (F = G - G_band); such a round is
+    redone from m0 under the minorizer that subtracts (lambda / 2 sigma^2) ||mbar - m0||^2 on the sums (tight at m0,
+    below the exact ELBO wherever lambda >= d'F d / d'd), lambda starting at the failed step's Rayleigh quotient and
+    doubling until the round is accepted, so the accepted rounds never lower the exact ELBO; rounds otherwise run at
+    lambda = 0, at no cost. A round whose pending gain does not shrink refuses the solve (the refinement does not
+    contract there), counted in ``unresolved``.
 
     Pure band route (a ``GramGaussian``): every read is the band's, and the far field is left out (``FitCertificate.far_field``
     reports its size); exact only where the band is the whole Gram."""
@@ -2406,6 +2411,9 @@ class _GramMeanField(_FullDataMeanField):
         # Each model's far field f held through a round, and the grouped means it was read at.
         self._far = np.zeros((self.band.group_count, gaussian.model_count))
         self._far_reference = np.zeros((self.band.group_count, gaussian.model_count))
+        # Each model's proximal weight lambda and anchor (the round's start's group sums) where a refinement round is redone
+        # under its minorizer (``_solve_model``); lambda 0 elsewhere.
+        self._proximal: list[tuple[float, F64Array | None]] = [(0.0, None)] * gaussian.model_count
         self._last_residual_square = 0.0
         self._last_rounding = 0.0
         self.refinements = 0
@@ -2487,10 +2495,12 @@ class _GramMeanField(_FullDataMeanField):
         noise = float(self.noise[model])
         started, read_before = time.perf_counter(), self.band.read_bytes
         far = self._far[:, model] if self.exact else None
+        proximal, anchor = self._proximal[model]
         result = self.band.sweep(
             self.gaussian.array_module, member_blocks=self.member_blocks, group=self.ties.group, sign=self.sign, class_index=self.class_index,
             log_density=np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)), scales=log_scale(prior, hyperparameters.coefficients),
-            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, field_shift=far, target=model, **arrays,
+            grid=np.asarray(prior.log_variance_grid, dtype=np.float64), noise=noise, field_shift=far, target=model, proximal=proximal, anchor=anchor,
+            **arrays,
         )
         for name in names:
             getattr(self, name)[:, model] = arrays[name]
@@ -2503,6 +2513,12 @@ class _GramMeanField(_FullDataMeanField):
             reference = self._far_reference[:, model]
             residual_square += float(reference @ far)
             size += float(np.abs(reference) @ np.abs(far))
+        if proximal > 0.0:
+            # The round's minorizer: its proximal term enters as lambda ||mbar - anchor||^2 more residual square, so the
+            # sweeps' ELBO and the noise's stationary update are the minorizer's (``_solve_model``).
+            moved = self._grouped(self.mean[:, model]) - anchor
+            residual_square += proximal * float(moved @ moved)
+            size += proximal * float(moved @ moved)
         # The residual square is y'Py - 2 mbar's + mbar'G mbar, formed from terms of the size ``residual_size``: its
         # rounding enters the ELBO's bound with the KL pieces' (``_elbo``'s count of summands covers its sums).
         return result.divergence, result.weighted_variance, residual_square, result.sizes + size / (2.0 * noise)
@@ -2558,18 +2574,53 @@ class _GramMeanField(_FullDataMeanField):
         pending: float | None = None
         exact_elbo: float | None = None
         rounds = 0
+        # Each round's start, which a round that lowers the exact ELBO is redone from.
+        start, start_fields, start_grouped = self._state(model), fields, self._grouped(self.mean[:, model])
         while True:
             grouped = self._grouped(self.mean[:, model])
             far = fields - (self.band.scores[:, model] - self._band_product(grouped))
             if rounds:
+                # The state's ELBO with the exact residual in place of the round's linearized one.
                 noise = float(self.noise[model])
+                self.elbo[model] += (self._last_residual_square - residual_square) / (2.0 * noise)
+                proximal = 0.0
+                while exact_elbo is not None and self.elbo[model] < exact_elbo - self._last_rounding:
+                    # The round's linearization (the far field held at its start m0) is a stale field, not a minorizer:
+                    # the exact ELBO is the round's less d'F d / 2 sigma^2 for its step d on the group sums, which lowered
+                    # it. It is redone from m0 under the minorizer that subtracts (lambda / 2 sigma^2) ||mbar - m0||^2:
+                    # equal to the exact ELBO at m0 (d = 0), below it wherever lambda >= d'F d / d'd, so a round it
+                    # accepts never lowers the exact ELBO. lambda starts at the failed step's Rayleigh quotient, F d being
+                    # (G m1 - G m0) - G_band d from the fields both checks read, and doubles until the round is accepted,
+                    # which it is by lambda_max(F) at the latest; each redo costs its sweeps and one read of the fields.
+                    step = grouped - start_grouped
+                    if proximal > 0.0:
+                        proximal *= 2.0
+                    elif np.any(step):
+                        proximal = float(step @ ((start_fields - fields) - self._band_product(step))) / float(step @ step)
+                    if not proximal > 0.0:
+                        # No step along which F rises: the far field did not lower the ELBO, so no minorizer redoes it.
+                        self.unresolved[model] += 1
+                        raise FloatingPointError(
+                            f"model {model}: a refinement round lowered the exact ELBO by {exact_elbo - self.elbo[model]:.3g} nats along no rise of the far "
+                            "field: unresolved"
+                        )
+                    log(
+                        f"gram refinement {rounds}: the round lowered the exact ELBO by {exact_elbo - self.elbo[model]:.3g} nats; redone from its start "
+                        f"under the proximal term lambda = {proximal:.4g} ({proximal / float(np.median(self.band.squares)):.3g} of the median ||x_g||^2)"
+                    )
+                    self._restore_state(start, model)
+                    self._proximal[model] = (proximal, start_grouped)
+                    try:
+                        super()._solve_model(model, hyperparameters, pass_budget)
+                    finally:
+                        self._proximal[model] = (0.0, None)
+                    fields, residual_square = self._exact_fields(model)
+                    noise = float(self.noise[model])
+                    self.elbo[model] += (self._last_residual_square - residual_square) / (2.0 * noise)
+                    grouped = self._grouped(self.mean[:, model])
+                    far = fields - (self.band.scores[:, model] - self._band_product(grouped))
                 change = (far - self._far[:, model])[self.ties.group]
                 round_pending = float(np.sum(self.variance[:, model] * change * change)) / (2.0 * noise * noise)
-                # The state's ELBO with the exact residual in place of the round's linearized one.
-                self.elbo[model] += (self._last_residual_square - residual_square) / (2.0 * noise)
-                if exact_elbo is not None and self.elbo[model] < exact_elbo - self._last_rounding:
-                    self.unresolved[model] += 1
-                    raise FloatingPointError(f"model {model}: a refinement round lowered the exact ELBO by {exact_elbo - self.elbo[model]:.3g} nats: unresolved")
                 if pending is not None and round_pending >= pending and round_pending > tolerance:
                     self.unresolved[model] += 1
                     raise FloatingPointError(
@@ -2580,6 +2631,7 @@ class _GramMeanField(_FullDataMeanField):
                 log(f"gram refinement {rounds}: pending gain {round_pending:.3g} nats of the far field's change (tolerance {tolerance:.3g})")
                 if round_pending <= tolerance:
                     break
+                start, start_fields, start_grouped = self._state(model), fields, grouped
             self._far[:, model], self._far_reference[:, model] = far, grouped
             super()._solve_model(model, hyperparameters, pass_budget)
             self.refinements += 1

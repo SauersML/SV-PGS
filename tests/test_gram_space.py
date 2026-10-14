@@ -258,10 +258,10 @@ def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> N
 def test_the_band_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # One chromosome in one Stage 0 block: the band route re-cuts it by its measured LD extent and sweeps the band, its
     # far field corrected from the samples, and the sample route sweeps the samples; both are the one full-data
-    # likelihood (timing picks the route; ``stage2_wiring``), so the two fits predict alike [own-sim]. On this store the
-    # band route's start has no certified fixed point (a far-field refinement round lowers the exact ELBO by 0.00536
-    # nats), so its model is the sample route's refit, and its refusals say so: the wired band route answers for a fit
-    # only where it reaches one.
+    # likelihood (timing picks the route; ``stage2_wiring``), so the two fits predict alike [own-sim]. On this store a
+    # far-field refinement round lowers the exact ELBO (by 0.00536 nats at the start's third round), which once left
+    # the band route's start with no fixed point and its model to the sample route's refit; the round is now redone
+    # under its proximal minorizer (``full_data_fit._GramMeanField._solve_model``), and the band route's own fit stands.
     from sv_pgs import fit_model, stage2_wiring
     from sv_pgs.config import TraitType
     from sv_pgs.dosage_store import DosageStore
@@ -282,6 +282,14 @@ def test_the_band_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path:
     covariate = generator.standard_normal(_SAMPLES)
     targets = 0.3 * covariate + genetic + np.sqrt(0.5) * generator.standard_normal(_SAMPLES)
     training = np.arange(_SAMPLES) < _TRAINING
+    sweep = GramBand.sweep
+    proximal_weights: list[float] = []
+
+    def recorded(self, xp, **arguments):
+        proximal_weights.append(float(arguments.get("proximal", 0.0)))
+        return sweep(self, xp, **arguments)
+
+    monkeypatch.setattr(GramBand, "sweep", recorded)
     models = {}
     for route, costs in (("samples", (0.0, np.inf)), ("band", (np.inf, 0.0))):
         monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp, costs=costs: costs)
@@ -294,7 +302,7 @@ def test_the_band_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path:
         ))
     assert models["samples"].certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
     assert all(acceptance(models[route])["accepted"] for route in models)
-    assert any("band route's fit had no certified start, so it was fitted on the sample route" in reason for reason in models["band"].refusals)
+    assert not any("band route" in reason for reason in models["band"].refusals) and max(proximal_weights) > 0.0
     coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "band")]
     standardized = (dosage - dosage.mean(axis=0)) / dosage.std(axis=0)
     rows = np.asarray(models["samples"].scoring[0].store_rows)
@@ -350,3 +358,32 @@ def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path:
         lag = np.abs(members[:, None] - members[None, :])
         assert np.all(reach[np.ix_(members, members)][lag < entry["extent"]])
     assert band_store.stored_bytes > 0 and linked.all()
+
+
+def test_the_proximal_update_maximizes_its_coordinate_minorizer() -> None:
+    """A member's update under the proximal term (``gram_space._proximal_shift``) is q_j's law at the shift s whose mean
+    m solves m = M(h - kappa (m - t)): the maximum over the shift of the coordinate's minorizer
+    J(s) = (h - s) M(s) + log Z(s) - (kappa / 2) (M(s) - t)^2, which is the coordinate's ELBO less the term, and which
+    at kappa = 0 is the plain update's (s = h)."""
+    from sv_pgs.gram_space import _proximal_shift, _tilted
+
+    generator = np.random.default_rng(9)
+    nodes = 30
+    grid = np.linspace(-14.0, 3.0, nodes)
+    log_density = np.log(generator.dirichlet(np.ones(nodes), size=1))
+    log_node_variance = np.ascontiguousarray((grid + 0.4)[None, :])
+    node_variance = np.exp(log_node_variance)
+    log_weights, conditional = np.empty(nodes), np.empty(nodes)
+
+    def minorizer(shift: float, h: float, omega: float, kappa: float, target: float) -> float:
+        log_normalizer, mean, *_moments = _tilted(shift, omega, 0, 0, log_density, node_variance, log_node_variance, log_weights, conditional)
+        return (h - shift) * mean + log_normalizer - 0.5 * kappa * (mean - target) ** 2
+
+    for h, omega, kappa, target in ((3.0, 40.0, 120.0, -0.02), (-25.0, 400.0, 900.0, 0.05), (0.4, 9.0, 2.0, 0.3)):
+        shift = _proximal_shift(h, omega, kappa, target, 0, 0, log_density, node_variance, log_node_variance, log_weights, conditional)
+        mean = _tilted(shift, omega, 0, 0, log_density, node_variance, log_node_variance, log_weights, conditional)[1]
+        np.testing.assert_allclose(shift, h - kappa * (mean - target), rtol=1e-12, atol=1e-12 * abs(h))
+        best = minorizer(shift, h, omega, kappa, target)
+        for delta in (1e-3, 1e-2, 1e-1):
+            assert best >= max(minorizer(shift + delta * abs(h), h, omega, kappa, target), minorizer(shift - delta * abs(h), h, omega, kappa, target))
+        assert _proximal_shift(h, omega, 0.0, target, 0, 0, log_density, node_variance, log_node_variance, log_weights, conditional) == h

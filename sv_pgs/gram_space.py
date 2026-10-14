@@ -67,7 +67,75 @@ def _host(values: Any) -> np.ndarray:
 
 
 @numba.njit(cache=True, fastmath={"reassoc", "contract"})
-def _gram_sweep(gram, field, groups, signs, squares, class_index, log_density, node_variance, log_node_variance, noise, mean, variance, shift, third, fourth, moved):
+def _tilted(h, omega, row, member, log_density, node_variance, log_node_variance, log_weights, conditional):
+    """Member ``member``'s q_j at precision ``omega`` and shift ``h``: its prior's scale mixture times exp(h b - omega
+    b^2 / 2) over the lattice, as (log normalizer, mean, variance, third and fourth central moments); ``log_weights``
+    and ``conditional`` are scratch (the nodes' weights and conditional variances)."""
+    node_count = node_variance.shape[1]
+    peak = -np.inf
+    for node in range(node_count):
+        variance_node = node_variance[member, node]
+        ratio = variance_node * omega
+        if ratio == np.inf:
+            conditional[node] = 1.0 / omega
+            log_weights[node] = log_density[row, node] - 0.5 * (log_node_variance[member, node] + np.log(omega)) + 0.5 * h * h * conditional[node]
+        else:
+            conditional[node] = 1.0 / (1.0 / variance_node + omega) if variance_node > 0.0 else 0.0
+            log_weights[node] = log_density[row, node] - 0.5 * np.log1p(ratio) + 0.5 * h * h * conditional[node]
+        if log_weights[node] > peak:
+            peak = log_weights[node]
+    total = 0.0
+    for node in range(node_count):
+        log_weights[node] = np.exp(log_weights[node] - peak)
+        total += log_weights[node]
+    log_normalizer = peak + np.log(total)
+    new_mean = 0.0
+    for node in range(node_count):
+        new_mean += log_weights[node] / total * h * conditional[node]
+    new_variance = 0.0
+    new_third = 0.0
+    new_fourth = 0.0
+    for node in range(node_count):
+        offset = h * conditional[node] - new_mean
+        weight = log_weights[node] / total
+        new_variance += weight * (conditional[node] + offset * offset)
+        new_third += weight * (offset * offset * offset + 3.0 * conditional[node] * offset)
+        new_fourth += weight * (offset**4 + 6.0 * conditional[node] * offset * offset + 3.0 * conditional[node] * conditional[node])
+    return log_normalizer, new_mean, new_variance, new_third, new_fourth
+
+
+@numba.njit(cache=True, fastmath={"reassoc", "contract"})
+def _proximal_shift(h, omega, kappa, target, row, member, log_density, node_variance, log_node_variance, log_weights, conditional):
+    """The shift of member ``member``'s coordinate update under the proximal term -(kappa / 2) (m_j - target)^2 on its
+    mean m_j = E_q b_j (``GramBand.sweep``'s): q_j is then its law at shift h - kappa (m_j - target), so m_j solves
+    m = M(h - kappa (m - target)), M the law's mean as a function of its shift. g(m) = m - M(...) rises with slope at
+    least one (M rises with the shift, by the law's variance), so its root lies within |g(m)| of any m: Newton's steps
+    inside that bracket, halving it where a step leaves it, until no double lies strictly inside it."""
+    mean = target
+    moments = _tilted(h - kappa * (mean - target), omega, row, member, log_density, node_variance, log_node_variance, log_weights, conditional)
+    gap = mean - moments[1]
+    lower, upper = (mean - gap, mean) if gap > 0.0 else (mean, mean - gap)
+    while gap != 0.0:
+        candidate = mean - gap / (1.0 + kappa * moments[2])
+        if not lower < candidate < upper:
+            candidate = 0.5 * (lower + upper)
+        if candidate == lower or candidate == upper:
+            break
+        mean = candidate
+        moments = _tilted(h - kappa * (mean - target), omega, row, member, log_density, node_variance, log_node_variance, log_weights, conditional)
+        gap = mean - moments[1]
+        if gap > 0.0:
+            upper = mean
+        else:
+            lower = mean
+    return h - kappa * (mean - target)
+
+
+@numba.njit(cache=True, fastmath={"reassoc", "contract"})
+def _gram_sweep(
+    gram, field, groups, signs, squares, class_index, log_density, node_variance, log_node_variance, noise, mean, variance, shift, third, fourth,
+    moved, proximal, anchor,
+):
     """One block's coordinate ascent in Gram space, in place, the members in the order given.
 
     ``gram`` is the block's Gram R_b (w x w, float32 as Stage 0 stores it, or float64), ``field`` c_b = x_g' r over the
@@ -75,7 +143,9 @@ def _gram_sweep(gram, field, groups, signs, squares, class_index, log_density, n
     groups' ||x_g||^2 (R_b's diagonal), the per-member arrays (class, node variances and moments) in sweep order, and
     ``moved`` (w) receives each group's signed mean change. Member j's update is ``mean_field._sweep``'s, with its
     projection x_j'r = s_j c_g; after it, c -= R_b[g, :] s_j dm_j over the block (R_b symmetric, so its row g is its
-    column g). Returns (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, the KL terms' pieces' sizes)."""
+    column g). With ``proximal`` lambda > 0 each update ascends the ELBO less (lambda / 2 sigma^2) ||mbar - a||^2 on the
+    groups' signed mean sums, ``anchor`` a - mbar at the block's start per group (``_proximal_shift``). Returns
+    (sum_j KL(q_j || p_j), sum_j ||x_j||^2 v_j, the KL terms' pieces' sizes)."""
     width = field.shape[0]
     member_count = groups.shape[0]
     node_count = node_variance.shape[1]
@@ -91,35 +161,15 @@ def _gram_sweep(gram, field, groups, signs, squares, class_index, log_density, n
         old_mean = mean[member]
         h = (sign * field[group] + squares[group] * old_mean) / noise
         row = class_index[member]
-        peak = -np.inf
-        for node in range(node_count):
-            variance_node = node_variance[member, node]
-            ratio = variance_node * omega
-            if ratio == np.inf:
-                conditional[node] = 1.0 / omega
-                log_weights[node] = log_density[row, node] - 0.5 * (log_node_variance[member, node] + np.log(omega)) + 0.5 * h * h * conditional[node]
-            else:
-                conditional[node] = 1.0 / (1.0 / variance_node + omega) if variance_node > 0.0 else 0.0
-                log_weights[node] = log_density[row, node] - 0.5 * np.log1p(ratio) + 0.5 * h * h * conditional[node]
-            if log_weights[node] > peak:
-                peak = log_weights[node]
-        total = 0.0
-        for node in range(node_count):
-            log_weights[node] = np.exp(log_weights[node] - peak)
-            total += log_weights[node]
-        log_normalizer = peak + np.log(total)
-        new_mean = 0.0
-        for node in range(node_count):
-            new_mean += log_weights[node] / total * h * conditional[node]
-        new_variance = 0.0
-        new_third = 0.0
-        new_fourth = 0.0
-        for node in range(node_count):
-            offset = h * conditional[node] - new_mean
-            weight = log_weights[node] / total
-            new_variance += weight * (conditional[node] + offset * offset)
-            new_third += weight * (offset * offset * offset + 3.0 * conditional[node] * offset)
-            new_fourth += weight * (offset**4 + 6.0 * conditional[node] * offset * offset + 3.0 * conditional[node] * conditional[node])
+        if proximal > 0.0:
+            # The member's mean that puts its group's sum at the anchor, the others' held: the term's target.
+            h = _proximal_shift(
+                h, omega, proximal / noise, old_mean + sign * (anchor[group] - moved[group]), row, member, log_density, node_variance,
+                log_node_variance, log_weights, conditional,
+            )
+        log_normalizer, new_mean, new_variance, new_third, new_fourth = _tilted(
+            h, omega, row, member, log_density, node_variance, log_node_variance, log_weights, conditional,
+        )
         step = new_mean - old_mean
         if step != 0.0:
             signed_step = sign * step
@@ -387,13 +437,15 @@ class GramBand:
     def sweep(
         self, xp: Any, *, member_blocks: tuple, group: I64Array, sign: F64Array, class_index: I64Array, log_density: F64Array,
         scales: F64Array, grid: F64Array, noise: float, mean: F64Array, variance: F64Array, shift: F64Array, third: F64Array,
-        fourth: F64Array, field_shift: F64Array | None = None, target: int = 0,
+        fourth: F64Array, field_shift: F64Array | None = None, target: int = 0, proximal: float = 0.0, anchor: F64Array | None = None,
     ) -> SweepResult:
         """One coordinate-ascent sweep of Stage 0's target ``target`` over every block's members in ``member_blocks``'
         order, in place on the members' moments (host arrays), on ``xp`` (numpy, or cupy with ``device_sweep``'s panel
         kernel). ``field_shift`` (groups) is added to every field and to the residual square's linear term,
         s -> s + field_shift: the far field held fixed through a round of the exact refinement
-        (``full_data_fit._GramMeanField``)."""
+        (``full_data_fit._GramMeanField``). ``proximal`` lambda > 0 ascends the ELBO less (lambda / 2 sigma^2)
+        ||mbar - anchor||^2 on the groups' signed mean sums instead (that round's minorizer), on the host kernel
+        (``_gram_sweep``; the returned residual square is the band's, without the term)."""
         if len(member_blocks) != self.block_count or any(
             members.size and not (self.starts[block] <= int(group[members].min()) and int(group[members].max()) < self.starts[block + 1])
             for block, members in enumerate(member_blocks)
@@ -408,8 +460,13 @@ class GramBand:
         scores = self._raw_scores[:, target]
         self._linear = scores if field_shift is None else scores + np.asarray(field_shift, dtype=np.float64)
         self._target_square = float(self.target_square[target])
-        if xp is np:
-            return self._host_sweep(member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped)
+        if xp is np or proximal > 0.0:
+            # Each group's anchor less its sum at the sweep's start, which each block's kernel reads at its own start.
+            offsets = np.zeros(self.group_count) if anchor is None else np.asarray(anchor, dtype=np.float64) - grouped
+            return self._host_sweep(
+                member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped,
+                proximal, offsets,
+            )
         return self._device_sweep(xp, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped)
 
     def _block_field(self, block: int, grouped: Any, xp: Any, within: Any) -> Any:
@@ -452,7 +509,9 @@ class GramBand:
         residual_size = abs(self._target_square) + 2.0 * float(np.abs(grouped) @ np.abs(weighted)) + quadratic_size
         return SweepResult(divergence, weighted_variance, residual_square, sizes, residual_size)
 
-    def _host_sweep(self, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped) -> SweepResult:
+    def _host_sweep(
+        self, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped, proximal, offsets,
+    ) -> SweepResult:
         divergence = weighted_variance = sizes = quadratic = quadratic_size = 0.0
         for block, members in enumerate(member_blocks):
             own = self.span(block)
@@ -463,10 +522,13 @@ class GramBand:
                 node_variance = np.exp(log_node_variance)
             state = [np.ascontiguousarray(values[members]) for values in (mean, variance, shift, third, fourth)]
             moved = np.zeros(own.stop - own.start)
+            # A block's groups are its own, so their sums at its start are the sweep's start's (``offsets``); the term is
+            # the untempered ELBO's, so it reaches the kernel over the block's tempering, as its noise does.
             part = _gram_sweep(
                 within, field, np.ascontiguousarray(group[members] - own.start), np.ascontiguousarray(sign[members]),
                 np.ascontiguousarray(self._raw_squares[own]), np.ascontiguousarray(class_index[members]), log_density, node_variance,
-                log_node_variance, float(noise) / float(self.temper[block]), *state, moved,
+                log_node_variance, float(noise) / float(self.temper[block]), *state, moved, float(proximal) / float(self.temper[block]),
+                np.ascontiguousarray(offsets[own]),
             )
             for values, piece in zip((mean, variance, shift, third, fourth), state):
                 values[members] = piece
