@@ -2873,7 +2873,7 @@ def fit_request(
         training=cohort.training[rows],
         model_names=tuple(cohort.model_names),
         trait_types=tuple(
-            TraitType.BINARY if disease_likelihood == "bernoulli" and cohort.trait_types[trait] == TraitType.BINARY else TraitType.QUANTITATIVE
+            TraitType.BINARY if disease_likelihood == "bernoulli" and cohort.trait_types[trait] == TraitType.BINARY else FIT_TRAIT_TYPE
             for trait in traits.tolist()
         ),
         research_ids=tuple(np.asarray(cohort.research_ids)[rows].tolist()),

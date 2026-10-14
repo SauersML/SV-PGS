@@ -44,7 +44,7 @@ def test_importing_the_package_loads_no_jax_and_keeps_the_cuda_math_mode():
     assert loaded == {
         "jax": [],
         "CUPY_TF32": None,
-        "exports": ["ModelConfig", "TraitType", "VariantClass", "VariantRecord"],
+        "exports": ["ModelConfig", "TraitType", "VariantClass"],
     }
 
 

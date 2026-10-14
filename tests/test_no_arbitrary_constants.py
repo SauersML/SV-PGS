@@ -261,7 +261,6 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('all_of_us.py', 'MEASUREMENT_DEFINITIONS.treatment'): ('phenotypes', frozenset({15.0, 0.7}), 'within-person learned treatment effect (PHENOTYPES.md item 3)'),
     ('config.py', 'ModelConfig.minimum_scale'): ('e2e', frozenset({1e-06}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),
     ('config.py', 'ModelConfig.minimum_minor_allele_frequency'): ('e2e', frozenset({0.01}), 'Stage 0 inclusion by the information rule and an exact zero-variance test, not a MAF or SD floor'),
-    ('data.py', 'VariantRecord.allele_frequency'): ('deslop-constants', frozenset({0.01}), 'require allele_frequency instead of a silent 0.01 default'),
     ('external_annotations.py', 'KMER_LENGTH'): ('deslop-store', frozenset({11}), 'match tiers bin continuous evidence; store similarity, ratio and proximity as continuous columns (lead/engine ruling)'),
     ('fast_scoring.py', '_READ_AHEAD_BUFFERS'): ('speed-io', frozenset({3}), 'I/O concurrency from a measurement'),
     ('genotype_buffers.py', 'LAYOUT_ALIGNMENT'): ('speed-io', frozenset({64}), 'cite the cuBLAS int8 tensor-core alignment requirement, or derive from it'),

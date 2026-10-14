@@ -269,12 +269,7 @@ class TiltedMoments:
 class HyperStep:
     """The result of one empirical-Bayes step at fixed cavities.
 
-    ``start_decrement`` is 1/2 g'|H|^-1 g of the penalized objective at the
-    hyperparameters the step started from (what these cavities still ask of
-    them), and ``evidence_gain`` is V at the returned weights minus V at the
-    starting ones, both in nats: the outer loop's certificate.
-    ``newton_decrement`` is the same decrement at the returned
-    hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
+    ``evidence`` is V at the returned hyperparameters, and ``smoothing_gradient`` the largest |dV/drho| over
     weights not held at an edge or a bound of their range, from V's analytic
     gradient; ``stationarity_steps`` are the curvature's difference steps,
     ``stationarity_errors`` the gradient's error bounds, and ``stationarity_gain`` the weights' remaining gain
@@ -286,12 +281,8 @@ class HyperStep:
     """
 
     hyperparameters: MixtureHyperparameters
-    penalized_objective: float
     evidence: float
-    newton_decrement: float
     smoothing_gradient: float
-    start_decrement: float
-    evidence_gain: float
     stationarity_steps: F64Array
     stationarity_errors: F64Array
     stationarity_gain: float
@@ -3783,7 +3774,7 @@ def _maximize_evidence(
     tolerance: float,
     held_edges: frozenset[int] = frozenset(),
     held_finite: frozenset[int] = frozenset(),
-) -> tuple[F64Array, F64Array, _Evidence, _Evidence]:
+) -> tuple[F64Array, F64Array, _Evidence]:
     """Maximize V over every weight in (0, infinity]: the interior by the trust-region ascent inside the resolvable
     range, and the lambda = infinity edge evaluated exactly (x confined to the block's null space), never by fitting
     at an extreme weight. Once the interior ascent converges, every finite weight is compared with its infinity edge
@@ -3793,8 +3784,7 @@ def _maximize_evidence(
     the block at its edge (the audit's M06), and what the fit then certifies is the stationarity it reached, as
     ``OuterFit`` says. There is no lambda = 0 edge (see the module
     docstring), so a start weight of -inf means its range's lower end, and one past its upper end the edge. Every V is the best certified maximum over the warm, flat and
-    global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, V there, and V at
-    the start.
+    global log-normal starts. Returns the log weights (+inf at an edge), x in full coordinates, and V there.
     """
     lower = np.array([bound[0] for bound in bounds])
     upper = np.array([bound[1] for bound in bounds])
@@ -3897,7 +3887,7 @@ def _maximize_evidence(
         if not moved:
             log_smoothing = weights.copy()
             log_smoothing[sorted(infinite)] = np.inf
-            return log_smoothing, coefficients, evidence, start
+            return log_smoothing, coefficients, evidence
 
 
 @dataclass(frozen=True)
@@ -4138,16 +4128,7 @@ def hyper_step(
     hyperparameters = replace(
         hyperparameters, log_smoothing=np.where(hyperparameters.log_smoothing == -np.inf, lowest, hyperparameters.log_smoothing)
     )
-    infinite = frozenset(int(position) for position in np.flatnonzero(hyperparameters.log_smoothing == np.inf))
-    view, allowed = _restricted_prior(prior, infinite)
-    finite = np.isfinite(hyperparameters.log_smoothing)
-    start_coefficients = allowed.T @ hyperparameters.coefficients
-    _value, start_gradient, start_hessian = _penalized(
-        view, _data_objective(view, start_coefficients, cavity, working_bytes), hyperparameters.log_smoothing[finite],
-        _penalty_matrix(view, hyperparameters.log_smoothing[finite]), start_coefficients,
-    )
-    start_decrement = 0.5 * float(start_gradient @ _ascent_direction(-start_hessian, start_gradient))
-    log_smoothing, coefficients, evidence, start_evidence = _maximize_evidence(
+    log_smoothing, coefficients, evidence = _maximize_evidence(
         prior, hyperparameters.log_smoothing, hyperparameters.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
     )
     final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
@@ -4268,12 +4249,8 @@ def hyper_step(
 
         return HyperStep(
             hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
-            penalized_objective=evidence.penalized_value,
             evidence=evidence.value,
-            newton_decrement=evidence.newton_decrement,
             smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
-            start_decrement=start_decrement,
-            evidence_gain=evidence.value - start_evidence.value,
             stationarity_steps=check.steps,
             stationarity_errors=check.error,
             stationarity_gain=check.gain,
@@ -4934,9 +4911,19 @@ def fit_hyperparameters(
                         "planned twice from one state")
             return None
         histories[model].append(float(remaining))
+        released = frozenset(
+            int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
+        )
+        # The weights' gain is read by its parts: a release's is never computed (``hyper_step``), and otherwise an
+        # infinite decrement is an indefinite difference curvature, as against a fold or the slopes' error.
+        weights = (
+            f"weights {step.stationarity_gain:.3g} (a release of blocks {sorted(released)})" if released else
+            f"weights {step.stationarity_gain:.3g} (decrement {step.stationarity_decrement:.3g}, fold {step.stationarity_fold:.3g}, "
+            f"exact-slope floor {step.stationarity_floor:.3g})"
+        )
         log(
             f"eb outer: model {model} plan {len(histories[model])}: predicted gain {predicted:.4g}, remaining {remaining:.4g} "
-            f"(state error {state.error:.3g}, step error {step.evidence_error:.3g}, weights {step.stationarity_gain:.3g}), "
+            f"(state error {state.error:.3g}, step error {step.evidence_error:.3g}, {weights}), "
             f"{iterations[model]} accepted steps, {halvings[model]} halvings so far"
         )
         if (
@@ -4951,9 +4938,6 @@ def fit_hyperparameters(
             log(f"eb outer: model {model} polishes before its trial: predicted {predicted:.4g} + remainder {remainders[model]:.3g} within the state's error {state.error:.3g}")
             return inner(model, step, remaining, True)
         entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
-        released = frozenset(
-            int(position) for position in np.flatnonzero(np.isfinite(step.hyperparameters.log_smoothing) & ~np.isfinite(hyperparameters[model].log_smoothing))
-        )
         if not released or entry.certifying:
             return entry
         assert not (released & frozenset().union(*refused_releases[model]))
