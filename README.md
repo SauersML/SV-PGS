@@ -25,7 +25,7 @@ What the workspace's outputs mean, and what they do not (the target, the effect 
 ## Status
 [docs/design/HANDOFF.md](docs/design/HANDOFF.md) has the current state and the ordered next steps; [docs/design/CAPABILITIES.md](docs/design/CAPABILITIES.md) has the requirements the public routes do not meet yet, each with the test that pins today's behaviour.
 - **On main:** the dosage store and its streamed reader, Stage 0, the EP-EB engine (`scale_mixture_ep.py`, with its local outer-loop diagnostics), the Stage 2 solves (`dual_solve.py`) and certified marginal variances (`marginal_variances.py`), the Stage 2 driver (`full_data_fit.py`), the small-n dense route (`small_n.py`), the fit/score API and its model artifact (`fit_model.py`, `artifact.py`, `cli.py`), scoring, the reliability and fusion models, the prior design, the cohort builder with typed sample IDs, the phenotypes and their measurement model, the evaluation tests, and two neutral benchmarks (`benchmarks/bench_real`, `benchmarks/bench_sim`) with SV-PGS's own method entry (`benchmarks/svpgs_method.py`).
-- **Deleted:** the old fitting path, in cutover steps C2–C8 ([CUTOVER.md](docs/design/CUTOVER.md)); it is recoverable from tag `archive/2026-09-19/old-path-final`.
+- **Deleted:** the old fitting path, in cutover steps C2–C8; it is recoverable from tag `archive/2026-09-19/old-path-final`.
 
 ## Install
 ```bash

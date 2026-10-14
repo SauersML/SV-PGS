@@ -77,7 +77,7 @@ Measurements carry the evidence tags defined in MODEL.md: `[sim-only]`, `[semi-r
 - **The headline is one pre-registered panel test with non-negative power weights.** Per-trait power is weak at 50k [sim-only: a power model].
 
 ## Engineering
-- **The new path replaces the old one, and superseded code is deleted.** About 74% of sv_pgs (48,616 of 65,304 lines at `c2a9443`) is slated for removal, in ordered commits C0–C8 ([CUTOVER.md](CUTOVER.md)).
+- **The new path replaces the old one, and superseded code is deleted.** About 74% of sv_pgs (48,616 of 65,304 lines at `c2a9443`) is slated for removal, in ordered commits C0–C8 (done; the old path is tag `archive/2026-09-19/old-path-final`).
 - **Landing:** every increment lands through the merge queue. The gate is the full suite on MSI (runq `cpu-node`) on the exact tip, under a memory ulimit, plus GPU tests when CUDA code changes. GitHub CI runs on main pushes as a secondary signal only (lead, 2026-09-19, after the user asked why GitHub CI was used when MSI is available).
 - **Compute:** development runs on MSI with public or synthetic data. Training runs in the dedicated AoU workspace through its in-perimeter launch path.
 - **All agents run on one model; helper subagents on other models are not used.**
