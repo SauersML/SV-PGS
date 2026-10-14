@@ -167,8 +167,9 @@ def test_a_beagle_style_plain_run_builds_every_step(workspace) -> None:
     np.testing.assert_allclose(
         np.load(run / "store" / "reported" / "chr22.npy"), [round(_reported_info(record), 2) for record in range(len(RECORDS))], rtol=np.finfo(np.float32).eps
     )
-    # One fit per (arm, trait): the run's one disease and one trait in both arms.
-    assert summaries["measurement"]["recalibrated"] and len(recorder.fit_calls) == 2 * len(ARMS)
+    # One fit request per arm, holding the run's one disease's and one trait's models (``fit_request``).
+    assert summaries["measurement"]["recalibrated"] and len(recorder.fit_calls) == len(ARMS)
+    assert all(len({name.split("/")[0] for name in request.model_names}) == 2 for request in recorder.fit_calls)
 
 
 GLIMPSE2 = _Tool(
