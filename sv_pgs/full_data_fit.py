@@ -1983,7 +1983,11 @@ class _FullDataMeanField:
         noise = float(self.noise[model])
 
         masked_covariates = self.gaussian.covariates * mask[:, None]
-        covariate_pinv = cupy.linalg.pinv(masked_covariates.T @ masked_covariates)
+        # (C'WC)^+ from the model's whitener, as the host sweep's projector (``dual_solve.covariate_whitener``: F F' on
+        # the numerical column space of W^1/2 C, from its own SVD), not a pseudo-inverse of the Gram, whose squared
+        # condition number and other rank cutoff gave the device another projector on near-collinear covariates.
+        factor = cupy.asarray(self.models.covariate_factor[model])
+        covariate_pinv = factor @ factor.T
         signs = cupy.asarray(self.sign)
         for tile, members, local in self._member_pieces(None):
             rows = cupy.asarray(members)
@@ -2144,28 +2148,50 @@ class _FullDataMeanField:
             nu = np.where(live, self.mean[:, model] / np.where(live, variance, 1.0) - self.shift[:, model], 0.0)
         return omega, tau, nu, live
 
-    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters], models: Sequence[int] | None = None) -> list[FixedPoint | None]:
+    def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
-        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x).
+        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x), with the dual
+        solver factored at q's sites, which the fixed points' responses read (``_fixed_point``).
 
         A model still at the fixed point this oracle last returned for it, asked at the same hyperparameters, keeps that
         point unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a
         model whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``), and a model fitted
         alone is not solved again there. A call where every model is so solves them all, as before: the outer loop's last
-        call, which leaves the oracle at the returned points by solving there once more. ``models`` solves those models
-        alone and leaves every other one as it is, with no point (the mode mixture's later orders, which a model that has
-        settled no longer joins, ``_mode_mixture``)."""
+        call, which leaves the oracle at the returned points by solving there once more."""
         held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
-            if models is None and point is not None and state is point[1]
+            if point is not None and state is point[1]
             and np.array_equal(point[0].coefficients, hyperparameters[model].coefficients)
             and np.array_equal(point[0].log_smoothing, hyperparameters[model].log_smoothing)
         ]
         if len(held) == self.model_count:
             held = []
-        solving = [model for model in range(self.model_count) if model not in held and (models is None or model in models)]
+        solving = [model for model in range(self.model_count) if model not in held]
         if held:
             log(f"mean-field oracle: models {', '.join(str(model) for model in held)} keep their fixed points; solving {', '.join(str(model) for model in solving)}")
+        entry = self._solved(hyperparameters, solving)
+        if entry is None:
+            return [None] * self.model_count
+        try:
+            self._iterate(self.site_precision, self.site_shift, self.noise)
+        except np.linalg.LinAlgError as error:
+            self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
+            for model, state in zip(solving, entry):
+                self._restore_state(state, model)
+            return [None] * self.model_count
+        del entry
+        self.refreshes += 1
+        for model in solving:
+            if self.elbo[model] > self.best_elbo[model]:
+                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
+        return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+
+    def _solved(self, hyperparameters: Sequence[MixtureHyperparameters], solving: Sequence[int]) -> list[_ModelState] | None:
+        """The models ``solving`` each at the fixed point of the higher ELBO between the solve from the carried state and,
+        after this oracle's first call, the solve from the start, every other model left as it is; the solved models'
+        entry states (which a refusal of the call puts back), or None where some model reaches no fixed point (the trial
+        is refused whole, as EP's oracle refuses, and every one is put back). No dual-solver factor: the mode mixture's
+        orders take only this, since nothing of the mixture reads one (``_mode_mixture``)."""
         entry = [self._state(model) for model in solving]
         first = self.refreshes == 0
         candidates: list[list[_ModelState]] = [[] for _ in range(self.model_count)]
@@ -2189,42 +2215,16 @@ class _FullDataMeanField:
                     budgets[model] = self.passes - before
                 candidates[model].append(self._state(model))
         if any(not candidates[model] for model in solving):
-            # No start reaches some model's fixed point: the trial is refused whole, as EP's oracle refuses.
             for model, state in zip(solving, entry):
                 self._restore_state(state, model)
-            return [None] * self.model_count
+            return None
         for model in solving:
             self._restore_state(max(candidates[model], key=lambda state: state.elbo), model)
         del candidates
         for model in range(self.model_count):
             omega, _tau, _nu, _live = self._sites(model)
             self.effective[model] = max(float(np.sum(omega * self.variance[:, model])), _EPSILON * self.prior.variant_count)
-        try:
-            self._iterate(self.site_precision, self.site_shift, self.noise)
-        except np.linalg.LinAlgError as error:
-            self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
-            for model, state in zip(solving, entry):
-                self._restore_state(state, model)
-            return [None] * self.model_count
-        del entry
-        self.refreshes += 1
-        for model in solving:
-            if self.elbo[model] > self.best_elbo[model]:
-                self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
-        return [
-            self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) if model in solving else None
-            for model in range(self.model_count)
-        ]
-
-    def _take(self, other: "_FullDataMeanField", model: int) -> None:
-        """Model ``model`` at ``other``'s state, ``other`` an oracle of the same fit (the mode mixture's main fixed point,
-        held by a later order's oracle for a model that has settled, so its dual solver factors at that model's sites)."""
-        self._restore_state(_ModelState(
-            mean=other.mean[:, model], variance=other.variance[:, model], shift=other.shift[:, model], third=other.third[:, model],
-            fourth=other.fourth[:, model], residual=other.residual[model], noise=float(other.noise[model]), effective=float(other.effective[model]),
-            mean_move=float(other.mean_move[model]), noise_gain=float(other.noise_gain[model]), elbo=float(other.elbo[model]), version=other.version,
-            sites=other.sites[model],
-        ), model)
+        return entry
 
     def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[tuple[MixtureHyperparameters, ...], BoolArray]:
         """Each model back at its highest-ELBO refreshed state where that is above where the outer loop ended by more than
@@ -2938,8 +2938,12 @@ def _mode_mixture(
 
     Each model's mixture is its own, as when it is fitted alone: its components, their weights, the repeat test, the
     settling test and the budget are its own, and once it has settled the later orders solve only the models that have
-    not (``__call__``'s ``models``), the settled ones held at the main fixed point. A model with fewer components than
-    its group's most has the rest at weight zero."""
+    not, the settled ones left unsolved there. A model with fewer components than its group's most has the rest at
+    weight zero.
+
+    The ridge start and the orders are solved and never factored by the dual solver (``_FullDataMeanField._solved``):
+    nothing here reads a factor, neither a component's state nor the repeat and settling tests (sample-space images),
+    nor a binary component (its reads of the store), and the main fixed point's own factor is put back at the end."""
     count = main.model_count
     # Per model, per component: its mean, (shift, omega), ELBO, ``BinaryComponent`` (None for a quantitative model),
     # mean move and noise gain.
@@ -2999,11 +3003,10 @@ def _mode_mixture(
             ),
             sites=list(main.sites),
         )
-        points = ridge(list(hyperparameters))
-        if not any(point is None for point in points):
+        if ridge._solved(list(hyperparameters), list(range(count))) is not None:
             admit(ridge, range(count))
             average = [weighted(model)[0] for model in range(count)]
-        del ridge, points
+        del ridge
     settled = np.zeros(count, dtype=bool)
     unresolved = np.zeros(count, dtype=np.int64)
     refusals: list[str] = []
@@ -3015,14 +3018,12 @@ def _mode_mixture(
             gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters), main.noise.copy(), order_seed=component, **main._siblings,
             sites=list(main.sites),
         )
-        for model in np.flatnonzero(settled):
-            oracle._take(main, int(model))
-        points = oracle(list(hyperparameters), models=searching)
+        solved = oracle._solved(list(hyperparameters), searching)
         unresolved += oracle.unresolved
-        if any(points[model] is None for model in searching):
+        if solved is None:
             continue
         admit(oracle, searching)
-        del oracle, points
+        del oracle, solved
         for model in searching:
             updated = weighted(model)[0]
             settled[model] = main._fitted_square(updated - average[model], model) / float(main.noise[model]) <= 1.0 / draw_count

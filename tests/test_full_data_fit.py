@@ -408,3 +408,47 @@ def test_a_group_s_mode_mixture_is_each_model_s_own(tmp_path: Path) -> None:
         assert np.all(together.weights[count:, column] == 0.0)
         np.testing.assert_allclose(together.mean[:, column], alone.mean[:, 0], rtol=1e-10, atol=1e-12)
         assert together.unresolved[column] == alone.unresolved[0]
+
+
+def test_the_mode_mixture_reads_no_dual_solver_factor_of_its_orders(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mode mixture's ridge start and orders are solved and never factored by the dual solver
+    (``_FullDataMeanField._solved``), since nothing of the mixture reads a factor: factoring the dual solver at an order's
+    sites, as an oracle's call does, leaves every part of the mixture as it is, bit for bit, and the only factor the
+    mixture makes is the main fixed point's own, put back at its end."""
+    from sv_pgs.full_data_fit import _FullDataMeanField, _mode_mixture
+
+    oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
+    iterate, solved = _FullDataMeanField._iterate, _FullDataMeanField._solved
+    factored: list[object] = []
+    mains: list[object] = []
+
+    def counted(self, *arguments):
+        factored.append(self)
+        return iterate(self, *arguments)
+
+    def mixture():
+        main = oracle_of([0, 1])
+        mains.append(main)
+        assert all(point is not None for point in main(list(starts)))
+        factored.clear()
+        return main, _mode_mixture(main, main.gaussian, statistics, prior, _DRAWS, 1 << 22, 13, tuple(starts))
+
+    monkeypatch.setattr(_FullDataMeanField, "_iterate", counted)
+    main, plain = mixture()
+    assert factored == [main]
+
+    def factoring(self, hyperparameters, solving):
+        # The ridge start and an order every model joins, factored as an oracle's call factors it (the main fixed
+        # point's own call is factored once, as before).
+        entry = solved(self, hyperparameters, solving)
+        if entry is not None and self is not mains[-1] and len(solving) == self.model_count:
+            iterate(self, self.site_precision, self.site_shift, self.noise)
+        return entry
+
+    monkeypatch.setattr(_FullDataMeanField, "_solved", factoring)
+    _main, again = mixture()
+    for name in ("mean", "weights", "counts", "mean_move", "noise_gain", "unresolved"):
+        np.testing.assert_array_equal(getattr(again, name), getattr(plain, name))
+    for (shift, omega), (plain_shift, plain_omega) in zip(again.components, plain.components, strict=True):
+        np.testing.assert_array_equal(shift, plain_shift)
+        np.testing.assert_array_equal(omega, plain_omega)
