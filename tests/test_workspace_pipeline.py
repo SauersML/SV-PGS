@@ -1027,7 +1027,7 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
     assert (len(config.diseases), len(config.traits), config.fold_count) == (15, 0, 5) and config.truth_calls is None
     # The direct channel reads the CDR's GATK-SV call set, one VCF per chromosome (CDR_LAYOUT.md).
     assert config.direct_sv is not None and config.direct_sv.gatksv_calls == (
-        "cdr_storage_path/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
+        "/mnt/disks/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
     )
     # Every catalogued disease, in the catalogue's order (the study abstract's five first, hypertension leading).
     assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS)

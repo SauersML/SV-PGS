@@ -28,6 +28,17 @@ python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" -
   --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
+if [ "$job" = store ]; then
+  # The store job reads the CDR's GATK-SV call set (run config direct_sv) through a read-only mount of the workspace's
+  # CDR bucket, CDR_STORAGE_PATH (gs://<bucket>/<release>), billed to the workspace project.
+  : "${CDR_STORAGE_PATH:?}" "${GOOGLE_PROJECT:?}"
+  if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
+    echo "CDR_STORAGE_PATH must be the workspace's gs:// CDR path" >&2; exit 2
+  fi
+  CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
+  export CDR_BUCKET="${CDR_BUCKET%/}"
+  variables+=(CDR_BUCKET GOOGLE_PROJECT)
+fi
 python3 "$here/budget_guard.py" render --template "$here/job_${job}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script, so another submission cannot change it underneath a running job.
 python3 - "$stage/job.json" "$BUDGET_SLOT" <<'PY'

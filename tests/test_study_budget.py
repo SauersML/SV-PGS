@@ -117,8 +117,9 @@ def test_render_preserves_runtime_variables_and_refuses_shell_injection(tmp_path
         guard.render(template, output, ["RUN_ID"])
 
 
-def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
-    """Exercise the real shell/CLI integration against a local fake gcloud, never a cloud account."""
+def _fake_cloud(tmp_path):
+    """A local fake gcloud (storage cp/cat with generation preconditions, batch submit), never a cloud account, and the
+    launcher's environment pointing at it."""
     executable = tmp_path / "gcloud"
     executable.write_text(f"#!{sys.executable}\n" + '''
 import json, os, sys
@@ -153,6 +154,12 @@ else:
         GPU_COUNT="1", NETWORK="network", SUBNETWORK="subnetwork", SERVICE_ACCOUNT="account@example.test",
         MAX_RETRIES="0", STUDY_BUDGET=str(launcher.with_name("study_budget.template.json")),
     )
+    return launcher, environment
+
+
+def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
+    """Exercise the real shell/CLI integration against a local fake gcloud, never a cloud account."""
+    launcher, environment = _fake_cloud(tmp_path)
     first = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
     assert first.returncode == 0, first.stderr
     second = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
@@ -163,3 +170,19 @@ else:
     guard.validate_job(spec, 146400, 0)
     script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
     assert "$RUN/venv/bin/sv-pgs" in script and "${status}" in script and "${RUN_ID}" not in script
+
+
+def test_the_store_job_mounts_the_workspace_cdr_read_only(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="direct_sv", BUDGET_SLOT="prepare", MACHINE_TYPE="n2d-standard-32")
+    environment.pop("CDR_STORAGE_PATH", None)
+    refused = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "CDR_STORAGE_PATH" in refused.stderr
+    environment["CDR_STORAGE_PATH"] = "gs://fc-aou-datasets-controlled/v8/"
+    submitted = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    volumes = {volume["mountPath"]: volume for volume in spec["taskGroups"][0]["taskSpec"]["volumes"]}
+    cdr = volumes["/mnt/disks/cdr"]
+    assert cdr["gcs"]["remotePath"] == "fc-aou-datasets-controlled/v8"
+    assert "-o ro" in cdr["mountOptions"] and "--billing-project=test-project" in cdr["mountOptions"]
