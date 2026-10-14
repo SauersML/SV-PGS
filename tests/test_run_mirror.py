@@ -29,6 +29,7 @@ def _run(root: Path) -> Path:
     _write(root / "samples" / COMPLETE_FILE, '{"key": "a"}')
     _write(root / "store" / "store" / "chunk" / "0", np.arange(64, dtype=np.uint8).tobytes())
     _write(root / "store" / COMPLETE_FILE, '{"key": "b"}')
+    (root / "store" / "calibration").mkdir()
     _write(root / "store.superseded-0123" / COMPLETE_FILE, '{"key": "old"}')
     partial = root / "fit.partial"
     _write(partial / KEY_FILE, "fitkey")
@@ -52,6 +53,20 @@ def test_a_restore_brings_back_completed_steps_and_the_fit_s_durable_progress_on
         and "scratch" not in name and "/." not in name and "/gout/" not in name
     }
     assert _tree(restored) == expected
+    assert (restored / "store" / "calibration").is_dir()
+
+
+def test_a_step_made_again_under_another_key_drops_its_stale_mirrored_copy(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    # The driver sets the completed store aside and makes it again: the mirror must not restore the old one over it.
+    (run / "store").rename(run / "store.superseded-b")
+    _write(run / "store.partial" / KEY_FILE, "newstore")
+    push(run, remote)
+    restored = tmp_path / "restored"
+    restore(restored, remote)
+    assert not (restored / "store").exists() and (restored / "store.partial" / KEY_FILE).read_text() == "newstore"
 
 
 def test_a_push_sends_only_what_changed_and_a_finished_step_drops_its_partial(tmp_path: Path) -> None:

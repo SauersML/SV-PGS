@@ -19,6 +19,7 @@ completes, so a mirrored file is whole or absent.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -36,6 +37,9 @@ RESTORING = ".restoring"
 CHECKPOINTS = "work/*/checkpoints/*/*.npz"
 """The engine's checkpoints in the fit step's partial: <arm>'s work directory, checkpoints/<key>/model<i>.npz
 (``stage2_wiring.fit_models``)."""
+DIRECTORIES = ".directories.json"
+"""Beside a mirrored step, its directories, which GCS keeps only as the prefixes of objects: an empty one is
+restored from this list."""
 RECORDS = "models/*/*.json"
 """The fit step's saved-model records in its partial: models/<arm>/<trait>.json, written after models/<arm>/<trait>."""
 
@@ -48,6 +52,8 @@ class Remote(Protocol):
     def read(self, name: str) -> bytes | None: ...
 
     def upload(self, path: Path, name: str) -> None: ...
+
+    def write(self, name: str, content: bytes) -> None: ...
 
     def download(self, name: str, path: Path) -> None: ...
 
@@ -85,6 +91,9 @@ class GcsRemote:
     def upload(self, path: Path, name: str) -> None:
         self._bucket.blob(self._root + name).upload_from_filename(str(path))
 
+    def write(self, name: str, content: bytes) -> None:
+        self._bucket.blob(self._root + name).upload_from_string(content)
+
     def download(self, name: str, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._bucket.blob(self._root + name).download_to_filename(str(path))
@@ -116,6 +125,13 @@ class DirectoryRemote:
         target.parent.mkdir(parents=True, exist_ok=True)
         aside = target.with_name(f".{target.name}.upload")
         shutil.copyfile(path, aside)
+        os.replace(aside, target)
+
+    def write(self, name: str, content: bytes) -> None:
+        target = self._root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        aside = target.with_name(f".{target.name}.upload")
+        aside.write_bytes(content)
         os.replace(aside, target)
 
     def download(self, name: str, path: Path) -> None:
@@ -152,6 +168,8 @@ def _push_step(remote: Remote, final: Path, name: str) -> None:
         return
     remote.delete(remote.sizes(f"{name}/"))
     files = [path for path in _files(final) if path != marker]
+    directories = sorted(path.relative_to(final).as_posix() for path in final.rglob("*") if path.is_dir())
+    remote.write(f"{name}{DIRECTORIES}", json.dumps(directories).encode())
     _transfer([(path, f"{name}/{path.relative_to(final).as_posix()}") for path in files], remote.upload)
     if marker.read_bytes() != content:
         raise FileNotFoundError(f"{final} was replaced while it was pushed.")
@@ -173,7 +191,11 @@ def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
     return units
 
 
-def _push_partial(remote: Remote, partial: Path, name: str) -> None:
+def _push_partial(remote: Remote, partial: Path, step: str) -> None:
+    # The driver set the step's completed directory aside to make it again under another key, so the mirrored one is
+    # stale: restored, it would take the partial's place.
+    remote.delete(remote.sizes(f"{step}/"))
+    name = f"{step}{PARTIAL}"
     key = (partial / KEY_FILE).read_bytes()
     if remote.read(f"{name}/{KEY_FILE}") != key:
         remote.delete(remote.sizes(f"{name}/"))
@@ -201,7 +223,7 @@ def push(run_directory: Path, remote: Remote) -> None:
             if (final / COMPLETE_FILE).is_file():
                 _push_step(remote, final, step)
             elif (partial / KEY_FILE).is_file():
-                _push_partial(remote, partial, f"{step}{PARTIAL}")
+                _push_partial(remote, partial, step)
         except FileNotFoundError as moved:
             LOGGER.info("run mirror: %s moved during the push (%s); it is pushed next time", step, moved)
 
@@ -248,6 +270,10 @@ def restore(run_directory: Path, remote: Remote) -> None:
         aside = run_directory / f"{name}{RESTORING}"
         if aside.exists():
             shutil.rmtree(aside)
+        aside.mkdir()
+        listed = remote.read(f"{name}{DIRECTORIES}") if target == final else None
+        for directory in json.loads(listed) if listed is not None else []:
+            (aside / directory).mkdir(parents=True, exist_ok=True)
         _transfer([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen], lambda path, entry: remote.download(entry, path))
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s, %d files, %.1f GB", name, len(chosen), sum(names[entry] for entry in chosen) / 1e9)
