@@ -240,6 +240,16 @@ The step reads the measurement step's store (D* where it recalibrated) and its p
 ### How the channel enters the measurement model (built: the no-truth form, no fusion)
 
 - **No fusion.** `fit_model.fit` takes no leakage map, so no map is fitted. Each pair stays two columns, kept in one unbreakable group. The certificate says `direct_calls_fused: 0`.
+- **Precondition for any fusion: truth pairs.** These are long-read panel members with an imputed D*, a GATK-SV call and a long-read truth at the imputed site. The template sets `truth_calls: null`, so the study's config cannot fuse whatever the code does.
+- **The separate-rows form is sound meanwhile.** The span of {D*, B} contains E_lin[G | D*, B], so the joint regression can reach the fused predictor, and `group_first` keeps each pair in one block, so the engine sees their correlation exactly. Predictions are not biased. Its costs:
+  - **Efficiency:** the pair's split of the effect is learned from y, not fixed by truth pairs, so a weak effect's split is unresolved and the sparse prior tends to put it on one column.
+  - **Prior:** one event gets two r²-scaled priors, about (r²_A + r²_B) τ² rather than τ², which the empirical Bayes τ² partly absorbs.
+  - **Interpretation:** an event shows two effects in the effects tables, and neither column's P(effect > 0) is the event's.
+  - **Mean field:** the default route's product approximation understates a strongly correlated pair's posterior variance and can favour one column.
+- **What fusion would gain:** genotype r², not measured PGS accuracy: bench-sim's fused 0.77–0.80 against 0.69–0.73 for D* alone (Measured, below), on paired events only: roughly 1–10 kb DEL, DUP and INS. A copy-number row never pairs (no imputed record is a copy number), so the CNVs gain nothing from fusion; they already enter as columns of their own.
+- **Two routes, neither built:**
+  - **(B) in the store, the one to build first if `truth_calls` becomes available.** A pooled pair map E_lin[T | D*, B] (`fit_leakage_map` on the two columns) writes the fused value into the imputed record's row: from D* and B where B is called, from D* alone (κ_A) where it is not, which a column map cannot express. The target gets its mapped share as its offset and the direct row −inf. No fit change is needed.
+  - **(A) in the fit, the spec's A = I + E.** `FitRequest` takes the maps; Stage 0 forms A'GA; the Stage 2 operator applies X A; scoring and effects fold A into the coefficients. It is needed only for the block-wide leakage map or for artifacts that score new genomes from D* and B.
 - **Each direct row's reliability** is the offset the fit uses. Every direct row is uncalibrated: no truth pair is formed for a GATK-SV row. Its reported r² goes through `fit_measurement_model`'s no-truth path in each ancestry group: offset log r², and −inf where the column does not vary over the group's fitted rows. That path uses the group's fitted-row moments in the row's own units (copies for a copy number). `pooled_measurement_model` then pools the groups, as the measurement step pools the imputed records. The reported r² (`gatksv_store_rows.reported_reliability`, over the store's called samples) is:
   - **a hard-call ALT count:** 1, the call set's own claim of exactness, with no genotype likelihoods to give a better number;
   - **a copy number:** the CNQ bound. Each called sample's miscall probability is ε_i = 10^(−Q_i/10), with Q_i the phred quality of its copy number, and a miscall moves the copy number by at least one copy. That gives r² ≤ 1 − Σ_i ε_i / (n · Var(called CN)), an upper bound;
@@ -272,4 +282,6 @@ R and N are not in these docs; both figures are assumptions to check against the
 
 The merge reads and writes the store once more. At `assemble_half`'s measured 6.3·10⁷ genotypes/s, that is about 7.5 core-hours at the design workload.
 
-The chromosomes run in parallel, so the wall time is the largest chromosome's. The step needs one more store's worth of disk: `direct_sv/store`, beside the store step's (and the measurement step's, where it recalibrated).
+The chromosomes run in parallel, at most 22 processes, so the wall time is the largest chromosome's. With chr1 holding about 8% of the records [est], that is 0.7 to 11 h for the range above. The VM is billed whole, so a machine of about 32 vCPUs fits this step better than the store's.
+
+The step needs one more store's worth of disk: `direct_sv/store`, beside the store step's (and the measurement step's, where it recalibrated). The added rows alone are R_kept·n bytes before zstd: 100 GB at R = 10⁶, n = 10⁵ [est]. A chromosome's blocks of rows are held uncompressed until it is written.
