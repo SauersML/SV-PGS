@@ -17,6 +17,7 @@ import inspect
 import json
 import pickle
 import re
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,6 +44,7 @@ from sv_pgs.store_converter import linear_recalibration, refalt_digest, tr_loci,
 from sv_pgs import workspace_pipeline
 from sv_pgs.workspace_pipeline import (
     ARMS,
+    COMPLETE_FILE,
     STEP_NAMES,
     StrataSites,
     WorkspaceBindings,
@@ -790,6 +792,30 @@ def test_a_quarantined_fit_is_named_by_the_fit_step_and_refused_before_the_store
     assert not (config.run_directory / "score").exists()
 
 
+def test_a_run_restored_from_its_mirror_on_a_new_disk_resumes_where_it_was_preempted(workspace) -> None:
+    """Each Batch job has a new disk (run_mirror): a job preempted during the second arm's fit, whose run was pushed,
+    resumes on an empty run directory restored from the mirror, fitting only that arm."""
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    remote = DirectoryRemote(config.run_directory.with_name("mirror"))
+    with pytest.raises(RuntimeError, match="preempted"):
+        run_pipeline(config, _bindings(_Recorder(fits_before_failing=1), client), BUDGET)
+    push(config.run_directory, remote)
+    shutil.rmtree(config.run_directory)
+    restore(config.run_directory, remote)
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET)
+    assert len(recorder.fit_calls) == len(ARMS) - 1 and (config.run_directory / "export" / COMPLETE_FILE).is_file()
+    push(config.run_directory, remote)
+    shutil.rmtree(config.run_directory)
+    restore(config.run_directory, remote)
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET)
+    assert recorder.fit_calls == []
+
+
 def test_without_truth_calls_the_run_says_so_and_keeps_the_stored_dosages(workspace) -> None:
     synthetic, client = workspace
     two_threads = dataclasses.replace(BUDGET, cpu_threads=2)
@@ -1037,7 +1063,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launcher" / "workspace"
 def _filled(text: str) -> str:
     """A template with its numeric placeholders set to 1, the two half labels to A and B, and every other
     placeholder to its own name in lower case."""
-    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
+    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("RUN_DISK_GB", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
         text = text.replace("${" + name + "}", value)
     return re.sub(r"\$\{([A-Z_]+)\}", lambda match: match.group(1).lower(), text)
 

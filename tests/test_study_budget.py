@@ -148,7 +148,7 @@ else:
     environment = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"], FAKE_CLOUD=str(tmp_path))
     environment.update(
         PROJECT_ID="test-project", REGION="us-central1", ZONE="us-central1-a", OPS_BUCKET="workspace",
-        RUN_ID="study", RUN_DISK="disk", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
+        RUN_ID="study", RUN_DISK_GB="2000", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
         WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu",
         MACHINE_TYPE="a2-highgpu-1g", PROVISIONING_MODEL="SPOT", GPU_TYPE="nvidia-tesla-a100",
         GPU_COUNT="1", NETWORK="network", SUBNETWORK="subnetwork", SERVICE_ACCOUNT="account@example.test",
@@ -170,11 +170,29 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     guard.validate_job(spec, 146400, 0)
     script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
     assert "$RUN/venv/bin/sv-pgs" in script and "${status}" in script and "${RUN_ID}" not in script
-    # The fit job shares the store job's run disk and venv, so its sync with the GPU extras runs on every start, outside
-    # the one-time staging copy, and a GPU it cannot reach stops it before the pipeline starts.
+    # The sync with the GPU extras runs on every start, outside the one-time staging copy, and a GPU the job cannot
+    # reach stops it before the pipeline starts.
     staging_end = script.index("\nfi\n", script.index('if [ ! -f "$RUN/tools/staged" ]'))
     assert script.index("sync --project") > staging_end and "sync --project" in script and "--extra gpu" in script
     assert script.index("exit-no-gpu") < script.index("workspace-run")
+    # Batch cannot write to an existing disk: the job's disk is new, and the run is restored from the workspace bucket
+    # before the driver and pushed back after it.
+    assert script.index("mirror restore") < script.index("workspace-run") < script.rindex("mirror push")
+    assert '--mirror "gs://workspace/svpgs/study/run"' in script
+    task = spec["taskGroups"][0]["taskSpec"]
+    assert task["runnables"][0]["script"]["text"] == "bash /mnt/disks/ops/svpgs/study/launcher/pilot/run_step.sh"
+    assert spec["logsPolicy"]["logsPath"] == "/mnt/disks/ops/svpgs/study/launcher/pilot/batch.log"
+    (disk,) = spec["allocationPolicy"]["instances"][0]["policy"]["disks"]
+    assert disk == {"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": 2000}}
+    ops = next(volume for volume in task["volumes"] if volume["mountPath"] == "/mnt/disks/ops")
+    assert ops["mountOptions"] == ["--implicit-dirs"]
+
+
+def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment["RUN_DISK_GB"] = "2T"
+    refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "RUN_DISK_GB" in refused.stderr and not (tmp_path / "submitted.jsonl").exists()
 
 
 def test_the_store_job_mounts_the_workspace_cdr_read_only(tmp_path):

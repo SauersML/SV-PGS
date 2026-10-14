@@ -17,6 +17,9 @@ here="$(cd "$(dirname "$0")" && pwd)"
 : "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?}" "${RUN_ID:?}" "${HOURLY_USD:?}" "${THROUGH:?}" "${BUDGET_SLOT:?}"
 STUDY_BUDGET="${STUDY_BUDGET:-$here/study_budget.template.json}"
 MAX_RETRIES="${MAX_RETRIES:-0}"
+if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
+fi
 if [[ ! "$RUN_ID" =~ ^[a-z][a-z0-9-]{0,25}$ ]]; then
   echo "RUN_ID must be a lowercase study ID, at most 26 characters; keep it across restarts" >&2; exit 2
 fi
@@ -25,8 +28,8 @@ export MAX_RUN_SECONDS MAX_RETRIES
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS
-variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET
+variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
 if [ "$job" = store ]; then
   # The store job reads the CDR's GATK-SV call set (run config direct_sv) through a read-only mount of the workspace's
@@ -40,14 +43,16 @@ if [ "$job" = store ]; then
   variables+=(CDR_BUCKET GOOGLE_PROJECT)
 fi
 python3 "$here/budget_guard.py" render --template "$here/job_${job}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
-# Each submitted job keeps its own task script, so another submission cannot change it underneath a running job.
+# Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
+# running job.
 python3 - "$stage/job.json" "$BUDGET_SLOT" <<'PY'
 import json, sys
 from pathlib import Path
 path = Path(sys.argv[1])
 spec = json.loads(path.read_text())
 script = spec["taskGroups"][0]["taskSpec"]["runnables"][0]["script"]
-script["path"] = script["path"].replace("/launcher/run_step.sh", f"/launcher/{sys.argv[2]}/run_step.sh")
+script["text"] = script["text"].replace("/launcher/run_step.sh", f"/launcher/{sys.argv[2]}/run_step.sh")
+spec["logsPolicy"]["logsPath"] = spec["logsPolicy"]["logsPath"].replace("/launcher/batch.log", f"/launcher/{sys.argv[2]}/batch.log")
 path.write_text(json.dumps(spec))
 PY
 python3 "$here/budget_guard.py" reserve --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" \

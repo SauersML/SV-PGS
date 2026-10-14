@@ -58,6 +58,8 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('cli.py', 'main'): ('spec', frozenset({130}), 'POSIX exit status 128 + SIGINT'),
     ('phenotype_measurement.py', 'READING_ROUNDINGS'): ('derived', frozenset({8}), "a recorded value's rounded float64 operations before the model (unit conversion, a same-day mean's sum and division), each at most half an ulp, with margin; Higham 2002 section 2.2"),
     ('workspace_pipeline.py', '_fit_step'): ('unit', frozenset({3600.0}), 'seconds per hour'),
+    ('run_mirror.py', '_push_step'): ('unit', frozenset({1e9}), 'bytes per GB'),
+    ('run_mirror.py', 'restore'): ('unit', frozenset({1e9}), 'bytes per GB'),
     ('workspace_pipeline.py', 'score_batches'): ('derived', frozenset({4}), "the host shared four ways: the loaded models, the scorer's per-model plan positions, its accumulators, and its read-ahead buffers"),
     ('gatksv_store_rows.py', 'PHRED_SCALE'): ('definitional', frozenset({10.0}), 'the phred scale of a genotype quality: Q = -10 log10 P(miscall) (Ewing and Green 1998, Genome Res 8:186)'),
     ('workspace_pipeline.py', '_MERGED_COPIES'): ('derived', frozenset({3}), "byte accounting of a merged code block: the imputed rows read, the direct rows read and the block itself, one byte per entry each"),

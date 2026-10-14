@@ -19,8 +19,8 @@ if [ ! -f "$RUN/tools/staged" ]; then
     && chmod +x "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
     || { mark "exit-install"; exit 1; }
 fi
-# Every job syncs, since the CPU and GPU jobs share the run disk and its venv but not their extras: the GPU job's
-# --extra gpu adds CuPy and the CUDA wheels to the venv the CPU job built, and an exact sync is quick when nothing changes.
+# Every start syncs: a retried task can find the venv a preempted attempt left half built, and the sync adds only what
+# this job's extras (the GPU job's --extra gpu: CuPy and the CUDA wheels) need.
 UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
   "$RUN/tools/uv" sync --project "$OPS/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
   || { mark "exit-install"; exit 1; }
@@ -31,8 +31,21 @@ case "${UV_EXTRAS}" in
 esac
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
 mkdir -p "$TMPDIR"
+# Batch cannot write to an existing disk, so this job's disk is new and the run lives in the workspace bucket
+# (sv_pgs/run_mirror.py): restored before the driver starts, pushed every 15 minutes while it runs (each push sends
+# only new checkpoints and finished steps), and pushed once more after it exits. A preemption loses at most the fit
+# progress since the last push. flock keeps one push at a time.
+mirror() {
+  flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run"
+}
+mirror restore || { mark "exit-restore"; exit 1; }
+( while sleep 900; do mirror push || mark "push-failed"; done ) &
+pusher=$!
 "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" &
 wait $!
 status=$?
+kill "$pusher"
+# A run whose last push failed did not keep its results: the job fails even if the driver finished.
+mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
 mark "exit-${status}"
 exit "$status"

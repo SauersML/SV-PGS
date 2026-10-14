@@ -3,7 +3,7 @@
     {
       "taskCount": 1,
       "taskSpec": {
-        "runnables": [{"script": {"path": "/mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
+        "runnables": [{"script": {"text": "bash /mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
         "maxRetryCount": ${MAX_RETRIES},
         "maxRunDuration": "${MAX_RUN_SECONDS}s",
         "lifecyclePolicies": [
@@ -11,7 +11,7 @@
           {"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}
         ],
         "volumes": [
-          {"gcs": {"remotePath": "${OPS_BUCKET}"}, "mountPath": "/mnt/disks/ops"},
+          {"gcs": {"remotePath": "${OPS_BUCKET}"}, "mountPath": "/mnt/disks/ops", "mountOptions": ["--implicit-dirs"]},
           {"deviceName": "run", "mountPath": "/mnt/disks/run", "mountOptions": "rw,async"}
         ]
       }
@@ -25,7 +25,7 @@
           "machineType": "${MACHINE_TYPE}",
           "provisioningModel": "${PROVISIONING_MODEL}",
           "accelerators": [{"type": "${GPU_TYPE}", "count": ${GPU_COUNT}}],
-          "disks": [{"deviceName": "run", "existingDisk": "projects/${PROJECT_ID}/zones/${ZONE}/disks/${RUN_DISK}"}]
+          "disks": [{"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": ${RUN_DISK_GB}}}]
         }
       }
     ],
@@ -41,5 +41,5 @@
     },
     "serviceAccount": {"email": "${SERVICE_ACCOUNT}"}
   },
-  "logsPolicy": {"destination": "PATH", "logsPath": "/mnt/disks/run/logs"}
+  "logsPolicy": {"destination": "PATH", "logsPath": "/mnt/disks/ops/svpgs/${RUN_ID}/launcher/batch.log"}
 }

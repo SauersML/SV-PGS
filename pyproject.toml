@@ -34,6 +34,8 @@ dependencies = [
     "numba>=0.60",
     # The prior's annotation smooths: B-spline bases and their exact derivative roughness penalties (gamfit.basis).
     "gamfit==0.1.272",
+    # The run mirror (sv_pgs/run_mirror.py): a Batch job's disk ends with it, so the run lives in the workspace bucket.
+    "google-cloud-storage>=2.18",
 ]
 
 [project.optional-dependencies]

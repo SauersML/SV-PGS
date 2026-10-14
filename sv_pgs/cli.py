@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError
@@ -106,6 +107,17 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_parser.add_argument("--config", required=True, help="The run config JSON supplied inside the workspace.")
     workspace_parser.add_argument("--through", choices=STEP_NAMES, default=None, help="Stop after this step.")
 
+    mirror_parser = subparsers.add_parser(
+        "run-mirror",
+        help=(
+            "Copy a workspace run's durable state to its gs:// mirror (push) or from it into a new run directory "
+            "(restore), which carries the run from one Batch job to the next (sv_pgs/run_mirror.py)."
+        ),
+    )
+    mirror_parser.add_argument("action", choices=("push", "restore"))
+    mirror_parser.add_argument("--config", required=True, help="The run config JSON, whose run_directory is mirrored.")
+    mirror_parser.add_argument("--mirror", required=True, help="The mirror, gs://<workspace bucket>/<prefix>.")
+
     subparsers.add_parser(
         "version",
         help="Print sv-pgs package version and git commit sha.",
@@ -174,6 +186,12 @@ def _main_impl(argv: list[str] | None = None) -> int:
             print(f"{step}\tcomplete")
         return 0
 
+    if args.command == "run-mirror":
+        from sv_pgs.run_mirror import GcsRemote, push, restore
+
+        (push if args.action == "push" else restore)(WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror))
+        return 0
+
     if args.command == "census-all-of-us-traits":
         print("census\t" + str(prepare_all_of_us_measurement_census(Path(args.output))))
         return 0
@@ -202,6 +220,10 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # The package's progress records (fit times, store reads, checkpoint reuse) at INFO, on stderr, which a Batch job
+    # keeps in its logs; other libraries' only from WARNING.
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(name)s %(levelname)s %(message)s", stream=sys.stderr)
+    logging.getLogger("sv_pgs").setLevel(logging.INFO)
     try:
         return _main_impl(argv)
     except KeyboardInterrupt as exc:
