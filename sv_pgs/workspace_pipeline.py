@@ -3009,52 +3009,69 @@ def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
     return batches
 
 
+def _quarantined_traits(run: _Run, cohort: _Cohort) -> dict[str, list[str]]:
+    """The traits ``model_acceptance`` keeps out of scoring and reporting, each with its quarantined arms and their
+    models' fatal codes, from the acceptance each fit record holds (written when the fit ended). A trait is compared
+    across the arms, so a quarantined model in either arm takes the trait out of every table; every other trait is
+    scored and reported, so one uncertified fit among a run's models does not withhold the study's results."""
+    quarantined: dict[str, list[str]] = {}
+    for arm in ARMS:
+        for trait_name in cohort.trait_names:
+            folder = _fitted_model_directory(run, arm, trait_name)
+            verdict = json.loads(folder.with_name(folder.name + ".json").read_text(encoding="utf-8"))["acceptance"]
+            if not verdict["accepted"]:
+                codes = sorted({issue["code"] for issue in verdict["issues"] if issue["severity"] == "fatal"})
+                quarantined.setdefault(trait_name, []).append(f"{arm} ({', '.join(codes)})")
+    return quarantined
+
+
 def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
-    host's memory allows the saved models to be held together (``score_batches``)."""
+    host's memory allows the saved models to be held together (``score_batches``). A quarantined trait
+    (``_quarantined_traits``) is not read: its scores stay NaN, and the step's summary names it with its codes."""
     cohort = _read_cohort(run)
-    directories = [_fitted_model_directory(run, arm, trait_name) for arm in ARMS for trait_name in cohort.trait_names]
-    quarantined = []
-    for folder in directories:
-        verdict = json.loads(folder.with_name(folder.name + ".json").read_text(encoding="utf-8"))["acceptance"]
-        if not verdict["accepted"]:
-            codes = sorted({issue["code"] for issue in verdict["issues"] if issue["severity"] == "fatal"})
-            quarantined.append(f"{folder.parent.name}/{folder.name} ({', '.join(codes)})")
-    if quarantined:
-        raise ValueError(f"model_acceptance quarantined {len(quarantined)} fitted models from scoring: {'; '.join(quarantined)}")
-    shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
-    columns = {name: np.empty((shape[1], shape[0] * shape[2])) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
-    names: list[str] = []
+    quarantined = _quarantined_traits(run, cohort)
+    if len(quarantined) == len(cohort.trait_names):
+        raise ValueError(f"model_acceptance quarantined a model of every trait, so no trait can be scored: {quarantined}")
+    for trait_name, arms in quarantined.items():
+        LOGGER.warning("workspace pipeline: %s is not scored or reported: model_acceptance quarantined its %s fit", trait_name, "; ".join(arms))
     trait_count = len(cohort.trait_names)
-    structural_genetic = np.empty((shape[1], trait_count))
+    scored = [(arm_index, trait) for arm_index in range(len(ARMS)) for trait in range(trait_count) if cohort.trait_names[trait] not in quarantined]
+    directories = [_fitted_model_directory(run, ARMS[arm_index], cohort.trait_names[trait]) for arm_index, trait in scored]
+    shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
+    columns = {name: np.full((shape[1], shape[0] * shape[2]), np.nan) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
+    structural_genetic = np.full((shape[1], trait_count), np.nan)
     batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
     with DosageStore.open(_final_store(run)) as store:
         structural = structural_records(store.variant_table)
         for batch in batches:
             fitted = [run.bindings.load_model(directories[position]) for position in batch]
-            for model in fitted:
+            # Each fitted model's column in [arms x models] (arm-major), from its own names.
+            targets: list[int] = []
+            for position, model in zip(batch, fitted):
                 require_accepted(model)
+                arm_index, trait = scored[position]
+                expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
+                if tuple(model.model_names) != expected:
+                    raise ValueError(f"the {ARMS[arm_index]} model of {cohort.trait_names[trait]} holds {model.model_names}, not its trait's models {expected}.")
+                targets.extend(arm_index * shape[2] + int(index) for index in cohort.trait_models(trait))
             # The structural part of each trait's all-rows with_sv model, by trait, scored in the same read as the
             # models themselves, after them.
             parts = {}
             for position, model in zip(batch, fitted):
-                if ARMS[position // trait_count] == "with_sv":
-                    all_rows_name = cohort.model_names[cohort.all_rows_model(position % trait_count)]
-                    parts[position % trait_count] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
+                arm_index, trait = scored[position]
+                if ARMS[arm_index] == "with_sv":
+                    all_rows_name = cohort.model_names[cohort.all_rows_model(trait)]
+                    parts[trait] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
             prediction = run.bindings.predict([*fitted, *parts.values()], store, cohort.store_columns, cohort.covariates[:, 1:], run.budget)
-            first = len(names)
-            names.extend(name for model in fitted for name in model.model_names)
             for name, values in (
                 ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
                 ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
             ):
-                columns[name][:, first : len(names)] = np.asarray(values, dtype=np.float64)[:, : len(names) - first]
-            structural_genetic[:, list(parts)] = np.asarray(prediction.genetic.means, dtype=np.float64)[:, len(names) - first :]
+                columns[name][:, targets] = np.asarray(values, dtype=np.float64)[:, : len(targets)]
+            structural_genetic[:, list(parts)] = np.asarray(prediction.genetic.means, dtype=np.float64)[:, len(targets) :]
             del fitted, parts, prediction
-    for arm_index, arm in enumerate(ARMS):
-        if tuple(names[arm_index * shape[2] : (arm_index + 1) * shape[2]]) != cohort.model_names:
-            raise ValueError(f"the {arm} arm's saved models are not the cohort's models in order.")
-    LOGGER.info("workspace pipeline: scored %d models in %d reads of the store", len(names), len(batches))
+    LOGGER.info("workspace pipeline: scored %d models in %d reads of the store", sum(len(cohort.trait_models(trait)) for _arm, trait in scored), len(batches))
 
     def by_arm(values: Any) -> F64Array:
         # [rows, arms x models] in arm-major model order, as [arms, rows, models].
@@ -3075,7 +3092,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     from sv_pgs.probability_calibration import FrozenCalibration
     if run.config.calibration_fraction:
         for model, trait in enumerate(cohort.model_traits):
-            if cohort.trait_types[trait] != TraitType.BINARY:
+            if cohort.trait_types[trait] != TraitType.BINARY or cohort.trait_names[trait] in quarantined:
                 continue
             reserved = cohort.calibration[:, model]
             if np.any(reserved & (cohort.training[:, model] | cohort.held_out[:, model])):
@@ -3101,7 +3118,10 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
         calibrated_logits=calibrated_logits,
         held_out_calibrated_logits=held_out(calibrated_logits),
     )
-    return {"arms": list(ARMS), "models": len(names), "store_reads": len(batches), "scored_rows": int(cohort.store_columns.shape[0])}
+    return {
+        "arms": list(ARMS), "models": sum(len(cohort.trait_models(trait)) for _arm, trait in scored), "store_reads": len(batches),
+        "scored_rows": int(cohort.store_columns.shape[0]), "quarantined": quarantined,
+    }
 
 
 def _read_scores(run: _Run) -> _Scores:
@@ -3226,11 +3246,14 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     the workspace: it carries each record's mean dosage, from which a rare record's carrier count follows), two
     summaries by variant class and length that carry no participant count (``effects_by_class.tsv``,
     ``effect_length_correlation.tsv``), and the structural records' share of the ``with_sv`` score's variance over each
-    trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS)."""
+    trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS). A trait the
+    score step left out as quarantined (``_quarantined_traits``) has no effects here."""
     cohort = _read_cohort(run)
     scores = _read_scores(run)
+    quarantined = run.summary("score")["quarantined"]
+    reported = [(trait, trait_name) for trait, trait_name in enumerate(cohort.trait_names) if trait_name not in quarantined]
     variance_lines: list[tuple[Any, ...]] = [GENETIC_VARIANCE_COLUMNS]
-    for trait, trait_name in enumerate(cohort.trait_names):
+    for trait, trait_name in reported:
         observed = np.flatnonzero(np.isfinite(cohort.targets[:, trait]))
         count = observed.shape[0]
         decomposition = genetic_variance_decomposition(
@@ -3253,7 +3276,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         codes_per_unit = np.asarray(table.codes_per_unit, dtype=np.float64)
         working_bytes = run.budget.host_bytes // 2
         for arm in ARMS:
-            for trait, trait_name in enumerate(cohort.trait_names):
+            for trait, trait_name in reported:
                 fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
                 require_accepted(fitted)
                 scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
@@ -3502,11 +3525,13 @@ def _primary_influence(
     raise ValueError(f"no primary influence for {metric!r}")
 
 
+QUARANTINE_COLUMNS = ("trait", "quarantined_fits")
+"""``quarantined.tsv``: each trait left out of every table, with its quarantined arms and their models' fatal codes."""
 PANEL_COLUMNS = ("trait", "n", "cases", "metric", "estimate", "standard_error", "z", "p_one_sided", "p_hommel", "weight")
 """``panel.tsv``: each trait's pre-registered test on the panel's primary fold, then the panel's weighted z."""
 
 
-def _panel_rows(run: _Run, cohort: _Cohort, scores: Any) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
+def _panel_rows(run: _Run, cohort: _Cohort, scores: Any, quarantined: Mapping[str, Any]) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
     """The pre-registered panel test (EVALUATION.md (a) and (f)) on the config's frozen primary fold.
 
     Each trait's test is one-sided (the with_sv arm predicts better), paired on the primary fold's held-out people:
@@ -3516,8 +3541,8 @@ def _panel_rows(run: _Run, cohort: _Cohort, scores: Any) -> tuple[list[tuple[Any
     enter needs each arm's posterior covariance, which a biobank-scale fit never forms. The panel's statistic is
     w'z / sqrt(w'Rw), one-sided, with the frozen weights and R the correlation of the traits' family-summed influences
     (``held_out_comparison.panel_z``, ``influence_correlation``); the per-trait p-values are Hommel-adjusted across the
-    panel. A trait whose statistic is undefined on the fold (one outcome class, no variance) leaves the panel, and the
-    summary names it."""
+    panel. A trait whose statistic is undefined on the fold (one outcome class, no variance), or that the score step left
+    out as quarantined, leaves the panel, and the summary names it."""
     panel = run.config.panel
     assert panel is not None
     weights = dict(panel.weights)
@@ -3534,6 +3559,10 @@ def _panel_rows(run: _Run, cohort: _Cohort, scores: Any) -> tuple[list[tuple[Any
         frozen = np.full(linear.shape, np.nan) if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[:, rows, trait]
         covariates = cohort.covariates[np.ix_(rows, np.flatnonzero(cohort.covariate_columns[trait]))]
         row: list[Any] = [name, reportable_count(rows.shape[0]), _cases_text(rows.shape[0], cases), metric, "", "", "", "", "", f"{weights[name]:.6g}"]
+        if name in quarantined:
+            row[3] = "quarantined"
+            table.append(row)
+            continue
         both_classes = cases is None or min(cases, rows.shape[0] - cases) >= 2
         calibrated = metric != "log_likelihood_gain" or bool(np.all(np.isfinite(frozen)))
         if rows.shape[0] and both_classes and calibrated:
@@ -3578,13 +3607,19 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     favours ``with_sv``. A frozen-probability metric is read on every fold of a cell, one with a single outcome class
     included; the others on the folds ``_scored_folds`` keeps. Across multiple folds the estimate and conditional
     standard error are descriptive: shared-training covariance is not estimated, so no combined z or p-value is emitted.
+
+    A trait the score step left out as quarantined (``_quarantined_traits``) is in no table but ``quarantined.tsv``
+    (QUARANTINE_COLUMNS), which names each one's quarantined arms and their models' fatal codes.
     """
     cohort = _read_cohort(run)
     scores = _read_scores(run)
+    quarantined = run.summary("score")["quarantined"]
     fold_count = run.config.fold_count
     accuracy: list[tuple[Any, ...]] = [ACCURACY_COLUMNS]
     comparison: list[tuple[Any, ...]] = [COMPARISON_COLUMNS]
     for trait, name in enumerate(cohort.trait_names):
+        if name in quarantined:
+            continue
         binary = cohort.trait_types[trait] == TraitType.BINARY
         covariates = cohort.covariates[:, cohort.covariate_columns[trait]]
         targets = cohort.targets[:, trait]
@@ -3649,10 +3684,13 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                     name, cell, level, *metric_counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
                     z_text, p_text, inference,
                 ))
-    tables = [("accuracy.tsv", accuracy), ("comparison.tsv", comparison)]
+    tables = [
+        ("accuracy.tsv", accuracy), ("comparison.tsv", comparison),
+        ("quarantined.tsv", [QUARANTINE_COLUMNS, *((name, "; ".join(arms)) for name, arms in quarantined.items())]),
+    ]
     panel_summary: dict[str, Any] | str = "no pre-registered panel in the run config"
     if run.config.panel is not None:
-        panel_lines, panel_summary = _panel_rows(run, cohort, scores)
+        panel_lines, panel_summary = _panel_rows(run, cohort, scores, quarantined)
         tables.append(("panel.tsv", panel_lines))
     for file_name, lines in tables:
         with (directory / file_name).open("w", newline="", encoding="utf-8") as handle:
@@ -3661,6 +3699,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     _write_json(directory / EXPORTABLE_FILE, exportable)
     return {
         "files": exportable,
+        "quarantined": sorted(quarantined),
         "panel": panel_summary,
         "comparison_inference": (
             "Standard errors are conditional on fitted models. Multi-fold comparisons are descriptive: "
@@ -3758,7 +3797,7 @@ _STEPS = (
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _final_store, score_batches, structural_records, model_part), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _quarantined_traits, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
         (_effects_step, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,
