@@ -593,7 +593,7 @@ def _fit_group(
         # against the same kappa (``null_scale``).
         band_store = build_band_store(ld, statistics.sample_count, work_dir / "band", share, certificate_level(draw_count), source.array_module, kappa)
         band = GramBand(statistics, share, store=band_store)
-        band.far_scale, band.far_scale_error = kappa, kappa_error
+        band.far_scale = kappa
         sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
         log(
             f"stage2 wiring: a pass costs {sample_seconds:.3g} s over the samples and {gram_seconds:.3g} s over the summary band "
@@ -616,7 +616,7 @@ def _fit_group(
         fit_band = None
         if on_band:
             fit_band = band if len(columns) == count else GramBand(view, share, store=band_store)
-            fit_band.far_scale, fit_band.far_scale_error = kappa, kappa_error
+            fit_band.far_scale = kappa
         fit_sites = [model_sites[column] for column in columns]
         gaussian = DualGaussian(
             source=source,

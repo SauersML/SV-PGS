@@ -251,7 +251,6 @@ class GramBand:
     def _unscaled(self) -> None:
         """The far field's measured scale unset (1: chance's own 1/n per pair; ``far_field_scale`` sets the store's)."""
         self.far_scale = 1.0
-        self.far_scale_error = 0.0
 
     @classmethod
     def from_arrays(
