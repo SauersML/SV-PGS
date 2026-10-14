@@ -202,12 +202,6 @@ class BernoulliSites:
         weights = self.weights
         return np.where(self.training, self.kappa / np.where(self.training, weights, 1.0), 0.0)
 
-    @property
-    def root_response(self) -> F64Array:
-        """y~_i = kappa_i / sqrt(omega_i), the whitened working response W^1/2 z."""
-        weights = self.weights
-        return np.where(self.training, self.kappa / np.sqrt(np.where(self.training, weights, 1.0)), 0.0)
-
     def constant(self) -> float:
         """sum_i [kappa_i^2 / (2 omega_i) + c(xi_i)] over the training rows: L less the weighted Gaussian value."""
         weights = self.weights[self.training]

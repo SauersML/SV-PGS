@@ -271,12 +271,10 @@ class PassCount:
     """Reads of the store, and the columns and operand error each carried."""
 
     passes: int = 0
-    column_passes: int = 0
     records: list = field(default_factory=list)
 
     def note(self, columns: int, relative_error: float, label: str) -> None:
         self.passes += 1
-        self.column_passes += columns
         self.records.append((label, columns, relative_error))
 
 
