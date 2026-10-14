@@ -5270,10 +5270,10 @@ def fit_hyperparameters(
                         uncertified(model, replace(entry, remaining=np.inf), last_steps[model], newton.decrement, "fixed point unmoved outside every basin")
                         continue
                 if previous_state is not None and trial_state is not None:
-                    inner_gain, inner_resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
+                    inner_gain, _resolution = _path_gain(prior, previous_state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                     inner_gains[model].append(float(inner_gain))
                 else:
-                    inner_gain, inner_resolution = np.nan, np.nan
+                    inner_gain = np.nan
                     inner_gains[model] = []
                 log(
                     f"eb outer: model {model} inner step accepted: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g} "

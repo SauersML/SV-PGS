@@ -18,7 +18,6 @@ from scipy.special import expit
 from sv_pgs._typing import F64Array, NDArray
 from sv_pgs.held_out_comparison import (
     PairedComparison,
-    RecalibrationSeparationError,
     _binary_inputs,
     cluster_totals,
     comparison_from_estimate,

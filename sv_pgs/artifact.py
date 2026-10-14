@@ -27,7 +27,7 @@ from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.content_identity import file_digest, tree_digest
 from sv_pgs.config import TraitType
-from sv_pgs.dosage_store import MANIFEST_FILE, DosageStore, read_manifest
+from sv_pgs.dosage_store import DosageStore, read_manifest
 from sv_pgs.draw_laws import law_from_arrays
 from sv_pgs.feature_identity import layout_digest, portable
 from sv_pgs.fast_scoring import (
