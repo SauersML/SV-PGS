@@ -815,7 +815,6 @@ class _FullDataFixedPoints:
         undecided = np.arange(len(blocks))
         probe_count = gaussian.probe_count
         stage = 0
-        final = None
         while True:
             subset = tuple(blocks[index] for index in undecided)
             residual = information_solve_tolerance(solve, variances, subset, column_square_norms, tolerance[undecided])
