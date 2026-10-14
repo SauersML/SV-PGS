@@ -19,6 +19,7 @@ from sv_pgs.artifact import (
     code_digest,
     load_model,
     model_part,
+    model_subset,
     named_digest,
     offset_digest,
     predict,
@@ -271,6 +272,34 @@ def test_a_model_part_scores_exactly_the_share_of_the_genetic_score_its_records_
     prediction = predict_models((model, part, rest), DosageStore.open(store_root), np.arange(_SAMPLES), covariates, _budget())
     means = prediction.genetic.means
     np.testing.assert_allclose(means[:, 2] + means[:, 3], means[:, 1], rtol=0.0, atol=1e-12 * float(np.max(np.abs(means[:, 1]))))
+
+
+def test_a_model_subset_is_laid_out_as_a_fit_of_those_models_alone(store_root: Path) -> None:
+    generator = np.random.default_rng(10)
+    base = _model(generator, store_root)
+    parts = certificate_parts(dataclasses.replace(_certificate(3, generator), refusals=(
+        "model 0: a", "model 2: b", "model 1: c", "model 2: d",
+    )), 3)
+    model = replace(
+        base, model_names=("a/fold0", "b/fold0", "b/all"), covariate_columns=np.array([[True, False], [True, True], [True, True]]),
+        scoring=(*base.scoring, base.scoring[1]), noise_variance=np.array([0.7, 1.0, 1.3]), hyperparameters=(*base.hyperparameters, base.hyperparameters[0]),
+        certificate=parts.terms, fit_counts=parts.counts, refusals=parts.refusals,
+    )
+    subset = model_subset(model, ["b/all", "a/fold0"])
+    assert subset.model_names == ("b/all", "a/fold0") and subset.scoring == (model.scoring[2], model.scoring[0])
+    np.testing.assert_array_equal(subset.covariate_columns, model.covariate_columns[[2, 0]])
+    np.testing.assert_array_equal(subset.noise_variance, [1.3, 0.7])
+    assert subset.hyperparameters == (model.hyperparameters[2], model.hyperparameters[0])
+    # The refusals of the subset's models, renumbered to it; the fit's counts and provenance unchanged.
+    assert subset.refusals == ("model 1: a", "model 0: b", "model 0: d")
+    assert subset.fit_counts == model.fit_counts and subset.provenance == model.provenance
+    # A padded sequence is cut to the subset's longest, as a fit of these models alone pads it (model k's has k + 1 entries).
+    assert model.certificate["stationarity_steps"].shape == (3, 3) and subset.certificate["stationarity_steps"].shape == (2, 3)
+    alone = model_subset(model, ["a/fold0"])
+    assert alone.certificate["stationarity_steps"].shape == (1, 1) and alone.certificate["stationarity_steps_count"].tolist() == [1]
+    np.testing.assert_array_equal(alone.certificate["remaining_gain"], model.certificate["remaining_gain"][[0]])
+    save_model(store_root.parent / "subset", subset)
+    assert load_model(store_root.parent / "subset").model_names == subset.model_names
 
 
 def test_prediction_refuses_covariates_of_the_wrong_shape(store_root: Path) -> None:

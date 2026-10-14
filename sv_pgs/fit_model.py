@@ -1,11 +1,12 @@
 """The public entry point: a dosage store and a cohort in, a fitted model out.
 
 Every column of ``targets`` and ``training`` is one model: a trait on one training set (a fold's training rows, or all
-of a trait's observed rows). ``stage2_wiring.fit_models`` runs Stage 0 once per model, on that model's own training
-rows and covariate columns, and fits it by empirical Bayes at mean-field fixed points (``stage2_wiring``'s default
-inference) from its learned prior; the models are fitted separately, so nothing is shared between them. This module
-checks the cohort, adds the provenance, and splits the certificate into per-model terms, whole-fit counts and refusals
-for ``artifact.FittedModel``.
+of a trait's observed rows); a request may hold the models of several traits. ``stage2_wiring.fit_models`` fits the
+models that train on the same rows with the same covariates and likelihood as one group, on one Stage 0 with a target
+column per model (``stage2_wiring.model_groups``: they share the store's passes, never a hyperparameter), each by
+empirical Bayes at mean-field fixed points (``stage2_wiring``'s default inference) from its own learned prior. This
+module checks the cohort, adds the provenance, and splits the certificate into per-model terms, whole-fit counts and
+refusals for ``artifact.FittedModel``; ``artifact.model_subset`` takes any of its models out as a model of their own.
 
 ``FitRequest`` is the whole input of one fit, checked and normalized by its own constructor. ``fit`` takes nothing
 else, so a caller that builds a request (``workspace_pipeline``'s fit step) either builds this exact object or fails

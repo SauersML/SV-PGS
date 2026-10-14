@@ -1,12 +1,19 @@
-"""Store -> fitted models: the production wiring of Stage 0, the prior and Stage 2, run once per model.
+"""Store -> fitted models: the production wiring of Stage 0, the prior and Stage 2, run once per group of models.
 
-Each model gets:
-Stage 0 on the model's own training rows and covariate columns, the start lattice from its single-variant
-likelihoods, the prior with one class per variant class present, the records' unit offsets and frequency function from the
-store's unit contract (``store_measurement``), the store's other sidecar columns as its annotation groups (``annotation_design``), the dual Gaussian, ``fit_full_data`` by the mean-field fixed
-points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Models are fitted separately, so there is no cross-trait pooling of the prior's hyperparameters.
-A binary model (0/1 targets) is fitted on its Polya-Gamma bound (``binary_likelihood``), on the same route; its reported
-noise variance is its whitened problem's known unit noise, which its predictive never reads.
+The models that train on the same rows with the same covariates and the same likelihood are one group
+(``model_groups``): Stage 0's Grams, its LD blocks and band, the candidate records and the prior's schema depend on the
+rows, the covariates and the records, never on a target, so the group's models share them and the dual solver's passes
+(docs/design/COMPUTE.md: each further model adds right-hand-side columns, not passes). Each group gets:
+Stage 0 on its training rows and covariate columns with every model's target as a column, the start lattice covering its
+models' single-variant likelihoods, the prior with one class per variant class present, the records' unit offsets and
+frequency function from the store's unit contract (``store_measurement``), the store's other sidecar columns as its
+annotation groups (``annotation_design``), the dual Gaussian with a column per model, ``fit_full_data`` by the
+mean-field fixed points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Each model keeps its own
+hyperparameters, noise, lattice check, certificate and prior digest, as when fitted alone: a group shares the store's
+reads, never a hyperparameter, so there is no cross-trait pooling of the prior. A group's models share its probes' and
+draws' seed, so their results are those of separate fits up to that Monte Carlo error.
+A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``), on the same
+route; its reported noise variance is its whitened problem's known unit noise, which its predictive never reads.
 """
 
 from __future__ import annotations
@@ -30,7 +37,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.fast_scoring import ScoringModel
-from sv_pgs.gram_space import GramBand, GramGaussian, build_band_store, far_field_scale, pass_costs
+from sv_pgs.gram_space import GramBand, build_band_store, far_field_scale, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
@@ -40,7 +47,7 @@ from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, co
 from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
 from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.progress import log
-from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior
+from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -147,7 +154,7 @@ def _block_cap(
     free space. The memory alone set the cap before, which at 20M candidates on an A100 VM asked 3.6 TB of disk per
     model and failed when the disk filled, hours into Stage 0.
 
-    There is at least one candidate: ``_fit_one`` returns the null genetic model before Stage 0 when there is none."""
+    There is at least one candidate: ``_fit_group`` returns the null genetic models before Stage 0 when there is none."""
     sample_groups = np.full(store.n_samples, -1, dtype=np.int64)
     sample_groups[training_columns] = 0
     memory_cap = stage0_block_cap(budget, build_sample_layout(sample_groups), covariate_count + 1)
@@ -163,9 +170,10 @@ def _block_cap(
     return cap
 
 
-def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificate:
-    """One certificate over models fitted one at a time: per-model terms stacked, whole-fit counts summed, refusals
-    joined with their model's index."""
+def _merged_certificate(certificates: Sequence[FitCertificate], groups: Sequence[I64Array]) -> FitCertificate:
+    """One certificate over the request's models (one certificate each, in model order), fitted a group at a time:
+    per-model terms stacked, whole-fit counts summed over the groups (each model of a group carries its group's, which
+    are counted once), refusals joined with their model's index."""
     values = {}
     for field in dataclasses.fields(FitCertificate):
         parts = [getattr(certificate, field.name) for certificate in certificates]
@@ -174,7 +182,7 @@ def _merged_certificate(certificates: Sequence[FitCertificate]) -> FitCertificat
         elif isinstance(parts[0], tuple):
             values[field.name] = tuple(entry for part in parts for entry in part)
         elif np.ndim(parts[0]) == 0:
-            values[field.name] = sum(int(part) for part in parts)
+            values[field.name] = sum(int(parts[int(group[0])]) for group in groups)
         else:
             values[field.name] = np.concatenate([np.asarray(part) for part in parts])
     return FitCertificate(**values)
@@ -337,16 +345,58 @@ def _null_binary_model(covariates: F64Array, labels: F64Array, draw_count: int, 
     return dataclasses.replace(base, scoring=scoring, noise=1.0, certificate=certificate)
 
 
-def _with_refusal(fit: FullDataFit, reason: str) -> FullDataFit:
-    """``fit`` with ``reason`` appended to its certificate's refusals."""
-    return dataclasses.replace(fit, certificate=dataclasses.replace(
-        fit.certificate, refusals=(*fit.certificate.refusals, reason),
-        outer_criterion_met=np.zeros_like(fit.certificate.outer_criterion_met, dtype=bool),
-        unresolved=np.asarray(fit.certificate.unresolved) + 1,
-    ))
+def _with_refusal(certificate: FitCertificate, reason: str) -> FitCertificate:
+    """One model's ``certificate`` with ``reason`` appended to its refusals, its outer criterion unmet and one more
+    unresolved trial."""
+    return dataclasses.replace(
+        certificate, refusals=(*certificate.refusals, reason),
+        outer_criterion_met=np.zeros_like(certificate.outer_criterion_met, dtype=bool),
+        unresolved=np.asarray(certificate.unresolved) + 1,
+    )
 
 
-def _fit_one(
+def _model_certificate(certificate: FitCertificate, model: int, joint: str) -> FitCertificate:
+    """Model ``model``'s certificate from its group's fit: its own entry of every per-model term, the fit's whole-fit
+    counts, and the fit's refusals, each after ``joint``, which names the models fitted together (a refusal's "model k"
+    is the k-th of them)."""
+    values = {}
+    for field in dataclasses.fields(FitCertificate):
+        value = getattr(certificate, field.name)
+        if field.name == "refusals":
+            values[field.name] = tuple(f"{joint}{reason}" for reason in value)
+        elif isinstance(value, tuple):
+            values[field.name] = (value[model],)
+        elif np.ndim(value) == 0:
+            values[field.name] = value
+        else:
+            values[field.name] = np.asarray(value)[model : model + 1]
+    return FitCertificate(**values)
+
+
+def _covering_lattice(lattices: Sequence[tuple[F64Array, float, float]]) -> tuple[F64Array, float, float]:
+    """One start lattice for a group's models from each one's (``stage0_lattice``): every one has the spacing
+    ``derived_lattice`` sets from the member count and the tolerance, which the group's models share, so the
+    lowest-starting one continued at that spacing past the highest end covers each one's nodes. Its floor is the lowest
+    (below a model's floor every kernel is flat, so below a lower one too) and its top the highest; the lattice check
+    then tests it at each model's fitted state. A single model's lattice is its own."""
+    nodes = min((entry[0] for entry in lattices), key=lambda values: float(values[0]))
+    spacing = float(nodes[1] - nodes[0])
+    beyond = int(np.ceil((max(float(entry[0][-1]) for entry in lattices) - float(nodes[-1])) / spacing))
+    return (
+        np.concatenate([nodes, nodes[-1] + spacing * np.arange(1, beyond + 1)]),
+        min(float(entry[1]) for entry in lattices),
+        max(float(entry[2]) for entry in lattices),
+    )
+
+
+def _fitted_cavity(fit: FullDataFit, model: int) -> Cavity:
+    """Model ``model``'s cavity at the fitted state: mean field's pseudo-likelihoods, or EP's own cavities."""
+    if fit.member_omega is not None:
+        return Cavity(precision=fit.member_omega[:, model], shift=fit.member_shift[:, model])
+    return Cavity(precision=fit.cavity_precision[:, model], shift=fit.cavity_shift[:, model])
+
+
+def _fit_group(
     store: DosageStore,
     training_columns: I64Array,
     covariates: F64Array,
@@ -356,46 +406,68 @@ def _fit_one(
     work_dir: Path,
     seed: int,
     draw_count: int,
+    models: I64Array,
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "mean_field",
     annotated_prior: bool = True,
-) -> _ModelFit:
-    """One model on the sorted store columns ``training_columns``, whose covariates (intercept first) and targets follow
-    them; the null genetic model where the training set has no genetic column to fit.
+) -> list[_ModelFit]:
+    """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
+    covariates (intercept first) and targets [n, models] follow them: one Stage 0 with a target column per model, one
+    prior, one dual Gaussian with a column per model and one ``fit_full_data``, then each model's own lattice check,
+    scoring, noise, hyperparameters, certificate and prior digest. A model is the null genetic model where its training
+    set has no genetic column to fit.
 
-    A binary model (0/1 targets) is fitted on its Polya-Gamma bound (``binary_likelihood``): after the separation check,
-    Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where the lattice and
-    the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0."""
+    A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``): after the
+    separation check, Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where
+    the lattice and the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0."""
     # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
     binary = trait_type == TraitType.BINARY
+    labels = targets
+    sites: list[BernoulliSites | None] = [None] * models.shape[0]
     if binary:
-        assert_no_separation(covariates, targets)
-        start_sites = BernoulliSites.start(targets)
-        labels, targets = targets, start_sites.response
+        for model in range(models.shape[0]):
+            assert_no_separation(covariates, labels[:, model])
+        sites = [BernoulliSites.start(labels[:, model]) for model in range(models.shape[0])]
+        targets = np.column_stack([model_sites.response for model_sites in sites])
     # Before the store is read: what the covariates alone leave, which decides whether there is anything to fit.
-    covariate_fit = _covariate_least_squares(covariates, targets)
-    if covariate_fit.degrees <= 0:
+    covariate_fits = [_covariate_least_squares(covariates, targets[:, model]) for model in range(models.shape[0])]
+    if covariate_fits[0].degrees <= 0:
         raise ValueError(
-            f"{targets.shape[0]} training rows against covariates of rank {targets.shape[0] - covariate_fit.degrees} leave no "
+            f"{targets.shape[0]} training rows against covariates of rank {targets.shape[0] - covariate_fits[0].degrees} leave no "
             "residual degrees of freedom, so the noise variance is not identified."
         )
 
-    def null_model(reason: str) -> _ModelFit:
-        return _null_binary_model(covariates, labels, draw_count, reason) if binary else _null_genetic_model(covariate_fit, draw_count, reason)
+    def null_model(model: int, reason: str) -> _ModelFit:
+        if binary:
+            return _null_binary_model(covariates, labels[:, model], draw_count, reason)
+        return _null_genetic_model(covariate_fits[model], draw_count, reason)
 
-    if covariate_fit.explained:
-        # (Never for a binary model: labels the covariates span exactly would separate, which the check refused.)
-        return null_model("the covariates explain every training target to working precision")
+    # (Never for a binary model: labels the covariates span exactly would separate, which the check refused.)
+    results: list[_ModelFit | None] = [
+        null_model(model, "the covariates explain every training target to working precision") if covariate_fit.explained else None
+        for model, covariate_fit in enumerate(covariate_fits)
+    ]
+    # The models with a residual to fit, the columns of Stage 0's targets and of the dual solver.
+    genetic = [model for model, result in enumerate(results) if result is None]
+
+    def without_genetic_column(reason: str) -> list[_ModelFit]:
+        return [null_model(model, reason) if result is None else result for model, result in enumerate(results)]
+
+    if not genetic:
+        return [result for result in results if result is not None]
     candidates = stage0_candidates(store, training_columns, measurement.log_reliability, config)
     if candidates.shape[0] == 0:
-        return null_model("no store record carries signal on these training rows")
+        return without_genetic_column("no store record carries signal on these training rows")
+    count = len(genetic)
+    store_targets = targets[:, genetic]
+    model_sites = [sites[model] for model in genetic]
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget, work_dir)
     statistics = compute_genotype_statistics(
-        DosageStoreTileSource(store, candidates), training_columns, covariates, targets[:, None], config, budget, block_cap, work_dir / "ld"
+        DosageStoreTileSource(store, candidates), training_columns, covariates, store_targets, config, budget, block_cap, work_dir / "ld"
     )
     if np.asarray(statistics.active_rows).shape[0] == 0:
-        return null_model("every candidate record is monomorphic on these training rows")
+        return without_genetic_column("every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
@@ -419,22 +491,15 @@ def _fit_one(
         exclude=RELIABILITY_COLUMNS + IDENTIFIER_COLUMNS,
     )
     log(f"stage2 wiring: {annotations.design.shape[1]} annotation columns in {len(annotations.groups)} groups: {', '.join(annotations.names) or 'none'}")
-    # This is one model: rows outside its training set have zero likelihood
+    # These are the group's models: rows outside its training set have zero likelihood
     # weight. Keep only training rows in every iterative genotype product and
     # sample-space buffer. Scoring still reads the original full store.
     fitted_samples = training_columns.size
-    mask = np.ones((fitted_samples, 1))
-    store_targets = targets[:, None]
-    store_covariates = covariates
-    store_sites = None
-    if binary:
-        store_sites = BernoulliSites.start(labels)
-        # The start's equal-weight problem has noise 1 / omega(0) = 4 exactly, in the response's units.
-        start_noise = 1.0 / POLYA_GAMMA_MEAN_AT_ZERO
-    else:
-        start_noise = float(covariate_residual_variance(store_targets, mask, store_covariates)[0])
+    mask = np.ones((fitted_samples, count))
+    # A binary model's start is the equal-weight problem, whose noise is 1 / omega(0) = 4 exactly, in the response's units.
+    start_noise = np.full(count, 1.0 / POLYA_GAMMA_MEAN_AT_ZERO) if binary else covariate_residual_variance(store_targets, mask, covariates)
     tolerance = 0.5 / draw_count
-    nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, tolerance)
+    nodes, floor, top = _covering_lattice([stage0_lattice(statistics, target, float(start_noise[target]), offsets, tolerance) for target in range(count)])
     prior = scale_mixture_prior(
         class_index=class_index.astype(np.int64),
         log_variance_offset=offsets,
@@ -481,76 +546,119 @@ def _fit_one(
         source=source,
         training=mask,
         targets=store_targets,
-        offsets=np.zeros((fitted_samples, 1)),
-        covariates=store_covariates,
-        grams=block_grams(statistics, start_noise),
+        offsets=np.zeros((fitted_samples, count)),
+        covariates=covariates,
+        # The dual solver reads the Grams' blocks and links only, never their metric's scale.
+        grams=block_grams(statistics),
         probe_count=draw_count,
         seed=_seed(seed, 0),
         probe_sample_indices=training_columns if fitted_samples != store.n_samples else None,
         # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
-        sample_weights=None if store_sites is None else store_sites.weights[:, None],
+        sample_weights=np.column_stack([entry.weights for entry in model_sites]) if binary else None,
     )
+    # A refusal of the joint fit names the models fitted together; its "model k" is the k-th of them.
+    joint = f"joint fit of models {', '.join(str(int(models[model])) for model in genetic)}: " if count > 1 else ""
+
+    def finish(fit: FullDataFit, fitted_prior: ScaleMixturePrior, finished: Sequence[int], open_checks: dict[int, str]) -> None:
+        """The models ``finished`` from ``fit`` on ``fitted_prior``'s lattice: their scoring models, noise,
+        hyperparameters, certificates (with the lattice check each one's fit left open) and prior digest."""
+        scoring = scoring_models(fit, fitted_prior, statistics, [trait_type] * count, draw_count, seed=_seed(seed, 2))
+        digest = _prior_schema_digest(
+            nodes=fitted_prior.log_variance_grid, floor=np.array([fitted_prior.kernel_floor]), top=np.array([fitted_prior.kernel_top]),
+            class_index=class_index.astype(np.int64), offsets=offsets, rows=member_rows, annotations=annotations.design,
+            annotation_names=annotations.names, measurement=measurement,
+        )
+        for model in finished:
+            certificate = _model_certificate(fit.certificate, model, joint)
+            if model in open_checks:
+                certificate = _with_refusal(certificate, open_checks[model])
+                log(f"stage2 wiring: model {int(models[genetic[model]])}: {open_checks[model]}")
+            results[genetic[model]] = _ModelFit(
+                scoring=scoring[model], noise=float(np.asarray(fit.noise_variance)[model]), hyperparameters=fit.hyperparameters[model],
+                certificate=certificate, prior_digest=digest,
+            )
+
     # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
     # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
     # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
-    # from the start's single-variant likelihoods only; where the fitted state's normalizers or moments move on the
-    # refined or the extended lattice, the model is fitted again on the lattice that passed the check.
+    # from the start's single-variant likelihoods only. Each model whose check passes is finished from the fit as it
+    # stands; where any model's fitted normalizers or moments move on the refined or the extended lattice, the group is
+    # fitted again on the lattice moved for it, and those models are checked there.
     fit = fit_full_data(
         gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-        sites=[store_sites], null_scale=kappa, band=band,
+        sites=model_sites, null_scale=kappa, band=band,
     )
-    while True:
-        check = lattice_check(
-            prior, fit.hyperparameters[0],
-            Cavity(precision=fit.member_omega[:, 0], shift=fit.member_shift[:, 0]) if fit.member_omega is not None
-            else Cavity(precision=fit.cavity_precision[:, 0], shift=fit.cavity_shift[:, 0]),
-            share, draw_count,
-        )
-        log(f"stage2 wiring: lattice check on {prior.grid_size} nodes: {check.record()}")
-        if not (check.refine or check.extend):
+    pending = list(range(count))
+    while pending:
+        checks = {model: lattice_check(prior, fit.hyperparameters[model], _fitted_cavity(fit, model), share, draw_count) for model in pending}
+        for model, check in checks.items():
+            log(f"stage2 wiring: lattice check of model {int(models[genetic[model]])} on {prior.grid_size} nodes: {check.record()}")
+        moving = [model for model in pending if checks[model].refine or checks[model].extend]
+        passed = [model for model in pending if model not in moving]
+        if passed:
+            finish(fit, prior, passed, {})
+        if not moving:
             break
-        moved, moved_hyperparameters = prior, fit.hyperparameters[0]
-        if check.extend:
-            moved, moved_hyperparameters = extended_lattice(moved, moved_hyperparameters)
-        if check.refine:
-            moved, moved_hyperparameters = halved_lattice(moved, moved_hyperparameters)
+        moved, moved_hyperparameters = prior, list(fit.hyperparameters)
+        if any(checks[model].extend for model in moving):
+            extended = [extended_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
+            moved, moved_hyperparameters = extended[0][0], [hyperparameters for _prior, hyperparameters in extended]
+        if any(checks[model].refine for model in moving):
+            halved = [halved_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
+            moved, moved_hyperparameters = halved[0][0], [hyperparameters for _prior, hyperparameters in halved]
         try:
             # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its noise
             # and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior repeated
             # the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
             refit = fit_full_data(
                 gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-                sites=[store_sites], starts=[moved_hyperparameters], start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
+                sites=model_sites, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
                 start_mean=fit.member_mean, null_scale=kappa, band=band,
             )
         except FloatingPointError as error:
-            # No fit on the checked lattice: the model keeps the fit it has, and its certificate says the quadrature
-            # check that fit failed was never resolved, so the artifact never reads as a passed check.
-            fit = _with_refusal(fit, f"lattice check unresolved ({check.record()}): the fit on {prior.grid_size} nodes stands; the refit on {moved.grid_size} nodes failed: {error}")
-            log(f"stage2 wiring: {fit.certificate.refusals[-1]}")
+            # No fit on the checked lattice: these models keep the fit they have, and each certificate says the
+            # quadrature check that fit failed was never resolved, so the artifact never reads as a passed check.
+            finish(fit, prior, moving, {
+                model: f"lattice check unresolved ({checks[model].record()}): the fit on {prior.grid_size} nodes stands; the refit on {moved.grid_size} nodes failed: {error}"
+                for model in moving
+            })
             break
-        if np.all(fit.certificate.outer_criterion_met) and not np.all(refit.certificate.outer_criterion_met):
-            # The refit ended without its outer criterion (an uncertified walk) where the fit it continued had met it:
-            # the certified fit stands, and its certificate records the quadrature check left open.
-            fit = _with_refusal(fit, f"lattice check unresolved ({check.record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {prior.grid_size} nodes stands")
-            log(f"stage2 wiring: {fit.certificate.refusals[-1]}")
-            break
-        prior, nodes, fit = moved, moved.log_variance_grid, refit
-    (scoring,) = scoring_models(fit, prior, statistics, [trait_type], draw_count, seed=_seed(seed, 2))
+        # A model whose refit ended without its outer criterion (an uncertified walk) where the fit it continued had met
+        # it keeps the certified fit, and its certificate records the quadrature check left open.
+        kept = [
+            model for model in moving
+            if fit.certificate.outer_criterion_met[model] and not refit.certificate.outer_criterion_met[model]
+        ]
+        if kept:
+            finish(fit, prior, kept, {
+                model: f"lattice check unresolved ({checks[model].record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {prior.grid_size} nodes stands"
+                for model in kept
+            })
+        pending = [model for model in moving if model not in kept]
+        prior, fit = moved, refit
     if band is not None:
         band.release()
-    log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples")
-    return _ModelFit(
-        scoring=scoring,
-        noise=float(np.asarray(fit.noise_variance)[0]),
-        hyperparameters=fit.hyperparameters[0],
-        certificate=fit.certificate,
-        prior_digest=_prior_schema_digest(
-            nodes=nodes, floor=np.array([floor]), top=np.array([top]), class_index=class_index.astype(np.int64),
-            offsets=offsets, rows=member_rows, annotations=annotations.design, annotation_names=annotations.names,
-            measurement=measurement,
-        ),
-    )
+    log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples, {count} models fitted together")
+    return [result for result in results if result is not None]
+
+
+def model_groups(store_columns: I64Array, covariate_columns: BoolArray, training: BoolArray, trait_types: Sequence[TraitType]) -> list[I64Array]:
+    """The request's models as the groups fitted together (``_fit_group``), each in model order and the groups in the
+    order of their first models: the models whose training rows (as store columns), adjusted covariates and trait type
+    are the same. Stage 0's Grams and band, the candidates and the prior's schema read the rows, the covariates and the
+    records, never a target, so these models share them and the dual solver's passes. A binary model is a group of its
+    own: its metric moves with its own Polya-Gamma sites."""
+    columns = np.asarray(store_columns, dtype=np.int64)
+    groups: dict[tuple, list[int]] = {}
+    for model, trait_type in enumerate(trait_types):
+        key = (
+            np.sort(columns[np.asarray(training[:, model], dtype=bool)]).tobytes(),
+            np.asarray(covariate_columns[model], dtype=bool).tobytes(),
+            trait_type,
+            model if trait_type == TraitType.BINARY else None,
+        )
+        groups.setdefault(key, []).append(model)
+    return [np.array(models, dtype=np.int64) for models in groups.values()]
 
 
 def fit_models(
@@ -571,9 +679,12 @@ def fit_models(
     checkpoint_key: str | None = None,
     annotated_prior: bool = True,
 ) -> FittedModels:
-    """Every model of ``fit_model.fit``, one at a time (see the module docstring); ``inference`` names the fixed
-    point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's genome-scale
-    EP) is measured on bench-sim, which then replaces it."""
+    """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
+    names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
+    genome-scale EP) is measured on bench-sim, which then replaces it.
+
+    Each model's completed fit is checkpointed on its own under ``checkpoint_key``; a group is fitted again unless every
+    one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same way."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
     # Stage 0 runs a buffer on every device; Stage 2's reads run on CuPy's current device, since the multi-device
@@ -582,63 +693,71 @@ def fit_models(
     log(f"stage2 wiring: Stage 0 runs on every device of the budget, Stage 2 on {stage2_device} alone "
         f"({len(budget.device_ids)} CUDA device(s) visible)")
     measurement = store_measurement(store, log_variance_offset)
-    scoring, noise, hyperparameters, certificates, prior_digests = [], [], [], [], []
-    for model in range(training.shape[1]):
-        rows = np.flatnonzero(training[:, model])
+    groups = model_groups(store_columns, covariate_columns, training, trait_types)
+    log(f"stage2 wiring: {training.shape[1]} models in {len(groups)} groups fitted together (models sharing training rows, covariates and likelihood)")
+    fits: list[_ModelFit | None] = [None] * training.shape[1]
+    for index, group in enumerate(groups):
+        first = int(group[0])
+        rows = np.flatnonzero(training[:, first])
         order = np.argsort(store_columns[rows], kind="stable")
         rows = rows[order]
-        adjusted = np.asarray(covariate_columns[model], dtype=bool)
-        model_dir = Path(work_dir) / f"model{model}"
-        checkpoint = None if checkpoint_key is None else Path(work_dir) / "checkpoints" / checkpoint_key / f"model{model}.npz"
-        if checkpoint is not None and checkpoint.is_file():
-            fit = load_checkpoint(checkpoint, checkpoint_key)
-            log(f"stage2 wiring: resumed completed model {model}")
+        adjusted = np.asarray(covariate_columns[first], dtype=bool)
+        label = ", ".join(str(int(model)) for model in group)
+        group_dir = Path(work_dir) / f"model{first}"
+        checkpoints = [Path(work_dir) / "checkpoints" / str(checkpoint_key) / f"model{int(model)}.npz" for model in group]
+        if checkpoint_key is not None and all(checkpoint.is_file() for checkpoint in checkpoints):
+            group_fits = [load_checkpoint(checkpoint, checkpoint_key) for checkpoint in checkpoints]
+            log(f"stage2 wiring: resumed completed models {label}")
         else:
-            # Incomplete scratch is disposable; completed folds live outside this directory.
-            if model_dir.exists():
-                shutil.rmtree(model_dir)
-            model_dir.mkdir(parents=True)
+            # Incomplete scratch is disposable; completed models live outside this directory.
+            if group_dir.exists():
+                shutil.rmtree(group_dir)
+            group_dir.mkdir(parents=True)
+            log(f"stage2 wiring: group {index + 1} of {len(groups)}: models {label} on {rows.shape[0]:,} training rows")
             started = time.perf_counter()
-            # One ledger per model's fit: its host leases and every device allocation.
+            # One ledger per group's fit: its host leases and every device allocation.
             with memory_scope(budget):
-                fit = _fit_one(
+                group_fits = _fit_group(
                     store,
                     np.asarray(store_columns[rows], dtype=np.int64),
                     np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
-                    np.asarray(targets[rows, model], dtype=np.float64),
+                    np.asarray(targets[np.ix_(rows, group)], dtype=np.float64),
                     measurement,
                     budget,
-                    model_dir,
-                    _seed(seed, model),
+                    group_dir,
+                    _seed(seed, *group.tolist()),
                     draw_count,
-                    trait_types[model],
+                    group,
+                    trait_types[first],
                     inference,
                     annotated_prior,
                 )
             elapsed = time.perf_counter() - started
-            if checkpoint is not None:
-                save_checkpoint(checkpoint, fit, checkpoint_key, elapsed)
-            log(f"stage2 wiring: completed model {model} in {elapsed:.3f} seconds")
-        # The model's Stage 0 LD blocks and band (its projected Grams, O(p x block cap) bytes on disk) are read by no
-        # later model and not by scoring, which the fit already ran: each is removed as its model ends, so the work
-        # directory never holds more than one model's.
-        if model_dir.exists():
-            shutil.rmtree(model_dir)
-        alpha = np.zeros(adjusted.shape[0])
-        alpha[adjusted] = fit.scoring.alpha
-        covariate_draws = np.zeros((adjusted.size, fit.scoring.draw_count))
-        covariate_draws[adjusted] = fit.scoring.covariate_draws
-        covariate_covariance = np.zeros((adjusted.size, adjusted.size))
-        covariate_covariance[np.ix_(adjusted, adjusted)] = fit.scoring.covariate_covariance
-        scoring.append(dataclasses.replace(fit.scoring, alpha=alpha, covariate_draws=covariate_draws, covariate_covariance=covariate_covariance))
-        noise.append(fit.noise)
-        hyperparameters.append(fit.hyperparameters)
-        certificates.append(fit.certificate)
-        prior_digests.append(fit.prior_digest)
+            if checkpoint_key is not None:
+                for checkpoint, fit in zip(checkpoints, group_fits):
+                    # Each model's share of its group's time, so the shares sum to the fit's.
+                    save_checkpoint(checkpoint, fit, checkpoint_key, elapsed / group.shape[0])
+            log(f"stage2 wiring: completed models {label} in {elapsed:.3f} seconds")
+        # The group's Stage 0 LD blocks and band (its projected Grams, O(p x block cap) bytes on disk) are read by no
+        # later group and not by scoring, which the fit already ran: each is removed as its group ends, so the work
+        # directory never holds more than one group's.
+        if group_dir.exists():
+            shutil.rmtree(group_dir)
+        for model, fit in zip(group.tolist(), group_fits):
+            alpha = np.zeros(adjusted.shape[0])
+            alpha[adjusted] = fit.scoring.alpha
+            covariate_draws = np.zeros((adjusted.size, fit.scoring.draw_count))
+            covariate_draws[adjusted] = fit.scoring.covariate_draws
+            covariate_covariance = np.zeros((adjusted.size, adjusted.size))
+            covariate_covariance[np.ix_(adjusted, adjusted)] = fit.scoring.covariate_covariance
+            fits[model] = dataclasses.replace(
+                fit, scoring=dataclasses.replace(fit.scoring, alpha=alpha, covariate_draws=covariate_draws, covariate_covariance=covariate_covariance),
+            )
+    finished = [fit for fit in fits if fit is not None]
     return FittedModels(
-        scoring=scoring,
-        noise_variance=np.array(noise),
-        hyperparameters=tuple(hyperparameters),
-        certificate=_merged_certificate(certificates),
-        prior_digests=tuple(prior_digests),
+        scoring=[fit.scoring for fit in finished],
+        noise_variance=np.array([fit.noise for fit in finished]),
+        hyperparameters=tuple(fit.hyperparameters for fit in finished),
+        certificate=_merged_certificate([fit.certificate for fit in finished], groups),
+        prior_digests=tuple(fit.prior_digest for fit in finished),
     )

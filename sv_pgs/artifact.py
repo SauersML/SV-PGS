@@ -229,18 +229,48 @@ class FittedModel:
         return tuple(model.trait_type for model in self.scoring)
 
 
+def model_subset(model: FittedModel, names: Sequence[str]) -> FittedModel:
+    """The models ``names`` of ``model``, in that order, as a fitted model of their own, in the layout a fit of those
+    models alone has: each one's scoring model, noise variance, hyperparameters, covariate columns and certificate terms,
+    a term padded to its longest sequence (``fit_model.certificate_parts``: ``<term>_count`` beside it) cut to the
+    subset's longest, and each one's refusals (``fit_model.fit`` writes every one as "model <index>: <reason>"),
+    renumbered to the subset. The whole-fit counts and the provenance are the fit's that made them."""
+    indices = [model.model_names.index(name) for name in names]
+    certificate = {term: np.asarray(values)[indices] for term, values in model.certificate.items()}
+    for term in model.certificate:
+        if f"{term}_count" in certificate:
+            certificate[term] = certificate[term][:, : int(certificate[f"{term}_count"].max(initial=0))]
+    renumbered = {index: position for position, index in enumerate(indices)}
+    refusals = []
+    for refusal in model.refusals:
+        label, _separator, reason = refusal.partition(": ")
+        index = int(label.removeprefix("model "))
+        if index in renumbered:
+            refusals.append(f"model {renumbered[index]}: {reason}")
+    return replace(
+        model,
+        model_names=tuple(names),
+        covariate_columns=np.asarray(model.covariate_columns)[indices],
+        scoring=tuple(model.scoring[index] for index in indices),
+        noise_variance=np.asarray(model.noise_variance)[indices],
+        hyperparameters=tuple(model.hyperparameters[index] for index in indices),
+        certificate=certificate,
+        refusals=tuple(refusals),
+    )
+
+
 def model_part(model: FittedModel, name: str, kept_records: BoolArray, part_name: str) -> FittedModel:
     """Model ``name`` of ``model`` restricted to the store records ``kept_records`` marks (one entry per store record),
     as a fitted model of its own named ``part_name``.
 
     The part keeps the model's posterior means, scales, coefficients and draw law (``DrawLaw.subset``, which draws for
     each kept record the numbers the whole law draws for it) on the kept records, and its covariates, noise variance,
-    hyperparameters, certificate terms, refusals and provenance unchanged. A genetic score is a sum over its records
-    (``fast_scoring``), so the part's genetic score is exactly the share of ``name``'s that the kept records carry, and
-    ``predict_models`` scores both from the same read of the store.
+    hyperparameters, certificate terms and refusals (``model_subset``) and the provenance unchanged. A genetic score is a
+    sum over its records (``fast_scoring``), so the part's genetic score is exactly the share of ``name``'s that the kept
+    records carry, and ``predict_models`` scores both from the same read of the store.
     """
-    index = model.model_names.index(name)
-    scoring = model.scoring[index]
+    single = model_subset(model, [name])
+    (scoring,) = single.scoring
     kept = np.asarray(kept_records, dtype=bool)[scoring.store_rows]
     part = replace(
         scoring,
@@ -250,15 +280,7 @@ def model_part(model: FittedModel, name: str, kept_records: BoolArray, part_name
         coefficients=scoring.coefficients[kept],
         posterior_draws=scoring.posterior_draws.subset(kept),
     )
-    return replace(
-        model,
-        model_names=(part_name,),
-        covariate_columns=np.asarray(model.covariate_columns)[[index]],
-        scoring=(part,),
-        noise_variance=np.asarray(model.noise_variance)[[index]],
-        hyperparameters=(model.hyperparameters[index],),
-        certificate={term: np.asarray(values)[[index]] for term, values in model.certificate.items()},
-    )
+    return replace(single, model_names=(part_name,), scoring=(part,))
 
 
 def save_model(path: str | Path, model: FittedModel) -> None:

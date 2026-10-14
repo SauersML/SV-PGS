@@ -17,6 +17,7 @@ from sv_pgs import fit_model
 from sv_pgs.artifact import load_model, predict, save_model
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
+from sv_pgs.fast_scoring import ScoringPlan, score_genetic
 from tests.test_full_data_fit import _store
 
 
@@ -252,3 +253,125 @@ def test_the_candidate_prefilter_keeps_every_record_stage0_keeps(tmp_path: Path)
     )
     assert set(np.asarray(statistics.active_rows).tolist()) <= set(candidates.tolist())
     assert candidates.shape[0] < records
+
+
+def test_models_with_the_same_rows_covariates_and_likelihood_form_one_group() -> None:
+    from sv_pgs.stage2_wiring import model_groups
+
+    generator = np.random.default_rng(3)
+    rows = 30
+    store_columns = generator.permutation(rows + 10)[:rows].astype(np.int64)
+    first = generator.uniform(size=rows) < 0.7
+    second = first.copy()
+    second[np.flatnonzero(first)[0]] = False
+    covariates = np.array([True, False, True])
+    # Models: two traits on the first rows, one on other rows, one on the first rows with other covariates, two binary
+    # models on the first rows (a binary model is a group of its own), and a third trait on the first rows again.
+    training = np.column_stack([first, first, second, first, first, first, first])
+    covariate_columns = np.array([covariates, covariates, covariates, ~covariates, covariates, covariates, covariates])
+    quantitative, binary = TraitType.QUANTITATIVE, TraitType.BINARY
+    groups = model_groups(store_columns, covariate_columns, training, (quantitative, quantitative, quantitative, quantitative, binary, binary, quantitative))
+    assert [group.tolist() for group in groups] == [[0, 1, 6], [2], [3], [4], [5]]
+
+
+def _fitted_group(store, covariate: np.ndarray, targets: np.ndarray, training: np.ndarray, work_dir: Path, seed: int, **arguments):
+    from sv_pgs.stage2_wiring import fit_models
+
+    work_dir.mkdir(parents=True)
+    return fit_models(
+        store=store, store_columns=np.arange(store.n_samples, dtype=np.int64), covariates=np.column_stack([np.ones(store.n_samples), covariate]),
+        covariate_columns=np.ones((training.shape[1], 2), dtype=bool), targets=np.where(training, targets, 0.0), training=training,
+        trait_types=(TraitType.QUANTITATIVE,) * training.shape[1], log_variance_offset=None, budget=_budget(), work_dir=work_dir, seed=seed,
+        draw_count=16, **arguments,
+    )
+
+
+@pytest.mark.slow  # seven fits of the synthetic store per route: 3-10 min each in the shared 6-CPU VM (batch-fit, 2026-10-13)
+@pytest.mark.parametrize("route", ["samples", "gram"])
+def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
+    """Three traits on two training sets: one fit per training set, with the traits as its columns, gives each model the
+    fit it gets alone, up to the Monte Carlo error of the probes and draws it shares with its group and the start lattice
+    that covers its group's. Whether the outer criterion is met is the engine's own outcome on this store either way, and
+    it flips both ways between a model's fits.
+
+    Each model alone is fitted on the sample route, the full-data likelihood both routes share: alone on the band route
+    this store's model 4 ends at a refused refinement (coefficients correlating 0.33 with its sample-route fit, as in
+    tests/test_gram_space.py's summary-route test, which fails on HEAD alike), while its group's band-route fit
+    correlates 0.997 with the group's sample-route fit. Timing alone chooses the route, so both are pinned."""
+    from sv_pgs import stage2_wiring
+    from tests.test_full_data_fit import _StoreCodes
+
+    store, covariate, targets, genetic = _store(tmp_path / "store", 7)
+    samples = store.n_samples
+    generator = np.random.default_rng(12)
+    traits = np.column_stack([
+        targets, 0.4 * covariate + 0.8 * genetic + 0.6 * generator.standard_normal(samples),
+        -0.2 * covariate - genetic + 0.9 * generator.standard_normal(samples),
+    ])
+    held_out = [np.arange(samples) >= samples * 4 // 5, np.arange(samples) < samples // 5]
+    # Models in trait-major order: (trait 0, rows 0), (trait 0, rows 1), (trait 1, rows 0), ...
+    training = np.column_stack([~held_out[rows] for _trait in range(3) for rows in range(2)])
+    model_targets = np.repeat(traits, 2, axis=1)
+    monkeypatch.setattr(stage2_wiring, "pass_costs", (lambda band, source, xp: (0.0, np.inf)) if route == "samples" else (lambda band, source, xp: (np.inf, 0.0)))
+    together = _fitted_group(store, covariate, model_targets, training, tmp_path / "together", 5)
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
+    for model in range(6):
+        alone = _fitted_group(store, covariate, model_targets[:, [model]], training[:, [model]], tmp_path / f"alone{model}", 5)
+        joint, single = together.scoring[model], alone.scoring[0]
+        np.testing.assert_array_equal(joint.store_rows, single.store_rows)
+        assert np.corrcoef(joint.coefficients, single.coefficients)[0, 1] > 0.99
+        rows = held_out[model % 2]
+        scores = [
+            score_genetic(_StoreCodes(store), ScoringPlan.from_models([scoring]), _budget()).means[rows, 0] for scoring in (joint, single)
+        ]
+        assert np.corrcoef(*scores)[0, 1] > 0.99
+        assert float(np.max(np.abs(scores[0] - scores[1]))) <= 0.25 * float(np.std(scores[1]))
+        np.testing.assert_allclose(together.noise_variance[model], alone.noise_variance[0], rtol=0.05)
+
+
+def test_a_group_resumes_only_when_every_model_is_checkpointed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from sv_pgs import stage2_wiring
+
+    generator = np.random.default_rng(9)
+    samples, records = 40, 12
+    milli = (generator.binomial(2, 0.3, size=(records, samples)) * 1000).astype(np.int64)
+    from sv_pgs.dosage_store import DosageStore
+    from tests.test_dosage_store import _write_store
+
+    _write_store(tmp_path / "store", [{"chr22": milli}])
+    store = DosageStore.open(tmp_path / "store")
+    fitted_groups: list[list[int]] = []
+
+    def covariates_alone(_store, _columns, covariates, targets, _measurement, _budget, work_dir, _seed, draw_count, models, *_rest):
+        # A stand-in for the engine: each model's covariates-only fit, which checkpoints like any other.
+        assert work_dir.is_dir()
+        fitted_groups.append(models.tolist())
+        return [
+            stage2_wiring._null_genetic_model(stage2_wiring._covariate_least_squares(covariates, targets[:, model]), draw_count, "stand-in")
+            for model in range(targets.shape[1])
+        ]
+
+    monkeypatch.setattr(stage2_wiring, "_fit_group", covariates_alone)
+    training = np.column_stack([np.ones(samples, dtype=bool)] * 2 + [np.arange(samples) < samples // 2])
+    targets = generator.normal(size=(samples, 3))
+
+    def fit():
+        return stage2_wiring.fit_models(
+            store=store, store_columns=np.arange(samples, dtype=np.int64), covariates=np.ones((samples, 1)),
+            covariate_columns=np.ones((3, 1), dtype=bool), targets=targets, training=training, trait_types=(TraitType.QUANTITATIVE,) * 3,
+            log_variance_offset=None, budget=_budget(), work_dir=tmp_path / "work", seed=4, draw_count=4, checkpoint_key="key",
+        )
+
+    first = fit()
+    assert fitted_groups == [[0, 1], [2]]
+    checkpoints = tmp_path / "work" / "checkpoints" / "key"
+    assert sorted(path.name for path in checkpoints.iterdir()) == ["model0.npz", "model1.npz", "model2.npz"]
+    resumed = fit()
+    assert fitted_groups == [[0, 1], [2]]
+    np.testing.assert_array_equal(resumed.noise_variance, first.noise_variance)
+    # One model of the pair lost its checkpoint: the pair is fitted again, the other group resumes.
+    (checkpoints / "model1.npz").unlink()
+    again = fit()
+    assert fitted_groups == [[0, 1], [2], [0, 1]]
+    np.testing.assert_array_equal(again.noise_variance, first.noise_variance)
+    assert again.certificate.refusals == ("model 0: stand-in", "model 1: stand-in", "model 2: stand-in")

@@ -637,8 +637,8 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
     design = json.loads((run / "cohort" / "cohort.json").read_text())
     traits = ["atrial_fibrillation", "total_bilirubin"]
     assert design["model_names"] == [f"{trait}/{fold}" for trait in traits for fold in ("fold0", "fold1", "all")]
-    # Trait by trait, both arms of a trait back to back, so a budget that stops the fit leaves complete comparisons.
-    assert [(call.model_names[0].split("/")[0]) for call in recorder.fit_calls] == [trait for trait in traits for _arm in ARMS]
+    # One fit per arm holds every trait's models, so the models that share training rows share the store's passes.
+    assert [call.model_names for call in recorder.fit_calls] == [tuple(design["model_names"])] * len(ARMS)
     names = design["covariate_names"]
     structure = {"intercept", "pipeline_half=B", "genotype_source=long_read", "PC1", "PC2", "PC3"}
     own = {
@@ -659,34 +659,35 @@ def test_a_dry_run_builds_every_step_from_synthetic_inputs(workspace) -> None:
         structural = np.asarray(store.variant_table.annotations["sv_length"]) >= 50
     # The SNV/indel arm leaves out exactly the structural records (the 52 bp insertion), through a -inf offset.
     assert structural.sum() == len(CHROMOSOMES)
-    for call_index, call in enumerate(recorder.fit_calls):
-        trait = call.model_names[0].split("/")[0]
-        observed = np.isfinite(cohort["targets"][:, traits.index(trait)])
+    fit_rows = cohort["training"].any(axis=1)
+    for arm, call in zip(ARMS, recorder.fit_calls):
         assert call.covariates.shape[1] == len(call.covariate_names) == len(names) - 1
-        assert len(call.research_ids) == len(call.store_columns) == observed.sum()
-        arm = ARMS[call_index % len(ARMS)]
+        assert len(call.research_ids) == len(call.store_columns) == fit_rows.sum()
         # Every model, a disease's included, is fitted on the Gaussian working likelihood (FIT_TRAIT_TYPE).
-        assert call.trait_types == (TraitType.QUANTITATIVE,) * 3
-        for model in range(3):
+        assert call.trait_types == (TraitType.QUANTITATIVE,) * 6
+        folds = cohort["folds"][fit_rows]
+        for model, model_name in enumerate(call.model_names):
+            trait, fold = model_name.split("/")
+            observed = np.isfinite(cohort["targets"][fit_rows, traits.index(trait)])
             used = {name for name, used in zip(names[1:], call.covariate_columns[model]) if used}
             assert used == (structure | own[trait]) - {"intercept"}
             assert np.all(np.isnan(call.targets[~call.training[:, model], model]))
-        folds = cohort["folds"][observed]
-        assert all(not np.any(call.training[:, fold] & (folds == fold)) for fold in range(2)) and call.training[:, 2].all()
+            # A fold model holds its fold out; the all-rows model trains on every row that observes its trait.
+            held = folds == int(fold.removeprefix("fold")) if fold != "all" else np.zeros_like(observed)
+            np.testing.assert_array_equal(call.training[:, model], observed & ~held)
         expected = np.where(structural, -np.inf, saved.log_reliability) if arm == "snv_indel" else saved.log_reliability
         np.testing.assert_array_equal(call.log_variance_offset, expected)
-    # Both arms of a trait share a seed (common random numbers); the traits' seeds differ.
-    seeds = [call.seed for call in recorder.fit_calls]
-    assert seeds[0::2] == seeds[1::2] and len(set(seeds)) == len(traits)
+    # Both arms' fits have the run's seed and the same models in the same order: each group's probes and draws are
+    # common random numbers across the arms.
+    assert [call.seed for call in recorder.fit_calls] == [config.seed] * len(ARMS)
     # A trait's own columns are 0 on the rows it does not observe.
     bilirubin_age = cohort["covariates"][:, names.index("total_bilirubin:age_at_measurement")]
     assert np.all(bilirubin_age[~np.isfinite(cohort["targets"][:, 1])] == 0.0) and np.all(bilirubin_age[np.isfinite(cohort["targets"][:, 1])] > 0.0)
     families = cohort["families"]
     assert np.array_equal(np.unique(families), np.arange(families.max() + 1)) and len(set(families.tolist())) == len(families) - 1
     # 5049 is genotyped but in no table: a cohort row with no target and no fit row.
-    fitted_rows = cohort["training"].any(axis=1)
     untabled = list(cohort["research_ids"]).index("5049")
-    assert np.all(np.isnan(cohort["targets"][untabled])) and not fitted_rows[untabled] and "7099" in cohort["research_ids"]
+    assert np.all(np.isnan(cohort["targets"][untabled])) and not fit_rows[untabled] and "7099" in cohort["research_ids"]
     assert all(json.loads((run / "fit" / "models" / arm / f"{trait}.json").read_text())["outer_criterion_met"] == [True] * 3 for arm in ARMS for trait in traits)
 
     # Scores: in both arms every observed target has its own fold's held-out prediction, and the arms differ.
@@ -752,13 +753,14 @@ def test_a_rerun_skips_completed_steps_and_resumes_after_a_failure(workspace) ->
         run_pipeline(config, _bindings(_Recorder(fits_before_failing=1), client), BUDGET)
     run = config.run_directory
     assert (run / "fit.partial").is_dir() and any(path.name.endswith("_fit_failed-RuntimeError") for path in config.marker_directory.iterdir())
-    # The first (arm, trait) fit finished before the preemption and was saved; the rerun resumes after it.
-    assert (run / "fit.partial" / "models" / ARMS[0] / "atrial_fibrillation.json").is_file()
+    # The first arm's fit finished before the preemption and every trait of it was saved; the rerun fits the other arm.
+    assert all((run / "fit.partial" / "models" / ARMS[0] / f"{trait}.json").is_file() for trait in ("atrial_fibrillation", "total_bilirubin"))
+    assert not (run / "fit.partial" / "models" / ARMS[1]).exists()
     finished = {step: _completed_at(run, step) for step in STEP_NAMES[:5]}
     recorder = _Recorder()
     run_pipeline(config, _bindings(recorder, client), BUDGET)
     assert {step: _completed_at(run, step) for step in STEP_NAMES[:5]} == finished
-    assert len(recorder.fit_calls) == 2 * len(ARMS) - 1 and (run / "export" / "_COMPLETE.json").is_file()
+    assert len(recorder.fit_calls) == len(ARMS) - 1 and (run / "export" / "_COMPLETE.json").is_file()
 
     # A changed phenotype set re-runs the steps that read it and keeps the store.
     fewer = WorkspaceConfig.from_mapping({**synthetic.raw, "traits": []})
@@ -1127,3 +1129,24 @@ def test_frozen_probability_calibration_uses_only_reserved_development_families(
         frozen = FrozenCalibration.fit(predictions['linear_predictor'][arm, rows, model], cohort['targets'][rows, trait])
         np.testing.assert_allclose([entry['intercept'], entry['slope']], [frozen.intercept, frozen.slope])
         np.testing.assert_allclose(predictions['calibrated_logits'][arm, :, model], frozen.logits(predictions['linear_predictor'][arm, :, model]))
+
+
+def test_two_diseases_with_the_same_eligible_rows_reserve_the_same_families_and_are_fitted_together() -> None:
+    from sv_pgs.stage2_wiring import model_groups
+
+    generator = np.random.default_rng(5)
+    rows, fold_count, diseases = 240, 2, 3
+    families = generator.integers(0, 80, size=rows)
+    folds = families % fold_count
+    # The third disease observes fewer people than the other two.
+    observed = np.ones((rows, diseases), dtype=bool)
+    observed[families < 10, 2] = False
+    model_traits = np.repeat(np.arange(diseases), fold_count + 1)
+    model_folds = np.tile(np.arange(fold_count + 1), diseases)
+    training = observed[:, model_traits] & (folds[:, None] != model_folds[None, :])
+    calibration = workspace_pipeline.development_calibration(training, model_traits, model_folds, diseases, families, 0.2, 7)
+    assert np.all(calibration.any(axis=0)) and not np.any(calibration & ~training)
+    for fold in range(fold_count + 1):
+        np.testing.assert_array_equal(calibration[:, fold], calibration[:, fold_count + 1 + fold])
+    groups = model_groups(np.arange(rows), np.ones((model_traits.shape[0], 1), dtype=bool), training & ~calibration, (TraitType.QUANTITATIVE,) * model_traits.shape[0])
+    assert [group.tolist() for group in groups] == [[0, 3], [1, 4], [2, 5], [6], [7], [8]]

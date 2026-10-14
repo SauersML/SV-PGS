@@ -121,7 +121,7 @@ from sv_pgs.cohort import (
     read_predicted_ancestry,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS, model_part
+from sv_pgs.artifact import CERTIFICATE_STATUS, model_part, model_subset
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -1006,11 +1006,7 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
     observed = cohort.observed[:, model_traits]
     training = observed & (folds[:, None] != model_folds[None, :])
     held_out = observed & (folds[:, None] == model_folds[None, :])
-    from sv_pgs.probability_calibration import calibration_mask
-    calibration = np.zeros_like(training)
-    for model, trait in enumerate(model_traits):
-        if trait < len(config.diseases):
-            calibration[:, model] = calibration_mask(training[:, model], families, config.calibration_fraction, [config.seed, int(trait), int(model_folds[model])])
+    calibration = development_calibration(training, model_traits, model_folds, len(config.diseases), families, config.calibration_fraction, config.seed)
     training &= ~calibration
     np.savez(
         directory / "cohort.npz",
@@ -1049,6 +1045,23 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         },
         "models": int(model_traits.shape[0]),
     }
+
+
+def development_calibration(
+    training: BoolArray, model_traits: I64Array, model_folds: I64Array, disease_count: int, families: I64Array, fraction: float, seed: int,
+) -> BoolArray:
+    """Each disease model's reserved calibration rows (``probability_calibration.calibration_mask``): whole families of
+    its development rows, drawn by the run's seed and the model's fold alone, never its trait.
+
+    Every disease's fold-k families are disjoint from its own training and evaluation rows whatever the draw, so the
+    outer validation does not depend on it. Drawn without the trait, two diseases with the same eligible rows reserve
+    the same families and keep the same training rows, so the fit fits them together and they share its store passes
+    (``stage2_wiring.model_groups``); drawn per trait, no two diseases' fold models shared a training row set."""
+    calibration = np.zeros_like(training)
+    for model, trait in enumerate(np.asarray(model_traits).tolist()):
+        if trait < disease_count:
+            calibration[:, model] = probability_calibration.calibration_mask(training[:, model], families, fraction, [seed, int(model_folds[model])])
+    return calibration
 
 
 @dataclass(frozen=True, slots=True)
@@ -2826,38 +2839,37 @@ A disease's linear predictor is made a probability by a logistic calibration fit
 families, whose scores and labels are independent of the outer evaluation labels."""
 
 
-def trait_seed(seed: int, trait: int) -> int:
-    """One trait's fit seed from the run's: both arms of a trait share it, so their probes and draws are common random
-    numbers where the models' layouts permit it; this does not eliminate their Monte Carlo error."""
-    return int(np.random.SeedSequence([seed, trait]).generate_state(1, dtype=np.uint64)[0])
-
-
-def trait_request(
-    cohort: _Cohort, trait: int, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int,
+def fit_request(
+    cohort: _Cohort, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int,
     disease_likelihood: str = "gaussian_working", annotated_prior: bool = True,
 ) -> FitRequest:
-    """One trait's models (its folds' and its all-rows model) as one fit, on the rows any of them trains on.
+    """Every trait's models (each trait's folds' and its all-rows model, in the cohort's model order) as one fit, on the
+    rows any of them trains on, so the models of different traits that share their training rows and covariates are
+    fitted together (``stage2_wiring.model_groups``) and share the store's passes.
 
     Every model adjusts for its own trait's covariates and the structure columns, never another trait's; the
     covariate names are the cohort's whole union, so every trait's fitted model scores with the same covariates
     (``artifact.predict_models``). A row's target is read only where its model trains on it.
 
-    The configured disease likelihood is explicit; quantitative traits always use Gaussian regression.
+    The configured disease likelihood is explicit; quantitative traits always use Gaussian regression. Both arms' requests
+    hold the same models in the same order with the run's ``seed``, so each group's probes and draws are common random
+    numbers across the arms where the models' layouts permit it; this does not eliminate their Monte Carlo error.
     """
-    models = cohort.trait_models(trait)
-    training = cohort.training[:, models]
-    rows = training.any(axis=1)
-    adjusted = cohort.covariate_columns[np.full(models.size, trait)]
+    rows = cohort.fit_rows
+    traits = np.asarray(cohort.model_traits)
     return FitRequest(
         store=store,
         store_columns=cohort.store_columns[rows],
         covariates=cohort.covariates[rows][:, 1:],
         covariate_names=cohort.covariate_names[1:],
-        covariate_columns=adjusted[:, 1:],
-        targets=np.where(training, cohort.targets[:, [trait]], np.nan)[rows],
-        training=training[rows],
-        model_names=tuple(cohort.model_names[model] for model in models),
-        trait_types=((TraitType.BINARY if disease_likelihood == "bernoulli" and cohort.trait_types[trait] == TraitType.BINARY else TraitType.QUANTITATIVE),) * models.size,
+        covariate_columns=cohort.covariate_columns[traits][:, 1:],
+        targets=np.where(cohort.training, cohort.targets[:, traits], np.nan)[rows],
+        training=cohort.training[rows],
+        model_names=tuple(cohort.model_names),
+        trait_types=tuple(
+            TraitType.BINARY if disease_likelihood == "bernoulli" and cohort.trait_types[trait] == TraitType.BINARY else TraitType.QUANTITATIVE
+            for trait in traits.tolist()
+        ),
         research_ids=tuple(np.asarray(cohort.research_ids)[rows].tolist()),
         log_variance_offset=log_variance_offset,
         budget=budget,
@@ -2872,13 +2884,17 @@ def _fitted_model_directory(run: _Run, arm: str, trait_name: str) -> Path:
 
 
 def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
-    """Every (arm, trait) fit, each saved on its own as it finishes: a rerun after a preemption resumes at the first
-    (arm, trait) whose model is not on disk (``artifact.save_model`` renames a complete model into place, so a model
-    directory that exists is whole). Each saved model's outcome is recorded beside it, from the saved model.
+    """Each arm's fit of every trait's models as one request (``fit_request``), so the models of different traits that
+    share training rows and covariates share their store passes (``stage2_wiring.model_groups``); each trait's models
+    are then saved on their own (``artifact.model_subset``), in the layout a fit of that trait alone has, so the score,
+    effects and report steps read one model directory per (arm, trait). ``artifact.save_model`` renames a complete model
+    into place, so a model directory that exists is whole, and each saved model's outcome is recorded beside it, from
+    the saved model. A rerun after a preemption fits only an arm with a trait not on disk, and every group of that arm
+    whose models all finished resumes from their checkpoints (``stage2_wiring.fit_models``).
 
-    The fits run trait by trait in the config's order, both arms of a trait back to back, so a run its budget stops
-    (``launcher/workspace``: each job's runtime is bounded) holds complete arm comparisons for the traits it reached.
-    After each trait the log gives the hours its fits took and the step's projected total."""
+    The arms run in ARMS order, each whole before the next, so a run its budget stops (``launcher/workspace``: each
+    job's runtime is bounded) holds the first arm's every trait before the second begins; the comparison of the arms
+    needs both. After each arm the log gives the hours its fit took and the step's projected total."""
     cohort = _read_cohort(run)
     # The measurement model reaches the fit as the records' log reliabilities (its scales already rewrote the store's
     # dosages in the measurement step). The fit has no term for its residual variances or its leakage maps, and none for
@@ -2886,50 +2902,57 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     records: dict[str, dict[str, Any]] = {arm: {} for arm in ARMS}
     fitted_seconds: list[float] = []
+    trait_model_names = {trait: tuple(cohort.model_names[model] for model in cohort.trait_models(trait)) for trait in range(len(cohort.trait_names))}
     with DosageStore.open(_final_store(run)) as store:
-        offsets_of = {arm: arm_log_reliability(store.variant_table, measurement.log_reliability, arm) for arm in ARMS}
-        for trait, trait_name in enumerate(cohort.trait_names):
-            started = time.perf_counter()
-            fitted_here = False
-            for arm in ARMS:
-                offsets = offsets_of[arm]
-                target = directory / "models" / arm / trait_name
-                record = target.with_name(target.name + ".json")
-                if not record.is_file():
-                    work = directory / "work" / arm / trait_name
-                    # A Spot restart keeps completed fold checkpoints; the engine discards only
-                    # the interrupted model's scratch and verifies each checkpoint's input digest.
-                    work.mkdir(parents=True, exist_ok=True)
-                    request = trait_request(cohort, trait, store, offsets, run.budget, work, trait_seed(run.config.seed, trait),
-                                            run.config.disease_likelihood, run.config.annotated_prior)
-                    if not target.is_dir():
-                        target.parent.mkdir(parents=True, exist_ok=True)
-                        LOGGER.info("workspace pipeline: fitting %s / %s", arm, trait_name)
-                        run.bindings.save_model(target, run.bindings.fit(request))
-                        fitted_here = True
-                    fitted = run.bindings.load_model(target)
+        for position, arm in enumerate(ARMS):
+            targets = [directory / "models" / arm / trait_name for trait_name in cohort.trait_names]
+            unrecorded = [trait for trait, target in enumerate(targets) if not target.with_name(target.name + ".json").is_file()]
+            if unrecorded:
+                work = directory / "work" / arm
+                # A Spot restart keeps completed models' checkpoints; the engine discards only the interrupted group's
+                # scratch and verifies each checkpoint's input digest.
+                work.mkdir(parents=True, exist_ok=True)
+                unsaved = [trait for trait in unrecorded if not targets[trait].is_dir()]
+                if unsaved:
+                    request = fit_request(
+                        cohort, store, arm_log_reliability(store.variant_table, measurement.log_reliability, arm), run.budget, work, run.config.seed,
+                        run.config.disease_likelihood, run.config.annotated_prior,
+                    )
+                    LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
+                    started = time.perf_counter()
+                    fitted = run.bindings.fit(request)
                     if tuple(fitted.model_names) != request.model_names:
-                        raise ValueError(f"the {arm} fit of {trait_name} returned other models than the trait's training sets.")
+                        raise ValueError(f"the {arm} fit returned other models than the cohort's training sets.")
+                    for trait in unsaved:
+                        targets[trait].parent.mkdir(parents=True, exist_ok=True)
+                        run.bindings.save_model(targets[trait], model_subset(fitted, trait_model_names[trait]))
+                    fitted_seconds.append(time.perf_counter() - started)
+                    remaining = len(ARMS) - position - 1
+                    LOGGER.info(
+                        "workspace pipeline: the %s fit took %.2f h in this run; at this run's mean of %.2f h an arm, the %d arms "
+                        "left need %.1f h more", arm, fitted_seconds[-1] / 3600.0, np.mean(fitted_seconds) / 3600.0, remaining,
+                        remaining * np.mean(fitted_seconds) / 3600.0,
+                    )
+                timings = checkpoint_timings(work)
+                for trait in unrecorded:
+                    fitted = run.bindings.load_model(targets[trait])
+                    if tuple(fitted.model_names) != trait_model_names[trait]:
+                        raise ValueError(f"the {arm} fit of {cohort.trait_names[trait]} returned other models than the trait's training sets.")
+                    models = set(cohort.trait_models(trait).tolist())
                     _write_json(
-                        record,
+                        targets[trait].with_name(targets[trait].name + ".json"),
                         {
                             "models": list(fitted.model_names),
-                            "completed_fold_timings": checkpoint_timings(work),
+                            # Each checkpointed model's share of its group's time, by its index among the cohort's models.
+                            "completed_fold_timings": [timing for timing in timings if timing["model_index"] in models],
                             "fitted_records": [int(scoring.store_rows.shape[0]) for scoring in fitted.scoring],
                             CERTIFICATE_STATUS: [bool(met) for met in np.asarray(fitted.certificate[CERTIFICATE_STATUS])],
                             "refusals": [str(refusal) for refusal in fitted.refusals],
                         },
                     )
-                    _remove_own(work, directory)
-                records[arm][trait_name] = json.loads(record.read_text(encoding="utf-8"))
-            if fitted_here:
-                fitted_seconds.append(time.perf_counter() - started)
-                remaining = len(cohort.trait_names) - trait - 1
-                LOGGER.info(
-                    "workspace pipeline: %s's fits took %.2f h in this run; at this run's mean of %.2f h a trait, the %d traits "
-                    "left need %.1f h more", trait_name, fitted_seconds[-1] / 3600.0, np.mean(fitted_seconds) / 3600.0, remaining,
-                    remaining * np.mean(fitted_seconds) / 3600.0,
-                )
+                _remove_own(work, directory)
+            for target, trait_name in zip(targets, cohort.trait_names):
+                records[arm][trait_name] = json.loads(target.with_name(target.name + ".json").read_text(encoding="utf-8"))
     _remove_own(directory / "work", directory)
     return {
         "arms": {
@@ -3700,7 +3723,7 @@ _STEPS = (
     # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
     # to either is a change to the phenotypes, not only a change to ``all_of_us``.
     _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
-    _Step("cohort", ("samples", "phenotypes"), lambda config: config.calibration_fraction, (cohort_module, _cohort_step, trait_table), _cohort_step),
+    _Step("cohort", ("samples", "phenotypes"), lambda config: config.calibration_fraction, (cohort_module, _cohort_step, development_calibration, trait_table), _cohort_step),
     _Step(
         "measurement",
         ("samples", "cohort", "store"),
@@ -3723,7 +3746,7 @@ _STEPS = (
         _direct_sv_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, trait_request, trait_seed, *module_closure(fit_model)), _fit_step),
+    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
