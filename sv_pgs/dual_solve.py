@@ -227,7 +227,11 @@ class DualModels:
             weighted = root * values if before else values
             covariates = root * self.covariates
             factor = self.covariate_factor[model]
-            projected = weighted - covariates @ (factor @ (factor.T @ (covariates.T @ weighted)))
+            thin = factor @ (factor.T @ (covariates.T @ weighted))
+            # The correction in the block's own layout, so the difference is one contiguous pass: a tile's columns are
+            # F-ordered, and a C-ordered correction made their projection 2 to 3 times slower and then a copy.
+            correction = (thin.T @ covariates.T).T if weighted.flags.f_contiguous and not weighted.flags.c_contiguous else covariates @ thin
+            projected = weighted - correction
             return root * projected if after else projected
         root = self.root_weights[:, column_models]
         weighted = root * values if before else values
