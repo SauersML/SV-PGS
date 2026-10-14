@@ -770,6 +770,26 @@ def test_a_rerun_skips_completed_steps_and_resumes_after_a_failure(workspace) ->
     assert any(path.name.startswith("phenotypes.superseded-") for path in run.iterdir())
 
 
+def test_a_quarantined_fit_is_named_by_the_fit_step_and_refused_before_the_store_is_scored(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    recorder = _Recorder()
+    fit = recorder.fit
+
+    def uncertified(request: FitRequest) -> _Fitted:
+        fitted = fit(request)
+        if len(recorder.fit_calls) == 1:
+            fitted.certificate["outer_criterion_met"][0] = False
+        return fitted
+
+    recorder.fit = uncertified
+    with pytest.raises(ValueError, match=rf"quarantined 1 fitted models from scoring: {ARMS[0]}/\w+ \(outer_criterion_met\)"):
+        run_pipeline(config, _bindings(recorder, client), BUDGET)
+    arms = json.loads((config.run_directory / "fit" / "_COMPLETE.json").read_text())["summary"]["arms"]
+    assert len(arms[ARMS[0]]["quarantined"]) == 1 and arms[ARMS[1]]["quarantined"] == []
+    assert not (config.run_directory / "score").exists()
+
+
 def test_without_truth_calls_the_run_says_so_and_keeps_the_stored_dosages(workspace) -> None:
     synthetic, client = workspace
     two_threads = dataclasses.replace(BUDGET, cpu_threads=2)

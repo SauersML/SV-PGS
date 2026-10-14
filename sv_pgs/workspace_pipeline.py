@@ -127,6 +127,7 @@ from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.fit_model import FitRequest
+from sv_pgs.model_acceptance import acceptance, require_accepted
 from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_r2
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
@@ -2948,6 +2949,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                             "fitted_records": [int(scoring.store_rows.shape[0]) for scoring in fitted.scoring],
                             CERTIFICATE_STATUS: [bool(met) for met in np.asarray(fitted.certificate[CERTIFICATE_STATUS])],
                             "refusals": [str(refusal) for refusal in fitted.refusals],
+                            # model_acceptance's verdict, recorded when the fit ends so the summary names a quarantined
+                            # trait at once and the score step refuses it before reading the store.
+                            "acceptance": acceptance(fitted),
                         },
                     )
                 _remove_own(work, directory)
@@ -2960,6 +2964,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 "models": sum(len(record["models"]) for record in by_trait.values()),
                 "outer_criterion_met": sum(sum(record[CERTIFICATE_STATUS]) for record in by_trait.values()),
                 "refusals": sum(len(record["refusals"]) for record in by_trait.values()),
+                "quarantined": [trait_name for trait_name, record in by_trait.items() if not record["acceptance"]["accepted"]],
             }
             for arm, by_trait in records.items()
         },
@@ -3007,9 +3012,16 @@ def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
 def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
     host's memory allows the saved models to be held together (``score_batches``)."""
-    from sv_pgs.model_acceptance import require_accepted
     cohort = _read_cohort(run)
     directories = [_fitted_model_directory(run, arm, trait_name) for arm in ARMS for trait_name in cohort.trait_names]
+    quarantined = []
+    for folder in directories:
+        verdict = json.loads(folder.with_name(folder.name + ".json").read_text(encoding="utf-8"))["acceptance"]
+        if not verdict["accepted"]:
+            codes = sorted({issue["code"] for issue in verdict["issues"] if issue["severity"] == "fatal"})
+            quarantined.append(f"{folder.parent.name}/{folder.name} ({', '.join(codes)})")
+    if quarantined:
+        raise ValueError(f"model_acceptance quarantined {len(quarantined)} fitted models from scoring: {'; '.join(quarantined)}")
     shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
     columns = {name: np.empty((shape[1], shape[0] * shape[2])) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
     names: list[str] = []
@@ -3243,7 +3255,6 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         for arm in ARMS:
             for trait, trait_name in enumerate(cohort.trait_names):
                 fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
-                from sv_pgs.model_acceptance import require_accepted
                 require_accepted(fitted)
                 scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
                 effects = variant_effects(scoring, codes_per_unit, working_bytes)
