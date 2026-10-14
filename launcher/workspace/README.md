@@ -15,10 +15,10 @@ Jobs go straight to Google Batch: `submit.sh` runs `gcloud batch jobs submit` fr
 ## The run's home: the workspace bucket
 
 Batch cannot write to an existing persistent disk ("All options except writing are supported", [Batch storage](https://docs.cloud.google.com/batch/docs/create-run-job-storage)), so no disk carries a run from one job to the next. Each job instead gets a new `pd-balanced` disk of `RUN_DISK_GB`, and the run lives in `gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run/` (`sv-pgs run-mirror`, `sv_pgs/run_mirror.py`):
-- **Restored before the driver starts:** every completed step, and the fit step's checkpoints and saved models.
+- **Restored before the driver starts:** every completed step, and the fit step's checkpoints and saved models. Of the store copies (the store, measurement and direct_sv steps each write one), only the last completed one is downloaded; each earlier one is linked to its mirrored copy on the `/mnt/disks/ops` mount, since only a step made again reads it.
 - **Pushed while the driver runs:** a step once it completes, the fit's checkpoints as they appear, and everything once more when the driver exits.
 - **Sizing:** the mirror holds participant-level data, so `OPS_BUCKET` must be the workspace's own bucket. `RUN_DISK_GB` must hold every step's output, including the store step's, measurement step's and direct_sv step's copies of the store.
-- **Cost:** a job's start copies the mirror to its disk. A preemption loses at most 15 minutes of fit progress and any unfinished step other than the fit. The mirror's storage comes out of the $750 reserve.
+- **Cost:** a job's start copies the mirror to its disk, with one store copy rather than three once those steps are done. A preemption loses at most 15 minutes of fit progress and any unfinished step other than the fit. The mirror's storage comes out of the $750 reserve.
 
 
 ## Study budget

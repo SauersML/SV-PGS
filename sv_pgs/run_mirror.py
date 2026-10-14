@@ -16,6 +16,13 @@ The durable state is what the driver resumes from:
 
 Any other partial work is redone, as after a preemption on one disk. GCS creates an object only when its upload
 completes, so a mirrored file is whole or absent.
+
+The store, measurement and direct_sv steps each write a full copy of the genotype codes (``<step>/store``, 1.7 TB at
+the design workload), and only the next of them reads it: the fit, score, effects and report steps read the last one
+(``workspace_pipeline._final_store``). Where the job mounts the mirror's bucket (content_identity.GCS_MOUNTS, as
+launcher/workspace does), a restore links each store a later completed step's replaces to its mirrored copy on the
+mount instead of downloading it, so a job start fetches one copy, not three. A step made again that reads a linked
+store reads it through the mount.
 """
 from __future__ import annotations
 
@@ -29,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Protocol
 
+from sv_pgs.content_identity import GCS_MOUNTS
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, STEP_NAMES
 
 LOGGER = logging.getLogger(__name__)
@@ -42,6 +50,8 @@ DIRECTORIES = ".directories.json"
 restored from this list."""
 RECORDS = "models/*/*.json"
 """The fit step's saved-model records in its partial: models/<arm>/<trait>.json, written after models/<arm>/<trait>."""
+STORE = "store"
+"""A step's store payload, <step>/store: a full copy of the genotype codes."""
 
 
 class Remote(Protocol):
@@ -249,12 +259,34 @@ def _matches(relative: str, pattern: str) -> bool:
     return len(parts) == len(wanted) and all(fnmatchcase(part, want) for part, want in zip(parts, wanted))
 
 
-def restore(run_directory: Path, remote: Remote) -> None:
+def mounted(url: str) -> Path | None:
+    """Where the mirror ``url`` (gs://bucket/prefix) shows on this machine's bucket mounts (GCS_MOUNTS), or None."""
+    bucket, _, prefix = url.removeprefix("gs://").partition("/")
+    for mount, shown in json.loads(os.environ.get(GCS_MOUNTS) or "{}").items():
+        shown_bucket, _, shown_prefix = shown.removeprefix("gs://").partition("/")
+        inside = Path(prefix.strip("/"))
+        if shown_bucket == bucket and inside.is_relative_to(shown_prefix.strip("/")):
+            return Path(mount) / inside.relative_to(shown_prefix.strip("/"))
+    return None
+
+
+def _replaced_stores(names: dict[str, int]) -> set[str]:
+    """The completed steps whose mirrored store payload a later completed step's replaces: each but the last."""
+    complete = {step for step in STEP_NAMES if f"{step}/{COMPLETE_FILE}" in names}
+    holding = {name.split("/", 1)[0] for name in names if name.split("/", 2)[1:2] == [STORE] and name.count("/") >= 2}
+    stores = [step for step in STEP_NAMES if step in complete and step in holding]
+    return set(stores[:-1])
+
+
+def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> None:
     """Fill a run directory from the mirror: every completed step, and each partial step's durable units, for every step
     this run directory does not hold already. Each is downloaded aside and renamed into place, so an interrupted restore
-    leaves no step directory the driver would take for its own."""
+    leaves no step directory the driver would take for its own. ``mount`` is where the mirror shows on this machine
+    (``mounted``): a completed step's store payload that a later completed step's replaces is linked there, not
+    downloaded."""
     names = remote.sizes("")
     run_directory.mkdir(parents=True, exist_ok=True)
+    linked = _replaced_stores(names) if mount is not None else set()
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
         if final.exists() or partial.exists():
@@ -271,8 +303,14 @@ def restore(run_directory: Path, remote: Remote) -> None:
         if aside.exists():
             shutil.rmtree(aside)
         aside.mkdir()
-        listed = remote.read(f"{name}{DIRECTORIES}") if target == final else None
-        for directory in json.loads(listed) if listed is not None else []:
+        listed = json.loads(remote.read(f"{name}{DIRECTORIES}") or "[]") if target == final else []
+        payload = mount / step / STORE if mount is not None and target == final and step in linked else None
+        if payload is not None and payload.is_dir():
+            chosen = [entry for entry in chosen if not entry.startswith(f"{step}/{STORE}/")]
+            listed = [directory for directory in listed if Path(directory).parts[0] != STORE]
+            (aside / STORE).symlink_to(payload, target_is_directory=True)
+            LOGGER.info("run mirror: %s/%s, which a later step's store replaces, is read from %s", step, STORE, payload)
+        for directory in listed:
             (aside / directory).mkdir(parents=True, exist_ok=True)
         _transfer([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen], lambda path, entry: remote.download(entry, path))
         os.rename(aside, target)

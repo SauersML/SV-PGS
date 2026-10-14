@@ -187,9 +187,13 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "run-mirror":
-        from sv_pgs.run_mirror import GcsRemote, push, restore
+        from sv_pgs.run_mirror import GcsRemote, mounted, push, restore
 
-        (push if args.action == "push" else restore)(WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror))
+        run_directory, remote = WorkspaceConfig.read(args.config).run_directory, GcsRemote(args.mirror)
+        if args.action == "push":
+            push(run_directory, remote)
+        else:
+            restore(run_directory, remote, mounted(args.mirror))
         return 0
 
     if args.command == "census-all-of-us-traits":

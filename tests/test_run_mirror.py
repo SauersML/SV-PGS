@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from sv_pgs.run_mirror import DirectoryRemote, push, restore
+from sv_pgs.content_identity import GCS_MOUNTS
+from sv_pgs.run_mirror import DirectoryRemote, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
 
 
@@ -128,3 +130,52 @@ def test_an_interrupted_restore_leaves_no_step_directory(tmp_path: Path) -> None
     assert not (restored / "store").exists()
     restore(restored, DirectoryRemote(mirror))
     assert (restored / "store" / COMPLETE_FILE).is_file() and not list(restored.glob("*.restoring"))
+
+
+def _stores(root: Path, steps: tuple[str, ...]) -> Path:
+    """A run directory whose completed steps ``steps`` each hold a store payload, as the store, measurement and
+    direct_sv steps do."""
+    for position, step in enumerate(steps):
+        _write(root / step / "store" / "chunk" / "0", bytes([position]) * 16)
+        (root / step / "store" / "loci").mkdir()
+        _write(root / step / "summary.json", "{}")
+        _write(root / step / COMPLETE_FILE, f'{{"key": "{step}"}}')
+    return root
+
+
+def test_a_store_a_later_step_s_replaces_is_linked_to_the_mount_and_the_last_is_downloaded(tmp_path: Path) -> None:
+    run, mirror = _stores(tmp_path / "run", ("store", "measurement", "direct_sv")), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    restored = tmp_path / "restored"
+    # The mirror's directory is where a DirectoryRemote's objects show, as the bucket's mount shows a GcsRemote's.
+    restore(restored, remote, mirror)
+    for step in ("store", "measurement"):
+        assert (restored / step / "store").is_symlink() and (restored / step / "store").resolve() == (mirror / step / "store").resolve()
+        assert (restored / step / "summary.json").is_file() and not (restored / step / "summary.json").is_symlink()
+    assert not (restored / "direct_sv" / "store").is_symlink() and (restored / "direct_sv" / "store" / "loci").is_dir()
+    # Read through the links, the restored run holds what the pushed one did.
+    followed = {
+        (Path(directory) / name).relative_to(restored).as_posix(): (Path(directory) / name).read_bytes()
+        for directory, _directories, names in os.walk(restored, followlinks=True) for name in names
+    }
+    assert followed == _tree(run)
+
+
+def test_the_store_the_next_step_reads_is_downloaded_and_without_a_mount_every_store_is(tmp_path: Path) -> None:
+    run, mirror = _stores(tmp_path / "run", ("store", "measurement")), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    # direct_sv has not run: it reads the measurement step's store, which is downloaded.
+    restore(tmp_path / "linked", remote, mirror)
+    assert (tmp_path / "linked" / "store" / "store").is_symlink() and not (tmp_path / "linked" / "measurement" / "store").is_symlink()
+    restore(tmp_path / "copied", remote)
+    assert not any(path.is_symlink() for path in (tmp_path / "copied").rglob("*"))
+    assert _tree(tmp_path / "copied") == _tree(run)
+
+
+def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> None:
+    monkeypatch.setenv(GCS_MOUNTS, '{"/mnt/disks/ops": "gs://ops", "/mnt/disks/cdr": "gs://cdr/v8"}')
+    assert mounted("gs://ops/svpgs/run1/run") == Path("/mnt/disks/ops/svpgs/run1/run")
+    assert mounted("gs://cdr/v8/svpgs") == Path("/mnt/disks/cdr/svpgs")
+    assert mounted("gs://cdr/v7/svpgs") is None and mounted("gs://other/run") is None
