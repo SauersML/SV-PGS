@@ -207,9 +207,13 @@ def test_tilted_moments_match_direct_quadrature_in_every_regime(seed, kind):
         mean = float(np.sum(responsibility * node_mean))
         variance = float(np.sum(responsibility * (node_variance + np.square(node_mean - mean))))
         # The reference's own error (QUADPACK's estimates, carried through the mixture) plus double precision's
-        # rounding of the K-term sums.
+        # rounding: the K-term sums, and each responsibility's exponential, whose argument (a log weight plus a log
+        # integral less the log normalizer) carries a rounding of about its own magnitude in ulps, which exp turns
+        # into that much relative error (exp(x(1 + d)) = exp(x)(1 + x d)). Strong cavities give arguments in the
+        # hundreds, and errors of that many ulps.
         reference_error = float(np.sum(responsibility * node_error))
-        summation = 4.0 * nodes.shape[0] * _EPSILON
+        conditioning = float(np.sum(responsibility * (np.abs(log_weights) + np.abs(log_node) + abs(log_normalizer))))
+        summation = (4.0 * nodes.shape[0] + conditioning) * _EPSILON
         assert abs(moments.log_normalizer[variant] - log_normalizer) <= reference_error + summation * (1.0 + abs(log_normalizer))
         scale = np.sqrt(variance)
         assert abs(moments.mean[variant] - mean) <= (reference_error + summation) * (abs(mean) + scale)
