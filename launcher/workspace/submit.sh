@@ -2,19 +2,23 @@
 # Submit one pipeline job to Google Batch, from a terminal inside the All of Us workspace (a Workbench app or VM in the
 # workspace project, as the workspace's identity). Never launched by an agent: launching is the user's decision.
 #
-#   submit.sh store   # steps samples .. measurement, on spot CPUs
-#   submit.sh fit     # steps fit .. export, on GPUs
+#   submit.sh store      # steps samples .. measurement, on spot CPUs
+#   submit.sh fit        # steps fit .. export, on GPUs
+#   submit.sh gpucheck   # the CUDA tests and a small fit on the fit job's GPUs, once, before the fit (gpu_check.sh)
 #
 # Each job reserves one slot in the study's immutable $3,000 envelope before submission.
 # Batch limits task runtime; separately billed resources use the plan's non-task reserve.
 set -euo pipefail
 job="${1:-}"
 case "$job" in
-  store|fit) ;;
-  *) echo "usage: submit.sh store|fit" >&2; exit 2 ;;
+  store|fit) spec="$job" ;;
+  # The GPU check runs on the fit job's machine.
+  gpucheck) spec=fit ;;
+  *) echo "usage: submit.sh store|fit|gpucheck" >&2; exit 2 ;;
 esac
 here="$(cd "$(dirname "$0")" && pwd)"
-: "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?}" "${RUN_ID:?}" "${HOURLY_USD:?}" "${THROUGH:?}" "${BUDGET_SLOT:?}"
+: "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?}" "${RUN_ID:?}" "${HOURLY_USD:?}" "${BUDGET_SLOT:?}"
+if [ "$job" != gpucheck ]; then : "${THROUGH:?}"; fi
 STUDY_BUDGET="${STUDY_BUDGET:-$here/study_budget.template.json}"
 MAX_RETRIES="${MAX_RETRIES:-0}"
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
@@ -36,12 +40,18 @@ if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
 fi
 CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
 export CDR_BUCKET="${CDR_BUCKET%/}"
-python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET
+# The slot's task script, run_step.sh in the slot's launcher directory whichever job it is.
+if [ "$job" = gpucheck ]; then
+  python3 "$here/budget_guard.py" render --template "$here/gpu_check.sh.template" --output "$stage/run_step.sh" \
+    --variables RUN_ID OPS_BUCKET BUDGET_SLOT
+else
+  python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
+    --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET
+fi
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
-if [ "$job" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
+if [ "$spec" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
 variables+=(CDR_BUCKET GOOGLE_PROJECT)
-python3 "$here/budget_guard.py" render --template "$here/job_${job}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
+python3 "$here/budget_guard.py" render --template "$here/job_${spec}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
 # running job.
 python3 - "$stage/job.json" "$BUDGET_SLOT" <<'PY'

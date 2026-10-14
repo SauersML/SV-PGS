@@ -63,10 +63,14 @@ Under `gs://${OPS_BUCKET}/svpgs/${RUN_ID}/`:
 - `source/`: this repository at the commit to run (`git archive`).
 - `bin/uv`: the uv binary (`cp "$(command -v uv)"`).
 - `python/`: CPython 3.12, `UV_PYTHON_INSTALL_DIR=python uv python install 3.12`.
-- `uv-cache/`: every locked wheel, `UV_CACHE_DIR=uv-cache UV_PYTHON_INSTALL_DIR=python uv sync --frozen --no-dev --extra gpu --python 3.12` in the source tree (the CPU job's `UV_EXTRAS` is empty and uses a subset).
+- `uv-cache/`: every locked wheel, `UV_CACHE_DIR=uv-cache UV_PYTHON_INSTALL_DIR=python uv sync --frozen --extra gpu --python 3.12` in the source tree. The CPU job's `UV_EXTRAS` is empty and uses a subset; the dev group's wheels are there for the GPU check's pytest.
 - `run_config.json`: the filled `run_config.template.json`; its `direct_sv.gatksv_calls` reads the CDR's GATK-SV VCFs through the CPU job's `/mnt/disks/cdr` mount.
 
 The staging machine and the Batch VMs must be the same platform (Linux x86-64). The inputs the config points at are read where they sit inside the workspace, through a mounted bucket.
+
+## The GPU check (once, before the fit)
+
+No CI or local machine has a CUDA device, so the CUDA paths first run on the fit job's machine. `submit.sh gpucheck` runs there, in a slot of its own (the `pilot` slot fits it), with the fit job's placeholders less `THROUGH`. It runs every `tests/*_cuda.py`, the CUDA cases of the other test files, and the bench-sim submissions' fits, which take the machine's devices, so Stage 0 and Stage 2 run on them end to end. It neither reads nor writes the run. The report is `launcher/<slot>/gpu_check.log`, with `gpu_check.xml` and `nvidia-smi.txt` beside it; the task fails if any test fails. Use the fit job's `MACHINE_TYPE` and `GPU_COUNT`, so the multi-device cases (two or more devices) run too.
 
 ## Placeholders
 

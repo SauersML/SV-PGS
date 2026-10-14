@@ -213,3 +213,20 @@ def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, throug
     cdr = volumes["/mnt/disks/cdr"]
     assert cdr["gcs"]["remotePath"] == "fc-aou-datasets-controlled/v8"
     assert "-o ro" in cdr["mountOptions"] and "--billing-project=test-project" in cdr["mountOptions"]
+
+
+def test_the_gpu_check_runs_the_cuda_tests_on_the_fit_job_s_machine_and_reports_to_its_slot(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.pop("THROUGH")
+    submitted = subprocess.run(["bash", str(launcher), "gpucheck"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    guard.validate_job(spec, 146400, 0)
+    assert spec["allocationPolicy"]["instances"][0]["policy"]["accelerators"] == [{"type": "nvidia-tesla-a100", "count": 1}]
+    assert spec["taskGroups"][0]["taskSpec"]["runnables"][0]["script"]["text"] == "bash /mnt/disks/ops/svpgs/study/launcher/pilot/run_step.sh"
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
+    assert "${RUN_ID}" not in script and "${BUDGET_SLOT}" not in script and 'REPORT="$OPS/launcher/pilot"' in script
+    # The dev group's pytest is synced (no --no-dev), the GPU is checked before the tests, and the run is untouched.
+    assert "--extra gpu" in script and "--no-dev" not in script
+    assert script.index("exit-no-gpu") < script.index("-m pytest") and "tests/*_cuda.py" in script
+    assert "run-mirror" not in script and "workspace-run" not in script

@@ -1,0 +1,39 @@
+#!/bin/bash
+# TEMPLATE, never launched by an agent: launching is the user's decision (submit.sh gpucheck fills and submits it).
+# The GPU check, run once on the fit job's machine type before the fit job spends its slots. No CI or local machine has
+# a CUDA device, so this is where the CUDA paths first run:
+# - every tests/*_cuda.py, and the CUDA cases of the other test files, which skip on a machine without a device;
+# - the bench-sim submissions' fits, whose budget takes the machine's devices, so Stage 0 and Stage 2 run on them end
+#   to end on a small synthetic cohort.
+# It builds the environment offline as run_step.sh does, with the dev group's pytest added (README.md, "Staging"). It
+# neither reads nor writes the run. Its report goes to launcher/${BUDGET_SLOT}/ in the ops bucket: gpu_check.log,
+# gpu_check.xml (JUnit) and nvidia-smi.txt.
+set -uo pipefail
+OPS=/mnt/disks/ops/svpgs/${RUN_ID}
+RUN=/mnt/disks/run
+REPORT="$OPS/launcher/${BUDGET_SLOT}"
+mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_gpu_check_$1"; }
+trap 'mark "terminated"; exit 75' TERM
+mark started
+# The source is copied to the run disk too, so pytest and Python write nothing into the bucket's copy.
+mkdir -p "$RUN/tools" "$REPORT" && cp "$OPS/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" \
+  && rm -rf "$RUN/python" "$RUN/uv-cache" "$RUN/source" && cp -r "$OPS/python" "$RUN/python" && cp -r "$OPS/uv-cache" "$RUN/uv-cache" \
+  && cp -r "$OPS/source" "$RUN/source" && chmod +x "$RUN"/python/*/bin/* \
+  || { mark "exit-install"; exit 1; }
+UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
+  "$RUN/tools/uv" sync --project "$RUN/source" --frozen --python 3.12 --extra gpu \
+  || { mark "exit-install"; exit 1; }
+nvidia-smi > "$REPORT/nvidia-smi.txt" 2>&1
+"$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1)" \
+  || { mark "exit-no-gpu"; exit 1; }
+export TMPDIR="$RUN/tmp"
+mkdir -p "$TMPDIR"
+cd "$RUN/source" || { mark "exit-install"; exit 1; }
+"$RUN/venv/bin/python" -m pytest -m "not slow" -p no:cacheprovider -rs --durations=20 --junitxml="$REPORT/gpu_check.xml" \
+  tests/*_cuda.py tests/test_store_block_source.py tests/test_resident_codes.py tests/test_memory_broker.py tests/test_fast_scoring.py \
+  tests/test_bench_sim_svpgs_submission.py tests/test_bench_sim_derived.py \
+  > "$REPORT/gpu_check.log" 2>&1
+status=$?
+mark "exit-${status}"
+# A failed or uncollected test fails the task, without a retry (job_fit.json.template retries only preemptions).
+[ "$status" -eq 0 ] || exit 1
