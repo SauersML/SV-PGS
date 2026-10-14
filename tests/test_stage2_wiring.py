@@ -359,17 +359,62 @@ def test_a_band_route_start_with_no_fixed_point_costs_no_model(tmp_path: Path, m
         return engine(**arguments)
 
     monkeypatch.setattr(stage2_wiring, "fit_full_data", refusing)
+    events: list[tuple[str, int]] = []
+
+    class RecordedBand(stage2_wiring.GramBand):
+        def __init__(self, *arguments, **keywords):
+            super().__init__(*arguments, **keywords)
+            events.append(("built", id(self)))
+
+        def release(self):
+            events.append(("released", id(self)))
+            super().release()
+
+    monkeypatch.setattr(stage2_wiring, "GramBand", RecordedBand)
     # Two traits on the first training set: one group.
     fitted = _fitted_group(store, covariate, model_targets[:, [0, 2]], training[:, [0, 2]], tmp_path / "work", 5)
     # The joint start, then each model's own; where that is refused too, the model's sample-route fit. (A model the gate
     # would quarantine is fitted on the sample route after these.)
     expected = [(2, True), (1, True), (1, True)] if refused == "joint" else [(2, True), (1, True), (1, False), (1, True), (1, False)]
     assert calls[: len(expected)] == expected
+    # The group's band is released before any model's own is built: two caches of the working share are never live.
+    group_band = events[0][1]
+    assert events[1] == ("released", group_band) and all(event != ("built", group_band) for event in events[1:])
     for model in range(2):
         reasons = [reason for reason in fitted.certificate.refusals if reason.startswith(f"model {model}: ")]
         assert any("joint fit of models 0, 1 had no certified start, so each was fitted on its own" in reason for reason in reasons)
         assert any("fitted on the sample route" in reason for reason in reasons) == (refused == "every")
         assert fitted.scoring[model].store_rows.shape[0] > 0
+
+
+def test_a_quarantined_band_fit_whose_sample_refit_has_no_start_stands_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A band-route fit the gate would quarantine whose sample-route refit has no certified start either stands, its
+    fatal terms quarantining that model alone and its refusals saying why, and the group's other models keep their fits:
+    the failure neither kills the group nor repeats on a restart. A stub has the gate quarantine every band-route fit and
+    refuses the first sample-route refit's start."""
+    from sv_pgs import stage2_wiring
+
+    store, covariate, model_targets, training, _held_out = _three_traits(tmp_path / "store")
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (np.inf, 0.0))
+    monkeypatch.setattr(stage2_wiring, "_quarantine_codes", lambda fit: ["outer_criterion_met"])
+    engine = stage2_wiring.fit_full_data
+    refits: list[int] = []
+
+    def refusing(**arguments):
+        if arguments["band"] is None and "starts" not in arguments:
+            refits.append(arguments["gaussian"].model_count)
+            if len(refits) == 1:
+                raise FloatingPointError("a starting point has no certified EP fixed point (stub)")
+        return engine(**arguments)
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", refusing)
+    fitted = _fitted_group(store, covariate, model_targets[:, [0, 2]], training[:, [0, 2]], tmp_path / "work", 5)
+    assert refits == [1, 1]
+    stands = [reason for reason in fitted.certificate.refusals if reason.startswith("model 0: ")]
+    assert any("its sample-route refit had no certified start, so it stands" in reason for reason in stands)
+    refitted = [reason for reason in fitted.certificate.refusals if reason.startswith("model 1: ")]
+    assert any(reason.endswith("so it was fitted again alone on the sample route") for reason in refitted)
+    assert all(scoring.store_rows.shape[0] > 0 for scoring in fitted.scoring)
 
 
 def test_a_band_route_fit_the_gate_would_quarantine_is_fitted_again_on_the_sample_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

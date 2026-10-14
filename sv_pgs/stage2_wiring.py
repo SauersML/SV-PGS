@@ -729,6 +729,9 @@ def _fit_group(
         try:
             fitted(everyone, True, ())
         except FloatingPointError as error:
+            # Nothing after this reads the group's band (a model's own band-route fit has its own band, and the gate's
+            # refits run on the samples): its cache goes before the models' fits build theirs.
+            band.release()
             if count == 1:
                 log(f"stage2 wiring: model {int(models[genetic[0]])}: the band route's fit has no certified start ({error}); fitted again on the sample route")
                 fitted(everyone, False, (f"the band route's fit had no certified start, so it was fitted on the sample route: {error}",))
@@ -747,7 +750,17 @@ def _fit_group(
             codes = _quarantine_codes(results[genetic[column]])
             if codes:
                 log(f"stage2 wiring: model {int(models[genetic[column]])}: its band-route fit would be quarantined ({', '.join(codes)}); fitted again alone on the sample route")
-                fitted([column], False, (*noted[column], f"the band route's fit would be quarantined ({', '.join(codes)}), so it was fitted again alone on the sample route"))
+                try:
+                    fitted([column], False, (*noted[column], f"the band route's fit would be quarantined ({', '.join(codes)}), so it was fitted again alone on the sample route"))
+                except FloatingPointError as error:
+                    # No sample-route fit either: the band-route fit stands, its fatal terms still quarantine this model
+                    # alone, its refusals say the refit failed, and the group's other models keep their fits.
+                    kept = results[genetic[column]]
+                    log(f"stage2 wiring: model {int(models[genetic[column]])}: its sample-route refit has no certified start either ({error}); its band-route fit stands")
+                    results[genetic[column]] = dataclasses.replace(kept, certificate=dataclasses.replace(kept.certificate, refusals=(
+                        *kept.certificate.refusals,
+                        f"the band route's fit would be quarantined ({', '.join(codes)}) and its sample-route refit had no certified start, so it stands: {error}",
+                    )))
         band.release()
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples, {count} models fitted together")
     return [result for result in results if result is not None]
