@@ -98,3 +98,42 @@ def test_failed_checkpoint_write_does_not_destroy_previous_file(tmp_path, monkey
     with pytest.raises(OSError, match="disk full"):
         save_checkpoint(path, _fit(2), "key", 2.0)
     _equal(fit, load_checkpoint(path, "key"))
+
+
+def test_a_group_whose_fit_raises_is_quarantined_and_the_other_groups_are_fitted(tmp_path, monkeypatch):
+    # Three quantitative models on different training rows: three groups. The middle group's fit has no certified
+    # fixed point; its model comes back as its covariates alone with the failure among its refusals and its outer
+    # criterion unmet (model_acceptance quarantines it), and the request still returns every model.
+    monkeypatch.setattr(stage2_wiring, "store_measurement", lambda *args: None)
+    failing = stage2_wiring._seed(91, 1)
+
+    def engine(*args):
+        if args[7] == failing:
+            raise FloatingPointError("a starting point has no certified fixed point")
+        fit = _fit(args[7])
+        # A fit's state digest is its 32 bytes per model, as the null model's (the stub certificate's is per model).
+        certificate = dataclasses.replace(fit.certificate, state_digest=np.zeros((1, 32), dtype=np.uint8))
+        return [dataclasses.replace(fit, scoring=dataclasses.replace(fit.scoring, trait_type=TraitType.QUANTITATIVE), certificate=certificate)]
+
+    monkeypatch.setattr(stage2_wiring, "_fit_group", engine)
+    rng = np.random.default_rng(5)
+    training = np.ones((12, 3), dtype=bool)
+    training[np.arange(3), np.arange(3)] = False
+    fitted = stage2_wiring.fit_models(
+        store=SimpleNamespace(), store_columns=np.arange(12), covariates=np.column_stack([np.ones(12), rng.normal(size=12)]),
+        covariate_columns=np.ones((3, 2), dtype=bool), targets=rng.normal(size=(12, 3)), training=training,
+        trait_types=(TraitType.QUANTITATIVE,) * 3, log_variance_offset=None, budget=_budget(), work_dir=tmp_path, seed=91,
+        draw_count=8, checkpoint_key="problem",
+    )
+    assert len(fitted.scoring) == 3 and np.asarray(fitted.certificate.outer_criterion_met).tolist() == [True, False, True]
+    assert fitted.scoring[1].store_rows.shape[0] == 0
+    assert any(reason.startswith("model 1: models 1: the fit failed: a starting point has no certified fixed point") for reason in fitted.certificate.refusals)
+    # The failure is checkpointed like a finished fit, so a rerun does not fit the group again.
+    monkeypatch.setattr(stage2_wiring, "_fit_group", lambda *args: pytest.fail("refitted a checkpointed group"))
+    repeated = stage2_wiring.fit_models(
+        store=SimpleNamespace(), store_columns=np.arange(12), covariates=np.column_stack([np.ones(12), rng.normal(size=12)]),
+        covariate_columns=np.ones((3, 2), dtype=bool), targets=rng.normal(size=(12, 3)), training=training,
+        trait_types=(TraitType.QUANTITATIVE,) * 3, log_variance_offset=None, budget=_budget(), work_dir=tmp_path, seed=91,
+        draw_count=8, checkpoint_key="problem",
+    )
+    assert np.asarray(repeated.certificate.outer_criterion_met).tolist() == [True, False, True]

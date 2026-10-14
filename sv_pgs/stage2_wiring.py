@@ -351,6 +351,21 @@ def _null_binary_model(covariates: F64Array, labels: F64Array, draw_count: int, 
     return dataclasses.replace(base, scoring=scoring, noise=1.0, certificate=certificate)
 
 
+def _failed_group(covariates: F64Array, targets: F64Array, trait_type: TraitType, draw_count: int, reason: str) -> list[_ModelFit]:
+    """A group whose fit raised (no certified fixed point on any route): each model as its covariates alone (the null
+    genetic model's form, so the request still returns one fit per model), with ``reason`` among its refusals and its
+    outer criterion unmet, which ``model_acceptance`` quarantines: it is saved, never scored or reported."""
+    log(f"stage2 wiring: {reason}; each model is quarantined")
+    fits = []
+    for model in range(targets.shape[1]):
+        if trait_type == TraitType.BINARY:
+            null = _null_binary_model(covariates, targets[:, model], draw_count, reason)
+        else:
+            null = _null_genetic_model(_covariate_least_squares(covariates, targets[:, model]), draw_count, reason)
+        fits.append(dataclasses.replace(null, certificate=_with_refusal(null.certificate, reason)))
+    return fits
+
+
 def _with_refusal(certificate: FitCertificate, reason: str) -> FitCertificate:
     """One model's ``certificate`` with ``reason`` appended to its refusals, its outer criterion unmet and one more
     unresolved trial."""
@@ -837,23 +852,31 @@ def fit_models(
             group_dir.mkdir(parents=True)
             log(f"stage2 wiring: group {index + 1} of {len(groups)}: models {label} on {rows.shape[0]:,} training rows")
             started = time.perf_counter()
+            group_covariates = np.asarray(covariates[rows][:, adjusted], dtype=np.float64)
+            group_targets = np.asarray(targets[np.ix_(rows, group)], dtype=np.float64)
             # One ledger per group's fit: its host leases and every device allocation.
-            with memory_scope(budget):
-                group_fits = _fit_group(
-                    store,
-                    np.asarray(store_columns[rows], dtype=np.int64),
-                    np.asarray(covariates[rows][:, adjusted], dtype=np.float64),
-                    np.asarray(targets[np.ix_(rows, group)], dtype=np.float64),
-                    measurement,
-                    budget,
-                    group_dir,
-                    _seed(seed, *group.tolist()),
-                    draw_count,
-                    group,
-                    trait_types[first],
-                    inference,
-                    annotated_prior,
-                )
+            try:
+                with memory_scope(budget):
+                    group_fits = _fit_group(
+                        store,
+                        np.asarray(store_columns[rows], dtype=np.int64),
+                        group_covariates,
+                        group_targets,
+                        measurement,
+                        budget,
+                        group_dir,
+                        _seed(seed, *group.tolist()),
+                        draw_count,
+                        group,
+                        trait_types[first],
+                        inference,
+                        annotated_prior,
+                    )
+            except FloatingPointError as error:
+                # A fit with no certified fixed point on any route is the same failure on every rerun (its seeds are
+                # its own), so it costs its models, not the request: each is quarantined (``_failed_group``) and
+                # checkpointed like any finished one, and every other group is fitted.
+                group_fits = _failed_group(group_covariates, group_targets, trait_types[first], draw_count, f"models {label}: the fit failed: {error}")
             elapsed = time.perf_counter() - started
             if checkpoint_key is not None:
                 for checkpoint, fit in zip(checkpoints, group_fits):
