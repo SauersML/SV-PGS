@@ -998,6 +998,9 @@ class _KernelRows:
         return log_normalizer, scaled, products, lost
 
     def components(self, log_density: F64Array) -> _Components:
+        # On the device, as ``normalizers`` takes it: the lost rows' exact terms add it to the device kernel below.
+        if hasattr(self.kernel, "get") and not hasattr(log_density, "get"):
+            log_density = _DEVICE.get().asarray(log_density)
         log_normalizer, scaled, products, lost = self.normalizers(log_density)
         responsibility = self.exponentials * scaled[None, :] / np.where(lost, 1.0, products)[:, None]
         if np.any(lost):

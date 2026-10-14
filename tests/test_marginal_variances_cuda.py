@@ -17,8 +17,11 @@ def test_cuda_marginals_and_jvp_match_the_host() -> None:
     grams = _grams(columns, blocks)
     direction = generator.uniform(0.0, 1.0, size=(columns.shape[1], 2)) * precision[:, None]
     host = marginal_variances.marginal_variances(solve, grams)
-    device = marginal_variances.marginal_variances(solve, grams, cupy)
     host_jvp = marginal_variances.variance_jvp(solve, grams, direction).values
+    # The window terms are cached per (solve, Grams), not per array module: without a clear the device maps would read
+    # the host's terms and never factor a window on the device.
+    marginal_variances._WINDOW_TERMS.clear()
+    device = marginal_variances.marginal_variances(solve, grams, cupy)
     device_jvp = marginal_variances.variance_jvp(solve, grams, direction, cupy).values
     # The same float64 algebra in a different summation order: agreement to the conditioning of the window
     # Cholesky (I + omega_F B has eigenvalues >= 1, so its condition number is at most 1 + omega_F lambda_max),

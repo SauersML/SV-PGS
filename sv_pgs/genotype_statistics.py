@@ -28,6 +28,7 @@ standardized columns. The 1/127 of ``DS = (s + 127) / 127`` cancels.
 
 from __future__ import annotations
 
+import contextvars
 import json
 import os
 import queue
@@ -336,8 +337,10 @@ def _run_on_devices(
             failures.append(error)
             stop.set()
 
+    # Each worker runs in its own copy of this thread's context: a new thread starts with an empty one, where the fit's
+    # memory scope (``memory_broker.current_broker``) is unset and its reads would go unbudgeted.
     workers = [
-        threading.Thread(target=device_worker, args=(buffer, chromosomes), name=f"stage0-device-{index}")
+        threading.Thread(target=contextvars.copy_context().run, args=(device_worker, buffer, chromosomes), name=f"stage0-device-{index}")
         for index, (buffer, chromosomes) in enumerate(zip(buffers, assign_chromosomes(counts, len(buffers))))
     ]
     for worker in workers:
@@ -363,8 +366,8 @@ class _TileStream:
             self._free.put(buffer.host_tile(tile_rows))
         self._filled: queue.Queue = queue.Queue()
         self._reader = threading.Thread(
-            target=self._read_ahead,
-            args=(source, chromosome, source.variant_count(chromosome), tile_rows),
+            target=contextvars.copy_context().run,
+            args=(self._read_ahead, source, chromosome, source.variant_count(chromosome), tile_rows),
             name=f"stage0-read-{chromosome}",
             daemon=True,
         )

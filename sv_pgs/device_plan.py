@@ -22,6 +22,7 @@ eq. 4.4), so the devices' sum and the single-device sum differ by at most twice 
 """
 from __future__ import annotations
 
+import contextvars
 import threading
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator, Mapping, Protocol, Sequence
@@ -303,8 +304,10 @@ class ShardedDualSource:
             except BaseException as error:
                 failures.append(error)
 
+        # Each worker runs in its own copy of this thread's context: a new thread starts with an empty one, where the fit's
+        # memory scope (``memory_broker.current_broker``) is unset and its reads would go unbudgeted.
         workers = [
-            threading.Thread(target=device_worker, args=(position,), name=f"stage2-device-{device_id}")
+            threading.Thread(target=contextvars.copy_context().run, args=(device_worker, position), name=f"stage2-device-{device_id}")
             for position, device_id in enumerate(self.plan.device_ids)
         ]
         for worker in workers:

@@ -137,7 +137,10 @@ def operand_digits(dense: Any, array_module: ModuleType, digit_count: int = OPER
         # One float64 layout copy makes input loads and all digit stores
         # coalesced. Avoid a strided store for each digit of a C-order operand.
         by_column = array_module.asfortranarray(values)
-        _split_digits_cuda(array_module)(by_column.T, scale, np.int64(rows), np.int64(columns), np.int32(digit_count), digits)
+        # A raw argument that is not C-contiguous is indexed in C order over its shape and strides (CuPy's
+        # CArray::operator[]), not as a memory offset: the kernel writes into the C-contiguous transpose, where its
+        # index is the column-major digits' offset.
+        _split_digits_cuda(array_module)(by_column.T, scale, np.int64(rows), np.int64(columns), np.int32(digit_count), digits.T)
     return digits, scale
 
 

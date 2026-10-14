@@ -188,6 +188,8 @@ def test_the_device_decode_runs_on_a_non_blocking_stream(tmp_path: Path) -> None
     decoder = rowdict_codec.GpuRowDecoder(cupy)
     stream = cupy.cuda.Stream(non_blocking=True)
     out = cupy.zeros(codes.shape, dtype=cupy.uint8)
+    # A non-blocking stream is not ordered after the null stream the zeros were written on.
+    cupy.cuda.Device().synchronize()
     with stream:
         array.read_rows_to_device(0, codes.shape[0], out, decoder)
     stream.synchronize()

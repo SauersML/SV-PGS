@@ -473,24 +473,26 @@ class GpuRowDecoder:
 
     def __init__(self, cupy: Any) -> None:
         self.cupy = cupy
-        module = cupy.RawModule(code=_GPU_SOURCE)
-        self._slots = module.get_function("decode_row_slots")
-        self._exceptions = module.get_function("scatter_row_exceptions")
+        # One RawKernel per function (CuPy compiles each source once): a RawKernel reports the most threads a block of
+        # it can launch with, which its register use can hold below the device's MaxThreadsPerBlock.
+        self._slots = cupy.RawKernel(_GPU_SOURCE, "decode_row_slots")
+        self._exceptions = cupy.RawKernel(_GPU_SOURCE, "scatter_row_exceptions")
+        chunk_source = _GPU_CHUNK_SOURCE.replace("CRC32C_POLYNOMIAL", f"{CRC32C_POLYNOMIAL:#x}u").replace("MAXIMUM_DEPTH", str(MAXIMUM_DEPTH))
+        chunk_options = tuple(f"-D{name}={bit}" for name, bit in FAILURE_BITS.items())
+        self._crc_segments = cupy.RawKernel(chunk_source, "crc32c_segments", options=chunk_options)
+        self._verify = cupy.RawKernel(chunk_source, "verify_chunks", options=chunk_options)
+        self._locate = cupy.RawKernel(chunk_source, "locate_frames", options=chunk_options)
+        self._checked_exceptions = cupy.RawKernel(chunk_source, "scatter_checked_exceptions", options=chunk_options)
         attributes = cupy.cuda.Device().attributes
-        self._threads = int(attributes["MaxThreadsPerBlock"])
+        # Every kernel launches with one block size, so it is the least any of them can launch with
+        # (cudaErrorLaunchOutOfResources above it); verify_chunks's segments per chunk follow it.
+        kernels = (self._slots, self._exceptions, self._crc_segments, self._verify, self._locate, self._checked_exceptions)
+        self._threads = min(int(attributes["MaxThreadsPerBlock"]), *(int(kernel.max_threads_per_block) for kernel in kernels))
         self._resident_blocks = int(attributes["MultiProcessorCount"]) * (
             int(attributes["MaxThreadsPerMultiProcessor"]) // self._threads
         )
         self._grid_rows = int(attributes["MaxGridDimY"])
         self._grid_blocks = int(attributes["MaxGridDimX"])
-        chunk_module = cupy.RawModule(
-            code=_GPU_CHUNK_SOURCE.replace("CRC32C_POLYNOMIAL", f"{CRC32C_POLYNOMIAL:#x}u").replace("MAXIMUM_DEPTH", str(MAXIMUM_DEPTH)),
-            options=tuple(f"-D{name}={bit}" for name, bit in FAILURE_BITS.items()),
-        )
-        self._crc_segments = chunk_module.get_function("crc32c_segments")
-        self._verify = chunk_module.get_function("verify_chunks")
-        self._locate = chunk_module.get_function("locate_frames")
-        self._checked_exceptions = chunk_module.get_function("scatter_checked_exceptions")
         self._crc_table = cupy.asarray(_crc32c_table())
         self._powers = cupy.asarray(np.asarray(_POWERS, dtype=np.uint32))
 

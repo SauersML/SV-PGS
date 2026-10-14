@@ -54,6 +54,7 @@ import numba
 import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
+from sv_pgs.dual_solve import positive_cholesky
 from sv_pgs.memory_broker import HOST, current_broker, device_pool, transient_device_arrays
 from sv_pgs.progress import log
 
@@ -946,13 +947,13 @@ class GramGaussian:
             matrix[xp.arange(size), xp.arange(size)] += 1.0
             factor = storage[offset:offset + size * size].reshape(size, size)
             offset += size * size
-            try:
-                factor[...] = xp.linalg.cholesky(matrix)
-            except np.linalg.LinAlgError:
-                continue
+            # cuSOLVER raises no error on a failed pivot and leaves it finite on the diagonal (``positive_cholesky``), so a part
+            # is preconditioned only where its factor's diagonal is positive, on either device.
+            positive = positive_cholesky(xp, matrix)
             del matrix
-            if not bool(xp.all(xp.isfinite(factor))):
+            if positive is None:
                 continue
+            factor[...] = positive
             factors.append((slice(first, last), factor))
         del within
 
