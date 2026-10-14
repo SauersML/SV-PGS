@@ -2463,7 +2463,12 @@ def _direct_chromosome(
     ))
     chosen = one_to_one(evidence)
     pair_imputed = evidence.imputed_records[chosen].astype(np.int64)
-    pair_direct = np.searchsorted(direct_records, evidence.gatksv_records[chosen].astype(np.int64))
+    pair_records = evidence.gatksv_records[chosen].astype(np.int64)
+    pair_direct = np.searchsorted(direct_records, pair_records)
+    # A pair's z is read over its record's called samples, so a record with none (no row) pairs with nothing; a pair
+    # whose record has no row would otherwise take the next row's place.
+    if np.any(pair_direct >= direct_count) or not np.array_equal(direct_records[np.minimum(pair_direct, max(direct_count - 1, 0))], pair_records):
+        raise ValueError(f"{path}: a paired GATK-SV record has no row of its own.")
 
     # The merged order: each direct row after the imputed records at or before its POS.
     record_count = positions.shape[0]
