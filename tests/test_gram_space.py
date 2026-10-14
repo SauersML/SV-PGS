@@ -255,13 +255,17 @@ def test_band_fit_on_many_blocks_predicts_as_the_sample_fit(tmp_path: Path) -> N
 
 
 @pytest.mark.slow  # two engine fits of a synthetic chromosome: about 40 s on acl42
-def test_the_summary_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    # One chromosome in one Stage 0 block: the summary route re-cuts it by its measured LD extent and puts what lies
-    # beyond each part's neighbours in the likelihood as field noise, measured (kappa); its effects are the sample
-    # route's up to that approximation, so the two fits' coefficients agree closely [own-sim].
+def test_the_band_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # One chromosome in one Stage 0 block: the band route re-cuts it by its measured LD extent and sweeps the band, its
+    # far field corrected from the samples, and the sample route sweeps the samples; both are the one full-data
+    # likelihood (timing picks the route; ``stage2_wiring``), so the two fits predict alike [own-sim]. On this store the
+    # band route's start has no certified fixed point (a far-field refinement round lowers the exact ELBO by 0.00536
+    # nats), so its model is the sample route's refit, and its refusals say so: the wired band route answers for a fit
+    # only where it reaches one.
     from sv_pgs import fit_model, stage2_wiring
     from sv_pgs.config import TraitType
     from sv_pgs.dosage_store import DosageStore
+    from sv_pgs.model_acceptance import acceptance
     from tests.stage0_support import mosaic_codes
     from tests.test_dosage_store import _write_store
 
@@ -279,7 +283,7 @@ def test_the_summary_route_predicts_as_the_sample_route_on_one_chromosome(tmp_pa
     targets = 0.3 * covariate + genetic + np.sqrt(0.5) * generator.standard_normal(_SAMPLES)
     training = np.arange(_SAMPLES) < _TRAINING
     models = {}
-    for route, costs in (("samples", (0.0, np.inf)), ("summary", (np.inf, 0.0))):
+    for route, costs in (("samples", (0.0, np.inf)), ("band", (np.inf, 0.0))):
         monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp, costs=costs: costs)
         (tmp_path / route).mkdir()
         models[route] = fit_model.fit(fit_model.FitRequest(
@@ -288,10 +292,10 @@ def test_the_summary_route_predicts_as_the_sample_route_on_one_chromosome(tmp_pa
             model_names=("trait",), trait_types=(TraitType.QUANTITATIVE,), research_ids=tuple(f"person{index}" for index in range(_SAMPLES)),
             log_variance_offset=None, budget=_budget(), work_dir=tmp_path / route, seed=3,
         ))
-    samples, summary = models["samples"].certificate, models["summary"].certificate
-    assert samples["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
-    assert summary["far_field_scale"][0] > 0.0 and summary["budget_unresolved"][0] == 0
-    coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "summary")]
+    assert models["samples"].certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
+    assert all(acceptance(models[route])["accepted"] for route in models)
+    assert any("band route's fit had no certified start, so it was fitted on the sample route" in reason for reason in models["band"].refusals)
+    coefficients = [np.asarray(models[route].scoring[0].coefficients) for route in ("samples", "band")]
     standardized = (dosage - dosage.mean(axis=0)) / dosage.std(axis=0)
     rows = np.asarray(models["samples"].scoring[0].store_rows)
     held_out = ~training

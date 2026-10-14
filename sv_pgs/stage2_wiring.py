@@ -23,6 +23,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Sequence
 
 import numpy as np
@@ -41,9 +42,13 @@ from sv_pgs.gram_space import GramBand, build_band_store, far_field_scale, pass_
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
+from sv_pgs.model_acceptance import acceptance
 from sv_pgs.genotype_buffers import build_sample_layout
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
-from sv_pgs.genotype_statistics import BLOCK_CAP_STEP, DosageStoreTileSource, compute_genotype_statistics, largest_block_cap, stage0_block_cap
+from sv_pgs.genotype_statistics import (
+    BLOCK_CAP_STEP, DosageStoreTileSource, GenotypeSufficientStatistics, LdGramStore, ProjectedLdBlock, compute_genotype_statistics,
+    largest_block_cap, stage0_block_cap,
+)
 from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
 from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.progress import log
@@ -389,6 +394,44 @@ def _covering_lattice(lattices: Sequence[tuple[F64Array, float, float]]) -> tupl
     )
 
 
+class _TargetLd:
+    """Stage 0's LD store (``genotype_statistics.LdGramStore``) seen with only some of its targets: each block's
+    projected scores are those targets' columns, and everything else is the store's own."""
+
+    def __init__(self, ld: LdGramStore, targets: I64Array) -> None:
+        self._ld = ld
+        self._targets = targets
+        self.target_count = int(targets.shape[0])
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self._ld, name)
+
+    def block(self, block_index: int) -> ProjectedLdBlock:
+        block = self._ld.block(block_index)
+        return dataclasses.replace(block, projected_score=block.projected_score[:, self._targets])
+
+
+def _target_view(statistics: GenotypeSufficientStatistics, targets: Sequence[int]) -> GenotypeSufficientStatistics:
+    """Stage 0's statistics of a group (``_fit_group``) as those of its targets ``targets`` alone: the targets' own parts
+    (C'y, Y'Y and each block's projected scores) selected, every other part, which no target enters, shared."""
+    index = np.asarray(targets, dtype=np.int64)
+    return dataclasses.replace(
+        statistics, covariate_target=statistics.covariate_target[:, index], target_gram=statistics.target_gram[np.ix_(index, index)],
+        ld=_TargetLd(statistics.ld, index),
+    )
+
+
+def _quarantine_codes(fit: _ModelFit) -> list[str]:
+    """The fatal issues ``model_acceptance.acceptance`` finds in one model's fit: empty where it would be accepted."""
+    certificate = fit.certificate
+    terms = {
+        field.name: np.asarray(getattr(certificate, field.name)) for field in dataclasses.fields(FitCertificate)
+        if not isinstance(getattr(certificate, field.name), tuple) and np.ndim(getattr(certificate, field.name)) > 0
+    }
+    decision = acceptance(SimpleNamespace(certificate=terms, refusals=certificate.refusals, model_names=("model",), scoring=(fit.scoring,)))
+    return [issue["code"] for issue in decision["issues"] if issue["severity"] == "fatal"]
+
+
 def _fitted_cavity(fit: FullDataFit, model: int) -> Cavity:
     """Model ``model``'s cavity at the fitted state: mean field's pseudo-likelihoods, or EP's own cavities."""
     if fit.member_omega is not None:
@@ -416,6 +459,12 @@ def _fit_group(
     prior, one dual Gaussian with a column per model and one ``fit_full_data``, then each model's own lattice check,
     scoring, noise, hyperparameters, certificate and prior digest. A model is the null genetic model where its training
     set has no genetic column to fit.
+
+    On the band route (``gram_space``, where a pass over the band measures cheaper) no model's fit is lost to the route: a
+    group whose joint fit has no certified start is fitted model by model on the same Stage 0, and a model whose band-route
+    fit has no certified start, or would be quarantined (``model_acceptance``: its outer criterion unmet, a returned state
+    unresolved, a quadrature check left open, ...), is fitted again alone on the sample route, the reference route both
+    compute; each such model's refusals say why.
 
     A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``): after the
     separation check, Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where
@@ -542,101 +591,151 @@ def _fit_group(
         if not gram_seconds < sample_seconds:
             band.release()
             band = None
-    gaussian = DualGaussian(
-        source=source,
-        training=mask,
-        targets=store_targets,
-        offsets=np.zeros((fitted_samples, count)),
-        covariates=covariates,
-        # The dual solver reads the Grams' blocks and links only, never their metric's scale.
-        grams=block_grams(statistics),
-        probe_count=draw_count,
-        seed=_seed(seed, 0),
-        probe_sample_indices=training_columns if fitted_samples != store.n_samples else None,
-        # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
-        sample_weights=np.column_stack([entry.weights for entry in model_sites]) if binary else None,
-    )
-    # A refusal of the joint fit names the models fitted together; its "model k" is the k-th of them.
-    joint = f"joint fit of models {', '.join(str(int(models[model])) for model in genetic)}: " if count > 1 else ""
+    # The columns of Stage 0 (positions in ``genetic``) whose fits ran on the band route, and the notes each column's
+    # fit was given.
+    banded: set[int] = set()
+    noted: dict[int, tuple[str, ...]] = {}
 
-    def finish(fit: FullDataFit, fitted_prior: ScaleMixturePrior, finished: Sequence[int], open_checks: dict[int, str]) -> None:
-        """The models ``finished`` from ``fit`` on ``fitted_prior``'s lattice: their scoring models, noise,
-        hyperparameters, certificates (with the lattice check each one's fit left open) and prior digest."""
-        scoring = scoring_models(fit, fitted_prior, statistics, [trait_type] * count, draw_count, seed=_seed(seed, 2))
-        digest = _prior_schema_digest(
-            nodes=fitted_prior.log_variance_grid, floor=np.array([fitted_prior.kernel_floor]), top=np.array([fitted_prior.kernel_top]),
-            class_index=class_index.astype(np.int64), offsets=offsets, rows=member_rows, annotations=annotations.design,
-            annotation_names=annotations.names, measurement=measurement,
+    def fitted(columns: list[int], on_band: bool, notes: tuple[str, ...]) -> None:
+        """The models ``columns`` (positions in ``genetic``) fitted together on one dual Gaussian with a column each, on
+        the band route where ``on_band``, each with ``notes`` (why it is fitted apart from its group, or on the samples)
+        among its refusals; raises ``FloatingPointError`` where the fit has no certified start."""
+        view = statistics if len(columns) == count else _target_view(statistics, columns)
+        fit_band = None
+        if on_band:
+            fit_band = band if len(columns) == count else GramBand(view, share, store=band_store)
+            fit_band.far_scale, fit_band.far_scale_error = kappa, kappa_error
+        fit_sites = [model_sites[column] for column in columns]
+        gaussian = DualGaussian(
+            source=source,
+            training=mask[:, columns],
+            targets=store_targets[:, columns],
+            offsets=np.zeros((fitted_samples, len(columns))),
+            covariates=covariates,
+            # The dual solver reads the Grams' blocks and links only, never their metric's scale.
+            grams=block_grams(statistics),
+            probe_count=draw_count,
+            seed=_seed(seed, 0),
+            probe_sample_indices=training_columns if fitted_samples != store.n_samples else None,
+            # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
+            sample_weights=np.column_stack([entry.weights for entry in fit_sites]) if binary else None,
         )
-        for model in finished:
-            certificate = _model_certificate(fit.certificate, model, joint)
-            if model in open_checks:
-                certificate = _with_refusal(certificate, open_checks[model])
-                log(f"stage2 wiring: model {int(models[genetic[model]])}: {open_checks[model]}")
-            results[genetic[model]] = _ModelFit(
-                scoring=scoring[model], noise=float(np.asarray(fit.noise_variance)[model]), hyperparameters=fit.hyperparameters[model],
-                certificate=certificate, prior_digest=digest,
-            )
+        # A refusal of the joint fit names the models fitted together; its "model k" is the k-th of them.
+        joint = f"joint fit of models {', '.join(str(int(models[genetic[column]])) for column in columns)}: " if len(columns) > 1 else ""
 
-    # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
-    # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
-    # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is derived
-    # from the start's single-variant likelihoods only. Each model whose check passes is finished from the fit as it
-    # stands; where any model's fitted normalizers or moments move on the refined or the extended lattice, the group is
-    # fitted again on the lattice moved for it, and those models are checked there.
-    fit = fit_full_data(
-        gaussian=gaussian, statistics=statistics, prior=prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-        sites=model_sites, null_scale=kappa, band=band,
-    )
-    pending = list(range(count))
-    while pending:
-        checks = {model: lattice_check(prior, fit.hyperparameters[model], _fitted_cavity(fit, model), share, draw_count) for model in pending}
-        for model, check in checks.items():
-            log(f"stage2 wiring: lattice check of model {int(models[genetic[model]])} on {prior.grid_size} nodes: {check.record()}")
-        moving = [model for model in pending if checks[model].refine or checks[model].extend]
-        passed = [model for model in pending if model not in moving]
-        if passed:
-            finish(fit, prior, passed, {})
-        if not moving:
-            break
-        moved, moved_hyperparameters = prior, list(fit.hyperparameters)
-        if any(checks[model].extend for model in moving):
-            extended = [extended_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
-            moved, moved_hyperparameters = extended[0][0], [hyperparameters for _prior, hyperparameters in extended]
-        if any(checks[model].refine for model in moving):
-            halved = [halved_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
-            moved, moved_hyperparameters = halved[0][0], [hyperparameters for _prior, hyperparameters in halved]
-        try:
-            # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its noise
-            # and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior repeated
-            # the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
-            refit = fit_full_data(
-                gaussian=gaussian, statistics=statistics, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1), inference=inference,
-                sites=model_sites, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
-                start_mean=fit.member_mean, null_scale=kappa, band=band,
+        def finish(fit: FullDataFit, fitted_prior: ScaleMixturePrior, finished: Sequence[int], open_checks: dict[int, str]) -> None:
+            """The models ``finished`` from ``fit`` on ``fitted_prior``'s lattice: their scoring models, noise,
+            hyperparameters, certificates (with the lattice check each one's fit left open) and prior digest."""
+            scoring = scoring_models(fit, fitted_prior, view, [trait_type] * len(columns), draw_count, seed=_seed(seed, 2))
+            digest = _prior_schema_digest(
+                nodes=fitted_prior.log_variance_grid, floor=np.array([fitted_prior.kernel_floor]), top=np.array([fitted_prior.kernel_top]),
+                class_index=class_index.astype(np.int64), offsets=offsets, rows=member_rows, annotations=annotations.design,
+                annotation_names=annotations.names, measurement=measurement,
             )
+            for model in finished:
+                certificate = _model_certificate(fit.certificate, model, joint)
+                certificate = dataclasses.replace(certificate, refusals=(*certificate.refusals, *notes))
+                if model in open_checks:
+                    certificate = _with_refusal(certificate, open_checks[model])
+                    log(f"stage2 wiring: model {int(models[genetic[columns[model]]])}: {open_checks[model]}")
+                results[genetic[columns[model]]] = _ModelFit(
+                    scoring=scoring[model], noise=float(np.asarray(fit.noise_variance)[model]), hyperparameters=fit.hyperparameters[model],
+                    certificate=certificate, prior_digest=digest,
+                )
+
+        # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
+        # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
+        # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is
+        # derived from the start's single-variant likelihoods only. Each model whose check passes is finished from the fit
+        # as it stands; where any model's fitted normalizers or moments move on the refined or the extended lattice, the
+        # models are fitted again on the lattice moved for them, and those are checked there.
+        fit_prior = prior
+        try:
+            fit = fit_full_data(
+                gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
+                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band,
+            )
+            pending = list(range(len(columns)))
+            while pending:
+                checks = {model: lattice_check(fit_prior, fit.hyperparameters[model], _fitted_cavity(fit, model), share, draw_count) for model in pending}
+                for model, check in checks.items():
+                    log(f"stage2 wiring: lattice check of model {int(models[genetic[columns[model]]])} on {fit_prior.grid_size} nodes: {check.record()}")
+                moving = [model for model in pending if checks[model].refine or checks[model].extend]
+                passed = [model for model in pending if model not in moving]
+                if passed:
+                    finish(fit, fit_prior, passed, {})
+                if not moving:
+                    break
+                moved, moved_hyperparameters = fit_prior, list(fit.hyperparameters)
+                if any(checks[model].extend for model in moving):
+                    extended = [extended_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
+                    moved, moved_hyperparameters = extended[0][0], [hyperparameters for _prior, hyperparameters in extended]
+                if any(checks[model].refine for model in moving):
+                    halved = [halved_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
+                    moved, moved_hyperparameters = halved[0][0], [hyperparameters for _prior, hyperparameters in halved]
+                try:
+                    # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its
+                    # noise and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior
+                    # repeated the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
+                    refit = fit_full_data(
+                        gaussian=gaussian, statistics=view, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
+                        inference=inference, sites=fit_sites, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
+                        start_mean=fit.member_mean, null_scale=kappa, band=fit_band,
+                    )
+                except FloatingPointError as error:
+                    # No fit on the checked lattice: these models keep the fit they have, and each certificate says the
+                    # quadrature check that fit failed was never resolved, so the artifact never reads as a passed check.
+                    finish(fit, fit_prior, moving, {
+                        model: f"lattice check unresolved ({checks[model].record()}): the fit on {fit_prior.grid_size} nodes stands; the refit on {moved.grid_size} nodes failed: {error}"
+                        for model in moving
+                    })
+                    break
+                # A model whose refit ended without its outer criterion (an uncertified walk) where the fit it continued
+                # had met it keeps the certified fit, and its certificate records the quadrature check left open.
+                kept = [
+                    model for model in moving
+                    if fit.certificate.outer_criterion_met[model] and not refit.certificate.outer_criterion_met[model]
+                ]
+                if kept:
+                    finish(fit, fit_prior, kept, {
+                        model: f"lattice check unresolved ({checks[model].record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {fit_prior.grid_size} nodes stands"
+                        for model in kept
+                    })
+                pending = [model for model in moving if model not in kept]
+                fit_prior, fit = moved, refit
+        finally:
+            if fit_band is not None and fit_band is not band:
+                fit_band.release()
+        if on_band:
+            banded.update(columns)
+        noted.update({column: notes for column in columns})
+
+    everyone = list(range(count))
+    if band is None:
+        fitted(everyone, False, ())
+    else:
+        try:
+            fitted(everyone, True, ())
         except FloatingPointError as error:
-            # No fit on the checked lattice: these models keep the fit they have, and each certificate says the
-            # quadrature check that fit failed was never resolved, so the artifact never reads as a passed check.
-            finish(fit, prior, moving, {
-                model: f"lattice check unresolved ({checks[model].record()}): the fit on {prior.grid_size} nodes stands; the refit on {moved.grid_size} nodes failed: {error}"
-                for model in moving
-            })
-            break
-        # A model whose refit ended without its outer criterion (an uncertified walk) where the fit it continued had met
-        # it keeps the certified fit, and its certificate records the quadrature check left open.
-        kept = [
-            model for model in moving
-            if fit.certificate.outer_criterion_met[model] and not refit.certificate.outer_criterion_met[model]
-        ]
-        if kept:
-            finish(fit, prior, kept, {
-                model: f"lattice check unresolved ({checks[model].record()}): the refit on {moved.grid_size} nodes did not meet its outer criterion; the fit on {prior.grid_size} nodes stands"
-                for model in kept
-            })
-        pending = [model for model in moving if model not in kept]
-        prior, fit = moved, refit
-    if band is not None:
+            if count == 1:
+                log(f"stage2 wiring: model {int(models[genetic[0]])}: the band route's fit has no certified start ({error}); fitted again on the sample route")
+                fitted(everyone, False, (f"the band route's fit had no certified start, so it was fitted on the sample route: {error}",))
+            else:
+                note = f"the band route's joint fit of models {', '.join(str(int(models[model])) for model in genetic)} had no certified start, so each was fitted on its own: {error}"
+                log(f"stage2 wiring: {note}")
+                for column in everyone:
+                    try:
+                        fitted([column], True, (note,))
+                    except FloatingPointError as single:
+                        log(f"stage2 wiring: model {int(models[genetic[column]])}: the band route's fit alone has no certified start ({single}); fitted again on the sample route")
+                        fitted([column], False, (note, f"alone on the band route it had no certified start either, so it was fitted on the sample route: {single}"))
+        # The band route answers for a fit only where the release gate would accept it: a model it would quarantine is
+        # fitted again alone on the sample route, the reference route both compute.
+        for column in sorted(banded):
+            codes = _quarantine_codes(results[genetic[column]])
+            if codes:
+                log(f"stage2 wiring: model {int(models[genetic[column]])}: its band-route fit would be quarantined ({', '.join(codes)}); fitted again alone on the sample route")
+                fitted([column], False, (*noted[column], f"the band route's fit would be quarantined ({', '.join(codes)}), so it was fitted again alone on the sample route"))
         band.release()
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples, {count} models fitted together")
     return [result for result in results if result is not None]

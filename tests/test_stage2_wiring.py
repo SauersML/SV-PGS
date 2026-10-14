@@ -7,6 +7,7 @@ store reproduces the fitted model's in-sample predictor. Accuracy comes from ben
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -286,6 +287,22 @@ def _fitted_group(store, covariate: np.ndarray, targets: np.ndarray, training: n
     )
 
 
+def _three_traits(root: Path):
+    """The synthetic store (``test_full_data_fit._store``), its covariate, and three traits on its genetic value each on
+    two training sets (all samples but the last fifth, all but the first): (store, covariate, model targets [n, 6],
+    training [n, 6], the two held-out masks), the models in trait-major order: (trait 0, rows 0), (trait 0, rows 1), ..."""
+    store, covariate, targets, genetic = _store(root, 7)
+    samples = store.n_samples
+    generator = np.random.default_rng(12)
+    traits = np.column_stack([
+        targets, 0.4 * covariate + 0.8 * genetic + 0.6 * generator.standard_normal(samples),
+        -0.2 * covariate - genetic + 0.9 * generator.standard_normal(samples),
+    ])
+    held_out = [np.arange(samples) >= samples * 4 // 5, np.arange(samples) < samples // 5]
+    training = np.column_stack([~held_out[rows] for _trait in range(3) for rows in range(2)])
+    return store, covariate, np.repeat(traits, 2, axis=1), training, held_out
+
+
 @pytest.mark.slow  # seven fits of the synthetic store per route: 3-10 min each in the shared 6-CPU VM (batch-fit, 2026-10-13)
 @pytest.mark.parametrize("route", ["samples", "gram"])
 def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
@@ -294,24 +311,14 @@ def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, mon
     that covers its group's. Whether the outer criterion is met is the engine's own outcome on this store either way, and
     it flips both ways between a model's fits.
 
-    Each model alone is fitted on the sample route, the full-data likelihood both routes share: alone on the band route
-    this store's model 4 ends at a refused refinement (coefficients correlating 0.33 with its sample-route fit, as in
-    tests/test_gram_space.py's summary-route test, which fails on HEAD alike), while its group's band-route fit
-    correlates 0.997 with the group's sample-route fit. Timing alone chooses the route, so both are pinned."""
+    Each model alone is fitted on the sample route, the full-data likelihood both routes share and the reference route:
+    alone on the band route this store's model 4 ends uncertified (its coefficients correlate 0.33 with its sample-route
+    fit's) and is fitted again on the sample route (the next test), while its group's band-route fit correlates 0.997 with
+    the group's sample-route fit. Timing alone chooses the route, so both are pinned."""
     from sv_pgs import stage2_wiring
     from tests.test_full_data_fit import _StoreCodes
 
-    store, covariate, targets, genetic = _store(tmp_path / "store", 7)
-    samples = store.n_samples
-    generator = np.random.default_rng(12)
-    traits = np.column_stack([
-        targets, 0.4 * covariate + 0.8 * genetic + 0.6 * generator.standard_normal(samples),
-        -0.2 * covariate - genetic + 0.9 * generator.standard_normal(samples),
-    ])
-    held_out = [np.arange(samples) >= samples * 4 // 5, np.arange(samples) < samples // 5]
-    # Models in trait-major order: (trait 0, rows 0), (trait 0, rows 1), (trait 1, rows 0), ...
-    training = np.column_stack([~held_out[rows] for _trait in range(3) for rows in range(2)])
-    model_targets = np.repeat(traits, 2, axis=1)
+    store, covariate, model_targets, training, held_out = _three_traits(tmp_path / "store")
     monkeypatch.setattr(stage2_wiring, "pass_costs", (lambda band, source, xp: (0.0, np.inf)) if route == "samples" else (lambda band, source, xp: (np.inf, 0.0)))
     together = _fitted_group(store, covariate, model_targets, training, tmp_path / "together", 5)
     monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
@@ -327,6 +334,60 @@ def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, mon
         assert np.corrcoef(*scores)[0, 1] > 0.99
         assert float(np.max(np.abs(scores[0] - scores[1]))) <= 0.25 * float(np.std(scores[1]))
         np.testing.assert_allclose(together.noise_variance[model], alone.noise_variance[0], rtol=0.05)
+
+
+@pytest.mark.parametrize("refused", ["joint", "every"])
+def test_a_band_route_start_with_no_fixed_point_costs_no_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refused: str) -> None:
+    """A group whose band-route joint fit has no certified start is fitted model by model on the same Stage 0, and a
+    model whose band-route fit alone has none either is fitted on the sample route; each one's refusals say why. A stub
+    refuses the band route's starts: the joint ones, or every one."""
+    from sv_pgs import stage2_wiring
+
+    store, covariate, model_targets, training, _held_out = _three_traits(tmp_path / "store")
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (np.inf, 0.0))
+    engine = stage2_wiring.fit_full_data
+    calls: list[tuple[int, bool]] = []
+
+    def refusing(**arguments):
+        on_band = arguments["band"] is not None
+        if "starts" in arguments:
+            # A lattice check's refit, continued from a fit that had its start.
+            return engine(**arguments)
+        calls.append((arguments["gaussian"].model_count, on_band))
+        if on_band and (refused == "every" or arguments["gaussian"].model_count > 1):
+            raise FloatingPointError("a starting point has no certified EP fixed point (stub)")
+        return engine(**arguments)
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", refusing)
+    # Two traits on the first training set: one group.
+    fitted = _fitted_group(store, covariate, model_targets[:, [0, 2]], training[:, [0, 2]], tmp_path / "work", 5)
+    # The joint start, then each model's own; where that is refused too, the model's sample-route fit. (A model the gate
+    # would quarantine is fitted on the sample route after these.)
+    expected = [(2, True), (1, True), (1, True)] if refused == "joint" else [(2, True), (1, True), (1, False), (1, True), (1, False)]
+    assert calls[: len(expected)] == expected
+    for model in range(2):
+        reasons = [reason for reason in fitted.certificate.refusals if reason.startswith(f"model {model}: ")]
+        assert any("joint fit of models 0, 1 had no certified start, so each was fitted on its own" in reason for reason in reasons)
+        assert any("fitted on the sample route" in reason for reason in reasons) == (refused == "every")
+        assert fitted.scoring[model].store_rows.shape[0] > 0
+
+
+def test_a_band_route_fit_the_gate_would_quarantine_is_fitted_again_on_the_sample_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model 4 alone on the band route, seed 5: its fit ends uncertified (its outer loop returns from outside every
+    basin; ``model_acceptance`` would quarantine it, and its coefficients correlate 0.33 with the sample route's), so it
+    is fitted again alone on the sample route, which the gate accepts, and its refusals say why."""
+    from sv_pgs import stage2_wiring
+    from sv_pgs.fit_model import certificate_parts
+    from sv_pgs.model_acceptance import acceptance
+
+    store, covariate, model_targets, training, _held_out = _three_traits(tmp_path / "store")
+    monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (np.inf, 0.0))
+    fitted = _fitted_group(store, covariate, model_targets[:, [4]], training[:, [4]], tmp_path / "work", 5)
+    (reason,) = [reason for reason in fitted.certificate.refusals if "quarantined" in reason]
+    assert reason.startswith("model 0: the band route's fit would be quarantined (outer_criterion_met") and reason.endswith("fitted again alone on the sample route")
+    parts = certificate_parts(fitted.certificate, 1)
+    decision = acceptance(SimpleNamespace(certificate=parts.terms, refusals=parts.refusals, model_names=("model 4",), scoring=tuple(fitted.scoring)))
+    assert decision["accepted"], decision["issues"]
 
 
 def test_a_group_resumes_only_when_every_model_is_checkpointed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
