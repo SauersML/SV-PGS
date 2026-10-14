@@ -1623,6 +1623,11 @@ class _FullDataMeanField:
         self.best_elbo = np.full(model_count, -np.inf)
         self.best_state: list[_ModelState | None] = [None] * model_count
         self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
+        # Each model's last fixed point (``_fixed_point``: its hyperparameters, its state and the point), and the held
+        # state the model is at now (a fixed point's, or one ``_restore_state`` put back; None once a solve moves it):
+        # where the two are one at the same hyperparameters, a call that solves other models keeps the point (``__call__``).
+        self._held: list[tuple[MixtureHyperparameters, _ModelState, FixedPoint] | None] = [None] * model_count
+        self._at: list[_ModelState | None] = [None] * model_count
 
     # the metric: each model's likelihood weights
 
@@ -1810,6 +1815,7 @@ class _FullDataMeanField:
         self.mean_move[model], self.noise_gain[model], self.elbo[model] = state.mean_move, state.noise_gain, state.elbo
         _omega, tau, nu, _live = self._sites(model)
         self.site_precision[:, model], self.site_shift[:, model] = tau, nu
+        self._at[model] = state
 
     def _ensure(self, state: _ModelState, model: int) -> None:
         """The dual solver's column of ``model`` back at this fixed point's sites and metric before it answers for it (a
@@ -2140,14 +2146,33 @@ class _FullDataMeanField:
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
-        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x)."""
-        entry = [self._state(model) for model in range(self.model_count)]
+        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x).
+
+        A model still at the fixed point this oracle last returned for it, asked at the same hyperparameters, keeps that
+        point unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a
+        model whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``), and a model fitted
+        alone is not solved again there. A call where every model is so solves them all, as before: the outer loop's last
+        call, which leaves the oracle at the returned points by solving there once more."""
+        held = [
+            model for model, (point, state) in enumerate(zip(self._held, self._at))
+            if point is not None and state is point[1]
+            and np.array_equal(point[0].coefficients, hyperparameters[model].coefficients)
+            and np.array_equal(point[0].log_smoothing, hyperparameters[model].log_smoothing)
+        ]
+        if len(held) == self.model_count:
+            held = []
+        solving = [model for model in range(self.model_count) if model not in held]
+        if held:
+            log(f"mean-field oracle: models {', '.join(str(model) for model in held)} keep their fixed points; solving {', '.join(str(model) for model in solving)}")
+        entry = [self._state(model) for model in solving]
         first = self.refreshes == 0
         candidates: list[list[_ModelState]] = [[] for _ in range(self.model_count)]
         # The cold solve gets the carried solve's own count of passes per model, and no more (``mean_field``).
         budgets: list[int | None] = [None] * self.model_count
+        for model in solving:
+            self._at[model] = None
         for cold in ((False,) if first else (False, True)):
-            for model in range(self.model_count):
+            for model in solving:
                 if cold:
                     self._cold_state(model)
                 before = self.passes
@@ -2161,13 +2186,13 @@ class _FullDataMeanField:
                 if budgets[model] is None:
                     budgets[model] = self.passes - before
                 candidates[model].append(self._state(model))
-        if any(not solved for solved in candidates):
+        if any(not candidates[model] for model in solving):
             # No start reaches some model's fixed point: the trial is refused whole, as EP's oracle refuses.
-            for model, state in enumerate(entry):
+            for model, state in zip(solving, entry):
                 self._restore_state(state, model)
             return [None] * self.model_count
-        for model, solved in enumerate(candidates):
-            self._restore_state(max(solved, key=lambda state: state.elbo), model)
+        for model in solving:
+            self._restore_state(max(candidates[model], key=lambda state: state.elbo), model)
         del candidates
         for model in range(self.model_count):
             omega, _tau, _nu, _live = self._sites(model)
@@ -2176,15 +2201,15 @@ class _FullDataMeanField:
             self._iterate(self.site_precision, self.site_shift, self.noise)
         except np.linalg.LinAlgError as error:
             self.refusals.append(f"the dual solver has no factor at q's sites: {error}")
-            for model, state in enumerate(entry):
+            for model, state in zip(solving, entry):
                 self._restore_state(state, model)
             return [None] * self.model_count
         del entry
         self.refreshes += 1
-        for model in range(self.model_count):
+        for model in solving:
             if self.elbo[model] > self.best_elbo[model]:
                 self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
-        return [self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+        return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
 
     def restore_best(self, hyperparameters: Sequence[MixtureHyperparameters], tolerance: float) -> tuple[tuple[MixtureHyperparameters, ...], BoolArray]:
         """Each model back at its highest-ELBO refreshed state where that is above where the outer loop ended by more than
@@ -2271,10 +2296,12 @@ class _FullDataMeanField:
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=False)
         cavity = Cavity(precision=omega, shift=shift)
         offset = float(self.elbo[model]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
-        return FixedPoint(
+        point = FixedPoint(
             cavity=cavity, posterior=posterior, mean=mean, precision_norm=norm, effective_effects=float(self.effective[model]),
             restore=lambda: self._restore_state(state, model), evidence_offset=offset,
         )
+        self._held[model], self._at[model] = (hyperparameters, state, point), state
+        return point
 
     def binary_component(self, model: int) -> BinaryComponent:
         """A binary model's ``BinaryComponent`` at this oracle's state and metric: three reads of the store (the

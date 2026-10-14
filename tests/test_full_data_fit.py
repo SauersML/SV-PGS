@@ -319,3 +319,68 @@ def test_stage2_by_mean_field_carries_tie_members(tmp_path: Path) -> None:
             "the outer loop stalls uncertified on the tied store (remaining 0.11 against 0.031): its second joint trial's "
             "certified gain, 0.060 with resolution 0.054, is refused and the next plan is the same state's"
         )
+
+
+def _two_trait_oracle(tmp_path: Path):
+    """Two traits on the same training rows (a group's models, ``stage2_wiring.model_groups``), Stage 0 over both: a
+    function building the mean-field oracle of any of them in order, and the moment starts of each."""
+    from sv_pgs.full_data_fit import _FullDataMeanField
+    from sv_pgs.scale_mixture_ep import initial_hyperparameters
+
+    store, covariate, targets, genetic = _store(tmp_path / "store", 7)
+    generator = np.random.default_rng(3)
+    traits = np.column_stack([targets, 0.6 * genetic - 0.2 * covariate + 0.8 * generator.standard_normal(_SAMPLES)])
+    training = np.arange(_TRAINING)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        traits[training], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    member_count = statistics.active_rows.shape[0]
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    mask = np.zeros((_SAMPLES, 2))
+    mask[training] = 1.0
+    offsets = np.zeros(member_count)
+    noise = covariate_residual_variance(traits, mask, store_covariates)
+    nodes, floor, top = stage0_lattice(statistics, 0, float(noise[0]), offsets, 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(member_count, dtype=np.int64), log_variance_offset=offsets, annotation_design=np.zeros((member_count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+    starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moment_starts(statistics, prior)]
+
+    def oracle(columns: list[int]) -> _FullDataMeanField:
+        gaussian = DualGaussian(
+            source=source, training=mask[:, columns], targets=traits[:, columns], offsets=np.zeros((_SAMPLES, len(columns))),
+            covariates=store_covariates, grams=block_grams(statistics), probe_count=_DRAWS, seed=11,
+        )
+        return _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [starts[column] for column in columns], noise[columns])
+
+    return oracle, starts
+
+
+def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> None:
+    """A model still at the fixed point the oracle returned for it, asked at the same hyperparameters, keeps that point
+    while the call solves the others (a joint fit's outer loop asks every model at each call, one whose fit has ended
+    included; fitted alone it is not solved again); a call where every model is so solves them all."""
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+    oracle_of, starts = _two_trait_oracle(tmp_path)
+    oracle = oracle_of([0, 1])
+    first = oracle(list(starts))
+    assert all(point is not None for point in first)
+    held_mean = oracle.mean[:, 0].copy()
+    moved = MixtureHyperparameters(coefficients=starts[1].coefficients * 0.9, log_smoothing=starts[1].log_smoothing.copy())
+    passes = oracle.passes
+    second = oracle([starts[0], moved])
+    assert second[0] is first[0] and second[1] is not first[1] and second[1] is not None
+    np.testing.assert_array_equal(oracle.mean[:, 0], held_mean)
+    # Only model 1's solves read the store: its carried and cold solves.
+    alone = oracle_of([1])
+    alone(list(starts[1:]))
+    alone_passes = alone.passes
+    alone([moved])
+    assert oracle.passes - passes == alone.passes - alone_passes
+    # Every model at its held point: the call solves them all.
+    third = oracle([starts[0], moved])
+    assert third[0] is not first[0] and third[1] is not second[1]
