@@ -937,3 +937,20 @@ def test_a_warm_started_posterior_solve_is_the_dense_inverse_and_takes_fewer_ite
         energy = np.sqrt(np.einsum("pc,pq,qc->c", error, posterior_precision, error))
         assert np.all(energy <= certificate + np.linalg.cond(posterior_precision) * genotypes.shape[1] * EPS * scale)
     assert passes[1] <= passes[0], passes
+
+
+def test_a_single_models_complement_is_the_per_column_one() -> None:
+    # Every column one model's takes the thin products (W^1/2 C) F F' (W^1/2 C)' v; columns of several models take the
+    # per-column factors. Both are [W^1/2] (I - H_m) [W^1/2] v with H_m the dense projector, whatever the covariates' rank.
+    _genotypes, _bounds, covariates, weights, variances, _prior_mean, _response = _rank_losing_problem(31)
+    models = dual_solve.DualModels(weights, variances, covariates)
+    values = np.random.default_rng(31).standard_normal((covariates.shape[0], 5))
+    for model in range(weights.shape[1]):
+        root = np.sqrt(weights[:, model])
+        weighted = root[:, None] * covariates
+        complement = np.eye(covariates.shape[0]) - weighted @ np.linalg.pinv(weighted)
+        single = np.full(values.shape[1], model, dtype=np.int64)
+        mixed = np.array([model, (model + 1) % weights.shape[1], model, model, model], dtype=np.int64)
+        np.testing.assert_allclose(models.complement(values, single), complement @ values, rtol=0.0, atol=1e-10)
+        np.testing.assert_allclose(models.sample_to_design(values, single), root[:, None] * (complement @ values), rtol=0.0, atol=1e-10)
+        np.testing.assert_allclose(models.complement(values, mixed)[:, 0], (complement @ values)[:, 0], rtol=0.0, atol=1e-10)

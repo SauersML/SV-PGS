@@ -215,7 +215,20 @@ class DualModels:
         return self.array_module.einsum("cab,cb->ac", factor, whitened)
 
     def _complement_block(self, values: Any, column_models: Any, before: bool, after: bool) -> Any:
-        """[W^1/2] (I - H) [W^1/2] v for one block of columns, each factor where asked."""
+        """[W^1/2] (I - H) [W^1/2] v for one block of columns, each factor where asked.
+
+        Where every column is one model's (a tile's projection, a model's residual), with A = W^1/2 C that model's
+        weighted covariates: (I - H) w = w - A F F' A' w, two thin products and one pass over the block, in place of the
+        per-column gathers of the weights and the factors (a sample-route fit spent 41% of its time here [own-sim])."""
+        models = np.asarray(_host(column_models))
+        if models.size and bool(np.all(models == models[0])):
+            model = int(models[0])
+            root = self.root_weights[:, model : model + 1]
+            weighted = root * values if before else values
+            covariates = root * self.covariates
+            factor = self.covariate_factor[model]
+            projected = weighted - covariates @ (factor @ (factor.T @ (covariates.T @ weighted)))
+            return root * projected if after else projected
         root = self.root_weights[:, column_models]
         weighted = root * values if before else values
         projected = weighted - root * (self.covariates @ self.covariate_solve(self.covariates.T @ (root * weighted), column_models))
