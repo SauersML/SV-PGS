@@ -390,7 +390,8 @@ def test_the_line_values_stay_inside_a_tight_device_ledger():
     refused, and the values are the host's (bench-sim chr22: chunks sized from the host's budget were refused)."""
     from sv_pgs.compute_budget import ComputeBudget
     from sv_pgs.memory_broker import memory_scope
-    from sv_pgs.scale_mixture_ep import _line, device_scope
+    from sv_pgs.scale_mixture_ep import device_scope
+    from tests.oracles import _line
 
     prior, cavity = _problem(variant_count=20000, seed=51, node_count=40)
     hyperparameters = _hyperparameters(prior, 52, log_smoothing=1.0)

@@ -29,7 +29,7 @@ fold is a mask, so neither needs a Gram or a factor. Site precisions that are no
 enter S (with q of them and A > 0, S has exactly q negative eigenvalues, by Sylvester's law of
 inertia); they are eliminated exactly by the caller's split.
 
-Tiles are code_products.CodeBlockTile (or DenseDualTile): a read prepares its sample operand once,
+Tiles are code_products.CodeBlockTile: a read prepares its sample operand once,
 with a normwise relative error per column ||delta_k|| <= relative_error ||operand_k|| (the int8
 digit split, exact zeros kept); relative_error 0 means the exact products.
 """
@@ -63,9 +63,6 @@ _DUAL_MEMBER_ARRAYS = ("mean", "unit squares")
 _COMPLEMENT_ARRAYS = ("root weights", "weighted values", "weighted root", "covariate image", "weighted covariate image", "projection", "weighted projection")
 """The samples x columns temporaries ``DualModels._complement_block`` may hold at once: the gathered root weights, the
 weighted values, root times them for C'W v, the covariates' image, its weighting, the projection and its weighting."""
-
-DIGIT_BITS = 7
-"""Bits per balanced base-128 operand digit of the int8 split."""
 
 
 class DualTile(Protocol):
@@ -119,71 +116,6 @@ class DualTileSource(Protocol):
         runs its blocks on all of them at once and sums the devices' images in a fixed order.
         """
         ...
-
-
-def rounded_operand(values: Any, relative_error: float, array_module: Any) -> Any:
-    """The operand the int8 digit split multiplies: the fewest digits meeting the normwise bound.
-
-    m digits keep each entry within 2^-(7m - 2) of its column's maximum and leave zeros zero, so a
-    column's rounding is at most sqrt(nnz) 2^-(7m - 2) max|v|. m is the least count meeting
-    relative_error * ||v|| for every column; once 2^-(7m - 2) reaches float64's resolution the
-    operand is exact.
-    """
-    if relative_error <= 0.0:
-        return values
-    magnitude = array_module.max(array_module.abs(values), axis=0)
-    norm = array_module.linalg.norm(values, axis=0)
-    support = array_module.sum(values != 0.0, axis=0)
-    needed = array_module.sqrt(support) * magnitude / array_module.maximum(relative_error * norm, np.finfo(np.float64).tiny)
-    exponent = float(array_module.max(array_module.log2(array_module.maximum(needed, 1.0))))
-    digits = int(np.ceil((exponent + 2.0) / DIGIT_BITS))
-    if DIGIT_BITS * digits - 2 >= np.finfo(np.float64).nmant:
-        return values
-    scale = array_module.exp2((DIGIT_BITS * digits - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0))))
-    return array_module.rint(values * scale[None, :]) / scale[None, :]
-
-
-class DenseDualTile:
-    """A block held as dense standardized columns; its products round the operand as the int8 split does."""
-
-    def __init__(self, values: Any, array_module: Any) -> None:
-        self.values = values
-        self.array_module = array_module
-
-    def sample_operand(self, left: Any, relative_error: float) -> Any:
-        return rounded_operand(left, relative_error, self.array_module)
-
-    def rmatmat(self, left: Any) -> Any:
-        return self.values.T @ left
-
-    def matmat(self, right: Any) -> Any:
-        return self.values @ right
-
-    def accumulate_matmat(self, right: Any, image: Any, relative_error: float) -> None:
-        image += self.values @ rounded_operand(right, relative_error, self.array_module)
-
-    def weighted_column_squares(self, weights: Any) -> Any:
-        return (self.values * self.values).T @ weights
-
-    def columns(self, local: Any) -> Any:
-        return self.values[:, local]
-
-
-class DenseDualSource:
-    """Dense standardized genotypes (n x p) cut into contiguous blocks."""
-
-    def __init__(self, genotypes: Any, block_bounds: list[tuple[int, int]], array_module: Any = np) -> None:
-        self.array_module = array_module
-        self.genotypes = array_module.asarray(genotypes, dtype=array_module.float64)
-        self.sample_count, self.variant_count = (int(extent) for extent in self.genotypes.shape)
-        self.block_bounds = _checked_bounds(block_bounds, self.variant_count)
-
-    def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
-        for start, stop in self.block_bounds:
-            yield start, stop, DenseDualTile(self.genotypes[:, start:stop], self.array_module)
-
-    def map_reduce(self, work: Callable[..., None], shared: dict, rows: dict, image_shape: tuple[int, ...]) -> Any:
-        return sequential_map_reduce(self, work, shared, rows, image_shape)
 
 
 def _checked_bounds(block_bounds: list[tuple[int, int]], variant_count: int) -> list[tuple[int, int]]:
@@ -427,29 +359,10 @@ def resolved_spikes(spikes: Any, sample_count: int, array_module: Any) -> np.nda
         chosen = updated
 
 
-def deflation_factor(array_module: Any, basis: Any, image: Any) -> Any:
-    """F with F F' = (W'SW)^+ on the numerical column space of a spike basis W (n x k), from S W = `image`.
-
-    Spikes tied on a model's rows (variants that differ only off them) give W equal columns, and
-    W'SW, whose null space is W's since S >= I, is singular: a Cholesky factorization fails, or passes
-    only on a pivot that rounding left positive. The computed Gram W'(SW) is within
-    gamma_n |W|'|SW| of the exact one (Higham 2002, 3.5; gamma_n = n u / (1 - n u) <= n eps for
-    u = eps / 2), so its error is below n eps ||W||_F ||SW||_F in norm and, by Weyl, an eigenvalue
-    at or below that spans no direction.
-    The others give F = V diag(lambda^-1/2): W F F' W' S is the S-orthogonal projector onto span(W),
-    so the deflated iteration is the one on the independent spike directions.
-    """
-    gram = basis.T @ image
-    eigenvalues, eigenvectors = array_module.linalg.eigh(0.5 * (gram + gram.T))
-    rounding = basis.shape[0] * np.finfo(np.float64).eps * array_module.linalg.norm(basis) * array_module.linalg.norm(image)
-    kept = eigenvalues > rounding
-    return eigenvectors * array_module.where(kept, 1.0 / array_module.sqrt(array_module.where(kept, eigenvalues, 1.0)), 0.0)[None, :]
-
-
 @dataclass
 class Deflation:
     """Per model, a basis W (n x k) of its spike directions, S W, F with F F' = (W'SW)^+
-    (`deflation_factor`), and the variants W holds.
+    and the variants W holds.
 
     Deflated CG (Saad, Yeung, Erhel & Guyomarc'h 2000) keeps every residual orthogonal to W and
     every direction S-orthogonal to it: the spikes W spans are solved exactly in the k x k system
@@ -469,57 +382,6 @@ class Deflation:
     def project_direction(self, array_module: Any, model: int, values: Any) -> Any:
         factor = self.factors[model]
         return values - self.bases[model] @ (factor @ (factor.T @ (self.images[model].T @ values)))
-
-
-def spike_deflation(
-    source: DualTileSource, models: DualModels, count: PassCount, edges: dict | None = None, column_budget: int | None = None
-) -> tuple[Deflation, dict]:
-    """Each model's spikes and their deflation basis: one pass for ||xt_k||^2, one for S W.
-
-    Variant k adds D_k ||xt_k||^2 to G = Xt D Xt' along Xt e_k. Without `edges`, k is resolved when
-    that spike exceeds 1 plus the bulk's mean eigenvalue tr(G_bulk)/n (iterated to its fixed point,
-    since removing spikes lowers the level). With `edges` (model -> the largest Ritz value of the
-    model's deflated operator in an earlier solve), only spikes above the bulk's measured edge are
-    resolved: a spike below it does not raise the condition number.
-    ||xt_k||^2 = x_k'W x_k - (x_k'WC)(C'WC)^-1(C'Wx_k) for every model comes from the first pass.
-    `column_budget` caps the basis columns over all models, from the memory the caller has for W,
-    S W and the S W pass: the largest spikes, which cost CG the most iterations, are kept.
-    """
-    array_module = source.array_module
-    spikes = models.variances * column_squares(source, models, count)
-    resolved: dict[int, np.ndarray] = {}
-    for model in range(models.model_count):
-        if edges is not None and model in edges:
-            resolved[model] = _host(array_module.flatnonzero(1.0 + spikes[:, model] > edges[model]))
-        else:
-            resolved[model] = resolved_spikes(spikes[:, model], source.sample_count, array_module)
-    if column_budget is not None and sum(indices.size for indices in resolved.values()) > column_budget:
-        ranked = sorted(
-            ((float(spikes[int(index), model]), model, int(index)) for model, indices in resolved.items() for index in indices),
-            reverse=True,
-        )[:column_budget]
-        resolved = {model: np.sort(np.asarray([index for _spike, owner, index in ranked if owner == model], dtype=np.int64)) for model in resolved}
-    bases: dict[int, Any] = {}
-    for model, indices in resolved.items():
-        if indices.size == 0:
-            continue
-        genotype_columns = array_module.concatenate(
-            [tile.columns(indices[(indices >= start) & (indices < stop)] - start) for start, stop, tile in source.blocks()], axis=1
-        )
-        bases[model] = models.design_to_sample(genotype_columns, array_module.full(indices.size, model))
-    images: dict[int, Any] = {}
-    factors: dict[int, Any] = {}
-    if bases:
-        order = sorted(bases)
-        stacked_models = np.concatenate([np.full(int(bases[model].shape[1]), model) for model in order])
-        image = apply_operator(source, models, array_module.concatenate([bases[model] for model in order], axis=1), array_module.asarray(stacked_models), 0.0, count, "deflation")
-        offset = 0
-        for model in order:
-            width = int(bases[model].shape[1])
-            images[model] = image[:, offset : offset + width]
-            offset += width
-            factors[model] = deflation_factor(array_module, bases[model], images[model])
-    return Deflation(bases, images, factors, resolved), {model: int(indices.size) for model, indices in resolved.items()}
 
 
 @dataclass
@@ -736,43 +598,6 @@ def certified_block_cg(
             directions = next_directions
 
 
-def refresh_pass(source: DualTileSource, models: DualModels, duals: Any, column_models: Any, block_update: Callable[[int, int, Any], tuple[Any, Any]], count: PassCount) -> tuple[Any, Any]:
-    """A refresh with no pass of its own: lagged products, the block-local step and the new product.
-
-    Per tile: U_b = Xt_b' z for every column (the previous solve's products, which the local step
-    consumes); (D_b, m_b) = block_update(start, stop, U_b) writes block b's new sites; then
-    Y += X_b (D_b U_b) and X m += X_b m_b under the new sites. Each block's second product uses
-    only its own D_b, so after the read S_new z and X m_new are exact. Returns (S_new z, X m_new).
-    """
-    array_module = source.array_module
-    left = models.sample_to_design(duals, column_models)
-    image = array_module.zeros_like(duals)
-    prior_image = array_module.zeros((source.sample_count, models.model_count))
-    column_count = int(duals.shape[1])
-    for start, stop, tile in source.blocks():
-        products = tile.rmatmat(left)
-        variances, means = block_update(start, stop, products)
-        if bool(array_module.any(variances < 0.0)):
-            raise ValueError("a block update returned a negative site variance; such sites need the exact split.")
-        models.variances[start:stop] = variances
-        combined = tile.matmat(array_module.concatenate([variances[:, column_models] * products, means], axis=1))
-        image += combined[:, :column_count]
-        prior_image += combined[:, column_count:]
-    count.note(column_count + models.model_count, 0.0, "refresh")
-    return duals + models.design_to_sample(image, column_models), prior_image
-
-
-def mean_from_dual(source: DualTileSource, models: DualModels, prior_mean: Any, duals: Any, count: PassCount) -> Any:
-    """mu = m + D Xt' z per model, one read."""
-    array_module = source.array_module
-    left = models.sample_to_design(duals, array_module.arange(models.model_count))
-    mean = prior_mean.copy()
-    for start, stop, tile in source.blocks():
-        mean[start:stop] += models.variances[start:stop] * tile.rmatmat(left)
-    count.note(int(duals.shape[1]), 0.0, "mean")
-    return mean
-
-
 def draw_right_hand_side(source: DualTileSource, models: DualModels, draw_models: Any, prior_noise: Any, sample_noise: Any, count: PassCount) -> Any:
     """Matheron's dual right-hand side e2 - Xt D^1/2 e1 per draw, one read.
 
@@ -785,53 +610,6 @@ def draw_right_hand_side(source: DualTileSource, models: DualModels, draw_models
         image += tile.matmat(array_module.sqrt(models.variances[start:stop][:, draw_models]) * prior_noise[start:stop])
     count.note(int(draw_models.shape[0]), 0.0, "draw-rhs")
     return sample_noise - models.design_to_sample(image, draw_models)
-
-
-def fused_final_pass(
-    source: DualTileSource,
-    models: DualModels,
-    prior_mean: Any,
-    duals: Any,
-    column_models: Any,
-    right_hand_side: Any,
-    draw_columns: Any,
-    prior_noise: Any,
-    score_rows: Any,
-    count: PassCount,
-    design_columns: Any = None,
-) -> tuple[Any, Any, Any, Any]:
-    """Weights, scores, exact certificates and chosen Xt'z, one read.
-
-    Per tile: U_b = Xt_b' z for every column; the model columns give mu_b = m_b + D_b U_b, the draw
-    columns beta*_b = mu_b + D_b^1/2 e1_b + D_b U_b; one product with [D_b U_b, weights] gives both
-    S z (hence each column's exact residual) and the scores of `score_rows`.
-    Returns (weights (p, columns), scores (score rows, columns), exact residual norms, Xt'z of
-    `design_columns` or None).
-    """
-    array_module = source.array_module
-    left = models.sample_to_design(duals, column_models)
-    column_count = int(duals.shape[1])
-    image = array_module.zeros_like(duals)
-    weights = array_module.empty((source.variant_count, column_count))
-    scores = array_module.zeros((int(score_rows.shape[0]), column_count))
-    model_columns = array_module.arange(models.model_count)
-    design_products = None if design_columns is None else array_module.empty((source.variant_count, int(len(design_columns))))
-    for start, stop, tile in source.blocks():
-        products = tile.rmatmat(left)
-        if design_products is not None:
-            design_products[start:stop] = products[:, design_columns]
-        variances = models.variances[start:stop][:, column_models]
-        shifted = variances * products
-        block_weights = shifted.copy()
-        block_weights[:, model_columns] += prior_mean[start:stop]
-        block_weights[:, draw_columns] += block_weights[:, column_models[draw_columns]] + array_module.sqrt(variances[:, draw_columns]) * prior_noise[start:stop]
-        weights[start:stop] = block_weights
-        combined = tile.matmat(array_module.concatenate([shifted, block_weights], axis=1))
-        image += combined[:, :column_count]
-        scores += combined[score_rows, column_count:]
-    count.note(column_count, 0.0, "fused-final")
-    residual = right_hand_side - (duals + models.design_to_sample(image, column_models))
-    return weights, scores, array_module.linalg.norm(residual, axis=0), design_products
 
 
 @dataclass
@@ -1096,15 +874,6 @@ class SampleDiagonal:
         rows = array_module.flatnonzero(self.weights > 0.0)
         base = 1.0 - bulk_diagonal[rows] + self.covariate_leverage[rows]
         return rows, (base + self.resolved_lower[rows]) / self.weights[rows], (base + self.resolved_upper[rows]) / self.weights[rows]
-
-
-def prediction_error_bound(error_bound: Any, predictive_variance: Any) -> Any:
-    """A mean's certificate in prediction units: for any person's row x, |x'(mu_hat - mu)| <= sqrt(x'A^-1 x)
-    ||mu_hat - mu||_A (Cauchy-Schwarz in A's inner product), and x'A^-1 x is the posterior variance of that person's
-    linear predictor, so each prediction's error is at most ``error_bound`` (``DualCertificate.error_bound``, from the
-    residual recomputed with the full operator) posterior standard deviations of it. Returns the bound per row for
-    the rows' predictive variances (any shape broadcasting against the certificate)."""
-    return np.sqrt(np.asarray(predictive_variance, dtype=np.float64)) * np.asarray(error_bound, dtype=np.float64)
 
 
 @dataclass(frozen=True)

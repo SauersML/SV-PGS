@@ -212,3 +212,9 @@ def mean_from_dual(source: DualTileSource, models: DualModels, prior_mean: Any, 
         mean[start:stop] += models.variances[start:stop] * tile.rmatmat(left)
     count.note(int(duals.shape[1]), 0.0, "mean")
     return mean
+
+
+def cavities(posterior_mean: NDArray[np.float64], posterior_variance: NDArray[np.float64], site_precision: NDArray[np.float64], site_shift: NDArray[np.float64]) -> Cavity:
+    """Divide each site out of q's marginal."""
+    marginal_precision = 1.0 / posterior_variance
+    return Cavity(precision=marginal_precision - site_precision, shift=posterior_mean * marginal_precision - site_shift)

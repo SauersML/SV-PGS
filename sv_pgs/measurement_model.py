@@ -552,34 +552,6 @@ class CalibrationPairs:
                 raise ValueError("CalibrationPairs has a block with more pairs than calibration samples.")
 
 
-def calibration_pairs(
-    sample_ids: Sequence[ResearchId],
-    dosage: NDArray,
-    truth: NDArray,
-    blocks: Sequence[LdBlock] = (),
-    block_covariances: Sequence[NDArray] = (),
-) -> CalibrationPairs:
-    """Calibration pairs from dense [records, samples] arrays, NaN where missing (a benchmark's scale).
-
-    ``block_covariances`` holds each block's cohort covariance of its stored columns.
-    """
-    dosage_values = np.asarray(dosage, dtype=np.float64)
-    truth_values = np.asarray(truth, dtype=np.float64)
-    if dosage_values.ndim != 2 or dosage_values.shape[1] != len(sample_ids):
-        raise ValueError("calibration_pairs needs dosage and truth of shape [records, samples], one column per sample ID.")
-    if len(block_covariances) != len(blocks):
-        raise ValueError("calibration_pairs needs one cohort covariance per block.")
-    block_pairs = []
-    for block, block_covariance in zip(blocks, block_covariances):
-        records = np.asarray(block.records, dtype=np.int64)
-        target_records = records[np.asarray(block.targets, dtype=np.int64)]
-        complete = np.all(np.isfinite(dosage_values[records]), axis=0) & np.all(np.isfinite(truth_values[target_records]), axis=0)
-        block_pairs.append(
-            BlockPairs(block, dosage_values[records][:, complete].T, truth_values[target_records][:, complete].T, np.asarray(block_covariance, dtype=np.float64))
-        )
-    return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
-
-
 def _calibrated_block_covariance(pairs: BlockPairs, scales: NDArray) -> F64Array:
     block_scales = np.asarray(scales, dtype=np.float64)[np.asarray(pairs.block.records, dtype=np.int64)]
     return block_scales[:, None] * np.asarray(pairs.cohort_covariance, dtype=np.float64) * block_scales[None, :]

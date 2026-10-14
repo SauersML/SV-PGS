@@ -16,6 +16,7 @@ import sv_pgs.krylov_recycle as krylov
 import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.krylov_recycle import RecycledSpace, block_gcro_dr
 from sv_pgs.scale_mixture_ep import GaussianPosterior, MixtureHyperparameters, initial_hyperparameters, moment_matched_prior_sites, scale_mixture_prior
+from tests.oracles import _total_curvature
 from tests.test_scale_mixture_ep import _WORKING_BYTES, _data, _dense_ep, _hyperparameters
 
 EPS = np.finfo(np.float64).eps
@@ -177,7 +178,7 @@ def test_the_block_krylov_curvature_is_the_exact_linear_response_and_preconditio
         matrix = np.eye(variant_count) - (np.eye(variant_count) - weight[:, None] * squared) @ (left[:, None] * covariance * right[None, :] + np.diag(diagonal))
         return np.linalg.solve(matrix, right_hand)
 
-    exact = engine._total_curvature(prior, coefficients, cavity, replace(posterior, linear_response=linear_response), _WORKING_BYTES, 1e-13)
+    exact = _total_curvature(prior, coefficients, cavity, replace(posterior, linear_response=linear_response), _WORKING_BYTES, 1e-13)
     blocks = (np.arange(0, 10), np.arange(10, 20), np.arange(20, 30))
 
     def local(left, right, diagonal, weight):

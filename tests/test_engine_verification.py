@@ -36,21 +36,18 @@ from sv_pgs.scale_mixture_ep import (
     _restricted_prior,
     _smoothing_bounds,
     _stationarity,
-    _total_curvature,
-    cavities,
     class_log_density,
     hyper_step,
     initial_hyperparameters,
     kernel_floor,
     kernel_top,
     log_scale,
-    INDEPENDENT_EFFECTS,
-    quadrature_majorant_ratio,
     scale_mixture_prior,
     site_targets,
     spacing_bound,
     tilted_moments,
 )
+from tests.oracles import INDEPENDENT_EFFECTS, _total_curvature, cavities, quadrature_majorant_ratio
 
 _EPSILON = float(np.finfo(np.float64).eps)
 _WORKING_BYTES = 1 << 22

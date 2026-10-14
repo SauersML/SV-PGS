@@ -6,11 +6,11 @@ import pytest
 
 from sv_pgs.measurement_model import (
     BlockPairs,
+    CalibrationPairs,
     LdBlock,
     LeakageMap,
     MeasurementModel,
     calibration_moments,
-    calibration_pairs,
     concatenate_calibration_moments,
     fit_leakage_map,
     fit_measurement_model,
@@ -23,6 +23,34 @@ from sv_pgs.measurement_model import (
 )
 from sv_pgs.sample_ids import ResearchId
 from tests.phenotype_bounds import rounding_gamma, sampling_bound
+
+
+def calibration_pairs(
+    sample_ids: tuple[ResearchId, ...],
+    dosage: np.ndarray,
+    truth: np.ndarray,
+    blocks: tuple[LdBlock, ...] = (),
+    block_covariances: tuple[np.ndarray, ...] = (),
+) -> CalibrationPairs:
+    """Calibration pairs from dense [records, samples] arrays, NaN where missing (a benchmark's scale).
+
+    ``block_covariances`` holds each block's cohort covariance of its stored columns.
+    """
+    dosage_values = np.asarray(dosage, dtype=np.float64)
+    truth_values = np.asarray(truth, dtype=np.float64)
+    if dosage_values.ndim != 2 or dosage_values.shape[1] != len(sample_ids):
+        raise ValueError("calibration_pairs needs dosage and truth of shape [records, samples], one column per sample ID.")
+    if len(block_covariances) != len(blocks):
+        raise ValueError("calibration_pairs needs one cohort covariance per block.")
+    block_pairs = []
+    for block, block_covariance in zip(blocks, block_covariances):
+        records = np.asarray(block.records, dtype=np.int64)
+        target_records = records[np.asarray(block.targets, dtype=np.int64)]
+        complete = np.all(np.isfinite(dosage_values[records]), axis=0) & np.all(np.isfinite(truth_values[target_records]), axis=0)
+        block_pairs.append(
+            BlockPairs(block, dosage_values[records][:, complete].T, truth_values[target_records][:, complete].T, np.asarray(block_covariance, dtype=np.float64))
+        )
+    return CalibrationPairs(tuple(sample_ids), calibration_moments(dosage_values, truth_values), tuple(block_pairs))
 
 
 def apply_leakage_map(calibrated_block: np.ndarray, leakage: LeakageMap) -> np.ndarray:

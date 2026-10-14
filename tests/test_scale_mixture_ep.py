@@ -18,7 +18,6 @@ import sv_pgs.scale_mixture_ep as engine
 from sv_pgs.scale_mixture_ep import (
     _sum_to_zero_basis,
     _sum_to_zero_rows,
-    INDEPENDENT_EFFECTS,
     CurvatureCorrection,
     FixedPoint,
     fit_hyperparameters,
@@ -31,14 +30,11 @@ from sv_pgs.scale_mixture_ep import (
     _evidence,
     _curvature_trace_gradient,
     _data_value,
-    _total_curvature,
     _directional_derivatives,
     _corrected,
     _ascend_evidence,
     _best_certified,
     _laplace_corrections,
-    _line_log_integral,
-    _line,
     _lines,
     _column_log_sums,
     _kernel_terms,
@@ -52,11 +48,9 @@ from sv_pgs.scale_mixture_ep import (
     _penalty_value,
     _restricted_prior,
     _smoothing_bounds,
-    cavities,
     curvature_correction,
     class_log_density,
     derived_lattice,
-    diagonal_posterior,
     halved_lattice,
     relattice,
     hyper_step,
@@ -69,15 +63,14 @@ from sv_pgs.scale_mixture_ep import (
     noise_gain,
     noise_variance,
     prior_second_moment,
-    quadrature_majorant_ratio,
     roughness_factor,
     scale_mixture_prior,
     site_targets,
     spacing_bound,
-    tail_mass,
     tilted_cumulants,
     tilted_moments,
 )
+from tests.oracles import INDEPENDENT_EFFECTS, _line, _line_log_integral, _total_curvature, cavities, diagonal_posterior, quadrature_majorant_ratio
 
 _WORKING_BYTES = 1 << 20
 # The evidence resolution a fit certifies for a scorer with 64 posterior draws, 1/(2K) nats.
@@ -505,13 +498,6 @@ def test_the_floor_bounds_the_flat_kernel_error_and_the_top_is_the_largest_mode(
     kernel = np.exp(offset[:, None] + grid[None, :])
     values = 0.5 * np.square(shift)[:, None] * kernel / (1.0 + kernel * precision[:, None]) - 0.5 * np.log1p(kernel * precision[:, None])
     assert np.all(np.diff(values, axis=1) <= 1e-12)
-
-
-def test_tail_mass_matches_numerical_integration():
-    for end_value, slope, curvature in ((0.3, -0.5, -0.2), (-1.0, 0.8, -1.5), (0.0, -2.0, 0.0)):
-        numerical = quad(lambda tau: np.exp(end_value + slope * tau + 0.5 * curvature * tau * tau), 0.0, np.inf, epsrel=1e-12)[0]
-        np.testing.assert_allclose(tail_mass(end_value, slope, curvature), numerical, rtol=1e-9)
-    assert tail_mass(0.0, 0.1, 0.0) == np.inf and tail_mass(0.0, -1.0, 0.1) == np.inf
 
 
 def test_the_derived_spacing_certifies_the_lattice_sum():

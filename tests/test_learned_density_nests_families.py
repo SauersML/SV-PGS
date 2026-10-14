@@ -16,7 +16,6 @@ from scipy.optimize import minimize, minimize_scalar
 from scipy.special import betainc, expit, logsumexp
 
 from sv_pgs.scale_mixture_ep import (
-    INDEPENDENT_EFFECTS,
     Cavity,
     class_log_density,
     derived_lattice,
@@ -24,6 +23,7 @@ from sv_pgs.scale_mixture_ep import (
     initial_hyperparameters,
     scale_mixture_prior,
 )
+from tests.oracles import INDEPENDENT_EFFECTS
 
 _WORKING_BYTES = 1 << 24
 # The resolution production fits to (MODEL.md: K = 64 posterior draws, 1/(2K) nats), for the lattice (Stage 0) and

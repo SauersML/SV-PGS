@@ -105,10 +105,9 @@ def test_cuda_resident_codes_with_relaxed_digits_keep_the_certificate() -> None:
     models = dual_solve.DualModels(cupy.asarray(weights), cupy.asarray(variances), cupy.asarray(covariates), cupy)
     right = dual_solve.mean_right_hand_side(models, cupy.asarray(response), cupy.asarray(standardized @ prior_mean))
     count = dual_solve.PassCount()
-    deflation, _resolved = dual_solve.spike_deflation(source, models, count)
     host_right = cupy.asnumpy(right)
     bound = cupy.asarray(_solve_bound(host_right))
-    result = dual_solve.certified_block_cg(source, models, right, cupy.zeros_like(right), cupy.arange(MODEL_COUNT), bound, count, deflation=deflation)
+    result = dual_solve.certified_block_cg(source, models, right, cupy.zeros_like(right), cupy.arange(MODEL_COUNT), bound, count, deflation=dual_solve.Deflation({}, {}, {}, {}))
     assert bool(cupy.all(result.residual_norm <= bound))
     assert any(relative_error > 0.0 for relative_error in result.relative_errors)
     exact = host_right - np.column_stack([

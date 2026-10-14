@@ -6,7 +6,8 @@ import numpy as np
 import pytest
 from scipy.special import expit
 
-from sv_pgs.binary_likelihood import BernoulliSites, auc, probability
+from sv_pgs.binary_likelihood import BernoulliSites, auc
+from sv_pgs.fast_scoring import posterior_predictive_probability
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.mean_field import MeanFieldFixedPoints
 from sv_pgs.small_n import dense_statistics, fit_small_n, small_n_prior, small_n_start, weighted_statistics
@@ -120,7 +121,7 @@ def test_the_binary_fit_calibrates_and_ranks():
         linear = columns @ scoring.coefficients + covariates[rows] @ scoring.alpha
         deviations = columns @ (scoring.posterior_draws - scoring.coefficients[:, None]) + covariates[rows] @ (scoring.covariate_draws - scoring.alpha[:, None])
         variance = np.mean(deviations**2, axis=1) + np.einsum("ij,jk,ik->i", covariates[rows], scoring.covariate_covariance, covariates[rows])
-        return probability(linear, variance, scoring.predictive_intercept_shift)
+        return posterior_predictive_probability(linear, variance, scoring.predictive_intercept_shift)
 
     # Calibration in the large on the training rows holds to the Monte Carlo spread of the draws' variance.
     assert float(np.mean(predictive(train))) == pytest.approx(float(labels[train].mean()), abs=0.02)

@@ -176,53 +176,6 @@ class JacobianProduct:
     window_part: NDArray[np.float64]
 
 
-def far_field_trace(bulk_trace: float, bulk_square_trace: float, sample_count: int, eigenvalues: NDArray[np.float64]) -> float:
-    """omega_F: the root of f(w) = w - omega_S - (omega_S2 / n) sum lambda / (1 + w lambda).
-
-    f is increasing and concave, and f(omega_S) <= 0. So Newton from omega_S never overshoots and
-    increases monotonically. It stops when an iterate no longer increases in floating point.
-    """
-    weight = bulk_square_trace / sample_count
-    current = bulk_trace
-    while True:
-        denominator = 1.0 + current * eigenvalues
-        value = current - bulk_trace - weight * float(np.sum(eigenvalues / denominator))
-        slope = 1.0 + weight * float(np.sum(np.square(eigenvalues / denominator)))
-        candidate = current - value / slope
-        if not candidate > current:
-            return current
-        current = candidate
-
-
-def _whitened_spectrum(gram: NDArray[np.float64], bulk_variance: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Eigenpairs of B = D^1/2 R D^1/2 (PSD; rounding below zero is clipped to its exact bound 0)."""
-    root = np.sqrt(bulk_variance)
-    eigenvalues, eigenvectors = np.linalg.eigh(root[:, None] * gram * root[None, :])
-    return np.maximum(eigenvalues, 0.0), eigenvectors
-
-
-def _quadratic_from_spectrum(
-    gram: NDArray[np.float64],
-    bulk_variance: NDArray[np.float64],
-    far_trace: float,
-    eigenvalues: NDArray[np.float64],
-    eigenvectors: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    projected = (gram * np.sqrt(bulk_variance)[None, :]) @ eigenvectors
-    correction = np.einsum("ik,k,ik->i", projected, 1.0 / (1.0 + far_trace * eigenvalues), projected)
-    return far_trace * np.diag(gram) - far_trace**2 * correction
-
-
-def window_bulk_quadratic(gram: NDArray[np.float64], bulk_variance: NDArray[np.float64], far_trace: float) -> NDArray[np.float64]:
-    """diag(Xt_W' K_S^-1 Xt_W) given G = far_trace * R_W (exact when the far field is far_trace^-1 I).
-
-    With B = D^1/2 R D^1/2 = V diag(lambda) V', the quadratic is
-    G - far_trace^2 (R D^1/2 V) diag(1 / (1 + far_trace lambda)) (R D^1/2 V)'.
-    """
-    eigenvalues, eigenvectors = _whitened_spectrum(gram, bulk_variance)
-    return _quadratic_from_spectrum(gram, bulk_variance, far_trace, eigenvalues, eigenvectors)
-
-
 def _window(grams: BlockGrams, block: int) -> tuple[NDArray[np.float64], NDArray[np.int64], slice]:
     """The window's Gram as Stage 0 stores it, its variant indices, and the own block's rows in it.
 
@@ -321,23 +274,6 @@ def _inconsistency(whitened: Any, own: slice, array_module: Any) -> str:
     return "; ".join(reports)
 
 
-def marginals_from_quadratics(
-    site_precision: NDArray[np.float64],
-    resolved: NDArray[np.int64],
-    resolved_core: NDArray[np.float64],
-    resolved_cross: NDArray[np.float64],
-    bulk_quadratic: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Identity 1 with a dense C: diag(A^-1) from q_j = xt_j' K_S^-1 xt_j (bulk j) and the resolved core."""
-    is_resolved = np.zeros(site_precision.shape[0], dtype=bool)
-    is_resolved[resolved] = True
-    bulk_variance = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, site_precision))
-    spikes = np.sum((resolved_cross @ np.linalg.inv(resolved_core)) * resolved_cross, axis=1) if resolved.shape[0] else 0.0
-    variances = bulk_variance - np.square(bulk_variance) * (bulk_quadratic - spikes)
-    variances[resolved] = np.diag(np.linalg.inv(resolved_core))
-    return variances
-
-
 def sandwich_diagonal(covariance: NDArray[np.float64], gram: NDArray[np.float64], array_module: Any = np) -> NDArray[np.float64]:
     """diag(S R S) as sum_k (S R)_ik S_ki: one BLAS product and an elementwise sum, on ``array_module``'s device (a
     bench-sim window's 5,870-column product on the host was 20% of a genome EP refresh [sim, py-spy]).
@@ -406,7 +342,8 @@ positive start reaches the same root, so a stale entry costs steps, never accura
 
 
 def _far_field_factored(whitened: Any, solve: BulkSolve, array_module: Any, start: float | None = None) -> tuple[float, Any]:
-    """omega_F (``far_field_trace``'s root, to float64) with B's spectral sums from the Cholesky factor L of
+    """omega_F, the root of w - omega_S - (omega_S2 / n) sum lambda / (1 + w lambda) (to float64), with B's spectral
+    sums from the Cholesky factor L of
     M = I + w B: tr M^-1 = ||L^-1||_F^2 and ||M^-1||_F^2 = ||L^-T L^-1||_F^2, three |W|^3 / 3 products per step.
     Newton starts from omega_S, or from ``start`` (the previous window's root: neighbouring windows share most of
     their far field, so their roots are close and one or two steps remain). The equation is increasing and concave,
@@ -462,8 +399,8 @@ def _window_quadratic(
 
     B enters only through omega_F and (I + omega_F B)^-1 on the own block's columns, so no eigendecomposition is formed
     (about 9 |W|^3, and cuSOLVER's took 11 s per 15k-column window on an A100, 18 min per bench-sim refresh): the
-    window's positive semidefiniteness is one Cholesky of B plus its rounding allowance, and omega_F is Newton on the
-    same equation as ``far_field_trace`` with its two spectral sums read from Cholesky factors,
+    window's positive semidefiniteness is one Cholesky of B plus its rounding allowance, and omega_F is Newton on its
+    equation (``_far_field_factored``) with the two spectral sums read from Cholesky factors,
     sum lambda / (1 + w lambda) = (|W| - tr M^-1) / w and sum (lambda / (1 + w lambda))^2 = ||I - M^-1||_F^2 / w^2 for
     M = I + w B (``_far_field_factored``); the last factor serves the solves. The dense algebra runs on
     ``array_module`` (numpy, or cupy on a device), in float64.
@@ -1406,8 +1343,6 @@ def variance_jvp(solve: BulkSolve, grams: BlockGrams, direction: NDArray[np.floa
     return JacobianProduct(values=values, standard_error=np.sqrt(variance), window_part=window_part)
 
 
-
-
 # --------------------------------------------------------------------------- the exact dual route (small n)
 
 
@@ -1440,33 +1375,3 @@ def exact_block_information(factor: KernelFactor, bulk_variance: NDArray[np.floa
     cross = columns.T @ factor.resolved_solves
     spikes = np.sum((cross @ factor.core_inverse) * cross, axis=1) if cross.shape[1] else 0.0
     return np.square(bulk_variance) * (quadratic - spikes)
-
-
-def exact_bulk_diagonal(factor: KernelFactor) -> NDArray[np.float64]:
-    """diag(K_S^-1), exactly: the column sums of squares of L^-1, with K_S = L L'. The cost is n^3 / 3.
-
-    This is the bulk diagonal only. The resolved sites' correction (Z_L core^-1 Z_L')_ii and the covariate
-    leverage are added once, by ``dual_solve.SampleDiagonal.predictor_variance``, the single assembler for the
-    exact and the windowed routes alike (binary-ep). Subtracting them here too would count them twice.
-    """
-    inverse_lower = solve_triangular(factor.lower, np.eye(factor.lower.shape[0]), lower=True)
-    return np.sum(np.square(inverse_lower), axis=0)
-
-
-def exact_route_is_cheaper(sample_count: int, grams: BlockGrams, working_bytes: int) -> bool:
-    """Whether the exact dual route costs fewer flops than the window route and its n x n factor fits.
-
-    Leading-order counts (Golub and Van Loan, Matrix Computations, 4th ed.: Cholesky n^3 / 3; a triangular solve
-    n^2 per column; the symmetric eigendecomposition with vectors about 9 n^3):
-    - exact: n^2 p (forming K_S) + n^3 / 3 (its factor) + n^2 p (the triangular solves);
-    - window: the sum over blocks of 9 |W_b|^3, with |W_b| the block's window size.
-    The exact route needs n^2 float64 for the factor and n^2 for its inverse (the leverages).
-    """
-    variant_count = sum(members.shape[0] for members in grams.blocks)
-    exact = 2.0 * sample_count**2 * variant_count + sample_count**3 / 3.0
-    window = 0.0
-    for block in range(len(grams.blocks)):
-        size = sum(grams.blocks[member].shape[0] for member in _window_blocks(grams, block))
-        window += 9.0 * float(size) ** 3
-    fits = 2 * sample_count * sample_count * np.dtype(np.float64).itemsize <= working_bytes
-    return bool(fits and exact < window)

@@ -46,8 +46,6 @@ CRC32C_POLYNOMIAL = 0x82F63B78
 CRC_BITS = np.iinfo(np.uint32).bits
 _CRC_TOP = 1 << (CRC_BITS - 1)
 """x^0 in the reflected bit order; x^k sits k bits below it."""
-_BYTE_EXPONENT = BITS_PER_CODE.bit_length() - 1
-"""log2 of the bits per byte: x^(8 n) = x^(2^(k + _BYTE_EXPONENT)) over n's set bits k."""
 
 
 def _crc32c_table() -> np.ndarray:
@@ -81,17 +79,6 @@ def _power_table() -> list[int]:
 
 
 _POWERS = _power_table()
-
-
-def byte_shift(byte_count: int) -> int:
-    """x^(8 byte_count) mod P: crc32c(A + B) = byte_shift(len(B)) (x) crc32c(A) ^ crc32c(B) (zlib's crc32_combine)."""
-    power, exponent, bit = _CRC_TOP, int(byte_count), _BYTE_EXPONENT
-    while exponent:
-        if exponent & 1:
-            power = _multiply_mod_polynomial(_POWERS[bit % CRC_BITS], power)
-        exponent >>= 1
-        bit += 1
-    return power
 
 
 def exception_sample_dtype(sample_count: int) -> np.dtype[Any]:
@@ -609,4 +596,3 @@ class GpuRowDecoder:
                  np.int64(sample_count), error),
             )
         return error, first_bad
-

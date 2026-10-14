@@ -126,16 +126,7 @@ since ‖G^½S⁻¹r‖² = r'(S⁻¹ − S⁻²)r ≤ max_{λ≥1}(λ − 1)/λ
 - at n = 30,000: 3–4 at a relative bound of 0.1 and 0.01, and 3–5 at 0.001, out of 8 (fp64-equivalent).
 - **A40 pass time** (n = 62k, 4,096-variant tiles, proto tiles): 2 digits instead of 6 was 1.9× faster at 126 columns and 2.4× at 6,720.
 
-## 5. Refresh with no pass of its own [proved; checked]
-
-`refresh_pass` makes one read, and for every tile:
-1. U_b = Xt_b'z for every column: the previous solve's products, which EDB-EP's block-local step consumes;
-2. (D_b, m_b) = block_update(b, U_b) writes block b's new sites;
-3. Y += X_b(D_b U_b) and X m += X_b m_b are accumulated under the new sites.
-
-After the read, S_new z and X m_new are exact. So a refresh costs its warm CG passes plus that one read.
-
-## 6. Pass counts [measured]
+## 5. Pass counts [measured]
 
 Models: 3 quantitative traits and 1 binary trait (logistic curvature weights at 10% prevalence), 24 models in all, each trait with its full-data fit and 5 folds. Sites: a heavy-tailed bulk plus 20 strong variants per trait.
 - The target is ep_eb §3.3 at K = 64, with p_eff exact from the dense dual at n = 3,500.
@@ -178,9 +169,8 @@ Models: 3 quantitative traits and 1 binary trait (logistic curvature weights at 
   - So `iterate` warm-starts only when a model's resolved set is unchanged, the small-move regime near an EP fixed point, and the matched-by-variant start was not landed.
 - **Memory:** the dense C = Xt'Z_L (14 GB for these 12 models) ran the device out of memory. It is now kept only on the maps' LD windows (`WindowCross`).
 
-## 7. What it replaces
+## 6. What it replaces
 - **exact_polish's block-Jacobi factors and `exact_curvature` Grams:** not needed.
 - **The p × C Krylov state:** n × C instead.
 - **Hutchinson variances in site updates:** none. Probes feed only the leave-block-out marginals' scalars and certificates.
 - **The 400-iteration cap:** replaced by the certificate.
-- **The Stage 2 tail:** means, draws, certificate and scores in 3–4 reads before; one fused read now (`fused_final_pass`).

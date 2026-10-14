@@ -41,7 +41,7 @@ with no point mass at zero.
   log lambda). The low end of a weight's range is its resolvable bound.
 - The lattice is a quadrature rule: its floor, top, spacing and extent are
   derived from the data and a tolerance (``kernel_floor``, ``kernel_top``,
-  ``spacing_bound``, ``tail_mass``). Below the floor every kernel is flat to
+  ``spacing_bound``). Below the floor every kernel is flat to
   that tolerance (log Z's error there is bounded), but each node keeps its own
   variance v = u e^t in the kernel, so a density with its mass below the floor
   is a near-zero effect, never a point mass at zero (review-mathbugs N1).
@@ -87,7 +87,7 @@ EP-re-solved one; at fixed cavities it is H.
 
 Outer loop (``fit_hyperparameters``). At an EP fixed point the EP evidence's
 gradient in x is the fixed-cavity one, and its negative Hessian is the total
-curvature B + S, with the cavities re-solved (``_total_curvature``). The loop
+curvature B + S, with the cavities re-solved (``_total_curvature_columns``). The loop
 ascends one function, V(rho), with x its inner solve: the weights and x move
 jointly to the maximum of V's local model (``hyper_step`` on the anchored
 objective), accepted on V's realized gain above the tolerance, and x alone by
@@ -123,7 +123,6 @@ from scipy import sparse
 from scipy.interpolate import make_interp_spline
 from scipy.linalg import solve_triangular
 from scipy.optimize import brentq
-from scipy.special import erfcx
 
 from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
@@ -376,16 +375,6 @@ def derived_lattice(single_precision: F64Array, single_shift: F64Array, log_scal
     # nodes than the roughness order to carry a density: half the order in spacings on each side gives order + 1.
     width = max(top - floor, 0.5 * ROUGHNESS_ORDER * spacing)
     return np.arange(floor - width, top + width + spacing, spacing), floor, top
-
-
-def tail_mass(end_value: float, outward_slope: float, curvature: float) -> float:
-    """The integral over tau >= 0 of exp(end_value + outward_slope tau + curvature tau^2 / 2); inf when improper."""
-    if curvature < 0.0:
-        root = np.sqrt(-2.0 * curvature)
-        return float(np.exp(end_value) * np.sqrt(np.pi / (-2.0 * curvature)) * erfcx(-outward_slope / root))
-    if curvature == 0.0 and outward_slope < 0.0:
-        return float(np.exp(end_value) / -outward_slope)
-    return float("inf")
 
 
 def _legendre_functionals(nodes: F64Array, floor: float, top: float, degree_count: int) -> F64Array:
@@ -946,7 +935,7 @@ class _KernelRows:
 
     So log Z_j = LSE_k(L_jk + log pi_ck) is one product of exp(L - max_k L) with exp(log pi - max log pi) over the
     nodes (a GEMV of positive terms: exact to K eps in relative terms), with a row whose product falls to where
-    subnormal terms could matter taken exactly, as ``_line`` takes its fixed rows. The derivatives in eta = log u are
+    subnormal terms could matter taken exactly, as ``_lines`` takes its fixed rows. The derivatives in eta = log u are
     formed on first use."""
 
     def __init__(self, log_scale_rows: F64Array, grid: F64Array, precision: F64Array, shift: F64Array) -> None:
@@ -1246,35 +1235,6 @@ def tilted_cumulants(
         third[rows] = _host(np.sum(weights * (offset ** 3 + 3.0 * offset * conditional), axis=1))
         fourth[rows] = _host(np.sum(weights * (offset ** 4 + 6.0 * np.square(offset) * conditional + 3.0 * np.square(conditional)), axis=1) - 3.0 * np.square(second))
     return third, fourth
-
-
-def quadrature_majorant_ratio(
-    prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters, cavity: Cavity, working_bytes: int
-) -> float:
-    """sum_j M_j / Z_j with M_j = max(Z_j, sum_k pi_k |L_j(t_k + i pi/2)|), for ``spacing_bound``.
-
-    At t + i pi/2 the variance is i v, so log|L| = -log(1 + q^2)/4 + h^2 v q / (2 (1 + q^2)), at every node with its
-    own v (``_kernel_terms``).
-    """
-    log_density = class_log_density(prior, hyperparameters.coefficients)
-    scales = log_scale(prior, hyperparameters.coefficients)
-    total = 0.0
-    for class_position, class_rows in enumerate(prior.class_rows):
-        for rows in _row_chunks(class_rows, prior.grid_size, working_bytes):
-            with np.errstate(over="ignore"):
-                variance = np.exp(scales[rows][:, None] + prior.log_variance_grid[None, :])
-            ratio = variance * cavity.precision[rows][:, None]
-            shift_square = np.square(cavity.shift[rows])[:, None]
-            log_real = log_density[class_position] - 0.5 * np.log1p(ratio) + 0.5 * shift_square * variance / (1.0 + ratio)
-            log_strip = log_density[class_position] - 0.25 * np.log1p(ratio * ratio) + 0.5 * shift_square * variance * ratio / (1.0 + ratio * ratio)
-            total += float(np.sum(np.exp(np.maximum(_log_sum_exp(log_strip, axis=1) - _log_sum_exp(log_real, axis=1), 0.0))))
-    return total
-
-
-def cavities(posterior_mean: F64Array, posterior_variance: F64Array, site_precision: F64Array, site_shift: F64Array) -> Cavity:
-    """Divide each site out of q's marginal."""
-    marginal_precision = 1.0 / posterior_variance
-    return Cavity(precision=marginal_precision - site_precision, shift=posterior_mean * marginal_precision - site_shift)
 
 
 def site_targets(moments: TiltedMoments, cavity: Cavity) -> tuple[F64Array, F64Array]:
@@ -1902,7 +1862,7 @@ class GaussianPosterior:
 
     ``linear_response(left, right, diagonal, weight, B)``, when a posterior can give it, is the exact solution X of
     (I - (I - diag(weight) (Sigma o Sigma)) (diag(left) Sigma diag(right) + diag(diagonal))) X = B: the linear response
-    ``_total_curvature`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once).
+    ``_total_curvature_columns`` otherwise finds by GMRES (speed-smalln: the small-n route factors this p x p matrix once).
 
     ``cavity_response(m_x E, s2_x E)``, for a fixed point that is not EP's (the mean-field fixed point, whose cavity
     is the pseudo-likelihood: ``mean_field``), is that fixed point's own response (dh, dP) of every variant's cavity
@@ -1942,7 +1902,7 @@ class CurvatureCorrection:
     at the fixed point x_k and A moves with x, so B + S is taken as A(x_rho) + S + C. At x_rho = x_k that is B + S
     exactly, which is where the certificate is taken; elsewhere it is B to first order in x_rho - x_k, as A is. A
     view's coordinates are x = K x_view with M_view = M K, so the correction there is K' C K. For independent effects
-    (normal means) the cavities do not move with the prior, so C = 0 (``INDEPENDENT_EFFECTS``).
+    (normal means) the cavities do not move with the prior, so C = 0.
 
     Either given whole (``coefficient_map`` and ``matrix``), or formed only where it is asked (``columns``, from
     ``curvature_correction``): B's linear response is solved for the directions of the views asked for, starting
@@ -2014,9 +1974,6 @@ class CurvatureCorrection:
         assert self._basis is not None and self._total is not None
         total = coefficient_map.T @ (self._total @ (self._basis.T @ view))
         return 0.5 * (total + total.T) - coefficient_map.T @ fixed @ coefficient_map
-
-
-INDEPENDENT_EFFECTS = CurvatureCorrection()
 
 
 class _Anchor:
@@ -2109,13 +2066,6 @@ def curvature_correction(
         return total
 
     return CurvatureCorrection(mapping=prior.coefficient_map, columns=columns, fixed_curvature=0.5 * (fixed + fixed.T), resolutions=achieved)
-
-
-def diagonal_posterior(variance: F64Array) -> GaussianPosterior:
-    """The posterior of independent effects (orthogonal design, normal means): Sigma = diag(variance). There the
-    cavities do not move with the prior, so B equals the fixed-cavity curvature."""
-    column = np.asarray(variance, dtype=np.float64)[:, None]
-    return GaussianPosterior(solve=lambda right, _relative_tolerance: column * right, variance_jvp=lambda weights: -np.square(column) * weights, exact=True)
 
 
 @dataclass(frozen=True)
@@ -2334,15 +2284,6 @@ def _through_z_transposed(prior: ScaleMixturePrior, by_density: tuple[F64Array, 
         result[class_position * grid_size : (class_position + 1) * grid_size] = by_density[class_position].T @ values[rows]
     result[prior.density_size :] = prior.scale_design.T @ (by_log_scale[:, None] * values)
     return result
-
-
-def _total_curvature(
-    prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, posterior: GaussianPosterior, working_bytes: int, relative_tolerance: float
-) -> F64Array:
-    """B in x: M' B_z M (``_total_curvature_columns`` on every direction)."""
-    directions = prior.coefficient_map
-    total = directions.T @ _total_curvature_columns(prior, coefficients, cavity, posterior, working_bytes, relative_tolerance, directions)
-    return 0.5 * (total + total.T)
 
 
 def _total_curvature_columns(
@@ -2779,7 +2720,7 @@ def _moving_line_sum(
     class_density: F64Array, log_scale_rows: F64Array, slopes: F64Array, steps: F64Array, grid: F64Array, precision: F64Array, shift: F64Array,
     working_bytes: int, array_module: ModuleType | None = None,
 ) -> F64Array:
-    """sum_j log Z_j(t_s) over rows whose log scale moves along the line, per step (``_line``): on the fit's device
+    """sum_j log Z_j(t_s) over rows whose log scale moves along the line, per step (``_lines``): on the fit's device
     the fused tilted kernel (``engine_kernels.tilted_moments``) over (row, step) pairs, each step its own class
     density row; on the host ``_moving_line_rows``. Rows go in chunks whose rows x steps outputs fit
     ``working_bytes``."""
@@ -2844,14 +2785,6 @@ def _column_log_sums(products, lost_below, out):
     for step in range(steps):
         out[step] += np.log(running[step])
     return lost
-
-
-def _line(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, cavity: Cavity, working_bytes: int,
-) -> Callable[[F64Array], F64Array]:
-    """``_lines`` for one direction: the penalized objective F(x + t b) - P(x + t b) as a function of the steps t."""
-    evaluate = _lines(prior, log_smoothing, origin, direction[:, None], cavity, working_bytes)
-    return lambda steps: evaluate({0: np.asarray(steps, dtype=np.float64)})[0]
 
 
 def _lines(
@@ -3084,13 +3017,6 @@ def _line_log_integrals(
             still_open.append(column)
         open_ = still_open
     return logs
-
-
-def _line_log_integral(
-    prior: ScaleMixturePrior, log_smoothing: F64Array, origin: F64Array, direction: F64Array, value: float, cavity: Cavity, working_bytes: int, share: float
-) -> float:
-    """``_line_log_integrals`` for one direction."""
-    return float(_line_log_integrals(prior, log_smoothing, origin, direction[:, None], value, cavity, working_bytes, share)[0])
 
 
 # One hyper step's exact repeats are answered once: the structural starts of each basin search land in one basin, and

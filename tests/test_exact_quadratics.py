@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from sv_pgs import dual_solve
+from tests.oracles import DenseDualSource
 from sv_pgs.exact_quadratics import exact_block_quadratics
 from sv_pgs.marginal_variances import BlockGrams
 
@@ -71,7 +72,7 @@ def _fit(seed: int, bound: float, duplicated: int = 0, noise_variance: float | N
         shift = shift / noise_variance
         grams = BlockGrams(blocks=grams.blocks, within=tuple(w.astype(np.float32) for w in grams.within),
                            next_cross=tuple(c.astype(np.float32) for c in grams.next_cross), scale=1.0 / noise_variance)
-    gaussian = dual_solve.DualGaussian(source=dual_solve.DenseDualSource(genotypes, bounds), training=training, targets=response, offsets=np.zeros_like(response),
+    gaussian = dual_solve.DualGaussian(source=DenseDualSource(genotypes, bounds), training=training, targets=response, offsets=np.zeros_like(response),
                                        covariates=covariates, grams=grams, probe_count=2, seed=seed)
     gaussian.iterate(site_precision=precision, site_shift=shift, noise_variance=noise, error_bound=np.full(1, bound), probe_residual_ratio=bound)
     posterior_precision = design.T @ design / float(noise[0]) + np.diag(precision[:, 0])

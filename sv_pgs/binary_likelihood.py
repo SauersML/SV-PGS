@@ -76,8 +76,7 @@ prevalence of that event, not a lifetime one); the offset is then exact whatever
 covariate distribution, because only the sampling fractions s_1 / s_0 enter. The probability output is the posterior
 predictive E_q[sigmoid(eta + shift)] under q's score law, never sigmoid of the posterior mean score
 (``fast_scoring.posterior_predictive_probability`` for a Gaussian score law with the draws' and the covariates'
-variance; ``fourier_predictive_probability`` for any law given by its characteristic function, such as a mixture's
-components), whose shift first matches the
+variance), whose shift first matches the
 training prevalence (``fast_scoring.predictive_intercept_shift``, the variational predictive's calibration in the large)
 and then carries the ascertainment offset. Predictions are evaluated by log loss, Brier score, calibration (the
 logistic recalibration's intercept and slope, and calibration in the large) and AUC (``log_loss``, ``brier_score``,
@@ -439,62 +438,6 @@ def training_prevalence(labels: F64Array) -> float:
     if not 0.0 < prevalence < 1.0:
         raise ValueError("a binary model's training labels need both cases and controls.")
     return prevalence
-
-
-def probability(linear_predictor: F64Array, predictor_variance: F64Array, intercept_shift: float) -> F64Array:
-    """P(y = 1) = E[sigmoid(eta + shift)] under eta ~ N(linear predictor, variance): the posterior predictive
-    (``fast_scoring.posterior_predictive_probability``, to 2 eps by its a-priori trapezoid rule)."""
-    from sv_pgs.fast_scoring import posterior_predictive_probability
-
-    return posterior_predictive_probability(linear_predictor, predictor_variance, intercept_shift)
-
-
-FOURIER_FREQUENCY_LIMIT = float(np.log(2.0 / (np.pi * _EPSILON)) / np.pi)
-"""T with the omitted tail of the Fourier form at most eps: log1p(2 / expm1(pi T)) / pi <= 2 e^(-pi T) / pi = eps."""
-
-
-def fourier_predictive_probability(
-    linear_predictor: F64Array, component_weights: F64Array, component_means: F64Array, component_variances: F64Array,
-) -> tuple[F64Array, F64Array]:
-    """The posterior predictive P(y = 1) = E[sigmoid(eta + U)] for a score law U given by its characteristic function,
-    here a Gaussian mixture phi_U(t) = sum_c w_c exp(i t mu_c - t^2 s_c^2 / 2) per sample (a mixture fit's components;
-    one component is the Gaussian law of ``fast_scoring.posterior_predictive_probability``), by
-
-        E[sigmoid(eta + U)] = 1/2 + int_0^inf Im(e^(i t eta) phi_U(t)) / sinh(pi t) dt,
-
-    (sigmoid(x) - 1/2 = (1/2) tanh(x / 2), whose Fourier sine transform is pi / sinh(pi t)). |Im(...)| <= 1, so the
-    frequencies beyond T omit at most int_T^inf dt / sinh(pi t) = log1p(2 / expm1(pi T)) / pi, whatever the number of
-    effects summed into U; T is ``FOURIER_FREQUENCY_LIMIT``, where that is eps. On [0, T] the integrand is analytic
-    (sinh's nearest zero off the real line is at t = i) and finite at 0, so Gauss-Legendre converges geometrically: the
-    node count doubles until two successive rules agree to eps (the returned bound adds the tail's).
-
-    ``linear_predictor`` is (n,), the component arrays (n, C) or (C,) with weights summing to 1. Returns (P(y = 1),
-    a bound on its error)."""
-    eta = np.asarray(linear_predictor, dtype=np.float64)
-    weights = np.broadcast_to(np.asarray(component_weights, dtype=np.float64), eta.shape + np.shape(component_weights)[-1:])
-    means = np.broadcast_to(np.asarray(component_means, dtype=np.float64), weights.shape)
-    variances = np.broadcast_to(np.asarray(component_variances, dtype=np.float64), weights.shape)
-    tail = float(np.log1p(2.0 / np.expm1(np.pi * FOURIER_FREQUENCY_LIMIT)) / np.pi)
-
-    def rule(count: int) -> F64Array:
-        nodes, node_weights = np.polynomial.legendre.leggauss(count)
-        t = 0.5 * FOURIER_FREQUENCY_LIMIT * (nodes + 1.0)
-        scaled = 0.5 * FOURIER_FREQUENCY_LIMIT * node_weights / np.sinh(np.pi * t)
-        # Im(e^{i t eta} sum_c w_c e^{i t mu_c - t^2 s_c^2 / 2}) = sum_c w_c e^{-t^2 s_c^2 / 2} sin(t (eta + mu_c)).
-        phase = t[None, None, :] * (eta[:, None, None] + means[:, :, None])
-        damping = np.exp(-0.5 * t[None, None, :] ** 2 * variances[:, :, None])
-        values = np.sum(weights[:, :, None] * damping * np.sin(phase), axis=1)
-        return 0.5 + values @ scaled
-
-    count = 2
-    previous = rule(count)
-    while True:
-        count *= 2
-        current = rule(count)
-        change = float(np.max(np.abs(current - previous)))
-        if change <= _EPSILON * count:
-            return current, np.full(eta.shape, change + tail)
-        previous = current
 
 
 def calibrated_shift(

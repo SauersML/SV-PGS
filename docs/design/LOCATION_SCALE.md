@@ -2,7 +2,7 @@
 
 Status: the evidence gate below passed, so this note specifies the change. Implementation is held until the EP route
 settles and goes to one owner of the per-node kernels (lead ruling, 2026-09-23): `scale_mixture_ep._kernel_terms`,
-`_KernelRows.derivatives`, `tilted_moments`, `tilted_cumulants`, `quadrature_majorant_ratio`, the device kernel
+`_KernelRows.derivatives`, `tilted_moments`, `tilted_cumulants`, the device kernel
 `engine_kernels.tilted_moments`, and the mean-field sweep and draws (`mean_field._sweep`, `_sample_nodes`).
 
 ## Why: SV effects on their own gene are sign-skewed [real]

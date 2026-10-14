@@ -8,6 +8,18 @@ from sv_pgs.dosage_store import CodeArray, CodeShardWriter, DosageStore, create_
 from tests.test_dosage_store import _all_codes, _two_half_dosage, _write_store
 
 
+def _byte_shift(byte_count: int) -> int:
+    """x^(8 byte_count) mod P: crc32c(A + B) = _byte_shift(len(B)) (x) crc32c(A) ^ crc32c(B) (zlib's crc32_combine), the
+    host reference of the device kernel's combine."""
+    power, exponent, bit = rowdict_codec._CRC_TOP, int(byte_count), rowdict_codec.BITS_PER_CODE.bit_length() - 1
+    while exponent:
+        if exponent & 1:
+            power = rowdict_codec._multiply_mod_polynomial(rowdict_codec._POWERS[bit % rowdict_codec.CRC_BITS], power)
+        exponent >>= 1
+        bit += 1
+    return power
+
+
 def _rows_of_every_depth(rng: np.random.Generator, samples: int) -> np.ndarray:
     """Rows whose best depth is each k in 0..8: 2^k equally common values plus a few rare ones."""
     rows = []
@@ -179,22 +191,5 @@ def test_the_crc32c_table_and_combine_match_google_crc32c() -> None:
         assert crc ^ 0xFFFFFFFF == google_crc32c.value(data)
         for cut in (0, length // 3, length):
             first, second = data[:cut], data[cut:]
-            combined = rowdict_codec._multiply_mod_polynomial(rowdict_codec.byte_shift(len(second)), google_crc32c.value(first))
-            assert combined ^ google_crc32c.value(second) == google_crc32c.value(data)
-
-
-def test_the_crc32c_table_and_combine_match_google_crc32c() -> None:
-    import google_crc32c
-
-    table = rowdict_codec._crc32c_table()
-    rng = np.random.default_rng(31)
-    for length in (0, 1, 7, 1000, 4097):
-        data = rng.integers(0, 256, length, dtype=np.uint8).tobytes()
-        crc = 0xFFFFFFFF
-        for byte in data:
-            crc = int(table[(crc ^ byte) & 0xFF]) ^ (crc >> 8)
-        assert crc ^ 0xFFFFFFFF == google_crc32c.value(data)
-        for cut in (0, length // 3, length):
-            first, second = data[:cut], data[cut:]
-            combined = rowdict_codec._multiply_mod_polynomial(rowdict_codec.byte_shift(len(second)), google_crc32c.value(first))
+            combined = rowdict_codec._multiply_mod_polynomial(_byte_shift(len(second)), google_crc32c.value(first))
             assert combined ^ google_crc32c.value(second) == google_crc32c.value(data)

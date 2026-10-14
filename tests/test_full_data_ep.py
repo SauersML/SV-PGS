@@ -131,21 +131,6 @@ def test_streamed_double_loop_reaches_the_dense_double_loops_fixed_point(tmp_pat
     np.testing.assert_allclose(streamed_mean, dense_mean, rtol=scale, atol=scale * float(np.max(np.sqrt(dense_variance))))
 
 
-def test_prediction_error_bound_holds_for_every_row() -> None:
-    """|x'(mu_hat - mu)| <= sqrt(x'A^-1 x) ||mu_hat - mu||_A for rows x, with a perturbed mean and its exact A-norm."""
-    from sv_pgs.dual_solve import prediction_error_bound
-
-    generator = np.random.default_rng(5)
-    design = generator.standard_normal((40, 12))
-    precision = design.T @ design + np.diag(generator.uniform(0.5, 2.0, 12))
-    error = generator.standard_normal(12) * 1e-3
-    norm = float(np.sqrt(error @ precision @ error))
-    rows = generator.standard_normal((25, 12))
-    variance = np.einsum("ij,jk,ik->i", rows, np.linalg.inv(precision), rows)
-    assert np.all(np.abs(rows @ error) <= prediction_error_bound(norm, variance) * (1.0 + 1e-12))
-
-
-
 def test_ld_extent_is_the_lag_where_the_excess_ld_is_unresolved() -> None:
     """A design whose LD reaches exactly three variants (a moving sum of four independent columns) has extent at most
     a few lags beyond three and at least three; independent columns have extent 1 (nothing to reach)."""
@@ -169,7 +154,8 @@ def test_ld_extent_is_the_lag_where_the_excess_ld_is_unresolved() -> None:
 def test_factored_far_field_trace_matches_the_spectral_one() -> None:
     """omega_F from Cholesky factors (``_far_field_factored``) equals ``far_field_trace`` from B's eigenvalues, and
     the factor returned is of I + omega_F B."""
-    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored, far_field_trace
+    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored
+    from tests.oracles import far_field_trace
 
     generator = np.random.default_rng(9)
     design = generator.standard_normal((50, 30))
@@ -191,7 +177,8 @@ def test_window_width_at_a_huge_budget_stops_at_the_widest_block() -> None:
 
 def test_factored_far_field_trace_from_a_warm_start_reaches_the_same_root() -> None:
     """Newton from above the root (a neighbouring window's omega) lands on the same omega_F as from omega_S."""
-    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored, far_field_trace
+    from sv_pgs.marginal_variances import BulkSolve, WindowCross, _far_field_factored
+    from tests.oracles import far_field_trace
 
     generator = np.random.default_rng(11)
     design = generator.standard_normal((50, 30))

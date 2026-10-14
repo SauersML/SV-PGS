@@ -28,8 +28,6 @@ from sv_pgs.marginal_variances import (
     sandwich_diagonal,
     KernelFactor,
     exact_block_information,
-    exact_route_is_cheaper,
-    exact_bulk_diagonal,
     block_covariance,
     block_trace_certificate,
     prepare_windows,
@@ -38,15 +36,13 @@ from sv_pgs.marginal_variances import (
     probes_to_decide,
     certificate_tolerance,
     covariance_products,
-    far_field_trace,
     marginal_variances,
-    marginals_from_quadratics,
     variance_jvp,
-    window_bulk_quadratic,
     window_cross,
 )
 import sv_pgs.marginal_variances as marginal_variances_module
 from sv_pgs.marginal_variances import _heavy_cut
+from tests.oracles import exact_bulk_diagonal, far_field_trace
 
 
 def _genotypes(generator, sample_count: int, variant_count: int, correlation: float) -> np.ndarray:
@@ -96,35 +92,6 @@ def _grams(columns: np.ndarray, blocks: tuple[np.ndarray, ...]) -> BlockGrams:
         within=tuple(gram[np.ix_(block, block)] for block in blocks),
         next_cross=tuple(gram[np.ix_(blocks[position], blocks[position + 1])] for position in range(len(blocks) - 1)),
     )
-
-
-def test_elimination_is_exact_with_non_positive_resolved_sites():
-    generator = np.random.default_rng(1)
-    columns = generator.standard_normal((200, 120))
-    gram = columns.T @ columns
-    precision = generator.uniform(1.0, 30.0, 120)
-    resolved = np.array([4, 50, 99])
-    smallest = float(np.linalg.eigvalsh(gram)[0])
-    precision[resolved] = [-0.5 * smallest, 0.0, 0.01]
-    is_resolved = np.isin(np.arange(120), resolved)
-    bulk = np.where(is_resolved, 0.0, 1.0 / np.where(is_resolved, 1.0, precision))
-    kernel_inverse = np.linalg.inv(np.eye(200) + (columns * bulk) @ columns.T)
-    quadratic = np.einsum("ij,ik,kj->j", columns, kernel_inverse, columns)
-    z_resolved = kernel_inverse @ columns[:, resolved]
-    core = np.diag(precision[resolved]) + columns[:, resolved].T @ z_resolved
-    variances = marginals_from_quadratics(precision, resolved, core, columns.T @ z_resolved, quadratic)
-    assert np.allclose(variances, np.diag(np.linalg.inv(gram + np.diag(precision))), rtol=1e-9)
-
-
-def test_window_quadratic_is_exact_against_a_white_far_field():
-    generator = np.random.default_rng(2)
-    columns = generator.standard_normal((90, 150))
-    variance = generator.uniform(0.001, 0.05, 150)
-    variance[[7, 30]] = 0.0
-    far_trace = 1.7
-    kernel = np.eye(90) / far_trace + (columns * variance) @ columns.T
-    exact = np.einsum("ij,ik,kj->j", columns, np.linalg.inv(kernel), columns)
-    assert np.allclose(window_bulk_quadratic(columns.T @ columns, variance, far_trace), exact, rtol=1e-9)
 
 
 def test_far_field_trace_is_the_increasing_root():
@@ -230,7 +197,6 @@ def test_certificate_tolerance_adds_the_probe_error_in_quadrature():
     scale = approximation_scale(solve)
     assert np.isclose(certificate_tolerance(solve, 2), scale * np.sqrt(2.0))
     assert certificate_tolerance(solve, 10**9) < scale * (1 + 1e-8)
-
 
 
 def test_information_certificate_flags_a_cavity_error_the_trace_certificate_misses():
@@ -579,13 +545,6 @@ def test_exact_dual_route_matches_the_dense_inverse_with_a_non_positive_site():
     assert np.allclose(leverage, np.einsum("ij,jk,ik->i", columns, covariance, columns), rtol=1e-8)
 
 
-def test_exact_route_rule_prefers_the_dual_when_samples_are_few():
-    blocks = (np.arange(4430),)
-    grams = BlockGrams(blocks=blocks, within=(np.eye(4430),), next_cross=())
-    assert exact_route_is_cheaper(580, grams, 2**30)
-    assert not exact_route_is_cheaper(50_000, grams, 2**30)
-
-
 def test_kernel_factor_inverts_its_core_once():
     generator = np.random.default_rng(25)
     columns = generator.standard_normal((40, 60))
@@ -738,7 +697,6 @@ def test_probes_to_decide_counts_the_probes_that_place_a_zero_estimate():
     assert probes_to_decide(certificate, k) == int(np.ceil(k * certificate.zero_estimate_ratio[0] ** 2))
     centred = marginal_variances_module._certificate(np.array([0.0]), [base], 0.1, level)
     assert probes_to_decide(centred, k) == np.inf
-
 
 
 def test_shared_float32_grams_with_a_scale_give_the_float64_answer():

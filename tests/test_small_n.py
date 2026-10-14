@@ -134,7 +134,8 @@ def test_the_exact_linear_response_solves_the_curvature_fixed_point(negative):
 
 
 def test_the_total_curvature_by_the_exact_response_equals_gmres():
-    from sv_pgs.scale_mixture_ep import Cavity, GaussianPosterior, _total_curvature, derived_lattice, initial_hyperparameters, scale_mixture_prior
+    from sv_pgs.scale_mixture_ep import Cavity, GaussianPosterior, derived_lattice, initial_hyperparameters, scale_mixture_prior
+    from tests.oracles import _total_curvature
 
     rng = np.random.default_rng(41)
     samples, variants = 30, 40
