@@ -236,12 +236,12 @@ def _fit(inference: str):
 
 
 _INTERIOR_CERTIFICATE_REASON = (
-    "with E comparable across fixed points (bf8a3b2) the release stands on this problem (the interior's own fixed point "
-    "2.9 nats above the edge's), and at that interior state the weights' certificate is infinite: the difference "
-    "curvature K is indefinite (eigenvalues -11, -6.9, -0.24 at rho [2.45, 1.87, 2.40]) and no weight move the model "
-    "proposes raises the certified V, so the fit returns its remaining gain as infinite; the boundary model (HANDOFF "
-    "Next 0) or a certificate at a rho-boundary of certifiability is the open work"
-)
+    "measured 2026-10-14: the first empirical Bayes ends uncertified (planned twice from one state, its state's V error "
+    "0.016 against the tolerance 0.0078, its later plans provisional releases, whose weight bound is never read) with class 0's density "
+    "a spike, 0.84 of its mass on the lattice's bottom node; the lattice check then both refines and extends it (the "
+    "moments move 1.5 and 1.0 nats), and the continuation on the moved lattice finds the weights' difference curvature K "
+    "indefinite (pooled -0.054) and walks x outside every basin until no certified step remains, so the fit keeps the "
+    "first solve; the boundary model (HANDOFF, open engine work) is the open work")
 
 
 @pytest.mark.xfail(strict=True, reason=_INTERIOR_CERTIFICATE_REASON)
