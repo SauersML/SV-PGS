@@ -21,11 +21,11 @@ def test_identical_nonconstant_scores_have_no_evidence_of_improvement(metric):
     assert result == comparison.PairedComparison(0., 0., 0.)
 
 
-
 def _no_quarantine(step: str) -> dict:
     """The score step's summary as the report step reads it: no trait quarantined."""
     assert step == "score"
     return {"quarantined": {}}
+
 
 def test_constant_binary_score_fits_prevalence_and_compares_without_crashing():
     labels = np.array([0., 0., 0., 1.])
