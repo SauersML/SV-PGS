@@ -2392,9 +2392,6 @@ class _GramMeanField(_FullDataMeanField):
             raise ValueError("the Gram-space route needs Stage 0's band beside the dual solver")
         self.band = band
         self._siblings = {"band": band}
-        if np.any(self.band.temper != 1.0):
-            # The far field is corrected from the samples, so the band is the untempered one.
-            self.band.set_tempering(np.ones(self.band.block_count))
         # Each model's far field f held through a round, and the grouped means it was read at.
         self._far = np.zeros((self.band.group_count, gaussian.model_count))
         self._far_reference = np.zeros((self.band.group_count, gaussian.model_count))

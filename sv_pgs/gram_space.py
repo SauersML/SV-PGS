@@ -246,29 +246,12 @@ class GramBand:
         self._cache: dict[tuple, tuple[Any, Any]] = {}
         self.reads = 0
         self.read_bytes = 0
-        self._untempered()
+        self._unscaled()
 
-    def _untempered(self) -> None:
-        """The raw squares and scores kept, and the band untempered (every block's lambda 1); the far field's measured
-        scale unset (1: chance's own 1/n per pair)."""
-        self._raw_squares = np.array(self.squares, dtype=np.float64)
-        self._raw_scores = np.array(self.scores, dtype=np.float64)
-        self.temper = np.ones(self.block_count)
+    def _unscaled(self) -> None:
+        """The far field's measured scale unset (1: chance's own 1/n per pair; ``far_field_scale`` sets the store's)."""
         self.far_scale = 1.0
         self.far_scale_error = 0.0
-
-    def set_tempering(self, temper: F64Array) -> None:
-        """The tempered band likelihood (the module docstring's far field): block b's likelihood raised to lambda_b, the
-        cross terms to sqrt(lambda_b lambda_c), so the problem is the band's own with G~ = L^1/2 G L^1/2 and s~ = L s
-        (L = diag(lambda) over the groups): ``squares``, ``scores`` and ``product`` are G~'s, and each field's noise is
-        sigma^2 / lambda_b = sigma^2 + phi_b."""
-        self.temper = np.asarray(temper, dtype=np.float64).copy()
-        per_group = np.repeat(self.temper, np.diff(self.starts))
-        self.squares = self._raw_squares * per_group
-        self.scores = self._raw_scores * per_group[:, None]
-
-    def _group_temper(self) -> F64Array:
-        return np.repeat(self.temper, np.diff(self.starts))
 
     @classmethod
     def from_arrays(
@@ -304,7 +287,7 @@ class GramBand:
         band._cache = {}
         band.reads = 0
         band.read_bytes = 0
-        band._untempered()
+        band._unscaled()
         return band
 
     # blocks
@@ -402,14 +385,9 @@ class GramBand:
         return (out, magnitude) if absolute else out
 
     def product(self, values: Any, array_module: Any = np) -> Any:
-        """G~_band @ values for values over the groups (groups x r, float64), one read of the band: the tempered band
-        L^1/2 G_band L^1/2 (G_band itself where every lambda is 1)."""
+        """G_band @ values for values over the groups (groups x r, float64), one read of the band."""
         xp = array_module
         values = xp.asarray(values, dtype=xp.float64)
-        tempered = bool(np.any(self.temper != 1.0))
-        if tempered:
-            root = xp.asarray(np.sqrt(self._group_temper()))
-            values = root.reshape((-1,) + (1,) * (values.ndim - 1)) * values
         out = xp.zeros_like(values)
         for block in range(self.block_count):
             own = self.span(block)
@@ -419,8 +397,6 @@ class GramBand:
                 following = self.span(block + 1)
                 out[own] += self._times(cross, values[following], xp)
                 out[following] += self._times(cross, values[own], xp, transposed=True)
-        if tempered:
-            out = root.reshape((-1,) + (1,) * (out.ndim - 1)) * out
         return out
 
     def quadratic(self, values: F64Array) -> float:
@@ -449,9 +425,7 @@ class GramBand:
             raise ValueError("every member of a sweep block must be one of the band's block's groups")
         grouped = np.zeros(self.group_count)
         np.add.at(grouped, group, sign * mean)
-        # The raw scores: the tempered field of block b is lambda_b times the raw one with its neighbours' terms scaled
-        # by sqrt(lambda_c / lambda_b) (``_block_field``), and its noise sigma^2 / lambda_b.
-        scores = self._raw_scores[:, target]
+        scores = self.scores[:, target]
         self._linear = scores if field_shift is None else scores + np.asarray(field_shift, dtype=np.float64)
         self._target_square = float(self.target_square[target])
         if xp is np or proximal > 0.0:
@@ -464,18 +438,15 @@ class GramBand:
         return self._device_sweep(xp, member_blocks, group, sign, class_index, log_density, scales, grid, noise, mean, variance, shift, third, fourth, grouped)
 
     def _block_field(self, block: int, grouped: Any, xp: Any, within: Any) -> Any:
-        """c_b = s_b - R_{b-1,b}' mbar_{b-1} - R_b mbar_b - R_{b,b+1} mbar_{b+1} at the current means, the neighbours'
-        terms scaled by sqrt(lambda_c / lambda_b) (the tempered field over lambda_b; 1 untempered)."""
+        """c_b = s_b - R_{b-1,b}' mbar_{b-1} - R_b mbar_b - R_{b,b+1} mbar_{b+1} at the current means."""
         own = self.span(block)
         field = xp.asarray(self._linear[own]) - self._times(within, grouped[own][:, None], xp)[:, 0]
         previous = self.cross(block - 1, xp)
         if previous is not None:
-            ratio = float(np.sqrt(self.temper[block - 1] / self.temper[block]))
-            field -= ratio * self._times(previous, grouped[self.span(block - 1)][:, None], xp, transposed=True)[:, 0]
+            field -= self._times(previous, grouped[self.span(block - 1)][:, None], xp, transposed=True)[:, 0]
         following = self.cross(block, xp)
         if following is not None:
-            ratio = float(np.sqrt(self.temper[block + 1] / self.temper[block]))
-            field -= ratio * self._times(following, grouped[self.span(block + 1)][:, None], xp)[:, 0]
+            field -= self._times(following, grouped[self.span(block + 1)][:, None], xp)[:, 0]
         return field
 
     def _block_quadratic(self, block: int, grouped: Any, xp: Any, within: Any) -> tuple[float, float]:
@@ -484,23 +455,20 @@ class GramBand:
         own = self.span(block)
         values = grouped[own][:, None]
         image, magnitude = self._times(within, values, xp, absolute=True)
-        weight = float(self.temper[block])
-        total = weight * float(_host(values[:, 0] @ image[:, 0]))
-        size = weight * float(_host(xp.abs(values[:, 0]) @ magnitude[:, 0]))
+        total = float(_host(values[:, 0] @ image[:, 0]))
+        size = float(_host(xp.abs(values[:, 0]) @ magnitude[:, 0]))
         previous = self.cross(block - 1, xp)
         if previous is not None:
             before = grouped[self.span(block - 1)][:, None]
             image, magnitude = self._times(previous, values, xp, absolute=True)
-            weight = float(np.sqrt(self.temper[block - 1] * self.temper[block]))
-            total += 2.0 * weight * float(_host(before[:, 0] @ image[:, 0]))
-            size += 2.0 * weight * float(_host(xp.abs(before[:, 0]) @ magnitude[:, 0]))
+            total += 2.0 * float(_host(before[:, 0] @ image[:, 0]))
+            size += 2.0 * float(_host(xp.abs(before[:, 0]) @ magnitude[:, 0]))
         return total, size
 
     def _finish(self, divergence: float, weighted_variance: float, sizes: float, grouped: np.ndarray, quadratic: float, quadratic_size: float) -> SweepResult:
-        weighted = self._linear * self._group_temper()
-        linear = float(grouped @ weighted)
+        linear = float(grouped @ self._linear)
         residual_square = self._target_square - 2.0 * linear + quadratic
-        residual_size = abs(self._target_square) + 2.0 * float(np.abs(grouped) @ np.abs(weighted)) + quadratic_size
+        residual_size = abs(self._target_square) + 2.0 * float(np.abs(grouped) @ np.abs(self._linear)) + quadratic_size
         return SweepResult(divergence, weighted_variance, residual_square, sizes, residual_size)
 
     def _host_sweep(
@@ -516,19 +484,17 @@ class GramBand:
                 node_variance = np.exp(log_node_variance)
             state = [np.ascontiguousarray(values[members]) for values in (mean, variance, shift, third, fourth)]
             moved = np.zeros(own.stop - own.start)
-            # A block's groups are its own, so their sums at its start are the sweep's start's (``offsets``); the term is
-            # the untempered ELBO's, so it reaches the kernel over the block's tempering, as its noise does.
+            # A block's groups are its own, so their sums at its start are the sweep's start's (``offsets``).
             part = _gram_sweep(
                 within, field, np.ascontiguousarray(group[members] - own.start), np.ascontiguousarray(sign[members]),
-                np.ascontiguousarray(self._raw_squares[own]), np.ascontiguousarray(class_index[members]), log_density, node_variance,
-                log_node_variance, float(noise) / float(self.temper[block]), *state, moved, float(proximal) / float(self.temper[block]),
-                np.ascontiguousarray(offsets[own]),
+                np.ascontiguousarray(self.squares[own]), np.ascontiguousarray(class_index[members]), log_density, node_variance,
+                log_node_variance, float(noise), *state, moved, float(proximal), np.ascontiguousarray(offsets[own]),
             )
             for values, piece in zip((mean, variance, shift, third, fourth), state):
                 values[members] = piece
             grouped[own] += moved
             divergence += part[0]
-            weighted_variance += float(self.temper[block]) * part[1]
+            weighted_variance += part[1]
             sizes += part[2]
             terms, size = self._block_quadratic(block, grouped, np, within)
             quadratic += terms
@@ -547,7 +513,7 @@ class GramBand:
         # The step kernel's per-(member, node) scratch (``device_sweep.sweep_piece``): one panel's worth each.
         scratch = [cupy.empty(PANEL * node_count, dtype=cupy.float64) for _name in ("conditional", "base", "weight")]
         device_grouped = cupy.asarray(grouped)
-        squares = cupy.asarray(self._raw_squares)
+        squares = cupy.asarray(self.squares)
         divergence = weighted_variance = sizes = quadratic = quadratic_size = 0.0
         for block, members in enumerate(member_blocks):
             own = self.span(block)
@@ -574,7 +540,7 @@ class GramBand:
                     (1,), (step_threads(kernel),),
                     (
                         panel_gram, projection, cupy.ascontiguousarray(member_squares[first:last]), classes[first:last], log_density_device,
-                        np.int32(node_count), node_variance[first:last], log_node_variance[first:last], np.float64(float(noise) / float(self.temper[block])),
+                        np.int32(node_count), node_variance[first:last], log_node_variance[first:last], np.float64(float(noise)),
                         np.int32(last - first),
                         state[0][first:last], state[1][first:last], state[2][first:last], state[3][first:last], state[4][first:last], step, pieces[first:last],
                         *scratch,
@@ -590,7 +556,7 @@ class GramBand:
             device_grouped[own] += moved
             totals = cupy.asnumpy(pieces.sum(axis=0))
             divergence += float(totals[0])
-            weighted_variance += float(self.temper[block]) * float(totals[1])
+            weighted_variance += float(totals[1])
             sizes += float(totals[2])
             terms, size = self._block_quadratic(block, device_grouped, cupy, within)
             quadratic += terms
@@ -605,7 +571,7 @@ class GramBand:
         band adds to each field of block b per unit of its ||x_j||^2, at E beta_g^2 per group. A pair beyond the band
         has mean r^2 kappa / n' (``far_field_scale``: kappa measured on the store, 1 for chance alone), so the fields'
         far terms sum_k G_jk E beta_k have that variance."""
-        load = self._raw_squares * np.asarray(second_moments, dtype=np.float64) * float(self.far_scale) / self.residual_dimension
+        load = self.squares * np.asarray(second_moments, dtype=np.float64) * float(self.far_scale) / self.residual_dimension
         per_block = np.array([float(np.sum(load[self.span(block)])) for block in range(self.block_count)])
         total = float(per_block.sum())
         near = per_block.copy()
