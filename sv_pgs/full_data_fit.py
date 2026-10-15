@@ -1910,10 +1910,6 @@ class _FullDataMeanField:
         """Xp'Xp c over the members (members x r), each group's column once, signed."""
         return self._back(self._image(columns, model, metric), model, metric)
 
-    def _residual_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> F64Array:
-        """r'Xp c (r,) for member columns c."""
-        return residual @ self._image(columns, model, metric)
-
     def _fitted_square(self, values: F64Array, model: int) -> float:
         """||Xp d||^2 for a member vector d."""
         return float(np.sum(np.square(self._image(np.asarray(values, dtype=np.float64)[:, None], model))))
@@ -2257,22 +2253,25 @@ class _FullDataMeanField:
         dual = _member_posterior(self._reduced_posterior(model, grams, group_variance, state), self.ties, tau, group_variance, algebraic=True)
         noise_solve: dict[str, object] = {}
 
-        def off_diagonal_gram(columns: F64Array) -> F64Array:
-            return self._gram_product(columns, model, metric) - squares[:, None] * columns
-
         def solve(right: F64Array, relative_tolerance: float) -> F64Array:
             # R^-1 right: the dual solver's A = Xp'Xp / sigma^2 + diag(tau) at these sites is R itself.
             assert dual.solve is not None
             return dual.solve(right, relative_tolerance)
 
-        def noise_terms(relative_tolerance: float) -> tuple[F64Array, F64Array, float]:
+        def coupling() -> F64Array:
+            return np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)[:, None]
+
+        def noise_terms(relative_tolerance: float, known: tuple[F64Array, F64Array, float] | None = None) -> tuple[F64Array, F64Array, float]:
+            # ``known`` is (R^-1 coupling, Xp'Xp of it, r'Xp of it) where the caller formed them with its own columns.
             if not noise_solve:
-                coupling = np.where(live, shift + mean_by_omega * omega / np.where(live, variance, 1.0), 0.0)
-                mean_one = solve(coupling[:, None], relative_tolerance)
-                shift_one = off_diagonal_gram(mean_one) / noise - shift[:, None]
+                if known is None:
+                    mean_one = solve(coupling(), relative_tolerance)
+                    gram_one, residual_one = self._response_products(residual, mean_one, model, metric)
+                    known = (mean_one, gram_one, float(residual_one[0]))
+                mean_one, gram_one, residual_one = known
+                shift_one = (gram_one - squares[:, None] * mean_one) / noise - shift[:, None]
                 scalar = residual_dimension - (
-                    2.0 * float(self._residual_products(residual, mean_one, model, metric)[0])
-                    + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
+                    2.0 * residual_one + float(squares @ (variance_by_shift * shift_one[:, 0] - variance_by_omega * omega))
                 ) / noise
                 noise_solve.update(mean_one=mean_one, shift_one=shift_one, scalar=scalar)
             return noise_solve["mean_one"], noise_solve["shift_one"], noise_solve["scalar"]  # type: ignore[return-value]
@@ -2281,15 +2280,24 @@ class _FullDataMeanField:
             # The dense route's ``cavity_response`` (``mean_field``), with R^-1 by the dual solver to the relative
             # tolerance asked and Xp'Xp by tile passes.
             scaled = np.where(live[:, None], mean_by_z / np.where(live, variance, 1.0)[:, None], 0.0)
-            mean_step = solve(scaled, relative_tolerance)
-            # Xp'Xp dm and r'Xp dm (``_response_products``: on the samples from one image X dm, which both read).
-            products, residual_terms = self._response_products(residual, mean_step, model, metric)
+            known = None
+            if binary or noise_solve:
+                mean_step = solve(scaled, relative_tolerance)
+                # Xp'Xp dm and r'Xp dm (``_response_products``: on the samples from one image X dm, which both read).
+                products, residual_terms = self._response_products(residual, mean_step, model, metric)
+            else:
+                # The noise response's own R^-1 solve and products (``noise_terms``) share this one's passes: one block
+                # solve of both, each column to its own relative tolerance, and one image of all their columns.
+                both = solve(np.hstack([scaled, coupling()]), relative_tolerance)
+                gram_both, residual_both = self._response_products(residual, both, model, metric)
+                mean_step, products, residual_terms = both[:, :-1], gram_both[:, :-1], residual_both[:-1]
+                known = (both[:, -1:], gram_both[:, -1:], float(residual_both[-1]))
             shift_step = -(products - squares[:, None] * mean_step) / noise
             if binary:
                 # Known noise: no noise response. The sites' own response is left out of the curvature, as in
                 # ``mean_field`` (the outer loop accepts its steps on the objective itself).
                 return shift_step, np.zeros_like(shift_step)
-            _mean_one, shift_one, scalar = noise_terms(relative_tolerance)
+            _mean_one, shift_one, scalar = noise_terms(relative_tolerance, known)
             right = -2.0 * residual_terms + squares @ (
                 np.where(live[:, None], variance_by_z, 0.0) + variance_by_shift[:, None] * shift_step
             )
