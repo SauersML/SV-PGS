@@ -1231,7 +1231,8 @@ class DualGaussian:
             if model in order:
                 block = state["blocks"][model]
                 design = block.design
-                kernel = solved - block.duals @ _core_solve(array_module, block, design.T @ solved)
+                if self.probe_count:
+                    kernel = solved - block.duals @ _core_solve(array_module, block, design.T @ solved)
                 core = block.core
                 model_cross = WindowCross(positions=tuple(positions[model]), values=tuple(window_values[model]))
             self.bulk_solves.append(BulkSolve(
