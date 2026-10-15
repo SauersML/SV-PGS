@@ -1239,9 +1239,11 @@ class DualGaussian:
                 resolved=resolved[model],
                 resolved_core=_host(core),
                 resolved_cross=model_cross,
-                bulk_trace=float(array_module.sum(probes * solved)) / (self.probe_count * count),
-                bulk_square_trace=float(array_module.sum(solved * solved)) / (self.probe_count * count),
-                kernel_square_trace=float(array_module.sum(kernel * kernel)) / (self.probe_count * count),
+                # No probes (the mean-field route, which never reads the variance map): no trace estimates, which
+                # ``marginal_variances._prepare`` refuses to use.
+                bulk_trace=float(array_module.sum(probes * solved)) / (self.probe_count * count) if self.probe_count else np.nan,
+                bulk_square_trace=float(array_module.sum(solved * solved)) / (self.probe_count * count) if self.probe_count else np.nan,
+                kernel_square_trace=float(array_module.sum(kernel * kernel)) / (self.probe_count * count) if self.probe_count else np.nan,
                 sample_count=int(count),
             ))
 

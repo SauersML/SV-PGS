@@ -713,6 +713,8 @@ def _cached_block_terms(
 
 
 def _prepare(solve: BulkSolve, grams: BlockGrams) -> tuple[WindowCross, NDArray[np.float64], NDArray[np.float64], NDArray[np.bool_]]:
+    if not np.isfinite(solve.bulk_trace + solve.bulk_square_trace + solve.kernel_square_trace):
+        raise ValueError("the bulk solve has no probe traces (a dual solver built with no probes): the variance map needs them")
     variant_count = solve.site_precision.shape[0]
     is_resolved = np.zeros(variant_count, dtype=bool)
     is_resolved[solve.resolved] = True

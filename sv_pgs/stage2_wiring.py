@@ -641,7 +641,10 @@ def _fit_group(
             covariates=covariates,
             # The dual solver reads the Grams' blocks and links only, never their metric's scale.
             grams=block_grams(statistics),
-            probe_count=draw_count,
+            # The probes estimate the variance map's traces, which only the EP route reads: the mean-field route's
+            # responses are the dual solver's solves, so its iterates carry no probe columns (each solved to
+            # sqrt(eps) relative, draw_count of them per model, at every fixed point).
+            probe_count=draw_count if inference == "ep" else 0,
             seed=_seed(seed, 0),
             probe_sample_indices=training_columns if fitted_samples != store.n_samples else None,
             # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
