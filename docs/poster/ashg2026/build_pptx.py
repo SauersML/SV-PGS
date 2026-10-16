@@ -1,19 +1,22 @@
-"""The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in), following the
-accepted abstract: its title, author list and framing, with marked placeholders where the All of Us results will go.
+"""The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in): the accepted
+abstract's title and authors, the realistic simulation study (benchmarks/power/grid.py on bench-sim's 1000 Genomes
+cohort, run on MSI), the All of Us results, and the one real-data result already in hand (SV type and expression, MAGE).
 
     python3 build_pptx.py [template.pptx] [output.pptx]
 
 The template is read from outside the repository and nothing of it is committed: its own content (another study's All
 of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
-kept; every text box, figure and caption is replaced, all in Arial. The author line and affiliations come from
-authors.local beside this file, untracked, so no personal name is committed. The figures come from figures.py.
+kept; every text box, figure and caption is replaced, all in Arial at one size and in black outside the header and
+bars. The author line and affiliations come from authors.local beside this file, untracked, so no personal name is
+committed. The figures come from figures.py.
 
-Placeholders: a figure the All of Us runs will supply is a dashed "placeholder" panel (figures.py); a number they will
-supply is a bracketed red run in the text, e.g. "[x]%".
+Placeholders: a figure the simulation or All of Us runs will supply is a dashed "placeholder" panel (figures.py); a
+number they will supply is a bracketed bold run in the text, e.g. "[x%]".
 """
 
 from __future__ import annotations
 
+import functools
 import re
 import shutil
 import subprocess
@@ -31,54 +34,67 @@ SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59
 EMU = 914400
 PLACEHOLDER = "000000"
 
-# ------------------------------------------------------------------ the copy, from the abstract
+# ------------------------------------------------------------------ the copy
 
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 
 INTRODUCTION = [
-    [("Polygenic scores (PGSs) sum the effects of many genetic variants to predict disease risk.", "")],
-    [("PGSs predict less accurately in non-European populations because most effect sizes are estimated in European-ancestry samples.", "")],
-    [("Structural variants (SVs, ≥ 50 bp) affect disease risk, but most PGS methods include only SNVs.", "")],
-    [("We test whether adding SVs improves polygenic prediction in the multi-ancestry NIH All of Us cohort.", "")],
+    [("Polygenic scores (PGSs) predict disease risk from the summed effects of many variants.", "")],
+    [("Most PGS methods use only SNVs, although structural variants (SVs, ≥ 50 bp) also affect disease risk.", "")],
+    [("We test whether SVs improve prediction in simulations and in the multi-ancestry NIH All of Us cohort.", "")],
 ]
 
 METHODS = [
-    [("We fit the model genome-wide on GPUs and estimate an effect size for every variant.", "")],
-    [("SV genotypes were imputed into All of Us short-read genomes from a callset of 12,212 phased genome assemblies.", "")],
-    [("We compare SNV-only and SNV + SV models for 15 diseases in 100,000 participants, with the same cross-validation folds.", "")],
+    [("SV-PGS fits all variants in one model and runs on GPUs.", "")],
+    [("For All of Us, SVs discovered in 12,212 phased genome assemblies are imputed into short-read genomes.", "")],
 ]
 
-RESULTS_TOP = [
-    ("head", "Hypertension in All of Us"),
-    [("We fit the model to hypertension using over 200,000 SVs called in 97,000 short-read genomes.", "")],
-    [("About as many SVs increased risk as decreased it (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"), (").", "")],
-    [("Longer SVs had larger effects (", ""), ("[statistic]", "ph"), (").", "")],
+SIMULATION_DESIGN = [
+    [("We simulated 50,000 people from 1000 Genomes chr22 haplotypes in five ancestry groups and imputed their SVs from a separate panel.", "")],
+    [("Each disease has 10% prevalence, h² = 0.1 and 50 to 2,000 causal variants, 0% to 20% of them SVs.", "")],
+    [("SV effect sizes are 1 or 3 times those of SNVs, and in some scenarios grow with SV length or depend on SV type.", "")],
+    [("We compare SV-PGS with and without SVs, and LDpred2-auto, at 5,000 to 40,000 training samples.", "")],
 ]
 
-RESULTS_BOTTOM = [
-    ("head", "Prediction across 15 diseases"),
-    [("Averaged across diseases, adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"), (" (95% CI ", ""), ("[ ]", "ph"),
-     (") and log loss by ", ""), ("[Δ]", "ph"), (".", "")],
+SIMULATION_ACCURACY = [
+    [("With 20% causal SVs and 40,000 training samples, adding SVs raised AUC by ", ""), ("[ΔAUC]", "ph"),
+     (". With no causal SVs, AUC changed by ", ""), ("[ΔAUC]", "ph"), (".", "")],
+    [("SV-PGS ", ""), ("[outperformed / matched]", "ph"), (" LDpred2-auto (ΔAUC ", ""), ("[ ]", "ph"), (").", "")],
+]
+
+SIMULATION_EFFECTS = [
+    [("The test for an SV gain reached 80% power at ", ""), ("[n]", "ph"), (" training samples with 20% causal SVs.", "")],
+    [("SV-PGS recovered the simulated increase of SV effect size with length (ρ = ", ""), ("[ ]", "ph"), (").", "")],
+]
+
+HYPERTENSION = [
+    [("We fit SV-PGS to hypertension with over 200,000 SVs called in 97,000 short-read genomes.", "")],
+    [("About as many SVs increased risk as decreased it (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"),
+     ("), and longer SVs had larger effects (", ""), ("[statistic]", "ph"), (").", "")],
+]
+
+DISEASES = [
+    [("Averaged over ", ""), ("[n]", "ph"), (" diseases, adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"),
+     (" (95% CI ", ""), ("[ ]", "ph"), (").", "")],
 ]
 
 DISCUSSION = [
-    [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction for ", ""), ("[n]", "ph"), (" of 15 diseases.", "")],
-    [("Exonic deletions and insertions change expression in opposite directions, so the prior should differ by SV type.", "")],
-    [("SV-PGS is an open-source tool for training and applying PGSs that include SVs.", "")],
+    [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction in simulations with causal SVs and in ", ""),
+     ("[n]", "ph"), (" All of Us diseases.", "")],
+    [("SV-PGS is open-source software for training and applying PGSs that include SVs.", "")],
 ]
 
 REFERENCES = [
-    "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
     "Byrska-Bishop et al. (2022) Cell 185:3426.",
     "Taylor et al. (2024) Nature 631:610.",
+    "Privé et al. (2020) Bioinformatics 36:5424.",
+    "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
 ]
 
-CAPTIONS = {
-    112: "SV effects on hypertension",
-    113: "Effect vs. length",
-    114: "Exonic deletions lowered expression of the affected gene; exonic insertions and duplications raised it (MAGE, 1000 Genomes; p < 0.001).",
-    117: "Held-out accuracy across 15 diseases",
-}
+EXPRESSION_CAPTION = "Exonic deletions lowered expression and exonic insertions or duplications raised it (MAGE RNA-seq, p < 0.001)."
+
+BARS = {97: "Introduction", 118: "SVs and gene expression", 91: "Methods", 93: "Simulation", 119: "All of Us",
+        95: "Discussion", 96: "References"}
 
 # ------------------------------------------------------------------ DrawingML in the template's own formats
 
@@ -139,6 +155,53 @@ def body(items: list) -> str:
     return "".join(heading(item[1]) if isinstance(item, tuple) and item[0] == "head" else bullet(item) for item in items)
 
 
+LIBERATION = Path("/Applications/LibreOffice.app/Contents/Resources/fonts/truetype")
+LINE_PITCH = 1.066
+"""Line pitch per point of type at the bullets' 90% spacing, measured on the LibreOffice render."""
+BULLET_INDENT = 0.35
+"""Inches from a text box's inset edge to a bullet's text, measured on the LibreOffice render."""
+
+
+@functools.cache
+def face(bold: bool, italic: bool):
+    from PIL import ImageFont
+
+    name = "LiberationSans-" + {(False, False): "Regular", (True, False): "Bold", (False, True): "Italic", (True, True): "BoldItalic"}[bold, italic]
+    return ImageFont.truetype(str(LIBERATION / f"{name}.ttf"), 100)
+
+
+def wrapped_lines(runs: list[tuple[str, str]], width: float, size_pt: float, italic: bool = False) -> int:
+    """Lines a paragraph of ``runs`` takes at ``width`` inches, wrapped greedily at spaces."""
+    scale = size_pt / 100 / 72
+    words: list[tuple[str, bool]] = []
+    for text, flags in runs:
+        bold = "ph" in flags.split() or "b" in flags.split()
+        for index, piece in enumerate(text.split(" ")):
+            if index:
+                words.append((" ", bold))
+            if piece:
+                words.append((piece, bold))
+    lines, used = 1, 0.0
+    pending = 0.0
+    for piece, bold in words:
+        length = face(bold, italic).getlength(piece) * scale
+        if piece == " ":
+            pending += length
+            continue
+        if used and used + pending + length > width:
+            lines, used = lines + 1, length
+        else:
+            used += pending + length
+        pending = 0.0
+    return lines
+
+
+def insets(xml: str, shape_id: int) -> tuple[float, float, float, float]:
+    start, end = shape_span(xml, shape_id)
+    found = re.search(r'<a:bodyPr[^>]*lIns="(\d+)" tIns="(\d+)" rIns="(\d+)" bIns="(\d+)"', xml[start:end])
+    return tuple(int(value) / EMU for value in found.groups()) if found else (0.1, 0.05, 0.1, 0.05)
+
+
 def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
     """authors.local: "Name | 1,2" per author in order (an empty mark list for a group author), then affiliation lines
     that start with their number."""
@@ -183,6 +246,13 @@ def move(xml: str, shape_id: int, x: float, y: float, w: float, h: float) -> str
     return xml[:start] + shape + xml[end:]
 
 
+def retitle(xml: str, shape_id: int, text: str) -> str:
+    """Set a section bar's label, keeping its run formatting."""
+    start, end = shape_span(xml, shape_id)
+    shape = re.sub(r"<a:t>[^<]*</a:t>", f"<a:t>{escape(text, quote=False)}</a:t>", xml[start:end], count=1)
+    return xml[:start] + shape + xml[end:]
+
+
 def delete(xml: str, shape_id: int) -> str:
     start, end = shape_span(xml, shape_id)
     return xml[:start] + xml[end:]
@@ -224,8 +294,9 @@ def build() -> None:
 
     # the figures as media of their own
     figures = {
-        "effects": "ph_hypertension_effects.png", "length": "ph_effect_by_length.png", "skew": "fig_sign_skew.png",
-        "diseases": "ph_fifteen_diseases.png", "equation": "equation.png",
+        "skew": "fig_sign_skew.png", "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
+        "power": "ph_sim_power.png", "effects": "ph_sim_effects.png", "hypertension": "ph_aou_hypertension.png",
+        "diseases": "ph_aou_diseases.png",
     }
     ids = {}
     for index, (key, name) in enumerate(figures.items()):
@@ -263,50 +334,105 @@ def build() -> None:
     for patch in (102, 103, 104, 105, 108, 111):
         xml = delete(xml, patch)
 
-    # column 1: introduction; methods with the model equation first
-    xml = replace_text(xml, 98, body(INTRODUCTION))
-    xml = move(xml, 91, 1.01, 17.5, 12.1, 0.99)
-    eq_w, eq_h = png_size(FIGURES / "equation.png")
-    eq_width = 11.6
-    eq_height = eq_width * eq_h / eq_w
-    xml = picture(xml, 110, ids["equation"])
-    xml = move(xml, 110, 1.07, 18.7, eq_width, eq_height)
-    xml = replace_text(xml, 92, body(METHODS))
-    xml = move(xml, 92, 1.07, 18.7 + eq_height + 0.15, 12.32, 35.6 - (18.7 + eq_height + 0.15))
+    # the template's shapes, duplicated where the poster needs more of a kind: section bars, pictures, captions, text
+    for source, new, name in (
+        (91, 118, "Expression bar"), (93, 119, "All of Us bar"),
+        (106, 120, "Simulation effects"), (106, 121, "Hypertension"), (106, 122, "Diseases"),
+        (113, 123, "Simulation effects caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
+        (94, 126, "Simulation accuracy text"), (94, 127, "Simulation effects text"), (94, 128, "Hypertension text"),
+        (94, 129, "Diseases text"),
+    ):
+        xml = duplicate(xml, source, new, name)
+    for bar, text in BARS.items():
+        xml = retitle(xml, bar, text)
 
-    # column 2: hypertension (two placeholder figures), then the 15-disease comparison (one placeholder figure)
-    xml = replace_text(xml, 94, body(RESULTS_TOP))
-    xml = move(xml, 94, 13.35, 7.01, 18.71, 4.6)
-    xml = picture(xml, 101, ids["effects"])
-    xml = move(xml, 101, 13.61, 12.2, 10.94, 8.40)
-    xml = picture(xml, 106, ids["length"])
-    xml = move(xml, 106, 24.75, 12.2, 6.96, 8.40)
-    xml = move(xml, 112, 13.61, 20.6, 10.94, 1.0)
-    xml = move(xml, 113, 24.75, 20.6, 6.96, 1.0)
-    xml = duplicate(xml, 94, 115, "Results continued")
-    xml = replace_text(xml, 115, body(RESULTS_BOTTOM))
-    xml = move(xml, 115, 13.35, 21.85, 18.71, 3.0)
-    xml = duplicate(xml, 106, 116, "15 diseases placeholder")
-    xml = picture(xml, 116, ids["diseases"])
-    xml = move(xml, 116, 13.61, 25.0, 18.20, 8.60)
-    xml = duplicate(xml, 113, 117, "15 diseases caption")
-    xml = move(xml, 117, 13.61, 33.6, 18.20, 1.0)
+    class Column:
+        """Stacks a column's bars, text boxes, figures and captions top down, each text box as tall as its wrapped
+        text, and refuses to run past the poster's bottom margin."""
 
-    # column 3: the public-data figure, discussion, references
-    xml = picture(xml, 107, ids["skew"])
-    xml = move(xml, 107, 32.24, 6.11, 15.64, 11.76)
-    for shape_id, text in CAPTIONS.items():
-        xml = replace_text(xml, shape_id, caption(text))
-    xml = move(xml, 114, 32.25, 17.87, 15.64, 2.6)
-    xml = move(xml, 95, 32.25, 20.85, 15.73, 0.89)
-    xml = replace_text(xml, 109, body(DISCUSSION))
-    xml = move(xml, 109, 32.25, 21.9, 15.64, 7.0)
-    xml = move(xml, 96, 32.16, 29.5, 15.73, 0.86)
-    xml = replace_text(xml, 99, "".join(line([(reference, "")], 4900, "000000", after=300, spacing=90000) for reference in REFERENCES))
-    xml = move(xml, 99, 32.17, 30.45, 15.73, 5.0)
+        def __init__(self, x: float, width: float) -> None:
+            self.x, self.width, self.y = x, width, 6.0
+
+        def bar(self, xml: str, shape_id: int) -> str:
+            xml = move(xml, shape_id, self.x, self.y, self.width, 0.9)
+            self.y += 1.0
+            return xml
+
+        def text(self, xml: str, shape_id: int, items: list, paragraphs=body, indent: float = BULLET_INDENT) -> str:
+            left, top, right, bottom = insets(xml, shape_id)
+            room = self.width - left - right - indent
+            height = top + bottom + sum(wrapped_lines(item, room, 49) * 49 * LINE_PITCH / 72 + 6 / 72 for item in items)
+            xml = move(xml, shape_id, self.x, self.y, self.width, height)
+            self.y += height + 0.15
+            return replace_text(xml, shape_id, paragraphs(items))
+
+        def figure(self, xml: str, shape_id: int, key: str, width: float | None = None, x: float | None = None) -> str:
+            width = width or self.width - 0.25
+            pixels_w, pixels_h = png_size(FIGURES / figures[key])
+            height = width * pixels_h / pixels_w
+            xml = move(picture(xml, shape_id, ids[key]), shape_id, self.x + 0.12 if x is None else x, self.y, width, height)
+            self.y += height
+            return xml
+
+        def caption(self, xml: str, shape_id: int, text: str, width: float | None = None, x: float | None = None) -> str:
+            width = width or self.width - 0.25
+            left, top, right, bottom = insets(xml, shape_id)
+            height = top + bottom + wrapped_lines([(text, "")], width - left - right, 49, italic=True) * 49 * 1.17 / 72
+            xml = move(xml, shape_id, self.x + 0.12 if x is None else x, self.y, width, height)
+            self.y += height + 0.3
+            return replace_text(xml, shape_id, caption(text))
+
+        def finish(self) -> None:
+            if self.y > 35.75:
+                raise SystemExit(f"column at x = {self.x} in runs to {self.y:.2f} in, past the bottom margin (35.75 in)")
+
+    # column 1: introduction, SVs and expression (the real-data result), methods with the model
+    column = Column(1.01, 13.6)
+    xml = column.bar(xml, 97)
+    xml = column.text(xml, 98, INTRODUCTION)
+    xml = column.bar(xml, 118)
+    xml = column.figure(xml, 107, "skew")
+    xml = column.caption(xml, 114, EXPRESSION_CAPTION)
+    xml = column.bar(xml, 91)
+    xml = column.figure(xml, 110, "equation", width=13.2)
+    xml = column.text(xml, 92, METHODS)
+    column.finish()
+
+    # column 2: the simulation, its design and three results figures
+    column = Column(14.85, 17.2)
+    xml = column.bar(xml, 93)
+    xml = column.text(xml, 94, SIMULATION_DESIGN)
+    xml = column.figure(xml, 101, "accuracy")
+    xml = column.caption(xml, 112, "Held-out AUC vs. training size")
+    xml = column.text(xml, 126, SIMULATION_ACCURACY)
+    half = (column.width - 0.5) / 2
+    top = column.y
+    xml = column.figure(xml, 106, "power", width=half)
+    xml = column.caption(xml, 113, "Power", width=half)
+    column.y = top
+    xml = column.figure(xml, 120, "effects", width=half, x=column.x + 0.37 + half)
+    xml = column.caption(xml, 123, "SV effect sizes", width=half, x=column.x + 0.37 + half)
+    xml = column.text(xml, 127, SIMULATION_EFFECTS)
+    column.finish()
+
+    # column 3: All of Us (hypertension, then the diseases), discussion, references
+    column = Column(32.25, 15.65)
+    xml = column.bar(xml, 119)
+    xml = column.text(xml, 128, HYPERTENSION)
+    xml = column.figure(xml, 121, "hypertension")
+    xml = column.caption(xml, 124, "SV effects on hypertension")
+    xml = column.text(xml, 129, DISEASES)
+    xml = column.figure(xml, 122, "diseases")
+    xml = column.caption(xml, 125, "Held-out AUC by disease")
+    xml = column.bar(xml, 95)
+    xml = column.text(xml, 109, DISCUSSION)
+    xml = column.bar(xml, 96)
+    xml = column.text(xml, 99, [[(reference, "")] for reference in REFERENCES], indent=0.0,
+                      paragraphs=lambda items: "".join(line(runs, 4900, "000000", after=600, spacing=90000) for runs in items))
+    column.finish()
 
     # the section bars all at the template's 60 pt (its References bar was set smaller)
-    for bar in (91, 93, 95, 96, 97):
+    for bar in BARS:
         start, end = shape_span(xml, bar)
         xml = xml[:start] + re.sub(r'sz="\d+"', 'sz="6000"', xml[start:end]) + xml[end:]
     # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike

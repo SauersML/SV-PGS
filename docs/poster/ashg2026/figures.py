@@ -65,23 +65,21 @@ def render(name: str, html: str, width: float, height: float, transparent: bool 
     return target
 
 
-# ------------------------------------------------------------------ SV sign skew (the large figure, 15.64 x 11.76 in)
+# ------------------------------------------------------------------ SV type and expression (MAGE), first column
 
 SKEW = [
     ("Deletion overlapping an exon", "78 SVs, 42 genes", RED, -1.33, (-0.28, 0.25), (-2.52, -0.21)),
     ("Insertion or duplication overlapping an exon", "93 SVs, 75 genes", NAVY, 0.66, (-0.22, 0.21), (0.25, 1.30)),
-    ("Deletion within an intron", "866 SVs", RED, 0.05, (-0.07, 0.08), (-0.15, 0.48)),
-    ("Insertion or duplication within an intron", "737 SVs", NAVY, 0.01, (-0.08, 0.08), (-0.47, 0.06)),
 ]
 
 
 def skew_figure() -> Path:
-    width, height = 15.64, 11.76
+    width, height = 13.4, 5.8
     w, h = width * 100, height * 100
-    plot_left, plot_right = 70.0, w - 60.0
+    plot_left, plot_right = 40.0, w - 40.0
     low, high = -2.75, 1.5
-    top = 160.0
-    row = 222.0
+    top = 130.0
+    row = 165.0
     bottom = top + row * (len(SKEW) - 1) + 125 + 52
 
     def x(value: float) -> float:
@@ -90,115 +88,31 @@ def skew_figure() -> Path:
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{STYLE}</style>']
     # legend
     parts.append(f'<rect x="{plot_left}" y="40" width="70" height="36" rx="5" fill="{NULL}"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 86}" y="70">95% range under permutation</text>')
-    parts.append(f'<line x1="{plot_left + 640}" y1="58" x2="{plot_left + 720}" y2="58" stroke="{INK}" stroke-width="7" stroke-linecap="round"/>')
-    parts.append(f'<circle cx="{plot_left + 680}" cy="58" r="15" fill="{INK}" stroke="#fff" stroke-width="5"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 738}" y="70">mean z, 95% CI (bootstrap over genes)</text>')
+    parts.append(f'<text class="legend" x="{plot_left + 86}" y="70">permutation 95% range</text>')
+    parts.append(f'<line x1="{plot_left + 560}" y1="58" x2="{plot_left + 640}" y2="58" stroke="{INK}" stroke-width="7" stroke-linecap="round"/>')
+    parts.append(f'<circle cx="{plot_left + 600}" cy="58" r="15" fill="{INK}" stroke="#fff" stroke-width="5"/>')
+    parts.append(f'<text class="legend" x="{plot_left + 658}" y="70">mean z, 95% CI</text>')
     for tick in (-2, -1, 0, 1):
         tx = x(tick)
         stroke, weight = (GREY, 4) if tick == 0 else (RULE, 3)
         # gridlines run inside each row's band only, never through the row labels
         for index in range(len(SKEW)):
-            cy = top + row * index + 125
+            cy = top + row * index + 105
             parts.append(f'<line x1="{tx:.1f}" y1="{cy - 52:.1f}" x2="{tx:.1f}" y2="{cy + 52:.1f}" stroke="{stroke}" stroke-width="{weight}"/>')
         label = "0" if tick == 0 else f"{tick:+d}".replace("-", "−")
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 44}" text-anchor="middle">{label}</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 40}" text-anchor="middle">Mean z-score for association with expression of the overlapped gene</text>')
+        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 24}" text-anchor="middle">{label}</text>')
+    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 30}" text-anchor="middle">Mean z-score for association with expression of the overlapped gene</text>')
     for index, (label, detail, colour, mean, null, ci) in enumerate(SKEW):
         base = top + row * index
         parts.append(f'<text class="label" x="{plot_left}" y="{base + 18:.1f}">{label} <tspan class="detail" dx="10">{detail}</tspan></text>')
-        cy = base + 125
+        cy = base + 105
         parts.append(f'<rect x="{x(null[0]):.1f}" y="{cy - 30:.1f}" width="{x(null[1]) - x(null[0]):.1f}" height="60" rx="6" fill="{NULL}"/>')
         parts.append(f'<line x1="{x(ci[0]):.1f}" y1="{cy:.1f}" x2="{x(ci[1]):.1f}" y2="{cy:.1f}" stroke="{colour}" stroke-width="9" stroke-linecap="round"/>')
         for end in ci:
             parts.append(f'<line x1="{x(end):.1f}" y1="{cy - 22:.1f}" x2="{x(end):.1f}" y2="{cy + 22:.1f}" stroke="{colour}" stroke-width="9" stroke-linecap="round"/>')
         parts.append(f'<circle cx="{x(mean):.1f}" cy="{cy:.1f}" r="22" fill="{colour}" stroke="#fff" stroke-width="7"/>')
-        if index < 2:
-            value = f"{mean:+.2f}".replace("-", "−")
-            parts.append(f'<text class="value" x="{x(mean):.1f}" y="{cy - 38:.1f}" text-anchor="middle">mean z = {value}</text>')
     parts.append("</svg>")
     return render("fig_sign_skew", page("".join(parts), width, height), width, height)
-
-
-# ------------------------------------------------------------------ bench-real baselines (10.94 x 8.40 in)
-
-BASELINES = [
-    ("mr.ash", (0.071, 0.081), 0.023),
-    ("Lead variant", (0.061, 0.068), 0.022),
-    ("GBLUP", (0.047, 0.053), 0.013),
-]
-
-
-def baseline_figure() -> Path:
-    width, height = 10.94, 8.40
-    w, h = width * 100, height * 100
-    label_right = 300.0
-    plot_left, plot_right = 340.0, w - 50.0
-    low, high = 0.0, 0.09
-    top = 190.0
-    row = 165.0
-    bottom = top + row * len(BASELINES)
-
-    def x(value: float) -> float:
-        return plot_left + (value - low) / (high - low) * (plot_right - plot_left)
-
-    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{STYLE}</style>']
-    parts.append(f'<rect x="{plot_left}" y="44" width="80" height="30" rx="15" fill="{NAVY}"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 96}" y="70">other held-out superpopulations</text>')
-    parts.append(f'<circle cx="{plot_left + 18}" cy="113" r="16" fill="#fff" stroke="{TEAL}" stroke-width="7"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 96}" y="124">African ancestry held out</text>')
-    for tick in (0.0, 0.02, 0.04, 0.06, 0.08):
-        tx = x(tick)
-        parts.append(f'<line x1="{tx:.1f}" y1="{top - 30}" x2="{tx:.1f}" y2="{bottom - 10}" stroke="{RULE}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 34}" text-anchor="middle">{fmt(tick) if tick else "0"}</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 34}" text-anchor="middle">Mean held-out r² per gene</text>')
-    for index, (method, (lo, hi), afr) in enumerate(BASELINES):
-        cy = top + row * index + row / 2 - 10
-        parts.append(f'<text class="label" x="{label_right}" y="{cy + 12:.1f}" text-anchor="end">{method}</text>')
-        parts.append(f'<rect x="{x(lo) - 18:.1f}" y="{cy - 18:.1f}" width="{x(hi) - x(lo) + 36:.1f}" height="36" rx="18" fill="{NAVY}"/>')
-        parts.append(f'<text class="value" x="{x(hi) + 18:.1f}" y="{cy - 34:.1f}" text-anchor="end">{lo:.3f}–{hi:.3f}</text>')
-        parts.append(f'<circle cx="{x(afr):.1f}" cy="{cy:.1f}" r="17" fill="#fff" stroke="{TEAL}" stroke-width="8"/>')
-        parts.append(f'<text class="value" x="{x(afr) + 32:.1f}" y="{cy + 12:.1f}">{afr:.3f}</text>')
-    parts.append("</svg>")
-    return render("fig_baselines", page("".join(parts), width, height), width, height)
-
-
-# ------------------------------------------------------------------ SV credit (6.96 x 8.40 in), vertical
-
-CREDIT = [("mr.ash", (1.9, 3.9)), ("GBLUP", (0.2, 0.3))]
-COLUMN_SHARE = 0.32
-
-
-def credit_figure() -> Path:
-    width, height = 6.96, 8.40
-    w, h = width * 100, height * 100
-    plot_left, plot_right = 130.0, w - 40.0
-    plot_top, plot_bottom = 70.0, h - 130.0
-    low, high = 0.0, 4.2
-
-    def y(value: float) -> float:
-        return plot_bottom - (value - low) / (high - low) * (plot_bottom - plot_top)
-
-    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{STYLE}</style>']
-    for tick in (0, 1, 2, 3, 4):
-        ty = y(tick)
-        parts.append(f'<line x1="{plot_left}" y1="{ty:.1f}" x2="{plot_right}" y2="{ty:.1f}" stroke="{RULE}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{plot_left - 18}" y="{ty + 10:.1f}" text-anchor="end">{tick}%</text>')
-    parts.append(
-        f'<text class="axis" transform="translate(36 {(plot_top + plot_bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">'
-        f"SV share of held-out prediction</text>"
-    )
-    share = y(COLUMN_SHARE)
-    parts.append(f'<line x1="{plot_left}" y1="{share:.1f}" x2="{plot_right}" y2="{share:.1f}" stroke="{RED}" stroke-width="5" stroke-dasharray="14 10"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 12}" y="{share + 42:.1f}" style="fill:{RED};font-weight:700;font-size:{21 * PT:.1f}px">SVs: 0.32% of variants</text>')
-    slot = (plot_right - plot_left) / len(CREDIT)
-    for index, (method, (lo, hi)) in enumerate(CREDIT):
-        cx = plot_left + slot * (index + 0.5)
-        parts.append(f'<rect x="{cx - 22:.1f}" y="{y(hi) - 22:.1f}" width="44" height="{y(lo) - y(hi) + 44:.1f}" rx="22" fill="{NAVY}"/>')
-        parts.append(f'<text class="value" x="{cx:.1f}" y="{y(hi) - 40:.1f}" text-anchor="middle">{fmt(lo)}–{fmt(hi)}%</text>')
-        parts.append(f'<text class="label" x="{cx:.1f}" y="{plot_bottom + 50:.1f}" text-anchor="middle">{method}</text>')
-    parts.append("</svg>")
-    return render("fig_sv_credit", page("".join(parts), width, height), width, height)
 
 
 # ------------------------------------------------------------------ the model equation, transparent, for the Methods panel
@@ -207,14 +121,14 @@ def equation_figure() -> Path:
     """The model for a poster audience: each formula line with a plain-language line under it. The variance of
     variant j's effect is s_j tau_j: tau_j from its class's learned mixing distribution g_c, s_j the scale its
     imputation quality (a known offset, r^2) and the learned smooths of allele frequency and annotations set."""
-    width, height = 11.6, 8.0
+    width, height = 13.2, 6.4
     rows = [
         ("<i>y</i> = Σ<sub><i>j</i></sub> <i>x<sub>j</sub></i> β<sub><i>j</i></sub> + covariates + ε",
-         "phenotype = sum of genotype × effect over SNVs, indels and SVs, plus covariates and noise"),
+         "trait = genotypes × effects (SNVs, indels, SVs) + covariates + noise"),
         ("β<sub><i>j</i></sub> ~ N(0, <i>s<sub>j</sub></i> τ<sub><i>j</i></sub>)",
          "each variant’s effect follows a normal distribution with its own variance"),
         ("τ<sub><i>j</i></sub> ~ <i>g</i><sub>class</sub>",
-         "the variance follows a distribution estimated separately for each variant class (SNV, deletion, insertion, …)"),
+         "each variant class (SNV, deletion, …) has its own variance distribution"),
         ("log <i>s<sub>j</sub></i> = log <i>r</i><sup>2</sup><sub style='margin-left:-0.35em'><i>j</i></sub> + <i>h</i>(freq.) + <i>f</i>(length) + ⋯",
          "the variance also depends on imputation quality (r²) and on smooth functions of allele frequency, SV length and other annotations"),
     ]
@@ -227,43 +141,47 @@ def equation_figure() -> Path:
         "<style>html,body{margin:0;background:transparent;}"
         f".rows{{width:{width * 96:.1f}px;height:{height * 96:.1f}px;box-sizing:border-box;padding:0.08in 0.12in;display:flex;flex-direction:column;justify-content:space-between;}}"
         ".math{font-family:'STIX Two Text','Times New Roman',serif;font-size:46pt;line-height:1.2;color:#000;white-space:nowrap;}"
-        f".plain{{font-family:Arial,Helvetica,sans-serif;font-size:29pt;line-height:1.25;color:#000;margin-top:2px;}}"
+        f".plain{{font-family:Arial,Helvetica,sans-serif;font-size:27pt;line-height:1.25;color:#000;margin-top:2px;}}"
         "sub,sup{font-size:0.66em;line-height:0;}</style></head>"
         f"<body><div class='rows'>{body}</div></body></html>"
     )
     return render("equation", html, width, height, transparent=True)
 
 
-# ------------------------------------------------------------------ placeholders for the All of Us results, not yet run
+# ------------------------------------------------------------------ placeholders for results not yet run
 
 PLACEHOLDERS = {
-    # name: (width in, height in, title, what the figure will show)
-    "ph_hypertension_effects": (10.94, 8.40, "SV effects on hypertension risk",
-                                "Distribution of estimated SV effects on hypertension risk, by SV type"),
-    "ph_effect_by_length": (6.96, 8.40, "SV effect size by length",
-                            "Absolute estimated effect vs. SV length, for deletions and insertions"),
-    "ph_fifteen_diseases": (18.20, 8.60, "Held-out accuracy across 15 diseases",
-                            "AUC and log loss of the SNV-only and SNV + SV models for each disease"),
+    # name: (width in, height in, source, title, what the figure will show)
+    "ph_sim_accuracy": (16.70, 5.30, "simulation", "Held-out AUC vs. training size",
+                        "SV-PGS with and without SVs, and LDpred2-auto, at 0%, 5% and 20% causal SVs, with the expected accuracy"),
+    "ph_sim_power": (8.20, 4.80, "simulation", "Power vs. training size",
+                     "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
+    "ph_sim_effects": (8.20, 4.80, "simulation", "SV effect sizes",
+                       "Estimated vs. simulated SV effects, and |effect| vs. SV length"),
+    "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",
+                            "Estimated SV effects by SV type, and |effect| vs. SV length"),
+    "ph_aou_diseases": (15.40, 4.60, "All of Us", "Held-out AUC by disease",
+                        "SNV-only and SNV + SV models, and LDpred2-auto, for each disease"),
 }
 
 
 def placeholder_figure(name: str) -> Path:
-    width, height, title, detail = PLACEHOLDERS[name]
+    width, height, source, title, detail = PLACEHOLDERS[name]
     html = (
         "<!doctype html><html><head><meta charset='utf-8'><style>"
         f"html,body{{margin:0;background:#fff;}} .box{{box-sizing:border-box;width:{width * 96:.1f}px;height:{height * 96:.1f}px;"
         f"border:6px dashed #9aa3ad;border-radius:18px;background:#eef1f4;display:flex;flex-direction:column;align-items:center;"
-        f"justify-content:center;gap:22px;padding:40px 60px;text-align:center;font-family:Arial,Helvetica,sans-serif;color:{INK};}}"
-        f".tag{{font-size:26pt;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:{TEAL};}}"
-        f".title{{font-size:40pt;font-weight:700;line-height:1.15;color:{NAVY};}}"
-        f".detail{{font-size:27pt;line-height:1.3;color:{GREY};max-width:90%;}}"
+        f"justify-content:center;gap:18px;padding:30px 50px;text-align:center;font-family:Arial,Helvetica,sans-serif;color:{INK};}}"
+        f".tag{{font-size:24pt;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:{TEAL};}}"
+        f".title{{font-size:38pt;font-weight:700;line-height:1.15;color:{NAVY};}}"
+        f".detail{{font-size:26pt;line-height:1.3;color:{GREY};max-width:92%;}}"
         "</style></head><body><div class='box'>"
-        f"<div class='tag'>Placeholder: All of Us result</div><div class='title'>{title}</div><div class='detail'>{detail}</div>"
+        f"<div class='tag'>Placeholder: {source} result</div><div class='title'>{title}</div><div class='detail'>{detail}</div>"
         "</div></body></html>"
     )
     return render(name, html, width, height)
 
 
 if __name__ == "__main__":
-    for made in (skew_figure(), baseline_figure(), credit_figure(), equation_figure(), *(placeholder_figure(name) for name in PLACEHOLDERS)):
+    for made in (skew_figure(), equation_figure(), *(placeholder_figure(name) for name in PLACEHOLDERS)):
         print(made)
