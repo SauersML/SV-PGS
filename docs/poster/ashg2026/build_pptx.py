@@ -1,10 +1,15 @@
-"""The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in).
+"""The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in), following the
+accepted abstract: its title, author list and framing, with marked placeholders where the All of Us results will go.
 
     python3 build_pptx.py [template.pptx] [output.pptx]
 
 The template is read from outside the repository and nothing of it is committed: its own content (another study's All
-of Us results) must not enter this public repository. Every text box, figure and caption of the template is replaced;
-its header, University of Minnesota wordmark, section bars and author block are kept, all set in Arial. The figures come from figures.py.
+of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
+kept; every text box, figure and caption is replaced, all in Arial. The author line and affiliations come from
+authors.local beside this file, untracked, so no personal name is committed. The figures come from figures.py.
+
+Placeholders: a figure the All of Us runs will supply is a dashed "placeholder" panel (figures.py); a number they will
+supply is a bracketed red run in the text, e.g. "[x]%".
 """
 
 from __future__ import annotations
@@ -24,59 +29,59 @@ TEMPLATE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads"
 OUTPUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Downloads" / "ASHG SV-PGS poster.pptx"
 SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59e_65ab35e1-5c99-4c20-a531-f6c547fa9553/pptx"
 EMU = 914400
+PLACEHOLDER = "C0392B"
 
-# ------------------------------------------------------------------ the copy
+# ------------------------------------------------------------------ the copy, from the abstract
 
-TITLE = ["A Bayesian polygenic score model for", "SNVs, indels and structural variants"]
+TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 
 INTRODUCTION = [
-    [("Structural variants (SVs, ≥ 50 bp) and tandem repeats change more sequence than SNVs, yet most polygenic scores (PGS) omit them or credit them only through tagging SNVs.", "")],
-    [("SVs are enriched for heritability in 31 of 105 UK Biobank traits (median 14.8×; Nguyen et al. 2026).", "")],
-    [("Imputed SV genotypes are noisy measurements (median r", ""), ("2", "sup"), (" = 0.78 for common SVs; Bai et al. 2026).", "")],
-    [("We are building SV-PGS, a Bayesian PGS in which every variant enters one model, and testing where SVs carry signal in public data.", "")],
+    [("Polygenic scores (PGSs) aggregate variant effects to predict genetic risk for common diseases.", "")],
+    [("PGSs transfer poorly across populations: effect sizes come mostly from European-ancestry participants.", "")],
+    [("PGS methods are built for SNVs and overlook structural variants (SVs, ≥ 50 bp), which influence disease risk.", "")],
+    [("We hypothesize that SVs collectively improve polygenic prediction, and quantify their contribution in the multi-ancestry NIH ", ""),
+     ("All of Us", "i"), (" cohort.", "")],
 ]
 
 METHODS = [
-    [("g", "i"), ("c", "i sub"), (": a smooth, nonparametric effect-size distribution, learned per variant class by empirical Bayes.", "")],
-    [("u", "i"), ("j", "i sub"), (": each variant’s prior scale, from its imputation reliability (κ), allele frequency (", ""), ("h", "i"),
-     (") and annotations such as SV length and distance to the TSS (θ).", "")],
-    [("Public data: MAGE RNA-seq with 1kGP high-coverage SNV, indel and SV calls (730 people); leave-one-superpopulation-out prediction.", "")],
+    [("One model for SNVs, indels and SVs, with variant-class-specific priors: effect sizes depend on SV type (e.g., insertion vs. deletion) and length.", "")],
+    [("Fully GPU-accelerated training fits genome-wide PGSs at biobank scale and estimates per-variant effect sizes.", "")],
+    [("SVs from a callset discovered in 12,212 phased genome assemblies, imputed into ", ""), ("All of Us", "i"), (" short-read genomes.", "")],
+    [("SNV-only vs. SNV + SV models on the same people and folds: 15 diseases, 100,000 multi-ancestry participants.", "")],
 ]
 
 RESULTS_TOP = [
-    [("Sparse priors beat an infinitesimal model: mr.ash exceeded GBLUP by 0.025–0.029 r", ""), ("2", "sup"), (" (z = 13–19).", "")],
-    [("SVs were 0.32% of variants but 1.9–3.9% of mr.ash’s held-out prediction (GBLUP: 0.2–0.3%).", "")],
-    [("Every method lost ~70% of r", ""), ("2", "sup"), (" with African ancestry held out.", "")],
+    ("head", "Hypertension in All of Us"),
+    [("Over 200,000 SVs from 97,000 short-read genomes.", "")],
+    [("Risk-increasing and risk-decreasing SVs were balanced (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"), (").", "")],
+    [("Longer SVs had larger effect sizes (", ""), ("[statistic]", "ph"), (").", "")],
 ]
 
 RESULTS_BOTTOM = [
-    ("head", "Exonic SV effects are directional"),
-    [("Exon-overlapping deletions lowered their gene’s expression (mean z = −1.33, permutation p = 0.0005); exon-overlapping insertions and duplications raised it (mean z = +0.66, p = 0.0005).", "")],
-    [("SVs in gene bodies without exon overlap showed no skew (mean z = 0.05 and 0.01).", "")],
-    ("head", "Imputed SVs behave like confident draws"),
-    [("In 5,000 mosaic genomes built from 1kGP haplotypes and re-imputed with Beagle 5.5, SVs at MAF 1–5% had a calibration slope of 0.80 (√r", ""),
-     ("2", "sup"), (" = 0.83) and a dosage-variance ratio of 0.89 (r", ""), ("2", "sup"), (" = 0.69).", "")],
-    [("Adding 1kGP SVs to mr.ash raised held-out r", ""), ("2", "sup"), (" by 0.0004–0.0015 (z = 1.2–2.1 per superpopulation).", "")],
+    ("head", "15 diseases: SNV-only vs. SNV + SV"),
+    [("Adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"), (" (95% CI ", ""), ("[ ]", "ph"), (") averaged over diseases, and log loss by ", ""),
+     ("[Δ]", "ph"), (".", "")],
 ]
 
 DISCUSSION = [
-    [("Exonic SV effects carry a biological sign, which a symmetric effect prior cannot represent. A location-scale extension of the SV-PGS prior is specified.", "")],
-    [("Sparse empirical-Bayes priors give SVs far more predictive weight than infinitesimal models.", "")],
-    [("Imputed SV dosages need calibrated reliability in the prior.", "")],
-    [("Next: SNV/indel versus SNV + SV scores for 15 diseases in ~100,000 ", ""), ("All of Us", "i"),
-     (" participants, starting with hypertension, coronary artery disease, asthma, hyperlipidemia and breast cancer.", "")],
+    [("SVs enter one Bayesian PGS with SNVs, under priors that learn how SV type and length shape effect sizes.", "")],
+    [("SV effects depend on type: in public data (MAGE, 1kGP), exonic deletions lowered and exonic insertions/duplications raised gene expression (p = 0.0005).", "")],
+    [("Comparing SNV-only and SNV + SV models across 15 diseases quantifies the added value of structural variation (", ""), ("[result]", "ph"), (").", "")],
+    [("SV-PGS: an open-source tool for SV-inclusive PGS training and inference.", "")],
 ]
 
 REFERENCES = [
-    "Bai et al. (2026) Nature Genetics. https://doi.org/10.1038/s41588-026-02612-z",
-    "Browning, B. L., Zhou, Y., & Browning, S. R. (2018) A one-penny imputed genome from next-generation reference panels. American Journal of Human Genetics, 103(3), 338–348.",
+    "All of Us Research Program Investigators (2019) The “All of Us” Research Program. New England Journal of Medicine, 381, 668–676.",
     "Byrska-Bishop, M. et al. (2022) High-coverage whole-genome sequencing of the expanded 1000 Genomes Project cohort including 602 trios. Cell, 185(18), 3426–3440.",
-    "Kim, Y., Wang, W., Carbonetto, P., & Stephens, M. (2024) A flexible empirical Bayes approach to multiple linear regression and connections with penalized regression. Journal of Machine Learning Research, 25.",
-    "Nguyen et al. (2026) MiXeR-SV. Preprint. https://pmc.ncbi.nlm.nih.gov/articles/PMC13484855/",
     "Taylor, D. J. et al. (2024) Sources of gene expression variation in a globally diverse human cohort. Nature, 631, 610–616.",
 ]
 
-CAPTIONS = {112: "Held-out r² of baseline methods", 113: "SV share of prediction", 114: "SV association with own-gene expression"}
+CAPTIONS = {
+    112: "SV effects on hypertension risk",
+    113: "Effect size by SV length",
+    114: "Public data: SV effects depend on type",
+    117: "15 diseases: SNV-only vs. SNV + SV",
+}
 
 # ------------------------------------------------------------------ DrawingML in the template's own formats
 
@@ -85,6 +90,8 @@ FONT = '<a:latin typeface="Arial"/><a:ea typeface="Arial"/><a:cs typeface="Arial
 
 def run(text: str, flags: str, size: int, colour: str = "000000", bold: bool = False) -> str:
     flags_set = set(flags.split())
+    if "ph" in flags_set:
+        colour, bold = PLACEHOLDER, True
     baseline = ' baseline="30000"' if "sup" in flags_set else (' baseline="-25000"' if "sub" in flags_set else "")
     b = "1" if bold or "b" in flags_set else "0"
     i = "1" if "i" in flags_set else "0"
@@ -108,37 +115,47 @@ def bullet(runs: list[tuple[str, str]], size: int = 4900, after: int = 600) -> s
 def heading(text: str, size: int = 5400) -> str:
     return (
         '<a:p><a:pPr marL="0" marR="0" lvl="0" indent="0" algn="l" rtl="0"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc>'
-        '<a:spcBef><a:spcPts val="1200"/></a:spcBef><a:spcAft><a:spcPts val="600"/></a:spcAft><a:buNone/></a:pPr>'
+        '<a:spcBef><a:spcPts val="600"/></a:spcBef><a:spcAft><a:spcPts val="600"/></a:spcAft><a:buNone/></a:pPr>'
         + run(text, "", size, bold=True)
         + "</a:p>"
     )
 
 
-def plain(text: str, size: int, colour: str, bold: bool = False, italic: bool = False, after: int = 0, spacing: int = 100000) -> str:
+def line(runs: list[tuple[str, str]], size: int, colour: str, after: int = 0, spacing: int = 100000) -> str:
     return (
         f'<a:p><a:pPr marL="0" marR="0" lvl="0" indent="0" algn="l" rtl="0"><a:lnSpc><a:spcPct val="{spacing}"/></a:lnSpc>'
         f'<a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="{after}"/></a:spcAft><a:buNone/></a:pPr>'
-        + run(text, "i" if italic else "", size, colour, bold)
+        + "".join(run(text, flags, size, colour) for text, flags in runs)
         + "</a:p>"
     )
 
 
 def caption(text: str) -> str:
-    # the template's caption: 38 pt italic in the theme's body font, dark text
+    # the template's caption: 38 pt italic, dark text
     return (
         '<a:p><a:pPr marL="0" lvl="0" indent="0" algn="l" rtl="0"><a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="0"/></a:spcAft><a:buNone/></a:pPr>'
-        f'<a:r><a:rPr lang="en-US" sz="3800" i="1"><a:solidFill><a:schemeClr val="dk1"/></a:solidFill></a:rPr><a:t>{escape(text, quote=False)}</a:t></a:r></a:p>'
+        f'<a:r><a:rPr lang="en-US" sz="3800" i="1"><a:solidFill><a:schemeClr val="dk1"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text, quote=False)}</a:t></a:r></a:p>'
     )
 
 
 def body(items: list) -> str:
-    parts = []
-    for item in items:
-        if isinstance(item, tuple) and item[0] == "head":
-            parts.append(heading(item[1]))
+    return "".join(heading(item[1]) if isinstance(item, tuple) and item[0] == "head" else bullet(item) for item in items)
+
+
+def authors_and_affiliations() -> tuple[list[tuple[str, str]], list[str]]:
+    """authors.local: "Name | 1,2" per author in order (an empty mark list for a group author), then affiliation lines
+    that start with their number."""
+    authors, affiliations = [], []
+    for raw in (HERE / "authors.local").read_text().splitlines():
+        text = raw.strip()
+        if not text or text.startswith("#"):
+            continue
+        if "|" in text:
+            name, marks = (part.strip() for part in text.split("|", 1))
+            authors.append((name, marks))
         else:
-            parts.append(bullet(item))
-    return "".join(parts)
+            affiliations.append(text)
+    return authors, affiliations
 
 
 # ------------------------------------------------------------------ editing the slide
@@ -182,9 +199,9 @@ def picture(xml: str, shape_id: int, rel: str) -> str:
     return xml[:start] + shape + xml[end:]
 
 
-def duplicate(xml: str, shape_id: int, new_id: int) -> str:
+def duplicate(xml: str, shape_id: int, new_id: int, name: str) -> str:
     start, end = shape_span(xml, shape_id)
-    shape = xml[start:end].replace(f'<p:cNvPr id="{shape_id}" name="Google Shape;{shape_id};p1"', f'<p:cNvPr id="{new_id}" name="Results continued"', 1)
+    shape = re.sub(r'<p:cNvPr id="\d+" name="[^"]*"', f'<p:cNvPr id="{new_id}" name="{name}"', xml[start:end], count=1)
     return xml[:end] + shape + xml[end:]
 
 
@@ -208,94 +225,86 @@ def build() -> None:
     types = work / "[Content_Types].xml"
     types.write_text(re.sub(r'<Override PartName="/ppt/comments/[^"]+"[^>]*/>', "", types.read_text()))
 
-    # the new figures as media of their own
-    figures = {"baselines": "fig_baselines.png", "credit": "fig_sv_credit.png", "skew": "fig_sign_skew.png", "equation": "equation.png"}
+    # the figures as media of their own
+    figures = {
+        "effects": "ph_hypertension_effects.png", "length": "ph_effect_by_length.png", "skew": "fig_sign_skew.png",
+        "diseases": "ph_fifteen_diseases.png", "equation": "equation.png",
+    }
     ids = {}
     for index, (key, name) in enumerate(figures.items()):
         target = f"svpgs_{name}"
         shutil.copy(FIGURES / name, work / "ppt/media" / target)
-        rel = f"rIdSvpgs{index + 1}"
-        ids[key] = rel
+        ids[key] = f"rIdSvpgs{index + 1}"
         rels = rels.replace(
             "</Relationships>",
-            f'<Relationship Id="{rel}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{target}"/></Relationships>',
+            f'<Relationship Id="{ids[key]}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/{target}"/></Relationships>',
         )
-    if "Extension=\"png\"" not in types.read_text():
-        types.write_text(types.read_text().replace("<Default ", '<Default Extension="png" ContentType="image/png"/><Default ', 1))
 
-    # title (two lines, as the template sets them) and the white patches laid over the old figure
+    # header: the abstract's title (two lines, as the template sets it), then its authors and affiliations
     title = "".join(
         '<a:p><a:pPr marL="0" lvl="0" indent="0" algn="l" rtl="0"><a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="0"/></a:spcAft><a:buNone/></a:pPr>'
-        + f'<a:r><a:rPr lang="en-US" sz="9600" b="1" dirty="0"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(line)}</a:t></a:r></a:p>'
-        for line in TITLE
+        + f'<a:r><a:rPr lang="en-US" sz="7600" b="1" dirty="0"><a:solidFill><a:schemeClr val="lt1"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text)}</a:t></a:r></a:p>'
+        for text in TITLE
     )
     xml = replace_text(xml, 89, title)
+    authors, affiliations = authors_and_affiliations()
+    author_runs: list[tuple[str, str]] = []
+    for position, (name, marks) in enumerate(authors):
+        author_runs.append((name, ""))
+        if marks:
+            author_runs.append((marks.replace(" ", ""), "sup"))
+        if position < len(authors) - 1:
+            author_runs.append((", ", ""))
+    plain = "".join(text for text, _flags in author_runs)
+    # the template's three-name line (about 56 characters at 72 pt) clears the wordmark with room for some 64
+    names_size = min(7200, 7200 * 64 // max(len(plain), 1) // 100 * 100)
+    affiliation_lines = [
+        line([(entry.split(" ", 1)[0], "sup"), (entry.split(" ", 1)[1], "")], 2200, "FFFFFF") for entry in affiliations
+    ]
+    xml = replace_text(xml, 90, line(author_runs, names_size, "FFFFFF", after=300) + "".join(affiliation_lines))
+    xml = move(xml, 90, 1.37, 2.55, 32.5, 2.9)
     for patch in (102, 103, 104, 105, 108, 111):
         xml = delete(xml, patch)
 
-    # authors: authors.local (untracked; no personal name is committed here) holds edits to the template's author line,
-    # "+Name" inserted after its first author with affiliation 1, set as that author is, and "-Name" removed with its
-    # affiliation marks; past the template's three names the line is set at 60 pt with 50 pt superscripts, since 72 pt
-    # then runs into the wordmark
-    local = HERE / "authors.local"
-    edits = [line.strip() for line in local.read_text().splitlines() if line.strip()] if local.exists() else []
-    added = [line[1:].strip() for line in edits if line.startswith("+")]
-    removed = [line[1:].strip() for line in edits if line.startswith("-")]
-    if edits:
-        start, end = shape_span(xml, 90)
-        authors = xml[start:end]
-        run_pattern = r"<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t[^>]*>([^<]*)</a:t></a:r>"
-        for name in removed:
-            words = set(name.split())
-            runs = list(re.finditer(run_pattern, authors, flags=re.S))
-            doomed = [match for match in runs if match.group(1).strip(" \u00a0,¹²³") in words]
-            if not doomed:
-                raise ValueError(f"no author {name!r} on the template's author line")
-            following = next((match for match in runs if match.start() >= doomed[-1].end()), None)
-            for match in reversed(doomed):
-                authors = authors[: match.start()] + authors[match.end():]
-            if following is not None and not following.group(1)[:1].isspace() and following.group(1)[:1] != "\u00a0":
-                # the name it followed ended in a space; the next name keeps one
-                text = following.group(1)
-                authors = authors.replace(f">{text}</a:t>", f">\u00a0{text}</a:t>", 1)
-        first = re.search(r"(<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t>)[^<]+,(</a:t></a:r>)((<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t>)¹(</a:t></a:r>))", authors, flags=re.S)
-        names = "".join(first.group(1) + "\u00a0" + escape(name) + "," + first.group(2) + first.group(4) + "¹" + first.group(5) for name in added)
-        authors = authors[: first.end()] + names + authors[first.end():]
-        if 3 + len(added) - len(removed) > 3:
-            authors = authors.replace('sz="6000"', 'sz="5000"').replace('sz="7200"', 'sz="6000"')
-        xml = xml[:start] + authors + xml[end:]
-
     # column 1: introduction; methods with the model equation first
     xml = replace_text(xml, 98, body(INTRODUCTION))
+    xml = move(xml, 91, 1.01, 18.0, 12.1, 0.99)
     eq_w, eq_h = png_size(FIGURES / "equation.png")
     eq_width = 11.6
     eq_height = eq_width * eq_h / eq_w
     xml = picture(xml, 110, ids["equation"])
-    xml = move(xml, 110, 1.07, 22.85, eq_width, eq_height)
+    xml = move(xml, 110, 1.07, 19.25, eq_width, eq_height)
     xml = replace_text(xml, 92, body(METHODS))
-    xml = move(xml, 92, 1.07, 22.85 + eq_height + 0.15, 12.32, 35.6 - (22.85 + eq_height + 0.15))
+    xml = move(xml, 92, 1.07, 19.25 + eq_height + 0.15, 12.32, 35.6 - (19.25 + eq_height + 0.15))
 
-    # column 2: results above and below the two figures
-    xml = duplicate(xml, 94, 115)
+    # column 2: hypertension (two placeholder figures), then the 15-disease comparison (one placeholder figure)
     xml = replace_text(xml, 94, body(RESULTS_TOP))
-    xml = move(xml, 94, 13.35, 7.01, 18.71, 5.3)
-    xml = picture(xml, 101, ids["baselines"])
-    xml = move(xml, 101, 13.61, 12.85, 10.94, 8.40)
-    xml = picture(xml, 106, ids["credit"])
-    xml = move(xml, 106, 24.75, 12.85, 6.96, 8.40)
+    xml = move(xml, 94, 13.35, 7.01, 18.71, 4.6)
+    xml = picture(xml, 101, ids["effects"])
+    xml = move(xml, 101, 13.61, 11.75, 10.94, 8.40)
+    xml = picture(xml, 106, ids["length"])
+    xml = move(xml, 106, 24.75, 11.75, 6.96, 8.40)
+    xml = move(xml, 112, 13.61, 20.15, 10.94, 0.92)
+    xml = move(xml, 113, 24.75, 20.15, 6.96, 0.92)
+    xml = duplicate(xml, 94, 115, "Results continued")
     xml = replace_text(xml, 115, body(RESULTS_BOTTOM))
-    xml = move(xml, 115, 13.35, 22.3, 18.71, 13.4)
+    xml = move(xml, 115, 13.35, 21.3, 18.71, 3.0)
+    xml = duplicate(xml, 106, 116, "15 diseases placeholder")
+    xml = picture(xml, 116, ids["diseases"])
+    xml = move(xml, 116, 13.61, 24.0, 18.20, 9.40)
+    xml = duplicate(xml, 113, 117, "15 diseases caption")
+    xml = move(xml, 117, 13.61, 33.4, 18.20, 0.92)
 
-    # column 3: the main figure, discussion, references
+    # column 3: the public-data figure, discussion, references
     xml = picture(xml, 107, ids["skew"])
     xml = move(xml, 107, 32.24, 6.11, 15.64, 11.76)
     for shape_id, text in CAPTIONS.items():
         xml = replace_text(xml, shape_id, caption(text))
-    xml = move(xml, 112, 13.61, 21.25, 10.94, 0.92)
-    xml = move(xml, 113, 24.75, 21.25, 6.96, 0.92)
     xml = replace_text(xml, 109, body(DISCUSSION))
-    xml = replace_text(xml, 99, "".join(plain(reference, 2000, "000000", after=500, spacing=85000) for reference in REFERENCES))
+    xml = replace_text(xml, 99, "".join(line([(reference, "")], 2000, "000000", after=500, spacing=85000) for reference in REFERENCES))
 
+    # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike
+    xml = xml.replace('typeface="Century Schoolbook"', 'typeface="Arial"').replace('typeface="Merriweather"', 'typeface="Arial"')
     # the comment anchor in the slide's extensions, and every relationship the new slide no longer references (the old
     # figures, the old equation, the old references' links), so the cleanup below drops their parts too
     xml = re.sub(r"<p188:commentRel [^>]*/>", "", xml)
@@ -308,11 +317,8 @@ def build() -> None:
         if structural or f'"{rel_id}"' in xml:
             kept.append(relationship)
     rels = re.sub(r"<Relationship [^>]*/>", "", rels).replace("</Relationships>", "".join(kept) + "</Relationships>")
-    # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike
-    xml = xml.replace('typeface="Century Schoolbook"', 'typeface="Arial"').replace('typeface="Merriweather"', 'typeface="Arial"')
     slide_path.write_text(xml)
     rels_path.write_text(rels)
-    # the old figure and equation images are no longer referenced
     subprocess.run([sys.executable, str(SKILL / "scripts/clean.py"), str(work)], check=True, capture_output=True)
     OUTPUT.unlink(missing_ok=True)
     subprocess.run(["zip", "-Xqr", str(OUTPUT), "."], cwd=work, check=True)

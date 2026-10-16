@@ -221,6 +221,36 @@ def equation_figure() -> Path:
     return render("equation", html, width, height, transparent=True)
 
 
+# ------------------------------------------------------------------ placeholders for the All of Us results, not yet run
+
+PLACEHOLDERS = {
+    # name: (width in, height in, title, what the figure will show)
+    "ph_hypertension_effects": (10.94, 8.40, "Hypertension: SV effect sizes",
+                                "Posterior effect of each SV on hypertension risk, risk-increasing against risk-decreasing, by SV type"),
+    "ph_effect_by_length": (6.96, 8.40, "Effect size by SV length",
+                            "Absolute posterior effect against SV length, deletions and insertions apart"),
+    "ph_fifteen_diseases": (18.20, 9.40, "15 diseases: SNV-only against SNV + SV",
+                            "Held-out AUC and log loss of the two models per disease, paired on the same people and folds"),
+}
+
+
+def placeholder_figure(name: str) -> Path:
+    width, height, title, detail = PLACEHOLDERS[name]
+    html = (
+        "<!doctype html><html><head><meta charset='utf-8'><style>"
+        f"html,body{{margin:0;background:#fff;}} .box{{box-sizing:border-box;width:{width * 96:.1f}px;height:{height * 96:.1f}px;"
+        f"border:6px dashed #9aa3ad;border-radius:18px;background:#eef1f4;display:flex;flex-direction:column;align-items:center;"
+        f"justify-content:center;gap:22px;padding:40px 60px;text-align:center;font-family:Arial,Helvetica,sans-serif;color:{INK};}}"
+        f".tag{{font-size:26pt;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:{TEAL};}}"
+        f".title{{font-size:40pt;font-weight:700;line-height:1.15;color:{NAVY};}}"
+        f".detail{{font-size:27pt;line-height:1.3;color:{GREY};max-width:90%;}}"
+        "</style></head><body><div class='box'>"
+        f"<div class='tag'>All of Us result · placeholder</div><div class='title'>{title}</div><div class='detail'>{detail}</div>"
+        "</div></body></html>"
+    )
+    return render(name, html, width, height)
+
+
 if __name__ == "__main__":
-    for made in (skew_figure(), baseline_figure(), credit_figure(), equation_figure()):
+    for made in (skew_figure(), baseline_figure(), credit_figure(), equation_figure(), *(placeholder_figure(name) for name in PLACEHOLDERS)):
         print(made)
