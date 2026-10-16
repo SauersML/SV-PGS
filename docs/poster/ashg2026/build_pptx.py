@@ -233,6 +233,38 @@ def build() -> None:
     for patch in (102, 103, 104, 105, 108, 111):
         xml = delete(xml, patch)
 
+    # authors: authors.local (untracked; no personal name is committed here) holds edits to the template's author line,
+    # "+Name" inserted after its first author with affiliation 1, set as that author is, and "-Name" removed with its
+    # affiliation marks; past the template's three names the line is set at 60 pt with 50 pt superscripts, since 72 pt
+    # then runs into the wordmark
+    local = HERE / "authors.local"
+    edits = [line.strip() for line in local.read_text().splitlines() if line.strip()] if local.exists() else []
+    added = [line[1:].strip() for line in edits if line.startswith("+")]
+    removed = [line[1:].strip() for line in edits if line.startswith("-")]
+    if edits:
+        start, end = shape_span(xml, 90)
+        authors = xml[start:end]
+        run_pattern = r"<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t[^>]*>([^<]*)</a:t></a:r>"
+        for name in removed:
+            words = set(name.split())
+            runs = list(re.finditer(run_pattern, authors, flags=re.S))
+            doomed = [match for match in runs if match.group(1).strip(" \u00a0,¹²³") in words]
+            if not doomed:
+                raise ValueError(f"no author {name!r} on the template's author line")
+            following = next((match for match in runs if match.start() >= doomed[-1].end()), None)
+            for match in reversed(doomed):
+                authors = authors[: match.start()] + authors[match.end():]
+            if following is not None and not following.group(1)[:1].isspace() and following.group(1)[:1] != "\u00a0":
+                # the name it followed ended in a space; the next name keeps one
+                text = following.group(1)
+                authors = authors.replace(f">{text}</a:t>", f">\u00a0{text}</a:t>", 1)
+        first = re.search(r"(<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t>)[^<]+,(</a:t></a:r>)((<a:r><a:rPr[^>]*>(?:(?!</a:r>).)*?<a:t>)¹(</a:t></a:r>))", authors, flags=re.S)
+        names = "".join(first.group(1) + "\u00a0" + escape(name) + "," + first.group(2) + first.group(4) + "¹" + first.group(5) for name in added)
+        authors = authors[: first.end()] + names + authors[first.end():]
+        if 3 + len(added) - len(removed) > 3:
+            authors = authors.replace('sz="6000"', 'sz="5000"').replace('sz="7200"', 'sz="6000"')
+        xml = xml[:start] + authors + xml[end:]
+
     # column 1: introduction; methods with the model equation first
     xml = replace_text(xml, 98, body(INTRODUCTION))
     eq_w, eq_h = png_size(FIGURES / "equation.png")
