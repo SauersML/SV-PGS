@@ -1,38 +1,31 @@
 <title>SV-PGS at ASHG 2026</title>
-<meta name="claude:viewport-fit-sides" content="cover">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@62..125,100..900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;0,700;1,400&family=STIX+Two+Text:ital,wght@0,400;0,500;1,400;1,500&display=swap">
 <style>
-/* Layout: one 72 × 36 in landscape sheet (ASHG 2026's recommended size): a dark title band closed by the real GRCh38
-   chr1 ideogram, five panels in reading order, a footer of evidence tags and references. Every size is a share of the
-   sheet's width, so the same file prints at full size and previews on screen; narrow screens get a stacked reading copy.
-   A printed sheet is one physical object, so the page keeps one light look in every theme. */
+/* One 72 x 36 in landscape sheet (ASHG 2026's recommended size): a dark title band closed by the GRCh38 chr1
+   ideogram, five panels in reading order, a footer of evidence tags and references. Every size is a share of the
+   sheet's width (1cqw = 0.72 in printed), so a browser preview is the print scaled down. */
 :root {
   color-scheme: light;
   --paper: #ffffff;
   --desk: #e7eaee;
   --ink: #151a22;
-  --ink-2: #454c59;
-  --muted: #707786;
+  --ink-2: #3d4451;
+  --muted: #6a7180;
   --rule: #d7dbe2;
-  --wash: #f2f4f7;
+  --wash: #f0f2f5;
   --null: #d3d8df;
   --loss: #e34948;
   --gain: #2a78d6;
   --on-band: #f4f6f9;
-  --on-band-2: #aeb6c3;
+  --on-band-2: #b3bbc7;
   --font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
   --font-body: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-mono: "IBM Plex Mono", ui-monospace, Menlo, monospace;
   --font-math: "STIX Two Text", "Times New Roman", Times, serif;
 }
+html, body { margin: 0; padding: 0; }
 body { background: var(--desk); color: var(--ink); font-family: var(--font-body); }
-.desk {
-  padding-left: max(16px, env(safe-area-inset-left, 0px));
-  padding-right: max(16px, env(safe-area-inset-right, 0px));
-  padding-block: 24px;
-}
+.desk { padding: 24px; }
 .poster {
   container-type: inline-size;
   width: 100%;
@@ -40,264 +33,124 @@ body { background: var(--desk); color: var(--ink); font-family: var(--font-body)
   margin-inline: auto;
   aspect-ratio: 2 / 1;
   background: var(--paper);
-  box-shadow: 0 1px 2px rgba(21, 26, 34, 0.12), 0 12px 32px rgba(21, 26, 34, 0.10);
+  box-shadow: 0 12px 32px rgba(21, 26, 34, 0.12);
 }
 .sheet {
-  /* sizes in shares of the sheet's width (1cqw = 0.72 in when printed) */
-  --pad: 1.4cqw;
-  --gap: 1.2cqw;
-  --fs-title: 1.98cqw;
-  --fs-h: 1.06cqw;
-  --fs-lead: 0.64cqw;
-  --fs-body: 0.55cqw;
-  --fs-small: 0.42cqw;
-  --fs-tag: 0.34cqw;
-  --fs-math: 0.7cqw;
-  --stroke: 0.06cqw;
+  --pad: 1.3cqw;
+  --gap: 1.05cqw;
+  --fs-title: 2.3cqw;
+  --fs-h: 1.5cqw;
+  --fs-lead: 0.95cqw;
+  --fs-body: 0.85cqw;
+  --fs-small: 0.68cqw;
+  --fs-tag: 0.52cqw;
+  --fs-foot: 0.5cqw;
+  --fs-math: 0.9cqw;
+  --stroke: 0.08cqw;
   height: 100%;
   display: grid;
   grid-template-rows: auto auto 1fr auto;
 }
 
-/* ---- title band */
-.band {
-  background: var(--ink);
-  color: var(--on-band);
-  padding: calc(var(--pad) * 0.85) var(--pad) calc(var(--pad) * 0.75);
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.34fr);
-  gap: calc(var(--gap) * 2);
-  align-items: end;
-}
-.eyebrow {
-  font-family: var(--font-mono);
-  font-size: var(--fs-small);
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--on-band-2);
-  margin: 0 0 0.55em;
-}
-h1 {
-  font-family: var(--font-display);
-  font-stretch: 118%;
-  font-weight: 800;
-  font-size: var(--fs-title);
-  line-height: 1.02;
-  letter-spacing: -0.012em;
-  margin: 0;
-  text-wrap: balance;
-}
+/* title band */
+.band { background: var(--ink); color: var(--on-band); padding: calc(var(--pad) * 0.75) var(--pad) calc(var(--pad) * 0.65); }
+.eyebrow { font-family: var(--font-mono); font-size: var(--fs-small); letter-spacing: 0.08em; text-transform: uppercase; color: var(--on-band-2); margin: 0 0 0.4em; }
+h1 { font-family: var(--font-display); font-stretch: 110%; font-weight: 800; font-size: var(--fs-title); line-height: 1.02; letter-spacing: -0.012em; margin: 0; }
 h1 .name { font-stretch: 125%; font-weight: 900; }
-.byline { margin: 0.7em 0 0; font-size: var(--fs-lead); color: var(--on-band); }
-.byline span { color: var(--on-band-2); }
-.scope {
-  border-left: var(--stroke) solid var(--on-band-2);
-  padding-left: 1.1em;
-  font-size: var(--fs-small);
-  line-height: 1.4;
-  color: var(--on-band);
-}
-.scope strong { font-weight: 600; }
-.scope p { margin: 0 0 0.6em; }
-.scope p:last-child { margin: 0; color: var(--on-band-2); }
+.byline { margin: 0.45em 0 0; font-size: var(--fs-lead); display: flex; flex-wrap: wrap; gap: 0.2em 1.6em; align-items: baseline; }
+.byline .scope { color: var(--on-band-2); font-size: var(--fs-small); }
 
-/* ---- ideogram strip */
-.chromosome {
-  padding: calc(var(--pad) * 0.45) var(--pad) 0;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 1em;
-  align-items: center;
-  font-family: var(--font-mono);
-  font-size: var(--fs-tag);
-  color: var(--muted);
-}
-.ideogram { display: block; width: 100%; height: 0.62cqw; }
+/* ideogram */
+.chromosome { padding: calc(var(--pad) * 0.4) var(--pad) 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1em; align-items: center; font-family: var(--font-mono); font-size: var(--fs-foot); color: var(--muted); }
+.ideogram { display: block; width: 100%; height: 0.7cqw; }
 
-/* ---- panels */
-.panels {
-  padding: calc(var(--pad) * 0.7) var(--pad) 0;
-  display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: var(--gap);
-  min-height: 0;
-}
-.panel { min-width: 0; display: flex; flex-direction: column; gap: 0.62em; font-size: var(--fs-body); line-height: 1.38; }
+/* panels */
+.panels { padding: calc(var(--pad) * 0.55) var(--pad) 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: var(--gap); min-height: 0; }
+.panel { min-width: 0; display: flex; flex-direction: column; gap: 0.5em; font-size: var(--fs-body); line-height: 1.3; }
 .panel > * { margin: 0; }
 .panel h2 {
-  font-family: var(--font-display);
-  font-stretch: 112%;
-  font-weight: 800;
-  font-size: var(--fs-h);
-  line-height: 1.06;
-  letter-spacing: -0.008em;
-  text-wrap: balance;
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 0.42em;
-  align-items: baseline;
-  padding-bottom: 0.32em;
-  border-bottom: var(--stroke) solid var(--ink);
+  font-family: var(--font-display); font-stretch: 106%; font-weight: 800; font-size: var(--fs-h); line-height: 1.04; letter-spacing: -0.01em;
+  display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.35em; align-items: baseline;
+  padding-bottom: 0.25em; border-bottom: var(--stroke) solid var(--ink);
 }
-.panel h2 .num { font-family: var(--font-mono); font-weight: 500; font-size: 0.62em; color: var(--muted); }
-.lead { font-size: var(--fs-lead); line-height: 1.3; font-weight: 500; color: var(--ink); text-wrap: pretty; }
-.points { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.5em; }
-.points li { padding-left: 0.95em; position: relative; color: var(--ink-2); text-wrap: pretty; }
-.points li::before { content: ""; position: absolute; left: 0; top: 0.6em; width: 0.4em; height: var(--stroke); background: var(--ink); }
-.points strong, .panel p strong { color: var(--ink); font-weight: 600; }
-.tag {
-  font-family: var(--font-mono);
-  font-size: var(--fs-tag);
-  font-weight: 500;
-  letter-spacing: 0.02em;
-  color: var(--ink-2);
-  border: calc(var(--stroke) * 0.7) solid var(--muted);
-  border-radius: 0.3em;
-  padding: 0.05em 0.35em;
-  white-space: nowrap;
-  vertical-align: 0.12em;
-}
-.cite { color: var(--muted); font-size: 0.86em; }
+.panel h2 .num { font-family: var(--font-mono); font-weight: 500; font-size: 0.6em; color: var(--muted); }
+.lead { font-size: var(--fs-lead); line-height: 1.25; font-weight: 500; }
+.points { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.4em; }
+.points li { padding-left: 0.85em; position: relative; color: var(--ink-2); }
+.points li::before { content: ""; position: absolute; left: 0; top: 0.62em; width: 0.42em; height: var(--stroke); background: var(--ink); }
+strong { color: var(--ink); font-weight: 600; }
+.tag { font-family: var(--font-mono); font-size: var(--fs-tag); font-weight: 500; color: var(--ink-2); border: calc(var(--stroke) * 0.6) solid var(--muted); border-radius: 0.3em; padding: 0 0.32em; white-space: nowrap; vertical-align: 0.14em; }
+.cite { color: var(--muted); font-size: 0.82em; }
 
-/* figures */
-figure { margin: 0; display: flex; flex-direction: column; gap: 0.4em; }
-.fig-title { font-weight: 600; font-size: var(--fs-body); line-height: 1.25; color: var(--ink); text-wrap: balance; }
-.legend { display: flex; flex-wrap: wrap; gap: 0.3em 1.2em; font-size: var(--fs-small); color: var(--ink-2); }
-.legend span { display: inline-flex; align-items: center; gap: 0.45em; }
-.legend svg { width: 1.9em; height: 1em; flex: none; }
+figure { margin: 0; display: flex; flex-direction: column; gap: 0.3em; }
+.fig-title { font-weight: 600; line-height: 1.22; color: var(--ink); }
+.legend { display: flex; flex-wrap: wrap; gap: 0.15em 1em; font-size: var(--fs-small); color: var(--ink-2); }
+.legend span { display: inline-flex; align-items: center; gap: 0.4em; }
+.legend svg { width: 1.7em; height: 0.95em; flex: none; }
 .chart { display: block; width: 100%; height: auto; overflow: visible; }
-.chart text { font-family: var(--font-body); fill: var(--ink-2); font-size: 25px; }
-.chart .row-label { font-size: 29px; font-weight: 600; fill: var(--ink); }
-.chart .row-detail { font-size: 23px; fill: var(--muted); }
-.chart .tick { font-size: 23px; fill: var(--muted); font-variant-numeric: tabular-nums; }
-.chart .axis { font-size: 23px; fill: var(--muted); }
-.chart .value { font-size: 26px; font-weight: 600; fill: var(--ink); font-variant-numeric: tabular-nums; }
+.chart text { font-family: var(--font-body); fill: var(--ink-2); }
+.chart .row-label { font-size: 42px; font-weight: 600; fill: var(--ink); }
+.chart .row-detail { font-size: 33px; fill: var(--muted); }
+.chart .tick, .chart .axis { font-size: 34px; fill: var(--muted); font-variant-numeric: tabular-nums; }
+.chart .value { font-size: 40px; font-weight: 600; fill: var(--ink); font-variant-numeric: tabular-nums; }
 .chart .value.muted { fill: var(--ink-2); font-weight: 500; }
-figcaption { font-size: var(--fs-small); line-height: 1.38; color: var(--ink-2); text-wrap: pretty; }
+figcaption { font-size: var(--fs-small); line-height: 1.3; color: var(--ink-2); }
 
-/* the model's equations */
-.math {
-  font-family: var(--font-math);
-  font-size: var(--fs-math);
-  line-height: 1.3;
-  background: var(--wash);
-  border-radius: 0.35em;
-  padding: 0.55em 0.75em 0.65em;
-  display: flex;
-  flex-direction: column;
-  gap: 0.5em;
-}
+.math { font-family: var(--font-math); font-size: var(--fs-math); line-height: 1.3; background: var(--wash); border-radius: 0.3em; padding: 0.45em 0.6em 0.5em; display: flex; flex-direction: column; gap: 0.4em; }
 .math .eq { white-space: nowrap; }
-.math i { font-style: italic; }
 .math sub, .math sup { font-size: 0.68em; line-height: 0; }
-.math .where { font-family: var(--font-body); font-size: var(--fs-small); color: var(--ink-2); white-space: normal; line-height: 1.35; }
-.terms { display: grid; grid-template-columns: repeat(4, auto); gap: 0 0.45em; align-items: start; justify-content: start; }
-.terms .term { display: flex; flex-direction: column; align-items: center; gap: 0.15em; }
+.terms { display: grid; grid-template-columns: repeat(3, auto); gap: 0.15em 0.4em; justify-content: start; }
+.terms .term { display: flex; flex-direction: column; align-items: center; gap: 0.12em; }
 .terms .term > span:first-child { white-space: nowrap; }
-.terms .brace { align-self: stretch; height: 0.32em; border: calc(var(--stroke) * 0.8) solid var(--muted); border-top: 0; border-radius: 0 0 0.25em 0.25em; }
-.terms .what { font-family: var(--font-body); font-size: calc(var(--fs-tag) * 1.05); line-height: 1.2; color: var(--ink-2); text-align: center; }
+.terms .brace { align-self: stretch; height: 0.3em; border: calc(var(--stroke) * 0.8) solid var(--muted); border-top: 0; border-radius: 0 0 0.22em 0.22em; }
+.terms .what { font-family: var(--font-body); font-size: var(--fs-tag); line-height: 1.15; color: var(--ink-2); text-align: center; }
 
-/* the lesson box and the stat tiles */
-.box { border: var(--stroke) solid var(--ink); border-radius: 0.4em; padding: 0.6em 0.75em 0.7em; display: flex; flex-direction: column; gap: 0.35em; }
-.box .box-title { font-weight: 700; color: var(--ink); line-height: 1.25; }
-.box p { margin: 0; color: var(--ink-2); font-size: var(--fs-small); line-height: 1.4; }
-.box .compare { display: grid; grid-template-columns: auto auto auto; gap: 0.1em 0.9em; font-size: var(--fs-small); color: var(--ink-2); align-items: baseline; justify-content: start; }
-.box .compare b { font-family: var(--font-display); font-stretch: 112%; font-weight: 800; font-size: 1.5em; color: var(--ink); font-variant-numeric: tabular-nums; }
-.box .compare .was { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 0.08em; }
-.steps { list-style: none; padding: 0; display: grid; gap: 0.32em; counter-reset: step; }
-.steps li { display: grid; grid-template-columns: 1.55em minmax(0, 1fr); gap: 0.5em; align-items: start; color: var(--ink-2); font-size: var(--fs-small); line-height: 1.38; }
-.steps li::before {
-  counter-increment: step;
-  content: counter(step);
-  font-family: var(--font-mono);
-  font-weight: 600;
-  font-size: 0.92em;
-  color: var(--paper);
-  background: var(--ink);
-  border-radius: 50%;
-  width: 1.55em;
-  height: 1.55em;
-  display: grid;
-  place-items: center;
-  margin-top: 0.05em;
-}
-.steps li strong { color: var(--ink); font-weight: 600; }
-.tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.55em; }
-.tile { background: var(--wash); border-radius: 0.35em; padding: 0.45em 0.55em 0.55em; display: flex; flex-direction: column; gap: 0.2em; }
-.tile .figure { font-family: var(--font-display); font-stretch: 104%; font-weight: 800; font-size: calc(var(--fs-h) * 0.8); line-height: 1; color: var(--ink); white-space: nowrap; }
-.tile .what { font-size: var(--fs-tag); line-height: 1.3; color: var(--ink-2); }
+.box { border: var(--stroke) solid var(--ink); border-radius: 0.35em; padding: 0.5em 0.6em 0.55em; display: flex; flex-direction: column; gap: 0.3em; }
+.box .box-title { font-weight: 700; line-height: 1.2; }
+.box p { margin: 0; color: var(--ink-2); font-size: var(--fs-small); line-height: 1.3; }
+.compare { display: grid; grid-template-columns: auto auto auto; gap: 0 0.7em; font-size: var(--fs-small); color: var(--ink-2); align-items: baseline; justify-content: start; }
+.compare b { font-family: var(--font-display); font-stretch: 106%; font-weight: 800; font-size: 1.55em; color: var(--ink); }
+.compare .was { color: var(--muted); text-decoration: line-through; text-decoration-thickness: 0.08em; }
+.tiles { display: grid; grid-template-columns: minmax(0, 1fr); gap: 0.35em; }
+.tile { background: var(--wash); border-radius: 0.3em; padding: 0.3em 0.5em; display: grid; grid-template-columns: 6.3em minmax(0, 1fr); gap: 0.5em; align-items: baseline; }
+.tile .figure { font-family: var(--font-display); font-stretch: 100%; font-weight: 800; font-size: 1.15em; line-height: 1.1; white-space: nowrap; }
+.tile .what { font-size: var(--fs-small); line-height: 1.25; color: var(--ink-2); }
 
-/* the study panel */
-.arms { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55em; }
-.arm { border: var(--stroke) solid var(--ink); border-radius: 0.35em; padding: 0.4em 0.55em 0.5em; font-size: var(--fs-small); line-height: 1.32; color: var(--ink-2); }
-.arm code { display: block; font-family: var(--font-mono); font-weight: 600; font-size: 1.05em; color: var(--ink); margin-bottom: 0.2em; }
-.diseases { display: flex; flex-wrap: wrap; gap: 0.3em; font-size: var(--fs-small); }
-.diseases span { padding: 0.08em 0.45em; border-radius: 1em; background: var(--wash); color: var(--ink-2); white-space: nowrap; }
+.arms { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.45em; }
+.arm { border: var(--stroke) solid var(--ink); border-radius: 0.3em; padding: 0.3em 0.45em 0.35em; font-size: var(--fs-small); line-height: 1.22; color: var(--ink-2); }
+.arm code { display: block; font-family: var(--font-mono); font-weight: 600; font-size: 1.05em; color: var(--ink); }
+.diseases { display: flex; flex-wrap: wrap; gap: 0.25em; font-size: var(--fs-small); }
+.diseases span { padding: 0.04em 0.4em; border-radius: 1em; background: var(--wash); color: var(--ink-2); white-space: nowrap; }
 .diseases span.primary { background: var(--ink); color: var(--paper); font-weight: 500; }
-.timeline { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.35em; font-size: var(--fs-tag); line-height: 1.25; }
-.timeline li { border-top: calc(var(--stroke) * 2.2) solid var(--rule); padding-top: 0.4em; color: var(--ink-2); }
-.timeline li.done { border-top-color: var(--ink); color: var(--ink); font-weight: 600; }
-.timeline li span { display: block; font-family: var(--font-mono); font-weight: 500; color: var(--muted); font-size: 0.9em; }
-.notice { font-size: var(--fs-small); line-height: 1.38; color: var(--ink); background: var(--wash); border-radius: 0.35em; padding: 0.5em 0.65em; }
+.status { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 0.12em; font-size: var(--fs-small); color: var(--ink-2); }
+.status li { display: grid; grid-template-columns: 1.3em minmax(0, 1fr); gap: 0.35em; align-items: baseline; }
+.status li::before { content: ""; width: 0.75em; height: 0.75em; border-radius: 50%; border: calc(var(--stroke) * 0.9) solid var(--muted); justify-self: center; transform: translateY(0.08em); }
+.status li.done { color: var(--ink); font-weight: 600; }
+.status li.done::before { background: var(--ink); border-color: var(--ink); }
+.notice { font-size: var(--fs-small); line-height: 1.28; background: var(--wash); border-radius: 0.3em; padding: 0.35em 0.5em; font-weight: 500; }
 
-/* ---- footer */
+/* footer */
 .foot {
-  margin: calc(var(--pad) * 0.55) var(--pad) calc(var(--pad) * 0.6);
-  padding-top: 0.6em;
-  border-top: var(--stroke) solid var(--rule);
-  display: grid;
-  grid-template-columns: minmax(0, 1.25fr) minmax(0, 2.2fr) minmax(0, 0.75fr);
-  gap: calc(var(--gap) * 1.5);
-  font-size: var(--fs-tag);
-  line-height: 1.4;
-  color: var(--ink-2);
+  margin: calc(var(--pad) * 0.45) var(--pad) calc(var(--pad) * 0.5); padding-top: 0.5em; border-top: var(--stroke) solid var(--rule);
+  display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 2.4fr) minmax(0, 0.7fr); gap: calc(var(--gap) * 1.3);
+  font-size: var(--fs-foot); line-height: 1.35; color: var(--ink-2);
 }
-.foot h3 { font-family: var(--font-mono); font-weight: 600; font-size: 1em; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 0.35em; }
-.foot dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.15em 0.6em; }
+.foot h3 { font-family: var(--font-mono); font-weight: 600; font-size: 1em; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 0.3em; }
+.foot dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 0.1em 0.6em; }
 .foot dt .tag { font-size: 1em; }
 .foot dd { margin: 0; }
 .foot ol { margin: 0; padding-left: 1.4em; columns: 2; column-gap: 2em; }
 .foot ol li { break-inside: avoid; }
 .foot p { margin: 0; }
-.placeholder { color: inherit; background: rgba(250, 178, 25, 0.28); border-radius: 0.2em; padding: 0 0.2em; }
-.band .placeholder { background: rgba(250, 178, 25, 0.32); color: var(--on-band); }
+.placeholder { background: rgba(250, 178, 25, 0.3); border-radius: 0.2em; padding: 0 0.2em; }
 
-/* ---- narrow screens: the same content as a stacked reading copy */
-@media screen and (max-width: 1100px) {
-  .desk { padding-block: 16px; }
-  .poster { aspect-ratio: auto; }
-  .sheet {
-    --pad: 20px;
-    --gap: 28px;
-    --fs-title: clamp(26px, 5.4vw, 40px);
-    --fs-h: 22px;
-    --fs-lead: 17px;
-    --fs-body: 15.5px;
-    --fs-small: 14px;
-    --fs-tag: 12.5px;
-    --fs-math: 18px;
-    --stroke: 2px;
-  }
-  .band { grid-template-columns: minmax(0, 1fr); gap: 18px; }
-  .ideogram { height: 12px; }
-  .panels { grid-template-columns: minmax(0, 1fr); padding-bottom: 8px; }
-  .math { overflow-x: auto; }
-  .tiles { grid-template-columns: minmax(0, 1fr); }
-  .timeline { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
-  .foot { grid-template-columns: minmax(0, 1fr); gap: 18px; }
-  .foot ol { columns: 1; }
-}
-
-/* ---- print: the full-size sheet */
 @media print {
   @page { size: 72in 36in; margin: 0; }
-  html, body { margin: 0; padding: 0; }
   body { background: var(--paper); }
   .desk { padding: 0; }
   .poster { width: 72in; height: 36in; max-width: none; aspect-ratio: auto; box-shadow: none; }
   .placeholder { background: none; }
 }
-@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto; } }
 </style>
 
 <div class="desk">
@@ -305,142 +158,119 @@ figcaption { font-size: var(--fs-small); line-height: 1.38; color: var(--ink-2);
 <div class="sheet">
 
 <header class="band">
-  <div>
-    <p class="eyebrow">ASHG 2026 · Montréal · Board <span class="placeholder">[board number]</span></p>
-    <h1><span class="name">SV-PGS:</span> one Bayesian model for SNVs, indels, tandem repeats and structural variants in polygenic scores</h1>
-    <p class="byline"><span class="placeholder">[Author names]</span> <span>· <span class="placeholder">[affiliations]</span> · <span class="placeholder">[contact]</span></span></p>
-  </div>
-  <div class="scope">
-    <p><strong>On this poster:</strong> the model, how it is fitted and checked, motivating results on public data, and the All of Us study design.</p>
-    <p><strong>Not yet:</strong> SV-PGS accuracy. Its All of Us fits have not run, and it is scored on the public benchmarks only once its end-to-end fits land. No All of Us data appear here.</p>
-    <p>Every measured number carries the evidence tag it has in the project’s records (key at bottom left).</p>
-  </div>
+  <p class="eyebrow">ASHG 2026 · Montréal · Board <span class="placeholder">[board number]</span></p>
+  <h1><span class="name">SV-PGS:</span> one Bayesian model for SNVs, indels, tandem repeats and structural variants in polygenic scores</h1>
+  <p class="byline"><span><span class="placeholder">[Author names]</span> · <span class="placeholder">[affiliations]</span> · <span class="placeholder">[contact]</span></span><span class="scope">Methods and public-data results. SV-PGS accuracy and All of Us results are not yet available; no All of Us data appear here.</span></p>
 </header>
 
-<div class="chromosome" aria-hidden="true">{{IDEOGRAM}}<span>chr1 · GRCh38 G-bands</span></div>
+<div class="chromosome" aria-hidden="true">{{IDEOGRAM}}<span>chr1 · GRCh38</span></div>
 
 <main class="panels">
 
 <section class="panel">
-  <h2><span class="num">1</span>Structural variant effects can have a sign</h2>
-  <p class="lead">Polygenic scores mostly leave out SVs (≥ 50 bp deletions, insertions, duplications) and tandem repeats, or credit them through tagging SNVs.</p>
+  <h2><span class="num">1</span>SV effects can have a sign</h2>
+  <p class="lead">Polygenic scores mostly leave out structural variants, or credit them through tagging SNVs.</p>
   <ul class="points">
-    <li>SVs are enriched for heritability in <strong>31 of 105</strong> UK Biobank traits, median <strong>14.8×</strong> <span class="cite">(MiXeR-SV; Nguyen et al. 2026, preprint)</span>.</li>
-    <li>They are measured badly: common SVs impute at median <strong>r² 0.78</strong> from a long-read panel <span class="cite">(Bai et al. 2026)</span>.</li>
-    <li>An SV’s ALT allele is a physical event, so its effect can carry a biological sign. A SNV’s REF/ALT orientation carries none.</li>
+    <li>SVs are enriched for heritability in <strong>31 of 105</strong> UK Biobank traits, median <strong>14.8×</strong> <span class="cite">(MiXeR-SV, preprint)</span>.</li>
+    <li>An SV’s ALT allele is a physical event, so its effect can have a biological sign.</li>
   </ul>
   <figure>
     <div class="fig-title">Exon deletions lower their gene’s expression; exon insertions and duplications raise it <span class="tag">real</span></div>
     <div class="legend">
       <span><svg viewBox="0 0 38 20" aria-hidden="true"><rect x="1" y="3" width="36" height="14" rx="3" fill="var(--null)"/></svg>permutation null, 95%</span>
-      <span><svg viewBox="0 0 38 20" aria-hidden="true"><line x1="3" y1="10" x2="35" y2="10" stroke="var(--ink-2)" stroke-width="3" stroke-linecap="round"/><circle cx="19" cy="10" r="6" fill="var(--ink-2)" stroke="var(--paper)" stroke-width="2"/></svg>mean z, gene-bootstrap 95% CI</span>
-      <span><svg viewBox="0 0 38 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="var(--loss)"/><circle cx="28" cy="10" r="7" fill="var(--gain)"/></svg>deletion · insertion/duplication</span>
+      <span><svg viewBox="0 0 38 20" aria-hidden="true"><circle cx="10" cy="10" r="7" fill="var(--loss)"/><circle cx="28" cy="10" r="7" fill="var(--gain)"/></svg>DEL · INS/DUP, mean z and 95% CI</span>
     </div>
     {{SKEW}}
-    <figcaption>Each SV’s marginal association z with its own gene’s covariate-adjusted expression. MAGE lymphoblastoid RNA-seq with 1kGP high-coverage SV calls: 500 genes, the 534 training people of the split that holds AFR out, 66,397 deletions, insertions and duplications in cis windows. The null permutes expression across genes, keeping each window’s LD. Both exon rows: p = 0.0005, the smallest 2,000 permutations can give. SVs outside the gene (64,623): mean z ≈ 0, p &gt; 0.4.</figcaption>
+    <figcaption>MAGE RNA-seq with 1kGP SV calls: 534 people, 500 genes, 66,397 SVs. Exon rows: permutation p = 0.0005, the smallest 2,000 permutations give.</figcaption>
   </figure>
-  <p class="cite">A symmetric prior puts equal mass on both signs here. A location-scale extension of the mixing law is specified and waits on the inference route.</p>
 </section>
 
 <section class="panel">
-  <h2><span class="num">2</span>One generative model for every variant</h2>
-  <p class="lead">Every record enters one model, from a single-base indel to a large deletion. No length bins, no separate SV model.</p>
+  <h2><span class="num">2</span>One model for every variant</h2>
+  <p class="lead">Every record, from a single-base indel to a large deletion, enters one model. No length bins.</p>
   <div class="math" role="group" aria-label="The model">
     <div class="eq"><i>y</i> = <i>C</i>α + Σ<sub><i>j</i></sub> <i>D<sub>j</sub></i> β<sub><i>j</i></sub> + ε</div>
-    <div class="eq">β<sub><i>j</i></sub> | class <i>c</i> ~ ∫ N(0, <i>u<sub>j</sub> s</i>) <i>g<sub>c</sub></i>(<i>s</i>) d<i>s</i>,&nbsp;&nbsp;log <i>g<sub>c</sub></i> = η + δ<sub><i>c</i></sub></div>
+    <div class="eq">β<sub><i>j</i></sub> ~ ∫ N(0, <i>u<sub>j</sub> s</i>) <i>g<sub>c</sub></i>(<i>s</i>) d<i>s</i></div>
     <div class="eq terms">
-      <div class="term"><span>log <i>u<sub>j</sub></i> = log(κ<sub><i>j</i></sub><sup>2</sup> Var <i>D<sub>j</sub></i>)</span><span class="brace"></span><span class="what">measured reliability</span></div>
-      <div class="term"><span>+ <i>h</i>(log Var <i>G<sub>j</sub></i>)</span><span class="brace"></span><span class="what">allele frequency</span></div>
+      <div class="term"><span>log <i>u<sub>j</sub></i> = log(κ<sub><i>j</i></sub><sup>2</sup> Var <i>D<sub>j</sub></i>)</span><span class="brace"></span><span class="what">reliability</span></div>
+      <div class="term"><span>+ <i>h</i>(log Var <i>G<sub>j</sub></i>)</span><span class="brace"></span><span class="what">frequency</span></div>
       <div class="term"><span>+ <i>d<sub>j</sub></i><sup>⊤</sup>θ</span><span class="brace"></span><span class="what">annotations</span></div>
-      <div class="term"><span>+ level<sub><i>c</i></sub></span><span class="brace"></span><span class="what">class</span></div>
     </div>
-    <div class="where"><i>D<sub>j</sub></i>: stored dosage, standardized in the training fold · <i>G<sub>j</sub></i>: true genotype · κ<sub><i>j</i></sub>: calibration slope of <i>D</i> on <i>G</i> · <i>C</i>: sex, age, PCs, imputation batch, projected out exactly first</div>
   </div>
   <ul class="points">
-    <li><strong>The mixing density <i>g<sub>c</sub></i> is learned per class</strong>, continuous and nonparametric, with no point mass at zero. A third-order roughness penalty with a learned weight; its λ → ∞ limit is the log-normal. Gaussian, BayesR-style grids and heavy tails are special cases.</li>
-    <li><strong>Continuous annotations are smooths with learned smoothness</strong> (log length, distance to the TSS, allele frequency); discrete ones (variant class, gene and exon overlap) stay discrete. A smooth’s linear term gets a learned ridge of its own (the double penalty; Marra &amp; Wood 2011).</li>
-    <li><strong>A tandem-repeat locus is one column</strong>, its signed total length Σ<sub><i>a</i></sub> Δlen<sub><i>a</i></sub> <i>D<sub>ia</sub></i>, so the score does not depend on which allele the reference carries.</li>
-    <li><strong>Imputed SVs behave like confident draws, not calibrated means.</strong> At MAF 1–5%, κ was 0.80 against √r² 0.83, and Var(DS)/Var(G) 0.89 against r² 0.69 <span class="tag">semi-real</span>. Reliability enters each variant’s prior scale through κ, never the LD matrix.</li>
+    <li><strong>The mixing density <i>g<sub>c</sub></i> is learned per class</strong>: continuous, nonparametric, roughness-penalized. Gaussian and BayesR-style priors are special cases.</li>
+    <li><strong>Annotations are smooths</strong> with learned smoothness: log length, distance to TSS, allele frequency.</li>
+    <li><strong>A tandem-repeat locus is one column</strong>: its signed total length.</li>
+    <li><strong>Imputed SVs act like confident draws</strong>, not calibrated means: at MAF 1–5%, κ 0.80 vs √r² 0.83 <span class="tag">semi-real</span>. Reliability sets each variant’s prior scale.</li>
   </ul>
 </section>
 
 <section class="panel">
-  <h2><span class="num">3</span>Fitting it, and refusing what did not converge</h2>
-  <p class="lead">Empirical Bayes: the prior’s hyperparameters maximize the approximate evidence at a fixed point of the approximate posterior.</p>
+  <h2><span class="num">3</span>Fit it; refuse what did not converge</h2>
+  <p class="lead">Empirical Bayes: hyperparameters maximize the approximate evidence at a fixed point of the approximate posterior.</p>
   <ul class="points">
-    <li><strong>Two fixed points</strong>: expectation propagation, and mean-field coordinate ascent (the store route’s default). Which one stays is decided on held-out accuracy.</li>
-    <li><strong>Hyper steps</strong> are Newton steps on the total curvature with a trust region. The evidence is the Laplace value plus leading Tierney–Kadane terms, the largest replaced by exact line integrals.</li>
-    <li><strong>A fit is scored only if it converged</strong>: remaining gain ≤ 1/(2K) nats for K posterior draws. A model that fails is quarantined; its trait leaves the report and the others stay. This is a numerical criterion, not a bound on posterior error.</li>
+    <li>Newton steps on the total curvature, with a trust region.</li>
+    <li><strong>A fit is scored only if converged</strong>: remaining gain ≤ 1/(2K) nats. Others are quarantined.</li>
   </ul>
   <div class="box">
     <div class="box-title">A flat prior on a smooth’s linear term has no maximum</div>
-    <p>For a group of signal-free variants the evidence keeps rising as their prior variance shrinks, so empirical Bayes walked one linear coefficient to 5 × 10⁴. A learned ridge on each smooth’s null space restores a maximum. On a 240-person annotated benchmark <span class="tag">machinery</span>:</p>
+    <p>Empirical Bayes walked a coefficient to 5 × 10⁴. A learned ridge on each smooth’s null space fixed it <span class="tag">machinery</span>:</p>
     <div class="compare">
       <span>sample route</span><b>8 s</b><span class="was">was 50 s</span>
       <span>LD-band route</span><b>19 s</b><span class="was">was &gt; 10 min</span>
     </div>
-    <p>A synthetic fit that used to end unconverged and quarantined now converges. Speed and convergence only; not an accuracy claim.</p>
   </div>
-  <ol class="steps" aria-label="The pipeline">
-    <li><span><strong>8-bit dosage store.</strong> One read streams every column.</span></li>
-    <li><span><strong>Stage 0, one genotype pass.</strong> Exact int8 LD-block Grams and X′y for every trait × fold.</span></li>
-    <li><span><strong>Stage 2, empirical Bayes on the full-data likelihood.</strong> The LD band only accelerates it; the far field is recomputed from the samples.</span></li>
-    <li><span><strong>Scoring.</strong> Every trait × fold model and its posterior draws in one read.</span></li>
-  </ol>
   <div class="tiles">
-    <div class="tile"><span class="figure">~100 s</span><span class="what">to score 100k people × 17.3M variants on one H100 <span class="tag">machinery</span></span></div>
-    <div class="tile"><span class="figure">149–180 s</span><span class="what">dual Gaussian solve, 12 models, 30,000 × 483,944, one A40 <span class="tag">machinery</span></span></div>
-    <div class="tile"><span class="figure">0.5–3.5%</span><span class="what">worst marginal-variance error vs a dense inverse; block-Jacobi 16–58% <span class="tag">machinery</span></span></div>
+    <div class="tile"><span class="figure">~100 s</span><span class="what">to score 100k people × 17.3M variants on one H100</span></div>
+    <div class="tile"><span class="figure">149–180 s</span><span class="what">12-model solve, 30k × 484k, one A40</span></div>
+    <div class="tile"><span class="figure">0.5–3.5%</span><span class="what">marginal-variance error (block-Jacobi 16–58%)</span></div>
   </div>
+  <p class="cite">Speed and exactness, against exact references <span class="tag">machinery</span></p>
 </section>
 
 <section class="panel">
-  <h2><span class="num">4</span>Public benchmarks no method controls</h2>
+  <h2><span class="num">4</span>Public benchmarks</h2>
   <ul class="points">
-    <li><strong>bench-real</strong> <span class="tag">real</span>: MAGE lymphoblastoid expression in 730 people from 26 populations, with 1kGP high-coverage SNV, indel and SV calls in TSS ± 1 Mb windows. Family-grouped 5-fold and leave-one-superpopulation-out splits; chromosome-jackknife SEs.</li>
-    <li><strong>bench-sim</strong>: 50,000 mosaic genomes copied from 1kGP founder haplotypes, with SVs and tandem repeats masked and re-imputed by Beagle from a disjoint panel. A pre-registered, deliberately misspecified truth family (eight effect-shape families; SV enrichment in scale or probability; frequency and LD dependence; non-additivity), with sealed seeds.</li>
+    <li><strong>bench-real</strong> <span class="tag">real</span>: MAGE expression, 730 people, 1kGP SNV, indel and SV calls.</li>
+    <li><strong>bench-sim</strong>: 50,000 1kGP mosaic genomes, SVs re-imputed, sealed seeds.</li>
   </ul>
   <figure>
-    <div class="fig-title">Baselines on bench-real: a sparse prior beats a Gaussian one, and every method loses about 70% of r² when AFR is held out <span class="tag">real</span></div>
+    <div class="fig-title">Baseline held-out r² on bench-real <span class="tag">real</span></div>
     <div class="legend">
-      <span><svg viewBox="0 0 38 20" aria-hidden="true"><rect x="2" y="5" width="34" height="10" rx="5" fill="var(--ink)"/></svg>other held-out superpopulations, range</span>
+      <span><svg viewBox="0 0 38 20" aria-hidden="true"><rect x="2" y="5" width="34" height="10" rx="5" fill="var(--ink)"/></svg>other superpopulations</span>
       <span><svg viewBox="0 0 38 20" aria-hidden="true"><circle cx="19" cy="10" r="6" fill="var(--paper)" stroke="var(--ink)" stroke-width="3"/></svg>AFR held out</span>
     </div>
     {{BASELINES}}
-    <figcaption>Leave-one-superpopulation-out, SNV/indel set; mr.ash on 2,000 random genes, the lead variant and GBLUP on 5,000. mr.ash − GBLUP: +0.025 to +0.029 (z 13–19).</figcaption>
+    <figcaption>Leave-one-superpopulation-out. Holding out AFR costs about 70% of r².</figcaption>
   </figure>
   <figure>
-    <div class="fig-title">A sparse prior gives SVs 6–12× their share of columns; a Gaussian prior gives them less than their share <span class="tag">real</span></div>
+    <div class="fig-title">A sparse prior gives SVs 6–12× their share of columns <span class="tag">real</span></div>
     {{CREDIT}}
-    <figcaption>Adding the 1kGP panel’s SVs to mr.ash: +0.0004 to +0.0015 r² (z 1.2–2.1 per superpopulation). Short-read PanGenie SV genotypes add about 0 for every method.</figcaption>
   </figure>
 </section>
 
 <section class="panel">
-  <h2><span class="num">5</span>The All of Us study, set up and not yet run</h2>
-  <p class="lead">About 100,000 multi-ancestry All of Us participants with imputed genomes, from a long-read-called reference panel.</p>
+  <h2><span class="num">5</span>The All of Us study</h2>
+  <p class="lead">About 100,000 multi-ancestry participants with imputed genomes. Set up; not yet run.</p>
   <div class="arms">
-    <div class="arm"><code>snv_indel</code>every record under 50 bp</div>
-    <div class="arm"><code>with_sv</code>every record, plus GATK-SV short-read calls as their own rows</div>
+    <div class="arm"><code>snv_indel</code>records under 50 bp</div>
+    <div class="arm"><code>with_sv</code>every record + GATK-SV calls</div>
   </div>
   <ul class="points">
-    <li><strong>Paired arms</strong>, fitted separately on the same people, folds, covariates and seeds.</li>
-    <li><strong>Five kinship-grouped outer folds</strong> (KING &gt; 2<sup>−3.5</sup> kept together). Per fold: fit on about 72%, calibrate on 8%, evaluate on 20%.</li>
-    <li><strong>Endpoints</strong>: log loss and Brier score of frozen, calibrated probabilities; AUC; calibration intercept and slope. A paired one-sided test on one frozen outer fold.</li>
-    <li><strong>Diseases are fitted on a Gaussian working likelihood</strong> of 0/1 status, for cost: a coefficient is a per-allele change in probability, not a log odds ratio.</li>
+    <li>Same people, folds and covariates in both arms; 5 kinship-grouped folds.</li>
+    <li>Endpoints: log loss, Brier score and AUC of calibrated probabilities.</li>
   </ul>
   <div class="diseases" aria-label="Diseases">
-    <span class="primary">hypertension</span><span class="primary">coronary artery disease</span><span class="primary">asthma</span><span class="primary">hyperlipidemia</span><span class="primary">breast cancer</span><span>type 2 diabetes</span><span>atrial fibrillation</span><span>hypothyroidism</span><span>COPD</span><span>depression</span><span>gout</span><span>cataract</span><span>chronic kidney disease</span><span>psoriasis</span><span>prostate cancer</span>
+    <span class="primary">hypertension</span><span class="primary">coronary artery disease</span><span class="primary">asthma</span><span class="primary">hyperlipidemia</span><span class="primary">breast cancer</span><span>type 2 diabetes</span><span>atrial fibrillation</span><span>hypothyroidism</span><span>COPD</span><span>depression</span><span>gout</span><span>cataract</span><span>CKD</span><span>psoriasis</span><span>prostate cancer</span>
   </div>
-  <p class="cite">15 diseases; the abstract’s five in black. 15 × 2 arms × (5 folds + a final fit) = 180 fits, on Google Batch GPUs under a $3,000 stop budget.</p>
-  <ol class="timeline" aria-label="Status">
-    <li class="done"><span>done</span>pipeline end to end on synthetic inputs</li>
-    <li><span>next</span>GPU validation</li>
-    <li><span>then</span>full-genome pilot, one trait</li>
-    <li><span>then</span>training fits, both arms</li>
-    <li><span>then</span>held-out evaluation</li>
+  <ol class="status" aria-label="Status">
+    <li class="done">pipeline runs end to end on synthetic data</li>
+    <li>GPU validation</li>
+    <li>full-genome pilot, one trait</li>
+    <li>180 fits: 15 diseases × 2 arms × 6</li>
+    <li>held-out evaluation</li>
   </ol>
-  <p class="notice">No All of Us data or results appear on this poster. Results will be reported under the All of Us Data and Statistics Dissemination Policy.</p>
+  <p class="notice">No All of Us data or results appear on this poster.</p>
 </section>
 
 </main>
@@ -450,21 +280,19 @@ figcaption { font-size: var(--fs-small); line-height: 1.38; color: var(--ink-2);
     <h3>Evidence tags</h3>
     <dl>
       <dt><span class="tag">real</span></dt><dd>real phenotypes and genotypes, nothing simulated</dd>
-      <dt><span class="tag">semi-real</span></dt><dd>real haplotypes and imputation, simulated effects (bench-sim v7, Beagle 5.5)</dd>
-      <dt><span class="tag">machinery</span></dt><dd>exactness or time against an exact reference; never an accuracy claim</dd>
+      <dt><span class="tag">semi-real</span></dt><dd>real haplotypes and imputation, simulated effects</dd>
+      <dt><span class="tag">machinery</span></dt><dd>speed or exactness only; never an accuracy claim</dd>
     </dl>
   </div>
   <div>
     <h3>References</h3>
     <ol>
-      <li>Bai et al. 2026. ImputeSV. <i>Nat Genet</i>, doi:10.1038/s41588-026-02612-z.</li>
       <li>Byrska-Bishop et al. 2022. 1kGP high-coverage panel. <i>Cell</i> 185:3426.</li>
       <li>Manichaikul et al. 2010. KING. <i>Bioinformatics</i> 26:2867.</li>
-      <li>Marra &amp; Wood 2011. Practical variable selection for GAMs. <i>CSDA</i> 55:2372.</li>
+      <li>Marra &amp; Wood 2011. Variable selection for GAMs. <i>CSDA</i> 55:2372.</li>
       <li>Minka 2001. Expectation propagation. <i>UAI</i>.</li>
       <li>Nguyen et al. 2026. MiXeR-SV. Preprint.</li>
       <li>Taylor et al. 2024. MAGE. <i>Nature</i> 631:610.</li>
-      <li>Tierney &amp; Kadane 1986. <i>JASA</i> 81:82.</li>
     </ol>
   </div>
   <div>

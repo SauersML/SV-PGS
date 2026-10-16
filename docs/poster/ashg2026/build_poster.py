@@ -76,10 +76,10 @@ def ideogram() -> str:
 
 SKEW_ROWS = [
     # label, detail, colour token, observed mean z, permutation null 95%, gene-bootstrap 95% CI
-    ("DEL × exon", "78 SVs · 42 genes", "loss", -1.33, (-0.28, 0.25), (-2.52, -0.21)),
-    ("INS/DUP × exon", "93 SVs · 75 genes", "gain", 0.66, (-0.22, 0.21), (0.25, 1.30)),
-    ("DEL in gene body", "866 SVs · no exon", "loss", 0.05, (-0.07, 0.08), (-0.15, 0.48)),
-    ("INS/DUP in body", "737 SVs · no exon", "gain", 0.01, (-0.08, 0.08), (-0.47, 0.06)),
+    ("DEL × exon", "78 SVs", "loss", -1.33, (-0.28, 0.25), (-2.52, -0.21)),
+    ("INS/DUP × exon", "93 SVs", "gain", 0.66, (-0.22, 0.21), (0.25, 1.30)),
+    ("DEL in body", "866 SVs", "loss", 0.05, (-0.07, 0.08), (-0.15, 0.48)),
+    ("INS/DUP in body", "737 SVs", "gain", 0.01, (-0.08, 0.08), (-0.47, 0.06)),
 ]
 
 
@@ -88,50 +88,43 @@ def skew_chart() -> str:
     label_right = 330.0
     plot_left, plot_right = 372.0, 980.0
     low, high = -2.6, 1.4
-    top = 40.0
-    row = 128.0
-    height = top + row * len(SKEW_ROWS) + 76.0
+    top = 70.0
+    row = 118.0
+    bottom = top + row * len(SKEW_ROWS)
+    height = bottom + 100.0
 
     def x(value: float) -> float:
         return plot_left + (value - low) / (high - low) * (plot_right - plot_left)
 
-    parts = [
-        f'<svg class="chart" viewBox="0 0 {width:.0f} {height:.0f}" role="img" '
-        f'aria-label="Mean association z of SVs with their own gene expression by class and exon overlap">'
-    ]
-    # grid and zero line
+    parts = [f'<svg class="chart" viewBox="0 0 {width:.0f} {height:.0f}" role="img" aria-label="Mean association z of SVs with their own gene by class and exon overlap">']
     for tick in (-2, -1, 0, 1):
         tx = x(tick)
-        stroke = "var(--ink-2)" if tick == 0 else "var(--rule)"
-        weight = 3 if tick == 0 else 2
-        parts.append(f'<line x1="{tx:.1f}" y1="{top - 18}" x2="{tx:.1f}" y2="{top + row * len(SKEW_ROWS) - 10}" stroke="{stroke}" stroke-width="{weight}"/>')
+        stroke, weight = ("var(--ink-2)", 4) if tick == 0 else ("var(--rule)", 3)
+        parts.append(f'<line x1="{tx:.1f}" y1="{top - 30}" x2="{tx:.1f}" y2="{bottom - 8}" stroke="{stroke}" stroke-width="{weight}"/>')
         label = "0" if tick == 0 else f"{tick:+d}".replace("-", "−")
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{top + row * len(SKEW_ROWS) + 30}" text-anchor="middle">{label}</text>')
-    parts.append(
-        f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{height - 6}" text-anchor="middle">'
-        f"mean association z with the SV's own gene</text>"
-    )
+        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 34}" text-anchor="middle">{label}</text>')
+    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{height - 8}" text-anchor="middle">mean z with the SV’s own gene</text>')
     for index, (label, detail, colour, mean, null, ci) in enumerate(SKEW_ROWS):
-        cy = top + row * index + row / 2 - 12
-        parts.append(f'<text class="row-label" x="{label_right}" y="{cy - 4:.1f}" text-anchor="end">{label}</text>')
-        parts.append(f'<text class="row-detail" x="{label_right}" y="{cy + 30:.1f}" text-anchor="end">{detail}</text>')
+        cy = top + row * index + row / 2 - 14
+        parts.append(f'<text class="row-label" x="{label_right}" y="{cy + 2:.1f}" text-anchor="end">{label}</text>')
+        parts.append(f'<text class="row-detail" x="{label_right}" y="{cy + 38:.1f}" text-anchor="end">{detail}</text>')
         parts.append(
-            f'<rect x="{x(null[0]):.1f}" y="{cy - 20:.1f}" width="{x(null[1]) - x(null[0]):.1f}" height="40" rx="4" fill="var(--null)">'
+            f'<rect x="{x(null[0]):.1f}" y="{cy - 24:.1f}" width="{x(null[1]) - x(null[0]):.1f}" height="48" rx="5" fill="var(--null)">'
             f"<title>Permutation null 95%: {fmt(null[0])} to {fmt(null[1])}</title></rect>"
         )
         parts.append(
-            f'<line x1="{x(ci[0]):.1f}" y1="{cy:.1f}" x2="{x(ci[1]):.1f}" y2="{cy:.1f}" stroke="var(--{colour})" stroke-width="5" stroke-linecap="round">'
+            f'<line x1="{x(ci[0]):.1f}" y1="{cy:.1f}" x2="{x(ci[1]):.1f}" y2="{cy:.1f}" stroke="var(--{colour})" stroke-width="7" stroke-linecap="round">'
             f"<title>Gene-bootstrap 95% CI: {fmt(ci[0])} to {fmt(ci[1])}</title></line>"
         )
         for end in ci:
-            parts.append(f'<line x1="{x(end):.1f}" y1="{cy - 14:.1f}" x2="{x(end):.1f}" y2="{cy + 14:.1f}" stroke="var(--{colour})" stroke-width="5" stroke-linecap="round"/>')
+            parts.append(f'<line x1="{x(end):.1f}" y1="{cy - 17:.1f}" x2="{x(end):.1f}" y2="{cy + 17:.1f}" stroke="var(--{colour})" stroke-width="7" stroke-linecap="round"/>')
         parts.append(
-            f'<circle cx="{x(mean):.1f}" cy="{cy:.1f}" r="14" fill="var(--{colour})" stroke="var(--paper)" stroke-width="5">'
+            f'<circle cx="{x(mean):.1f}" cy="{cy:.1f}" r="17" fill="var(--{colour})" stroke="var(--paper)" stroke-width="6">'
             f"<title>{label}: mean z {fmt(mean)}</title></circle>"
         )
         if index < 2:
             value = f"{mean:+.2f}".replace("-", "−")
-            parts.append(f'<text class="value" x="{x(mean):.1f}" y="{cy - 30:.1f}" text-anchor="middle">{value}</text>')
+            parts.append(f'<text class="value" x="{x(mean):.1f}" y="{cy - 34:.1f}" text-anchor="middle">{value}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -139,7 +132,7 @@ def skew_chart() -> str:
 # ------------------------------------------------------------------ figure 3: bench-real baselines [real]
 
 BASELINES = [
-    # method, held-out r² range over the other held-out superpopulations, AFR held out
+    # method, mean held-out r² range over the other held-out superpopulations, AFR held out
     ("mr.ash", (0.071, 0.081), 0.023),
     ("Lead variant", (0.061, 0.068), 0.022),
     ("GBLUP", (0.047, 0.053), 0.013),
@@ -148,12 +141,13 @@ BASELINES = [
 
 def baseline_chart() -> str:
     width = 1000.0
-    label_right = 250.0
-    plot_left, plot_right = 290.0, 960.0
+    label_right = 268.0
+    plot_left, plot_right = 306.0, 950.0
     low, high = 0.0, 0.09
-    top = 52.0
-    row = 116.0
-    height = top + row * len(BASELINES) + 72.0
+    top = 66.0
+    row = 118.0
+    bottom = top + row * len(BASELINES)
+    height = bottom + 52.0
 
     def x(value: float) -> float:
         return plot_left + (value - low) / (high - low) * (plot_right - plot_left)
@@ -161,22 +155,21 @@ def baseline_chart() -> str:
     parts = [f'<svg class="chart" viewBox="0 0 {width:.0f} {height:.0f}" role="img" aria-label="Held-out r squared of three baselines on bench-real">']
     for tick in (0.0, 0.02, 0.04, 0.06, 0.08):
         tx = x(tick)
-        parts.append(f'<line x1="{tx:.1f}" y1="{top - 14}" x2="{tx:.1f}" y2="{top + row * len(BASELINES) - 14}" stroke="var(--rule)" stroke-width="2"/>')
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{top + row * len(BASELINES) + 22}" text-anchor="middle">{fmt(tick) if tick else "0"}</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{height - 6}" text-anchor="middle">mean held-out r² per gene</text>')
+        parts.append(f'<line x1="{tx:.1f}" y1="{top - 30}" x2="{tx:.1f}" y2="{bottom - 10}" stroke="var(--rule)" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 30}" text-anchor="middle">{fmt(tick) if tick else "0"}</text>')
     for index, (method, (lo, hi), afr) in enumerate(BASELINES):
         cy = top + row * index + row / 2
-        parts.append(f'<text class="row-label" x="{label_right}" y="{cy + 11:.1f}" text-anchor="end">{method}</text>')
+        parts.append(f'<text class="row-label" x="{label_right}" y="{cy + 14:.1f}" text-anchor="end">{method}</text>')
         parts.append(
-            f'<rect x="{x(lo) - 13:.1f}" y="{cy - 13:.1f}" width="{x(hi) - x(lo) + 26:.1f}" height="26" rx="13" fill="var(--ink)">'
+            f'<rect x="{x(lo) - 16:.1f}" y="{cy - 16:.1f}" width="{x(hi) - x(lo) + 32:.1f}" height="32" rx="16" fill="var(--ink)">'
             f"<title>{method}: {lo:.3f} to {hi:.3f}</title></rect>"
         )
-        parts.append(f'<text class="value" x="{(x(lo) + x(hi)) / 2:.1f}" y="{cy - 26:.1f}" text-anchor="middle">{lo:.3f}–{hi:.3f}</text>')
+        parts.append(f'<text class="value" x="{x(hi) + 16:.1f}" y="{cy - 30:.1f}" text-anchor="end">{lo:.3f}–{hi:.3f}</text>')
         parts.append(
-            f'<circle cx="{x(afr):.1f}" cy="{cy:.1f}" r="12" fill="var(--paper)" stroke="var(--ink)" stroke-width="5">'
+            f'<circle cx="{x(afr):.1f}" cy="{cy:.1f}" r="15" fill="var(--paper)" stroke="var(--ink)" stroke-width="6">'
             f"<title>{method}, AFR held out: {afr:.3f}</title></circle>"
         )
-        parts.append(f'<text class="value muted" x="{x(afr) + 24:.1f}" y="{cy + 10:.1f}">{afr:.3f}</text>')
+        parts.append(f'<text class="value muted" x="{x(afr) + 28:.1f}" y="{cy + 14:.1f}">{afr:.3f}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -192,12 +185,13 @@ COLUMN_SHARE = 0.32
 
 def credit_chart() -> str:
     width = 1000.0
-    label_right = 250.0
-    plot_left, plot_right = 290.0, 960.0
+    label_right = 268.0
+    plot_left, plot_right = 306.0, 950.0
     low, high = 0.0, 4.2
     top = 112.0
-    row = 116.0
-    height = top + row * len(CREDIT) + 72.0
+    row = 112.0
+    bottom = top + row * len(CREDIT)
+    height = bottom + 100.0
 
     def x(value: float) -> float:
         return plot_left + (value - low) / (high - low) * (plot_right - plot_left)
@@ -205,23 +199,23 @@ def credit_chart() -> str:
     parts = [f'<svg class="chart" viewBox="0 0 {width:.0f} {height:.0f}" role="img" aria-label="SV share of held-out predictive covariance against their share of columns">']
     for tick in (0, 1, 2, 3, 4):
         tx = x(tick)
-        parts.append(f'<line x1="{tx:.1f}" y1="{top - 14}" x2="{tx:.1f}" y2="{top + row * len(CREDIT) - 14}" stroke="var(--rule)" stroke-width="2"/>')
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{top + row * len(CREDIT) + 22}" text-anchor="middle">{tick}%</text>')
+        parts.append(f'<line x1="{tx:.1f}" y1="{top - 20}" x2="{tx:.1f}" y2="{bottom - 10}" stroke="var(--rule)" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 30}" text-anchor="middle">{tick}%</text>')
     share_x = x(COLUMN_SHARE)
-    parts.append(f'<line x1="{share_x:.1f}" y1="{top - 52}" x2="{share_x:.1f}" y2="{top + row * len(CREDIT) - 14}" stroke="var(--ink-2)" stroke-width="3" stroke-dasharray="10 8"/>')
-    parts.append(f'<text class="value" x="{share_x + 14:.1f}" y="{top - 34}">SVs’ share of columns: 0.32%</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{height - 6}" text-anchor="middle">SVs’ share of held-out predictive covariance</text>')
+    parts.append(f'<line x1="{share_x:.1f}" y1="{top - 66}" x2="{share_x:.1f}" y2="{bottom - 10}" stroke="var(--ink-2)" stroke-width="4" stroke-dasharray="12 10"/>')
+    parts.append(f'<text class="value" x="{share_x + 18:.1f}" y="{top - 40}">share of columns: 0.32%</text>')
+    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{height - 8}" text-anchor="middle">share of held-out predictive covariance</text>')
     for index, (method, (lo, hi)) in enumerate(CREDIT):
-        cy = top + row * index + row / 2 - 14
-        parts.append(f'<text class="row-label" x="{label_right}" y="{cy + 11:.1f}" text-anchor="end">{method}</text>')
+        cy = top + row * index + row / 2 - 6
+        parts.append(f'<text class="row-label" x="{label_right}" y="{cy + 14:.1f}" text-anchor="end">{method}</text>')
         parts.append(
-            f'<rect x="{x(lo) - 13:.1f}" y="{cy - 13:.1f}" width="{x(hi) - x(lo) + 26:.1f}" height="26" rx="13" fill="var(--ink)">'
+            f'<rect x="{x(lo) - 16:.1f}" y="{cy - 16:.1f}" width="{x(hi) - x(lo) + 32:.1f}" height="32" rx="16" fill="var(--ink)">'
             f"<title>{method}: {fmt(lo)}% to {fmt(hi)}%</title></rect>"
         )
-        if x(hi) - x(lo) > 160:
-            parts.append(f'<text class="value" x="{(x(lo) + x(hi)) / 2:.1f}" y="{cy - 26:.1f}" text-anchor="middle">{fmt(lo)}–{fmt(hi)}%</text>')
+        if x(hi) - x(lo) > 200:
+            parts.append(f'<text class="value" x="{(x(lo) + x(hi)) / 2:.1f}" y="{cy - 30:.1f}" text-anchor="middle">{fmt(lo)}–{fmt(hi)}%</text>')
         else:
-            parts.append(f'<text class="value" x="{max(x(hi) + 26, share_x + 16):.1f}" y="{cy + 10:.1f}">{fmt(lo)}–{fmt(hi)}%</text>')
+            parts.append(f'<text class="value" x="{max(x(hi) + 30, share_x + 22):.1f}" y="{cy + 14:.1f}">{fmt(lo)}–{fmt(hi)}%</text>')
     parts.append("</svg>")
     return "".join(parts)
 
