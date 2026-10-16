@@ -204,19 +204,32 @@ def credit_figure() -> Path:
 # ------------------------------------------------------------------ the model equation, transparent, for the Methods panel
 
 def equation_figure() -> Path:
-    width, height = 11.6, 2.3
-    eq = (
-        "<div style=\"font-family:'STIX Two Text','TeX Gyre Schola','Times New Roman',serif;font-size:44pt;line-height:1.45;color:#000;"
-        "padding:0.05in 0.1in;white-space:nowrap\">"
-        "<i>y</i> = <i>C</i>α + Σ<sub><i>j</i></sub> <i>D<sub>j</sub></i>β<sub><i>j</i></sub> + ε,&nbsp;&nbsp; "
-        "β<sub><i>j</i></sub> ~ ∫ N(0, <i>u<sub>j</sub>s</i>) <i>g<sub>c</sub></i>(<i>s</i>) d<i>s</i><br>"
-        "log <i>u<sub>j</sub></i> = log(κ<sub><i>j</i></sub><sup>2</sup>Var <i>D<sub>j</sub></i>) + <i>h</i>(log Var <i>G<sub>j</sub></i>) + "
-        "<i>d<sub>j</sub></i><sup>⊤</sup>θ</div>"
+    """The model for a poster audience: each formula line with a plain-language line under it. The variance of
+    variant j's effect is s_j tau_j: tau_j from its class's learned mixing distribution g_c, s_j the scale its
+    imputation quality (a known offset, r^2) and the learned smooths of allele frequency and annotations set."""
+    width, height = 11.6, 7.0
+    rows = [
+        ("<i>y</i> = Σ<sub><i>j</i></sub> <i>x<sub>j</sub></i> β<sub><i>j</i></sub> + covariates + ε",
+         "trait = genotypes × effects of SNVs, indels and SVs, plus covariates and noise"),
+        ("β<sub><i>j</i></sub> ~ N(0, <i>s<sub>j</sub></i> τ<sub><i>j</i></sub>)",
+         "each variant’s effect is normal, with a variance of its own"),
+        ("τ<sub><i>j</i></sub> ~ <i>g</i><sub>class</sub>",
+         "drawn from a smooth distribution learned for each variant class (SNV, deletion, insertion, …)"),
+        ("log <i>s<sub>j</sub></i> = log <i>r</i><sup>2</sup><sub style='margin-left:-0.35em'><i>j</i></sub> + <i>h</i>(freq.) + <i>f</i>(length) + ⋯",
+         "scaled by imputation quality r², and learned smooth functions of allele frequency, SV length and other annotations"),
+    ]
+    body = "".join(
+        f"<div class='row'><div class='math'>{math}</div><div class='plain'>{plain}</div></div>" for math, plain in rows
     )
     html = (
         "<!doctype html><html><head><meta charset='utf-8'>"
         "<link rel='stylesheet' href='https://fonts.googleapis.com/css2?family=STIX+Two+Text:ital,wght@0,400;1,400&display=swap'>"
-        f"<style>html,body{{margin:0;background:transparent;}} sub,sup{{font-size:0.66em;line-height:0;}}</style></head><body>{eq}</body></html>"
+        "<style>html,body{margin:0;background:transparent;}"
+        f".rows{{width:{width * 96:.1f}px;height:{height * 96:.1f}px;box-sizing:border-box;padding:0.08in 0.12in;display:flex;flex-direction:column;justify-content:space-between;}}"
+        ".math{font-family:'STIX Two Text','Times New Roman',serif;font-size:46pt;line-height:1.2;color:#000;white-space:nowrap;}"
+        f".plain{{font-family:Arial,Helvetica,sans-serif;font-size:29pt;line-height:1.25;color:{GREY};margin-top:2px;}}"
+        "sub,sup{font-size:0.66em;line-height:0;}</style></head>"
+        f"<body><div class='rows'>{body}</div></body></html>"
     )
     return render("equation", html, width, height, transparent=True)
 

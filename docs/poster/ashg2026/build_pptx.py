@@ -44,7 +44,6 @@ INTRODUCTION = [
 ]
 
 METHODS = [
-    [("One model for SNVs, indels and SVs, with variant-class-specific priors: effect sizes depend on SV type (e.g., insertion vs. deletion) and length.", "")],
     [("Fully GPU-accelerated training fits genome-wide PGSs at biobank scale and estimates per-variant effect sizes.", "")],
     [("SVs from a callset discovered in 12,212 phased genome assemblies, imputed into ", ""), ("All of Us", "i"), (" short-read genomes.", "")],
     [("SNV-only vs. SNV + SV models on the same people and folds: 15 diseases, 100,000 multi-ancestry participants.", "")],
