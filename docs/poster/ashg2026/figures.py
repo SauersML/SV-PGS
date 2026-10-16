@@ -69,9 +69,9 @@ def render(name: str, html: str, width: float, height: float, transparent: bool 
 
 SKEW = [
     ("Deletion overlapping an exon", "78 SVs, 42 genes", RED, -1.33, (-0.28, 0.25), (-2.52, -0.21)),
-    ("Insertion/duplication overlapping an exon", "93 SVs, 75 genes", NAVY, 0.66, (-0.22, 0.21), (0.25, 1.30)),
-    ("Deletion in the gene body, no exon", "866 SVs", RED, 0.05, (-0.07, 0.08), (-0.15, 0.48)),
-    ("Insertion/duplication in the gene body, no exon", "737 SVs", NAVY, 0.01, (-0.08, 0.08), (-0.47, 0.06)),
+    ("Insertion or duplication overlapping an exon", "93 SVs, 75 genes", NAVY, 0.66, (-0.22, 0.21), (0.25, 1.30)),
+    ("Deletion within an intron", "866 SVs", RED, 0.05, (-0.07, 0.08), (-0.15, 0.48)),
+    ("Insertion or duplication within an intron", "737 SVs", NAVY, 0.01, (-0.08, 0.08), (-0.47, 0.06)),
 ]
 
 
@@ -90,10 +90,10 @@ def skew_figure() -> Path:
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{STYLE}</style>']
     # legend
     parts.append(f'<rect x="{plot_left}" y="40" width="70" height="36" rx="5" fill="{NULL}"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 86}" y="70">permutation null, 95%</text>')
-    parts.append(f'<line x1="{plot_left + 830}" y1="58" x2="{plot_left + 910}" y2="58" stroke="{INK}" stroke-width="7" stroke-linecap="round"/>')
-    parts.append(f'<circle cx="{plot_left + 870}" cy="58" r="15" fill="{INK}" stroke="#fff" stroke-width="5"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 928}" y="70">mean z, gene-bootstrap 95% CI</text>')
+    parts.append(f'<text class="legend" x="{plot_left + 86}" y="70">95% range under permutation</text>')
+    parts.append(f'<line x1="{plot_left + 640}" y1="58" x2="{plot_left + 720}" y2="58" stroke="{INK}" stroke-width="7" stroke-linecap="round"/>')
+    parts.append(f'<circle cx="{plot_left + 680}" cy="58" r="15" fill="{INK}" stroke="#fff" stroke-width="5"/>')
+    parts.append(f'<text class="legend" x="{plot_left + 738}" y="70">mean z, 95% CI (bootstrap over genes)</text>')
     for tick in (-2, -1, 0, 1):
         tx = x(tick)
         stroke, weight = (GREY, 4) if tick == 0 else (RULE, 3)
@@ -103,7 +103,7 @@ def skew_figure() -> Path:
             parts.append(f'<line x1="{tx:.1f}" y1="{cy - 52:.1f}" x2="{tx:.1f}" y2="{cy + 52:.1f}" stroke="{stroke}" stroke-width="{weight}"/>')
         label = "0" if tick == 0 else f"{tick:+d}".replace("-", "−")
         parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 44}" text-anchor="middle">{label}</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 40}" text-anchor="middle">Mean association z of each SV with its own gene’s expression</text>')
+    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 40}" text-anchor="middle">Mean z-score for association with expression of the overlapped gene</text>')
     for index, (label, detail, colour, mean, null, ci) in enumerate(SKEW):
         base = top + row * index
         parts.append(f'<text class="label" x="{plot_left}" y="{base + 18:.1f}">{label} <tspan class="detail" dx="10">{detail}</tspan></text>')
@@ -207,16 +207,16 @@ def equation_figure() -> Path:
     """The model for a poster audience: each formula line with a plain-language line under it. The variance of
     variant j's effect is s_j tau_j: tau_j from its class's learned mixing distribution g_c, s_j the scale its
     imputation quality (a known offset, r^2) and the learned smooths of allele frequency and annotations set."""
-    width, height = 11.6, 7.0
+    width, height = 11.6, 8.0
     rows = [
         ("<i>y</i> = Σ<sub><i>j</i></sub> <i>x<sub>j</sub></i> β<sub><i>j</i></sub> + covariates + ε",
-         "trait = genotypes × effects of SNVs, indels and SVs, plus covariates and noise"),
+         "phenotype = sum of genotype × effect over SNVs, indels and SVs, plus covariates and noise"),
         ("β<sub><i>j</i></sub> ~ N(0, <i>s<sub>j</sub></i> τ<sub><i>j</i></sub>)",
-         "each variant’s effect is normal, with a variance of its own"),
+         "each variant’s effect follows a normal distribution with its own variance"),
         ("τ<sub><i>j</i></sub> ~ <i>g</i><sub>class</sub>",
-         "drawn from a smooth distribution learned for each variant class (SNV, deletion, insertion, …)"),
+         "the variance follows a distribution estimated separately for each variant class (SNV, deletion, insertion, …)"),
         ("log <i>s<sub>j</sub></i> = log <i>r</i><sup>2</sup><sub style='margin-left:-0.35em'><i>j</i></sub> + <i>h</i>(freq.) + <i>f</i>(length) + ⋯",
-         "scaled by imputation quality r², and learned smooth functions of allele frequency, SV length and other annotations"),
+         "the variance also depends on imputation quality (r²) and on smooth functions of allele frequency, SV length and other annotations"),
     ]
     body = "".join(
         f"<div class='row'><div class='math'>{math}</div><div class='plain'>{plain}</div></div>" for math, plain in rows
@@ -238,12 +238,12 @@ def equation_figure() -> Path:
 
 PLACEHOLDERS = {
     # name: (width in, height in, title, what the figure will show)
-    "ph_hypertension_effects": (10.94, 8.40, "Hypertension: SV effect sizes",
-                                "Posterior effect of each SV on hypertension risk, risk-increasing against risk-decreasing, by SV type"),
-    "ph_effect_by_length": (6.96, 8.40, "Effect size by SV length",
-                            "Absolute posterior effect against SV length, deletions and insertions apart"),
-    "ph_fifteen_diseases": (18.20, 9.40, "15 diseases: SNV-only against SNV + SV",
-                            "Held-out AUC and log loss of the two models per disease, paired on the same people and folds"),
+    "ph_hypertension_effects": (10.94, 8.40, "SV effects on hypertension risk",
+                                "Distribution of estimated SV effects on hypertension risk, by SV type"),
+    "ph_effect_by_length": (6.96, 8.40, "SV effect size by length",
+                            "Absolute estimated effect vs. SV length, for deletions and insertions"),
+    "ph_fifteen_diseases": (18.20, 8.60, "Held-out accuracy across 15 diseases",
+                            "AUC and log loss of the SNV-only and SNV + SV models for each disease"),
 }
 
 
@@ -258,7 +258,7 @@ def placeholder_figure(name: str) -> Path:
         f".title{{font-size:40pt;font-weight:700;line-height:1.15;color:{NAVY};}}"
         f".detail{{font-size:27pt;line-height:1.3;color:{GREY};max-width:90%;}}"
         "</style></head><body><div class='box'>"
-        f"<div class='tag'>All of Us result · placeholder</div><div class='title'>{title}</div><div class='detail'>{detail}</div>"
+        f"<div class='tag'>Placeholder: All of Us result</div><div class='title'>{title}</div><div class='detail'>{detail}</div>"
         "</div></body></html>"
     )
     return render(name, html, width, height)

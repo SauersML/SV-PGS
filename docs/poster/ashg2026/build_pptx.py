@@ -36,37 +36,35 @@ PLACEHOLDER = "C0392B"
 TITLE = ["Enabling Polygenic Prediction from Structural", "Variants in the NIH All of Us Multi-Ancestry Biobank"]
 
 INTRODUCTION = [
-    [("Polygenic scores (PGSs) aggregate variant effects to predict genetic risk for common diseases.", "")],
-    [("PGSs transfer poorly across populations: effect sizes come mostly from European-ancestry participants.", "")],
-    [("PGS methods are built for SNVs and overlook structural variants (SVs, ≥ 50 bp), which influence disease risk.", "")],
-    [("We hypothesize that SVs collectively improve polygenic prediction, and quantify their contribution in the multi-ancestry NIH ", ""),
-     ("All of Us", "i"), (" cohort.", "")],
+    [("Polygenic scores (PGSs) sum the effects of many genetic variants to predict disease risk.", "")],
+    [("PGSs predict less accurately in non-European populations because most effect sizes are estimated in European-ancestry samples.", "")],
+    [("Structural variants (SVs, ≥ 50 bp) affect disease risk, but most PGS methods include only SNVs.", "")],
+    [("We test whether adding SVs improves polygenic prediction in the multi-ancestry NIH All of Us cohort.", "")],
 ]
 
 METHODS = [
-    [("Fully GPU-accelerated training fits genome-wide PGSs at biobank scale and estimates per-variant effect sizes.", "")],
-    [("SVs from a callset discovered in 12,212 phased genome assemblies, imputed into ", ""), ("All of Us", "i"), (" short-read genomes.", "")],
-    [("SNV-only vs. SNV + SV models on the same people and folds: 15 diseases, 100,000 multi-ancestry participants.", "")],
+    [("We fit the model genome-wide on GPUs and estimate an effect size for every variant.", "")],
+    [("SV genotypes were imputed into All of Us short-read genomes from a callset of 12,212 phased genome assemblies.", "")],
+    [("We compare SNV-only and SNV + SV models for 15 diseases in 100,000 participants, with the same cross-validation folds.", "")],
 ]
 
 RESULTS_TOP = [
     ("head", "Hypertension in All of Us"),
-    [("Over 200,000 SVs from 97,000 short-read genomes.", "")],
-    [("Risk-increasing and risk-decreasing SVs were balanced (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"), (").", "")],
-    [("Longer SVs had larger effect sizes (", ""), ("[statistic]", "ph"), (").", "")],
+    [("We fit the model to hypertension using over 200,000 SVs called in 97,000 short-read genomes.", "")],
+    [("About as many SVs increased risk as decreased it (", ""), ("[x%]", "ph"), (" vs. ", ""), ("[y%]", "ph"), (").", "")],
+    [("Longer SVs had larger effects (", ""), ("[statistic]", "ph"), (").", "")],
 ]
 
 RESULTS_BOTTOM = [
-    ("head", "15 diseases: SNV-only vs. SNV + SV"),
-    [("Adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"), (" (95% CI ", ""), ("[ ]", "ph"), (") averaged over diseases, and log loss by ", ""),
-     ("[Δ]", "ph"), (".", "")],
+    ("head", "Prediction across 15 diseases"),
+    [("Averaged across diseases, adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"), (" (95% CI ", ""), ("[ ]", "ph"),
+     (") and log loss by ", ""), ("[Δ]", "ph"), (".", "")],
 ]
 
 DISCUSSION = [
-    [("SVs enter one Bayesian PGS with SNVs, under priors that learn how SV type and length shape effect sizes.", "")],
-    [("SV effects depend on type: in public data (MAGE, 1kGP), exonic deletions lowered and exonic insertions/duplications raised gene expression (p = 0.0005).", "")],
-    [("Comparing SNV-only and SNV + SV models across 15 diseases quantifies the added value of structural variation (", ""), ("[result]", "ph"), (").", "")],
-    [("SV-PGS: an open-source tool for SV-inclusive PGS training and inference.", "")],
+    [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction for ", ""), ("[n]", "ph"), (" of 15 diseases.", "")],
+    [("Exonic deletions and insertions change expression in opposite directions, so the prior should differ by SV type.", "")],
+    [("SV-PGS is an open-source tool for training and applying PGSs that include SVs.", "")],
 ]
 
 REFERENCES = [
@@ -77,9 +75,9 @@ REFERENCES = [
 
 CAPTIONS = {
     112: "SV effects on hypertension risk",
-    113: "Effect size by SV length",
-    114: "Public data: SV effects depend on type",
-    117: "15 diseases: SNV-only vs. SNV + SV",
+    113: "SV effect size by length",
+    114: "Exonic deletions lowered expression of the affected gene; exonic insertions and duplications raised it (MAGE RNA-seq, 1000 Genomes SVs; permutation p < 0.001).",
+    117: "Held-out accuracy across 15 diseases",
 }
 
 # ------------------------------------------------------------------ DrawingML in the template's own formats
@@ -267,39 +265,42 @@ def build() -> None:
 
     # column 1: introduction; methods with the model equation first
     xml = replace_text(xml, 98, body(INTRODUCTION))
-    xml = move(xml, 91, 1.01, 18.0, 12.1, 0.99)
+    xml = move(xml, 91, 1.01, 17.5, 12.1, 0.99)
     eq_w, eq_h = png_size(FIGURES / "equation.png")
     eq_width = 11.6
     eq_height = eq_width * eq_h / eq_w
     xml = picture(xml, 110, ids["equation"])
-    xml = move(xml, 110, 1.07, 19.25, eq_width, eq_height)
+    xml = move(xml, 110, 1.07, 18.7, eq_width, eq_height)
     xml = replace_text(xml, 92, body(METHODS))
-    xml = move(xml, 92, 1.07, 19.25 + eq_height + 0.15, 12.32, 35.6 - (19.25 + eq_height + 0.15))
+    xml = move(xml, 92, 1.07, 18.7 + eq_height + 0.15, 12.32, 35.6 - (18.7 + eq_height + 0.15))
 
     # column 2: hypertension (two placeholder figures), then the 15-disease comparison (one placeholder figure)
     xml = replace_text(xml, 94, body(RESULTS_TOP))
     xml = move(xml, 94, 13.35, 7.01, 18.71, 4.6)
     xml = picture(xml, 101, ids["effects"])
-    xml = move(xml, 101, 13.61, 11.75, 10.94, 8.40)
+    xml = move(xml, 101, 13.61, 12.2, 10.94, 8.40)
     xml = picture(xml, 106, ids["length"])
-    xml = move(xml, 106, 24.75, 11.75, 6.96, 8.40)
-    xml = move(xml, 112, 13.61, 20.15, 10.94, 0.92)
-    xml = move(xml, 113, 24.75, 20.15, 6.96, 0.92)
+    xml = move(xml, 106, 24.75, 12.2, 6.96, 8.40)
+    xml = move(xml, 112, 13.61, 20.6, 10.94, 0.92)
+    xml = move(xml, 113, 24.75, 20.6, 6.96, 0.92)
     xml = duplicate(xml, 94, 115, "Results continued")
     xml = replace_text(xml, 115, body(RESULTS_BOTTOM))
-    xml = move(xml, 115, 13.35, 21.3, 18.71, 3.0)
+    xml = move(xml, 115, 13.35, 21.7, 18.71, 3.0)
     xml = duplicate(xml, 106, 116, "15 diseases placeholder")
     xml = picture(xml, 116, ids["diseases"])
-    xml = move(xml, 116, 13.61, 24.0, 18.20, 9.40)
+    xml = move(xml, 116, 13.61, 25.0, 18.20, 8.60)
     xml = duplicate(xml, 113, 117, "15 diseases caption")
-    xml = move(xml, 117, 13.61, 33.4, 18.20, 0.92)
+    xml = move(xml, 117, 13.61, 33.6, 18.20, 0.92)
 
     # column 3: the public-data figure, discussion, references
     xml = picture(xml, 107, ids["skew"])
     xml = move(xml, 107, 32.24, 6.11, 15.64, 11.76)
     for shape_id, text in CAPTIONS.items():
         xml = replace_text(xml, shape_id, caption(text))
+    xml = move(xml, 114, 32.25, 17.87, 15.64, 2.1)
+    xml = move(xml, 95, 32.25, 20.3, 15.73, 0.89)
     xml = replace_text(xml, 109, body(DISCUSSION))
+    xml = move(xml, 109, 32.25, 21.35, 15.64, 10.3)
     xml = replace_text(xml, 99, "".join(line([(reference, "")], 2000, "000000", after=500, spacing=85000) for reference in REFERENCES))
 
     # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike
