@@ -227,7 +227,7 @@ def equation_figure() -> Path:
         "<style>html,body{margin:0;background:transparent;}"
         f".rows{{width:{width * 96:.1f}px;height:{height * 96:.1f}px;box-sizing:border-box;padding:0.08in 0.12in;display:flex;flex-direction:column;justify-content:space-between;}}"
         ".math{font-family:'STIX Two Text','Times New Roman',serif;font-size:46pt;line-height:1.2;color:#000;white-space:nowrap;}"
-        f".plain{{font-family:Arial,Helvetica,sans-serif;font-size:29pt;line-height:1.25;color:{GREY};margin-top:2px;}}"
+        f".plain{{font-family:Arial,Helvetica,sans-serif;font-size:29pt;line-height:1.25;color:#000;margin-top:2px;}}"
         "sub,sup{font-size:0.66em;line-height:0;}</style></head>"
         f"<body><div class='rows'>{body}</div></body></html>"
     )

@@ -29,7 +29,7 @@ TEMPLATE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads"
 OUTPUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Downloads" / "ASHG SV-PGS poster.pptx"
 SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59e_65ab35e1-5c99-4c20-a531-f6c547fa9553/pptx"
 EMU = 914400
-PLACEHOLDER = "C0392B"
+PLACEHOLDER = "000000"
 
 # ------------------------------------------------------------------ the copy, from the abstract
 
@@ -68,15 +68,15 @@ DISCUSSION = [
 ]
 
 REFERENCES = [
-    "All of Us Research Program Investigators (2019) The “All of Us” Research Program. New England Journal of Medicine, 381, 668–676.",
-    "Byrska-Bishop, M. et al. (2022) High-coverage whole-genome sequencing of the expanded 1000 Genomes Project cohort including 602 trios. Cell, 185(18), 3426–3440.",
-    "Taylor, D. J. et al. (2024) Sources of gene expression variation in a globally diverse human cohort. Nature, 631, 610–616.",
+    "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
+    "Byrska-Bishop et al. (2022) Cell 185:3426.",
+    "Taylor et al. (2024) Nature 631:610.",
 ]
 
 CAPTIONS = {
-    112: "SV effects on hypertension risk",
-    113: "SV effect size by length",
-    114: "Exonic deletions lowered expression of the affected gene; exonic insertions and duplications raised it (MAGE RNA-seq, 1000 Genomes SVs; permutation p < 0.001).",
+    112: "SV effects on hypertension",
+    113: "Effect vs. length",
+    114: "Exonic deletions lowered expression of the affected gene; exonic insertions and duplications raised it (MAGE, 1000 Genomes; p < 0.001).",
     117: "Held-out accuracy across 15 diseases",
 }
 
@@ -109,7 +109,7 @@ def bullet(runs: list[tuple[str, str]], size: int = 4900, after: int = 600) -> s
     )
 
 
-def heading(text: str, size: int = 5400) -> str:
+def heading(text: str, size: int = 4900) -> str:
     return (
         '<a:p><a:pPr marL="0" marR="0" lvl="0" indent="0" algn="l" rtl="0"><a:lnSpc><a:spcPct val="90000"/></a:lnSpc>'
         '<a:spcBef><a:spcPts val="600"/></a:spcBef><a:spcAft><a:spcPts val="600"/></a:spcAft><a:buNone/></a:pPr>'
@@ -128,10 +128,10 @@ def line(runs: list[tuple[str, str]], size: int, colour: str, after: int = 0, sp
 
 
 def caption(text: str) -> str:
-    # the template's caption: 38 pt italic, dark text
+    # the template's caption style (italic, dark text), at the poster's one text size
     return (
         '<a:p><a:pPr marL="0" lvl="0" indent="0" algn="l" rtl="0"><a:spcBef><a:spcPts val="0"/></a:spcBef><a:spcAft><a:spcPts val="0"/></a:spcAft><a:buNone/></a:pPr>'
-        f'<a:r><a:rPr lang="en-US" sz="3800" i="1"><a:solidFill><a:schemeClr val="dk1"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text, quote=False)}</a:t></a:r></a:p>'
+        f'<a:r><a:rPr lang="en-US" sz="4900" i="1"><a:solidFill><a:srgbClr val="000000"/></a:solidFill>{FONT}</a:rPr><a:t>{escape(text, quote=False)}</a:t></a:r></a:p>'
     )
 
 
@@ -281,28 +281,34 @@ def build() -> None:
     xml = move(xml, 101, 13.61, 12.2, 10.94, 8.40)
     xml = picture(xml, 106, ids["length"])
     xml = move(xml, 106, 24.75, 12.2, 6.96, 8.40)
-    xml = move(xml, 112, 13.61, 20.6, 10.94, 0.92)
-    xml = move(xml, 113, 24.75, 20.6, 6.96, 0.92)
+    xml = move(xml, 112, 13.61, 20.6, 10.94, 1.0)
+    xml = move(xml, 113, 24.75, 20.6, 6.96, 1.0)
     xml = duplicate(xml, 94, 115, "Results continued")
     xml = replace_text(xml, 115, body(RESULTS_BOTTOM))
-    xml = move(xml, 115, 13.35, 21.7, 18.71, 3.0)
+    xml = move(xml, 115, 13.35, 21.85, 18.71, 3.0)
     xml = duplicate(xml, 106, 116, "15 diseases placeholder")
     xml = picture(xml, 116, ids["diseases"])
     xml = move(xml, 116, 13.61, 25.0, 18.20, 8.60)
     xml = duplicate(xml, 113, 117, "15 diseases caption")
-    xml = move(xml, 117, 13.61, 33.6, 18.20, 0.92)
+    xml = move(xml, 117, 13.61, 33.6, 18.20, 1.0)
 
     # column 3: the public-data figure, discussion, references
     xml = picture(xml, 107, ids["skew"])
     xml = move(xml, 107, 32.24, 6.11, 15.64, 11.76)
     for shape_id, text in CAPTIONS.items():
         xml = replace_text(xml, shape_id, caption(text))
-    xml = move(xml, 114, 32.25, 17.87, 15.64, 2.1)
-    xml = move(xml, 95, 32.25, 20.3, 15.73, 0.89)
+    xml = move(xml, 114, 32.25, 17.87, 15.64, 2.6)
+    xml = move(xml, 95, 32.25, 20.85, 15.73, 0.89)
     xml = replace_text(xml, 109, body(DISCUSSION))
-    xml = move(xml, 109, 32.25, 21.35, 15.64, 10.3)
-    xml = replace_text(xml, 99, "".join(line([(reference, "")], 2000, "000000", after=500, spacing=85000) for reference in REFERENCES))
+    xml = move(xml, 109, 32.25, 21.9, 15.64, 7.0)
+    xml = move(xml, 96, 32.16, 29.5, 15.73, 0.86)
+    xml = replace_text(xml, 99, "".join(line([(reference, "")], 4900, "000000", after=300, spacing=90000) for reference in REFERENCES))
+    xml = move(xml, 99, 32.17, 30.45, 15.73, 5.0)
 
+    # the section bars all at the template's 60 pt (its References bar was set smaller)
+    for bar in (91, 93, 95, 96, 97):
+        start, end = shape_span(xml, bar)
+        xml = xml[:start] + re.sub(r'sz="\d+"', 'sz="6000"', xml[start:end]) + xml[end:]
     # one sans-serif face throughout, which PowerPoint and LibreOffice (as metric-identical Liberation Sans) set alike
     xml = xml.replace('typeface="Century Schoolbook"', 'typeface="Arial"').replace('typeface="Merriweather"', 'typeface="Arial"')
     # the comment anchor in the slide's extensions, and every relationship the new slide no longer references (the old
