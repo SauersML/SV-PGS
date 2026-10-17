@@ -51,8 +51,11 @@ CAUSAL_VARIANTS = 200
 LENGTH_SLOPE = 0.5
 DELETION_FOLD = 3.0
 TRAIN_COUNTS = (5_000, 10_000, 20_000, 40_000)
-MEASUREMENT_ARM = "glimpse2"
-"""bench-sim's measurement mirroring the All of Us imputation (PREREG.md Amendment 1)."""
+MEASUREMENT_ARM = "beagle"
+"""bench-sim's Beagle arm: the one imputed arm covering all 50,000 samples (the GLIMPSE2 arm covers only the 2,500-sample
+calibration subset, SUBMIT.md). Simple sites are read-model calls and TR and SV records are imputed from the separate panel."""
+LDPRED2 = Path(__file__).resolve().parents[1] / "bench_sim" / "submissions" / "ldpred2_auto.py"
+"""The published-practice competitor, LDpred2-auto on HapMap3-density SNVs, fitted on the same training samples."""
 SMALL_ARM_DROPPED = ("SV",)
 POINTS = {
     "null": {"sv_causal_fraction": 0.0, "sv_effect_fold": 1.0},
@@ -117,17 +120,22 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
     }
 
 
-def structural_effect_readout(model, cohort: Path) -> dict:
+def structural_effect_readout(model, cohort: Path, target: Path) -> dict:
     """The SV arm's fitted SV effects against what the positive controls set: Spearman's rho of |effect| per allele with
-    log length, and the median |effect| of deletions over insertions. Descriptive, like the workspace's: records in LD."""
+    log length, and the median |effect| of deletions over insertions. Descriptive, like the workspace's: records in LD.
+    Every SV record's signed per-allele effect is written to ``target`` with its cohort record index, for the comparison
+    with the simulated effects."""
     table = harness.public_variant_table(cohort, MEASUREMENT_ARM)
     scoring = model.scoring
     rows = model.order[np.asarray(scoring.store_rows)]
-    magnitude = np.abs(np.asarray(scoring.coefficients) / np.asarray(scoring.signed_scales)) * SIGNED_CODE_OFFSET
+    effect = np.asarray(scoring.coefficients) / np.asarray(scoring.signed_scales) * SIGNED_CODE_OFFSET
+    magnitude = np.abs(effect)
     structural = np.asarray(table["cls"])[rows] == truth.SV
     log_length = np.asarray(table["log_sv_length"])[rows]
     change = np.asarray(table["len_change"])[rows]
     deletions, insertions = magnitude[structural & (change < 0)], magnitude[structural & (change > 0)]
+    records = np.flatnonzero(measured_records(cohort))
+    np.savez(target, record=records[rows[structural]], per_allele=effect[structural])
     return {
         "structural_records": int(structural.sum()),
         "length_rho": float(stats.spearmanr(log_length[structural], magnitude[structural]).statistic) if structural.sum() > 2 else math.nan,
@@ -150,19 +158,25 @@ def _run_task(method: Path, cohort: Path, out: Path, point: str, train_count: in
             raise ValueError("Existing scenario has different parameters; use a new output directory")
     task = out / "tasks" / point / f"n{train_count}" / f"replicate{replicate}"
     models = {}
-    for arm, dropped in (("snv_indel", SMALL_ARM_DROPPED), ("with_sv", ())):
-        models[arm] = harness.run(method, cohort, scenario, task / arm, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
+    for arm, arm_method, dropped in (("snv_indel", method, SMALL_ARM_DROPPED), ("with_sv", method, ()), ("ldpred2_auto", LDPRED2, ())):
+        models[arm] = harness.run(arm_method, cohort, scenario, task / arm, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
     samples = np.load(cohort / "samples.npz")
     labels = np.load(scenario / "truth.npz")["phenotype"][np.flatnonzero(samples["is_test"])]
     small_score = np.load(task / "snv_indel" / "prediction.npz")["total"]
     sv_score = np.load(task / "with_sv" / "prediction.npz")["total"]
+    ldpred2_score = np.load(task / "ldpred2_auto" / "prediction.npz")["total"]
     comparison = paired_delta_auc(labels, small_score, sv_score)
+    against_ldpred2 = paired_delta_auc(labels, ldpred2_score, sv_score)
     result = {
         "point": point, "train_count": train_count, "replicate": replicate,
         "snv_indel_auc": harness.auc(labels, small_score), "with_sv_auc": harness.auc(labels, sv_score),
-        "delta_auc": comparison.estimate, "z": comparison.z_score, "prediction": "genetic_only",
+        "ldpred2_auc": harness.auc(labels, ldpred2_score),
+        "delta_auc": comparison.estimate, "z": comparison.z_score,
+        "delta_auc_vs_ldpred2": against_ldpred2.estimate, "z_vs_ldpred2": against_ldpred2.z_score,
+        "prediction": "genetic_only",
+        "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in models},
         "truth": json.loads((scenario / "scenario.json").read_text())["summary"],
-        **structural_effect_readout(models["with_sv"], cohort),
+        **structural_effect_readout(models["with_sv"], cohort, task / "with_sv" / "sv_effects.npz"),
     }
     (task / "result.json").write_text(json.dumps(result, indent=1))
     return result
