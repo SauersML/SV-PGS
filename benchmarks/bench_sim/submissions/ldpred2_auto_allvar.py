@@ -26,7 +26,7 @@ import tempfile
 
 import numpy as np
 
-from benchmarks.bench_sim.submissions.ldpred2_auto import WINDOW_CM
+from benchmarks.bench_sim.submissions.ldpred2_auto import WINDOW_CM, covariate_basis
 from benchmarks.bench_sim.submissions.sbayesrc import Model, Stages, common_rows, gemm_nt
 
 __all__ = ["Model", "fit"]
@@ -43,8 +43,7 @@ class Adjuster:
 
     def __init__(self, train) -> None:
         count = train.n_samples
-        design = np.column_stack([np.ones(count), np.asarray(train.covariates, dtype=np.float64)])
-        basis, _ = np.linalg.qr(design)
+        basis = covariate_basis(train)
         self.basis32 = basis.astype(np.float32)
         phenotype = np.asarray(train.phenotype, dtype=np.float64)
         self.residual = phenotype - basis @ (basis.T @ phenotype)

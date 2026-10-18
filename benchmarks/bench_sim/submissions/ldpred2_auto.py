@@ -12,7 +12,7 @@ at the compete library).
 
 The GWAS is big_univLinReg's with the covariates: by Frisch-Waugh-Lovell, each variant's marginal effect adjusted for
 C = [1, covariates] is b_j = <P x_j, P y> / |P x_j|^2 with P = I - Q Q' (Q an orthonormal basis of C), and its standard
-error has n - k - 1 degrees of freedom (k = C's columns). The LD these summary statistics imply is the correlation of
+error has n - k - 1 degrees of freedom (k = rank C). The LD these summary statistics imply is the correlation of
 the same projected dosages: E[b_j] |P x_j| = sum_l corr(P x_j, P x_l) beta_l |P x_l|, so the in-sample LD matrix is
 built from P X, not from the raw dosages. The distinction is not cosmetic in this cohort: its training people are five
 ancestry groups, and raw in-sample correlations carry the ancestry structure the ten PCs remove from the phenotype
@@ -64,6 +64,8 @@ def hapmap3_density_rows(train) -> np.ndarray:
     for start in range(0, snv.shape[0], CHUNK):
         frequency[start : start + CHUNK] = _dosages(train, snv[start : start + CHUNK]).mean(axis=1) / 2.0
     common = snv[np.minimum(frequency, 1.0 - frequency) >= MINOR_ALLELE_FLOOR]
+    if not common.size:
+        raise ValueError("LDpred2 needs at least one SNV with training minor allele frequency >= 1%")
     cm = np.asarray(variants["cm"], dtype=np.float64)[common]
     order = np.argsort(cm, kind="stable")
     common, cm = common[order], cm[order]
@@ -73,11 +75,21 @@ def hapmap3_density_rows(train) -> np.ndarray:
     return np.sort(common[chosen])
 
 
+def covariate_basis(train) -> np.ndarray:
+    """The numerical column space of [1, covariates], allowing constant or redundant covariates."""
+    count = train.n_samples
+    design = np.column_stack([np.ones(count), np.asarray(train.covariates, dtype=np.float64)])
+    left, singular, _right = np.linalg.svd(design, full_matrices=False)
+    basis = left[:, singular > max(design.shape) * np.finfo(np.float64).eps * singular[0]]
+    if count - basis.shape[1] - 1 <= 0:
+        raise ValueError("LDpred2 needs residual degrees of freedom after adjusting for covariates and a variant")
+    return basis
+
+
 def covariate_adjusted(train, rows: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
     """P X (float32, [rows, n]) and P y with P the projection off [1, covariates], the dosage means, and k = rank C."""
     count = train.n_samples
-    design = np.column_stack([np.ones(count), np.asarray(train.covariates, dtype=np.float64)])
-    basis, _ = np.linalg.qr(design)
+    basis = covariate_basis(train)
     phenotype = np.asarray(train.phenotype, dtype=np.float64)
     residual = phenotype - basis @ (basis.T @ phenotype)
     projected = np.empty((rows.shape[0], count), dtype=np.float32)
