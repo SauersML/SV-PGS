@@ -89,6 +89,13 @@ POINTS = {
     "polygenic_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "causal_variants": 2000},
     "rare_disease": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"prevalence": 0.01}},
     "low_heritability": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"h2": 0.01}},
+    # Where SVs should help: causal SVs drawn only from those that small-variant haplotypes tag (Beagle realized
+    # r^2 >= 0.8), so imputed SVs are accurate, or only from common SVs. The SV class's prior still differs from the
+    # small variants' (SVs are causal far more often per record), so a model that fits the SV directly can gain even
+    # where SNVs tag it. Appended last: the seeds of the points above depend on their positions.
+    "tagged_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"sv_min_realized_r2": 0.8}},
+    "tagged_sv_fold3": {"sv_causal_fraction": 0.2, "sv_effect_fold": 3.0, "truth": {"sv_min_realized_r2": 0.8}},
+    "common_sv_fold3": {"sv_causal_fraction": 0.2, "sv_effect_fold": 3.0, "truth": {"sv_min_frequency": 0.05}},
 }
 
 
@@ -105,6 +112,10 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
     small_count = int(classes.size - structural_count)
     if min(structural_count, small_count) == 0 or replicate < 0:
         raise ValueError("The grid needs both variant classes and a nonnegative replicate index")
+    # the eligible SVs only, where the point restricts which SVs can be causal
+    variants = np.load(cohort / "variants.npz")
+    eligible_params = {key: setting.get("truth", {}).get(key, 0.0) for key in ("sv_min_frequency", "sv_min_realized_r2")}
+    structural_count -= int(truth.structural_ineligible(eligible_params, cohort, variants).sum())
     fraction = setting["sv_causal_fraction"]
     causal_count = setting.get("causal_variants", CAUSAL_VARIANTS)
     small_probability = causal_count * (1.0 - fraction) / small_count

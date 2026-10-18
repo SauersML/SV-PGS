@@ -118,6 +118,21 @@ def draw_parameters(seed: int) -> dict:
     return params
 
 
+def structural_ineligible(params: dict, root: Path, variants) -> np.ndarray:
+    """SV records the eligible-SV architectures exclude from being causal: donor minor allele frequency below
+    ``sv_min_frequency``, or Beagle realized r^2 below ``sv_min_realized_r2``. All False at the defaults (0)."""
+    cls = variants["cls"]
+    excluded = np.zeros(cls.size, dtype=bool)
+    minimum_frequency = params.get("sv_min_frequency", 0.0)
+    if minimum_frequency:
+        frequency = variants["donor_ac"] / float(variants["donor_an"])
+        excluded |= np.minimum(frequency, 1.0 - frequency) < minimum_frequency
+    minimum_r2 = params.get("sv_min_realized_r2", 0.0)
+    if minimum_r2:
+        excluded |= ~(np.load(root / "imputation_beagle.npz")["realized_r2"] >= minimum_r2)
+    return excluded & (cls == SV)
+
+
 def genetic_value(params: dict, root: Path) -> tuple[np.ndarray, dict]:
     variants = np.load(root / "variants.npz")
     annotations = np.load(root / "annotations.npz")
@@ -160,6 +175,11 @@ def genetic_value(params: dict, root: Path) -> tuple[np.ndarray, dict]:
             logit_pi += annotation_rng.normal(0.0, 0.7) * values
         for values in continuous_annotations.values():
             logit_pi += random_spline(annotation_rng, values, 0.4)
+    # The power study's eligible-SV architectures: only SVs at least this common in the donors, or imputed by Beagle
+    # at least this well (realized r^2: SVs that small-variant haplotypes tag), can be causal. Defaults change nothing.
+    ineligible = structural_ineligible(params, root, variants)
+    if ineligible.any():
+        logit_pi[ineligible] = -np.inf
     causal = np.flatnonzero(rng.random(n_var) < 1.0 / (1.0 + np.exp(-logit_pi)))
 
     # Frequency and LD dependence of the per-SD variance.

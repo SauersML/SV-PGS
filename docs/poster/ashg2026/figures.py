@@ -133,7 +133,10 @@ def nice_range(low: float, high: float, steps=(0.005, 0.01, 0.02, 0.025, 0.05, 0
 def tick_text(value: float, step: float, percent: bool = False) -> str:
     if percent:
         return f"{value * 100:.0f}%"
+    # as many decimals as the step needs: 0.025 steps print 0.025, not a rounded 0.03
     decimals = max(0, -math.floor(math.log10(step) + 1e-9))
+    while abs(round(step, decimals) - step) > 1e-12:
+        decimals += 1
     return f"{value:.{decimals}f}".replace("-", "−")
 
 
@@ -329,7 +332,7 @@ def power_figure(summary: dict) -> Path:
         parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
     parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Power</text>')
     parts.append(f'<text class="axis" x="{(left + plot_right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
-    ends, labels = [], []
+    ends, labels, drew_true = [], [], False
     present = [entry for entry in POWER_SERIES if entry[0] in summary["points"]]
     for offset_index, (point, label, colour) in enumerate(present):
         offset = (offset_index - (len(present) - 1) / 2) * 9.0
@@ -343,32 +346,38 @@ def power_figure(summary: dict) -> Path:
         for px, row in points:
             parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
             parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
+        true = summary.get("genotype_accuracy", {}).get("delta_auc", {}).get(point, {}).get("true_power")
+        if true and true["replicates"] >= MIN_REPLICATES:
+            tx, ty = x(counts[-1]) + offset, y(true["rate"])
+            parts.append(f'<line x1="{tx:.1f}" y1="{y(true["lower"]):.1f}" x2="{tx:.1f}" y2="{y(true["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
+            parts.append(f'<rect x="{tx - 11:.1f}" y="{ty - 11:.1f}" width="22" height="22" transform="rotate(45 {tx:.1f} {ty:.1f})" fill="{colour}" stroke="#fff" stroke-width="3"/>')
+            drew_true = True
         ends.append((points[-1][0], y(points[-1][1]["rate"]), colour))
         labels.append(label)
     placed = spread_labels([end[1] for end in ends], 34.0, top + 8, bottom - 4)
     for (end_x, end_y, colour), label, label_y in zip(ends, labels, placed):
         parts.append(f'<polyline points="{end_x + 14:.1f},{end_y:.1f} {plot_right + 10:.1f},{label_y:.1f} {plot_right + 24:.1f},{label_y:.1f}" fill="none" stroke="{colour}" stroke-width="2.5"/>')
         parts.append(f'<text class="end" x="{plot_right + 32:.1f}" y="{label_y + 9:.1f}" style="fill:{colour}">{label}</text>')
+    if drew_true:
+        # the key for the diamonds, top left inside the axes: the lines are imputed genotypes
+        parts.append(f'<rect x="{left + 30:.1f}" y="{top + 4:.1f}" width="18" height="18" transform="rotate(45 {left + 39:.1f} {top + 13:.1f})" fill="{GREY}"/>')
+        parts.append(f'<text class="key" x="{left + 60:.1f}" y="{top + 22:.1f}">True SV genotypes</text>')
     parts.append("</svg>")
     return render("ph_sim_power", page("".join(parts), width, height), width, height)
 
 
 GENOTYPE_CLASSES = (("SNV", "SNVs", NAVY), ("SV", "SVs", TEAL))
-GENOTYPE_POINTS = ("null", "sv_20pct", "sv_20pct_fold3")
 
 
 def genotypes_figure(summary: dict) -> Path:
-    """Left: mean dosage r^2 of imputed SVs and SNVs against their true genotypes by minor allele frequency, with the
-    middle half of variants shaded. Right: the AUC gain from adding SVs at the largest training size, per main scenario,
-    on imputed genotypes (open) and on true genotypes (filled), with 95% t intervals over replicates."""
+    """Mean dosage r^2 of imputed SVs and SNVs against their true genotypes by minor allele frequency, with the middle
+    half of variants shaded."""
     width, height = 8.20, 4.40
     w, h = width * 100, height * 100
-    accuracy = summary["genotype_accuracy"]
-    by_frequency = accuracy["r2_by_frequency"]
+    by_frequency = summary["genotype_accuracy"]["r2_by_frequency"]
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    top, bottom = 28.0, h - 128.0
-    # left: r^2 against minor allele frequency on a log axis
-    a0, a1 = 128.0, 372.0
+    top, bottom = 28.0, h - 112.0
+    a0, a1 = 128.0, w - 30.0
     edges = by_frequency["edges"]
     frequency_low, frequency_high = math.log10(edges[0]), math.log10(edges[-1])
 
@@ -380,12 +389,13 @@ def genotypes_figure(summary: dict) -> Path:
 
     parts.append(f'<line x1="{a0}" y1="{bottom}" x2="{a1}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
     parts.append(f'<line x1="{a0}" y1="{top}" x2="{a0}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    for r2, label in ((0.0, "0"), (0.5, "0.5"), (1.0, "1")):
+    for r2 in (0.0, 0.25, 0.5, 0.75, 1.0):
         parts.append(f'<line x1="{a0 - 10}" y1="{fy(r2):.1f}" x2="{a0}" y2="{fy(r2):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{a0 - 16}" y="{fy(r2) + 9:.1f}" text-anchor="end">{label}</text>')
-    for frequency, label in ((0.001, "0.1%"), (0.01, "1%"), (0.1, "10%")):
-        parts.append(f'<line x1="{fx(frequency):.1f}" y1="{bottom}" x2="{fx(frequency):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{fx(frequency):.1f}" y="{bottom + 42}" text-anchor="middle">{label}</text>')
+        parts.append(f'<text class="tick" x="{a0 - 16}" y="{fy(r2) + 9:.1f}" text-anchor="end">{r2:g}</text>')
+    for frequency, label in ((0.001, "0.1%"), (0.01, "1%"), (0.1, "10%"), (0.5, "50%")):
+        if edges[0] <= frequency <= edges[-1]:
+            parts.append(f'<line x1="{fx(frequency):.1f}" y1="{bottom}" x2="{fx(frequency):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+            parts.append(f'<text class="tick" x="{fx(frequency):.1f}" y="{bottom + 44}" text-anchor="middle">{label}</text>')
     for name, label, colour in GENOTYPE_CLASSES:
         # each bin at its geometric midpoint
         bins = [(fx(math.sqrt(entry["low"] * entry["high"])), entry) for entry in by_frequency[name]["bins"] if entry["count"]]
@@ -401,54 +411,8 @@ def genotypes_figure(summary: dict) -> Path:
         else:
             label_x, label_y, anchor = bins[-1][0] + 8, fy(min(entry["q25"] for _px, entry in bins[-3:])) + 38, "end"
         parts.append(f'<text class="end" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" style="fill:{colour}">{label}</text>')
-    parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 16}" text-anchor="middle">Allele frequency</text>')
+    parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 14}" text-anchor="middle">Minor allele frequency</text>')
     parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Imputation r²</text>')
-    # right: AUC gain from adding SVs, one row per scenario, imputed (open) above true (filled)
-    b0, b1 = 448.0, 805.0
-    largest = str(max(summary["train_counts"]))
-    true_gains = accuracy.get("delta_auc", {})
-    rows = []
-    for point, label, colour in (entry for point in GENOTYPE_POINTS for entry in POWER_SERIES if entry[0] == point):
-        imputed = summary["points"].get(point, {}).get("sizes", {}).get(largest, {}).get("delta_auc")
-        true = true_gains.get(point, {}).get("true")
-        rows.append((label, colour, [(entry, filled) for entry, filled in ((imputed, False), (true, True))
-                                     if entry and entry["replicates"] >= MIN_REPLICATES]))
-    values = [0.0] + finite(value for _label, _colour, marks in rows for entry, _filled in marks
-                            for value in (entry["mean"], entry["lower"], entry["upper"]))
-    low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=4)
-
-    def gx(value: float) -> float:
-        return b0 + (value - low) / (high - low) * (b1 - b0)
-
-    # the key in two lines at the top right, then the rows
-    rows_top = 104.0
-    key_x = b1 - 32 - text_width("True genotypes", 26)
-    for line, (label, filled) in enumerate((("Imputed", False), ("True genotypes", True))):
-        key_y = 34 + 40 * line
-        parts.append(f'<circle cx="{key_x + 12:.1f}" cy="{key_y - 10:.1f}" r="10" fill="{GREY if filled else "#fff"}" stroke="{GREY}" stroke-width="5"/>')
-        parts.append(f'<text class="key" x="{key_x + 32:.1f}" y="{key_y + 2:.1f}">{label}</text>')
-    parts.append(f'<line x1="{b0}" y1="{bottom}" x2="{b1}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    parts.append(f'<line x1="{gx(0.0):.1f}" y1="{rows_top}" x2="{gx(0.0):.1f}" y2="{bottom}" stroke="{GREY}" stroke-width="3" stroke-dasharray="10 8"/>')
-    tick = low
-    while tick <= high + 1e-9:
-        parts.append(f'<line x1="{gx(tick):.1f}" y1="{bottom}" x2="{gx(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
-        # the last label ends at the figure's edge instead of past it
-        label = tick_text(tick, step)
-        edge = gx(tick) + text_width(label, 26) / 2 > w - 4
-        parts.append(f'<text class="tick" x="{w - 4 if edge else gx(tick):.1f}" y="{bottom + 42}" text-anchor="{"end" if edge else "middle"}">{label}</text>')
-        tick += step
-    row_height = (bottom - rows_top) / len(rows)
-    for index, (label, colour, marks) in enumerate(rows):
-        row_top = rows_top + index * row_height
-        # a white outline breaks the zero line behind the label
-        parts.append(f'<text class="row" x="{b0 + 6}" y="{row_top + 22:.1f}" style="fill:{colour}; font-weight:700; paint-order:stroke; '
-                     f'stroke:#fff; stroke-width:10px; stroke-linejoin:round">{label}</text>')
-        for entry, filled in marks:
-            mark_y = row_top + (44 if not filled else 64)
-            if math.isfinite(entry["lower"]):
-                parts.append(f'<line x1="{gx(entry["lower"]):.1f}" y1="{mark_y:.1f}" x2="{gx(entry["upper"]):.1f}" y2="{mark_y:.1f}" stroke="{colour}" stroke-width="4"/>')
-            parts.append(f'<circle cx="{gx(entry["mean"]):.1f}" cy="{mark_y:.1f}" r="10" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
-    parts.append(f'<text class="axis" x="{(b0 + b1) / 2:.1f}" y="{h - 16}" text-anchor="middle">AUC gain from SVs</text>')
     parts.append("</svg>")
     return render("ph_sim_genotypes", page("".join(parts), width, height), width, height)
 
@@ -462,21 +426,28 @@ ARCHITECTURES = (
      ("sv_two_point", "Two-point effects"), ("rare_disease", "Prevalence 1%"), ("low_heritability", "h² = 0.01")),
 )
 GAINS = (
-    # (summary key, key label, colour, filled marker)
-    ("delta_auc", "vs. SV-PGS without SVs", TEAL, True),
-    ("delta_auc_vs_ldpred2", "vs. LDpred2, SNV subset", AMBER, True),
-    ("delta_auc_vs_ldpred2_allvar", "vs. LDpred2, all classes", AMBER, False),
+    # (key label, colour, filled marker): the SV arm's gain over the same method without SVs
+    ("Imputed SVs", TEAL, False),
+    ("True SV genotypes", TEAL, True),
 )
 
 
+def architecture_marks(summary: dict, point: str) -> list[dict | None]:
+    """The point's AUC gain from adding SVs at its largest drawn training size on imputed genotypes, and at the largest
+    training size on true genotypes, each with at least MIN_REPLICATES replicates (None otherwise)."""
+    imputed = summary["points"][point]["sizes"][sizes(summary, point)[-1]]["delta_auc"]
+    true = summary.get("genotype_accuracy", {}).get("delta_auc", {}).get(point, {}).get("true")
+    return [entry if entry and entry["replicates"] >= MIN_REPLICATES else None for entry in (imputed, true)]
+
+
 def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> Path:
-    """For every simulated architecture, at its largest training size: the mean test AUC gain of SV-PGS with SVs over
-    each other method, with its 95% interval over replicates, on one axis shared by both blocks of architectures."""
+    """For every simulated architecture: the mean test AUC gain of SV-PGS from adding SVs on imputed and on true
+    genotypes, with 95% intervals over replicates, on one axis shared by both blocks of architectures."""
     blocks = [[(point, label) for point, label in block if sizes(summary, point)] for block in ARCHITECTURES]
     blocks = [block for block in blocks if block]
     rows = [row for block in blocks for row in block]
-    cells = {point: summary["points"][point]["sizes"][sizes(summary, point)[-1]] for point, _label in rows}
-    gains = [gain for gain in GAINS if any(cells[point].get(gain[0], {}).get("replicates", 0) >= MIN_REPLICATES for point, _label in rows)]
+    marks = {point: architecture_marks(summary, point) for point, _label in rows}
+    shown = [index for index in range(len(GAINS)) if any(marks[point][index] for point, _label in rows)]
     w, h = width * 100, height * 100
     key_y, top, bottom = 40.0, 84.0, h - 112.0
     pitch = (bottom - top) / max(len(block) for block in blocks)
@@ -486,15 +457,16 @@ def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.
     panel = (w - right - gap * (len(blocks) - 1) - sum(labels)) / len(blocks)
     values = [0.0]
     for point, _label in rows:
-        for key, *_rest in gains:
-            entry = cells[point].get(key, {})
-            values += finite([entry.get("lower"), entry.get("upper"), entry.get("mean")])
+        for entry in marks[point]:
+            if entry:
+                values += finite([entry["lower"], entry["upper"], entry["mean"]])
     # tick labels at least 120 units apart
-    low, high, step = nice_range(min(values), max(values), steps=(0.002, 0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=int(panel // 120))
+    low, high, step = nice_range(min(values), max(values), steps=(0.002, 0.005, 0.01, 0.02, 0.05, 0.1), most=int(panel // 120))
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    spans = [40 + text_width(label, 26) for _key, label, _colour, _filled in gains]
+    key = [(GAINS[index][0], GAINS[index][1], GAINS[index][2]) for index in shown]
+    spans = [40 + text_width(label, 26) for label, _colour, _filled in key]
     cursor = (w - sum(spans) - 50 * (len(spans) - 1)) / 2
-    for (_key, label, colour, filled), span in zip(gains, spans):
+    for (label, colour, filled), span in zip(key, spans):
         parts.append(f'<circle cx="{cursor + 12:.1f}" cy="{key_y}" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
         parts.append(f'<text class="key" x="{cursor + 34:.1f}" y="{key_y + 12}">{label}</text>')
         cursor += span + 50
@@ -515,16 +487,17 @@ def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.
         for index, (point, label) in enumerate(block):
             cy = top + pitch * index + pitch / 2
             parts.append(f'<text class="row" x="{x0 - 16:.1f}" y="{cy + 9:.1f}" text-anchor="end">{label}</text>')
-            for gain_index, (key, _label, colour, filled) in enumerate(gains):
-                entry = cells[point].get(key, {})
-                if entry.get("replicates", 0) < MIN_REPLICATES:
+            for slot, gain_index in enumerate(shown):
+                entry = marks[point][gain_index]
+                if not entry:
                     continue
-                y = cy + (gain_index - (len(gains) - 1) / 2) * 13.0
+                _label, colour, filled = GAINS[gain_index]
+                y = cy + (slot - (len(shown) - 1) / 2) * 14.0
                 if math.isfinite(entry["lower"]):
                     parts.append(f'<line x1="{x(entry["lower"]):.1f}" y1="{y:.1f}" x2="{x(entry["upper"]):.1f}" y2="{y:.1f}" stroke="{colour}" stroke-width="4" stroke-linecap="round"/>')
                 parts.append(f'<circle cx="{x(entry["mean"]):.1f}" cy="{y:.1f}" r="9" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="4"/>')
     counts = sorted({int(sizes(summary, point)[-1]) for point, _label in rows})
-    parts.append(f'<text class="axis" x="{w / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain of SV-PGS with SVs at {" / ".join(thousands(count) for count in counts)} training samples</text>')
+    parts.append(f'<text class="axis" x="{w / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain from adding SVs at {" / ".join(thousands(count) for count in counts)} training samples</text>')
     parts.append("</svg>")
     return render("fig_sim_architectures", page("".join(parts), width, height), width, height)
 
@@ -557,7 +530,7 @@ PLACEHOLDERS = {
     "ph_sim_power": (8.20, 4.40, "simulation", "Power vs. training size",
                      "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
     "ph_sim_genotypes": (8.20, 4.40, "simulation", "SV genotype accuracy",
-                         "Imputation r² of SVs and SNVs by allele frequency, and the AUC gain from SVs on imputed vs. true genotypes"),
+                         "Imputation r² of SVs and SNVs by allele frequency"),
     "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",
                             "Estimated SV effects by SV type, and |effect| vs. SV length"),
     "ph_aou_diseases": (15.40, 4.60, "All of Us", "Test AUC by disease",

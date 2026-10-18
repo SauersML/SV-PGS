@@ -34,7 +34,8 @@ GRID = "grid2"
 """The grid run on MSI the poster reads: alpha = -0.38 (benchmarks/power/grid.py, FREQUENCY_ALPHA)."""
 TRUTH_GRID = f"{GRID}-truth"
 """The same scenarios and replicates at the largest training size, every variant measured by its true genotype."""
-TRUTH_POINTS = ("null", "sv_20pct", "sv_20pct_fold3")
+TRUTH_POINTS = ("null", "sv_20pct", "sv_20pct_fold3", "deletion_positive", "multi_feature_positive", "tagged_sv",
+                "tagged_sv_fold3", "common_sv_fold3")
 LOCAL = Path.home() / "svpgs-bench" / f"poster-{GRID}"
 REMOTE = "msi:/scratch.global/sauer354/svpgs-poster"
 TEST_PEOPLE = 10_000
@@ -177,7 +178,10 @@ def genotype_accuracy(local: Path, imputed: list[dict]) -> dict:
         if not by_measurement["true"]:
             continue
         both = sorted(set(by_measurement["imputed"]) & set(by_measurement["true"]))
+        tests = [row["z"] for row in true if row["point"] == point and row["train_count"] == largest
+                 and math.isfinite(row["delta_auc"]) and math.isfinite(row.get("z", math.nan))]
         gains[point] = {
+            "true_power": rejection_summary(sum(z > ONE_SIDED for z in tests), len(tests)),
             "imputed": interval(by_measurement["imputed"].values()),
             "true": interval(by_measurement["true"].values()),
             "true_minus_imputed": interval(by_measurement["true"][replicate] - by_measurement["imputed"][replicate] for replicate in both),
