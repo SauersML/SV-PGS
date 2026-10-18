@@ -19,6 +19,7 @@ all-variant fit against its fit on the identical record set without the structur
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import resource
@@ -102,6 +103,19 @@ class TrainData:
 
     def codes(self, rows) -> np.ndarray:
         return np.asarray(self._observed[self._records[rows]])[..., self._columns]
+
+    def codes_identity(self) -> str:
+        """What determines every code ``codes`` returns: the observed file (its resolved path, size and modification time,
+        which any rewrite changes) and the records and samples read from it."""
+        source = Path(self._observed.filename).resolve()
+        status = source.stat()
+        digest = hashlib.sha256()
+        digest.update(json.dumps([str(source), status.st_size, status.st_mtime_ns]).encode())
+        for indices in (self._records, self._columns):
+            values = np.ascontiguousarray(indices, dtype=np.int64)
+            digest.update(json.dumps(values.shape).encode())
+            digest.update(values.tobytes())
+        return digest.hexdigest()
 
 
 @dataclass

@@ -91,6 +91,8 @@ def test_the_truth_arm_is_the_true_genotypes_in_code_units(tmp_path: Path) -> No
 def test_the_store_cache_builds_once_and_is_reused(tmp_path: Path, monkeypatch) -> None:
     rng = np.random.default_rng(9)
     observed, variants = _cohort(rng, 40, 60)
+    np.save(tmp_path / "observed.npy", observed)
+    observed = np.load(tmp_path / "observed.npy", mmap_mode="r")
     columns = np.arange(60)
     reads = harness.ReadEvidence(rows=np.zeros(0, dtype=np.int64), _pl=np.zeros((0, 0, 3), dtype=np.uint8), _columns=columns)
     train = harness.TrainData(
@@ -108,11 +110,13 @@ def test_the_store_cache_builds_once_and_is_reused(tmp_path: Path, monkeypatch) 
         work.mkdir()
         path, order = module.cached_store(train, work)
         with module.DosageStore.open(path) as store:
-            assert np.array_equal(store.read_codes(0, store.n_variants), observed[order])
+            assert np.array_equal(store.read_codes(0, store.n_variants), np.asarray(observed)[order])
     assert built == [1]
     # another arm's codes are another store
-    other = observed.copy()
+    other = np.array(observed)
     other[7] = 254 - other[7]  # An interior row absent from the former sampled cache key.
+    np.save(tmp_path / "observed_other.npy", other)
+    other = np.load(tmp_path / "observed_other.npy", mmap_mode="r")
     train_other = harness.TrainData(**{**{name: getattr(train, name) for name in train.__dataclass_fields__}, "_observed": other})
     work = tmp_path / "work_other"
     work.mkdir()
@@ -124,7 +128,8 @@ def test_cache_identity_binds_annotation_values(tmp_path):
     from types import SimpleNamespace
     from benchmarks.bench_sim.submissions.svpgs_full import _store_key
     codes, variants = _cohort(np.random.default_rng(12), 100, 10)
-    train = SimpleNamespace(n_samples=10, n_variants=100, variants=variants, codes=lambda rows: codes[rows])
+    train = SimpleNamespace(n_samples=10, n_variants=100, variants=variants, codes=lambda rows: codes[rows],
+                            codes_identity=lambda: "the same codes")
     before = _store_key(train)
     variants['in_gene'][17] = 1 - variants['in_gene'][17]
     assert _store_key(train) != before

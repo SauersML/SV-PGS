@@ -147,24 +147,23 @@ and public fields only (no phenotype), the same for every scenario on the arm.""
 
 
 def _store_key(train) -> str:
-    """Bind every public variant field and every training code, in bounded tiles.
+    """Bind every public variant field and every training code.
 
     Sampled rows cannot identify a cache: a changed unsampled dosage or annotation
-    must not silently reuse a previous simulation's training store.
+    must not silently reuse a previous simulation's training store. The codes are bound by the harness's identity of
+    their source (the observed file's path, size and modification time, and the records and samples read), which any
+    change to a code changes, so a cached store is found without a pass over the codes.
     """
     variants = train.variants
     digest = hashlib.sha256()
-    digest.update(f"svpgs-simulation-store-v2:{train.n_samples}:{train.n_variants}".encode())
+    digest.update(f"svpgs-simulation-store-v3:{train.n_samples}:{train.n_variants}".encode())
     for name in sorted(variants):
         values = np.ascontiguousarray(np.asarray(variants[name]))
         if values.dtype.hasobject:
             raise ValueError("Public variant metadata must use portable numeric or string arrays")
         digest.update(json.dumps([name, values.dtype.str, values.shape]).encode())
         digest.update(values.tobytes())
-    for start in range(0, train.n_variants, BLOCK_ROWS):
-        codes = np.ascontiguousarray(train.codes(np.arange(start, min(start + BLOCK_ROWS, train.n_variants))))
-        digest.update(json.dumps([codes.dtype.str, codes.shape]).encode())
-        digest.update(codes.tobytes())
+    digest.update(train.codes_identity().encode())
     return digest.hexdigest()
 
 
