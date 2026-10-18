@@ -81,16 +81,24 @@ def mean_se(values) -> list[float]:
 
 
 def interval(values) -> dict:
+    values = [value for value in values if value is not None and math.isfinite(value)]
     mean, se = mean_se(values)
-    return {"mean": mean, "se": se, "lower": mean - 1.96 * se, "upper": mean + 1.96 * se}
+    critical = float(stats.t.ppf(0.975, len(values) - 1)) if len(values) > 1 else math.nan
+    return {"mean": mean, "se": se, "lower": mean - critical * se, "upper": mean + critical * se,
+            "replicates": len(values)}
 
 
 def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
     results = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/result.json"))]
     # each arm's attempt record (grid.py writes one per arm job), to count replicates lost to a failed fit
     attempts = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/*/attempt.json"))]
-    if not results:
-        raise SystemExit(f"no finished grid tasks under {local / 'grid' / 'tasks'}")
+    if not results and not attempts:
+        raise SystemExit(f"no grid results or attempts under {local / 'grid' / 'tasks'}")
+    coverage = {}
+    for attempt in attempts:
+        cell = coverage.setdefault(attempt["point"], {}).setdefault(str(attempt["train_count"]), {})
+        counts = cell.setdefault(attempt["arm"], {"completed": 0, "failed": 0, "running": 0})
+        counts[attempt["status"]] += 1
     points: dict = {}
     for point in POINTS:
         rows = [result for result in results if result["point"] == point]
@@ -114,6 +122,8 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
                 "delta_auc_vs_ldpred2": interval(row.get("delta_auc_vs_ldpred2") for row in group),
                 "ldpred2_allvar_auc": mean_se(row.get("ldpred2_allvar_auc") for row in group),
                 "ldpred2_allvar_replicates": len(valid_allvar),
+                "auc_intervals": {key: interval(row.get(key) for row in group)
+                                  for key in ("snv_indel_auc", "with_sv_auc", "ldpred2_auc", "ldpred2_allvar_auc")},
                 "delta_auc_vs_ldpred2_allvar": interval(row.get("delta_auc_vs_ldpred2_allvar") for row in group),
                 "power": power,
                 "share_sv_beats_ldpred2": rejection_summary(sum(row["z_vs_ldpred2"] > ONE_SIDED for row in valid_ldpred2), len(valid_ldpred2)),
@@ -131,13 +141,17 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
     summary = {
         "source": "benchmarks/power/grid.py on bench-sim v7 chr22 (Beagle arm), MSI",
         "tasks": len(results),
+        "coverage": coverage,
+        "mean_interval": "Student t 95% interval across completed simulation replicates",
         "train_counts": list(TRAIN_COUNTS),
         "test_people": TEST_PEOPLE,
         "effective_segments": effective_segments(),
         "points": points,
         "effects": effects(local),
     }
-    target.write_text(json.dumps(summary, indent=1, allow_nan=True) + "\n")
+    temporary = target.with_suffix(".partial.json")
+    temporary.write_text(json.dumps(summary, indent=1, allow_nan=True) + "\n")
+    temporary.replace(target)
     return target
 
 
@@ -145,6 +159,11 @@ def effects(local: Path) -> dict:
     """At each effect point's largest training size with fitted effects: (simulated, fitted) per-allele effects of
     every causal SV, the simulated liability-scale effect put on the fit's scale (a per-allele change in case
     probability: phi(threshold) times the liability effect), and every SV's fitted |effect| by length bin."""
+    completed = {point: [path for path in sorted((local / "grid" / "tasks" / point).glob("n*/replicate*/with_sv/sv_effects.npz"))
+                         if json.loads((path.parent / "attempt.json").read_text())["status"] == "completed"]
+                 for point in EFFECT_POINTS}
+    if not any(completed.values()):
+        return {}
     public = np.load(local / "public" / "sv_records.npz")
     records, log_length = public["record"], public["log_sv_length"]
     edges = np.log(np.asarray(LENGTH_EDGES_BP, dtype=float))
@@ -152,7 +171,7 @@ def effects(local: Path) -> dict:
     imputed = log_length[public["measured"]]
     found = {}
     for point in EFFECT_POINTS:
-        files = sorted((local / "grid" / "tasks" / point).glob("n*/replicate*/with_sv/sv_effects.npz"))
+        files = completed[point]
         if not files:
             continue
         largest = max(int(path.parts[-4][1:]) for path in files)
@@ -172,15 +191,22 @@ def effects(local: Path) -> dict:
             magnitude = np.abs(fitted["per_allele"])
             bins.append([float(magnitude[which == index].mean()) if np.any(which == index) else math.nan for index in range(bin_count)])
         bins = np.asarray(bins)
+        bin_intervals = [interval(bins[:, index]) for index in range(bin_count)]
+        median_lengths = []
+        for low, high in zip(edges[:-1], edges[1:]):
+            lengths = imputed[(imputed >= low) & (imputed < high)]
+            median_lengths.append(float(np.median(np.exp(lengths))) if lengths.size else math.nan)
         simulated, fitted_values = (np.asarray(pairs).T if pairs else (np.array([]), np.array([])))
         found[point] = {
             "train_count": largest, "replicates": len(files), "pairs": pairs,
-            "pearson": float(np.corrcoef(simulated, fitted_values)[0, 1]) if len(pairs) > 2 else math.nan,
+            "pearson": (float(np.corrcoef(simulated, fitted_values)[0, 1])
+                        if len(pairs) > 2 and np.ptp(simulated) > 0 and np.ptp(fitted_values) > 0 else math.nan),
             "length_bins": {
                 "lower_bp": list(LENGTH_EDGES_BP[:-1]), "upper_bp": list(LENGTH_EDGES_BP[1:]),
-                "median_bp": [float(np.median(np.exp(imputed[(imputed >= low) & (imputed < high)]))) for low, high in zip(edges[:-1], edges[1:])],
-                "mean_abs": np.nanmean(bins, axis=0).tolist(),
-                "se": (np.nanstd(bins, axis=0, ddof=1) / np.sqrt(np.sum(np.isfinite(bins), axis=0))).tolist() if len(files) > 1 else [math.nan] * bin_count,
+                "median_bp": median_lengths,
+                "mean_abs": [entry["mean"] for entry in bin_intervals],
+                "se": [entry["se"] for entry in bin_intervals],
+                "intervals": bin_intervals,
             },
         }
     return found

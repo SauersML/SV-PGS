@@ -122,6 +122,8 @@ def text_width(text: str, size_pt: float) -> float:
 
 
 def nice_range(low: float, high: float, steps=(0.005, 0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0), most: int = 6):
+    if low == high:
+        low, high = low - steps[0], high + steps[0]
     for step in steps:
         if (high - low) / step <= most:
             break
@@ -175,16 +177,21 @@ ACCURACY_METHODS = (
     # (summary key, key label, colour, filled marker, horizontal offset)
     ("with_sv_auc", "SV-PGS with SVs", TEAL, True, 18.0),
     ("snv_indel_auc", "SV-PGS without SVs", NAVY, False, 6.0),
-    ("ldpred2_allvar_auc", "LDpred2-auto, all variants", AMBER, False, -6.0),
-    ("ldpred2_auc", "LDpred2-auto, HapMap3 SNVs", AMBER, True, -18.0),
+    ("ldpred2_allvar_auc", "LDpred2, all classes", AMBER, False, -6.0),
+    ("ldpred2_auc", "LDpred2, SNV subset", AMBER, True, -18.0),
 )
 NO_VALUE = [math.nan, math.nan]
 
 
+def auc_interval(row: dict, key: str) -> dict:
+    """Read the collector's replicate interval; old summaries without one show only their measured mean."""
+    return row.get("auc_intervals", {}).get(key, {"mean": row.get(key, NO_VALUE)[0], "lower": math.nan, "upper": math.nan})
+
+
 def accuracy_figure(summary: dict) -> Path:
     """Test AUC against training size, one panel per causal-SV share: SV-PGS with and without SVs, LDpred2-auto on
-    HapMap3 SNVs and on every variant, and the expected AUC of a PGS that captures the whole heritability (dashed)."""
-    width, height = 16.70, 5.00
+    an SNV subset and every variant class at MAF >= 1%, and the analytic expected AUC (dashed)."""
+    width, height = 16.70, 4.80
     w, h = width * 100, height * 100
     left, right, gap = 140.0, 30.0, 55.0
     # a method is keyed only where it has a value: the all-variant LDpred2 arm joined the grid after the others
@@ -202,9 +209,8 @@ def accuracy_figure(summary: dict) -> Path:
         for size in sizes(summary, point):
             row = summary["points"][point]["sizes"][size]
             for key, *_rest in ACCURACY_METHODS:
-                mean, se = row.get(key, NO_VALUE)
-                if math.isfinite(mean):
-                    values += [mean - 1.96 * (se if math.isfinite(se) else 0.0), mean + 1.96 * (se if math.isfinite(se) else 0.0)]
+                entry = auc_interval(row, key)
+                values += finite([entry["mean"], entry["lower"], entry["upper"]])
             values.append(row["expected_auc"])
     # tick labels at least 52 units (0.52 in) apart
     low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.04, 0.05, 0.1, 0.2), most=int((bottom - top) // 52))
@@ -255,15 +261,15 @@ def accuracy_figure(summary: dict) -> Path:
         expected = " ".join(f"{x(int(size)):.1f},{y(rows[size]['expected_auc']):.1f}" for size in present)
         parts.append(f'<polyline points="{expected}" fill="none" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
         for key, _label, colour, filled, offset in reversed(shown):
-            points = [(x(int(size)) + offset, rows[size][key]) for size in present if math.isfinite(rows[size].get(key, NO_VALUE)[0])]
+            points = [(x(int(size)) + offset, auc_interval(rows[size], key)) for size in present if math.isfinite(rows[size].get(key, NO_VALUE)[0])]
             if not points:
                 continue
-            parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(mean):.1f}" for px, (mean, _se) in points)
+            parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(entry['mean']):.1f}" for px, entry in points)
                          + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"/>')
-            for px, (mean, se) in points:
-                if math.isfinite(se):
-                    parts.append(f'<line x1="{px:.1f}" y1="{y(mean - 1.96 * se):.1f}" x2="{px:.1f}" y2="{y(mean + 1.96 * se):.1f}" stroke="{colour}" stroke-width="4"/>')
-                parts.append(f'<circle cx="{px:.1f}" cy="{y(mean):.1f}" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
+            for px, entry in points:
+                if math.isfinite(entry["lower"]):
+                    parts.append(f'<line x1="{px:.1f}" y1="{y(entry["lower"]):.1f}" x2="{px:.1f}" y2="{y(entry["upper"]):.1f}" stroke="{colour}" stroke-width="4"/>')
+                parts.append(f'<circle cx="{px:.1f}" cy="{y(entry["mean"]):.1f}" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
     parts.append(f'<text class="axis" x="{left + (w - left - right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
     parts.append("</svg>")
     return render("ph_sim_accuracy", page("".join(parts), width, height), width, height)
@@ -280,10 +286,11 @@ POWER_SERIES = (
 
 def power_figure(summary: dict) -> Path:
     """Share of replicates whose one-sided paired DeLong test favours the SV arm at 0.05, against training size, per
-    causal-SV scenario, with Wilson 95% intervals; the no-causal-SV control should sit near the test's 5% level."""
-    width, height = 8.20, 4.80
+    causal-SV scenario, with Wilson 95% intervals. No causal SV does not imply equal predictive accuracy: tagging and
+    regularization can still change the two methods' scores."""
+    width, height = 8.20, 4.40
     w, h = width * 100, height * 100
-    left, top, bottom = 128.0, 28.0, 368.0
+    left, top, bottom = 128.0, 28.0, h - 112.0
     plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in POWER_SERIES) - 40
     counts = summary["train_counts"]
 
@@ -331,16 +338,16 @@ def effects_figure(summary: dict) -> Path:
     """Left: each causal SV's estimated effect against its simulated one (20% causal SVs, the largest training size),
     both as a per-allele change in case probability, with the identity line. Right: mean |estimated effect| of every
     SV by length, when simulated effects grow with length and when they do not."""
-    width, height = 8.20, 4.80
+    width, height = 8.20, 4.40
     w, h = width * 100, height * 100
     effects = summary["effects"]
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    top, bottom = 28.0, 352.0
+    top, bottom = 28.0, h - 128.0
     # left: estimated vs simulated, in percentage points of case probability per allele
     scatter = effects.get("sv_20pct") or effects.get("length_positive")
     a0, a1 = 112.0, 322.0
     pairs = [(simulated * 100, estimated * 100) for simulated, estimated in scatter["pairs"]]
-    reach = max(max(abs(value) for pair in pairs for value in pair), 1e-9) * 1.04
+    reach = max(max((abs(value) for pair in pairs for value in pair), default=0.0), 1e-9) * 1.04
     # a symmetric range at the next round value, ticked at its ends and zero
     scale = 10 ** math.floor(math.log10(reach))
     high = next(multiple * scale for multiple in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0) if multiple * scale >= reach)
@@ -365,13 +372,16 @@ def effects_figure(summary: dict) -> Path:
         tick += step
     for simulated, estimated in pairs:
         parts.append(f'<circle cx="{sx(simulated):.1f}" cy="{sy(estimated):.1f}" r="7" fill="{TEAL}" fill-opacity="0.55"/>')
-    parts.append(f'<text class="stat" x="{a0 + 18}" y="{top + 30}">r = {scatter["pearson"]:.2f}</text>')
+    if math.isfinite(scatter["pearson"]):
+        parts.append(f'<text class="stat" x="{a0 + 18}" y="{top + 30}">r = {scatter["pearson"]:.2f}</text>')
     parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 16}" text-anchor="middle">Simulated effect</text>')
     parts.append(f'<text class="axis" transform="translate(28 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Estimated effect</text>')
     # right: mean |estimated effect| by SV length
     b0, b1 = 540.0, 805.0
     lines = [(point, label, colour) for point, label, colour in (("length_positive", "Length effect", TEAL), ("sv_20pct", "No length effect", GREY)) if point in effects]
-    peak = max(max(finite(mean + (se if math.isfinite(se) else 0.0) for mean, se in zip(effects[point]["length_bins"]["mean_abs"], effects[point]["length_bins"]["se"]))) for point, _label, _colour in lines) * 100
+    peak = max((value for point, _label, _colour in lines
+                for value in finite(effects[point]["length_bins"]["mean_abs"] +
+                                    [entry["upper"] for entry in effects[point]["length_bins"].get("intervals", [])])), default=0.0) * 100
     # headroom above the lines for their two labels
     _low, top_value, step = nice_range(0.0, peak * 1.6, steps=(0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0), most=4)
     lengths_low, lengths_high = math.log10(40.0), math.log10(80_000.0)
@@ -395,12 +405,14 @@ def effects_figure(summary: dict) -> Path:
     ends = []
     for point, label, colour in lines:
         bins = effects[point]["length_bins"]
-        points = [(lx(median), mean * 100, se * 100) for median, mean, se in zip(bins["median_bp"], bins["mean_abs"], bins["se"]) if math.isfinite(mean)]
+        intervals = bins.get("intervals", [{"lower": math.nan, "upper": math.nan}] * len(bins["mean_abs"]))
+        points = [(lx(median), mean * 100, entry) for median, mean, entry in zip(bins["median_bp"], bins["mean_abs"], intervals)
+                  if math.isfinite(mean) and math.isfinite(median)]
         parts.append('<polyline points="' + " ".join(f"{px:.1f},{ly(mean):.1f}" for px, mean, _se in points)
                      + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"/>')
-        for px, mean, se in points:
-            if math.isfinite(se):
-                parts.append(f'<line x1="{px:.1f}" y1="{ly(mean - 1.96 * se):.1f}" x2="{px:.1f}" y2="{ly(mean + 1.96 * se):.1f}" stroke="{colour}" stroke-width="3.5"/>')
+        for px, mean, entry in points:
+            if math.isfinite(entry["lower"]):
+                parts.append(f'<line x1="{px:.1f}" y1="{ly(max(0.0, entry["lower"]) * 100):.1f}" x2="{px:.1f}" y2="{ly(entry["upper"] * 100):.1f}" stroke="{colour}" stroke-width="3.5"/>')
             parts.append(f'<circle cx="{px:.1f}" cy="{ly(mean):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
         ends.append((label, colour))
     for index, (label, colour) in enumerate(ends):
@@ -422,8 +434,8 @@ ARCHITECTURES = (
 GAINS = (
     # (summary key, key label, colour, filled marker)
     ("delta_auc", "SV-PGS without SVs", TEAL, True),
-    ("delta_auc_vs_ldpred2", "LDpred2-auto, HapMap3 SNVs", AMBER, True),
-    ("delta_auc_vs_ldpred2_allvar", "LDpred2-auto, all variants", AMBER, False),
+    ("delta_auc_vs_ldpred2", "LDpred2, SNV subset", AMBER, True),
+    ("delta_auc_vs_ldpred2_allvar", "LDpred2, all classes", AMBER, False),
 )
 
 
@@ -498,6 +510,10 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     made.append(effects_figure(summary) if all(point in effects for point in ("sv_20pct", "length_positive")) else placeholder_figure("ph_sim_effects"))
     if summary and len(points) > 1:
         made.append(architectures_figure(summary))
+    else:
+        # The builder includes this optional panel by filename: never reuse a previous run's result.
+        for suffix in (".png", ".html"):
+            (OUT / f"fig_sim_architectures{suffix}").unlink(missing_ok=True)
     return made
 
 
@@ -505,11 +521,11 @@ def simulation_figures(summary: dict | None) -> list[Path]:
 
 PLACEHOLDERS = {
     # name: (width in, height in, source, title, what the figure will show)
-    "ph_sim_accuracy": (16.70, 5.00, "simulation", "Test AUC vs. training size",
+    "ph_sim_accuracy": (16.70, 4.80, "simulation", "Test AUC vs. training size",
                         "SV-PGS with and without SVs, and LDpred2-auto, at 0%, 5% and 20% causal SVs, with the expected accuracy"),
-    "ph_sim_power": (8.20, 4.80, "simulation", "Power vs. training size",
+    "ph_sim_power": (8.20, 4.40, "simulation", "Power vs. training size",
                      "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
-    "ph_sim_effects": (8.20, 4.80, "simulation", "SV effect sizes",
+    "ph_sim_effects": (8.20, 4.40, "simulation", "SV effect sizes",
                        "Estimated vs. simulated SV effects, and |effect| vs. SV length"),
     "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",
                             "Estimated SV effects by SV type, and |effect| vs. SV length"),

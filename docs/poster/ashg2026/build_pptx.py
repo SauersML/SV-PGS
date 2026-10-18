@@ -1,6 +1,6 @@
 """The ASHG 2026 science poster as a PowerPoint file, built on the lab's poster template (48 x 36 in): the accepted
 abstract's title and authors, the realistic simulation study (benchmarks/power/grid.py on bench-sim's 1000 Genomes
-cohort, run on MSI), the All of Us results, and the one real-data result already in hand (SV type and expression, MAGE).
+cohort, run on MSI), and placeholders for the All of Us results.
 
     python3 build_pptx.py [template.pptx] [output.pptx] [simulation_summary.json] [figures directory]
 
@@ -12,8 +12,7 @@ committed. The figures come from figures.py.
 
 Placeholders: a figure the simulation or All of Us runs will supply is a dashed "placeholder" panel (figures.py); a
 number they will supply is a bracketed bold run in the text, e.g. "[x%]". The simulation's numbers and the verbs that
-depend on them (raised or changed, outperformed or matched) come from simulation_summary.json (simulation.py) when it
-exists, with each 95% interval deciding the verb.
+depend on them come from simulation_summary.json (simulation.py) when it exists.
 """
 
 from __future__ import annotations
@@ -56,24 +55,25 @@ METHODS = [
 
 SIMULATION_DESIGN = [
     [("50,000 people simulated from 1000 Genomes chr22 haplotypes in five ancestry groups, with SVs imputed from a separate panel.", "")],
-    [("Diseases of 10% prevalence and h² = 0.1 with 50 to 2,000 causal variants, 0% to 20% of them SVs with 1× or 3× SNV effect sizes.", "")],
+    [("We vary prevalence (1–10%), h² (0.01–0.1), causal count (50–2,000), SV fraction (0–20%) and SV effect SD (1× or 3× SNVs).", "")],
     [("Rarer variants have larger effects (α = −0.38, as in UK Biobank); SV effects may also grow with length or depend on type.", "")],
 ]
 
 SIMULATION_METHODS = [
-    [("We compare SV-PGS with and without SVs, and LDpred2-auto on HapMap3 SNVs or on all variants, at 5,000 to 40,000 training samples.", "")],
+    [("SV-PGS with/without SVs and LDpred2-auto (MAF ≥ 1% SNVs at HapMap3 density, or all classes) use 5,000–40,000 training samples.", "")],
 ]
 
 SIMULATION_ACCURACY = [
     [("With 20% causal SVs and 40,000 training samples, adding SVs changed AUC by ", ""), ("[ΔAUC]", "ph"),
      (". With no causal SVs, AUC changed by ", ""), ("[ΔAUC]", "ph"), (".", "")],
-    [("SV-PGS ", ""), ("[outperformed / matched]", "ph"), (" LDpred2-auto (ΔAUC ", ""), ("[ ]", "ph"), (").", "")],
+    [("SV-PGS − LDpred2-auto ΔAUC was ", ""), ("[ ]", "ph"), (" (SNV subset) and ", ""), ("[ ]", "ph"), (" (all variant classes).", "")],
 ]
 
 SIMULATION_EFFECTS = [
-    [("The test for an SV gain reached 80% power at ", ""), ("[n]", "ph"), (" training samples with 20% causal SVs.", "")],
-    [("SV-PGS ", ""), ("[recovered / did not recover]", "ph"), (" the simulated increase of SV effect size with length (ρ = ", ""),
-     ("[ ]", "ph"), (").", "")],
+    [("With 20% causal SVs, estimated power at 40,000 samples was ", ""), ("[x%]", "ph"),
+     (" (95% CI ", ""), ("[ ]", "ph"), ("; ", ""), ("[n]", "ph"), (" replicates).", "")],
+    [("The correlation of SV length with estimated |effect| was ρ = ", ""), ("[ ]", "ph"),
+     (" with a simulated length effect and ", ""), ("[ ]", "ph"), (" without one.", "")],
 ]
 
 HYPERTENSION = [
@@ -118,67 +118,45 @@ def settled(point: dict, size: str) -> dict | None:
     return cell if cell and cell["replicates"] >= MIN_REPLICATES else None
 
 
-def change_verb(entry: dict, rose: str, fell: str, neither: str) -> str:
-    return rose if entry["lower"] > 0 else fell if entry["upper"] < 0 else neither
-
-
-def size_reaching(rows: dict, target: float) -> float | None:
-    """Training size at which power first reaches ``target``, interpolated in log size; None if never."""
-    points = sorted((int(size), row["power"]["rate"]) for size, row in rows.items() if row["replicates"] >= MIN_REPLICATES)
-    for (size_a, rate_a), (size_b, rate_b) in zip(points, points[1:]):
-        if rate_a < target <= rate_b:
-            fraction = (target - rate_a) / (rate_b - rate_a)
-            return math.exp(math.log(size_a) + fraction * (math.log(size_b) - math.log(size_a)))
-    if points and points[0][1] >= target:
-        return float(points[0][0])
-    return None
-
-
 def simulation_copy(summary: dict) -> None:
-    """Fill the simulation's bracketed numbers from the grid's summary, each verb chosen by its interval."""
+    """Fill the simulation's bracketed numbers with estimates and uncertainty from completed replicates."""
     global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_EFFECTS, DISCUSSION
     points = summary["points"]
     largest = str(max(summary["train_counts"]))
     largest_text = f"{int(largest):,}"
-    SIMULATION_METHODS = [[(f"We compare SV-PGS with and without SVs, and LDpred2-auto on HapMap3 SNVs or on all variants, at "
-                            f"{min(summary['train_counts']):,} to {int(largest):,} training samples.", "")]]
+    SIMULATION_METHODS = [[("SV-PGS with/without SVs and LDpred2-auto (MAF ≥ 1% SNVs at HapMap3 density, or all classes) use "
+                           f"{min(summary['train_counts']):,}–{int(largest):,} training samples.", "")]]
 
     twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
     accuracy = []
     if twenty and null_cell:
         positive, null = twenty["delta_auc"], null_cell["delta_auc"]
         accuracy.append([
-            (f"With 20% causal SVs and {largest_text} training samples, adding SVs {change_verb(positive, 'raised', 'lowered', 'changed')} AUC by {auc_change(positive)}; "
-             f"with no causal SVs, ΔAUC = {number(null['mean'])}.", ""),
+            (f"At {largest_text} samples, adding SVs changed AUC by {auc_change(positive)} with 20% causal SVs; "
+             f"without causal SVs, ΔAUC = {number(null['mean'])}.", ""),
         ])
     if twenty:
-        against = twenty["delta_auc_vs_ldpred2"]
-        if math.isfinite(against["lower"]):
-            every = [cell["delta_auc_vs_ldpred2"] for cell in (settled(point, largest) for point in points.values()) if cell]
-            verb = change_verb(against, "outperformed", "had lower AUC than", "matched")
-            tail = f" in all {len(every)} settings" if all(entry["lower"] > 0 for entry in every) else ""
-            accuracy.append([(f"SV-PGS {verb} LDpred2-auto{tail} (ΔAUC {number(against['mean'])} with 20% causal SVs).", "")])
+        found = [(twenty[key], which) for key, which in (("delta_auc_vs_ldpred2", "SNV subset"),
+                                                         ("delta_auc_vs_ldpred2_allvar", "all variant classes"))
+                 if twenty.get(key, {}).get("replicates", 0) >= MIN_REPLICATES]
+        if found:
+            gains = " and ".join(f"{auc_change(against)} ({which})" for against, which in found)
+            accuracy.append([(f"At 20% causal SVs, ΔAUC vs. LDpred2-auto was {gains}.", "")])
     if accuracy:
         SIMULATION_ACCURACY = accuracy
 
     effects = []
     if twenty:
-        reach = size_reaching(points["sv_20pct"]["sizes"], 0.8)
-        rate = twenty["power"]["rate"]
-        if reach is not None:
-            effects.append([(f"The test for an SV gain reached 80% power at about {round(reach, -3):,.0f} training samples with 20% causal SVs.", "")])
-        else:
-            stronger_cell = settled(points.get("sv_20pct_fold3", {}), largest)
-            stronger = stronger_cell["power"]["rate"] if stronger_cell else None
-            effects.append([(f"With 20% causal SVs, the test for an SV gain had {rate:.0%} power at {largest_text} samples"
-                             + (f" ({stronger:.0%} with 3× effects)." if stronger is not None else "."), "")])
+        power = twenty["power"]
+        if power["replicates"] >= MIN_REPLICATES:
+            effects.append([(f"At 20% causal SVs and {largest_text} samples, power was {power['rate']:.0%} "
+                             f"(95% CI {power['lower']:.0%}–{power['upper']:.0%}; {power['replicates']} replicates).", "")])
     length_cell = settled(points.get("length_positive", {}), largest)
     if length_cell and twenty:
-        rho, rho_se = length_cell["length_rho"]
-        null_rho, null_se = twenty["length_rho"]
-        recovered = math.isfinite(rho_se) and math.isfinite(null_se) and rho - null_rho > 1.96 * math.hypot(rho_se, null_se)
-        effects.append([(f"SV-PGS {'recovered' if recovered else 'did not recover'} the simulated increase of SV effect size with length "
-                         f"(ρ = {number(rho, 2)} vs. {number(null_rho, 2)}).", "")])
+        rho = length_cell["length_rho"][0]
+        null_rho = twenty["length_rho"][0]
+        effects.append([(f"SV length–|effect| correlation was ρ = {number(rho, 2)} with a length effect "
+                         f"and {number(null_rho, 2)} without one.", "")])
     if effects:
         SIMULATION_EFFECTS = effects
 
@@ -186,7 +164,8 @@ def simulation_copy(summary: dict) -> None:
     if positives:
         improved = sum(entry["lower"] > 0 for entry in positives)
         DISCUSSION = [
-            [(f"Adding SVs improved prediction in {improved} of {len(positives)} simulated settings with causal SVs, and in ", ""), ("[n]", "ph"), (" All of Us diseases.", "")],
+            [(f"The AUC gain's 95% interval was above zero in {improved} of {len(positives)} simulated settings with causal SVs. "
+              "The All of Us results are pending.", "")],
             DISCUSSION[1],
         ]
 
@@ -518,7 +497,7 @@ def build() -> None:
     xml = column.bar(xml, 118)
     xml = column.text(xml, 132, SIMULATION_METHODS)
     xml = column.figure(xml, 101, "accuracy")
-    xml = column.caption(xml, 112, "Test-set AUC vs. training size")
+    xml = column.caption(xml, 112, "Test AUC (mean and 95% t interval)")
     xml = column.text(xml, 126, SIMULATION_ACCURACY)
     half = (column.width - 0.5) / 2
     top = column.y
@@ -530,7 +509,7 @@ def build() -> None:
     xml = column.text(xml, 127, SIMULATION_EFFECTS)
     if "architectures" in figures:
         xml = column.figure(xml, 130, "architectures")
-        xml = column.caption(xml, 131, "AUC gain by simulated architecture")
+        xml = column.caption(xml, 131, "AUC gain by architecture (95% t interval)")
     else:
         xml = delete(delete(xml, 130), 131)
     column.finish()
