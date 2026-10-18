@@ -19,13 +19,13 @@ effects with equal per-SD variance, no annotation or non-additive effects and ho
   ``sv_two_point`` stress the effect distribution. ``sparse_sv``/``polygenic_sv`` vary expected causal counts,
   while ``rare_disease`` and ``low_heritability`` probe outcome imbalance and weak signal.
 
-Arms follow the workspace (``workspace_pipeline.ARMS``): ``with_sv`` fits every record; ``snv_indel`` is refitted without
-bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels and short repeat indels.
-
-One task is one (point, training size, replicate), both arms fitted (``run``); ``summarize`` collects every finished task
-into ``summary.tsv``: per point and size, the mean SV-arm gain in AUC and its SE over replicates, the share of replicates
-whose paired DeLong test favours the SV arm at one-sided 0.05, its Monte Carlo uncertainty, and the
-positive controls' readouts. Tasks are independent, so the grid runs as one task each (bench-sim's runq, or Batch).
+Arms follow the workspace (``workspace_pipeline.ARMS``) plus the published-practice competitor: ``with_sv`` fits every
+record; ``snv_indel`` is refitted without bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels
+and short repeat indels; ``ldpred2_auto`` is LDpred2-auto on HapMap3-density SNVs. One job is one arm of one (point,
+training size, replicate) task (``run``); the last arm to finish writes the task's comparison, and ``summarize`` compares
+any task left without one and collects every finished task into ``summary.tsv``: per point and size, the mean SV-arm gain
+in AUC and its SE over replicates, the share of replicates whose paired DeLong test favours the SV arm at one-sided 0.05,
+its Monte Carlo uncertainty, and the positive controls' readouts. Arms and tasks are independent jobs.
 """
 from __future__ import annotations
 
@@ -143,12 +143,16 @@ def structural_effect_readout(model, cohort: Path, target: Path) -> dict:
     }
 
 
-def _run_task(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, cores: int) -> dict:
-    """One task: the point's replicate scenario (built once and shared by every training size), both arms fitted on
-    ``train_count`` training samples drawn by the replicate's seed, scored on bench-sim's test samples, compared."""
+ARMS = {"snv_indel": (None, SMALL_ARM_DROPPED), "with_sv": (None, ()), "ldpred2_auto": (LDPRED2, ())}
+"""Each task's fits: (method, withheld classes). None is the submitted method, so both SV-PGS arms run it; LDpred2-auto
+selects its own HapMap3-density SNVs."""
+
+
+def _scenario(cohort: Path, out: Path, point: str, replicate: int) -> Path:
+    """The point's replicate scenario, built once and shared by every training size and arm."""
     scenario = out / "scenarios" / point / f"replicate{replicate}"
     scenario.parent.mkdir(parents=True, exist_ok=True)
-    # Different sample-size tasks share a scenario. Serialize creation to prevent partial truth reads.
+    # Different tasks share a scenario. Serialize creation to prevent partial truth reads.
     with (scenario.parent / f".{scenario.name}.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         parameters = scenario_parameters(point, replicate, cohort)
@@ -156,54 +160,80 @@ def _run_task(method: Path, cohort: Path, out: Path, point: str, train_count: in
             truth.write_scenario(parameters, cohort, scenario)
         elif json.loads((scenario / "scenario.json").read_text())["params"] != parameters:
             raise ValueError("Existing scenario has different parameters; use a new output directory")
-    task = out / "tasks" / point / f"n{train_count}" / f"replicate{replicate}"
-    models = {}
-    for arm, arm_method, dropped in (("snv_indel", method, SMALL_ARM_DROPPED), ("with_sv", method, ()), ("ldpred2_auto", LDPRED2, ())):
-        models[arm] = harness.run(arm_method, cohort, scenario, task / arm, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
-    samples = np.load(cohort / "samples.npz")
-    labels = np.load(scenario / "truth.npz")["phenotype"][np.flatnonzero(samples["is_test"])]
-    small_score = np.load(task / "snv_indel" / "prediction.npz")["total"]
-    sv_score = np.load(task / "with_sv" / "prediction.npz")["total"]
-    ldpred2_score = np.load(task / "ldpred2_auto" / "prediction.npz")["total"]
-    comparison = paired_delta_auc(labels, small_score, sv_score)
-    against_ldpred2 = paired_delta_auc(labels, ldpred2_score, sv_score)
-    result = {
-        "point": point, "train_count": train_count, "replicate": replicate,
-        "snv_indel_auc": harness.auc(labels, small_score), "with_sv_auc": harness.auc(labels, sv_score),
-        "ldpred2_auc": harness.auc(labels, ldpred2_score),
-        "delta_auc": comparison.estimate, "z": comparison.z_score,
-        "delta_auc_vs_ldpred2": against_ldpred2.estimate, "z_vs_ldpred2": against_ldpred2.z_score,
-        "prediction": "genetic_only",
-        "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in models},
-        "truth": json.loads((scenario / "scenario.json").read_text())["summary"],
-        **structural_effect_readout(models["with_sv"], cohort, task / "with_sv" / "sv_effects.npz"),
-    }
-    (task / "result.json").write_text(json.dumps(result, indent=1))
-    return result
+    return scenario
 
 
-def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, cores: int) -> dict:
-    """Record failed fits as well as successful ones; reject duplicate task writers."""
-    task = out / "tasks" / point / f"n{train_count}" / f"replicate{replicate}"
-    task.mkdir(parents=True, exist_ok=True)
-    identity = dict(point=point, train_count=train_count, replicate=replicate, method=str(method))
+def _task(out: Path, point: str, train_count: int, replicate: int) -> Path:
+    return out / "tasks" / point / f"n{train_count}" / f"replicate{replicate}"
+
+
+def _completed(folder: Path) -> bool:
+    attempt = folder / "attempt.json"
+    return attempt.is_file() and json.loads(attempt.read_text())["status"] == "completed"
+
+
+def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str, cores: int) -> dict | None:
+    """One arm of one (point, training size, replicate) task, fitted on ``train_count`` training samples drawn by the
+    replicate's seed and scored on bench-sim's test samples. Arms run as separate jobs; the last one to finish writes the
+    task's comparison. Failed fits are recorded as well as successful ones; duplicate writers are rejected."""
+    scenario = _scenario(cohort, out, point, replicate)
+    folder = _task(out, point, train_count, replicate) / arm
+    folder.mkdir(parents=True, exist_ok=True)
+    arm_method, dropped = ARMS[arm][0] or method, ARMS[arm][1]
+    identity = dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(arm_method))
 
     def status(value, **details):
-        temporary = task / "attempt.partial.json"
+        temporary = folder / "attempt.partial.json"
         temporary.write_text(json.dumps(identity | dict(status=value) | details, indent=1))
-        temporary.replace(task / "attempt.json")
+        temporary.replace(folder / "attempt.json")
 
-    with (task / ".lock").open("a") as lock:
+    with (folder / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if (task / "result.json").exists():
-            raise FileExistsError("Completed task already exists; use a new directory to rerun changed inputs")
+        if _completed(folder):
+            raise FileExistsError("Completed arm already exists; use a new directory to rerun changed inputs")
         status("running")
         try:
-            result = _run_task(method, cohort, out, point, train_count, replicate, cores)
+            model = harness.run(arm_method, cohort, scenario, folder, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
+            if arm == "with_sv":
+                readout = structural_effect_readout(model, cohort, folder / "sv_effects.npz")
+                (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
         except Exception as error:
             status("failed", error_type=type(error).__name__, error=str(error))
             raise
         status("completed")
+    return compare(cohort, out, point, train_count, replicate)
+
+
+def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: int) -> dict | None:
+    """The task's held-out comparison once every arm has completed (None before): each arm's AUC, the SV arm's paired
+    DeLong gain over the SNV/indel arm and over LDpred2-auto, the truth summary and the SV effect readout."""
+    task = _task(out, point, train_count, replicate)
+    if not all(_completed(task / arm) for arm in ARMS):
+        return None
+    with (task / ".compare.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if (task / "result.json").exists():
+            return json.loads((task / "result.json").read_text())
+        scenario = out / "scenarios" / point / f"replicate{replicate}"
+        samples = np.load(cohort / "samples.npz")
+        labels = np.load(scenario / "truth.npz")["phenotype"][np.flatnonzero(samples["is_test"])]
+        scores = {arm: np.load(task / arm / "prediction.npz")["total"] for arm in ARMS}
+        comparison = paired_delta_auc(labels, scores["snv_indel"], scores["with_sv"])
+        against_ldpred2 = paired_delta_auc(labels, scores["ldpred2_auto"], scores["with_sv"])
+        result = {
+            "point": point, "train_count": train_count, "replicate": replicate,
+            "snv_indel_auc": harness.auc(labels, scores["snv_indel"]), "with_sv_auc": harness.auc(labels, scores["with_sv"]),
+            "ldpred2_auc": harness.auc(labels, scores["ldpred2_auto"]),
+            "delta_auc": comparison.estimate, "z": comparison.z_score,
+            "delta_auc_vs_ldpred2": against_ldpred2.estimate, "z_vs_ldpred2": against_ldpred2.z_score,
+            "prediction": "genetic_only",
+            "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in ARMS},
+            "truth": json.loads((scenario / "scenario.json").read_text())["summary"],
+            **json.loads((task / "with_sv" / "sv_readout.json").read_text()),
+        }
+        temporary = task / "result.partial.json"
+        temporary.write_text(json.dumps(result, indent=1))
+        temporary.replace(task / "result.json")
         return result
 
 
@@ -214,12 +244,16 @@ SUMMARY_COLUMNS = (
 )
 
 
-def summarize(out: Path) -> Path:
+def summarize(out: Path, cohort: Path) -> Path:
     """Every finished task's result, per (point, training size): the replicates' means, the SE of the mean gain, and the
     share whose one-sided paired DeLong test favours the SV arm at 0.05. Conditions on completed tasks;
-    invalid comparisons are counted explicitly and excluded from the rejection-rate denominator."""
+    invalid comparisons are counted explicitly and excluded from the rejection-rate denominator. A task whose arms all
+    completed but whose comparison is missing (its last arm died between the two writes) is compared here first."""
+    for folder in sorted((out / "tasks").glob("*/n*/replicate*")):
+        if not (folder / "result.json").exists():
+            compare(cohort, out, folder.parent.parent.name, int(folder.parent.name[1:]), int(folder.name.removeprefix("replicate")))
     results = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/result.json"))]
-    attempts = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/attempt.json"))]
+    attempts = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/*/attempt.json"))]
     def finite_mean(values):
         values = np.asarray(values, dtype=float)
         values = values[np.isfinite(values)]
@@ -230,7 +264,9 @@ def summarize(out: Path) -> Path:
         for train_count in sorted({result["train_count"] for result in results + attempts if result["point"] == point}):
             group = [result for result in results if result["point"] == point and result["train_count"] == train_count]
             completed = {result['replicate'] for result in group}
-            incomplete = [row for row in attempts if row['point'] == point and row['train_count'] == train_count and row['replicate'] not in completed]
+            incomplete_arms = [row for row in attempts if row['point'] == point and row['train_count'] == train_count and row['replicate'] not in completed]
+            failed = {row['replicate'] for row in incomplete_arms if row['status'] == 'failed'}
+            unfinished = {row['replicate'] for row in incomplete_arms} - failed
             deltas = np.array([result["delta_auc"] for result in group])
             valid = [result for result in group if np.isfinite(result["delta_auc"]) and np.isfinite(result["z"])]
             rate = rejection_summary(sum(result["z"] > critical for result in valid), len(valid))
@@ -242,7 +278,7 @@ def summarize(out: Path) -> Path:
                 f"{rate['lower']:.4f}", f"{rate['upper']:.4f}",
                 f"{finite_mean([result['length_rho'] for result in group]):.3f}",
                 f"{finite_mean([result['deletion_over_insertion'] for result in group]):.3f}",
-                sum(row['status'] == 'failed' for row in incomplete), sum(row['status'] != 'failed' for row in incomplete),
+                len(failed), len(unfinished),
             ))
     target = out / "summary.tsv"
     with target.open("w", newline="") as handle:
@@ -253,21 +289,24 @@ def summarize(out: Path) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     commands = parser.add_subparsers(dest="command", required=True)
-    task = commands.add_parser("run", help="one (point, training size, replicate) task, both arms")
+    task = commands.add_parser("run", help="one arm of one (point, training size, replicate) task")
     task.add_argument("--method", type=Path, required=True, help="a bench-sim submission, e.g. benchmarks/bench_sim/submissions/svpgs_full.py")
     task.add_argument("--cohort", type=Path, required=True, help="a bench-sim cohort chromosome directory")
     task.add_argument("--out", type=Path, required=True)
     task.add_argument("--point", choices=list(POINTS), required=True)
     task.add_argument("--train-count", type=int, choices=TRAIN_COUNTS, required=True)
     task.add_argument("--replicate", type=int, required=True)
+    task.add_argument("--arm", choices=list(ARMS), required=True)
     task.add_argument("--cores", type=int, default=16)
-    collect = commands.add_parser("summarize", help="collect every finished task into summary.tsv")
+    collect = commands.add_parser("summarize", help="compare finished tasks and collect them into summary.tsv")
     collect.add_argument("--out", type=Path, required=True)
+    collect.add_argument("--cohort", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.command == "run":
-        print(json.dumps(run(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count, arguments.replicate, arguments.cores)))
+        print(json.dumps(run(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
+                             arguments.replicate, arguments.arm, arguments.cores)))
     else:
-        print(summarize(arguments.out))
+        print(summarize(arguments.out, arguments.cohort))
 
 
 if __name__ == "__main__":

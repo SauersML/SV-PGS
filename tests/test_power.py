@@ -150,7 +150,7 @@ def test_summary_reports_invalid_comparisons_separately(tmp_path):
         (path / 'result.json').write_text(json.dumps(dict(
             point='null', train_count=5000, replicate=replicate, z=z, delta_auc=.01,
             snv_indel_auc=.6, with_sv_auc=.61, length_rho=0., deletion_over_insertion=1.)))
-    with grid.summarize(tmp_path).open() as handle:
+    with grid.summarize(tmp_path, tmp_path / 'cohort').open() as handle:
         row, = list(csv.DictReader(handle, delimiter='\t'))
     assert row['valid_comparisons'] == '2' and row['invalid_comparisons'] == '1'
     assert float(row['share_favouring_sv']) == .5
@@ -159,12 +159,13 @@ def test_summary_reports_invalid_comparisons_separately(tmp_path):
 
 def test_failed_tasks_are_counted_even_if_no_fit_completes(tmp_path, monkeypatch):
     import csv
-    def failed(*args):
+    def failed(*args, **kwargs):
         raise ValueError('synthetic rejected fit')
-    monkeypatch.setattr(grid, '_run_task', failed)
+    monkeypatch.setattr(grid, '_scenario', lambda *args: tmp_path / 'scenario')
+    monkeypatch.setattr(grid.harness, 'run', failed)
     with pytest.raises(ValueError, match='rejected fit'):
-        grid.run(tmp_path / 'method.py', tmp_path / 'cohort', tmp_path, 'null', 5000, 0, 1)
-    with grid.summarize(tmp_path).open() as handle:
+        grid.run(tmp_path / 'method.py', tmp_path / 'cohort', tmp_path, 'null', 5000, 0, 'with_sv', 1)
+    with grid.summarize(tmp_path, tmp_path / 'cohort').open() as handle:
         row, = list(csv.DictReader(handle, delimiter='\t'))
     assert row['failed_tasks'] == '1' and row['replicates'] == '0'
     assert row['valid_comparisons'] == '0' and row['share_favouring_sv'] == 'nan'
