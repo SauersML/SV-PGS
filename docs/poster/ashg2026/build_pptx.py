@@ -69,11 +69,12 @@ SIMULATION_ACCURACY = [
     [("SV-PGS − LDpred2-auto ΔAUC was ", ""), ("[ ]", "ph"), (" (SNV subset) and ", ""), ("[ ]", "ph"), (" (all variant classes).", "")],
 ]
 
-SIMULATION_EFFECTS = [
+SIMULATION_GENOTYPES = [
     [("With 20% causal SVs, estimated power at 40,000 samples was ", ""), ("[x%]", "ph"),
      (" (95% CI ", ""), ("[ ]", "ph"), ("; ", ""), ("[n]", "ph"), (" replicates).", "")],
-    [("The correlation of SV length with estimated |effect| was ρ = ", ""), ("[ ]", "ph"),
-     (" with a simulated length effect and ", ""), ("[ ]", "ph"), (" without one.", "")],
+    [("Imputed SVs below 1% frequency had mean r² ", ""), ("[ ]", "ph"), (" with their true genotypes, vs. ", ""),
+     ("[ ]", "ph"), (" for SNVs.", "")],
+    [("With true genotypes, adding SVs changed AUC by ", ""), ("[ΔAUC]", "ph"), (" (20% SVs, 3× effect).", "")],
 ]
 
 HYPERTENSION = [
@@ -119,9 +120,15 @@ def settled(point: dict, size: str) -> dict | None:
     return cell if cell and cell["replicates"] >= MIN_REPLICATES else None
 
 
+def rare_r2(bins: list[dict]) -> float:
+    """Mean imputation r^2 over the frequency bins below 1%, each weighted by its variant count."""
+    rare = [entry for entry in bins if entry["high"] <= 0.01 and entry["count"]]
+    return sum(entry["mean"] * entry["count"] for entry in rare) / sum(entry["count"] for entry in rare)
+
+
 def simulation_copy(summary: dict) -> None:
     """Fill the simulation's bracketed numbers with estimates and uncertainty from completed replicates."""
-    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_EFFECTS, DISCUSSION
+    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_GENOTYPES, DISCUSSION
     points = summary["points"]
     largest = str(max(summary["train_counts"]))
     largest_text = f"{int(largest):,}"
@@ -134,44 +141,49 @@ def simulation_copy(summary: dict) -> None:
                                  f"{min(counts)}–{max(counts)} completed replicates per cell. The grid is incomplete.", "")]]
     else:
         SIMULATION_ACCURACY = [[("No paired simulation comparisons have completed yet.", "")]]
-    SIMULATION_EFFECTS = [[("Power and effect-size summaries are preliminary while simulation replicates finish.", "")]]
+    SIMULATION_GENOTYPES = [[("Power and genotype-accuracy summaries are preliminary while simulation replicates finish.", "")]]
     DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")],
                   DISCUSSION[1]]
-    SIMULATION_METHODS = [[("SV-PGS with/without SVs and LDpred2-auto (MAF ≥ 1% SNVs at HapMap3 density, or all classes) use "
-                           f"{min(summary['train_counts']):,}–{int(largest):,} training samples.", "")]]
+    SIMULATION_METHODS = [[(f"{min(summary['train_counts']):,}–{int(largest):,} training samples; LDpred2-auto uses MAF ≥ 1% "
+                           "SNVs at HapMap3 density, or all classes.", "")]]
 
     twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
     accuracy = []
     if twenty and null_cell:
         positive, null = twenty["delta_auc"], null_cell["delta_auc"]
-        accuracy.append([
-            (f"At {largest_text} samples, adding SVs changed AUC by {auc_change(positive)} with 20% causal SVs; "
-             f"without causal SVs, ΔAUC = {number(null['mean'])}.", ""),
-        ])
+        accuracy.append([(f"Adding SVs at {largest_text} samples, 20% causal SVs: ΔAUC {auc_change(positive)}; "
+                          f"no causal SVs: {number(null['mean'])}.", "")])
     if twenty:
         found = [(twenty[key], which) for key, which in (("delta_auc_vs_ldpred2", "SNV subset"),
                                                          ("delta_auc_vs_ldpred2_allvar", "all variant classes"))
                  if twenty.get(key, {}).get("replicates", 0) >= MIN_REPLICATES]
         if found:
-            gains = " and ".join(f"{auc_change(against)} ({which})" for against, which in found)
-            accuracy.append([(f"At 20% causal SVs, ΔAUC vs. LDpred2-auto was {gains}.", "")])
+            gains = "; ".join(f"{which} {auc_change(against)}" for against, which in found)
+            accuracy.append([(f"SV-PGS minus LDpred2-auto: {gains}.", "")])
     if accuracy:
         SIMULATION_ACCURACY = accuracy
 
-    effects = []
+    genotypes = []
     if twenty:
         power = twenty["power"]
         if power["replicates"] >= MIN_REPLICATES:
-            effects.append([(f"At 20% causal SVs and {largest_text} samples, power was {power['rate']:.0%} "
-                             f"(95% CI {power['lower']:.0%}–{power['upper']:.0%}; {power['replicates']} replicates).", "")])
-    length_cell = settled(points.get("length_positive", {}), largest)
-    if length_cell and twenty:
-        rho = length_cell["length_rho"][0]
-        null_rho = twenty["length_rho"][0]
-        effects.append([(f"SV length–|effect| correlation was ρ = {number(rho, 2)} with a length effect "
-                         f"and {number(null_rho, 2)} without one.", "")])
-    if effects:
-        SIMULATION_EFFECTS = effects
+            genotypes.append([(f"Power at 20% causal SVs: {power['rate']:.0%} (95% CI {power['lower']:.0%}–{power['upper']:.0%}; "
+                               f"{power['replicates']} replicates).", "")])
+    accuracy_by_frequency = summary.get("genotype_accuracy", {}).get("r2_by_frequency")
+    if accuracy_by_frequency:
+        rare = {name: rare_r2(accuracy_by_frequency[name]["bins"]) for name in ("SV", "SNV")}
+        genotypes.append([(f"Imputed SVs below 1% frequency ({accuracy_by_frequency['SV']['below_1pct']:.0%} of SVs): mean "
+                           f"r² {number(rare['SV'], 2)}, vs. {number(rare['SNV'], 2)} for SNVs.", "")])
+    true_gains = summary.get("genotype_accuracy", {}).get("delta_auc", {})
+    found = [(point, label, true_gains[point]["true"]) for point, label in (("sv_20pct_fold3", "20% SVs, 3× effect"), ("sv_20pct", "20% SVs"))
+             if true_gains.get(point, {}).get("true", {}).get("replicates", 0) >= MIN_REPLICATES]
+    if found:
+        point, label, gain = found[0]
+        imputed = settled(points.get(point, {}), largest)
+        imputed_text = f"; imputed: {number(imputed['delta_auc']['mean'])}" if imputed else ""
+        genotypes.append([(f"True genotypes, {label}: ΔAUC {auc_change(gain)}{imputed_text}.", "")])
+    if genotypes:
+        SIMULATION_GENOTYPES = genotypes
 
     positives = [cell["delta_auc"] for cell in (settled(point, largest) for name, point in points.items() if name != "null") if cell]
     if positives:
@@ -396,7 +408,7 @@ def build() -> None:
     # the figures as media of their own
     figures = {
         "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
-        "power": "ph_sim_power.png", "effects": "ph_sim_effects.png", "hypertension": "ph_aou_hypertension.png",
+        "power": "ph_sim_power.png", "genotypes": "ph_sim_genotypes.png", "hypertension": "ph_aou_hypertension.png",
         "diseases": "ph_aou_diseases.png",
     }
     # the per-scenario gains exist once the grid has more than one scenario (figures.py)
@@ -441,9 +453,9 @@ def build() -> None:
     # the template's shapes, duplicated where the poster needs more of a kind: section bars, pictures, captions, text
     for source, new, name in (
         (93, 118, "Simulation results bar"), (93, 119, "All of Us bar"),
-        (106, 120, "Simulation effects"), (106, 121, "Hypertension"), (106, 122, "Diseases"),
-        (113, 123, "Simulation effects caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
-        (94, 126, "Simulation accuracy text"), (94, 127, "Simulation effects text"), (94, 128, "Hypertension text"),
+        (106, 120, "Simulation genotypes"), (106, 121, "Hypertension"), (106, 122, "Diseases"),
+        (113, 123, "Simulation genotypes caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
+        (94, 126, "Simulation accuracy text"), (94, 127, "Simulation genotypes text"), (94, 128, "Hypertension text"),
         (94, 129, "Diseases text"), (106, 130, "Simulation architectures"), (113, 131, "Simulation architectures caption"),
         (94, 132, "Simulation methods text"),
     ):
@@ -517,9 +529,9 @@ def build() -> None:
     xml = column.figure(xml, 106, "power", width=half)
     xml = column.caption(xml, 113, "Power", width=half)
     column.y = top
-    xml = column.figure(xml, 120, "effects", width=half, x=column.x + 0.37 + half)
-    xml = column.caption(xml, 123, "SV effect sizes", width=half, x=column.x + 0.37 + half)
-    xml = column.text(xml, 127, SIMULATION_EFFECTS)
+    xml = column.figure(xml, 120, "genotypes", width=half, x=column.x + 0.37 + half)
+    xml = column.caption(xml, 123, "SV genotype accuracy", width=half, x=column.x + 0.37 + half)
+    xml = column.text(xml, 127, SIMULATION_GENOTYPES)
     if "architectures" in figures:
         xml = column.figure(xml, 130, "architectures")
         xml = column.caption(xml, 131, "AUC gain by architecture (95% t interval)")

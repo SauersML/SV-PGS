@@ -29,10 +29,8 @@ def test_summary_can_report_failures_before_any_paired_result_exists(tmp_path):
     folder.mkdir(parents=True)
     (folder / "attempt.json").write_text(json.dumps(dict(point="sv_20pct", train_count=40000, replicate=0,
                                                         arm="with_sv", status="failed")))
-    # A partial/stale effect output from a failed attempt must not enter the poster.
-    np.savez(folder / "sv_effects.npz", record=[1], per_allele=[0.1])
     summary = json.loads(simulation.collect(tmp_path, tmp_path / "summary.json").read_text())
-    assert summary["tasks"] == 0 and summary["points"] == {} and summary["effects"] == {}
+    assert summary["tasks"] == 0 and summary["points"] == {} and summary["genotype_accuracy"] == {}
     assert summary["coverage"]["sv_20pct"]["40000"]["with_sv"] == {"completed": 0, "failed": 1, "running": 0}
 
 
@@ -60,6 +58,24 @@ def test_summary_keeps_each_comparisons_actual_denominator(tmp_path):
     assert math.isnan(cell["delta_auc_vs_ldpred2_allvar"]["lower"])
 
 
+def test_true_genotype_gain_is_paired_only_over_replicates_both_runs_finished(tmp_path):
+    def write(grid, replicate, delta):
+        folder = tmp_path / f"{grid}/tasks/sv_20pct/n40000/replicate{replicate}"
+        folder.mkdir(parents=True)
+        (folder / "result.json").write_text(json.dumps(dict(point="sv_20pct", train_count=40000, replicate=replicate,
+                                                            delta_auc=delta)))
+    for replicate, delta in enumerate((0.0, 0.01, 0.02)):
+        write("grid", replicate, delta)
+    for replicate, delta in ((1, 0.05), (2, 0.04), (3, 0.09)):
+        write("grid-truth", replicate, delta)
+    imputed = [json.loads(path.read_text()) for path in sorted((tmp_path / "grid").rglob("result.json"))]
+    gains = simulation.genotype_accuracy(tmp_path, imputed)["delta_auc"]["sv_20pct"]
+    assert gains["imputed"]["replicates"] == 3 and gains["true"]["replicates"] == 3
+    assert gains["true"]["mean"] == pytest.approx(0.06)
+    assert gains["true_minus_imputed"]["replicates"] == 2
+    assert gains["true_minus_imputed"]["mean"] == pytest.approx(0.03)
+
+
 def test_zero_gains_have_a_nonzero_plot_range():
     low, high, step = figures.nice_range(0.0, 0.0)
     assert low < 0 < high and step > 0
@@ -82,7 +98,7 @@ def test_missing_results_remove_an_optional_figure_from_a_previous_run(monkeypat
 def test_poster_does_not_call_an_inconclusive_comparison_equivalent(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
     poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
-    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_EFFECTS", "DISCUSSION"):
+    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION"):
         monkeypatch.setattr(poster, name, getattr(poster, name))
     entry = simulation.interval([-0.01, 0.0, 0.01])
     cell = dict(replicates=3, delta_auc=entry, delta_auc_vs_ldpred2=entry,
@@ -99,10 +115,10 @@ def test_poster_does_not_call_an_inconclusive_comparison_equivalent(monkeypatch,
 def test_partial_poster_replaces_template_numbers_with_actual_coverage(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
     poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
-    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_EFFECTS", "DISCUSSION"):
+    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION"):
         monkeypatch.setattr(poster, name, getattr(poster, name))
     poster.simulation_copy(dict(train_counts=[5000, 40000], points={"sv_20pct": {"sizes": {"40000": {"replicates": 2}}}}))
     copy = " ".join(text for paragraph in poster.SIMULATION_ACCURACY for text, _flag in paragraph)
     assert "2 paired comparisons" in copy and "grid is incomplete" in copy
-    assert not any(flag == "ph" for paragraphs in (poster.SIMULATION_ACCURACY, poster.SIMULATION_EFFECTS)
+    assert not any(flag == "ph" for paragraphs in (poster.SIMULATION_ACCURACY, poster.SIMULATION_GENOTYPES)
                    for paragraph in paragraphs for _text, flag in paragraph)

@@ -9,8 +9,9 @@ The local copy lives outside the repository (LOCAL). Per grid point and training
 mean test AUC with its SE over replicates, the SV arm's mean AUC gain with a 95% interval, the share of replicates whose
 one-sided paired DeLong test favours the SV arm at 0.05 with its Wilson interval, the truth's realized SV share of the
 genetic variance, and the expected AUC of a PGS that captures the whole heritability (Daetwyler et al. 2008 accuracy,
-Wray et al. 2010 AUC; benchmarks/power/expected.py). The SV effects section pairs each causal SV's simulated effect with
-its fitted one at the largest training size, and bins every SV's fitted |effect| by length.
+Wray et al. 2010 AUC; benchmarks/power/expected.py). The genotype accuracy section gives the imputed SVs' and SNVs' dosage r^2 against their true genotypes by allele frequency
+(benchmarks/power/imputation_accuracy.py) and, for the main scenarios, the SV arm's AUC gain when every variant is fitted
+on its true genotype (the same scenarios run with grid.py --measurement truth) beside the gain on imputed genotypes.
 """
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ HERE = Path(__file__).resolve().parent
 SUMMARY = HERE / "simulation_summary.json"
 GRID = "grid2"
 """The grid run on MSI the poster reads: alpha = -0.38 (benchmarks/power/grid.py, FREQUENCY_ALPHA)."""
+TRUTH_GRID = f"{GRID}-truth"
+"""The same scenarios and replicates at the largest training size, every variant measured by its true genotype."""
+TRUTH_POINTS = ("null", "sv_20pct", "sv_20pct_fold3")
 LOCAL = Path.home() / "svpgs-bench" / f"poster-{GRID}"
 REMOTE = "msi:/scratch.global/sauer354/svpgs-poster"
 TEST_PEOPLE = 10_000
@@ -39,9 +43,6 @@ CHR22_MORGANS = 0.839
 EFFECTIVE_POPULATION = 10_000
 """The human effective population size of Goddard (2009)'s effective-segment count."""
 ONE_SIDED = stats.norm.isf(0.05)
-LENGTH_EDGES_BP = (50, 100, 300, 1_000, 10_000, math.inf)
-"""SV length bins: about 950, 380, 170, 130 and 30 imputed SVs on chr22 from shortest to longest."""
-EFFECT_POINTS = ("sv_20pct", "length_positive")
 
 
 def effective_segments() -> float:
@@ -147,7 +148,7 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
         "test_people": TEST_PEOPLE,
         "effective_segments": effective_segments(),
         "points": points,
-        "effects": effects(local),
+        "genotype_accuracy": genotype_accuracy(local, results),
     }
     temporary = target.with_suffix(".partial.json")
     temporary.write_text(json.dumps(summary, indent=1, allow_nan=True) + "\n")
@@ -155,70 +156,44 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
     return target
 
 
-def effects(local: Path) -> dict:
-    """At each effect point's largest training size with fitted effects: (simulated, fitted) per-allele effects of
-    every causal SV, the simulated liability-scale effect put on the fit's scale (a per-allele change in case
-    probability: phi(threshold) times the liability effect), and every SV's fitted |effect| by length bin."""
-    completed = {point: [path for path in sorted((local / "grid" / "tasks" / point).glob("n*/replicate*/with_sv/sv_effects.npz"))
-                         if json.loads((path.parent / "attempt.json").read_text())["status"] == "completed"]
-                 for point in EFFECT_POINTS}
-    if not any(completed.values()):
-        return {}
-    public = np.load(local / "public" / "sv_records.npz")
-    records, log_length = public["record"], public["log_sv_length"]
-    edges = np.log(np.asarray(LENGTH_EDGES_BP, dtype=float))
-    bin_count = edges.size - 1
-    imputed = log_length[public["measured"]]
+def genotype_accuracy(local: Path, imputed: list[dict]) -> dict:
+    """Dosage r^2 by allele frequency (the figs copy of imputation_accuracy.py's output), and per truth point at the
+    largest size the AUC gain from adding SVs on imputed and on true genotypes, each over its completed replicates, with
+    the paired difference (true minus imputed) over the replicates both finished."""
     found = {}
-    for point in EFFECT_POINTS:
-        files = completed[point]
-        if not files:
-            continue
-        largest = max(int(path.parts[-4][1:]) for path in files)
-        files = [path for path in files if int(path.parts[-4][1:]) == largest]
-        slope = stats.norm.pdf(stats.norm.isf(setting(point)["prevalence"]))
-        pairs, bins = [], []
-        for path in files:
-            replicate = path.parts[-3]
-            truth = np.load(local / "grid" / "scenarios" / point / replicate / "truth.npz")
-            fitted = np.load(path)
-            estimate = dict(zip(fitted["record"].tolist(), fitted["per_allele"].tolist()))
-            for record, effect in zip(truth["causal"].tolist(), truth["per_allele"].tolist()):
-                if record in estimate:
-                    pairs.append([slope * effect, estimate[record]])
-            lengths = log_length[np.searchsorted(records, fitted["record"])]
-            which = np.clip(np.searchsorted(edges, lengths, side="right") - 1, 0, bin_count - 1)
-            magnitude = np.abs(fitted["per_allele"])
-            bins.append([float(magnitude[which == index].mean()) if np.any(which == index) else math.nan for index in range(bin_count)])
-        bins = np.asarray(bins)
-        bin_intervals = [interval(bins[:, index]) for index in range(bin_count)]
-        median_lengths = []
-        for low, high in zip(edges[:-1], edges[1:]):
-            lengths = imputed[(imputed >= low) & (imputed < high)]
-            median_lengths.append(float(np.median(np.exp(lengths))) if lengths.size else math.nan)
-        simulated, fitted_values = (np.asarray(pairs).T if pairs else (np.array([]), np.array([])))
-        found[point] = {
-            "train_count": largest, "replicates": len(files), "pairs": pairs,
-            "pearson": (float(np.corrcoef(simulated, fitted_values)[0, 1])
-                        if len(pairs) > 2 and np.ptp(simulated) > 0 and np.ptp(fitted_values) > 0 else math.nan),
-            "length_bins": {
-                "lower_bp": list(LENGTH_EDGES_BP[:-1]), "upper_bp": list(LENGTH_EDGES_BP[1:]),
-                "median_bp": median_lengths,
-                "mean_abs": [entry["mean"] for entry in bin_intervals],
-                "se": [entry["se"] for entry in bin_intervals],
-                "intervals": bin_intervals,
-            },
+    accuracy = local / "public" / "imputation_accuracy.json"
+    if accuracy.is_file():
+        found["r2_by_frequency"] = json.loads(accuracy.read_text())
+    true = [json.loads(path.read_text()) for path in sorted((local / "grid-truth" / "tasks").glob("*/n*/replicate*/result.json"))]
+    largest = max(TRAIN_COUNTS)
+    gains = {}
+    for point in TRUTH_POINTS:
+        by_measurement = {
+            name: {row["replicate"]: row["delta_auc"] for row in rows
+                   if row["point"] == point and row["train_count"] == largest and math.isfinite(row["delta_auc"])}
+            for name, rows in (("imputed", imputed), ("true", true))
         }
+        if not by_measurement["true"]:
+            continue
+        both = sorted(set(by_measurement["imputed"]) & set(by_measurement["true"]))
+        gains[point] = {
+            "imputed": interval(by_measurement["imputed"].values()),
+            "true": interval(by_measurement["true"].values()),
+            "true_minus_imputed": interval(by_measurement["true"][replicate] - by_measurement["imputed"][replicate] for replicate in both),
+        }
+    if gains:
+        found["train_count"] = largest
+        found["delta_auc"] = gains
     return found
 
 
 def fetch(local: Path = LOCAL) -> None:
-    """Copy the grid's results (result.json, the SV arm's SV effects) and the scenario truths from MSI, over the open
-    SSH connection (ssh config host msi), plus the public SV record table."""
+    """Copy the grid's and the true-genotype run's results (result.json, attempt.json) from MSI, over the open SSH
+    connection (ssh config host msi), plus the genotype accuracy by allele frequency."""
     local.mkdir(parents=True, exist_ok=True)
-    rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--include=sv_effects.npz",
-             "--include=truth.npz", "--include=scenario.json", "--exclude=*"]
-    subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{GRID}/", str(local / "grid")], check=True)
+    rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--exclude=*"]
+    for grid, folder in ((GRID, "grid"), (TRUTH_GRID, "grid-truth")):
+        subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)], check=True)
     subprocess.run(["rsync", "-a", f"{REMOTE}/figs/", str(local / "public")], check=True)
 
 

@@ -334,93 +334,104 @@ def power_figure(summary: dict) -> Path:
     return render("ph_sim_power", page("".join(parts), width, height), width, height)
 
 
-def effects_figure(summary: dict) -> Path:
-    """Left: each causal SV's estimated effect against its simulated one (20% causal SVs, the largest training size),
-    both as a per-allele change in case probability, with the identity line. Right: mean |estimated effect| of every
-    SV by length, when simulated effects grow with length and when they do not."""
+GENOTYPE_CLASSES = (("SNV", "SNVs", NAVY), ("SV", "SVs", TEAL))
+GENOTYPE_POINTS = ("null", "sv_20pct", "sv_20pct_fold3")
+
+
+def genotypes_figure(summary: dict) -> Path:
+    """Left: mean dosage r^2 of imputed SVs and SNVs against their true genotypes by minor allele frequency, with the
+    middle half of variants shaded. Right: the AUC gain from adding SVs at the largest training size, per main scenario,
+    on imputed genotypes (open) and on true genotypes (filled), with 95% t intervals over replicates."""
     width, height = 8.20, 4.40
     w, h = width * 100, height * 100
-    effects = summary["effects"]
+    accuracy = summary["genotype_accuracy"]
+    by_frequency = accuracy["r2_by_frequency"]
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
     top, bottom = 28.0, h - 128.0
-    # left: estimated vs simulated, in percentage points of case probability per allele
-    scatter = effects.get("sv_20pct") or effects.get("length_positive")
-    a0, a1 = 112.0, 322.0
-    pairs = [(simulated * 100, estimated * 100) for simulated, estimated in scatter["pairs"]]
-    reach = max(max((abs(value) for pair in pairs for value in pair), default=0.0), 1e-9) * 1.04
-    # a symmetric range at the next round value, ticked at its ends and zero
-    scale = 10 ** math.floor(math.log10(reach))
-    high = next(multiple * scale for multiple in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0) if multiple * scale >= reach)
-    low, step = -high, high
+    # left: r^2 against minor allele frequency on a log axis
+    a0, a1 = 128.0, 372.0
+    edges = by_frequency["edges"]
+    frequency_low, frequency_high = math.log10(edges[0]), math.log10(edges[-1])
 
-    def sx(value: float) -> float:
-        return a0 + (value - low) / (high - low) * (a1 - a0)
+    def fx(frequency: float) -> float:
+        return a0 + 12 + (math.log10(frequency) - frequency_low) / (frequency_high - frequency_low) * (a1 - a0 - 24)
 
-    def sy(value: float) -> float:
-        return bottom - (value - low) / (high - low) * (bottom - top)
+    def fy(r2: float) -> float:
+        return bottom - r2 * (bottom - top)
 
     parts.append(f'<line x1="{a0}" y1="{bottom}" x2="{a1}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
     parts.append(f'<line x1="{a0}" y1="{top}" x2="{a0}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    parts.append(f'<line x1="{sx(low):.1f}" y1="{sy(low):.1f}" x2="{sx(high):.1f}" y2="{sy(high):.1f}" stroke="{GREY}" stroke-width="3.5" stroke-dasharray="12 9"/>')
+    for r2, label in ((0.0, "0"), (0.5, "0.5"), (1.0, "1")):
+        parts.append(f'<line x1="{a0 - 10}" y1="{fy(r2):.1f}" x2="{a0}" y2="{fy(r2):.1f}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{a0 - 16}" y="{fy(r2) + 9:.1f}" text-anchor="end">{label}</text>')
+    for frequency, label in ((0.001, "0.1%"), (0.01, "1%"), (0.1, "10%")):
+        parts.append(f'<line x1="{fx(frequency):.1f}" y1="{bottom}" x2="{fx(frequency):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{fx(frequency):.1f}" y="{bottom + 42}" text-anchor="middle">{label}</text>')
+    for name, label, colour in GENOTYPE_CLASSES:
+        # each bin at its geometric midpoint
+        bins = [(fx(math.sqrt(entry["low"] * entry["high"])), entry) for entry in by_frequency[name]["bins"] if entry["count"]]
+        band = [f"{px:.1f},{fy(entry['q75']):.1f}" for px, entry in bins] + [f"{px:.1f},{fy(entry['q25']):.1f}" for px, entry in reversed(bins)]
+        parts.append(f'<polygon points="{" ".join(band)}" fill="{colour}" fill-opacity="0.16"/>')
+        parts.append('<polyline points="' + " ".join(f"{px:.1f},{fy(entry['mean']):.1f}" for px, entry in bins)
+                     + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"/>')
+        for px, entry in bins:
+            parts.append(f'<circle cx="{px:.1f}" cy="{fy(entry["mean"]):.1f}" r="8" fill="{colour}" stroke="#fff" stroke-width="3"/>')
+        # SNVs labelled under their first bins, where the SV band is low; SVs under their band's last three bins
+        if name == "SNV":
+            label_x, label_y, anchor = bins[0][0] - 8, fy(bins[0][1]["mean"]) + 46, "start"
+        else:
+            label_x, label_y, anchor = bins[-1][0] + 8, fy(min(entry["q25"] for _px, entry in bins[-3:])) + 38, "end"
+        parts.append(f'<text class="end" x="{label_x:.1f}" y="{label_y:.1f}" text-anchor="{anchor}" style="fill:{colour}">{label}</text>')
+    parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 16}" text-anchor="middle">Allele frequency</text>')
+    parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Imputation r²</text>')
+    # right: AUC gain from adding SVs, one row per scenario, imputed (open) above true (filled)
+    b0, b1 = 448.0, 805.0
+    largest = str(max(summary["train_counts"]))
+    true_gains = accuracy.get("delta_auc", {})
+    rows = []
+    for point, label, colour in (entry for point in GENOTYPE_POINTS for entry in POWER_SERIES if entry[0] == point):
+        imputed = summary["points"].get(point, {}).get("sizes", {}).get(largest, {}).get("delta_auc")
+        true = true_gains.get(point, {}).get("true")
+        rows.append((label, colour, [(entry, filled) for entry, filled in ((imputed, False), (true, True))
+                                     if entry and math.isfinite(entry["mean"])]))
+    values = [0.0] + finite(value for _label, _colour, marks in rows for entry, _filled in marks
+                            for value in (entry["mean"], entry["lower"], entry["upper"]))
+    low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=4)
+
+    def gx(value: float) -> float:
+        return b0 + (value - low) / (high - low) * (b1 - b0)
+
+    # the key in two lines at the top right, then the rows
+    rows_top = 104.0
+    key_x = b1 - 32 - text_width("True genotypes", 26)
+    for line, (label, filled) in enumerate((("Imputed", False), ("True genotypes", True))):
+        key_y = 34 + 40 * line
+        parts.append(f'<circle cx="{key_x + 12:.1f}" cy="{key_y - 10:.1f}" r="10" fill="{GREY if filled else "#fff"}" stroke="{GREY}" stroke-width="5"/>')
+        parts.append(f'<text class="key" x="{key_x + 32:.1f}" y="{key_y + 2:.1f}">{label}</text>')
+    parts.append(f'<line x1="{b0}" y1="{bottom}" x2="{b1}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+    parts.append(f'<line x1="{gx(0.0):.1f}" y1="{rows_top}" x2="{gx(0.0):.1f}" y2="{bottom}" stroke="{GREY}" stroke-width="3" stroke-dasharray="10 8"/>')
     tick = low
     while tick <= high + 1e-9:
-        label = tick_text(tick, step) + ("%" if abs(tick) > 1e-12 else "")
-        parts.append(f'<line x1="{sx(tick):.1f}" y1="{bottom}" x2="{sx(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{sx(tick):.1f}" y="{bottom + 42}" text-anchor="middle">{label}</text>')
-        parts.append(f'<line x1="{a0 - 10}" y1="{sy(tick):.1f}" x2="{a0}" y2="{sy(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{a0 - 16}" y="{sy(tick) + 9:.1f}" text-anchor="end">{label}</text>')
+        parts.append(f'<line x1="{gx(tick):.1f}" y1="{bottom}" x2="{gx(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+        # the last label ends at the figure's edge instead of past it
+        label = tick_text(tick, step)
+        edge = gx(tick) + text_width(label, 26) / 2 > w - 4
+        parts.append(f'<text class="tick" x="{w - 4 if edge else gx(tick):.1f}" y="{bottom + 42}" text-anchor="{"end" if edge else "middle"}">{label}</text>')
         tick += step
-    for simulated, estimated in pairs:
-        parts.append(f'<circle cx="{sx(simulated):.1f}" cy="{sy(estimated):.1f}" r="7" fill="{TEAL}" fill-opacity="0.55"/>')
-    if math.isfinite(scatter["pearson"]):
-        parts.append(f'<text class="stat" x="{a0 + 18}" y="{top + 30}">r = {scatter["pearson"]:.2f}</text>')
-    parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 16}" text-anchor="middle">Simulated effect</text>')
-    parts.append(f'<text class="axis" transform="translate(28 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Estimated effect</text>')
-    # right: mean |estimated effect| by SV length
-    b0, b1 = 540.0, 805.0
-    lines = [(point, label, colour) for point, label, colour in (("length_positive", "Length effect", TEAL), ("sv_20pct", "No length effect", GREY)) if point in effects]
-    peak = max((value for point, _label, _colour in lines
-                for value in finite(effects[point]["length_bins"]["mean_abs"] +
-                                    [entry["upper"] for entry in effects[point]["length_bins"].get("intervals", [])])), default=0.0) * 100
-    # headroom above the lines for their two labels
-    _low, top_value, step = nice_range(0.0, peak * 1.6, steps=(0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0), most=4)
-    lengths_low, lengths_high = math.log10(40.0), math.log10(80_000.0)
-
-    def lx(length_bp: float) -> float:
-        return b0 + (math.log10(length_bp) - lengths_low) / (lengths_high - lengths_low) * (b1 - b0)
-
-    def ly(value: float) -> float:
-        return bottom - value / top_value * (bottom - top)
-
-    parts.append(f'<line x1="{b0}" y1="{bottom}" x2="{b1}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    parts.append(f'<line x1="{b0}" y1="{top}" x2="{b0}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    for length_bp, label in ((100, "100"), (1_000, "1k"), (10_000, "10k")):
-        parts.append(f'<line x1="{lx(length_bp):.1f}" y1="{bottom}" x2="{lx(length_bp):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{lx(length_bp):.1f}" y="{bottom + 42}" text-anchor="middle">{label}</text>')
-    tick = 0.0
-    while tick <= top_value + 1e-9:
-        parts.append(f'<line x1="{b0 - 10}" y1="{ly(tick):.1f}" x2="{b0}" y2="{ly(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{b0 - 16}" y="{ly(tick) + 9:.1f}" text-anchor="end">{tick_text(tick, step) + "%" if tick > 1e-12 else "0"}</text>')
-        tick += step
-    ends = []
-    for point, label, colour in lines:
-        bins = effects[point]["length_bins"]
-        intervals = bins.get("intervals", [{"lower": math.nan, "upper": math.nan}] * len(bins["mean_abs"]))
-        points = [(lx(median), mean * 100, entry) for median, mean, entry in zip(bins["median_bp"], bins["mean_abs"], intervals)
-                  if math.isfinite(mean) and math.isfinite(median)]
-        parts.append('<polyline points="' + " ".join(f"{px:.1f},{ly(mean):.1f}" for px, mean, _se in points)
-                     + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"/>')
-        for px, mean, entry in points:
+    row_height = (bottom - rows_top) / len(rows)
+    for index, (label, colour, marks) in enumerate(rows):
+        row_top = rows_top + index * row_height
+        # a white outline breaks the zero line behind the label
+        parts.append(f'<text class="row" x="{b0 + 6}" y="{row_top + 22:.1f}" style="fill:{colour}; font-weight:700; paint-order:stroke; '
+                     f'stroke:#fff; stroke-width:10px; stroke-linejoin:round">{label}</text>')
+        for entry, filled in marks:
+            mark_y = row_top + (44 if not filled else 64)
             if math.isfinite(entry["lower"]):
-                parts.append(f'<line x1="{px:.1f}" y1="{ly(max(0.0, entry["lower"]) * 100):.1f}" x2="{px:.1f}" y2="{ly(entry["upper"] * 100):.1f}" stroke="{colour}" stroke-width="3.5"/>')
-            parts.append(f'<circle cx="{px:.1f}" cy="{ly(mean):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
-        ends.append((label, colour))
-    for index, (label, colour) in enumerate(ends):
-        parts.append(f'<text class="end" x="{b1}" y="{top + 30 + 36 * index:.1f}" text-anchor="end" style="fill:{colour}">{label}</text>')
-    parts.append(f'<text class="axis" x="{(b0 + b1) / 2:.1f}" y="{h - 16}" text-anchor="middle">SV length (bp)</text>')
-    parts.append(f'<text class="axis" transform="translate({b0 - 118} {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Mean |effect|</text>')
+                parts.append(f'<line x1="{gx(entry["lower"]):.1f}" y1="{mark_y:.1f}" x2="{gx(entry["upper"]):.1f}" y2="{mark_y:.1f}" stroke="{colour}" stroke-width="4"/>')
+            parts.append(f'<circle cx="{gx(entry["mean"]):.1f}" cy="{mark_y:.1f}" r="10" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
+    parts.append(f'<text class="axis" x="{(b0 + b1) / 2:.1f}" y="{h - 16}" text-anchor="middle">AUC gain from SVs</text>')
     parts.append("</svg>")
-    return render("ph_sim_effects", page("".join(parts), width, height), width, height)
+    return render("ph_sim_genotypes", page("".join(parts), width, height), width, height)
 
 
 ARCHITECTURES = (
@@ -505,9 +516,8 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     points = summary["points"] if summary else {}
     made.append(accuracy_figure(summary) if all(point in points for point, _title in ACCURACY_PANELS) else placeholder_figure("ph_sim_accuracy"))
     made.append(power_figure(summary) if "null" in points and any(point in points for point, *_rest in POWER_SERIES[:-1]) else placeholder_figure("ph_sim_power"))
-    # the length panel compares the two effect points, so the figure waits for both
-    effects = summary["effects"] if summary else {}
-    made.append(effects_figure(summary) if all(point in effects for point in ("sv_20pct", "length_positive")) else placeholder_figure("ph_sim_effects"))
+    made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
+                else placeholder_figure("ph_sim_genotypes"))
     if summary and len(points) > 1:
         made.append(architectures_figure(summary))
     else:
@@ -525,8 +535,8 @@ PLACEHOLDERS = {
                         "SV-PGS with and without SVs, and LDpred2-auto, at 0%, 5% and 20% causal SVs, with the expected accuracy"),
     "ph_sim_power": (8.20, 4.40, "simulation", "Power vs. training size",
                      "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
-    "ph_sim_effects": (8.20, 4.40, "simulation", "SV effect sizes",
-                       "Estimated vs. simulated SV effects, and |effect| vs. SV length"),
+    "ph_sim_genotypes": (8.20, 4.40, "simulation", "SV genotype accuracy",
+                         "Imputation r² of SVs and SNVs by allele frequency, and the AUC gain from SVs on imputed vs. true genotypes"),
     "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",
                             "Estimated SV effects by SV type, and |effect| vs. SV length"),
     "ph_aou_diseases": (15.40, 4.60, "All of Us", "Test AUC by disease",
