@@ -5,7 +5,23 @@ are fatal. Saving a diagnostic artifact is allowed; scoring or reporting it is n
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
+
+
+def subset_refusals(refusals: Sequence[str], indices: Sequence[int]) -> tuple[str, ...]:
+    """Select and renumber the model-indexed refusal notes written by ``stage2_wiring.fit_models``."""
+    renumbered = {index: position for position, index in enumerate(indices)}
+    selected = []
+    for refusal in refusals:
+        label, separator, reason = refusal.partition(": ")
+        if not separator or not label.startswith("model "):
+            raise ValueError(f"Fit refusal has no model index: {refusal}")
+        index = int(label.removeprefix("model "))
+        if index in renumbered:
+            selected.append(f"model {renumbered[index]}: {reason}")
+    return tuple(selected)
 
 
 def acceptance(model) -> dict:

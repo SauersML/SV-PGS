@@ -22,8 +22,8 @@ effects whose per-SD variance follows FREQUENCY_ALPHA, no annotation or non-addi
 Arms follow the workspace (``workspace_pipeline.ARMS``) plus the published-practice competitor: ``with_sv`` fits every
 record; ``snv_indel`` is refitted without bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels
 and short repeat indels; ``ldpred2_auto`` is LDpred2-auto on HapMap3-density SNVs, and ``ldpred2_allvar`` is
-LDpred2-auto on every measured record of minor allele frequency at least 1%, SVs included, so the SV arm's gain over it
-is the method's at equal input. One job is one arm of one (point, training size, replicate) task (``run``); the last of
+LDpred2-auto on every measured record of minor allele frequency at least 1%, SVs included. SV-PGS also retains rarer
+variants, so this comparison does not hold the input variants fixed. One job is one arm of one (point, training size, replicate) task (``run``); the last of
 the core arms to finish writes the task's comparison (a later ``ldpred2_allvar`` adds its own), and ``summarize`` compares
 any task left without one and collects every finished task into ``summary.tsv``: per point and size, the mean SV-arm gain
 in AUC and its SE over replicates, the share of replicates whose paired DeLong test favours the SV arm at one-sided 0.05,
@@ -188,6 +188,12 @@ def _completed(folder: Path) -> bool:
     return attempt.is_file() and json.loads(attempt.read_text())["status"] == "completed"
 
 
+def _write_attempt(folder: Path, identity: dict, status: str, **details) -> None:
+    temporary = folder / "attempt.partial.json"
+    temporary.write_text(json.dumps(identity | dict(status=status) | details, indent=1))
+    temporary.replace(folder / "attempt.json")
+
+
 def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str, cores: int) -> dict | None:
     """One arm of one (point, training size, replicate) task, fitted on ``train_count`` training samples drawn by the
     replicate's seed and scored on bench-sim's test samples. Arms run as separate jobs; the last one to finish writes the
@@ -198,25 +204,20 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
     arm_method, dropped = ARMS[arm][0] or method, ARMS[arm][1]
     identity = dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(arm_method))
 
-    def status(value, **details):
-        temporary = folder / "attempt.partial.json"
-        temporary.write_text(json.dumps(identity | dict(status=value) | details, indent=1))
-        temporary.replace(folder / "attempt.json")
-
     with (folder / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if _completed(folder):
             raise FileExistsError("Completed arm already exists; use a new directory to rerun changed inputs")
-        status("running")
+        _write_attempt(folder, identity, "running")
         try:
             model = harness.run(arm_method, cohort, scenario, folder, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
             if arm == "with_sv":
                 readout = structural_effect_readout(model, cohort, folder / "sv_effects.npz")
                 (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
         except Exception as error:
-            status("failed", error_type=type(error).__name__, error=str(error))
+            _write_attempt(folder, identity, "failed", error_type=type(error).__name__, error=str(error))
             raise
-        status("completed")
+        _write_attempt(folder, identity, "completed")
     return compare(cohort, out, point, train_count, replicate)
 
 
@@ -227,6 +228,8 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
     recorded as ``run`` records it, and a point whose arm another job holds or has completed is left out."""
     if ARMS[arm][0] is not None:
         raise ValueError(f"run-group fits the submitted method's arms, not {arm}")
+    if not points or len(set(points)) != len(points) or any(point not in POINTS for point in points):
+        raise ValueError("run-group requires distinct, known grid points")
     module = harness.load_method(method)
     dropped = ARMS[arm][1]
     with contextlib.ExitStack() as held:
@@ -247,35 +250,43 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
         identities = {point: dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(method),
                                   fitted_with=[member[0] for member in members]) for point, _scenario_path, _folder in members}
 
-        def status(point, folder, value, **details):
-            temporary = folder / "attempt.partial.json"
-            temporary.write_text(json.dumps(identities[point] | dict(status=value) | details, indent=1))
-            temporary.replace(folder / "attempt.json")
-
-        views = [harness.views(cohort, scenario, cores, MEASUREMENT_ARM, dropped, train_count, replicate) for _point, scenario, _folder in members]
         for point, _scenario_path, folder in members:
-            status(point, folder, "running")
-        train, test = views[0]
-        started = time.time()
+            _write_attempt(folder, identities[point], "running")
         try:
-            outcomes = module.fit_phenotypes(train, np.column_stack([view[0].phenotype for view in views]))
+            views = [harness.views(cohort, scenario, cores, MEASUREMENT_ARM, dropped, train_count, replicate)
+                     for _point, scenario, _folder in members]
+            train, test = views[0]
+            started = time.monotonic()
+            outcomes = list(module.fit_phenotypes(train, np.column_stack([view[0].phenotype for view in views])))
+            if len(outcomes) != len(members):
+                raise ValueError(f"Grouped fit returned {len(outcomes)} outcomes for {len(members)} phenotypes")
         except Exception as error:
             for point, _scenario_path, folder in members:
-                status(point, folder, "failed", error_type=type(error).__name__, error=str(error))
+                _write_attempt(folder, identities[point], "failed", error_type=type(error).__name__, error=str(error))
             raise
-        seconds = time.time() - started
+        seconds = time.monotonic() - started
+        errors = []
         for (point, scenario, folder), outcome in zip(members, outcomes):
             if isinstance(outcome, Exception):
-                status(point, folder, "failed", error_type=type(outcome).__name__, error=str(outcome))
+                _write_attempt(folder, identities[point], "failed", error_type=type(outcome).__name__, error=str(outcome))
                 continue
-            harness.write_prediction(outcome, test, folder, seconds, method=str(method), scenario=str(scenario), cores=cores,
-                                     measurement=harness.ARMS[MEASUREMENT_ARM][2], dropped_classes=list(dropped),
-                                     train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members))
-            if arm == "with_sv":
-                readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz")
-                (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
-            status(point, folder, "completed")
-    return [compare(cohort, out, point, train_count, replicate) for point, _scenario_path, _folder in members]
+            try:
+                harness.write_prediction(outcome, test, folder, seconds, method=str(method), scenario=str(scenario), cores=cores,
+                                         measurement=harness.ARMS[MEASUREMENT_ARM][2], dropped_classes=list(dropped),
+                                         train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members))
+                if arm == "with_sv":
+                    readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz")
+                    (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
+            except Exception as error:
+                _write_attempt(folder, identities[point], "failed", error_type=type(error).__name__, error=str(error))
+                error.add_note(f"grid point {point}, n={train_count}, replicate={replicate}, arm={arm}")
+                errors.append(error)
+                continue
+            _write_attempt(folder, identities[point], "completed")
+    comparisons = [compare(cohort, out, point, train_count, replicate) for point, _scenario_path, _folder in members]
+    if errors:
+        raise ExceptionGroup("Grouped fit finished with scoring or output failures", errors)
+    return comparisons
 
 
 def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str) -> Path:

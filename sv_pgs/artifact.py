@@ -38,7 +38,7 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
-from sv_pgs.model_acceptance import acceptance, require_accepted
+from sv_pgs.model_acceptance import acceptance, require_accepted, subset_refusals
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
 MODEL_FORMAT = "svpgs-model v3"
@@ -240,13 +240,6 @@ def model_subset(model: FittedModel, names: Sequence[str]) -> FittedModel:
     for term in model.certificate:
         if f"{term}_count" in certificate:
             certificate[term] = certificate[term][:, : int(certificate[f"{term}_count"].max(initial=0))]
-    renumbered = {index: position for position, index in enumerate(indices)}
-    refusals = []
-    for refusal in model.refusals:
-        label, _separator, reason = refusal.partition(": ")
-        index = int(label.removeprefix("model "))
-        if index in renumbered:
-            refusals.append(f"model {renumbered[index]}: {reason}")
     return replace(
         model,
         model_names=tuple(names),
@@ -255,7 +248,7 @@ def model_subset(model: FittedModel, names: Sequence[str]) -> FittedModel:
         noise_variance=np.asarray(model.noise_variance)[indices],
         hyperparameters=tuple(model.hyperparameters[index] for index in indices),
         certificate=certificate,
-        refusals=tuple(refusals),
+        refusals=subset_refusals(model.refusals, indices),
     )
 
 

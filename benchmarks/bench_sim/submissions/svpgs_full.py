@@ -31,6 +31,7 @@ from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import CODES_PER_DOSAGE, VARIANT_CLASSES, DosageStore, VariantTable, write_dosage_store
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET, ScoringModel
 from sv_pgs.fit_model import DRAW_COUNT
+from sv_pgs.model_acceptance import subset_refusals
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import device_scope
 from sv_pgs.stage2_wiring import fit_models
@@ -302,6 +303,7 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
             # the model's own certificate terms: every per-model array's row ``index``
             terms = {key: (np.asarray(value)[index:index + 1] if np.ndim(value) and np.shape(value)[0] == count else value)
                      for key, value in parts.terms.items()}
+            refusals = subset_refusals(parts.refusals, [index])
             profile = {
                 "fit_seconds": seconds,
                 "models_fitted_together": count,
@@ -312,7 +314,7 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
                 "outer_criterion_met": None if certificate.outer_criterion_met is None else bool(np.asarray(certificate.outer_criterion_met)[index]),
                 "remaining_gain": float(np.asarray(certificate.remaining_gain)[index]) if np.asarray(certificate.remaining_gain).size else None,
                 "inference": inference,
-                "refusals": len(certificate.refusals),
+                "refusals": len(refusals),
                 # The outer loop's own record, so an uncertified fit shows how it ended: accepted steps, refused trials, those
                 # with no fixed point, and the remaining gain at its last evaluations.
                 "outer_iterations": int(np.asarray(certificate.outer_iterations)[index]),
@@ -322,7 +324,7 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
                 "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
                 "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
             }
-            state = SimpleNamespace(model_names=(f"simulation {index}",), certificate=terms, refusals=parts.refusals, scoring=(scoring,))
+            state = SimpleNamespace(model_names=(f"simulation {index}",), certificate=terms, refusals=refusals, scoring=(scoring,))
             profile["acceptance"] = acceptance(state)
             profile["annotated_prior"] = annotated_prior
             log(f"svpgs_full: model {index}: {profile}")

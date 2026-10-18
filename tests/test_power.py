@@ -208,7 +208,7 @@ def test_a_group_fit_records_each_point_on_its_own_and_leaves_out_completed_arms
     views = {"null": 0.0, "sv_5pct": 1.0, "sv_20pct": 2.0}
     monkeypatch.setattr(grid, "_scenario", lambda cohort, out, point, replicate: tmp_path / "scenarios" / point)
     monkeypatch.setattr(grid.harness, "views", lambda cohort, scenario, *rest: (
-        SimpleNamespace(phenotype=np.full(4, views[scenario.name]), n_samples=4), SimpleNamespace()))
+        SimpleNamespace(phenotype=np.full(4, views[scenario.name]), n_samples=4), SimpleNamespace(n_samples=3)))
     monkeypatch.setattr(grid.harness, "load_method", lambda method: SimpleNamespace(fit_phenotypes=fit_phenotypes))
     monkeypatch.setattr(grid, "compare", lambda *args: None)
     done = grid._task(tmp_path, "null", 5000, 0) / "snv_indel"
@@ -224,6 +224,60 @@ def test_a_group_fit_records_each_point_on_its_own_and_leaves_out_completed_arms
     assert json.loads((done / "attempt.json").read_text()) == dict(status="completed")
     with pytest.raises(ValueError, match="submitted method"):
         grid.run_group(tmp_path / "method.py", tmp_path / "cohort", tmp_path, ["null"], 5000, 0, "ldpred2_auto", 1)
+
+
+@pytest.mark.parametrize("failure", ["views", "missing_outcome", "extra_outcome", "score", "readout"])
+def test_group_failures_are_recorded_without_discarding_other_models(tmp_path, monkeypatch, failure):
+    import json
+    from types import SimpleNamespace
+
+    class Fitted:
+        def __init__(self, index):
+            self.index = index
+
+        def score(self, test):
+            if failure == "score" and self.index == 0:
+                raise RuntimeError("scoring failed")
+            return {"total": np.arange(test.n_samples, dtype=float)}
+
+    def views(*args):
+        if failure == "views":
+            raise RuntimeError("view failed")
+        return SimpleNamespace(phenotype=np.zeros(4), n_samples=4), SimpleNamespace(n_samples=3)
+
+    def readout(model, *args):
+        if failure == "readout" and model.index == 0:
+            raise RuntimeError("effect readout failed")
+        return {}
+
+    count = {"missing_outcome": 1, "extra_outcome": 3}.get(failure, 2)
+    monkeypatch.setattr(grid, "_scenario", lambda *args: tmp_path / "scenario")
+    monkeypatch.setattr(grid.harness, "views", views)
+    monkeypatch.setattr(grid.harness, "load_method", lambda *args: SimpleNamespace(
+        fit_phenotypes=lambda *args: [Fitted(index) for index in range(count)]))
+    monkeypatch.setattr(grid, "structural_effect_readout", readout)
+    compared = []
+    monkeypatch.setattr(grid, "compare", lambda cohort, out, point, *args: compared.append(point))
+    with pytest.raises((ValueError, RuntimeError, ExceptionGroup)):
+        grid.run_group(tmp_path / "method.py", tmp_path / "cohort", tmp_path, ["null", "sv_20pct"], 5000, 0, "with_sv", 1)
+    attempts = [json.loads((grid._task(tmp_path, point, 5000, 0) / "with_sv" / "attempt.json").read_text())
+                for point in ("null", "sv_20pct")]
+    assert attempts[0]["status"] == "failed"
+    if failure in ("score", "readout"):
+        assert attempts[1]["status"] == "completed"
+        assert compared == ["null", "sv_20pct"]
+    else:
+        assert attempts[1]["status"] == "failed"
+
+
+@pytest.mark.parametrize("prediction", [{}, {"total": [0.0]}, {"total": [0.0, np.nan, 1.0]},
+                                        {"total": [0.0, 0.5, 1.0], "structural": [np.inf, 0.0, 1.0]}])
+def test_invalid_predictions_are_not_written(tmp_path, prediction):
+    from types import SimpleNamespace
+    with pytest.raises(ValueError, match="prediction|Prediction"):
+        grid.harness.write_prediction(SimpleNamespace(score=lambda test: prediction), SimpleNamespace(n_samples=3), tmp_path, 1.0)
+    assert not (tmp_path / "prediction.npz").exists()
+    assert not (tmp_path / "meta.json").exists()
 
 
 def test_failed_tasks_are_counted_even_if_no_fit_completes(tmp_path, monkeypatch):

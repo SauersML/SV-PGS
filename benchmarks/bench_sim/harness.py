@@ -77,6 +77,11 @@ VARIANT_FIELDS = ("pos", "cm", "cls", "len_change", "ref_len", "alt_len")
 ANNOTATION_FIELDS = ("in_gene", "in_exon", "log_tss_distance", "in_repeat", "repeat_locus", "log_sv_length")
 
 
+def _selected_codes(observed: np.ndarray, records: np.ndarray, columns: np.ndarray, rows) -> np.ndarray:
+    """Read just the requested records and samples, without copying every sample in those records first."""
+    return np.asarray(observed[records[rows][..., None], columns])
+
+
 @dataclass
 class TrainData:
     """Training view. codes(rows) returns observed uint8 codes (dosage = code / 127) for training samples."""
@@ -102,7 +107,7 @@ class TrainData:
         return int(self._columns.size)
 
     def codes(self, rows) -> np.ndarray:
-        return np.asarray(self._observed[self._records[rows]])[..., self._columns]
+        return _selected_codes(self._observed, self._records, self._columns, rows)
 
     def codes_identity(self) -> str:
         """What determines every code ``codes`` returns: the observed file (its resolved path, size and modification time,
@@ -137,7 +142,7 @@ class ScoreData:
         return int(self._columns.size)
 
     def codes(self, rows) -> np.ndarray:
-        return np.asarray(self._observed[self._records[rows]])[..., self._columns]
+        return _selected_codes(self._observed, self._records, self._columns, rows)
 
 
 def public_variant_table(cohort: Path, arm: str) -> dict:
@@ -198,8 +203,16 @@ def write_prediction(model, test: ScoreData, out: Path, fit_seconds: float, **me
     prediction = model.score(test)
     if not isinstance(prediction, dict):
         prediction = {"total": prediction}
+    if "total" not in prediction:
+        raise ValueError("A benchmark prediction must contain the total score")
+    prediction = {key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()}
+    for name, values in prediction.items():
+        if values.shape != (test.n_samples,) or not np.all(np.isfinite(values)):
+            raise ValueError(f"Prediction {name!r} must contain one finite score per test sample")
     out.mkdir(parents=True, exist_ok=True)
-    np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
+    temporary = out / "prediction.partial.npz"
+    np.savez(temporary, **prediction)
+    temporary.replace(out / "prediction.npz")
     meta |= {"fit_seconds": fit_seconds, "score_seconds": time.time() - started,
              "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))

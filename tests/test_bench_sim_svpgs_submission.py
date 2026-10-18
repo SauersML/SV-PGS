@@ -77,6 +77,8 @@ def test_the_submission_scores_only_accepted_synthetic_fits(tmp_path: Path, monk
 
 
 def test_scenarios_fitted_together_match_their_separate_fits(tmp_path: Path, monkeypatch) -> None:
+    from dataclasses import replace
+
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     rng = np.random.default_rng(5)
     n_var, n_train, n_test = 60, 240, 80
@@ -111,6 +113,20 @@ def test_scenarios_fitted_together_match_their_separate_fits(tmp_path: Path, mon
         joint = model.score(test)["total"]
         assert np.corrcoef(alone, joint)[0, 1] > 0.99
         assert np.allclose(joint, alone, rtol=0.05, atol=0.05 * np.std(alone))
+
+    # A fatal note for one returned model must not quarantine its accepted peers.
+    original_fit = module.fit_models
+
+    def one_unresolved_model(**kwargs):
+        fitted = original_fit(**kwargs)
+        certificate = replace(fitted.certificate, refusals=("model 1: lattice check unresolved (regression fixture)",))
+        return replace(fitted, certificate=certificate)
+
+    monkeypatch.setattr(module, "fit_models", one_unresolved_model)
+    outcomes = module.fit_phenotypes(train_view(phenotypes[:, 0]), phenotypes[:n_train])
+    assert isinstance(outcomes[1], ValueError) and "quadrature_unresolved" in str(outcomes[1])
+    assert all(outcomes[index].profile["acceptance"]["accepted"] for index in (0, 2))
+    assert all(outcomes[index].profile["refusals"] == 0 for index in (0, 2))
 
 
 def test_the_truth_arm_is_the_true_genotypes_in_code_units(tmp_path: Path) -> None:
