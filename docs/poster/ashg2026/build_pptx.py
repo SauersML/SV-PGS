@@ -55,11 +55,13 @@ METHODS = [
 ]
 
 SIMULATION_DESIGN = [
-    [("We simulated 50,000 people from 1000 Genomes chr22 haplotypes in five ancestry groups and imputed their SVs from a separate panel.", "")],
-    [("Each disease has 10% prevalence, h² = 0.1 and 50 to 2,000 causal variants, 0% to 20% of them SVs.", "")],
-    [("Rarer variants have larger effects, at the rate estimated in UK Biobank (α = −0.38).", "")],
-    [("SV effect sizes are 1 or 3 times those of SNVs, and in some scenarios grow with SV length or depend on SV type.", "")],
-    [("We compare SV-PGS with and without SVs, and LDpred2-auto, at 5,000 to 40,000 training samples.", "")],
+    [("50,000 people simulated from 1000 Genomes chr22 haplotypes in five ancestry groups, with SVs imputed from a separate panel.", "")],
+    [("Diseases of 10% prevalence and h² = 0.1 with 50 to 2,000 causal variants, 0% to 20% of them SVs with 1× or 3× SNV effect sizes.", "")],
+    [("Rarer variants have larger effects (α = −0.38, as in UK Biobank); SV effects may also grow with length or depend on type.", "")],
+]
+
+SIMULATION_METHODS = [
+    [("We compare SV-PGS with and without SVs, and LDpred2-auto on HapMap3 SNVs or on all variants, at 5,000 to 40,000 training samples.", "")],
 ]
 
 SIMULATION_ACCURACY = [
@@ -134,13 +136,12 @@ def size_reaching(rows: dict, target: float) -> float | None:
 
 def simulation_copy(summary: dict) -> None:
     """Fill the simulation's bracketed numbers from the grid's summary, each verb chosen by its interval."""
-    global SIMULATION_DESIGN, SIMULATION_ACCURACY, SIMULATION_EFFECTS, DISCUSSION
+    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_EFFECTS, DISCUSSION
     points = summary["points"]
     largest = str(max(summary["train_counts"]))
     largest_text = f"{int(largest):,}"
-    # the design bullets stand as written: every poster scenario has 10% prevalence and h2 = 0.1
-    SIMULATION_DESIGN[3] = [(f"We compare SV-PGS with and without SVs, and LDpred2-auto, at {min(summary['train_counts']):,} to "
-                             f"{int(largest):,} training samples.", "")]
+    SIMULATION_METHODS = [[(f"We compare SV-PGS with and without SVs, and LDpred2-auto on HapMap3 SNVs or on all variants, at "
+                            f"{min(summary['train_counts']):,} to {int(largest):,} training samples.", "")]]
 
     twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
     accuracy = []
@@ -201,9 +202,7 @@ REFERENCES = [
     "All of Us Research Program Investigators (2019) N Engl J Med 381:668.",
 ]
 
-EXPRESSION_CAPTION = "Exonic deletions lowered expression and exonic insertions or duplications raised it (MAGE RNA-seq, p < 0.001)."
-
-BARS = {97: "Introduction", 118: "SVs and gene expression", 91: "Methods", 93: "Simulation", 119: "All of Us",
+BARS = {97: "Introduction", 91: "Methods", 93: "Simulation design", 118: "Simulation results", 119: "All of Us",
         95: "Discussion", 96: "References"}
 
 # ------------------------------------------------------------------ DrawingML in the template's own formats
@@ -404,10 +403,13 @@ def build() -> None:
 
     # the figures as media of their own
     figures = {
-        "skew": "fig_sign_skew.png", "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
+        "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
         "power": "ph_sim_power.png", "effects": "ph_sim_effects.png", "hypertension": "ph_aou_hypertension.png",
         "diseases": "ph_aou_diseases.png",
     }
+    # the per-scenario gains exist once the grid has more than one scenario (figures.py)
+    if (FIGURES / "fig_sim_architectures.png").is_file():
+        figures["architectures"] = "fig_sim_architectures.png"
     ids = {}
     for index, (key, name) in enumerate(figures.items()):
         target = f"svpgs_{name}"
@@ -446,11 +448,12 @@ def build() -> None:
 
     # the template's shapes, duplicated where the poster needs more of a kind: section bars, pictures, captions, text
     for source, new, name in (
-        (91, 118, "Expression bar"), (93, 119, "All of Us bar"),
+        (93, 118, "Simulation results bar"), (93, 119, "All of Us bar"),
         (106, 120, "Simulation effects"), (106, 121, "Hypertension"), (106, 122, "Diseases"),
         (113, 123, "Simulation effects caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
         (94, 126, "Simulation accuracy text"), (94, 127, "Simulation effects text"), (94, 128, "Hypertension text"),
-        (94, 129, "Diseases text"),
+        (94, 129, "Diseases text"), (106, 130, "Simulation architectures"), (113, 131, "Simulation architectures caption"),
+        (94, 132, "Simulation methods text"),
     ):
         xml = duplicate(xml, source, new, name)
     for bar, text in BARS.items():
@@ -496,22 +499,24 @@ def build() -> None:
             if self.y > 35.75:
                 raise SystemExit(f"column at x = {self.x} in runs to {self.y:.2f} in, past the bottom margin (35.75 in)")
 
-    # column 1: introduction, SVs and expression (the real-data result), methods with the model
+    # the template's own picture and caption that no section uses
+    xml = delete(delete(xml, 107), 114)
+
+    # column 1: introduction, methods with the model, the simulation's design
     column = Column(1.01, 13.6)
     xml = column.bar(xml, 97)
     xml = column.text(xml, 98, INTRODUCTION)
-    xml = column.bar(xml, 118)
-    xml = column.figure(xml, 107, "skew")
-    xml = column.caption(xml, 114, EXPRESSION_CAPTION)
     xml = column.bar(xml, 91)
     xml = column.figure(xml, 110, "equation", width=13.2)
     xml = column.text(xml, 92, METHODS)
-    column.finish()
-
-    # column 2: the simulation, its design and three results figures
-    column = Column(14.85, 17.2)
     xml = column.bar(xml, 93)
     xml = column.text(xml, 94, SIMULATION_DESIGN)
+    column.finish()
+
+    # column 2: the simulation's results, in four figures
+    column = Column(14.85, 17.2)
+    xml = column.bar(xml, 118)
+    xml = column.text(xml, 132, SIMULATION_METHODS)
     xml = column.figure(xml, 101, "accuracy")
     xml = column.caption(xml, 112, "Test-set AUC vs. training size")
     xml = column.text(xml, 126, SIMULATION_ACCURACY)
@@ -523,6 +528,11 @@ def build() -> None:
     xml = column.figure(xml, 120, "effects", width=half, x=column.x + 0.37 + half)
     xml = column.caption(xml, 123, "SV effect sizes", width=half, x=column.x + 0.37 + half)
     xml = column.text(xml, 127, SIMULATION_EFFECTS)
+    if "architectures" in figures:
+        xml = column.figure(xml, 130, "architectures")
+        xml = column.caption(xml, 131, "AUC gain by simulated architecture")
+    else:
+        xml = delete(delete(xml, 130), 131)
     column.finish()
 
     # column 3: All of Us (hypertension, then the diseases), discussion, references

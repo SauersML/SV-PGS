@@ -1,8 +1,6 @@
 """The science poster's figures and its model equation, as print-resolution PNGs for the PowerPoint template.
 
 Every value is the repository's recorded measurement, as in build_poster.py:
-- SV sign skew: docs/design/LOCATION_SCALE.md [real: bench-real genes500, MAGE + 1kGP]
-- bench-real baselines and SV credit: docs/design/EVALUATION.md [real]
 - the simulation study: simulation_summary.json, collected by simulation.py from the power grid's finished tasks
   (benchmarks/power/grid.py on bench-sim's 1000 Genomes chr22 cohort, MSI). Until a figure's grid points have results,
   its dashed placeholder is drawn instead.
@@ -28,7 +26,6 @@ PT = 100.0 / 72.0
 
 NAVY = "#235078"
 TEAL = "#1482A5"
-RED = "#C0392B"
 INK = "#1d1d1f"
 GREY = "#5b6068"
 NULL = "#d9dde3"
@@ -72,58 +69,6 @@ def render(name: str, html: str, width: float, height: float, transparent: bool 
     subprocess.run(command + [source.as_uri()], check=True, capture_output=True)
     return target
 
-
-# ------------------------------------------------------------------ SV type and expression (MAGE), first column
-
-SKEW = [
-    ("Deletion overlapping an exon", "78 SVs, 42 genes", RED, -1.33, (-0.28, 0.25), (-2.52, -0.21)),
-    ("Insertion or duplication overlapping an exon", "93 SVs, 75 genes", NAVY, 0.66, (-0.22, 0.21), (0.25, 1.30)),
-]
-
-
-def skew_figure() -> Path:
-    width, height = 13.4, 5.8
-    w, h = width * 100, height * 100
-    plot_left, plot_right = 40.0, w - 40.0
-    low, high = -2.75, 1.5
-    top = 130.0
-    row = 165.0
-    bottom = top + row * (len(SKEW) - 1) + 125 + 52
-
-    def x(value: float) -> float:
-        return plot_left + (value - low) / (high - low) * (plot_right - plot_left)
-
-    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{STYLE}</style>']
-    # legend
-    parts.append(f'<rect x="{plot_left}" y="40" width="70" height="36" rx="5" fill="{NULL}"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 86}" y="70">permutation 95% range</text>')
-    parts.append(f'<line x1="{plot_left + 560}" y1="58" x2="{plot_left + 640}" y2="58" stroke="{INK}" stroke-width="7" stroke-linecap="round"/>')
-    parts.append(f'<circle cx="{plot_left + 600}" cy="58" r="15" fill="{INK}" stroke="#fff" stroke-width="5"/>')
-    parts.append(f'<text class="legend" x="{plot_left + 658}" y="70">mean z, 95% CI</text>')
-    for tick in (-2, -1, 0, 1):
-        tx = x(tick)
-        stroke, weight = (GREY, 4) if tick == 0 else (RULE, 3)
-        # gridlines run inside each row's band only, never through the row labels
-        for index in range(len(SKEW)):
-            cy = top + row * index + 105
-            parts.append(f'<line x1="{tx:.1f}" y1="{cy - 52:.1f}" x2="{tx:.1f}" y2="{cy + 52:.1f}" stroke="{stroke}" stroke-width="{weight}"/>')
-        label = "0" if tick == 0 else f"{tick:+d}".replace("-", "−")
-        parts.append(f'<text class="tick" x="{tx:.1f}" y="{bottom + 24}" text-anchor="middle">{label}</text>')
-    parts.append(f'<text class="axis" x="{(plot_left + plot_right) / 2:.1f}" y="{h - 30}" text-anchor="middle">Mean z-score for association with expression of the overlapped gene</text>')
-    for index, (label, detail, colour, mean, null, ci) in enumerate(SKEW):
-        base = top + row * index
-        parts.append(f'<text class="label" x="{plot_left}" y="{base + 18:.1f}">{label} <tspan class="detail" dx="10">{detail}</tspan></text>')
-        cy = base + 105
-        parts.append(f'<rect x="{x(null[0]):.1f}" y="{cy - 30:.1f}" width="{x(null[1]) - x(null[0]):.1f}" height="60" rx="6" fill="{NULL}"/>')
-        parts.append(f'<line x1="{x(ci[0]):.1f}" y1="{cy:.1f}" x2="{x(ci[1]):.1f}" y2="{cy:.1f}" stroke="{colour}" stroke-width="9" stroke-linecap="round"/>')
-        for end in ci:
-            parts.append(f'<line x1="{x(end):.1f}" y1="{cy - 22:.1f}" x2="{x(end):.1f}" y2="{cy + 22:.1f}" stroke="{colour}" stroke-width="9" stroke-linecap="round"/>')
-        parts.append(f'<circle cx="{x(mean):.1f}" cy="{cy:.1f}" r="22" fill="{colour}" stroke="#fff" stroke-width="7"/>')
-    parts.append("</svg>")
-    return render("fig_sign_skew", page("".join(parts), width, height), width, height)
-
-
-# ------------------------------------------------------------------ the model equation, transparent, for the Methods panel
 
 def equation_figure() -> Path:
     """The model for a poster audience: each formula line with a plain-language line under it. The variance of
@@ -206,12 +151,19 @@ def spread_labels(wanted: list[float], gap: float, low: float, high: float) -> l
     """Label y positions as close to ``wanted`` as possible, at least ``gap`` apart, within [low, high]."""
     order = sorted(range(len(wanted)), key=lambda index: wanted[index])
     placed = [wanted[index] for index in order]
-    for _sweep in range(50):
-        for index in range(1, len(placed)):
-            placed[index] = max(placed[index], placed[index - 1] + gap)
-        for index in range(len(placed) - 2, -1, -1):
-            placed[index] = min(placed[index], placed[index + 1] - gap)
-        placed = [min(max(value, low), high) for value in placed]
+    if not placed:
+        return []
+    # push down from the top bound, then up from the bottom bound; only the ends are clamped, so the gaps survive
+    placed[0] = max(placed[0], low)
+    for index in range(1, len(placed)):
+        placed[index] = max(placed[index], placed[index - 1] + gap)
+    placed[-1] = min(placed[-1], high)
+    for index in range(len(placed) - 2, -1, -1):
+        placed[index] = min(placed[index], placed[index + 1] - gap)
+    if placed[0] < low:
+        # more labels than the span holds at this gap: spread them evenly over it
+        step = (high - low) / max(len(placed) - 1, 1)
+        placed = [low + step * index for index in range(len(placed))]
     result = [0.0] * len(wanted)
     for slot, index in enumerate(order):
         result[index] = placed[slot]
@@ -221,48 +173,59 @@ def spread_labels(wanted: list[float], gap: float, low: float, high: float) -> l
 ACCURACY_PANELS = (("null", "No causal SVs"), ("sv_5pct", "5% causal SVs"), ("sv_20pct", "20% causal SVs"))
 ACCURACY_METHODS = (
     # (summary key, key label, colour, filled marker, horizontal offset)
-    ("with_sv_auc", "SV-PGS with SVs", TEAL, True, 12.0),
-    ("snv_indel_auc", "SV-PGS without SVs", NAVY, False, 0.0),
-    ("ldpred2_auc", "LDpred2-auto", AMBER, True, -12.0),
+    ("with_sv_auc", "SV-PGS with SVs", TEAL, True, 18.0),
+    ("snv_indel_auc", "SV-PGS without SVs", NAVY, False, 6.0),
+    ("ldpred2_allvar_auc", "LDpred2-auto, all variants", AMBER, False, -6.0),
+    ("ldpred2_auc", "LDpred2-auto, HapMap3 SNVs", AMBER, True, -18.0),
 )
+NO_VALUE = [math.nan, math.nan]
 
 
 def accuracy_figure(summary: dict) -> Path:
-    """Test AUC against training size, one panel per causal-SV share: SV-PGS with and without SVs, LDpred2-auto, and
-    the expected AUC of a PGS that captures the whole heritability (dashed)."""
-    width, height = 16.70, 5.30
+    """Test AUC against training size, one panel per causal-SV share: SV-PGS with and without SVs, LDpred2-auto on
+    HapMap3 SNVs and on every variant, and the expected AUC of a PGS that captures the whole heritability (dashed)."""
+    width, height = 16.70, 5.00
     w, h = width * 100, height * 100
     left, right, gap = 140.0, 30.0, 55.0
-    top, bottom = 140.0, 415.0
+    # a method is keyed only where it has a value: the all-variant LDpred2 arm joined the grid after the others
+    shown = [method for method in ACCURACY_METHODS if any(
+        math.isfinite(row.get(method[0], NO_VALUE)[0]) for point, _title in ACCURACY_PANELS for row in summary["points"][point]["sizes"].values())]
+    entries = [(label, colour, filled, False) for _key, label, colour, filled, _off in shown]
+    # the key, centred over the panels: SV-PGS and the expected accuracy on one line, the LDpred2 arms on a second
+    key_lines = [[entry for entry in entries if entry[0].startswith("SV-PGS")] + [("Expected", GREY, None, True)],
+                 [entry for entry in entries if not entry[0].startswith("SV-PGS")]]
+    key_lines = [line for line in key_lines if line]
+    top, bottom = 132.0 + 46.0 * (len(key_lines) - 1), h - 115.0
     panel = (w - left - right - gap * (len(ACCURACY_PANELS) - 1)) / len(ACCURACY_PANELS)
     values = []
     for point, _title in ACCURACY_PANELS:
         for size in sizes(summary, point):
             row = summary["points"][point]["sizes"][size]
             for key, *_rest in ACCURACY_METHODS:
-                mean, se = row[key]
+                mean, se = row.get(key, NO_VALUE)
                 if math.isfinite(mean):
                     values += [mean - 1.96 * (se if math.isfinite(se) else 0.0), mean + 1.96 * (se if math.isfinite(se) else 0.0)]
             values.append(row["expected_auc"])
-    low, high, step = nice_range(min(values), max(values))
+    # tick labels at least 52 units (0.52 in) apart
+    low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.04, 0.05, 0.1, 0.2), most=int((bottom - top) // 52))
     counts = summary["train_counts"]
 
     def y(value: float) -> float:
         return bottom - (value - low) / (high - low) * (bottom - top)
 
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    # key, centred over the panels
-    entries = [(label, colour, filled, False) for _key, label, colour, filled, _off in ACCURACY_METHODS] + [("Expected", GREY, None, True)]
-    span = sum(80 + text_width(label, 26) for label, *_rest in entries) + 50 * (len(entries) - 1)
-    cursor = left + (w - left - right - span) / 2
-    for label, colour, filled, dashed in entries:
-        if dashed:
-            parts.append(f'<line x1="{cursor}" y1="44" x2="{cursor + 64}" y2="44" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
-        else:
-            parts.append(f'<line x1="{cursor}" y1="44" x2="{cursor + 64}" y2="44" stroke="{colour}" stroke-width="6"/>')
-            parts.append(f'<circle cx="{cursor + 32}" cy="44" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
-        parts.append(f'<text class="key" x="{cursor + 80}" y="56">{label}</text>')
-        cursor += 80 + text_width(label, 26) + 50
+    for line_index, line in enumerate(key_lines):
+        key_y = 40 + 46 * line_index
+        span = sum(80 + text_width(label, 26) for label, *_rest in line) + 50 * (len(line) - 1)
+        cursor = left + (w - left - right - span) / 2
+        for label, colour, filled, dashed in line:
+            if dashed:
+                parts.append(f'<line x1="{cursor}" y1="{key_y}" x2="{cursor + 64}" y2="{key_y}" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
+            else:
+                parts.append(f'<line x1="{cursor}" y1="{key_y}" x2="{cursor + 64}" y2="{key_y}" stroke="{colour}" stroke-width="6"/>')
+                parts.append(f'<circle cx="{cursor + 32}" cy="{key_y}" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
+            parts.append(f'<text class="key" x="{cursor + 80}" y="{key_y + 12}">{label}</text>')
+            cursor += 80 + text_width(label, 26) + 50
     # y axis (shared)
     parts.append(f'<text class="axis" transform="translate(34 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Test AUC</text>')
     tick = low
@@ -291,8 +254,8 @@ def accuracy_figure(summary: dict) -> Path:
         present = sizes(summary, point)
         expected = " ".join(f"{x(int(size)):.1f},{y(rows[size]['expected_auc']):.1f}" for size in present)
         parts.append(f'<polyline points="{expected}" fill="none" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
-        for key, _label, colour, filled, offset in reversed(ACCURACY_METHODS):
-            points = [(x(int(size)) + offset, rows[size][key]) for size in present if math.isfinite(rows[size][key][0])]
+        for key, _label, colour, filled, offset in reversed(shown):
+            points = [(x(int(size)) + offset, rows[size][key]) for size in present if math.isfinite(rows[size].get(key, NO_VALUE)[0])]
             if not points:
                 continue
             parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(mean):.1f}" for px, (mean, _se) in points)
@@ -449,72 +412,77 @@ def effects_figure(summary: dict) -> Path:
 
 
 ARCHITECTURES = (
-    ("null", "No causal SVs"),
-    ("sv_5pct", "5% causal SVs"),
-    ("sv_5pct_fold3", "5% causal SVs, 3× effect"),
-    ("sv_20pct", "20% causal SVs"),
-    ("sv_20pct_fold3", "20% causal SVs, 3× effect"),
-    ("length_positive", "Effect grows with SV length"),
-    ("deletion_positive", "Deletions 3× insertions"),
-    ("multi_feature_positive", "Length, type and annotations"),
-    ("sv_heavy_tail", "Heavy-tailed SV effects"),
-    ("sv_two_point", "Two-point SV effects"),
-    ("sparse_sv", "50 causal variants"),
-    ("polygenic_sv", "2,000 causal variants"),
-    ("rare_disease", "Prevalence 1%"),
-    ("low_heritability", "h² = 0.01"),
+    # two blocks of the poster's figure: how many variants are causal and how many are SVs; SV effects and the trait
+    (("null", "No causal SVs"), ("sv_5pct", "5% SVs"), ("sv_5pct_fold3", "5% SVs, 3× effect"), ("sv_20pct", "20% SVs"),
+     ("sv_20pct_fold3", "20% SVs, 3× effect"), ("sparse_sv", "50 causal"), ("polygenic_sv", "2,000 causal")),
+    (("length_positive", "Grows with length"), ("deletion_positive", "Deletions 3×"),
+     ("multi_feature_positive", "Length, type, annotation"), ("sv_heavy_tail", "Heavy-tailed effects"),
+     ("sv_two_point", "Two-point effects"), ("rare_disease", "Prevalence 1%"), ("low_heritability", "h² = 0.01")),
+)
+GAINS = (
+    # (summary key, key label, colour, filled marker)
+    ("delta_auc", "SV-PGS without SVs", TEAL, True),
+    ("delta_auc_vs_ldpred2", "LDpred2-auto, HapMap3 SNVs", AMBER, True),
+    ("delta_auc_vs_ldpred2_allvar", "LDpred2-auto, all variants", AMBER, False),
 )
 
 
-def architectures_figure(summary: dict) -> Path:
-    """Mean AUC gain at the largest training size with its 95% interval over replicates, for every simulated
-    architecture: left, adding SVs to SV-PGS; right, SV-PGS with SVs over LDpred2-auto."""
-    rows = [(point, label) for point, label in ARCHITECTURES if point in summary["points"]]
-    width = 16.7
-    pitch = 52.0
-    top = 92.0
-    height = (top + pitch * len(rows) + 110) / 100
+def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> Path:
+    """For every simulated architecture, at its largest training size: the mean test AUC gain of SV-PGS with SVs over
+    each other method, with its 95% interval over replicates, on one axis shared by both blocks of architectures."""
+    blocks = [[(point, label) for point, label in block if point in summary["points"]] for block in ARCHITECTURES]
+    blocks = [block for block in blocks if block]
+    rows = [row for block in blocks for row in block]
+    cells = {point: summary["points"][point]["sizes"][sizes(summary, point)[-1]] for point, _label in rows}
+    gains = [gain for gain in GAINS if any(math.isfinite(cells[point].get(gain[0], {}).get("mean", math.nan)) for point, _label in rows)]
     w, h = width * 100, height * 100
-    label_right = 30 + max(text_width(label, 24) for _point, label in rows) + 10
-    gap, right = 120.0, 60.0
-    panel = (w - label_right - right - gap) / 2
-    panels = (("delta_auc", "Gain from adding SVs", TEAL), ("delta_auc_vs_ldpred2", "Gain over LDpred2-auto", AMBER))
-    largest = {point: sizes(summary, point)[-1] for point, _label in rows}
+    key_y, top, bottom = 40.0, 84.0, h - 112.0
+    pitch = (bottom - top) / max(len(block) for block in blocks)
+    # each block's row labels as wide as its longest; the panels share what is left
+    labels = [24 + max(text_width(label, 24) for _point, label in block) for block in blocks]
+    gap, right = 70.0, 40.0
+    panel = (w - right - gap * (len(blocks) - 1) - sum(labels)) / len(blocks)
+    values = [0.0]
+    for point, _label in rows:
+        for key, *_rest in gains:
+            entry = cells[point].get(key, {})
+            values += finite([entry.get("lower"), entry.get("upper"), entry.get("mean")])
+    # tick labels at least 120 units apart
+    low, high, step = nice_range(min(values), max(values), steps=(0.002, 0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=int(panel // 120))
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    for index, (point, label) in enumerate(rows):
-        cy = top + pitch * index + pitch / 2
-        parts.append(f'<text class="row" x="{label_right - 10:.1f}" y="{cy + 9:.1f}" text-anchor="end">{label}</text>')
-    for panel_index, (key, title, colour) in enumerate(panels):
-        x0 = label_right + panel_index * (panel + gap)
-        values = [0.0]
-        for point, _label in rows:
-            entry = summary["points"][point]["sizes"][largest[point]][key]
-            values += finite([entry["lower"], entry["upper"]])
-        low, high, step = nice_range(min(values), max(values), steps=(0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1), most=4)
+    spans = [40 + text_width(label, 26) for _key, label, _colour, _filled in gains]
+    cursor = (w - sum(spans) - 50 * (len(spans) - 1)) / 2
+    for (_key, label, colour, filled), span in zip(gains, spans):
+        parts.append(f'<circle cx="{cursor + 12:.1f}" cy="{key_y}" r="11" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="5"/>')
+        parts.append(f'<text class="key" x="{cursor + 34:.1f}" y="{key_y + 12}">{label}</text>')
+        cursor += span + 50
+    for block_index, block in enumerate(blocks):
+        x0 = sum(labels[:block_index + 1]) + block_index * (panel + gap)
 
         def x(value: float) -> float:
             return x0 + (value - low) / (high - low) * panel
 
-        bottom = top + pitch * len(rows)
-        parts.append(f'<text class="facet" x="{x0 + panel / 2:.1f}" y="{top - 34}" text-anchor="middle">{title}</text>')
         parts.append(f'<line x1="{x(0.0):.1f}" y1="{top}" x2="{x(0.0):.1f}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<line x1="{x0}" y1="{bottom}" x2="{x0 + panel}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<line x1="{x0}" y1="{bottom}" x2="{x0 + panel:.1f}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
         tick = low
         while tick <= high + 1e-9:
-            parts.append(f'<line x1="{x(tick):.1f}" y1="{bottom}" x2="{x(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
             text = tick_text(tick, step)
-            parts.append(f'<text class="tick" x="{x(tick):.1f}" y="{bottom + 42}" text-anchor="middle">{"+" + text if tick > 1e-12 else text}</text>')
+            parts.append(f'<line x1="{x(tick):.1f}" y1="{bottom}" x2="{x(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+            parts.append(f'<text class="tick" x="{x(tick):.1f}" y="{bottom + 42}" text-anchor="middle">{text if abs(tick) > 1e-12 else "0"}</text>')
             tick += step
-        for index, (point, _label) in enumerate(rows):
-            entry = summary["points"][point]["sizes"][largest[point]][key]
+        for index, (point, label) in enumerate(block):
             cy = top + pitch * index + pitch / 2
-            if not math.isfinite(entry["mean"]):
-                continue
-            if math.isfinite(entry["lower"]):
-                parts.append(f'<line x1="{x(entry["lower"]):.1f}" y1="{cy:.1f}" x2="{x(entry["upper"]):.1f}" y2="{cy:.1f}" stroke="{colour}" stroke-width="6" stroke-linecap="round"/>')
-            parts.append(f'<circle cx="{x(entry["mean"]):.1f}" cy="{cy:.1f}" r="12" fill="{colour}" stroke="#fff" stroke-width="4"/>')
-    counts = sorted({int(size) for size in largest.values()})
-    parts.append(f'<text class="axis" x="{label_right + (w - label_right - right) / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain at {" / ".join(thousands(count) for count in counts)} training samples</text>')
+            parts.append(f'<text class="row" x="{x0 - 16:.1f}" y="{cy + 9:.1f}" text-anchor="end">{label}</text>')
+            for gain_index, (key, _label, colour, filled) in enumerate(gains):
+                entry = cells[point].get(key, {})
+                if not math.isfinite(entry.get("mean", math.nan)):
+                    continue
+                y = cy + (gain_index - (len(gains) - 1) / 2) * 13.0
+                if math.isfinite(entry["lower"]):
+                    parts.append(f'<line x1="{x(entry["lower"]):.1f}" y1="{y:.1f}" x2="{x(entry["upper"]):.1f}" y2="{y:.1f}" stroke="{colour}" stroke-width="4" stroke-linecap="round"/>')
+                parts.append(f'<circle cx="{x(entry["mean"]):.1f}" cy="{y:.1f}" r="9" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="4"/>')
+    counts = sorted({int(sizes(summary, point)[-1]) for point, _label in rows})
+    parts.append(f'<text class="axis" x="{w / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain of SV-PGS with SVs at {" / ".join(thousands(count) for count in counts)} training samples</text>')
     parts.append("</svg>")
     return render("fig_sim_architectures", page("".join(parts), width, height), width, height)
 
@@ -537,7 +505,7 @@ def simulation_figures(summary: dict | None) -> list[Path]:
 
 PLACEHOLDERS = {
     # name: (width in, height in, source, title, what the figure will show)
-    "ph_sim_accuracy": (16.70, 5.30, "simulation", "Test AUC vs. training size",
+    "ph_sim_accuracy": (16.70, 5.00, "simulation", "Test AUC vs. training size",
                         "SV-PGS with and without SVs, and LDpred2-auto, at 0%, 5% and 20% causal SVs, with the expected accuracy"),
     "ph_sim_power": (8.20, 4.80, "simulation", "Power vs. training size",
                      "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
@@ -573,5 +541,5 @@ if __name__ == "__main__":
         OUT = Path(sys.argv[2])
     summary = json.loads(source.read_text()) if source.is_file() else None
     aou = [name for name in PLACEHOLDERS if name.startswith("ph_aou")]
-    for made in (skew_figure(), equation_figure(), *simulation_figures(summary), *(placeholder_figure(name) for name in aou)):
+    for made in (equation_figure(), *simulation_figures(summary), *(placeholder_figure(name) for name in aou)):
         print(made)
