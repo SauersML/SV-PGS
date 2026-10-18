@@ -21,8 +21,10 @@ effects whose per-SD variance follows FREQUENCY_ALPHA, no annotation or non-addi
 
 Arms follow the workspace (``workspace_pipeline.ARMS``) plus the published-practice competitor: ``with_sv`` fits every
 record; ``snv_indel`` is refitted without bench-sim's SV class (records >= 50 bp or symbolic), keeping its short indels
-and short repeat indels; ``ldpred2_auto`` is LDpred2-auto on HapMap3-density SNVs. One job is one arm of one (point,
-training size, replicate) task (``run``); the last arm to finish writes the task's comparison, and ``summarize`` compares
+and short repeat indels; ``ldpred2_auto`` is LDpred2-auto on HapMap3-density SNVs, and ``ldpred2_allvar`` is
+LDpred2-auto on every measured record of minor allele frequency at least 1%, SVs included, so the SV arm's gain over it
+is the method's at equal input. One job is one arm of one (point, training size, replicate) task (``run``); the last of
+the core arms to finish writes the task's comparison (a later ``ldpred2_allvar`` adds its own), and ``summarize`` compares
 any task left without one and collects every finished task into ``summary.tsv``: per point and size, the mean SV-arm gain
 in AUC and its SE over replicates, the share of replicates whose paired DeLong test favours the SV arm at one-sided 0.05,
 its Monte Carlo uncertainty, and the positive controls' readouts. Arms and tasks are independent jobs.
@@ -62,6 +64,7 @@ MEASUREMENT_ARM = "beagle"
 """bench-sim's Beagle arm: the one imputed arm covering all 50,000 samples (the GLIMPSE2 arm covers only the 2,500-sample
 calibration subset, SUBMIT.md). Simple sites are read-model calls and TR and SV records are imputed from the separate panel."""
 LDPRED2 = Path(__file__).resolve().parents[1] / "bench_sim" / "submissions" / "ldpred2_auto.py"
+LDPRED2_ALLVAR = LDPRED2.with_name("ldpred2_auto_allvar.py")
 """The published-practice competitor, LDpred2-auto on HapMap3-density SNVs, fitted on the same training samples."""
 SMALL_ARM_DROPPED = ("SV",)
 POINTS = {
@@ -150,9 +153,11 @@ def structural_effect_readout(model, cohort: Path, target: Path) -> dict:
     }
 
 
-ARMS = {"snv_indel": (None, SMALL_ARM_DROPPED), "with_sv": (None, ()), "ldpred2_auto": (LDPRED2, ())}
-"""Each task's fits: (method, withheld classes). None is the submitted method, so both SV-PGS arms run it; LDpred2-auto
-selects its own HapMap3-density SNVs."""
+ARMS = {"snv_indel": (None, SMALL_ARM_DROPPED), "with_sv": (None, ()), "ldpred2_auto": (LDPRED2, ()), "ldpred2_allvar": (LDPRED2_ALLVAR, ())}
+"""Each task's fits: (method, withheld classes). None is the submitted method, so both SV-PGS arms run it; each
+LDpred2-auto arm selects its own variants (HapMap3-density SNVs; every class at minor allele frequency >= 1%)."""
+CORE_ARMS = ("snv_indel", "with_sv", "ldpred2_auto")
+"""The arms a task's comparison waits for; ``ldpred2_allvar`` joins it when it completes."""
 
 
 def _scenario(cohort: Path, out: Path, point: str, replicate: int) -> Path:
@@ -225,19 +230,24 @@ def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int
 
 
 def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: int) -> dict | None:
-    """The task's held-out comparison once every arm has completed (None before): each arm's AUC, the SV arm's paired
-    DeLong gain over the SNV/indel arm and over LDpred2-auto, the truth summary and the SV effect readout."""
+    """The task's held-out comparison once the core arms have completed (None before): each arm's AUC, the SV arm's
+    paired DeLong gain over the SNV/indel arm and over each LDpred2-auto arm, the truth summary and the SV effect
+    readout. The all-variant LDpred2 arm's fields are added when it completes, before or after the core arms."""
     task = _task(out, point, train_count, replicate)
-    if not all(_completed(task / arm) for arm in ARMS):
+    if not all(_completed(task / arm) for arm in CORE_ARMS):
         return None
+    allvar = _completed(task / "ldpred2_allvar")
     with (task / ".compare.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if (task / "result.json").exists():
-            return json.loads((task / "result.json").read_text())
+            existing = json.loads((task / "result.json").read_text())
+            if not allvar or "ldpred2_allvar_auc" in existing:
+                return existing
         scenario = out / "scenarios" / point / f"replicate{replicate}"
         samples = np.load(cohort / "samples.npz")
         labels = np.load(scenario / "truth.npz")["phenotype"][np.flatnonzero(samples["is_test"])]
-        scores = {arm: np.load(task / arm / "prediction.npz")["total"] for arm in ARMS}
+        arms = CORE_ARMS + (("ldpred2_allvar",) if allvar else ())
+        scores = {arm: np.load(task / arm / "prediction.npz")["total"] for arm in arms}
         comparison = paired_delta_auc(labels, scores["snv_indel"], scores["with_sv"])
         against_ldpred2 = paired_delta_auc(labels, scores["ldpred2_auto"], scores["with_sv"])
         result = {
@@ -247,10 +257,16 @@ def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: in
             "delta_auc": comparison.estimate, "z": comparison.z_score,
             "delta_auc_vs_ldpred2": against_ldpred2.estimate, "z_vs_ldpred2": against_ldpred2.z_score,
             "prediction": "genetic_only",
-            "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in ARMS},
+            "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in arms},
             "truth": json.loads((scenario / "scenario.json").read_text())["summary"],
             **json.loads((task / "with_sv" / "sv_readout.json").read_text()),
         }
+        if allvar:
+            against_allvar = paired_delta_auc(labels, scores["ldpred2_allvar"], scores["with_sv"])
+            result |= {
+                "ldpred2_allvar_auc": harness.auc(labels, scores["ldpred2_allvar"]),
+                "delta_auc_vs_ldpred2_allvar": against_allvar.estimate, "z_vs_ldpred2_allvar": against_allvar.z_score,
+            }
         temporary = task / "result.partial.json"
         temporary.write_text(json.dumps(result, indent=1))
         temporary.replace(task / "result.json")
@@ -268,10 +284,10 @@ def summarize(out: Path, cohort: Path) -> Path:
     """Every finished task's result, per (point, training size): the replicates' means, the SE of the mean gain, and the
     share whose one-sided paired DeLong test favours the SV arm at 0.05. Conditions on completed tasks;
     invalid comparisons are counted explicitly and excluded from the rejection-rate denominator. A task whose arms all
-    completed but whose comparison is missing (its last arm died between the two writes) is compared here first."""
+    completed but whose comparison is missing (its last arm died between the two writes), or lacks a since-completed
+    all-variant LDpred2 arm, is compared here first."""
     for folder in sorted((out / "tasks").glob("*/n*/replicate*")):
-        if not (folder / "result.json").exists():
-            compare(cohort, out, folder.parent.parent.name, int(folder.parent.name[1:]), int(folder.name.removeprefix("replicate")))
+        compare(cohort, out, folder.parent.parent.name, int(folder.parent.name[1:]), int(folder.name.removeprefix("replicate")))
     results = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/result.json"))]
     attempts = [json.loads(path.read_text()) for path in sorted((out / "tasks").glob("*/*/*/*/attempt.json"))]
     def finite_mean(values):

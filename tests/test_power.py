@@ -157,6 +157,40 @@ def test_summary_reports_invalid_comparisons_separately(tmp_path):
     assert float(row['rate_lower_95']) < .5 < float(row['rate_upper_95'])
 
 
+def test_the_comparison_waits_for_the_core_arms_and_adds_the_all_variant_ldpred2_arm_when_it_completes(tmp_path):
+    import json
+    rng = np.random.default_rng(0)
+    cohort, scenario = tmp_path / 'cohort', tmp_path / 'scenarios' / 'null' / 'replicate0'
+    cohort.mkdir()
+    scenario.mkdir(parents=True)
+    is_test = np.arange(400) >= 100
+    labels = rng.random(400) < 0.3
+    np.savez(cohort / 'samples.npz', is_test=is_test)
+    np.savez(scenario / 'truth.npz', phenotype=labels)
+    (scenario / 'scenario.json').write_text(json.dumps(dict(summary=dict(structural_share=0.0))))
+    task = grid._task(tmp_path, 'null', 5000, 0)
+
+    def finish(arm, signal):
+        folder = task / arm
+        folder.mkdir(parents=True)
+        np.savez(folder / 'prediction.npz', total=signal * labels[is_test] + rng.normal(size=is_test.sum()))
+        (folder / 'meta.json').write_text(json.dumps(dict(fit_seconds=1.0)))
+        (folder / 'attempt.json').write_text(json.dumps(dict(point='null', train_count=5000, replicate=0, arm=arm, status='completed')))
+        if arm == 'with_sv':
+            (folder / 'sv_readout.json').write_text(json.dumps(dict(length_rho=0.0)))
+
+    finish('snv_indel', 1.0)
+    finish('with_sv', 1.5)
+    assert grid.compare(cohort, tmp_path, 'null', 5000, 0) is None
+    finish('ldpred2_auto', 0.5)
+    first = grid.compare(cohort, tmp_path, 'null', 5000, 0)
+    assert 'ldpred2_allvar_auc' not in first and first['with_sv_auc'] > first['ldpred2_auc']
+    finish('ldpred2_allvar', 1.0)
+    second = grid.compare(cohort, tmp_path, 'null', 5000, 0)
+    assert second['with_sv_auc'] == first['with_sv_auc'] and np.isfinite(second['z_vs_ldpred2_allvar'])
+    assert json.loads((task / 'result.json').read_text()) == second
+
+
 def test_failed_tasks_are_counted_even_if_no_fit_completes(tmp_path, monkeypatch):
     import csv
     def failed(*args, **kwargs):

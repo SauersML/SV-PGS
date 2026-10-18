@@ -102,6 +102,7 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
             valid = [row for row in group if math.isfinite(row["delta_auc"]) and math.isfinite(row["z"])]
             power = rejection_summary(sum(row["z"] > ONE_SIDED for row in valid), len(valid))
             valid_ldpred2 = [row for row in group if "z_vs_ldpred2" in row and math.isfinite(row["z_vs_ldpred2"])]
+            valid_allvar = [row for row in group if "z_vs_ldpred2_allvar" in row and math.isfinite(row["z_vs_ldpred2_allvar"])]
             failed = {row["replicate"] for row in attempts if row["point"] == point and row["train_count"] == train_count and row["status"] == "failed"}
             by_size[str(train_count)] = {
                 "replicates": len(group),
@@ -111,15 +112,19 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
                 "ldpred2_auc": mean_se(row.get("ldpred2_auc") for row in group),
                 "delta_auc": interval(row["delta_auc"] for row in group),
                 "delta_auc_vs_ldpred2": interval(row.get("delta_auc_vs_ldpred2") for row in group),
+                "ldpred2_allvar_auc": mean_se(row.get("ldpred2_allvar_auc") for row in group),
+                "ldpred2_allvar_replicates": len(valid_allvar),
+                "delta_auc_vs_ldpred2_allvar": interval(row.get("delta_auc_vs_ldpred2_allvar") for row in group),
                 "power": power,
                 "share_sv_beats_ldpred2": rejection_summary(sum(row["z_vs_ldpred2"] > ONE_SIDED for row in valid_ldpred2), len(valid_ldpred2)),
+                "share_sv_beats_ldpred2_allvar": rejection_summary(sum(row["z_vs_ldpred2_allvar"] > ONE_SIDED for row in valid_allvar), len(valid_allvar)),
                 "structural_share": mean_se(row["truth"]["structural_share"] for row in group),
                 "causal_svs": mean_se(row["truth"]["causal_by_class"][3] for row in group),
                 "causal_count": mean_se(row["truth"]["causal_count"] for row in group),
                 "length_rho": mean_se(row.get("length_rho") for row in group),
                 "deletion_over_insertion": mean_se(row.get("deletion_over_insertion") for row in group),
                 "fit_seconds": {arm: mean_se(row["fit_seconds"][arm] for row in group if arm in row.get("fit_seconds", {}))[0]
-                                for arm in ("snv_indel", "with_sv", "ldpred2_auto")},
+                                for arm in ("snv_indel", "with_sv", "ldpred2_auto", "ldpred2_allvar")},
                 "expected_auc": expected_auc(point, train_count),
             }
         points[point] = {"setting": setting(point), "sizes": by_size}
