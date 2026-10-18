@@ -1,6 +1,6 @@
 """The science poster's figures and its model equation, as print-resolution PNGs for the PowerPoint template.
 
-Every value is the repository's recorded measurement, as in build_poster.py:
+Every value is the repository's recorded measurement:
 - the simulation study: simulation_summary.json, collected by simulation.py from the power grid's finished tasks
   (benchmarks/power/grid.py on bench-sim's 1000 Genomes chr22 cohort, MSI). Until a figure's grid points have results,
   its dashed placeholder is drawn instead.

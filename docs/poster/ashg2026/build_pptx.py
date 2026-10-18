@@ -2,7 +2,13 @@
 abstract's title and authors, the realistic simulation study (benchmarks/power/grid.py on bench-sim's 1000 Genomes
 cohort, run on MSI), and placeholders for the All of Us results.
 
-    python3 build_pptx.py [template.pptx] [output.pptx] [simulation_summary.json] [figures directory]
+    uv run python docs/poster/ashg2026/simulation.py fetch     # from the repository root, MSI connected
+    uv run python docs/poster/ashg2026/figures.py
+    uv run --no-project --with defusedxml --with lxml --with pillow python docs/poster/ashg2026/build_pptx.py \
+        [template.pptx] [output.pptx] [simulation_summary.json] [figures directory]
+
+The template defaults to ~/Downloads/ASHG draft.PH.pptx and the output to ~/Downloads/ASHG SV-PGS poster.pptx; render
+the output to PDF (soffice --headless --convert-to pdf) to inspect it.
 
 The template is read from outside the repository and nothing of it is committed: its own content (another study's All
 of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
