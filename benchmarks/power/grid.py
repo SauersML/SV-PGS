@@ -5,7 +5,7 @@ held-out comparison the workspace report makes, with null and positive controls.
 Each grid point fixes the architecture that ``benchmarks/bench_sim/truth.py`` otherwise draws at random: a liability
 threshold disease of liability heritability HERITABILITY on the simulated chromosome and prevalence PREVALENCE,
 CAUSAL_VARIANTS causal records, a given fraction of them SVs and an SV effect size relative to small variants, Gaussian
-effects with equal per-SD variance, no annotation or non-additive effects and homoscedastic noise. Points:
+effects whose per-SD variance follows FREQUENCY_ALPHA, no annotation or non-additive effects and homoscedastic noise. Points:
 
 - ``null`` (legacy name): no causal SV. SVs retain their LD with causal small variants. This is a no-SV-causality
   control, NOT necessarily a null of equal predictive accuracy: tagging, representation and regularization can
@@ -50,6 +50,11 @@ from benchmarks.power.uncertainty import rejection_summary
 HERITABILITY = 0.1
 PREVALENCE = 0.1
 CAUSAL_VARIANTS = 200
+FREQUENCY_ALPHA = -0.38
+"""The frequency dependence of effect sizes, per-allele variance proportional to [2p(1 - p)]^alpha: the mean over 25 UK
+Biobank traits (Schoech et al. 2019, Nat Commun 10:790). With causal records drawn uniformly over chr22's records, most
+of them rare, it puts about 17% of h2 on variants of minor allele frequency below 1% and about 70% on those of at least
+5%, close to whole-genome estimates; alpha = -1 (equal per-SD variance at every frequency) put about 64% below 1%."""
 LENGTH_SLOPE = 0.5
 DELETION_FOLD = 3.0
 TRAIN_COUNTS = (5_000, 10_000, 20_000, 40_000)
@@ -110,8 +115,8 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
         "sv_scale_fold": setting["sv_effect_fold"],
         "tr_mode": "none", "tr_scale_fold": 1.0, "tr_probability_fold": 1.0,
         "shape": "gaussian", "shape_params": {}, "sv_own_shape": False, "sv_shape": "gaussian", "sv_shape_params": {},
-        # Equal per-SD variance at every frequency (alpha = -1), no plateau, no LD dependence.
-        "alpha_snv": -1.0, "alpha_sv": -1.0, "plateau": 0.0, "frequency_source": "cohort", "ld_gamma": 0.0,
+        # Per-SD variance proportional to [2p(1 - p)]^(1 + alpha) at FREQUENCY_ALPHA for every class, no plateau, no LD dependence.
+        "alpha_snv": FREQUENCY_ALPHA, "alpha_sv": FREQUENCY_ALPHA, "plateau": 0.0, "frequency_source": "cohort", "ld_gamma": 0.0,
         "annotation_mode": "none", "annotation_seed": int(seeds[1]),
         "dominance": False, "tr_saturating": False, "link_c": 0.0, "hetero_kappa": 0.0, "t_noise": False,
         "beta_sex": 0.0, "beta_age": 0.0, "beta_batch": 0.0, "ancestry_means": [0.0] * 5,
