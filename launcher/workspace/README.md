@@ -28,6 +28,15 @@ queries and other overhead, within the user's $3,000 total. Five folds and the f
 full-data fit remain enabled. No runtime or total-cost claim has been established
 at biobank scale; measure a full-genome pilot before spending the training slots.
 
+The `pilot` slot limits spending; it does not select a phenotype. The supplied
+run-config template lists all 15 diseases. For the single-trait pilot, stage a
+config with `diseases: ["hypertension"]`, `traits: []`, and panel weights naming
+only hypertension (or `panel: null` for this timing-only run). Retain all 22
+autosomes, the five folds, calibration and the final fit. With `THROUGH=fit`,
+the pipeline fits both matched variant arms. Inspect acceptance and per-fold
+timings inside the workspace before deciding whether the full study fits the
+remaining budget; merely exhausting the pilot slot is not a successful pilot.
+
 `submit.sh` requires `BUDGET_SLOT` and a current whole-VM `HOURLY_USD` quote. It
 calculates a task timeout from that slot, including every retry and a startup
 allowance. The default is no automatic retries. The six `train-1` through `train-6`
