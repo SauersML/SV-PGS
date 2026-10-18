@@ -129,7 +129,9 @@ def operand_digits(dense: Any, array_module: ModuleType, digit_count: int = OPER
     rows, columns = values.shape
     magnitude = _column_max(array_module.abs(values), array_module) if rows else array_module.zeros(columns)
     exponent = (DIGIT_BITS * digit_count - 2) - array_module.ceil(array_module.log2(array_module.where(magnitude > 0, magnitude, 1.0)))
-    scale = array_module.exp2(exponent)
+    # CUDA exp2 can return a neighbouring float even for an integer exponent. The digit recurrence requires an
+    # exact power of two: construct it by shifting the exponent rather than approximating an exponential.
+    scale = array_module.ldexp(array_module.ones_like(magnitude), exponent.astype(array_module.int32))
     digits = array_module.empty((rows, digit_count * columns), dtype=array_module.int8, order="F")
     if array_module is np:
         _split_digits_cpu(values, scale, digits, digit_count)
