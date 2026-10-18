@@ -154,65 +154,68 @@ def simulation_copy(summary: dict) -> None:
     SIMULATION_METHODS = [[(f"{min(drawn):,}–{max(drawn):,} training samples; LDpred2-auto uses MAF ≥ 1% "
                            "SNVs at HapMap3 density, or all classes.", "")]]
 
-    twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
+    cells = {name: settled(point, largest) for name, point in points.items()}
     accuracy = []
-    if twenty and null_cell:
-        positive, null = twenty["delta_auc"], null_cell["delta_auc"]
-        accuracy.append([(f"Adding SVs at {largest_text} samples, 20% causal SVs: ΔAUC {auc_change(positive)}; "
-                          f"no causal SVs: {number(null['mean'])}.", "")])
-    if twenty:
-        found = [(twenty[key], which) for key, which in (("delta_auc_vs_ldpred2", "SNV subset"),
-                                                         ("delta_auc_vs_ldpred2_allvar", "all variant classes"))
-                 if twenty.get(key, {}).get("replicates", 0) >= MIN_REPLICATES]
-        if found:
-            gains = "; ".join(f"{which} {auc_change(against)}" for against, which in found)
-            accuracy.append([(f"SV-PGS minus LDpred2-auto: {gains}.", "")])
+    # SV-PGS against LDpred2-auto on its SNV subset; "beat" counts only architectures whose 95% interval lies above zero
+    versus = {name: cell["delta_auc_vs_ldpred2"] for name, cell in cells.items()
+              if cell and cell.get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES}
+    if versus:
+        best = max(versus, key=lambda name: versus[name]["mean"])
+        ahead = sum(entry["lower"] > 0 for entry in versus.values())
+        if ahead:
+            accuracy.append([(f"SV-PGS beat LDpred2-auto (SNV subset) in {ahead} of {len(versus)} architectures at {largest_text} "
+                              f"training samples, by up to {auc_change(versus[best])} AUC.", "")])
+        else:
+            accuracy.append([(f"SV-PGS minus LDpred2-auto (SNV subset), {largest_text} training samples: {auc_change(versus[best])}.", "")])
     if accuracy:
         SIMULATION_ACCURACY = accuracy
 
-    genotypes = []
-    if twenty:
-        power = twenty["power"]
-        if power["replicates"] >= MIN_REPLICATES:
-            genotypes.append([(f"Power at 20% causal SVs: {power['rate']:.0%} (95% CI {power['lower']:.0%}–{power['upper']:.0%}; "
-                               f"{power['replicates']} replicates).", "")])
+    # what adding SVs does where causal SVs are measured well (SNP-tagged or common SVs imputed; any architecture on true
+    # genotypes), then how well the rare majority of SVs imputes
+    genotypes, raised = [], []
+    true_gains = summary.get("genotype_accuracy", {}).get("delta_auc", {})
+    for point, label in ARCHITECTURE_LABELS:
+        sizes_done = [size for size in sorted(points.get(point, {}).get("sizes", {}), key=int, reverse=True) if settled(points[point], size)]
+        imputed = settled(points[point], sizes_done[0])["delta_auc"] if point in WELL_IMPUTED and sizes_done else None
+        true = true_gains.get(point, {}).get("true")
+        true = true if true and true["replicates"] >= MIN_REPLICATES else None
+        if imputed:
+            genotypes.append([(f"{label}, imputed: adding SVs changed AUC by {auc_change(imputed)}.", "")])
+        if true:
+            genotypes.append([(f"{label}, true SV genotypes: {auc_change(true)}.", "")])
+        raised += [label for entry in (imputed, true) if entry and entry["lower"] > 0]
     accuracy_by_frequency = summary.get("genotype_accuracy", {}).get("r2_by_frequency")
     if accuracy_by_frequency:
         rare = {name: rare_r2(accuracy_by_frequency[name]["bins"]) for name in ("SV", "SNV")}
-        genotypes.append([(f"Imputed SVs below 1% frequency ({accuracy_by_frequency['SV']['below_1pct']:.0%} of SVs): mean "
-                           f"r² {number(rare['SV'], 2)}, vs. {number(rare['SNV'], 2)} for SNVs.", "")])
-    true_gains = summary.get("genotype_accuracy", {}).get("delta_auc", {})
-    found = [(point, label, true_gains[point]["true"]) for point, label in (("sv_20pct_fold3", "20% SVs, 3× effect"), ("sv_20pct", "20% SVs"))
-             if true_gains.get(point, {}).get("true", {}).get("replicates", 0) >= MIN_REPLICATES]
-    if found:
-        point, label, gain = found[0]
-        imputed = settled(points.get(point, {}), largest)
-        imputed_text = f"; imputed: {number(imputed['delta_auc']['mean'])}" if imputed else ""
-        genotypes.append([(f"True genotypes, {label}: ΔAUC {auc_change(gain)}{imputed_text}.", "")])
+        genotypes.append([(f"{accuracy_by_frequency['SV']['below_1pct']:.0%} of SVs are below 1% frequency, where imputation "
+                           f"r² averages {number(rare['SV'], 2)} (SNVs: {number(rare['SNV'], 2)}).", "")])
     if genotypes:
         SIMULATION_GENOTYPES = genotypes
 
-    # the conclusions at the largest size: what imputed SVs add, what true SV genotypes add, SV-PGS against LDpred2-auto;
-    # "raised" and "exceeded" count only architectures whose unadjusted 95% interval lies above zero
     conclusions = []
-    cells = {name: settled(point, largest) for name, point in points.items()}
-    gains = [cell["delta_auc"] for name, cell in cells.items() if cell and name != "null"]
-    if gains:
-        rare = (f"; SVs below 1% frequency impute at r² {number(rare_r2(accuracy_by_frequency['SV']['bins']), 2)}"
-                if accuracy_by_frequency else "")
-        conclusions.append([(f"Imputed SVs raised AUC in {sum(entry['lower'] > 0 for entry in gains)} of {len(gains)} "
-                             f"causal-SV architectures{rare}.", "")])
-    if found:
-        _point, label, gain = found[0]
-        conclusions.append([(f"True SV genotypes {'raised' if gain['lower'] > 0 else 'changed'} AUC by {number(gain['mean'])} "
-                             f"({label}).", "")])
-    versus = [cell["delta_auc_vs_ldpred2"] for cell in cells.values()
-              if cell and cell.get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES]
-    if versus:
-        conclusions.append([(f"SV-PGS exceeded LDpred2-auto in {sum(entry['lower'] > 0 for entry in versus)} of {len(versus)} "
-                             "architectures.", "")])
+    if versus and sum(entry["lower"] > 0 for entry in versus.values()):
+        conclusions.append([(f"SV-PGS beat LDpred2-auto by up to {number(versus[max(versus, key=lambda name: versus[name]['mean'])]['mean'])} AUC.", "")])
+    if raised:
+        conclusions.append([(f"Adding well-measured SVs raised AUC ({'; '.join(dict.fromkeys(raised))}).", "")])
+    elif accuracy_by_frequency:
+        conclusions.append([(f"Rare SVs impute at r² {number(rare_r2(accuracy_by_frequency['SV']['bins']), 2)} from a 2,072-haplotype "
+                             "panel; imputed rare SVs added little.", "")])
     if conclusions:
         DISCUSSION = conclusions
+
+
+ARCHITECTURE_LABELS = (
+    # (point, label): the architectures the copy reports adding SVs for, in order
+    ("tagged_sv_fold3", "SNP-tagged causal SVs, 3× effect"),
+    ("tagged_sv", "SNP-tagged causal SVs"),
+    ("common_sv", "Common causal SVs"),
+    ("sv_20pct_fold3", "20% causal SVs, 3× effect"),
+    ("deletion_positive", "Deletions 3×"),
+    ("multi_feature_positive", "Length, type, annotation"),
+)
+WELL_IMPUTED = {"tagged_sv_fold3", "tagged_sv", "common_sv"}
+"""Architectures whose causal SVs are imputed accurately (Beagle r^2 >= 0.8, or common); elsewhere the copy reports only
+the true-genotype gain."""
 
 
 if SUMMARY.is_file():

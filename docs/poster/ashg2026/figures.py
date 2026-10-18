@@ -426,23 +426,27 @@ ARCHITECTURES = (
      ("sv_two_point", "Two-point effects"), ("rare_disease", "Prevalence 1%"), ("low_heritability", "h² = 0.01")),
 )
 GAINS = (
-    # (key label, colour, filled marker): the SV arm's gain over the same method without SVs
-    ("Imputed SVs", TEAL, False),
-    ("True SV genotypes", TEAL, True),
+    # (key label, colour, filled marker): SV-PGS with SVs over SV-PGS without them (imputed, then true genotypes) and
+    # over LDpred2-auto on its SNV subset
+    ("vs. no SVs, imputed", TEAL, False),
+    ("vs. no SVs, true genotypes", TEAL, True),
+    ("vs. LDpred2-auto", AMBER, True),
 )
 
 
 def architecture_marks(summary: dict, point: str) -> list[dict | None]:
-    """The point's AUC gain from adding SVs at its largest drawn training size on imputed genotypes, and at the largest
-    training size on true genotypes, each with at least MIN_REPLICATES replicates (None otherwise)."""
-    imputed = summary["points"][point]["sizes"][sizes(summary, point)[-1]]["delta_auc"]
+    """SV-PGS with SVs at the point's largest drawn training size: its AUC gain over SV-PGS without SVs on imputed
+    genotypes, the same at the largest training size on true genotypes, and its gain over LDpred2-auto, each with at
+    least MIN_REPLICATES replicates (None otherwise)."""
+    cell = summary["points"][point]["sizes"][sizes(summary, point)[-1]]
     true = summary.get("genotype_accuracy", {}).get("delta_auc", {}).get(point, {}).get("true")
-    return [entry if entry and entry["replicates"] >= MIN_REPLICATES else None for entry in (imputed, true)]
+    return [entry if entry and entry["replicates"] >= MIN_REPLICATES else None
+            for entry in (cell["delta_auc"], true, cell.get("delta_auc_vs_ldpred2"))]
 
 
 def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> Path:
-    """For every simulated architecture: the mean test AUC gain of SV-PGS from adding SVs on imputed and on true
-    genotypes, with 95% intervals over replicates, on one axis shared by both blocks of architectures."""
+    """For every simulated architecture: the mean test AUC gain of SV-PGS with SVs over SV-PGS without them (imputed
+    and true genotypes) and over LDpred2-auto, with 95% intervals over replicates, on one axis shared by both blocks."""
     blocks = [[(point, label) for point, label in block if sizes(summary, point)] for block in ARCHITECTURES]
     blocks = [block for block in blocks if block]
     rows = [row for block in blocks for row in block]
@@ -497,7 +501,7 @@ def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.
                     parts.append(f'<line x1="{x(entry["lower"]):.1f}" y1="{y:.1f}" x2="{x(entry["upper"]):.1f}" y2="{y:.1f}" stroke="{colour}" stroke-width="4" stroke-linecap="round"/>')
                 parts.append(f'<circle cx="{x(entry["mean"]):.1f}" cy="{y:.1f}" r="9" fill="{colour if filled else "#fff"}" stroke="{colour}" stroke-width="4"/>')
     counts = sorted({int(sizes(summary, point)[-1]) for point, _label in rows})
-    parts.append(f'<text class="axis" x="{w / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain from adding SVs at {" / ".join(thousands(count) for count in counts)} training samples</text>')
+    parts.append(f'<text class="axis" x="{w / 2:.1f}" y="{h - 16}" text-anchor="middle">Test AUC gain of SV-PGS with SVs at {" / ".join(thousands(count) for count in counts)} training samples</text>')
     parts.append("</svg>")
     return render("fig_sim_architectures", page("".join(parts), width, height), width, height)
 
