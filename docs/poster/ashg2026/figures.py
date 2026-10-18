@@ -525,7 +525,9 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     points = summary["points"] if summary else {}
     made.append(accuracy_figure(summary) if all(point in points for point, _title in ACCURACY_PANELS) else placeholder_figure("ph_sim_accuracy"))
     made.append(power_figure(summary) if "null" in points and any(point in points for point, *_rest in POWER_SERIES[:-1]) else placeholder_figure("ph_sim_power"))
-    made.append(effects_figure(summary) if summary and summary["effects"] else placeholder_figure("ph_sim_effects"))
+    # the length panel compares the two effect points, so the figure waits for both
+    effects = summary["effects"] if summary else {}
+    made.append(effects_figure(summary) if all(point in effects for point in ("sv_20pct", "length_positive")) else placeholder_figure("ph_sim_effects"))
     if summary and len(points) > 1:
         made.append(architectures_figure(summary))
     return made

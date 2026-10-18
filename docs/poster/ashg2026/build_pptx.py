@@ -62,14 +62,15 @@ SIMULATION_DESIGN = [
 ]
 
 SIMULATION_ACCURACY = [
-    [("With 20% causal SVs and 40,000 training samples, adding SVs raised AUC by ", ""), ("[ΔAUC]", "ph"),
+    [("With 20% causal SVs and 40,000 training samples, adding SVs changed AUC by ", ""), ("[ΔAUC]", "ph"),
      (". With no causal SVs, AUC changed by ", ""), ("[ΔAUC]", "ph"), (".", "")],
     [("SV-PGS ", ""), ("[outperformed / matched]", "ph"), (" LDpred2-auto (ΔAUC ", ""), ("[ ]", "ph"), (").", "")],
 ]
 
 SIMULATION_EFFECTS = [
     [("The test for an SV gain reached 80% power at ", ""), ("[n]", "ph"), (" training samples with 20% causal SVs.", "")],
-    [("SV-PGS recovered the simulated increase of SV effect size with length (ρ = ", ""), ("[ ]", "ph"), (").", "")],
+    [("SV-PGS ", ""), ("[recovered / did not recover]", "ph"), (" the simulated increase of SV effect size with length (ρ = ", ""),
+     ("[ ]", "ph"), (").", "")],
 ]
 
 HYPERTENSION = [
@@ -104,13 +105,23 @@ def auc_change(entry: dict) -> str:
     return f"{number(entry['mean'])} (95% CI {span})"
 
 
+MIN_REPLICATES = 3
+"""A sentence is filled only from (point, training size) cells with at least this many finished replicates."""
+
+
+def settled(point: dict, size: str) -> dict | None:
+    """The point's cell at ``size`` if it has enough replicates for an interval, else None."""
+    cell = point.get("sizes", {}).get(size)
+    return cell if cell and cell["replicates"] >= MIN_REPLICATES else None
+
+
 def change_verb(entry: dict, rose: str, fell: str, neither: str) -> str:
     return rose if entry["lower"] > 0 else fell if entry["upper"] < 0 else neither
 
 
 def size_reaching(rows: dict, target: float) -> float | None:
     """Training size at which power first reaches ``target``, interpolated in log size; None if never."""
-    points = sorted((int(size), row["power"]["rate"]) for size, row in rows.items() if row["power"]["replicates"])
+    points = sorted((int(size), row["power"]["rate"]) for size, row in rows.items() if row["replicates"] >= MIN_REPLICATES)
     for (size_a, rate_a), (size_b, rate_b) in zip(points, points[1:]):
         if rate_a < target <= rate_b:
             fraction = (target - rate_a) / (rate_b - rate_a)
@@ -130,18 +141,18 @@ def simulation_copy(summary: dict) -> None:
     SIMULATION_DESIGN[3] = [(f"We compare SV-PGS with and without SVs, and LDpred2-auto, at {min(summary['train_counts']):,} to "
                              f"{int(largest):,} training samples.", "")]
 
+    twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
     accuracy = []
-    if "sv_20pct" in points and "null" in points and largest in points["sv_20pct"]["sizes"] and largest in points["null"]["sizes"]:
-        positive = points["sv_20pct"]["sizes"][largest]["delta_auc"]
-        null = points["null"]["sizes"][largest]["delta_auc"]
+    if twenty and null_cell:
+        positive, null = twenty["delta_auc"], null_cell["delta_auc"]
         accuracy.append([
             (f"With 20% causal SVs and {largest_text} training samples, adding SVs {change_verb(positive, 'raised', 'lowered', 'changed')} AUC by {auc_change(positive)}; "
              f"with no causal SVs, by {number(null['mean'])}.", ""),
         ])
-    if "sv_20pct" in points and largest in points["sv_20pct"]["sizes"]:
-        against = points["sv_20pct"]["sizes"][largest]["delta_auc_vs_ldpred2"]
-        if math.isfinite(against["mean"]):
-            every = [point["sizes"][largest]["delta_auc_vs_ldpred2"] for point in points.values() if largest in point["sizes"]]
+    if twenty:
+        against = twenty["delta_auc_vs_ldpred2"]
+        if math.isfinite(against["lower"]):
+            every = [cell["delta_auc_vs_ldpred2"] for cell in (settled(point, largest) for point in points.values()) if cell]
             verb = change_verb(against, "outperformed", "had lower AUC than", "matched")
             tail = f" in all {len(every)} settings" if all(entry["lower"] > 0 for entry in every) else ""
             accuracy.append([(f"SV-PGS {verb} LDpred2-auto{tail} (ΔAUC {number(against['mean'])} with 20% causal SVs).", "")])
@@ -149,25 +160,27 @@ def simulation_copy(summary: dict) -> None:
         SIMULATION_ACCURACY = accuracy
 
     effects = []
-    if "sv_20pct" in points:
+    if twenty:
         reach = size_reaching(points["sv_20pct"]["sizes"], 0.8)
-        rate = points["sv_20pct"]["sizes"][largest]["power"]["rate"] if largest in points["sv_20pct"]["sizes"] else math.nan
+        rate = twenty["power"]["rate"]
         if reach is not None:
             effects.append([(f"The test for an SV gain reached 80% power at about {round(reach, -3):,.0f} training samples with 20% causal SVs.", "")])
         else:
-            stronger = points.get("sv_20pct_fold3", {}).get("sizes", {}).get(largest, {}).get("power", {}).get("rate")
+            stronger_cell = settled(points.get("sv_20pct_fold3", {}), largest)
+            stronger = stronger_cell["power"]["rate"] if stronger_cell else None
             effects.append([(f"With 20% causal SVs, the test for an SV gain had {rate:.0%} power at {largest_text} samples"
                              + (f" ({stronger:.0%} with 3× effects)." if stronger is not None else "."), "")])
-    if "length_positive" in points and "sv_20pct" in points and largest in points["length_positive"]["sizes"]:
-        rho, rho_se = points["length_positive"]["sizes"][largest]["length_rho"]
-        null_rho, null_se = points["sv_20pct"]["sizes"][largest]["length_rho"]
+    length_cell = settled(points.get("length_positive", {}), largest)
+    if length_cell and twenty:
+        rho, rho_se = length_cell["length_rho"]
+        null_rho, null_se = twenty["length_rho"]
         recovered = math.isfinite(rho_se) and math.isfinite(null_se) and rho - null_rho > 1.96 * math.hypot(rho_se, null_se)
         effects.append([(f"SV-PGS {'recovered' if recovered else 'did not recover'} the simulated increase of SV effect size with length "
                          f"(ρ = {number(rho, 2)} vs. {number(null_rho, 2)}).", "")])
     if effects:
         SIMULATION_EFFECTS = effects
 
-    positives = [point["sizes"][largest]["delta_auc"] for name, point in points.items() if name != "null" and largest in point["sizes"]]
+    positives = [cell["delta_auc"] for cell in (settled(point, largest) for name, point in points.items() if name != "null") if cell]
     if positives:
         improved = sum(entry["lower"] > 0 for entry in positives)
         DISCUSSION = [
