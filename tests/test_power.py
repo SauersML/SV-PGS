@@ -191,6 +191,41 @@ def test_the_comparison_waits_for_the_core_arms_and_adds_the_all_variant_ldpred2
     assert json.loads((task / 'result.json').read_text()) == second
 
 
+def test_a_group_fit_records_each_point_on_its_own_and_leaves_out_completed_arms(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    class Fitted:
+        def score(self, test):
+            return {"total": np.zeros(3)}
+
+    fitted_columns = []
+
+    def fit_phenotypes(train, phenotypes):
+        fitted_columns.append(phenotypes.shape[1])
+        return [Fitted(), ValueError("Model quarantined from scoring and primary reporting: outer_criterion_met")]
+
+    views = {"null": 0.0, "sv_5pct": 1.0, "sv_20pct": 2.0}
+    monkeypatch.setattr(grid, "_scenario", lambda cohort, out, point, replicate: tmp_path / "scenarios" / point)
+    monkeypatch.setattr(grid.harness, "views", lambda cohort, scenario, *rest: (
+        SimpleNamespace(phenotype=np.full(4, views[scenario.name]), n_samples=4), SimpleNamespace()))
+    monkeypatch.setattr(grid.harness, "load_method", lambda method: SimpleNamespace(fit_phenotypes=fit_phenotypes))
+    monkeypatch.setattr(grid, "compare", lambda *args: None)
+    done = grid._task(tmp_path, "null", 5000, 0) / "snv_indel"
+    done.mkdir(parents=True)
+    (done / "attempt.json").write_text(json.dumps(dict(status="completed")))
+    grid.run_group(tmp_path / "method.py", tmp_path / "cohort", tmp_path, ["null", "sv_5pct", "sv_20pct"], 5000, 0, "snv_indel", 1)
+    assert fitted_columns == [2]
+    accepted, quarantined = (json.loads((grid._task(tmp_path, point, 5000, 0) / "snv_indel" / "attempt.json").read_text()) for point in ("sv_5pct", "sv_20pct"))
+    assert accepted["status"] == "completed" and accepted["fitted_with"] == ["sv_5pct", "sv_20pct"]
+    assert quarantined["status"] == "failed" and "quarantined" in quarantined["error"]
+    meta = json.loads((grid._task(tmp_path, "sv_5pct", 5000, 0) / "snv_indel" / "meta.json").read_text())
+    assert meta["models_fitted_together"] == 2 and meta["train_count"] == 4
+    assert json.loads((done / "attempt.json").read_text()) == dict(status="completed")
+    with pytest.raises(ValueError, match="submitted method"):
+        grid.run_group(tmp_path / "method.py", tmp_path / "cohort", tmp_path, ["null"], 5000, 0, "ldpred2_auto", 1)
+
+
 def test_failed_tasks_are_counted_even_if_no_fit_completes(tmp_path, monkeypatch):
     import csv
     def failed(*args, **kwargs):

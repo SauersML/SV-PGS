@@ -252,12 +252,24 @@ def fit(train) -> Model:
 
 def fit_with(train, inference: str, *, annotated_prior: bool = True) -> Model:
     """The fit by ``inference``'s fixed points (``stage2_wiring.fit_models``), with its profile: time, the process's
-    peak resident set and the device pool's bytes at the end."""
+    peak resident set and the device pool's bytes at the end. A fit the acceptance check quarantines raises."""
+    (outcome,) = fit_phenotypes(train, train.phenotype[:, None], inference, annotated_prior=annotated_prior)
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field", *, annotated_prior: bool = True) -> list:
+    """One model per column of ``phenotypes`` (the training samples' phenotypes of several scenarios on the same
+    genotypes), fitted together: ``fit_models`` fits the models that share training rows, covariates and likelihood as
+    one group, so the store, Stage 0's LD blocks and every pass over the codes serve all of them. Each model is
+    accepted or quarantined on its own; a quarantined model's entry is the ValueError ``require_accepted`` raises."""
+    phenotypes = np.asarray(phenotypes, dtype=np.float64)
+    count = phenotypes.shape[1]
     work = Path(tempfile.mkdtemp(prefix="svpgs_full_", dir=os.environ.get("TMPDIR")))
     try:
         store_path, order = cached_store(train, work)
         budget = task_budget()
-        phenotype = np.asarray(train.phenotype, dtype=np.float64)
         covariates = np.column_stack([np.ones(train.n_samples), np.asarray(train.covariates, dtype=np.float64)])
         started = time.time()
         (work / "fit").mkdir()
@@ -266,10 +278,10 @@ def fit_with(train, inference: str, *, annotated_prior: bool = True) -> Model:
                 store=store,
                 store_columns=np.arange(train.n_samples, dtype=np.int64),
                 covariates=covariates,
-                covariate_columns=np.ones((1, covariates.shape[1]), dtype=bool),
-                targets=phenotype[:, None],
-                training=np.ones((train.n_samples, 1), dtype=bool),
-                trait_types=[TraitType.QUANTITATIVE],
+                covariate_columns=np.ones((count, covariates.shape[1]), dtype=bool),
+                targets=phenotypes,
+                training=np.ones((train.n_samples, count), dtype=bool),
+                trait_types=[TraitType.QUANTITATIVE] * count,
                 log_variance_offset=None,
                 budget=budget,
                 work_dir=work / "fit",
@@ -278,37 +290,48 @@ def fit_with(train, inference: str, *, annotated_prior: bool = True) -> Model:
                 inference=inference,
                 annotated_prior=annotated_prior,
             )
-        (scoring,) = fitted.scoring
+        seconds = time.time() - started
         certificate = fitted.certificate
-        profile = {
-            "fit_seconds": time.time() - started,
-            "device": budget.device_kind,
-            "rows": int(np.asarray(scoring.store_rows).shape[0]),
-            "noise_variance": float(fitted.noise_variance[0]),
-            "phenotype_variance": float(phenotype.var()),
-            "outer_criterion_met": None if certificate.outer_criterion_met is None else bool(np.all(certificate.outer_criterion_met)),
-            "remaining_gain": float(np.max(certificate.remaining_gain)) if np.asarray(certificate.remaining_gain).size else None,
-            "inference": inference,
-            "refusals": len(certificate.refusals),
-            # The outer loop's own record, so an uncertified fit shows how it ended: accepted steps, refused trials, those
-            # with no fixed point, and the remaining gain at its last evaluations.
-            "outer_iterations": np.asarray(certificate.outer_iterations).tolist(),
-            "halvings": np.asarray(certificate.halvings).tolist(),
-            "unresolved": np.asarray(certificate.unresolved).tolist(),
-            "outer_history_tail": [list(map(float, history[-8:])) for history in certificate.outer_history],
-            "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
-            "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
-        }
         from types import SimpleNamespace
         from sv_pgs.fit_model import certificate_parts
         from sv_pgs.model_acceptance import acceptance, require_accepted
-        parts = certificate_parts(certificate, 1)
-        state = SimpleNamespace(model_names=("simulation",), certificate=parts.terms, refusals=parts.refusals,
-                                scoring=fitted.scoring)
-        profile["acceptance"] = acceptance(state)
-        profile["annotated_prior"] = annotated_prior
-        log(f"svpgs_full: {profile}")
-        require_accepted(state)
-        return Model(scoring, order, np.asarray(train.variants["cls"]) >= 2, profile)
+        parts = certificate_parts(certificate, count)
+        structural = np.asarray(train.variants["cls"]) >= 2
+        outcomes = []
+        for index, scoring in enumerate(fitted.scoring):
+            # the model's own certificate terms: every per-model array's row ``index``
+            terms = {key: (np.asarray(value)[index:index + 1] if np.ndim(value) and np.shape(value)[0] == count else value)
+                     for key, value in parts.terms.items()}
+            profile = {
+                "fit_seconds": seconds,
+                "models_fitted_together": count,
+                "device": budget.device_kind,
+                "rows": int(np.asarray(scoring.store_rows).shape[0]),
+                "noise_variance": float(fitted.noise_variance[index]),
+                "phenotype_variance": float(phenotypes[:, index].var()),
+                "outer_criterion_met": None if certificate.outer_criterion_met is None else bool(np.asarray(certificate.outer_criterion_met)[index]),
+                "remaining_gain": float(np.asarray(certificate.remaining_gain)[index]) if np.asarray(certificate.remaining_gain).size else None,
+                "inference": inference,
+                "refusals": len(certificate.refusals),
+                # The outer loop's own record, so an uncertified fit shows how it ended: accepted steps, refused trials, those
+                # with no fixed point, and the remaining gain at its last evaluations.
+                "outer_iterations": int(np.asarray(certificate.outer_iterations)[index]),
+                "halvings": int(np.asarray(certificate.halvings)[index]),
+                "unresolved": int(np.asarray(certificate.unresolved)[index]),
+                "outer_history_tail": list(map(float, certificate.outer_history[index][-8:])),
+                "peak_host_bytes": int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024,
+                "device_pool_bytes": None if _array_module(budget) is None else int(_array_module(budget).get_default_memory_pool().total_bytes()),
+            }
+            state = SimpleNamespace(model_names=(f"simulation {index}",), certificate=terms, refusals=parts.refusals, scoring=(scoring,))
+            profile["acceptance"] = acceptance(state)
+            profile["annotated_prior"] = annotated_prior
+            log(f"svpgs_full: model {index}: {profile}")
+            try:
+                require_accepted(state)
+            except ValueError as error:
+                outcomes.append(error)
+                continue
+            outcomes.append(Model(scoring, order, structural, profile))
+        return outcomes
     finally:
         shutil.rmtree(work, ignore_errors=True)

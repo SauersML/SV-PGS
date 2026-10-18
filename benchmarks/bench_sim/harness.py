@@ -186,21 +186,23 @@ def run(
     module = load_method(method)
     started = time.time()
     model = module.fit(train)
-    fitted = time.time()
+    write_prediction(model, test, out, time.time() - started, method=str(method), scenario=str(scenario), cores=cores,
+                     measurement=ARMS[arm][2], dropped_classes=list(dropped), train_count=int(train.n_samples), train_seed=train_seed)
+    return model
+
+
+def write_prediction(model, test: ScoreData, out: Path, fit_seconds: float, **meta) -> None:
+    """Score the test samples with a fitted model and write its prediction and meta (``meta`` plus the fit's and the
+    scoring's seconds and the process's peak resident set)."""
+    started = time.time()
     prediction = model.score(test)
-    finished = time.time()
     if not isinstance(prediction, dict):
         prediction = {"total": prediction}
     out.mkdir(parents=True, exist_ok=True)
     np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
-    meta = {
-        "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
-        "dropped_classes": list(dropped), "train_count": int(train.n_samples), "train_seed": train_seed,
-        "fit_seconds": fitted - started, "score_seconds": finished - fitted,
-        "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
-    }
+    meta |= {"fit_seconds": fit_seconds, "score_seconds": time.time() - started,
+             "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6}
     (out / "meta.json").write_text(json.dumps(meta, indent=1))
-    return model
 
 
 def views(

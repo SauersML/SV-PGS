@@ -27,17 +27,21 @@ is the method's at equal input. One job is one arm of one (point, training size,
 the core arms to finish writes the task's comparison (a later ``ldpred2_allvar`` adds its own), and ``summarize`` compares
 any task left without one and collects every finished task into ``summary.tsv``: per point and size, the mean SV-arm gain
 in AUC and its SE over replicates, the share of replicates whose paired DeLong test favours the SV arm at one-sided 0.05,
-its Monte Carlo uncertainty, and the positive controls' readouts. Arms and tasks are independent jobs.
+its Monte Carlo uncertainty, and the positive controls' readouts. Arms and tasks are independent jobs; ``run-group``
+fits one SV-PGS arm of every point at a training size and replicate in one job, the points sharing their training
+codes and differing only in phenotype.
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import fcntl
 import json
 import math
 import os
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -216,6 +220,64 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
     return compare(cohort, out, point, train_count, replicate)
 
 
+def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_count: int, replicate: int, arm: str, cores: int) -> list:
+    """One SV-PGS arm of several points' tasks at one training size and replicate, fitted together: the points share
+    the training samples and their codes and differ only in phenotype, so the method's ``fit_phenotypes`` fits them
+    as one group (one store, one set of LD blocks, every pass over the codes serving each model). Each point's arm is
+    recorded as ``run`` records it, and a point whose arm another job holds or has completed is left out."""
+    if ARMS[arm][0] is not None:
+        raise ValueError(f"run-group fits the submitted method's arms, not {arm}")
+    module = harness.load_method(method)
+    dropped = ARMS[arm][1]
+    with contextlib.ExitStack() as held:
+        members = []
+        for point in points:
+            scenario = _scenario(cohort, out, point, replicate)
+            folder = _task(out, point, train_count, replicate) / arm
+            folder.mkdir(parents=True, exist_ok=True)
+            lock = held.enter_context((folder / ".lock").open("a"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            if not _completed(folder):
+                members.append((point, scenario, folder))
+        if not members:
+            return []
+        identities = {point: dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(method),
+                                  fitted_with=[member[0] for member in members]) for point, _scenario_path, _folder in members}
+
+        def status(point, folder, value, **details):
+            temporary = folder / "attempt.partial.json"
+            temporary.write_text(json.dumps(identities[point] | dict(status=value) | details, indent=1))
+            temporary.replace(folder / "attempt.json")
+
+        views = [harness.views(cohort, scenario, cores, MEASUREMENT_ARM, dropped, train_count, replicate) for _point, scenario, _folder in members]
+        for point, _scenario_path, folder in members:
+            status(point, folder, "running")
+        train, test = views[0]
+        started = time.time()
+        try:
+            outcomes = module.fit_phenotypes(train, np.column_stack([view[0].phenotype for view in views]))
+        except Exception as error:
+            for point, _scenario_path, folder in members:
+                status(point, folder, "failed", error_type=type(error).__name__, error=str(error))
+            raise
+        seconds = time.time() - started
+        for (point, scenario, folder), outcome in zip(members, outcomes):
+            if isinstance(outcome, Exception):
+                status(point, folder, "failed", error_type=type(outcome).__name__, error=str(outcome))
+                continue
+            harness.write_prediction(outcome, test, folder, seconds, method=str(method), scenario=str(scenario), cores=cores,
+                                     measurement=harness.ARMS[MEASUREMENT_ARM][2], dropped_classes=list(dropped),
+                                     train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members))
+            if arm == "with_sv":
+                readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz")
+                (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
+            status(point, folder, "completed")
+    return [compare(cohort, out, point, train_count, replicate) for point, _scenario_path, _folder in members]
+
+
 def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str) -> Path:
     """Build an SV-PGS arm's training store into the method's store cache once, before the fits that share it start: the
     store holds the training samples' codes and public fields and no phenotype, so every point with the same training
@@ -334,6 +396,15 @@ def main() -> None:
     task.add_argument("--replicate", type=int, required=True)
     task.add_argument("--arm", choices=list(ARMS), required=True)
     task.add_argument("--cores", type=int, default=16)
+    group = commands.add_parser("run-group", help="one SV-PGS arm of several points' tasks, fitted together")
+    group.add_argument("--method", type=Path, required=True)
+    group.add_argument("--cohort", type=Path, required=True)
+    group.add_argument("--out", type=Path, required=True)
+    group.add_argument("--points", required=True, help="comma-separated grid points")
+    group.add_argument("--train-count", type=int, choices=TRAIN_COUNTS, required=True)
+    group.add_argument("--replicate", type=int, required=True)
+    group.add_argument("--arm", choices=[arm for arm, (method, _dropped) in ARMS.items() if method is None], required=True)
+    group.add_argument("--cores", type=int, default=16)
     store = commands.add_parser("prebuild", help="build an SV-PGS arm's training store into the store cache")
     store.add_argument("--method", type=Path, required=True)
     store.add_argument("--cohort", type=Path, required=True)
@@ -349,6 +420,9 @@ def main() -> None:
     if arguments.command == "run":
         print(json.dumps(run(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
                              arguments.replicate, arguments.arm, arguments.cores)))
+    elif arguments.command == "run-group":
+        print(json.dumps(run_group(arguments.method, arguments.cohort, arguments.out, arguments.points.split(","), arguments.train_count,
+                                   arguments.replicate, arguments.arm, arguments.cores)))
     elif arguments.command == "prebuild":
         print(prebuild(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
                        arguments.replicate, arguments.arm))

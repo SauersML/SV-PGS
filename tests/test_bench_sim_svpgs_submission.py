@@ -76,6 +76,43 @@ def test_the_submission_scores_only_accepted_synthetic_fits(tmp_path: Path, monk
         assert np.all(prediction["structural"] == 0.0)
 
 
+def test_scenarios_fitted_together_match_their_separate_fits(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    rng = np.random.default_rng(5)
+    n_var, n_train, n_test = 60, 240, 80
+    observed, variants = _cohort(rng, n_var, n_train + n_test)
+    covariates = rng.normal(size=(n_train + n_test, 3))
+    phenotypes = []
+    for _scenario in range(3):
+        effects = np.zeros(n_var)
+        effects[rng.choice(n_var, 6, replace=False)] = rng.normal(0.0, 0.4, 6)
+        phenotypes.append(effects @ (observed / 127.0) + covariates @ np.array([0.3, -0.2, 0.1]) + rng.normal(0.0, 1.0, n_train + n_test))
+    phenotypes = np.column_stack(phenotypes)
+    columns, records = np.arange(n_train + n_test), np.arange(n_var)
+    reads = harness.ReadEvidence(rows=np.zeros(0, dtype=np.int64), _pl=np.zeros((0, 0, 3), dtype=np.uint8), _columns=columns)
+
+    def train_view(phenotype):
+        return harness.TrainData(
+            variants=variants, covariates=covariates[:n_train], covariate_names=("a", "b", "c"), phenotype=phenotype[:n_train],
+            trait_type="quantitative", prevalence=None, cores=1, truth_half=np.zeros(n_train, dtype=bool), reads=reads,
+            _observed=observed, _columns=columns[:n_train], _records=records,
+        )
+
+    test = harness.ScoreData(
+        variants=variants, covariates=covariates[n_train:], covariate_names=("a", "b", "c"), reads=reads,
+        _observed=observed, _columns=columns[n_train:], _records=records,
+    )
+    module = harness.load_method(SUBMISSION)
+    together = module.fit_phenotypes(train_view(phenotypes[:, 0]), phenotypes[:n_train])
+    assert len(together) == 3 and all(model.profile["acceptance"]["accepted"] for model in together)
+    assert all(model.profile["models_fitted_together"] == 3 for model in together)
+    for index, model in enumerate(together):
+        alone = module.fit(train_view(phenotypes[:, index])).score(test)["total"]
+        joint = model.score(test)["total"]
+        assert np.corrcoef(alone, joint)[0, 1] > 0.99
+        assert np.allclose(joint, alone, rtol=0.05, atol=0.05 * np.std(alone))
+
+
 def test_the_truth_arm_is_the_true_genotypes_in_code_units(tmp_path: Path) -> None:
     rng = np.random.default_rng(5)
     truth = rng.integers(0, 3, size=(50, 12)).astype(np.uint8)
