@@ -6,6 +6,8 @@ store reproduces the fitted model's in-sample predictor. Accuracy comes from ben
 
 from __future__ import annotations
 
+import gc
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,35 @@ def _budget() -> ComputeBudget:
     return ComputeBudget(
         device_kind="cpu", device_ids=(), device_names=(), device_bytes=(), device_compute_capabilities=(), host_bytes=1 << 31, cpu_threads=2
     )
+
+
+def test_group_scratch_closes_unreachable_cyclic_mappings_before_removal(tmp_path, monkeypatch):
+    from sv_pgs import stage2_wiring
+
+    folder = tmp_path / "model0"
+    folder.mkdir()
+    mapped = np.memmap(folder / "gram.bin", dtype=np.float64, mode="w+", shape=(16,))
+    mapping = weakref.ref(mapped)
+    cycle = [mapped]
+    cycle.append(cycle)
+    remove = stage2_wiring.shutil.rmtree
+
+    def nfs_remove(directory):
+        # On NFS an open mapping leaves a .nfs file and makes the final rmdir fail.
+        assert mapping() is None, "LD file is still mapped when scratch is removed"
+        remove(directory)
+
+    monkeypatch.setattr(stage2_wiring.shutil, "rmtree", nfs_remove)
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        del mapped, cycle
+        assert mapping() is not None
+        stage2_wiring._remove_group_scratch(folder)
+    finally:
+        if was_enabled:
+            gc.enable()
+    assert not folder.exists()
 
 
 @pytest.mark.parametrize("route", ["samples", "gram"])

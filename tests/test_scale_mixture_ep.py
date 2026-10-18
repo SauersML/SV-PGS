@@ -7,6 +7,7 @@ Gaussian-prior regression for the noise update.
 from __future__ import annotations
 
 import pathlib
+import weakref
 from dataclasses import replace
 
 import numpy as np
@@ -349,6 +350,32 @@ def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotation
     (null_block,) = (block for block in prior.smoothing_blocks if block.name == "annotation group 1 null space")
     assert null_block.factor.shape[0] == 2
     np.testing.assert_allclose(null_block.factor @ _second_difference(3), 0.0, atol=1e-12)
+
+
+@pytest.mark.parametrize("node_count", [8, 17, 33])
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_known_prior_null_space_matches_the_dense_penalty_reference(node_count, offset_group_count):
+    prior, _ = _problem(variant_count=40, seed=7, node_count=node_count, offset_group_count=offset_group_count)
+    penalty = np.zeros((prior.coefficient_size, prior.coefficient_size))
+    for block in prior.smoothing_blocks:
+        penalty[np.ix_(block.coordinates, block.coordinates)] += block.factor.T @ block.factor
+    values, vectors = np.linalg.eigh(penalty)
+    reference = vectors[:, :2]
+    assert values[2] > 1e-10
+    np.testing.assert_allclose(prior.null_basis.T @ prior.null_basis, np.eye(2), atol=1e-13)
+    np.testing.assert_allclose(prior.null_basis @ prior.null_basis.T, reference @ reference.T, atol=2e-9)
+
+
+def test_fine_lattice_does_not_turn_a_proper_annotation_penalty_into_a_profiled_direction():
+    nodes = np.linspace(-1e-3, 1e-3, 17)
+    prior = scale_mixture_prior(
+        class_index=np.arange(40) % 2, log_variance_offset=np.zeros(40),
+        annotation_design=np.arange(40, dtype=float)[:, None],
+        annotation_groups=(AnnotationGroup(columns=np.array([0]), penalty=np.eye(1)),),
+        nodes=nodes, floor=nodes[0], top=nodes[-1],
+    )
+    assert prior.null_basis.shape == (prior.coefficient_size, 2)
+    np.testing.assert_array_equal(prior.null_basis[prior.pooled_size:], 0.0)
 
 
 @pytest.mark.parametrize("offset_group_count", [0, 3])
@@ -1423,6 +1450,52 @@ def test_the_lattice_check_flags_mass_at_a_lattice_end_and_passes_a_contained_de
     assert rising.extend and rising.extended_log_normalizer > rising.tolerance
     contained = engine.lattice_check(prior, at(-0.5 * ((nodes + 2.0) / 0.7) ** 2), cavity, 1 << 24, 64)
     assert not contained.extend and not contained.refine, contained.record()
+
+
+def test_lattice_check_releases_each_comparison_prior_before_constructing_the_next(monkeypatch):
+    prior, cavity = _problem(variant_count=30, seed=8, node_count=9)
+    hyperparameters = initial_hyperparameters(prior)
+    expected = engine.lattice_check(prior, hyperparameters, cavity, _WORKING_BYTES, 64)
+    previous = []
+
+    def tracked(move):
+        def invoke(*args):
+            assert all(reference() is None for reference in previous), "the previous dense comparison prior is still live"
+            moved, coefficients = move(*args)
+            previous.append(weakref.ref(moved))
+            return moved, coefficients
+        return invoke
+
+    monkeypatch.setattr(engine, "halved_lattice", tracked(engine.halved_lattice))
+    monkeypatch.setattr(engine, "extended_lattice", tracked(engine.extended_lattice))
+    actual = engine.lattice_check(prior, hyperparameters, cavity, _WORKING_BYTES, 64)
+    assert actual == expected
+    assert len(previous) == 2 and all(reference() is None for reference in previous)
+
+
+@pytest.mark.parametrize("move", [engine.halved_lattice, engine.extended_lattice])
+def test_group_relattice_constructs_one_prior_and_preserves_separate_model_transfers(move):
+    from sv_pgs.stage2_wiring import _move_lattice
+
+    prior, _ = _problem(variant_count=30, seed=8, node_count=9)
+    first = initial_hyperparameters(prior)
+    second = MixtureHyperparameters(
+        coefficients=np.random.default_rng(92).normal(size=prior.coefficient_size),
+        log_smoothing=np.zeros(len(prior.smoothing_blocks)),
+    )
+    expected = [move(prior, hyperparameters) for hyperparameters in (first, second)]
+    calls = []
+
+    def counted(*args):
+        calls.append(1)
+        return move(*args)
+
+    shared, transferred = _move_lattice(prior, [first, second], counted)
+    assert len(calls) == 1
+    for actual, (separate, reference) in zip(transferred, expected):
+        np.testing.assert_array_equal(shared.coefficient_map, separate.coefficient_map)
+        np.testing.assert_allclose(actual.coefficients, reference.coefficients, rtol=0, atol=0)
+        np.testing.assert_array_equal(actual.log_smoothing, reference.log_smoothing)
 
 
 def test_a_finite_log_variance_past_double_precision_keeps_its_finite_normalizer():

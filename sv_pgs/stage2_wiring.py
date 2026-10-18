@@ -19,12 +19,13 @@ route; its reported noise variance is its whitened problem's known unit noise, w
 from __future__ import annotations
 
 import dataclasses
+import gc
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 
@@ -53,10 +54,29 @@ from sv_pgs.genotype_statistics import (
 from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
 from sv_pgs.annotation_design import annotation_design, frequency_annotation
 from sv_pgs.progress import log
-from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior
+from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior, transfer_hyperparameters
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 
 _EPSILON = float(np.finfo(np.float64).eps)
+
+
+def _remove_group_scratch(directory: Path) -> None:
+    """Release unreachable solver/ledger cycles before deleting their memory-mapped LD files.
+
+    NFS keeps an unlinked but mapped file as .nfs*, so rmtree otherwise fails with ENOTEMPTY after a successful fit.
+    Refcounting alone cannot release closures and cache-eviction callbacks that refer back to their owners.
+    """
+    gc.collect()
+    shutil.rmtree(directory)
+
+
+def _move_lattice(
+    prior: ScaleMixturePrior, hyperparameters: Sequence[MixtureHyperparameters],
+    move: Callable[[ScaleMixturePrior, MixtureHyperparameters], tuple[ScaleMixturePrior, MixtureHyperparameters]],
+) -> tuple[ScaleMixturePrior, list[MixtureHyperparameters]]:
+    """Move a group's shared prior once, transferring each model's own coefficients to it."""
+    moved, first = move(prior, hyperparameters[0])
+    return moved, [first, *(transfer_hyperparameters(prior, moved, item) for item in hyperparameters[1:])]
 
 
 @dataclass(frozen=True)
@@ -687,6 +707,9 @@ def _fit_group(
             )
             pending = list(range(len(columns)))
             while pending:
+                # Completed solver closures can form cycles holding large NumPy buffers. Their byte size does not
+                # trigger Python's allocation-count GC threshold; release unreachable states before a larger lattice.
+                gc.collect()
                 checks = {model: lattice_check(fit_prior, fit.hyperparameters[model], _fitted_cavity(fit, model), share, draw_count) for model in pending}
                 for model, check in checks.items():
                     log(f"stage2 wiring: lattice check of model {int(models[genetic[columns[model]]])} on {fit_prior.grid_size} nodes: {check.record()}")
@@ -698,11 +721,9 @@ def _fit_group(
                     break
                 moved, moved_hyperparameters = fit_prior, list(fit.hyperparameters)
                 if any(checks[model].extend for model in moving):
-                    extended = [extended_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
-                    moved, moved_hyperparameters = extended[0][0], [hyperparameters for _prior, hyperparameters in extended]
+                    moved, moved_hyperparameters = _move_lattice(moved, moved_hyperparameters, extended_lattice)
                 if any(checks[model].refine for model in moving):
-                    halved = [halved_lattice(moved, hyperparameters) for hyperparameters in moved_hyperparameters]
-                    moved, moved_hyperparameters = halved[0][0], [hyperparameters for _prior, hyperparameters in halved]
+                    moved, moved_hyperparameters = _move_lattice(moved, moved_hyperparameters, halved_lattice)
                 try:
                     # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its
                     # noise and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior
@@ -851,7 +872,7 @@ def fit_models(
         else:
             # Incomplete scratch is disposable; completed models live outside this directory.
             if group_dir.exists():
-                shutil.rmtree(group_dir)
+                _remove_group_scratch(group_dir)
             group_dir.mkdir(parents=True)
             log(f"stage2 wiring: group {index + 1} of {len(groups)}: models {label} on {rows.shape[0]:,} training rows")
             started = time.perf_counter()
@@ -890,7 +911,7 @@ def fit_models(
         # later group and not by scoring, which the fit already ran: each is removed as its group ends, so the work
         # directory never holds more than one group's.
         if group_dir.exists():
-            shutil.rmtree(group_dir)
+            _remove_group_scratch(group_dir)
         for model, fit in zip(group.tolist(), group_fits):
             alpha = np.zeros(adjusted.shape[0])
             alpha[adjusted] = fit.scoring.alpha

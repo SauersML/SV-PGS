@@ -528,11 +528,17 @@ def scale_mixture_prior(
     level_size = design.shape[1] - annotation_size
     if level_size:
         blocks.append(SmoothingBlock("offset group levels", annotation_start + annotation_size + np.arange(level_size), np.eye(level_size)))
-    total = np.zeros((coefficient_size, coefficient_size))
-    for block in blocks:
-        total[np.ix_(block.coordinates, block.coordinates)] += block.matrix
-    null_eigenvalues, null_vectors = np.linalg.eigh(total)
-    null_basis = null_vectors[:, null_eigenvalues <= _EPSILON * coefficient_size * float(null_eigenvalues[-1])]
+    # Only the pooled polynomial of degree < ROUGHNESS_ORDER is unpenalized: deviations have their location/width
+    # penalty, annotation null spaces have their own ridge, and offset-group levels have a ridge. The constant was
+    # removed by the sum-to-zero coordinates. Construct these known directions directly, instead of forming and
+    # diagonalizing a dense matrix over every class and annotation. A global eigenvalue threshold can also mistake
+    # a small proper annotation penalty for zero when fine-grid roughness scales as h^-5.
+    coordinate = np.linspace(-1.0, 1.0, grid_size)
+    polynomials = np.column_stack([coordinate ** degree for degree in range(1, ROUGHNESS_ORDER)])
+    polynomials -= polynomials.mean(axis=0)
+    pooled_null, _ = np.linalg.qr(basis.T @ polynomials, mode="reduced")
+    null_basis = np.zeros((coefficient_size, ROUGHNESS_ORDER - 1))
+    null_basis[:pooled_size] = pooled_null
     return ScaleMixturePrior(
         class_index=classes,
         class_count=class_count,
@@ -727,7 +733,6 @@ def relattice(
     functionals to their quadrature, whose residual the least change in x removes here rather than silently in
     the edge view's projection.
     """
-    old_nodes = prior.log_variance_grid
     new_nodes = np.asarray(nodes, dtype=np.float64)
     moved = scale_mixture_prior(
         class_index=prior.class_index,
@@ -739,6 +744,19 @@ def relattice(
         floor=floor,
         top=top,
     )
+    return moved, transfer_hyperparameters(prior, moved, hyperparameters)
+
+
+def transfer_hyperparameters(
+    prior: ScaleMixturePrior, moved: ScaleMixturePrior, hyperparameters: MixtureHyperparameters,
+) -> MixtureHyperparameters:
+    """Transfer one model to an already constructed relattice of its prior.
+
+    A jointly fitted group's models share the lattice and penalty matrices. Constructing these dense matrices once
+    per model needlessly multiplies their quadratic memory cost; only the transferred coefficients are model-specific.
+    ``moved`` must be the same schema as ``prior`` on the requested new lattice, as constructed by ``relattice``.
+    """
+    old_nodes, new_nodes = prior.log_variance_grid, moved.log_variance_grid
     old_basis = prior.coefficient_map[: prior.grid_size, : prior.pooled_size]
     new_basis = moved.coefficient_map[: moved.grid_size, : moved.pooled_size]
     coefficients = np.asarray(hyperparameters.coefficients, dtype=np.float64)
@@ -768,7 +786,7 @@ def relattice(
             constraints.append(embedded)
         constraint = np.vstack(constraints)
         moved_coefficients -= np.linalg.lstsq(constraint, constraint @ moved_coefficients, rcond=None)[0]
-    return moved, MixtureHyperparameters(coefficients=moved_coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
+    return MixtureHyperparameters(coefficients=moved_coefficients, log_smoothing=hyperparameters.log_smoothing.copy())
 
 
 def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
@@ -835,10 +853,14 @@ def lattice_check(
     base = tilted_moments(prior, hyperparameters, cavity, working_bytes, np)
     weight = np.abs(np.asarray(cavity.precision, dtype=np.float64))
     changes = []
-    for moved_prior, moved in (halved_lattice(prior, hyperparameters), extended_lattice(prior, hyperparameters)):
+    # These priors contain dense quadratic-size penalty and coefficient maps. Do not construct both eagerly or
+    # retain the previous one while constructing the next (the chr22 GPU run exhausted 96 GiB on refined lattices).
+    for move in (halved_lattice, extended_lattice):
+        moved_prior, moved = move(prior, hyperparameters)
         other = tilted_moments(moved_prior, moved, cavity, working_bytes, np)
         moments = 0.5 * float(np.sum(weight * (np.square(other.mean - base.mean) + np.abs(other.variance - base.variance))))
         changes.append((abs(float(np.sum(other.log_normalizer) - np.sum(base.log_normalizer))), moments))
+        del moved_prior, moved, other
     (refined_z, refined_m), (extended_z, extended_m) = changes
     return LatticeCheck(
         refined_log_normalizer=refined_z, extended_log_normalizer=extended_z, refined_moments=refined_m, extended_moments=extended_m,
