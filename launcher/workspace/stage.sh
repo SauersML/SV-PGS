@@ -12,7 +12,6 @@ set -euo pipefail
 : "${OPS_BUCKET:?}" "${RUN_ID:?}"
 config=${1:?usage: stage.sh RUN_CONFIG.json}
 here=$(cd "$(dirname "$0")" && pwd)
-root=$(git -C "$here" rev-parse --show-toplevel)
 python3 - "$config" "$here/run_config.template.json" <<'PY'
 import json, re, sys
 filled_text = open(sys.argv[1]).read()
@@ -26,6 +25,7 @@ if missing:
 PY
 # The wheels and the interpreter must be the Batch VMs' platform.
 [ "$(uname -sm)" = "Linux x86_64" ] || { echo "stage from Linux x86-64, the Batch VMs' platform" >&2; exit 2; }
+root=$(git -C "$here" rev-parse --show-toplevel)
 [ -z "$(git -C "$root" status --porcelain --untracked-files=no)" ] || { echo "commit or discard local changes: git archive stages HEAD only" >&2; exit 2; }
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -38,9 +38,10 @@ uv python install 3.12
 (cd "$work/source" && UV_PROJECT_ENVIRONMENT="$work/venv" uv sync --frozen --extra gpu --python 3.12)
 cp "$config" "$work/run_config.json"
 destination="gs://${OPS_BUCKET}/svpgs/${RUN_ID}"
-# rsync with deletion, so a restage at a later commit leaves no file of the earlier one behind
+# each part removed before its copy, so a restage at a later commit leaves no file of the earlier one behind
 for part in source bin python uv-cache; do
-  gcloud storage rsync -r --delete-unmatched-destination-objects "$work/$part" "$destination/$part"
+  if gcloud storage ls "$destination/$part" > /dev/null 2>&1; then gcloud storage rm -r "$destination/$part"; fi
+  gcloud storage cp -r "$work/$part" "$destination/"
 done
 gcloud storage cp "$work/run_config.json" "$destination/run_config.json"
 echo "staged $(git -C "$root" rev-parse --short HEAD) at $destination"
