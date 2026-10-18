@@ -134,12 +134,12 @@ def scenario_parameters(point: str, replicate: int, cohort: Path) -> dict:
     }
 
 
-def structural_effect_readout(model, cohort: Path, target: Path) -> dict:
+def structural_effect_readout(model, cohort: Path, target: Path, measurement: str = MEASUREMENT_ARM) -> dict:
     """The SV arm's fitted SV effects against what the positive controls set: Spearman's rho of |effect| per allele with
     log length, and the median |effect| of deletions over insertions. Descriptive, like the workspace's: records in LD.
     Every SV record's signed per-allele effect is written to ``target`` with its cohort record index, for the comparison
     with the simulated effects."""
-    table = harness.public_variant_table(cohort, MEASUREMENT_ARM)
+    table = harness.public_variant_table(cohort, measurement)
     scoring = model.scoring
     rows = model.order[np.asarray(scoring.store_rows)]
     effect = np.asarray(scoring.coefficients) / np.asarray(scoring.signed_scales) * SIGNED_CODE_OFFSET
@@ -194,15 +194,17 @@ def _write_attempt(folder: Path, identity: dict, status: str, **details) -> None
     temporary.replace(folder / "attempt.json")
 
 
-def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str, cores: int) -> dict | None:
+def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str, cores: int,
+        measurement: str = MEASUREMENT_ARM) -> dict | None:
     """One arm of one (point, training size, replicate) task, fitted on ``train_count`` training samples drawn by the
-    replicate's seed and scored on bench-sim's test samples. Arms run as separate jobs; the last one to finish writes the
-    task's comparison. Failed fits are recorded as well as successful ones; duplicate writers are rejected."""
+    replicate's seed and scored on bench-sim's test samples, every record observed through ``measurement`` (a bench-sim
+    measurement arm; one per output directory). Arms run as separate jobs; the last one to finish writes the task's
+    comparison. Failed fits are recorded as well as successful ones; duplicate writers are rejected."""
     scenario = _scenario(cohort, out, point, replicate)
     folder = _task(out, point, train_count, replicate) / arm
     folder.mkdir(parents=True, exist_ok=True)
     arm_method, dropped = ARMS[arm][0] or method, ARMS[arm][1]
-    identity = dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(arm_method))
+    identity = dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(arm_method), measurement=measurement)
 
     with (folder / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -210,9 +212,9 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
             raise FileExistsError("Completed arm already exists; use a new directory to rerun changed inputs")
         _write_attempt(folder, identity, "running")
         try:
-            model = harness.run(arm_method, cohort, scenario, folder, cores, MEASUREMENT_ARM, dropped, train_count=train_count, train_seed=replicate)
+            model = harness.run(arm_method, cohort, scenario, folder, cores, measurement, dropped, train_count=train_count, train_seed=replicate)
             if arm == "with_sv":
-                readout = structural_effect_readout(model, cohort, folder / "sv_effects.npz")
+                readout = structural_effect_readout(model, cohort, folder / "sv_effects.npz", measurement)
                 (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
         except Exception as error:
             _write_attempt(folder, identity, "failed", error_type=type(error).__name__, error=str(error))
@@ -221,7 +223,8 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
     return compare(cohort, out, point, train_count, replicate)
 
 
-def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_count: int, replicate: int, arm: str, cores: int) -> list:
+def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_count: int, replicate: int, arm: str, cores: int,
+              measurement: str = MEASUREMENT_ARM) -> list:
     """One SV-PGS arm of several points' tasks at one training size and replicate, fitted together: the points share
     the training samples and their codes and differ only in phenotype, so the method's ``fit_phenotypes`` fits them
     as one group (one store, one set of LD blocks, every pass over the codes serving each model). Each point's arm is
@@ -248,12 +251,12 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
         if not members:
             return []
         identities = {point: dict(point=point, train_count=train_count, replicate=replicate, arm=arm, method=str(method),
-                                  fitted_with=[member[0] for member in members]) for point, _scenario_path, _folder in members}
+                                  measurement=measurement, fitted_with=[member[0] for member in members]) for point, _scenario_path, _folder in members}
 
         for point, _scenario_path, folder in members:
             _write_attempt(folder, identities[point], "running")
         try:
-            views = [harness.views(cohort, scenario, cores, MEASUREMENT_ARM, dropped, train_count, replicate)
+            views = [harness.views(cohort, scenario, cores, measurement, dropped, train_count, replicate)
                      for _point, scenario, _folder in members]
             train, test = views[0]
             started = time.monotonic()
@@ -272,10 +275,10 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
                 continue
             try:
                 harness.write_prediction(outcome, test, folder, seconds, method=str(method), scenario=str(scenario), cores=cores,
-                                         measurement=harness.ARMS[MEASUREMENT_ARM][2], dropped_classes=list(dropped),
+                                         measurement=harness.ARMS[measurement][2], dropped_classes=list(dropped),
                                          train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members))
                 if arm == "with_sv":
-                    readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz")
+                    readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz", measurement)
                     (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
             except Exception as error:
                 _write_attempt(folder, identities[point], "failed", error_type=type(error).__name__, error=str(error))
@@ -289,14 +292,15 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
     return comparisons
 
 
-def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str) -> Path:
+def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str,
+             measurement: str = MEASUREMENT_ARM) -> Path:
     """Build an SV-PGS arm's training store into the method's store cache once, before the fits that share it start: the
     store holds the training samples' codes and public fields and no phenotype, so every point with the same training
     size, replicate and arm reads the same one."""
     module = harness.load_method(method)
     if not os.environ.get(module.STORE_CACHE_VARIABLE):
         raise ValueError(f"prebuild writes into the store cache; set {module.STORE_CACHE_VARIABLE}")
-    train, _test = harness.views(cohort, _scenario(cohort, out, point, replicate), 1, MEASUREMENT_ARM, ARMS[arm][1], train_count, replicate)
+    train, _test = harness.views(cohort, _scenario(cohort, out, point, replicate), 1, measurement, ARMS[arm][1], train_count, replicate)
     with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as work:
         path, _order = module.cached_store(train, Path(work))
         return path
@@ -407,6 +411,7 @@ def main() -> None:
     task.add_argument("--replicate", type=int, required=True)
     task.add_argument("--arm", choices=list(ARMS), required=True)
     task.add_argument("--cores", type=int, default=16)
+    task.add_argument("--measurement", choices=list(harness.ARMS), default=MEASUREMENT_ARM)
     group = commands.add_parser("run-group", help="one SV-PGS arm of several points' tasks, fitted together")
     group.add_argument("--method", type=Path, required=True)
     group.add_argument("--cohort", type=Path, required=True)
@@ -416,6 +421,7 @@ def main() -> None:
     group.add_argument("--replicate", type=int, required=True)
     group.add_argument("--arm", choices=[arm for arm, (method, _dropped) in ARMS.items() if method is None], required=True)
     group.add_argument("--cores", type=int, default=16)
+    group.add_argument("--measurement", choices=list(harness.ARMS), default=MEASUREMENT_ARM)
     store = commands.add_parser("prebuild", help="build an SV-PGS arm's training store into the store cache")
     store.add_argument("--method", type=Path, required=True)
     store.add_argument("--cohort", type=Path, required=True)
@@ -424,19 +430,20 @@ def main() -> None:
     store.add_argument("--train-count", type=int, choices=TRAIN_COUNTS, required=True)
     store.add_argument("--replicate", type=int, required=True)
     store.add_argument("--arm", choices=[arm for arm, (method, _dropped) in ARMS.items() if method is None], required=True)
+    store.add_argument("--measurement", choices=list(harness.ARMS), default=MEASUREMENT_ARM)
     collect = commands.add_parser("summarize", help="compare finished tasks and collect them into summary.tsv")
     collect.add_argument("--out", type=Path, required=True)
     collect.add_argument("--cohort", type=Path, required=True)
     arguments = parser.parse_args()
     if arguments.command == "run":
         print(json.dumps(run(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
-                             arguments.replicate, arguments.arm, arguments.cores)))
+                             arguments.replicate, arguments.arm, arguments.cores, arguments.measurement)))
     elif arguments.command == "run-group":
         print(json.dumps(run_group(arguments.method, arguments.cohort, arguments.out, arguments.points.split(","), arguments.train_count,
-                                   arguments.replicate, arguments.arm, arguments.cores)))
+                                   arguments.replicate, arguments.arm, arguments.cores, arguments.measurement)))
     elif arguments.command == "prebuild":
         print(prebuild(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
-                       arguments.replicate, arguments.arm))
+                       arguments.replicate, arguments.arm, arguments.measurement))
     else:
         print(summarize(arguments.out, arguments.cohort))
 

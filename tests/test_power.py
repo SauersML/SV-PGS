@@ -2,6 +2,7 @@
 (benchmarks/power/grid.py, on bench-sim's truth generator)."""
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import numpy as np
@@ -317,3 +318,17 @@ def test_grid_varies_polygenicity_and_includes_joint_and_off_distribution_contro
     heavy = grid.scenario_parameters('sv_heavy_tail', 0, tmp_path)
     assert heavy['sv_shape'] == 'student_t' and heavy['sv_own_shape']
     assert grid.scenario_parameters('rare_disease', 0, tmp_path)['prevalence'] == .01
+
+
+def test_a_task_observes_its_records_through_the_chosen_measurement_arm(tmp_path, monkeypatch):
+    seen = []
+
+    def stopped(method, cohort, scenario, folder, cores, measurement, *rest, **kwargs):
+        seen.append(measurement)
+        raise ValueError('synthetic stop')
+    monkeypatch.setattr(grid, '_scenario', lambda *args: tmp_path / 'scenario')
+    monkeypatch.setattr(grid.harness, 'run', stopped)
+    with pytest.raises(ValueError, match='synthetic stop'):
+        grid.run(tmp_path / 'method.py', tmp_path / 'cohort', tmp_path, 'null', 5000, 0, 'with_sv', 1, measurement='truth')
+    attempt = json.loads((tmp_path / 'tasks' / 'null' / 'n5000' / 'replicate0' / 'with_sv' / 'attempt.json').read_text())
+    assert seen == ['truth'] and attempt['measurement'] == 'truth' and attempt['status'] == 'failed'
