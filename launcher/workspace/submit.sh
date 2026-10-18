@@ -16,6 +16,9 @@ case "$job" in
   gpucheck) spec=fit ;;
   *) echo "usage: submit.sh store|fit|gpucheck" >&2; exit 2 ;;
 esac
+if [ "$job" = gpucheck ] && [[ ! "${GPU_COUNT:-}" =~ ^([2-9]|[1-9][0-9]+)$ ]]; then
+  echo "gpucheck requires GPU_COUNT >= 2 so the multi-device tests cannot be skipped" >&2; exit 2
+fi
 here="$(cd "$(dirname "$0")" && pwd)"
 : "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?}" "${RUN_ID:?}" "${HOURLY_USD:?}" "${BUDGET_SLOT:?}"
 if [ "$job" != gpucheck ]; then : "${THROUGH:?}"; fi

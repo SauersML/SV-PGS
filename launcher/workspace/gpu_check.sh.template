@@ -24,7 +24,7 @@ UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV
   "$RUN/tools/uv" sync --project "$RUN/source" --frozen --python 3.12 --extra gpu \
   || { mark "exit-install"; exit 1; }
 nvidia-smi > "$REPORT/nvidia-smi.txt" 2>&1
-"$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1)" \
+"$RUN/venv/bin/python" -c "import cupy, sys; count = cupy.cuda.runtime.getDeviceCount(); print('Visible CUDA devices:', count); sys.exit(count < 2)" \
   || { mark "exit-no-gpu"; exit 1; }
 export TMPDIR="$RUN/tmp"
 mkdir -p "$TMPDIR"
@@ -34,6 +34,12 @@ cd "$RUN/source" || { mark "exit-install"; exit 1; }
   tests/test_bench_sim_svpgs_submission.py tests/test_bench_sim_derived.py \
   > "$REPORT/gpu_check.log" 2>&1
 status=$?
+if [ "$status" -eq 0 ]; then
+  # Both grouped routes, including the slower sample reference, must agree before training.
+  "$RUN/venv/bin/python" -m pytest -p no:cacheprovider -rs --durations=20 --junitxml="$REPORT/gpu_wiring.xml" \
+    tests/test_stage2_wiring.py >> "$REPORT/gpu_check.log" 2>&1
+  status=$?
+fi
 mark "exit-${status}"
 # A failed or uncollected test fails the task, without a retry (job_fit.json.template retries only preemptions).
 [ "$status" -eq 0 ] || exit 1
