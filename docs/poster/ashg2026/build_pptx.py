@@ -81,7 +81,7 @@ HYPERTENSION = [
 ]
 
 DISEASES = [
-    [("Averaged over ", ""), ("[n]", "ph"), (" diseases, adding SVs changed held-out AUC by ", ""), ("[ΔAUC]", "ph"),
+    [("Averaged over ", ""), ("[n]", "ph"), (" diseases, adding SVs changed test AUC by ", ""), ("[ΔAUC]", "ph"),
      (" (95% CI ", ""), ("[ ]", "ph"), (").", "")],
 ]
 
@@ -533,7 +533,7 @@ def build() -> None:
     xml = column.caption(xml, 124, "SV effects on hypertension")
     xml = column.text(xml, 129, DISEASES)
     xml = column.figure(xml, 122, "diseases")
-    xml = column.caption(xml, 125, "Held-out AUC by disease")
+    xml = column.caption(xml, 125, "Test AUC by disease")
     xml = column.bar(xml, 95)
     xml = column.text(xml, 109, DISCUSSION)
     xml = column.bar(xml, 96)

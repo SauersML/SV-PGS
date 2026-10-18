@@ -545,7 +545,7 @@ PLACEHOLDERS = {
                        "Estimated vs. simulated SV effects, and |effect| vs. SV length"),
     "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",
                             "Estimated SV effects by SV type, and |effect| vs. SV length"),
-    "ph_aou_diseases": (15.40, 4.60, "All of Us", "Held-out AUC by disease",
+    "ph_aou_diseases": (15.40, 4.60, "All of Us", "Test AUC by disease",
                         "SNV-only and SNV + SV models, and LDpred2-auto, for each disease"),
 }
 
