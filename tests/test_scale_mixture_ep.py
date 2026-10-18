@@ -300,10 +300,13 @@ def test_halving_the_lattice_keeps_every_class_density():
     coefficients[: prior.pooled_size] = prior.coefficient_map[: prior.grid_size, : prior.pooled_size].T @ (bump - bump.mean())
     hyperparameters = MixtureHyperparameters(coefficients=coefficients, log_smoothing=np.zeros(len(prior.smoothing_blocks)))
     finer, transferred = halved_lattice(prior, hyperparameters)
-    coarse_density = np.exp(class_log_density(prior, hyperparameters.coefficients))
     fine_density = np.exp(class_log_density(finer, transferred.coefficients))
-    # Each coarse node's mass is split between two fine nodes: the density per unit t agrees.
-    np.testing.assert_allclose(fine_density[:, ::2] * 2.0, coarse_density, rtol=2e-3, atol=1e-12)
+    # The children sit at different t's: compare against the same analytic density evaluated there.
+    child_nodes = finer.log_variance_grid
+    child_bump = -np.square((child_nodes + 2.5) / 0.8) + 0.3 * np.sin(2.0 * child_nodes)
+    reference = np.exp(child_bump - np.max(child_bump))
+    reference /= reference.sum()
+    np.testing.assert_allclose(fine_density, np.broadcast_to(reference, fine_density.shape), rtol=2e-3, atol=1e-12)
     np.testing.assert_allclose(log_scale(finer, transferred.coefficients), log_scale(prior, hyperparameters.coefficients), atol=1e-12)
 
 
@@ -320,10 +323,20 @@ def test_halving_a_three_class_lattice_keeps_every_class_density():
     )
     hyperparameters = _hyperparameters(prior, 72)
     finer, moved = halved_lattice(prior, hyperparameters)
-    # Each class's log g passes through its old nodal values (up to the class's normalizing constant).
-    fine = engine._density_and_scale(finer, moved.coefficients)[0][:, ::2]
+    # Compare each class independently against its scalar natural spline at the child midpoints.
+    # The midpoints differ from the old nodes; comparing every other value would test different t's.
+    from scipy.interpolate import make_interp_spline
+
+    child_nodes = finer.log_variance_grid
+    inside = (child_nodes >= nodes[0]) & (child_nodes <= nodes[-1])
+    fine = engine._density_and_scale(finer, moved.coefficients)[0][:, inside]
     coarse = engine._density_and_scale(prior, hyperparameters.coefficients)[0]
-    np.testing.assert_allclose(np.diff(fine, axis=1), np.diff(coarse, axis=1), rtol=1e-9, atol=1e-9)
+    natural = [(3, 0.0), (4, 0.0)]
+    reference = np.asarray([
+        make_interp_spline(nodes, values, k=5, bc_type=(natural, natural))(child_nodes[inside])
+        for values in coarse
+    ])
+    np.testing.assert_allclose(np.diff(fine, axis=1), np.diff(reference, axis=1), rtol=1e-9, atol=1e-9)
 
 
 def test_the_layout_is_a_shared_density_plus_class_deviations_and_the_annotations():
@@ -416,7 +429,6 @@ def test_evidence_gradient_in_the_log_weights_matches_finite_differences(offset_
         np.testing.assert_allclose(evidence.gradient, np.array(numerical), rtol=1e-5, atol=1e-7)
 
 
-@pytest.mark.xfail(strict=False, raises=FloatingPointError, reason=_FOLD_REASON)
 def test_hyper_step_reaches_a_maximum_of_the_evidence():
     prior, cavity = _problem(variant_count=150, seed=19)
     step = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
@@ -427,7 +439,7 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
     correction = INDEPENDENT_EFFECTS
     laplace = _evidence(view, weights, allowed.T @ fitted.coefficients, cavity, correction, _WORKING_BYTES, 0.0)
     assert laplace is not None and laplace.newton_decrement < 1e-10
-    # V is certified to the tolerance (its Tierney-Kadane corrections), so values computed apart agree to it.
+    # Recomputations of this directional evidence approximation agree within its numerical tolerance.
     base = _corrected(view, weights, laplace, cavity, correction, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     assert base is not None and abs(step.evidence - base.value) <= _EVIDENCE_TOLERANCE
     for unit in np.eye(weights.shape[0]):
@@ -444,7 +456,6 @@ def test_hyper_step_reaches_a_maximum_of_the_evidence():
     assert step.stationarity_gain <= _EVIDENCE_TOLERANCE
 
 
-@pytest.mark.xfail(strict=False, raises=FloatingPointError, reason=_FOLD_REASON)
 def test_the_fit_does_not_depend_on_the_lattice_spacing():
     prior, cavity = _problem(variant_count=150, seed=19)
     coarse = hyper_step(prior, initial_hyperparameters(prior), cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
@@ -456,7 +467,7 @@ def test_the_fit_does_not_depend_on_the_lattice_spacing():
     coarse_moments = tilted_moments(prior, coarse.hyperparameters, cavity, _WORKING_BYTES)
     transferred_moments = tilted_moments(finer, start, cavity, _WORKING_BYTES)
     assert abs(float(np.sum(transferred_moments.log_normalizer - coarse_moments.log_normalizer))) <= 2.0 * _LATTICE_TOLERANCE
-    # Refitting on the finer lattice finds no better fit: each V is a maximum certified to the tolerance.
+    # This fixture's refitted directional objective agrees across the grids within the numerical tolerance.
     fine = hyper_step(finer, start, cavity, INDEPENDENT_EFFECTS, _WORKING_BYTES, _EVIDENCE_TOLERANCE)
     np.testing.assert_allclose(fine.evidence, coarse.evidence, atol=2.0 * _EVIDENCE_TOLERANCE)
 
@@ -1839,3 +1850,55 @@ def test_all_infinite_transfer_agrees_with_dense_constraint_projection(monkeypat
     _, actual = move(prior, MixtureHyperparameters(coefficients, np.full(len(prior.smoothing_blocks), np.inf)))
     np.testing.assert_allclose(actual.coefficients, expected, atol=2e-10)
     np.testing.assert_array_equal(actual.coefficients[moved.pooled_size:], 0.0)
+
+
+@pytest.mark.parametrize("slope", [-0.7, 0.5])
+def test_refinement_keeps_quadrature_boundaries_and_converges_to_the_same_truncated_density(slope):
+    # Density remains nonzero at the finite interval's ends. Equal-weight midpoint quadrature must refine the same
+    # interval; keeping the old end nodes instead moves its bounds and produces a first-order normalization drift.
+    nodes = np.linspace(-8.0, -1.0, 33)
+    prior = scale_mixture_prior(
+        class_index=np.zeros(1, dtype=np.int64), log_variance_offset=np.zeros(1), annotation_design=np.zeros((1, 0)),
+        annotation_groups=(), nodes=nodes, floor=-7.0, top=-1.0,
+    )
+    log_density = slope * nodes
+    hyperparameters = MixtureHyperparameters(
+        prior.coefficient_map.T @ (log_density - log_density.mean()), np.full(len(prior.smoothing_blocks), np.inf),
+    )
+    precision, shift = 50.0, 7.0
+    cavity = Cavity(precision=np.array([precision]), shift=np.array([shift]))
+    spacing = nodes[1] - nodes[0]
+    lower, upper = nodes[0] - spacing / 2, nodes[-1] + spacing / 2
+
+    def integrate(function):
+        return quad(function, lower, upper, epsabs=1e-12, epsrel=1e-12)[0]
+
+    def density(t):
+        return np.exp(slope * t)
+
+    def kernel(t):
+        variance = np.exp(t)
+        return np.exp(-0.5 * np.log1p(precision * variance) + 0.5 * shift**2 * variance / (1 + precision * variance))
+
+    def conditional_mean(t):
+        return shift * np.exp(t) / (1 + precision * np.exp(t))
+
+    def conditional_variance(t):
+        return np.exp(t) / (1 + precision * np.exp(t))
+
+    normalizer = integrate(lambda t: density(t) * kernel(t))
+    mean = integrate(lambda t: density(t) * kernel(t) * conditional_mean(t)) / normalizer
+    variance = integrate(lambda t: density(t) * kernel(t) * (conditional_variance(t) + conditional_mean(t)**2)) / normalizer - mean**2
+    reference = np.array([np.log(normalizer / integrate(density)), mean, variance])
+    previous = None
+    for level in range(4):
+        grid = prior.log_variance_grid
+        step = grid[1] - grid[0]
+        np.testing.assert_allclose([grid[0] - step / 2, grid[-1] + step / 2], [lower, upper], rtol=0, atol=1e-13)
+        assert prior.grid_size == 33 * 2**level
+        got = tilted_moments(prior, hyperparameters, cavity, _WORKING_BYTES, np)
+        error = np.abs(np.array([got.log_normalizer[0], got.mean[0], got.variance[0]]) - reference)
+        if previous is not None:
+            assert np.all(error < 0.27 * previous + 1e-13), (previous, error)
+        previous = error
+        prior, hyperparameters = halved_lattice(prior, hyperparameters)

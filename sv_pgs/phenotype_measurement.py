@@ -1086,7 +1086,7 @@ class _Model:
             nodes = state.prior.log_variance_grid
             if nodes[1] - nodes[0] <= bound:
                 return state
-            _check_lattice(2 * nodes.shape[0] - 1, self.working_bytes)
+            _check_lattice(2 * nodes.shape[0], self.working_bytes)
             prior, hyperparameters = halved_lattice(state.prior, state.hyperparameters)
             state = _State(state.fixed_effects, state.level_variance, prior, hyperparameters)
 

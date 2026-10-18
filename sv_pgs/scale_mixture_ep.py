@@ -13,8 +13,9 @@ Prior. Each effect is a continuous Gaussian scale mixture,
 with no point mass at zero.
 - g_c, class c's mixing density over t = log s, is a continuous function
   learned nonparametrically, held as its log values eta_ck at the nodes of a
-  uniform lattice over the real line; integrals over t are trapezoid sums, so
-  node k carries pi_ck = softmax(eta_c)_k.
+  uniform lattice. On its finite working interval each node represents an
+  equal-width midpoint cell, so node k carries pi_ck = softmax(eta_c)_k.
+  Refinement bisects those cells without moving the integration boundaries.
 - The classes share one density shape: eta_c = eta_bar + delta_c. Roughness,
   the integral of eta'''(t)^2 (``ROUGHNESS_ORDER``), is penalized in its
   lattice form lambda h^-5 ||D3 eta||^2, so lambda does not depend on the
@@ -794,9 +795,17 @@ def transfer_hyperparameters(
 
 
 def halved_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
-    """The same model on the lattice with half the spacing over the same extent and kernel range."""
+    """Bisect every equal-weight quadrature cell, preserving the finite integration interval and kernel range.
+
+    Equal node weights are midpoint cells: at spacing h the interval is [t0 - h/2, t_last + h/2]. Keeping the end
+    nodes fixed while halving h shrinks both ends by h/4, changing the truncated prior when its density is nonzero
+    there. That introduces first-order boundary drift rather than testing quadrature of the same density. Two child
+    midpoints per old cell keep the interval fixed; the natural continuation supplies the outer quarter-cell values.
+    """
     nodes = prior.log_variance_grid
-    return relattice(prior, hyperparameters, np.linspace(nodes[0], nodes[-1], 2 * nodes.shape[0] - 1), prior.kernel_floor, prior.kernel_top)
+    spacing = float(nodes[1] - nodes[0])
+    refined = nodes[0] - 0.25 * spacing + 0.5 * spacing * np.arange(2 * nodes.shape[0])
+    return relattice(prior, hyperparameters, refined, prior.kernel_floor, prior.kernel_top)
 
 
 def extended_lattice(prior: ScaleMixturePrior, hyperparameters: MixtureHyperparameters) -> tuple[ScaleMixturePrior, MixtureHyperparameters]:
@@ -4250,6 +4259,7 @@ def hyper_step(
     released = release_provisional and bool(np.any(finite_final & ~np.isfinite(hyperparameters.log_smoothing)))
     # The weights, evidence and check before a band move (below), until the check after it has judged it.
     band: tuple[F64Array, _Evidence, _Stationarity] | None = None
+    recheck_structure = False
     while not released:
         interior = (weights > lower) & (weights < upper)
         check = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance)
@@ -4263,9 +4273,24 @@ def hyper_step(
                 break
             band = None
         moved = check.better
+        structural_retry = False
         if moved is None and check.gain <= tolerance:
-            break
+            if not recheck_structure:
+                break
+            # Polishing a finite weight can make an infinity edge worth releasing. Revisit those edges after
+            # the finite weights settle; otherwise another identical call finds a better solution.
+            moved = (weights, evidence)
+            structural_retry = True
+            recheck_structure = False
         if moved is None:
+            # The stationarity calculation uses a resolved inner solution. Use that same accuracy for move
+            # comparisons when a finite weight still needs to move; an obsolete error allowance can hide its gain.
+            refined = _corrected(
+                final_view, weights, _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, 0.0),
+                cavity, correction, working_bytes, tolerance,
+            )
+            if refined is not None:
+                evidence = refined
             # Newton on the difference curvature over the weights whose basin does not end on their climbing side
             # (on its magnitude where it is indefinite), accepted only when the certified V rises by more than the tolerance.
             open_ = interior & ~(check.folds > 0.0)
@@ -4302,17 +4327,22 @@ def hyper_step(
         if moved is None:
             break
         weights, evidence = moved
-        if check.better is None:
+        if check.better is None and not structural_retry:
+            recheck_structure = True
             continue
-        # A certifiably better side is another basin: the search resumes from it, edges and structural starts included.
+        # Revisit edges and structural starts after a better side or a settled finite-weight polish.
         # It keeps the move when the resumed search ends lower (a basin chosen by its corrected V), so V rises at every
         # pass and the loop ends.
         resumed_smoothing = log_smoothing.copy()
         resumed_smoothing[finite_final] = weights
+        resumed_bounds = _smoothing_bounds(
+            prior, _data_objective(prior, final_allowed @ evidence.coefficients, cavity, working_bytes)
+        ) if structural_retry else bounds
         resumed = _maximize_evidence(
-            prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, bounds, tolerance, held_edges, held_finite
+            prior, resumed_smoothing, final_allowed @ evidence.coefficients, cavity, correction, working_bytes, resumed_bounds, tolerance, held_edges, held_finite
         )
         if resumed[2].value > evidence.value:
+            bounds = resumed_bounds
             log_smoothing, coefficients, evidence = resumed[0], resumed[1], resumed[2]
             final_infinite = frozenset(int(position) for position in np.flatnonzero(log_smoothing == np.inf))
             final_view, final_allowed = _restricted_prior(prior, final_infinite)
