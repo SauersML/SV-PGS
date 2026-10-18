@@ -55,7 +55,7 @@ INTRODUCTION = [
 ]
 
 METHODS = [
-    [("SV-PGS fits all variants in one model and runs on GPUs.", "")],
+    [("SV-PGS, open-source software, fits all variants in one model on GPUs.", "")],
     [("For All of Us, SVs discovered in 12,212 phased genome assemblies are imputed into short-read genomes.", "")],
 ]
 
@@ -97,7 +97,6 @@ DISEASES = [
 DISCUSSION = [
     [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction in simulations with causal SVs and in ", ""),
      ("[n]", "ph"), (" All of Us diseases.", "")],
-    [("SV-PGS is open-source software for training and applying PGSs that include SVs.", "")],
 ]
 
 # ------------------------------------------------------------------ the simulation's numbers in the copy
@@ -148,9 +147,11 @@ def simulation_copy(summary: dict) -> None:
     else:
         SIMULATION_ACCURACY = [[("No paired simulation comparisons have completed yet.", "")]]
     SIMULATION_GENOTYPES = [[("Power and genotype-accuracy summaries are preliminary while simulation replicates finish.", "")]]
-    DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")],
-                  DISCUSSION[1]]
-    SIMULATION_METHODS = [[(f"{min(summary['train_counts']):,}–{int(largest):,} training samples; LDpred2-auto uses MAF ≥ 1% "
+    DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")]]
+    # the training sizes the figures draw (cells with enough replicates), else the planned ones
+    drawn = sorted({int(size) for point in points.values() for size, cell in point.get("sizes", {}).items()
+                    if cell["replicates"] >= MIN_REPLICATES}) or summary["train_counts"]
+    SIMULATION_METHODS = [[(f"{min(drawn):,}–{max(drawn):,} training samples; LDpred2-auto uses MAF ≥ 1% "
                            "SNVs at HapMap3 density, or all classes.", "")]]
 
     twenty, null_cell = settled(points.get("sv_20pct", {}), largest), settled(points.get("null", {}), largest)
@@ -191,14 +192,27 @@ def simulation_copy(summary: dict) -> None:
     if genotypes:
         SIMULATION_GENOTYPES = genotypes
 
-    positives = [cell["delta_auc"] for cell in (settled(point, largest) for name, point in points.items() if name != "null") if cell]
-    if positives:
-        improved = sum(entry["lower"] > 0 for entry in positives)
-        DISCUSSION = [
-            [(f"At {largest_text} samples, {improved}/{len(positives)} causal-SV settings with ≥{MIN_REPLICATES} replicates "
-              "had a positive gain interval (unadjusted 95% CI). Results are preliminary.", "")],
-            DISCUSSION[1],
-        ]
+    # the conclusions at the largest size: what imputed SVs add, what true SV genotypes add, SV-PGS against LDpred2-auto;
+    # "raised" and "exceeded" count only architectures whose unadjusted 95% interval lies above zero
+    conclusions = []
+    cells = {name: settled(point, largest) for name, point in points.items()}
+    gains = [cell["delta_auc"] for name, cell in cells.items() if cell and name != "null"]
+    if gains:
+        rare = (f"; SVs below 1% frequency impute at r² {number(rare_r2(accuracy_by_frequency['SV']['bins']), 2)}"
+                if accuracy_by_frequency else "")
+        conclusions.append([(f"Imputed SVs raised AUC in {sum(entry['lower'] > 0 for entry in gains)} of {len(gains)} "
+                             f"causal-SV architectures{rare}.", "")])
+    if found:
+        _point, label, gain = found[0]
+        conclusions.append([(f"True SV genotypes {'raised' if gain['lower'] > 0 else 'changed'} AUC by {number(gain['mean'])} "
+                             f"({label}).", "")])
+    versus = [cell["delta_auc_vs_ldpred2"] for cell in cells.values()
+              if cell and cell.get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES]
+    if versus:
+        conclusions.append([(f"SV-PGS exceeded LDpred2-auto in {sum(entry['lower'] > 0 for entry in versus)} of {len(versus)} "
+                             "architectures.", "")])
+    if conclusions:
+        DISCUSSION = conclusions
 
 
 if SUMMARY.is_file():
