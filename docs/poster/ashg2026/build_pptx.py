@@ -97,8 +97,9 @@ DISCUSSION = [
 
 
 def number(value: float, digits: int = 3) -> str:
-    """A value with a typographic minus sign."""
-    return f"{value:.{digits}f}".replace("-", "−")
+    """A value with a typographic minus sign; one that rounds to zero prints unsigned, not as −0.000."""
+    text = f"{value:.{digits}f}"
+    return text.lstrip("-") if float(text) == 0.0 else text.replace("-", "−")
 
 
 def auc_change(entry: dict) -> str:
