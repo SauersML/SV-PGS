@@ -35,7 +35,7 @@ GRID = "grid2"
 TRUTH_GRID = f"{GRID}-truth"
 """The same scenarios and replicates at the largest training size, every variant measured by its true genotype."""
 TRUTH_POINTS = ("null", "sv_20pct", "sv_20pct_fold3", "deletion_positive", "multi_feature_positive", "tagged_sv",
-                "tagged_sv_fold3", "common_sv_fold3")
+                "tagged_sv_fold3", "common_sv")
 LOCAL = Path.home() / "svpgs-bench" / f"poster-{GRID}"
 REMOTE = "msi:/scratch.global/sauer354/svpgs-poster"
 TEST_PEOPLE = 10_000

@@ -95,7 +95,7 @@ POINTS = {
     # where SNVs tag it. Appended last: the seeds of the points above depend on their positions.
     "tagged_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"sv_min_realized_r2": 0.8}},
     "tagged_sv_fold3": {"sv_causal_fraction": 0.2, "sv_effect_fold": 3.0, "truth": {"sv_min_realized_r2": 0.8}},
-    "common_sv_fold3": {"sv_causal_fraction": 0.2, "sv_effect_fold": 3.0, "truth": {"sv_min_frequency": 0.05}},
+    "common_sv": {"sv_causal_fraction": 0.2, "sv_effect_fold": 1.0, "truth": {"sv_min_frequency": 0.05}},
 }
 
 
