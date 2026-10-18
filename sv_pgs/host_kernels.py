@@ -30,15 +30,21 @@ def row_kernel(kernel, node_visits: int, *arguments):
     the compiled kernel nor any within-row summation or downstream reduction.
     Kernels must completely overwrite their outputs on every call. After an
     untimed warmup, time both schedules (including mask changes) and remember
-    the faster one for that kernel, worker count and array shapes. No arrays
-    are retained, and the caller's worker count is never increased. Timing
-    selects only a schedule for identical arithmetic, never an estimator.
+    the faster one for that kernel, worker count and the octave of the work
+    and of every array extent. No arrays are retained, and the caller's worker
+    count is never increased. Timing selects only a schedule for identical
+    arithmetic, never an estimator.
+
+    Exact shapes and visit counts as the key retimed nearly every call of a
+    kernel whose step count changes per call (a line search's), and a retime
+    runs the kernel three times, once on one worker: a 16-core fit spent hours
+    on one core there (bench-sim chr22, 5,000 training samples).
     """
     workers = numba.get_num_threads()
     if workers == 1:
         return kernel(*arguments)
-    shapes = tuple((argument.shape, argument.dtype.str) for argument in arguments if hasattr(argument, "shape"))
-    key = (kernel, workers, node_visits, shapes)
+    shapes = tuple((tuple(int(extent).bit_length() for extent in argument.shape), argument.dtype.str) for argument in arguments if hasattr(argument, "shape"))
+    key = (kernel, workers, int(node_visits).bit_length(), shapes)
     single = _schedules.choices.get(key)
     if single is None:
         kernel(*arguments)  # compilation and pool initialization are not timed

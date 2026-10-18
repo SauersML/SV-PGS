@@ -2588,6 +2588,13 @@ def _directional_derivatives(
     Without an annotation design b_e = 0, so theta' = b_c and d3, d4 are the third cumulant and the fourth cumulant
     of b_c under w_j: every direction at once from the raw moments R_r = w_j' (b_c - b_c[m])^r (one GEMM per power),
     taken about each variant's modal node m, where they do not cancel (the variants grouped by that node).
+
+    With one, every direction is also taken at once. Each derivative is centred exactly in its row (l1 = L' - w'L',
+    g2 = L'' - w'L'', g3 = L''' - w'L''', none of them depending on b), so with o = b_c - b_c[m] about the modal node,
+    u = o - w'o and s = b_e, theta' - w'theta' = u + s l1, and every joint cumulant above is a polynomial in s whose
+    coefficients are the w-moments (w l1^q)' o^p, (w g2)' o^p and (w g3)' o: one GEMM per moment over the variants of
+    a modal node, in place of a pass over every (variant, node) per direction on one core (bench-sim chr22, 5,000
+    training samples: hours of a fit). The polynomial sums the direct sums' terms in another order.
     """
     mapping = prior.coefficient_map
     directions_z = mapping @ directions
@@ -2620,31 +2627,95 @@ def _directional_derivatives(
             third += both[0]
             fourth += both[1]
     for class_position, rows, terms in (() if not prior.scale_size else _class_terms(prior, coefficients, cavity, working_bytes)):
-        weights = terms.responsibility
         xp = _DEVICE.get()
-        design = xp.asarray(prior.scale_design[rows])
-        span = slice(class_position * grid_size, (class_position + 1) * grid_size)
-        for column in range(directions.shape[1]):
-            density_step = xp.asarray(directions_z[span, column])[None, :]
-            scale_step = (design @ xp.asarray(directions_z[scale_span, column]))[:, None]
-            first = density_step + terms.first * scale_step
-            second = terms.second * scale_step**2
-            third_term = terms.third * scale_step**3
-            fourth_term = terms.fourth * scale_step**4
-            centred = first - np.sum(weights * first, axis=1, keepdims=True)
-            centred_second = second - np.sum(weights * second, axis=1, keepdims=True)
-            centred_third = third_term - np.sum(weights * third_term, axis=1, keepdims=True)
-            variance = np.sum(weights * centred**2, axis=1)
-            third[column] += float(np.sum(
-                np.sum(weights * centred**3, axis=1) + 3.0 * np.sum(weights * centred * centred_second, axis=1) + np.sum(weights * third_term, axis=1)
-            ))
-            fourth[column] += float(np.sum(
-                np.sum(weights * centred**4, axis=1) - 3.0 * variance**2
-                + 6.0 * np.sum(weights * centred**2 * centred_second, axis=1)
-                + 3.0 * np.sum(weights * centred_second**2, axis=1)
-                + 4.0 * np.sum(weights * centred * centred_third, axis=1)
-                + np.sum(weights * fourth_term, axis=1)
-            ))
+        weights = terms.responsibility
+        steps = xp.asarray(directions_z[class_position * grid_size : (class_position + 1) * grid_size])
+        scale_steps = xp.asarray(prior.scale_design[rows]) @ xp.asarray(directions_z[scale_span])
+        # Per variant, with no direction in them: the derivatives centred in their row and their w-moments.
+        first = terms.first
+        centred = first - xp.sum(weights * first, axis=1, keepdims=True)
+        del first
+        second = terms.second
+        centred_second = second - xp.sum(weights * second, axis=1, keepdims=True)
+        del second
+        third_terms = terms.third
+        mean_third = xp.sum(weights * third_terms, axis=1)
+        centred_third = third_terms - mean_third[:, None]
+        del third_terms
+        mean_fourth = xp.sum(weights * terms.fourth, axis=1)
+        weighted = weights * centred
+        weighted_square = weighted * centred
+        weighted_cube = weighted_square * centred
+        weighted_second = weights * centred_second
+        weighted_mixed = weighted * centred_second
+        weighted_third = weights * centred_third
+        square_mean = xp.sum(weighted_square, axis=1)
+        cube_mean = xp.sum(weighted_cube, axis=1)
+        fourth_power_mean = xp.sum(weighted_cube * centred, axis=1)
+        mixed_mean = xp.sum(weighted_mixed, axis=1)
+        mixed_square_mean = xp.sum(weighted_square * centred_second, axis=1)
+        second_square_mean = xp.sum(weighted_second * centred_second, axis=1)
+        third_mixed_mean = xp.sum(weighted * centred_third, axis=1)
+        del centred, centred_second, centred_third
+        modes = xp.argmax(weights, axis=1)
+        # A piece's thirty or so (rows x directions) arrays and its gathered (rows x K) ones stay within the budget of
+        # the seven directional-derivative row arrays and three temporaries (``_ROW_INTERMEDIATES``) less the six above.
+        piece = max(1, 4 * weights.shape[0] * grid_size // (7 * grid_size + 30 * directions.shape[1]))
+        third_here = xp.zeros(directions.shape[1])
+        fourth_here = xp.zeros(directions.shape[1])
+        for node in _host(xp.unique(modes)).tolist():
+            members = xp.flatnonzero(modes == node)
+            offset = steps - steps[node][None, :]
+            offset_square = offset * offset
+            offset_cube = offset_square * offset
+            offset_fourth = offset_square * offset_square
+            for begin in range(0, int(members.shape[0]), piece):
+                chosen = members[begin : begin + piece]
+                node_weights = weights[chosen]
+                mean = node_weights @ offset
+                moment_2 = node_weights @ offset_square
+                moment_3 = node_weights @ offset_cube
+                moment_4 = node_weights @ offset_fourth
+                del node_weights
+                part = weighted[chosen]
+                cross_11, cross_21, cross_31 = part @ offset, part @ offset_square, part @ offset_cube
+                part = weighted_square[chosen]
+                cross_12, cross_22 = part @ offset, part @ offset_square
+                cross_13 = weighted_cube[chosen] @ offset
+                part = weighted_second[chosen]
+                second_10, second_20 = part @ offset, part @ offset_square
+                second_11 = weighted_mixed[chosen] @ offset
+                third_10 = weighted_third[chosen] @ offset
+                del part
+                s = scale_steps[chosen]
+                square = square_mean[chosen][:, None]
+                cube = cube_mean[chosen][:, None]
+                mixed = mixed_mean[chosen][:, None]
+                # The central moments of u and its joint moments with l1, from the moments about the modal node.
+                u2 = moment_2 - mean * mean
+                u3 = moment_3 - 3.0 * mean * moment_2 + 2.0 * mean**3
+                u4 = moment_4 - 4.0 * mean * moment_3 + 6.0 * mean * mean * moment_2 - 3.0 * mean**4
+                u2_l1 = cross_21 - 2.0 * mean * cross_11
+                u3_l1 = cross_31 - 3.0 * mean * cross_21 + 3.0 * mean * mean * cross_11
+                u_l1sq = cross_12 - mean * square
+                u2_l1sq = cross_22 - 2.0 * mean * cross_12 + mean * mean * square
+                u_l1cu = cross_13 - mean * cube
+                variance = u2 + 2.0 * s * cross_11 + s * s * square
+                central_3 = u3 + 3.0 * s * u2_l1 + 3.0 * s * s * u_l1sq + s**3 * cube
+                central_4 = u4 + 4.0 * s * u3_l1 + 6.0 * s * s * u2_l1sq + 4.0 * s**3 * u_l1cu + s**4 * fourth_power_mean[chosen][:, None]
+                # E[(u + s l1) g2], E[(u + s l1)^2 g2] and E[(u + s l1) g3]; w'g2 = w'g3 = 0.
+                with_second = second_10 + s * mixed
+                square_with_second = second_20 - 2.0 * mean * second_10 + 2.0 * s * (second_11 - mean * mixed) + s * s * mixed_square_mean[chosen][:, None]
+                with_third = third_10 + s * third_mixed_mean[chosen][:, None]
+                third_here += xp.sum(central_3 + 3.0 * s * s * with_second + s**3 * mean_third[chosen][:, None], axis=0)
+                fourth_here += xp.sum(
+                    central_4 - 3.0 * variance**2 + 6.0 * s * s * square_with_second + 3.0 * s**4 * second_square_mean[chosen][:, None]
+                    + 4.0 * s**3 * with_third + s**4 * mean_fourth[chosen][:, None],
+                    axis=0,
+                )
+        both = _host(xp.stack([third_here, fourth_here]))
+        third += both[0]
+        fourth += both[1]
     for class_position, class_rows in enumerate(prior.class_rows):
         span = slice(class_position * grid_size, (class_position + 1) * grid_size)
         class_density = density[class_position]

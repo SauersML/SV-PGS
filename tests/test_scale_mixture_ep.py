@@ -740,6 +740,47 @@ def test_directional_third_and_fourth_derivatives_match_finite_differences():
         np.testing.assert_allclose(fourth[column], numerical_fourth, rtol=2e-2, atol=1e-2)
 
 
+def test_directional_derivatives_of_every_direction_at_once_are_the_direct_cumulant_sums():
+    # With an annotation design every direction comes from w-moments about each variant's modal node, over row chunks
+    # and pieces; the direct sums form theta' to theta'''' per direction and take their joint cumulants under w.
+    prior, cavity = _problem(variant_count=400, seed=41, node_count=24)
+    coefficients = _hyperparameters(prior, 42).coefficients
+    directions = np.random.default_rng(43).standard_normal((prior.coefficient_size, 9))
+    working_bytes = engine._ROW_INTERMEDIATES * 8 * prior.grid_size * 37
+    third, fourth = _directional_derivatives(prior, coefficients, cavity, directions, working_bytes)
+    directions_z = prior.coefficient_map @ directions
+    grid_size = prior.grid_size
+    scale_steps = directions_z[prior.density_size : prior.density_size + prior.scale_size]
+    density = np.exp(class_log_density(prior, coefficients))
+    expected_third = np.zeros(directions.shape[1])
+    expected_fourth = np.zeros(directions.shape[1])
+    for class_position, rows, terms in engine._class_terms(prior, coefficients, cavity, working_bytes):
+        weights = terms.responsibility
+        for column in range(directions.shape[1]):
+            density_step = directions_z[class_position * grid_size : (class_position + 1) * grid_size, column]
+            scale_step = (prior.scale_design[rows] @ scale_steps[:, column])[:, None]
+            first = density_step[None, :] + terms.first * scale_step
+            second, third_term, fourth_term = terms.second * scale_step**2, terms.third * scale_step**3, terms.fourth * scale_step**4
+            centred, centred_second, centred_third = (values - np.sum(weights * values, axis=1, keepdims=True) for values in (first, second, third_term))
+            variance = np.sum(weights * centred**2, axis=1)
+            expected_third[column] += np.sum(
+                np.sum(weights * centred**3, axis=1) + 3.0 * np.sum(weights * centred * centred_second, axis=1) + np.sum(weights * third_term, axis=1)
+            )
+            expected_fourth[column] += np.sum(
+                np.sum(weights * centred**4, axis=1) - 3.0 * variance**2 + 6.0 * np.sum(weights * centred**2 * centred_second, axis=1)
+                + 3.0 * np.sum(weights * centred_second**2, axis=1) + 4.0 * np.sum(weights * centred * centred_third, axis=1)
+                + np.sum(weights * fourth_term, axis=1)
+            )
+    for class_position, class_rows in enumerate(prior.class_rows):
+        step = directions_z[class_position * grid_size : (class_position + 1) * grid_size]
+        centred = step - density[class_position] @ step
+        variance = density[class_position] @ centred**2
+        expected_third -= class_rows.shape[0] * (density[class_position] @ centred**3)
+        expected_fourth -= class_rows.shape[0] * (density[class_position] @ centred**4 - 3.0 * variance**2)
+    np.testing.assert_allclose(third, expected_third, rtol=1e-9, atol=1e-9 * np.max(np.abs(expected_third)))
+    np.testing.assert_allclose(fourth, expected_fourth, rtol=1e-9, atol=1e-9 * np.max(np.abs(expected_fourth)))
+
+
 def test_quadrature_corrections_are_the_exact_integrals_along_the_standardized_directions():
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)

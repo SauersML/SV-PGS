@@ -157,6 +157,25 @@ def _split_digits_cpu(values, scale, digits, digit_count):
                 integer = (integer - low) >> DIGIT_BITS
 
 
+@numba.njit(parallel=True, cache=True, nogil=True)
+def _fp64_codes_rows(codes, start, stop, square, out):
+    """out [p_b, stop - start] = codes[:, start:stop] as fp64 (squared where asked), one variant per worker."""
+    for variant in numba.prange(codes.shape[0]):
+        for sample in range(stop - start):
+            value = np.float64(codes[variant, start + sample])
+            out[variant, sample] = value * value if square else value
+
+
+def _fp64_codes(codes: np.ndarray, start: int, stop: int, square: bool = False) -> np.ndarray:
+    """``codes[:, start:stop].astype(np.float64)`` (C order; ``np.square`` of it when ``square``) converted by every
+    worker: numpy's conversion runs on one core and held a 16-core fit's code products to one (bench-sim chr22,
+    40,000 training samples: a CG iteration 54 s). The values and the layout are the same, so every GEMM is the
+    same call: ``.T`` of the result is the layout of ``codes[:, start:stop].T.astype(np.float64)``."""
+    out = np.empty((int(codes.shape[0]), stop - start), dtype=np.float64)
+    _fp64_codes_rows(codes, start, stop, square, out)
+    return out
+
+
 @cache
 def _split_digits_cuda(cupy):
     """One CUDA launch replaces the per-digit array expressions; no dense int64 scratch.
@@ -475,7 +494,7 @@ class CodeBlockTile:
             for start in range(0, min(samples, self._sample_count), chunk):
                 stop = min(start + chunk, samples)
                 rows = min(stop, self._sample_count) - start
-                image[start : start + rows] += (self._codes[:, start:stop].T.astype(np.float64) @ padded)[:rows] - offset[None, :]
+                image[start : start + rows] += (_fp64_codes(self._codes, start, stop).T @ padded)[:rows] - offset[None, :]
             return
         if variants > INT32_EXACT_DIGIT_ROWS:
             raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
@@ -681,7 +700,7 @@ class CodeBlockTile:
             chunk = self._sample_chunk(fixed, _FLOAT64_BYTES * variants, samples)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
-                total += self._codes[:, start:stop].astype(np.float64) @ padded[start:stop]
+                total += _fp64_codes(self._codes, start, stop) @ padded[start:stop]
             return total[: self._variant_count]
         # fixed: the operand, the total, the integer products and two fp64 recombination terms;
         # per sample: the digit split of its operand row
@@ -737,7 +756,7 @@ class CodeBlockTile:
             raise MemoryError(f"a workspace of {self._workspace_bytes} bytes cannot hold a product's fixed buffers ({fixed_bytes} bytes)")
 
     def _operand_codes_times(self, operand: SampleOperand, converted: Any) -> Any:
-        """sum over samples of converted(codes chunk) @ operand, on the CPU; [p_b, K]."""
+        """sum over samples of converted(start, stop), the fp64 codes of a sample chunk, @ operand, on the CPU; [p_b, K]."""
         variants, samples = (int(extent) for extent in self._codes.shape)
         columns = operand.columns
         # fixed: the total and one GEMM result; per sample: its converted fp64 codes
@@ -745,7 +764,7 @@ class CodeBlockTile:
         total = np.zeros((variants, columns), dtype=np.float64)
         for start in range(0, samples, chunk):
             stop = min(start + chunk, samples)
-            total += converted(self._codes[:, start:stop]) @ operand.padded[start:stop]
+            total += converted(start, stop) @ operand.padded[start:stop]
         return total
 
     def _check_operand(self, operand: SampleOperand) -> None:
@@ -756,7 +775,7 @@ class CodeBlockTile:
         """S @ L for the read's prepared L; returns [p_b, K] float64."""
         self._check_operand(operand)
         if self._array_module is np:
-            return self._operand_codes_times(operand, lambda codes: codes.astype(np.float64))[: self._variant_count]
+            return self._operand_codes_times(operand, lambda start, stop: _fp64_codes(self._codes, start, stop))[: self._variant_count]
         variants = int(self._codes.shape[0])
         # fixed: the total, the integer products and two fp64 recombination terms
         self._require_workspace(variants * operand.columns * (3 * _FLOAT64_BYTES + operand.digit_count * _INT32_BYTES))
@@ -767,7 +786,7 @@ class CodeBlockTile:
         self._check_operand(operand)
         xp = self._array_module
         if xp is np:
-            return self._operand_codes_times(operand, lambda codes: np.square(codes.astype(np.float64)))[: self._variant_count]
+            return self._operand_codes_times(operand, lambda start, stop: _fp64_codes(self._codes, start, stop, square=True))[: self._variant_count]
         variants = int(self._codes.shape[0])
         # fixed: the int16 squares, their two int8 halves, the total, the integer products and two
         # fp64 recombination terms
@@ -797,7 +816,7 @@ class CodeBlockTile:
             out = np.empty((samples, columns), dtype=np.float64)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
-                out[start:stop] = self._codes[:, start:stop].T.astype(np.float64) @ padded
+                out[start:stop] = _fp64_codes(self._codes, start, stop).T @ padded
             return out[: self._sample_count]
         if variants > INT32_EXACT_DIGIT_ROWS:
             raise ValueError(f"an LD block of {variants} variants exceeds the int32-exact depth {INT32_EXACT_DIGIT_ROWS}")
@@ -835,7 +854,7 @@ class CodeBlockTile:
             total = np.zeros((variants, variants), dtype=np.float64)
             for start in range(0, samples, chunk):
                 stop = min(start + chunk, samples)
-                converted = self._codes[:, start:stop].astype(np.float64)
+                converted = _fp64_codes(self._codes, start, stop)
                 total += converted @ (padded_weights[start:stop, None] * converted.T)
             return total[: self._variant_count, : self._variant_count]
         total = xp.zeros((variants, variants), dtype=xp.float64)
