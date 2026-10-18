@@ -29,7 +29,9 @@ from benchmarks.power.uncertainty import rejection_summary
 
 HERE = Path(__file__).resolve().parent
 SUMMARY = HERE / "simulation_summary.json"
-LOCAL = Path.home() / "svpgs-bench" / "poster-grid"
+GRID = "grid2"
+"""The grid run on MSI the poster reads: alpha = -0.38 (benchmarks/power/grid.py, FREQUENCY_ALPHA)."""
+LOCAL = Path.home() / "svpgs-bench" / f"poster-{GRID}"
 REMOTE = "msi:/scratch.global/sauer354/svpgs-poster"
 TEST_PEOPLE = 10_000
 CHR22_MORGANS = 0.839
@@ -185,7 +187,7 @@ def fetch(local: Path = LOCAL) -> None:
     local.mkdir(parents=True, exist_ok=True)
     rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--include=sv_effects.npz",
              "--include=truth.npz", "--include=scenario.json", "--exclude=*"]
-    subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/grid/", str(local / "grid")], check=True)
+    subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{GRID}/", str(local / "grid")], check=True)
     subprocess.run(["rsync", "-a", f"{REMOTE}/figs/", str(local / "public")], check=True)
 
 

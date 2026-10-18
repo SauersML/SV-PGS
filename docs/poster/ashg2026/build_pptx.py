@@ -57,6 +57,7 @@ METHODS = [
 SIMULATION_DESIGN = [
     [("We simulated 50,000 people from 1000 Genomes chr22 haplotypes in five ancestry groups and imputed their SVs from a separate panel.", "")],
     [("Each disease has 10% prevalence, h² = 0.1 and 50 to 2,000 causal variants, 0% to 20% of them SVs.", "")],
+    [("Rarer variants have larger effects, at the rate estimated in UK Biobank (α = −0.38).", "")],
     [("SV effect sizes are 1 or 3 times those of SNVs, and in some scenarios grow with SV length or depend on SV type.", "")],
     [("We compare SV-PGS with and without SVs, and LDpred2-auto, at 5,000 to 40,000 training samples.", "")],
 ]
