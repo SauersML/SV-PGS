@@ -69,6 +69,8 @@ metadata. Checkpointing does not relax convergence or remove variants.
 
 ## Staging (once, from a Workbench app with internet access)
 
+`OPS_BUCKET=... RUN_ID=... launcher/workspace/stage.sh run_config.json` stages all of the following from a clean checkout at the commit to run; it refuses a run config with a `${PLACEHOLDER}` left or a template key missing.
+
 Under `gs://${OPS_BUCKET}/svpgs/${RUN_ID}/`:
 - `source/`: this repository at the commit to run (`git archive`).
 - `bin/uv`: the uv binary (`cp "$(command -v uv)"`).

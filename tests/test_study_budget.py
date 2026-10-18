@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 import sys
@@ -262,3 +263,19 @@ def test_gpu_check_checks_actual_device_visibility_before_running_tests(tmp_path
                             capture_output=True, text=True, cwd=tmp_path)
     assert (result.returncode == 0) == (visible >= 2), result.stderr
     assert f"Visible CUDA devices: {visible}" in result.stdout
+
+
+def test_staging_refuses_a_run_config_with_a_placeholder_or_a_missing_key(tmp_path: Path) -> None:
+    stage = Path(__file__).parents[1] / "launcher/workspace/stage.sh"
+    template = (Path(__file__).parents[1] / "launcher/workspace/run_config.template.json").read_text()
+    environment = {**os.environ, "OPS_BUCKET": "bucket", "RUN_ID": "run"}
+    unfilled = tmp_path / "unfilled.json"
+    unfilled.write_text(template)
+    result = subprocess.run(["bash", str(stage), str(unfilled)], capture_output=True, text=True, env=environment)
+    assert result.returncode != 0 and "placeholders" in result.stderr and "${FOLD_SEED}" in result.stderr
+    filled = json.loads(re.sub(r"\$\{[A-Z_0-9]+\}", "0", template))
+    del filled["crosswalk"]
+    partial = tmp_path / "partial.json"
+    partial.write_text(json.dumps(filled))
+    result = subprocess.run(["bash", str(stage), str(partial)], capture_output=True, text=True, env=environment)
+    assert result.returncode != 0 and "lacks the template's keys ['crosswalk']" in result.stderr
