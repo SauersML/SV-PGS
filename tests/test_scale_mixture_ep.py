@@ -1784,3 +1784,58 @@ def test_inner_trust_agreement_uses_the_mode_objective_without_laplace_offsets()
     # A separate absolute evidence diagnostic must not freeze this accurately modelled local step.
     assert _next_radius(newton, step, length, length, gain, rounding) > length
     assert _next_radius(newton, step, length, length, gain, .02) == length
+
+
+@pytest.mark.parametrize("node_count", [8, 17, 33])
+@pytest.mark.parametrize("offset_group_count", [0, 3])
+def test_all_infinite_constraints_use_the_exact_null_space_without_a_dense_decomposition(monkeypatch, node_count, offset_group_count):
+    prior, cavity = _problem(variant_count=60, seed=13, node_count=node_count, offset_group_count=offset_group_count)
+    constraints = []
+    for block in prior.smoothing_blocks:
+        embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
+        embedded[:, block.coordinates] = block.factor
+        constraints.append(embedded)
+    constraint = np.vstack(constraints)
+    _, singular, right = np.linalg.svd(constraint)
+    rank = np.count_nonzero(singular > np.finfo(float).eps * max(constraint.shape) * singular[0])
+    reference = right[rank:].T
+    assert reference.shape[1] == 2
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("all-infinite restriction needs no dense SVD")
+
+    monkeypatch.setattr(np.linalg, "svd", forbidden)
+    view, allowed = _restricted_prior(prior, frozenset(range(len(prior.smoothing_blocks))))
+    np.testing.assert_allclose(allowed @ allowed.T, reference @ reference.T, atol=2e-10)
+    assert view.coefficient_size == 2 and not view.smoothing_blocks
+    np.testing.assert_allclose(view.null_basis @ view.null_basis.T, np.eye(2), atol=1e-14)
+    coefficients = np.array([0.3, -0.7])
+    np.testing.assert_allclose(
+        tilted_moments(view, MixtureHyperparameters(coefficients, np.zeros(0)), cavity, _WORKING_BYTES, np).log_normalizer,
+        tilted_moments(prior, MixtureHyperparameters(allowed @ coefficients, np.full(len(prior.smoothing_blocks), np.inf)), cavity, _WORKING_BYTES, np).log_normalizer,
+        atol=1e-13,
+    )
+
+
+@pytest.mark.parametrize("move", [engine.halved_lattice, engine.extended_lattice])
+def test_all_infinite_transfer_agrees_with_dense_constraint_projection(monkeypatch, move):
+    prior, _ = _problem(variant_count=60, seed=13, node_count=13, offset_group_count=3)
+    coefficients = np.random.default_rng(23).normal(size=prior.coefficient_size)
+    # First transfer unconstrained nodal functions; independently project the result onto the new constraints.
+    finite = MixtureHyperparameters(coefficients, np.zeros(len(prior.smoothing_blocks)))
+    moved, unconstrained = move(prior, finite)
+    constraints = []
+    for block in moved.smoothing_blocks:
+        embedded = np.zeros((block.factor.shape[0], moved.coefficient_size))
+        embedded[:, block.coordinates] = block.factor
+        constraints.append(embedded)
+    constraint = np.vstack(constraints)
+    expected = unconstrained.coefficients - np.linalg.lstsq(constraint, constraint @ unconstrained.coefficients, rcond=None)[0]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("all-infinite transfer needs no dense least-squares solve")
+
+    monkeypatch.setattr(np.linalg, "lstsq", forbidden)
+    _, actual = move(prior, MixtureHyperparameters(coefficients, np.full(len(prior.smoothing_blocks), np.inf)))
+    np.testing.assert_allclose(actual.coefficients, expected, atol=2e-10)
+    np.testing.assert_array_equal(actual.coefficients[moved.pooled_size:], 0.0)

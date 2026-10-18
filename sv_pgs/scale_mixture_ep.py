@@ -777,7 +777,11 @@ def transfer_hyperparameters(
     values -= values.mean(axis=1, keepdims=True)
     moved_coefficients = np.concatenate([(values @ new_basis).ravel(), coefficients[part_count * prior.pooled_size :]])
     infinite = [position for position in range(len(moved.smoothing_blocks)) if hyperparameters.log_smoothing[position] == np.inf]
-    if infinite:
+    if len(infinite) == len(moved.smoothing_blocks):
+        # Every penalty is active: the allowed coefficients are exactly the known pooled polynomial null space.
+        # A dense stacked-constraint least-squares solve otherwise grows cubically on each refined lattice.
+        moved_coefficients = moved.null_basis @ (moved.null_basis.T @ moved_coefficients)
+    elif infinite:
         constraints = []
         for position in infinite:
             block = moved.smoothing_blocks[position]
@@ -3661,19 +3665,24 @@ def _restricted_prior(prior: ScaleMixturePrior, infinite: frozenset[int]) -> tup
     basis of every such block's null space. The other blocks act on z
     through their factors times K, and any direction none of them penalizes is profiled.
     """
-    constraints = [np.zeros((0, prior.coefficient_size))]
-    for position in sorted(infinite):
-        block = prior.smoothing_blocks[position]
-        embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
-        embedded[:, block.coordinates] = block.factor
-        constraints.append(embedded)
-    constraint = np.vstack(constraints)
-    if constraint.shape[0]:
-        _left, singular, right = np.linalg.svd(constraint)
-        rank = int(np.sum(singular > _EPSILON * max(constraint.shape) * float(singular[0])))
-        allowed = right[rank:].T
+    if infinite == frozenset(range(len(prior.smoothing_blocks))):
+        # The intersection of every penalty null space is already known. This also avoids the scale-dependent
+        # numerical rank decision of a large SVD mistaking a weak proper annotation penalty for a free direction.
+        allowed = prior.null_basis
     else:
-        allowed = np.eye(prior.coefficient_size)
+        constraints = [np.zeros((0, prior.coefficient_size))]
+        for position in sorted(infinite):
+            block = prior.smoothing_blocks[position]
+            embedded = np.zeros((block.factor.shape[0], prior.coefficient_size))
+            embedded[:, block.coordinates] = block.factor
+            constraints.append(embedded)
+        constraint = np.vstack(constraints)
+        if constraint.shape[0]:
+            _left, singular, right = np.linalg.svd(constraint)
+            rank = int(np.sum(singular > _EPSILON * max(constraint.shape) * float(singular[0])))
+            allowed = right[rank:].T
+        else:
+            allowed = np.eye(prior.coefficient_size)
     blocks = []
     for position, block in enumerate(prior.smoothing_blocks):
         if position in infinite:
