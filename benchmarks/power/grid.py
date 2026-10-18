@@ -34,6 +34,8 @@ import csv
 import fcntl
 import json
 import math
+import os
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -204,6 +206,19 @@ def run(method: Path, cohort: Path, out: Path, point: str, train_count: int, rep
     return compare(cohort, out, point, train_count, replicate)
 
 
+def prebuild(method: Path, cohort: Path, out: Path, point: str, train_count: int, replicate: int, arm: str) -> Path:
+    """Build an SV-PGS arm's training store into the method's store cache once, before the fits that share it start: the
+    store holds the training samples' codes and public fields and no phenotype, so every point with the same training
+    size, replicate and arm reads the same one."""
+    module = harness.load_method(method)
+    if not os.environ.get(module.STORE_CACHE_VARIABLE):
+        raise ValueError(f"prebuild writes into the store cache; set {module.STORE_CACHE_VARIABLE}")
+    train, _test = harness.views(cohort, _scenario(cohort, out, point, replicate), 1, MEASUREMENT_ARM, ARMS[arm][1], train_count, replicate)
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as work:
+        path, _order = module.cached_store(train, Path(work))
+        return path
+
+
 def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: int) -> dict | None:
     """The task's held-out comparison once every arm has completed (None before): each arm's AUC, the SV arm's paired
     DeLong gain over the SNV/indel arm and over LDpred2-auto, the truth summary and the SV effect readout."""
@@ -298,6 +313,14 @@ def main() -> None:
     task.add_argument("--replicate", type=int, required=True)
     task.add_argument("--arm", choices=list(ARMS), required=True)
     task.add_argument("--cores", type=int, default=16)
+    store = commands.add_parser("prebuild", help="build an SV-PGS arm's training store into the store cache")
+    store.add_argument("--method", type=Path, required=True)
+    store.add_argument("--cohort", type=Path, required=True)
+    store.add_argument("--out", type=Path, required=True)
+    store.add_argument("--point", choices=list(POINTS), required=True)
+    store.add_argument("--train-count", type=int, choices=TRAIN_COUNTS, required=True)
+    store.add_argument("--replicate", type=int, required=True)
+    store.add_argument("--arm", choices=[arm for arm, (method, _dropped) in ARMS.items() if method is None], required=True)
     collect = commands.add_parser("summarize", help="compare finished tasks and collect them into summary.tsv")
     collect.add_argument("--out", type=Path, required=True)
     collect.add_argument("--cohort", type=Path, required=True)
@@ -305,6 +328,9 @@ def main() -> None:
     if arguments.command == "run":
         print(json.dumps(run(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
                              arguments.replicate, arguments.arm, arguments.cores)))
+    elif arguments.command == "prebuild":
+        print(prebuild(arguments.method, arguments.cohort, arguments.out, arguments.point, arguments.train_count,
+                       arguments.replicate, arguments.arm))
     else:
         print(summarize(arguments.out, arguments.cohort))
 

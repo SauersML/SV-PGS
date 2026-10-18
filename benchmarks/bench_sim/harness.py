@@ -182,6 +182,33 @@ def run(
     """Fit ``method`` on the scenario's training samples, score the test samples, write the prediction and meta, and
     return the fitted model. ``train_count`` fits on that many training samples, drawn without replacement by
     ``train_seed`` (the power study's sample-size sweep, benchmarks/power/grid.py); None fits on every one."""
+    train, test = views(cohort, scenario, cores, arm, dropped, train_count, train_seed)
+    module = load_method(method)
+    started = time.time()
+    model = module.fit(train)
+    fitted = time.time()
+    prediction = model.score(test)
+    finished = time.time()
+    if not isinstance(prediction, dict):
+        prediction = {"total": prediction}
+    out.mkdir(parents=True, exist_ok=True)
+    np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
+    meta = {
+        "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
+        "dropped_classes": list(dropped), "train_count": int(train.n_samples), "train_seed": train_seed,
+        "fit_seconds": fitted - started, "score_seconds": finished - fitted,
+        "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
+    }
+    (out / "meta.json").write_text(json.dumps(meta, indent=1))
+    return model
+
+
+def views(
+    cohort: Path, scenario: Path, cores: int, arm: str, dropped: tuple = (), train_count: int | None = None, train_seed: int = 0,
+) -> tuple[TrainData, ScoreData]:
+    """The training and test views ``run`` hands a method: the arm's observed codes of the measured records less the
+    ``dropped`` classes, the training samples (``train_count`` of them drawn without replacement by ``train_seed``, or
+    all), their covariates and the scenario's phenotype."""
     if dropped and arm in READ_ARMS:
         raise ValueError(f"the {arm} arm's read channel is on structural records; it has no class-withheld run")
     samples = np.load(cohort / "samples.npz")
@@ -209,25 +236,7 @@ def run(
     test = ScoreData(variants=table, covariates=covariates[test_columns], covariate_names=names,
                      reads=read_evidence(cohort, scenario, arm, records, test_columns),
                      _observed=observed, _columns=test_columns, _records=records)
-    del phenotype
-    module = load_method(method)
-    started = time.time()
-    model = module.fit(train)
-    fitted = time.time()
-    prediction = model.score(test)
-    finished = time.time()
-    if not isinstance(prediction, dict):
-        prediction = {"total": prediction}
-    out.mkdir(parents=True, exist_ok=True)
-    np.savez(out / "prediction.npz", **{key: np.asarray(value, dtype=np.float64) for key, value in prediction.items()})
-    meta = {
-        "method": str(method), "scenario": str(scenario), "cores": cores, "measurement": ARMS[arm][2],
-        "dropped_classes": list(dropped), "train_count": int(train_columns.size), "train_seed": train_seed,
-        "fit_seconds": fitted - started, "score_seconds": finished - fitted,
-        "peak_rss_gb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6,
-    }
-    (out / "meta.json").write_text(json.dumps(meta, indent=1))
-    return model
+    return train, test
 
 
 def incremental_r2(outcome: np.ndarray, prediction: np.ndarray, covariates: np.ndarray) -> tuple[float, float]:
