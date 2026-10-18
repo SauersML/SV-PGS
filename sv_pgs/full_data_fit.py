@@ -2383,7 +2383,8 @@ class _GramMeanField(_FullDataMeanField):
     below the exact ELBO wherever lambda >= d'F d / d'd), lambda starting at the failed step's Rayleigh quotient and
     doubling until the round is accepted, so the accepted rounds never lower the exact ELBO; rounds otherwise run at
     lambda = 0, at no cost. A round whose pending gain does not shrink refuses the solve (the refinement does not
-    contract there), counted in ``unresolved``."""
+    contract there), counted in ``unresolved``. The pending gain is a local coordinate estimate, not a bound on coupled
+    slow modes; ``stage2_wiring`` therefore continues a converged band fit on the sample route before accepting it."""
 
     def __init__(
         self, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,

@@ -11,7 +11,8 @@ annotation groups (``annotation_design``), the dual Gaussian with a column per m
 mean-field fixed points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Each model keeps its own
 hyperparameters, noise, lattice check, certificate and prior digest, as when fitted alone: a group shares the store's
 reads, never a hyperparameter, so there is no cross-trait pooling of the prior. A group's models share its probes' and
-draws' seed, so their results are those of separate fits up to that Monte Carlo error.
+draws' seed and start lattice. The finite numerical tolerances and local empirical-Bayes maxima can also affect
+agreement with separate fits. A band-accelerated fit continues on the sample route before its final acceptance check.
 A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``), on the same
 route; its reported noise variance is its whitened problem's known unit noise, which its predictive never reads.
 """
@@ -693,6 +694,25 @@ def _fit_group(
                     certificate=certificate, prior_digest=digest,
                 )
 
+        def solve(fit_prior: ScaleMixturePrior, **continuation) -> FullDataFit:
+            fit = fit_full_data(
+                gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
+                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, **continuation,
+            )
+            if fit_band is not None and np.any(fit.certificate.outer_criterion_met):
+                # The band's far-field stopping estimate can miss a slowly converging direction: a grouped fixture
+                # reported convergence but its held-out scores correlated only 0.951 with the sample-route reference.
+                # Continue from its fitted state on the samples before accepting it. An unresolved continuation is
+                # handled by the existing per-model sample-route fallback, rather than accepting the band's certificate.
+                log(f"stage2 wiring: continuing the band fit of {len(columns)} models on the sample route for final validation")
+                fit_band.release()
+                fit = fit_full_data(
+                    gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
+                    inference=inference, sites=fit_sites, null_scale=kappa, band=None, starts=fit.hyperparameters,
+                    start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
+                )
+            return fit
+
         # ``inference``'s fixed points: the mean-field route by default until the EP route (with its double loop, which
         # passes the wiring store EP refused 59 of 65 calls on) is measured on bench-sim.
         # The quadrature at the fitted state (review F17, ``scale_mixture_ep.lattice_check``): the start lattice is
@@ -701,10 +721,7 @@ def _fit_group(
         # models are fitted again on the lattice moved for them, and those are checked there.
         fit_prior = prior
         try:
-            fit = fit_full_data(
-                gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
-                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band,
-            )
+            fit = solve(fit_prior)
             pending = list(range(len(columns)))
             while pending:
                 # Completed solver closures can form cycles holding large NumPy buffers. Their byte size does not
@@ -728,10 +745,8 @@ def _fit_group(
                     # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its
                     # noise and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior
                     # repeated the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
-                    refit = fit_full_data(
-                        gaussian=gaussian, statistics=view, prior=moved, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
-                        inference=inference, sites=fit_sites, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64),
-                        start_mean=fit.member_mean, null_scale=kappa, band=fit_band,
+                    refit = solve(
+                        moved, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
                     )
                 except FloatingPointError as error:
                     # No fit on the checked lattice: these models keep the fit they have, and each certificate says the

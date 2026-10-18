@@ -334,8 +334,9 @@ def _three_traits(root: Path):
     return store, covariate, np.repeat(traits, 2, axis=1), training, held_out
 
 
-@pytest.mark.slow  # seven fits of the synthetic store per route: 3-10 min each in the shared 6-CPU VM (batch-fit, 2026-10-13)
-@pytest.mark.parametrize("route", ["samples", "gram"])
+# Keep the band regression in the normal suite: its old convergence estimate admitted a fit with held-out
+# correlation 0.951 against the sample-route reference. The sample-only comparison remains an extended check.
+@pytest.mark.parametrize("route", [pytest.param("samples", marks=pytest.mark.slow), "gram"])
 def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str) -> None:
     """Three traits on two training sets: one fit per training set, with the traits as its columns, gives each model the
     fit it gets alone, up to the Monte Carlo error of the probes and draws it shares with its group and the start lattice
@@ -357,7 +358,7 @@ def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, mon
         alone = _fitted_group(store, covariate, model_targets[:, [model]], training[:, [model]], tmp_path / f"alone{model}", 5)
         joint, single = together.scoring[model], alone.scoring[0]
         np.testing.assert_array_equal(joint.store_rows, single.store_rows)
-        assert np.corrcoef(joint.coefficients, single.coefficients)[0, 1] > 0.99
+        assert np.corrcoef(joint.coefficients, single.coefficients)[0, 1] > 0.99, f"model {model}"
         rows = held_out[model % 2]
         scores = [
             score_genetic(_StoreCodes(store), ScoringPlan.from_models([scoring]), _budget()).means[rows, 0] for scoring in (joint, single)
