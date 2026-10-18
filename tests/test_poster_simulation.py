@@ -94,3 +94,15 @@ def test_poster_does_not_call_an_inconclusive_comparison_equivalent(monkeypatch,
     assert "95% CI" in copy and "SNV subset" in copy
     # Three core completions do not justify a sentence about an optional comparator with only two replicates.
     assert "all variant classes" not in copy
+
+
+def test_partial_poster_replaces_template_numbers_with_actual_coverage(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
+    poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
+    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_EFFECTS", "DISCUSSION"):
+        monkeypatch.setattr(poster, name, getattr(poster, name))
+    poster.simulation_copy(dict(train_counts=[5000, 40000], points={"sv_20pct": {"sizes": {"40000": {"replicates": 2}}}}))
+    copy = " ".join(text for paragraph in poster.SIMULATION_ACCURACY for text, _flag in paragraph)
+    assert "2 paired comparisons" in copy and "grid is incomplete" in copy
+    assert not any(flag == "ph" for paragraphs in (poster.SIMULATION_ACCURACY, poster.SIMULATION_EFFECTS)
+                   for paragraph in paragraphs for _text, flag in paragraph)

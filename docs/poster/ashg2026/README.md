@@ -14,6 +14,8 @@ The template defaults to `~/Downloads/ASHG draft.PH.pptx`, the output to `~/Down
 
 Missing results produce explicit placeholders. A previous optional architecture panel is removed when the new summary cannot supply it. Never use layout-test values as scientific results.
 
+When only part of the simulation grid has completed, the narrative reports the actual paired-comparison and replicate counts and labels the results as interim. Cells without enough replicates do not retain template numbers. Scheduler-killed attempts may still say `running` until reconciled against job history; an active writer's lock must never be bypassed during such a repair.
+
 ## Reading the summary
 
 - `coverage` counts completed, failed and running arm attempts, including cells without any paired result. It does not count scheduler jobs that have not started or prove that a recorded running attempt is still alive.

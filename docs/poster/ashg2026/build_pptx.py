@@ -124,6 +124,18 @@ def simulation_copy(summary: dict) -> None:
     points = summary["points"]
     largest = str(max(summary["train_counts"]))
     largest_text = f"{int(largest):,}"
+    cells = [cell for point in points.values() for cell in point.get("sizes", {}).values()]
+    counts = [cell["replicates"] for cell in cells]
+    # A partial real run must not leave template numbers in its simulation narrative, or imply that the earliest
+    # completed cells are a finished grid. Keep the planned sample-size range separate from observed coverage.
+    if counts:
+        SIMULATION_ACCURACY = [[(f"Interim results: {sum(counts)} paired comparisons across {len(cells)} settings and sample sizes; "
+                                 f"{min(counts)}–{max(counts)} completed replicates per cell. The grid is incomplete.", "")]]
+    else:
+        SIMULATION_ACCURACY = [[("No paired simulation comparisons have completed yet.", "")]]
+    SIMULATION_EFFECTS = [[("Power and effect-size summaries are preliminary while simulation replicates finish.", "")]]
+    DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")],
+                  DISCUSSION[1]]
     SIMULATION_METHODS = [[("SV-PGS with/without SVs and LDpred2-auto (MAF ≥ 1% SNVs at HapMap3 density, or all classes) use "
                            f"{min(summary['train_counts']):,}–{int(largest):,} training samples.", "")]]
 
@@ -164,8 +176,8 @@ def simulation_copy(summary: dict) -> None:
     if positives:
         improved = sum(entry["lower"] > 0 for entry in positives)
         DISCUSSION = [
-            [(f"The AUC gain's 95% interval was above zero in {improved} of {len(positives)} simulated settings with causal SVs. "
-              "The All of Us results are pending.", "")],
+            [(f"At {largest_text} samples, {improved}/{len(positives)} causal-SV settings with ≥{MIN_REPLICATES} replicates "
+              "had a positive gain interval (unadjusted 95% CI). Results are preliminary.", "")],
             DISCUSSION[1],
         ]
 
