@@ -2671,9 +2671,12 @@ def _directional_derivatives(
         third_mixed_mean = xp.sum(weighted * centred_third, axis=1)
         del centred, centred_second, centred_third
         modes = xp.argmax(weights, axis=1)
-        # A piece's thirty or so (rows x directions) arrays and its gathered (rows x K) ones stay within the budget of
-        # the seven directional-derivative row arrays and three temporaries (``_ROW_INTERMEDIATES``) less the six above.
-        piece = max(1, 4 * weights.shape[0] * grid_size // (7 * grid_size + 30 * directions.shape[1]))
+        # Reserve all seven possible gathered node arrays (weights and the six weighted arrays), and 29 named
+        # row-by-direction arrays below plus five expression temporaries. The named arrays are four moments,
+        # six cross moments, four derivative moments, s, eight u moments, three central moments and three mixed
+        # derivatives. The available four row-by-node arrays are the seven plus three temporaries reserved by
+        # _ROW_INTERMEDIATES, less the six weighted arrays retained above. This bounds piece size, not accuracy.
+        piece = max(1, 4 * weights.shape[0] * grid_size // (7 * grid_size + 34 * directions.shape[1]))
         third_here = xp.zeros(directions.shape[1])
         fourth_here = xp.zeros(directions.shape[1])
         for node in _host(xp.unique(modes)).tolist():

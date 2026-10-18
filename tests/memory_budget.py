@@ -88,6 +88,7 @@ def run_within_budget(function: Callable[..., Any], *args: Any, working_bytes: i
         OMP_NUM_THREADS="1",
         OPENBLAS_NUM_THREADS="1",
         MKL_NUM_THREADS="1",
+        NUMBA_NUM_THREADS="1",
         MALLOC_ARENA_MAX="1",
         MALLOC_MMAP_THRESHOLD_=str(_GLIBC_MMAP_THRESHOLD),
         MALLOC_TOP_PAD_=str(_GLIBC_TOP_PAD),

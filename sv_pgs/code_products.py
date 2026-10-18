@@ -173,6 +173,13 @@ def _fp64_codes(codes: np.ndarray, start: int, stop: int, square: bool = False) 
     worker: numpy's conversion runs on one core and held a 16-core fit's code products to one (bench-sim chr22,
     40,000 training samples: a CG iteration 54 s). The values and the layout are the same, so every GEMM is the
     same call: ``.T`` of the result is the layout of ``codes[:, start:stop].T.astype(np.float64)``."""
+    # A single worker gains nothing from the parallel kernel. Avoid initializing LLVM and its thread pool
+    # in that case: their process-level allocations do not belong to the code tile's working-memory plan.
+    if numba.config.NUMBA_NUM_THREADS == 1 or numba.get_num_threads() == 1:
+        out = codes[:, start:stop].astype(np.float64, order="C")
+        if square:
+            np.square(out, out=out)
+        return out
     out = np.empty((int(codes.shape[0]), stop - start), dtype=np.float64)
     _fp64_codes_rows(codes, start, stop, square, out)
     return out
