@@ -147,7 +147,7 @@ def simulation_copy(summary: dict) -> None:
         positive, null = twenty["delta_auc"], null_cell["delta_auc"]
         accuracy.append([
             (f"With 20% causal SVs and {largest_text} training samples, adding SVs {change_verb(positive, 'raised', 'lowered', 'changed')} AUC by {auc_change(positive)}; "
-             f"with no causal SVs, by {number(null['mean'])}.", ""),
+             f"with no causal SVs, ΔAUC = {number(null['mean'])}.", ""),
         ])
     if twenty:
         against = twenty["delta_auc_vs_ldpred2"]

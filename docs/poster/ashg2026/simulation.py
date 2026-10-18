@@ -85,6 +85,8 @@ def interval(values) -> dict:
 
 def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
     results = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/result.json"))]
+    # each arm's attempt record (grid.py writes one per arm job), to count replicates lost to a failed fit
+    attempts = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/*/attempt.json"))]
     if not results:
         raise SystemExit(f"no finished grid tasks under {local / 'grid' / 'tasks'}")
     points: dict = {}
@@ -98,8 +100,10 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
             valid = [row for row in group if math.isfinite(row["delta_auc"]) and math.isfinite(row["z"])]
             power = rejection_summary(sum(row["z"] > ONE_SIDED for row in valid), len(valid))
             valid_ldpred2 = [row for row in group if "z_vs_ldpred2" in row and math.isfinite(row["z_vs_ldpred2"])]
+            failed = {row["replicate"] for row in attempts if row["point"] == point and row["train_count"] == train_count and row["status"] == "failed"}
             by_size[str(train_count)] = {
                 "replicates": len(group),
+                "failed_replicates": len(failed - {row["replicate"] for row in group}),
                 "snv_indel_auc": mean_se(row["snv_indel_auc"] for row in group),
                 "with_sv_auc": mean_se(row["with_sv_auc"] for row in group),
                 "ldpred2_auc": mean_se(row.get("ldpred2_auc") for row in group),
