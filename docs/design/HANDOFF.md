@@ -1,8 +1,22 @@
-# Handoff: current state (2026-10-14)
+# Handoff: current state (2026-10-18)
 
 This is the entry point for the project's state. The model is in [MODEL.md](MODEL.md), the AoU run in [WORKSPACE_PIPELINE.md](WORKSPACE_PIPELINE.md) and [launcher/workspace/README.md](../../launcher/workspace/README.md), what the routes do not yet meet in [CAPABILITIES.md](CAPABILITIES.md), and the rulings in [DECISIONS.md](DECISIONS.md).
 
 **"Certified"** means a fit met its numerical stopping criterion on the computed objective: remaining gain at most 1/(2K) nats on V, the Laplace evidence with the leading Tierney–Kadane term along each standardized direction. That term has no remainder bound, so a certified V is not within 1/(2K) of the exact evidence (CAPABILITIES.md). The artifact records it as `outer_criterion_met`; `model_acceptance` quarantines a model without it.
+
+## Current simulation/poster continuation
+
+The current task is the MSI simulation grid and ASHG poster, excluding an All of Us run. The AoU launch steps below describe the older study plan, not work to start during this continuation.
+
+- `benchmarks/power/grid.py` runs `grid2` on the bench-sim v7 chr22 cohort. The recovered October 17 transcript records active CPU and GPU fits using normal Slurm submissions; the older Slurm-outage instructions in COMPUTE.md are historical. Inspect the current queue and existing results before submitting or cancelling anything.
+- On October 18 the local MSI VPN session had expired and reconnection needed Duo approval. The live job status and completed simulation results have **not** been verified in this continuation. No GPU validation or fresh MSI result is claimed.
+- Grouped fits now select each model's own refusal notes, so one refused model does not quarantine accepted peers. The runner records view, fit and output failures while preserving successful peers, and validates outcome counts and finite, correctly shaped predictions.
+- The harness reads selected genotype samples directly. LDpred2's two comparator arms use the numerical covariate rank, including when columns are redundant; their GWAS statistics and streamed LD agree with direct least-squares references in tests.
+- Poster summaries use Student t intervals across completed replicates and retain per-arm completion/failure counts. Power uses Wilson intervals with its actual valid-comparison count. Neither an inconclusive interval nor the no-causal-SV setting establishes equivalence. The LDpred2 SNV arm uses HapMap3 **density**, not the actual HapMap3 set; both LDpred2 arms filter MAF below 1%, so their variant inputs differ from SV-PGS.
+- The editable poster and PDF have been rebuilt and visually checked with placeholders. A separate, explicitly marked synthetic fixture verifies the fully populated layout; its values are not results. Fetch and collect actual MSI outputs before filling the scientific panels. Generated artifacts, authors and the template remain outside version control.
+- Validation: the broad Linux CPU suite passed 1,321 tests (96 skipped, 34 deselected, 11 expected failures). Later targeted Linux checks cover the grouped-refusal fix, artifact subsets and LDpred2 projection; the latter passes with warnings treated as errors. CUDA and MSI-scale performance remain to be checked on MSI.
+
+Next: restore MSI access, inventory existing grid2 attempts and scheduler jobs, inspect the grouped CPU/GPU fit logs and acceptance outcomes, then collect completed results and repair measured failures. Preserve existing completed work and inspect each active checkout before updating its source.
 
 ## The study
 SV-inclusive Bayesian PGS for 15 diseases (hypertension first) in about 100k multi-ancestry All of Us participants, imputation already done: the `snv_indel` arm (records under 50 bp, no copy number) against `with_sv` (everything), paired on the same folds and seeds, with effects by SV type and length. Compute is under $3,000, as Google Batch jobs the user submits (`launcher/workspace/submit.sh`); agents never launch anything in the workspace.

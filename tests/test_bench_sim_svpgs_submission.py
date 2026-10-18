@@ -1,6 +1,7 @@
 """The bench-sim SV-PGS submission (full-data route) and the truth measurement arm, on a small synthetic cohort."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -178,7 +179,6 @@ def test_the_store_cache_builds_once_and_is_reused(tmp_path: Path, monkeypatch) 
 
 
 def test_cache_identity_binds_annotation_values(tmp_path):
-    from types import SimpleNamespace
     from benchmarks.bench_sim.submissions.svpgs_full import _store_key
     codes, variants = _cohort(np.random.default_rng(12), 100, 10)
     train = SimpleNamespace(n_samples=10, n_variants=100, variants=variants, codes=lambda rows: codes[rows],
@@ -186,3 +186,19 @@ def test_cache_identity_binds_annotation_values(tmp_path):
     before = _store_key(train)
     variants['in_gene'][17] = 1 - variants['in_gene'][17]
     assert _store_key(train) != before
+
+
+def test_store_statistics_preserve_maximum_codes_and_totals_above_uint32(tmp_path):
+    codes, variants = _cohort(np.random.default_rng(31), 4, 70_000)
+    codes[0] = 254
+    codes[1] = 0
+    codes[2] = 127
+    train = SimpleNamespace(n_samples=codes.shape[1], n_variants=codes.shape[0], variants=variants,
+                            codes=lambda rows: codes[rows])
+    module = harness.load_method(SUBMISSION)
+    path, order = module.build_store(train, tmp_path)
+    with module.DosageStore.open(path) as store:
+        exact = codes[order].astype(np.uint64)
+        np.testing.assert_array_equal(store.variant_table.sum_code, exact.sum(axis=1))
+        np.testing.assert_array_equal(store.variant_table.sum_code2, (exact * exact).sum(axis=1))
+        assert store.variant_table.sum_code2.max() > np.iinfo(np.uint32).max

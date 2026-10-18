@@ -109,9 +109,11 @@ def build_store(train, work: Path) -> tuple[Path, np.ndarray]:
         rows = order[first:first + BLOCK_ROWS]
         block = np.asarray(train.codes(rows), dtype=np.uint8)
         codes[first:first + BLOCK_ROWS] = block
-        wide = block.astype(np.uint64)
-        sums[first:first + BLOCK_ROWS] = wide.sum(axis=1)
-        squares[first:first + BLOCK_ROWS] = (wide * wide).sum(axis=1)
+        # Every uint8 code's square fits uint16; only the accumulated totals need uint64.
+        # At 40,000 people this avoids two 1.3 GB uint64 temporaries per block.
+        wide = block.astype(np.uint16)
+        sums[first:first + BLOCK_ROWS] = wide.sum(axis=1, dtype=np.uint64)
+        squares[first:first + BLOCK_ROWS] = (wide * wide).sum(axis=1, dtype=np.uint64)
     codes.flush()
     log(f"svpgs_full: {n_var:,} records x {n_train:,} training samples read in {time.time() - started:.0f} s")
     ids = [f"v{row}" for row in order]
