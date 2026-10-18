@@ -2,7 +2,7 @@
 abstract's title and authors, the realistic simulation study (benchmarks/power/grid.py on bench-sim's 1000 Genomes
 cohort, run on MSI), the All of Us results, and the one real-data result already in hand (SV type and expression, MAGE).
 
-    python3 build_pptx.py [template.pptx] [output.pptx]
+    python3 build_pptx.py [template.pptx] [output.pptx] [simulation_summary.json] [figures directory]
 
 The template is read from outside the repository and nothing of it is committed: its own content (another study's All
 of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
@@ -11,12 +11,16 @@ bars. The author line and affiliations come from authors.local beside this file,
 committed. The figures come from figures.py.
 
 Placeholders: a figure the simulation or All of Us runs will supply is a dashed "placeholder" panel (figures.py); a
-number they will supply is a bracketed bold run in the text, e.g. "[x%]".
+number they will supply is a bracketed bold run in the text, e.g. "[x%]". The simulation's numbers and the verbs that
+depend on them (raised or changed, outperformed or matched) come from simulation_summary.json (simulation.py) when it
+exists, with each 95% interval deciding the verb.
 """
 
 from __future__ import annotations
 
 import functools
+import json
+import math
 import re
 import shutil
 import subprocess
@@ -27,9 +31,10 @@ from html import escape
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-FIGURES = HERE / "figures"
 TEMPLATE = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.home() / "Downloads" / "ASHG draft.PH.pptx"
 OUTPUT = Path(sys.argv[2]) if len(sys.argv) > 2 else Path.home() / "Downloads" / "ASHG SV-PGS poster.pptx"
+SUMMARY = Path(sys.argv[3]) if len(sys.argv) > 3 else HERE / "simulation_summary.json"
+FIGURES = Path(sys.argv[4]) if len(sys.argv) > 4 else HERE / "figures"
 SKILL = Path.home() / ".claude/skills/synced/cf317dd8-fe6e-4d5f-8d52-41758c24f59e_65ab35e1-5c99-4c20-a531-f6c547fa9553/pptx"
 EMU = 914400
 PLACEHOLDER = "000000"
@@ -83,6 +88,97 @@ DISCUSSION = [
      ("[n]", "ph"), (" All of Us diseases.", "")],
     [("SV-PGS is open-source software for training and applying PGSs that include SVs.", "")],
 ]
+
+# ------------------------------------------------------------------ the simulation's numbers in the copy
+
+
+def number(value: float, digits: int = 3) -> str:
+    """A value with a typographic minus sign."""
+    return f"{value:.{digits}f}".replace("-", "−")
+
+
+def auc_change(entry: dict) -> str:
+    """'0.006 (95% CI 0.004–0.008)' style text for an AUC difference and its interval."""
+    low, high = entry["lower"], entry["upper"]
+    span = f"{number(low)}–{number(high)}" if low * high > 0 else f"{number(low)} to {number(high)}"
+    return f"{number(entry['mean'])} (95% CI {span})"
+
+
+def change_verb(entry: dict, rose: str, fell: str, neither: str) -> str:
+    return rose if entry["lower"] > 0 else fell if entry["upper"] < 0 else neither
+
+
+def size_reaching(rows: dict, target: float) -> float | None:
+    """Training size at which power first reaches ``target``, interpolated in log size; None if never."""
+    points = sorted((int(size), row["power"]["rate"]) for size, row in rows.items() if row["power"]["replicates"])
+    for (size_a, rate_a), (size_b, rate_b) in zip(points, points[1:]):
+        if rate_a < target <= rate_b:
+            fraction = (target - rate_a) / (rate_b - rate_a)
+            return math.exp(math.log(size_a) + fraction * (math.log(size_b) - math.log(size_a)))
+    if points and points[0][1] >= target:
+        return float(points[0][0])
+    return None
+
+
+def simulation_copy(summary: dict) -> None:
+    """Fill the simulation's bracketed numbers from the grid's summary, each verb chosen by its interval."""
+    global SIMULATION_DESIGN, SIMULATION_ACCURACY, SIMULATION_EFFECTS, DISCUSSION
+    points = summary["points"]
+    largest = str(max(summary["train_counts"]))
+    largest_text = f"{int(largest):,}"
+    # the design bullets stand as written: every poster scenario has 10% prevalence and h2 = 0.1
+    SIMULATION_DESIGN[3] = [(f"We compare SV-PGS with and without SVs, and LDpred2-auto, at {min(summary['train_counts']):,} to "
+                             f"{int(largest):,} training samples.", "")]
+
+    accuracy = []
+    if "sv_20pct" in points and "null" in points and largest in points["sv_20pct"]["sizes"] and largest in points["null"]["sizes"]:
+        positive = points["sv_20pct"]["sizes"][largest]["delta_auc"]
+        null = points["null"]["sizes"][largest]["delta_auc"]
+        accuracy.append([
+            (f"With 20% causal SVs and {largest_text} training samples, adding SVs {change_verb(positive, 'raised', 'lowered', 'changed')} AUC by {auc_change(positive)}; "
+             f"with no causal SVs, by {number(null['mean'])}.", ""),
+        ])
+    if "sv_20pct" in points and largest in points["sv_20pct"]["sizes"]:
+        against = points["sv_20pct"]["sizes"][largest]["delta_auc_vs_ldpred2"]
+        if math.isfinite(against["mean"]):
+            every = [point["sizes"][largest]["delta_auc_vs_ldpred2"] for point in points.values() if largest in point["sizes"]]
+            verb = change_verb(against, "outperformed", "had lower AUC than", "matched")
+            tail = f" in all {len(every)} settings" if all(entry["lower"] > 0 for entry in every) else ""
+            accuracy.append([(f"SV-PGS {verb} LDpred2-auto{tail} (ΔAUC {number(against['mean'])} with 20% causal SVs).", "")])
+    if accuracy:
+        SIMULATION_ACCURACY = accuracy
+
+    effects = []
+    if "sv_20pct" in points:
+        reach = size_reaching(points["sv_20pct"]["sizes"], 0.8)
+        rate = points["sv_20pct"]["sizes"][largest]["power"]["rate"] if largest in points["sv_20pct"]["sizes"] else math.nan
+        if reach is not None:
+            effects.append([(f"The test for an SV gain reached 80% power at about {round(reach, -3):,.0f} training samples with 20% causal SVs.", "")])
+        else:
+            stronger = points.get("sv_20pct_fold3", {}).get("sizes", {}).get(largest, {}).get("power", {}).get("rate")
+            effects.append([(f"With 20% causal SVs, the test for an SV gain had {rate:.0%} power at {largest_text} samples"
+                             + (f" ({stronger:.0%} with 3× effects)." if stronger is not None else "."), "")])
+    if "length_positive" in points and "sv_20pct" in points and largest in points["length_positive"]["sizes"]:
+        rho, rho_se = points["length_positive"]["sizes"][largest]["length_rho"]
+        null_rho, null_se = points["sv_20pct"]["sizes"][largest]["length_rho"]
+        recovered = math.isfinite(rho_se) and math.isfinite(null_se) and rho - null_rho > 1.96 * math.hypot(rho_se, null_se)
+        effects.append([(f"SV-PGS {'recovered' if recovered else 'did not recover'} the simulated increase of SV effect size with length "
+                         f"(ρ = {number(rho, 2)} vs. {number(null_rho, 2)}).", "")])
+    if effects:
+        SIMULATION_EFFECTS = effects
+
+    positives = [point["sizes"][largest]["delta_auc"] for name, point in points.items() if name != "null" and largest in point["sizes"]]
+    if positives:
+        improved = sum(entry["lower"] > 0 for entry in positives)
+        DISCUSSION = [
+            [(f"Adding SVs improved prediction in {improved} of {len(positives)} simulated settings with causal SVs, and in ", ""), ("[n]", "ph"), (" All of Us diseases.", "")],
+            DISCUSSION[1],
+        ]
+
+
+if SUMMARY.is_file():
+    simulation_copy(json.loads(SUMMARY.read_text()))
+
 
 REFERENCES = [
     "Byrska-Bishop et al. (2022) Cell 185:3426.",
@@ -403,7 +499,7 @@ def build() -> None:
     xml = column.bar(xml, 93)
     xml = column.text(xml, 94, SIMULATION_DESIGN)
     xml = column.figure(xml, 101, "accuracy")
-    xml = column.caption(xml, 112, "Held-out AUC vs. training size")
+    xml = column.caption(xml, 112, "Test-set AUC vs. training size")
     xml = column.text(xml, 126, SIMULATION_ACCURACY)
     half = (column.width - 0.5) / 2
     top = column.y

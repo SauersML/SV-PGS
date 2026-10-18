@@ -375,10 +375,13 @@ def effects_figure(summary: dict) -> Path:
     top, bottom = 28.0, 352.0
     # left: estimated vs simulated, in percentage points of case probability per allele
     scatter = effects.get("sv_20pct") or effects.get("length_positive")
-    a0, a1 = 112.0, 352.0
+    a0, a1 = 112.0, 322.0
     pairs = [(simulated * 100, estimated * 100) for simulated, estimated in scatter["pairs"]]
-    reach = max(max(abs(value) for pair in pairs for value in pair), 1e-9) * 1.06
-    low, high, step = nice_range(-reach, reach, steps=(0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 2.5, 5.0, 10.0), most=4)
+    reach = max(max(abs(value) for pair in pairs for value in pair), 1e-9) * 1.04
+    # a symmetric range at the next round value, ticked at its ends and zero
+    scale = 10 ** math.floor(math.log10(reach))
+    high = next(multiple * scale for multiple in (1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0) if multiple * scale >= reach)
+    low, step = -high, high
 
     def sx(value: float) -> float:
         return a0 + (value - low) / (high - low) * (a1 - a0)
@@ -391,7 +394,7 @@ def effects_figure(summary: dict) -> Path:
     parts.append(f'<line x1="{sx(low):.1f}" y1="{sy(low):.1f}" x2="{sx(high):.1f}" y2="{sy(high):.1f}" stroke="{GREY}" stroke-width="3.5" stroke-dasharray="12 9"/>')
     tick = low
     while tick <= high + 1e-9:
-        label = tick_text(tick, step)
+        label = tick_text(tick, step) + ("%" if abs(tick) > 1e-12 else "")
         parts.append(f'<line x1="{sx(tick):.1f}" y1="{bottom}" x2="{sx(tick):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
         parts.append(f'<text class="tick" x="{sx(tick):.1f}" y="{bottom + 42}" text-anchor="middle">{label}</text>')
         parts.append(f'<line x1="{a0 - 10}" y1="{sy(tick):.1f}" x2="{a0}" y2="{sy(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
@@ -403,8 +406,8 @@ def effects_figure(summary: dict) -> Path:
     parts.append(f'<text class="axis" x="{(a0 + a1) / 2:.1f}" y="{h - 16}" text-anchor="middle">Simulated effect</text>')
     parts.append(f'<text class="axis" transform="translate(28 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Estimated effect</text>')
     # right: mean |estimated effect| by SV length
-    b0, b1 = 578.0, 805.0
-    lines = [(point, label, colour) for point, label, colour in (("length_positive", "Grows with length", TEAL), ("sv_20pct", "No length effect", GREY)) if point in effects]
+    b0, b1 = 540.0, 805.0
+    lines = [(point, label, colour) for point, label, colour in (("length_positive", "Length effect", TEAL), ("sv_20pct", "No length effect", GREY)) if point in effects]
     peak = max(max(finite(mean + (se if math.isfinite(se) else 0.0) for mean, se in zip(effects[point]["length_bins"]["mean_abs"], effects[point]["length_bins"]["se"]))) for point, _label, _colour in lines) * 100
     # headroom above the lines for their two labels
     _low, top_value, step = nice_range(0.0, peak * 1.6, steps=(0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1.0), most=4)
@@ -424,7 +427,7 @@ def effects_figure(summary: dict) -> Path:
     tick = 0.0
     while tick <= top_value + 1e-9:
         parts.append(f'<line x1="{b0 - 10}" y1="{ly(tick):.1f}" x2="{b0}" y2="{ly(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{b0 - 16}" y="{ly(tick) + 9:.1f}" text-anchor="end">{tick_text(tick, step)}</text>')
+        parts.append(f'<text class="tick" x="{b0 - 16}" y="{ly(tick) + 9:.1f}" text-anchor="end">{tick_text(tick, step) + "%" if tick > 1e-12 else "0"}</text>')
         tick += step
     ends = []
     for point, label, colour in lines:
