@@ -138,7 +138,8 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
                                 for arm in ("snv_indel", "with_sv", "ldpred2_auto", "ldpred2_allvar")},
                 "expected_auc": expected_auc(point, train_count),
             }
-        points[point] = {"setting": setting(point), "sizes": by_size}
+        points[point] = {"setting": setting(point), "sizes": by_size,
+                         "expected_auc": {str(count): expected_auc(point, count) for count in TRAIN_COUNTS}}
     summary = {
         "source": "benchmarks/power/grid.py on bench-sim v7 chr22 (Beagle arm), MSI",
         "tasks": len(results),

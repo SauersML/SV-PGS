@@ -137,8 +137,28 @@ def tick_text(value: float, step: float, percent: bool = False) -> str:
     return f"{value:.{decimals}f}".replace("-", "−")
 
 
+MIN_REPLICATES = 3
+"""A (point, training size) cell is drawn only with at least this many completed replicates, as build_pptx.py's text."""
+
+
 def sizes(summary: dict, point: str) -> list[str]:
-    return sorted(summary["points"][point]["sizes"], key=int)
+    """The point's training sizes with enough replicates to draw, smallest first."""
+    cells = summary["points"].get(point, {}).get("sizes", {})
+    return sorted((size for size, cell in cells.items() if cell["replicates"] >= MIN_REPLICATES), key=int)
+
+
+def shown_counts(summary: dict, points) -> list[int]:
+    """The training sizes at which any of ``points`` has a drawable cell, or every planned size when none has."""
+    present = {int(size) for point in points for size in sizes(summary, point)}
+    return [count for count in summary["train_counts"] if count in present] or list(summary["train_counts"])
+
+
+def expected_line(summary: dict, point: str) -> dict[int, float]:
+    """The point's analytic expected AUC at every planned training size (older summaries: only at its cells)."""
+    values = summary["points"][point]
+    if "expected_auc" in values:
+        return {int(size): auc for size, auc in values["expected_auc"].items()}
+    return {int(size): cell["expected_auc"] for size, cell in values["sizes"].items()}
 
 
 def finite(values) -> list[float]:
@@ -172,7 +192,7 @@ def spread_labels(wanted: list[float], gap: float, low: float, high: float) -> l
     return result
 
 
-ACCURACY_PANELS = (("null", "No causal SVs"), ("sv_5pct", "5% causal SVs"), ("sv_20pct", "20% causal SVs"))
+ACCURACY_PANELS = (("null", "No causal SVs"), ("sv_20pct", "20% causal SVs"), ("sv_20pct_fold3", "20% causal SVs, 3× effect"))
 ACCURACY_METHODS = (
     # (summary key, key label, colour, filled marker, horizontal offset)
     ("with_sv_auc", "SV-PGS with SVs", TEAL, True, 18.0),
@@ -196,7 +216,9 @@ def accuracy_figure(summary: dict) -> Path:
     left, right, gap = 140.0, 30.0, 55.0
     # a method is keyed only where it has a value: the all-variant LDpred2 arm joined the grid after the others
     shown = [method for method in ACCURACY_METHODS if any(
-        math.isfinite(row.get(method[0], NO_VALUE)[0]) for point, _title in ACCURACY_PANELS for row in summary["points"][point]["sizes"].values())]
+        math.isfinite(summary["points"][point]["sizes"][size].get(method[0], NO_VALUE)[0])
+        for point, _title in ACCURACY_PANELS for size in sizes(summary, point))]
+    counts = shown_counts(summary, [point for point, _title in ACCURACY_PANELS])
     entries = [(label, colour, filled, False) for _key, label, colour, filled, _off in shown]
     # the key, centred over the panels: SV-PGS and the expected accuracy on one line, the LDpred2 arms on a second
     key_lines = [[entry for entry in entries if entry[0].startswith("SV-PGS")] + [("Expected", GREY, None, True)],
@@ -211,10 +233,9 @@ def accuracy_figure(summary: dict) -> Path:
             for key, *_rest in ACCURACY_METHODS:
                 entry = auc_interval(row, key)
                 values += finite([entry["mean"], entry["lower"], entry["upper"]])
-            values.append(row["expected_auc"])
+        values += [auc for count, auc in expected_line(summary, point).items() if count in counts]
     # tick labels at least 52 units (0.52 in) apart
     low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.04, 0.05, 0.1, 0.2), most=int((bottom - top) // 52))
-    counts = summary["train_counts"]
 
     def y(value: float) -> float:
         return bottom - (value - low) / (high - low) * (bottom - top)
@@ -242,7 +263,7 @@ def accuracy_figure(summary: dict) -> Path:
         x0 = left + index * (panel + gap)
 
         def x(count: int) -> float:
-            return x0 + 34 + math.log2(count / counts[0]) / math.log2(counts[-1] / counts[0]) * (panel - 68)
+            return x0 + 34 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (panel - 68)
 
         parts.append(f'<text class="facet" x="{x0}" y="{top - 22}">{title}</text>')
         parts.append(f'<line x1="{x0}" y1="{bottom}" x2="{x0 + panel}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
@@ -254,11 +275,10 @@ def accuracy_figure(summary: dict) -> Path:
         for count in counts:
             parts.append(f'<line x1="{x(count):.1f}" y1="{bottom}" x2="{x(count):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
             parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
-        if point not in summary["points"]:
-            continue
         rows = summary["points"][point]["sizes"]
         present = sizes(summary, point)
-        expected = " ".join(f"{x(int(size)):.1f},{y(rows[size]['expected_auc']):.1f}" for size in present)
+        line = expected_line(summary, point)
+        expected = " ".join(f"{x(count):.1f},{y(line[count]):.1f}" for count in counts if count in line)
         parts.append(f'<polyline points="{expected}" fill="none" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
         for key, _label, colour, filled, offset in reversed(shown):
             points = [(x(int(size)) + offset, auc_interval(rows[size], key)) for size in present if math.isfinite(rows[size].get(key, NO_VALUE)[0])]
@@ -278,8 +298,6 @@ def accuracy_figure(summary: dict) -> Path:
 POWER_SERIES = (
     ("sv_20pct_fold3", "20% SVs, 3× effect", NAVY),
     ("sv_20pct", "20% SVs", TEAL),
-    ("sv_5pct_fold3", "5% SVs, 3× effect", PURPLE),
-    ("sv_5pct", "5% SVs", AMBER),
     ("null", "No causal SVs", LIGHT),
 )
 
@@ -292,10 +310,10 @@ def power_figure(summary: dict) -> Path:
     w, h = width * 100, height * 100
     left, top, bottom = 128.0, 28.0, h - 112.0
     plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in POWER_SERIES) - 40
-    counts = summary["train_counts"]
+    counts = shown_counts(summary, [point for point, *_rest in POWER_SERIES])
 
     def x(count: int) -> float:
-        return left + 26 + math.log2(count / counts[0]) / math.log2(counts[-1] / counts[0]) * (plot_right - left - 52)
+        return left + 26 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (plot_right - left - 52)
 
     def y(rate: float) -> float:
         return bottom - rate * (bottom - top)
@@ -316,7 +334,8 @@ def power_figure(summary: dict) -> Path:
     for offset_index, (point, label, colour) in enumerate(present):
         offset = (offset_index - (len(present) - 1) / 2) * 9.0
         rows = summary["points"][point]["sizes"]
-        points = [(x(int(size)) + offset, rows[size]["power"]) for size in sizes(summary, point) if rows[size]["power"]["replicates"]]
+        points = [(x(int(size)) + offset, rows[size]["power"]) for size in sizes(summary, point)
+                  if rows[size]["power"]["replicates"] >= MIN_REPLICATES]
         if not points:
             continue
         parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in points)
@@ -393,7 +412,7 @@ def genotypes_figure(summary: dict) -> Path:
         imputed = summary["points"].get(point, {}).get("sizes", {}).get(largest, {}).get("delta_auc")
         true = true_gains.get(point, {}).get("true")
         rows.append((label, colour, [(entry, filled) for entry, filled in ((imputed, False), (true, True))
-                                     if entry and math.isfinite(entry["mean"])]))
+                                     if entry and entry["replicates"] >= MIN_REPLICATES]))
     values = [0.0] + finite(value for _label, _colour, marks in rows for entry, _filled in marks
                             for value in (entry["mean"], entry["lower"], entry["upper"]))
     low, high, step = nice_range(min(values), max(values), steps=(0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=4)
@@ -444,20 +463,20 @@ ARCHITECTURES = (
 )
 GAINS = (
     # (summary key, key label, colour, filled marker)
-    ("delta_auc", "SV-PGS without SVs", TEAL, True),
-    ("delta_auc_vs_ldpred2", "LDpred2, SNV subset", AMBER, True),
-    ("delta_auc_vs_ldpred2_allvar", "LDpred2, all classes", AMBER, False),
+    ("delta_auc", "vs. SV-PGS without SVs", TEAL, True),
+    ("delta_auc_vs_ldpred2", "vs. LDpred2, SNV subset", AMBER, True),
+    ("delta_auc_vs_ldpred2_allvar", "vs. LDpred2, all classes", AMBER, False),
 )
 
 
 def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> Path:
     """For every simulated architecture, at its largest training size: the mean test AUC gain of SV-PGS with SVs over
     each other method, with its 95% interval over replicates, on one axis shared by both blocks of architectures."""
-    blocks = [[(point, label) for point, label in block if point in summary["points"]] for block in ARCHITECTURES]
+    blocks = [[(point, label) for point, label in block if sizes(summary, point)] for block in ARCHITECTURES]
     blocks = [block for block in blocks if block]
     rows = [row for block in blocks for row in block]
     cells = {point: summary["points"][point]["sizes"][sizes(summary, point)[-1]] for point, _label in rows}
-    gains = [gain for gain in GAINS if any(math.isfinite(cells[point].get(gain[0], {}).get("mean", math.nan)) for point, _label in rows)]
+    gains = [gain for gain in GAINS if any(cells[point].get(gain[0], {}).get("replicates", 0) >= MIN_REPLICATES for point, _label in rows)]
     w, h = width * 100, height * 100
     key_y, top, bottom = 40.0, 84.0, h - 112.0
     pitch = (bottom - top) / max(len(block) for block in blocks)
@@ -498,7 +517,7 @@ def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.
             parts.append(f'<text class="row" x="{x0 - 16:.1f}" y="{cy + 9:.1f}" text-anchor="end">{label}</text>')
             for gain_index, (key, _label, colour, filled) in enumerate(gains):
                 entry = cells[point].get(key, {})
-                if not math.isfinite(entry.get("mean", math.nan)):
+                if entry.get("replicates", 0) < MIN_REPLICATES:
                     continue
                 y = cy + (gain_index - (len(gains) - 1) / 2) * 13.0
                 if math.isfinite(entry["lower"]):
@@ -514,11 +533,13 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     """Each simulation figure whose grid points have results; a placeholder for the others."""
     made = []
     points = summary["points"] if summary else {}
-    made.append(accuracy_figure(summary) if all(point in points for point, _title in ACCURACY_PANELS) else placeholder_figure("ph_sim_accuracy"))
-    made.append(power_figure(summary) if "null" in points and any(point in points for point, *_rest in POWER_SERIES[:-1]) else placeholder_figure("ph_sim_power"))
+    made.append(accuracy_figure(summary) if summary and all(sizes(summary, point) for point, _title in ACCURACY_PANELS)
+                else placeholder_figure("ph_sim_accuracy"))
+    made.append(power_figure(summary) if summary and all(sizes(summary, point) for point, *_rest in POWER_SERIES)
+                else placeholder_figure("ph_sim_power"))
     made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
                 else placeholder_figure("ph_sim_genotypes"))
-    if summary and len(points) > 1:
+    if summary and sum(bool(sizes(summary, point)) for point in points) > 1:
         made.append(architectures_figure(summary))
     else:
         # The builder includes this optional panel by filename: never reuse a previous run's result.
