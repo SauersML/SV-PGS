@@ -228,12 +228,14 @@ def genotype_accuracy(local: Path, imputed: list[dict]) -> dict:
 
 def fetch(local: Path = LOCAL) -> None:
     """Copy the grid's and the true-genotype run's results (result.json, attempt.json) from MSI, over the open SSH
-    connection (ssh config host msi), plus the genotype accuracy by allele frequency."""
+    connection (ssh config host msi), plus the genotype accuracy by allele frequency. The copy mirrors MSI: a result
+    or attempt no longer there is deleted here (old-code fits moved to MSI's archive-oldcode/ for refitting on current
+    code would otherwise still be collected)."""
     local.mkdir(parents=True, exist_ok=True)
     rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--exclude=*"]
     for grid, folder in ((GRID, "grid"), (TRUTH_GRID, "grid-truth"), (WINDOW_GRID, "window"), (f"{WINDOW_GRID}-truth", "window-truth")):
         # exit 24: a source file vanished mid-copy (an attempt.json replaced by its job); the next fetch reads it
-        copied = subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)])
+        copied = subprocess.run(["rsync", "-a", "--delete", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)])
         if copied.returncode not in (0, 24):
             raise subprocess.CalledProcessError(copied.returncode, copied.args)
     subprocess.run(["rsync", "-a", f"{REMOTE}/figs/", str(local / "public")], check=True)
