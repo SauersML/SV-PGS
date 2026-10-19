@@ -385,7 +385,7 @@ def window_power_figure(summary: dict) -> Path:
     Wilson 95% intervals on the true-genotype points."""
     width, height = 8.20, 4.40
     w, h = width * 100, height * 100
-    left, top, bottom = 128.0, 28.0, h - 112.0
+    left, top, bottom = 128.0, 76.0, h - 112.0
     plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in WINDOW_POWER_SERIES) - 40
     series = [entry for entry in WINDOW_POWER_SERIES if window_power(summary, "true", entry[0]) or window_power(summary, "imputed", entry[0])]
     counts = sorted({count for point, *_rest in series for measurement in ("true", "imputed") for count in window_power(summary, measurement, point)})
@@ -431,11 +431,12 @@ def window_power_figure(summary: dict) -> Path:
     for (end_x, end_y, colour), label, label_y in zip(ends, labels, placed):
         parts.append(f'<polyline points="{end_x + 14:.1f},{end_y:.1f} {plot_right + 10:.1f},{label_y:.1f} {plot_right + 24:.1f},{label_y:.1f}" fill="none" stroke="{colour}" stroke-width="2.5"/>')
         parts.append(f'<text class="end" x="{plot_right + 32:.1f}" y="{label_y + 9:.1f}" style="fill:{colour}">{label}</text>')
-    # the key, top left inside the axes: solid lines are true genotypes, dashed imputed
-    for row, (text, dash) in enumerate((("True SV genotypes", ""), ("Imputed SVs", ' stroke-dasharray="12 9"'))):
-        key_y = top + 14 + row * 36
-        parts.append(f'<line x1="{left + 24:.1f}" y1="{key_y:.1f}" x2="{left + 80:.1f}" y2="{key_y:.1f}" stroke="{GREY}" stroke-width="5"{dash}/>')
-        parts.append(f'<text class="key" x="{left + 92:.1f}" y="{key_y + 9:.1f}">{text}</text>')
+    # the key, one line above the axes: solid lines are true genotypes, dashed imputed
+    cursor = left
+    for text, dash in (("True SVs", ""), ("Imputed SVs", ' stroke-dasharray="12 9"')):
+        parts.append(f'<line x1="{cursor:.1f}" y1="26" x2="{cursor + 56:.1f}" y2="26" stroke="{GREY}" stroke-width="5"{dash}/>')
+        parts.append(f'<text class="key" x="{cursor + 68:.1f}" y="35">{text}</text>')
+        cursor += 68 + text_width(text, 26) + 44
     parts.append("</svg>")
     return render("ph_sim_power", page("".join(parts), width, height), width, height)
 
@@ -594,7 +595,7 @@ def window_cells(summary: dict, measurement: str, point: str) -> dict[int, dict]
     return {int(size): cell["delta_auc"] for size, cell in cells.items() if cell["delta_auc"]["replicates"] >= MIN_REPLICATES}
 
 
-def window_figure(summary: dict, width: float = 16.95, height: float = 4.5) -> Path:
+def window_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> Path:
     """The chr22 window study: the test AUC gain of SV-PGS with SVs over SV-PGS without them against training size,
     one panel per causal architecture, on true SV genotypes (filled) and imputed SVs (open), with 95% intervals."""
     panels = [(point, title, detail) for point, title, detail in WINDOW_PANELS

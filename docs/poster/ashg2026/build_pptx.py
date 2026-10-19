@@ -209,20 +209,21 @@ def simulation_copy(summary: dict) -> None:
     true_gains = {point: gain for point, gain in true_gains.items() if gain}
     if cohort and true_gains:
         megabases = (cohort["end_bp"] - cohort["start_bp"]) / 1e6
-        replicates = min(gain[1]["replicates"] for gain in true_gains.values())
-        WINDOW = [[(f"One {megabases:.0f}-Mb chr22 window ({cohort['last_record'] - cohort['first_record']:,} variants, the same "
-                    f"50,000 people) runs every architecture at every size, {replicates}+ replicates each.", "")]]
+        window_sizes = sorted({int(size) for cells in window.get("true", {}).values() for size in cells.get("sizes", {})})
+        # the window's design joins the methods line; its figure's text is the headline gain
+        SIMULATION_METHODS = [[(SIMULATION_METHODS[0][0][0].rstrip(".") + f"; one {megabases:.0f}-Mb chr22 window "
+                                f"({cohort['last_record'] - cohort['first_record']:,} variants) repeats every architecture at "
+                                f"{min(window_sizes):,}–{max(window_sizes):,}.", "")]]
         best = max(true_gains, key=lambda point: true_gains[point][1]["mean"])
         count, true = true_gains[best]
-        label = dict(ARCHITECTURE_LABELS)[best]
         imputed = window_gain("imputed", best)
-        sentence = f"{label}: adding SVs raised AUC by {auc_change(true)} on true SV genotypes at {count // 1000}k"
+        sentence = f"{dict(ARCHITECTURE_LABELS)[best]}, {count // 1000}k: SVs added {auc_change(true)} AUC on true genotypes"
         if imputed:
-            sentence += f" and by {auc_change(imputed[1])} imputed"
+            sentence += f", {number(imputed[1]['mean'])} imputed"
         control = window_gain("true", "null")
         if control:
-            sentence += f"; with no causal SVs, {auc_change(control[1])}"
-        WINDOW.append([(sentence + ".", "")])
+            sentence += f"; no causal SVs: {number(control[1]['mean'])}"
+        WINDOW = [[(sentence + ".", "")]]
         # the per-architecture sentences give way to the window figure: the genotype text keeps the r^2 sentence only
         if accuracy_by_frequency:
             SIMULATION_GENOTYPES = [genotypes[-1]]
@@ -233,8 +234,9 @@ def simulation_copy(summary: dict) -> None:
     window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0} if cohort else {}
     if window_raised:
         best = max(window_raised, key=lambda point: window_raised[point][1]["mean"])
+        label = dict(ARCHITECTURE_LABELS)[best]
         conclusions.append([(f"Measured SVs raised AUC by up to {number(window_raised[best][1]['mean'])} "
-                             f"({dict(ARCHITECTURE_LABELS)[best].lower()}).", "")])
+                             f"({label[0].lower() + label[1:]}).", "")])
     elif raised:
         conclusions.append([(f"Adding well-measured SVs raised AUC ({'; '.join(dict.fromkeys(raised))}).", "")])
     elif accuracy_by_frequency:
@@ -606,7 +608,7 @@ def build() -> None:
         xml = delete(delete(xml, 130), 131)
     if "window" in figures:
         xml = column.figure(xml, 133, "window")
-        xml = column.caption(xml, 134, "AUC gain from adding SVs in one chr22 window (95% t interval)")
+        xml = column.caption(xml, 134, "AUC gain from adding SVs, chr22 window")
         xml = column.text(xml, 135, WINDOW) if WINDOW else delete(xml, 135)
     else:
         xml = delete(delete(delete(xml, 133), 134), 135)
