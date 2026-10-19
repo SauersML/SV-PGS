@@ -278,12 +278,10 @@ def test_a_plain_header_declares_exactly_one_reported_r2_field(tmp_path: Path) -
         plain_batch_fields(neither)
 
 
-def test_the_config_pairs_the_popped_sidecars_and_reads_the_genetic_map_only_for_plain_input(workspace) -> None:
+def test_the_config_pairs_the_popped_sidecars_and_names_the_genetic_map_key(workspace) -> None:
     synthetic, _client = workspace
     with pytest.raises(ValueError, match="set together .* or null together"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "strata_directory": None})
-    with pytest.raises(ValueError, match="genetic_map is read only for plain input"):
-        WorkspaceConfig.from_mapping({**synthetic.raw, "genetic_map": "maps/plink.{chromosome}.GRCh38.map"})
     with pytest.raises(ValueError, match=r"plink\.GRCh38\.map\.zip"):
         WorkspaceConfig.from_mapping({key: value for key, value in synthetic.raw.items() if key != "genetic_map"})
 
@@ -291,7 +289,7 @@ def test_the_config_pairs_the_popped_sidecars_and_reads_the_genetic_map_only_for
 def test_a_plain_chromosome_without_cm_or_a_genetic_map_stops_the_store(workspace) -> None:
     synthetic, client = workspace
     plain = _plain(synthetic, {"A": BEAGLE, "B": BEAGLE}, genetic_map=None)
-    with pytest.raises(ValueError, match=r"chr21: the plain batches' records lack INFO/CM.*genetic_map.*plink\.GRCh38\.map\.zip"):
+    with pytest.raises(ValueError, match=r"chr21: the batches' records lack INFO/CM.*genetic_map.*plink\.GRCh38\.map\.zip"):
         run_pipeline(WorkspaceConfig.from_mapping(plain.raw), _bindings(_Recorder(), client), BUDGET, through="store")
 
 

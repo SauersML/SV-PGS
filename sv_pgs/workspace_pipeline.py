@@ -230,8 +230,8 @@ KEY_HINTS = {
         "https://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_38/ (GRCh38, chr-prefixed contigs)."
     ),
     "genetic_map": (
-        "genetic_map is null for popped batches, which carry INFO/CM. For plain imputed batches without INFO/CM it is a path "
-        "pattern over {chromosome} to the public Beagle GRCh38 PLINK maps, plink.GRCh38.map.zip from "
+        "genetic_map is null where every imputed record carries INFO/CM. For batches whose records lack it (AoU's popped "
+        "batches declare it but carry it on no record) it is a path pattern over {chromosome} to the public Beagle GRCh38 PLINK maps, plink.GRCh38.map.zip from "
         "https://bochet.gcc.biostat.washington.edu/beagle/genetic_maps/plink.GRCh38.map.zip, unzipped: e.g. "
         "<dir>/no_chr_in_chrom_field/plink.{chromosome}.GRCh38.map."
     ),
@@ -368,8 +368,8 @@ class WorkspaceConfig:
 
     ``strata_directory`` and ``bubble_split`` are set together for popped batches (``popped``), or
     null together for plain imputed VCF/BCFs (``popped`` None). ``genetic_map`` is a path pattern
-    over ``{chromosome}`` to a PLINK-format map, read for a plain chromosome whose records lack
-    INFO/CM, or null; popped batches carry INFO/CM, so it is null for them.
+    over ``{chromosome}`` to a PLINK-format map, read for a chromosome whose records (popped or plain)
+    do not all carry INFO/CM, or null.
 
     ``direct_sv`` is the direct read-based channel's sources (``DirectSvInputs``), or None. With it None or its
     GATK-SV call set None, the ``direct_sv`` step adds no row and says so.
@@ -463,8 +463,6 @@ class WorkspaceConfig:
             raise ValueError(
                 "strata_directory and bubble_split are set together (popped batches) or null together (plain imputed VCF/BCFs)."
             )
-        if raw["strata_directory"] is not None and raw["genetic_map"] is not None:
-            raise ValueError("popped batches carry INFO/CM, so genetic_map is read only for plain input; set it null.")
         if raw["truth_calls"] is None and raw["imputation_reference_ids"] is not None:
             raise ValueError("imputation_reference_ids is read only for the calibration pairs of truth_calls; set it null.")
         marker_directory = raw["marker_directory"]
@@ -514,7 +512,7 @@ class WorkspaceConfig:
     def genetic_map_path(self, chromosome: str) -> Path:
         if self.genetic_map is None:
             raise ValueError(
-                f"{chromosome}: the plain batches' records lack INFO/CM, so their genetic positions come from genetic_map, which is "
+                f"{chromosome}: the batches' records lack INFO/CM, so their genetic positions come from genetic_map, which is "
                 f"null; nothing assumes a rate of cM per Mb. {KEY_HINTS['genetic_map']}"
             )
         return Path(self.genetic_map.format(chromosome=chromosome))
@@ -1312,18 +1310,6 @@ def read_popped_sites(path: Path, strata: StrataSites) -> RecordSites:
     )
 
 
-def carried_genetic_positions(positions: NDArray, centimorgans: F64Array) -> F64Array:
-    """Each record's genetic position: its INFO/CM where it carries one, else linear in bp between the records that do,
-    held at the first or last carried value before or after them. The carried values are the imputation's own map, so
-    no outside map is read; a chromosome where fewer than two positions carry INFO/CM has none to interpolate on."""
-    positions = np.asarray(positions, dtype=np.int64)
-    carried = np.isfinite(centimorgans)
-    map_positions, first = np.unique(positions[carried], return_index=True)
-    if map_positions.shape[0] < 2:
-        raise ValueError(f"INFO/CM is on {int(carried.sum())} records at {map_positions.shape[0]} positions; interpolating the rest needs two.")
-    return np.where(carried, centimorgans, np.interp(positions, map_positions, centimorgans[carried][first]))
-
-
 def read_bubble_paths(path: Path) -> list[list[frozenset[str]]]:
     """Each bubble's paths, in file order, as the sets of atomic IDs they carry.
 
@@ -1650,11 +1636,16 @@ def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, ch
     first_half = config.imputed_halves[0]
     path = first_half.path(chromosome, first_half.batches[0])
     records = read_popped_sites(path, strata)
-    # AoU's popped batches leave INFO/CM off some records (chr1's first, for one): those take positions interpolated
-    # between the records that carry it, and the store's facts count them.
-    missing = int(np.count_nonzero(~np.isfinite(records.genetic_position_cm)))
-    source = "INFO/CM" if missing == 0 else f"INFO/CM, interpolated in bp for the {missing} of {strata.positions.shape[0]} records without it"
-    centimorgans = carried_genetic_positions(strata.positions, records.genetic_position_cm) if missing else records.genetic_position_cm
+    # AoU's popped batches declare INFO/CM but carry it on no record: their genetic positions come from genetic_map, as
+    # a plain batch's do.
+    record_count = strata.positions.shape[0]
+    carried = int(np.isfinite(records.genetic_position_cm).sum())
+    if carried == record_count:
+        centimorgans, source = records.genetic_position_cm, "INFO/CM"
+    else:
+        map_path = config.genetic_map_path(chromosome)
+        centimorgans = interpolated_genetic_positions(*read_genetic_map(map_path, chromosome), strata.positions)
+        source = f"genetic_map {map_path.name}, as INFO/CM is on {carried} of {record_count} records"
     records = dataclasses.replace(records, genetic_position_cm=_checked_genetic_positions(path, centimorgans, source))
     counts = path_counts(strata, read_bubble_paths(popped.bubble_split_path(chromosome)))
     batch_count = sum(len(half.batches) for half in config.imputed_halves)

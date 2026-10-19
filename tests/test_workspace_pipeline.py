@@ -1018,29 +1018,27 @@ def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(worksp
         run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="store")
 
 
-def test_popped_records_without_info_cm_take_positions_interpolated_between_those_with_it(workspace) -> None:
-    """AoU's popped batches leave INFO/CM off some records: the first (held at the first carried value), one sharing a
-    POS with carried records (their value), and the last (held at the last carried value); the store counts them."""
+def test_popped_records_without_info_cm_take_their_genetic_positions_from_the_genetic_map(workspace) -> None:
+    """AoU's popped batches declare INFO/CM but carry it on no record: the store interpolates every record's genetic
+    position from genetic_map and says so, and stops naming genetic_map where it is null."""
     synthetic, client = workspace
-    dropped = (0, 4, 8)
     for label, batches in HALVES:
         for batch, _width in batches:
             for chromosome in CHROMOSOMES:
                 path = synthetic.root / label / f"{chromosome}.{batch}.vcf"
-                lines = path.read_text().splitlines()
-                body = len(lines) - len(RECORDS)
-                for record in dropped:
-                    lines[body + record] = re.sub(r";CM=[0-9.]+", "", lines[body + record])
-                path.write_text("\n".join(lines) + "\n")
-    config = WorkspaceConfig.from_mapping(synthetic.raw)
+                path.write_text(re.sub(r";CM=[0-9.]+", "", path.read_text()))
+    with pytest.raises(ValueError, match=r"chr21: the batches' records lack INFO/CM.*genetic_map"):
+        run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="store")
+    (synthetic.root / "maps").mkdir()
+    for chromosome in CHROMOSOMES:
+        (synthetic.root / "maps" / f"plink.{chromosome}.GRCh38.map").write_text(f"{chromosome} . 0.0 1\n{chromosome} . 20.0 10001\n")
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "genetic_map": str(synthetic.root / "maps" / "plink.{chromosome}.GRCh38.map")})
     summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
     assert summaries["store"]["genetic_position"] == {
-        chromosome: f"INFO/CM, interpolated in bp for the 3 of {len(RECORDS)} records without it" for chromosome in CHROMOSOMES
+        chromosome: f"genetic_map plink.{chromosome}.GRCh38.map, as INFO/CM is on 0 of {len(RECORDS)} records" for chromosome in CHROMOSOMES
     }
-    carried = [0.001 * position for position, *_rest in RECORDS]
-    expected = [carried[1], *carried[1:8], carried[7]]
     with DosageStore.open(config.run_directory / "store" / "store") as store:
-        np.testing.assert_allclose(store.variant_table.genetic_position_cm, expected * len(CHROMOSOMES))
+        np.testing.assert_allclose(store.variant_table.genetic_position_cm, [0.002 * (position - 1) for position, *_rest in RECORDS] * len(CHROMOSOMES))
 
 
 def _strata(identifiers, carried, totals) -> StrataSites:
