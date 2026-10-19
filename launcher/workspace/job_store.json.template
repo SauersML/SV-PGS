@@ -24,12 +24,12 @@
       {
         "policy": {
           "machineType": "${MACHINE_TYPE}",
-          "provisioningModel": "SPOT",
+          "provisioningModel": "${PROVISIONING_MODEL}",
           "disks": [{"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": ${RUN_DISK_GB}}}]
         }
       }
     ],
-    "location": {"allowedLocations": ["zones/${ZONE}"]},
+    "location": {"allowedLocations": ["regions/${REGION}"]},
     "network": {
       "networkInterfaces": [
         {

@@ -31,7 +31,7 @@
         }
       }
     ],
-    "location": {"allowedLocations": ["zones/${ZONE}"]},
+    "location": {"allowedLocations": ["regions/${REGION}"]},
     "network": {
       "networkInterfaces": [
         {

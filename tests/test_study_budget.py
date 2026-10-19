@@ -148,7 +148,7 @@ else:
     launcher = Path(__file__).parents[1] / "launcher/workspace/submit.sh"
     environment = dict(os.environ, PATH=str(tmp_path) + os.pathsep + os.environ["PATH"], FAKE_CLOUD=str(tmp_path))
     environment.update(
-        PROJECT_ID="test-project", REGION="us-central1", ZONE="us-central1-a", OPS_BUCKET="workspace",
+        PROJECT_ID="test-project", REGION="us-central1", OPS_BUCKET="workspace",
         RUN_ID="study", RUN_DISK_GB="2000", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
         WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu", CDR_STORAGE_PATH="gs://cdr-bucket/v8",
         IMPUTED_BUCKET="imputed-bucket", PANEL_BUCKET="panel-bucket",
@@ -191,6 +191,8 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     assert spec["logsPolicy"]["logsPath"] == "/mnt/disks/ops/svpgs/study/launcher/pilot/batch.log"
     (disk,) = spec["allocationPolicy"]["instances"][0]["policy"]["disks"]
     assert disk == {"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": 2000}}
+    # Any zone of the region with capacity takes the job.
+    assert spec["allocationPolicy"]["location"] == {"allowedLocations": ["regions/us-central1"]}
     ops = next(volume for volume in task["volumes"] if volume["mountPath"] == "/mnt/disks/ops")
     assert ops["mountOptions"] == ["--implicit-dirs"]
     # Batch takes one lifecycle policy: exit 1 (the driver's or the install's failure) fails the task, and any other
@@ -224,6 +226,13 @@ def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, throug
     # The imputed batches with their strata sidecar, and the panel's bubble.split sites, are mounted read-only too.
     assert volumes["/mnt/disks/imputed"]["gcs"]["remotePath"] == "imputed-bucket" and "-o ro" in volumes["/mnt/disks/imputed"]["mountOptions"]
     assert volumes["/mnt/disks/panel"]["gcs"]["remotePath"] == "panel-bucket" and "-o ro" in volumes["/mnt/disks/panel"]["mountOptions"]
+    # Either job takes the provisioning model it is given: a store's partial work is not mirrored, so it can run STANDARD.
+    assert spec["allocationPolicy"]["instances"][0]["policy"]["provisioningModel"] == "SPOT"
+    environment.update(PROVISIONING_MODEL="STANDARD", BUDGET_SLOT="train-1")
+    standard = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
+    assert standard.returncode == 0, standard.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    assert spec["allocationPolicy"]["instances"][0]["policy"]["provisioningModel"] == "STANDARD"
 
 
 def test_staging_refuses_a_run_config_with_a_placeholder_or_a_missing_key(tmp_path: Path) -> None:

@@ -2,8 +2,10 @@
 # Submit one pipeline job to Google Batch, from a terminal inside the All of Us workspace (a Workbench app or VM in the
 # workspace project, as the workspace's identity). Never launched by an agent: launching is the user's decision.
 #
-#   submit.sh store      # steps samples .. direct_sv, on spot CPUs
+#   submit.sh store      # steps samples .. direct_sv, on CPUs
 #   submit.sh fit        # steps fit .. export, on GPUs
+#
+# PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity.
 #
 # Each job reserves one slot in the study's immutable $3,000 envelope before submission.
 # Batch limits task runtime; separately billed resources use the plan's non-task reserve.
@@ -47,8 +49,8 @@ export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
   --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET
-variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
-if [ "$spec" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
+variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
+if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${spec}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
