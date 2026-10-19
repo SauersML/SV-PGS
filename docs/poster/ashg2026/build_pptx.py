@@ -216,13 +216,14 @@ def simulation_copy(summary: dict) -> None:
                                 f"{min(window_sizes):,}–{max(window_sizes):,}.", "")]]
         best = max(true_gains, key=lambda point: true_gains[point][1]["mean"])
         count, true = true_gains[best]
-        imputed = window_gain("imputed", best)
+        # the imputed gain and the control at the same training size as the true-genotype gain
+        imputed = settled(window.get("imputed", {}).get(best, {}), str(count))
         sentence = f"{dict(ARCHITECTURE_LABELS)[best]}, {count // 1000}k: SVs added {auc_change(true)} AUC on true genotypes"
         if imputed:
-            sentence += f", {number(imputed[1]['mean'])} imputed"
-        control = window_gain("true", "null")
+            sentence += f", {number(imputed['delta_auc']['mean'])} imputed"
+        control = settled(window.get("true", {}).get("null", {}), str(count))
         if control:
-            sentence += f"; no causal SVs: {number(control[1]['mean'])}"
+            sentence += f"; no causal SVs: {number(control['delta_auc']['mean'])}"
         WINDOW = [[(sentence + ".", "")]]
         # the per-architecture sentences give way to the window figure: the genotype text keeps the r^2 sentence only
         if accuracy_by_frequency:

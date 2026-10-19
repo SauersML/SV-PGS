@@ -146,3 +146,21 @@ def test_partial_poster_replaces_template_numbers_with_actual_coverage(monkeypat
     assert "2 paired comparisons" in copy and "grid is incomplete" in copy
     assert not any(flag == "ph" for paragraphs in (poster.SIMULATION_ACCURACY, poster.SIMULATION_GENOTYPES)
                    for paragraph in paragraphs for _text, flag in paragraph)
+
+
+def test_window_sentence_compares_true_imputed_and_control_at_one_training_size(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "argv", ["build_pptx.py", "template.pptx", "poster.pptx", str(tmp_path / "missing.json")])
+    poster = importlib.import_module("docs.poster.ashg2026.build_pptx")
+    for name in ("SIMULATION_METHODS", "SIMULATION_ACCURACY", "SIMULATION_GENOTYPES", "DISCUSSION", "WINDOW"):
+        monkeypatch.setattr(poster, name, getattr(poster, name))
+
+    def cell(*gains):
+        return dict(replicates=len(gains), delta_auc=simulation.interval(gains))
+
+    window = {"cohort": dict(start_bp=1, end_bp=3_000_001, first_record=0, last_record=60_000),
+              "true": {"sv_20pct_fold3": {"sizes": {"10000": cell(.03, .031, .032), "20000": cell(.05, .06)}},
+                       "null": {"sizes": {"10000": cell(.001, .001, .001), "20000": cell(.009, .009, .009)}}},
+              "imputed": {"sv_20pct_fold3": {"sizes": {"10000": cell(.002, .002, .002), "20000": cell(.007, .007, .007)}}}}
+    poster.simulation_copy(dict(train_counts=[5000, 40000], points={}, window=window))
+    sentence = " ".join(text for paragraph in poster.WINDOW for text, _flag in paragraph)
+    assert "10k" in sentence and "0.002 imputed" in sentence and "no causal SVs: 0.001" in sentence
