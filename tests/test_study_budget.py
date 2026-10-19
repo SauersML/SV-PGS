@@ -193,6 +193,9 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     assert disk == {"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": 2000}}
     ops = next(volume for volume in task["volumes"] if volume["mountPath"] == "/mnt/disks/ops")
     assert ops["mountOptions"] == ["--implicit-dirs"]
+    # Batch takes one lifecycle policy: exit 1 (the driver's or the install's failure) fails the task, and any other
+    # non-zero exit (a spot preemption's 50001, the TERM trap's 75) is retried up to maxRetryCount by default.
+    assert task["lifecyclePolicies"] == [{"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}]
 
 
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
