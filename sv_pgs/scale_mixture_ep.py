@@ -3104,6 +3104,15 @@ def _line_log_integrals(
                 logs[column] = float(np.log(total) - 0.5 * np.log(2.0 * np.pi))
                 continue
             settled = error <= 0.5 * target * (highs - lows)
+            if np.all(settled):
+                # Every open interval is within its share, yet the sum is over the target: the intervals settled in
+                # earlier rounds were held to an earlier, larger total (resolving a cliff lowers it), and their errors
+                # take more than the open intervals leave. Refining the open intervals is the only slack left, and
+                # none is left where the settled errors alone reach the target [sim-only, grid-window common_sv
+                # n10000 replicate 6, where nothing was left to subdivide].
+                if done_error[column] >= target:
+                    raise FloatingPointError("the exact integral along a direction did not converge: intervals settled against an earlier total exceed its target")
+                settled[:] = False
             done_value[column] += float(np.sum(estimates[settled]))
             done_error[column] += float(np.sum(error[settled]))
             if np.any((highs[~settled] - lows[~settled]) <= _EPSILON * np.maximum(highs[~settled], _EPSILON)):
@@ -3450,6 +3459,10 @@ def _profiled_factor(matrix: F64Array, null_basis: F64Array, complement: F64Arra
     basis = np.hstack([null_basis, complement])
     rotated = basis.T @ matrix @ basis
     symmetric = 0.5 * (rotated + rotated.T)
+    if not np.all(np.isfinite(symmetric)):
+        # eigvalsh and cholesky pass a nan through without raising, and the test below is False for a nan eigenvalue
+        # [sim-only, grid-window low_heritability n10000 replicate 1, sample-route refit]
+        raise np.linalg.LinAlgError("the profiled curvature is not finite")
     eigenvalues = np.linalg.eigvalsh(symmetric)
     if float(eigenvalues[0]) <= _EPSILON * eigenvalues.shape[0] * max(float(np.max(np.abs(eigenvalues))), np.finfo(np.float64).tiny):
         raise np.linalg.LinAlgError("the profiled curvature is not resolvably positive definite: a direction is flat to rounding")

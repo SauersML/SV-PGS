@@ -869,6 +869,33 @@ def test_the_line_integral_matches_a_tight_quadrature_to_its_share():
         assert abs(found - (np.log(integral) - 0.5 * np.log(2.0 * np.pi))) <= share
 
 
+def test_a_line_integral_whose_settled_errors_outgrow_a_falling_total_raises_the_handled_error(monkeypatch):
+    # A spike on a first-round node inflates the first total; the rough left half-line settles against it, and the
+    # second round misses the spike, so the total falls below what the settled error allows while every open interval
+    # is within its share. It raised numpy's empty-concatenate ValueError, which no caller handles.
+    from types import SimpleNamespace
+
+    nodes = np.concatenate([-engine._KRONROD_NODES[:-1], engine._KRONROD_NODES[::-1]])
+    spike = (1.0 - (0.5 + 0.5 * nodes[3])) / (0.5 + 0.5 * nodes[3])
+
+    def log_integrand(steps: np.ndarray) -> np.ndarray:
+        base = np.where(steps < 0.0, np.exp(-0.5 * (steps / 0.02) ** 2), np.exp(-0.5 * steps**2))
+        with np.errstate(divide="ignore"):
+            return np.log(base + 1e3 * np.exp(-0.5 * ((steps - spike) / 1e-9) ** 2))
+
+    monkeypatch.setattr(engine, "_lines", lambda *arguments: lambda steps: {column: log_integrand(step) for column, step in steps.items()})
+    with pytest.raises(FloatingPointError, match="settled against an earlier total"):
+        engine._line_log_integrals(SimpleNamespace(variant_count=1), None, None, np.zeros((1, 1)), 0.0, None, _WORKING_BYTES, 1e-3)
+
+
+def test_a_non_finite_curvature_is_not_resolvably_positive_definite():
+    # eigvalsh and cholesky pass a nan through without raising; solve_triangular's ValueError reached no handler.
+    matrix = np.eye(3)
+    matrix[1, 2] = matrix[2, 1] = np.nan
+    with pytest.raises(np.linalg.LinAlgError, match="not finite"):
+        engine._profiled_factor(matrix, np.zeros((3, 0)), np.eye(3))
+
+
 def test_starts_that_find_one_basin_are_corrected_once(monkeypatch):
     prior, cavity = _problem(variant_count=60, seed=39, node_count=12)
     hyperparameters = _hyperparameters(prior, 40, log_smoothing=2.0)
