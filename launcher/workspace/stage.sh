@@ -16,7 +16,9 @@ python3 - "$config" "$here/run_config.template.json" <<'PY'
 import json, re, sys
 filled_text = open(sys.argv[1]).read()
 if "${" in filled_text:
-    sys.exit(f"{sys.argv[1]} still holds placeholders: {sorted(set(re.findall(r'\$\{[A-Z_0-9]+\}', filled_text)))}")
+    # outside the f-string: a backslash in an f-string expression needs Python 3.12, and this is the app's python3
+    placeholders = sorted(set(re.findall(r'\$\{[A-Z_0-9]+\}', filled_text)))
+    sys.exit(f"{sys.argv[1]} still holds placeholders: {placeholders}")
 filled = json.loads(filled_text)
 template = json.loads(re.sub(r'\$\{[A-Z_0-9]+\}', "0", open(sys.argv[2]).read()))
 missing = sorted(set(template) - set(filled))
