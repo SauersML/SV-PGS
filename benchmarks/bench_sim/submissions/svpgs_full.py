@@ -255,7 +255,8 @@ def fit(train) -> Model:
 
 def fit_with(train, inference: str, *, annotated_prior: bool = True) -> Model:
     """The fit by ``inference``'s fixed points (``stage2_wiring.fit_models``), with its profile: time, the process's
-    peak resident set and the device pool's bytes at the end. A fit the acceptance check quarantines raises."""
+    peak resident set and the device pool's bytes at the end. A fit that cannot be scored raises; an uncertified one is
+    returned, its verdict in the profile."""
     (outcome,) = fit_phenotypes(train, train.phenotype[:, None], inference, annotated_prior=annotated_prior)
     if isinstance(outcome, Exception):
         raise outcome
@@ -266,7 +267,8 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
     """One model per column of ``phenotypes`` (the training samples' phenotypes of several scenarios on the same
     genotypes), fitted together: ``fit_models`` fits the models that share training rows, covariates and likelihood as
     one group, so the store, Stage 0's LD blocks and every pass over the codes serve all of them. Each model is
-    accepted or quarantined on its own; a quarantined model's entry is the ValueError ``require_accepted`` raises."""
+    certified on its own and scored whether or not it is certified, as the workspace pipeline scores it, its verdict in
+    ``profile["acceptance"]``; an unscorable model's entry is the ValueError ``require_scorable`` raises."""
     phenotypes = np.asarray(phenotypes, dtype=np.float64)
     count = phenotypes.shape[1]
     work = Path(tempfile.mkdtemp(prefix="svpgs_full_", dir=os.environ.get("TMPDIR")))
@@ -297,7 +299,7 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
         certificate = fitted.certificate
         from types import SimpleNamespace
         from sv_pgs.fit_model import certificate_parts
-        from sv_pgs.model_acceptance import acceptance, require_accepted
+        from sv_pgs.model_acceptance import acceptance, require_scorable
         parts = certificate_parts(certificate, count)
         structural = np.asarray(train.variants["cls"]) >= 2
         outcomes = []
@@ -331,7 +333,7 @@ def fit_phenotypes(train, phenotypes: np.ndarray, inference: str = "mean_field",
             profile["annotated_prior"] = annotated_prior
             log(f"svpgs_full: model {index}: {profile}")
             try:
-                require_accepted(state)
+                require_scorable(state)
             except ValueError as error:
                 outcomes.append(error)
                 continue

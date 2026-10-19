@@ -287,7 +287,8 @@ def run_group(method: Path, cohort: Path, out: Path, points: list[str], train_co
             try:
                 harness.write_prediction(outcome, test, folder, seconds, method=str(method), scenario=str(scenario), cores=cores,
                                          measurement=harness.ARMS[measurement][2], dropped_classes=list(dropped),
-                                         train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members))
+                                         train_count=int(train.n_samples), train_seed=replicate, models_fitted_together=len(members),
+                                         **harness.certification(outcome))
                 if arm == "with_sv":
                     readout = structural_effect_readout(outcome, cohort, folder / "sv_effects.npz", measurement)
                     (folder / "sv_readout.json").write_text(json.dumps(readout, indent=1))
@@ -336,6 +337,7 @@ def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: in
         labels = np.load(scenario / "truth.npz")["phenotype"][np.flatnonzero(samples["is_test"])]
         arms = CORE_ARMS + (("ldpred2_allvar",) if allvar else ())
         scores = {arm: np.load(task / arm / "prediction.npz")["total"] for arm in arms}
+        metas = {arm: json.loads((task / arm / "meta.json").read_text()) for arm in arms}
         comparison = paired_delta_auc(labels, scores["snv_indel"], scores["with_sv"])
         against_ldpred2 = paired_delta_auc(labels, scores["ldpred2_auto"], scores["with_sv"])
         result = {
@@ -345,7 +347,9 @@ def compare(cohort: Path, out: Path, point: str, train_count: int, replicate: in
             "delta_auc": comparison.estimate, "z": comparison.z_score,
             "delta_auc_vs_ldpred2": against_ldpred2.estimate, "z_vs_ldpred2": against_ldpred2.z_score,
             "prediction": "genetic_only",
-            "fit_seconds": {arm: json.loads((task / arm / "meta.json").read_text())["fit_seconds"] for arm in arms},
+            "fit_seconds": {arm: metas[arm]["fit_seconds"] for arm in arms},
+            # arms whose fit missed certification (scored all the same); a method that certifies nothing records none
+            "uncertified_arms": [arm for arm in arms if metas[arm].get("certified") is False],
             "truth": json.loads((scenario / "scenario.json").read_text())["summary"],
             **json.loads((task / "with_sv" / "sv_readout.json").read_text()),
         }

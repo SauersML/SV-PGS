@@ -171,21 +171,23 @@ def test_the_comparison_waits_for_the_core_arms_and_adds_the_all_variant_ldpred2
     (scenario / 'scenario.json').write_text(json.dumps(dict(summary=dict(structural_share=0.0))))
     task = grid._task(tmp_path, 'null', 5000, 0)
 
-    def finish(arm, signal):
+    def finish(arm, signal, **certification):
         folder = task / arm
         folder.mkdir(parents=True)
         np.savez(folder / 'prediction.npz', total=signal * labels[is_test] + rng.normal(size=is_test.sum()))
-        (folder / 'meta.json').write_text(json.dumps(dict(fit_seconds=1.0)))
+        (folder / 'meta.json').write_text(json.dumps(dict(fit_seconds=1.0, **certification)))
         (folder / 'attempt.json').write_text(json.dumps(dict(point='null', train_count=5000, replicate=0, arm=arm, status='completed')))
         if arm == 'with_sv':
             (folder / 'sv_readout.json').write_text(json.dumps(dict(length_rho=0.0)))
 
-    finish('snv_indel', 1.0)
-    finish('with_sv', 1.5)
+    finish('snv_indel', 1.0, certified=False, certification_issues=['outer_criterion_met'])
+    finish('with_sv', 1.5, certified=True, certification_issues=[])
     assert grid.compare(cohort, tmp_path, 'null', 5000, 0) is None
     finish('ldpred2_auto', 0.5)
     first = grid.compare(cohort, tmp_path, 'null', 5000, 0)
     assert 'ldpred2_allvar_auc' not in first and first['with_sv_auc'] > first['ldpred2_auc']
+    # an uncertified fit is scored and named; LDpred2 records no certification
+    assert first['uncertified_arms'] == ['snv_indel']
     finish('ldpred2_allvar', 1.0)
     second = grid.compare(cohort, tmp_path, 'null', 5000, 0)
     assert second['with_sv_auc'] == first['with_sv_auc'] and np.isfinite(second['z_vs_ldpred2_allvar'])
@@ -204,7 +206,7 @@ def test_a_group_fit_records_each_point_on_its_own_and_leaves_out_completed_arms
 
     def fit_phenotypes(train, phenotypes):
         fitted_columns.append(phenotypes.shape[1])
-        return [Fitted(), ValueError("Model quarantined from scoring and primary reporting: outer_criterion_met")]
+        return [Fitted(), ValueError("Model cannot be scored: fit_failed")]
 
     views = {"null": 0.0, "sv_5pct": 1.0, "sv_20pct": 2.0}
     monkeypatch.setattr(grid, "_scenario", lambda cohort, out, point, replicate: tmp_path / "scenarios" / point)
@@ -219,7 +221,7 @@ def test_a_group_fit_records_each_point_on_its_own_and_leaves_out_completed_arms
     assert fitted_columns == [2]
     accepted, quarantined = (json.loads((grid._task(tmp_path, point, 5000, 0) / "snv_indel" / "attempt.json").read_text()) for point in ("sv_5pct", "sv_20pct"))
     assert accepted["status"] == "completed" and accepted["fitted_with"] == ["sv_5pct", "sv_20pct"]
-    assert quarantined["status"] == "failed" and "quarantined" in quarantined["error"]
+    assert quarantined["status"] == "failed" and "cannot be scored" in quarantined["error"]
     meta = json.loads((grid._task(tmp_path, "sv_5pct", 5000, 0) / "snv_indel" / "meta.json").read_text())
     assert meta["models_fitted_together"] == 2 and meta["train_count"] == 4
     assert json.loads((done / "attempt.json").read_text()) == dict(status="completed")
@@ -332,3 +334,13 @@ def test_a_task_observes_its_records_through_the_chosen_measurement_arm(tmp_path
         grid.run(tmp_path / 'method.py', tmp_path / 'cohort', tmp_path, 'null', 5000, 0, 'with_sv', 1, measurement='truth')
     attempt = json.loads((tmp_path / 'tasks' / 'null' / 'n5000' / 'replicate0' / 'with_sv' / 'attempt.json').read_text())
     assert seen == ['truth'] and attempt['measurement'] == 'truth' and attempt['status'] == 'failed'
+
+
+def test_a_fit_s_certification_reaches_its_meta_and_a_method_without_one_records_nothing():
+    from types import SimpleNamespace
+    from benchmarks.bench_sim import harness
+    verdict = {"accepted": False, "issues": [{"code": "outer_criterion_met", "severity": "fatal"},
+                                             {"code": "approximate_inference", "severity": "info"}]}
+    assert harness.certification(SimpleNamespace(profile={"acceptance": verdict})) == {
+        "certified": False, "certification_issues": ["outer_criterion_met"]}
+    assert harness.certification(SimpleNamespace()) == {}

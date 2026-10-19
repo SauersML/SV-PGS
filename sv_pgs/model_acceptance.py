@@ -91,9 +91,3 @@ def require_scorable(model) -> None:
     if codes:
         raise ValueError(f"Model cannot be scored: {', '.join(codes)}")
 
-
-def require_accepted(model) -> None:
-    decision = acceptance(model)
-    if not decision["accepted"]:
-        fatal = ", ".join(i["code"] for i in decision["issues"] if i["severity"] == "fatal")
-        raise ValueError(f"Model quarantined from scoring and primary reporting: {fatal}")

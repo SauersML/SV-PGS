@@ -37,7 +37,7 @@ def _cohort(rng: np.random.Generator, n_var: int, n_samples: int):
 
 
 @pytest.mark.parametrize("annotated_prior", [True, False])
-def test_the_submission_scores_only_accepted_synthetic_fits(tmp_path: Path, monkeypatch, annotated_prior) -> None:
+def test_the_submission_certifies_its_synthetic_fits(tmp_path: Path, monkeypatch, annotated_prior) -> None:
     monkeypatch.setenv("TMPDIR", str(tmp_path))
     rng = np.random.default_rng(3)
     n_var, n_train, n_test = 60, 240, 80
@@ -115,19 +115,22 @@ def test_scenarios_fitted_together_match_their_separate_fits(tmp_path: Path, mon
         assert np.corrcoef(alone, joint)[0, 1] > 0.99
         assert np.allclose(joint, alone, rtol=0.05, atol=0.05 * np.std(alone))
 
-    # A fatal note for one returned model must not quarantine its accepted peers.
+    # One model's fatal note leaves its peers certified: an uncertified model is scored with its codes, a failed one refused.
     original_fit = module.fit_models
 
-    def one_unresolved_model(**kwargs):
+    def noted_models(**kwargs):
         fitted = original_fit(**kwargs)
-        certificate = replace(fitted.certificate, refusals=("model 1: lattice check unresolved (regression fixture)",))
+        certificate = replace(fitted.certificate, refusals=("model 1: lattice check unresolved (regression fixture)",
+                                                            "model 2: the fit failed: regression fixture"))
         return replace(fitted, certificate=certificate)
 
-    monkeypatch.setattr(module, "fit_models", one_unresolved_model)
+    monkeypatch.setattr(module, "fit_models", noted_models)
     outcomes = module.fit_phenotypes(train_view(phenotypes[:, 0]), phenotypes[:n_train])
-    assert isinstance(outcomes[1], ValueError) and "quadrature_unresolved" in str(outcomes[1])
-    assert all(outcomes[index].profile["acceptance"]["accepted"] for index in (0, 2))
-    assert all(outcomes[index].profile["refusals"] == 0 for index in (0, 2))
+    verdict = outcomes[1].profile["acceptance"]
+    assert not verdict["accepted"] and "quadrature_unresolved" in {issue["code"] for issue in verdict["issues"]}
+    assert np.all(np.isfinite(outcomes[1].score(test)["total"]))
+    assert isinstance(outcomes[2], ValueError) and "fit_failed" in str(outcomes[2])
+    assert outcomes[0].profile["acceptance"]["accepted"] and outcomes[0].profile["refusals"] == 0
 
 
 def test_the_truth_arm_is_the_true_genotypes_in_code_units(tmp_path: Path) -> None:

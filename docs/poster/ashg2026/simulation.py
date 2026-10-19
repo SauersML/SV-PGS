@@ -161,6 +161,8 @@ def summarize(results: list[dict], attempts: list[dict], expected: bool = True) 
             by_size[str(train_count)] = {
                 "replicates": len(group),
                 "failed_replicates": len(failed - {row["replicate"] for row in group}),
+                # SV-PGS fits scored without their convergence certificate, of the two SV-PGS fits per replicate
+                "uncertified_fits": sum(len(row.get("uncertified_arms", [])) for row in group),
                 "snv_indel_auc": mean_se(row["snv_indel_auc"] for row in group),
                 "with_sv_auc": mean_se(row["with_sv_auc"] for row in group),
                 "ldpred2_auc": mean_se(row.get("ldpred2_auc") for row in group),

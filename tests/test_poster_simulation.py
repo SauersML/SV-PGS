@@ -44,6 +44,8 @@ def test_summary_keeps_each_comparisons_actual_denominator(tmp_path):
                       truth=dict(structural_share=.2, causal_by_class=[160, 0, 0, 40], causal_count=200))
         if replicate == 0:
             result.update(ldpred2_allvar_auc=.62, delta_auc_vs_ldpred2_allvar=-.01, z_vs_ldpred2_allvar=-2.0)
+        if replicate == 1:
+            result.update(uncertified_arms=["snv_indel"])
         (folder / "result.json").write_text(json.dumps(result))
     failed = tmp_path / "grid/tasks/sv_20pct/n40000/replicate3/with_sv"
     failed.mkdir(parents=True)
@@ -51,7 +53,7 @@ def test_summary_keeps_each_comparisons_actual_denominator(tmp_path):
                                                         arm="with_sv", status="failed")))
     summary = json.loads(simulation.collect(tmp_path, tmp_path / "summary.json").read_text())
     cell = summary["points"]["sv_20pct"]["sizes"]["40000"]
-    assert cell["replicates"] == 3 and cell["failed_replicates"] == 1
+    assert cell["replicates"] == 3 and cell["failed_replicates"] == 1 and cell["uncertified_fits"] == 1
     assert cell["delta_auc"]["replicates"] == 3 and cell["power"]["replicates"] == 2
     assert cell["power"]["rate"] == 1.0
     assert cell["auc_intervals"]["ldpred2_allvar_auc"]["replicates"] == 1

@@ -57,9 +57,8 @@ def test_exact_feature_identity_disambiguates_equal_length_and_symbolic_alleles(
     assert chromosome_identity(**sv) != chromosome_identity(**(sv | dict(ends=[601])))
 
 
-def test_acceptance_quarantines_unresolved_fits_but_allows_null_notes():
-    from sv_pgs.model_acceptance import acceptance, require_accepted
-    import pytest
+def test_acceptance_fails_unresolved_fits_but_allows_null_notes():
+    from sv_pgs.model_acceptance import acceptance
     model = SimpleNamespace(model_names=('null',), scoring=(), refusals=('no variable genetic columns',),
                             certificate=dict(outer_criterion_met=np.array([True]), unresolved=np.array([0]),
                                              budget_unresolved=np.array([0]), restored_best=np.array([False]), far_field_scale=np.array([0.])))
@@ -67,8 +66,7 @@ def test_acceptance_quarantines_unresolved_fits_but_allows_null_notes():
     assert not acceptance(model)['deployment_validated']
     for term, value in (('outer_criterion_met', False), ('budget_unresolved', 1), ('restored_best', True)):
         bad = SimpleNamespace(**(vars(model) | {'certificate': model.certificate | {term: np.array([value])}}))
-        with pytest.raises(ValueError, match='quarantined'):
-            require_accepted(bad)
+        assert not acceptance(bad)['accepted']
     model.certificate['unresolved'] = np.array([3])
     assert acceptance(model)['accepted']  # Failed trials do not invalidate a converged final state.
     model.refusals = ('lattice check unresolved: refit failed',)

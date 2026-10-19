@@ -192,8 +192,16 @@ def run(
     started = time.time()
     model = module.fit(train)
     write_prediction(model, test, out, time.time() - started, method=str(method), scenario=str(scenario), cores=cores,
-                     measurement=ARMS[arm][2], dropped_classes=list(dropped), train_count=int(train.n_samples), train_seed=train_seed)
+                     measurement=ARMS[arm][2], dropped_classes=list(dropped), train_count=int(train.n_samples), train_seed=train_seed,
+                     **certification(model))
     return model
+
+
+def certification(model) -> dict:
+    """The fit's certification verdict for its meta, where the method records one (``profile["acceptance"]``)."""
+    verdict = getattr(model, "profile", {}).get("acceptance")
+    return {} if verdict is None else {"certified": bool(verdict["accepted"]),
+                                       "certification_issues": sorted({i["code"] for i in verdict["issues"] if i["severity"] == "fatal"})}
 
 
 def write_prediction(model, test: ScoreData, out: Path, fit_seconds: float, **meta) -> None:
