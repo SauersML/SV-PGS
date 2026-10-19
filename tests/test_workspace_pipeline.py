@@ -9,6 +9,7 @@ signatures; they are other lanes' modules.
 """
 from __future__ import annotations
 
+import csv
 import dataclasses
 import datetime
 import gzip
@@ -1213,3 +1214,27 @@ def test_two_diseases_with_the_same_eligible_rows_reserve_the_same_families_and_
         np.testing.assert_array_equal(calibration[:, fold], calibration[:, fold_count + 1 + fold])
     groups = model_groups(np.arange(rows), np.ones((model_traits.shape[0], 1), dtype=bool), training & ~calibration, (TraitType.QUANTITATIVE,) * model_traits.shape[0])
     assert [group.tolist() for group in groups] == [[0, 3], [1, 4], [2, 5], [6], [7], [8]]
+
+
+def test_a_single_split_fits_one_model_per_trait_and_reports_its_test_fold_alone(workspace) -> None:
+    """cross_fit false: each trait's one model trains on every fold but the test fold (fold 0 without a panel), is
+    scored on that fold alone, and is the model the effects step reads; the report's cells hold the test fold only."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "cross_fit": False, "panel": None})
+    assert config.model_folds() == (0,)
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET)
+    run = config.run_directory
+    cohort = np.load(run / "cohort" / "cohort.npz")
+    design = json.loads((run / "cohort" / "cohort.json").read_text())
+    traits = len(design["trait_names"])
+    assert cohort["model_traits"].tolist() == list(range(traits)) and cohort["model_folds"].tolist() == [0] * traits
+    assert design["model_names"] == [f"{name}/fold0" for name in design["trait_names"]]
+    observed = np.isfinite(cohort["targets"])
+    np.testing.assert_array_equal(cohort["held_out"], observed & (cohort["folds"] == 0)[:, None])
+    assert not np.any(cohort["training"] & (cohort["folds"] == 0)[:, None])
+    with (run / "report" / "accuracy.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert {row["level"] for row in rows if row["cell"] == "fold"} == {"0"}
+    assert all(row["value"] != "nan" for row in rows if row["cell"] == "all" and row["value"])
+    # The cross-fitting default keeps its cohort key, so its runs are not redone.
+    assert WorkspaceConfig.from_mapping(synthetic.raw).cross_fit and WorkspaceConfig.from_mapping(synthetic.raw).model_folds() == (0, 1, 2)

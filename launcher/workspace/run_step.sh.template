@@ -1,7 +1,7 @@
 #!/bin/bash
 # TEMPLATE, never launched by an agent: launching is the user's decision (submit.sh fills and submits it).
 # The Batch task. It builds the locked environment offline with uv from what the user staged under
-# svpgs/${RUN_ID}/ in the ops bucket (the source tree, the uv binary, a uv cache holding every
+# svpgs/${RUN_ID}/ in the ops bucket (the source tree, and env.tar: the uv binary, a uv cache holding every
 # locked wheel, and a uv-installed CPython 3.12), then runs the pipeline through ${THROUGH}. The VM has no external IP,
 # and the image's own Python is not the 3.12 sv-pgs needs, so nothing is fetched and the image's Python is never used.
 # Status goes only to empty marker files in the workspace's ops bucket mount.
@@ -12,11 +12,11 @@ mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)
 trap 'mark "terminated"; exit 75' TERM
 mark started
 if [ ! -f "$RUN/tools/staged" ]; then
-  # The bucket mount gives no file an execute bit, so uv and Python are copied to the run disk first. The marker is
-  # written last, so a copy a preemption cut short is redone.
-  mkdir -p "$RUN/tools" && cp "$OPS/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" \
-    && rm -rf "$RUN/python" "$RUN/uv-cache" && cp -r "$OPS/python" "$RUN/python" && cp -r "$OPS/uv-cache" "$RUN/uv-cache" \
-    && chmod +x "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
+  # uv, Python and the cache come as one tarball read in one stream: copied file by file over the bucket mount, the
+  # cache's tens of thousands of files took over 20 minutes. The marker is written last, so an extraction a preemption
+  # cut short is redone.
+  rm -rf "$RUN/tools" "$RUN/bin" "$RUN/python" "$RUN/uv-cache" && mkdir -p "$RUN/tools" && tar -xf "$OPS/env.tar" -C "$RUN" \
+    && mv "$RUN/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
     || { mark "exit-install"; exit 1; }
 fi
 # Every start syncs: a retried task can find the venv a preempted attempt left half built, and the sync adds only what
@@ -30,6 +30,10 @@ case "${UV_EXTRAS}" in
            || { mark "exit-no-gpu"; exit 1; } ;;
 esac
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
+# google-auth 2.4x reaches the metadata server over mTLS when the VM offers its certificates, and the Batch image's
+# do not verify ("CERTIFICATE_VERIFY_FAILED"): the job then had no credentials. Plain HTTP to the metadata server is
+# the VM-local path every earlier version used.
+export GCE_METADATA_MTLS_MODE=none
 # The job's bucket mounts (the job templates' volumes): an input file there is keyed by its object's generation instead
 # of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
 # IMPUTED_BUCKET holds the imputed batches and their strata sidecar, PANEL_BUCKET the panel's bubble.split sites.

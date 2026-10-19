@@ -2,9 +2,8 @@
 # Never run by an agent: staging is the user's step, from a Workbench app with internet access inside the workspace.
 # Stages what every Batch job builds its environment from under gs://${OPS_BUCKET}/svpgs/${RUN_ID}/:
 #   source/          this repository at HEAD (git archive)
-#   bin/uv           the uv binary
-#   python/          a uv-installed CPython 3.12
-#   uv-cache/        every locked wheel, the gpu extra and the dev group (the GPU check's pytest)
+#   env.tar          bin/uv (the uv binary), python/ (a uv-installed CPython 3.12) and uv-cache/ (every locked
+#                    wheel, the gpu extra and the dev group: the GPU check's pytest), as one tarball
 #   run_config.json  the filled run_config.template.json, refused while a ${PLACEHOLDER} or a template key is missing
 #
 #   OPS_BUCKET=... RUN_ID=... launcher/workspace/stage.sh my_run_config.json
@@ -41,9 +40,13 @@ uv python install 3.12
 cp "$config" "$work/run_config.json"
 destination="gs://${OPS_BUCKET}/svpgs/${RUN_ID}"
 # each part removed before its copy, so a restage at a later commit leaves no file of the earlier one behind
+# uv, Python and the cache go as one tarball (env.tar), which a job reads in one stream: copied file by file over the
+# bucket mount, the cache took over 20 minutes.
+tar -C "$work" -cf "$work/env.tar" bin python uv-cache
 for part in source bin python uv-cache; do
   if gcloud storage ls "$destination/$part" > /dev/null 2>&1; then gcloud storage rm -r "$destination/$part"; fi
-  gcloud storage cp -r "$work/$part" "$destination/"
 done
+gcloud storage cp -r "$work/source" "$destination/"
+gcloud storage cp "$work/env.tar" "$destination/env.tar"
 gcloud storage cp "$work/run_config.json" "$destination/run_config.json"
 echo "staged $(git -C "$root" rev-parse --short HEAD) at $destination"

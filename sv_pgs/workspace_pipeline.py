@@ -402,6 +402,10 @@ class WorkspaceConfig:
     calibration_fraction: float = 0.0
     annotated_prior: bool = True
     panel: PanelInputs | None = None
+    cross_fit: bool = True
+    """True: one model per fold, each scored on the fold it left out, and an all-rows model per trait. False: a single
+    train/test split, one model per trait trained on every fold but the test fold (the panel's primary fold, else fold
+    0) and scored on it, which also serves as the trait's released model: 1 / fold_count of the rows test, the rest train."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -410,7 +414,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel"})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit"})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -420,6 +424,8 @@ class WorkspaceConfig:
             raise ValueError("disease_likelihood must be gaussian_working or bernoulli")
         if not isinstance(raw.get("annotated_prior", True), bool):
             raise ValueError("annotated_prior must be a boolean")
+        if not isinstance(raw.get("cross_fit", True), bool):
+            raise ValueError("cross_fit must be a boolean")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -490,7 +496,15 @@ class WorkspaceConfig:
             calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
             annotated_prior=raw.get("annotated_prior", True),
             panel=PanelInputs.from_mapping(raw.get("panel"), diseases + traits, int(raw["fold_count"])),
+            cross_fit=raw.get("cross_fit", True),
         )
+
+    def model_folds(self) -> tuple[int, ...]:
+        """Each trait's models by the fold they leave out, in model order: every fold then fold_count (the all-rows
+        model, which leaves out no one) when cross-fitting; the test fold alone for a single split."""
+        if self.cross_fit:
+            return tuple(range(self.fold_count + 1))
+        return (0 if self.panel is None else self.panel.primary_fold,)
 
     def truth_path(self, chromosome: str) -> Path:
         if self.truth_calls is None:
@@ -1000,10 +1014,11 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
     # The kinship components as family clusters 0..C-1, the resampling unit of the held-out tests.
     families = np.unique(np.array([int(row["family"]) for row in kept], dtype=np.int64), return_inverse=True)[1].astype(np.int64)
     # Per trait, one model per fold (trained without that fold, scored on it) and then the all-rows model (fold index
-    # fold_count, which no person belongs to: it trains on every observed row and holds none out).
-    models_per_trait = config.fold_count + 1
-    model_traits = np.repeat(np.arange(len(trait_names)), models_per_trait)
-    model_folds = np.tile(np.arange(models_per_trait), len(trait_names))
+    # fold_count, which no person belongs to: it trains on every observed row and holds none out); a single split
+    # (cross_fit false) fits only the test fold's model.
+    trait_folds = config.model_folds()
+    model_traits = np.repeat(np.arange(len(trait_names)), len(trait_folds))
+    model_folds = np.tile(np.array(trait_folds, dtype=np.int64), len(trait_names))
     observed = cohort.observed[:, model_traits]
     training = observed & (folds[:, None] != model_folds[None, :])
     held_out = observed & (folds[:, None] == model_folds[None, :])
@@ -1025,7 +1040,7 @@ def _cohort_step(run: _Run, directory: Path) -> dict[str, Any]:
         model_folds=model_folds,
     )
     trait_types = [TraitType.BINARY.value] * len(config.diseases) + [TraitType.QUANTITATIVE.value] * len(config.traits)
-    fold_names = [f"fold{fold}" for fold in range(config.fold_count)] + [ALL_ROWS_MODEL]
+    fold_names = {fold: ALL_ROWS_MODEL if fold == config.fold_count else f"fold{fold}" for fold in trait_folds}
     _write_json(
         directory / "cohort.json",
         {
@@ -1095,8 +1110,13 @@ class _Cohort:
         return np.flatnonzero(self.model_traits == trait)
 
     def all_rows_model(self, trait: int) -> int:
-        """The all-rows model of one trait (ALL_ROWS_MODEL), the last of its models."""
+        """The released model of one trait, the last of its models: the all-rows model (ALL_ROWS_MODEL) when
+        cross-fitting, else the single split's one model, trained on every fold but the test fold."""
         return int(self.trait_models(trait)[-1])
+
+    def evaluated_folds(self, trait: int, fold_count: int) -> tuple[int, ...]:
+        """The folds a trait's held-out predictions cover: those its fold models leave out (never the all-rows model's)."""
+        return tuple(sorted(int(fold) for fold in self.model_folds[self.model_traits == trait] if fold < fold_count))
 
 
 def _read_cohort(run: _Run) -> _Cohort:
@@ -3385,17 +3405,18 @@ class _HeldOutCell:
 
 
 def _cells(cohort: _Cohort, trait: int, fold_count: int) -> list[tuple[str, str, _HeldOutCell]]:
-    """Every report cell of a trait: all its held-out rows, each fold, each ancestry group and each half."""
+    """Every report cell of a trait: all its held-out rows, each evaluated fold, each ancestry group and each half."""
     observed = np.isfinite(cohort.targets[:, trait])
     ancestry, half = np.array(cohort.ancestry), np.array(cohort.half)
+    folds = cohort.evaluated_folds(trait, fold_count)
 
     def cell(member: BoolArray) -> _HeldOutCell:
-        return _HeldOutCell(tuple(np.flatnonzero(observed & member & (cohort.folds == fold)) for fold in range(fold_count)))
+        return _HeldOutCell(tuple(np.flatnonzero(observed & member & (cohort.folds == fold)) for fold in folds))
 
     everyone = np.ones(cohort.folds.shape[0], dtype=bool)
     return (
         [("all", "all", cell(everyone))]
-        + [("fold", str(fold), cell(cohort.folds == fold)) for fold in range(fold_count)]
+        + [("fold", str(fold), cell(cohort.folds == fold)) for fold in folds]
         + [("ancestry", label, cell(ancestry == label)) for label in sorted(set(cohort.ancestry))]
         + [("half", label, cell(half == label)) for label in sorted(set(cohort.half))]
     )
@@ -3795,7 +3816,11 @@ _STEPS = (
     # The targets come from the occasion model (``phenotype_measurement``, on ``scale_mixture_ep``'s lattice), so a change
     # to either is a change to the phenotypes, not only a change to ``all_of_us``.
     _Step("phenotypes", (), _phenotype_inputs, (all_of_us, phenotype_measurement, scale_mixture_ep, _phenotypes_step), _phenotypes_step),
-    _Step("cohort", ("samples", "phenotypes"), lambda config: config.calibration_fraction, (cohort_module, _cohort_step, development_calibration, trait_table), _cohort_step),
+    _Step(
+        "cohort", ("samples", "phenotypes"),
+        lambda config: config.calibration_fraction if config.cross_fit else (config.calibration_fraction, config.model_folds()),
+        (cohort_module, _cohort_step, development_calibration, trait_table), _cohort_step,
+    ),
     _Step(
         "measurement",
         ("samples", "cohort", "store"),
