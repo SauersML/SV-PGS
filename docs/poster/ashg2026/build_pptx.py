@@ -162,14 +162,15 @@ def simulation_copy(summary: dict) -> None:
     # SV-PGS against LDpred2-auto on its SNV subset; "beat" counts only architectures whose 95% interval lies above zero
     versus = {name: cell["delta_auc_vs_ldpred2"] for name, cell in cells.items()
               if cell and cell.get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES}
-    if versus:
+    # the "up to" margin comes from an architecture SV-PGS beat, never from one whose interval crosses zero
+    ahead = {name: entry for name, entry in versus.items() if entry["lower"] > 0}
+    if ahead:
+        best = max(ahead, key=lambda name: ahead[name]["mean"])
+        accuracy.append([(f"SV-PGS beat LDpred2-auto (SNV subset) in {len(ahead)} of {len(versus)} architectures at {largest_text} "
+                          f"training samples, by up to {auc_change(ahead[best])} AUC.", "")])
+    elif versus:
         best = max(versus, key=lambda name: versus[name]["mean"])
-        ahead = sum(entry["lower"] > 0 for entry in versus.values())
-        if ahead:
-            accuracy.append([(f"SV-PGS beat LDpred2-auto (SNV subset) in {ahead} of {len(versus)} architectures at {largest_text} "
-                              f"training samples, by up to {auc_change(versus[best])} AUC.", "")])
-        else:
-            accuracy.append([(f"SV-PGS minus LDpred2-auto (SNV subset), {largest_text} training samples: {auc_change(versus[best])}.", "")])
+        accuracy.append([(f"SV-PGS minus LDpred2-auto (SNV subset), {largest_text} training samples: {auc_change(versus[best])}.", "")])
     if accuracy:
         SIMULATION_ACCURACY = accuracy
 
@@ -230,8 +231,8 @@ def simulation_copy(summary: dict) -> None:
             SIMULATION_GENOTYPES = [genotypes[-1]]
 
     conclusions = []
-    if versus and sum(entry["lower"] > 0 for entry in versus.values()):
-        conclusions.append([(f"SV-PGS beat LDpred2-auto by up to {number(versus[max(versus, key=lambda name: versus[name]['mean'])]['mean'])} AUC.", "")])
+    if ahead:
+        conclusions.append([(f"SV-PGS beat LDpred2-auto by up to {number(ahead[max(ahead, key=lambda name: ahead[name]['mean'])]['mean'])} AUC.", "")])
     window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0} if cohort else {}
     if window_raised:
         best = max(window_raised, key=lambda point: window_raised[point][1]["mean"])
