@@ -1018,6 +1018,31 @@ def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(worksp
         run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="store")
 
 
+def test_popped_records_without_info_cm_take_positions_interpolated_between_those_with_it(workspace) -> None:
+    """AoU's popped batches leave INFO/CM off some records: the first (held at the first carried value), one sharing a
+    POS with carried records (their value), and the last (held at the last carried value); the store counts them."""
+    synthetic, client = workspace
+    dropped = (0, 4, 8)
+    for label, batches in HALVES:
+        for batch, _width in batches:
+            for chromosome in CHROMOSOMES:
+                path = synthetic.root / label / f"{chromosome}.{batch}.vcf"
+                lines = path.read_text().splitlines()
+                body = len(lines) - len(RECORDS)
+                for record in dropped:
+                    lines[body + record] = re.sub(r";CM=[0-9.]+", "", lines[body + record])
+                path.write_text("\n".join(lines) + "\n")
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    assert summaries["store"]["genetic_position"] == {
+        chromosome: f"INFO/CM, interpolated in bp for the 3 of {len(RECORDS)} records without it" for chromosome in CHROMOSOMES
+    }
+    carried = [0.001 * position for position, *_rest in RECORDS]
+    expected = [carried[1], *carried[1:8], carried[7]]
+    with DosageStore.open(config.run_directory / "store" / "store") as store:
+        np.testing.assert_allclose(store.variant_table.genetic_position_cm, expected * len(CHROMOSOMES))
+
+
 def _strata(identifiers, carried, totals) -> StrataSites:
     count = len(identifiers)
     zeros = np.zeros(count, dtype=np.int64)

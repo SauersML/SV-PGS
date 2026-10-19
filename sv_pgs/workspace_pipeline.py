@@ -1259,7 +1259,8 @@ def _checked_genetic_positions(path: Path, centimorgans: F64Array, source: str) 
 
 
 def read_popped_sites(path: Path, strata: StrataSites) -> RecordSites:
-    """One popped batch file's site fields, checked against the strata sidecar.
+    """One popped batch file's site fields, checked against the strata sidecar, with INFO/CM NaN where a record has none
+    (``_popped_chromosome_sites`` fills those).
 
     Each record is checked against its sidecar row (POS, INFO/ID, REF/ALT md5, allele lengths).
     The whole file is then checked against the sidecar's sites md5 (the md5 of the records'
@@ -1291,11 +1292,9 @@ def read_popped_sites(path: Path, strata: StrataSites) -> RecordSites:
             ):
                 raise ValueError(f"{path} record {row}: POS, INFO/ID, REF/ALT or allele lengths differ from the strata sidecar.")
             centimorgans = record.INFO.get("CM")
-            if centimorgans is None:
-                raise ValueError(f"{path} record {row}: no INFO/CM, so the record has no genetic position.")
             refs.append(record.REF)
             alts.append(alt)
-            genetic.append(float(centimorgans))
+            genetic.append(np.nan if centimorgans is None else float(centimorgans))
             lengths.append(info_sv_length(record))
     finally:
         reader.close()
@@ -1309,8 +1308,20 @@ def read_popped_sites(path: Path, strata: StrataSites) -> RecordSites:
         sv_types=(None,) * count,
         sv_lengths=np.array(lengths, dtype=np.float64),
         ends=(None,) * count,
-        genetic_position_cm=_checked_genetic_positions(path, np.array(genetic, dtype=np.float64), "INFO/CM"),
+        genetic_position_cm=np.array(genetic, dtype=np.float64),
     )
+
+
+def carried_genetic_positions(positions: NDArray, centimorgans: F64Array) -> F64Array:
+    """Each record's genetic position: its INFO/CM where it carries one, else linear in bp between the records that do,
+    held at the first or last carried value before or after them. The carried values are the imputation's own map, so
+    no outside map is read; a chromosome where fewer than two positions carry INFO/CM has none to interpolate on."""
+    positions = np.asarray(positions, dtype=np.int64)
+    carried = np.isfinite(centimorgans)
+    map_positions, first = np.unique(positions[carried], return_index=True)
+    if map_positions.shape[0] < 2:
+        raise ValueError(f"INFO/CM is on {int(carried.sum())} records at {map_positions.shape[0]} positions; interpolating the rest needs two.")
+    return np.where(carried, centimorgans, np.interp(positions, map_positions, centimorgans[carried][first]))
 
 
 def read_bubble_paths(path: Path) -> list[list[frozenset[str]]]:
@@ -1637,7 +1648,14 @@ def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, ch
     record's bubble, K and m from bubble.split; the sidecar's n_paths, n_paths_total and cx are its annotations."""
     strata = read_strata_sites(popped.strata_directory, chromosome, complexity_legend)
     first_half = config.imputed_halves[0]
-    records = read_popped_sites(first_half.path(chromosome, first_half.batches[0]), strata)
+    path = first_half.path(chromosome, first_half.batches[0])
+    records = read_popped_sites(path, strata)
+    # AoU's popped batches leave INFO/CM off some records (chr1's first, for one): those take positions interpolated
+    # between the records that carry it, and the store's facts count them.
+    missing = int(np.count_nonzero(~np.isfinite(records.genetic_position_cm)))
+    source = "INFO/CM" if missing == 0 else f"INFO/CM, interpolated in bp for the {missing} of {strata.positions.shape[0]} records without it"
+    centimorgans = carried_genetic_positions(strata.positions, records.genetic_position_cm) if missing else records.genetic_position_cm
+    records = dataclasses.replace(records, genetic_position_cm=_checked_genetic_positions(path, centimorgans, source))
     counts = path_counts(strata, read_bubble_paths(popped.bubble_split_path(chromosome)))
     batch_count = sum(len(half.batches) for half in config.imputed_halves)
     return ChromosomeSites(
@@ -1658,7 +1676,7 @@ def _popped_chromosome_sites(popped: PoppedSidecars, config: WorkspaceConfig, ch
             "cx": strata.complexity,
         },
         annotation_legends={} if strata.complexity_legend is None else {"cx": strata.complexity_legend},
-        facts={"genetic_position": "INFO/CM", "reported_r2_fields": ["INFO"], "probability_checked_batches": batch_count, "imputed_batches": batch_count},
+        facts={"genetic_position": source, "reported_r2_fields": ["INFO"], "probability_checked_batches": batch_count, "imputed_batches": batch_count},
     )
 
 
