@@ -195,32 +195,47 @@ def simulation_copy(summary: dict) -> None:
     if genotypes:
         SIMULATION_GENOTYPES = genotypes
 
-    # the window study: per architecture, the gain from adding SVs at its largest settled size, true then imputed
+    # the window study: the design, then the architecture with the largest true-genotype gain at its largest settled
+    # size, its imputed gain there, and the no-causal-SV control
     window = summary.get("window", {})
     cohort = window.get("cohort")
-    window_gains = []
-    for point, label in ARCHITECTURE_LABELS:
-        entries = {}
-        for measurement in ("true", "imputed"):
-            cells = window.get(measurement, {}).get(point, {})
-            done = [size for size in sorted(cells.get("sizes", {}), key=int, reverse=True) if settled(cells, size)]
-            if done:
-                entries[measurement] = (int(done[0]), cells["sizes"][done[0]]["delta_auc"])
-        if entries:
-            window_gains.append((label, entries))
-    if cohort and window_gains:
+
+    def window_gain(measurement: str, point: str) -> tuple[int, dict] | None:
+        cells = window.get(measurement, {}).get(point, {})
+        done = [size for size in sorted(cells.get("sizes", {}), key=int, reverse=True) if settled(cells, size)]
+        return (int(done[0]), cells["sizes"][done[0]]["delta_auc"]) if done else None
+
+    true_gains = {point: window_gain("true", point) for point, _label in ARCHITECTURE_LABELS}
+    true_gains = {point: gain for point, gain in true_gains.items() if gain}
+    if cohort and true_gains:
         megabases = (cohort["end_bp"] - cohort["start_bp"]) / 1e6
+        replicates = min(gain[1]["replicates"] for gain in true_gains.values())
         WINDOW = [[(f"One {megabases:.0f}-Mb chr22 window ({cohort['last_record'] - cohort['first_record']:,} variants, the same "
-                    "50,000 people) fits in minutes, so every architecture runs at every size.", "")]]
-        for label, entries in window_gains:
-            parts = [f"{'true SV genotypes' if measurement == 'true' else 'imputed'} {auc_change(entry)} at {count // 1000}k"
-                     for measurement, (count, entry) in entries.items()]
-            WINDOW.append([(f"{label}: adding SVs changed AUC by " + "; ".join(parts) + ".", "")])
+                    f"50,000 people) runs every architecture at every size, {replicates}+ replicates each.", "")]]
+        best = max(true_gains, key=lambda point: true_gains[point][1]["mean"])
+        count, true = true_gains[best]
+        label = dict(ARCHITECTURE_LABELS)[best]
+        imputed = window_gain("imputed", best)
+        sentence = f"{label}: adding SVs raised AUC by {auc_change(true)} on true SV genotypes at {count // 1000}k"
+        if imputed:
+            sentence += f" and by {auc_change(imputed[1])} imputed"
+        control = window_gain("true", "null")
+        if control:
+            sentence += f"; with no causal SVs, {auc_change(control[1])}"
+        WINDOW.append([(sentence + ".", "")])
+        # the per-architecture sentences give way to the window figure: the genotype text keeps the r^2 sentence only
+        if accuracy_by_frequency:
+            SIMULATION_GENOTYPES = [genotypes[-1]]
 
     conclusions = []
     if versus and sum(entry["lower"] > 0 for entry in versus.values()):
         conclusions.append([(f"SV-PGS beat LDpred2-auto by up to {number(versus[max(versus, key=lambda name: versus[name]['mean'])]['mean'])} AUC.", "")])
-    if raised:
+    window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0} if cohort else {}
+    if window_raised:
+        best = max(window_raised, key=lambda point: window_raised[point][1]["mean"])
+        conclusions.append([(f"Measured SVs raised AUC by up to {number(window_raised[best][1]['mean'])} "
+                             f"({dict(ARCHITECTURE_LABELS)[best].lower()}).", "")])
+    elif raised:
         conclusions.append([(f"Adding well-measured SVs raised AUC ({'; '.join(dict.fromkeys(raised))}).", "")])
     elif accuracy_by_frequency:
         conclusions.append([(f"Rare SVs impute at r² {number(rare_r2(accuracy_by_frequency['SV']['bins']), 2)} from a 2,072-haplotype "
@@ -583,7 +598,8 @@ def build() -> None:
     xml = column.figure(xml, 120, "genotypes", width=half, x=column.x + 0.37 + half)
     xml = column.caption(xml, 123, "SV genotype accuracy", width=half, x=column.x + 0.37 + half)
     xml = column.text(xml, 127, SIMULATION_GENOTYPES)
-    if "architectures" in figures:
+    # the window study covers the architectures at every size with more replicates: its figure takes their place
+    if "architectures" in figures and "window" not in figures:
         xml = column.figure(xml, 130, "architectures")
         xml = column.caption(xml, 131, "AUC gain by architecture (95% t interval)")
     else:

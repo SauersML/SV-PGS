@@ -366,6 +366,80 @@ def power_figure(summary: dict) -> Path:
     return render("ph_sim_power", page("".join(parts), width, height), width, height)
 
 
+WINDOW_POWER_SERIES = (
+    ("tagged_sv_fold3", "Tagged SVs, 3×", NAVY),
+    ("sv_20pct_fold3", "Any SVs, 3×", TEAL),
+    ("null", "No causal SVs", LIGHT),
+)
+
+
+def window_power(summary: dict, measurement: str, point: str) -> dict[int, dict]:
+    """The window study's power per training size with at least MIN_REPLICATES valid comparisons."""
+    cells = summary.get("window", {}).get(measurement, {}).get(point, {}).get("sizes", {})
+    return {int(size): cell["power"] for size, cell in cells.items() if cell["power"]["replicates"] >= MIN_REPLICATES}
+
+
+def window_power_figure(summary: dict) -> Path:
+    """The chr22 window study's power against training size per causal architecture: the share of replicates whose
+    one-sided paired DeLong test favours the SV arm at 0.05, on true SV genotypes (solid) and imputed SVs (dashed), with
+    Wilson 95% intervals on the true-genotype points."""
+    width, height = 8.20, 4.40
+    w, h = width * 100, height * 100
+    left, top, bottom = 128.0, 28.0, h - 112.0
+    plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in WINDOW_POWER_SERIES) - 40
+    series = [entry for entry in WINDOW_POWER_SERIES if window_power(summary, "true", entry[0]) or window_power(summary, "imputed", entry[0])]
+    counts = sorted({count for point, *_rest in series for measurement in ("true", "imputed") for count in window_power(summary, measurement, point)})
+
+    def x(count: int) -> float:
+        return left + 26 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (plot_right - left - 52)
+
+    def y(rate: float) -> float:
+        return bottom - rate * (bottom - top)
+
+    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
+    parts.append(f'<line x1="{left}" y1="{bottom}" x2="{plot_right}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+    for rate in (0.0, 0.25, 0.5, 0.75, 1.0):
+        parts.append(f'<line x1="{left - 10}" y1="{y(rate):.1f}" x2="{left}" y2="{y(rate):.1f}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{left - 16}" y="{y(rate) + 9:.1f}" text-anchor="end">{rate * 100:.0f}%</text>')
+    for count in counts:
+        parts.append(f'<line x1="{x(count):.1f}" y1="{bottom}" x2="{x(count):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
+    parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Power</text>')
+    parts.append(f'<text class="axis" x="{(left + plot_right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
+    ends, labels = [], []
+    for index, (point, label, colour) in enumerate(series):
+        offset = (index - (len(series) - 1) / 2) * 9.0
+        for measurement in ("imputed", "true"):
+            cells = window_power(summary, measurement, point)
+            marks = [(x(count) + offset, cells[count]) for count in counts if count in cells]
+            if not marks:
+                continue
+            dash = ' stroke-dasharray="12 9"' if measurement == "imputed" else ""
+            parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in marks)
+                         + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"{dash}/>')
+            for px, row in marks:
+                if measurement == "true":
+                    parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
+                    parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
+                else:
+                    parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="8" fill="#fff" stroke="{colour}" stroke-width="4"/>')
+            if measurement == "true" or not window_power(summary, "true", point):
+                ends.append((marks[-1][0], y(marks[-1][1]["rate"]), colour))
+                labels.append(label)
+    placed = spread_labels([end[1] for end in ends], 34.0, top + 8, bottom - 4)
+    for (end_x, end_y, colour), label, label_y in zip(ends, labels, placed):
+        parts.append(f'<polyline points="{end_x + 14:.1f},{end_y:.1f} {plot_right + 10:.1f},{label_y:.1f} {plot_right + 24:.1f},{label_y:.1f}" fill="none" stroke="{colour}" stroke-width="2.5"/>')
+        parts.append(f'<text class="end" x="{plot_right + 32:.1f}" y="{label_y + 9:.1f}" style="fill:{colour}">{label}</text>')
+    # the key, top left inside the axes: solid lines are true genotypes, dashed imputed
+    for row, (text, dash) in enumerate((("True SV genotypes", ""), ("Imputed SVs", ' stroke-dasharray="12 9"'))):
+        key_y = top + 14 + row * 36
+        parts.append(f'<line x1="{left + 24:.1f}" y1="{key_y:.1f}" x2="{left + 80:.1f}" y2="{key_y:.1f}" stroke="{GREY}" stroke-width="5"{dash}/>')
+        parts.append(f'<text class="key" x="{left + 92:.1f}" y="{key_y + 9:.1f}">{text}</text>')
+    parts.append("</svg>")
+    return render("ph_sim_power", page("".join(parts), width, height), width, height)
+
+
 GENOTYPE_CLASSES = (("SNV", "SNVs", NAVY), ("SV", "SVs", TEAL))
 
 
@@ -595,8 +669,11 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     points = summary["points"] if summary else {}
     made.append(accuracy_figure(summary) if summary and all(sizes(summary, point) for point, _title in ACCURACY_PANELS)
                 else placeholder_figure("ph_sim_accuracy"))
-    made.append(power_figure(summary) if summary and all(sizes(summary, point) for point, *_rest in POWER_SERIES)
-                else placeholder_figure("ph_sim_power"))
+    if summary and any(window_power(summary, "true", point) for point, *_rest in WINDOW_POWER_SERIES):
+        made.append(window_power_figure(summary))
+    else:
+        made.append(power_figure(summary) if summary and all(sizes(summary, point) for point, *_rest in POWER_SERIES)
+                    else placeholder_figure("ph_sim_power"))
     made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
                 else placeholder_figure("ph_sim_genotypes"))
     optional = {
