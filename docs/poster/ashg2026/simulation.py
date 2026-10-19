@@ -232,7 +232,10 @@ def fetch(local: Path = LOCAL) -> None:
     local.mkdir(parents=True, exist_ok=True)
     rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--exclude=*"]
     for grid, folder in ((GRID, "grid"), (TRUTH_GRID, "grid-truth"), (WINDOW_GRID, "window"), (f"{WINDOW_GRID}-truth", "window-truth")):
-        subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)], check=True)
+        # exit 24: a source file vanished mid-copy (an attempt.json replaced by its job); the next fetch reads it
+        copied = subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)])
+        if copied.returncode not in (0, 24):
+            raise subprocess.CalledProcessError(copied.returncode, copied.args)
     subprocess.run(["rsync", "-a", f"{REMOTE}/figs/", str(local / "public")], check=True)
     subprocess.run(["rsync", "-a", f"{REMOTE}/{WINDOW_COHORT}/window.json", str(local / "public" / "window.json")], check=True)
 
