@@ -141,6 +141,8 @@ def tick_text(value: float, step: float, percent: bool = False) -> str:
 
 
 MIN_REPLICATES = 3
+POWER_MIN_REPLICATES = 8
+"""A power point is a share of replicates; below 8 valid comparisons its Wilson interval spans most of [0, 1]."""
 """A (point, training size) cell is drawn only with at least this many completed replicates, as build_pptx.py's text."""
 
 
@@ -338,7 +340,7 @@ def power_figure(summary: dict) -> Path:
         offset = (offset_index - (len(present) - 1) / 2) * 9.0
         rows = summary["points"][point]["sizes"]
         points = [(x(int(size)) + offset, rows[size]["power"]) for size in sizes(summary, point)
-                  if rows[size]["power"]["replicates"] >= MIN_REPLICATES]
+                  if rows[size]["power"]["replicates"] >= POWER_MIN_REPLICATES]
         if not points:
             continue
         parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in points)
@@ -374,15 +376,15 @@ WINDOW_POWER_SERIES = (
 
 
 def window_power(summary: dict, measurement: str, point: str) -> dict[int, dict]:
-    """The window study's power per training size with at least MIN_REPLICATES valid comparisons."""
+    """The window study's power per training size with at least POWER_MIN_REPLICATES valid comparisons."""
     cells = summary.get("window", {}).get(measurement, {}).get(point, {}).get("sizes", {})
-    return {int(size): cell["power"] for size, cell in cells.items() if cell["power"]["replicates"] >= MIN_REPLICATES}
+    return {int(size): cell["power"] for size, cell in cells.items() if cell["power"]["replicates"] >= POWER_MIN_REPLICATES}
 
 
 def window_power_figure(summary: dict) -> Path:
     """The chr22 window study's power against training size per causal architecture: the share of replicates whose
-    one-sided paired DeLong test favours the SV arm at 0.05, on true SV genotypes (solid) and imputed SVs (dashed), with
-    Wilson 95% intervals on the true-genotype points."""
+    one-sided paired DeLong test favours the SV arm at 0.05, on true SV genotypes (solid) and imputed SVs (dashed), each
+    point with its Wilson 95% interval."""
     width, height = 8.20, 4.40
     w, h = width * 100, height * 100
     left, top, bottom = 128.0, 76.0, h - 112.0
@@ -412,15 +414,16 @@ def window_power_figure(summary: dict) -> Path:
         offset = (index - (len(series) - 1) / 2) * 9.0
         for measurement in ("imputed", "true"):
             cells = window_power(summary, measurement, point)
-            marks = [(x(count) + offset, cells[count]) for count in counts if count in cells]
+            marks = [(x(count) + offset + (0.0 if measurement == "true" else 14.0), cells[count]) for count in counts if count in cells]
             if not marks:
                 continue
             dash = ' stroke-dasharray="12 9"' if measurement == "imputed" else ""
             parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in marks)
                          + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"{dash}/>')
             for px, row in marks:
+                # imputed marks sit beside the true ones, each with its own Wilson interval
+                parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"{dash}/>')
                 if measurement == "true":
-                    parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
                     parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
                 else:
                     parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="8" fill="#fff" stroke="{colour}" stroke-width="4"/>')
@@ -650,7 +653,7 @@ def window_figure(summary: dict, width: float = 16.95, height: float = 4.6) -> P
             parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
         for measurement, _label, filled, offset in WINDOW_SERIES:
             cells = window_cells(summary, measurement, point)
-            marks = [(x(count) + offset, cells[count]) for count in counts if count in cells]
+            marks = [(x(count) + offset + (0.0 if measurement == "true" else 14.0), cells[count]) for count in counts if count in cells]
             if not marks:
                 continue
             parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(entry['mean']):.1f}" for px, entry in marks)
@@ -670,10 +673,13 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     points = summary["points"] if summary else {}
     made.append(accuracy_figure(summary) if summary and all(sizes(summary, point) for point, _title in ACCURACY_PANELS)
                 else placeholder_figure("ph_sim_accuracy"))
-    if summary and any(window_power(summary, "true", point) for point, *_rest in WINDOW_POWER_SERIES):
+    # the window's power is a curve once some architecture has it at two training sizes
+    if summary and any(len(window_power(summary, "true", point)) >= 2 for point, *_rest in WINDOW_POWER_SERIES):
         made.append(window_power_figure(summary))
     else:
-        made.append(power_figure(summary) if summary and all(sizes(summary, point) for point, *_rest in POWER_SERIES)
+        made.append(power_figure(summary) if summary and all(
+                        any(cell["power"]["replicates"] >= POWER_MIN_REPLICATES for cell in summary["points"].get(point, {}).get("sizes", {}).values())
+                        for point, *_rest in POWER_SERIES)
                     else placeholder_figure("ph_sim_power"))
     made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
                 else placeholder_figure("ph_sim_genotypes"))
