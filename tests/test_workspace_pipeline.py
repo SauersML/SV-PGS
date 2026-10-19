@@ -772,9 +772,9 @@ def test_a_rerun_skips_completed_steps_and_resumes_after_a_failure(workspace) ->
     assert any(path.name.startswith("phenotypes.superseded-") for path in run.iterdir())
 
 
-def test_a_quarantined_fit_takes_its_trait_out_of_every_table_and_the_rest_are_reported(workspace) -> None:
-    """One uncertified model among a run's must not withhold the study: its trait is neither scored nor reported (both
-    arms, since the trait is compared across them), the reports name it, and every other trait goes through."""
+def test_an_uncertified_fit_is_scored_and_reported_and_named(workspace) -> None:
+    """A model that misses certification must not withhold its trait: held-out accuracy measures it whatever its
+    convergence, so the trait is scored and in every table, and uncertified.tsv names it with its arm and codes."""
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
     recorder = _Recorder()
@@ -790,19 +790,21 @@ def test_a_quarantined_fit_takes_its_trait_out_of_every_table_and_the_rest_are_r
     run_pipeline(config, _bindings(recorder, client), BUDGET)
     run = config.run_directory
     arms = json.loads((run / "fit" / "_COMPLETE.json").read_text())["summary"]["arms"]
-    assert len(arms[ARMS[0]]["quarantined"]) == 1 and arms[ARMS[1]]["quarantined"] == []
+    assert len(arms[ARMS[0]]["uncertified"]) == 1 and arms[ARMS[1]]["uncertified"] == []
     cohort = json.loads((run / "cohort" / "cohort.json").read_text())
-    excluded = cohort["trait_names"][0]
+    flagged = cohort["trait_names"][0]
     score = json.loads((run / "score" / "_COMPLETE.json").read_text())["summary"]
-    assert list(score["quarantined"]) == [excluded] and "outer_criterion_met" in score["quarantined"][excluded][0]
+    assert score["quarantined"] == {} and list(score["uncertified"]) == [flagged]
+    assert "outer_criterion_met" in score["uncertified"][flagged][0]
     predictions = np.load(run / "score" / "predictions.npz")
-    assert np.all(np.isnan(predictions["held_out_genetic"][:, :, 0])) and np.any(np.isfinite(predictions["held_out_genetic"][:, :, 1]))
+    assert np.any(np.isfinite(predictions["held_out_genetic"][:, :, 0])) and np.any(np.isfinite(predictions["held_out_genetic"][:, :, 1]))
     for table in ("accuracy.tsv", "comparison.tsv"):
         traits = {line.split("\t")[0] for line in (run / "report" / table).read_text().splitlines()[1:]}
-        assert excluded not in traits and cohort["trait_names"][1] in traits
-    quarantined = [line.split("\t") for line in (run / "report" / "quarantined.tsv").read_text().splitlines()]
-    assert quarantined[0] == list(workspace_pipeline.QUARANTINE_COLUMNS) and [line[0] for line in quarantined[1:]] == [excluded]
-    assert not list((run / "effects").glob(f"{excluded}.*.tsv.gz")) and list((run / "effects").glob(f"{cohort['trait_names'][1]}.*.tsv.gz"))
+        assert flagged in traits and cohort["trait_names"][1] in traits
+    named = [line.split("\t") for line in (run / "report" / "uncertified.tsv").read_text().splitlines()]
+    assert named[0] == list(workspace_pipeline.UNCERTIFIED_COLUMNS) and [line[0] for line in named[1:]] == [flagged]
+    assert (run / "report" / "quarantined.tsv").read_text().splitlines() == ["\t".join(workspace_pipeline.QUARANTINE_COLUMNS)]
+    assert list((run / "effects").glob(f"{flagged}.*.tsv.gz"))
     assert (run / "export" / "_COMPLETE.json").is_file()
 
 

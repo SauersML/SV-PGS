@@ -23,49 +23,24 @@ Batch cannot write to an existing persistent disk ("All options except writing a
 
 ## Study budget
 
-`study_budget.template.json` allocates $2,250 to jobs and reserves $750 for storage,
-queries and other overhead, within the user's $3,000 total. Five folds and the final
-full-data fit remain enabled. No runtime or total-cost claim has been established
-at biobank scale; measure a full-genome pilot before spending the training slots.
+`study_budget.template.json` allocates $2,250 to jobs and reserves $750 for storage, queries and other overhead, within
+the user's $3,000 total: `prepare` for the store job, `pilot` and `train-1` to `train-6` for fit jobs, `evaluate` for
+remaining scoring and report work. Customize the allocations before the first submission, keeping their sum plus the
+reserve at or below $3,000; `STUDY_BUDGET` can point to that customized file.
 
-The `pilot` slot limits spending; it does not select a phenotype. The supplied
-run-config template lists all 15 diseases. For the single-trait pilot, stage a
-config with `diseases: ["hypertension"]`, `traits: []`, and panel weights naming
-only hypertension (or `panel: null` for this timing-only run). Retain all 22
-autosomes, the five folds, calibration and the final fit. With `THROUGH=fit`,
-the pipeline fits both matched variant arms. Inspect acceptance and per-fold
-timings inside the workspace before deciding whether the full study fits the
-remaining budget; merely exhausting the pilot slot is not a successful pilot.
+`submit.sh` requires `BUDGET_SLOT` and a current whole-VM `HOURLY_USD` quote, and sets the task timeout from that slot,
+including every retry and a startup allowance (default: no automatic retries). The first submission writes an immutable
+plan to the ops bucket, and each slot is reserved with a GCS generation precondition before its job is submitted, so
+no slot is spent twice. Keep the same `RUN_ID` throughout the study. A failed submission retains its reservation.
 
-`submit.sh` requires `BUDGET_SLOT` and a current whole-VM `HOURLY_USD` quote. It
-calculates a task timeout from that slot, including every retry and a startup
-allowance. The default is no automatic retries. The six `train-1` through `train-6`
-slots allow bounded successive jobs to resume the same run from its mirror.
-The three `gpucheck` slots ($45 in all, taken evenly from the training slots) are for the GPU check below.
-Use `prepare` for conversion, `pilot` for a bounded benchmark, and `evaluate` for
-remaining scoring/report work. Customize allocations before the first submission,
-keeping their sum plus the reserve at or below $3,000. `STUDY_BUDGET` can point to
-that customized JSON file.
+The first fit job is the run itself: steps are keyed by their inputs, and the fit checkpoints each completed fold, so a
+job that reaches its slot's timeout is continued by the next slot's job from the mirror, losing at most 15 minutes. The
+diseases fitted are the run config's `diseases`: changing that list later re-runs the cohort step and every fit, so
+choose it before the first fit job. Per-fold timings are in each arm/trait's JSON record (`completed_fold_timings`).
 
-The first submission writes an immutable plan to the workspace ops bucket. Each
-slot is reserved with a GCS generation precondition before its job is submitted;
-a second launcher cannot reuse it. Keep the same `RUN_ID` throughout the study.
-Changing the study ID or submitting jobs outside this launcher bypasses this
-ledger. A failed submission retains its reservation and must be inspected; it is
-never automatically refunded or resubmitted under a fresh job name.
-
-These are submission and task-runtime controls, **not an account-wide billing
-cap**. Batch task timeouts do not bound VM provisioning/cleanup or stop bucket
-charges. Check actual spending and storage retention against the
-$750 reserve. Do not delete the budget ledger or reuse a spent slot. Source:
-[Batch task timeouts](https://docs.cloud.google.com/batch/docs/set-timeouts).
-
-The engine checkpoints each completed fold atomically, preserving its seeds,
-posterior draw law and convergence certificate. Checkpoints are bound to the code,
-store and full fitting problem. After an interruption only the unfinished fold
-restarts. Per-fold timing records are retained in each completed arm/trait's JSON
-record as `completed_fold_timings`; unfinished groups retain them in the checkpoint
-metadata. Checkpointing does not relax convergence or remove variants.
+These are submission and task-runtime controls, **not an account-wide billing cap**: Batch task timeouts do not bound VM
+provisioning or bucket charges ([Batch task timeouts](https://docs.cloud.google.com/batch/docs/set-timeouts)). Check
+actual spending against the $750 reserve.
 
 ## Staging (once, from a Workbench app with internet access)
 
@@ -75,14 +50,10 @@ Under `gs://${OPS_BUCKET}/svpgs/${RUN_ID}/`:
 - `source/`: this repository at the commit to run (`git archive`).
 - `bin/uv`: the uv binary (`cp "$(command -v uv)"`).
 - `python/`: CPython 3.12, `UV_PYTHON_INSTALL_DIR=python uv python install 3.12`.
-- `uv-cache/`: every locked wheel, `UV_CACHE_DIR=uv-cache UV_PYTHON_INSTALL_DIR=python uv sync --frozen --extra gpu --python 3.12` in the source tree. The CPU job's `UV_EXTRAS` is empty and uses a subset; the dev group's wheels are there for the GPU check's pytest.
+- `uv-cache/`: every locked wheel, `UV_CACHE_DIR=uv-cache UV_PYTHON_INSTALL_DIR=python uv sync --frozen --extra gpu --python 3.12` in the source tree. The CPU job's `UV_EXTRAS` is empty and uses a subset.
 - `run_config.json`: the filled `run_config.template.json`; its `direct_sv.gatksv_calls` reads the CDR's GATK-SV VCFs through the CPU job's `/mnt/disks/cdr` mount.
 
 The staging machine and the Batch VMs must be the same platform (Linux x86-64). The inputs the config points at are read where they sit inside the workspace, through a mounted bucket.
-
-## The GPU check (once, before the fit)
-
-No CI or local machine has a CUDA device, so the CUDA paths first run here. `submit.sh gpucheck` takes the fit job's placeholders less `THROUGH`, in one of the `gpucheck-1` to `gpucheck-3` slots ($15 each, so a fix can be checked again). It runs every `tests/*_cuda.py`, the CUDA cases of the other test files, and the bench-sim submissions' fits, which take the machine's devices, so Stage 0 and Stage 2 run on them end to end. It neither reads nor writes the run. The report is `launcher/<slot>/gpu_check.log`, with `gpu_check.xml`, `gpu_wiring.xml` and `nvidia-smi.txt` beside it; the task fails if any test fails. The launcher requires at least two requested GPUs before reserving budget, and the task requires at least two visible CUDA devices before testing. Both grouped-fit routes run, including the slower sample-route reference, so a single visible device or a skipped multi-device test cannot silently satisfy this gate. Use the fit job's `GPU_TYPE` on its two-GPU machine (`a2-highgpu-2g` for A100s) with `GPU_COUNT=2`, Spot: the multi-device cases need two devices, and $15 covers the startup allowance and about two hours at Spot prices.
 
 ## Placeholders
 

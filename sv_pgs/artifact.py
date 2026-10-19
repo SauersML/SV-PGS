@@ -38,7 +38,7 @@ from sv_pgs.fast_scoring import (
     score_genetic,
     score_linear_predictor,
 )
-from sv_pgs.model_acceptance import acceptance, require_accepted, subset_refusals
+from sv_pgs.model_acceptance import acceptance, require_scorable, subset_refusals
 from sv_pgs.scale_mixture_ep import MixtureHyperparameters
 
 MODEL_FORMAT = "svpgs-model v3"
@@ -471,7 +471,7 @@ def predict_models(
     layout = sites_digest(store.root)
     complete_store_digest = None
     for model in models:
-        require_accepted(model)
+        require_scorable(model)
         if layout != model.provenance.sites_digest:
             raise ValueError(f"{store.root} has a different variant layout than the store the model was fitted on.")
         if not portable(store.root, read_manifest(store.root)):

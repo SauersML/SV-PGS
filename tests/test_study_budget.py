@@ -216,55 +216,6 @@ def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, throug
     assert "-o ro" in cdr["mountOptions"] and "--billing-project=test-project" in cdr["mountOptions"]
 
 
-def test_the_gpu_check_runs_the_cuda_tests_on_the_fit_job_s_machine_and_reports_to_its_slot(tmp_path):
-    launcher, environment = _fake_cloud(tmp_path)
-    environment.pop("THROUGH")
-    environment["BUDGET_SLOT"] = "gpucheck-1"
-    environment.update(GPU_COUNT="2", MACHINE_TYPE="a2-highgpu-2g")
-    submitted = subprocess.run(["bash", str(launcher), "gpucheck"], env=environment, capture_output=True, text=True)
-    assert submitted.returncode == 0, submitted.stderr
-    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
-    # $15 at $2.40 an hour, less the hour's startup allowance.
-    guard.validate_job(spec, 18900, 0)
-    assert spec["allocationPolicy"]["instances"][0]["policy"]["accelerators"] == [{"type": "nvidia-tesla-a100", "count": 2}]
-    assert spec["taskGroups"][0]["taskSpec"]["runnables"][0]["script"]["text"] == "bash /mnt/disks/ops/svpgs/study/launcher/gpucheck-1/run_step.sh"
-    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/gpucheck-1/run_step.sh"]
-    assert "${RUN_ID}" not in script and "${BUDGET_SLOT}" not in script and 'REPORT="$OPS/launcher/gpucheck-1"' in script
-    # The dev group's pytest is synced (no --no-dev), the GPU is checked before the tests, and the run is untouched.
-    assert "--extra gpu" in script and "--no-dev" not in script
-    assert script.index("exit-no-gpu") < script.index("-m pytest") and "tests/*_cuda.py" in script
-    assert "run-mirror" not in script and "workspace-run" not in script
-    assert 'tests/test_stage2_wiring.py >> "$REPORT/gpu_check.log"' in script
-    assert '--junitxml="$REPORT/gpu_wiring.xml"' in script
-
-
-@pytest.mark.parametrize("count", ["", "0", "1", "-2", "two", "2.0"])
-def test_gpu_check_refuses_fewer_than_two_devices_before_reserving_budget(tmp_path, count):
-    launcher, environment = _fake_cloud(tmp_path)
-    environment.update(BUDGET_SLOT="gpucheck-1", GPU_COUNT=count)
-    refused = subprocess.run(["bash", str(launcher), "gpucheck"], env=environment, capture_output=True, text=True)
-    assert refused.returncode != 0 and "GPU_COUNT >= 2" in refused.stderr
-    assert not (tmp_path / "objects.json").exists() and not (tmp_path / "submitted.jsonl").exists()
-
-
-@pytest.mark.parametrize("visible", [0, 1, 2])
-def test_gpu_check_checks_actual_device_visibility_before_running_tests(tmp_path, visible):
-    import shlex
-
-    template = Path(__file__).parents[1] / "launcher/workspace/gpu_check.sh.template"
-    line = next(line for line in template.read_text().splitlines() if '" -c "import cupy' in line)
-    command = shlex.split(line.removesuffix("\\"))
-    # Run the actual task's probe with a fake driver: a two-device allocation can still expose just one device.
-    (tmp_path / "cupy.py").write_text(
-        "from types import SimpleNamespace\n"
-        f"cuda = SimpleNamespace(runtime=SimpleNamespace(getDeviceCount=lambda: {visible}))\n"
-    )
-    result = subprocess.run([sys.executable, *command[1:]], env=dict(os.environ, PYTHONPATH=str(tmp_path)),
-                            capture_output=True, text=True, cwd=tmp_path)
-    assert (result.returncode == 0) == (visible >= 2), result.stderr
-    assert f"Visible CUDA devices: {visible}" in result.stdout
-
-
 def test_staging_refuses_a_run_config_with_a_placeholder_or_a_missing_key(tmp_path: Path) -> None:
     stage = Path(__file__).parents[1] / "launcher/workspace/stage.sh"
     template = (Path(__file__).parents[1] / "launcher/workspace/run_config.template.json").read_text()

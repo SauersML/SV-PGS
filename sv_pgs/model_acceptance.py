@@ -1,7 +1,9 @@
-"""Numerical release gate for fitted research models, separate from deployment validation.
+"""A fitted model's certification verdict, and what scoring it needs.
 
-Refused trial steps are diagnostic, not automatically fatal. Unresolved returned states
-are fatal. Saving a diagnostic artifact is allowed; scoring or reporting it is not.
+``acceptance`` certifies a returned state: its outer criterion met, no unresolved returned state, no open quadrature
+check. A model that misses certification is still scored and reported, since held-out accuracy measures it whatever its
+convergence, and the report lists it with its codes. ``require_scorable`` refuses only a model that cannot be scored:
+non-finite or non-positive scoring parameters, or a group whose fit failed and returned its covariates alone.
 """
 from __future__ import annotations
 
@@ -57,8 +59,12 @@ def acceptance(model) -> dict:
     if "far_field_scale" in terms and np.any(np.asarray(terms["far_field_scale"]) != 0):
         issue("truncated_ld", "fatal", "Summary-only LD approximation is not validated for primary results")
     for reason in model.refusals:
-        fatal = "lattice check unresolved" in reason
-        issue("quadrature_unresolved" if fatal else "fit_note", "fatal" if fatal else "info", reason)
+        if ": the fit failed: " in reason:
+            issue("fit_failed", "fatal", reason)
+        elif "lattice check unresolved" in reason:
+            issue("quadrature_unresolved", "fatal", reason)
+        else:
+            issue("fit_note", "info", reason)
     for scoring in model.scoring:
         for name in ("coefficients", "signed_means", "signed_scales", "alpha"):
             if not np.all(np.isfinite(getattr(scoring, name))):
@@ -68,6 +74,22 @@ def acceptance(model) -> dict:
     issue("approximate_inference", "info", "Local numerical acceptance does not establish posterior coverage or an exact evidence bound")
     return {"schema": "svpgs-acceptance-v1", "accepted": not any(i["severity"] == "fatal" for i in issues),
             "deployment_validated": False, "issues": issues}
+
+
+UNSCORABLE = frozenset({"fit_failed", "nonfinite_coefficients", "nonfinite_signed_means", "nonfinite_signed_scales",
+                        "nonfinite_alpha", "invalid_scale"})
+"""The fatal codes under which a model has no score: every other fatal code leaves it uncertified but scored."""
+
+
+def unscorable_codes(decision: dict) -> list[str]:
+    """The fatal codes of an ``acceptance`` verdict that stop the model being scored."""
+    return sorted({i["code"] for i in decision["issues"] if i["severity"] == "fatal" and i["code"] in UNSCORABLE})
+
+
+def require_scorable(model) -> None:
+    codes = unscorable_codes(acceptance(model))
+    if codes:
+        raise ValueError(f"Model cannot be scored: {', '.join(codes)}")
 
 
 def require_accepted(model) -> None:

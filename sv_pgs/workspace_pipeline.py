@@ -127,7 +127,7 @@ from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
 from sv_pgs.fit_model import FitRequest
-from sv_pgs.model_acceptance import acceptance, require_accepted
+from sv_pgs.model_acceptance import acceptance, require_scorable, unscorable_codes
 from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_r2
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import (
@@ -2954,8 +2954,8 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                             "fitted_records": [int(scoring.store_rows.shape[0]) for scoring in fitted.scoring],
                             CERTIFICATE_STATUS: [bool(met) for met in np.asarray(fitted.certificate[CERTIFICATE_STATUS])],
                             "refusals": [str(refusal) for refusal in fitted.refusals],
-                            # model_acceptance's verdict, recorded when the fit ends so the summary names a quarantined
-                            # trait at once and the score step refuses it before reading the store.
+                            # model_acceptance's verdict, recorded when the fit ends so the summary names an uncertified
+                            # trait at once and the score step leaves out an unscorable one before reading the store.
                             "acceptance": acceptance(fitted),
                         },
                     )
@@ -2969,7 +2969,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 "models": sum(len(record["models"]) for record in by_trait.values()),
                 "outer_criterion_met": sum(sum(record[CERTIFICATE_STATUS]) for record in by_trait.values()),
                 "refusals": sum(len(record["refusals"]) for record in by_trait.values()),
-                "quarantined": [trait_name for trait_name, record in by_trait.items() if not record["acceptance"]["accepted"]],
+                "uncertified": [trait_name for trait_name, record in by_trait.items() if not record["acceptance"]["accepted"]],
             }
             for arm, by_trait in records.items()
         },
@@ -3014,32 +3014,37 @@ def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
     return batches
 
 
-def _quarantined_traits(run: _Run, cohort: _Cohort) -> dict[str, list[str]]:
-    """The traits ``model_acceptance`` keeps out of scoring and reporting, each with its quarantined arms and their
-    models' fatal codes, from the acceptance each fit record holds (written when the fit ended). A trait is compared
-    across the arms, so a quarantined model in either arm takes the trait out of every table; every other trait is
-    scored and reported, so one uncertified fit among a run's models does not withhold the study's results."""
-    quarantined: dict[str, list[str]] = {}
+def _fit_verdicts(run: _Run, cohort: _Cohort, unscorable: bool) -> dict[str, list[str]]:
+    """From the acceptance each fit record holds (written when the fit ended): with ``unscorable``, the traits that
+    cannot be scored (``model_acceptance.unscorable_codes``: non-finite parameters, or a fit that failed and returned its
+    covariates alone), else the traits with an uncertified fit; each with its arms and their models' fatal codes. A trait
+    is compared across the arms, so an unscorable model in either arm takes the trait out of every table. An uncertified
+    trait is scored and reported like any other: held-out accuracy measures a fit whatever its convergence."""
+    found: dict[str, list[str]] = {}
     for arm in ARMS:
         for trait_name in cohort.trait_names:
             folder = _fitted_model_directory(run, arm, trait_name)
             verdict = json.loads(folder.with_name(folder.name + ".json").read_text(encoding="utf-8"))["acceptance"]
-            if not verdict["accepted"]:
-                codes = sorted({issue["code"] for issue in verdict["issues"] if issue["severity"] == "fatal"})
-                quarantined.setdefault(trait_name, []).append(f"{arm} ({', '.join(codes)})")
-    return quarantined
+            codes = unscorable_codes(verdict) if unscorable else sorted({issue["code"] for issue in verdict["issues"] if issue["severity"] == "fatal"})
+            if codes:
+                found.setdefault(trait_name, []).append(f"{arm} ({', '.join(codes)})")
+    return found
 
 
 def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
-    host's memory allows the saved models to be held together (``score_batches``). A quarantined trait
-    (``_quarantined_traits``) is not read: its scores stay NaN, and the step's summary names it with its codes."""
+    host's memory allows the saved models to be held together (``score_batches``). An unscorable trait
+    (``_fit_verdicts``) is not read: its scores stay NaN, and the step's summary names it with its codes under
+    ``quarantined``; the summary names each uncertified trait, scored like the rest, under ``uncertified``."""
     cohort = _read_cohort(run)
-    quarantined = _quarantined_traits(run, cohort)
+    quarantined = _fit_verdicts(run, cohort, unscorable=True)
+    uncertified = _fit_verdicts(run, cohort, unscorable=False)
     if len(quarantined) == len(cohort.trait_names):
-        raise ValueError(f"model_acceptance quarantined a model of every trait, so no trait can be scored: {quarantined}")
+        raise ValueError(f"no trait can be scored: {quarantined}")
     for trait_name, arms in quarantined.items():
-        LOGGER.warning("workspace pipeline: %s is not scored or reported: model_acceptance quarantined its %s fit", trait_name, "; ".join(arms))
+        LOGGER.warning("workspace pipeline: %s is not scored or reported: its %s fit cannot be scored", trait_name, "; ".join(arms))
+    for trait_name, arms in uncertified.items():
+        LOGGER.warning("workspace pipeline: %s is scored and reported, uncertified: %s", trait_name, "; ".join(arms))
     trait_count = len(cohort.trait_names)
     scored = [(arm_index, trait) for arm_index in range(len(ARMS)) for trait in range(trait_count) if cohort.trait_names[trait] not in quarantined]
     directories = [_fitted_model_directory(run, ARMS[arm_index], cohort.trait_names[trait]) for arm_index, trait in scored]
@@ -3054,7 +3059,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             # Each fitted model's column in [arms x models] (arm-major), from its own names.
             targets: list[int] = []
             for position, model in zip(batch, fitted):
-                require_accepted(model)
+                require_scorable(model)
                 arm_index, trait = scored[position]
                 expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
                 if tuple(model.model_names) != expected:
@@ -3125,7 +3130,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     )
     return {
         "arms": list(ARMS), "models": sum(len(cohort.trait_models(trait)) for _arm, trait in scored), "store_reads": len(batches),
-        "scored_rows": int(cohort.store_columns.shape[0]), "quarantined": quarantined,
+        "scored_rows": int(cohort.store_columns.shape[0]), "quarantined": quarantined, "uncertified": uncertified,
     }
 
 
@@ -3252,7 +3257,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     summaries by variant class and length that carry no participant count (``effects_by_class.tsv``,
     ``effect_length_correlation.tsv``), and the structural records' share of the ``with_sv`` score's variance over each
     trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS). A trait the
-    score step left out as quarantined (``_quarantined_traits``) has no effects here."""
+    score step left out as unscorable (``_fit_verdicts``) has no effects here."""
     cohort = _read_cohort(run)
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
@@ -3283,7 +3288,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         for arm in ARMS:
             for trait, trait_name in reported:
                 fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
-                require_accepted(fitted)
+                require_scorable(fitted)
                 scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
                 effects = variant_effects(scoring, codes_per_unit, working_bytes)
                 rows = effects.store_rows
@@ -3531,7 +3536,9 @@ def _primary_influence(
 
 
 QUARANTINE_COLUMNS = ("trait", "quarantined_fits")
-"""``quarantined.tsv``: each trait left out of every table, with its quarantined arms and their models' fatal codes."""
+"""``quarantined.tsv``: each trait left out of every table as unscorable, with its arms and their models' codes."""
+UNCERTIFIED_COLUMNS = ("trait", "uncertified_fits")
+"""``uncertified.tsv``: each reported trait with a fit that missed certification, with its arms and their fatal codes."""
 PANEL_COLUMNS = ("trait", "n", "cases", "metric", "estimate", "standard_error", "z", "p_one_sided", "p_hommel", "weight")
 """``panel.tsv``: each trait's pre-registered test on the panel's primary fold, then the panel's weighted z."""
 
@@ -3547,7 +3554,7 @@ def _panel_rows(run: _Run, cohort: _Cohort, scores: Any, quarantined: Mapping[st
     w'z / sqrt(w'Rw), one-sided, with the frozen weights and R the correlation of the traits' family-summed influences
     (``held_out_comparison.panel_z``, ``influence_correlation``); the per-trait p-values are Hommel-adjusted across the
     panel. A trait whose statistic is undefined on the fold (one outcome class, no variance), or that the score step left
-    out as quarantined, leaves the panel, and the summary names it."""
+    out as unscorable, leaves the panel, and the summary names it."""
     panel = run.config.panel
     assert panel is not None
     weights = dict(panel.weights)
@@ -3613,12 +3620,14 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     included; the others on the folds ``_scored_folds`` keeps. Across multiple folds the estimate and conditional
     standard error are descriptive: shared-training covariance is not estimated, so no combined z or p-value is emitted.
 
-    A trait the score step left out as quarantined (``_quarantined_traits``) is in no table but ``quarantined.tsv``
-    (QUARANTINE_COLUMNS), which names each one's quarantined arms and their models' fatal codes.
+    A trait the score step left out as unscorable (``_fit_verdicts``) is in no table but ``quarantined.tsv``
+    (QUARANTINE_COLUMNS). An uncertified trait is in every table, and ``uncertified.tsv`` (UNCERTIFIED_COLUMNS) names it
+    with its arms and their models' fatal codes.
     """
     cohort = _read_cohort(run)
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
+    uncertified = run.summary("score").get("uncertified", {})
     fold_count = run.config.fold_count
     accuracy: list[tuple[Any, ...]] = [ACCURACY_COLUMNS]
     comparison: list[tuple[Any, ...]] = [COMPARISON_COLUMNS]
@@ -3692,6 +3701,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     tables = [
         ("accuracy.tsv", accuracy), ("comparison.tsv", comparison),
         ("quarantined.tsv", [QUARANTINE_COLUMNS, *((name, "; ".join(arms)) for name, arms in quarantined.items())]),
+        ("uncertified.tsv", [UNCERTIFIED_COLUMNS, *((name, "; ".join(arms)) for name, arms in uncertified.items())]),
     ]
     panel_summary: dict[str, Any] | str = "no pre-registered panel in the run config"
     if run.config.panel is not None:
@@ -3705,6 +3715,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     return {
         "files": exportable,
         "quarantined": sorted(quarantined),
+        "uncertified": sorted(uncertified),
         "panel": panel_summary,
         "comparison_inference": (
             "Standard errors are conditional on fitted models. Multi-fold comparisons are descriptive: "
@@ -3802,7 +3813,7 @@ _STEPS = (
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _quarantined_traits, _final_store, score_batches, structural_records, model_part), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
         (_effects_step, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,

@@ -75,6 +75,18 @@ def test_acceptance_quarantines_unresolved_fits_but_allows_null_notes():
     assert not acceptance(model)['accepted']
 
 
+def test_an_uncertified_model_is_scorable_but_a_failed_fit_is_not():
+    from sv_pgs.model_acceptance import require_scorable
+    import pytest
+    model = SimpleNamespace(model_names=('trait',), scoring=(), refusals=('lattice check unresolved: refit failed',),
+                            certificate=dict(outer_criterion_met=np.array([False]), unresolved=np.array([0]),
+                                             budget_unresolved=np.array([1]), restored_best=np.array([True]), far_field_scale=np.array([0.])))
+    require_scorable(model)
+    model.refusals = ('model 0: models 0: the fit failed: a starting point has no certified fixed point',)
+    with pytest.raises(ValueError, match='fit_failed'):
+        require_scorable(model)
+
+
 def test_frozen_calibration_cannot_hide_a_reversed_evaluation_predictor():
     from sv_pgs.probability_calibration import FrozenCalibration, paired_frozen_gain
     from scipy.special import expit
