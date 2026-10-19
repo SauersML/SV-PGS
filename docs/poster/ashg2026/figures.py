@@ -141,8 +141,6 @@ def tick_text(value: float, step: float, percent: bool = False) -> str:
 
 
 MIN_REPLICATES = 3
-POWER_MIN_REPLICATES = 8
-"""A power point is a share of replicates; below 8 valid comparisons its Wilson interval spans most of [0, 1]."""
 """A (point, training size) cell is drawn only with at least this many completed replicates, as build_pptx.py's text."""
 
 
@@ -303,148 +301,69 @@ def accuracy_figure(summary: dict) -> Path:
     return render("ph_sim_accuracy", page("".join(parts), width, height), width, height)
 
 
-POWER_SERIES = (
-    ("sv_20pct_fold3", "20% SVs, 3× effect", NAVY),
+ADVANTAGE_SERIES = (
+    ("sv_20pct_fold3", "20% SVs, 3×", NAVY),
     ("sv_20pct", "20% SVs", TEAL),
     ("null", "No causal SVs", LIGHT),
 )
 
 
-def power_figure(summary: dict) -> Path:
-    """Share of replicates whose one-sided paired DeLong test favours the SV arm at 0.05, against training size, per
-    causal-SV scenario, with Wilson 95% intervals. No causal SV does not imply equal predictive accuracy: tagging and
-    regularization can still change the two methods' scores."""
+def advantage_figure(summary: dict) -> Path:
+    """SV-PGS with SVs minus LDpred2-auto on its SNV subset: the paired test AUC difference against training size for
+    the accuracy figure's architectures, with 95% t intervals over replicates. Pairing removes the replicate-to-replicate
+    spread in achievable AUC that widens the accuracy figure's intervals."""
     width, height = 8.20, 4.40
     w, h = width * 100, height * 100
-    left, top, bottom = 128.0, 28.0, h - 112.0
-    plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in POWER_SERIES) - 40
-    counts = shown_counts(summary, [point for point, *_rest in POWER_SERIES])
+    left, top, bottom = 150.0, 28.0, h - 112.0
+    plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in ADVANTAGE_SERIES) - 40
+    present = [entry for entry in ADVANTAGE_SERIES if entry[0] in summary["points"]]
+    counts = shown_counts(summary, [point for point, *_rest in present])
+    cells = {point: {int(size): summary["points"][point]["sizes"][size]["delta_auc_vs_ldpred2"] for size in sizes(summary, point)
+                     if summary["points"][point]["sizes"][size].get("delta_auc_vs_ldpred2", {}).get("replicates", 0) >= MIN_REPLICATES}
+             for point, *_rest in present}
+    values = [0.0] + [value for marks in cells.values() for entry in marks.values() for value in finite([entry["lower"], entry["upper"]])]
+    low, high, step = nice_range(min(values), max(values), steps=(0.01, 0.02, 0.025, 0.05, 0.1), most=int((bottom - top) // 52))
 
     def x(count: int) -> float:
         return left + 26 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (plot_right - left - 52)
 
-    def y(rate: float) -> float:
-        return bottom - rate * (bottom - top)
+    def y(value: float) -> float:
+        return bottom - (value - low) / (high - low) * (bottom - top)
 
     parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
     parts.append(f'<line x1="{left}" y1="{bottom}" x2="{plot_right}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
     parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    for rate in (0.0, 0.25, 0.5, 0.75, 1.0):
-        parts.append(f'<line x1="{left - 10}" y1="{y(rate):.1f}" x2="{left}" y2="{y(rate):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{left - 16}" y="{y(rate) + 9:.1f}" text-anchor="end">{rate * 100:.0f}%</text>')
+    parts.append(f'<line x1="{left}" y1="{y(0.0):.1f}" x2="{plot_right}" y2="{y(0.0):.1f}" stroke="{GREY}" stroke-width="2.5" stroke-dasharray="8 8"/>')
+    tick = low
+    while tick <= high + 1e-9:
+        parts.append(f'<line x1="{left - 10}" y1="{y(tick):.1f}" x2="{left}" y2="{y(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<text class="tick" x="{left - 16}" y="{y(tick) + 9:.1f}" text-anchor="end">{tick_text(tick, step) if abs(tick) > 1e-12 else "0"}</text>')
+        tick += step
     for count in counts:
         parts.append(f'<line x1="{x(count):.1f}" y1="{bottom}" x2="{x(count):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
         parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
-    parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Power</text>')
+    parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">AUC difference</text>')
     parts.append(f'<text class="axis" x="{(left + plot_right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
-    ends, labels, drew_true = [], [], False
-    present = [entry for entry in POWER_SERIES if entry[0] in summary["points"]]
-    for offset_index, (point, label, colour) in enumerate(present):
-        offset = (offset_index - (len(present) - 1) / 2) * 9.0
-        rows = summary["points"][point]["sizes"]
-        points = [(x(int(size)) + offset, rows[size]["power"]) for size in sizes(summary, point)
-                  if rows[size]["power"]["replicates"] >= POWER_MIN_REPLICATES]
-        if not points:
+    ends, labels = [], []
+    for index, (point, label, colour) in enumerate(present):
+        offset = (index - (len(present) - 1) / 2) * 12.0
+        marks = [(x(count) + offset, cells[point][count]) for count in counts if count in cells[point]]
+        if not marks:
             continue
-        parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in points)
+        parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(entry['mean']):.1f}" for px, entry in marks)
                      + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"/>')
-        for px, row in points:
-            parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
-            parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
-        true = summary.get("genotype_accuracy", {}).get("delta_auc", {}).get(point, {}).get("true_power")
-        if true and true["replicates"] >= MIN_REPLICATES:
-            tx, ty = x(counts[-1]) + offset, y(true["rate"])
-            parts.append(f'<line x1="{tx:.1f}" y1="{y(true["lower"]):.1f}" x2="{tx:.1f}" y2="{y(true["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"/>')
-            parts.append(f'<rect x="{tx - 11:.1f}" y="{ty - 11:.1f}" width="22" height="22" transform="rotate(45 {tx:.1f} {ty:.1f})" fill="{colour}" stroke="#fff" stroke-width="3"/>')
-            drew_true = True
-        ends.append((points[-1][0], y(points[-1][1]["rate"]), colour))
+        for px, entry in marks:
+            if math.isfinite(entry["lower"]):
+                parts.append(f'<line x1="{px:.1f}" y1="{y(entry["lower"]):.1f}" x2="{px:.1f}" y2="{y(entry["upper"]):.1f}" stroke="{colour}" stroke-width="4"/>')
+            parts.append(f'<circle cx="{px:.1f}" cy="{y(entry["mean"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
+        ends.append((marks[-1][0], y(marks[-1][1]["mean"]), colour))
         labels.append(label)
     placed = spread_labels([end[1] for end in ends], 34.0, top + 8, bottom - 4)
     for (end_x, end_y, colour), label, label_y in zip(ends, labels, placed):
         parts.append(f'<polyline points="{end_x + 14:.1f},{end_y:.1f} {plot_right + 10:.1f},{label_y:.1f} {plot_right + 24:.1f},{label_y:.1f}" fill="none" stroke="{colour}" stroke-width="2.5"/>')
         parts.append(f'<text class="end" x="{plot_right + 32:.1f}" y="{label_y + 9:.1f}" style="fill:{colour}">{label}</text>')
-    if drew_true:
-        # the key for the diamonds, top left inside the axes: the lines are imputed genotypes
-        parts.append(f'<rect x="{left + 30:.1f}" y="{top + 4:.1f}" width="18" height="18" transform="rotate(45 {left + 39:.1f} {top + 13:.1f})" fill="{GREY}"/>')
-        parts.append(f'<text class="key" x="{left + 60:.1f}" y="{top + 22:.1f}">True SV genotypes</text>')
     parts.append("</svg>")
-    return render("ph_sim_power", page("".join(parts), width, height), width, height)
-
-
-WINDOW_POWER_SERIES = (
-    ("tagged_sv_fold3", "Tagged SVs, 3×", NAVY),
-    ("sv_20pct_fold3", "Any SVs, 3×", TEAL),
-    ("null", "No causal SVs", LIGHT),
-)
-
-
-def window_power(summary: dict, measurement: str, point: str) -> dict[int, dict]:
-    """The window study's power per training size with at least POWER_MIN_REPLICATES valid comparisons."""
-    cells = summary.get("window", {}).get(measurement, {}).get(point, {}).get("sizes", {})
-    return {int(size): cell["power"] for size, cell in cells.items() if cell["power"]["replicates"] >= POWER_MIN_REPLICATES}
-
-
-def window_power_figure(summary: dict) -> Path:
-    """The chr22 window study's power against training size per causal architecture: the share of replicates whose
-    one-sided paired DeLong test favours the SV arm at 0.05, on true SV genotypes (solid) and imputed SVs (dashed), each
-    point with its Wilson 95% interval."""
-    width, height = 8.20, 4.40
-    w, h = width * 100, height * 100
-    left, top, bottom = 128.0, 76.0, h - 112.0
-    plot_right = w - 12 - max(text_width(label, 22) for _point, label, _colour in WINDOW_POWER_SERIES) - 40
-    series = [entry for entry in WINDOW_POWER_SERIES if window_power(summary, "true", entry[0]) or window_power(summary, "imputed", entry[0])]
-    counts = sorted({count for point, *_rest in series for measurement in ("true", "imputed") for count in window_power(summary, measurement, point)})
-
-    def x(count: int) -> float:
-        return left + 26 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (plot_right - left - 52)
-
-    def y(rate: float) -> float:
-        return bottom - rate * (bottom - top)
-
-    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
-    parts.append(f'<line x1="{left}" y1="{bottom}" x2="{plot_right}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    parts.append(f'<line x1="{left}" y1="{top}" x2="{left}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
-    for rate in (0.0, 0.25, 0.5, 0.75, 1.0):
-        parts.append(f'<line x1="{left - 10}" y1="{y(rate):.1f}" x2="{left}" y2="{y(rate):.1f}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{left - 16}" y="{y(rate) + 9:.1f}" text-anchor="end">{rate * 100:.0f}%</text>')
-    for count in counts:
-        parts.append(f'<line x1="{x(count):.1f}" y1="{bottom}" x2="{x(count):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
-        parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
-    parts.append(f'<text class="axis" transform="translate(30 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">Power</text>')
-    parts.append(f'<text class="axis" x="{(left + plot_right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
-    ends, labels = [], []
-    for index, (point, label, colour) in enumerate(series):
-        offset = (index - (len(series) - 1) / 2) * 9.0
-        for measurement in ("imputed", "true"):
-            cells = window_power(summary, measurement, point)
-            marks = [(x(count) + offset + (0.0 if measurement == "true" else 14.0), cells[count]) for count in counts if count in cells]
-            if not marks:
-                continue
-            dash = ' stroke-dasharray="12 9"' if measurement == "imputed" else ""
-            parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(row['rate']):.1f}" for px, row in marks)
-                         + f'" fill="none" stroke="{colour}" stroke-width="6" stroke-linejoin="round"{dash}/>')
-            for px, row in marks:
-                # imputed marks sit beside the true ones, each with its own Wilson interval
-                parts.append(f'<line x1="{px:.1f}" y1="{y(row["lower"]):.1f}" x2="{px:.1f}" y2="{y(row["upper"]):.1f}" stroke="{colour}" stroke-width="3" opacity="0.55"{dash}/>')
-                if measurement == "true":
-                    parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="9" fill="{colour}" stroke="#fff" stroke-width="3"/>')
-                else:
-                    parts.append(f'<circle cx="{px:.1f}" cy="{y(row["rate"]):.1f}" r="8" fill="#fff" stroke="{colour}" stroke-width="4"/>')
-            if measurement == "true" or not window_power(summary, "true", point):
-                ends.append((marks[-1][0], y(marks[-1][1]["rate"]), colour))
-                labels.append(label)
-    placed = spread_labels([end[1] for end in ends], 34.0, top + 8, bottom - 4)
-    for (end_x, end_y, colour), label, label_y in zip(ends, labels, placed):
-        parts.append(f'<polyline points="{end_x + 14:.1f},{end_y:.1f} {plot_right + 10:.1f},{label_y:.1f} {plot_right + 24:.1f},{label_y:.1f}" fill="none" stroke="{colour}" stroke-width="2.5"/>')
-        parts.append(f'<text class="end" x="{plot_right + 32:.1f}" y="{label_y + 9:.1f}" style="fill:{colour}">{label}</text>')
-    # the key, one line above the axes: solid lines are true genotypes, dashed imputed
-    cursor = left
-    for text, dash in (("True SVs", ""), ("Imputed SVs", ' stroke-dasharray="12 9"')):
-        parts.append(f'<line x1="{cursor:.1f}" y1="26" x2="{cursor + 56:.1f}" y2="26" stroke="{GREY}" stroke-width="5"{dash}/>')
-        parts.append(f'<text class="key" x="{cursor + 68:.1f}" y="35">{text}</text>')
-        cursor += 68 + text_width(text, 26) + 44
-    parts.append("</svg>")
-    return render("ph_sim_power", page("".join(parts), width, height), width, height)
+    return render("ph_sim_advantage", page("".join(parts), width, height), width, height)
 
 
 GENOTYPE_CLASSES = (("SNV", "SNVs", NAVY), ("SV", "SVs", TEAL))
@@ -676,14 +595,8 @@ def simulation_figures(summary: dict | None) -> list[Path]:
     points = summary["points"] if summary else {}
     made.append(accuracy_figure(summary) if summary and all(sizes(summary, point) for point, _title in ACCURACY_PANELS)
                 else placeholder_figure("ph_sim_accuracy"))
-    # the window's power is a curve once some architecture has it at two training sizes
-    if summary and any(len(window_power(summary, "true", point)) >= 2 for point, *_rest in WINDOW_POWER_SERIES):
-        made.append(window_power_figure(summary))
-    else:
-        made.append(power_figure(summary) if summary and all(
-                        any(cell["power"]["replicates"] >= POWER_MIN_REPLICATES for cell in summary["points"].get(point, {}).get("sizes", {}).values())
-                        for point, *_rest in POWER_SERIES)
-                    else placeholder_figure("ph_sim_power"))
+    made.append(advantage_figure(summary) if summary and all(sizes(summary, point) for point, *_rest in ADVANTAGE_SERIES)
+                else placeholder_figure("ph_sim_advantage"))
     made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
                 else placeholder_figure("ph_sim_genotypes"))
     optional = {
@@ -707,8 +620,8 @@ PLACEHOLDERS = {
     # name: (width in, height in, source, title, what the figure will show)
     "ph_sim_accuracy": (16.70, 4.80, "simulation", "Test AUC vs. training size",
                         "SV-PGS with and without SVs, and LDpred2-auto, at 0%, 5% and 20% causal SVs, with the expected accuracy"),
-    "ph_sim_power": (8.20, 4.40, "simulation", "Power vs. training size",
-                     "Share of replicates in which adding SVs raised AUC (one-sided paired DeLong test, α = 0.05)"),
+    "ph_sim_advantage": (8.20, 4.40, "simulation", "SV-PGS minus LDpred2-auto",
+                         "Paired test AUC difference against training size, with 95% t intervals"),
     "ph_sim_genotypes": (8.20, 4.40, "simulation", "SV genotype accuracy",
                          "Imputation r² of SVs and SNVs by allele frequency"),
     "ph_aou_hypertension": (15.40, 5.00, "All of Us", "SV effects on hypertension",

@@ -149,7 +149,7 @@ def simulation_copy(summary: dict) -> None:
                                  f"{min(counts)}–{max(counts)} completed replicates per cell. The grid is incomplete.", "")]]
     else:
         SIMULATION_ACCURACY = [[("No paired simulation comparisons have completed yet.", "")]]
-    SIMULATION_GENOTYPES = [[("Power and genotype-accuracy summaries are preliminary while simulation replicates finish.", "")]]
+    SIMULATION_GENOTYPES = [[("Genotype-accuracy summaries appear once simulation replicates finish.", "")]]
     DISCUSSION = [[("The simulation grid is incomplete. Predictive benefit remains under evaluation; All of Us results are pending.", "")]]
     # the training sizes the figures draw (cells with enough replicates), else the planned ones
     drawn = sorted({int(size) for point in points.values() for size, cell in point.get("sizes", {}).items()
@@ -484,7 +484,7 @@ def build() -> None:
     # the figures as media of their own
     figures = {
         "equation": "equation.png", "accuracy": "ph_sim_accuracy.png",
-        "power": "ph_sim_power.png", "genotypes": "ph_sim_genotypes.png", "hypertension": "ph_aou_hypertension.png",
+        "advantage": "ph_sim_advantage.png", "genotypes": "ph_sim_genotypes.png", "hypertension": "ph_aou_hypertension.png",
         "diseases": "ph_aou_diseases.png",
     }
     # the per-scenario gains exist once the grid has more than one scenario (figures.py)
@@ -605,11 +605,13 @@ def build() -> None:
     xml = column.text(xml, 126, SIMULATION_ACCURACY)
     half = (column.width - 0.5) / 2
     top = column.y
-    xml = column.figure(xml, 106, "power", width=half)
-    xml = column.caption(xml, 113, "Power", width=half)
-    column.y = top
+    xml = column.figure(xml, 106, "advantage", width=half)
+    xml = column.caption(xml, 113, "Gain over LDpred2-auto", width=half)
+    # the text below starts under the taller of the two figure-and-caption stacks
+    left_bottom, column.y = column.y, top
     xml = column.figure(xml, 120, "genotypes", width=half, x=column.x + 0.37 + half)
     xml = column.caption(xml, 123, "SV genotype accuracy", width=half, x=column.x + 0.37 + half)
+    column.y = max(column.y, left_bottom)
     xml = column.text(xml, 127, SIMULATION_GENOTYPES)
     # the window study covers the architectures at every size with more replicates: its figure takes their place
     if "architectures" in figures and "window" not in figures:
