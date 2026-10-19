@@ -37,12 +37,19 @@ if [[ ! "$CDR_STORAGE_PATH" =~ ^gs://[a-z0-9._-]+(/[A-Za-z0-9._-]+)*/?$ ]]; then
 fi
 CDR_BUCKET="${CDR_STORAGE_PATH#gs://}"
 export CDR_BUCKET="${CDR_BUCKET%/}"
+# Both jobs also mount, read-only, the bucket of the imputed batches and their strata sidecar (IMPUTED_BUCKET, at
+# /mnt/disks/imputed) and the panel's bucket of bubble.split sites (PANEL_BUCKET, at /mnt/disks/panel): bucket names only.
+: "${IMPUTED_BUCKET:?}" "${PANEL_BUCKET:?}"
+for bucket in "$IMPUTED_BUCKET" "$PANEL_BUCKET"; do
+  [[ "$bucket" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || { echo "IMPUTED_BUCKET and PANEL_BUCKET are bucket names, without gs://" >&2; exit 2; }
+done
+export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROJECT_ID ZONE RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(PROVISIONING_MODEL GPU_TYPE GPU_COUNT); fi
-variables+=(CDR_BUCKET GOOGLE_PROJECT)
+variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${spec}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
 # running job.

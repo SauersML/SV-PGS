@@ -151,6 +151,7 @@ else:
         PROJECT_ID="test-project", REGION="us-central1", ZONE="us-central1-a", OPS_BUCKET="workspace",
         RUN_ID="study", RUN_DISK_GB="2000", HOURLY_USD="2.4", THROUGH="fit", BUDGET_SLOT="pilot",
         WORKSPACE_CDR="cdr", GOOGLE_PROJECT="test-project", UV_EXTRAS="--extra gpu", CDR_STORAGE_PATH="gs://cdr-bucket/v8",
+        IMPUTED_BUCKET="imputed-bucket", PANEL_BUCKET="panel-bucket",
         MACHINE_TYPE="a2-highgpu-1g", PROVISIONING_MODEL="SPOT", GPU_TYPE="nvidia-tesla-a100",
         GPU_COUNT="1", NETWORK="network", SUBNETWORK="subnetwork", SERVICE_ACCOUNT="account@example.test",
         MAX_RETRIES="0", STUDY_BUDGET=str(launcher.with_name("study_budget.template.json")),
@@ -181,7 +182,10 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     assert script.index("mirror restore") < script.index("workspace-run") < script.rindex("mirror push")
     assert '--mirror "gs://workspace/svpgs/study/run"' in script
     # Input files on the bucket mounts are keyed by their objects' generations, not a pass over their bytes.
-    assert """SVPGS_GCS_MOUNTS='{"/mnt/disks/ops": "gs://workspace", "/mnt/disks/cdr": "gs://cdr-bucket/v8"}'""" in script
+    assert (
+        """SVPGS_GCS_MOUNTS='{"/mnt/disks/ops": "gs://workspace", "/mnt/disks/cdr": "gs://cdr-bucket/v8", """
+        """"/mnt/disks/imputed": "gs://imputed-bucket", "/mnt/disks/panel": "gs://panel-bucket"}'"""
+    ) in script
     task = spec["taskGroups"][0]["taskSpec"]
     assert task["runnables"][0]["script"]["text"] == "bash /mnt/disks/ops/svpgs/study/launcher/pilot/run_step.sh"
     assert spec["logsPolicy"]["logsPath"] == "/mnt/disks/ops/svpgs/study/launcher/pilot/batch.log"
@@ -214,6 +218,9 @@ def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, throug
     cdr = volumes["/mnt/disks/cdr"]
     assert cdr["gcs"]["remotePath"] == "fc-aou-datasets-controlled/v8"
     assert "-o ro" in cdr["mountOptions"] and "--billing-project=test-project" in cdr["mountOptions"]
+    # The imputed batches with their strata sidecar, and the panel's bubble.split sites, are mounted read-only too.
+    assert volumes["/mnt/disks/imputed"]["gcs"]["remotePath"] == "imputed-bucket" and "-o ro" in volumes["/mnt/disks/imputed"]["mountOptions"]
+    assert volumes["/mnt/disks/panel"]["gcs"]["remotePath"] == "panel-bucket" and "-o ro" in volumes["/mnt/disks/panel"]["mountOptions"]
 
 
 def test_staging_refuses_a_run_config_with_a_placeholder_or_a_missing_key(tmp_path: Path) -> None:

@@ -13,6 +13,8 @@
         "volumes": [
           {"gcs": {"remotePath": "${OPS_BUCKET}"}, "mountPath": "/mnt/disks/ops", "mountOptions": ["--implicit-dirs"]},
           {"gcs": {"remotePath": "${CDR_BUCKET}"}, "mountPath": "/mnt/disks/cdr", "mountOptions": ["-o ro", "--implicit-dirs", "--billing-project=${GOOGLE_PROJECT}"]},
+          {"gcs": {"remotePath": "${IMPUTED_BUCKET}"}, "mountPath": "/mnt/disks/imputed", "mountOptions": ["-o ro", "--implicit-dirs"]},
+          {"gcs": {"remotePath": "${PANEL_BUCKET}"}, "mountPath": "/mnt/disks/panel", "mountOptions": ["-o ro", "--implicit-dirs"]},
           {"deviceName": "run", "mountPath": "/mnt/disks/run", "mountOptions": "rw,async"}
         ]
       }
