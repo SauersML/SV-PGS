@@ -154,8 +154,11 @@ def simulation_copy(summary: dict) -> None:
     # the training sizes the figures draw (cells with enough replicates), else the planned ones
     drawn = sorted({int(size) for point in points.values() for size, cell in point.get("sizes", {}).items()
                     if cell["replicates"] >= MIN_REPLICATES}) or summary["train_counts"]
+    # the all-variant LDpred2 arm is named only where the figure draws it (enough replicates)
+    allvar = any(cell.get("ldpred2_allvar_replicates", 0) >= MIN_REPLICATES
+                 for point in points.values() for cell in point.get("sizes", {}).values())
     SIMULATION_METHODS = [[(f"{min(drawn):,}–{max(drawn):,} training samples; LDpred2-auto uses MAF ≥ 1% "
-                           "SNVs at HapMap3 density, or all classes.", "")]]
+                           f"SNVs at HapMap3 density{', or all classes' if allvar else ''}.", "")]]
 
     cells = {name: settled(point, largest) for name, point in points.items()}
     accuracy = []
@@ -210,12 +213,17 @@ def simulation_copy(summary: dict) -> None:
     true_gains = {point: gain for point, gain in true_gains.items() if gain}
     if cohort and true_gains:
         megabases = (cohort["end_bp"] - cohort["start_bp"]) / 1e6
-        window_sizes = sorted({int(size) for cells in window.get("true", {}).values() for size in cells.get("sizes", {})})
+        # the training sizes the window figure draws (cells with enough replicates)
+        window_sizes = sorted({int(size) for cells in window.get("true", {}).values() for size in cells.get("sizes", {})
+                               if settled(cells, size)}) or summary["train_counts"]
         # the window's design joins the methods line; its figure's text is the headline gain
         SIMULATION_METHODS = [[(SIMULATION_METHODS[0][0][0].rstrip(".") + f"; one {megabases:.0f}-Mb chr22 window "
                                 f"({cohort['last_record'] - cohort['first_record']:,} variants) repeats every architecture at "
                                 f"{min(window_sizes):,}–{max(window_sizes):,}.", "")]]
-        best = max(true_gains, key=lambda point: true_gains[point][1]["mean"])
+        # the headline is the largest gain whose 95% interval lies above zero, else the largest gain
+        window_raised = {point: gain for point, gain in true_gains.items() if gain[1]["lower"] > 0}
+        candidates = window_raised or true_gains
+        best = max(candidates, key=lambda point: candidates[point][1]["mean"])
         count, true = true_gains[best]
         # the imputed gain and the control at the same training size as the true-genotype gain
         imputed = settled(window.get("imputed", {}).get(best, {}), str(count))
@@ -237,8 +245,9 @@ def simulation_copy(summary: dict) -> None:
     if window_raised:
         best = max(window_raised, key=lambda point: window_raised[point][1]["mean"])
         label = dict(ARCHITECTURE_LABELS)[best]
-        conclusions.append([(f"Measured SVs raised AUC by up to {number(window_raised[best][1]['mean'])} "
-                             f"({label[0].lower() + label[1:]}).", "")])
+        # lower-case the label's first letter unless it starts an acronym (SNP-tagged, SV)
+        label = label if label[1:2].isupper() else label[0].lower() + label[1:]
+        conclusions.append([(f"Measured SVs raised AUC by up to {number(window_raised[best][1]['mean'])} ({label}).", "")])
     elif raised:
         conclusions.append([(f"Adding well-measured SVs raised AUC ({'; '.join(dict.fromkeys(raised))}).", "")])
     elif accuracy_by_frequency:
@@ -255,7 +264,7 @@ ARCHITECTURE_LABELS = (
     ("common_sv", "Common causal SVs"),
     ("sv_20pct_fold3", "20% causal SVs, 3× effect"),
     ("deletion_positive", "Deletions 3×"),
-    ("multi_feature_positive", "Length, type, annotation"),
+    ("multi_feature_positive", "SV effects by length, type and annotation"),
 )
 WELL_IMPUTED = {"tagged_sv_fold3", "tagged_sv", "common_sv"}
 """Architectures whose causal SVs are imputed accurately (Beagle r^2 >= 0.8, or common); elsewhere the copy reports only

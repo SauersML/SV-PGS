@@ -209,7 +209,10 @@ NO_VALUE = [math.nan, math.nan]
 
 
 def auc_interval(row: dict, key: str) -> dict:
-    """Read the collector's replicate interval; old summaries without one show only their measured mean."""
+    """Read the collector's replicate interval; old summaries without one show only their measured mean. An arm fit in
+    fewer than MIN_REPLICATES of a cell's replicates (the all-variant LDpred2 arm joined the grid late) has no value."""
+    if row.get(key.replace("_auc", "_replicates"), MIN_REPLICATES) < MIN_REPLICATES:
+        return {"mean": math.nan, "lower": math.nan, "upper": math.nan}
     return row.get("auc_intervals", {}).get(key, {"mean": row.get(key, NO_VALUE)[0], "lower": math.nan, "upper": math.nan})
 
 
@@ -221,7 +224,7 @@ def accuracy_figure(summary: dict) -> Path:
     left, right, gap = 140.0, 30.0, 55.0
     # a method is keyed only where it has a value: the all-variant LDpred2 arm joined the grid after the others
     shown = [method for method in ACCURACY_METHODS if any(
-        math.isfinite(summary["points"][point]["sizes"][size].get(method[0], NO_VALUE)[0])
+        math.isfinite(auc_interval(summary["points"][point]["sizes"][size], method[0])["mean"])
         for point, _title in ACCURACY_PANELS for size in sizes(summary, point))]
     counts = shown_counts(summary, [point for point, _title in ACCURACY_PANELS])
     entries = [(label, colour, filled, False) for _key, label, colour, filled, _off in shown]
@@ -286,7 +289,7 @@ def accuracy_figure(summary: dict) -> Path:
         expected = " ".join(f"{x(count):.1f},{y(line[count]):.1f}" for count in counts if count in line)
         parts.append(f'<polyline points="{expected}" fill="none" stroke="{GREY}" stroke-width="5" stroke-dasharray="13 9"/>')
         for key, _label, colour, filled, offset in reversed(shown):
-            points = [(x(int(size)) + offset, auc_interval(rows[size], key)) for size in present if math.isfinite(rows[size].get(key, NO_VALUE)[0])]
+            points = [(x(int(size)) + offset, auc_interval(rows[size], key)) for size in present if math.isfinite(auc_interval(rows[size], key)["mean"])]
             if not points:
                 continue
             parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(entry['mean']):.1f}" for px, entry in points)
