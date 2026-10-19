@@ -21,7 +21,7 @@ import numpy as np
 from benchmarks.bench_sim.harness import ARMS, score
 
 BREAKDOWNS = ("family", "shape", "sv_mode", "tr_mode", "annotation_mode", "binary", "frequency_source")
-# In-family scenarios (PREREG section 3) carry no "family" key; out-of-family ones (amendment 9) do.
+# In-family scenarios (the pre-registered truth family) carry no "family" key; out-of-family ones (amendment 9) do.
 IN_FAMILY = "in-family"
 
 

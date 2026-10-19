@@ -15,7 +15,7 @@ identity A^-1 Xt' = D Xt' S^-1. For any iterate with residual r = b - S z_hat,
     ||mu_hat - mu||_A^2 = r'(I - S^-1) r <= ||r||^2
 
 (e = -D Xt' S^-1 r and Xt (D A D) Xt' = G S with G = S - I), so a column's exact residual norm is
-its certificate against ep_eb.md's target ||e||_A^2 <= p_eff / K. Rows outside the training metric
+its certificate against the target ||e||_A^2 <= p_eff / K. Rows outside the training metric
 (held-out folds, target people) satisfy ||X_out e||^2 <= lambda_max(X_out D X_out') ||r||^2 / 4.
 H is the projector onto the column space of W^1/2 C, which can lose rank on a model's rows while C
 has full rank on the cohort (`covariate_whitener`).

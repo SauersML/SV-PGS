@@ -1,6 +1,6 @@
 """bench-sim out-of-family truths (PREREG amendment 9): architectures outside SV-PGS's own model class.
 
-critic-method (critique/CRITIQUE_METHOD.md, item 3) showed that the in-family truths of PREREG section 3 mostly share
+critic-method showed that the in-family truths of bench-sim's pre-registered family mostly share
 SV-PGS's prior: Gaussian scale-mixture effect shapes, the [2p(1-p)]^(1+alpha) frequency law, LD and annotation smooths,
 and class scales. Each family here breaks one of those assumptions. Section 3 is reused only for heritability,
 covariates, noise and trait type.

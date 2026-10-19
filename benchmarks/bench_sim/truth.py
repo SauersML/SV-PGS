@@ -1,4 +1,4 @@
-"""bench-sim step 4: scenario truths drawn from the pre-registered family (PREREG.md section 3).
+"""bench-sim step 4: scenario truths drawn from the pre-registered family.
 
 scenario(seed) draws every parameter from its own seed, computes the true genetic value from truth
 genotypes, and returns the phenotype. Dev seeds 0-23 are public; test seeds derive from the sealed

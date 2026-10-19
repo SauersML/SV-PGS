@@ -1,5 +1,4 @@
-"""Artifact checks for the genes whose SV columns carry held-out signal (critique/CRITIQUE_REAL.md items 6-7,
-critique/CRITIQUE_METHOD.md items 4-5).
+"""Artifact checks for the genes whose SV columns carry held-out signal.
 
 For each (method, design, gene) the SV part of the score is d = f - m: the snv_sv prediction minus the same prediction
 with the SV columns at their training means. For a linear predictor d = sum_j beta_j (x_j - mean_j), and the driving SV

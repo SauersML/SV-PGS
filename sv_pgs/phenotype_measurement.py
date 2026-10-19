@@ -1,4 +1,4 @@
-"""The measurement model of a quantitative trait's occasions (docs/design/math/novel-pheno.md §3).
+"""The measurement model of a quantitative trait's occasions.
 
 Occasion j of person i is a positive reading y_ij in the trait's canonical unit, and
 
@@ -21,13 +21,13 @@ recorded value (1 for a reading that is one; an eGFR is computed from recorded c
 is resolvable. The lattice reaches the largest squared within-person deviation, past it by its own width,
 and its spacing is halved until its quadrature in t meets the evidence tolerance. PENDING (lead ruling): the
 extent past the largest deviation is generous, not derived; math-density's R2 rule (the fitted mass beyond the
-last node, mixing_density.md section 2) replaces it.
+last node) replaces it.
 
 Inference is exact in T_i, which is one-dimensional (the lead's ruling): EM over the complete data
 (T_i, each occasion's lattice component), with the density's step on the exact likelihood.
 - E-step: p(T_i | z_i) by the trapezoid rule in T. Each person's step is certified by the Trefethen-Weideman
   bound with the mass-weighted strip modulus, bounded in closed form (its strip width searched per person),
-  and the ends by a tail bound (``level_posterior``; math-density, mixing_density.md §11). Duplicated
+  and the ends by a tail bound (``level_posterior``). Duplicated
   readings, whose integrand spikes, need no separate treatment: their modulus bound is large, so their step
   is small. At every node come each occasion's component responsibilities.
 - M-steps (ECME, Liu and Rubin 1994): gamma and tau^2 by PX-EM (the levels' prior mean expanded and absorbed
@@ -356,8 +356,8 @@ def _log_modulus_bound(
 
     On |Im T| = y < b, |N(e + i y; 0, s)| = N(e; 0, s) e^(y^2 / (2 s)) and |T^m| <= (|x| + b)^m, so with
     w_k = pi_k e^(b^2 / (2 s_k)) and W_j(x) = sum_k w_k N(r_j - x; 0, s_k), M_m(b) is at most the integral of
-    g(x) = (|x| + b)^m N(x; 0, tau^2) e^(b^2 / (2 tau^2)) prod_j W_j(x) (the mass-weighted modulus,
-    mixing_density.md section 11). Between two neighbouring nodes each Gaussian factor is largest at the point
+    g(x) = (|x| + b)^m N(x; 0, tau^2) e^(b^2 / (2 tau^2)) prod_j W_j(x) (the mass-weighted
+    modulus). Between two neighbouring nodes each Gaussian factor is largest at the point
     of the interval nearest its centre and (|x| + b)^m at the end farthest from 0, so h times their product
     bounds g's integral there (an upper Riemann sum on the trapezoid's own nodes); beyond the end nodes,
     ``_log_widened_tail``. The bound tightens as h does and weights every component by its own mass, so a narrow
@@ -1149,7 +1149,7 @@ class _Model:
         if best in (lower, upper):
             # The ascent reached an end of the resolvable range: the weight moves to that edge exactly. The
             # engine (engine-tk) also compares V(infinity) with an interior maximum; that needs the global
-            # null-space fit of mixing_density.md B4 (a grid over the log-normal's location and width, then a
+            # null-space fit (a grid over the log-normal's location and width, then a
             # polish), which this model does not have yet: a local EM there is neither global nor cheap.
             edge = np.inf if best == upper else -np.inf
             at(edge)

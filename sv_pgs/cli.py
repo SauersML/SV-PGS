@@ -100,7 +100,7 @@ def build_parser() -> argparse.ArgumentParser:
     workspace_parser = subparsers.add_parser(
         "workspace-run",
         help=(
-            "Run the in-workspace pipeline (docs/design/WORKSPACE_PIPELINE.md) from its JSON config, resuming "
+            "Run the in-workspace pipeline from its JSON config, resuming "
             "from the run directory's checkpoints. Nothing is sent anywhere; outputs stay in the run directory."
         ),
     )

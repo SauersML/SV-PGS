@@ -1,4 +1,4 @@
-"""bench-sim step 3: public annotations and truth LD scores for every kept record (PREREG.md sections 3.6-3.7).
+"""bench-sim step 3: public annotations and truth LD scores for every kept record.
 
 Writes <dir>/annotations.npz:
   in_gene, in_exon       overlap with any RefSeq-curated transcript span / exon

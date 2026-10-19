@@ -40,7 +40,7 @@ from sv_pgs.store_converter import overlap_group_first
 BLOCK_ROWS = 4096
 """Rows per read of the harness's observed codes: 4096 x 40,000 training samples is a 164 MB block."""
 CHROMOSOME = 22
-"""bench-sim v1 is chr22 only (SUBMIT.md)."""
+"""bench-sim v1 is chr22 only."""
 TR_CLASS = 2
 """bench-sim's TR class (``cls``): an indel in a repeat."""
 

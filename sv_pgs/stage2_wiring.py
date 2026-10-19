@@ -3,7 +3,7 @@
 The models that train on the same rows with the same covariates and the same likelihood are one group
 (``model_groups``): Stage 0's Grams, its LD blocks and band, the candidate records and the prior's schema depend on the
 rows, the covariates and the records, never on a target, so the group's models share them and the dual solver's passes
-(docs/design/COMPUTE.md: each further model adds right-hand-side columns, not passes). Each group gets:
+(each further model adds right-hand-side columns, not passes). Each group gets:
 Stage 0 on its training rows and covariate columns with every model's target as a column, the start lattice covering its
 models' single-variant likelihoods, the prior with one class per variant class present, the records' unit offsets and
 frequency function from the store's unit contract (``store_measurement``), the store's other sidecar columns as its

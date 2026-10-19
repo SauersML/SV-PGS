@@ -229,7 +229,7 @@ def main() -> None:
         "--panel-weights", action="store_true",
         help="write the run config's frozen panel block instead: weights proportional to each disease's E[z] at one common "
         "SV architecture (the first of each scenario list, the first arm error correlation), so they follow h2, n and "
-        "prevalence and no SV biology (EVALUATION.md, the pre-registered panel)",
+        "prevalence and no SV biology (the pre-registered panel)",
     )
     arguments = parser.parse_args()
     if arguments.folds < 2 or not 0 <= arguments.calibration_fraction < 1:

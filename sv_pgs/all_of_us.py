@@ -84,8 +84,8 @@ class LabCriterion:
 
     ``plausible_range`` bounds the canonical value of a row the criterion may
     count. It is a hand-set rule of the disease definitions, kept until their
-    measurement model replaces it with an explicit unit-confusion component
-    (docs/design/PHENOTYPES.md); the quantitative traits have no range, their
+    measurement model replaces it with an explicit unit-confusion component;
+    the quantitative traits have no range, their
     gross errors being downweighted by the learned noise density.
     """
 
@@ -1979,7 +1979,7 @@ def measurement_covariate_columns() -> tuple[str, ...]:
     The occasion count is not one: how often a trait is measured depends on
     its level, and with T = beta x + u and K = a T + v, regressing T on (x, K)
     shrinks the genetic coefficient to beta sigma_v^2 / (a^2 sigma_u^2 +
-    sigma_v^2) (docs/design/math/novel-pheno.md, Theorem 5). Its legitimate
+    sigma_v^2). Its legitimate
     role, each person's precision, is target_reliability's.
     """
     return (

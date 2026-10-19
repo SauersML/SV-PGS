@@ -1,6 +1,6 @@
 name: cpu-tests
 
-# The landing gate is the MSI suite run on each tip before it reaches main (docs/design/COMPUTE.md). This workflow
+# The landing gate is the MSI suite run on each tip before it reaches main. This workflow
 # is a secondary signal on main: the project has no branches other than main, so a pull_request trigger would never
 # fire, and nothing here blocks a landing.
 on:

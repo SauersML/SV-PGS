@@ -1,6 +1,6 @@
 """Score out-of-fold predictions from the harness.
 
-The held-out metric is the within-group partial r^2 (lead ruling, review-stats STATS_REVIEW.md §0). Within one held-out
+The held-out metric is the within-group partial r^2. Within one held-out
 superpopulation T, R_T is the residual on [1, C] (the MAGE covariates) fitted over T's own held-out people. Per gene:
   partial_correlation  corr(R_T s, R_T y), with y the dataset's expression and s the saved prediction (0 when
            R_T s = 0): the partial correlation of the score with the expression given [1, C_T], inside the target
@@ -481,7 +481,7 @@ def main():
     headline = pooled_r2(scores)
     headline.to_csv(pathlib.Path(arguments.out) / "pooled_r2.tsv", sep="\t", index=False)
     with pd.option_context("display.width", 250, "display.max_rows", 500, "display.float_format", "{:.5f}".format):
-        print("within-group partial r^2 given the covariates (R_T y, R_T s; STATS_REVIEW.md §0)")
+        print("within-group partial r^2 given the covariates (R_T y, R_T s)")
         for design, group, people, rank in sorted(held_out(dataset_dir).unscorable):
             print(f"unscored: {design} {group}: {people} held-out people, [1, C] rank {rank}, no residual dimension")
         print("pooled held-out r^2 (headline)")

@@ -1,6 +1,6 @@
 """Per-record transforms and sidecar fields of the popped-BCF -> dosage-store converter.
 
-The converter (store spec A4-A4.15, team/target-format/STORE_SPEC.md) turns every popped
+The converter turns every popped
 record of the imputed panel into one store row. This module holds its exact per-record
 pieces; each is a pure function of sites-only inputs or of one record block:
 

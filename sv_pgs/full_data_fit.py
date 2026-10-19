@@ -273,7 +273,7 @@ class FitCertificate:
       having no EP fixed point, whose reasons ``refusals`` keeps; ``outer_history``: each model's decrement plus remaining
       gain at every outer evaluation (the outer rate);
     - ``prediction_move``: the certifying Newton step's move of q's mean in q's posterior metric, against
-      ``prediction_tolerance`` = p_eff / K (MODEL.md: the certificate includes the prediction change);
+      ``prediction_tolerance`` = p_eff / K (the certificate includes the prediction change);
       ``refreshes`` and ``passes``: certified variance refreshes and mean solves over the whole fit.
     """
 

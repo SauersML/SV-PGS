@@ -1,6 +1,6 @@
 """bench-sim step 1: a real-haplotype mosaic cohort from the public 1kGP phased SNV/INDEL/SV panel.
 
-PREREG.md section 1. Writes, under <out>/<chrom>/:
+Writes, under <out>/<chrom>/:
   variants.npz     per kept record: pos, end, ref_len, alt_len, cm, cls (0 SNV, 1 INDEL, 2 TR, 3 SV),
                    svtype, ids, donor allele counts, superpopulation AFs of the donors
   donor_haps.u8    [n_var, 2 * n_donor] donor haplotypes (0/1), variant-major (kept for re-imputation)

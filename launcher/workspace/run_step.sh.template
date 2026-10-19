@@ -1,7 +1,7 @@
 #!/bin/bash
 # TEMPLATE, never launched by an agent: launching is the user's decision (submit.sh fills and submits it).
 # The Batch task. It builds the locked environment offline with uv from what the user staged under
-# svpgs/${RUN_ID}/ in the ops bucket (README.md, "Staging": the source tree, the uv binary, a uv cache holding every
+# svpgs/${RUN_ID}/ in the ops bucket (the source tree, the uv binary, a uv cache holding every
 # locked wheel, and a uv-installed CPython 3.12), then runs the pipeline through ${THROUGH}. The VM has no external IP,
 # and the image's own Python is not the 3.12 sv-pgs needs, so nothing is fetched and the image's Python is never used.
 # Status goes only to empty marker files in the workspace's ops bucket mount.

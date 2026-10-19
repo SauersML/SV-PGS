@@ -2,7 +2,7 @@
 block-local preconditioner, and a subspace recycled across outer steps (lane speed-recycle).
 
 The total curvature B needs the cavity response dP to every coefficient direction (``scale_mixture_ep.
-_total_curvature_columns``, b_products.md): the fixed point of an affine map whose linear part is
+_total_curvature_columns``): the fixed point of an affine map whose linear part is
 
     L = (I - diag(w) (Sigma o Sigma)) (diag(l) Sigma diag(r) + diag(d)),
 
@@ -10,7 +10,7 @@ with per-variant vectors w, l, r, d. It applies one p x p operator to each of th
 (I - L) dP = c is r systems with one operator. GMRES on the flattened p r vector builds one scalar polynomial for all r
 columns. Block GMRES (O'Leary 1980; Vital 1990) builds the block Krylov space K_j(I - L, c), of dimension up to j r,
 from the same j applications. An application of I - L is one posterior solve (Sigma on its columns), which is where the
-store reads are, and its r columns ride the same reads (compute_floor.md section 2).
+store reads are, and its r columns ride the same reads.
 
 Three more things cut applications without changing what is accepted (the caller's true-residual test):
 - **Flexible right preconditioning** (Saad 1993) by the exact inverse of I - L_loc, L with Sigma replaced by the block

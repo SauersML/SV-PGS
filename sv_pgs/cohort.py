@@ -5,7 +5,7 @@ PCs, the pipeline-half and cohort indicators). Its other covariates are its own,
 sample table (lead ruling, 2026-09-19: no covariate matrix is shared across traits). Targets are
 one column per trait, NaN where a participant has no value for that trait. Folds are assigned
 once, before any phenotype is built: relatives stay inside one fold, and every stratum (pipeline
-half x ancestry) is spread evenly over the folds (docs/design/EVALUATION.md, "Folds").
+half x ancestry) is spread evenly over the folds.
 """
 
 from __future__ import annotations

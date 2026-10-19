@@ -1,4 +1,4 @@
-"""Alternative sealed splits for bench-real's portability controls (critique/CRITIQUE_REAL.md item 5).
+"""Alternative sealed splits for bench-real's portability controls.
 
 size_matched  every loso and random5 training set is subsampled to the smallest loso training set, which is the
               AFR-held-out one. Test sets don't change, so portability (loso vs random5) is compared at equal training n.

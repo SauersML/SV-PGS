@@ -32,9 +32,8 @@ truth samples, and on public benchmarks from their truth.
    v_j = E[(G - D*_j)^2] = Var(G_j) - Var(D*_j) = V_j (lambda_j - kappa_j^2),
    with lambda = Var(G) / Var(D) fitted like kappa(x), enters the predictive
    variance, and r^2_j = Var(D*_j) / (Var(D*_j) + v_j) = kappa_j^2 / lambda_j
-   gives the prior offset log r^2_j (coefficient 1,
-   docs/design/math/scale_model.md section 1).
-3. The leakage map, the "A-map" (scale_model.md sections 2-3). A draw-type
+   gives the prior offset log r^2_j (coefficient 1).
+3. The leakage map, the "A-map". A draw-type
    column leaves information about G_k in nearby columns, so in a joint fit part
    of an SV's effect moves onto its tag SNPs, and a stacked truth half no longer
    shares coefficients with the imputed half. The linear predictor of G_k from
@@ -379,7 +378,7 @@ class LeakageMap:
 
 
 def fit_leakage_map(cohort_covariance: NDArray, calibrated_pairs: NDArray, target_truth: NDArray, targets: NDArray) -> LeakageMap:
-    """Fit the A-map of one LD block: A = Sigma_D^-1 Sigma_DG (scale_model.md section 2).
+    """Fit the A-map of one LD block: A = Sigma_D^-1 Sigma_DG.
 
     ``cohort_covariance`` is [columns, columns], the covariance of the block's
     calibrated columns D* in the fitted cohort: Sigma_D, which the cohort knows

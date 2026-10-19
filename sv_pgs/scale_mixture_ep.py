@@ -2334,8 +2334,8 @@ def _total_curvature_columns(
     derivatives: _VariantDerivatives | None = None,
     fixed_cavity: F64Array | None = None,
 ) -> F64Array:
-    """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved (speed-ep,
-    B_PRODUCTS.md), without re-solving EP; B in x on a view is (M K)' B_z (M K). ``derivatives`` and
+    """B_z E for the given z-space directions E (columns): B = -d2 log Z_EP / dz2 with EP re-solved, without
+    re-solving EP; B in x on a view is (M K)' B_z (M K). ``derivatives`` and
     ``fixed_cavity`` (the variants' derivatives and A at this x and cavity) are formed here when not given: a lazy
     correction (``curvature_correction``) forms them once and hands them to every call at its fixed point.
 
@@ -3273,7 +3273,7 @@ def _correction_value(
 
 
 def _coarse_targets(evidence: _Evidence, interior: F64Array, tolerance: float) -> F64Array:
-    """The correction slopes' error per weight before the curvature is known: with s bounding |V''| (MODEL.md S4) and
+    """The correction slopes' error per weight before the curvature is known: with s bounding |V''| and
     n interior weights, E^2 / (2 s) = tolerance / (4 n) leaves the error a quarter of the tolerance's gain at that
     curvature (``_stationarity`` tightens it once the difference curvature is in)."""
     count = max(int(np.count_nonzero(interior)), 1)
@@ -3296,7 +3296,7 @@ def _correction_slopes(
     to a share e / m of its log (m integrals) with e set so the difference errs by about ``targets`` (the slope error
     the certificate can carry, ``_stationarity``), never below the rounding of the line values (eps times the
     objective's magnitude), and at the step h = (3 e / s)^(1/3) that balances truncation h^2 s / 6 against e / h (s the scale of
-    V's derivatives, MODEL.md S4); the differences at h and h / 2 must agree within their two errors, and the step
+    V's derivatives); the differences at h and h / 2 must agree within their two errors, and the step
     halves otherwise (a ranking switch of the replaced directions). Where a side leaves the basin (the Schur
     complement is not positive definite there), the one-sided difference on the other side is used, with its larger
     truncation h s / 2. The error estimate is a posteriori (the h / h/2 agreement); it is not a bound.
@@ -4070,7 +4070,7 @@ def _stationarity(
     is -dg/drho of the Laplace part by one forward difference per interior weight, taken on the side the gradient
     climbs (where a fold would be), plus the corrections' second differences on the diagonal (their mixed second
     differences are left out of the local model). With the Laplace gradient's error E and V's third derivative in
-    rho_i bounded by s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound of MODEL.md S4), a difference of
+    rho_i bounded by s_i = (edf_i + lambda_i ||R_i x||^2) / 2 (the logistic bound), a difference of
     step h errs by h s / 2 + 2 E / h, least at h = 2 sqrt(E / s). Where that side has no certified maximum within h, the basin ends
     there: the difference is taken on the other side, and the gain along that weight is at most (|g| + E) h, the
     most V can climb before the fold. Elsewhere the gain is the most the Newton decrement 1/2 (g + d)'K^-1 (g + d)
@@ -4769,7 +4769,7 @@ def fit_hyperparameters(
     A model is certified when its state is inside a basin, the predicted gain plus the weights' remaining stationarity
     gain and the prediction's measured error (the model's realized remainder at its last whole joint trial and both
     values' own errors) is at most ``tolerance``, and the joint trial then moves q's mean by at most 1 / K in q's
-    posterior metric, KL(q || q') <= 1 / (2K) nats (MODEL.md: the certificate includes the prediction change; in
+    posterior metric, KL(q || q') <= 1 / (2K) nats (the certificate includes the prediction change; in
     evidence units, lead ruling via speed-smalln), at the trial's own EP fixed point. With K = 1 / (2 tolerance)
     posterior draws that is the scorer's own Monte Carlo resolution, as for the EP fixed point. A trial that fails
     the check is taken as an ordinary joint trial. Where the weights' stationarity bound is what stops the
@@ -5349,7 +5349,7 @@ def fit_hyperparameters(
                     # along the ray being 2.8 units each with the gradient and the curvature falling by the same
                     # factor). x is at its maximum to double precision from here on, and V has no Laplace value there
                     # (the fixed-cavity curvature is singular), so the trial is the fit's state and the fit returns
-                    # uncertified with its last evaluated step; the boundary model is the open work (MODEL.md).
+                    # uncertified with its last evaluated step; the boundary model is the open work.
                     if anchors[model] is not None:
                         # A release's polish that walked to the boundary: the release is judged against the certified
                         # state it left (``settle_release``), never returned as the fit's answer in its place.

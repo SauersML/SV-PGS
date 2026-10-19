@@ -1,8 +1,7 @@
 """The in-workspace pipeline on plain imputed VCFs: one imputation tool's standard output per chromosome per batch.
 
 The synthetic inputs are the dry run's (tests/test_workspace_pipeline.py), with every popped batch rewritten as a
-plain tool would write the same dosages, and no strata sidecar or bubble.split (docs/design/WORKSPACE_PIPELINE.md,
-"Plain imputed VCF/BCFs"): Beagle 5 (GT:DS, DR2, IDs '.', no INFO/CM, a genetic map), GLIMPSE2 (GT:DS:GP, INFO,
+plain tool would write the same dosages, and no strata sidecar or bubble.split: Beagle 5 (GT:DS, DR2, IDs '.', no INFO/CM, a genetic map), GLIMPSE2 (GT:DS:GP, INFO,
 INFO/CM, SV records carrying SVTYPE/SVLEN/END) and Minimac4 (R2, which can exceed 1).
 """
 from __future__ import annotations

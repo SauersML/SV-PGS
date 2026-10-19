@@ -44,7 +44,7 @@ from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.imputation_reliability import checked_log_reliability
 from sv_pgs.stage2_wiring import fit_models
 
-# MODEL.md section 4: the scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
+# The scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
 DRAW_COUNT = 64
 
 

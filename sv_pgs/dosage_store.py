@@ -141,7 +141,7 @@ MAXIMUM_CODE = 254
 MISSING_CODE = 255
 MAXIMUM_DOSAGE_MILLI = 2000
 # Minimizes the worst relative read-time regret over request runs of at least one Stage 0 tile,
-# given the measured per-byte, per-chunk and per-request costs (docs/design/math/codec.md §3).
+# given the measured per-byte, per-chunk and per-request costs.
 DEFAULT_INNER_CHUNK_ROWS = 64
 # libzstd's ZSTD_CLEVEL_DEFAULT; decoding does not depend on the level.
 ZSTD_LEVEL = 3
@@ -334,7 +334,7 @@ def shard_rows_for(record_counts: Sequence[int], *, inner_rows: int, parallel_wr
     """Rows per shard (a multiple of ``inner_rows``) for arrays of ``record_counts`` rows.
 
     Nothing a read costs depends on the shard size: a range decodes by inner chunk and costs the
-    same across a shard boundary (docs/design/math/codec.md §3), except that a zero-copy view of
+    same across a shard boundary, except that a zero-copy view of
     the page cache must lie inside one shard. A writer fills a shard sequentially and encodes its
     inner chunks on the worker pool, so shards add parallelism only where whole shards are written
     in parallel (the synthetic store's generator). Every shard costs the reader one descriptor

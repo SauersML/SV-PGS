@@ -27,7 +27,7 @@ from tests import ep_eb_reference as reference
 
 
 # The fits here are certified to 1/(2K) nats, the resolution of a scorer with K = 64 posterior draws
-# (MODEL.md §4, "K = 64 exact posterior draws"), the engine's tolerance.
+# (K = 64 exact posterior draws), the engine's tolerance.
 TOLERANCE = 1.0 / (2.0 * 64.0)
 
 

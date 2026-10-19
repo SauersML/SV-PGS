@@ -1,5 +1,5 @@
 """bench-sim prototype arm: ``svpgs_full`` with each tandem-repeat locus's length-changing records replaced by its one
-signed-length column Z = sum_a dlen_a D_a (MODEL.md section 1: the allele effects' rank-one prior beta_a = dlen_a theta).
+signed-length column Z = sum_a dlen_a D_a (the allele effects' rank-one prior beta_a = dlen_a theta).
 
 A locus is the public ``repeat_locus`` (the merged simpleRepeat interval a record overlaps); its members are its
 TR-class records (class 2, bench-sim's indels in a repeat, the records its TR truths are drawn from) with a length

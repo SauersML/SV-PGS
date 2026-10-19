@@ -1,6 +1,6 @@
 #!/bin/bash
 # Never run by an agent: staging is the user's step, from a Workbench app with internet access inside the workspace.
-# Stages what every Batch job builds its environment from (README.md, "Staging") under gs://${OPS_BUCKET}/svpgs/${RUN_ID}/:
+# Stages what every Batch job builds its environment from under gs://${OPS_BUCKET}/svpgs/${RUN_ID}/:
 #   source/          this repository at HEAD (git archive)
 #   bin/uv           the uv binary
 #   python/          a uv-installed CPython 3.12

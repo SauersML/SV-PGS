@@ -1,6 +1,6 @@
 """The pipeline that runs inside the All of Us workspace: imputed batches to held-out scores.
 
-One driver, restartable step by step (docs/design/WORKSPACE_PIPELINE.md). A step writes into
+One driver, restartable step by step. A step writes into
 ``<run>/<step>.partial`` and is complete once that directory, holding ``_COMPLETE.json`` with the
 step's key, is renamed to ``<run>/<step>``. The key is a digest of the configuration the step
 reads, the keys of the steps it depends on, and the source of the code it runs. A rerun:
@@ -18,7 +18,7 @@ Steps:
 1. ``samples``: the halves' typed sample manifests from the batch headers. Then the cohort rows
    (``cohort.resolve_cohort_rows``: the truth row wins, an imputed sample maps to a person only
    through the crosswalk, KING duplicates of a truth genome are dropped), and the trait-agnostic
-   kinship folds over both halves, frozen before any phenotype exists (EVALUATION.md, "Folds").
+   kinship folds over both halves, frozen before any phenotype exists.
 2. ``phenotypes``: each configured disease's and trait's sample table from the CDR (``all_of_us``).
 3. ``cohort``: over the cohort rows, the structure covariates every trait shares, each trait's own
    covariates from its own table, one target column per trait (``cohort.build_cohort``), and every
@@ -51,7 +51,7 @@ Steps:
 
 Nothing is ever sent anywhere. Moving a staged file out of the workspace is the user's action.
 Everything here reads and writes participant-derived data, so every output stays in the
-workspace (STORE.md, "Data class"). Progress is visible only as empty marker files whose names
+workspace. Progress is visible only as empty marker files whose names
 hold the step and the event.
 """
 
@@ -242,7 +242,7 @@ KEY_HINTS = {
     "direct_sv": (
         "direct_sv is null (no direct read-based rows) or {\"gatksv_calls\": a path pattern over {chromosome} to the CDR's "
         "GATK-SV call set, one VCF per chromosome, e.g. "
-        "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz (CDR_LAYOUT.md), "
+        "${CDR_STORAGE_PATH}/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz, "
         "or null; \"read_depth_cnv_calls\", \"ctyper_copy_numbers\", \"cn_estimator_copy_numbers\" and "
         "\"truth_copy_numbers\": null, as none of them is implemented}."
     ),
@@ -287,13 +287,13 @@ class PoppedSidecars:
 
 
 DIRECT_SV_KEYS = ("gatksv_calls", "read_depth_cnv_calls", "ctyper_copy_numbers", "cn_estimator_copy_numbers", "truth_copy_numbers")
-"""The ``direct_sv`` config's keys (WORKSPACE_PIPELINE.md, "Direct read-based SV/CNV channel"): the GATK-SV call set,
+"""The ``direct_sv`` config's keys: the GATK-SV call set,
 the one source implemented, then the optional sources, each of which must be null."""
 
 
 @dataclass(frozen=True, slots=True)
 class PanelInputs:
-    """The pre-registered panel test (EVALUATION.md, "The pre-registered panel"), frozen before any test phenotype is
+    """The pre-registered panel test, frozen before any test phenotype is
     read: the outer fold its per-trait tests are read on, and each trait's non-negative weight, proportional to the
     trait's expected z under a power model that uses no SV biology."""
 
@@ -442,7 +442,7 @@ class WorkspaceConfig:
         if len(set(diseases + traits)) != len(diseases + traits) or not diseases + traits:
             raise ValueError("diseases and traits must name at least one phenotype, each once.")
         if raw["codec"] not in ("raw", "zstd"):
-            raise ValueError("codec must be 'raw' or 'zstd' (STORE.md).")
+            raise ValueError("codec must be 'raw' or 'zstd'.")
         chromosomes = tuple(str(chromosome) for chromosome in raw["chromosomes"])
         for chromosome in chromosomes:
             chromosome_number(chromosome)
@@ -1311,7 +1311,7 @@ def read_bubble_paths(path: Path) -> list[list[frozenset[str]]]:
 
 @dataclass(frozen=True, slots=True)
 class PathCounts:
-    """Each record's bubble (its index in bubble.split, -1 for a single-path record), K and m (STORE.md, background)."""
+    """Each record's bubble (its index in bubble.split, -1 for a single-path record), K and m."""
 
     bubble: I64Array
     kept: I64Array
@@ -1543,7 +1543,7 @@ def store_core_spans(positions: NDArray, sites: RecordSites) -> tuple[I64Array, 
 
 
 def store_variant_classes(sites: RecordSites, positions: NDArray, record_locus: NDArray) -> tuple[U8Array, F64Array]:
-    """Each record's store class code (an index of VARIANT_CLASSES) and length, by STORE.md's first-match rules.
+    """Each record's store class code (an index of VARIANT_CLASSES) and length, by the store's first-match rules.
 
     A record that is not an SNV and whose core overlaps a tandem-repeat locus is str_vntr_repeat.
     Every other record is typed from its alleles, INFO/SVTYPE, |SVLEN| and INFO/END by
@@ -1777,7 +1777,7 @@ def _clear_chromosome(root: Path, chromosome: str, half_count: int, owner: Path)
 
 
 def _write_loci(root: Path, chromosome: str, loci: TrLoci) -> None:
-    """The chromosome's TR loci table (STORE.md, "Loci")."""
+    """The chromosome's TR loci table."""
     for name, values in (
         ("tr_start", loci.starts),
         ("tr_end", loci.ends),
@@ -2074,7 +2074,7 @@ class _StoredHalfCodes:
 def rewrite_recalibrated_store(
     source_root: Path, target_root: Path, scales: F64Array, groups: Sequence[I64Array], fill_directory: Path, codec: Codec, budget: ComputeBudget
 ) -> None:
-    """The store again with every imputed half's codes recalibrated to D* (scales[record, group], STORE.md).
+    """The store again with every imputed half's codes recalibrated to D* (scales[record, group]).
 
     D* is computed from the stored codes. A long-read half is written through unchanged. The
     variant columns and loci are copied, and the MANIFEST records the recalibration.
@@ -2358,8 +2358,7 @@ def _direct_chromosome(
     crosswalk: SampleCrosswalk, gene: GeneIntervals, complexity_legend: tuple[str, ...] | None, fit_columns: I64Array, fit_groups: I64Array,
     group_count: int,
 ) -> dict[str, Any]:
-    """One chromosome of the store with its GATK-SV rows merged in (WORKSPACE_PIPELINE.md, "Conversion into store
-    columns"), and the direct rows' reported r^2 and fitted-cohort moments for the measurement model.
+    """One chromosome of the store with its GATK-SV rows merged in, and the direct rows' reported r^2 and fitted-cohort moments for the measurement model.
 
     The call set is read in blocks of records that hold half the host (``gatksv_block_rows``), each block's rows saved
     as they are built; the pairs of every block are resolved one to one together (``one_to_one``). The direct rows go in
@@ -2640,7 +2639,7 @@ def _direct_sv_inputs(config: WorkspaceConfig) -> Any:
 
 
 def _direct_sv_step(run: _Run, directory: Path) -> dict[str, Any]:
-    """The direct read-based SV/CNV channel (WORKSPACE_PIPELINE.md): every kept GATK-SV record a store row of its own
+    """The direct read-based SV/CNV channel: every kept GATK-SV record a store row of its own
     beside the imputed records, and the measurement model over the merged store's rows.
 
     Each chromosome is a sub-checkpoint, merged in a process of its own with its share of the host, its blocks of rows
@@ -3544,7 +3543,7 @@ PANEL_COLUMNS = ("trait", "n", "cases", "metric", "estimate", "standard_error", 
 
 
 def _panel_rows(run: _Run, cohort: _Cohort, scores: Any, quarantined: Mapping[str, Any]) -> tuple[list[tuple[Any, ...]], dict[str, Any]]:
-    """The pre-registered panel test (EVALUATION.md (a) and (f)) on the config's frozen primary fold.
+    """The pre-registered panel test on the config's frozen primary fold.
 
     Each trait's test is one-sided (the with_sv arm predicts better), paired on the primary fold's held-out people:
     a disease's gain in log likelihood of its frozen probabilities (Delta log loss; its delta AUC where the run has no

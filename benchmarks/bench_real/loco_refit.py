@@ -1,4 +1,4 @@
-"""Training-side leave-one-carrier-out refits for the SV-driven genes (critique/CRITIQUE_METHOD.md item 5B).
+"""Training-side leave-one-carrier-out refits for the SV-driven genes.
 
 sv_artifacts.py's influence check removes a carrier from the test set only. Here each minor-allele carrier of a gene's
 driving SV is removed from every loso training set that holds them. The snv and snv_sv arms are refitted with the

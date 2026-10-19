@@ -13,7 +13,7 @@ warm the page cache, then read in sequential requests of L records:
   for raw, preadv into pinned memory plus the copy, which is what the device path costs today.
 
 The host share is fitted as seconds = tau * bytes + t_chunk * chunks + t_request * requests by
-least squares over every (R, L); ``docs/design/math/codec.md`` derives the chunk size from it.
+least squares over every (R, L); the store's chunk size is derived from it.
 argv: output json, rows, work directory.
 """
 

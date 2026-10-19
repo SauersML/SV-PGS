@@ -775,7 +775,7 @@ def certificate_level(draw_count: int) -> float:
     """The certificate's family-wise error probability: 1/K for a scorer of K posterior draws.
 
     The scorer resolves posterior probabilities only to 1/K: an event rarer than that is, on average, absent from
-    its K draws. ep_eb.md §3.3 sets every numerical tolerance to what the K draws cannot see, and this is the same
+    its K draws. The engine sets every numerical tolerance to what the K draws cannot see, and this is the same
     rule applied to the certificate's chance of letting a bad block through.
     """
     return 1.0 / draw_count
@@ -1153,7 +1153,7 @@ def cavity_tolerance(
     exactly where predicted.
 
     **The tolerance** is the smallest of three:
-    - variance channel: sqrt(2/K) posterior sds of a variance is invisible to K draws (ep_eb.md §3.3). With a
+    - variance channel: sqrt(2/K) posterior sds of a variance is invisible to K draws. With a
       uniform eps over the block, that is eps_b <= sqrt(2/K) / rms_{j in b}(|r_j| w_j / (1 - w_j));
     - mean channel: |delta mu|^2 <= p_eff / K, split evenly over the model, is
       eps <= sqrt(p_eff / K) / sqrt(sum_j (gamma_j w_j / (2 (1 - w_j)))^2), for every block;

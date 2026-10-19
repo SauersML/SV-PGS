@@ -1,4 +1,4 @@
-"""Relatedness among the MAGE samples, and the fold checks it drives (critique/CRITIQUE_REAL.md item 5).
+"""Relatedness among the MAGE samples, and the fold checks it drives.
 
 Kinship is KING-robust, the between-family estimator of Manichaikul et al. 2010 (Bioinformatics 26:2867). It is robust to
 population structure because it normalizes by the less heterozygous member of each pair:

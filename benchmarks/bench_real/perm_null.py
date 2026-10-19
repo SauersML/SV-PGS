@@ -1,5 +1,4 @@
-"""Within-ancestry permutation null for the SV gain of bench-real's top_variant baseline (critique/CRITIQUE_METHOD.md
-item 5, EVALUATION.md's C-null).
+"""Within-ancestry permutation null for the SV gain of bench-real's top_variant baseline.
 
 Each replicate permutes people within every superpopulation and applies that one permutation to every panel SV column
 of every gene, in training and test alike. That keeps each SV's allele frequency per ancestry and the SV-SV linkage, and

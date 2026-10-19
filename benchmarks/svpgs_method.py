@@ -1,6 +1,6 @@
 """SV-PGS as a benchmark method, for both harnesses.
 
-- **bench-sim:** ``fit(train) -> model`` and ``model.score(test)``, per benchmarks/bench_sim/SUBMIT.md.
+- **bench-sim:** ``fit(train) -> model`` and ``model.score(test)``.
 - **bench-real:** ``fit_expression(train) -> predictor`` and ``predictor.predict(genotypes)``, per
   benchmarks/bench_real/harness.py. The method spec is ``benchmarks/svpgs_method.py:fit_expression``.
 
@@ -250,7 +250,7 @@ class BenchSimModel:
 
 
 def fit(train: Any) -> BenchSimModel:
-    """bench-sim: fit SV-PGS on the training view (SUBMIT.md)."""
+    """bench-sim: fit SV-PGS on the training view."""
     budget = detect_compute_budget()
     variants = train.variants
     annotations, kept = bench_sim_annotations(variants)

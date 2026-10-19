@@ -1,4 +1,4 @@
-"""SPEC.md: the number of variants or samples is never capped.
+"""The number of variants or samples is never capped.
 
 A cap that comes back is a SPEC violation: delete the cap, not the test.
 """

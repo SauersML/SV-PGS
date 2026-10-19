@@ -23,7 +23,7 @@ with their store codes:
    with no such candidate takes the mean of its observed calls.
 
 4. Each row's reported r^2, the measurement model's no-truth reliability for a
-   direct call (WORKSPACE_PIPELINE.md, "A direct row with no truth"), over its
+   direct call, over its
    called samples. A hard-call ALT-count row takes 1, the call set's own claim of
    exactness. A copy-number row takes the CNQ bound: each called sample's
    miscall probability is e_i = 10^(-Q_i / 10) from the phred quality of its copy

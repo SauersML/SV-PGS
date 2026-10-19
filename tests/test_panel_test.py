@@ -1,4 +1,4 @@
-"""The pre-registered panel test (EVALUATION.md (a) and (f)): per-trait one-sided tests on a frozen primary fold,
+"""The pre-registered panel test: per-trait one-sided tests on a frozen primary fold,
 Hommel-adjusted, combined by w'z / sqrt(w'Rw) with frozen power weights."""
 from __future__ import annotations
 

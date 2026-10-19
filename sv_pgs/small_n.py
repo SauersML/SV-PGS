@@ -995,8 +995,7 @@ def _segment_start(
     design: _Design, noise: float, data_score: F64Array, precision: F64Array, shift: F64Array, marginal_precision: F64Array,
     marginal_shift: F64Array, cavity_precision: F64Array, tilted: Tilted, largest_variance: F64Array, jvp_bytes: int, profile: dict,
 ) -> _LoopPoint | None:
-    """The inner problem's start when q's cavities at the current sites theta* leave its domain (theory-ep, THEORY_EP.md
-    section 7): on the segment theta(s) = theta0 + s (theta* - theta0) from the sites equal to q's new marginals, theta0
+    """The inner problem's start when q's cavities at the current sites theta* leave its domain: on the segment theta(s) = theta0 + s (theta* - theta0) from the sites equal to q's new marginals, theta0
     (every cavity zero, the precision definite), every cavity is s times q's cavity at theta*, and the precision stays
     definite (a convex combination of two definite ones). The domain is then s < s_j = 1 / (v_j (-P*_j)) for each
     negative cavity precision P*_j, and the start is the minimizer of the convex Phi on [0, min(1, min_j s_j)), where
@@ -1098,7 +1097,7 @@ def double_loop_sites(
     largest_variance: F64Array, draw_count: int, jvp_bytes: int, profile: dict, trace: list | None = None,
 ) -> tuple[F64Array, F64Array]:
     """EP's sites at fixed hyperparameters and noise by the Opper-Winther double loop, which provably reaches a
-    stationary point of the EP free energy (MODEL.md section 4's fallback; ``tests/ep_eb_reference.double_loop_sites``).
+    stationary point of the EP free energy (the fallback; ``tests/ep_eb_reference.double_loop_sites``).
 
     The outer loop fixes (P_s, h_s) at q's marginals, which bounds the free energy's concave part linearly; the inner
     problem, the minimum of the convex Phi over the sites, is solved by Newton with sufficient-decrease halving until no
@@ -1252,8 +1251,7 @@ def _ec_free_energy(
     design: _Design, noise: float, data_score: F64Array, site_precision: F64Array, site_shift: F64Array, tilted: Tilted,
     largest_variance: F64Array,
 ) -> float:
-    """The EC free energy F(eta) = A_q*(eta) + A_s*(eta) - A_r*(eta) at q's diagonal moments eta (theory-ep, THEORY_EP.md
-    section 7): the quantity the double loop's outer steps lower, so its decrease can be verified rather than assumed.
+    """The EC free energy F(eta) = A_q*(eta) + A_s*(eta) - A_r*(eta) at q's diagonal moments eta: the quantity the double loop's outer steps lower, so its decrease can be verified rather than assumed.
     At an EP fixed point it equals -log Z_EP (``_log_evidence``) exactly.
 
     A_q*(eta) = theta . eta - A_q(theta) at q's own sites; A_r*(eta) = -1/2 sum_j log(2 pi e z_j), the Gaussian's; and
@@ -1671,7 +1669,7 @@ class _DenseFixedPoints:
                 # Written so that a non-finite step also ends the halving (review-mathbugs N2).
                 if not fraction * move > _EPSILON * scale:
                     # PD failures halved the damped step to the sites' rounding: no damped EP pass keeps the precision
-                    # positive definite from here, so EP falls back to the convergent double loop (MODEL.md section 4).
+                    # positive definite from here, so EP falls back to the convergent double loop.
                     self._double_loop(hyperparameters)
                     return
             self.site_precision, self.site_shift = trial_precision, trial_shift
@@ -1686,8 +1684,8 @@ class _DenseFixedPoints:
                 if damping < 1.0:
                     # A pass damped by 1/(1 + rho), exact for the map's eigenvalue at -rho^2, still does not contract:
                     # the frozen-cavity map has a mode damping cannot reach (an eigenvalue past +1, or complex), and
-                    # mean-only EP does not converge here. EP falls back to the convergent double loop (MODEL.md
-                    # section 4), as where no damped pass stays positive definite (svpgs-profiler's slow genes 6, 7).
+                    # mean-only EP does not converge here. EP falls back to the convergent double loop,
+                    # as where no damped pass stays positive definite (svpgs-profiler's slow genes 6, 7).
                     self._double_loop(hyperparameters)
                     return
                 damping = 1.0 / (1.0 + np.sqrt(ratio))

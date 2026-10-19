@@ -1,5 +1,5 @@
 """The power study's simulation grid: controlled architectures on bench-sim's real-LD cohort (1kGP haplotypes with
-their imputed SVs, PREREG.md sections 1-2), both study arms fitted by the method on training sets of several sizes, and the
+their imputed SVs), both study arms fitted by the method on training sets of several sizes, and the
 held-out comparison the workspace report makes, with null and positive controls.
 
 Each grid point fixes the architecture that ``benchmarks/bench_sim/truth.py`` otherwise draws at random: a liability
@@ -66,7 +66,7 @@ DELETION_FOLD = 3.0
 TRAIN_COUNTS = (5_000, 10_000, 20_000, 40_000)
 MEASUREMENT_ARM = "beagle"
 """bench-sim's Beagle arm: the one imputed arm covering all 50,000 samples (the GLIMPSE2 arm covers only the 2,500-sample
-calibration subset, SUBMIT.md). Simple sites are read-model calls and TR and SV records are imputed from the separate panel."""
+calibration subset). Simple sites are read-model calls and TR and SV records are imputed from the separate panel."""
 LDPRED2 = Path(__file__).resolve().parents[1] / "bench_sim" / "submissions" / "ldpred2_auto.py"
 LDPRED2_ALLVAR = LDPRED2.with_name("ldpred2_auto_allvar.py")
 """The published-practice competitor, LDpred2-auto on HapMap3-density SNVs, fitted on the same training samples."""

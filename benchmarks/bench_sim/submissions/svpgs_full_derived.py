@@ -3,7 +3,7 @@
 A derived column is c + sum_a w_a D_a over some of the arm's records (``Derived``: a sparse weight matrix over the
 records, one row per derived column, an offset, and the records it replaces, which leave the store). Two arms use it:
 
-- ``svpgs_full_trlocus``: each tandem-repeat locus's signed-length column, MODEL.md section 1;
+- ``svpgs_full_trlocus``: each tandem-repeat locus's signed-length column;
 - ``svpgs_full_refstate``: each non-TR multi-allelic site's REF state, the same section.
 
 These measure a column before the engine computes it from the per-allele products. The store holds a derived column

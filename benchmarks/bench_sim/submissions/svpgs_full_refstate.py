@@ -1,5 +1,5 @@
 """bench-sim prototype arm: ``svpgs_full`` with each non-TR multi-allelic site's REF state given its own column,
-2 - sum_a D_a over the site's records (MODEL.md section 1: exchangeable allele states, so the prediction does not
+2 - sum_a D_a over the site's records (exchangeable allele states, so the prediction does not
 depend on which allele the reference carries). The site's ALT records keep their columns.
 
 A site is a position with two or more records none of which is a TR (class 2); the REF column takes the class of the

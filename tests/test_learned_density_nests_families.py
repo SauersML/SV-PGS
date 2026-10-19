@@ -26,7 +26,7 @@ from sv_pgs.scale_mixture_ep import (
 from tests.oracles import INDEPENDENT_EFFECTS
 
 _WORKING_BYTES = 1 << 24
-# The resolution production fits to (MODEL.md: K = 64 posterior draws, 1/(2K) nats), for the lattice (Stage 0) and
+# The resolution production fits to (K = 64 posterior draws, 1/(2K) nats), for the lattice (Stage 0) and
 # the empirical Bayes step alike. The allowances compared below are nats, far above it.
 _RESOLUTION = 1.0 / (2.0 * 64.0)
 _LOG_2PI = float(np.log(2.0 * np.pi))

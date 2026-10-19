@@ -1,1 +1,1 @@
-"""bench-sim: the neutral semi-synthetic benchmark. PREREG.md is its frozen specification."""
+"""bench-sim: the neutral semi-synthetic benchmark on real 1000 Genomes haplotypes."""

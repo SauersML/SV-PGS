@@ -1,4 +1,4 @@
-"""bench-sim harness: runs a submitted method on one scenario and scores it (PREREG.md section 5).
+"""bench-sim harness: runs a submitted method on one scenario and scores it.
 
 Submission contract (a Python file passed with --method):
 

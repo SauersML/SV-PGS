@@ -60,7 +60,7 @@ _ROUGHNESS_DERIVATIVE = 2
 FREQUENCY = "log_genotype_variance"
 LOG_SCALE_ANNOTATIONS = ("sv_length",)
 """Annotations that enter the prior on their log scale: a record's length (bp, at least 1) is a learned smooth of log
-length (MODEL.md, section 3; STORE.md), which spans 1 bp to megabases evenly. On raw base pairs the smooth was one
+length, which spans 1 bp to megabases evenly. On raw base pairs the smooth was one
 cubic over [1, the longest SV], effectively linear across every SV a cohort has, so a length effect fitted between 50 bp
 and 5 kb gave a 2 Mb record hundreds of times its log-variance shift."""
 """The frequency function's annotation: each member's log true-genotype variance log Var(G_j), from the unit contract

@@ -1,4 +1,4 @@
-"""Robust scoring of bench-real's out-of-fold predictions (the fixes in critique/CRITIQUE_REAL.md, items 1-4 and 12).
+"""Robust scoring of bench-real's out-of-fold predictions.
 
 It reads the harness's own outputs (``<results>/<method>/<design>/<tag>.{genes.tsv,truth.npy,<set>.predictions*.npy}``)
 and changes nothing upstream.

@@ -1,6 +1,6 @@
 """The in-workspace pipeline's synthetic dry run: every step on a synthetic store and synthetic OMOP.
 
-The inputs mimic the imputation's deliverables (docs/design/WORKSPACE_PIPELINE.md, "Inputs"):
+The inputs mimic the imputation's deliverables:
 popped GT:DS:GP batches in two imputation halves, long-read hard calls on the same sites, the
 strata sidecar v2 with its _done manifest and md5s, bubble.split path records, a repeat BED, the
 CDR crosswalk, ancestry and relatedness tables, and OMOP rows through a fake BigQuery client. The
@@ -1089,7 +1089,7 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
     config = WorkspaceConfig.from_mapping(raw)
     # The study's panel is its diseases; the quantitative traits are left out of the template to keep the fit in budget.
     assert (len(config.diseases), len(config.traits), config.fold_count) == (15, 0, 5) and config.truth_calls is None
-    # The direct channel reads the CDR's GATK-SV call set, one VCF per chromosome (CDR_LAYOUT.md).
+    # The direct channel reads the CDR's GATK-SV call set, one VCF per chromosome.
     assert config.direct_sv is not None and config.direct_sv.gatksv_calls == (
         "/mnt/disks/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
     )
@@ -1101,7 +1101,7 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
 
 
 def test_the_launcher_sends_nothing_outside_the_workspace() -> None:
-    text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.is_file() and path.name != "README.md")
+    text = "\n".join(path.read_text().lower() for path in LAUNCHER.iterdir() if path.is_file())
     # The service account's "email" key names an identity inside the workspace; it sends nothing.
     assert not re.search(r"https?://|curl|wget|webhook|notif|sendmail|smtp|\bmail\b|slack|pubsub|scp |rsync", text)
 
