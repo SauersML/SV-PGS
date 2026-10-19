@@ -11,7 +11,8 @@ one-sided paired DeLong test favours the SV arm at 0.05 with its Wilson interval
 genetic variance, and the expected AUC of a PGS that captures the whole heritability (Daetwyler et al. 2008 accuracy,
 Wray et al. 2010 AUC; benchmarks/power/expected.py). The genotype accuracy section gives the imputed SVs' and SNVs' dosage r^2 against their true genotypes by allele frequency
 (benchmarks/power/imputation_accuracy.py) and, for the main scenarios, the SV arm's AUC gain when every variant is fitted
-on its true genotype (the same scenarios run with grid.py --measurement truth) beside the gain on imputed genotypes.
+on its true genotype (the same scenarios run with grid.py --measurement truth) beside the gain on imputed genotypes. The
+window section gives the same cells for the grid run on one chr22 window (WINDOW_GRID), on imputed and true genotypes.
 """
 from __future__ import annotations
 
@@ -36,6 +37,10 @@ TRUTH_GRID = f"{GRID}-truth"
 """The same scenarios and replicates at the largest training size, every variant measured by its true genotype."""
 TRUTH_POINTS = ("null", "sv_20pct", "sv_20pct_fold3", "deletion_positive", "multi_feature_positive", "tagged_sv",
                 "tagged_sv_fold3", "common_sv")
+WINDOW_GRID = "grid-window"
+"""The grid on one 60,000-record chr22 window of the same cohort (tools/window_cohort.py on MSI): the same people,
+variants, imputation and truth model, with fits in minutes, so every point runs at every size with more replicates."""
+WINDOW_COHORT = "cohort-window60k"
 LOCAL = Path.home() / "svpgs-bench" / f"poster-{GRID}"
 REMOTE = "msi:/scratch.global/sauer354/svpgs-poster"
 TEST_PEOPLE = 10_000
@@ -90,10 +95,15 @@ def interval(values) -> dict:
             "replicates": len(values)}
 
 
+def read_grid(folder: Path) -> tuple[list[dict], list[dict]]:
+    """A grid copy's finished tasks and each arm's attempt record (grid.py writes one per arm job)."""
+    results = [json.loads(path.read_text()) for path in sorted((folder / "tasks").glob("*/n*/replicate*/result.json"))]
+    attempts = [json.loads(path.read_text()) for path in sorted((folder / "tasks").glob("*/n*/replicate*/*/attempt.json"))]
+    return results, attempts
+
+
 def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
-    results = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/result.json"))]
-    # each arm's attempt record (grid.py writes one per arm job), to count replicates lost to a failed fit
-    attempts = [json.loads(path.read_text()) for path in sorted((local / "grid" / "tasks").glob("*/n*/replicate*/*/attempt.json"))]
+    results, attempts = read_grid(local / "grid")
     if not results and not attempts:
         raise SystemExit(f"no grid results or attempts under {local / 'grid' / 'tasks'}")
     coverage = {}
@@ -101,6 +111,40 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
         cell = coverage.setdefault(attempt["point"], {}).setdefault(str(attempt["train_count"]), {})
         counts = cell.setdefault(attempt["arm"], {"completed": 0, "failed": 0, "running": 0})
         counts[attempt["status"]] += 1
+    summary = {
+        "source": "benchmarks/power/grid.py on bench-sim v7 chr22 (Beagle arm), MSI",
+        "tasks": len(results),
+        "coverage": coverage,
+        "mean_interval": "Student t 95% interval across completed simulation replicates",
+        "train_counts": list(TRAIN_COUNTS),
+        "test_people": TEST_PEOPLE,
+        "effective_segments": effective_segments(),
+        "points": summarize(results, attempts),
+        "genotype_accuracy": genotype_accuracy(local, results),
+        "window": window_study(local),
+    }
+    temporary = target.with_suffix(".partial.json")
+    temporary.write_text(json.dumps(summary, indent=1, allow_nan=True) + "\n")
+    temporary.replace(target)
+    return target
+
+
+def window_study(local: Path) -> dict:
+    """The same grid on one chr22 window (WINDOW_GRID), on imputed and on true genotypes: per point and training
+    size the summary's cells, without the whole-chromosome expected AUC."""
+    found = {}
+    cohort = local / "public" / "window.json"
+    if cohort.is_file():
+        found["cohort"] = json.loads(cohort.read_text())
+    for name, folder in (("imputed", "window"), ("true", "window-truth")):
+        results, attempts = read_grid(local / folder)
+        if results:
+            found[name] = summarize(results, attempts, expected=False)
+    return found
+
+
+def summarize(results: list[dict], attempts: list[dict], expected: bool = True) -> dict:
+    """Per grid point and training size: each method's mean AUC, the SV arm's gains and tests, and the truth's draw."""
     points: dict = {}
     for point in POINTS:
         rows = [result for result in results if result["point"] == point]
@@ -137,25 +181,13 @@ def collect(local: Path = LOCAL, target: Path = SUMMARY) -> Path:
                 "deletion_over_insertion": mean_se(row.get("deletion_over_insertion") for row in group),
                 "fit_seconds": {arm: mean_se(row["fit_seconds"][arm] for row in group if arm in row.get("fit_seconds", {}))[0]
                                 for arm in ("snv_indel", "with_sv", "ldpred2_auto", "ldpred2_allvar")},
-                "expected_auc": expected_auc(point, train_count),
             }
-        points[point] = {"setting": setting(point), "sizes": by_size,
-                         "expected_auc": {str(count): expected_auc(point, count) for count in TRAIN_COUNTS}}
-    summary = {
-        "source": "benchmarks/power/grid.py on bench-sim v7 chr22 (Beagle arm), MSI",
-        "tasks": len(results),
-        "coverage": coverage,
-        "mean_interval": "Student t 95% interval across completed simulation replicates",
-        "train_counts": list(TRAIN_COUNTS),
-        "test_people": TEST_PEOPLE,
-        "effective_segments": effective_segments(),
-        "points": points,
-        "genotype_accuracy": genotype_accuracy(local, results),
-    }
-    temporary = target.with_suffix(".partial.json")
-    temporary.write_text(json.dumps(summary, indent=1, allow_nan=True) + "\n")
-    temporary.replace(target)
-    return target
+            if expected:
+                by_size[str(train_count)]["expected_auc"] = expected_auc(point, train_count)
+        points[point] = {"setting": setting(point), "sizes": by_size}
+        if expected:
+            points[point]["expected_auc"] = {str(count): expected_auc(point, count) for count in TRAIN_COUNTS}
+    return points
 
 
 def genotype_accuracy(local: Path, imputed: list[dict]) -> dict:
@@ -197,9 +229,10 @@ def fetch(local: Path = LOCAL) -> None:
     connection (ssh config host msi), plus the genotype accuracy by allele frequency."""
     local.mkdir(parents=True, exist_ok=True)
     rules = ["--include=*/", "--include=result.json", "--include=attempt.json", "--exclude=*"]
-    for grid, folder in ((GRID, "grid"), (TRUTH_GRID, "grid-truth")):
+    for grid, folder in ((GRID, "grid"), (TRUTH_GRID, "grid-truth"), (WINDOW_GRID, "window"), (f"{WINDOW_GRID}-truth", "window-truth")):
         subprocess.run(["rsync", "-a", "--prune-empty-dirs", *rules, f"{REMOTE}/{grid}/", str(local / folder)], check=True)
     subprocess.run(["rsync", "-a", f"{REMOTE}/figs/", str(local / "public")], check=True)
+    subprocess.run(["rsync", "-a", f"{REMOTE}/{WINDOW_COHORT}/window.json", str(local / "public" / "window.json")], check=True)
 
 
 def main() -> None:

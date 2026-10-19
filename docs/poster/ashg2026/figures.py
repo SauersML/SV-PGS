@@ -506,6 +506,89 @@ def architectures_figure(summary: dict, width: float = 16.95, height: float = 4.
     return render("fig_sim_architectures", page("".join(parts), width, height), width, height)
 
 
+WINDOW_PANELS = (
+    # (point, title, second title line): causal SVs restricted to well-imputed (r^2 >= 0.8) or common ones, or any SV
+    ("tagged_sv_fold3", "Tagged SVs", "3× effect"), ("tagged_sv", "Tagged SVs", "1× effect"),
+    ("common_sv", "Common SVs", "1× effect"), ("sv_20pct_fold3", "Any SVs", "3× effect"), ("null", "No causal SVs", "control"),
+)
+WINDOW_SERIES = (("true", "True SV genotypes", True, 7.0), ("imputed", "Imputed SVs", False, -7.0))
+
+
+def window_cells(summary: dict, measurement: str, point: str) -> dict[int, dict]:
+    """The window study's AUC gain from adding SVs per training size with at least MIN_REPLICATES replicates."""
+    cells = summary.get("window", {}).get(measurement, {}).get(point, {}).get("sizes", {})
+    return {int(size): cell["delta_auc"] for size, cell in cells.items() if cell["delta_auc"]["replicates"] >= MIN_REPLICATES}
+
+
+def window_figure(summary: dict, width: float = 16.95, height: float = 4.5) -> Path:
+    """The chr22 window study: the test AUC gain of SV-PGS with SVs over SV-PGS without them against training size,
+    one panel per causal architecture, on true SV genotypes (filled) and imputed SVs (open), with 95% intervals."""
+    panels = [(point, title, detail) for point, title, detail in WINDOW_PANELS
+              if any(window_cells(summary, measurement, point) for measurement, *_rest in WINDOW_SERIES)]
+    w, h = width * 100, height * 100
+    left, right, gap = 165.0, 20.0, 40.0
+    key_y, top, bottom = 40.0, 172.0, h - 112.0
+    counts = sorted({count for point, *_titles in panels for measurement, *_rest in WINDOW_SERIES
+                     for count in window_cells(summary, measurement, point)})
+    values = [0.0]
+    for point, *_titles in panels:
+        for measurement, *_rest in WINDOW_SERIES:
+            for entry in window_cells(summary, measurement, point).values():
+                values += finite([entry["mean"], entry["lower"], entry["upper"]])
+    low, high, step = nice_range(min(values), max(values), steps=(0.002, 0.005, 0.01, 0.02, 0.025, 0.05, 0.1), most=int((bottom - top) // 52))
+    panel = (w - left - right - gap * (len(panels) - 1)) / len(panels)
+
+    def y(value: float) -> float:
+        return bottom - (value - low) / (high - low) * (bottom - top)
+
+    parts = [f'<svg viewBox="0 0 {w:.0f} {h:.0f}" xmlns="http://www.w3.org/2000/svg"><style>{SIM_STYLE}</style>']
+    spans = [80 + text_width(label, 26) for _measurement, label, _filled, _offset in WINDOW_SERIES]
+    cursor = left + (w - left - right - sum(spans) - 50 * (len(spans) - 1)) / 2
+    for (_measurement, label, filled, _offset), span in zip(WINDOW_SERIES, spans):
+        parts.append(f'<line x1="{cursor}" y1="{key_y}" x2="{cursor + 64}" y2="{key_y}" stroke="{TEAL}" stroke-width="6"/>')
+        parts.append(f'<circle cx="{cursor + 32}" cy="{key_y}" r="11" fill="{TEAL if filled else "#fff"}" stroke="{TEAL}" stroke-width="5"/>')
+        parts.append(f'<text class="key" x="{cursor + 80}" y="{key_y + 12}">{label}</text>')
+        cursor += span + 50
+    parts.append(f'<text class="axis" transform="translate(34 {(top + bottom) / 2:.1f}) rotate(-90)" text-anchor="middle">AUC gain</text>')
+    tick = low
+    while tick <= high + 1e-9:
+        text = tick_text(tick, step) if abs(tick) > 1e-12 else "0"
+        parts.append(f'<text class="tick" x="{left - 16}" y="{y(tick) + 9:.1f}" text-anchor="end">{text}</text>')
+        tick += step
+    for index, (point, title, detail) in enumerate(panels):
+        x0 = left + index * (panel + gap)
+
+        def x(count: int) -> float:
+            return x0 + 30 + math.log2(count / counts[0]) / max(math.log2(counts[-1] / counts[0]), 1.0) * (panel - 60)
+
+        parts.append(f'<text class="facet" x="{x0 + panel / 2:.1f}" y="{top - 58}" text-anchor="middle">{title}</text>')
+        parts.append(f'<text class="detail" x="{x0 + panel / 2:.1f}" y="{top - 20}" text-anchor="middle">{detail}</text>')
+        parts.append(f'<line x1="{x0}" y1="{bottom}" x2="{x0 + panel:.1f}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<line x1="{x0}" y1="{top}" x2="{x0}" y2="{bottom}" stroke="{GREY}" stroke-width="3"/>')
+        parts.append(f'<line x1="{x0}" y1="{y(0.0):.1f}" x2="{x0 + panel:.1f}" y2="{y(0.0):.1f}" stroke="{GREY}" stroke-width="2.5" stroke-dasharray="8 8"/>')
+        tick = low
+        while tick <= high + 1e-9:
+            parts.append(f'<line x1="{x0 - 10}" y1="{y(tick):.1f}" x2="{x0}" y2="{y(tick):.1f}" stroke="{GREY}" stroke-width="3"/>')
+            tick += step
+        for count in counts:
+            parts.append(f'<line x1="{x(count):.1f}" y1="{bottom}" x2="{x(count):.1f}" y2="{bottom + 10}" stroke="{GREY}" stroke-width="3"/>')
+            parts.append(f'<text class="tick" x="{x(count):.1f}" y="{bottom + 44}" text-anchor="middle">{thousands(count)}</text>')
+        for measurement, _label, filled, offset in WINDOW_SERIES:
+            cells = window_cells(summary, measurement, point)
+            marks = [(x(count) + offset, cells[count]) for count in counts if count in cells]
+            if not marks:
+                continue
+            parts.append('<polyline points="' + " ".join(f"{px:.1f},{y(entry['mean']):.1f}" for px, entry in marks)
+                         + f'" fill="none" stroke="{TEAL}" stroke-width="6" stroke-linejoin="round"/>')
+            for px, entry in marks:
+                if math.isfinite(entry["lower"]):
+                    parts.append(f'<line x1="{px:.1f}" y1="{y(entry["lower"]):.1f}" x2="{px:.1f}" y2="{y(entry["upper"]):.1f}" stroke="{TEAL}" stroke-width="4"/>')
+                parts.append(f'<circle cx="{px:.1f}" cy="{y(entry["mean"]):.1f}" r="11" fill="{TEAL if filled else "#fff"}" stroke="{TEAL}" stroke-width="5"/>')
+    parts.append(f'<text class="axis" x="{left + (w - left - right) / 2:.1f}" y="{h - 14}" text-anchor="middle">Training samples</text>')
+    parts.append("</svg>")
+    return render("fig_sim_window", page("".join(parts), width, height), width, height)
+
+
 def simulation_figures(summary: dict | None) -> list[Path]:
     """Each simulation figure whose grid points have results; a placeholder for the others."""
     made = []
@@ -516,12 +599,18 @@ def simulation_figures(summary: dict | None) -> list[Path]:
                 else placeholder_figure("ph_sim_power"))
     made.append(genotypes_figure(summary) if summary and "r2_by_frequency" in summary.get("genotype_accuracy", {})
                 else placeholder_figure("ph_sim_genotypes"))
-    if summary and sum(bool(sizes(summary, point)) for point in points) > 1:
-        made.append(architectures_figure(summary))
-    else:
-        # The builder includes this optional panel by filename: never reuse a previous run's result.
-        for suffix in (".png", ".html"):
-            (OUT / f"fig_sim_architectures{suffix}").unlink(missing_ok=True)
+    optional = {
+        "fig_sim_architectures": (architectures_figure, summary and sum(bool(sizes(summary, point)) for point in points) > 1),
+        "fig_sim_window": (window_figure, summary and any(window_cells(summary, measurement, point) for point, *_titles in WINDOW_PANELS
+                                                          for measurement, *_rest in WINDOW_SERIES)),
+    }
+    for name, (draw, ready) in optional.items():
+        if ready:
+            made.append(draw(summary))
+        else:
+            # The builder includes these optional panels by filename: never reuse a previous run's result.
+            for suffix in (".png", ".html"):
+                (OUT / f"{name}{suffix}").unlink(missing_ok=True)
     return made
 
 

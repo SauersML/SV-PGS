@@ -76,6 +76,28 @@ def test_true_genotype_gain_is_paired_only_over_replicates_both_runs_finished(tm
     assert gains["true_minus_imputed"]["mean"] == pytest.approx(0.03)
 
 
+def test_window_study_summarizes_each_measurement_apart_from_the_chromosome_grid(tmp_path):
+    def write(grid, replicate, delta):
+        folder = tmp_path / f"{grid}/tasks/tagged_sv/n10000/replicate{replicate}"
+        folder.mkdir(parents=True)
+        (folder / "result.json").write_text(json.dumps(dict(
+            point="tagged_sv", train_count=10000, replicate=replicate, snv_indel_auc=.6, with_sv_auc=.6 + delta,
+            delta_auc=delta, z=3.0, truth=dict(structural_share=.25, causal_by_class=[160, 0, 0, 40], causal_count=200))))
+    for replicate in range(3):
+        write("grid", replicate, 0.001)
+        write("window", replicate, 0.01)
+        write("window-truth", replicate, 0.03)
+    (tmp_path / "public").mkdir()
+    (tmp_path / "public/window.json").write_text(json.dumps(dict(first_record=0, last_record=60000)))
+    summary = json.loads(simulation.collect(tmp_path, tmp_path / "summary.json").read_text())
+    window = summary["window"]
+    assert summary["points"]["tagged_sv"]["sizes"]["10000"]["delta_auc"]["mean"] == pytest.approx(0.001)
+    assert window["imputed"]["tagged_sv"]["sizes"]["10000"]["delta_auc"]["mean"] == pytest.approx(0.01)
+    assert window["true"]["tagged_sv"]["sizes"]["10000"]["delta_auc"]["mean"] == pytest.approx(0.03)
+    assert "expected_auc" not in window["true"]["tagged_sv"] and window["cohort"]["last_record"] == 60000
+    assert figures.window_cells(summary, "true", "tagged_sv")[10000]["replicates"] == 3
+
+
 def test_zero_gains_have_a_nonzero_plot_range():
     low, high, step = figures.nice_range(0.0, 0.0)
     assert low < 0 < high and step > 0

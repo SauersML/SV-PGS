@@ -94,6 +94,9 @@ DISEASES = [
      (" (95% CI ", ""), ("[ ]", "ph"), (").", "")],
 ]
 
+WINDOW = []
+"""The chr22 window study's sentences (simulation_copy), under its figure when figures.py drew one."""
+
 DISCUSSION = [
     [("Adding SVs ", ""), ("[improved / did not improve]", "ph"), (" prediction in simulations with causal SVs and in ", ""),
      ("[n]", "ph"), (" All of Us diseases.", "")],
@@ -133,7 +136,7 @@ def rare_r2(bins: list[dict]) -> float:
 
 def simulation_copy(summary: dict) -> None:
     """Fill the simulation's bracketed numbers with estimates and uncertainty from completed replicates."""
-    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_GENOTYPES, DISCUSSION
+    global SIMULATION_METHODS, SIMULATION_ACCURACY, SIMULATION_GENOTYPES, WINDOW, DISCUSSION
     points = summary["points"]
     largest = str(max(summary["train_counts"]))
     largest_text = f"{int(largest):,}"
@@ -191,6 +194,28 @@ def simulation_copy(summary: dict) -> None:
                            f"r² averages {number(rare['SV'], 2)} (SNVs: {number(rare['SNV'], 2)}).", "")])
     if genotypes:
         SIMULATION_GENOTYPES = genotypes
+
+    # the window study: per architecture, the gain from adding SVs at its largest settled size, true then imputed
+    window = summary.get("window", {})
+    cohort = window.get("cohort")
+    window_gains = []
+    for point, label in ARCHITECTURE_LABELS:
+        entries = {}
+        for measurement in ("true", "imputed"):
+            cells = window.get(measurement, {}).get(point, {})
+            done = [size for size in sorted(cells.get("sizes", {}), key=int, reverse=True) if settled(cells, size)]
+            if done:
+                entries[measurement] = (int(done[0]), cells["sizes"][done[0]]["delta_auc"])
+        if entries:
+            window_gains.append((label, entries))
+    if cohort and window_gains:
+        megabases = (cohort["end_bp"] - cohort["start_bp"]) / 1e6
+        WINDOW = [[(f"One {megabases:.0f}-Mb chr22 window ({cohort['last_record'] - cohort['first_record']:,} variants, the same "
+                    "50,000 people) fits in minutes, so every architecture runs at every size.", "")]]
+        for label, entries in window_gains:
+            parts = [f"{'true SV genotypes' if measurement == 'true' else 'imputed'} {auc_change(entry)} at {count // 1000}k"
+                     for measurement, (count, entry) in entries.items()]
+            WINDOW.append([(f"{label}: adding SVs changed AUC by " + "; ".join(parts) + ".", "")])
 
     conclusions = []
     if versus and sum(entry["lower"] > 0 for entry in versus.values()):
@@ -437,6 +462,8 @@ def build() -> None:
     # the per-scenario gains exist once the grid has more than one scenario (figures.py)
     if (FIGURES / "fig_sim_architectures.png").is_file():
         figures["architectures"] = "fig_sim_architectures.png"
+    if (FIGURES / "fig_sim_window.png").is_file():
+        figures["window"] = "fig_sim_window.png"
     ids = {}
     for index, (key, name) in enumerate(figures.items()):
         target = f"svpgs_{name}"
@@ -480,7 +507,8 @@ def build() -> None:
         (113, 123, "Simulation genotypes caption"), (113, 124, "Hypertension caption"), (113, 125, "Diseases caption"),
         (94, 126, "Simulation accuracy text"), (94, 127, "Simulation genotypes text"), (94, 128, "Hypertension text"),
         (94, 129, "Diseases text"), (106, 130, "Simulation architectures"), (113, 131, "Simulation architectures caption"),
-        (94, 132, "Simulation methods text"),
+        (94, 132, "Simulation methods text"), (106, 133, "Simulation window"), (113, 134, "Simulation window caption"),
+        (94, 135, "Simulation window text"),
     ):
         xml = duplicate(xml, source, new, name)
     for bar, text in BARS.items():
@@ -560,6 +588,12 @@ def build() -> None:
         xml = column.caption(xml, 131, "AUC gain by architecture (95% t interval)")
     else:
         xml = delete(delete(xml, 130), 131)
+    if "window" in figures:
+        xml = column.figure(xml, 133, "window")
+        xml = column.caption(xml, 134, "AUC gain from adding SVs in one chr22 window (95% t interval)")
+        xml = column.text(xml, 135, WINDOW) if WINDOW else delete(xml, 135)
+    else:
+        xml = delete(delete(delete(xml, 133), 134), 135)
     column.finish()
 
     # column 3: All of Us (hypertension, then the diseases), discussion, references
