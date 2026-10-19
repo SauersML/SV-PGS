@@ -2,7 +2,7 @@
 
 The inputs mimic the imputation's deliverables:
 popped GT:DS:GP batches in two imputation halves, long-read hard calls on the same sites, the
-strata sidecar v2 with its _done manifest and md5s, bubble.split path records, a repeat BED, the
+strata sidecar v2 with its chrK.json manifest of md5s and its _done marker, bubble.split path records, a repeat BED, the
 CDR crosswalk, ancestry and relatedness tables, and OMOP rows through a fake BigQuery client. The
 measurement model, fit, model files and prediction are bound to doubles with the production
 signatures; they are other lanes' modules.
@@ -266,7 +266,8 @@ def _write_inputs(root: Path) -> _Synthetic:
             ids.update(f"{identifier}\n".encode())
         with gzip.open(strata / f"{chromosome}.strata.tsv.gz", "wt") as handle:
             handle.write("\n".join(rows) + "\n")
-        (strata / "_done" / f"{chromosome}.json").write_text(json.dumps({"sites_md5": sites.hexdigest(), "ids_md5": ids.hexdigest()}))
+        (strata / f"{chromosome}.json").write_text(json.dumps({"sites_md5": sites.hexdigest(), "ids_md5": ids.hexdigest()}))
+        (strata / "_done" / f"{chromosome}.json").write_text(json.dumps({"chrom": chromosome}))
         lines = _vcf_header([], ())
         for bubble, (position, paths) in enumerate(BUBBLES):
             for path, carried in enumerate(paths):
@@ -1010,8 +1011,8 @@ def test_direct_sv_refuses_a_source_it_does_not_read(workspace) -> None:
 
 def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(workspace) -> None:
     synthetic, client = workspace
-    done = synthetic.root / "strata" / "_done" / "chr22.json"
-    done.write_text(json.dumps({**json.loads(done.read_text()), "ids_md5": "0" * 32}))
+    manifest = synthetic.root / "strata" / "chr22.json"
+    manifest.write_text(json.dumps({**json.loads(manifest.read_text()), "ids_md5": "0" * 32}))
     with pytest.raises(ValueError, match="md5"):
         run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="store")
 

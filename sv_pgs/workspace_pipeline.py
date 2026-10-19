@@ -1175,8 +1175,15 @@ def _strata_names(path: Path) -> list[str]:
     return names
 
 
+def strata_manifest(directory: Path, chromosome: str) -> Path:
+    """A contig's strata manifest, ``chrK.json``: its sites and ids md5s, and the md5 of every sidecar file."""
+    return directory / f"{chromosome}.json"
+
+
 def read_strata_sites(directory: Path, chromosome: str, complexity_legend: tuple[str, ...] | None) -> StrataSites:
-    """The STRATA_COLUMNS of ``chrK.strata.tsv.gz``, once ``_done/chrK.json`` marks the contig complete.
+    """The STRATA_COLUMNS of ``chrK.strata.tsv.gz``, once ``_done/chrK.json`` marks the contig complete, with the
+    popped records' sites and ids md5s from the contig's manifest ``chrK.json`` (the strata build's counts, md5s and
+    checks).
 
     ``cx`` is numeric where ``complexity_legend`` is None, and is otherwise coded by that legend, the store's one legend
     over every chromosome (``strata_complexity_legend``).
@@ -1184,7 +1191,7 @@ def read_strata_sites(directory: Path, chromosome: str, complexity_legend: tuple
     done = directory / "_done" / f"{chromosome}.json"
     if not done.is_file():
         raise ValueError(f"the strata sidecar of {chromosome} is not complete: {done} does not exist.")
-    manifest = json.loads(done.read_text(encoding="utf-8"))
+    manifest = json.loads(strata_manifest(directory, chromosome).read_text(encoding="utf-8"))
     path = directory / f"{chromosome}.strata.tsv.gz"
     names = _strata_names(path)
     table = pd.read_csv(
@@ -1913,7 +1920,7 @@ def _store_inputs(config: WorkspaceConfig) -> Any:
             for half in config.imputed_halves
         ],
         "truth": None if config.truth_calls is None else [genotype_file_fingerprint(config.truth_path(chromosome)) for chromosome in config.chromosomes],
-        "strata": None if popped is None else [_file_digest(popped.strata_directory / "_done" / f"{chromosome}.json") for chromosome in config.chromosomes],
+        "strata": None if popped is None else [_file_digest(strata_manifest(popped.strata_directory, chromosome)) for chromosome in config.chromosomes],
         "bubble_split": None if popped is None else [genotype_file_fingerprint(popped.bubble_split_path(chromosome)) for chromosome in config.chromosomes],
         "genetic_map": None if config.genetic_map is None else [_file_digest(config.genetic_map_path(chromosome)) for chromosome in config.chromosomes],
         "tandem_repeats": _file_digest(config.tandem_repeats),
