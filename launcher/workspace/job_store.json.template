@@ -3,6 +3,7 @@
     {
       "taskCount": ${TASK_COUNT},
       "parallelism": ${TASK_COUNT},
+      "taskCountPerNode": 1,
       "taskSpec": {
         "runnables": [{"script": {"text": "bash /mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
         "maxRetryCount": ${MAX_RETRIES},

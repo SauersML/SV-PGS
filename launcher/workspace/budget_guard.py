@@ -70,8 +70,11 @@ def validate_job(spec, seconds, retries, tasks=1):
     if len(groups) != 1 or len(instances) != 1 or groups[0].get("taskCount") != tasks:
         raise ValueError(f"budgeted jobs must allocate their reserved {tasks} task(s), one VM each")
     group = groups[0]
-    if group.get("parallelism", 1) != tasks or group.get("taskCountPerNode", 1) != 1:
-        raise ValueError("budgeted jobs cannot multiply tasks or nodes beyond their reservation")
+    # Without taskCountPerNode, Batch packs tasks onto a VM by their default 2-vCPU request: 20 of a 22-task store job
+    # shared one VM and its disk. A job of several tasks must say one per VM.
+    per_node = group.get("taskCountPerNode", 1 if tasks == 1 else None)
+    if group.get("parallelism", 1) != tasks or per_node != 1:
+        raise ValueError("budgeted jobs cannot multiply tasks or nodes beyond their reservation, and run one task per VM")
     task = group["taskSpec"]
     if task.get("maxRetryCount") != retries or task.get("maxRunDuration") != f"{seconds}s":
         raise ValueError("the job's retries or timeout do not match its reservation")

@@ -66,6 +66,10 @@ def test_a_fan_out_reserves_every_task_s_vm(plan):
     assert (seconds / 3600 + 1) * 2.5 * 22 * 2 <= plan["slots"]["train-1"] < (seconds / 3600 + 1.01) * 2.5 * 22 * 2
     fan_out = job(seconds, 1)
     fan_out["taskGroups"][0].update(taskCount=22, parallelism=22)
+    # Batch packs tasks without taskCountPerNode, so a fan-out must name one per VM.
+    with pytest.raises(ValueError, match="one task per VM"):
+        guard.validate_job(fan_out, seconds, 1, 22)
+    fan_out["taskGroups"][0]["taskCountPerNode"] = 1
     guard.validate_job(fan_out, seconds, 1, 22)
     with pytest.raises(ValueError, match="one VM each"):
         guard.validate_job(fan_out, seconds, 1)
@@ -226,7 +230,7 @@ def test_a_store_fan_out_gives_each_task_its_chromosome_and_the_fit_job_has_one_
     assert submitted.returncode == 0, submitted.stderr
     spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
     group = spec["taskGroups"][0]
-    assert group["taskCount"] == 22 and group["parallelism"] == 22
+    assert group["taskCount"] == 22 and group["parallelism"] == 22 and group["taskCountPerNode"] == 1
     guard.validate_job(spec, guard.duration_seconds(json.loads(Path(environment["STUDY_BUDGET"]).read_text()), "train-1", 2.5, 1, 22), 1, 22)
     script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-1/run_step.sh"]
     assert 'shard=(--store-shard "$BATCH_TASK_INDEX")' in script and '--through "store" ${shard[@]+"${shard[@]}"}' in script
