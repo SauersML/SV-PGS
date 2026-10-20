@@ -1,9 +1,12 @@
 """Changing worker scheduling preserves numerical results and the caller's mask."""
+import threading
+
 import numba
 import numpy as np
 import pytest
 
 from sv_pgs import host_kernels
+from sv_pgs.code_products import _fp64_codes
 from sv_pgs.host_kernels import row_kernel
 from sv_pgs.scale_mixture_ep import _LOST_BELOW, _moving_line_rows, _objective_rows
 
@@ -63,3 +66,23 @@ def test_worker_scheduling_preserves_likelihood_rows_bitwise(rows):
     assert row_kernel(_objective_rows, rows * grid.size, *args, *actual_outputs) == bad
     for actual, expected in zip(actual_outputs, expected_outputs):
         np.testing.assert_array_equal(actual, expected)
+
+
+def test_parallel_launches_from_several_threads_take_turns():
+    """The stage-0 host pool converts code tiles on several threads at once. Under Numba's workqueue threading layer
+    (macOS, or a Linux host without libgomp such as the Batch VM image) two overlapping launches abort the process."""
+    codes = np.random.default_rng(0).integers(0, 256, size=(64, 500), dtype=np.uint8)
+    expected = codes.astype(np.float64)
+    failures = []
+
+    def convert():
+        for _ in range(50):
+            if not np.array_equal(_fp64_codes(codes, 0, codes.shape[1]), expected):
+                failures.append("converted codes differ")
+
+    threads = [threading.Thread(target=convert) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert failures == []

@@ -14,11 +14,23 @@ class _Schedules(threading.local):
 
 _schedules = _Schedules()
 
+# Numba's workqueue threading layer, the one it falls back to on a host with neither TBB nor GNU OpenMP (the Batch VM
+# image has no libgomp), is not thread-safe: two threads launching parallel kernels at once abort the process ("Nested
+# parallel kernel launch detected", exit 134) or crash it (exit 139), as the stage-0 host pool's code conversions did
+# in the All of Us fit. Every parallel launch holds this lock; each launch uses every worker anyway.
+_LAUNCH = threading.Lock()
+
+
+def launch(kernel, *arguments):
+    """``kernel(*arguments)`` with no other parallel kernel running in the process."""
+    with _LAUNCH:
+        return kernel(*arguments)
+
 
 def _one_worker(kernel, workers, arguments):
     numba.set_num_threads(1)
     try:
-        return kernel(*arguments)
+        return launch(kernel, *arguments)
     finally:
         numba.set_num_threads(workers)
 
@@ -42,18 +54,18 @@ def row_kernel(kernel, node_visits: int, *arguments):
     """
     workers = numba.get_num_threads()
     if workers == 1:
-        return kernel(*arguments)
+        return launch(kernel, *arguments)
     shapes = tuple((tuple(int(extent).bit_length() for extent in argument.shape), argument.dtype.str) for argument in arguments if hasattr(argument, "shape"))
     key = (kernel, workers, int(node_visits).bit_length(), shapes)
     single = _schedules.choices.get(key)
     if single is None:
-        kernel(*arguments)  # compilation and pool initialization are not timed
+        launch(kernel, *arguments)  # compilation and pool initialization are not timed
         started = time.perf_counter()
         _one_worker(kernel, workers, arguments)
         single_seconds = time.perf_counter() - started
         started = time.perf_counter()
-        result = kernel(*arguments)
+        result = launch(kernel, *arguments)
         parallel_seconds = time.perf_counter() - started
         _schedules.choices[key] = single_seconds < parallel_seconds
         return result
-    return _one_worker(kernel, workers, arguments) if single else kernel(*arguments)
+    return _one_worker(kernel, workers, arguments) if single else launch(kernel, *arguments)

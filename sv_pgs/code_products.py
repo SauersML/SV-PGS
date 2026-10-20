@@ -55,6 +55,7 @@ from sv_pgs.genotype_buffers import (
     _CUDA_R_8I,
     _CUDA_R_32I,
 )
+from sv_pgs.host_kernels import launch
 from sv_pgs.memory_broker import current_broker, device_pool
 
 DIGIT_BITS = 7
@@ -181,7 +182,7 @@ def _fp64_codes(codes: np.ndarray, start: int, stop: int, square: bool = False) 
             np.square(out, out=out)
         return out
     out = np.empty((int(codes.shape[0]), stop - start), dtype=np.float64)
-    _fp64_codes_rows(codes, start, stop, square, out)
+    launch(_fp64_codes_rows, codes, start, stop, square, out)
     return out
 
 
