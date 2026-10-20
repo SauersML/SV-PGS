@@ -124,8 +124,13 @@ class GcsRemote:
         self._bucket.blob(self._root + name).upload_from_string(content)
 
     def download(self, name: str, path: Path) -> None:
+        from google.cloud.storage.retry import DEFAULT_RETRY
+
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._bucket.blob(self._root + name).download_to_filename(str(path))
+        # A broken read resumes from its last byte (a range request) for as long as it keeps failing transiently: under
+        # the client's default 120 s deadline, one stalled stream among a restore's parallel downloads ended the AoU
+        # whole-genome restore an hour and 547 GB in ("Connection broken: IncompleteRead").
+        self._bucket.blob(self._root + name).download_to_filename(str(path), retry=DEFAULT_RETRY.with_timeout(None))
 
     def delete(self, names: Iterable[str]) -> None:
         blobs = [self._bucket.blob(self._root + name) for name in names]

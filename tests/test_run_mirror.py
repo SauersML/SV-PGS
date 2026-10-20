@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.content_identity import GCS_MOUNTS
-from sv_pgs.run_mirror import DirectoryRemote, mounted, push, restore
+from sv_pgs.run_mirror import DirectoryRemote, GcsRemote, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
 
 
@@ -212,3 +212,21 @@ def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> N
     assert mounted("gs://ops/svpgs/run1/run") == Path("/mnt/disks/ops/svpgs/run1/run")
     assert mounted("gs://cdr/v8/svpgs") == Path("/mnt/disks/cdr/svpgs")
     assert mounted("gs://cdr/v7/svpgs") is None and mounted("gs://other/run") is None
+
+
+def test_a_gcs_download_retries_a_broken_read_without_a_deadline(tmp_path: Path) -> None:
+    calls = []
+
+    class Blob:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def download_to_filename(self, filename: str, **options) -> None:
+            calls.append((self.name, filename, options))
+
+    remote = GcsRemote.__new__(GcsRemote)
+    remote._bucket, remote._root = type("Bucket", (), {"blob": lambda self, name: Blob(name)})(), "svpgs/run/"
+    remote.download("store/chr1.codes", tmp_path / "a" / "chr1.codes")
+    (name, filename, options), = calls
+    assert name == "svpgs/run/store/chr1.codes" and filename == str(tmp_path / "a" / "chr1.codes") and (tmp_path / "a").is_dir()
+    assert options["retry"].timeout is None
