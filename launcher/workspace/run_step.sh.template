@@ -26,9 +26,12 @@ if [ ! -f "$RUN/tools/staged" ]; then
     || { mark "exit-install"; exit 1; }
 fi
 # Every start syncs: a retried task can find the venv a preempted attempt left half built, and the sync adds only what
-# this job's extras (the GPU job's --extra gpu: CuPy and the CUDA wheels) need.
+# this job's extras (the GPU job's --extra gpu: CuPy and the CUDA wheels) need. It builds from this task's own copy of
+# the staged source: the editable build writes sv_pgs.egg-info into the project, and 22 fan-out tasks writing it on the
+# shared bucket mount failed with "Stale file handle".
+rm -rf "$RUN/source" && cp -r "$OPS/source" "$RUN/source" || { mark "exit-install"; exit 1; }
 UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
-  "$RUN/tools/uv" sync --project "$OPS/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
+  "$RUN/tools/uv" sync --project "$RUN/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
   || { mark "exit-install"; exit 1; }
 case "${UV_EXTRAS}" in
   # A fit job that cannot reach its GPU would fit on the CPUs at the GPU VM's price until its timeout: it stops here.
