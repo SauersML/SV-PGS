@@ -1551,8 +1551,11 @@ treatment_starts AS (
   WHERE drug_concept_id IN (SELECT concept_id FROM treatment_concepts)
   GROUP BY person_id
 ),
-measurement_rows AS (
+-- Each analyte row joined to every exclusion window over its date (BigQuery refuses the correlated
+-- subquery MIN(window_priority) over them), then folded back to one row per measurement_id, the OMOP key.
+window_rows AS (
   SELECT
+    measurement.measurement_id,
     measurement.person_id,
     measurement.measurement_date,
     measurement.value_as_number,
@@ -1570,12 +1573,7 @@ measurement_rows AS (
       OR COALESCE(measurement.value_source_value, '') LIKE '%<%'
       OR COALESCE(measurement.value_source_value, '') LIKE '%>%' AS censored,
     measurement.measurement_type_concept_id = {SELF_REPORT_TYPE_CONCEPT_ID} AS self_reported,
-    (
-      SELECT MIN(exclusion_windows.window_priority)
-      FROM exclusion_windows
-      WHERE exclusion_windows.person_id = measurement.person_id
-        AND measurement.measurement_date BETWEEN exclusion_windows.window_start AND exclusion_windows.window_end
-    ) AS exclusion_window,
+    exclusion_windows.window_priority,
     COALESCE(measurement.measurement_date >= treatment_starts.first_treatment_date, FALSE) AS on_treatment
   FROM `{dataset}.measurement` AS measurement
   JOIN `{dataset}.person` AS person
@@ -1587,12 +1585,29 @@ measurement_rows AS (
     AND operator.concept_id != 0
   LEFT JOIN treatment_starts
     ON treatment_starts.person_id = measurement.person_id
+  LEFT JOIN exclusion_windows
+    ON exclusion_windows.person_id = measurement.person_id
+    AND measurement.measurement_date BETWEEN exclusion_windows.window_start AND exclusion_windows.window_end
   WHERE measurement.value_as_number IS NOT NULL
     AND (
       measurement.measurement_concept_id IN (SELECT concept_id FROM analyte_concepts)
       OR measurement.measurement_source_concept_id IN (SELECT concept_id FROM analyte_concepts)
     )
     AND COALESCE(measurement.measurement_source_concept_id, 0) NOT IN UNNEST(@excluded_source_concept_ids)
+),
+measurement_rows AS (
+  SELECT
+    ANY_VALUE(person_id) AS person_id,
+    ANY_VALUE(measurement_date) AS measurement_date,
+    ANY_VALUE(value_as_number) AS value_as_number,
+    ANY_VALUE(age_years) AS age_years,
+    ANY_VALUE(unit_label) AS unit_label,
+    ANY_VALUE(censored) AS censored,
+    ANY_VALUE(self_reported) AS self_reported,
+    MIN(window_priority) AS exclusion_window,
+    ANY_VALUE(on_treatment) AS on_treatment
+  FROM window_rows
+  GROUP BY measurement_id
 ),
 analyte_rows AS (
   SELECT

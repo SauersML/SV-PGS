@@ -17,8 +17,10 @@ import numpy as np
 import pytest
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import traverse_scope
 
 from sv_pgs.all_of_us import (
+    DISEASE_DEFINITIONS,
     DiseaseDefinition,
     LabCriterion,
     MeasurementDefinition,
@@ -1000,3 +1002,21 @@ def test_census_counts_participants_per_trait_concept_and_unit(cdr: _Cdr):
         ("height", "8302-2", False, "no unit"): (1, 1),
         ("mean_corpuscular_volume", "787-2", True, "femtoliter"): (1, 1),
     }
+
+
+def test_no_query_correlates_a_subquery_with_an_outer_table(monkeypatch):
+    """BigQuery refuses a subquery that reads an outer query's table unless it can turn it into a join ("Correlated
+    subqueries that reference other tables are not supported"); DuckDB, which runs these tests, takes it, so every
+    query is checked here for a subquery naming an outer table's column. Uncorrelated IN (SELECT ...) reads no
+    outer column by its table."""
+    monkeypatch.setenv("WORKSPACE_CDR", DATASET)
+    queries = {
+        "measurement": build_all_of_us_measurement_sql(),
+        "measurement census": build_all_of_us_measurement_census_sql(),
+        **{definition.canonical_name: build_all_of_us_disease_sql(definition) for definition in DISEASE_DEFINITIONS},
+    }
+    correlated = {
+        name: sorted({column.sql() for scope in traverse_scope(sqlglot.parse_one(sql, read="bigquery")) for column in scope.external_columns if column.table})
+        for name, sql in queries.items()
+    }
+    assert {name: columns for name, columns in correlated.items() if columns} == {}
