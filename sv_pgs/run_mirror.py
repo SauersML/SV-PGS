@@ -32,11 +32,13 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing
 import os
 import shutil
 from collections.abc import Iterable
 from fnmatch import fnmatchcase
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from itertools import repeat
 from pathlib import Path
 from typing import Protocol
 
@@ -86,6 +88,8 @@ class Remote(Protocol):
 
     def download(self, name: str, path: Path) -> None: ...
 
+    def download_many(self, pairs: list[tuple[Path, str]]) -> None: ...
+
     def delete(self, names: Iterable[str]) -> None: ...
 
 
@@ -102,6 +106,7 @@ class GcsRemote:
         self._client = storage.Client(project=project)
         self._bucket = self._client.bucket(bucket, user_project=project)
         self._root = prefix.strip("/") + "/" if prefix.strip("/") else ""
+        self._url = url
 
     def sizes(self, prefix: str) -> dict[str, int]:
         return {
@@ -131,6 +136,17 @@ class GcsRemote:
         # the client's default 120 s deadline, one stalled stream among a restore's parallel downloads ended the AoU
         # whole-genome restore an hour and 547 GB in ("Connection broken: IncompleteRead").
         self._bucket.blob(self._root + name).download_to_filename(str(path), retry=DEFAULT_RETRY.with_timeout(None))
+
+    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+        """``download`` each (local path, object name) pair, in one process per CPU this process may use, each with its
+        own client: in one process the client's per-chunk Python work shares one interpreter lock, and a thread per CPU
+        restored the AoU whole-genome run's 547 GB at 140 MB/s, 65 minutes of every job start."""
+        if not pairs:
+            return
+        # spawn, not fork: a forked child would share the parent client's connections
+        with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0)), mp_context=multiprocessing.get_context("spawn")) as pool:
+            for _ in pool.map(_download_in_process, repeat(self._url), [name for _, name in pairs], [path for path, _ in pairs]):
+                pass
 
     def delete(self, names: Iterable[str]) -> None:
         blobs = [self._bucket.blob(self._root + name) for name in names]
@@ -172,6 +188,9 @@ class DirectoryRemote:
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(self._root / name, path)
 
+    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+        _transfer(pairs, lambda path, name: self.download(name, path))
+
     def delete(self, names: Iterable[str]) -> None:
         for name in names:
             path = self._root / name
@@ -180,6 +199,16 @@ class DirectoryRemote:
             while path.parent != self._root and not any(path.parent.iterdir()):
                 path = path.parent
                 path.rmdir()
+
+
+_PROCESS_REMOTES: dict[str, GcsRemote] = {}
+"""A GcsRemote.download_many worker process's own client, one per mirror URL."""
+
+
+def _download_in_process(url: str, name: str, path: Path) -> None:
+    if url not in _PROCESS_REMOTES:
+        _PROCESS_REMOTES[url] = GcsRemote(url)
+    _PROCESS_REMOTES[url].download(name, path)
 
 
 def _transfer(pairs: list[tuple[Path, str]], move) -> None:
@@ -345,6 +374,6 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> N
             LOGGER.info("run mirror: %s/%s, which a later step's store replaces, is read from %s", step, STORE, payload)
         for directory in listed:
             (aside / directory).mkdir(parents=True, exist_ok=True)
-        _transfer([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen], lambda path, entry: remote.download(entry, path))
+        remote.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s, %d files, %.1f GB", name, len(chosen), sum(names[entry] for entry in chosen) / 1e9)

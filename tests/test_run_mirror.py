@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
 import pytest
 
+from sv_pgs import run_mirror
 from sv_pgs.content_identity import GCS_MOUNTS
 from sv_pgs.run_mirror import DirectoryRemote, GcsRemote, mounted, push, restore
 from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE
@@ -230,3 +232,25 @@ def test_a_gcs_download_retries_a_broken_read_without_a_deadline(tmp_path: Path)
     (name, filename, options), = calls
     assert name == "svpgs/run/store/chr1.codes" and filename == str(tmp_path / "a" / "chr1.codes") and (tmp_path / "a").is_dir()
     assert options["retry"].timeout is None
+
+
+def test_a_gcs_restore_downloads_each_object_in_a_spawned_process_through_that_process_s_client(tmp_path: Path, monkeypatch) -> None:
+    calls, contexts = [], []
+
+    class Client:
+        def download(self, name: str, path: Path) -> None:
+            calls.append((name, path))
+
+    class Pool(ThreadPoolExecutor):
+        def __init__(self, max_workers: int, mp_context) -> None:
+            contexts.append(mp_context.get_start_method())
+            super().__init__(max_workers)
+
+    monkeypatch.setitem(run_mirror._PROCESS_REMOTES, "gs://ops/svpgs/run", Client())
+    monkeypatch.setattr(run_mirror, "ProcessPoolExecutor", Pool)
+    remote = GcsRemote.__new__(GcsRemote)
+    remote._url = "gs://ops/svpgs/run"
+    pairs = [(tmp_path / f"chunk{index}", f"store/chunk{index}") for index in range(7)]
+    remote.download_many(pairs)
+    assert sorted(calls) == sorted((name, path) for path, name in pairs) and contexts == ["spawn"]
+
