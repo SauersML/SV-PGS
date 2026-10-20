@@ -54,6 +54,14 @@ def _aligned(count: int) -> int:
     return -(-count // INT8_GEMM_ALIGNMENT) * INT8_GEMM_ALIGNMENT
 
 
+def consecutive_runs(rows: NDArray[np.int64]) -> list[tuple[int, int]]:
+    """The maximal runs of consecutive store rows in the ascending, distinct ``rows``, as [start, stop) ranges."""
+    breaks = np.flatnonzero(np.diff(rows) != 1) + 1
+    starts = rows[np.concatenate([[0], breaks])]
+    stops = rows[np.concatenate([breaks, [rows.shape[0]]]) - 1] + 1
+    return list(zip(starts.tolist(), stops.tolist()))
+
+
 def reduced_block_layout(
     statistics: GenotypeSufficientStatistics,
 ) -> tuple[list[NDArray[np.int64]], list[NDArray[np.int64]], list[NDArray[np.float64]], list[NDArray[np.float64]]]:
@@ -149,8 +157,8 @@ class StoreGenotypeBlockSource:
             self._sample_columns = (cupy.asarray(self._sample_indices) if self._decoder is not None and self._sample_indices is not None
                                     else cupy.arange(self._samples, dtype=cupy.int64))
             # A block's rows are staged compactly, so the gather is the identity: a rowdict read lands them so, and other
-            # codecs take them from their span on the host before the upload. Staged whole, a span is every record between
-            # the block's first and last: chr22's HapMap3 block of 14,542 sites spanned 861k records, 37 GB of an A100's 42.
+            # codecs read only them (``_iter_device_tiles``). Staged whole, a span is every record between the block's
+            # first and last: chr22's HapMap3 block of 14,542 sites spanned 861k records, 37 GB of an A100's 42.
             self._spans_on_device = [cupy.empty((widest_block, self._input_samples), dtype=cupy.uint8) for _ in range(2)]
             self._rows_in_span = [cupy.arange(rows.shape[0], dtype=cupy.int64) for rows in self._block_rows]
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span) + int(self._sample_columns.nbytes)
@@ -266,49 +274,52 @@ class StoreGenotypeBlockSource:
 
     def _iter_streamed(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
         """The blocks from ``first_block`` on, read from the store."""
-        if self._cupy is not None and self._decoder is not None:
-            yield from self._iter_decoded_tiles(first_block)
+        if self._cupy is not None:
+            yield from (self._iter_decoded_tiles(first_block) if self._decoder is not None else self._iter_device_tiles(first_block))
             return
         spans = self._store.iter_codes(self._spans[first_block:], self._sample_indices, self._budget)
-        if self._cupy is None:
-            for position, (start, _stop, codes) in enumerate(spans):
-                block_index = first_block + position
-                rows = self._block_rows[block_index]
-                target = self._signed[block_index % 2][: rows.shape[0], : self._samples]
-                gathered = codes[rows - start]
-                np.subtract(gathered.view(np.int8), np.int8(SIGNED_CODE_OFFSET), out=target)
-                yield block_index, self._tile(block_index, block_index % 2)
-            return
-        yield from self._iter_device_tiles(spans, first_block)
+        for position, (start, _stop, codes) in enumerate(spans):
+            block_index = first_block + position
+            rows = self._block_rows[block_index]
+            target = self._signed[block_index % 2][: rows.shape[0], : self._samples]
+            gathered = codes[rows - start]
+            np.subtract(gathered.view(np.int8), np.int8(SIGNED_CODE_OFFSET), out=target)
+            yield block_index, self._tile(block_index, block_index % 2)
 
-    def _iter_device_tiles(self, spans: Iterator[tuple[int, int, NDArray[np.uint8]]], first_block: int = 0) -> Iterator[tuple[int, CodeBlockTile]]:
+    def _iter_device_tiles(self, first_block: int = 0) -> Iterator[tuple[int, CodeBlockTile]]:
         cupy = self._cupy
         compute = cupy.cuda.get_current_stream()
         copied = [cupy.cuda.Event() for _ in range(2)]
         computed = [cupy.cuda.Event() for _ in range(2)]
         for event in computed:
             event.record(compute)
+        # Only the blocks' own rows are read, each maximal run of consecutive store rows as one range: a block's span is
+        # every record between its first and last, and read whole (chr22's HapMap3 block of 14,542 sites spanned 861k
+        # records) its pinned read-ahead slots outgrew what the host could pin.
+        runs = [consecutive_runs(rows) for rows in self._block_rows[first_block:]]
+        pieces = self._store.iter_codes([run for block in runs for run in block], self._sample_indices, self._budget)
+        # Each slot's block, assembled on the host from its runs; a slot is refilled only after its last copy has run.
+        assembled = [np.empty(self._spans_on_device[slot].shape, dtype=np.uint8) for slot in range(2)]
 
-        # each slot's gathered host rows, held until their copy has run
-        gathered: list[NDArray[np.uint8] | None] = [None, None]
-
-        def upload(position: int, start: int, span: NDArray[np.uint8]) -> None:
+        def upload(position: int) -> None:
             slot = position % 2
-            gathered[slot] = span[self._block_rows[position] - start]
+            filled = 0
+            for _run in runs[position - first_block]:
+                _start, _stop, codes = next(pieces)
+                assembled[slot][filled : filled + codes.shape[0]] = codes
+                filled += codes.shape[0]
             # The staging buffer is free once the block that last used it has been computed.
             self._copy_stream.wait_event(computed[slot])
-            self._spans_on_device[slot][: gathered[slot].shape[0]].set(gathered[slot], stream=self._copy_stream)
+            self._spans_on_device[slot][:filled].set(assembled[slot][:filled], stream=self._copy_stream)
             copied[slot].record(self._copy_stream)
 
-        count = len(self._spans)
-        start, _stop, first = next(spans)
-        upload(first_block, start, first)
+        count = len(self._block_rows)
+        upload(first_block)
         for block_index in range(first_block, count):
             slot = block_index % 2
             copied[slot].synchronize()
             if block_index + 1 < count:
-                start, _stop, following = next(spans)
-                upload(block_index + 1, start, following)
+                upload(block_index + 1)
             compute.wait_event(copied[slot])
             self._gather_block(block_index, slot)
             self._keep(block_index, slot)

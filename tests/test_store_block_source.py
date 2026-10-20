@@ -10,7 +10,7 @@ from sv_pgs.code_products import INT8_GEMM_ALIGNMENT, CodeBlockTile
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.dosage_store import DosageStore, encode_dosage_milli
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
-from sv_pgs.store_block_source import StoreGenotypeBlockSource
+from sv_pgs.store_block_source import StoreGenotypeBlockSource, consecutive_runs
 from tests.test_dosage_store import _two_half_dosage, _write_store
 
 cupy = _try_import_cupy()
@@ -231,3 +231,11 @@ def test_inside_a_cuda_scope_every_allocation_is_charged_before_it_is_made() -> 
         del held, more
     # Outside the scope the default allocator is back.
     cupy.zeros(1 << 20, dtype=cupy.uint8)
+
+
+def test_consecutive_runs_tile_the_rows_with_one_range_per_unbroken_stretch() -> None:
+    rows = np.array([3, 4, 5, 9, 11, 12, 40], dtype=np.int64)
+    runs = consecutive_runs(rows)
+    assert runs == [(3, 6), (9, 10), (11, 13), (40, 41)]
+    np.testing.assert_array_equal(np.concatenate([np.arange(start, stop) for start, stop in runs]), rows)
+    assert consecutive_runs(np.array([7], dtype=np.int64)) == [(7, 8)]
