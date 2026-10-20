@@ -252,7 +252,7 @@ PENDING: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('scale_mixture_ep.py', '_ascend_evidence'): ('e2e', frozenset({0.25, 0.75}), 'the trust-region gain-ratio thresholds and radius factors are the illustrative defaults of Algorithm 4.1 (any eta in [0, 1/4) converges): set the radius from the accuracy of the model itself (the cubic-term bound) instead'),
     ('fit_model.py', 'DRAW_COUNT'): ('e2e', frozenset({64}), 'the scorer fixes K = 64 posterior draws, which also sets every certificate tolerance at 1/(2K): derive K from the Monte Carlo accuracy the scorer needs'),
     ('all_of_us.py', 'EHR_DEPTH_LANDMARK_DAYS'): ('phenotypes', frozenset({365}), 'latent-class EHR evidence model'),
-    ('all_of_us.py', 'DISEASE_DEFINITIONS.minimum_control_age_years'): ('phenotypes', frozenset({40.0, 50.0}), 'latent-class EHR evidence model'),
+    ('all_of_us.py', 'DISEASE_DEFINITIONS.minimum_control_age_years'): ('phenotypes', frozenset({40.0, 50.0, 65.0}), 'latent-class EHR evidence model'),
     ('all_of_us.py', 'ADULT_AGE_YEARS'): ('phenotypes', frozenset({18}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component'),
     ('all_of_us.py', 'ACUTE_CARE_WINDOW_DAYS'): ('phenotypes', frozenset({30}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component'),
     ('all_of_us.py', 'HEMATOLOGIC_MALIGNANCY'): ('phenotypes', frozenset({180}), 'per-occasion measurement model with learned time-since-event smooths and a contamination component'),

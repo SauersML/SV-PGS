@@ -211,6 +211,18 @@ ASTHMA_CONTROLLER = MedicationClass(
 )
 OBSTRUCTIVE_AIRWAY_DRUGS = MedicationClass("drugs for obstructive airway diseases", ("R03",))
 LIPID_MODIFYING = MedicationClass("lipid-modifying agents", ("C10",))
+# The drugs licensed for Alzheimer's disease: the anticholinesterases
+# (donepezil, rivastigmine, galantamine, alone or with memantine), memantine,
+# and the anti-amyloid antibodies aducanumab, lecanemab and donanemab.
+# Rivastigmine also treats Parkinson's disease dementia, and the
+# anticholinesterases are given off-label in other dementias, but beside an
+# Alzheimer's code they are its treatment. Ginkgo folium (N06DX02), a
+# supplement, and the unlicensed blarcamesine and hydromethylthionine are left
+# out.
+ALZHEIMERS_THERAPY = MedicationClass(
+    "Alzheimer's disease therapy", ("N06DA", "N06DX01", "N06DX03", "N06DX04", "N06DX05")
+)
+ANTI_DEMENTIA = MedicationClass("anti-dementia drugs", ("N06D",))
 
 # The disease panel, 15 diseases. Ten are design-traits' mixed_panel_v1 (over 9
 # organ systems, chosen by power and phenotype quality, never by SV biology).
@@ -223,7 +235,9 @@ LIPID_MODIFYING = MedicationClass("lipid-modifying agents", ("C10",))
 # diseases' codes, on the HL7 terminology server tx.fhir.org, which also
 # carries the US Extension's 1000119-namespace codes) and the WHO ATC index;
 # OMOP concept ids are resolved at query time through `concept` and
-# `concept_ancestor`.
+# `concept_ancestor`. Alzheimer's disease follows the panel and is not one of
+# it: it is the outcome of the APOE locus's regional score (a run config's
+# fit_region), whose codes were checked the same way.
 DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
     DiseaseDefinition(
         canonical_name="hypertension",
@@ -497,6 +511,37 @@ DISEASE_DEFINITIONS: tuple[DiseaseDefinition, ...] = (
         control_exclusion_snomed_codes=("92691004",),
         required_sex="male",
         minimum_control_age_years=50.0,
+    ),
+    DiseaseDefinition(
+        canonical_name="alzheimers_disease",
+        aliases=("alzheimers", "alzheimer_disease", "alzheimer's disease"),
+        description=(
+            "Alzheimer's disease from EHR diagnoses and Alzheimer's therapy; controls are aged 65 and over with no "
+            "dementia, cognitive decline, memory impairment or anti-dementia drug."
+        ),
+        # Alzheimer's disease, early and late onset, familial and autosomal
+        # dominant (APP, PSEN1, PSEN2), atypical (focal, non-amnestic,
+        # logopenic) and mixed Alzheimer's and vascular dementia, which SNOMED
+        # files under it.
+        case_snomed_codes=("26929004",),
+        # Controls exclude every dementia (unspecified, vascular, Lewy body,
+        # frontotemporal and the rest), mild neurocognitive disorder (mild
+        # cognitive impairment), age-related cognitive decline and memory
+        # impairment: EHRs often code Alzheimer's disease as an unspecified
+        # dementia, and a memory complaint or a cognitive decline is often the
+        # record of a dementia not yet diagnosed. Another dementia's code does
+        # not remove a case: mixed pathology is the rule in late-life dementia,
+        # and one patient's dementia is coded several ways over the years.
+        control_exclusion_snomed_codes=("52448006", "386805003", "102891000", "386807006"),
+        # Down syndrome is ambiguous for both groups: nearly every adult with it
+        # develops Alzheimer's disease, from the third copy of APP on
+        # chromosome 21 rather than the late-onset disease's risk alleles.
+        ambiguous_snomed_codes=("41040004",),
+        case_medication=ALZHEIMERS_THERAPY,
+        control_exclusion_medication=ANTI_DEMENTIA,
+        # Late-onset Alzheimer's disease begins at 65 or later, the conventional
+        # boundary; a younger control has not lived through most of its risk.
+        minimum_control_age_years=65.0,
     ),
 )
 

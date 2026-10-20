@@ -504,11 +504,12 @@ def test_liability_target_uses_sex_specific_incidence_and_pools_unknown_sex():
 
 
 def test_the_disease_panel_is_the_fifteen_preregistered_diseases():
-    # The study abstract's five (hypertension first), then the ten of mixed_panel_v1.
+    # The study abstract's five (hypertension first), then the ten of mixed_panel_v1, then Alzheimer's disease, the
+    # APOE locus's regional score's outcome, which is not one of the panel.
     assert [definition.canonical_name for definition in DISEASE_DEFINITIONS] == [
         "hypertension", "coronary_artery_disease", "asthma", "hyperlipidemia", "breast_cancer",
         "type2_diabetes", "atrial_fibrillation", "hypothyroidism", "copd", "depression", "gout", "cataract",
-        "chronic_kidney_disease", "psoriasis", "prostate_cancer",
+        "chronic_kidney_disease", "psoriasis", "prostate_cancer", "alzheimers_disease",
     ]
 
 
@@ -565,6 +566,39 @@ def test_panel_diseases_parameterize_their_case_and_control_rules():
     breast = resolve_disease_definition("breast_cancer")
     assert breast.required_sex == "female" and breast.minimum_control_age_years == 40.0
     assert breast.control_exclusion_snomed_codes == ("189336000",)
+
+
+def test_alzheimers_disease_cases_come_from_its_codes_and_its_controls_are_old_and_cognitively_unremarkable():
+    """Two Alzheimer's dates, or one with a licensed Alzheimer's drug, make a case, another dementia's code beside them
+    included; a control is 65 or older with no dementia, cognitive decline or memory code and no anti-dementia drug;
+    Down syndrome is in neither group."""
+    alzheimers = resolve_disease_definition("alzheimer's disease")
+    parameters = build_all_of_us_disease_query_parameters(alzheimers)
+    assert parameters["case_snomed_codes"] == ("STRING", ["26929004"])
+    # Dementia, mild neurocognitive disorder, age-related cognitive decline and memory impairment.
+    assert parameters["control_exclusion_snomed_codes"] == ("STRING", ["52448006", "386805003", "102891000", "386807006"])
+    assert parameters["ambiguous_snomed_codes"] == ("STRING", ["41040004"])
+    # Anticholinesterases, memantine and the anti-amyloid antibodies confirm a code; Ginkgo folium does not, though it
+    # (like every anti-dementia drug) excludes a control.
+    assert parameters["case_medication_atc_codes"] == ("STRING", ["N06DA", "N06DX01", "N06DX03", "N06DX04", "N06DX05"])
+    assert parameters["control_exclusion_medication_atc_codes"] == ("STRING", ["N06D"])
+    assert alzheimers.minimum_control_age_years == 65.0 and alzheimers.minimum_case_age_years == 0.0 and alzheimers.required_sex is None
+    # Ages at the end of observation are 45 + id % 30: 620 is 65, 615 is 60.
+    rows = [
+        _disease_row(601, occurrence_count=2),  # two Alzheimer's dates: case
+        _disease_row(602, occurrence_count=1, case_medication_dates=1),  # one date and donepezil: case
+        _disease_row(603, occurrence_count=1),  # one date alone: neither
+        _disease_row(604, occurrence_count=2, control_exclusion=True),  # two dates and a vascular dementia code: case
+        _disease_row(605, occurrence_count=2, ambiguous=True),  # Down syndrome: neither
+        _disease_row(620, occurrence_count=0),  # 65, nothing: control
+        _disease_row(621, occurrence_count=0, control_exclusion=True),  # an unspecified dementia or memory code: neither
+        _disease_row(622, occurrence_count=0, control_exclusion_medication=True),  # memantine without a code: neither
+        _disease_row(615, occurrence_count=0),  # 60, nothing: too young to be a control
+    ]
+    training_rows, _columns, counts = _prepare_training_rows(alzheimers, rows, [])
+    assert [(row["person_id"], row["target"]) for row in training_rows] == [("601", 1), ("602", 1), ("604", 1), ("620", 0)]
+    assert counts["n_cases_by_evidence"] == {"diagnosis": 3}
+    assert (counts["n_excluded_one_date"], counts["n_excluded_ambiguous_code"], counts["n_excluded_control_exclusion"], counts["n_excluded_age"]) == (1, 1, 2, 1)
 
 
 def test_every_lab_criterion_reads_a_known_measurement():

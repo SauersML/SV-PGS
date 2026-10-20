@@ -1206,8 +1206,10 @@ def test_the_launcher_templates_parse_and_name_the_preregistered_panel() -> None
     assert config.direct_sv is not None and config.direct_sv.gatksv_calls == (
         "/mnt/disks/cdr/wgs/short_read/structural_variants/vcf/full/AoU_srWGS_SV.v8.{chromosome}.vcf.gz"
     )
-    # Every catalogued disease, in the catalogue's order (the study abstract's five first, hypertension leading).
-    assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS)
+    # Every catalogued disease of the panel, in the catalogue's order (the study abstract's five first, hypertension
+    # leading); Alzheimer's disease, catalogued last for the APOE locus's regional run, is not one of it.
+    assert config.diseases == tuple(definition.canonical_name for definition in DISEASE_DEFINITIONS[:-1])
+    assert DISEASE_DEFINITIONS[-1].canonical_name == "alzheimers_disease"
     for job in ("job_store.json.template", "job_fit.json.template"):
         network = json.loads(_filled((LAUNCHER / job).read_text()))["allocationPolicy"]["network"]["networkInterfaces"][0]
         assert network["noExternalIpAddress"] is True
@@ -1383,6 +1385,154 @@ def test_fit_keeps_listed_substitutions_and_every_structural_record(tmp_path: Pa
     assert WorkspaceConfig.from_mapping(synthetic.raw).fit_variant_sites is None
     with pytest.raises(ValueError, match="fit_variant_sites"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "fit_variant_sites": 7})
+
+
+def test_a_fit_region_keeps_the_records_in_its_window_of_every_class(workspace, caplog) -> None:
+    # (chromosome, POS, ID, REF length, ALT length, SVLEN, class): a substitution, a short deletion and a structural
+    # deletion inside chr5:100-200 (its ends included), a substitution before it, after it and at its position on chr2.
+    records = (
+        (5, 100, "a", 1, 1, 0.0, VariantClass.SNV), (5, 150, "b", 3, 1, 2.0, VariantClass.DELETION), (5, 200, "c", 1, 1, 0.0, VariantClass.DELETION),
+        (5, 160, "d", 900, 1, 899.0, VariantClass.DELETION), (5, 99, "e", 1, 1, 0.0, VariantClass.SNV), (5, 201, "f", 1, 1, 0.0, VariantClass.SNV),
+        (2, 150, "g", 1, 1, 0.0, VariantClass.SNV),
+    )
+    chromosome, position, ids, ref_length, alt_length, sv_length, classes = zip(*records)
+    count = len(records)
+    table = VariantTable(
+        chromosome=np.array(chromosome, dtype=np.int8), position=np.array(position, dtype=np.int64), genetic_position_cm=np.zeros(count),
+        ref_length=np.array(ref_length, dtype=np.int32), alt_length=np.array(alt_length, dtype=np.int32),
+        variant_class=np.array([VARIANT_CLASSES.index(name) for name in classes], dtype=np.uint8), codes_per_unit=np.full(count, 254, dtype=np.uint8),
+        value_origin=np.zeros(count, dtype=np.int64), group_first=np.arange(count, dtype=np.int64), sum_code=np.full(count, 254 * 40, dtype=np.uint64),
+        sum_code2=np.zeros(count, dtype=np.uint64), annotations={"sv_length": np.array(sv_length)}, annotation_legends={},
+        id_bytes=np.frombuffer("".join(ids).encode(), dtype=np.uint8), id_offsets=np.arange(count + 1, dtype=np.int64),
+    )
+    log_reliability = np.log(np.linspace(0.9, 0.6, count))
+    with caplog.at_level("INFO", logger="sv_pgs.workspace_pipeline"):
+        kept = fit_filtered(table, 100, log_reliability, 0.0, 0.0, None, (5, 100, 200))
+    assert np.isfinite(kept).tolist() == [True, True, True, True, False, False, False]
+    np.testing.assert_array_equal(kept[:4], log_reliability[:4])
+    # The window's records by class, short and structural apart: the snv_indel arm fits the short ones.
+    assert "the fit region chr5:100-200 keeps 2 deletion short, 1 deletion structural, 1 snv short" in caplog.text
+    # The floors still apply inside the window.
+    assert np.isfinite(fit_filtered(table, 100, log_reliability, 0.0, 0.82, None, (5, 100, 200))).tolist() == [True, True, False, False, False, False, False]
+    with pytest.raises(ValueError, match="holds no record"):
+        fit_filtered(table, 100, log_reliability, 0.0, 0.0, None, (5, 300, 400))
+    synthetic, _client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "fit_region": {"chromosome": 22, "start": 1500, "end": 6500}})
+    assert config.fit_region == (22, 1500, 6500) and WorkspaceConfig.from_mapping(synthetic.raw).fit_region is None
+    # The region is part of the fit step's key, and of no earlier step's.
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    unbounded = WorkspaceConfig.from_mapping(synthetic.raw)
+    assert steps["fit"].inputs(config) != steps["fit"].inputs(unbounded)
+    assert all(steps[name].inputs(config) == steps[name].inputs(unbounded) for name in ("cohort", "measurement", "direct_sv"))
+    for region in (
+        {"chromosome": 19, "start": 1, "end": 2}, {"chromosome": 22, "start": 7, "end": 6}, {"chromosome": 22, "start": 0, "end": 6},
+        {"chromosome": 22, "start": 1.0, "end": 6}, {"chromosome": True, "start": 1, "end": 6}, {"chromosome": 22, "start": 1}, [22, 1, 6],
+        {"chromosome": "chr22", "start": 1, "end": 6},
+    ):
+        with pytest.raises(ValueError, match="fit_region"):
+            WorkspaceConfig.from_mapping({**synthetic.raw, "fit_region": region})
+
+
+def test_a_regional_alzheimers_run_fits_its_window_suppresses_its_few_cases_and_compares_ldpred2_on_its_people(
+    workspace, monkeypatch, tmp_path: Path
+) -> None:
+    """The APOE run's shape: one disease with few cases (Alzheimer's: cases by their codes, controls 65 and over), a
+    single split, both arms fitted on one window's records alone, every report table exportable, then LDpred2 on exactly
+    the snv_indel arm's records and the arms and LDpred2 compared on the same held-out people."""
+    from benchmarks.bench_real import aou_compare, aou_ldpred2
+
+    synthetic, client = workspace
+    region = (22, 1500, 6500)
+    raw = {
+        **synthetic.raw, "diseases": ["alzheimers_disease"], "traits": [], "cross_fit": False,
+        "panel": {"primary_fold": 0, "weights": {"alzheimers_disease": 1.0}}, "fit_region": dict(zip(("chromosome", "start", "end"), region)),
+        "export": ["accuracy.tsv", "comparison.tsv", "panel.tsv", "effects_by_class.tsv", "genetic_variance.tsv"],
+    }
+    config_path = tmp_path / "run_config.json"
+    config_path.write_text(json.dumps(raw))
+    config = WorkspaceConfig.read(config_path)
+    recorder = _Recorder()
+    # Saved models with their provenance, so the driver's handoff check recomputes the window's arm offsets.
+    bindings = _artifact_bindings(recorder, client)
+    run_pipeline(config, bindings, BUDGET)
+    run = config.run_directory
+    assert json.loads((run / "cohort" / "cohort.json").read_text())["model_names"] == ["alzheimers_disease/fold0"]
+    # Each arm fits the window's records alone: snv_indel its short ones, with_sv those and its structural ones.
+    snv_indel, with_sv = recorder.fit_calls
+    table = snv_indel.store.variant_table
+    inside, structural = workspace_pipeline.region_records(table, region), workspace_pipeline.structural_records(table)
+    short_fitted, all_fitted = np.isfinite(snv_indel.log_variance_offset), np.isfinite(with_sv.log_variance_offset)
+    assert short_fitted.any() and not np.any(short_fitted & ~inside) and not np.any(short_fitted & structural)
+    assert not np.any(all_fitted & ~inside) and np.any(all_fitted & structural)
+    np.testing.assert_array_equal(all_fitted & ~structural, short_fitted)
+    # Every count of 1 to 20 is suppressed in every staged table (the export step refuses any other).
+    assert sorted(path.name for path in (run / "export").glob("*.tsv")) == sorted(raw["export"])
+    for name in raw["export"]:
+        check_exportable(run / "export" / name)
+
+    # LDpred2 reads exactly the snv_indel arm's records and scores exactly the model's held-out people.
+    monkeypatch.setattr(aou_ldpred2, "workspace_bindings", lambda: bindings)
+    monkeypatch.setattr(aou_compare, "workspace_bindings", lambda: bindings)
+    monkeypatch.setattr(aou_ldpred2, "detect_compute_budget", lambda: BUDGET)
+    monkeypatch.setattr(aou_compare, "detect_compute_budget", lambda: BUDGET)
+    read: list[np.ndarray] = []
+
+    def posterior_effects(train, rows):
+        read.append(train.records.copy())
+        return train.codes(rows).astype(np.float64).mean(axis=1) / 127.0, np.random.default_rng(3).normal(size=rows.shape[0])
+
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", posterior_effects)
+    # The synthetic disease's held-out cases are too few to show, which would leave LDpred2 unfitted: fit it anyway here.
+    monkeypatch.setattr(aou_ldpred2, "_shown", lambda count, cases: count > 0)
+    scores_path = tmp_path / "ldpred2_held_out.npz"
+    assert aou_ldpred2.main(["--config", str(config_path), "--out", str(tmp_path / "ldpred2.jsonl"), "--scores", str(scores_path)]) == 0
+    [records] = read
+    np.testing.assert_array_equal(records, np.flatnonzero(short_fitted))
+    cohort = np.load(run / "cohort" / "cohort.npz")
+    with np.load(scores_path) as saved:
+        assert saved["research_ids"].tolist() == cohort["research_ids"].tolist() and saved["trait_names"].tolist() == ["alzheimers_disease"]
+        np.testing.assert_array_equal(np.isfinite(saved["held_out_score"][:, 0]), cohort["held_out"][:, 0] & np.isfinite(cohort["targets"][:, 0]))
+    [line] = (tmp_path / "ldpred2.jsonl").read_text().splitlines()
+    assert json.loads(line)["variants"] == records.shape[0]
+    compared = tmp_path / "compare.tsv"
+    assert aou_compare.main(["--config", str(config_path), "--scores", str(scores_path), "--out", str(compared)]) == 0
+    with compared.open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert [(row["score"], row["metric"]) for row in rows] == [
+        (score, metric) for metric in ("pgs_partial_r2", "pgs_auc") for score in ("snv_indel", "with_sv", "ldpred2", "with_sv - snv_indel", "snv_indel - ldpred2", "with_sv - ldpred2")
+    ]
+    # The synthetic disease's few held-out cases and controls are never shown, nor any value read on them.
+    check_exportable(compared)
+    assert all(row["estimate"] == "" for row in rows)
+
+
+def test_report_cells_hide_the_levels_from_which_a_small_count_would_follow() -> None:
+    """Each family of cells partitions the held-out rows, so a level's small count is hidden with the smallest others
+    until the hidden ones hold at least MINIMUM_REPORTED_PARTICIPANTS rows, cases and controls."""
+    from sv_pgs.workspace_pipeline import _HeldOutCell, _partition_hidden
+
+    # (ancestry, rows, cases) and (half, rows): every level's rows and cases are its first ones.
+    ancestry = (("eur", 300, 40), ("afr", 100, 25), ("amr", 30, 10), ("eas", 25, 0))
+    halves = (("A", 440), ("B", 15))
+    total = sum(rows for _level, rows, _cases in ancestry)
+    targets = np.zeros(total)
+    starts = np.cumsum([0] + [rows for _level, rows, _cases in ancestry])
+    members = {}
+    for (level, rows, cases), start in zip(ancestry, starts):
+        targets[start : start + cases] = 1.0
+        members[level] = np.arange(start, start + rows)
+    cells = [("all", "all", _HeldOutCell((np.arange(total),)))]
+    cells += [("ancestry", level, _HeldOutCell((rows,))) for level, rows in members.items()]
+    cells += [("half", "A", _HeldOutCell((np.arange(440),))), ("half", "B", _HeldOutCell((np.arange(440, total),)))]
+    # Cases: amr's 10 hides afr's 25 (the smallest other) with it; controls: amr's 20 hides eas's 25; rows: half B's 15
+    # hides half A's.
+    assert _partition_hidden(cells, targets, True) == {
+        ("ancestry", "amr"): "cases", ("ancestry", "afr"): "cases", ("ancestry", "eas"): "cases", ("half", "A"): "rows", ("half", "B"): "rows",
+    }
+    assert _partition_hidden(cells, targets, False) == {("half", "A"): "rows", ("half", "B"): "rows"}
+    # A total itself suppressed hides every level that is not empty.
+    small = [("all", "all", _HeldOutCell((np.arange(15),))), ("ancestry", "eur", _HeldOutCell((np.arange(15),))), ("ancestry", "afr", _HeldOutCell((np.arange(0),)))]
+    assert _partition_hidden(small, np.zeros(15), False) == {("ancestry", "eur"): "rows"}
 
 
 

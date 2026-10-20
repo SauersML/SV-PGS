@@ -106,6 +106,7 @@ from sv_pgs.all_of_us import (
     prepare_all_of_us_disease_sample_table,
     prepare_all_of_us_measurement_sample_table,
     reportable_count,
+    reportable_partition,
     resolve_disease_definition,
     resolve_measurement_definition,
 )
@@ -417,6 +418,11 @@ class WorkspaceConfig:
     record, each still subject to the floors above; None keeps every record. The floors alone left 8M of the All of Us
     genome's 128M records, 67 times chr22's, whose filtered fit took half an hour an arm on two A100s; HapMap3's 1.05M
     sites are the usual polygenic-score set."""
+    fit_region: tuple[int, int, int] | None = None
+    """A window of one store chromosome, (its number, the first position, the last position) in the store's build, both
+    ends included: the fit keeps only the records whose position lies in it (``region_records``), SNVs, short indels and
+    structural records alike, each still subject to the floors and the site list above; None keeps every chromosome
+    whole. A regional score is fitted on one locus's records alone: the APOE locus's for Alzheimer's disease."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -425,7 +431,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", *_FIT_FILTER_KEYS})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", *_FIT_FILTER_KEYS})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -471,6 +477,17 @@ class WorkspaceConfig:
             chromosome_number(chromosome)
         if not chromosomes or len({chromosome_number(chromosome) for chromosome in chromosomes}) != len(chromosomes):
             raise ValueError("chromosomes must list each store chromosome once.")
+        region = raw.get("fit_region")
+        if region is not None and (
+            not isinstance(region, Mapping) or set(region) != {"chromosome", "start", "end"}
+            or any(isinstance(region[key], bool) or not isinstance(region[key], (int, np.integer)) for key in region)
+            or region["chromosome"] not in {chromosome_number(chromosome) for chromosome in chromosomes}
+            or not 1 <= region["start"] <= region["end"]
+        ):
+            raise ValueError(
+                "fit_region is null or {chromosome, start, end}: the number of one of the store's chromosomes and the window's "
+                "first and last positions (1-based, both included, in the store's build); never rounded or coerced."
+            )
         try:
             research_column, sequencing_column = (str(column) for column in raw["crosswalk_columns"])
             first_column, second_column, kinship_column = (str(column) for column in raw["relatedness_columns"])
@@ -515,6 +532,7 @@ class WorkspaceConfig:
             fit_minimum_minor_allele_frequency=float(raw.get("fit_minimum_minor_allele_frequency", 0.0)),
             fit_minimum_r2=float(raw.get("fit_minimum_r2", 0.0)),
             fit_variant_sites=raw.get("fit_variant_sites"),
+            fit_region=None if region is None else (int(region["chromosome"]), int(region["start"]), int(region["end"])),
         )
 
     def model_folds(self) -> tuple[int, ...]:
@@ -2967,14 +2985,24 @@ def listed_sites(table: VariantTable, path: str | Path) -> BoolArray:
     return listed
 
 
+def region_records(table: VariantTable, region: tuple[int, int, int]) -> BoolArray:
+    """Whether each record lies in ``region`` (``WorkspaceConfig.fit_region``): on its chromosome, with its position (the
+    record's POS in the store's build; a structural record's first base) from the region's first to its last position."""
+    chromosome, first, last = region
+    position = np.asarray(table.position, dtype=np.int64)
+    return (np.asarray(table.chromosome, dtype=np.int64) == chromosome) & (position >= first) & (position <= last)
+
+
 def fit_filtered(
     table: VariantTable, sample_count: int, log_reliability: F64Array, minimum_frequency: float, minimum_r2: float, variant_sites: str | Path | None = None,
+    region: tuple[int, int, int] | None = None,
 ) -> F64Array:
     """``log_reliability`` with -inf on every record the fit leaves out (``WorkspaceConfig.fit_minimum_r2``, its
-    frequency floor and its site list): one whose minor allele frequency over the store's ``sample_count`` samples,
-    from its code sums, or whose reliability (the measurement model's r^2, ``log_reliability``) is below its floor, and
-    with a site list, a record that is neither structural (``structural_records``) nor at a listed site
-    (``listed_sites``)."""
+    frequency floor, its site list and its region): one whose minor allele frequency over the store's ``sample_count``
+    samples, from its code sums, or whose reliability (the measurement model's r^2, ``log_reliability``) is below its
+    floor; with a site list, a record that is neither structural (``structural_records``) nor at a listed site
+    (``listed_sites``); with a region, a record outside it (``region_records``). A region's kept records are logged by
+    variant class, short and structural apart: the snv_indel arm fits the short ones, with_sv every one."""
     kept = np.ones(np.asarray(table.sum_code).shape[0], dtype=bool)
     if minimum_frequency > 0.0:
         frequency = np.asarray(table.sum_code, dtype=np.float64) / (2.0 * CODES_PER_DOSAGE * sample_count)
@@ -2983,10 +3011,23 @@ def fit_filtered(
         kept &= np.asarray(log_reliability, dtype=np.float64) >= np.log(minimum_r2)
     if variant_sites is not None:
         kept &= structural_records(table) | listed_sites(table, variant_sites)
+    if region is not None:
+        kept &= region_records(table, region)
     LOGGER.info(
-        "workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g, sites %s)",
+        "workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g, sites %s, region %s)",
         int(kept.sum()), kept.shape[0], minimum_frequency, minimum_r2, "all" if variant_sites is None else variant_sites,
+        "none" if region is None else "chr{}:{}-{}".format(*region),
     )
+    if region is not None:
+        classes = Counter(
+            f"{VARIANT_CLASS_LEGEND[code]} {'structural' if structural else 'short'}"
+            for code, structural in zip(np.asarray(table.variant_class)[kept].tolist(), structural_records(table)[kept].tolist())
+        )
+        LOGGER.info(
+            "workspace pipeline: the fit region chr%d:%d-%d keeps %s", *region, ", ".join(f"{count} {name}" for name, count in sorted(classes.items())),
+        )
+        if not classes:
+            raise ValueError("the fit region chr{}:{}-{} holds no record the fit keeps; its positions are in the store's build.".format(*region))
     return np.where(kept, np.asarray(log_reliability, dtype=np.float64), -np.inf)
 
 
@@ -3118,7 +3159,8 @@ def _check_fit_records(run: _Run, directory: Path, key: str) -> None:
                     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
                     with DosageStore.open(_final_store(run)) as store:
                         kept = fit_filtered(store.variant_table, store.n_samples, measurement.log_reliability,
-                                            run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2, run.config.fit_variant_sites)
+                                            run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2, run.config.fit_variant_sites,
+                                            run.config.fit_region)
                         expected_offsets = {name: fit_model.offset_digest(arm_log_reliability(store.variant_table, kept, name)) for name in ARMS}
                     del measurement, kept
                 if fitted.provenance.offset_digest != expected_offsets[arm]:
@@ -3194,7 +3236,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 if unsaved:
                     kept = fit_filtered(
                         store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2,
-                        run.config.fit_variant_sites,
+                        run.config.fit_variant_sites, run.config.fit_region,
                     )
                     request = fit_request(
                         cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
@@ -3856,6 +3898,41 @@ def _cases_text(count: int, cases: int | None) -> str:
     return "suppressed"
 
 
+def _partition_hidden(cells: Sequence[tuple[str, str, _HeldOutCell]], targets: F64Array, binary: bool) -> dict[tuple[str, str], str]:
+    """The cells of one trait (``_cells``) whose counts complementary suppression hides, each with "rows" where its row
+    count is hidden or "cases" where only a disease's case count is (its controls follow from its rows less its cases).
+
+    Each family of cells (the folds, the ancestry groups, the halves) partitions the trait's held-out rows, the cell
+    "all", so one level's count of 1 to 20 hidden alone follows from the total less the other levels' shown counts: a
+    disease's few cases leave several ancestry groups with fewer than MINIMUM_REPORTED_PARTICIPANTS. Rows, cases and
+    controls are each hidden as ``all_of_us.reportable_partition`` hides the parts of a written total: every part of 1
+    to 20, then the smallest others until the hidden parts hold MINIMUM_REPORTED_PARTICIPANTS, and every part of a total
+    not written. A disease's total controls are written where its rows and cases are (the one follows from the other
+    two)."""
+    whole = next(held for cell, _level, held in cells if cell == "all")
+
+    def cases_of(held: _HeldOutCell) -> int:
+        return int(sum(int(targets[rows].sum()) for rows in held.folds))
+
+    totals = {"rows": reportable_count(whole.count)}
+    if binary:
+        totals["cases"] = _cases_text(whole.count, cases_of(whole))
+        written = totals["rows"].isdigit() and totals["cases"].isdigit()
+        totals["controls"] = str(whole.count - cases_of(whole)) if written else "suppressed"
+    hidden: dict[tuple[str, str], str] = {}
+    for family in dict.fromkeys(cell for cell, _level, _held in cells if cell != "all"):
+        members = {level: held for cell, level, held in cells if cell == family}
+        parts = {"rows": {level: held.count for level, held in members.items()}}
+        if binary:
+            parts["cases"] = {level: cases_of(held) for level, held in members.items()}
+            parts["controls"] = {level: parts["rows"][level] - parts["cases"][level] for level in members}
+        for kind, counts in parts.items():
+            for level, text in reportable_partition(totals[kind], counts).items():
+                if not text.isdigit() and hidden.get((family, level)) != "rows":
+                    hidden[(family, level)] = "rows" if kind == "rows" else "cases"
+    return hidden
+
+
 def _scored_folds(held: _HeldOutCell, targets: F64Array, binary: bool) -> list[I64Array]:
     """The folds of a cell that a held-out metric can be read on: a disease's with at least two cases and two controls
     (DeLong's components need a variance of each), a quantitative trait's whose targets vary."""
@@ -4074,11 +4151,17 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
         if binary and not run.config.calibration_fraction:
             metric_names = ("auc", "pgs_auc", "pgs_partial_r2")
             comparison_names = ("delta_auc", "delta_pgs_auc")
-        for cell, level, held in _cells(cohort, trait, fold_count):
+        cells = _cells(cohort, trait, fold_count)
+        hidden = _partition_hidden(cells, targets, binary)
+        for cell, level, held in cells:
             count = held.count
             cases = int(sum(int(targets[rows].sum()) for rows in held.folds)) if binary else None
             counts = (reportable_count(count), _cases_text(count, cases))
             shown = _shown(count, cases)
+            if (cell, level) in hidden:
+                # Hidden with its family's other small levels, so that no count of 1 to 20 follows from "all" less them.
+                rows_text = counts[0] if hidden[(cell, level)] == "cases" or count < MINIMUM_REPORTED_PARTICIPANTS else "suppressed"
+                counts, shown = (rows_text, "suppressed" if binary else ""), False
             scored = _scored_folds(held, targets, binary) if shown else []
             proper = _proper_folds([rows for rows in held.folds if rows.shape[0]], scored, targets, binary) if shown else []
 
@@ -4244,8 +4327,8 @@ _STEPS = (
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (
         config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
-        None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)),
-    ), (_fit_step, fit_filtered, listed_sites, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
+        None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)), config.fit_region,
+    ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
@@ -4256,7 +4339,7 @@ _STEPS = (
         ("cohort", "score"),
         lambda config: None if config.panel is None else [config.panel.primary_fold, [list(weight) for weight in config.panel.weights]],
         (
-            _report_step, _read_scores, _Cohort.evaluated_folds, _proper_folds, _evaluated_counts, _residualized, _cells, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text,
+            _report_step, _read_scores, _Cohort.evaluated_folds, _proper_folds, _evaluated_counts, _residualized, _cells, _partition_hidden, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text,
             _primary_influence, _panel_rows,
             held_out_comparison, probability_calibration,
         ),
