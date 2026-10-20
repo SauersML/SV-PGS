@@ -39,8 +39,12 @@ UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV
   "$RUN/tools/uv" sync --project "$RUN/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
   || { mark "exit-install"; exit 1; }
 case "${UV_EXTRAS}" in
-  # A fit job that cannot reach its GPU would fit on the CPUs at the GPU VM's price until its timeout: it stops here.
-  *gpu*) "$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1)" \
+  # The CUDA libraries come from the gpu extra's nvidia-* wheels, which CuPy does not search: on the Batch image, which
+  # has the driver and no toolkit, the first kernel it compiled failed with "CuPy failed to load libnvrtc.so.12".
+  # A fit job that cannot reach its GPU would fit on the CPUs at the GPU VM's price until its timeout: it stops here,
+  # and also if CuPy cannot compile and run a kernel.
+  *gpu*) export LD_LIBRARY_PATH="$(ls -d "$RUN"/venv/lib/python3.12/site-packages/nvidia/*/lib | paste -sd:)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+         "$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1 or float(cupy.eye(2).sum()) != 2.0)" \
            || { mark "exit-no-gpu"; exit 1; } ;;
 esac
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
