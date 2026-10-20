@@ -72,6 +72,17 @@ def plan_blocks(device_ids: Sequence[int], block_widths: Sequence[int], sample_c
     return DevicePlan(tuple(int(device_id) for device_id in device_ids), block_devices, tuple(loads))
 
 
+def devices_for_blocks(budget: ComputeBudget, block_count: int) -> ComputeBudget:
+    """``budget`` over as many of its devices as there are blocks, the first ones: Graham's rule (``plan_blocks``) gives
+    each of the first devices one block before any device a second, so with fewer blocks than devices the later ones
+    would hold no block, and a shard of no block has no rows to read (chr22's HapMap3 sites are one block)."""
+    count = min(len(budget.device_ids), block_count)
+    return replace(
+        budget, device_ids=budget.device_ids[:count], device_names=budget.device_names[:count], device_bytes=budget.device_bytes[:count],
+        device_compute_capabilities=budget.device_compute_capabilities[:count],
+    )
+
+
 def log_device_plan(budget: ComputeBudget, plan: DevicePlan) -> None:
     """The device decision, logged once when a fit starts."""
     log(f"  device plan ({budget.device_kind}): {plan.describe()}")
@@ -243,6 +254,7 @@ class ShardedDualSource:
         if cupy is None:
             raise RuntimeError("the compute budget names CUDA devices but CuPy cannot be imported")
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
+        budget = devices_for_blocks(budget, len(block_rows))
         sample_count = int(store.n_samples if sample_indices is None else np.asarray(sample_indices).shape[0])
         plan = plan_blocks(budget.device_ids, [rows.shape[0] for rows in block_rows], sample_count)
         log_device_plan(budget, plan)

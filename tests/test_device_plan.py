@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from sv_pgs.compute_budget import ComputeBudget, check_visible_devices, exposed_device_count
-from sv_pgs.device_plan import plan_blocks, reassociation_bound
+from sv_pgs.device_plan import devices_for_blocks, plan_blocks, reassociation_bound
 
 
 def _budget(device_ids: tuple[int, ...]) -> ComputeBudget:
@@ -31,6 +31,16 @@ def test_one_device_takes_every_block_in_order() -> None:
     plan = plan_blocks((3,), [4, 4, 7], 5)
     np.testing.assert_array_equal(plan.block_devices, [0, 0, 0])
     np.testing.assert_array_equal(plan.blocks_on(0), [0, 1, 2])
+
+
+def test_fewer_blocks_than_devices_are_planned_over_as_many_devices_as_blocks() -> None:
+    budget = _budget((4, 5, 6))
+    assert plan_blocks(budget.device_ids, [7], 5).blocks_on(1).size == 0
+    for block_count, expected in ((1, (4,)), (2, (4, 5)), (3, (4, 5, 6)), (9, (4, 5, 6))):
+        trimmed = devices_for_blocks(budget, block_count)
+        assert trimmed.device_ids == expected and len(trimmed.device_names) == len(trimmed.device_bytes) == len(trimmed.device_compute_capabilities) == len(expected)
+        plan = plan_blocks(trimmed.device_ids, [7] * block_count, 5)
+        assert all(plan.blocks_on(position).size for position in range(len(expected)))
 
 
 def test_the_plan_refuses_empty_devices_and_empty_blocks() -> None:
