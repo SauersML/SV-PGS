@@ -109,6 +109,17 @@ export PYTHONFAULTHANDLER=1
 # Two minutes without a progress line, the driver logs where its main thread is (sv_pgs/progress.py), so the progress
 # copy below shows what a silent stretch spends its time on: the AoU disease fits went twenty minutes between lines.
 export SVPGS_QUIET_STACK_SECONDS=120
+# The driver's log (below) also holds, once a minute from here to the driver's end, a line of the VM's resources from
+# launcher/workspace/sample_resources.py (each GPU's utilization over nvidia-smi's samples every 5 s and its memory, the
+# CPU's busy and iowait shares, the load, the host memory in use, the run disk's and the network's MiB/s), and the store
+# restore's time: with the driver's timing lines (sv_pgs/phase_timer.py) the progress copies are a profile of the run,
+# which benchmarks/profile_log.py reads. Every writer appends, so no line overwrites another; the sampler's output and
+# exit are its own, never the task's, and it stops with the task whichever way the task ends.
+: > "$RUN/driver.log"
+"$RUN/venv/bin/python" "$RUN/source/launcher/workspace/sample_resources.py" --every 60 --gpu-every 5 --disk "$RUN" >> "$RUN/driver.log" 2>&1 &
+sampler=$!
+trap 'kill "$sampler" 2>/dev/null' EXIT
+restore_started=$SECONDS
 # The job's bucket mounts (the job templates' volumes): an input file there is keyed by its object's generation instead
 # of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
 # IMPUTED_BUCKET holds the imputed batches and their strata sidecar, PANEL_BUCKET the panel's bubble.split sites.
@@ -131,16 +142,21 @@ pusher=$!
 # Batch writes the task log to the bucket only when the task ends, so a fit gave no sign of its progress for hours. The
 # driver's stderr also goes to a file whose last lines are copied beside the task log every 5 minutes: the same lines
 # the task log holds (steps, counts, timings, paths).
+# The whole log goes beside them (progress-task<i>.full.log): the run's timeline from the restore on, whose time leads it
+# (only definitions ran between the restore's start and here).
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] timing: store_restore $((SECONDS - restore_started)) s" >> "$RUN/driver.log"
 progress="$(dirname "$0")/progress-task${BATCH_TASK_INDEX}.log"
+copy_progress() { tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; cp "$RUN/driver.log" "${progress%.log}.full.log" 2>/dev/null; }
 "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} \
-  2> >(tee "$RUN/driver.log" >&2) &
+  2> >(tee -a "$RUN/driver.log" >&2) &
 driver=$!
-( while sleep 300; do tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; done ) &
+( while sleep 300; do copy_progress; done ) &
 progressor=$!
 wait "$driver"
 status=$?
+kill "$sampler" 2>/dev/null
 stop "$progressor"
-tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null
+copy_progress
 # AFTER_SCRIPT ("${AFTER_SCRIPT}"), a script of the source tree, runs once the driver has finished, with RUN and OPS set,
 # its output beside the progress log: benchmarks/bench_real/aou_ldpred2.sh reads the steps the driver left.
 # An arm-only driver exits successfully with fit.partial (StepPart). Its success is not a completed run: the

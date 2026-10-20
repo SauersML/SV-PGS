@@ -55,6 +55,7 @@ from sv_pgs.genotype_buffers import (
     host_buffer_bytes,
 )
 from sv_pgs.ld_partition import LdBlockBoundaries, OnlineBlockPartitioner, cut_allowed_from_groups
+from sv_pgs.phase_timer import GB, timing
 from sv_pgs.progress import log
 from sv_pgs.tie_map import tie_map_from_representatives
 
@@ -1056,6 +1057,7 @@ def compute_genotype_statistics(
     ``config.minimum_scale`` are inactive; exact duplicate or negated standardized columns
     within a block collapse into tie groups.
     """
+    started = time.perf_counter()
     indices = np.asarray(sample_indices, dtype=np.int64)
     if indices.ndim != 1 or np.any(np.diff(indices) <= 0):
         raise ValueError("sample_indices must be sorted, distinct store columns")
@@ -1104,10 +1106,12 @@ def compute_genotype_statistics(
     summary = run_genotype_pass(source, layout, buffers, plan, sink)
     for buffer in buffers:
         buffer.close()
-    return _assemble_statistics(source, summary, summaries, writer, indices.shape[0], block_cap,
-                                covariate_gram, projection.covariate_gram_pseudo_inverse,
-                                int(np.linalg.matrix_rank(covariate_matrix)) if covariate_matrix.shape[1] else 0,
-                                covariate_target, target_matrix.T @ target_matrix)
+    statistics = _assemble_statistics(source, summary, summaries, writer, indices.shape[0], block_cap,
+                                      covariate_gram, projection.covariate_gram_pseudo_inverse,
+                                      int(np.linalg.matrix_rank(covariate_matrix)) if covariate_matrix.shape[1] else 0,
+                                      covariate_target, target_matrix.T @ target_matrix)
+    timing("stage0", time.perf_counter() - started, blocks=statistics.ld.block_count, ld_gb=statistics.ld.stored_bytes / GB, genotype_pass=summary.seconds)
+    return statistics
 
 
 def _assemble_statistics(

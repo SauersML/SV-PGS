@@ -50,6 +50,7 @@ import numpy as np
 
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.memory_broker import HOST, current_broker, device_pool, transient_device_arrays
+from sv_pgs.phase_timer import GB, timing
 from sv_pgs.progress import log
 
 _EPSILON = float(np.finfo(np.float64).eps)
@@ -773,6 +774,7 @@ def build_band_store(
     )
     for entry in extents:
         log(f"summary band: block {entry['block']}: {entry['width']} columns, LD extent {entry['extent']}, {entry['parts']} parts")
+    timing("summary_band", time.perf_counter() - started, blocks=len(extents), parts=len(widths), gb=stored / GB)
     return BandStore(directory)
 
 
@@ -789,6 +791,7 @@ def far_field_scale(
     the PCs leave), so chance alone would under-state the far field. m is the least count whose chance standard error,
     2 / m for m (m - 1) / 2 pairs of chi-square(1) r^2 n', is within the fit's resolution 1 / (2K) of the scale: 4K
     columns, one read of each, never a pass over the store."""
+    started = time.perf_counter()
     generator = np.random.default_rng(seed)
     starts = np.asarray(starts, dtype=np.int64)
     group_count = int(starts[-1])
@@ -819,6 +822,7 @@ def far_field_scale(
     upper = np.triu(~near, 1)
     squares = (values.T @ values)[upper] ** 2 * residual
     pairs = int(squares.shape[0])
+    timing("far_field", time.perf_counter() - started, columns=count)
     if pairs < 2:
         return 1.0, 0.0, pairs
     return float(np.mean(squares)), float(np.std(squares) / np.sqrt(pairs)), pairs

@@ -73,6 +73,7 @@ from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.gram_space import GramBand, read_block
+from sv_pgs.phase_timer import TimedOracle, timed_sweep, timing
 from sv_pgs.progress import log
 from sv_pgs.krylov_recycle import local_response
 from sv_pgs.tie_members import TieGroups, group_sites, member_draws, member_moments, member_weights, tied_groups, tied_weights
@@ -1977,7 +1978,8 @@ class _FullDataMeanField:
 
     def _sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
         if self.gaussian.array_module is not np:
-            return self._device_sweep(model, hyperparameters)
+            with timed_sweep(self.gaussian.array_module):
+                return self._device_sweep(model, hyperparameters)
         # ``mean_field`` imports ``small_n``, which imports this module's certificate: the kernel is bound at first use.
         from sv_pgs.mean_field import _sweep as mean_field_sweep
 
@@ -2100,7 +2102,9 @@ class _FullDataMeanField:
         sweeps = 0
 
         def done(outcome: str) -> None:
-            log(f"mean-field solve: model {model} {outcome} after {sweeps} sweeps in {time.perf_counter() - started:.1f} s, {self.passes - passes_at_entry} passes")
+            seconds = time.perf_counter() - started
+            log(f"mean-field solve: model {model} {outcome} after {sweeps} sweeps in {seconds:.1f} s, {self.passes - passes_at_entry} passes")
+            timing("mean_field_solve", seconds, model=model, outcome=outcome, sweeps=sweeps, **({"per_sweep": seconds / sweeps} if sweeps else {}))
 
         while True:
             if pass_budget is not None and self.passes - passes_at_entry >= pass_budget:
@@ -2693,6 +2697,18 @@ def state_digest(parts: Sequence[F64Array]) -> np.ndarray:
     return np.frombuffer(digest.digest(), dtype=np.uint8).copy()
 
 
+def _timed_hyperparameters(
+    prior: ScaleMixturePrior, starts: Sequence[MixtureHyperparameters], oracle: Callable, working_bytes: int, tolerance: float,
+) -> list:
+    """``fit_hyperparameters`` on ``oracle``, its rounds and its whole timed in the progress log (``phase_timer.TimedOracle``:
+    each round's solve and the rest, written as the loop runs); the fits are the unwrapped oracle's."""
+    timed = TimedOracle(oracle)
+    try:
+        return fit_hyperparameters(prior, starts, timed, working_bytes, tolerance)
+    finally:
+        timed.close()
+
+
 def fit_full_data(
     *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
     inference: str = "ep",
@@ -2766,7 +2782,7 @@ def fit_full_data(
             oracle.monitor = monitor
         try:
             with device_scope(device):
-                return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
+                return oracle, _timed_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
             raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
@@ -2802,7 +2818,7 @@ def fit_full_data(
         )
         try:
             with device_scope(device):
-                fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
+                fits = _timed_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as warm_error:
             # EP has no certified fixed point from mean field's point (its refusals say why): EP from the prior, as
             # without the warm start.
@@ -2811,7 +2827,7 @@ def fit_full_data(
             oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, null_scale=null_scale)
             try:
                 with device_scope(device):
-                    fits = fit_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
+                    fits = _timed_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
             except FloatingPointError as error:
                 raise FloatingPointError(f"{error}; ep refusals: {oracle.refusals}") from error
         fixed_points = oracle

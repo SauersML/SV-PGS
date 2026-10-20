@@ -61,6 +61,8 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('workspace_pipeline.py', '_group_code_moments'): ('definitional', frozenset({256}), 'the 256 values of an 8-bit store code, the square lookup table'),
     ('run_mirror.py', '_push_step'): ('unit', frozenset({1e9}), 'bytes per GB'),
     ('run_mirror.py', 'restore'): ('unit', frozenset({1e9}), 'bytes per GB'),
+    ('phase_timer.py', 'GB'): ('unit', frozenset({1e9}), 'bytes per GB'),
+    ('phase_timer.py', 'DeviceBusy.kernel_seconds'): ('unit', frozenset({1e3}), 'milliseconds per second: cupy.cuda.get_elapsed_time reports milliseconds (cudaEventElapsedTime)'),
     ('workspace_pipeline.py', '_prediction_budget'): ('derived', frozenset({4}), "four plan arrays at peak (concatenation, unique work, union, positions), and four caller arrays per scoring column (linear variances, linear predictor, predictive mean, predictive variance)"),
     ('workspace_pipeline.py', 'score_batches'): ('derived', frozenset({4}), "the host shared four ways: the loaded models, the scorer's per-model plan positions, its accumulators, and its read-ahead buffers"),
     ('gatksv_store_rows.py', 'PHRED_SCALE'): ('definitional', frozenset({10.0}), 'the phred scale of a genotype quality: Q = -10 log10 P(miscall) (Ewing and Green 1998, Genome Res 8:186)'),

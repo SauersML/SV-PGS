@@ -18,6 +18,7 @@ one contiguous span from its first to its last row.
 
 from __future__ import annotations
 
+import time
 import weakref
 from typing import Any, Iterator, Sequence
 
@@ -31,6 +32,7 @@ from sv_pgs.dosage_store import DosageStore
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.memory_broker import HOST, MemoryBroker, current_broker, device_pool, meter_device
+from sv_pgs.phase_timer import GB, timing
 from sv_pgs.progress import log
 
 _GATHER_SOURCE = r"""
@@ -296,7 +298,12 @@ class StoreGenotypeBlockSource:
             return
         if self._cupy is not None and self._resident is None and not self._resident_complete and self._admit_resident():
             self._resident = [None] * len(self._block_rows)
+        started = time.perf_counter()
         yield from self._iter_streamed(0)
+        if self._cupy is not None:
+            # A device read of the store: the one that fills the resident set, or one that streams (``_admit_resident``),
+            # its wall time the reader's work on its tiles included.
+            timing("resident_fill" if self._resident is not None else "store_read", time.perf_counter() - started, gb=self.resident_codes_bytes / GB, pool=self._pool)
         # only a read that reached every block leaves a complete resident set
         self._resident_complete = self._cupy is not None and self._resident is not None
 

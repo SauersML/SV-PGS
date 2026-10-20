@@ -27,6 +27,8 @@ from typing import Any
 
 import numpy as np
 
+from sv_pgs.phase_timer import launch_timer
+
 PANEL = 32
 """Columns per panel: the CUDA warp width (one lane per member of the panel)."""
 PIECE_COLUMNS = 3
@@ -248,21 +250,27 @@ class CodePanels:
 
     def project(self, first: int, last: int, mask: Any, residual: Any) -> Any:
         out = self.cupy.empty(last - first, dtype=self.cupy.float64)
+        timer = launch_timer()
+        mark = timer.before()
         self.project_kernel(
             (last - first,), (PROJECT_THREADS,),
             (self.codes, np.int64(self.stride), self.rows[first:last], np.int32(self.sample_count), mask, residual,
              self.means, self.scales, self.signs[first:last], out),
         )
+        timer.after(mark)
         return out
 
     def apply(self, first: int, last: int, step: Any, mask: Any, covariates: Any, covariate_step: Any, residual: Any) -> None:
         threads = PROJECT_THREADS
+        timer = launch_timer()
+        mark = timer.before()
         self.apply_kernel(
             (-(-self.sample_count // threads),), (threads,),
             (self.codes, np.int64(self.stride), self.rows[first:last], np.int32(last - first), np.int32(self.sample_count),
              step, self.means, self.scales, self.signs[first:last], mask, covariates, covariate_step,
              np.int32(covariates.shape[1]), residual),
         )
+        timer.after(mark)
 
 
 class PanelGrams:
@@ -351,6 +359,8 @@ def sweep_piece(
     the Gram cache. With ``panels`` (``CodePanels``) the panel products read the codes and ``decode`` runs only to
     build a Gram the cache does not hold."""
     kernel = _kernel(cupy)
+    # The step kernel's launches, timed where the sweep is (``phase_timer.timed_sweep``).
+    timer = launch_timer()
     node_count = int(node_variance.shape[1])
     # The step kernel's per-(member, node) terms that do not depend on the cavity shift, formed by the whole block
     # before its one warp's sequential member loop (``panel_sweep``), and the loop's weights: one panel's worth each.
@@ -371,6 +381,7 @@ def sweep_piece(
         gram, coupling = grams.get((int(model), metric, np.ascontiguousarray(members[first:last], dtype=np.int64).tobytes()), build)
         projection = cupy.ascontiguousarray(columns.T @ (mask * residual)) if panels is None else panels.project(first, last, mask, residual)
         step = cupy.empty(last - first, dtype=cupy.float64)
+        mark = timer.before()
         kernel(
             (1,), (step_threads(kernel),),
             (
@@ -380,6 +391,7 @@ def sweep_piece(
                 pieces[first:last], conditional_scratch, base_scratch, weight_scratch,
             ),
         )
+        timer.after(mark)
         if panels is None:
             residual -= (columns @ step) * mask - covariates @ (coupling @ step)
         else:

@@ -3470,6 +3470,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     loading any fitted model. The exact ordered membership and output columns belong to the batch key, so a different
     memory plan cannot mistake an earlier batch number for its own models. Final calibration and held-out assembly
     run again from these same float64 values; neither the prediction call nor its arithmetic changes."""
+    from sv_pgs.phase_timer import timing
     from sv_pgs.postfit_checkpoint import BatchCheckpoint
 
     step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
@@ -3505,6 +3506,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     structural_genetic[:, part_traits] = arrays["structural_genetic"]
                 restored_batches += 1
                 continue
+            started = time.perf_counter()
             fitted = [_checked_trait_model(run, cohort, ARMS[scored[position][0]], scored[position][1], directories[position]) for position in batch]
             # Each fitted model's column in [arms x models] (arm-major), from its own names.
             for position, model in zip(batch, fitted):
@@ -3531,6 +3533,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                 del fitted, parts, models, model
                 continue
             try:
+                loaded = time.perf_counter()
                 prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget)
                 # Production prediction checks these too; bindings must obey the same contract. A failed fused read
                 # is retried one trait at a time so one overflow cannot hide the other traits' valid predictions.
@@ -3540,6 +3543,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     raise ValueError("misaligned prediction columns")
                 if any(not np.all(np.isfinite(values)) for values in values_to_check) or np.any(prediction.predictive_variance < 0):
                     raise ValueError("Non-finite predictions or invalid predictive variances")
+                predicted = time.perf_counter()
             except ValueError as error:
                 if not str(error).startswith("Non-finite predictions"):
                     raise
@@ -3563,6 +3567,8 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             with checkpoint.write() as temporary:
                 np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
                          structural_genetic=structural_genetic[:, part_traits])
+            # The batch's models loaded (and checked), then read from the store in one prediction, then committed.
+            timing("score_batch", time.perf_counter() - started, models=len(batch), load=loaded - started, predict=predicted - loaded)
     # Comparisons need the same trait in both arms. If one arm failed during prediction, erase the other arm's
     # already computed columns too; every downstream table uses this trait-wide quarantine.
     for trait, name in enumerate(cohort.trait_names):

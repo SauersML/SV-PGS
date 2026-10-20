@@ -7,8 +7,11 @@ import hashlib
 import json
 import os
 import struct
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+from sv_pgs.phase_timer import GB, timing
 
 GCS_MOUNTS = "SVPGS_GCS_MOUNTS"
 """The environment variable naming the Cloud Storage buckets mounted on this machine: a JSON object from mount path to
@@ -75,7 +78,12 @@ def tree_digest(root: str | Path) -> str:
     Hash files concurrently but do not reuse mutable metadata as a content identity.
     In particular, a guest kernel clock does not certify host/remote filesystem ctime
     granularity or clock alignment. Reuse requires an immutable generation contract.
+
+    Each pass ends with a ``timing: tree_digest`` line (``phase_timer``): its files, their bytes and the root's last two
+    parts, as ``store/`` under a step (``artifact.store_digest``: the All of Us whole-genome store, 547 GB, took about
+    12 minutes a start [real]).
     """
+    started = time.perf_counter()
     root = Path(root).resolve()
     paths = sorted(p for p in root.rglob("*") if p.is_file() and p.name != "CACHE_COMPLETE.json")
     stamps = [_stamp(path) for path in paths]
@@ -87,4 +95,5 @@ def tree_digest(root: str | Path) -> str:
         digest.update(struct.pack("<Q", len(name)))
         digest.update(name)
         digest.update(bytes.fromhex(content))
+    timing("tree_digest", time.perf_counter() - started, files=len(paths), gb=sum(stamp[2] for stamp in stamps) / GB, root="/".join(root.parts[-2:]))
     return digest.hexdigest()
