@@ -52,6 +52,12 @@ export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDI
 # do not verify ("CERTIFICATE_VERIFY_FAILED"): the job then had no credentials. Plain HTTP to the metadata server is
 # the VM-local path every earlier version used.
 export GCE_METADATA_MTLS_MODE=none
+# numpy's OpenBLAS is built for 128 threads and keeps a table of twice that many buffers: each of its own workers
+# holds one, and each thread calling it takes one more. On 128 vCPUs its 127 workers and the stage-0 host pool's
+# callers overflowed the table ("precompiled NUM_THREADS exceeded, adding auxiliary array for thread metadata"), and
+# the fit segfaulted 20 s in. Half the CPUs as its workers leaves a buffer for a caller on every CPU.
+cpus=$(nproc)
+export OPENBLAS_NUM_THREADS=$(( cpus > 64 ? cpus / 2 : cpus ))
 # The job's bucket mounts (the job templates' volumes): an input file there is keyed by its object's generation instead
 # of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
 # IMPUTED_BUCKET holds the imputed batches and their strata sidecar, PANEL_BUCKET the panel's bubble.split sites.
