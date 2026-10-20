@@ -109,6 +109,30 @@ def reassociation_bound(block_images: Sequence[Any], array_module: Any) -> Any:
     return 2.0 * gamma * magnitude
 
 
+def _current_device(cupy: Any) -> int:
+    """The current CUDA device, 0 on an array module with no devices (numpy standing in for CuPy)."""
+    runtime = getattr(getattr(cupy, "cuda", None), "runtime", None)
+    return int(runtime.getDevice()) if runtime is not None else 0
+
+
+def block_devices(source: Any, cupy: Any) -> list[int]:
+    """Each block's device: a sharded source's plan, else the current device for every block."""
+    if isinstance(source, ShardedDualSource):
+        return [int(source.plan.device_ids[int(position)]) for position in source.plan.block_devices]
+    return [_current_device(cupy)] * len(source.block_bounds)
+
+
+def native_blocks(source: Any, cupy: Any) -> Iterator[tuple[int, int, Any, int]]:
+    """Every block of a Stage 2 source as (start, stop, tile, device_id) on its own device (``ShardedDualSource.
+    native_blocks``); a one-device source's blocks on the current device."""
+    if isinstance(source, ShardedDualSource):
+        yield from source.native_blocks()
+        return
+    device_id = _current_device(cupy)
+    for start, stop, tile in source.blocks():
+        yield start, stop, tile, device_id
+
+
 class ShardTileSource(Protocol):
     """One device's share of the blocks: ``iter_tiles`` yields ``(local_index, tile)`` in the order
     of ``DevicePlan.blocks_on`` for that device, each tile valid until the next is requested
@@ -293,13 +317,25 @@ class ShardedDualSource:
 
     def blocks(self) -> Iterator[tuple[int, int, Any]]:
         """Every block in variant order, as a tile that takes and returns home-device arrays."""
+        for start, stop, tile, device_id in self.native_blocks():
+            yield start, stop, _PeerTile(tile, device_id, self.home_id, self._cupy)
+
+    def native_blocks(self) -> Iterator[tuple[int, int, Any, int]]:
+        """Every block in variant order on its own device: (start, stop, tile, device_id), the tile the shard's own (a
+        ``code_products.CodeBlockTile`` of a store source), valid until the next block is requested. The caller enters
+        the device to use it; no device context spans a yield.
+
+        A mean-field sweep (``device_sweep.sweep_models``) reads the held codes where they are and hands its residual
+        from one block's device to the next: through ``blocks`` each panel's columns were decoded on the block's device
+        and copied home, 25 array operations and a peer copy of n x 32 float64 for every 32 columns, the All of Us
+        whole-genome sweeps' 35-70 s [real]."""
         iterators = [iter(shard.iter_tiles()) for shard in self._shards]
         for block, (start, stop) in enumerate(self.block_bounds):
             position = int(self.plan.block_devices[block])
             device_id = self.plan.device_ids[position]
             with _cupy_device_context(self._cupy, device_id):
                 _local, tile = next(iterators[position])
-            yield start, stop, _PeerTile(tile, device_id, self.home_id, self._cupy)
+            yield start, stop, tile, device_id
         # Each shard's read is run past its last block, as map_reduce's strict zip runs it: a store source records a
         # complete read only there (its resident genotype codes serve the reads after it), and left at its last block,
         # no read ever completed, so every sweep of the All of Us whole-genome fits streamed the store from disk.

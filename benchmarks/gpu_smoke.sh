@@ -8,12 +8,15 @@
 # NETWORK=... SUBNETWORK=... bash benchmarks/gpu_smoke.sh submit
 #
 # GPU_COUNT defaults to 2 (a2-highgpu-2g); use GPU_COUNT=1 for a2-highgpu-1g.
+# STEPS (default "smoke bench tests") picks the task's commands, run in the order given: smoke is
+# benchmarks/gpu_smoke.py, bench is benchmarks/sweep_bench.py (old against new seconds per mean-field sweep on one GPU),
+# tests the CUDA test files. GPU_COUNT=1 STEPS=bench measures the sweep alone on one A100.
 # JOB_ID, MACHINE_TYPE, GPU_TYPE and RUN_DISK_GB may be overridden. JOB_SECONDS includes VM task environment
-# preparation; the Python command itself has a separate 300-second deadline, the CUDA test files PYTEST_SECONDS
-# (default 1200). No task retries hide a failure.
+# preparation; the smoke command itself has a separate 300-second deadline, the benchmark 600 seconds, the CUDA test
+# files PYTEST_SECONDS (default 1200). No task retries hide a failure.
 # Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging and to
-# svpgs/${RUN_ID}/smoke/${JOB_ID}.log in the ops bucket (mounted read-write for it); the task's exit status is the smoke
-# command's or the CUDA tests', and FAIL lines identify failed checks (including a missing CUDA device).
+# svpgs/${RUN_ID}/smoke/${JOB_ID}.log in the ops bucket (mounted read-write for it); the task fails where any of its
+# commands fails, and FAIL lines identify failed checks (including a missing CUDA device).
 set -euo pipefail
 
 smoke_task() {
@@ -28,12 +31,18 @@ smoke_task() {
     export LD_LIBRARY_PATH="$(ls -d "$RUN"/venv/lib/python3.12/site-packages/nvidia/*/lib | paste -sd:)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     export TMPDIR="$RUN/tmp" PYTHONUNBUFFERED=1
     cd "$RUN/source"
-    # The smoke command first, then every CUDA test file (env.tar's cache holds the dev group, pytest included): the
-    # CUDA tests skip on a laptop and on CI, so this job is where they run. Either failing fails the task.
-    local status=0
-    "$RUN/venv/bin/python" -m benchmarks.gpu_smoke || status=$?
-    timeout "${PYTEST_SECONDS:-1200}" "$RUN/venv/bin/python" -m pytest -q -p no:cacheprovider tests/*_cuda.py \
-      tests/test_scale_mixture_ep.py -k "cuda or device or chunk" || status=$?
+    # The smoke command first, the mean-field sweep's benchmark (its own ten-minute deadline), then every CUDA test
+    # file (env.tar's cache holds the dev group, pytest included): the CUDA tests skip on a laptop and on CI, so this
+    # job is where they run. Any of them failing fails the task.
+    local status=0 step
+    for step in ${STEPS:-smoke bench tests}; do
+        case "$step" in
+            smoke) "$RUN/venv/bin/python" -m benchmarks.gpu_smoke || status=$? ;;
+            bench) "$RUN/venv/bin/python" -m benchmarks.sweep_bench || status=$? ;;
+            tests) timeout "${PYTEST_SECONDS:-1200}" "$RUN/venv/bin/python" -m pytest -q -p no:cacheprovider tests/*_cuda.py \
+                     tests/test_scale_mixture_ep.py -k "cuda or device or chunk" || status=$? ;;
+        esac
+    done
     return "$status"
 }
 
@@ -62,6 +71,10 @@ esac
 export PROJECT_ID REGION OPS_BUCKET RUN_ID SERVICE_ACCOUNT NETWORK SUBNETWORK
 export GPU_COUNT="${GPU_COUNT:-2}"
 case "$GPU_COUNT" in 1|2) ;; *) echo 'GPU_COUNT must be 1 or 2' >&2; exit 2 ;; esac
+export STEPS="${STEPS:-smoke bench tests}"
+for step in $STEPS; do
+    case "$step" in smoke|bench|tests) ;; *) echo "STEPS takes smoke, bench and tests, not $step" >&2; exit 2 ;; esac
+done
 export MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-${GPU_COUNT}g}" GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
 export RUN_DISK_GB="${RUN_DISK_GB:-100}" JOB_SECONDS="${JOB_SECONDS:-3600}"
 export JOB_ID="${JOB_ID:-svpgs-gpu-smoke-$(date +%Y%m%d%H%M%S)}"
@@ -76,7 +89,7 @@ ops = f"/mnt/disks/ops/svpgs/{e['RUN_ID']}"
 # Task values are structured environment entries: no shell expansion of project, bucket or run names into code.
 task = {
     "runnables": [{"script": {"text": 'bash "$OPS/source/benchmarks/gpu_smoke.sh" task'}}],
-    "environment": {"variables": {"OPS": ops, "RUN": "/mnt/disks/run", "JOB": e["JOB_ID"]}},
+    "environment": {"variables": {"OPS": ops, "RUN": "/mnt/disks/run", "JOB": e["JOB_ID"], "STEPS": e["STEPS"]}},
     "maxRetryCount": 0,
     "maxRunDuration": f"{int(e['JOB_SECONDS'])}s",
     "computeResource": {"cpuMilli": 2000, "memoryMib": 8192},

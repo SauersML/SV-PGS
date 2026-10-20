@@ -100,6 +100,44 @@ def test_a_sharded_read_runs_every_shards_read_to_its_end() -> None:
         list(sharded.blocks())
 
 
+def test_native_blocks_are_the_shards_own_tiles_on_their_devices() -> None:
+    """``native_blocks`` hands the sweep each block's own tile with its device (the batched sweep reads the codes where
+    they are), runs every shard's read to its end as ``blocks`` does, and places a one-device source's blocks on the
+    current device; ``block_devices`` is the same placement without a read."""
+    from sv_pgs.device_plan import ShardedDualSource, block_devices, native_blocks
+
+    class Shard:
+        def __init__(self, count: int) -> None:
+            self.tiles, self.completed = [object() for _ in range(count)], 0
+
+        def iter_tiles(self):
+            yield from enumerate(self.tiles)
+            self.completed += 1
+
+    plan = plan_blocks((3, 5), [5, 9, 4, 3], 10)
+    shards = [Shard(plan.blocks_on(position).shape[0]) for position in range(2)]
+    bounds = [(0, 5), (5, 14), (14, 18), (18, 21)]
+    sharded = ShardedDualSource(shards, plan, bounds, 10, np)
+    native = list(native_blocks(sharded, np))
+    devices = [plan.device_ids[int(position)] for position in plan.block_devices]
+    assert [(start, stop) for start, stop, _tile, _device in native] == bounds
+    assert [device for _start, _stop, _tile, device in native] == devices == block_devices(sharded, np)
+    for position in range(2):
+        on_device = [tile for (_start, _stop, tile, device) in native if device == plan.device_ids[position]]
+        assert on_device == shards[position].tiles
+    assert [shard.completed for shard in shards] == [1, 1]
+
+    class Source:
+        block_bounds = bounds
+
+        def blocks(self):
+            for start, stop in bounds:
+                yield start, stop, (start, stop)
+
+    assert [(tile, device) for _start, _stop, tile, device in native_blocks(Source(), np)] == [(bound, 0) for bound in bounds]
+    assert block_devices(Source(), np) == [0] * len(bounds)
+
+
 def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stage 2's reads are sharded over a budget's CUDA devices by LD block (``stage2_wiring.stage2_source``), on a model's
     training samples. Checked on the host: numpy stands in for CuPy (``compute_budget._cupy_device_context`` needs no

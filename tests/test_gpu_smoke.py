@@ -76,6 +76,7 @@ def test_batch_spec_uses_staged_offline_runtime_and_no_retries(devices):
                        SERVICE_ACCOUNT="smoke@example.invalid", NETWORK="default", SUBNETWORK="default", GPU_COUNT=str(devices))
     environment.pop("MACHINE_TYPE", None)
     environment.pop("JOB_ID", None)
+    environment.pop("STEPS", None)
     spec = json.loads(subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=environment,
                                     capture_output=True, text=True, check=True).stdout)
     task = spec["taskGroups"][0]["taskSpec"]
@@ -84,7 +85,23 @@ def test_batch_spec_uses_staged_offline_runtime_and_no_retries(devices):
     assert '"$OPS/source/benchmarks/gpu_smoke.sh" task' in task["runnables"][0]["script"]["text"]
     # The workspace cannot read Cloud Logging: the task copies its output to smoke/<job>.log on the writable ops mount.
     assert task["environment"]["variables"]["JOB"].startswith("svpgs-gpu-smoke-")
+    assert task["environment"]["variables"]["STEPS"] == "smoke bench tests"
     assert "-o ro" not in task["volumes"][0]["mountOptions"]
     policy = spec["allocationPolicy"]["instances"][0]["policy"]
     assert policy["accelerators"][0]["count"] == devices
     assert policy["machineType"] == f"a2-highgpu-{devices}g"
+
+
+def test_batch_spec_takes_the_sweep_benchmark_alone_and_refuses_an_unknown_step():
+    """STEPS=bench on one GPU is the sweep benchmark's own cheap job; a misspelt step is refused before any submission."""
+    root = Path(__file__).resolve().parents[1]
+    environment = dict(os.environ, PROJECT_ID="smoke-project", REGION="us-central1", OPS_BUCKET="smoke-ops", RUN_ID="smoke",
+                       SERVICE_ACCOUNT="smoke@example.invalid", NETWORK="default", SUBNETWORK="default", GPU_COUNT="1", STEPS="bench")
+    environment.pop("MACHINE_TYPE", None)
+    spec = json.loads(subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=environment,
+                                    capture_output=True, text=True, check=True).stdout)
+    assert spec["taskGroups"][0]["taskSpec"]["environment"]["variables"]["STEPS"] == "bench"
+    assert spec["allocationPolicy"]["instances"][0]["policy"]["machineType"] == "a2-highgpu-1g"
+    refused = subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=dict(environment, STEPS="smoke benchmark"),
+                             capture_output=True, text=True)
+    assert refused.returncode == 2 and "not benchmark" in refused.stderr

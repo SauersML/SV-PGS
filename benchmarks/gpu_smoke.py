@@ -180,7 +180,8 @@ def _products(cp):
 def _sweep_panels(cp):
     """test_device_sweep_cuda's code-panel sweep against the host sweep on the same projected problem.
 
-    The sharded fit's peer tiles use decoded panels, so this separate check also runs CodePanels' held-code
+    The fits sweep through the batched route (``device_sweep.sweep_models``, which the fits below observe); a source
+    whose tiles hold no codes still takes ``sweep_piece``, so this separate check also runs CodePanels' held-code
     projection and residual kernels on every visible device. Three sweeps reuse the panel Grams, including
     the last partial panel, and check every moment and both scalar ELBO pieces against the host sweep.
     """
@@ -294,7 +295,7 @@ def _fit(source, statistics, prior, covariates, target, binary):
         sample_weights=None if sites is None else sites.weights[:, None], probe_sample_indices=np.arange(TRAINING),
     )
     observed = {"curvature": 0, "responses": 0, "derivatives": 0, "sweeps": 0, "widths": []}
-    curvature, derivatives, sweep, mixture = engine.curvature_correction, engine._variant_derivatives, full.sweep_piece, full._mode_mixture
+    curvature, derivatives, sweep, mixture = engine.curvature_correction, engine._variant_derivatives, full.sweep_models, full._mode_mixture
 
     response_columns = engine._total_curvature_columns
 
@@ -316,9 +317,10 @@ def _fit(source, statistics, prior, covariates, target, binary):
         return result
 
     def counted_sweep(*args, **kwargs):
+        # The batched sweep over the held codes (``device_sweep.sweep_models``): its layout's pieces are the widths.
         result = sweep(*args, **kwargs)
         observed["sweeps"] += 1
-        observed["widths"].append(kwargs["width"])
+        observed["widths"].extend(last - first for block in args[2].blocks for first, last in block.pieces)
         return result
 
     def measured_mixture(main, *args, **kwargs):
@@ -332,7 +334,7 @@ def _fit(source, statistics, prior, covariates, target, binary):
         "sv_pgs.store_block_source.StoreGenotypeBlockSource._iter_streamed", side_effect=AssertionError("resident fit touched disk")
     )
     with resident_read, patch.object(engine, "curvature_correction", counted_curvature), patch.object(engine, "_variant_derivatives", counted_derivatives), \
-            patch.object(full, "sweep_piece", counted_sweep), patch.object(full, "_mode_mixture", measured_mixture), \
+            patch.object(full, "sweep_models", counted_sweep), patch.object(full, "_mode_mixture", measured_mixture), \
             patch.object(engine, "_total_curvature_columns", counted_response):
         fit = full.fit_full_data(
             gaussian=gaussian, statistics=statistics, prior=prior, draw_count=DRAWS, working_bytes=working_bytes,
@@ -345,7 +347,7 @@ def _fit(source, statistics, prior, covariates, target, binary):
         _require(max(observed["widths"]) <= PANEL + 7, "the piece working set was not respected")
         _resident_shards(source)
     print(f"INFO EB steps={fit.certificate.outer_iterations.tolist()} curvature={observed['curvature']} "
-          f"responses={observed['responses']} derivatives={observed['derivatives']} device_pieces={observed['sweeps']} "
+          f"responses={observed['responses']} derivatives={observed['derivatives']} batched_sweeps={observed['sweeps']} "
           f"certified={fit.certificate.outer_criterion_met.tolist()}", flush=True)
     return dict(mean=fit.member_mean.copy(), elbo=observed["elbo"], noise=fit.noise_variance.copy(),
                 coefficients=fit.hyperparameters[0].coefficients.copy(), smoothing=fit.hyperparameters[0].log_smoothing.copy())

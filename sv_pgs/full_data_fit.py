@@ -57,7 +57,7 @@ import gc
 import hashlib
 import weakref
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Generator, Iterator, Sequence
 
 import time
 
@@ -65,10 +65,11 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array, I64Array
 from sv_pgs.config import TraitType
-from sv_pgs.device_sweep import PIECE_COLUMNS, CodePanels, PanelGrams, sweep_piece
+from sv_pgs.device_plan import ShardedDualSource, block_devices, native_blocks
+from sv_pgs.device_sweep import MOMENTS, PANEL, PIECE_COLUMNS, CodePanels, CudaPanelKernels, NoCodes, PanelGrams, SweepLayout, sweep_models, sweep_piece
 from sv_pgs.binary_likelihood import BernoulliSites, calibrated_shift, covariate_evidence
 from sv_pgs.draw_laws import ProductMixtureDraws, seed_key, tile_rows
-from sv_pgs.dual_solve import DualGaussian, DualModels, _WindowLayout, _host, column_squares
+from sv_pgs.dual_solve import DualGaussian, DualModels, StreamedDualSource, _WindowLayout, _host, column_squares
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
@@ -1622,6 +1623,12 @@ class _FullDataMeanField:
         self.refreshes = 0
         self.reweights = 0
         self.passes = 0
+        # Each model's own passes over the store (its sweeps and its predictor-variance reads): a solve's work budget
+        # counts its model's, whichever other models' sweeps share its launches (``_solve_models``).
+        self.model_passes = np.zeros(model_count, dtype=np.int64)
+        # Where the panel route's members live (``device_sweep.SweepLayout``), built at the first device sweep; False
+        # where the source's tiles hold no codes (the decoded route).
+        self._layout: SweepLayout | bool | None = None
         self.version = 0
         # The curvature's posterior solves' last duals per (model, directions), their warm starts (``_posterior``).
         self._solve_starts: dict = {}
@@ -1735,7 +1742,7 @@ class _FullDataMeanField:
         self.sites[model] = sites
         self._install_metric()
         self.residual[model] = self.projected_targets[model] - self._image(self.mean[:, model:model + 1], model)[:, 0]
-        self._panel_grams.clear()
+        self._panel_grams.drop(model)
         self.reweights += 1
 
     def _moment_pieces(self, count: int) -> Iterator[tuple[int, int]]:
@@ -1784,6 +1791,7 @@ class _FullDataMeanField:
                 del projected
         explained = np.asarray(_host(explained), dtype=np.float64)
         self.passes += 1
+        self.model_passes[model] += 1
         covariates = np.asarray(_host(self.gaussian.covariates), dtype=np.float64)
         factor = np.asarray(_host(self.models.covariate_factor[model]), dtype=np.float64)
         whitened = covariates @ factor
@@ -1821,7 +1829,7 @@ class _FullDataMeanField:
         if sites is not self.sites[model]:
             self.sites[model] = sites
             self._install_metric()
-            self._panel_grams.clear()
+            self._panel_grams.drop(model)
 
     def _cold_state(self, model: int) -> None:
         """Model ``model`` back at the cold start (the recipe: zero moments or the start means, the start's sites, and
@@ -2006,11 +2014,16 @@ class _FullDataMeanField:
                 weighted_variance += part[1]
                 sizes += part[3]
         self.passes += 1
+        self.model_passes[model] += 1
         return divergence, weighted_variance, float(residual @ residual), sizes
 
     def _device_sweep(self, model: int, hyperparameters: MixtureHyperparameters) -> tuple[float, float, float, float]:
         """The same sweep on the device (``device_sweep``): the members in the same order, the residual and the panel
-        Grams held there, and only each piece's moments copied back."""
+        Grams held there, and only each piece's moments copied back. On a store's held codes the batched route's
+        (``_panel_sweeps``); elsewhere each panel's columns decoded (``sweep_piece``)."""
+        swept = self._panel_sweeps({model: hyperparameters})
+        if swept is not None:
+            return swept[model]
         cupy = self.gaussian.array_module
         prior = self.prior
         log_density = cupy.asarray(np.ascontiguousarray(class_log_density(prior, hyperparameters.coefficients)))
@@ -2058,8 +2071,105 @@ class _FullDataMeanField:
         self.residual[model] = cupy.asnumpy(residual)
         totals = cupy.asnumpy(pieces.sum(axis=0))
         self.passes += 1
+        self.model_passes[model] += 1
         residual_square = float(cupy.asnumpy(residual @ residual))
         return float(totals[0]), float(totals[1]), residual_square, float(totals[2])
+
+    def _panel_layout(self) -> SweepLayout | None:
+        """Where the batched sweep's members live (``device_sweep.SweepLayout``: each block's device, and each device's
+        members in the order it visits them), built at its first use; None for a source whose tiles are not the store's
+        codes (neither ``StreamedDualSource`` nor ``ShardedDualSource``), or whose tiles held none (``NoCodes``)."""
+        if self._layout is None:
+            source = self.gaussian.source
+            if isinstance(source, (StreamedDualSource, ShardedDualSource)):
+                xp = self.gaussian.array_module
+                self._layout = SweepLayout(
+                    xp, block_devices(source, xp), self.member_blocks, source.block_bounds, self.ties.group, self.sign, self.class_index, self._pieces,
+                )
+            else:
+                self._layout = False
+        return self._layout or None
+
+    def _gram_columns(self, width: int) -> int:
+        """Columns of a piece decoded at once to form its panel Grams (``device_sweep._piece_grams``): their three
+        dense (n x width) float64 arrays (the decode's, the projection, its panels' stack) within the host working set
+        and, on a device, what the ledger can grant on the current one (``_moment_pieces``); whole panels, at least one."""
+        column_bytes = 3 * self.sample_count * np.dtype(np.float64).itemsize
+        columns = max(1, self.working_bytes // column_bytes)
+        xp = self.gaussian.array_module
+        if xp is not np:
+            pool = self._device_pool()
+            if pool is not None:
+                available = self._broker.reclaimable(pool)
+            else:
+                free, _total = xp.cuda.runtime.memGetInfo()
+                available = int(free) + int(xp.get_default_memory_pool().free_bytes())
+            columns = min(columns, available // column_bytes)
+        return max(PANEL, min(int(width), int(columns)) // PANEL * PANEL)
+
+    def _panel_sweeps(
+        self, requests: dict[int, MixtureHyperparameters], kernels: Any = None,
+    ) -> dict[int, tuple[float, float, float, float]] | None:
+        """One sweep of each requested model (model -> its hyperparameters) on the store's held codes, all of them in one
+        pass over the blocks (``device_sweep.sweep_models``: one kernel launch per panel for every model, on the device
+        that holds the panel's codes); each model's (divergence, weighted variance, residual square, sizes) as
+        ``_sweep``'s, or None where the source holds no codes (the decoded route). ``kernels`` are the CUDA kernels on a
+        device, or ``device_sweep.HostPanelKernels``, the numpy reference, on the host.
+
+        A model's sweep reads and moves only its own columns, residual, mask, sites and noise, and its arithmetic is the
+        same whichever models share its launches. The batched pass is one read of the store (``passes``) and one pass
+        of each of its models (``model_passes``)."""
+        layout = self._panel_layout()
+        if layout is None:
+            return None
+        xp = self.gaussian.array_module
+        prior = self.prior
+        models = sorted(requests)
+        columns = np.asarray(models, dtype=np.int64)
+        state = {name: np.ascontiguousarray(getattr(self, name)[:, columns]) for name in MOMENTS}
+        factors = [self.models.covariate_factor[model] for model in models]
+        try:
+            residuals, totals, residual_squares = sweep_models(
+                xp, CudaPanelKernels(xp, prior.grid_size) if kernels is None else kernels, layout, native_blocks(self.gaussian.source, xp),
+                grams=self._panel_grams, keys=[(model, b"" if self.sites[model] is None else self.sites[model].key) for model in models],
+                masks=np.ascontiguousarray(self.root[:, columns].T), residuals=np.stack([self.residual[model] for model in models]),
+                noise=np.ascontiguousarray(self.noise[columns]),
+                log_density=np.stack([class_log_density(prior, requests[model].coefficients) for model in models]),
+                grid=np.asarray(prior.log_variance_grid, dtype=np.float64),
+                log_scale=np.column_stack([log_scale(prior, requests[model].coefficients) for model in models]),
+                squares=np.ascontiguousarray(self.member_squares[:, columns]), state=state, covariates=self.gaussian.covariates,
+                # (C'WC)^+ from each model's whitener, as ``_device_sweep``'s.
+                covariate_pinvs=[factor @ factor.T for factor in factors], gram_columns=self._gram_columns,
+            )
+        except NoCodes:
+            self._layout = False
+            return None
+        for name in MOMENTS:
+            getattr(self, name)[:, columns] = state[name]
+        for index, model in enumerate(models):
+            self.residual[model] = np.ascontiguousarray(residuals[index])
+        self.passes += 1
+        self.model_passes[columns] += 1
+        return {
+            model: (float(totals[index, 0]), float(totals[index, 1]), float(residual_squares[index]), float(totals[index, 2]))
+            for index, model in enumerate(models)
+        }
+
+    def _sweeps(self, requests: dict[int, MixtureHyperparameters]) -> dict[int, tuple[float, float, float, float] | BaseException]:
+        """One sweep of each requested model: on a device, every one in one batched pass (``_panel_sweeps``); else each
+        model's own (``_sweep``), a model's refusal (FloatingPointError, ZeroDivisionError) its outcome, the others
+        swept."""
+        if self.gaussian.array_module is not np:
+            swept = self._panel_sweeps(requests)
+            if swept is not None:
+                return dict(swept)
+        outcomes: dict[int, tuple[float, float, float, float] | BaseException] = {}
+        for model, hyperparameters in requests.items():
+            try:
+                outcomes[model] = self._sweep(model, hyperparameters)
+            except (FloatingPointError, ZeroDivisionError) as error:
+                outcomes[model] = error
+        return outcomes
 
     def _elbo(self, model: int, divergence: float, weighted_variance: float, residual_square: float, sizes: float) -> tuple[float, float]:
         """As ``MeanFieldFixedPoints._elbo``, on this model's training rows: a binary model's Bernoulli bound L at unit
@@ -2090,29 +2200,84 @@ class _FullDataMeanField:
         """Sweeps at the current noise, the noise moving to its stationary value between them, until the sweeps'
         measured remainder (the geometric extrapolation of the last two gains, ``mean_field``) plus the noise's
         pending gain is within the tolerance, or the solve's derived work budget (``SweepBudget``) is spent, which
-        raises ``FloatingPointError`` (the trial is refused, counted in ``unresolved``, and never reported solved)."""
+        raises ``FloatingPointError`` (the trial is refused, counted in ``unresolved``, and never reported solved).
+        ``pass_budget`` caps the model's own passes (``model_passes``): ``_PassBudget`` where they are spent."""
+        solve = self._solve_steps(model, hyperparameters, pass_budget)
+        swept = None
+        while True:
+            try:
+                solve.send(swept)
+            except StopIteration:
+                return
+            swept = self._sweep(model, hyperparameters)
+
+    def _solve_models(
+        self, models: Sequence[int], hyperparameters: Sequence[MixtureHyperparameters], budgets: Sequence[int | None],
+    ) -> list[BaseException | None]:
+        """``_solve_model`` for each of ``models`` (their pass budgets in ``budgets``, in the same order; ``hyperparameters``
+        every model's), side by side: at each round every solve still running asks for its next sweep, and the round's
+        sweeps run as one (``_sweeps``: on a device, one pass over the store for all of them, the AoU groups' three
+        models in each launch). A solve reads and moves only its model's columns, residual, sites and noise, and its pass
+        budget counts its model's passes, so each model reaches the state it reaches alone, in as many sweeps; one model's
+        solve is ``_solve_model`` itself. Returns each model's outcome: None where it ended solved, else what it raised
+        (``_PassBudget``, or a refusal's FloatingPointError or ZeroDivisionError)."""
+        if len(models) == 1:
+            try:
+                self._solve_model(models[0], hyperparameters[models[0]], pass_budget=budgets[0])
+            except (_PassBudget, FloatingPointError, ZeroDivisionError) as error:
+                return [error]
+            return [None]
+        outcomes: dict[int, BaseException | None] = {}
+        solves = {model: self._solve_steps(model, hyperparameters[model], budget) for model, budget in zip(models, budgets)}
+        swept: dict[int, Any] = {model: None for model in models}
+        while solves:
+            for model in list(solves):
+                try:
+                    solves[model].send(swept.pop(model))
+                except StopIteration:
+                    outcomes[model] = None
+                    del solves[model]
+                except (_PassBudget, FloatingPointError, ZeroDivisionError) as error:
+                    outcomes[model] = error
+                    del solves[model]
+            if solves:
+                for model, outcome in self._sweeps({model: hyperparameters[model] for model in solves}).items():
+                    if isinstance(outcome, BaseException):
+                        outcomes[model] = outcome
+                        solves.pop(model).close()
+                    else:
+                        swept[model] = outcome
+        return [outcomes[model] for model in models]
+
+    def _solve_steps(
+        self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None,
+    ) -> Generator[None, tuple[float, float, float, float], None]:
+        """``_solve_model``'s solve as a generator: it yields where it needs its model's next sweep at the current noise
+        and is sent the sweep's (divergence, weighted variance, residual square, sizes), so that one round's sweeps of
+        several models can run as one (``_solve_models``)."""
         tolerance = 0.5 / self.draw_count
         elbo: float | None = None
         gain: float | None = None
         previous_gain: float | None = None
         pending_noise: float | None = None
-        passes_at_entry = self.passes
+        passes_at_entry = int(self.model_passes[model])
         budget = self._sweep_budget(model, hyperparameters)
         started = time.perf_counter()
         sweeps = 0
 
         def done(outcome: str) -> None:
             seconds = time.perf_counter() - started
-            log(f"mean-field solve: model {model} {outcome} after {sweeps} sweeps in {seconds:.1f} s, {self.passes - passes_at_entry} passes")
+            passes = int(self.model_passes[model]) - passes_at_entry
+            log(f"mean-field solve: model {model} {outcome} after {sweeps} sweeps in {seconds:.1f} s, {passes} passes")
             timing("mean_field_solve", seconds, model=model, outcome=outcome, sweeps=sweeps, **({"per_sweep": seconds / sweeps} if sweeps else {}))
 
         while True:
-            if pass_budget is not None and self.passes - passes_at_entry >= pass_budget:
+            if pass_budget is not None and int(self.model_passes[model]) - passes_at_entry >= pass_budget:
                 raise _PassBudget()
             if pending_noise is not None:
                 elbo = elbo + float(self.noise_gain[model]) if elbo is not None else None
                 self.noise[model] = pending_noise
-            divergence, weighted_variance, residual_square, sizes = self._sweep(model, hyperparameters)
+            divergence, weighted_variance, residual_square, sizes = yield
             sweeps += 1
             if not (np.isfinite(divergence) and np.isfinite(weighted_variance) and np.isfinite(residual_square)):
                 raise FloatingPointError(f"model {model}: a mean-field sweep is not finite")
@@ -2242,7 +2407,9 @@ class _FullDataMeanField:
         after this oracle's first call, the solve from the start, every other model left as it is; the solved models'
         entry states (which a refusal of the call puts back), or None where some model reaches no fixed point (the trial
         is refused whole, as EP's oracle refuses, and every one is put back). No dual-solver factor: the mode mixture's
-        orders take only this, since nothing of the mixture reads one (``_mode_mixture``).
+        orders take only this, since nothing of the mixture reads one (``_mode_mixture``). The models' carried solves
+        run side by side, then their cold solves (``_solve_models``: on a device each round's sweeps are one pass over
+        the store), each reaching what it reaches alone, in as many of its own passes (``model_passes``).
 
         The cold solve gets the carried solve's own count of passes, and no more (``mean_field``), so where the cold
         start is known to need more it can only be abandoned at that count: it is then not run, and the carried solve's
@@ -2268,6 +2435,7 @@ class _FullDataMeanField:
         for model in solving:
             self._at[model] = None
         for cold in ((False,) if first else (False, True)):
+            running: list[int] = []
             for model in solving:
                 budget = budgets[model]
                 if cold and budget is not None:
@@ -2280,20 +2448,22 @@ class _FullDataMeanField:
                         continue
                 if cold:
                     self._cold_state(model)
-                before = self.passes
-                try:
-                    self._solve_model(model, hyperparameters[model], pass_budget=budget)
-                except _PassBudget:
-                    self._cold_need[model] = self.passes - before + 1
-                    log(f"mean-field solve: model {model}'s cold start abandoned at its budget of {budget} passes (the carried solve's)")
+                running.append(model)
+            before = self.model_passes.copy()
+            # The models' solves side by side (``_solve_models``), each the solve it is alone.
+            for model, outcome in zip(running, self._solve_models(running, hyperparameters, [budgets[model] for model in running])):
+                used = int(self.model_passes[model] - before[model])
+                if isinstance(outcome, _PassBudget):
+                    self._cold_need[model] = used + 1
+                    log(f"mean-field solve: model {model}'s cold start abandoned at its budget of {budgets[model]} passes (the carried solve's)")
                     continue
-                except (FloatingPointError, ZeroDivisionError) as error:
-                    self.refusals.append(f"{type(error).__name__}: {error}")
+                if outcome is not None:
+                    self.refusals.append(f"{type(outcome).__name__}: {outcome}")
                     continue
                 if first or cold:
-                    self._cold_need[model] = self.passes - before
-                if budget is None:
-                    budgets[model] = self.passes - before
+                    self._cold_need[model] = used
+                if budgets[model] is None:
+                    budgets[model] = used
                 candidates[model].append(self._state(model))
         if skipped:
             log(
@@ -2574,6 +2744,7 @@ class _GramMeanField(_FullDataMeanField):
         for name in names:
             getattr(self, name)[:, model] = arrays[name]
         self.passes += 1
+        self.model_passes[model] += 1
         log(f"gram sweep {self.passes}: {time.perf_counter() - started:.1f} s, {(self.band.read_bytes - read_before) / 1e9:.1f} GB read from Stage 0's files")
         residual_square, size = result.residual_square, result.residual_size
         if far.any():
@@ -2591,6 +2762,21 @@ class _GramMeanField(_FullDataMeanField):
         # The residual square is y'Py - 2 mbar's + mbar'G mbar, formed from terms of the size ``residual_size``: its
         # rounding enters the ELBO's bound with the KL pieces' (``_elbo``'s count of summands covers its sums).
         return result.divergence, result.weighted_variance, residual_square, result.sizes + size / (2.0 * noise)
+
+    def _solve_models(
+        self, models: Sequence[int], hyperparameters: Sequence[MixtureHyperparameters], budgets: Sequence[int | None],
+    ) -> list[BaseException | None]:
+        """One model at a time: a band sweep is one model's (``GramBand.sweep``), and a refinement round reads the
+        oracle's last residual square and rounding (``_elbo``), its own model's."""
+        outcomes: list[BaseException | None] = []
+        for model, pass_budget in zip(models, budgets):
+            try:
+                self._solve_model(model, hyperparameters[model], pass_budget)
+            except (_PassBudget, FloatingPointError, ZeroDivisionError) as error:
+                outcomes.append(error)
+                continue
+            outcomes.append(None)
+        return outcomes
 
     def _solve_model(self, model: int, hyperparameters: MixtureHyperparameters, pass_budget: int | None = None) -> None:
         tolerance = 0.5 / self.draw_count
