@@ -29,6 +29,7 @@ from sv_pgs.all_of_us import (
     LDL_LOWERING,
     MEASUREMENT_DEFINITIONS,
     MEASUREMENT_EXCLUSION_REASONS,
+    MIN_DISEASE_OCCURRENCES,
     UNBOUNDED_WINDOW_DAYS,
     ClinicalWindow,
     DiseaseDefinition,
@@ -190,6 +191,7 @@ def _disease_row(
     occurrence_count: int,
     sex_at_birth_concept_id: int = 45878463,
     pre_landmark_condition_dates: int = 12,
+    condition_dates: int = 20,
     control_exclusion: bool = False,
     ambiguous: bool = False,
     case_medication_dates: int = 0,
@@ -210,6 +212,7 @@ def _disease_row(
         "age_at_first_case_procedure": 50.0 if case_procedure_dates else None,
         "age_at_observation_end": 45.0 + person_id % 30,
         "pre_landmark_condition_dates": pre_landmark_condition_dates,
+        "condition_dates": condition_dates,
         "has_control_exclusion_code": control_exclusion,
         "has_ambiguous_code": ambiguous,
         "case_medication_dates": case_medication_dates,
@@ -422,11 +425,11 @@ def _participant_counts_are_reportable(counts: list[str]) -> bool:
 
 def test_disease_metadata_and_log_write_no_count_of_one_to_twenty(tmp_path: Path, monkeypatch, caplog):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
-    # 40 cases, 100 controls, 25 with sparse early EHR and 3 with one diagnosis date: the 3 is suppressed, and with it
+    # 40 cases, 100 controls, 25 with one condition date and 3 with one diagnosis date: the 3 is suppressed, and with it
     # the 25, the smallest other count, so that 168 - 140 - 25 does not give it back.
     rows = [_disease_row(person_id, occurrence_count=3) for person_id in range(40)]
     rows += [_disease_row(person_id, occurrence_count=0) for person_id in range(40, 140)]
-    rows += [_disease_row(person_id, occurrence_count=0, pre_landmark_condition_dates=2) for person_id in range(140, 165)]
+    rows += [_disease_row(person_id, occurrence_count=0, condition_dates=1) for person_id in range(140, 165)]
     rows += [_disease_row(person_id, occurrence_count=1) for person_id in range(165, 168)]
     with caplog.at_level("INFO", logger="sv_pgs.all_of_us"):
         outputs = prepare_all_of_us_disease_sample_table("afib", tmp_path / "afib.tsv", client=_FakeBigQueryClient(rows))
@@ -642,13 +645,14 @@ def test_lab_evidence_must_cover_every_criterion():
         _prepare_training_rows(resolve_disease_definition("ckd"), [_disease_row(1, occurrence_count=0)], [])
 
 
-def test_sparse_early_ehr_excludes_cases_and_controls_alike(monkeypatch, tmp_path: Path):
+def test_a_control_needs_the_condition_dates_a_diagnosis_takes(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("GOOGLE_PROJECT", "billing-project")
+    # Early EHR depth is a covariate, not a floor: 101 and 103 have no condition date in their first year and stay.
     rows = [
-        _disease_row(101, occurrence_count=3),
-        _disease_row(102, occurrence_count=3, pre_landmark_condition_dates=4),
-        _disease_row(103, occurrence_count=0),
-        _disease_row(104, occurrence_count=0, pre_landmark_condition_dates=4),
+        _disease_row(101, occurrence_count=3, pre_landmark_condition_dates=0, condition_dates=MIN_DISEASE_OCCURRENCES + 1),
+        _disease_row(102, occurrence_count=0, pre_landmark_condition_dates=0, condition_dates=MIN_DISEASE_OCCURRENCES - 1),
+        _disease_row(103, occurrence_count=0, pre_landmark_condition_dates=0, condition_dates=MIN_DISEASE_OCCURRENCES),
+        _disease_row(104, occurrence_count=0, pre_landmark_condition_dates=0, condition_dates=0),
     ]
     outputs = prepare_all_of_us_disease_sample_table(
         "gout",
@@ -660,7 +664,7 @@ def test_sparse_early_ehr_excludes_cases_and_controls_alike(monkeypatch, tmp_pat
     metadata = json.loads(outputs.metadata_path.read_text(encoding="utf-8"))
     # Two of four participants: the metadata writes no count of 1 to 20.
     assert metadata["n_excluded_sparse_ehr"] == "suppressed"
-    assert metadata["min_pre_landmark_condition_dates"] == 5
+    assert metadata["min_condition_dates"] == MIN_DISEASE_OCCURRENCES
 
 
 def test_prepare_all_of_us_disease_requires_all_of_us_env(monkeypatch, tmp_path: Path):
@@ -897,7 +901,8 @@ def test_measurement_sql_is_one_parameterized_query_for_every_trait(monkeypatch)
         assert f"{reason}_row_count" in sql
     assert "vocabulary_id = 'LOINC'" in sql
     # Both concept columns are matched; units are matched by All of Us unit name.
-    assert "measurement.measurement_source_concept_id IN (SELECT concept_id FROM analyte_concepts)" in sql
+    assert "ON by_source.concept_id = measurement.measurement_source_concept_id" in sql
+    assert "(by_concept.concept_id IS NOT NULL OR by_source.concept_id IS NOT NULL)" in sql
     assert "LOWER(unit.concept_name)" in sql
     assert "GROUP BY person_id, measurement_date, age_years, on_treatment" in sql
     assert "race_concept_id" not in sql

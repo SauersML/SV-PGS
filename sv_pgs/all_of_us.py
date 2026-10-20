@@ -26,12 +26,15 @@ if TYPE_CHECKING:
     from google.cloud import bigquery
 
 MIN_DISEASE_OCCURRENCES = 2
-# Symmetric EHR-depth floor (pgsEngine C06): cases and controls alike need at
-# least this many distinct condition dates on or before the landmark, the
-# first observation-period start plus EHR_DEPTH_LANDMARK_DAYS. The landmark
-# does not depend on the outcome, so the floor selects on pre-outcome EHR use
-# only.
-MIN_PRE_LANDMARK_CONDITION_DATES = 5
+# Symmetric EHR-depth floor: cases and controls alike need at least
+# MIN_DISEASE_OCCURRENCES distinct condition dates of any kind, the record a
+# diagnosis takes, so no one is a control only for having no record. (pgsEngine
+# C06's floor, five condition dates on or before the first observation-period
+# start plus a year, selects on pre-outcome EHR use only, but it kept about one
+# All of Us EHR participant in seven; this one keeps more than half.) The
+# pre-landmark depth, distinct condition dates on or before the first
+# observation-period start plus EHR_DEPTH_LANDMARK_DAYS, does not depend on the
+# outcome and stays a covariate.
 EHR_DEPTH_LANDMARK_DAYS = 365
 LOGGER = logging.getLogger(__name__)
 # Every phenotype adjusts for biological sex (All of Us
@@ -1017,7 +1020,8 @@ def resolve_disease_definition(disease: str) -> DiseaseDefinition:
 
 def build_all_of_us_disease_sql(disease_definition: DiseaseDefinition) -> str:
     """One row per EHR participant: diagnosis dates, exclusion flags, the
-    disease's drug and procedure evidence, the pre-landmark EHR depth and the
+    disease's drug and procedure evidence, the EHR depth (all condition dates
+    and those before the landmark) and the
     ages the liability target needs. Lab evidence comes from the measurement
     query (fetch_all_of_us_lab_criterion_rows); the case and control rules are
     applied in _prepare_training_rows."""
@@ -1077,7 +1081,7 @@ condition_summaries AS (
   -- One pass over condition_occurrence. Occurrences are distinct diagnosis
   -- dates: several condition rows on one day (one visit coded twice) are one
   -- occurrence, not a confirmation. The EHR depth counts distinct condition
-  -- dates of any kind on or before the landmark.
+  -- dates of any kind, all of them and those on or before the landmark.
   SELECT
     condition_occurrence.person_id,
     COUNT(
@@ -1094,7 +1098,8 @@ condition_summaries AS (
         condition_occurrence.condition_start_date,
         NULL
       )
-    ) AS pre_landmark_condition_dates
+    ) AS pre_landmark_condition_dates,
+    COUNT(DISTINCT condition_occurrence.condition_start_date) AS condition_dates
   FROM `{dataset}.condition_occurrence` AS condition_occurrence
   JOIN ehr_participants
     ON ehr_participants.person_id = condition_occurrence.person_id
@@ -1151,6 +1156,7 @@ SELECT
   DATE_DIFF(ehr_participants.observation_end_date, DATE(person.year_of_birth, 7, 1), DAY) / 365.25
     AS age_at_observation_end,
   COALESCE(condition_summaries.pre_landmark_condition_dates, 0) AS pre_landmark_condition_dates,
+  COALESCE(condition_summaries.condition_dates, 0) AS condition_dates,
   COALESCE(condition_summaries.has_control_exclusion_code, FALSE) AS has_control_exclusion_code,
   COALESCE(condition_summaries.has_ambiguous_code, FALSE) AS has_ambiguous_code,
   COALESCE(medication_summaries.case_medication_dates, 0) AS case_medication_dates,
@@ -1338,7 +1344,7 @@ def prepare_all_of_us_disease_sample_table(
                 "minimum_case_age_years": disease_definition.minimum_case_age_years,
                 "minimum_control_age_years": disease_definition.minimum_control_age_years,
                 "min_occurrences": MIN_DISEASE_OCCURRENCES,
-                "min_pre_landmark_condition_dates": MIN_PRE_LANDMARK_CONDITION_DATES,
+                "min_condition_dates": MIN_DISEASE_OCCURRENCES,
                 "ehr_depth_landmark_days": EHR_DEPTH_LANDMARK_DAYS,
                 "liability_target_definition": (
                     "E[liability | status, age] under the age-of-onset threshold model; a case's age is its "
@@ -2342,7 +2348,7 @@ def _prepare_training_rows(
 
     ``lab_evidence`` holds, per lab criterion, fetch_all_of_us_lab_criterion_rows.
     Everyone who is neither case nor control is left out and counted by reason:
-    EHR depth below MIN_PRE_LANDMARK_CONDITION_DATES, an ambiguous code, the
+    fewer than MIN_DISEASE_OCCURRENCES condition dates, an ambiguous code, the
     wrong sex, an age below the minimum, one diagnosis date without supporting
     evidence, qualifying lab values short of the criterion, or a control
     exclusion code or drug. A case's age of onset is its earliest evidence:
@@ -2383,7 +2389,7 @@ def _prepare_training_rows(
             *([float(row["age_at_first_case_procedure"])] if procedure_case else []),
             *met_lab_ages,
         ]
-        if int(row["pre_landmark_condition_dates"]) < MIN_PRE_LANDMARK_CONDITION_DATES:
+        if int(row["condition_dates"]) < MIN_DISEASE_OCCURRENCES:
             exclusion_counts["n_excluded_sparse_ehr"] += 1
         elif bool(row["has_ambiguous_code"]):
             exclusion_counts["n_excluded_ambiguous_code"] += 1

@@ -342,7 +342,7 @@ def _omop_rows(persons: list[str]) -> tuple[list[dict], list[dict]]:
             "first_condition_date": "2020-01-01" if occurrences else None, "observation_start_date": "2015-01-01",
             "observation_end_date": "2024-01-01", "primary_consent_date": "2018-06-01", "year_of_birth": 1975,
             "age_at_first_condition": 40.0 + number % 30 if occurrences else None, "age_at_first_case_procedure": None,
-            "age_at_observation_end": 45.0 + number % 30, "pre_landmark_condition_dates": 6 + number % 7,
+            "age_at_observation_end": 45.0 + number % 30, "pre_landmark_condition_dates": 6 + number % 7, "condition_dates": 9 + number % 7,
             "has_control_exclusion_code": False, "has_ambiguous_code": False, "case_medication_dates": 0,
             "has_control_exclusion_medication": False, "case_procedure_dates": 0, "sex_at_birth_concept_id": sex,
             "sex_at_birth_name": "female" if sex == FEMALE else "male",
