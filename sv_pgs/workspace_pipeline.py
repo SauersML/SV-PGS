@@ -406,6 +406,11 @@ class WorkspaceConfig:
     """True: one model per fold, each scored on the fold it left out, and an all-rows model per trait. False: a single
     train/test split, one model per trait trained on every fold but the test fold (the panel's primary fold, else fold
     0) and scored on it, which also serves as the trait's released model: 1 / fold_count of the rows test, the rest train."""
+    fit_minimum_minor_allele_frequency: float = 0.0
+    fit_minimum_r2: float = 0.0
+    """The fit leaves out every record whose minor allele frequency over the store's samples (its code sums) or whose
+    reported imputation r^2 (the store's quality column) is below these; 0 keeps every record. A fit's cost grows with
+    its records: the All of Us chr22 store's 1.8M candidates made a 364 GB LD store and a 10-minute pass on an A100."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -414,7 +419,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit"})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", *_FIT_FILTER_KEYS})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -426,6 +431,10 @@ class WorkspaceConfig:
             raise ValueError("annotated_prior must be a boolean")
         if not isinstance(raw.get("cross_fit", True), bool):
             raise ValueError("cross_fit must be a boolean")
+        for key in _FIT_FILTER_KEYS:
+            value = raw.get(key, 0.0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
+                raise ValueError(f"{key} must be a number in [0, 1)")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -495,6 +504,8 @@ class WorkspaceConfig:
             annotated_prior=raw.get("annotated_prior", True),
             panel=PanelInputs.from_mapping(raw.get("panel"), diseases + traits, int(raw["fold_count"])),
             cross_fit=raw.get("cross_fit", True),
+            fit_minimum_minor_allele_frequency=float(raw.get("fit_minimum_minor_allele_frequency", 0.0)),
+            fit_minimum_r2=float(raw.get("fit_minimum_r2", 0.0)),
         )
 
     def model_folds(self) -> tuple[int, ...]:
@@ -591,6 +602,9 @@ def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
     from sv_pgs.content_identity import file_digest
 
     return path.stat().st_size, file_digest(path)
+
+
+_FIT_FILTER_KEYS = ("fit_minimum_minor_allele_frequency", "fit_minimum_r2")
 
 
 def module_closure(*roots: ModuleType) -> tuple[ModuleType, ...]:
@@ -2900,6 +2914,20 @@ def structural_records(table: VariantTable) -> BoolArray:
     return structural
 
 
+def fit_filtered(table: VariantTable, sample_count: int, log_reliability: F64Array, minimum_frequency: float, minimum_r2: float) -> F64Array:
+    """``log_reliability`` with -inf on every record the fit leaves out (``WorkspaceConfig.fit_minimum_r2`` and its
+    frequency floor): one whose minor allele frequency over the store's ``sample_count`` samples, from its code sums,
+    or whose reported imputation r^2 (the ``quality`` column) is below its floor."""
+    kept = np.ones(np.asarray(table.sum_code).shape[0], dtype=bool)
+    if minimum_frequency > 0.0:
+        frequency = np.asarray(table.sum_code, dtype=np.float64) / (2.0 * CODES_PER_DOSAGE * sample_count)
+        kept &= np.minimum(frequency, 1.0 - frequency) >= minimum_frequency
+    if minimum_r2 > 0.0:
+        kept &= np.asarray(table.annotations["quality"], dtype=np.float64) >= minimum_r2
+    LOGGER.info("workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g)", int(kept.sum()), kept.shape[0], minimum_frequency, minimum_r2)
+    return np.where(kept, np.asarray(log_reliability, dtype=np.float64), -np.inf)
+
+
 def arm_log_reliability(table: VariantTable, log_reliability: F64Array, arm: str) -> F64Array:
     """The records' log reliability as ``arm`` (ARMS) fits them: unchanged where the arm fits a record, -inf where it
     leaves a structural record (``structural_records``) out."""
@@ -2989,8 +3017,11 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 work.mkdir(parents=True, exist_ok=True)
                 unsaved = [trait for trait in unrecorded if not targets[trait].is_dir()]
                 if unsaved:
+                    kept = fit_filtered(
+                        store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2
+                    )
                     request = fit_request(
-                        cohort, store, arm_log_reliability(store.variant_table, measurement.log_reliability, arm), run.budget, work, run.config.seed,
+                        cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
                         run.config.disease_likelihood, run.config.annotated_prior,
                     )
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
@@ -3886,7 +3917,7 @@ _STEPS = (
         _direct_sv_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior), (_fit_step, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
+    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2), (_fit_step, fit_filtered, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
