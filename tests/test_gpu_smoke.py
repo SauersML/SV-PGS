@@ -75,12 +75,16 @@ def test_batch_spec_uses_staged_offline_runtime_and_no_retries(devices):
     environment = dict(os.environ, PROJECT_ID="smoke-project", REGION="us-central1", OPS_BUCKET="smoke-ops", RUN_ID="smoke",
                        SERVICE_ACCOUNT="smoke@example.invalid", NETWORK="default", SUBNETWORK="default", GPU_COUNT=str(devices))
     environment.pop("MACHINE_TYPE", None)
+    environment.pop("JOB_ID", None)
     spec = json.loads(subprocess.run(["bash", "benchmarks/gpu_smoke.sh", "spec"], cwd=root, env=environment,
                                     capture_output=True, text=True, check=True).stdout)
     task = spec["taskGroups"][0]["taskSpec"]
     assert task["maxRetryCount"] == 0
     assert task["environment"]["variables"]["OPS"] == "/mnt/disks/ops/svpgs/smoke"
     assert '"$OPS/source/benchmarks/gpu_smoke.sh" task' in task["runnables"][0]["script"]["text"]
+    # The workspace cannot read Cloud Logging: the task copies its output to smoke/<job>.log on the writable ops mount.
+    assert task["environment"]["variables"]["JOB"].startswith("svpgs-gpu-smoke-")
+    assert "-o ro" not in task["volumes"][0]["mountOptions"]
     policy = spec["allocationPolicy"]["instances"][0]["policy"]
     assert policy["accelerators"][0]["count"] == devices
     assert policy["machineType"] == f"a2-highgpu-{devices}g"

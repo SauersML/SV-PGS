@@ -11,12 +11,12 @@
 # JOB_ID, MACHINE_TYPE, GPU_TYPE and RUN_DISK_GB may be overridden. JOB_SECONDS includes VM task environment
 # preparation; the Python command itself has a separate 300-second deadline, the CUDA test files PYTEST_SECONDS
 # (default 1200). No task retries hide a failure.
-# Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging; the task's
-# exit status is the smoke command's, and FAIL lines identify failed checks (including a missing CUDA device).
+# Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging and to
+# svpgs/${RUN_ID}/smoke/${JOB_ID}.log in the ops bucket (mounted read-write for it); the task's exit status is the smoke
+# command's or the CUDA tests', and FAIL lines identify failed checks (including a missing CUDA device).
 set -euo pipefail
 
-if [[ "${1:-}" == task ]]; then
-    : "${OPS:?staged source/ and env.tar directory}" "${RUN:?task-local writable directory}"
+smoke_task() {
     mkdir -p "$RUN/tools" "$RUN/tmp"
     tar -xf "$OPS/env.tar" -C "$RUN"
     mv "$RUN/bin/uv" "$RUN/tools/uv"
@@ -30,10 +30,26 @@ if [[ "${1:-}" == task ]]; then
     cd "$RUN/source"
     # The smoke command first, then every CUDA test file (env.tar's cache holds the dev group, pytest included): the
     # CUDA tests skip on a laptop and on CI, so this job is where they run. Either failing fails the task.
-    status=0
+    local status=0
     "$RUN/venv/bin/python" -m benchmarks.gpu_smoke || status=$?
     timeout "${PYTEST_SECONDS:-1200}" "$RUN/venv/bin/python" -m pytest -q -p no:cacheprovider tests/*_cuda.py \
       tests/test_scale_mixture_ep.py -k "cuda or device or chunk" || status=$?
+    return "$status"
+}
+
+if [[ "${1:-}" == task ]]; then
+    : "${OPS:?staged source/ and env.tar directory}" "${RUN:?task-local writable directory}" "${JOB:?job id}"
+    # The workspace cannot read Cloud Logging (PERMISSION_DENIED for its service account), so the task's output also
+    # goes to smoke/<job>.log beside the staged source: copied every minute while it runs and once at the end.
+    mkdir -p "$RUN" "$OPS/smoke"
+    log="$OPS/smoke/$JOB.log"
+    ( while sleep 60; do cp "$RUN/smoke.log" "$log" 2>/dev/null; done ) &
+    copier=$!
+    status=0
+    smoke_task 2>&1 | tee "$RUN/smoke.log" || status=${PIPESTATUS[0]}
+    kill "$copier" 2>/dev/null
+    echo "smoke task exit $status" >> "$RUN/smoke.log"
+    cp "$RUN/smoke.log" "$log"
     exit "$status"
 fi
 
@@ -48,7 +64,7 @@ export GPU_COUNT="${GPU_COUNT:-2}"
 case "$GPU_COUNT" in 1|2) ;; *) echo 'GPU_COUNT must be 1 or 2' >&2; exit 2 ;; esac
 export MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-${GPU_COUNT}g}" GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
 export RUN_DISK_GB="${RUN_DISK_GB:-100}" JOB_SECONDS="${JOB_SECONDS:-3600}"
-JOB_ID="${JOB_ID:-svpgs-gpu-smoke-$(date +%Y%m%d%H%M%S)}"
+export JOB_ID="${JOB_ID:-svpgs-gpu-smoke-$(date +%Y%m%d%H%M%S)}"
 spec=$(mktemp)
 trap 'rm -f "$spec"' EXIT
 python3 - > "$spec" <<'PY'
@@ -60,12 +76,12 @@ ops = f"/mnt/disks/ops/svpgs/{e['RUN_ID']}"
 # Task values are structured environment entries: no shell expansion of project, bucket or run names into code.
 task = {
     "runnables": [{"script": {"text": 'bash "$OPS/source/benchmarks/gpu_smoke.sh" task'}}],
-    "environment": {"variables": {"OPS": ops, "RUN": "/mnt/disks/run"}},
+    "environment": {"variables": {"OPS": ops, "RUN": "/mnt/disks/run", "JOB": e["JOB_ID"]}},
     "maxRetryCount": 0,
     "maxRunDuration": f"{int(e['JOB_SECONDS'])}s",
     "computeResource": {"cpuMilli": 2000, "memoryMib": 8192},
     "volumes": [
-        {"gcs": {"remotePath": e["OPS_BUCKET"]}, "mountPath": "/mnt/disks/ops", "mountOptions": ["-o ro", "--implicit-dirs"]},
+        {"gcs": {"remotePath": e["OPS_BUCKET"]}, "mountPath": "/mnt/disks/ops", "mountOptions": ["--implicit-dirs"]},
         {"deviceName": "run", "mountPath": "/mnt/disks/run", "mountOptions": "rw,async"},
     ],
 }
