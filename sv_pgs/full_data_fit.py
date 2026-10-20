@@ -1506,6 +1506,9 @@ class _FullDataMeanField:
     # The keyword arguments a sibling oracle (the mode mixture's components, ``_mode_mixture``) is built with beside the
     # common ones: a subclass's own (``_GramMeanField``'s band).
     _siblings: dict = {}
+    # The fit's monitor (``eb_monitor``), shown each call that returns fixed points (``__call__``); a sibling oracle has
+    # none. Nothing of the oracle reads it.
+    monitor: Any = None
 
     """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
     q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
@@ -2226,6 +2229,8 @@ class _FullDataMeanField:
         for model in solving:
             if self.elbo[model] > self.best_elbo[model]:
                 self.best_elbo[model], self.best_state[model], self.best_hyperparameters[model] = self.elbo[model], self._state(model), hyperparameters[model]
+        if self.monitor is not None:
+            self.monitor.observe(self, hyperparameters, solving)
         return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
 
     def _solved(self, hyperparameters: Sequence[MixtureHyperparameters], solving: Sequence[int]) -> list[_ModelState] | None:
@@ -2697,6 +2702,7 @@ def fit_full_data(
     start_mean: F64Array | None = None,
     band: GramBand | None = None,
     null_scale: float = 1.0,
+    monitor: Any = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -2718,7 +2724,11 @@ def fit_full_data(
     the largest over its components (each measured at its own fixed point); ``mixture_components`` counts them,
     ``budget_unresolved`` counts the solves and mixture searches that ended at their derived work budgets, and
     ``state_digest`` is the SHA-256 of the returned mean, hyperparameters, noise, components, weights and covariate
-    coefficients (``state_digest``)."""
+    coefficients (``state_digest``).
+
+    ``monitor`` (``eb_monitor.MonitorView``, the mean-field route's) logs each outer-loop call's posterior mean scored
+    on the models' evaluation rows; it is told each stage (a new oracle) and shown each call, and nothing here reads
+    anything of it."""
     # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
     # moments, the moment start's Grams) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
@@ -2746,11 +2756,14 @@ def fit_full_data(
 
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
-        start_sites: Sequence[BernoulliSites | None],
+        start_sites: Sequence[BernoulliSites | None], stage: str,
     ):
         extra = {} if start_mean is None else {"start_mean": start_mean}
         extra["sites"] = list(start_sites)
         oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
+        if monitor is not None:
+            monitor.stage(stage)
+            oracle.monitor = monitor
         try:
             with device_scope(device):
                 return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
@@ -2763,19 +2776,19 @@ def fit_full_data(
     if starts is not None:
         continued_noise = noise if start_noise is None else np.where(binary, 1.0, np.asarray(start_noise, dtype=np.float64))
         fixed_points, fits = solve(prior, list(starts), continued_noise, None if start_mean is None else np.asarray(start_mean, dtype=np.float64).copy(),
-                                   model_sites)
+                                   model_sites, "continued")
     elif prior.annotation_groups:
         # Nested empirical Bayes (``small_n.fit_small_n``): the prior without annotation groups first, then the annotated
         # one continued from its fit, every annotation effect zero at its lambda = infinity edge
         # (``embed_hyperparameters``), so an annotation group enters only where the evidence rises.
         base = without_annotations(prior)
-        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None, model_sites)
+        base_points, base_fits = solve(base, [initial_hyperparameters(base, moment.mean_variance) for moment in moments], noise, None, model_sites, "base")
         starts = [embed_hyperparameters(base, prior, fit.hyperparameters) for fit in base_fits]
         fixed_points, fits = solve(
-            prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(), base_points.mean.copy(), base_points.sites,
+            prior, starts, np.asarray(base_points.noise, dtype=np.float64).copy(), base_points.mean.copy(), base_points.sites, "annotated",
         )
     else:
-        fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None, model_sites)
+        fixed_points, fits = solve(prior, [initial_hyperparameters(prior, moment.mean_variance) for moment in moments], noise, None, model_sites, "prior")
     if inference == "ep":
         # EP starts where mean field ended (its fitted hyperparameters, noise and sites: q's means and precision), so its
         # refreshes pay for EP's correction to mean field, not the path from the prior. Mean field is its own route to

@@ -242,6 +242,7 @@ REGISTRY: dict[tuple[str, str], tuple[str, frozenset[object], str]] = {
     ('synthetic_store.py', 'half_statistics'): ('scenario', frozenset({1000.0, 256, 1000000.0, 500}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
     ('synthetic_store.py', 'plan_store'): ('scenario', frozenset({3}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
     ('synthetic_store.py', '_write_variant_table'): ('scenario', frozenset({31}), 'simulator scenario parameters, with the units, code ranges and RNG stream labels they use (synthetic_store module docstring)'),
+    ('eb_monitor.py', 'MONITOR_SHARE'): ('spec', frozenset({0.05}), "the EB monitor's time bound, at most 5% of the fit's: the lead's specification of a log-only monitor that no result reads"),
     ('variant_typing.py', 'COMMUNITY_SV_MINIMUM_LENGTH'): ('spec', frozenset({50}), 'community SV definition, >= 50 bp; reporting label and external-record matching only'),
     ('variant_typing.py', '_core_kind_and_length'): ('external-config', frozenset({10.0, 0.1}), 'imputation strata near-pure rule max(10, 10%) (lrma-strata scripts/finalqc/strata_build.py classify)'),
 }

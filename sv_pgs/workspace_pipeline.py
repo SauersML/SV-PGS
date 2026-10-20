@@ -128,6 +128,7 @@ from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
 from sv_pgs.fast_scoring import SIGNED_CODE_OFFSET
+from sv_pgs.eb_monitor import EvaluationRows
 from sv_pgs.fit_model import FitRequest
 from sv_pgs.model_acceptance import acceptance, require_scorable, unscorable_codes
 from sv_pgs.held_out_comparison import PairedComparison, auc_components, paired_delta_auc, paired_delta_r2
@@ -3098,7 +3099,9 @@ def fit_request(
 
     Every model adjusts for its own trait's covariates and the structure columns, never another trait's; the
     covariate names are the cohort's whole union, so every trait's fitted model scores with the same covariates
-    (``artifact.predict_models``). A row's target is read only where its model trains on it.
+    (``artifact.predict_models``). A row's target is read only where its model trains on it; each model's held-out
+    rows (its evaluation fold) go to the fit's EB monitor alone (``eb_monitor``), which logs each empirical-Bayes call's
+    held-out partial r^2 (and a disease's AUC) and nothing else, so a fit's signal shows before it ends.
 
     The configured disease likelihood is explicit; quantitative traits always use Gaussian regression. Both arms' requests
     hold the same models in the same order with the run's ``seed``, so each group's probes and draws are common random
@@ -3106,6 +3109,16 @@ def fit_request(
     """
     rows = cohort.fit_rows
     traits = np.asarray(cohort.model_traits)
+    # The EB monitor's rows: each model's held-out fold where its target and the covariates are finite (a monitor's
+    # input never refuses a fit).
+    held = np.asarray(cohort.held_out) & np.isfinite(cohort.targets[:, traits]) & np.all(np.isfinite(cohort.covariates), axis=1)[:, None]
+    evaluated = held.any(axis=1)
+    evaluation = EvaluationRows(
+        store_columns=cohort.store_columns[evaluated],
+        covariates=cohort.covariates[evaluated][:, 1:],
+        targets=np.where(held, cohort.targets[:, traits], np.nan)[evaluated],
+        disease=np.array([cohort.trait_types[trait] == TraitType.BINARY for trait in traits.tolist()], dtype=bool),
+    ) if evaluated.any() else None
     return FitRequest(
         store=store,
         store_columns=cohort.store_columns[rows],
@@ -3125,6 +3138,7 @@ def fit_request(
         work_dir=work_dir,
         seed=seed,
         annotated_prior=annotated_prior,
+        evaluation=evaluation,
     )
 
 

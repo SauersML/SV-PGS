@@ -40,6 +40,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.device_plan import ShardedDualSource
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
+from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, EvaluationTee, GroupEvaluation, monitor_on
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.gram_space import GramBand, build_band_store, far_field_scale, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
@@ -501,6 +502,7 @@ def _fit_group(
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "mean_field",
     annotated_prior: bool = True,
+    evaluation: GroupEvaluation | None = None,
 ) -> list[_ModelFit]:
     """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
     covariates (intercept first) and targets [n, models] follow them: one Stage 0 with a target column per model, one
@@ -516,7 +518,11 @@ def _fit_group(
 
     A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``): after the
     separation check, Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where
-    the lattice and the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0."""
+    the lattice and the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0.
+
+    ``evaluation``, the group's evaluation rows, is the EB monitor's alone (``eb_monitor``): Stage 0's pass keeps their
+    codes as it reads, and the mean-field fit logs each outer-loop call's posterior mean scored on them. Nothing of the
+    fit reads it."""
     # SPEC 1fca1cf: no variant is filtered by rarity or any threshold (only a derived bound may leave one out).
     config = ModelConfig(minimum_minor_allele_frequency=0.0)
     binary = trait_type == TraitType.BINARY
@@ -560,14 +566,27 @@ def _fit_group(
     store_targets = targets[:, genetic]
     model_sites = [sites[model] for model in genetic]
     block_cap = _block_cap(store, candidates, training_columns, covariates.shape[1], budget, work_dir)
+    # The EB monitor's codes of the evaluation rows, kept from Stage 0's own tiles (``eb_monitor.EvaluationTee``).
+    evaluation_codes = None
+    if evaluation is not None and evaluation.store_columns.size:
+        try:
+            evaluation_codes = EvaluationCodes(candidates, evaluation.store_columns, block_cap)
+        except MemoryError as error:
+            log(f"eb monitor: off: {error}")
     statistics = compute_genotype_statistics(
-        DosageStoreTileSource(store, candidates), training_columns, covariates, store_targets, config, budget, block_cap, work_dir / "ld"
+        DosageStoreTileSource(store, candidates) if evaluation_codes is None else EvaluationTee(store, candidates, evaluation_codes),
+        training_columns, covariates, store_targets, config, budget, block_cap, work_dir / "ld",
     )
     if np.asarray(statistics.active_rows).shape[0] == 0:
+        if evaluation_codes is not None:
+            evaluation_codes.release()
         return without_genetic_column("every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
     member_rows = np.asarray(statistics.active_rows, dtype=np.int64)
+    monitor = None if evaluation is None else EbMonitor.start(
+        evaluation_codes, member_rows, np.asarray(statistics.means), np.asarray(statistics.scales), evaluation,
+    )
     # The unit contract (``imputation_reliability.ColumnMeasurement``): each member's offset log(kappa^2 Var(D)) in its
     # stored value's raw units (code sd over codes_per_unit; a copy number's differ), with kappa = 1 because the store
     # holds calibrated conditional means (a GLIMPSE2/Beagle DS, or the measurement step's rewritten D*), and its log
@@ -694,10 +713,13 @@ def _fit_group(
                     certificate=certificate, prior_digest=digest,
                 )
 
+        # The EB monitor's view of these models (their positions in the group).
+        watched = None if monitor is None else monitor.view([genetic[column] for column in columns])
+
         def solve(fit_prior: ScaleMixturePrior, **continuation) -> FullDataFit:
             fit = fit_full_data(
                 gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
-                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, **continuation,
+                inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched, **continuation,
             )
             if fit_band is not None and np.any(fit.certificate.outer_criterion_met):
                 # The band's far-field stopping estimate can miss a slowly converging direction: a grouped fixture
@@ -709,7 +731,7 @@ def _fit_group(
                 fit = fit_full_data(
                     gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
                     inference=inference, sites=fit_sites, null_scale=kappa, band=None, starts=fit.hyperparameters,
-                    start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
+                    start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean, monitor=watched,
                 )
             return fit
 
@@ -816,6 +838,8 @@ def _fit_group(
                         f"the band route's fit would be quarantined ({', '.join(codes)}) and its sample-route refit had no certified start, so it stands: {error}",
                     )))
         band.release()
+    if monitor is not None:
+        monitor.close()
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples, {count} models fitted together")
     return [result for result in results if result is not None]
 
@@ -856,10 +880,17 @@ def fit_models(
     inference: str = "mean_field",
     checkpoint_key: str | None = None,
     annotated_prior: bool = True,
+    evaluation: EvaluationRows | None = None,
+    model_names: Sequence[str] | None = None,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
     names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
     genome-scale EP) is measured on bench-sim, which then replaces it.
+
+    ``evaluation`` (its covariates with the intercept first, as ``covariates``) gives each model's evaluation rows to
+    the EB monitor alone (``eb_monitor``), which logs each outer-loop call's held-out metrics under ``model_names``;
+    nothing fitted, saved or checkpointed reads it. With the monitor switched off (``eb_monitor.MONITOR_SWITCH``) it
+    is dropped here, before any group.
 
     Each model's completed fit is checkpointed on its own under ``checkpoint_key``; a group is fitted again unless every
     one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same way."""
@@ -869,6 +900,9 @@ def fit_models(
     stage2_devices = f"CUDA devices {', '.join(str(device) for device in budget.device_ids)}" if budget.device_kind == "cuda" else "the CPU"
     log(f"stage2 wiring: Stage 0 and Stage 2's reads run on {stage2_devices}")
     measurement = store_measurement(store, log_variance_offset)
+    if evaluation is not None and not monitor_on():
+        log(f"eb monitor: off ({MONITOR_SWITCH}=0): no codes kept, nothing scored")
+        evaluation = None
     groups = model_groups(store_columns, covariate_columns, training, trait_types)
     log(f"stage2 wiring: {training.shape[1]} models in {len(groups)} groups fitted together (models sharing training rows, covariates and likelihood)")
     fits: list[_ModelFit | None] = [None] * training.shape[1]
@@ -893,6 +927,8 @@ def fit_models(
             started = time.perf_counter()
             group_covariates = np.asarray(covariates[rows][:, adjusted], dtype=np.float64)
             group_targets = np.asarray(targets[np.ix_(rows, group)], dtype=np.float64)
+            names = [str(int(model)) if model_names is None else model_names[int(model)] for model in group]
+            group_evaluation = None if evaluation is None else evaluation.group(group, adjusted, names)
             # One ledger per group's fit: its host leases and every device allocation.
             try:
                 with memory_scope(budget):
@@ -910,6 +946,7 @@ def fit_models(
                         trait_types[first],
                         inference,
                         annotated_prior,
+                        group_evaluation,
                     )
             except FloatingPointError as error:
                 # A fit with no certified fixed point on any route is the same failure on every rerun (its seeds are

@@ -40,6 +40,7 @@ from sv_pgs.binary_likelihood import ascertainment_offset, training_prevalence
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore
+from sv_pgs.eb_monitor import EvaluationRows
 from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.imputation_reliability import checked_log_reliability
 from sv_pgs.stage2_wiring import fit_models
@@ -97,10 +98,10 @@ class FitRequest:
     Cohort row i is the store sample ``store_columns[i]`` with id ``research_ids[i]``; ``covariates`` [n, k] holds the
     named covariates of every model without the intercept, as ``artifact.predict`` takes them, and
     ``covariate_columns`` [models, k] the ones each model adjusts for besides the intercept; ``targets`` and
-    ``training`` are [n, models], and a model's non-training targets are never read. ``log_variance_offset`` [store
-    records] is each record's log measurement reliability, log r^2 <= 0, the prior's variance offset (-inf: the record
-    carries no signal); None takes r^2 from the store's ``quality`` column. Stage 0 keeps its LD blocks under
-    ``work_dir``.
+    ``training`` are [n, models], and a model's non-training targets are never read by the fit (``evaluation``'s are
+    the EB monitor's, which only logs). ``log_variance_offset`` [store records] is each record's log measurement
+    reliability, log r^2 <= 0, the prior's variance offset (-inf: the record carries no signal); None takes r^2 from
+    the store's ``quality`` column. Stage 0 keeps its LD blocks under ``work_dir``.
 
     The fit has no measurement-object and no target-variance term: the measurement model enters as the records'
     ``log_variance_offset`` (and as the store's own recalibrated dosages), and every target is taken as measured
@@ -129,6 +130,10 @@ class FitRequest:
     # store's annotations as learned smooths, beside the class densities, the frequency function and each record's
     # reliability); False, the simpler prior of the class densities, the frequency function and the reliability alone.
     annotated_prior: bool = True
+    # Monitoring only (``eb_monitor``): each model's evaluation rows (its held-out fold), on which the fit logs each
+    # empirical-Bayes call's genetic score beside the call's ELBO and hyperparameter move. Nothing the fit computes,
+    # saves or checkpoints reads them, and the problem's digest leaves them out: a fit with them is the fit without.
+    evaluation: EvaluationRows | None = None
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -213,6 +218,8 @@ class FitRequest:
                 if trait_type != TraitType.BINARY or not 0.0 < prevalence < 1.0:
                     raise ValueError(f"model {self.model_names[model]!r}: a population prevalence belongs to a binary model and lies in (0, 1).")
             set_field(self, "population_prevalence", prevalences)
+        if self.evaluation is not None:
+            set_field(self, "evaluation", self.evaluation.checked(self.store.n_samples, len(self.covariate_names), model_count))
         set_field(self, "store_columns", columns)
         set_field(self, "covariates", covariate_matrix)
         set_field(self, "targets", target_matrix)
@@ -254,6 +261,10 @@ def fit(request: FitRequest) -> FittedModel:
         draw_count=DRAW_COUNT,
         checkpoint_key=checkpoint_key,
         annotated_prior=request.annotated_prior,
+        evaluation=None if request.evaluation is None else dataclasses.replace(
+            request.evaluation, covariates=np.column_stack([np.ones(request.evaluation.store_columns.shape[0]), request.evaluation.covariates]),
+        ),
+        model_names=request.model_names,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)
