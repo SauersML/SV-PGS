@@ -426,7 +426,68 @@ def test_a_restored_model_waits_while_another_model_solves(tmp_path: Path, monke
     )
     solved.clear()
     assert all(point is not None for point in oracle([reweighted, moved[1]]))
-    assert solved == [0, 0]
+    # Its carried solve, and its cold solve where the cold start's measured need is within the budget
+    # (``_FullDataMeanField._solved``); model 1 is not solved.
+    assert solved[0] == 0 and set(solved) == {0}
+
+
+def test_a_cold_solve_known_to_need_more_than_its_budget_is_not_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cold solve gets the carried solve's count of passes, so where the cold start is known to need more it could
+    only be abandoned at that count (``_FullDataMeanField._solved``): it is not run, and the call returns what an oracle
+    running every cold solve returns, bit for bit, where that cold solve does not win. The need is the first call's
+    passes (that solve starts at the cold start), measured again by every cold solve that runs (one more than it used
+    where it was abandoned), and the model's 1st, 2nd, 4th, ... budgeted cold solves run whatever their need."""
+    from sv_pgs.full_data_fit import _PassBudget
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+    oracle_of, starts, _statistics, _prior = _two_trait_oracle(tmp_path)
+    skipping, running = oracle_of([0]), oracle_of([0])
+    # Per oracle, each solve's (budget, passes, outcome, ELBO).
+    solves: dict[int, list[tuple[int | None, int, str, float]]] = {id(skipping): [], id(running): []}
+    for oracle in (skipping, running):
+        solve_model = oracle._solve_model
+
+        def counted(model, hyperparameters, pass_budget=None, oracle=oracle, solve_model=solve_model):
+            before = oracle.passes
+            try:
+                solve_model(model, hyperparameters, pass_budget)
+            except _PassBudget:
+                solves[id(oracle)].append((pass_budget, oracle.passes - before, "abandoned", float(oracle.elbo[model])))
+                raise
+            solves[id(oracle)].append((pass_budget, oracle.passes - before, "solved", float(oracle.elbo[model])))
+
+        monkeypatch.setattr(oracle, "_solve_model", counted)
+        assert oracle([starts[0]])[0] is not None
+    assert skipping._cold_need[0] == solves[id(skipping)][0][1] > 0
+    unreachable = np.iinfo(np.int64).max
+
+    def call(factor: float) -> tuple[list, list]:
+        """Both oracles at the coefficients times ``factor``, ``skipping`` told its cold start needs more than any budget
+        and ``running`` that it needs none; each one's solves in the call."""
+        hyperparameters = MixtureHyperparameters(coefficients=starts[0].coefficients * factor, log_smoothing=starts[0].log_smoothing.copy())
+        skipping._cold_need[0], running._cold_need[0] = unreachable, 0
+        counts = {key: len(values) for key, values in solves.items()}
+        assert skipping([hyperparameters])[0] is not None and running([hyperparameters])[0] is not None
+        return solves[id(skipping)][counts[id(skipping)]:], solves[id(running)][counts[id(running)]:]
+
+    # The 1st and 2nd budgeted calls run the cold solve whatever its need, and measure it again.
+    for factor in (0.9, 0.8):
+        skipped, ran = call(factor)
+        assert skipped == ran and len(skipped) == 2
+        (budget, carried, _outcome, _elbo), (cold_budget, used, outcome, _cold_elbo) = skipped
+        assert budget is None and cold_budget == carried
+        assert skipping._cold_need[0] == (used + 1 if outcome == "abandoned" else used)
+        np.testing.assert_array_equal(skipping.mean, running.mean)
+    # The 3rd does not: only the carried solve runs, the need stands, and the fixed point is the running oracle's,
+    # whose cold solve did not win.
+    skipped, ran = call(0.7)
+    assert len(skipped) == 1 and skipped[0] == ran[0] and len(ran) == 2
+    assert ran[1][2] == "abandoned" or ran[1][3] <= ran[0][3]
+    assert skipping._cold_need[0] == unreachable
+    np.testing.assert_array_equal(skipping.mean, running.mean)
+    np.testing.assert_array_equal(skipping.variance, running.variance)
+    np.testing.assert_array_equal(skipping.residual[0], running.residual[0])
+    assert skipping.elbo[0] == running.elbo[0] and skipping.noise[0] == running.noise[0]
 
 
 def test_a_group_s_mode_mixture_is_each_model_s_own(tmp_path: Path) -> None:

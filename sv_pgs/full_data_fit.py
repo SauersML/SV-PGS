@@ -1640,6 +1640,11 @@ class _FullDataMeanField:
             for model in range(model_count):
                 self.residual[model] = self._residual_of(model)
         self._cold_residual = [values.copy() for values in self.residual]
+        # Each model's passes a solve from the cold start needs, as last measured (``_solved``): the first call's solve,
+        # which starts there, then each cold solve's own (its passes where it converged, one more than it used where it
+        # was abandoned); and the calls at which its budgeted cold solve was due, run or not.
+        self._cold_need = np.zeros(model_count, dtype=np.int64)
+        self._cold_calls = np.zeros(model_count, dtype=np.int64)
         # Each model's highest-ELBO refreshed state and its hyperparameters (``mean_field.MeanFieldFixedPoints.best``):
         # the outer loop's objective is not the ELBO and can end below a state it visited.
         self.best_elbo = np.full(model_count, -np.inf)
@@ -2182,8 +2187,9 @@ class _FullDataMeanField:
 
     def __call__(self, hyperparameters: Sequence[MixtureHyperparameters]) -> list[FixedPoint | None]:
         """Each model's fixed point of the higher ELBO between the solve from the carried state and the solve from the
-        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x), with the dual
-        solver factored at q's sites, which the fixed points' responses read (``_fixed_point``).
+        start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x; the latter is not
+        run where it is known to need more passes than its budget, ``_solved``), with the dual solver factored at q's
+        sites, which the fixed points' responses read (``_fixed_point``).
 
         A model at a fixed point this oracle returned for it, asked at the same hyperparameters, keeps that point
         unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a model
@@ -2227,29 +2233,65 @@ class _FullDataMeanField:
         after this oracle's first call, the solve from the start, every other model left as it is; the solved models'
         entry states (which a refusal of the call puts back), or None where some model reaches no fixed point (the trial
         is refused whole, as EP's oracle refuses, and every one is put back). No dual-solver factor: the mode mixture's
-        orders take only this, since nothing of the mixture reads one (``_mode_mixture``)."""
+        orders take only this, since nothing of the mixture reads one (``_mode_mixture``).
+
+        The cold solve gets the carried solve's own count of passes, and no more (``mean_field``), so where the cold
+        start is known to need more it can only be abandoned at that count: it is then not run, and the carried solve's
+        fixed point is the one the call would have chosen. The need is measured, never assumed: the first call's solve
+        starts at the cold start, and every cold solve that runs measures it again (its passes where it converged, one
+        more than it used where it was abandoned). A need measured at earlier hyperparameters can fall below a later
+        budget unseen (a cold solve converged in 7 passes at a budget of 8 where the first call's had taken 14, on
+        test_stage2_by_mean_field_carries_tie_members), so the cold solve also runs at the model's 1st, 2nd, 4th, 8th,
+        ... budgeted call whatever its need: a skipped cold solve that has become quick is found within a doubling of
+        the calls so far, and an oracle asked R times runs about log2 R of them it would have skipped. The whole-genome
+        fit's base phase is where this pays: its cold start is zero, from which the first solve took 7-16 sweeps
+        [real], while its carried solves take 2-3, each followed by a cold solve abandoned at 2-3 sweeps of 35-70 s.
+        Where a cold solve the need ruled out would have converged within its budget and above the carried solve's
+        ELBO, the call keeps the carried fixed point instead (on three of the repository's CPU test fits no cold solve
+        won: of 17 cold solves 15 were abandoned and 2 converged below the carried solve's ELBO, by 2.92 and 0.02
+        nats)."""
         entry = [self._state(model) for model in solving]
         first = self.refreshes == 0
         candidates: list[list[_ModelState]] = [[] for _ in range(self.model_count)]
         # The cold solve gets the carried solve's own count of passes per model, and no more (``mean_field``).
         budgets: list[int | None] = [None] * self.model_count
+        skipped: list[int] = []
         for model in solving:
             self._at[model] = None
         for cold in ((False,) if first else (False, True)):
             for model in solving:
+                budget = budgets[model]
+                if cold and budget is not None:
+                    # Known to need more than its budget, it could only be abandoned there: not run, except at the
+                    # model's 1st, 2nd, 4th, ... budgeted call (a power of two), which runs it to measure the need again.
+                    self._cold_calls[model] += 1
+                    calls = int(self._cold_calls[model])
+                    if budget < self._cold_need[model] and calls & (calls - 1):
+                        skipped.append(model)
+                        continue
                 if cold:
                     self._cold_state(model)
                 before = self.passes
                 try:
-                    self._solve_model(model, hyperparameters[model], pass_budget=budgets[model])
+                    self._solve_model(model, hyperparameters[model], pass_budget=budget)
                 except _PassBudget:
+                    self._cold_need[model] = self.passes - before + 1
+                    log(f"mean-field solve: model {model}'s cold start abandoned at its budget of {budget} passes (the carried solve's)")
                     continue
                 except (FloatingPointError, ZeroDivisionError) as error:
                     self.refusals.append(f"{type(error).__name__}: {error}")
                     continue
-                if budgets[model] is None:
+                if first or cold:
+                    self._cold_need[model] = self.passes - before
+                if budget is None:
                     budgets[model] = self.passes - before
                 candidates[model].append(self._state(model))
+        if skipped:
+            log(
+                "mean-field oracle: no cold solve for "
+                + ", ".join(f"model {model} (budget {budgets[model]} passes, measured need {int(self._cold_need[model])})" for model in skipped)
+                + ": it could only be abandoned at its budget"
+            )
         if any(not candidates[model] for model in solving):
             for model, state in zip(solving, entry):
                 self._restore_state(state, model)
