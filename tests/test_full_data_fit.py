@@ -387,6 +387,48 @@ def test_a_joint_call_keeps_a_model_at_its_held_fixed_point(tmp_path: Path) -> N
     assert third[0] is not first[0] and third[1] is not second[1]
 
 
+def test_a_restored_model_waits_while_another_model_solves(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trial of the first model lost its evidence test; after its accepted point is restored it waits while the
+    second model moves. Only the second model takes carried and cold solves, just as if it had been fitted alone.
+    A raw snapshot with the same values is not the returned point: identity is required as well as hyperparameters,
+    so the reuse cannot silently choose another basin or certify an arbitrary restored candidate."""
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+    oracle_of, starts, _statistics, _prior = _two_trait_oracle(tmp_path)
+    oracle = oracle_of([0, 1])
+    first = oracle(list(starts))
+    assert all(point is not None for point in first)
+    moved = [MixtureHyperparameters(coefficients=start.coefficients * 0.9, log_smoothing=start.log_smoothing.copy()) for start in starts]
+    assert all(point is not None for point in oracle([moved[0], starts[1]]))
+    first[0].restore()
+    solve_model = oracle._solve_model
+    solved: list[int] = []
+
+    def counted(model, hyperparameters, pass_budget=None):
+        solved.append(model)
+        return solve_model(model, hyperparameters, pass_budget)
+
+    monkeypatch.setattr(oracle, "_solve_model", counted)
+    second = oracle([starts[0], moved[1]])
+    assert second[0] is first[0] and second[1] is not None
+    assert solved == [1, 1]
+    np.testing.assert_array_equal(oracle.mean[:, 0], first[0].mean)
+    raw = oracle._state(0)
+    oracle._restore_state(raw, 0)
+    solved.clear()
+    assert all(point is not None for point in oracle([starts[0], moved[1]]))
+    assert solved == [0, 0]
+    # The reuse key includes the smoothing weights as well as the coefficients, even though the mean-field
+    # sweeps themselves read the coefficients: a different outer request must take the ordinary solve path.
+    reweighted = MixtureHyperparameters(
+        coefficients=starts[0].coefficients.copy(),
+        log_smoothing=np.where(np.isfinite(starts[0].log_smoothing), starts[0].log_smoothing + 1.0, 0.0),
+    )
+    solved.clear()
+    assert all(point is not None for point in oracle([reweighted, moved[1]]))
+    assert solved == [0, 0]
+
+
 def test_a_group_s_mode_mixture_is_each_model_s_own(tmp_path: Path) -> None:
     """The mode mixture of a group's oracle gives each model the mixture it gets alone: its own components, weights,
     repeat and settling tests, the later orders solving only the models still searching."""

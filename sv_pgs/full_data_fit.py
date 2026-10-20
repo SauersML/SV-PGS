@@ -1645,9 +1645,10 @@ class _FullDataMeanField:
         self.best_elbo = np.full(model_count, -np.inf)
         self.best_state: list[_ModelState | None] = [None] * model_count
         self.best_hyperparameters: list[MixtureHyperparameters | None] = [None] * model_count
-        # Each model's last fixed point (``_fixed_point``: its hyperparameters, its state and the point), and the held
+        # Each model's held fixed point (``_fixed_point``: its hyperparameters, its state and the point), and the held
         # state the model is at now (a fixed point's, or one ``_restore_state`` put back; None once a solve moves it):
-        # where the two are one at the same hyperparameters, a call that solves other models keeps the point (``__call__``).
+        # where the two are one at the same hyperparameters, a call keeps the point (``__call__``). A fixed point's
+        # restore puts back both records: a refused trial must not hide the accepted point it displaced.
         self._held: list[tuple[MixtureHyperparameters, _ModelState, FixedPoint] | None] = [None] * model_count
         self._at: list[_ModelState | None] = [None] * model_count
 
@@ -2184,11 +2185,14 @@ class _FullDataMeanField:
         start (``MeanFieldFixedPoints.__call__``: coordinate ascent has several fixed points at one x), with the dual
         solver factored at q's sites, which the fixed points' responses read (``_fixed_point``).
 
-        A model still at the fixed point this oracle last returned for it, asked at the same hyperparameters, keeps that
-        point unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a
-        model whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``), and a model fitted
-        alone is not solved again there. A call where every model is so solves them all, as before: the outer loop's last
-        call, which leaves the oracle at the returned points by solving there once more."""
+        A model at a fixed point this oracle returned for it, asked at the same hyperparameters, keeps that point
+        unsolved while other models are solved: the outer loop of a joint fit asks every model at each call, a model
+        whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``). Restoring an accepted
+        point after a refused trial restores its held record too; the trial's record cannot make that accepted point
+        look unsolved. Both the state identity and the hyperparameters must match: another state's basin at the same
+        hyperparameters is not interchangeable. A call where every model is so solves them all, as before: the outer
+        loop's last call, which leaves the oracle at the returned points by solving there once more (without it the
+        returned point can sit below a best-ELBO state and its certificate is withheld)."""
         _collect_cycles()
         held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
@@ -2355,9 +2359,19 @@ class _FullDataMeanField:
         posterior = GaussianPosterior(cavity_response=cavity_response, exact=False)
         cavity = Cavity(precision=omega, shift=shift)
         offset = float(self.elbo[model]) - _data_value(self.prior, hyperparameters.coefficients, cavity, self.working_bytes)
+
+        def restore() -> None:
+            # The outer loop restores its accepted point before every trial, including after a trial which returned
+            # a fixed point but lost the evidence test. Its arrays and its held record belong together: retaining
+            # the later trial's record made the accepted point pay another carried and cold solve when asked again
+            # unchanged, or while another model moved. Only this point's restore installs the record; restoring a
+            # raw candidate or the best-ELBO snapshot does not claim a fixed point was returned for it.
+            self._restore_state(state, model)
+            self._held[model] = (hyperparameters, state, point)
+
         point = FixedPoint(
             cavity=cavity, posterior=posterior, mean=mean, precision_norm=norm, effective_effects=float(self.effective[model]),
-            restore=lambda: self._restore_state(state, model), evidence_offset=offset,
+            restore=restore, evidence_offset=offset,
         )
         self._held[model], self._at[model] = (hyperparameters, state, point), state
         return point
