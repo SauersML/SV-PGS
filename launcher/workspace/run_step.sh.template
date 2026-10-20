@@ -76,15 +76,25 @@ mirror() {
   flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run"
 }
 mirror restore || { mark "exit-restore"; exit 1; }
+# A loop's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when the
+# sleep did, up to 15 minutes later. A push in progress is left to finish; the last push below waits on its lock.
+stop() { pkill -x -P "$1" sleep 2>/dev/null; kill "$1" 2>/dev/null; }
 ( while sleep 900; do mirror push || mark "push-failed"; done ) &
 pusher=$!
-"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} &
-wait $!
+# Batch writes the task log to the bucket only when the task ends, so a fit gave no sign of its progress for hours. The
+# driver's stderr also goes to a file whose last lines are copied beside the task log every 5 minutes: the same lines
+# the task log holds (steps, counts, timings, paths).
+progress="$(dirname "$0")/progress-task${BATCH_TASK_INDEX}.log"
+"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} \
+  2> >(tee "$RUN/driver.log" >&2) &
+driver=$!
+( while sleep 300; do tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; done ) &
+progressor=$!
+wait "$driver"
 status=$?
-# The pusher's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when
-# the sleep did, up to 15 minutes later. A push in progress is left to finish; the last push below waits on its lock.
-pkill -x -P "$pusher" sleep 2>/dev/null
-kill "$pusher" 2>/dev/null
+stop "$progressor"
+tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null
+stop "$pusher"
 # A run whose last push failed did not keep its results: the job fails even if the driver finished.
 mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
 mark "exit-${status}"
