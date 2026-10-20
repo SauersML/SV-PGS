@@ -3808,10 +3808,13 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
         # Other folds' out-of-fold models trained on this fold's labels: calibrating from
         # those models would indirectly reuse evaluation labels and is not outer validation.
         frozen = np.full(linear.shape, np.nan) if scores.held_out_calibrated_logits is None else scores.held_out_calibrated_logits[:, :, trait]
-        metric_names = ("auc", "pgs_auc", "log_loss", "brier", "calibration_intercept", "calibration_slope") if binary else ("r2", "pgs_partial_r2")
+        # A disease's genetic score is also read as a quantitative trait's is (pgs_partial_r2: its squared correlation with
+        # the outcome after both are residualized on the trait's covariates), the measure the LDpred2 baseline reports
+        # (benchmarks/bench_real/aou_ldpred2.py), so every trait compares with it on one scale.
+        metric_names = ("auc", "pgs_auc", "pgs_partial_r2", "log_loss", "brier", "calibration_intercept", "calibration_slope") if binary else ("r2", "pgs_partial_r2")
         comparison_names = ("delta_auc", "delta_pgs_auc", "log_likelihood_gain", "brier_reduction") if binary else ("delta_pgs_partial_r2",)
         if binary and not run.config.calibration_fraction:
-            metric_names = ("auc", "pgs_auc")
+            metric_names = ("auc", "pgs_auc", "pgs_partial_r2")
             comparison_names = ("delta_auc", "delta_pgs_auc")
         for cell, level, held in _cells(cohort, trait, fold_count):
             count = held.count

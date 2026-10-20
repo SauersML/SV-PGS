@@ -110,7 +110,7 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
         trait_names=("disease",), trait_types=(TraitType.BINARY,),
         targets=labels[:, None], covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), dtype=bool),
         folds=np.arange(n) // 2 % fold_count, families=np.arange(n) // 2,
-        ancestry=["group"] * n, half=["imputed"] * n,
+        ancestry=["group"] * n, half=["imputed"] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)),
     )
     both = np.stack([score, score])[:, :, None]
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=both)
@@ -139,7 +139,7 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
     linear = labels + np.random.default_rng(3).normal(size=n)
     cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
-        ancestry=['group'] * n, half=['imputed'] * n)
+        ancestry=['group'] * n, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
@@ -155,6 +155,10 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
         assert float(metrics[metric]['value']) == pytest.approx(proper_scores(labels, frozen)[metric].mean(), rel=1e-5)
     assert float(metrics['auc']['value']) == pytest.approx(
         np.mean([comparison.auc_components(labels[fold == index], linear[fold == index]).auc for index in (1, 2)]), rel=1e-5
+    )
+    # the genetic score's partial r^2 on the trait's covariates, the LDpred2 baseline's measure (aou_ldpred2.py)
+    assert float(metrics['pgs_partial_r2']['value']) == pytest.approx(
+        np.mean([np.corrcoef(labels[fold == index], linear[fold == index])[0, 1] ** 2 for index in (1, 2)]), rel=1e-5
     )
     slopes = [comparison.logistic_recalibration_coefficients(frozen[fold == index], labels[fold == index])[1] for index in (1, 2)]
     assert float(metrics['calibration_slope']['value']) == pytest.approx(np.mean(slopes), rel=1e-5)
@@ -176,7 +180,7 @@ def test_a_cells_rows_show_no_small_count_by_their_difference_and_stay_exportabl
     linear = labels + np.random.default_rng(8).normal(size=n)
     cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
-        ancestry=ancestry, half=['imputed'] * n)
+        ancestry=ancestry, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]
     scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)

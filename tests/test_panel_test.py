@@ -68,7 +68,7 @@ def _panel_run(tmp_path, monkeypatch, weights, primary_fold=1):
     cohort = SimpleNamespace(
         trait_names=("asthma", "gout", "height"), trait_types=(TraitType.BINARY, TraitType.BINARY, TraitType.QUANTITATIVE),
         targets=targets, covariates=np.ones((n, 1)), covariate_columns=np.ones((3, 1), bool), folds=folds, families=families,
-        ancestry=["group"] * n, half=["imputed"] * n,
+        ancestry=["group"] * n, half=["imputed"] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)),
     )
     scores = SimpleNamespace(
         held_out_linear_predictor=scores_by_arm, held_out_genetic=scores_by_arm, held_out_calibrated_logits=scores_by_arm - 1.0,
