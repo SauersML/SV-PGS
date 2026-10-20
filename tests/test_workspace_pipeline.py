@@ -1028,7 +1028,8 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
     config = WorkspaceConfig.from_mapping(synthetic.raw)
     run = config.run_directory
     whole = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
-    tree = lambda root: {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    # Every file but the completion record, whose time differs (its summary is compared).
+    tree = lambda root: {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file() and path.name != COMPLETE_FILE}
     expected = tree(run / "store")
     shutil.rmtree(run)
     remote = DirectoryRemote(run.with_name("mirror"))
