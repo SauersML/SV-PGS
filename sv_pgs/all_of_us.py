@@ -1588,11 +1588,14 @@ window_rows AS (
   LEFT JOIN exclusion_windows
     ON exclusion_windows.person_id = measurement.person_id
     AND measurement.measurement_date BETWEEN exclusion_windows.window_start AND exclusion_windows.window_end
+  -- An analyte row matches on its concept or its source concept. BigQuery cannot de-correlate
+  -- IN (SELECT ... FROM analyte_concepts), a UNION DISTINCT, so each key is a join (analyte_concepts is distinct).
+  LEFT JOIN analyte_concepts AS by_concept
+    ON by_concept.concept_id = measurement.measurement_concept_id
+  LEFT JOIN analyte_concepts AS by_source
+    ON by_source.concept_id = measurement.measurement_source_concept_id
   WHERE measurement.value_as_number IS NOT NULL
-    AND (
-      measurement.measurement_concept_id IN (SELECT concept_id FROM analyte_concepts)
-      OR measurement.measurement_source_concept_id IN (SELECT concept_id FROM analyte_concepts)
-    )
+    AND (by_concept.concept_id IS NOT NULL OR by_source.concept_id IS NOT NULL)
     AND COALESCE(measurement.measurement_source_concept_id, 0) NOT IN UNNEST(@excluded_source_concept_ids)
 ),
 measurement_rows AS (
