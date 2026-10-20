@@ -31,6 +31,7 @@ from sv_pgs.dosage_store import DosageStore
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
 from sv_pgs.memory_broker import HOST, MemoryBroker, current_broker, device_pool, meter_device
+from sv_pgs.progress import log
 
 _GATHER_SOURCE = r"""
 extern "C" __global__
@@ -170,11 +171,16 @@ class StoreGenotypeBlockSource:
         # on the A40]. The cache is admitted only from what the device's pool has left once everything the fit holds is
         # counted, and never from a free-memory snapshot; a later allocation that needs its bytes evicts it
         # (``_drop_resident``), and the read in progress then streams the blocks it has not reached, so the eviction
-        # frees every block but the one a tile still references. An evicted set is not admitted again: the fit's own
-        # working set has shown it needs those bytes.
+        # frees every block but the one a tile still references. An evicted set is asked for again at the next read,
+        # from what the ledger then has left: the peak that evicted it can be a step's own (the moment starts square
+        # each Stage 0 block in float64 on the device, 10 GB at a 29k-column block), and a set never readmitted
+        # streamed every later read from the store (an All of Us whole-genome fit [real]: three reads of 6-10 minutes
+        # each after its moment starts, where the resident reads are seconds). A readmission costs nothing beyond the
+        # read that refills it, which streams the store either way.
         self._resident: list[Any] | None = None
         self._resident_complete = False
-        self._resident_dropped = False
+        self._evictions = 0
+        self._refused = False
         self.resident_codes_bytes = sum(_aligned(int(rows.shape[0])) * self._padded_samples for rows in self._block_rows)
         self._broker = None
         if self._cupy is not None:
@@ -189,16 +195,33 @@ class StoreGenotypeBlockSource:
 
     def _admit_resident(self) -> bool:
         """Admit the resident set as a device cache from what the ledger has left (the class docstring)."""
-        if self._cupy is None or self._resident_dropped or self._broker is None:
+        if self._cupy is None or self._broker is None:
             return False
         lease = self._broker.admit(self._pool, self.resident_codes_bytes, "the resident genotype codes", self._drop_resident)
+        if lease is not None:
+            log(f"resident genotype codes: {self.resident_codes_bytes / 1e9:.1f} GB admitted on {self._pool}{' again' if self._evictions else ''}")
+            self._refused = False
+        elif not self._refused:
+            # Logged once per refusal spell: every read asks again.
+            log(f"resident genotype codes: {self.resident_codes_bytes / 1e9:.1f} GB not admitted on {self._pool}, "
+                f"{self._broker.remaining(self._pool) / 1e9:.1f} GB left: reads stream the store")
+            self._refused = True
         return lease is not None
 
     def _drop_resident(self) -> None:
-        """The ledger evicts the resident set: its blocks are freed as their last tile releases them."""
+        """The ledger evicts the resident set: its blocks are freed as their last tile releases them, and the next read
+        asks for it again."""
         self._resident = None
         self._resident_complete = False
-        self._resident_dropped = True
+        self._evictions += 1
+        log(f"resident genotype codes: evicted from {self._pool} (eviction {self._evictions}); the next read streams the store and asks again")
+
+    def holds_codes(self) -> bool:
+        """Whether this source's codes are held on its device, or would be at its next read (within what the ledger has
+        left): its reads after the one that fills them are then device passes, not reads of the store."""
+        if self._resident is not None:
+            return True
+        return self._cupy is not None and self._broker is not None and self._broker.admits(self._pool, self.resident_codes_bytes)
 
     def _keep(self, block_index: int, slot: int) -> None:
         """Copy block ``block_index``'s signed codes into the resident set (on the first read), or drop the set if the

@@ -116,6 +116,8 @@ class ShardTileSource(Protocol):
 
     def iter_tiles(self) -> Iterator[tuple[int, Any]]: ...
 
+    def holds_codes(self) -> bool: ...
+
 
 def moved(cupy: Any, values: Any, device_id: int) -> Any:
     """``values`` (a cupy array on any device, or a numpy array) as a contiguous array on ``device_id``,
@@ -283,6 +285,11 @@ class ShardedDualSource:
                 ))
         bounds = [(int(indices[0]), int(indices[-1]) + 1) for indices in block_indices]
         return cls(shards, plan, bounds, shards[0].sample_count, cupy)
+
+    def holds_codes(self) -> bool:
+        """Whether every shard's codes are held on its device, or would be at its next read
+        (``store_block_source.StoreGenotypeBlockSource.holds_codes``)."""
+        return all(shard.holds_codes() for shard in self._shards)
 
     def blocks(self) -> Iterator[tuple[int, int, Any]]:
         """Every block in variant order, as a tile that takes and returns home-device arrays."""

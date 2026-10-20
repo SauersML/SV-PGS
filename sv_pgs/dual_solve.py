@@ -153,6 +153,10 @@ class StreamedDualSource:
         self.variant_count = int(indices[-1][-1] + 1)
         self.block_bounds = _checked_bounds([(int(block[0]), int(block[-1]) + 1) for block in indices], self.variant_count)
 
+    def holds_codes(self) -> bool:
+        """Whether the source's codes are held on its device (``StoreGenotypeBlockSource.holds_codes``)."""
+        return bool(self.source.holds_codes())
+
     def blocks(self) -> Iterator[tuple[int, int, DualTile]]:
         for block_index, tile in self.source.iter_tiles():
             start, stop = self.block_bounds[block_index]

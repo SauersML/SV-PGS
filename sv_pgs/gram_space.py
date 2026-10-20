@@ -599,7 +599,11 @@ def pass_costs(band: GramBand, source: Any, array_module: Any) -> tuple[float, f
     """Seconds per pass over the design in sample space (the store's codes: ``dual_solve``'s tiles) and in Gram space
     (the band), each measured on the first LD block and scaled to every block: its read by the bytes (n x |b| codes;
     |b| (|b| + |b+1|) float32 Grams) and its products by the work (n |b|; |b| (|b| + 2 |b+1|)). Every sweep, product
-    and solve of the fit is a whole number of such passes in either space, so the cheaper pass is the cheaper fit."""
+    and solve of the fit is a whole number of such passes in either space, so the cheaper pass is the cheaper fit. The
+    samples' read counts only where the devices cannot hold the codes (``holds_codes``): a held set is read from the
+    store once, to fill it, and every later pass is its products alone. Charged a read per pass, an All of Us chr22
+    fit's sample pass measured 7 s where its sweeps took 0.4 s [real], and at the whole genome the band route chosen
+    on that count read an 82 GB band the devices could not hold at every sweep."""
     xp = array_module
 
     def synchronized() -> float:
@@ -647,10 +651,11 @@ def pass_costs(band: GramBand, source: Any, array_module: Any) -> tuple[float, f
     tile.rmatmat(left)
     tile.matmat(right)
     sample_compute = synchronized() - started
+    held = bool(source.holds_codes())
     close = getattr(blocks, "close", None)
     if close is not None:
         close()
-    sample_seconds = (sample_read + sample_compute) * float(band.group_count) / float(stop - start)
+    sample_seconds = ((0.0 if held else sample_read) + sample_compute) * float(band.group_count) / float(stop - start)
     return sample_seconds, gram_seconds
 
 
