@@ -102,6 +102,7 @@ from sv_pgs.scale_mixture_ep import (
     _DEVICE,
     _data_value,
     class_log_density,
+    device_scope,
     FixedPoint,
     GaussianPosterior,
     MixtureHyperparameters,
@@ -2622,9 +2623,15 @@ def fit_full_data(
     ``budget_unresolved`` counts the solves and mixture searches that ended at their derived work budgets, and
     ``state_digest`` is the SHA-256 of the returned mean, hyperparameters, noise, components, weights and covariate
     coefficients (``state_digest``)."""
+    # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
+    # moments, the moment start's Grams) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
+    # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
+    # fit's silent bulk (AoU chr22 disease fits: twenty-minute stretches inside hyper_step's evidence maximizations).
+    device = gaussian.array_module
     # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
-    moments = moment_starts(statistics, prior)
+    with device_scope(device):
+        moments = moment_starts(statistics, prior)
     if len(moments) != gaussian.model_count:
         raise ValueError("Stage 0's targets must be the models, in order")
     if inference not in ("ep", "mean_field"):
@@ -2649,7 +2656,8 @@ def fit_full_data(
         extra["sites"] = list(start_sites)
         oracle = oracle_class(gaussian, statistics, model_prior, draw_count, working_bytes, seed, starts, noise, **extra, **extra_oracle)
         try:
-            return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
+            with device_scope(device):
+                return oracle, fit_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
             raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
@@ -2684,7 +2692,8 @@ def fit_full_data(
             start_sites=(fixed_points.site_precision.copy(), fixed_points.site_shift.copy()), null_scale=null_scale,
         )
         try:
-            fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
+            with device_scope(device):
+                fits = fit_hyperparameters(prior, field_hyperparameters, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as warm_error:
             # EP has no certified fixed point from mean field's point (its refusals say why): EP from the prior, as
             # without the warm start.
@@ -2692,7 +2701,8 @@ def fit_full_data(
             starts = [initial_hyperparameters(prior, moment.mean_variance) for moment in moments]
             oracle = _FullDataFixedPoints(gaussian, statistics, prior, draw_count, working_bytes, seed, starts, noise, null_scale=null_scale)
             try:
-                fits = fit_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
+                with device_scope(device):
+                    fits = fit_hyperparameters(prior, starts, oracle, working_bytes, 0.5 / draw_count)
             except FloatingPointError as error:
                 raise FloatingPointError(f"{error}; ep refusals: {oracle.refusals}") from error
         fixed_points = oracle
