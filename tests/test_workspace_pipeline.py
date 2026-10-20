@@ -1034,9 +1034,9 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
     remote = DirectoryRemote(run.with_name("mirror"))
     run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="samples")
     push(run, remote)
+    shutil.rmtree(run)
     shards = []
     for shard, chromosome in enumerate(CHROMOSOMES):
-        shutil.rmtree(run)
         restore(run, remote)
         summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="export", store_shard=shard)
         assert list(summaries) == ["samples"] and not (run / "store").exists()
