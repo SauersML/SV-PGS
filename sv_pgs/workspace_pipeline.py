@@ -3199,7 +3199,15 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Every model of both arms scored for the whole cohort (``predict_models``), in as few reads of the store as the
     host's memory allows the saved models to be held together (``score_batches``). An unscorable trait
     (``_fit_verdicts``) is not read: its scores stay NaN, and the step's summary names it with its codes under
-    ``quarantined``; the summary names each uncertified trait, scored like the rest, under ``uncertified``."""
+    ``quarantined``; the summary names each uncertified trait, scored like the rest, under ``uncertified``.
+
+    Each completed model batch is durable in the keyed partial: a restart fills its columns from that batch before
+    loading any fitted model. The exact ordered membership and output columns belong to the batch key, so a different
+    memory plan cannot mistake an earlier batch number for its own models. Final calibration and held-out assembly
+    run again from these same float64 values; neither the prediction call nor its arithmetic changes."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+
+    step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
     cohort = _read_cohort(run)
     quarantined = _fit_verdicts(run, cohort, unscorable=True)
     uncertified = _fit_verdicts(run, cohort, unscorable=False)
@@ -3216,19 +3224,32 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     columns = {name: np.full((shape[1], shape[0] * shape[2]), np.nan) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
     structural_genetic = np.full((shape[1], trait_count), np.nan)
     batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
+    restored_batches = 0
     with DosageStore.open(_final_store(run)) as store:
         structural = structural_records(store.variant_table)
         for batch in batches:
+            batch_models = [scored[position] for position in batch]
+            targets = [arm_index * shape[2] + int(index) for arm_index, trait in batch_models for index in cohort.trait_models(trait)]
+            part_traits = [trait for arm_index, trait in batch_models if ARMS[arm_index] == "with_sv"]
+            checkpoint = BatchCheckpoint(directory, step_key, {
+                "models": batch_models, "targets": targets, "parts": part_traits, "shape": shape,
+            }, ("predictions.npz",))
+            saved = checkpoint.read()
+            if saved is not None:
+                with np.load(saved / "predictions.npz", allow_pickle=False) as arrays:
+                    for name in columns:
+                        columns[name][:, targets] = arrays[name]
+                    structural_genetic[:, part_traits] = arrays["structural_genetic"]
+                restored_batches += 1
+                continue
             fitted = [run.bindings.load_model(directories[position]) for position in batch]
             # Each fitted model's column in [arms x models] (arm-major), from its own names.
-            targets: list[int] = []
             for position, model in zip(batch, fitted):
                 require_scorable(model)
                 arm_index, trait = scored[position]
                 expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
                 if tuple(model.model_names) != expected:
                     raise ValueError(f"the {ARMS[arm_index]} model of {cohort.trait_names[trait]} holds {model.model_names}, not its trait's models {expected}.")
-                targets.extend(arm_index * shape[2] + int(index) for index in cohort.trait_models(trait))
             # The structural part of each trait's all-rows with_sv model, by trait, scored in the same read as the
             # models themselves, after them.
             parts = {}
@@ -3245,7 +3266,11 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                 columns[name][:, targets] = np.asarray(values, dtype=np.float64)[:, : len(targets)]
             structural_genetic[:, list(parts)] = np.asarray(prediction.genetic.means, dtype=np.float64)[:, len(targets) :]
             del fitted, parts, prediction
-    LOGGER.info("workspace pipeline: scored %d models in %d reads of the store", sum(len(cohort.trait_models(trait)) for _arm, trait in scored), len(batches))
+            with checkpoint.write() as temporary:
+                np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
+                         structural_genetic=structural_genetic[:, part_traits])
+    LOGGER.info("workspace pipeline: scored %d models in %d reads of the store, reused %d batches",
+                sum(len(cohort.trait_models(trait)) for _arm, trait in scored), len(batches) - restored_batches, restored_batches)
 
     def by_arm(values: Any) -> F64Array:
         # [rows, arms x models] in arm-major model order, as [arms, rows, models].
@@ -3421,7 +3446,15 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     summaries by variant class and length that carry no participant count (``effects_by_class.tsv``,
     ``effect_length_correlation.tsv``), and the structural records' share of the ``with_sv`` score's variance over each
     trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS). A trait the
-    score step left out as unscorable (``_fit_verdicts``) has no effects here."""
+    score step left out as unscorable (``_fit_verdicts``) has no effects here.
+
+    A batch is one (arm, trait)'s all-rows model: its compressed per-record table and its already formatted summary
+    rows are committed together. A restart reuses only whole, matching batches, in the original arm/trait order;
+    the small score-derived variance table and final summary tables are assembled again. Per-record tables link to
+    their durable copies on the local disk, so keeping a partial does not hold a second copy of the largest files."""
+    from sv_pgs.postfit_checkpoint import BatchCheckpoint
+
+    step_key = (directory / KEY_FILE).read_text(encoding="utf-8")
     cohort = _read_cohort(run)
     scores = _read_scores(run)
     quarantined = run.summary("score")["quarantined"]
@@ -3451,59 +3484,74 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         working_bytes = run.budget.host_bytes // 2
         for arm in ARMS:
             for trait, trait_name in reported:
-                fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
-                require_scorable(fitted)
-                scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
-                effects = variant_effects(scoring, codes_per_unit, working_bytes)
-                rows = effects.store_rows
-                root_mean_square = np.sqrt(effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation)
-                pd.DataFrame(
-                    {
-                        "chromosome": np.asarray(table.chromosome)[rows].astype(np.int64),
-                        "position": np.asarray(table.position)[rows],
-                        "id": table.variant_ids(rows),
-                        "variant_class": classes[rows],
-                        "length": lengths[rows],
-                        "row_source": row_sources[rows],
-                        "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
-                        "effect": effects.mean,
-                        "posterior_sd": effects.standard_deviation,
-                        "likelihood": "bernoulli" if scoring.trait_type == TraitType.BINARY else "gaussian",
-                        "effect_scale": "log_odds" if scoring.trait_type == TraitType.BINARY else ("observed_status" if cohort.trait_types[trait] == TraitType.BINARY else "trait_units"),
-                        "sign_method": "analytic_represented_mixture" if hasattr(scoring.posterior_draws, "marginal_summary") else "monte_carlo",
-                        "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
-                        "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
-                        "probability_positive": effects.probability_positive,
-                        "probability_negative": effects.probability_negative,
-                    }
-                ).to_csv(
-                    directory / f"{trait_name}.{arm}.tsv.gz", sep="\t", index=False, float_format="%.6g",
-                    # gzip's fastest level: a genome's records are tens of millions of rows per table.
-                    compression={"method": "gzip", "compresslevel": 1},
-                )
-                frame = pd.DataFrame(
-                    {
-                        "variant_class": classes[rows], "length_bin": bins[rows], "mean": effects.mean,
-                        "probability_positive": effects.probability_positive, "probability_negative": effects.probability_negative,
-                        "root_mean_square": root_mean_square,
-                    }
-                )
-                for (variant_class, length_bin), group in frame.groupby(["variant_class", "length_bin"], sort=True):
-                    absolute = np.abs(group["mean"].to_numpy())
-                    summary_lines.append((
-                        trait_name, arm, variant_class, length_bin, len(group), int((group["mean"] > 0.0).sum()), int((group["mean"] < 0.0).sum()),
-                        f"{group['probability_positive'].sum():.6g}", f"{group['probability_negative'].sum():.6g}",
-                        f"{absolute.mean():.6g}", f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(group['root_mean_square'].to_numpy() ** 2)):.6g}",
-                    ))
-                structural = lengths[rows] >= COMMUNITY_SV_MINIMUM_LENGTH
-                for variant_class in [*sorted(set(classes[rows][structural])), "all_structural"]:
-                    member = structural & ((classes[rows] == variant_class) | (variant_class == "all_structural"))
-                    if np.unique(lengths[rows][member]).shape[0] < 2:
-                        continue
-                    for quantity, values in (("absolute_mean", np.abs(effects.mean)), ("posterior_sd", effects.standard_deviation)):
-                        selected = values[member]
-                        rho = stats.spearmanr(np.log(lengths[rows][member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
-                        correlation_lines.append((trait_name, arm, variant_class, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
+                table_name = f"{trait_name}.{arm}.tsv.gz"
+                checkpoint = BatchCheckpoint(directory, step_key, {"arm": arm, "trait": trait_name}, (table_name, "summary.json"))
+                saved = checkpoint.read()
+                if saved is None:
+                    batch_summary: list[tuple[Any, ...]] = []
+                    batch_correlation: list[tuple[Any, ...]] = []
+                    with checkpoint.write() as temporary:
+                        fitted = run.bindings.load_model(_fitted_model_directory(run, arm, trait_name))
+                        require_scorable(fitted)
+                        scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
+                        effects = variant_effects(scoring, codes_per_unit, working_bytes)
+                        rows = effects.store_rows
+                        root_mean_square = np.sqrt(effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation)
+                        pd.DataFrame(
+                            {
+                                "chromosome": np.asarray(table.chromosome)[rows].astype(np.int64),
+                                "position": np.asarray(table.position)[rows],
+                                "id": table.variant_ids(rows),
+                                "variant_class": classes[rows],
+                                "length": lengths[rows],
+                                "row_source": row_sources[rows],
+                                "mean_value": (np.asarray(scoring.signed_means) + SIGNED_CODE_OFFSET) / codes_per_unit[rows] + np.asarray(table.value_origin)[rows],
+                                "effect": effects.mean,
+                                "posterior_sd": effects.standard_deviation,
+                                "likelihood": "bernoulli" if scoring.trait_type == TraitType.BINARY else "gaussian",
+                                "effect_scale": "log_odds" if scoring.trait_type == TraitType.BINARY else ("observed_status" if cohort.trait_types[trait] == TraitType.BINARY else "trait_units"),
+                                "sign_method": "analytic_represented_mixture" if hasattr(scoring.posterior_draws, "marginal_summary") else "monte_carlo",
+                                "sign_draw_count": 0 if hasattr(scoring.posterior_draws, "marginal_summary") else scoring.draw_count,
+                                "sign_probability_resolution": 0.0 if hasattr(scoring.posterior_draws, "marginal_summary") else 1.0 / scoring.draw_count,
+                                "probability_positive": effects.probability_positive,
+                                "probability_negative": effects.probability_negative,
+                            }
+                        ).to_csv(
+                            temporary / table_name, sep="\t", index=False, float_format="%.6g",
+                            # gzip's fastest level: a genome's records are tens of millions of rows per table.
+                            compression={"method": "gzip", "compresslevel": 1},
+                        )
+                        frame = pd.DataFrame(
+                            {
+                                "variant_class": classes[rows], "length_bin": bins[rows], "mean": effects.mean,
+                                "probability_positive": effects.probability_positive, "probability_negative": effects.probability_negative,
+                                "root_mean_square": root_mean_square,
+                            }
+                        )
+                        for (variant_class, length_bin), group in frame.groupby(["variant_class", "length_bin"], sort=True):
+                            absolute = np.abs(group["mean"].to_numpy())
+                            batch_summary.append((
+                                trait_name, arm, variant_class, length_bin, len(group), int((group["mean"] > 0.0).sum()), int((group["mean"] < 0.0).sum()),
+                                f"{group['probability_positive'].sum():.6g}", f"{group['probability_negative'].sum():.6g}",
+                                f"{absolute.mean():.6g}", f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(group['root_mean_square'].to_numpy() ** 2)):.6g}",
+                            ))
+                        structural = lengths[rows] >= COMMUNITY_SV_MINIMUM_LENGTH
+                        for variant_class in [*sorted(set(classes[rows][structural])), "all_structural"]:
+                            member = structural & ((classes[rows] == variant_class) | (variant_class == "all_structural"))
+                            if np.unique(lengths[rows][member]).shape[0] < 2:
+                                continue
+                            for quantity, values in (("absolute_mean", np.abs(effects.mean)), ("posterior_sd", effects.standard_deviation)):
+                                selected = values[member]
+                                rho = stats.spearmanr(np.log(lengths[rows][member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
+                                batch_correlation.append((trait_name, arm, variant_class, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
+                        _write_json(temporary / "summary.json", {"summary": batch_summary, "correlation": batch_correlation})
+                    saved = checkpoint.path
+                record = json.loads((saved / "summary.json").read_text(encoding="utf-8"))
+                summary_lines.extend(record["summary"])
+                correlation_lines.extend(record["correlation"])
+                output = directory / table_name
+                output.unlink(missing_ok=True)
+                os.link(saved / table_name, output)
     for name, lines in (("effects_by_class.tsv", summary_lines), ("effect_length_correlation.tsv", correlation_lines), ("genetic_variance.tsv", variance_lines)):
         with (directory / name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
@@ -3988,10 +4036,10 @@ _STEPS = (
         config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
         None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)),
     ), (_fit_step, fit_filtered, listed_sites, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _final_store, score_batches, structural_records, model_part), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,
-        (_effects_step, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown), _effects_step,
+        (_effects_step, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown, importlib.import_module("sv_pgs.postfit_checkpoint")), _effects_step,
     ),
     _Step(
         "report",

@@ -1382,3 +1382,135 @@ def test_fit_keeps_listed_substitutions_and_every_structural_record(tmp_path: Pa
     with pytest.raises(ValueError, match="fit_variant_sites"):
         WorkspaceConfig.from_mapping({**synthetic.raw, "fit_variant_sites": 7})
 
+
+
+def _single_model_batches(model_bytes, host_bytes):
+    """Give the dry run several production-shaped score batches without reducing the scorer's working memory."""
+    return [range(position, position + 1) for position in range(len(model_bytes))]
+
+
+def _postfit_outputs(directory: Path) -> dict[str, bytes | dict[str, np.ndarray]]:
+    """The step's public outputs, comparing gzip's table bytes, not its wall-clock header, and NPZ's arrays."""
+    outputs = {}
+    for path in directory.iterdir():
+        if not path.is_file() or path.name in (COMPLETE_FILE, workspace_pipeline.KEY_FILE):
+            continue
+        if path.suffix == ".npz":
+            with np.load(path, allow_pickle=False) as arrays:
+                outputs[path.name] = {name: arrays[name] for name in arrays.files}
+        else:
+            outputs[path.name] = gzip.decompress(path.read_bytes()) if path.suffix == ".gz" else path.read_bytes()
+    return outputs
+
+
+def _assert_postfit_outputs(directory: Path, expected) -> None:
+    actual = _postfit_outputs(directory)
+    assert actual.keys() == expected.keys()
+    for name, values in expected.items():
+        if isinstance(values, dict):
+            assert actual[name].keys() == values.keys()
+            for column, array in values.items():
+                np.testing.assert_array_equal(actual[name][column], array)
+        else:
+            assert actual[name] == values
+
+
+@pytest.mark.parametrize("step", ["score", "effects"])
+def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace, monkeypatch, tmp_path, step) -> None:
+    """A completed batch survives the loss of the VM; a failed batch is redone, and reassembly is exactly the same
+    as an uninterrupted pass, including held-out/calibrated scores, structural parts and report tables."""
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "calibration_fraction": .3, "annotated_prior": False})
+    recorder = _Recorder()
+    bindings = _bindings(recorder, client)
+    monkeypatch.setattr(workspace_pipeline, "score_batches", _single_model_batches)
+    run_pipeline(config, bindings, BUDGET, through="report")
+    run = config.run_directory
+    expected = _postfit_outputs(run / step)
+    report = _postfit_outputs(run / "report")
+    total = len(list((run / step / "batches").glob("*/complete.json")))
+    assert total > 1
+    fit_time = _completed_at(run, "fit")
+    for name in STEP_NAMES[STEP_NAMES.index(step):]:
+        if (run / name).exists():
+            shutil.rmtree(run / name)
+    calls = []
+    original = bindings.predict if step == "score" else workspace_pipeline.variant_effects
+
+    def interrupted(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            raise RuntimeError("preempted batch")
+        return original(*args, **kwargs)
+
+    if step == "score":
+        interrupted_bindings = dataclasses.replace(bindings, predict=interrupted)
+    else:
+        interrupted_bindings = bindings
+        monkeypatch.setattr(workspace_pipeline, "variant_effects", interrupted)
+    with pytest.raises(RuntimeError, match="preempted batch"):
+        run_pipeline(config, interrupted_bindings, BUDGET, through=step)
+    assert _completed_at(run, "fit") == fit_time
+    partial = run / f"{step}.partial"
+    assert len(list((partial / "batches").glob("*/complete.json"))) == 1
+    remote = DirectoryRemote(tmp_path / "postfit-mirror")
+    push(run, remote)
+    shutil.rmtree(run)
+    restore(run, remote)
+    assert len(list((partial / "batches").glob("*/complete.json"))) == 1
+    calls.clear()
+
+    def resumed(*args, **kwargs):
+        calls.append(True)
+        return original(*args, **kwargs)
+
+    if step == "score":
+        bindings = dataclasses.replace(bindings, predict=resumed)
+    else:
+        monkeypatch.setattr(workspace_pipeline, "variant_effects", resumed)
+    fit_calls = len(recorder.fit_calls)
+    run_pipeline(config, bindings, BUDGET, through="report")
+    assert len(recorder.fit_calls) == fit_calls
+    assert len(calls) == total - 1
+    _assert_postfit_outputs(run / step, expected)
+    _assert_postfit_outputs(run / "report", report)
+
+    # All batches were committed but final assembly was interrupted. No model should be opened on the next pass.
+    partial = run / f"{step}.partial"
+    (run / step).rename(partial)
+    (partial / COMPLETE_FILE).unlink()
+    for path in partial.iterdir():
+        if path.is_file() and path.name != workspace_pipeline.KEY_FILE:
+            path.unlink()
+            path.write_bytes(b"interrupted assembly")
+
+    def no_model(path):
+        pytest.fail(f"a completed post-fit batch loaded {path}")
+
+    run_pipeline(config, dataclasses.replace(bindings, load_model=no_model), BUDGET, through=step)
+    _assert_postfit_outputs(run / step, expected)
+
+    # A same-size damaged payload is a single batch to redo, even with every completion record still present.
+    (run / step).rename(partial)
+    (partial / COMPLETE_FILE).unlink()
+    record = next((partial / "batches").glob("*/complete.json"))
+    payload = record.parent / ("predictions.npz" if step == "score" else next(record.parent.glob("*.tsv.gz")).name)
+    damaged = bytearray(payload.read_bytes())
+    damaged[0] ^= 1
+    payload.write_bytes(damaged)
+    calls.clear()
+    run_pipeline(config, bindings, BUDGET, through=step)
+    assert len(calls) == 1
+    _assert_postfit_outputs(run / step, expected)
+
+
+def test_postfit_checkpoint_code_is_keyed_only_after_the_fit() -> None:
+    """Changing the batch protocol invalidates score/effects partials without changing phenotypes, measurement or fit
+    keys: the helper is a code dependency of those two steps and never an engine import."""
+    from sv_pgs import postfit_checkpoint
+
+    for step in workspace_pipeline._STEPS:
+        assert (postfit_checkpoint in step.code) == (step.name in ("score", "effects"))
+    assert postfit_checkpoint not in workspace_pipeline.module_closure(workspace_pipeline.fit_model)

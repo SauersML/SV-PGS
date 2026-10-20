@@ -17,6 +17,9 @@ The durable state is what the driver resumes from:
   with its record chromosomes/<chromosome>.json, the record last, as the store step writes them; and the KEY_FILE. A
   fan-out of store shards (``workspace_pipeline.run_pipeline``'s ``store_shard``), one job's tasks on separate disks,
   meets here: each pushes its own chromosomes under the one key, and the next job restores them all.
+- **The score and effects steps' completed batches:** each batch directory with its content-digest record last,
+  and the partial's KEY_FILE. Hidden batches are still being written. A completed step carries its final outputs
+  alone; its batch copies are needed only while it is partial.
 
 Any other partial work is redone, as after a preemption on one disk. GCS creates an object only when its upload
 completes, so a mirrored file is whole or absent.
@@ -61,6 +64,9 @@ STORE = "store"
 STORE_RECORDS = "chromosomes/*.json"
 """The store step's record of each chromosome it converted, in its partial: chromosomes/<chromosome>.json, written
 after the chromosome's files."""
+BATCH_RECORDS = "batches/*/complete.json"
+"""The score/effects partial's committed batches (``postfit_checkpoint``); each record binds its files' content to
+the step key and ordered batch identity. The generation in a repaired batch's record makes the mirror send it again."""
 STORE_CHROMOSOME_FILES = ("fill", "reported", "calibration")
 """The store step's per-chromosome files beside its store, <directory>/<chromosome>.<suffix>; inside store/, a
 chromosome's files are those under a directory named for it (dosage/half<i>/<chromosome>, stats/half<i>/<chromosome>,
@@ -230,8 +236,9 @@ def _push_step(remote: Remote, final: Path, name: str) -> None:
     if remote.read(f"{name}/{COMPLETE_FILE}") == content:
         return
     remote.delete(remote.sizes(f"{name}/"))
-    files = [path for path in _files(final) if path != marker]
-    directories = sorted(path.relative_to(final).as_posix() for path in final.rglob("*") if path.is_dir())
+    batches = final / "batches" if name in ("score", "effects") else None
+    files = [path for path in _files(final) if path != marker and (batches is None or not path.is_relative_to(batches))]
+    directories = sorted(path.relative_to(final).as_posix() for path in final.rglob("*") if path.is_dir() and (batches is None or not path.is_relative_to(batches)))
     remote.write(f"{name}{DIRECTORIES}", json.dumps(directories).encode())
     _transfer([(path, f"{name}/{path.relative_to(final).as_posix()}") for path in files], remote.upload)
     if marker.read_bytes() != content:
@@ -245,7 +252,8 @@ def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
     """The durable units in a step's ``partial``, each as (its files, the file that marks it whole, sent last): the fit
     step's every engine checkpoint (CHECKPOINTS; a hidden name is one ``fit_checkpoint`` is still writing) and every
     saved model directory models/<arm>/<trait> beside its record <trait>.json; the store step's every converted
-    chromosome's files beside its record chromosomes/<chromosome>.json."""
+    chromosome's files beside its record chromosomes/<chromosome>.json; and the score/effects steps' committed
+    batch directories beside their content-digest records."""
     units: list[tuple[list[Path], Path]] = [([], path) for path in sorted(partial.glob(CHECKPOINTS)) if not path.name.startswith(".")]
     if (partial / "models").is_dir():
         for record in sorted(partial.glob(RECORDS)):
@@ -257,6 +265,10 @@ def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
         files = [(path, path.relative_to(partial).as_posix()) for path in _files(partial)]
         for record in records:
             units.append(([path for path, relative in files if _of_chromosome(relative, record.stem)], record))
+    if partial.name in ("score.partial", "effects.partial"):
+        for record in sorted(partial.glob(BATCH_RECORDS)):
+            if not record.parent.name.startswith("."):
+                units.append(([path for path in _files(record.parent) if path != record], record))
     return units
 
 
@@ -273,13 +285,29 @@ def _push_partial(remote: Remote, partial: Path, step: str) -> None:
     pushed = 0
     for files, marker in _partial_units(partial):
         marker_name = f"{name}/{marker.relative_to(partial).as_posix()}"
+        if step in ("score", "effects") and _matches(marker.relative_to(partial).as_posix(), BATCH_RECORDS):
+            # Capture the record before the payload. A repair may replace the directory during upload; never send
+            # its new record after old files. A reader also checks each digest, rejecting any mixed generation.
+            content = marker.read_bytes()
+            if remote.read(marker_name) == content and all(
+                held.get(f"{name}/{path.relative_to(partial).as_posix()}") == path.stat().st_size for path in files
+            ):
+                continue
+            if marker_name in held:
+                remote.delete([marker_name])
+            _transfer([(path, f"{name}/{path.relative_to(partial).as_posix()}") for path in files], remote.upload)
+            if marker.read_bytes() != content:
+                raise FileNotFoundError(f"{marker} was replaced while it was pushed.")
+            remote.write(marker_name, content)
+            pushed += 1
+            continue
         if marker_name in held and (remote.read(marker_name) == marker.read_bytes() if files else held[marker_name] == marker.stat().st_size):
             continue
         _transfer([(path, f"{name}/{path.relative_to(partial).as_posix()}") for path in files], remote.upload)
         remote.upload(marker, marker_name)
         pushed += 1
     if pushed:
-        LOGGER.info("run mirror: pushed %d checkpoints and saved models of %s", pushed, name)
+        LOGGER.info("run mirror: pushed %d durable units of %s", pushed, name)
 
 
 def push(run_directory: Path, remote: Remote) -> None:
@@ -298,18 +326,23 @@ def push(run_directory: Path, remote: Remote) -> None:
 
 
 def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
-    """The partial's KEY_FILE, checkpoints, every model directory and every store chromosome whose record is mirrored,
-    and those records."""
+    """The partial's KEY_FILE, checkpoints, every model directory, store chromosome and score/effects batch whose
+    record is mirrored, and those records. Payloads without their record are interrupted uploads, never batches."""
     prefix = f"{name}/"
     inside = [entry.removeprefix(prefix) for entry in names if entry.startswith(prefix)]
     records = {relative for relative in inside if _matches(relative, RECORDS) or _matches(relative, STORE_RECORDS)}
     models = tuple(record.removesuffix(".json") + "/" for record in records if _matches(record, RECORDS))
     chromosomes = [record.removeprefix("chromosomes/").removesuffix(".json") for record in records if _matches(record, STORE_RECORDS)]
+    batches = tuple(
+        relative.removesuffix("complete.json") for relative in inside
+        if name in ("score.partial", "effects.partial") and _matches(relative, BATCH_RECORDS) and not relative.split("/")[1].startswith(".")
+    )
     return sorted(
         prefix + relative for relative in inside
         if relative == KEY_FILE
         or relative in records
         or relative.startswith(models)
+        or relative.startswith(batches)
         or any(_of_chromosome(relative, chromosome) for chromosome in chromosomes)
         or (_matches(relative, CHECKPOINTS) and not relative.rsplit("/", 1)[-1].startswith("."))
     )
