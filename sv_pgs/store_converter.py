@@ -77,10 +77,11 @@ ASSEMBLY_STEP_BYTES_PER_ENTRY = (
 )
 # GP is written to 3 decimals, so its thousandths sum to 1000 within one unit of rounding.
 GENOTYPE_PROBABILITY_SUM_SLACK_MILLI = 1
-# DS and GP are rounded from one unrounded GP. With a, b in [0, 1) the fractional thousandths
-# of GP1 and GP2, DS rounds a + 2b while GP1 + 2 GP2 rounds a and b separately; every case
-# away from exact halves puts the two within one thousandth.
-DOSAGE_FROM_PROBABILITY_SLACK_MILLI = 1
+# Were DS and GP rounded from one unrounded GP, the two would agree within one thousandth: with a, b in [0, 1) the
+# fractional thousandths of GP1 and GP2, DS rounds a + 2b while GP1 + 2 GP2 rounds a and b separately. The popped
+# batches' chr19 file has records further apart than that, so the gate allows any gap under one stored code step
+# (2000/254 thousandths): the store keeps DS, and a gap that small changes no stored code by more than one step.
+DOSAGE_FROM_PROBABILITY_SLACK_MILLI = MAXIMUM_DOSAGE_MILLI // MAXIMUM_CODE
 # The INFO fields in which the plain imputation tools report their own r^2: GLIMPSE2 and IMPUTE5
 # write INFO, Beagle 5 DR2, Minimac4 R2. A plain batch's header declares exactly one of them.
 REPORTED_R2_FIELDS = ("INFO", "DR2", "R2")

@@ -7,6 +7,8 @@ import pytest
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.dosage_store import (
     CODES_PER_DOSAGE,
+    MAXIMUM_CODE,
+    MAXIMUM_DOSAGE_MILLI,
     MISSING_CODE,
     CodeArray,
     HalfSamples,
@@ -22,6 +24,7 @@ from sv_pgs.dosage_store import (
     write_variant_columns,
 )
 from sv_pgs.store_converter import (
+    DOSAGE_FROM_PROBABILITY_SLACK_MILLI,
     NO_LOCUS,
     ExpectedSites,
     assemble_half,
@@ -38,6 +41,7 @@ from sv_pgs.store_converter import (
     value_matched_background,
     write_store_manifest,
 )
+from sv_pgs.store_converter import _gate_probabilities
 
 
 def _budget(host_bytes: int) -> ComputeBudget:
@@ -500,3 +504,14 @@ def test_records_the_8_bit_codes_make_monomorphic_are_counted_across_batches() -
     second_dosage = np.array([[0, 0], [0, 0], [500, 500], [2001, 0]])
     second_code = np.array([[0, 0], [0, 0], [64, 64], [255, 0]])
     np.testing.assert_array_equal(encoding_flattened([first_dosage, second_dosage], [first_code, second_code]), [0, 3])
+
+
+def test_dosage_gate_allows_a_gap_under_one_stored_code_step(tmp_path):
+    """Gate G4 passes DS that differs from GP1 + 2 GP2 by less than one 8-bit code step, and stops one a step away."""
+    probability_milli = np.array([[250.0, 500.0, 250.0], [0.0, 0.0, 1000.0]])
+    implied = probability_milli[:, 1] + 2.0 * probability_milli[:, 2]
+    step_milli = MAXIMUM_DOSAGE_MILLI / MAXIMUM_CODE
+    assert DOSAGE_FROM_PROBABILITY_SLACK_MILLI < step_milli <= DOSAGE_FROM_PROBABILITY_SLACK_MILLI + 1
+    _gate_probabilities(implied + [DOSAGE_FROM_PROBABILITY_SLACK_MILLI, -DOSAGE_FROM_PROBABILITY_SLACK_MILLI], probability_milli, 1, DOSAGE_FROM_PROBABILITY_SLACK_MILLI, tmp_path, 0)
+    with pytest.raises(ValueError, match="DS differs from GP1"):
+        _gate_probabilities(implied + [0.0, -(DOSAGE_FROM_PROBABILITY_SLACK_MILLI + 1)], probability_milli, 1, DOSAGE_FROM_PROBABILITY_SLACK_MILLI, tmp_path, 0)
