@@ -6,10 +6,16 @@
 #   submit.sh fit        # steps fit .. export, on GPUs
 #
 # PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity, and has
-# no fallback from one model to the other (it uses a job's first instance policy only). A preempted task (exit 50001) is
-# retried up to MAX_RETRIES times (0 by default), and a retry resumes from what the mirror holds, so each preemption
-# redoes the job's start (environment, restore, digest) and the work since the last durable push. Spot at a fraction p of
-# the STANDARD price is the cheaper while preemptions per hour of runtime stay below (1 - p) / (hours each one redoes).
+# no fallback from one model to the other (it uses a job's first instance policy only). A task is retried, up to
+# MAX_RETRIES times (0 by default), only when its VM went away under it: a Spot preemption (exit 50001), a VM rebooted or
+# recreated during the task (50003, 50006: what host maintenance does to a GPU VM, which cannot live-migrate; Batch
+# documents no code of its own for maintenance), or the SIGTERM of a VM shutting down, which run_step.sh's trap exits 75
+# on. Any other exit fails the task at once: the task's own failures (1, or the driver's status, such as an OOM kill's
+# 137), a VM that stopped reporting or answering (50002, 50004, which a task exhausting its VM's memory can cause) and an
+# attempt over its maxRunDuration (50005). Batch takes one lifecycle policy, and RETRY_TASK fails every exit code it does
+# not name (the job templates' lifecyclePolicies). A retry resumes from what the mirror holds, so each preemption redoes
+# the job's start (environment, restore, digest) and the work since the last durable push. Spot at a fraction p of the
+# STANDARD price is the cheaper while preemptions per hour of runtime stay below (1 - p) / (hours each one redoes).
 # A store job with TASK_COUNT > 1 (THROUGH=store) is a fan-out: task i converts the run config's chromosome i on its
 # own VM (workspace-run --store-shard), and the next job, finding every chromosome in the mirror, writes the store.
 #
@@ -50,7 +56,11 @@ AFTER_SCRIPT="${AFTER_SCRIPT:-}"
 if [ -n "$AFTER_SCRIPT" ] && [[ ! "$AFTER_SCRIPT" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]*\.sh$ || "$AFTER_SCRIPT" == *..* ]]; then
   echo "AFTER_SCRIPT is a .sh path inside the staged source tree" >&2; exit 2
 fi
-export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT
+# SHARED_RUNTIME (optional): 1 to take the job's environment prebuilt from the ops bucket when a job has published one
+# for the staged uv.lock, and to publish it otherwise (run_step.sh.template, launcher/workspace/runtime_pack.py).
+SHARED_RUNTIME="${SHARED_RUNTIME:-}"
+[[ "$SHARED_RUNTIME" =~ ^1?$ ]] || { echo "SHARED_RUNTIME is 1 or empty" >&2; exit 2; }
+export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
@@ -92,7 +102,7 @@ done
 export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT SHARED_RUNTIME
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB RUN_DISK_TYPE REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)

@@ -4,8 +4,10 @@ import json
 import os
 import re
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -197,7 +199,7 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     assert "$RUN/venv/bin/sv-pgs" in script and "${status}" in script and "${RUN_ID}" not in script
     # The sync with the GPU extras runs on every start, outside the one-time staging copy, and a GPU the job cannot
     # reach stops it before the pipeline starts.
-    staging_end = script.index("\nfi\n", script.index('if [ ! -f "$RUN/tools/staged" ]'))
+    staging_end = script.index("\n  fi\n", script.index('if [ ! -f "$RUN/tools/staged" ]'))
     assert script.index("sync --project") > staging_end and "sync --project" in script and "--extra gpu" in script
     assert script.index("exit-no-gpu") < script.index("workspace-run")
     # Batch cannot write to an existing disk: the job's disk is new, and the run is restored from the workspace bucket
@@ -218,9 +220,9 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     assert spec["allocationPolicy"]["location"] == {"allowedLocations": ["regions/us-central1"]}
     ops = next(volume for volume in task["volumes"] if volume["mountPath"] == "/mnt/disks/ops")
     assert ops["mountOptions"] == ["--implicit-dirs"]
-    # Batch takes one lifecycle policy: exit 1 (the driver's or the install's failure) fails the task, and any other
-    # non-zero exit (a spot preemption's 50001, the TERM trap's 75) is retried up to maxRetryCount by default.
-    assert task["lifecyclePolicies"] == [{"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}]
+    # Batch takes one lifecycle policy: a task whose VM went away is retried up to maxRetryCount, any other exit fails it
+    # (test_a_task_is_retried_only_when_its_vm_went_away).
+    assert task["lifecyclePolicies"] == [{"action": "RETRY_TASK", "actionCondition": {"exitCodes": [50001, 50003, 50006, 75]}}]
 
 
 def test_a_store_fan_out_gives_each_task_its_chromosome_and_the_fit_job_has_one_task(tmp_path):
@@ -309,6 +311,105 @@ def test_a_job_s_run_disk_can_be_local_ssd_in_whole_devices(tmp_path, job, slot)
     assert disk == {"deviceName": "run", "newDisk": {"type": "local-ssd", "sizeGb": 1500}}
     run = next(volume for volume in spec["taskGroups"][0]["taskSpec"]["volumes"] if volume.get("deviceName") == "run")
     assert run["mountPath"] == "/mnt/disks/run"
+
+
+def _retried(policies, exit_code):
+    """Batch's rule for a failed task (projects.locations.jobs, LifecyclePolicy.action): with RETRY_TASK it retries a task
+    whose exit code is listed and fails every other; with FAIL_TASK the reverse. It takes one policy; without one it
+    would retry every non-zero exit."""
+    (policy,) = policies
+    listed = exit_code in policy["actionCondition"]["exitCodes"]
+    return listed if policy["action"] == "RETRY_TASK" else not listed
+
+
+@pytest.mark.parametrize("job, slot", [("store", "prepare"), ("fit", "pilot")])
+def test_a_task_is_retried_only_when_its_vm_went_away(tmp_path, job, slot):
+    """A preemption (50001), a VM rebooted or recreated under the task (50003, 50006: host maintenance on a GPU VM) and the
+    task script's own SIGTERM exit are retried; the task's failures, a VM that stopped reporting or answering, and an
+    attempt over its runtime are not, however many retries the job has."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(BUDGET_SLOT=slot, MAX_RETRIES="3")
+    submitted = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    task = spec["taskGroups"][0]["taskSpec"]
+    assert task["maxRetryCount"] == 3
+    policies = task["lifecyclePolicies"]
+    assert len(policies) == 1
+    script = json.loads((tmp_path / "objects.json").read_text())[f"gs://workspace/svpgs/study/launcher/{slot}/run_step.sh"]
+    (terminated,) = re.findall(r"trap 'mark \"terminated\"; exit (\d+)' TERM", script)
+    for exit_code in (50001, 50003, 50006, int(terminated)):
+        assert _retried(policies, exit_code), exit_code
+    # The script's own failures (install, GPU check, restore, push: exit 1), the driver's status passed through (an
+    # argument error's 2, 128 + a signal: abort, OOM kill, segfault), Batch's generic failure, and the VM-level codes a
+    # task can cause itself or that end an attempt at its cap.
+    own = {int(code) for code in re.findall(r"exit (\d+)", script)} - {int(terminated)}
+    assert own == {1}
+    for exit_code in (*own, 2, 134, 137, 139, 143, 50000, 50002, 50004, 50005):
+        assert not _retried(policies, exit_code), exit_code
+
+
+_UV = """#!/bin/bash
+# uv sync, as far as run_step.sh sees it: the venv with its interpreter and the sv-pgs script, which logs its calls.
+mkdir -p "$UV_PROJECT_ENVIRONMENT/bin" "$UV_PROJECT_ENVIRONMENT/lib/python3.12/site-packages"
+echo "uv $*" >> "$UV_PROJECT_ENVIRONMENT/../uv-calls"
+ln -sfn "{python}" "$UV_PROJECT_ENVIRONMENT/bin/python"
+printf '#!/bin/bash\\necho "$*" >> "$(dirname "$0")/../../sv-pgs-calls"\\n' > "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs"
+chmod +x "$UV_PROJECT_ENVIRONMENT/bin/sv-pgs"
+echo "VALUE = 1" > "$UV_PROJECT_ENVIRONMENT/lib/python3.12/site-packages/module.py"
+"""
+
+
+@pytest.mark.skipif(shutil.which("flock") is None or shutil.which("pkill") is None, reason="run_step.sh runs on Linux")
+def test_a_shared_runtime_is_built_and_published_once_then_unpacked_instead_of_synced(tmp_path):
+    """The rendered task script, run twice on new run disks against one ops directory, with uv and sv-pgs stubbed: the
+    first job extracts env.tar, syncs and publishes its environment; the second unpacks that one and never syncs."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(UV_EXTRAS="", SHARED_RUNTIME="yes")
+    refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "SHARED_RUNTIME" in refused.stderr
+    environment["SHARED_RUNTIME"] = "1"
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/pilot/run_step.sh"]
+    assert 'if [ "1" = 1 ]; then' in script
+    ops = tmp_path / "ops/svpgs/study"
+    (ops / "source/launcher/workspace").mkdir(parents=True)
+    shutil.copy(Path(__file__).parents[1] / "launcher/workspace/runtime_pack.py", ops / "source/launcher/workspace")
+    (ops / "source/uv.lock").write_text("version = 1\n")
+    (ops / "source/pyproject.toml").write_text("[project]\nname = 'sv-pgs'\n")
+    (ops / "run_config.json").write_text(json.dumps({"run_directory": str(tmp_path / "pipeline")}))
+    staged = tmp_path / "staged"
+    (staged / "bin").mkdir(parents=True)
+    (staged / "bin/uv").write_text(_UV.format(python=sys.executable))
+    (staged / "python/cpython-3.12-linux/bin").mkdir(parents=True)
+    (staged / "python/cpython-3.12-linux/bin/python3.12").write_text("#!/bin/sh\n")
+    with tarfile.open(ops / "env.tar", "w") as archive:
+        for part in ("bin", "python"):
+            archive.add(staged / part, arcname=part)
+    runtime = tmp_path / "ops/svpgs/_runtime"
+    for job in ("first", "second"):
+        # Each job's run disk is new and mounted.
+        run = tmp_path / job
+        run.mkdir()
+        task = tmp_path / f"{job}-launcher/run_step.sh"
+        task.parent.mkdir(parents=True)
+        task.write_text(script.replace("OPS=/mnt/disks/ops/svpgs/study\n", f"OPS={ops}\n").replace("RUN=/mnt/disks/run\n", f"RUN={run}\n"))
+        ran = subprocess.run(["bash", str(task)], env=dict(os.environ, BATCH_TASK_INDEX="0"), capture_output=True, text=True, timeout=120)
+        assert ran.returncode == 0, ran.stderr
+        calls = (run / "sv-pgs-calls").read_text().splitlines()
+        assert calls[0].startswith("run-mirror restore") and calls[1].startswith("workspace-run") and calls[-1].startswith("run-mirror push")
+        markers = {path.name.split("_task_", 1)[1] for path in (ops / "markers").iterdir()}
+        assert {"started", "env-ready", "restored", "exit-0"} <= markers
+        published = sorted(runtime.glob("*/*/COMPLETE"))
+        assert len(published) == 1 and published[0].read_text() == "8\n"
+        if job == "first":
+            assert (run / "uv-calls").read_text().startswith("uv sync --project") and (run / "tools/staged").exists()
+        else:
+            # The second job's environment is the first one's, unpacked: no env.tar, no sync.
+            assert not (run / "uv-calls").exists() and not (run / "tools/staged").exists() and not (run / "uv-cache").exists()
+            assert os.readlink(run / "venv/bin/python") == sys.executable
+            assert (run / "venv/lib/python3.12/site-packages/module.py").read_text() == "VALUE = 1\n"
 
 
 @pytest.mark.parametrize("job, slot, through", [("store", "prepare", "direct_sv"), ("fit", "pilot", "fit")])

@@ -26,22 +26,52 @@ for arm in ${FIT_ARMS}; do fit_arm+=(--fit-arm "$arm"); done
 mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_${tag}$1"; }
 trap 'mark "terminated"; exit 75' TERM
 mark started
-if [ ! -f "$RUN/tools/staged" ]; then
-  # uv, Python and the cache come as one tarball read in one stream: copied file by file over the bucket mount, the
-  # cache's tens of thousands of files took over 20 minutes. The marker is written last, so an extraction a preemption
-  # cut short is redone.
-  rm -rf "$RUN/tools" "$RUN/bin" "$RUN/python" "$RUN/uv-cache" && mkdir -p "$RUN/tools" && tar -xf "$OPS/env.tar" -C "$RUN" \
-    && mv "$RUN/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
+# The environment runs from this task's own copy of the staged source: the editable build writes sv_pgs.egg-info into
+# the project, and 22 fan-out tasks writing it on the shared bucket mount failed with "Stale file handle".
+rm -rf "$RUN/source" && cp -r "$OPS/source" "$RUN/source" || { mark "exit-install"; exit 1; }
+# SHARED_RUNTIME ("${SHARED_RUNTIME}"), when 1: a job takes its environment ($RUN/venv and $RUN/python) prebuilt from
+# the ops bucket's svpgs/_runtime/<key>/<publisher>/ if a job has published one there for this uv.lock, pyproject.toml
+# and extras (key), instead of extracting env.tar and syncing; and a job that built its own publishes it there once its
+# GPU check passed. Its parts (runtime_pack.py) are read and extracted at once, where env.tar is one stream. One
+# environment serves every run of that lock: the code it runs is still each run's own source, which the editable
+# install names. The CPython in it is the one the publishing job's env.tar carried.
+unpack() {
+  local parts part pids=() failed=0
+  read -r parts < "$1/COMPLETE" && [ "$(ls "$1"/part-*.tar | wc -l)" = "$parts" ] || return 1
+  for part in "$1"/part-*.tar; do tar -xf "$part" -C "$RUN" & pids+=($!); done
+  for part in ${pids[@]+"${pids[@]}"}; do wait "$part" || failed=1; done
+  return "$failed"
+}
+runtime=""
+prebuilt=""
+if [ "${SHARED_RUNTIME}" = 1 ]; then
+  key=$( { cat "$RUN/source/uv.lock" "$RUN/source/pyproject.toml"; echo "${UV_EXTRAS}"; } | sha256sum | cut -c1-16)
+  runtime="$(dirname "$OPS")/_runtime/$key"
+  if [ ! -f "$RUN/tools/runtime-$key" ]; then
+    for published in "$runtime"/*/COMPLETE; do
+      [ -f "$published" ] || continue
+      # The marker is written last, so an extraction a preemption cut short is redone.
+      rm -rf "$RUN/venv" "$RUN/python" && mkdir -p "$RUN/tools" && unpack "$(dirname "$published")" \
+        && : > "$RUN/tools/runtime-$key" && break
+    done
+  fi
+  [ ! -f "$RUN/tools/runtime-$key" ] || prebuilt=1
+fi
+if [ -z "$prebuilt" ]; then
+  if [ ! -f "$RUN/tools/staged" ]; then
+    # uv, Python and the cache come as one tarball read in one stream: copied file by file over the bucket mount, the
+    # cache's tens of thousands of files took over 20 minutes. The marker is written last, so an extraction a
+    # preemption cut short is redone.
+    rm -rf "$RUN/tools" "$RUN/bin" "$RUN/python" "$RUN/uv-cache" && mkdir -p "$RUN/tools" && tar -xf "$OPS/env.tar" -C "$RUN" \
+      && mv "$RUN/bin/uv" "$RUN/tools/uv" && chmod +x "$RUN/tools/uv" "$RUN"/python/*/bin/* && : > "$RUN/tools/staged" \
+      || { mark "exit-install"; exit 1; }
+  fi
+  # Every start that builds syncs: a retried task can find the venv a preempted attempt left half built, and the sync
+  # adds only what this job's extras (the GPU job's --extra gpu: CuPy and the CUDA wheels) need.
+  UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
+    "$RUN/tools/uv" sync --project "$RUN/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
     || { mark "exit-install"; exit 1; }
 fi
-# Every start syncs: a retried task can find the venv a preempted attempt left half built, and the sync adds only what
-# this job's extras (the GPU job's --extra gpu: CuPy and the CUDA wheels) need. It builds from this task's own copy of
-# the staged source: the editable build writes sv_pgs.egg-info into the project, and 22 fan-out tasks writing it on the
-# shared bucket mount failed with "Stale file handle".
-rm -rf "$RUN/source" && cp -r "$OPS/source" "$RUN/source" || { mark "exit-install"; exit 1; }
-UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
-  "$RUN/tools/uv" sync --project "$RUN/source" --frozen --no-dev --python 3.12 ${UV_EXTRAS} \
-  || { mark "exit-install"; exit 1; }
 case "${UV_EXTRAS}" in
   # The CUDA libraries come from the gpu extra's nvidia-* wheels, which CuPy does not search: on the Batch image, which
   # has the driver and no toolkit, the first kernel it compiled failed with "CuPy failed to load libnvrtc.so.12".
@@ -51,6 +81,15 @@ case "${UV_EXTRAS}" in
          "$RUN/venv/bin/python" -c "import cupy, sys; sys.exit(cupy.cuda.runtime.getDeviceCount() < 1 or float(cupy.eye(2).sum()) != 2.0)" \
            || { mark "exit-no-gpu"; exit 1; } ;;
 esac
+# The markers' times split a start into its parts: the VM's boot to "started", the environment to "env-ready", the
+# run's restore to "restored".
+mark env-ready
+publisher=""
+if [ -n "$runtime" ] && [ -z "$prebuilt" ] && ! ls "$runtime"/*/COMPLETE > /dev/null 2>&1; then
+  "$RUN/venv/bin/python" "$RUN/source/launcher/workspace/runtime_pack.py" --root "$RUN" --into "$runtime/$(hostname)-$$" \
+    > "$RUN/runtime-publish.log" 2>&1 &
+  publisher=$!
+fi
 export WORKSPACE_CDR="${WORKSPACE_CDR}" GOOGLE_PROJECT="${GOOGLE_PROJECT}" TMPDIR="$RUN/tmp"
 # google-auth 2.4x reaches the metadata server over mTLS when the VM offers its certificates, and the Batch image's
 # do not verify ("CERTIFICATE_VERIFY_FAILED"): the job then had no credentials. Plain HTTP to the metadata server is
@@ -83,6 +122,7 @@ mirror() {
   flock "$RUN/mirror.lock" "$RUN/venv/bin/sv-pgs" run-mirror "$1" --config "$OPS/run_config.json" --mirror "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/run"
 }
 mirror restore || { mark "exit-restore"; exit 1; }
+mark restored
 # A loop's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when the
 # sleep did, up to 15 minutes later. A push in progress is left to finish; the last push below waits on its lock.
 stop() { pkill -x -P "$1" sleep 2>/dev/null; kill "$1" 2>/dev/null; }
@@ -119,5 +159,7 @@ fi
 stop "$pusher"
 # A run whose last push failed did not keep its results: the job fails even if the driver finished.
 mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
+# A publication still writing is let finish: one cut short leaves no COMPLETE, so no job reads it, but its parts stay.
+[ -z "$publisher" ] || wait "$publisher"
 mark "exit-${status}"
 exit "$status"

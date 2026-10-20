@@ -9,7 +9,7 @@
         "maxRetryCount": ${MAX_RETRIES},
         "maxRunDuration": "${MAX_RUN_SECONDS}s",
         "lifecyclePolicies": [
-          {"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}
+          {"action": "RETRY_TASK", "actionCondition": {"exitCodes": [50001, 50003, 50006, 75]}}
         ],
         "volumes": [
           {"gcs": {"remotePath": "${OPS_BUCKET}"}, "mountPath": "/mnt/disks/ops", "mountOptions": ["--implicit-dirs"]},
