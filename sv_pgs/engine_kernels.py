@@ -272,11 +272,13 @@ def derivative_row_bytes(node_count: int) -> int:
 
 
 def variant_derivatives(
-    cupy: ModuleType, log_density: Any, log_scale_rows: Any, grid: Any, precision: Any, shift: Any, with_scale: bool
+    cupy: ModuleType, log_density: Any, log_scale_rows: Any, grid: Any, precision: Any, shift: Any, with_scale: bool,
+    *, node_variance: Any | None = None,
 ) -> tuple[Any, Any, Any, Any]:
     """(fields (rows x 8), w (mu - m) and w (raw - s2) (rows x K), improper flag) on the device for rows of one class
     (``log_density`` its K log pi), as ``scale_mixture_ep._variant_derivatives`` defines them; the caller sizes the
-    rows from its device budget (``derivative_row_bytes``)."""
+    rows from its device budget (``derivative_row_bytes``). ``node_variance`` is exp(grid), shared by all chunks of
+    a pass when supplied; the same device exponential is used when the kernel is called on its own."""
     rows = int(log_scale_rows.shape[0])
     node_count = int(log_density.shape[0])
     nodes = _column(cupy, grid, cupy.float64)
@@ -286,7 +288,8 @@ def variant_derivatives(
     improper = cupy.zeros(1, dtype=cupy.int32)
     if rows:
         _launch(cupy, "derivative_rows", rows, (
-            np.int64(rows), np.int32(node_count), np.int32(1 if with_scale else 0), _column(cupy, log_density, cupy.float64), nodes, cupy.exp(nodes),
+            np.int64(rows), np.int32(node_count), np.int32(1 if with_scale else 0), _column(cupy, log_density, cupy.float64), nodes,
+            cupy.exp(nodes) if node_variance is None else node_variance,
             *_range_arguments(), _column(cupy, log_scale_rows, cupy.float64), _column(cupy, precision, cupy.float64),
             _column(cupy, shift, cupy.float64), fields, by_mean, by_second, improper,
         ))

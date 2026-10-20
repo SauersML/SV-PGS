@@ -438,3 +438,77 @@ def test_the_device_variant_derivatives_are_the_host_twins_within_a_tight_ledger
         values = getattr(expected, name)
         scale = float(np.max(np.abs(values)))
         np.testing.assert_allclose(getattr(got, name), values, rtol=1e-10, atol=1e-10 * scale, err_msg=name)
+
+
+@pytest.mark.parametrize("layout", ["single", "contiguous", "interleaved"])
+def test_derivative_chunks_download_exactly_and_do_not_accumulate_device_arrays(monkeypatch, layout):
+    """Small chunks exercise direct downloads and the scattered-class fallback against one unchunked device
+    launch per class, bit for bit. Repeating the pass with an open step cache retains only its shared inputs;
+    every pass logs its chunk count once and reuses one uploaded lattice exponential across all its chunks."""
+    import sv_pgs.scale_mixture_ep as engine
+    from sv_pgs.compute_budget import ComputeBudget
+    from sv_pgs.memory_broker import memory_scope
+
+    count = 2000
+    classes = np.zeros(count, dtype=np.int64) if layout == "single" else (
+        np.arange(count) // (count // 2) if layout == "contiguous" else np.arange(count) % 2
+    )
+    nodes = np.linspace(-8.0, -1.0, 17)
+    prior = engine.scale_mixture_prior(
+        class_index=classes, log_variance_offset=np.zeros(count), annotation_design=np.zeros((count, 0)),
+        annotation_groups=(), nodes=nodes, floor=nodes[0] - 1.0, top=nodes[-1],
+    )
+    coefficients = engine.initial_hyperparameters(prior).coefficients
+    cavity = Cavity(precision=np.full(count, 100.0), shift=np.linspace(-20.0, 20.0, count))
+    density, scales = class_log_density(prior, coefficients), log_scale(prior, coefficients)
+    expected_fields = np.empty((count, len(engine._DERIVATIVE_FIELDS)))
+    expected_mean, expected_second = np.empty((count, nodes.size)), np.empty((count, nodes.size))
+    for position, rows in enumerate(prior.class_rows):
+        fields, mean, second, improper = engine_kernels.variant_derivatives(
+            cupy, density[position], scales[rows], nodes, cavity.precision[rows], cavity.shift[rows], False,
+        )
+        engine_kernels._raise_if_improper(improper.get())
+        expected_fields[rows], expected_mean[rows], expected_second[rows] = fields.get(), mean.get(), second.get()
+        del fields, mean, second, improper
+
+    calls, messages = [], []
+    original = engine_kernels.variant_derivatives
+
+    def tracked(*args, **kwargs):
+        calls.append((args[2].shape[0], kwargs["node_variance"].data.ptr))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(engine_kernels, "variant_derivatives", tracked)
+    monkeypatch.setattr(engine, "log", messages.append)
+    pool = cupy.get_default_memory_pool()
+    pool.free_all_blocks()
+    budget = ComputeBudget(
+        device_kind="cuda", device_ids=(0,), device_names=("derivative chunks",), device_bytes=(int(pool.total_bytes()) + (2 << 20),),
+        device_compute_capabilities=((0, 0),), host_bytes=1 << 26, cpu_threads=1,
+    )
+    token = engine._STEP_CACHE.set({})
+    try:
+        with memory_scope(budget), engine.device_scope(cupy):
+            held = None
+            for _ in range(3):
+                calls.clear()
+                got = engine._variant_derivatives(prior, coefficients, cavity, 1 << 16)
+                assert len(calls) > prior.class_count
+                assert sum(rows for rows, _ in calls) == count
+                assert len({pointer for _, pointer in calls}) == 1
+                np.testing.assert_array_equal(got.mean_by_density, expected_mean)
+                np.testing.assert_array_equal(got.second_by_density, expected_second)
+                for position, name in enumerate(engine._DERIVATIVE_FIELDS):
+                    np.testing.assert_array_equal(getattr(got, name), expected_fields[:, position])
+                used = int(pool.used_bytes())
+                if held is not None:
+                    assert used == held
+                held = used
+            assert len(messages) == 3
+            assert all("chunks" in message and "device bytes" in message for message in messages)
+            precision = cavity.precision.copy()
+            precision[-1] = -np.exp(-nodes[-1]) * 2.0
+            with pytest.raises(FloatingPointError, match="improper"):
+                engine._variant_derivatives(prior, coefficients, Cavity(precision=precision, shift=cavity.shift), 1 << 16)
+    finally:
+        engine._STEP_CACHE.reset(token)

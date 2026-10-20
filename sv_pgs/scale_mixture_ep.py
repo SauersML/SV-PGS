@@ -128,7 +128,7 @@ from scipy.optimize import brentq
 from sv_pgs import engine_kernels
 from sv_pgs._typing import F64Array, I64Array
 from sv_pgs.host_kernels import row_kernel
-from sv_pgs.memory_broker import current_broker, device_pool
+from sv_pgs.memory_broker import _CUPY_ALLOCATION_ALIGNMENT, current_broker, device_pool
 from sv_pgs.krylov_recycle import block_gcro_dr
 from sv_pgs.progress import log
 
@@ -2132,9 +2132,20 @@ class _VariantDerivatives:
         blocks = self._blocks.get(key)
         if blocks is None:
             values = getattr(self, name)
-            blocks = tuple(np.ascontiguousarray(values[rows]) for rows in prior.class_rows)
+            blocks = tuple(np.ascontiguousarray(values[_contiguous_rows(rows)]) for rows in prior.class_rows)
             self._blocks[key] = blocks
         return blocks
+
+
+def _contiguous_rows(rows: I64Array) -> slice | I64Array:
+    """A slice where the class's ordered rows are consecutive, their gather otherwise. Class rows are sorted by
+    construction; slicing keeps a one-class p x K derivative as a view and lets a device download write straight
+    into its host output. An interleaved class still gathers in its original row order."""
+    if not rows.size:
+        return slice(0, 0)
+    if int(rows[-1]) - int(rows[0]) + 1 == rows.size:
+        return slice(int(rows[0]), int(rows[-1]) + 1)
+    return rows
 
 
 @numba.njit(parallel=True, cache=True, error_model="numpy")
@@ -2249,6 +2260,35 @@ def _derivative_rows(log_density, grid, log_scale_rows, precision, shift, with_s
 _DERIVATIVE_FIELDS = ("mean", "second", "variance", "variance_by_shift", "mean_by_precision", "variance_by_precision", "mean_by_log_scale", "second_by_log_scale")
 
 
+def _derivative_chunk(working_bytes: int, grid_size: int, largest_class: int) -> tuple[int, int]:
+    """(rows, device bytes sized from) for a derivative pass. One device-wide wave of threads is the minimum
+    useful chunk, bounded by the largest class and the caller's working budget. Beside the row bytes, allow one
+    allocation quantum for each of the three outputs, the three gathered inputs and the improper flag (the flag
+    fits in one quantum; each other allocation rounds up by less than one). The mandatory request evicts idle
+    caches before admitting that floor, or refuses with the ledger's live holdings instead of running one kernel
+    per variant. A truly full device cannot promise throughput by silently shrinking the computation.
+
+    The row cache is only saved recomputation, but is not a broker cache lease: the caller drops it before sizing.
+    Inputs shared with the objective have already been uploaded, so their live bytes are counted here too."""
+    xp = _DEVICE.get()
+    row_bytes = engine_kernels.derivative_row_bytes(grid_size)
+    attributes = xp.cuda.Device().attributes
+    wave = int(attributes["MultiProcessorCount"]) * int(attributes["MaxThreadsPerMultiProcessor"])
+    overhead = 7 * _CUPY_ALLOCATION_ALIGNMENT
+    floor = max(1, min(largest_class, wave, (int(working_bytes) - overhead) // row_bytes))
+    broker = current_broker()
+    pool = device_pool(int(xp.cuda.Device().id))
+    available = _device_budget(working_bytes)
+    if broker is None or pool not in broker.capacities:
+        free, _total = xp.cuda.runtime.memGetInfo()
+        available = min(available, int(free) + int(xp.get_default_memory_pool().free_bytes()))
+    budget = max(overhead + floor * row_bytes, available)
+    chunk = max(floor, min(largest_class, (budget - overhead) // row_bytes))
+    if broker is not None and pool in broker.capacities:
+        broker.make_room(pool, overhead + chunk * row_bytes, "EB derivative chunk")
+    return chunk, budget
+
+
 def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavity: Cavity, working_bytes: int) -> _VariantDerivatives:
     """Given node k the tilted law is N(mu_k, c_k) with mu_k = h c_k; with weights w and ell_k = -(c_k + mu_k^2)/2
     (d log Z_k / dP), f_k = d log Z_k / d eta and dc_k / d eta = c_k r_k (r_k = 1/(1 + v_k P)):
@@ -2261,7 +2301,8 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
     three passes over its nodes, the covariances centred, and no rows x K temporaries but the two outputs. The
     kernel-row form built about twenty rows x K arrays per chunk, and on a device its chunks, sized for the kernel
     rows alone, were refused by the ledger (bench-sim chr22 [sim]: 484 MB at 33.5 GB allocated). Device chunks are
-    sized from the ledger's device remainder (``_device_budget``)."""
+    sized from the ledger's reclaimable bytes with a mandatory device-wide floor (``_derivative_chunk``). Shared
+    inputs are uploaded once for the pass, and contiguous class rows download into the preallocated outputs."""
     variant_count, grid_size = prior.variant_count, prior.grid_size
     fields = np.empty((variant_count, len(_DERIVATIVE_FIELDS)))
     mean_by_density = np.empty((variant_count, grid_size))
@@ -2271,18 +2312,39 @@ def _variant_derivatives(prior: ScaleMixturePrior, coefficients: F64Array, cavit
     with_scale = bool(prior.scale_size)
     xp = _DEVICE.get()
     if xp is not np:
-        chunk = max(1, _device_budget(working_bytes) // engine_kernels.derivative_row_bytes(grid_size))
+        # Kernel rows are an optional objective cache, not part of the derivative pass. Unlike leased caches they
+        # cannot be evicted by the allocator, so release them before the mandatory chunk asks for its workspace.
+        cache = _STEP_CACHE.get()
+        if cache is not None:
+            cache.pop("rows", None)
+        device_rows, device_scales, precision, shift, _design = _device_inputs(prior, scales, cavity)
+        density = xp.asarray(log_density)
+        grid = xp.asarray(prior.log_variance_grid)
+        node_variance = xp.exp(grid)
+        chunk, budget = _derivative_chunk(working_bytes, grid_size, max(rows.size for rows in prior.class_rows))
+        chunks = sum((rows.size + chunk - 1) // chunk for rows in prior.class_rows)
+        log(f"eb curvature chunks: {chunks} chunks, {chunk} rows per chunk, sized from {budget} device bytes")
         for class_position, class_rows in enumerate(prior.class_rows):
             for start in range(0, class_rows.shape[0], chunk):
                 rows = class_rows[start : start + chunk]
+                destination = _contiguous_rows(rows)
+                source = destination if isinstance(destination, slice) else device_rows[class_position][start : start + chunk]
                 values, by_mean, by_second, improper = engine_kernels.variant_derivatives(
-                    xp, log_density[class_position], scales[rows], prior.log_variance_grid, cavity.precision[rows], cavity.shift[rows], with_scale,
+                    xp, density[class_position], device_scales[source], grid, precision[source], shift[source], with_scale,
+                    node_variance=node_variance,
                 )
+                if isinstance(destination, slice):
+                    # These slices are C-contiguous, including the fields' row matrix. Queue all three copies on
+                    # the kernel's stream; the improper flag's blocking read completes them before buffers die.
+                    values.get(out=fields[destination], blocking=False)
+                    by_mean.get(out=mean_by_density[destination], blocking=False)
+                    by_second.get(out=second_by_density[destination], blocking=False)
+                else:
+                    fields[rows] = _host(values)
+                    mean_by_density[rows] = _host(by_mean)
+                    second_by_density[rows] = _host(by_second)
                 engine_kernels._raise_if_improper(_host(improper))
-                fields[rows] = _host(values)
-                mean_by_density[rows] = _host(by_mean)
-                second_by_density[rows] = _host(by_second)
-                del values, by_mean, by_second
+                del values, by_mean, by_second, improper
     else:
         for class_position, rows in enumerate(prior.class_rows):
             values = np.empty((rows.shape[0], len(_DERIVATIVE_FIELDS)))
@@ -4376,41 +4438,58 @@ def hyper_step(
             gain=np.inf, better=None,
         )
 
-    def checked(check: _Stationarity, evidence: _Evidence = evidence) -> HyperStep:
-        """The step at ``evidence`` (V at the returned weights, as resolved so far) with the stationarity ``check``;
-        its ``tighten`` and ``resolve`` compose, each keeping what the other resolved."""
+    return _checked_hyper_step(
+        check, evidence, final_view, weights, interior, cavity, correction, working_bytes, tolerance, final_allowed, log_smoothing,
+    )
 
-        def tighten(budget: float) -> HyperStep | None:
-            """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the
-            check then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
-            tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
-            return checked(tightened, evidence) if tightened.better is None and np.isfinite(tightened.gain) else None
 
-        def resolve(budget: float) -> HyperStep | None:
-            """This step with V at its returned weights certified to ``budget``: x re-maximized to the inner tolerance
-            that budget asks (the determinant's first-order move under x's remaining decrement), then more of the
-            Tierney-Kadane directions integrated exactly; the stationarity check as it stands. None where V has no
-            certified value there."""
-            refined = _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, budget)
-            resolved = _corrected(final_view, weights, refined, cavity, correction, working_bytes, budget)
-            return None if resolved is None else checked(check, resolved)
+def _checked_hyper_step(
+    check: _Stationarity, evidence: _Evidence, final_view: ScaleMixturePrior, weights: F64Array, interior: F64Array,
+    cavity: Cavity, correction: CurvatureCorrection, working_bytes: int, tolerance: float, final_allowed: F64Array,
+    log_smoothing: F64Array,
+) -> HyperStep:
+    """The step at ``evidence`` (V at the returned weights, as resolved so far) with the stationarity ``check``;
+    its ``tighten`` and ``resolve`` compose, each keeping what the other resolved. The factory is a module function:
+    a local recursive ``checked`` captured itself, its anchored view and correction, keeping the derivatives and
+    posterior's device arrays alive until cyclic GC even after the outer loop replaced the step."""
 
-        return HyperStep(
-            hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
-            evidence=evidence.value,
-            smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
-            stationarity_steps=check.steps,
-            stationarity_errors=check.error,
-            stationarity_gain=check.gain,
-            stationarity_floor=check.floor,
-            stationarity_decrement=check.decrement,
-            stationarity_fold=check.fold,
-            tighten=tighten,
-            resolve=resolve,
-            evidence_error=evidence.error,
+    def tighten(budget: float) -> HyperStep | None:
+        """This step with its stationarity bound tightened to ``budget`` at its final weights; None where the
+        check then finds a better side or no finite bound (the search, not the bound, is what is left there)."""
+        tightened = _stationarity(final_view, weights, evidence, interior, cavity, correction, working_bytes, tolerance, budget)
+        if tightened.better is not None or not np.isfinite(tightened.gain):
+            return None
+        return _checked_hyper_step(
+            tightened, evidence, final_view, weights, interior, cavity, correction, working_bytes, tolerance, final_allowed, log_smoothing,
         )
 
-    return checked(check)
+    def resolve(budget: float) -> HyperStep | None:
+        """This step with V at its returned weights certified to ``budget``: x re-maximized to the inner tolerance
+        that budget asks (the determinant's first-order move under x's remaining decrement), then more of the
+        Tierney-Kadane directions integrated exactly; the stationarity check as it stands. None where V has no
+        certified value there."""
+        refined = _evidence(final_view, weights, evidence.coefficients, cavity, correction, working_bytes, budget)
+        resolved = _corrected(final_view, weights, refined, cavity, correction, working_bytes, budget)
+        if resolved is None:
+            return None
+        return _checked_hyper_step(
+            check, resolved, final_view, weights, interior, cavity, correction, working_bytes, tolerance, final_allowed, log_smoothing,
+        )
+
+    return HyperStep(
+        hyperparameters=MixtureHyperparameters(coefficients=final_allowed @ evidence.coefficients, log_smoothing=log_smoothing),
+        evidence=evidence.value,
+        smoothing_gradient=float(np.max(np.abs(check.gradient[interior]), initial=0.0)),
+        stationarity_steps=check.steps,
+        stationarity_errors=check.error,
+        stationarity_gain=check.gain,
+        stationarity_floor=check.floor,
+        stationarity_decrement=check.decrement,
+        stationarity_fold=check.fold,
+        tighten=tighten,
+        resolve=resolve,
+        evidence_error=evidence.error,
+    )
 
 
 # ------------------------------------------------------------------ the outer loop
@@ -4806,6 +4885,9 @@ def fit_hyperparameters(
     solved = [solve_state(start, point) for start, point in zip(hyperparameters, points)]
     corrections = [correction for correction, _state in solved]
     states = [state for _correction, state in solved]
+    # The lists own the current states; the construction temporary must not keep the first corrections and their
+    # posteriors alive for the entire fit after those lists move to later fixed points.
+    del solved
     fits: list[OuterFit | None] = [None] * count
     pending: list[_OuterTrial | None] = [None] * count
     radii: list[float | None] = [None] * count

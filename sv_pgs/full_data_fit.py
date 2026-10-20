@@ -53,6 +53,7 @@ component's own metric (``BinaryComponent``).
 from __future__ import annotations
 
 import contextlib
+import gc
 import hashlib
 import weakref
 from dataclasses import dataclass, replace
@@ -416,6 +417,28 @@ def _hold_start(starts: dict, key: tuple, duals: Any) -> None:
         starts[key] = (duals, lease)
 
 
+def _collect_cycles() -> None:
+    """Free the outer loop's unreachable reference cycles before the next fixed point, and log each device's ledger.
+
+    A hyper step's ``tighten`` and ``resolve`` close over the step itself and its correction, so a replaced step is
+    a cycle only the cyclic collector frees, and with it every correction, posterior and response it reached; the
+    collector's own schedule runs on object counts, not bytes. Uncollected, they held device arrays that the ledger
+    counts as live, the curvature's derivative chunks are sized from what it has left, and on the All of Us
+    whole-genome fits [real] the derivatives took 1.2 s, then 161, 440 and 772 s over successive outer iterations (a
+    few 1-3 s calls between them, where a collection happened to run). One collection per oracle call costs well
+    under a second against a fixed point of minutes."""
+    found = gc.collect()
+    broker = current_broker()
+    if broker is None:
+        return
+    pools = [pool for pool in sorted(broker.capacities) if pool.startswith("device")]
+    if pools:
+        log(
+            f"mean-field oracle: {found} unreachable objects collected; "
+            + ", ".join(f"{pool} {broker.held(pool) / 1e9:.1f} GB held, {broker.reclaimable(pool) / 1e9:.1f} GB reclaimable of {broker.capacities[pool] / 1e9:.1f} GB" for pool in pools)
+        )
+
+
 def _posterior(
     gaussian: DualGaussian, model: int, grams: BlockGrams, variances: F64Array, ensure: Callable[[], None], starts: dict | None = None
 ) -> GaussianPosterior:
@@ -452,8 +475,8 @@ def _relative_solve(
         memory = None if starts is None or key is None else (model, key, values.shape[1])
         held = None if memory is None or memory not in starts else starts[memory][0]
         duals = None
+        start = None if held is None else held[:, live]
         while live.size:
-            start = None if held is None else held[:, live]
             solved, certified = gaussian.posterior_solve(values[:, live], model, bound, start)
             if memory is not None:
                 last = gaussian.last_posterior_duals
@@ -469,6 +492,9 @@ def _relative_solve(
             solution[:, live[done]] = solved[:, done]
             bound = np.where(lower > 0.0, relative_tolerance * lower, 0.5 * bound)[~done]
             live = live[~done]
+            # A tighter certificate continues the solve just made, including where no cross-call cache is open.
+            # ``held`` belongs to the preceding fixed point; retrying it discarded this call's Krylov progress.
+            start = gaussian.last_posterior_duals[:, np.flatnonzero(~done)] if live.size else None
         if memory is not None and duals is not None:
             _hold_start(starts, memory, duals)
         return solution
@@ -1922,8 +1948,21 @@ class _FullDataMeanField:
         return self._back(image, model, metric), residual @ image
 
     def _reduced_posterior(self, model: int, grams: BlockGrams, group_variance: F64Array, state: "_ModelState") -> GaussianPosterior:
-        """The groups' responses at this fixed point from the dual solver, warm-started across fixed points."""
-        return _posterior(self.gaussian, model, grams, group_variance, lambda: self._ensure(state, model), self._solve_starts)
+        """The groups' mean responses at this fixed point, warm-started across fixed points. Mean field never asks
+        for the leave-block-out variance map: constructing it with ``_posterior`` captured the refresh's BulkSolve,
+        including its device window cross-products, for every point kept by an outer state, anchor or hyper step.
+        The mean solve needs only the oracle and its host snapshot; ``_ensure`` refactors the shared solver when
+        that snapshot is asked for, so no old device factor belongs to this posterior. The variance map it carries
+        is the contract's placeholder (``GaussianPosterior`` answers by a solve and a variance map) and refuses
+        to answer, so a caller that did read it fails here instead of reading a released refresh."""
+
+        def unread_variance_map(weights: F64Array) -> F64Array:
+            raise RuntimeError("the mean-field fixed point's posterior answers by its solve only: it holds no variance map")
+
+        return GaussianPosterior(
+            solve=_relative_solve(self.gaussian, model, group_variance, lambda: self._ensure(state, model), self._solve_starts),
+            variance_jvp=unread_variance_map,
+        )
 
     # the sweeps
 
@@ -2150,6 +2189,7 @@ class _FullDataMeanField:
         model whose fit has ended or that waits included (``scale_mixture_ep.fit_hyperparameters``), and a model fitted
         alone is not solved again there. A call where every model is so solves them all, as before: the outer loop's last
         call, which leaves the oracle at the returned points by solving there once more."""
+        _collect_cycles()
         held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
             if point is not None and state is point[1]

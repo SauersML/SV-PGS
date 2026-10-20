@@ -1929,3 +1929,103 @@ def test_refinement_keeps_quadrature_boundaries_and_converges_to_the_same_trunca
             assert np.all(error < 0.27 * previous + 1e-13), (previous, error)
         previous = error
         prior, hyperparameters = halved_lattice(prior, hyperparameters)
+
+
+@pytest.mark.parametrize("available", [True, False])
+def test_derivative_chunk_reclaims_idle_memory_or_refuses_a_tiny_chunk(monkeypatch, available):
+    """A full metered device with an idle cache still gives curvature a device-wide chunk. With those same bytes
+    genuinely live it refuses before launching, rather than silently scheduling one kernel per variant."""
+    from types import SimpleNamespace
+    from sv_pgs.memory_broker import MemoryBroker, device_pool
+
+    device = SimpleNamespace(id=0, attributes={"MultiProcessorCount": 4, "MaxThreadsPerMultiProcessor": 32})
+    xp = SimpleNamespace(cuda=SimpleNamespace(Device=lambda: device))
+    pool = device_pool(0)
+    capacity = 1 << 20
+    live = [capacity - 1]
+    broker = MemoryBroker({pool: capacity}, meters={pool: lambda: live[0]})
+    if available:
+        def evict():
+            live[0] = 0
+        lease = broker.admit(pool, live[0], "old panels", evict, allocated=True)
+        assert lease is not None
+    monkeypatch.setattr(engine, "current_broker", lambda: broker)
+    with engine.device_scope(xp):
+        if available:
+            chunk, budget = engine._derivative_chunk(capacity, 146, 1000)
+            assert chunk >= 128 and (1000 + chunk - 1) // chunk < 10
+            assert budget == capacity and not lease.live
+        else:
+            with pytest.raises(MemoryError, match="EB derivative chunk"):
+                engine._derivative_chunk(capacity, 146, 1000)
+
+
+def test_derivative_chunk_floor_respects_small_classes_and_working_budgets(monkeypatch):
+    from types import SimpleNamespace
+    from sv_pgs.memory_broker import MemoryBroker, device_pool
+
+    device = SimpleNamespace(id=0, attributes={"MultiProcessorCount": 4, "MaxThreadsPerMultiProcessor": 32})
+    xp = SimpleNamespace(cuda=SimpleNamespace(Device=lambda: device))
+    broker = MemoryBroker({device_pool(0): 1 << 20}, meters={device_pool(0): lambda: 0})
+    monkeypatch.setattr(engine, "current_broker", lambda: broker)
+    row_bytes = engine.engine_kernels.derivative_row_bytes(146)
+    with engine.device_scope(xp):
+        assert engine._derivative_chunk(1 << 20, 146, 7)[0] == 7
+        chunk, budget = engine._derivative_chunk(16 * row_bytes, 146, 1000)
+        assert 1 < chunk < 128 and budget == 16 * row_bytes
+        assert chunk * row_bytes < budget
+
+
+@pytest.mark.parametrize("rows", [np.arange(12), np.arange(3, 9), np.arange(0, 12, 2)])
+def test_density_blocks_share_contiguous_rows_and_preserve_interleaved_classes(rows):
+    from types import SimpleNamespace
+
+    values = np.arange(60, dtype=np.float64).reshape(12, 5)
+    derivatives = engine._VariantDerivatives(
+        mean_by_density=values, second_by_density=values.copy(),
+        **{name: np.zeros(12) for name in engine._DERIVATIVE_FIELDS},
+    )
+    prior = SimpleNamespace(class_rows=(rows,))
+    blocks = derivatives.density_blocks("mean_by_density", prior)
+    np.testing.assert_array_equal(blocks[0], values[rows])
+    assert blocks[0].flags.c_contiguous
+    assert np.shares_memory(blocks[0], values) == bool(np.all(np.diff(rows) == 1))
+    assert derivatives.density_blocks("mean_by_density", prior) is blocks
+
+
+def test_checked_hyper_steps_compose_and_release_their_correction_without_cyclic_gc(monkeypatch):
+    """Resolving V and tightening the weights keep each other's progress, but replacing a step leaves no recursive
+    factory cycle holding its anchor, correction and derivative arrays until cyclic GC happens to run."""
+    import gc
+    from types import SimpleNamespace
+
+    prior, cavity = _problem(variant_count=20, seed=91, node_count=9)
+    correction = CurvatureCorrection()
+    anchored = engine._anchored(prior, correction, np.zeros(prior.coefficient_map.shape[0]))
+    reference = weakref.ref(correction)
+    check = engine._Stationarity(
+        gradient=np.zeros(1), error=np.zeros(1), curvature=np.eye(1), steps=np.ones(1), folds=np.zeros(1), gain=1.0, better=None,
+    )
+    evidence = SimpleNamespace(coefficients=np.zeros(prior.coefficient_size), value=2.0, error=1.0)
+    refined = SimpleNamespace(coefficients=evidence.coefficients, value=3.0, error=0.25)
+    monkeypatch.setattr(engine, "_stationarity", lambda *args: replace(check, gain=0.5))
+    monkeypatch.setattr(engine, "_evidence", lambda *args: refined)
+    monkeypatch.setattr(engine, "_corrected", lambda *args: refined)
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        step = engine._checked_hyper_step(
+            check, evidence, anchored, np.zeros(1), np.ones(1, dtype=bool), cavity, correction, _WORKING_BYTES,
+            _EVIDENCE_TOLERANCE, np.eye(prior.coefficient_size), np.zeros(1),
+        )
+        del anchored, correction
+        resolved = step.resolve(0.25)
+        tightened = resolved.tighten(0.5)
+        assert tightened.evidence == 3.0 and tightened.evidence_error == 0.25 and tightened.stationarity_gain == 0.5
+        again = tightened.resolve(0.25)
+        assert again.stationarity_gain == 0.5
+        del step, resolved, tightened, again
+        assert reference() is None
+    finally:
+        if enabled:
+            gc.enable()

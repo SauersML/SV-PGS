@@ -452,3 +452,64 @@ def test_the_mode_mixture_reads_no_dual_solver_factor_of_its_orders(tmp_path: Pa
     for (shift, omega), (plain_shift, plain_omega) in zip(again.components, plain.components, strict=True):
         np.testing.assert_array_equal(shift, plain_shift)
         np.testing.assert_array_equal(omega, plain_omega)
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_relative_solve_retries_from_its_latest_duals_for_the_unfinished_columns(cached):
+    """A tighter relative certificate continues only the unfinished columns, from this solve's answer. The
+    cross-fixed-point cache may be absent or contain a stale answer; neither changes the retry's start."""
+    from types import SimpleNamespace
+    from sv_pgs.full_data_fit import _relative_solve
+    from sv_pgs.scale_mixture_ep import solve_key
+
+    right = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    starts = {(0, b"directions", 3): (np.array([[3.0, 4.0, 5.0]]), None)} if cached else None
+    seen = []
+    gaussian = SimpleNamespace(array_module=np)
+
+    def posterior_solve(values, model, bound, start):
+        seen.append(None if start is None else start.copy())
+        if len(seen) == 1:
+            gaussian.last_posterior_duals = np.array([[11.0, 22.0]])
+            return values.copy(), np.array([0.01, 0.5])
+        np.testing.assert_array_equal(values, right[:, 2:])
+        gaussian.last_posterior_duals = np.array([[23.0]])
+        return values.copy(), np.array([0.001])
+
+    gaussian.posterior_solve = posterior_solve
+    token = solve_key.set(b"directions" if cached else None)
+    try:
+        solved = _relative_solve(gaussian, 0, np.full(2, 100.0), lambda: None, starts)(right, 0.1)
+    finally:
+        solve_key.reset(token)
+    assert len(seen) == 2
+    if cached:
+        np.testing.assert_array_equal(seen[0], [[3.0, 5.0]])
+        np.testing.assert_array_equal(starts[(0, b"directions", 3)][0], [[11.0, 0.0, 23.0]])
+    else:
+        assert seen[0] is None
+    np.testing.assert_array_equal(seen[1], [[22.0]])
+    np.testing.assert_array_equal(solved, right)
+
+
+def test_mean_field_posterior_does_not_hold_an_unused_refreshs_device_cross_products():
+    """Mean-field curvature uses only Sigma R. Replacing the shared solver's refresh must release its old window
+    cross-products even while an outer anchor still owns the old mean-field posterior."""
+    import weakref
+    from types import SimpleNamespace
+    from sv_pgs.full_data_fit import _FullDataMeanField
+
+    cross = np.ones((8, 8))
+    reference = weakref.ref(cross)
+    oracle = object.__new__(_FullDataMeanField)
+    oracle.gaussian = SimpleNamespace(bulk_solves=[SimpleNamespace(resolved_cross=cross, site_precision=np.ones(8))])
+    oracle._solve_starts = {}
+    oracle._ensure = lambda state, model: None
+    posterior = oracle._reduced_posterior(0, SimpleNamespace(blocks=(np.arange(8),)), np.ones(8), None)
+    oracle.gaussian.bulk_solves = []
+    del cross
+    assert reference() is None
+    assert posterior.solve is not None
+    assert posterior.local_response is None
+    with pytest.raises(RuntimeError, match="holds no variance map"):
+        posterior.variance_jvp(np.ones((8, 1)))
