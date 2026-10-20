@@ -19,6 +19,10 @@ if [ "${TASK_COUNT}" != 1 ] || [ "${#shards[@]}" != 0 ]; then
   index="${shards[$BATCH_TASK_INDEX]:-$BATCH_TASK_INDEX}"
   shard=(--store-shard "$index"); tag="${index}-"
 fi
+# A fit job given FIT_ARMS ("${FIT_ARMS}") fits only those arms (the driver's --fit-arm), so each arm can have its own VM;
+# the mirror carries each job's models to the job that finds every arm fitted.
+fit_arm=()
+for arm in ${FIT_ARMS}; do fit_arm+=(--fit-arm "$arm"); done
 mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_${tag}$1"; }
 trap 'mark "terminated"; exit 75' TERM
 mark started
@@ -85,7 +89,7 @@ pusher=$!
 # driver's stderr also goes to a file whose last lines are copied beside the task log every 5 minutes: the same lines
 # the task log holds (steps, counts, timings, paths).
 progress="$(dirname "$0")/progress-task${BATCH_TASK_INDEX}.log"
-"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} \
+"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"} \
   2> >(tee "$RUN/driver.log" >&2) &
 driver=$!
 ( while sleep 300; do tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null; done ) &

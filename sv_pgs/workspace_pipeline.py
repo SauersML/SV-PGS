@@ -698,6 +698,8 @@ class _Run:
     keys: dict[str, str]
     store_chromosomes: tuple[str, ...] | None = None
     """The chromosomes this run's store step converts, or None for every one (``run_pipeline``'s ``store_shard``)."""
+    fit_arms: tuple[str, ...] | None = None
+    """The arms this run's fit step fits, or None for every one (``run_pipeline``'s ``fit_arms``)."""
 
     def output(self, step: str) -> Path:
         return self.config.run_directory / step
@@ -3047,6 +3049,9 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     the saved model. A rerun after a preemption fits only an arm with a trait not on disk, and every group of that arm
     whose models all finished resumes from their checkpoints (``stage2_wiring.fit_models``).
 
+    A run given ``fit_arms`` (``run_pipeline``) fits only those arms and leaves the step to the run that finds every arm
+    on disk (the run mirror carries each run's models to it), so the arms can be fitted at once on their own machines.
+
     The arms run in ARMS order, each whole before the next, so a run its budget stops (``launcher/workspace``: each
     job's runtime is bounded) holds the first arm's every trait before the second begins; the comparison of the arms
     needs both. After each arm the log gives the hours its fit took and the step's projected total."""
@@ -3059,9 +3064,13 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
     fitted_seconds: list[float] = []
     trait_model_names = {trait: tuple(cohort.model_names[model] for model in cohort.trait_models(trait)) for trait in range(len(cohort.trait_names))}
     with DosageStore.open(_final_store(run)) as store:
+        others = []
         for position, arm in enumerate(ARMS):
             targets = [directory / "models" / arm / trait_name for trait_name in cohort.trait_names]
             unrecorded = [trait for trait, target in enumerate(targets) if not target.with_name(target.name + ".json").is_file()]
+            if unrecorded and run.fit_arms is not None and arm not in run.fit_arms:
+                others.append(arm)
+                continue
             if unrecorded:
                 work = directory / "work" / arm
                 # A Spot restart keeps completed models' checkpoints; the engine discards only the interrupted group's
@@ -3115,6 +3124,8 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 _remove_own(work, directory)
             for target, trait_name in zip(targets, cohort.trait_names):
                 records[arm][trait_name] = json.loads(target.with_name(target.name + ".json").read_text(encoding="utf-8"))
+    if others:
+        raise StepPart(f"the fit holds its arms but {others}, which are another run's.")
     _remove_own(directory / "work", directory)
     return {
         "arms": {
@@ -3995,19 +4006,24 @@ _STEPS = (
 
 
 def run_pipeline(
-    config: WorkspaceConfig, bindings: WorkspaceBindings, budget: ComputeBudget, *, through: str | None = None, store_shard: int | None = None
+    config: WorkspaceConfig, bindings: WorkspaceBindings, budget: ComputeBudget, *, through: str | None = None, store_shard: int | None = None,
+    fit_arms: Sequence[str] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Run every step in order, through ``through`` when given, resuming from the run directory's checkpoints.
 
     With ``store_shard`` the run is one of a fan-out over the config's chromosomes: its store step converts only the
     chromosome at that index, and the run stops there unless the store is then whole. The store step's key does not
-    name the shard, so every shard's converted chromosomes belong to one store."""
+    name the shard, so every shard's converted chromosomes belong to one store. With ``fit_arms`` the fit step fits only
+    those of ARMS, and the run stops there unless every arm is then on disk; the fit step's key does not name them either.
+    On the All of Us chr22 store an arm took half an hour on two A100s, the second waiting on the first."""
     if through is not None and through not in STEP_NAMES:
         raise ValueError(f"through must be one of {STEP_NAMES}.")
     if store_shard is not None and not 0 <= store_shard < len(config.chromosomes):
         raise ValueError(f"store_shard indexes the config's {len(config.chromosomes)} chromosomes; got {store_shard}.")
     config.run_directory.mkdir(parents=True, exist_ok=True)
-    run = _Run(config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],))
+    if fit_arms is not None and (not fit_arms or not set(fit_arms) <= set(ARMS)):
+        raise ValueError(f"fit_arms names some of {ARMS}; got {fit_arms}.")
+    run = _Run(config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],), None if fit_arms is None else tuple(fit_arms))
     summaries = {}
     for step in _STEPS:
         try:

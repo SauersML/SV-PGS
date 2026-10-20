@@ -18,7 +18,7 @@ from sv_pgs.all_of_us import (
 from sv_pgs.artifact import write_predictions
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.fit_model import write_model
-from sv_pgs.workspace_pipeline import STEP_NAMES, WorkspaceConfig, run_pipeline, workspace_bindings
+from sv_pgs.workspace_pipeline import ARMS, STEP_NAMES, WorkspaceConfig, run_pipeline, workspace_bindings
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -110,6 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--store-shard", type=int, default=None,
         help="Convert only the config's chromosome at this index in the store step, one task of a fan-out (run_pipeline).",
     )
+    workspace_parser.add_argument(
+        "--fit-arm", action="append", choices=ARMS, default=None,
+        help="Fit only this arm in the fit step (repeatable), one machine's part of the arms (run_pipeline).",
+    )
 
     mirror_parser = subparsers.add_parser(
         "run-mirror",
@@ -184,7 +188,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.command == "workspace-run":
         summaries = run_pipeline(
-            WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through, store_shard=args.store_shard
+            WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through, store_shard=args.store_shard,
+            fit_arms=args.fit_arm,
         )
         for step in summaries:
             print(f"{step}\tcomplete")

@@ -1056,6 +1056,26 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
         run_pipeline(config, _bindings(_Recorder(), client), BUDGET, store_shard=len(CHROMOSOMES))
 
 
+def test_each_arm_can_be_fitted_by_its_own_run(workspace) -> None:
+    """A run given fit_arms fits only those and leaves the fit step to the run that finds every arm on disk."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    partial = config.run_directory / "fit.partial" / "models"
+    first = _Recorder()
+    summaries = run_pipeline(config, _bindings(first, client), BUDGET, through="fit", fit_arms=("with_sv",))
+    assert "fit" not in summaries and len(first.fit_calls) == 1
+    assert (partial / "with_sv").is_dir() and not (partial / "snv_indel").exists()
+    assert any(path.name.endswith("_fit_part-done") for path in config.marker_directory.iterdir())
+    second = _Recorder()
+    summaries = run_pipeline(config, _bindings(second, client), BUDGET, through="fit", fit_arms=("snv_indel",))
+    assert "fit" in summaries and len(second.fit_calls) == 1
+    # The snv_indel arm leaves every structural record out; the with_sv arm fitted some.
+    assert np.isinf(second.fit_calls[0].log_variance_offset).sum() > np.isinf(first.fit_calls[0].log_variance_offset).sum()
+    assert set(summaries["fit"]["arms"]) == set(ARMS)
+    with pytest.raises(ValueError, match="fit_arms"):
+        run_pipeline(config, _bindings(_Recorder(), client), BUDGET, fit_arms=("all",))
+
+
 def test_a_marker_that_cannot_be_written_does_not_stop_the_run(workspace, monkeypatch) -> None:
     """Markers are status signals: on the bucket mount, fan-out tasks touching one name in one second raised Stale file
     handle, which must not end the step."""

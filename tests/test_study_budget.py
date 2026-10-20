@@ -255,6 +255,21 @@ def test_a_store_fan_out_gives_each_task_its_chromosome_and_the_fit_job_has_one_
         assert chosen.stdout.strip() == expected
 
 
+def test_a_fit_job_given_its_arms_passes_them_to_the_driver(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="report", BUDGET_SLOT="train-2", UV_EXTRAS="--extra gpu", FIT_ARMS="with_sv")
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-2/run_step.sh"]
+    assert "for arm in with_sv; do" in script and '${shard[@]+"${shard[@]}"} ${fit_arm[@]+"${fit_arm[@]}"}' in script
+    arms = subprocess.run(["bash", "-c", 'fit_arm=(); for arm in snv_indel with_sv; do fit_arm+=(--fit-arm "$arm"); done; echo "${fit_arm[@]}"'], capture_output=True, text=True)
+    assert arms.stdout.split() == ["--fit-arm", "snv_indel", "--fit-arm", "with_sv"]
+    for refused_arms in ("with_sv snv", "all"):
+        environment["FIT_ARMS"] = refused_arms
+        refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+        assert refused.returncode != 0 and "FIT_ARMS" in refused.stderr
+
+
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     launcher, environment = _fake_cloud(tmp_path)
     environment["RUN_DISK_GB"] = "2T"
