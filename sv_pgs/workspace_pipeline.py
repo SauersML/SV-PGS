@@ -73,6 +73,7 @@ import logging
 import multiprocessing
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from types import ModuleType
@@ -411,6 +412,11 @@ class WorkspaceConfig:
     """The fit leaves out every record whose minor allele frequency over the store's samples (its code sums) or whose
     reliability (the measurement model's r^2) is below these; 0 keeps every record. A fit's cost grows with
     its records: the All of Us chr22 store's 1.8M candidates made a 364 GB LD store and a 10-minute pass on an A100."""
+    fit_variant_sites: str | None = None
+    """A site list (``listed_sites``): the fit keeps only the single-base substitutions at its sites and every structural
+    record, each still subject to the floors above; None keeps every record. The floors alone left 8M of the All of Us
+    genome's 128M records, 67 times chr22's, whose filtered fit took half an hour an arm on two A100s; HapMap3's 1.05M
+    sites are the usual polygenic-score set."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -419,7 +425,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", *_FIT_FILTER_KEYS})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", *_FIT_FILTER_KEYS})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -435,6 +441,8 @@ class WorkspaceConfig:
             value = raw.get(key, 0.0)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value < 1:
                 raise ValueError(f"{key} must be a number in [0, 1)")
+        if raw.get("fit_variant_sites") is not None and (not isinstance(raw["fit_variant_sites"], str) or not raw["fit_variant_sites"]):
+            raise ValueError("fit_variant_sites must be a site list's path or null")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -506,6 +514,7 @@ class WorkspaceConfig:
             cross_fit=raw.get("cross_fit", True),
             fit_minimum_minor_allele_frequency=float(raw.get("fit_minimum_minor_allele_frequency", 0.0)),
             fit_minimum_r2=float(raw.get("fit_minimum_r2", 0.0)),
+            fit_variant_sites=raw.get("fit_variant_sites"),
         )
 
     def model_folds(self) -> tuple[int, ...]:
@@ -2914,17 +2923,60 @@ def structural_records(table: VariantTable) -> BoolArray:
     return structural
 
 
-def fit_filtered(table: VariantTable, sample_count: int, log_reliability: F64Array, minimum_frequency: float, minimum_r2: float) -> F64Array:
-    """``log_reliability`` with -inf on every record the fit leaves out (``WorkspaceConfig.fit_minimum_r2`` and its
-    frequency floor): one whose minor allele frequency over the store's ``sample_count`` samples, from its code sums,
-    or whose reliability (the measurement model's r^2, ``log_reliability``) is below its floor."""
+_COMPLEMENT = str.maketrans("ACGT", "TGCA")
+_ALLELE_ID = re.compile(r"[^:]+:[0-9]+:([ACGTacgt]+):([ACGTacgt]+)")
+"""A record ID that names its alleles: CHROM:POS:REF:ALT."""
+
+
+def listed_sites(table: VariantTable, path: str | Path) -> BoolArray:
+    """Whether each record is a single-base substitution at a site of the list at ``path`` (``WorkspaceConfig.
+    fit_variant_sites``): a tab-separated file, one site a line under a header naming its columns chromosome (the
+    autosome's number), position (in the store's build), allele_a and allele_b. A record whose ID names its alleles
+    (``_ALLELE_ID``) matches a site only with the site's two alleles, in either order or both complemented (a list
+    lifted over from another build can hold a site on the other strand); a record whose ID does not name them matches
+    on its chromosome and position alone."""
+    sites = pd.read_csv(path, sep="\t", usecols=["chromosome", "position", "allele_a", "allele_b"], dtype={"chromosome": np.int64, "position": np.int64, "allele_a": str, "allele_b": str})
+    position = np.asarray(table.position, dtype=np.int64)
+    rows = np.flatnonzero((np.asarray(table.ref_length) == 1) & (np.asarray(table.alt_length) == 1) & np.isin(position, sites["position"].to_numpy()))
+    candidates = pd.DataFrame({"row": rows, "chromosome": np.asarray(table.chromosome, dtype=np.int64)[rows], "position": position[rows]})
+    matched = candidates.merge(sites, on=["chromosome", "position"])
+    listed = np.zeros(table.variant_count, dtype=bool)
+    named = 0
+    for row, identifier, first, second in zip(matched["row"].tolist(), table.variant_ids(matched["row"].to_numpy()), matched["allele_a"], matched["allele_b"]):
+        alleles = _ALLELE_ID.fullmatch(identifier)
+        if alleles is None:
+            listed[row] = True
+            continue
+        named += 1
+        pair = (first.upper(), second.upper())
+        listed[row] |= frozenset(allele.upper() for allele in alleles.groups()) in (frozenset(pair), frozenset(allele.translate(_COMPLEMENT) for allele in pair))
+    LOGGER.info(
+        "workspace pipeline: %d records are at %d listed sites (%d of the %d at a listed site's position matched on their ID's alleles, the rest on position)",
+        int(listed.sum()), sites.shape[0], named, matched.shape[0],
+    )
+    return listed
+
+
+def fit_filtered(
+    table: VariantTable, sample_count: int, log_reliability: F64Array, minimum_frequency: float, minimum_r2: float, variant_sites: str | Path | None = None,
+) -> F64Array:
+    """``log_reliability`` with -inf on every record the fit leaves out (``WorkspaceConfig.fit_minimum_r2``, its
+    frequency floor and its site list): one whose minor allele frequency over the store's ``sample_count`` samples,
+    from its code sums, or whose reliability (the measurement model's r^2, ``log_reliability``) is below its floor, and
+    with a site list, a record that is neither structural (``structural_records``) nor at a listed site
+    (``listed_sites``)."""
     kept = np.ones(np.asarray(table.sum_code).shape[0], dtype=bool)
     if minimum_frequency > 0.0:
         frequency = np.asarray(table.sum_code, dtype=np.float64) / (2.0 * CODES_PER_DOSAGE * sample_count)
         kept &= np.minimum(frequency, 1.0 - frequency) >= minimum_frequency
     if minimum_r2 > 0.0:
         kept &= np.asarray(log_reliability, dtype=np.float64) >= np.log(minimum_r2)
-    LOGGER.info("workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g)", int(kept.sum()), kept.shape[0], minimum_frequency, minimum_r2)
+    if variant_sites is not None:
+        kept &= structural_records(table) | listed_sites(table, variant_sites)
+    LOGGER.info(
+        "workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g, sites %s)",
+        int(kept.sum()), kept.shape[0], minimum_frequency, minimum_r2, "all" if variant_sites is None else variant_sites,
+    )
     return np.where(kept, np.asarray(log_reliability, dtype=np.float64), -np.inf)
 
 
@@ -3018,7 +3070,8 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                 unsaved = [trait for trait in unrecorded if not targets[trait].is_dir()]
                 if unsaved:
                     kept = fit_filtered(
-                        store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2
+                        store.variant_table, store.n_samples, measurement.log_reliability, run.config.fit_minimum_minor_allele_frequency, run.config.fit_minimum_r2,
+                        run.config.fit_variant_sites,
                     )
                     request = fit_request(
                         cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
@@ -3917,7 +3970,10 @@ _STEPS = (
         _direct_sv_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
-    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2), (_fit_step, fit_filtered, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
+    _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (
+        config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
+        None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)),
+    ), (_fit_step, fit_filtered, listed_sites, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _final_store, score_batches, structural_records, model_part), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: None,

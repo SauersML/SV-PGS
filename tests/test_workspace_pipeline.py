@@ -30,7 +30,7 @@ from sv_pgs.all_of_us import DISEASE_DEFINITIONS, MEASUREMENT_EXCLUSION_REASONS,
 from sv_pgs.cohort import pipeline_half_levels
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType, VariantClass
-from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, VARIANT_CLASSES, DosageStore, HalfSamples, encode_dosage_milli
+from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, VARIANT_CLASSES, DosageStore, HalfSamples, VariantTable, encode_dosage_milli
 from sv_pgs.fast_scoring import (
     ScoringModel,
     ScoringPlan,
@@ -51,6 +51,7 @@ from sv_pgs.workspace_pipeline import (
     WorkspaceBindings,
     WorkspaceConfig,
     check_exportable,
+    fit_filtered,
     path_counts,
     run_pipeline,
     store_group_first,
@@ -1328,3 +1329,36 @@ def test_a_single_split_fits_one_model_per_trait_and_reports_its_test_fold_alone
     assert all(row["value"] != "nan" for row in rows if row["cell"] == "all" and row["value"])
     # The cross-fitting default keeps its cohort key, so its runs are not redone.
     assert WorkspaceConfig.from_mapping(synthetic.raw).cross_fit and WorkspaceConfig.from_mapping(synthetic.raw).model_folds() == (0, 1, 2)
+
+
+def test_fit_keeps_listed_substitutions_and_every_structural_record(tmp_path: Path, workspace) -> None:
+    # (chromosome, POS, ID, REF length, ALT length, SVLEN): a listed A/G site's A>G (kept) and A>T (other alleles),
+    # an rsID substitution at a listed position (kept on position), an unlisted substitution, an indel at a listed
+    # position, a substitution listed on the other strand (kept), and an unlisted structural record (kept).
+    records = (
+        (2, 100, "chr2:100:A:G", 1, 1, 0.0), (2, 100, "chr2:100:A:T", 1, 1, 0.0), (2, 200, "rs7", 1, 1, 0.0), (2, 300, "chr2:300:C:T", 1, 1, 0.0),
+        (2, 400, "chr2:400:AT:A", 2, 1, 1.0), (5, 100, "chr5:100:G:A", 1, 1, 0.0), (5, 150, "sv1", 1, 1, 5000.0),
+    )
+    chromosome, position, ids, ref_length, alt_length, sv_length = zip(*records)
+    count = len(records)
+    table = VariantTable(
+        chromosome=np.array(chromosome, dtype=np.int8), position=np.array(position, dtype=np.int64), genetic_position_cm=np.zeros(count),
+        ref_length=np.array(ref_length, dtype=np.int32), alt_length=np.array(alt_length, dtype=np.int32),
+        variant_class=np.full(count, VARIANT_CLASSES.index(VariantClass.SNV), dtype=np.uint8), codes_per_unit=np.full(count, 254, dtype=np.uint8),
+        value_origin=np.zeros(count, dtype=np.int64), group_first=np.arange(count, dtype=np.int64), sum_code=np.full(count, 254 * 40, dtype=np.uint64),
+        sum_code2=np.zeros(count, dtype=np.uint64), annotations={"sv_length": np.array(sv_length)}, annotation_legends={},
+        id_bytes=np.frombuffer("".join(ids).encode(), dtype=np.uint8), id_offsets=np.concatenate([[0], np.cumsum([len(name) for name in ids])]).astype(np.int64),
+    )
+    sites = tmp_path / "sites.tsv"
+    sites.write_text("chromosome\tposition\tallele_a\tallele_b\n2\t100\tA\tG\n2\t200\tC\tT\n2\t400\tA\tT\n5\t100\tC\tT\n")
+    log_reliability = np.log(np.linspace(0.9, 0.6, count))
+    kept = fit_filtered(table, 100, log_reliability, 0.0, 0.0, sites)
+    assert np.isfinite(kept).tolist() == [True, False, True, False, False, True, True]
+    np.testing.assert_array_equal(kept[np.isfinite(kept)], log_reliability[[0, 2, 5, 6]])
+    np.testing.assert_array_equal(fit_filtered(table, 100, log_reliability, 0.0, 0.0), log_reliability)
+    synthetic, _client = workspace
+    assert WorkspaceConfig.from_mapping({**synthetic.raw, "fit_variant_sites": str(sites)}).fit_variant_sites == str(sites)
+    assert WorkspaceConfig.from_mapping(synthetic.raw).fit_variant_sites is None
+    with pytest.raises(ValueError, match="fit_variant_sites"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "fit_variant_sites": 7})
+
