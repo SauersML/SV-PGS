@@ -28,6 +28,7 @@ to the panel, so its outputs are workspace-only (A4.9).
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import functools
 import hashlib
@@ -795,6 +796,22 @@ def no_call_fill(group_sums: I64Array, group_counts: I64Array) -> NDArray:
     return np.floor(means + 0.5).astype(np.uint16)
 
 
+def _side_by_side(batch_codes: Sequence[U8Array], start: int, stop: int, pool: ThreadPoolExecutor) -> U8Array:
+    """Rows [start, stop) of every batch side by side, each batch's rows copied on a thread of ``pool``. A memory-mapped
+    batch's copy faults its pages in from disk: copied one batch at a time, the disk had one read in flight (chr1 of the
+    All of Us store read at 125 MiB/s and took 80 minutes), and numpy's copy releases the GIL, so the batches' reads
+    overlap."""
+    edges = np.concatenate([[0], np.cumsum([codes.shape[1] for codes in batch_codes])]).astype(np.int64)
+    block = np.empty((stop - start, int(edges[-1])), dtype=np.uint8)
+
+    def copy(index: int) -> None:
+        block[:, edges[index] : edges[index + 1]] = batch_codes[index][start:stop]
+
+    for _ in pool.map(copy, range(len(batch_codes))):
+        pass
+    return block
+
+
 def _half_code_blocks(
     batch_codes: Sequence[U8Array],
     sample_groups: NDArray,
@@ -802,11 +819,12 @@ def _half_code_blocks(
     no_call_milli: NDArray,
     block_rows: int,
     no_calls: NDArray,
+    pool: ThreadPoolExecutor,
 ) -> Iterator[U8Array]:
     record_count = batch_codes[0].shape[0]
     for start in range(0, record_count, block_rows):
         stop = min(start + block_rows, record_count)
-        codes = np.hstack([codes[start:stop] for codes in batch_codes])
+        codes = _side_by_side(batch_codes, start, stop, pool)
         rows, columns = np.nonzero(codes == MISSING_CODE)
         codes[rows, columns] = encode_dosage_milli(no_call_milli[start:stop])[rows, sample_groups[columns]]
         no_calls[start:stop] = np.bincount(rows, minlength=stop - start)
@@ -852,17 +870,18 @@ def assemble_half(
     if groups.shape != (sample_count,) or (groups.size and (int(groups.min()) < 0 or int(groups.max()) >= fill.shape[1])):
         raise ValueError("sample_groups must cover the half's samples in batch order, one of no_call_milli's groups each.")
     no_calls = np.zeros(record_count, dtype=np.uint32)
-    sums = write_half_codes(
-        Path(root),
-        half_index,
-        chromosome,
-        record_count,
-        sample_count,
-        _half_code_blocks(
-            batch_codes, groups, scales, fill, _block_rows(budget, sample_count, ASSEMBLY_STEP_BYTES_PER_ENTRY, record_count), no_calls
-        ),
-        codec=codec,
-    )
+    with ThreadPoolExecutor(max_workers=max(1, min(len(batch_codes), budget.cpu_threads))) as pool:
+        sums = write_half_codes(
+            Path(root),
+            half_index,
+            chromosome,
+            record_count,
+            sample_count,
+            _half_code_blocks(
+                batch_codes, groups, scales, fill, _block_rows(budget, sample_count, ASSEMBLY_STEP_BYTES_PER_ENTRY, record_count), no_calls, pool
+            ),
+            codec=codec,
+        )
     write_column(statistic_column_directory(Path(root), half_index, chromosome, "no_calls"), no_calls)
     return sums
 

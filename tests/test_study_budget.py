@@ -55,8 +55,27 @@ def test_over_budget_plans_and_unbounded_jobs_are_refused(plan):
         guard.validate_job(job(999999), 3600, 0)
     multiplied = job(3600)
     multiplied["taskGroups"][0]["taskCount"] = 2
-    with pytest.raises(ValueError, match="one task"):
+    with pytest.raises(ValueError, match="one VM each"):
         guard.validate_job(multiplied, 3600, 0)
+
+
+def test_a_fan_out_reserves_every_task_s_vm(plan):
+    """A store job of 22 chromosome tasks, each on its own VM: every attempt of every task fits inside the slot, and
+    the job must run exactly the reserved tasks, one per VM."""
+    seconds = guard.duration_seconds(plan, "train-1", 2.5, 1, 22)
+    assert (seconds / 3600 + 1) * 2.5 * 22 * 2 <= plan["slots"]["train-1"] < (seconds / 3600 + 1.01) * 2.5 * 22 * 2
+    fan_out = job(seconds, 1)
+    fan_out["taskGroups"][0].update(taskCount=22, parallelism=22)
+    guard.validate_job(fan_out, seconds, 1, 22)
+    with pytest.raises(ValueError, match="one VM each"):
+        guard.validate_job(fan_out, seconds, 1)
+    for change in ({"parallelism": 11}, {"taskCountPerNode": 2}):
+        changed = copy.deepcopy(fan_out)
+        changed["taskGroups"][0].update(change)
+        with pytest.raises(ValueError, match="multiply"):
+            guard.validate_job(changed, seconds, 1, 22)
+    with pytest.raises(ValueError, match="tasks"):
+        guard.duration_seconds(plan, "train-1", 2.5, 1, 0)
 
 
 class Storage:
@@ -198,6 +217,23 @@ def test_submit_script_reserves_once_and_preserves_task_shell(tmp_path):
     # Batch takes one lifecycle policy: exit 1 (the driver's or the install's failure) fails the task, and any other
     # non-zero exit (a spot preemption's 50001, the TERM trap's 75) is retried up to maxRetryCount by default.
     assert task["lifecyclePolicies"] == [{"action": "FAIL_TASK", "actionCondition": {"exitCodes": [1]}}]
+
+
+def test_a_store_fan_out_gives_each_task_its_chromosome_and_the_fit_job_has_one_task(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="store", BUDGET_SLOT="train-1", TASK_COUNT="22", HOURLY_USD="2.5", MAX_RETRIES="1", UV_EXTRAS="")
+    submitted = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    group = spec["taskGroups"][0]
+    assert group["taskCount"] == 22 and group["parallelism"] == 22
+    guard.validate_job(spec, guard.duration_seconds(json.loads(Path(environment["STUDY_BUDGET"]).read_text()), "train-1", 2.5, 1, 22), 1, 22)
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-1/run_step.sh"]
+    assert 'shard=(--store-shard "$BATCH_TASK_INDEX")' in script and '--through "store" ${shard[@]+"${shard[@]}"}' in script
+    assert '_task_${tag}$1' in script and 'if [ "22" != 1 ]' in script
+    environment.update(THROUGH="report", BUDGET_SLOT="train-2", UV_EXTRAS="--extra gpu")
+    refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "TASK_COUNT" in refused.stderr
 
 
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):

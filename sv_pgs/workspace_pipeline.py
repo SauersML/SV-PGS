@@ -666,6 +666,8 @@ class _Run:
     bindings: WorkspaceBindings
     budget: ComputeBudget
     keys: dict[str, str]
+    store_chromosomes: tuple[str, ...] | None = None
+    """The chromosomes this run's store step converts, or None for every one (``run_pipeline``'s ``store_shard``)."""
 
     def output(self, step: str) -> Path:
         return self.config.run_directory / step
@@ -673,6 +675,11 @@ class _Run:
     def summary(self, step: str) -> dict[str, Any]:
         record: dict[str, Any] = json.loads((self.output(step) / COMPLETE_FILE).read_text(encoding="utf-8"))
         return dict(record["summary"])
+
+
+class StepPart(Exception):
+    """A step body did the part of its work its run was given, and the step is not complete: its partial directory holds
+    that part for another run (or a later one) to finish."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -714,6 +721,9 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     _mark(run.config, step.name, "started")
     try:
         summary = step.body(run, partial)
+    except StepPart:
+        _mark(run.config, step.name, "part-done")
+        raise
     except BaseException as error:
         _mark(run.config, step.name, f"failed-{type(error).__name__}")
         raise
@@ -2009,14 +2019,19 @@ def _store_step(run: _Run, directory: Path) -> dict[str, Any]:
         if absent:
             raise ValueError(f"{name} has no record on {absent}; its chromosomes are named {sorted(table)[:3]}..., the store's {list(config.chromosomes[:3])}...")
     complexity_legend = None if config.popped is None else strata_complexity_legend(config.popped.strata_directory, config.chromosomes)
-    facts = []
-    for chromosome in config.chromosomes:
+    # A store shard (run.store_chromosomes) converts its own chromosomes and leaves the rest to the shards that hold them;
+    # the run that finds every chromosome converted (the run mirror carries each shard's to it) writes the store.
+    for chromosome in config.chromosomes if run.store_chromosomes is None else run.store_chromosomes:
         done = directory / "chromosomes" / f"{chromosome}.json"
         if not done.is_file():
             _clear_chromosome(root, chromosome, len(samples.halves), directory)
             _write_json(done, _convert_chromosome(run, directory, root, chromosome, samples, repeats, genes, complexity_legend))
             _remove_own(directory / "batches" / chromosome, directory)
-        facts.append(json.loads(done.read_text(encoding="utf-8")))
+            _mark(config, "store", f"converted-{chromosome}")
+    remaining = [chromosome for chromosome in config.chromosomes if not (directory / "chromosomes" / f"{chromosome}.json").is_file()]
+    if remaining:
+        raise StepPart(f"the store holds {len(config.chromosomes) - len(remaining)} of its chromosomes; {remaining} are another shard's.")
+    facts = [json.loads((directory / "chromosomes" / f"{chromosome}.json").read_text(encoding="utf-8")) for chromosome in config.chromosomes]
     from sv_pgs.feature_identity import IDENTITY_FILE
     _write_json(root / IDENTITY_FILE, {chromosome: fact["feature_identity"] for chromosome, fact in zip(config.chromosomes, facts)})
     measurements = ["imputed_dosage"] * len(config.imputed_halves) + (["long_read_calls"] if config.truth_calls is not None else [])
@@ -3873,15 +3888,27 @@ _STEPS = (
 )
 
 
-def run_pipeline(config: WorkspaceConfig, bindings: WorkspaceBindings, budget: ComputeBudget, *, through: str | None = None) -> dict[str, dict[str, Any]]:
-    """Run every step in order, through ``through`` when given, resuming from the run directory's checkpoints."""
+def run_pipeline(
+    config: WorkspaceConfig, bindings: WorkspaceBindings, budget: ComputeBudget, *, through: str | None = None, store_shard: int | None = None
+) -> dict[str, dict[str, Any]]:
+    """Run every step in order, through ``through`` when given, resuming from the run directory's checkpoints.
+
+    With ``store_shard`` the run is one of a fan-out over the config's chromosomes: its store step converts only the
+    chromosome at that index, and the run stops there unless the store is then whole. The store step's key does not
+    name the shard, so every shard's converted chromosomes belong to one store."""
     if through is not None and through not in STEP_NAMES:
         raise ValueError(f"through must be one of {STEP_NAMES}.")
+    if store_shard is not None and not 0 <= store_shard < len(config.chromosomes):
+        raise ValueError(f"store_shard indexes the config's {len(config.chromosomes)} chromosomes; got {store_shard}.")
     config.run_directory.mkdir(parents=True, exist_ok=True)
-    run = _Run(config, bindings, budget, {})
+    run = _Run(config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],))
     summaries = {}
     for step in _STEPS:
-        summaries[step.name] = _run_step(run, step)
+        try:
+            summaries[step.name] = _run_step(run, step)
+        except StepPart as part:
+            LOGGER.info("workspace pipeline: %s stopped after its part: %s", step.name, part)
+            break
         if step.name == through:
             break
     return summaries

@@ -58,6 +58,39 @@ def test_a_restore_brings_back_completed_steps_and_the_fit_s_durable_progress_on
     assert (restored / "store" / "calibration").is_dir()
 
 
+def test_store_shards_push_their_converted_chromosomes_into_one_partial_and_a_restore_takes_each_whole_one(tmp_path: Path) -> None:
+    """Each converted chromosome is a unit: its store arrays and its fill, reported and calibration files, its record
+    chromosomes/<chromosome>.json last. chr1's files are not chr10's, and a chromosome without its record, or a batch's
+    decoded codes, stays behind."""
+    remote = DirectoryRemote(tmp_path / "mirror")
+    shards = []
+    for shard, chromosomes in enumerate((["chr1"], ["chr10", "chr2"])):
+        partial = tmp_path / f"shard{shard}" / "store.partial"
+        _write(partial / KEY_FILE, "storekey")
+        for chromosome in chromosomes:
+            _write(partial / "store" / "dosage" / "half0" / chromosome / "shard0", chromosome.encode())
+            _write(partial / "store" / "stats" / "half0" / chromosome / "sum_code" / "values", b"sums")
+            _write(partial / "store" / "variants" / chromosome / "position" / "values", b"positions")
+            _write(partial / "store" / "loci" / chromosome / "tr_start" / "values", b"loci")
+            for directory in ("fill", "reported"):
+                _write(partial / directory / f"{chromosome}.npy", chromosome.encode())
+            _write(partial / "calibration" / f"{chromosome}.npz", b"pairs")
+            _write(partial / "batches" / chromosome / "batch0.codes.npy", b"decoded")
+        _write(partial / "chromosomes" / f"{chromosomes[0]}.json", "{}")
+        shards.append(partial.parent)
+    for shard in shards:
+        push(shard, remote)
+    push(shards[0], remote)
+    restored = tmp_path / "restored"
+    restore(restored, remote)
+    expected = {
+        name: content for shard in shards for name, content in _tree(shard).items()
+        if "/batches/" not in name and "chr2" not in name
+    }
+    assert _tree(restored) == expected
+    assert {"store.partial/store/dosage/half0/chr1/shard0", "store.partial/store/dosage/half0/chr10/shard0"} <= set(expected)
+
+
 def test_a_step_made_again_under_another_key_drops_its_stale_mirrored_copy(tmp_path: Path) -> None:
     run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
     remote = DirectoryRemote(mirror)

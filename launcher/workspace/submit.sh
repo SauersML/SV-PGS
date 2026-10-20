@@ -6,6 +6,8 @@
 #   submit.sh fit        # steps fit .. export, on GPUs
 #
 # PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity.
+# A store job with TASK_COUNT > 1 (THROUGH=store) is a fan-out: task i converts the run config's chromosome i on its
+# own VM (workspace-run --store-shard), and the next job, finding every chromosome in the mirror, writes the store.
 #
 # Each job reserves one slot in the study's immutable $3,000 envelope before submission.
 # Batch limits task runtime; separately billed resources use the plan's non-task reserve.
@@ -20,13 +22,18 @@ here="$(cd "$(dirname "$0")" && pwd)"
 : "${THROUGH:?}"
 STUDY_BUDGET="${STUDY_BUDGET:-$here/study_budget.template.json}"
 MAX_RETRIES="${MAX_RETRIES:-0}"
+TASK_COUNT="${TASK_COUNT:-1}"
+if [[ ! "$TASK_COUNT" =~ ^[1-9][0-9]*$ ]] || { [ "$spec" = fit ] && [ "$TASK_COUNT" != 1 ]; }; then
+  echo "TASK_COUNT is the store job's number of chromosome tasks, one VM each; the fit job has one" >&2; exit 2
+fi
+export TASK_COUNT
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
 if [[ ! "$RUN_ID" =~ ^[a-z][a-z0-9-]{0,25}$ ]]; then
   echo "RUN_ID must be a lowercase study ID, at most 26 characters; keep it across restarts" >&2; exit 2
 fi
-MAX_RUN_SECONDS="$(python3 "$here/budget_guard.py" duration --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES")"
+MAX_RUN_SECONDS="$(python3 "$here/budget_guard.py" duration --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" --tasks "$TASK_COUNT")"
 export MAX_RUN_SECONDS MAX_RETRIES
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
@@ -48,9 +55,9 @@ done
 export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
-if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); fi
+if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${spec}.json.template" --output "$stage/job.json" --variables "${variables[@]}"
 # Each submitted job keeps its own task script and Batch log, so another submission cannot change them underneath a
@@ -66,7 +73,7 @@ spec["logsPolicy"]["logsPath"] = spec["logsPolicy"]["logsPath"].replace("/launch
 path.write_text(json.dumps(spec))
 PY
 python3 "$here/budget_guard.py" reserve --plan "$STUDY_BUDGET" --slot "$BUDGET_SLOT" --hourly-usd "$HOURLY_USD" --retries "$MAX_RETRIES" \
-  --spec "$stage/job.json" --ledger "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/budget"
+  --tasks "$TASK_COUNT" --spec "$stage/job.json" --ledger "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/budget"
 gcloud storage cp "$stage/run_step.sh" "gs://${OPS_BUCKET}/svpgs/${RUN_ID}/launcher/${BUDGET_SLOT}/run_step.sh" --if-generation-match=0
-echo "submitting ${job} in reserved slot ${BUDGET_SLOT}: ${MAX_RUN_SECONDS} seconds per attempt, at most $((MAX_RETRIES + 1)) attempts"
+echo "submitting ${job} in reserved slot ${BUDGET_SLOT}: ${TASK_COUNT} task(s), ${MAX_RUN_SECONDS} seconds per attempt, at most $((MAX_RETRIES + 1)) attempts"
 gcloud batch jobs submit "svpgs-${RUN_ID}-${BUDGET_SLOT}" --project="${PROJECT_ID}" --location="${REGION}" --config="$stage/job.json"

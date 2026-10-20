@@ -8,7 +8,13 @@
 set -uo pipefail
 OPS=/mnt/disks/ops/svpgs/${RUN_ID}
 RUN=/mnt/disks/run
-mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_$1"; }
+# A store job of ${TASK_COUNT} tasks is a fan-out over the run config's chromosomes: Batch's task i converts chromosome i
+# on its own VM and disk (the driver's --store-shard), the mirror carries each task's chromosomes to the next job, and
+# each task's markers carry its index.
+shard=()
+tag=""
+if [ "${TASK_COUNT}" != 1 ]; then shard=(--store-shard "$BATCH_TASK_INDEX"); tag="${BATCH_TASK_INDEX}-"; fi
+mark() { mkdir -p "$OPS/markers" && : > "$OPS/markers/$(date -u +%Y%m%dT%H%M%SZ)_task_${tag}$1"; }
 trap 'mark "terminated"; exit 75' TERM
 mark started
 if [ ! -f "$RUN/tools/staged" ]; then
@@ -49,7 +55,7 @@ mirror() {
 mirror restore || { mark "exit-restore"; exit 1; }
 ( while sleep 900; do mirror push || mark "push-failed"; done ) &
 pusher=$!
-"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" &
+"$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} &
 wait $!
 status=$?
 kill "$pusher"

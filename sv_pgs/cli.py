@@ -106,6 +106,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     workspace_parser.add_argument("--config", required=True, help="The run config JSON supplied inside the workspace.")
     workspace_parser.add_argument("--through", choices=STEP_NAMES, default=None, help="Stop after this step.")
+    workspace_parser.add_argument(
+        "--store-shard", type=int, default=None,
+        help="Convert only the config's chromosome at this index in the store step, one task of a fan-out (run_pipeline).",
+    )
 
     mirror_parser = subparsers.add_parser(
         "run-mirror",
@@ -180,7 +184,7 @@ def _main_impl(argv: list[str] | None = None) -> int:
 
     if args.command == "workspace-run":
         summaries = run_pipeline(
-            WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through
+            WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through, store_shard=args.store_shard
         )
         for step in summaries:
             print(f"{step}\tcomplete")

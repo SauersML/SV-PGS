@@ -13,6 +13,10 @@ The durable state is what the driver resumes from:
   - each engine checkpoint, which ``fit_checkpoint`` writes whole;
   - each saved (arm, trait) model with its record, the record last, as the fit step saves them;
   - the partial's KEY_FILE.
+- **The store step's converted chromosomes in ``store.partial``:** each chromosome's files (STORE_CHROMOSOME_FILES)
+  with its record chromosomes/<chromosome>.json, the record last, as the store step writes them; and the KEY_FILE. A
+  fan-out of store shards (``workspace_pipeline.run_pipeline``'s ``store_shard``), one job's tasks on separate disks,
+  meets here: each pushes its own chromosomes under the one key, and the next job restores them all.
 
 Any other partial work is redone, as after a preemption on one disk. GCS creates an object only when its upload
 completes, so a mirrored file is whole or absent.
@@ -52,6 +56,21 @@ RECORDS = "models/*/*.json"
 """The fit step's saved-model records in its partial: models/<arm>/<trait>.json, written after models/<arm>/<trait>."""
 STORE = "store"
 """A step's store payload, <step>/store: a full copy of the genotype codes."""
+STORE_RECORDS = "chromosomes/*.json"
+"""The store step's record of each chromosome it converted, in its partial: chromosomes/<chromosome>.json, written
+after the chromosome's files."""
+STORE_CHROMOSOME_FILES = ("fill", "reported", "calibration")
+"""The store step's per-chromosome files beside its store, <directory>/<chromosome>.<suffix>; inside store/, a
+chromosome's files are those under a directory named for it (dosage/half<i>/<chromosome>, stats/half<i>/<chromosome>,
+variants/<chromosome>, loci/<chromosome>)."""
+
+
+def _of_chromosome(relative: str, chromosome: str) -> bool:
+    """Whether the store partial's file ``relative`` ('/'-separated) is one of ``chromosome``'s."""
+    parts = relative.split("/")
+    if parts[0] == STORE:
+        return chromosome in parts[1:-1]
+    return len(parts) == 2 and parts[0] in STORE_CHROMOSOME_FILES and parts[1].split(".", 1)[0] == chromosome
 
 
 class Remote(Protocol):
@@ -189,15 +208,21 @@ def _push_step(remote: Remote, final: Path, name: str) -> None:
 
 
 def _partial_units(partial: Path) -> list[tuple[list[Path], Path]]:
-    """The fit step's durable units in ``partial``, each as (its files, the file that marks it whole, sent last): every
-    engine checkpoint (CHECKPOINTS; a hidden name is one ``fit_checkpoint`` is still writing), and every saved model
-    directory models/<arm>/<trait> beside its record <trait>.json."""
+    """The durable units in a step's ``partial``, each as (its files, the file that marks it whole, sent last): the fit
+    step's every engine checkpoint (CHECKPOINTS; a hidden name is one ``fit_checkpoint`` is still writing) and every
+    saved model directory models/<arm>/<trait> beside its record <trait>.json; the store step's every converted
+    chromosome's files beside its record chromosomes/<chromosome>.json."""
     units: list[tuple[list[Path], Path]] = [([], path) for path in sorted(partial.glob(CHECKPOINTS)) if not path.name.startswith(".")]
     if (partial / "models").is_dir():
         for record in sorted(partial.glob(RECORDS)):
             model = record.with_suffix("")
             if model.is_dir():
                 units.append((_files(model), record))
+    records = sorted(partial.glob(STORE_RECORDS))
+    if records:
+        files = [(path, path.relative_to(partial).as_posix()) for path in _files(partial)]
+        for record in records:
+            units.append(([path for path, relative in files if _of_chromosome(relative, record.stem)], record))
     return units
 
 
@@ -239,16 +264,19 @@ def push(run_directory: Path, remote: Remote) -> None:
 
 
 def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
-    """The partial's KEY_FILE, checkpoints and every model directory whose record is mirrored, records last."""
+    """The partial's KEY_FILE, checkpoints, every model directory and every store chromosome whose record is mirrored,
+    and those records."""
     prefix = f"{name}/"
     inside = [entry.removeprefix(prefix) for entry in names if entry.startswith(prefix)]
-    records = {relative for relative in inside if _matches(relative, RECORDS)}
-    models = tuple(record.removesuffix(".json") + "/" for record in records)
+    records = {relative for relative in inside if _matches(relative, RECORDS) or _matches(relative, STORE_RECORDS)}
+    models = tuple(record.removesuffix(".json") + "/" for record in records if _matches(record, RECORDS))
+    chromosomes = [record.removeprefix("chromosomes/").removesuffix(".json") for record in records if _matches(record, STORE_RECORDS)]
     return sorted(
         prefix + relative for relative in inside
         if relative == KEY_FILE
         or relative in records
         or relative.startswith(models)
+        or any(_of_chromosome(relative, chromosome) for chromosome in chromosomes)
         or (_matches(relative, CHECKPOINTS) and not relative.rsplit("/", 1)[-1].startswith("."))
     )
 

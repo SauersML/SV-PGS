@@ -4,8 +4,8 @@ No cloud client library is needed on the submission host. Reservations use GCS g
 preconditions, so two launchers cannot spend the same slot. A failed submission retains its
 reservation: it is safer to inspect it than to automatically release an ambiguous charge.
 
-The allowance covers task runtime at the supplied whole-VM hourly rate, including every
-retry and an allowance for startup. Persistent storage, queries, idle launch machines and
+The allowance covers task runtime at the supplied whole-VM hourly rate, for every task of the
+job on its own VM, including every retry and an allowance for startup. Persistent storage, queries, idle launch machines and
 billing latency use the separate reserve; this is not a provider-enforced billing cap.
 """
 from __future__ import annotations
@@ -46,12 +46,15 @@ def validate_plan(plan):
         raise ValueError("job allocations plus the non-task reserve exceed the study budget")
 
 
-def duration_seconds(plan, slot, hourly_usd, retries):
+def duration_seconds(plan, slot, hourly_usd, retries, tasks=1):
     validate_plan(plan)
     rate = positive(hourly_usd, "hourly_usd")
     if isinstance(retries, bool) or not isinstance(retries, int) or not 0 <= retries <= 10:
         raise ValueError("retries must be an integer between 0 and 10")
-    seconds = math.floor((plan["slots"][slot] / (rate * (retries + 1)) - plan["startup_hours_per_attempt"]) * 3600)
+    if isinstance(tasks, bool) or not isinstance(tasks, int) or not 1 <= tasks <= 100:
+        raise ValueError("tasks must be an integer between 1 and 100")
+    # Each task runs on its own VM: every attempt of every task is charged its runtime and its startup.
+    seconds = math.floor((plan["slots"][slot] / (rate * tasks * (retries + 1)) - plan["startup_hours_per_attempt"]) * 3600)
     if seconds < 1:
         raise ValueError("this allocation cannot cover startup and one second of task runtime")
     # Batch's job lifetime is at most 14 days, including repeated attempts.
@@ -61,14 +64,14 @@ def duration_seconds(plan, slot, hourly_usd, retries):
     return min(seconds, lifetime)
 
 
-def validate_job(spec, seconds, retries):
+def validate_job(spec, seconds, retries, tasks=1):
     groups = spec["taskGroups"]
     instances = spec["allocationPolicy"]["instances"]
-    if len(groups) != 1 or len(instances) != 1 or groups[0].get("taskCount") != 1:
-        raise ValueError("budgeted jobs must allocate one task on one VM")
+    if len(groups) != 1 or len(instances) != 1 or groups[0].get("taskCount") != tasks:
+        raise ValueError(f"budgeted jobs must allocate their reserved {tasks} task(s), one VM each")
     group = groups[0]
-    if group.get("parallelism", 1) != 1 or group.get("taskCountPerNode", 1) != 1:
-        raise ValueError("budgeted jobs cannot multiply tasks or nodes")
+    if group.get("parallelism", 1) != tasks or group.get("taskCountPerNode", 1) != 1:
+        raise ValueError("budgeted jobs cannot multiply tasks or nodes beyond their reservation")
     task = group["taskSpec"]
     if task.get("maxRetryCount") != retries or task.get("maxRunDuration") != f"{seconds}s":
         raise ValueError("the job's retries or timeout do not match its reservation")
@@ -83,9 +86,9 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
-def reserve(plan, slot, spec, rate, retries, root, run=subprocess.run):
-    seconds = duration_seconds(plan, slot, rate, retries)
-    validate_job(spec, seconds, retries)
+def reserve(plan, slot, spec, rate, retries, root, run=subprocess.run, tasks=1):
+    seconds = duration_seconds(plan, slot, rate, retries, tasks)
+    validate_job(spec, seconds, retries, tasks)
     if not root.startswith("gs://") or "#" in root or "*" in root:
         raise ValueError("the ledger must be a workspace GCS prefix")
     with tempfile.TemporaryDirectory() as temporary:
@@ -98,7 +101,7 @@ def reserve(plan, slot, spec, rate, retries, root, run=subprocess.run):
             if canonical(json.loads(existing.stdout)) != canonical(plan):
                 raise ValueError("the study already has a different budget plan; its envelope cannot be reset")
         record = {
-            "slot": slot, "reserved_usd": plan["slots"][slot], "hourly_usd": rate,
+            "slot": slot, "reserved_usd": plan["slots"][slot], "hourly_usd": rate, "task_count": tasks,
             "max_retry_count": retries, "max_run_seconds": seconds,
             "job_sha256": hashlib.sha256(canonical(spec)).hexdigest(),
             "machine": spec["allocationPolicy"]["instances"][0]["policy"],
@@ -130,6 +133,7 @@ def main():
     parser.add_argument("--slot")
     parser.add_argument("--hourly-usd", type=float)
     parser.add_argument("--retries", type=int, default=0)
+    parser.add_argument("--tasks", type=int, default=1, help="The job's tasks, each on its own VM at --hourly-usd.")
     parser.add_argument("--spec", type=Path)
     parser.add_argument("--ledger")
     parser.add_argument("--template", type=Path)
@@ -141,9 +145,9 @@ def main():
         return
     plan = json.loads(args.plan.read_text())
     if args.action == "duration":
-        print(duration_seconds(plan, args.slot, args.hourly_usd, args.retries))
+        print(duration_seconds(plan, args.slot, args.hourly_usd, args.retries, args.tasks))
     else:
-        reserve(plan, args.slot, json.loads(args.spec.read_text()), args.hourly_usd, args.retries, args.ledger)
+        reserve(plan, args.slot, json.loads(args.spec.read_text()), args.hourly_usd, args.retries, args.ledger, tasks=args.tasks)
 
 
 if __name__ == "__main__":

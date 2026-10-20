@@ -1018,6 +1018,42 @@ def test_a_sidecar_that_disagrees_with_the_popped_records_stops_the_store(worksp
         run_pipeline(WorkspaceConfig.from_mapping(synthetic.raw), _bindings(_Recorder(), client), BUDGET, through="store")
 
 
+def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_one_run_makes(workspace, monkeypatch) -> None:
+    """A fan-out store job's tasks (store_shard) start on new disks from one mirror, each converts its chromosome and
+    pushes it without completing the step; the next job, restored from the mirror, writes the store a single run writes
+    and converts nothing again."""
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    run = config.run_directory
+    whole = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    tree = lambda root: {path.relative_to(root).as_posix(): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    expected = tree(run / "store")
+    shutil.rmtree(run)
+    remote = DirectoryRemote(run.with_name("mirror"))
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="samples")
+    push(run, remote)
+    shards = []
+    for shard, chromosome in enumerate(CHROMOSOMES):
+        shutil.rmtree(run)
+        restore(run, remote)
+        summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="export", store_shard=shard)
+        assert list(summaries) == ["samples"] and not (run / "store").exists()
+        assert sorted(path.name for path in (run / "store.partial" / "chromosomes").iterdir()) == [f"{chromosome}.json"]
+        shards.append(run.rename(run.with_name(f"shard{shard}")))
+    assert sum(path.name.endswith(f"_store_converted-{CHROMOSOMES[0]}") for path in config.marker_directory.iterdir()) == 2
+    assert any(path.name.endswith("_store_part-done") for path in config.marker_directory.iterdir())
+    for directory in shards:
+        push(directory, remote)
+    restore(run, remote)
+    monkeypatch.setattr(workspace_pipeline, "_convert_chromosome", lambda *arguments: pytest.fail("a mirrored chromosome was converted again"))
+    merged = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    assert merged["store"] == whole["store"] and tree(run / "store") == expected
+    with pytest.raises(ValueError, match="store_shard"):
+        run_pipeline(config, _bindings(_Recorder(), client), BUDGET, store_shard=len(CHROMOSOMES))
+
+
 def test_popped_records_without_info_cm_take_their_genetic_positions_from_the_genetic_map(workspace) -> None:
     """AoU's popped batches declare INFO/CM but carry it on no record: the store interpolates every record's genetic
     position from genetic_map and says so, and stops naming genetic_map where it is null."""

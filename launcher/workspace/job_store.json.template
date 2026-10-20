@@ -1,7 +1,8 @@
 {
   "taskGroups": [
     {
-      "taskCount": 1,
+      "taskCount": ${TASK_COUNT},
+      "parallelism": ${TASK_COUNT},
       "taskSpec": {
         "runnables": [{"script": {"text": "bash /mnt/disks/ops/svpgs/${RUN_ID}/launcher/run_step.sh"}}],
         "maxRetryCount": ${MAX_RETRIES},
