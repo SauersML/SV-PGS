@@ -183,7 +183,7 @@ def test_cuda_reads_after_the_first_come_from_the_resident_codes(tmp_path: Path,
 @pytest.mark.parametrize("codec", ["zstd", "rowdict"])
 def test_cuda_resident_codes_evicted_mid_read_stream_the_blocks_left(tmp_path: Path, codec: str) -> None:
     # The resident codes are a cache of the shared ledger: evicted during a read, the blocks not yet reached are read
-    # from the store, the image is the same, and an evicted set is never admitted again.
+    # from the store, the image is the same, and the next read admits the set again.
     _write_store(tmp_path / "store", _two_half_dosage(), codec)
     source, _signed, _means, _scales = _source(tmp_path / "store", "cuda")
     rng = np.random.default_rng(5)
@@ -201,8 +201,8 @@ def test_cuda_resident_codes_evicted_mid_read_stream_the_blocks_left(tmp_path: P
     first = image()
     assert source._resident_complete and source._resident is not None
     assert np.array_equal(_bits(image(evict_after=0)), _bits(first))
-    assert source._resident is None and source._resident_dropped
-    assert np.array_equal(_bits(image()), _bits(first)) and source._resident is None
+    assert source._resident is None and source._evictions == 1
+    assert np.array_equal(_bits(image()), _bits(first)) and source._resident_complete and source._resident is not None
 
 
 @pytest.mark.skipif(cupy is None, reason="needs a CUDA device")

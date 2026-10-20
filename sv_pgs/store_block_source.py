@@ -218,10 +218,15 @@ class StoreGenotypeBlockSource:
 
     def holds_codes(self) -> bool:
         """Whether this source's codes are held on its device, or would be at its next read (within what the ledger has
-        left): its reads after the one that fills them are then device passes, not reads of the store."""
+        left): its reads after the one that fills them are then device passes, not reads of the store.
+
+        What is left is counted as the admission counts it, the pool's free blocks returned first (``remaining``), not
+        as ``admits`` reads the pool as it stands: there, on the All of Us whole-genome fits, the device the route
+        choice's first read had not reached yet answered no while CuPy's pool held freed blocks, admitted the set at
+        its own first read a minute later, and half the fits took the band route."""
         if self._resident is not None:
             return True
-        return self._cupy is not None and self._broker is not None and self._broker.admits(self._pool, self.resident_codes_bytes)
+        return self._cupy is not None and self._broker is not None and self._broker.remaining(self._pool) >= self.resident_codes_bytes
 
     def _keep(self, block_index: int, slot: int) -> None:
         """Copy block ``block_index``'s signed codes into the resident set (on the first read), or drop the set if the
