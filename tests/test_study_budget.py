@@ -270,6 +270,20 @@ def test_a_fit_job_given_its_arms_passes_them_to_the_driver(tmp_path):
         assert refused.returncode != 0 and "FIT_ARMS" in refused.stderr
 
 
+def test_a_job_given_an_after_script_runs_it_once_its_driver_has_finished(tmp_path):
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(THROUGH="report", BUDGET_SLOT="train-2", UV_EXTRAS="--extra gpu", AFTER_SCRIPT="benchmarks/bench_real/aou_ldpred2.sh")
+    submitted = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-2/run_step.sh"]
+    assert '[ -n "benchmarks/bench_real/aou_ldpred2.sh" ]' in script and 'bash "$RUN/source/benchmarks/bench_real/aou_ldpred2.sh"' in script
+    assert script.index('bash "$RUN/source/benchmarks') < script.index('mirror push || { mark "exit-push"')
+    for refused_script in ("../escape.sh", "/abs/path.sh", "benchmarks/run.py"):
+        environment["AFTER_SCRIPT"] = refused_script
+        refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
+        assert refused.returncode != 0 and "AFTER_SCRIPT" in refused.stderr
+
+
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     launcher, environment = _fake_cloud(tmp_path)
     environment["RUN_DISK_GB"] = "2T"

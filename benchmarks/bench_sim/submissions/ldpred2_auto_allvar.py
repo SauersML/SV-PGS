@@ -100,18 +100,16 @@ def write_band(train, rows: np.ndarray, folder: pathlib.Path):
     return means, beta, se, lo, hi, scores
 
 
-def fit(train) -> Model:
-    stage = Stages("ldpred2_auto_allvar")
-    rows = common_rows(train)
-    stage(f"{rows.shape[0]} common records found")
-    structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
+def posterior_effects(train, rows: np.ndarray, stage=None) -> tuple[np.ndarray, np.ndarray]:
+    """The training dosage means and LDpred2-auto's posterior mean effects of the records `rows` (rising in cM)."""
     # on a network scratch TMPDIR, files the R session's forked workers still hold open linger as .nfs entries for a
     # while after it exits; a directory that cannot be removed yet must not discard a finished fit
     with tempfile.TemporaryDirectory(prefix="ldpred2_allvar_", dir=os.environ.get("TMPDIR"),
                                      ignore_cleanup_errors=True) as directory:
         folder = pathlib.Path(directory)
         means, beta, se, lo, hi, scores = write_band(train, rows, folder)
-        stage("GWAS and LD band written")
+        if stage is not None:
+            stage("GWAS and LD band written")
         np.column_stack([beta, se]).astype("<f8").tofile(folder / "sumstats.bin")
         lo.astype("<i4").tofile(folder / "ld_lo.bin")
         hi.astype("<i4").tofile(folder / "ld_hi.bin")
@@ -119,6 +117,15 @@ def fit(train) -> Model:
         (folder / "meta.txt").write_text(f"{rows.shape[0]} {train.n_samples} {int(train.cores)} {CHUNK}\n")
         single = {name: "1" for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS")}
         subprocess.run(["Rscript", str(_SCRIPT), str(folder)], check=True, env=os.environ | single)
-        stage("LDpred2 done")
-        effects = np.fromfile(folder / "beta.bin", dtype="<f8")
+        if stage is not None:
+            stage("LDpred2 done")
+        return means, np.fromfile(folder / "beta.bin", dtype="<f8")
+
+
+def fit(train) -> Model:
+    stage = Stages("ldpred2_auto_allvar")
+    rows = common_rows(train)
+    stage(f"{rows.shape[0]} common records found")
+    structural = (np.asarray(train.variants["cls"])[rows] >= 2).astype(np.float64)
+    means, effects = posterior_effects(train, rows, stage)
     return Model(rows, means, effects, structural)
