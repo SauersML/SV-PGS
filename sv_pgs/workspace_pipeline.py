@@ -409,7 +409,7 @@ class WorkspaceConfig:
     fit_minimum_minor_allele_frequency: float = 0.0
     fit_minimum_r2: float = 0.0
     """The fit leaves out every record whose minor allele frequency over the store's samples (its code sums) or whose
-    reported imputation r^2 (the store's quality column) is below these; 0 keeps every record. A fit's cost grows with
+    reliability (the measurement model's r^2) is below these; 0 keeps every record. A fit's cost grows with
     its records: the All of Us chr22 store's 1.8M candidates made a 364 GB LD store and a 10-minute pass on an A100."""
 
     @classmethod
@@ -2917,13 +2917,13 @@ def structural_records(table: VariantTable) -> BoolArray:
 def fit_filtered(table: VariantTable, sample_count: int, log_reliability: F64Array, minimum_frequency: float, minimum_r2: float) -> F64Array:
     """``log_reliability`` with -inf on every record the fit leaves out (``WorkspaceConfig.fit_minimum_r2`` and its
     frequency floor): one whose minor allele frequency over the store's ``sample_count`` samples, from its code sums,
-    or whose reported imputation r^2 (the ``quality`` column) is below its floor."""
+    or whose reliability (the measurement model's r^2, ``log_reliability``) is below its floor."""
     kept = np.ones(np.asarray(table.sum_code).shape[0], dtype=bool)
     if minimum_frequency > 0.0:
         frequency = np.asarray(table.sum_code, dtype=np.float64) / (2.0 * CODES_PER_DOSAGE * sample_count)
         kept &= np.minimum(frequency, 1.0 - frequency) >= minimum_frequency
     if minimum_r2 > 0.0:
-        kept &= np.asarray(table.annotations["quality"], dtype=np.float64) >= minimum_r2
+        kept &= np.asarray(log_reliability, dtype=np.float64) >= np.log(minimum_r2)
     LOGGER.info("workspace pipeline: the fit keeps %d of %d records (minor allele frequency >= %g, r^2 >= %g)", int(kept.sum()), kept.shape[0], minimum_frequency, minimum_r2)
     return np.where(kept, np.asarray(log_reliability, dtype=np.float64), -np.inf)
 
