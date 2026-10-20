@@ -66,7 +66,10 @@ pusher=$!
 "$RUN/venv/bin/sv-pgs" workspace-run --config "$OPS/run_config.json" --through "${THROUGH}" ${shard[@]+"${shard[@]}"} &
 wait $!
 status=$?
-kill "$pusher"
+# The pusher's sleep goes first: killed alone, the subshell left it running, and the task (and its log) ended only when
+# the sleep did, up to 15 minutes later. A push in progress is left to finish; the last push below waits on its lock.
+pkill -x -P "$pusher" sleep 2>/dev/null
+kill "$pusher" 2>/dev/null
 # A run whose last push failed did not keep its results: the job fails even if the driver finished.
 mirror push || { mark "exit-push"; [ "$status" -ne 0 ] || status=1; }
 mark "exit-${status}"
