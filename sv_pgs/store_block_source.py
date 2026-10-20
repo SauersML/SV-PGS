@@ -122,7 +122,6 @@ class StoreGenotypeBlockSource:
         self._workspace_bytes = int(workspace_bytes)
         self._samples = int(store.n_samples if self._sample_indices is None else self._sample_indices.size)
         self._padded_samples = _aligned(self._samples)
-        widest_span = max(stop - start for start, stop in self._spans)
         widest_block = _aligned(max(rows.shape[0] for rows in self._block_rows))
         self._cupy = _try_import_cupy() if budget.device_kind == "cuda" else None
         xp = self._cupy if self._cupy is not None else np
@@ -149,13 +148,11 @@ class StoreGenotypeBlockSource:
             self._input_samples = int(store.n_samples) if self._decoder is not None else self._samples
             self._sample_columns = (cupy.asarray(self._sample_indices) if self._decoder is not None and self._sample_indices is not None
                                     else cupy.arange(self._samples, dtype=cupy.int64))
-            # a rowdict read lands the block's rows compactly, so the gather is the identity there
-            staged_rows = widest_block if self._decoder is not None else widest_span
-            self._spans_on_device = [cupy.empty((staged_rows, self._input_samples), dtype=cupy.uint8) for _ in range(2)]
-            self._rows_in_span = [
-                cupy.arange(rows.shape[0], dtype=cupy.int64) if self._decoder is not None else cupy.asarray(rows - rows[0])
-                for rows in self._block_rows
-            ]
+            # A block's rows are staged compactly, so the gather is the identity: a rowdict read lands them so, and other
+            # codecs take them from their span on the host before the upload. Staged whole, a span is every record between
+            # the block's first and last: chr22's HapMap3 block of 14,542 sites spanned 861k records, 37 GB of an A100's 42.
+            self._spans_on_device = [cupy.empty((widest_block, self._input_samples), dtype=cupy.uint8) for _ in range(2)]
+            self._rows_in_span = [cupy.arange(rows.shape[0], dtype=cupy.int64) for rows in self._block_rows]
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span) + int(self._sample_columns.nbytes)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
@@ -292,23 +289,26 @@ class StoreGenotypeBlockSource:
         for event in computed:
             event.record(compute)
 
-        def upload(position: int, host_codes: NDArray[np.uint8]) -> None:
+        # each slot's gathered host rows, held until their copy has run
+        gathered: list[NDArray[np.uint8] | None] = [None, None]
+
+        def upload(position: int, start: int, span: NDArray[np.uint8]) -> None:
             slot = position % 2
-            # The span buffer is free once the block that last used it has been computed.
+            gathered[slot] = span[self._block_rows[position] - start]
+            # The staging buffer is free once the block that last used it has been computed.
             self._copy_stream.wait_event(computed[slot])
-            self._spans_on_device[slot][: host_codes.shape[0]].set(host_codes, stream=self._copy_stream)
+            self._spans_on_device[slot][: gathered[slot].shape[0]].set(gathered[slot], stream=self._copy_stream)
             copied[slot].record(self._copy_stream)
 
         count = len(self._spans)
-        _start, _stop, first = next(spans)
-        upload(first_block, first)
+        start, _stop, first = next(spans)
+        upload(first_block, start, first)
         for block_index in range(first_block, count):
             slot = block_index % 2
-            # iter_codes reuses the host buffer of this span once the next span is requested.
             copied[slot].synchronize()
             if block_index + 1 < count:
-                _start, _stop, following = next(spans)
-                upload(block_index + 1, following)
+                start, _stop, following = next(spans)
+                upload(block_index + 1, start, following)
             compute.wait_event(copied[slot])
             self._gather_block(block_index, slot)
             self._keep(block_index, slot)
