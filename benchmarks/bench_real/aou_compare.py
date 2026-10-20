@@ -18,6 +18,9 @@ error.
 Only aggregates are written, with the report's suppression (``_shown``): a trait's values are shown only where its
 people, and a disease's cases and controls, number at least MINIMUM_REPORTED_PARTICIPANTS. The three scores must cover
 the same people wherever values are shown, so no count follows from this table less the report's.
+
+A run that fits regions (``WorkspaceConfig.fit_regions``) is compared region by region, each region's arms (its run
+directory's score step) beside its LDpred2 scores; the column "region" names it, and is empty for a run without them.
 """
 from __future__ import annotations
 
@@ -37,7 +40,7 @@ from sv_pgs.workspace_pipeline import (
     _residualized, _Run, _scored_folds, _shown, workspace_bindings,
 )
 
-COLUMNS = ("trait", "score", "n", "cases", "metric", "estimate", "standard_error", "ci_lower", "ci_upper")
+COLUMNS = ("region", "trait", "score", "n", "cases", "metric", "estimate", "standard_error", "ci_lower", "ci_upper")
 SCORES = (*ARMS, "ldpred2")
 PAIRS = (("with_sv", "snv_indel"), ("snv_indel", "ldpred2"), ("with_sv", "ldpred2"))
 """The paired differences, each the first score's metric less the second's."""
@@ -60,7 +63,8 @@ def auc(labels: np.ndarray, score: np.ndarray, families: np.ndarray) -> tuple[fl
 
 
 def trait_rows(cohort, genetic: np.ndarray, trait: int) -> list[tuple[str, ...]]:
-    """One trait's rows of COLUMNS from ``genetic`` [SCORES, cohort rows], each score's held-out values (NaN elsewhere)."""
+    """One trait's rows of COLUMNS but the region from ``genetic`` [SCORES, cohort rows], each score's held-out values
+    (NaN elsewhere)."""
     name, binary = cohort.trait_names[trait], cohort.trait_types[trait] == TraitType.BINARY
     targets = cohort.targets[:, trait]
     observed = np.isfinite(targets) & np.any(np.isfinite(genetic), axis=0)
@@ -111,24 +115,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--out", required=True, help="The aggregate table to write (COLUMNS, tab-separated).")
     args = parser.parse_args(argv)
     config = WorkspaceConfig.read(args.config)
-    run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
-    if not (run.output("score") / COMPLETE_FILE).is_file():
+    budget, bindings = detect_compute_budget(), workspace_bindings()
+    regions = config.region_runs() or (("", config),)
+    scored = [(index, name, _Run(region, bindings, budget, {})) for index, (name, region) in enumerate(regions)]
+    scored = [(index, name, run) for index, name, run in scored if (run.output("score") / COMPLETE_FILE).is_file()]
+    if not scored:
         print(f"{config.run_directory} holds no scored arms (its driver stopped before the score step): nothing to compare", flush=True)
         return 0
-    cohort, scores = _read_cohort(run), _read_scores(run)
+    cohort = _read_cohort(_Run(config, bindings, budget, {}))
     with np.load(args.scores, allow_pickle=False) as ldpred2:
-        if tuple(ldpred2["research_ids"].tolist()) != cohort.research_ids or tuple(ldpred2["trait_names"].tolist()) != cohort.trait_names:
-            raise ValueError(f"{args.scores} holds another cohort's rows or traits than {config.run_directory}'s.")
+        if (
+            tuple(ldpred2["regions"].tolist()) != tuple(name for name, _region in regions)
+            or tuple(ldpred2["research_ids"].tolist()) != cohort.research_ids or tuple(ldpred2["trait_names"].tolist()) != cohort.trait_names
+        ):
+            raise ValueError(f"{args.scores} holds another run's regions, cohort rows or traits than {config.run_directory}'s.")
         held_out = ldpred2["held_out_score"]
     table = [COLUMNS]
-    quarantined = run.summary("score")["quarantined"]
-    for trait in range(len(cohort.trait_names)):
-        if cohort.trait_names[trait] in quarantined:
-            # The score step left it out as unscorable (the report's quarantined.tsv): its arms have no held-out scores.
-            print(f"{cohort.trait_names[trait]} is quarantined: not compared", flush=True)
-            continue
-        genetic = np.vstack([scores.held_out_genetic[:, :, trait], held_out[None, :, trait]])
-        table.extend(trait_rows(cohort, genetic, trait))
+    for index, name, run in scored:
+        scores, quarantined = _read_scores(run), run.summary("score")["quarantined"]
+        for trait in range(len(cohort.trait_names)):
+            if cohort.trait_names[trait] in quarantined:
+                # The score step left it out as unscorable (the report's quarantined.tsv): its arms have no held-out scores.
+                print(f"{name or config.run_directory}: {cohort.trait_names[trait]} is quarantined: not compared", flush=True)
+                continue
+            genetic = np.vstack([scores.held_out_genetic[:, :, trait], held_out[index, None, :, trait]])
+            table.extend((name, *row) for row in trait_rows(cohort, genetic, trait))
     with open(args.out, "w", newline="", encoding="utf-8") as handle:
         csv.writer(handle, delimiter="\t").writerows(table)
     for row in table:

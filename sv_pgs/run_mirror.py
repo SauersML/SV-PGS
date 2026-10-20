@@ -20,6 +20,9 @@ The durable state is what the driver resumes from:
 - **The score and effects steps' completed batches:** each batch directory with its content-digest record last,
   and the partial's KEY_FILE. Hidden batches are still being written. A completed step carries its final outputs
   alone; its batch copies are needed only while it is partial.
+- **Each region's run directory** (``WorkspaceConfig.fit_regions``), REGIONS_DIRECTORY/<name>: its own steps from the
+  fit on, mirrored as a run's under the same name. Its steps before the fit are links to the run's own, which the run
+  mirrors once.
 
 Any other partial work is redone, as after a preemption on one disk. GCS creates an object only when its upload
 completes, so a mirrored file is whole or absent.
@@ -46,7 +49,7 @@ from pathlib import Path
 from typing import Protocol
 
 from sv_pgs.content_identity import GCS_MOUNTS
-from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, STEP_NAMES
+from sv_pgs.workspace_pipeline import COMPLETE_FILE, KEY_FILE, REGIONS_DIRECTORY, STEP_NAMES
 
 LOGGER = logging.getLogger(__name__)
 PARTIAL = ".partial"
@@ -207,6 +210,34 @@ class DirectoryRemote:
                 path.rmdir()
 
 
+class _Within:
+    """``remote``'s objects under ``prefix``, named relative to it: a region's run directory's mirror inside its run's."""
+
+    def __init__(self, remote: Remote, prefix: str) -> None:
+        self._remote, self._prefix = remote, prefix
+
+    def sizes(self, prefix: str) -> dict[str, int]:
+        return {name.removeprefix(self._prefix): size for name, size in self._remote.sizes(self._prefix + prefix).items()}
+
+    def read(self, name: str) -> bytes | None:
+        return self._remote.read(self._prefix + name)
+
+    def upload(self, path: Path, name: str) -> None:
+        self._remote.upload(path, self._prefix + name)
+
+    def write(self, name: str, content: bytes) -> None:
+        self._remote.write(self._prefix + name, content)
+
+    def download(self, name: str, path: Path) -> None:
+        self._remote.download(self._prefix + name, path)
+
+    def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+        self._remote.download_many([(path, self._prefix + name) for path, name in pairs])
+
+    def delete(self, names: Iterable[str]) -> None:
+        self._remote.delete([self._prefix + name for name in names])
+
+
 _PROCESS_REMOTES: dict[str, GcsRemote] = {}
 """A GcsRemote.download_many worker process's own client, one per mirror URL."""
 
@@ -341,6 +372,9 @@ def push(run_directory: Path, remote: Remote) -> None:
     sees where it went."""
     for step in STEP_NAMES:
         final, partial = run_directory / step, run_directory / f"{step}{PARTIAL}"
+        if final.is_symlink():
+            # A region's link to its run's step, which the run's own push sends.
+            continue
         try:
             if (final / COMPLETE_FILE).is_file():
                 _push_step(remote, final, step)
@@ -348,6 +382,9 @@ def push(run_directory: Path, remote: Remote) -> None:
                 _push_partial(remote, partial, step)
         except FileNotFoundError as moved:
             LOGGER.info("run mirror: %s moved during the push (%s); it is pushed next time", step, moved)
+    regions = run_directory / REGIONS_DIRECTORY
+    for region in sorted(regions.iterdir()) if regions.is_dir() else ():
+        push(region, _Within(remote, f"{REGIONS_DIRECTORY}/{region.name}/"))
 
 
 def _restorable_partial(names: dict[str, int], name: str) -> list[str]:
@@ -439,3 +476,6 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> N
         remote.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s, %d files, %.1f GB", name, len(chosen), sum(names[entry] for entry in chosen) / 1e9)
+    # Each region's own steps; the driver links the run's steps before the fit into its directory again.
+    for region in sorted({entry.split("/")[1] for entry in names if entry.startswith(f"{REGIONS_DIRECTORY}/") and entry.count("/") >= 2}):
+        restore(run_directory / REGIONS_DIRECTORY / region, _Within(remote, f"{REGIONS_DIRECTORY}/{region}/"))

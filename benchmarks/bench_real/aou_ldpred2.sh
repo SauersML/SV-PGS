@@ -4,7 +4,7 @@
 # packed with conda-pack: the job has no internet), then aou_ldpred2.py, whose per-trait aggregates go to
 # $OPS/ldpred2.jsonl and each held-out person's score to $OPS/ldpred2_held_out.npz (participant-level: it stays in the
 # workspace bucket, beside the run's mirror). Then aou_compare.py compares the arms and LDpred2 on the same held-out
-# people ($OPS/compare.tsv, aggregates), where the driver scored the arms.
+# people ($OPS/compare.tsv, aggregates), where the driver scored the arms. A run of fit_regions has both region by region.
 set -euo pipefail
 rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"

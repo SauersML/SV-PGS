@@ -17,6 +17,10 @@ Only aggregates leave the VM: per trait, the held-out row count (never 1 to 20),
 Each held-out person's score, by its own model, goes to ``--scores`` by cohort row (``held_out_scores``), so the arms
 and LDpred2 are compared on the same people (aou_compare.py): participant-level data, which stays in the workspace
 beside the run's mirror, and which no step stages for export.
+
+A run that fits regions (``WorkspaceConfig.fit_regions``) has LDpred2 fitted on each region's snv_indel records in
+turn, on the run's one cohort and store, and each line names its region ("region" first); a run without them writes
+the lines it always did.
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import argparse
 import json
 import os
 import pathlib
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -135,13 +140,15 @@ def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -
     }, np.concatenate(held_rows), np.concatenate(held_scores)
 
 
-def held_out_scores(path: str | pathlib.Path, cohort, scores: np.ndarray, variants: np.ndarray) -> None:
-    """Each held-out person's LDpred2 score, [cohort rows, traits] in the cohort's row and trait order (NaN where the
-    person is not held out of the trait or its cell was not fitted), with the cohort's research IDs and trait names to
-    check that order by."""
+def held_out_scores(path: str | pathlib.Path, cohort, regions: Sequence[str], scores: np.ndarray, variants: np.ndarray) -> None:
+    """Each held-out person's LDpred2 score, [regions, cohort rows, traits] in the run's region order (one region, "",
+    for a run without fit_regions) and the cohort's row and trait order (NaN where the person is not held out of the
+    trait or its cell was not fitted), with the region names and the cohort's research IDs and trait names to check
+    that order by, and each region's variant count."""
     with open(path, "wb") as handle:
         np.savez(
-            handle, research_ids=np.array(cohort.research_ids), trait_names=np.array(cohort.trait_names), held_out_score=scores, variants=variants,
+            handle, regions=np.array(regions), research_ids=np.array(cohort.research_ids), trait_names=np.array(cohort.trait_names),
+            held_out_score=scores, variants=variants,
         )
 
 
@@ -156,20 +163,24 @@ def main(argv: list[str] | None = None) -> int:
     cohort = _read_cohort(run)
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     lines = []
-    scores = np.full((len(cohort.research_ids), len(cohort.trait_names)), np.nan)
+    regions = config.region_runs() or (("", config),)
+    scores = np.full((len(regions), len(cohort.research_ids), len(cohort.trait_names)), np.nan)
+    variants = np.zeros(len(regions), dtype=np.int64)
     with DosageStore.open(_final_store(run)) as store:
         table = store.variant_table
-        kept = fit_filtered(
-            table, store.n_samples, measurement.log_reliability, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2, config.fit_variant_sites,
-            config.fit_region,
-        )
-        records = np.flatnonzero(np.isfinite(arm_log_reliability(table, kept, "snv_indel")))
-        for trait in range(len(cohort.trait_names)):
-            line, rows, score = ldpred2_trait(store, records, cohort, trait)
-            scores[rows, trait] = score
-            lines.append(json.dumps(line))
-            print(lines[-1], flush=True)
-    held_out_scores(args.scores, cohort, scores, np.full(len(cohort.trait_names), records.shape[0]))
+        for index, (name, region) in enumerate(regions):
+            kept = fit_filtered(
+                table, store.n_samples, measurement.log_reliability, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
+                config.fit_variant_sites, region.fit_region,
+            )
+            records = np.flatnonzero(np.isfinite(arm_log_reliability(table, kept, "snv_indel")))
+            variants[index] = records.shape[0]
+            for trait in range(len(cohort.trait_names)):
+                line, rows, score = ldpred2_trait(store, records, cohort, trait)
+                scores[index, rows, trait] = score
+                lines.append(json.dumps({"region": name, **line} if name else line))
+                print(lines[-1], flush=True)
+    held_out_scores(args.scores, cohort, [name for name, _region in regions], scores, variants)
     pathlib.Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
 

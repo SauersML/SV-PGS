@@ -1491,14 +1491,16 @@ def test_a_regional_alzheimers_run_fits_its_window_suppresses_its_few_cases_and_
     cohort = np.load(run / "cohort" / "cohort.npz")
     with np.load(scores_path) as saved:
         assert saved["research_ids"].tolist() == cohort["research_ids"].tolist() and saved["trait_names"].tolist() == ["alzheimers_disease"]
-        np.testing.assert_array_equal(np.isfinite(saved["held_out_score"][:, 0]), cohort["held_out"][:, 0] & np.isfinite(cohort["targets"][:, 0]))
+        # One region, unnamed: the run's own window.
+        assert saved["regions"].tolist() == [""] and saved["variants"].tolist() == [records.shape[0]]
+        np.testing.assert_array_equal(np.isfinite(saved["held_out_score"][0, :, 0]), cohort["held_out"][:, 0] & np.isfinite(cohort["targets"][:, 0]))
     [line] = (tmp_path / "ldpred2.jsonl").read_text().splitlines()
     assert json.loads(line)["variants"] == records.shape[0]
     compared = tmp_path / "compare.tsv"
     assert aou_compare.main(["--config", str(config_path), "--scores", str(scores_path), "--out", str(compared)]) == 0
     with compared.open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
-    assert [(row["score"], row["metric"]) for row in rows] == [
+    assert {row["region"] for row in rows} == {""} and [(row["score"], row["metric"]) for row in rows] == [
         (score, metric) for metric in ("pgs_partial_r2", "pgs_auc") for score in ("snv_indel", "with_sv", "ldpred2", "with_sv - snv_indel", "snv_indel - ldpred2", "with_sv - ldpred2")
     ]
     # The synthetic disease's few held-out cases and controls are never shown, nor any value read on them.
@@ -1534,6 +1536,121 @@ def test_report_cells_hide_the_levels_from_which_a_small_count_would_follow() ->
     small = [("all", "all", _HeldOutCell((np.arange(15),))), ("ancestry", "eur", _HeldOutCell((np.arange(15),))), ("ancestry", "afr", _HeldOutCell((np.arange(0),)))]
     assert _partition_hidden(small, np.zeros(15), False) == {("ancestry", "eur"): "rows"}
 
+
+
+def test_fit_regions_name_windows_each_fitted_as_a_run_of_its_own_on_the_runs_shared_steps(workspace) -> None:
+    synthetic, _client = workspace
+    regions = [{"name": "apoe", "chromosome": 22, "start": 1500, "end": 6500}, {"name": "lpa_kiv2", "chromosome": 21, "start": 1, "end": 9000}]
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "fit_regions": regions})
+    assert config.fit_regions == (("apoe", (22, 1500, 6500)), ("lpa_kiv2", (21, 1, 9000))) and config.fit_region is None
+    runs = dict(config.region_runs())
+    assert list(runs) == ["apoe", "lpa_kiv2"] and WorkspaceConfig.from_mapping(synthetic.raw).region_runs() == ()
+    apoe = runs["apoe"]
+    assert apoe.run_directory == config.run_directory / workspace_pipeline.REGIONS_DIRECTORY / "apoe"
+    assert apoe.marker_directory == config.marker_directory / workspace_pipeline.REGIONS_DIRECTORY / "apoe"
+    assert apoe.fit_region == (22, 1500, 6500) and apoe.fit_regions is None
+    # A region's window keys its fit alone (the steps before it are the run's, which a region never makes again).
+    steps = {step.name: step for step in workspace_pipeline._STEPS}
+    assert all(steps[name].inputs(apoe) == steps[name].inputs(config) for name in ("cohort", "measurement", "direct_sv"))
+    assert steps["fit"].inputs(apoe) != steps["fit"].inputs(runs["lpa_kiv2"])
+    window = {key: value for key, value in regions[0].items() if key != "name"}
+    for bad, match in (
+        ([], "non-empty list"), (regions[0], "non-empty list"), (["apoe"], "non-empty list"), ([regions[0], regions[0]], "distinct name"),
+        ([{**regions[0], "name": "APOE"}], "distinct name"), ([{**regions[0], "name": "a-b"}], "distinct name"),
+        ([{**regions[0], "name": ""}], "distinct name"), ([window], "distinct name"), ([{**regions[0], "chromosome": 19}], r"fit_regions\[0\]"),
+        ([regions[0], {**regions[1], "start": 0}], r"fit_regions\[1\]"), ([{**regions[0], "strand": "+"}], r"fit_regions\[0\]"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            WorkspaceConfig.from_mapping({**synthetic.raw, "fit_regions": bad})
+    with pytest.raises(ValueError, match="never both"):
+        WorkspaceConfig.from_mapping({**synthetic.raw, "fit_regions": regions, "fit_region": window})
+
+
+def test_a_run_of_regions_fits_each_window_on_the_shared_steps_mirrors_each_once_and_compares_each_with_ldpred2(
+    workspace, monkeypatch, tmp_path: Path
+) -> None:
+    """Two named windows on one store: the steps before the fit made once, each region's fit and later steps in its own
+    directory on its window alone; the mirror carries each region's own steps and the shared ones once, and a fresh disk
+    restored from it fits nothing again; LDpred2 and the comparison run region by region."""
+    from benchmarks.bench_real import aou_compare, aou_ldpred2
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    windows = {"left": (21, 1, 4500), "right": (22, 2500, 9500)}
+    raw = {**synthetic.raw, "fit_regions": [{"name": name, **dict(zip(("chromosome", "start", "end"), window))} for name, window in windows.items()]}
+    config_path = tmp_path / "run_config.json"
+    config_path.write_text(json.dumps(raw))
+    config = WorkspaceConfig.read(config_path)
+    recorder = _Recorder()
+    bindings = _artifact_bindings(recorder, client)
+    assert not workspace_pipeline.completed_through(config, "export")
+    summaries = run_pipeline(config, bindings, BUDGET)
+    run, shared = config.run_directory, STEP_NAMES[:STEP_NAMES.index("fit")]
+    own = STEP_NAMES[STEP_NAMES.index("fit"):]
+    assert list(summaries) == [*shared, *(f"{workspace_pipeline.REGIONS_DIRECTORY}/{name}/{step}" for name in windows for step in own)]
+    assert not any((run / step).exists() for step in own)
+    assert workspace_pipeline.completed_through(config, "export") and workspace_pipeline.completed_through(config, "direct_sv")
+    keys = {}
+    for name in windows:
+        region = run / workspace_pipeline.REGIONS_DIRECTORY / name
+        assert all((region / step).is_symlink() and (region / step).resolve() == (run / step).resolve() for step in shared)
+        assert all((region / step / COMPLETE_FILE).is_file() and not (region / step).is_symlink() for step in own)
+        keys[name] = json.loads((region / "fit" / COMPLETE_FILE).read_text())["key"]
+        for table in raw["export"]:
+            check_exportable(region / "export" / table)
+    assert keys["left"] != keys["right"]
+    # Each region's two arms fit its window alone, the regions in the config's order.
+    assert len(recorder.fit_calls) == len(ARMS) * len(windows)
+    for position, window in enumerate(windows.values()):
+        calls = recorder.fit_calls[len(ARMS) * position:len(ARMS) * (position + 1)]
+        inside = workspace_pipeline.region_records(calls[0].store.variant_table, window)
+        assert all(np.isfinite(call.log_variance_offset).any() and not np.any(np.isfinite(call.log_variance_offset) & ~inside) for call in calls)
+
+    mirror = DirectoryRemote(tmp_path / "mirror")
+    push(run, mirror)
+    held = mirror.sizes("")
+    for name in windows:
+        prefix = f"{workspace_pipeline.REGIONS_DIRECTORY}/{name}/"
+        assert all(f"{prefix}{step}/{COMPLETE_FILE}" in held for step in own)
+        assert not any(entry.startswith(f"{prefix}{step}") for entry in held for step in shared)
+    assert all(f"{step}/{COMPLETE_FILE}" in held for step in shared)
+    restored = dataclasses.replace(config, run_directory=tmp_path / "restored")
+    restore(restored.run_directory, mirror)
+    resumed = _Recorder(fits_before_failing=0)
+    run_pipeline(restored, _artifact_bindings(resumed, client), BUDGET)
+    assert not resumed.fit_calls
+    for name in windows:
+        relative = Path(workspace_pipeline.REGIONS_DIRECTORY) / name / "report" / "accuracy.tsv"
+        assert (restored.run_directory / relative).read_bytes() == (run / relative).read_bytes()
+
+    # LDpred2 region by region, each on its region's snv_indel records, then the comparison of each region's arms with it.
+    for module in (aou_ldpred2, aou_compare):
+        monkeypatch.setattr(module, "workspace_bindings", lambda: bindings)
+        monkeypatch.setattr(module, "detect_compute_budget", lambda: BUDGET)
+    read: list[np.ndarray] = []
+
+    def posterior_effects(train, rows):
+        read.append(train.records.copy())
+        return train.codes(rows).astype(np.float64).mean(axis=1) / 127.0, np.random.default_rng(3).normal(size=rows.shape[0])
+
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", posterior_effects)
+    monkeypatch.setattr(aou_ldpred2, "_shown", lambda count, cases: count > 0)
+    scores_path, ldpred2_path = tmp_path / "ldpred2_held_out.npz", tmp_path / "ldpred2.jsonl"
+    assert aou_ldpred2.main(["--config", str(config_path), "--out", str(ldpred2_path), "--scores", str(scores_path)]) == 0
+    short = [np.flatnonzero(np.isfinite(recorder.fit_calls[len(ARMS) * position].log_variance_offset)) for position in range(len(windows))]
+    assert read and all(any(np.array_equal(records, region) for region in short) for records in read)
+    lines = [json.loads(line) for line in ldpred2_path.read_text().splitlines()]
+    traits = [*config.diseases, *config.traits]
+    assert [(line["region"], line["trait"]) for line in lines] == [(name, trait) for name in windows for trait in traits]
+    assert [line["variants"] for line in lines] == [region.shape[0] for region in short for _trait in traits]
+    with np.load(scores_path) as saved:
+        assert saved["regions"].tolist() == list(windows) and saved["held_out_score"].shape[0] == len(windows)
+    compared = tmp_path / "compare.tsv"
+    assert aou_compare.main(["--config", str(config_path), "--scores", str(scores_path), "--out", str(compared)]) == 0
+    with compared.open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert list(dict.fromkeys(row["region"] for row in rows)) == list(windows)
+    check_exportable(compared)
 
 
 def _single_model_batches(model_bytes, host_bytes):

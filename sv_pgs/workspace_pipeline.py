@@ -201,6 +201,10 @@ genetic score the score step writes beside the model's own for the effects step'
 COMPLETE_FILE = "_COMPLETE.json"
 KEY_FILE = "_KEY"
 EXPORTABLE_FILE = "_EXPORTABLE.json"
+REGIONS_DIRECTORY = "regions"
+"""The run directory's directory of its regions' runs (``WorkspaceConfig.fit_regions``), one directory each by name."""
+REGION_NAME = re.compile(r"[a-z0-9_]+")
+"""A fit region's name, which names its directory (and its mirror's): lowercase letters, digits and underscores."""
 CONFIG_KEYS = (
     "run_directory",
     "marker_directory",
@@ -423,6 +427,13 @@ class WorkspaceConfig:
     ends included: the fit keeps only the records whose position lies in it (``region_records``), SNVs, short indels and
     structural records alike, each still subject to the floors and the site list above; None keeps every chromosome
     whole. A regional score is fitted on one locus's records alone: the APOE locus's for Alzheimer's disease."""
+    fit_regions: tuple[tuple[str, tuple[int, int, int]], ...] | None = None
+    """Named windows, (name, fit_region's window), each fitted as its own model set: a region's fit, score, effects,
+    report and export steps run in REGIONS_DIRECTORY/<name> of the run directory, as a run whose fit_region is its
+    window (``region_runs``), on the run's steps before the fit, which every region shares (``run_pipeline``). Names
+    are distinct and REGION_NAME's; windows may overlap, each fitted alone. None fits the run's own models; a run sets
+    fit_region or fit_regions, never both. A window's fit is minutes on a small machine, so one job fits a panel of
+    loci on one store."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -431,7 +442,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", *_FIT_FILTER_KEYS})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", "fit_regions", *_FIT_FILTER_KEYS})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -477,16 +488,20 @@ class WorkspaceConfig:
             chromosome_number(chromosome)
         if not chromosomes or len({chromosome_number(chromosome) for chromosome in chromosomes}) != len(chromosomes):
             raise ValueError("chromosomes must list each store chromosome once.")
-        region = raw.get("fit_region")
-        if region is not None and (
-            not isinstance(region, Mapping) or set(region) != {"chromosome", "start", "end"}
-            or any(isinstance(region[key], bool) or not isinstance(region[key], (int, np.integer)) for key in region)
-            or region["chromosome"] not in {chromosome_number(chromosome) for chromosome in chromosomes}
-            or not 1 <= region["start"] <= region["end"]
-        ):
-            raise ValueError(
-                "fit_region is null or {chromosome, start, end}: the number of one of the store's chromosomes and the window's "
-                "first and last positions (1-based, both included, in the store's build); never rounded or coerced."
+        numbers = {chromosome_number(chromosome) for chromosome in chromosomes}
+        region = None if raw.get("fit_region") is None else _fit_window(raw["fit_region"], numbers, "fit_region")
+        regions = raw.get("fit_regions")
+        if regions is not None:
+            if region is not None:
+                raise ValueError("a run sets fit_region (its own models' window) or fit_regions (a model set per named window), never both.")
+            if not isinstance(regions, Sequence) or isinstance(regions, str) or not regions or not all(isinstance(entry, Mapping) for entry in regions):
+                raise ValueError("fit_regions is null or a non-empty list of {name, chromosome, start, end}.")
+            names = [entry.get("name") for entry in regions]
+            if any(not isinstance(name, str) or not REGION_NAME.fullmatch(name) for name in names) or len(set(names)) != len(names):
+                raise ValueError(f"each of fit_regions has a distinct name matching {REGION_NAME.pattern}: it names the region's directory.")
+            regions = tuple(
+                (name, _fit_window({key: value for key, value in entry.items() if key != "name"}, numbers, f"fit_regions[{index}]"))
+                for index, (name, entry) in enumerate(zip(names, regions))
             )
         try:
             research_column, sequencing_column = (str(column) for column in raw["crosswalk_columns"])
@@ -532,7 +547,20 @@ class WorkspaceConfig:
             fit_minimum_minor_allele_frequency=float(raw.get("fit_minimum_minor_allele_frequency", 0.0)),
             fit_minimum_r2=float(raw.get("fit_minimum_r2", 0.0)),
             fit_variant_sites=raw.get("fit_variant_sites"),
-            fit_region=None if region is None else (int(region["chromosome"]), int(region["start"]), int(region["end"])),
+            fit_region=region,
+            fit_regions=regions,
+        )
+
+    def region_runs(self) -> tuple[tuple[str, WorkspaceConfig], ...]:
+        """Each of ``fit_regions`` by name, as the run its steps from the fit on make: in REGIONS_DIRECTORY/<name> of the
+        run directory (and of the marker directory), with the region's window as its fit_region. None without
+        fit_regions."""
+        return tuple(
+            (name, dataclasses.replace(
+                self, run_directory=self.run_directory / REGIONS_DIRECTORY / name, fit_region=window, fit_regions=None,
+                marker_directory=None if self.marker_directory is None else self.marker_directory / REGIONS_DIRECTORY / name,
+            ))
+            for name, window in self.fit_regions or ()
         )
 
     def model_folds(self) -> tuple[int, ...]:
@@ -632,6 +660,21 @@ def genotype_file_fingerprint(path: Path) -> tuple[int, str]:
 
 
 _FIT_FILTER_KEYS = ("fit_minimum_minor_allele_frequency", "fit_minimum_r2")
+
+
+def _fit_window(window: Any, chromosomes: set[int], key: str) -> tuple[int, int, int]:
+    """A fit window (``WorkspaceConfig.fit_region``) from the config's {chromosome, start, end}: the number of one of
+    the store's ``chromosomes`` and the window's first and last positions, integers never rounded or coerced."""
+    if (
+        not isinstance(window, Mapping) or set(window) != {"chromosome", "start", "end"}
+        or any(isinstance(window[name], bool) or not isinstance(window[name], (int, np.integer)) for name in window)
+        or window["chromosome"] not in chromosomes or not 1 <= window["start"] <= window["end"]
+    ):
+        raise ValueError(
+            f"{key} is {{chromosome, start, end}}: the number of one of the store's chromosomes and the window's first and last "
+            "positions (1-based, both included, in the store's build); never rounded or coerced."
+        )
+    return int(window["chromosome"]), int(window["start"]), int(window["end"])
 
 
 def module_closure(*roots: ModuleType) -> tuple[ModuleType, ...]:
@@ -4359,7 +4402,11 @@ def run_pipeline(
     chromosome at that index, and the run stops there unless the store is then whole. The store step's key does not
     name the shard, so every shard's converted chromosomes belong to one store. With ``fit_arms`` the fit step fits only
     those of ARMS, and the run stops there unless every arm is then on disk; the fit step's key does not name them either.
-    On the All of Us chr22 store an arm took half an hour on two A100s, the second waiting on the first."""
+    On the All of Us chr22 store an arm took half an hour on two A100s, the second waiting on the first.
+
+    With ``fit_regions`` the steps before the fit are made once, in the run directory, and each region's fit and the
+    steps after it in the region's own, in the config's order (``_region_steps``); a region's summaries are named
+    REGIONS_DIRECTORY/<name>/<step>."""
     if through is not None and through not in STEP_NAMES:
         raise ValueError(f"through must be one of {STEP_NAMES}.")
     if store_shard is not None and not 0 <= store_shard < len(config.chromosomes):
@@ -4370,6 +4417,10 @@ def run_pipeline(
     run = _Run(config, bindings, budget, {}, None if store_shard is None else (config.chromosomes[store_shard],), None if fit_arms is None else tuple(fit_arms))
     summaries = {}
     for step in _STEPS:
+        if step.name == "fit" and config.fit_regions is not None:
+            for name, region in config.region_runs():
+                summaries.update({f"{REGIONS_DIRECTORY}/{name}/{done}": summary for done, summary in _region_steps(run, region, through).items()})
+            break
         try:
             summaries[step.name] = _run_step(run, step)
         except StepPart as part:
@@ -4378,3 +4429,38 @@ def run_pipeline(
         if step.name == through:
             break
     return summaries
+
+
+def _region_steps(shared: _Run, config: WorkspaceConfig, through: str | None) -> dict[str, dict[str, Any]]:
+    """One region's fit and the steps after it (``WorkspaceConfig.region_runs``), on the shared run's steps before the
+    fit. Each of those is linked into the region's run directory, where the later steps read it as their own
+    (``_final_store`` names the store by its path in the run directory), and keeps the shared run's key, so no region
+    makes it again. A region's fit stopped after its part (``fit_arms``) ends that region's steps alone."""
+    config.run_directory.mkdir(parents=True, exist_ok=True)
+    later = [step for step in _STEPS if STEP_NAMES.index(step.name) >= STEP_NAMES.index("fit")]
+    for name in STEP_NAMES[:STEP_NAMES.index("fit")]:
+        link = config.run_directory / name
+        if link.exists() and not link.is_symlink():
+            raise RuntimeError(f"{link} is not the shared run's {name}; move it away first.")
+        if not link.is_symlink():
+            link.symlink_to(os.path.relpath(shared.output(name), config.run_directory), target_is_directory=True)
+    run = _Run(config, shared.bindings, shared.budget, dict(shared.keys), None, shared.fit_arms)
+    summaries = {}
+    for step in later:
+        try:
+            summaries[step.name] = _run_step(run, step)
+        except StepPart as part:
+            LOGGER.info("workspace pipeline: region %s: %s stopped after its part: %s", config.run_directory.name, step.name, part)
+            break
+        if step.name == through:
+            break
+    return summaries
+
+
+def completed_through(config: WorkspaceConfig, through: str) -> bool:
+    """Whether the run holds ``through`` completed (launcher/workspace runs its AFTER_SCRIPT only then): in every
+    region's run directory when the run fits regions and ``through`` is the fit or a later step, else in its own."""
+    if through not in STEP_NAMES:
+        raise ValueError(f"through must be one of {STEP_NAMES}.")
+    regional = config.fit_regions is not None and STEP_NAMES.index(through) >= STEP_NAMES.index("fit")
+    return all((run.run_directory / through / COMPLETE_FILE).is_file() for run in ([region for _name, region in config.region_runs()] if regional else [config]))
