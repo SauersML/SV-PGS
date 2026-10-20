@@ -703,7 +703,11 @@ class CudaGenotypeBuffer:
                         total = output.astype(cupy.int64) if total is None else total + output
                 lower = (output if total is None else total)[:rows, :rows]
                 index = cupy.arange(rows)
-                grams[group] = cupy.where(index[:, None] >= index[None, :], lower, lower.T)
+                # By row panels: a whole block's condition and result (5 bytes a pair) are not in cuda_buffer_bytes, and
+                # beside the AoU chr22 with_sv arm's 29,696-row block they ran the A100 out of memory.
+                for panel_row in range(0, rows, _CUDA_GRAM_PANEL):
+                    panel = slice(panel_row, min(panel_row + _CUDA_GRAM_PANEL, rows))
+                    grams[group, panel] = cupy.where(index[panel, None] >= index[None, :], lower[panel], lower.T[panel])
             cross = None if self._cross is None else self.cross_products(slot, rows)
         return sums, grams, cross
 
