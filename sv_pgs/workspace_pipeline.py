@@ -58,7 +58,7 @@ hold the step and the event.
 from __future__ import annotations
 
 from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import ast
 import csv
 import dataclasses
@@ -2074,7 +2074,9 @@ def _group_code_moments(store: DosageStore, columns: I64Array, column_groups: I6
     """Per record and group, the count, sum and sum of squares of the codes of ``columns`` (exact, in int64), from one read.
 
     Half the host budget goes to the store's read-ahead ring, the other half to each block's
-    int64 copies of one group's codes and their squares.
+    copies of one group's codes and their squares. Each block's rows are split over the budget's
+    CPU threads (numpy's take and reduce release the GIL): on one thread, the whole-genome All of
+    Us store's 6e12 fit entries took hours on the GPU VM.
     """
     record_count = store.n_variants
     sums = np.zeros((record_count, group_count), dtype=np.int64)
@@ -2083,12 +2085,22 @@ def _group_code_moments(store: DosageStore, columns: I64Array, column_groups: I6
     rows = max(1, int(budget.host_bytes // 2 // (columns.shape[0] * (1 + 2 * _INT64_BYTES))))
     ranges = [(start, min(start + rows, record_count)) for start in range(0, record_count, rows)]
     reader_budget = dataclasses.replace(budget, host_bytes=budget.host_bytes // 2)
-    members = [column_groups == group for group in range(group_count)]
-    for start, stop, codes in store.iter_codes(ranges, columns, reader_budget):
+    members = [np.flatnonzero(column_groups == group) for group in range(group_count)]
+    # A code's square, exact in uint16 (255**2 < 2**16).
+    square_of = np.arange(256, dtype=np.uint16) ** 2
+    threads = max(1, budget.cpu_threads)
+
+    def moments(codes: U8Array, start: int, low: int, high: int) -> None:
         for group, member in enumerate(members):
-            values = codes[:, member].astype(np.int64)
-            sums[start:stop, group] = values.sum(axis=1)
-            squares[start:stop, group] = (values * values).sum(axis=1)
+            values = np.take(codes[low:high], member, axis=1)
+            sums[start + low : start + high, group] = np.add.reduce(values, axis=1, dtype=np.int64)
+            squares[start + low : start + high, group] = np.add.reduce(np.take(square_of, values), axis=1, dtype=np.int64)
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for start, stop, codes in store.iter_codes(ranges, columns, reader_budget):
+            step = -(-(stop - start) // threads)
+            for _ in pool.map(lambda low: moments(codes, start, low, min(low + step, stop - start)), range(0, stop - start, step)):
+                pass
     return counts, sums, squares
 
 

@@ -1042,8 +1042,8 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
         assert list(summaries) == ["samples"] and not (run / "store").exists()
         assert sorted(path.name for path in (run / "store.partial" / "chromosomes").iterdir()) == [f"{chromosome}.json"]
         shards.append(run.rename(run.with_name(f"shard{shard}")))
-    assert sum(path.name.endswith(f"_store_converted-{CHROMOSOMES[0]}") for path in config.marker_directory.iterdir()) == 2
-    assert any(path.name.endswith("_store_part-done") for path in config.marker_directory.iterdir())
+    events = {path.name.split("_", 1)[1] for path in config.marker_directory.iterdir()}
+    assert {f"store_converted-{chromosome}" for chromosome in CHROMOSOMES} | {"store_part-done"} <= events
     for directory in shards:
         push(directory, remote)
     restore(run, remote)
@@ -1052,6 +1052,22 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
     assert merged["store"] == whole["store"] and tree(run / "store") == expected
     with pytest.raises(ValueError, match="store_shard"):
         run_pipeline(config, _bindings(_Recorder(), client), BUDGET, store_shard=len(CHROMOSOMES))
+
+
+def test_the_code_moments_split_over_threads_are_the_exact_moments_of_each_group_s_columns(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="store")
+    with DosageStore.open(config.run_directory / "store" / "store") as store:
+        codes = store.read_codes(0, store.n_variants).astype(np.int64)
+        columns = np.arange(1, store.n_samples, 2)
+        groups = np.arange(columns.shape[0]) % 3
+        for threads in (1, 3, 64):
+            counts, sums, squares = workspace_pipeline._group_code_moments(store, columns, groups, 4, dataclasses.replace(BUDGET, cpu_threads=threads))
+            assert counts.tolist() == [int((groups == group).sum()) for group in range(4)]
+            for group in range(4):
+                values = codes[:, columns[groups == group]]
+                assert np.array_equal(sums[:, group], values.sum(axis=1)) and np.array_equal(squares[:, group], (values * values).sum(axis=1))
 
 
 def test_popped_records_without_info_cm_take_their_genetic_positions_from_the_genetic_map(workspace) -> None:
@@ -1140,7 +1156,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launcher" / "workspace"
 def _filled(text: str) -> str:
     """A template with its numeric placeholders set to 1, the two half labels to A and B, and every other
     placeholder to its own name in lower case."""
-    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("RUN_DISK_GB", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
+    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("RUN_DISK_GB", "1"), ("TASK_COUNT", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
         text = text.replace("${" + name + "}", value)
     return re.sub(r"\$\{([A-Z_]+)\}", lambda match: match.group(1).lower(), text)
 
