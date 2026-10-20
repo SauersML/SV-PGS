@@ -76,6 +76,30 @@ def test_two_summation_orders_differ_within_the_reassociation_bound() -> None:
     assert np.all(np.abs(forward - (by_halves[0] + by_halves[1])) <= reassociation_bound(images, np))
 
 
+def test_a_sharded_read_runs_every_shards_read_to_its_end() -> None:
+    """A shard's read records its completion only past its last block (``StoreGenotypeBlockSource.iter_tiles``: its
+    resident genotype codes serve the reads after a complete one), so ``blocks`` runs every shard's read to its end, as
+    ``map_reduce``'s strict zip does."""
+    from sv_pgs.device_plan import ShardedDualSource
+
+    class Shard:
+        def __init__(self, count: int) -> None:
+            self.count, self.completed = count, 0
+
+        def iter_tiles(self):
+            for index in range(self.count):
+                yield index, object()
+            self.completed += 1
+
+    plan = plan_blocks((0, 1), [5, 9, 4, 3], 10)
+    shards = [Shard(plan.blocks_on(position).shape[0]) for position in range(2)]
+    sharded = ShardedDualSource(shards, plan, [(0, 5), (5, 14), (14, 18), (18, 21)], 10, np)
+    assert len(list(sharded.blocks())) == 4 and [shard.completed for shard in shards] == [1, 1]
+    shards[0].count += 1
+    with pytest.raises(ValueError, match="more blocks than the plan"):
+        list(sharded.blocks())
+
+
 def test_stage2_shards_its_reads_over_the_devices_as_one_streamed_source_reads(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stage 2's reads are sharded over a budget's CUDA devices by LD block (``stage2_wiring.stage2_source``), on a model's
     training samples. Checked on the host: numpy stands in for CuPy (``compute_budget._cupy_device_context`` needs no

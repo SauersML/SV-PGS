@@ -300,6 +300,13 @@ class ShardedDualSource:
             with _cupy_device_context(self._cupy, device_id):
                 _local, tile = next(iterators[position])
             yield start, stop, _PeerTile(tile, device_id, self.home_id, self._cupy)
+        # Each shard's read is run past its last block, as map_reduce's strict zip runs it: a store source records a
+        # complete read only there (its resident genotype codes serve the reads after it), and left at its last block,
+        # no read ever completed, so every sweep of the All of Us whole-genome fits streamed the store from disk.
+        for position, iterator in enumerate(iterators):
+            with _cupy_device_context(self._cupy, self.plan.device_ids[position]):
+                if next(iterator, None) is not None:
+                    raise ValueError("a shard yielded more blocks than the plan gives it")
 
     def map_reduce(self, work: BlockWork, shared: Mapping[str, Any], rows: Mapping[str, Any], image_shape: tuple[int, ...]) -> Any:
         """Run ``work`` on every block, all devices at once, and return the sum of the devices'
