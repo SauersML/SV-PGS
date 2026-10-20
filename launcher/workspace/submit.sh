@@ -26,7 +26,16 @@ TASK_COUNT="${TASK_COUNT:-1}"
 if [[ ! "$TASK_COUNT" =~ ^[1-9][0-9]*$ ]] || { [ "$spec" = fit ] && [ "$TASK_COUNT" != 1 ]; }; then
   echo "TASK_COUNT is the store job's number of chromosome tasks, one VM each; the fit job has one" >&2; exit 2
 fi
-export TASK_COUNT
+# STORE_SHARDS (optional): the run config's chromosome indices the store job's tasks convert, one per task, such as the
+# chromosomes an earlier fan-out did not finish.
+STORE_SHARDS="${STORE_SHARDS:-}"
+if [ -n "$STORE_SHARDS" ]; then
+  read -r -a listed <<< "$STORE_SHARDS"
+  if [ "$spec" = fit ] || [[ ! "$STORE_SHARDS" =~ ^[0-9]+( [0-9]+)*$ ]] || [ "${#listed[@]}" != "$TASK_COUNT" ]; then
+    echo "STORE_SHARDS lists a store job's chromosome indices, one per task (TASK_COUNT of them)" >&2; exit 2
+  fi
+fi
+export TASK_COUNT STORE_SHARDS
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
@@ -55,7 +64,7 @@ done
 export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
-  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT
+  --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS
 variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)

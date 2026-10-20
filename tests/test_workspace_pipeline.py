@@ -1055,6 +1055,20 @@ def test_store_shards_on_their_own_disks_meet_in_the_mirror_and_make_the_store_o
         run_pipeline(config, _bindings(_Recorder(), client), BUDGET, store_shard=len(CHROMOSOMES))
 
 
+def test_a_marker_that_cannot_be_written_does_not_stop_the_run(workspace, monkeypatch) -> None:
+    """Markers are status signals: on the bucket mount, fan-out tasks touching one name in one second raised Stale file
+    handle, which must not end the step."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+
+    def stale(self, *arguments, **keywords):
+        raise OSError(116, "Stale file handle")
+
+    monkeypatch.setattr(Path, "touch", stale)
+    summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="samples")
+    assert list(summaries) == ["samples"] and (config.run_directory / "samples" / COMPLETE_FILE).is_file()
+
+
 def test_the_code_moments_split_over_threads_are_the_exact_moments_of_each_group_s_columns(workspace) -> None:
     synthetic, client = workspace
     config = WorkspaceConfig.from_mapping(synthetic.raw)
@@ -1157,7 +1171,7 @@ LAUNCHER = Path(__file__).resolve().parents[1] / "launcher" / "workspace"
 def _filled(text: str) -> str:
     """A template with its numeric placeholders set to 1, the two half labels to A and B, and every other
     placeholder to its own name in lower case."""
-    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("RUN_DISK_GB", "1"), ("TASK_COUNT", "1"), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
+    for name, value in (("FOLD_SEED", "1"), ("MAX_RETRIES", "1"), ("GPU_COUNT", "1"), ("RUN_DISK_GB", "1"), ("TASK_COUNT", "1"), ("STORE_SHARDS", ""), ("HALF_A_LABEL", "A"), ("HALF_B_LABEL", "B")):
         text = text.replace("${" + name + "}", value)
     return re.sub(r"\$\{([A-Z_]+)\}", lambda match: match.group(1).lower(), text)
 

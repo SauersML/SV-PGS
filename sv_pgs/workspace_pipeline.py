@@ -635,11 +635,18 @@ def _write_json(path: Path, value: Any) -> None:
 
 
 def _mark(config: WorkspaceConfig, step: str, event: str) -> None:
-    """An empty marker file named by time, step and event, and never by any value computed from data."""
+    """An empty marker file named by time, step and event, and never by any value computed from data.
+
+    A marker is a status signal only, so one that cannot be written is logged and the run goes on: on the bucket mount,
+    a store fan-out's tasks touching the same name in the same second failed with "Stale file handle", which ended two
+    chromosome tasks before they converted anything."""
     if config.marker_directory is None:
         return
-    config.marker_directory.mkdir(parents=True, exist_ok=True)
-    (config.marker_directory / f"{_utc()}_{step}_{event}").touch()
+    try:
+        config.marker_directory.mkdir(parents=True, exist_ok=True)
+        (config.marker_directory / f"{_utc()}_{step}_{event}").touch()
+    except OSError as error:
+        LOGGER.warning("workspace pipeline: marker %s_%s not written: %s", step, event, error)
 
 
 def _set_aside(directory: Path, key: str) -> None:

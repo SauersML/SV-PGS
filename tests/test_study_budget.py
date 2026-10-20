@@ -233,11 +233,26 @@ def test_a_store_fan_out_gives_each_task_its_chromosome_and_the_fit_job_has_one_
     assert group["taskCount"] == 22 and group["parallelism"] == 22 and group["taskCountPerNode"] == 1
     guard.validate_job(spec, guard.duration_seconds(json.loads(Path(environment["STUDY_BUDGET"]).read_text()), "train-1", 2.5, 1, 22), 1, 22)
     script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-1/run_step.sh"]
-    assert 'shard=(--store-shard "$BATCH_TASK_INDEX")' in script and '--through "store" ${shard[@]+"${shard[@]}"}' in script
-    assert '_task_${tag}$1' in script and 'if [ "22" != 1 ]' in script
+    assert 'shard=(--store-shard "$index")' in script and '--through "store" ${shard[@]+"${shard[@]}"}' in script
+    assert '_task_${tag}$1' in script and 'if [ "22" != 1 ] || [ "${#shards[@]}" != 0 ]' in script and "shards=()" in script
     environment.update(THROUGH="report", BUDGET_SLOT="train-2", UV_EXTRAS="--extra gpu")
     refused = subprocess.run(["bash", str(launcher), "fit"], env=environment, capture_output=True, text=True)
     assert refused.returncode != 0 and "TASK_COUNT" in refused.stderr
+    # A rerun of the chromosomes a fan-out did not finish names their indices, one per task.
+    environment.update(THROUGH="store", BUDGET_SLOT="train-3", UV_EXTRAS="", TASK_COUNT="2", STORE_SHARDS="1 16 3")
+    refused = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "STORE_SHARDS" in refused.stderr
+    environment["STORE_SHARDS"] = "1 16"
+    rerun = subprocess.run(["bash", str(launcher), "store"], env=environment, capture_output=True, text=True)
+    assert rerun.returncode == 0, rerun.stderr
+    script = json.loads((tmp_path / "objects.json").read_text())["gs://workspace/svpgs/study/launcher/train-3/run_step.sh"]
+    assert 'shards=(1 16)' in script and 'index="${shards[$BATCH_TASK_INDEX]:-$BATCH_TASK_INDEX}"' in script
+    for task, expected in ((0, "1"), (1, "16")):
+        chosen = subprocess.run(
+            ["bash", "-c", 'shards=(1 16); BATCH_TASK_INDEX=%d; echo "${shards[$BATCH_TASK_INDEX]:-$BATCH_TASK_INDEX}"' % task],
+            capture_output=True, text=True,
+        )
+        assert chosen.stdout.strip() == expected
 
 
 def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
