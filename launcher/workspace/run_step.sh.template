@@ -67,6 +67,9 @@ export OPENBLAS_NUM_THREADS=$(( room < 1 ? 1 : room < cpus ? room : cpus ))
 # A driver that dies on a signal writes every thread's Python stack to the task log: the first AoU fits ended in
 # "Segmentation fault" with no other line.
 export PYTHONFAULTHANDLER=1
+# Two minutes without a progress line, the driver logs where its main thread is (sv_pgs/progress.py), so the progress
+# copy below shows what a silent stretch spends its time on: the AoU disease fits went twenty minutes between lines.
+export SVPGS_QUIET_STACK_SECONDS=120
 # The job's bucket mounts (the job templates' volumes): an input file there is keyed by its object's generation instead
 # of a pass over its bytes (sv_pgs/content_identity.py), which for the imputed and GATK-SV call sets is terabytes a start.
 # IMPUTED_BUCKET holds the imputed batches and their strata sidecar, PANEL_BUCKET the panel's bubble.split sites.

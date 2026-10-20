@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError
@@ -18,6 +19,7 @@ from sv_pgs.all_of_us import (
 from sv_pgs.artifact import write_predictions
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.fit_model import write_model
+from sv_pgs.progress import QUIET_STACK_SECONDS, sample_quiet_stacks
 from sv_pgs.workspace_pipeline import ARMS, STEP_NAMES, WorkspaceConfig, run_pipeline, workspace_bindings
 
 
@@ -187,6 +189,8 @@ def _main_impl(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "workspace-run":
+        if os.environ.get(QUIET_STACK_SECONDS):
+            sample_quiet_stacks(float(os.environ[QUIET_STACK_SECONDS]))
         summaries = run_pipeline(
             WorkspaceConfig.read(args.config), workspace_bindings(), detect_compute_budget(), through=args.through, store_shard=args.store_shard,
             fit_arms=args.fit_arm,
