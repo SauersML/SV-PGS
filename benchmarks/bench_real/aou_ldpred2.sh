@@ -6,6 +6,7 @@
 set -euo pipefail
 rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"
-"$RUN/renv/bin/conda-unpack"
+# conda-unpack's shebang asks for a python on PATH, and the Batch image has none: the packed environment's own runs it
+"$RUN/renv/bin/python" "$RUN/renv/bin/conda-unpack"
 cd "$RUN/source"
 PATH="$RUN/renv/bin:$PATH" "$RUN/venv/bin/python" -m benchmarks.bench_real.aou_ldpred2 --config "$OPS/run_config.json" --out "$OPS/ldpred2.jsonl"
