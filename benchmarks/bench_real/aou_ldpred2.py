@@ -1,7 +1,7 @@
 """LDpred2-auto beside an All of Us run's fit: the summary-statistic baseline on the run's own cohort, store and split.
 
 Everything that decides the comparison is the run's: each trait's model's training rows and held-out rows
-(``_Cohort.training`` and ``held_out`` of the trait's single-split model), the trait's own covariates, the store the fit
+(``_Cohort.training`` and ``held_out`` of each evaluated fold model), the trait's own covariates, the store the fit
 reads (the measurement step's recalibrated dosages) and the snv_indel arm's records (``fit_filtered`` at the run
 config's floors and site list, structural records left out). The GWAS, the 3 cM band of in-sample LD and LDpred2-auto's
 settings are ldpred2_auto_allvar.py's, unchanged (the bench-sim LDpred2 arm): covariate-adjusted marginal effects by
@@ -13,7 +13,7 @@ CHROMOSOME_SPACING_CM, so no window reaches another chromosome and the genome is
 
 The held-out genetic score is the posterior mean effects on the centred held-out dosages, read as the report reads the
 fit's (``_partial_r2``: the squared correlation with the target after both are residualized on the trait's covariates).
-Only aggregates leave the VM: per trait, the held-out row count (never 1 to 19), the partial r^2 and the variant count.
+Only aggregates leave the VM: per trait, the held-out row count (never 1 to 20), the partial r^2 and the variant count.
 """
 from __future__ import annotations
 
@@ -25,17 +25,19 @@ import pathlib
 import numpy as np
 
 from benchmarks.bench_sim.submissions import ldpred2_auto_allvar
+from sv_pgs.all_of_us import MINIMUM_REPORTED_PARTICIPANTS
+from sv_pgs.config import TraitType
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.workspace_pipeline import (
-    WorkspaceConfig, _final_measurement_model, _final_store, _partial_r2, _read_cohort, _Run, arm_log_reliability, fit_filtered, workspace_bindings,
+    WorkspaceConfig, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort, _Run, _shown, arm_log_reliability, fit_filtered, workspace_bindings,
 )
 
 CHROMOSOME_SPACING_CM = 1e4
 """Each chromosome's genetic positions are offset by its number times this: longer than any chromosome's map (chr1's
 is about 290 cM) and the band's 3 cM window, so a window never reaches another chromosome."""
-SMALLEST_SHOWN_COUNT = 20
-"""The All of Us rule: no participant count from 1 to 19 leaves the workspace."""
+SMALLEST_SHOWN_COUNT = MINIMUM_REPORTED_PARTICIPANTS
+"""The workspace report's threshold: no participant count from 1 to 20 leaves the workspace."""
 
 
 class StoreView:
@@ -82,16 +84,42 @@ def held_out_score(view: StoreView, means: np.ndarray, effects: np.ndarray) -> n
 
 
 def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -> dict[str, object]:
-    """LDpred2-auto on one trait's training rows over ``records``, scored on its held-out rows."""
-    model = cohort.all_rows_model(trait)
-    means, effects = ldpred2_auto_allvar.posterior_effects(cohort_view(store, records, cohort, cohort.training[:, model], trait), np.arange(records.shape[0]))
-    test = cohort_view(store, records, cohort, cohort.held_out[:, model], trait)
-    shown = test.n_samples >= SMALLEST_SHOWN_COUNT
+    """LDpred2-auto on each evaluated model's own training and held-out rows, on the report's partial-r^2 scale.
+
+    The all-rows model has no held-out rows and never enters a comparison. Across folds the report averages the
+    per-fold correlations with row-count weights, so the baseline does too; pooling differently scaled fold scores
+    would answer another question. Empty and suppressed cells do not launch a fit, and a disease's case and control
+    counts obey the same display rule even though this JSON row does not itself print those counts.
+    """
+    models = cohort.trait_models(trait) if hasattr(cohort, "trait_models") else (cohort.all_rows_model(trait),)
+    evaluated = [(model, np.flatnonzero(cohort.held_out[:, model] & np.isfinite(cohort.targets[:, trait]))) for model in models]
+    evaluated = [(model, rows) for model, rows in evaluated if rows.size]
+    binary = hasattr(cohort, "trait_types") and cohort.trait_types[trait] == TraitType.BINARY
+
+    def counts():
+        return sum(rows.size for _, rows in evaluated), int(sum(cohort.targets[rows, trait].sum() for _, rows in evaluated)) if binary else None
+
+    count, cases = counts()
+    if _shown(count, cases):
+        evaluated = [(model, rows) for model, rows in evaluated if
+                     (min(int(cohort.targets[rows, trait].sum()), rows.size - int(cohort.targets[rows, trait].sum())) >= 2
+                      if binary else np.ptp(cohort.targets[rows, trait]) > 0.0)]
+        count, cases = counts()
+    values = []
+    if _shown(count, cases):
+        for model, rows in evaluated:
+            means, effects = ldpred2_auto_allvar.posterior_effects(
+                cohort_view(store, records, cohort, cohort.training[:, model], trait), np.arange(records.shape[0]))
+            held = np.zeros(cohort.targets.shape[0], dtype=bool)
+            held[rows] = True
+            test = cohort_view(store, records, cohort, held, trait)
+            values.append((test.n_samples, _partial_r2(test.phenotype, held_out_score(test, means, effects), test.covariates)))
+    value = _fold_weighted(values)
     return {
         "trait": cohort.trait_names[trait],
-        "held_out_rows": test.n_samples if shown else f"<{SMALLEST_SHOWN_COUNT}",
+        "held_out_rows": count if count == 0 or count >= SMALLEST_SHOWN_COUNT else f"<{SMALLEST_SHOWN_COUNT}",
         "variants": int(records.shape[0]),
-        "pgs_partial_r2": _partial_r2(test.phenotype, held_out_score(test, means, effects), test.covariates) if shown else None,
+        "pgs_partial_r2": value if np.isfinite(value) else None,
     }
 
 

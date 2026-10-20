@@ -233,11 +233,18 @@ def _files(directory: Path) -> list[Path]:
 def _push_step(remote: Remote, final: Path, name: str) -> None:
     marker = final / COMPLETE_FILE
     content = marker.read_bytes()
-    if remote.read(f"{name}/{COMPLETE_FILE}") == content:
-        return
-    remote.delete(remote.sizes(f"{name}/"))
     batches = final / "batches" if name in ("score", "effects") else None
     files = [path for path in _files(final) if path != marker and (batches is None or not path.is_relative_to(batches))]
+    held = remote.sizes(f"{name}/")
+    if remote.read(f"{name}/{COMPLETE_FILE}") == content:
+        files = [path for path in files if held.get(f"{name}/{path.relative_to(final).as_posix()}") != path.stat().st_size]
+        if not files:
+            return
+        # A completion marker alone is not a whole step after an interrupted manual copy. Repair only its missing
+        # companions, but withdraw that marker while doing so, as for a partial's saved-model unit.
+        remote.delete([f"{name}/{COMPLETE_FILE}"])
+    else:
+        remote.delete(held)
     directories = sorted(path.relative_to(final).as_posix() for path in final.rglob("*") if path.is_dir() and (batches is None or not path.is_relative_to(batches)))
     remote.write(f"{name}{DIRECTORIES}", json.dumps(directories).encode())
     _transfer([(path, f"{name}/{path.relative_to(final).as_posix()}") for path in files], remote.upload)
@@ -301,10 +308,28 @@ def _push_partial(remote: Remote, partial: Path, step: str) -> None:
             remote.write(marker_name, content)
             pushed += 1
             continue
-        if marker_name in held and (remote.read(marker_name) == marker.read_bytes() if files else held[marker_name] == marker.stat().st_size):
+        model_record = _matches(marker.relative_to(partial).as_posix(), RECORDS)
+        content = marker.read_bytes() if files or model_record else None
+        if model_record:
+            record = json.loads(content)
+            if record.get("fit_key", key.decode()) != key.decode():
+                raise ValueError(f"{marker} belongs to a different fit key; it cannot be merged into {name}.")
+            # The source key must travel with an arm, rather than being inferred from the destination's KEY_FILE.
+            # Sizes make an interrupted manual copy distinguishable from a whole model before it is loaded.
+            record.update(fit_key=key.decode(), model_files={path.relative_to(marker.with_suffix("")).as_posix(): path.stat().st_size for path in files})
+            content = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode()
+        complete = all(held.get(f"{name}/{path.relative_to(partial).as_posix()}") == path.stat().st_size for path in files)
+        if marker_name in held and complete and (remote.read(marker_name) == content if files or model_record else held[marker_name] == marker.stat().st_size):
             continue
+        # A previous marker cannot certify a replacement that has only been partly uploaded. Remove it first,
+        # then publish this version's marker only after every companion is present (also repairs missing companions).
+        if marker_name in held:
+            remote.delete([marker_name])
         _transfer([(path, f"{name}/{path.relative_to(partial).as_posix()}") for path in files], remote.upload)
-        remote.upload(marker, marker_name)
+        if model_record:
+            remote.write(marker_name, content)
+        else:
+            remote.upload(marker, marker_name)
         pushed += 1
     if pushed:
         LOGGER.info("run mirror: pushed %d durable units of %s", pushed, name)

@@ -108,7 +108,7 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
     score = labels if separated else np.zeros(n)
     cohort = SimpleNamespace(
         trait_names=("disease",), trait_types=(TraitType.BINARY,),
-        targets=labels[:, None], covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), dtype=bool),
+        targets=labels[:, None], held_out=np.ones((n, 1), dtype=bool), trait_models=lambda trait: np.array([0]), covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), dtype=bool),
         folds=np.arange(n) // 2 % fold_count, families=np.arange(n) // 2,
         ancestry=["group"] * n, half=["imputed"] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)),
     )
@@ -137,7 +137,7 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
     labels = np.r_[np.zeros(100), np.tile([0., 1.], 100)]
     fold = np.repeat(np.arange(3), 100)
     linear = labels + np.random.default_rng(3).normal(size=n)
-    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
+    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None], held_out=np.ones((n, 1), dtype=bool), trait_models=lambda trait: np.array([0]),
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
         ancestry=['group'] * n, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]
@@ -178,7 +178,7 @@ def test_a_cells_rows_show_no_small_count_by_their_difference_and_stay_exportabl
     ancestry = ['big'] * 444 + ['small'] * 90 + ['thin'] * 66
     n = labels.shape[0]
     linear = labels + np.random.default_rng(8).normal(size=n)
-    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None],
+    cohort = SimpleNamespace(trait_names=('disease',), trait_types=(TraitType.BINARY,), targets=labels[:, None], held_out=np.ones((n, 1), dtype=bool), trait_models=lambda trait: np.array([0]),
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
         ancestry=ancestry, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]

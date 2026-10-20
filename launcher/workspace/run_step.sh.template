@@ -103,7 +103,12 @@ stop "$progressor"
 tail -n 300 "$RUN/driver.log" > "$progress" 2>/dev/null
 # AFTER_SCRIPT ("${AFTER_SCRIPT}"), a script of the source tree, runs once the driver has finished, with RUN and OPS set,
 # its output beside the progress log: benchmarks/bench_real/aou_ldpred2.sh reads the steps the driver left.
-if [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then
+# An arm-only driver exits successfully with fit.partial (StepPart). Its success is not a completed run: the
+# comparison script must wait for the resubmission that holds both arms and reaches the requested final step.
+completed="$("$RUN/venv/bin/python" -c 'import json, pathlib, sys; print(pathlib.Path(json.load(open(sys.argv[1]))["run_directory"]) / sys.argv[2] / "_COMPLETE.json")' "$OPS/run_config.json" "${THROUGH}")"
+if [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ] && [ ! -f "$completed" ]; then
+  mark "after-deferred"
+elif [ "$status" -eq 0 ] && [ -n "${AFTER_SCRIPT}" ]; then
   mark "after-started"
   RUN="$RUN" OPS="$OPS" bash "$RUN/source/${AFTER_SCRIPT}" > "$(dirname "$0")/after-task${BATCH_TASK_INDEX}.log" 2>&1 \
     && mark "after-done" || { mark "exit-after"; status=1; }

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -56,6 +57,8 @@ def test_a_restore_brings_back_completed_steps_and_the_fit_s_durable_progress_on
         if not name.startswith("store.superseded")
         and "scratch" not in name and "/." not in name and "/gout/" not in name
     }
+    record = "fit.partial/models/snv_indel/asthma.json"
+    expected[record] = (json.dumps({"fit_key": "fitkey", "model_files": {"model.pickle": len(b"model")}}, indent=2, sort_keys=True) + "\n").encode()
     assert _tree(restored) == expected
     assert (restored / "store" / "calibration").is_dir()
 
@@ -254,3 +257,56 @@ def test_a_gcs_restore_downloads_each_object_in_a_spawned_process_through_that_p
     remote.download_many(pairs)
     assert sorted(calls) == sorted((name, path) for path, name in pairs) and contexts == ["spawn"]
 
+
+
+def test_a_saved_model_marker_does_not_hide_a_missing_companion(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    payload = mirror / "fit.partial" / "models" / "snv_indel" / "asthma" / "model.pickle"
+    payload.unlink()
+    push(run, remote)
+    assert payload.read_bytes() == b"model"
+    marker = json.loads((payload.parent.with_suffix(".json")).read_text())
+    assert marker["fit_key"] == "fitkey" and marker["model_files"] == {"model.pickle": len(b"model")}
+
+
+def test_a_replacement_model_loses_its_old_marker_until_its_upload_finishes(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    model = run / "fit.partial" / "models" / "snv_indel" / "asthma"
+    _write(model / "model.pickle", b"replacement model")
+
+    class InterruptedUpload(DirectoryRemote):
+        def upload(self, path, name):
+            if name.endswith("model.pickle"):
+                raise ConnectionError("interrupted replacement")
+            super().upload(path, name)
+
+    with pytest.raises(ConnectionError, match="interrupted replacement"):
+        push(run, InterruptedUpload(mirror))
+    restored = tmp_path / "restored"
+    restore(restored, remote)
+    assert not (restored / "fit.partial" / "models" / "snv_indel" / "asthma").exists()
+    push(run, remote)
+    assert (mirror / "fit.partial" / "models" / "snv_indel" / "asthma.json").is_file()
+
+
+def test_an_arm_record_from_another_fit_key_is_not_pushed(tmp_path: Path) -> None:
+    run = _run(tmp_path / "run")
+    record = run / "fit.partial" / "models" / "snv_indel" / "asthma.json"
+    record.write_text(json.dumps({"fit_key": "another fit"}))
+    with pytest.raises(ValueError, match="different fit key"):
+        push(run, DirectoryRemote(tmp_path / "mirror"))
+
+
+def test_a_completed_step_marker_does_not_hide_a_missing_payload(tmp_path: Path) -> None:
+    run, mirror = _run(tmp_path / "run"), tmp_path / "mirror"
+    remote = DirectoryRemote(mirror)
+    push(run, remote)
+    payload = mirror / "store" / "store" / "chunk" / "0"
+    payload.unlink()
+    push(run, remote)
+    assert payload.read_bytes() == (run / "store" / "store" / "chunk" / "0").read_bytes()
+    assert (mirror / "store" / COMPLETE_FILE).is_file()

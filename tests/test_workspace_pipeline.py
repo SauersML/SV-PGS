@@ -495,7 +495,7 @@ class _Recorder:
                 alpha[0], alpha[1:][own] = coefficients[0], coefficients[1:]
             models.append(ScoringModel(active.astype(np.int64), means[active], scales[active], effects, draws, alpha, trait_type, 0.0,
                                       np.repeat(alpha[:, None], draws.shape[1], axis=1), np.zeros((alpha.size, alpha.size)), True))
-        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool), "unresolved": np.zeros(len(models)), "budget_unresolved": np.zeros(len(models)), "restored_best": np.zeros(len(models)), "far_field_scale": np.zeros(len(models))})
+        return _Fitted(tuple(model_names), tuple(request.covariate_names), tuple(models), np.ones(len(models)), {"outer_criterion_met": np.ones(len(models), dtype=bool), "unresolved": np.zeros(len(models)), "budget_unresolved": np.zeros(len(models)), "restored_best": np.zeros(len(models)), "far_field_scale": np.zeros(len(models))}, covariate_columns=np.asarray(request.covariate_columns))
 
 
 def _save_model(path: Path, model: _Fitted) -> None:
@@ -1271,7 +1271,9 @@ def test_scoring_holds_at_most_a_quarter_of_the_host_in_saved_models_per_store_r
     # A quarter of 80 bytes is 20: two 10-byte models share a read; a model past the quarter is read alone.
     assert workspace_pipeline.score_batches([10, 10, 10], 80) == [range(0, 2), range(2, 3)]
     assert workspace_pipeline.score_batches([30, 5, 5], 80) == [range(0, 1), range(1, 3)]
-    assert workspace_pipeline.score_batches([5], 1) == [range(0, 1)]
+    assert workspace_pipeline.score_batches([], 80) == []
+    with pytest.raises(MemoryError, match="before it is loaded"):
+        workspace_pipeline.score_batches([5], 1)
 
 
 def test_the_simpler_prior_reaches_every_fit_call(workspace):
@@ -1514,3 +1516,270 @@ def test_postfit_checkpoint_code_is_keyed_only_after_the_fit() -> None:
     for step in workspace_pipeline._STEPS:
         assert (postfit_checkpoint in step.code) == (step.name in ("score", "effects"))
     assert postfit_checkpoint not in workspace_pipeline.module_closure(workspace_pipeline.fit_model)
+
+
+def _artifact_bindings(recorder: _Recorder, client: _FakeBigQuery, *, flagged: str | None = None) -> WorkspaceBindings:
+    """The synthetic fitter with production artifacts and prediction, so a dry run crosses the actual saved-model
+    boundary. The certificate can miss convergence or refuse a model; the scorer's numerical parameters stay finite.
+    Neither a failed nor an uncertified fit is simulated by corrupting an array that the artifact cannot load."""
+    from sv_pgs import artifact, fit_model
+    from sv_pgs.scale_mixture_ep import MixtureHyperparameters
+
+    def fit(request: FitRequest):
+        fitted = recorder.fit(request)
+        if flagged == "uncertified":
+            fitted.certificate["outer_criterion_met"][0] = False
+        elif flagged == "quarantined":
+            fitted.refusals = ("model 0: the fit failed: synthetic refusal",)
+        problem = artifact.problem_digest(
+            research_ids=request.research_ids, store_columns=request.store_columns, model_names=request.model_names,
+            trait_types=request.trait_types, covariate_names=request.covariate_names, covariate_columns=request.covariate_columns,
+            covariates=request.covariates, targets=request.targets, training=request.training, draw_count=fit_model.DRAW_COUNT, seed=request.seed,
+        )
+        return artifact.FittedModel(
+            model_names=fitted.model_names, covariate_names=fitted.covariate_names, covariate_columns=request.covariate_columns,
+            scoring=fitted.scoring, noise_variance=fitted.noise_variance, certificate=fitted.certificate, refusals=fitted.refusals,
+            hyperparameters=tuple(MixtureHyperparameters(np.zeros(1), np.zeros(1)) for _ in fitted.scoring), fit_counts={},
+            provenance=artifact.Provenance(
+                code_digest="synthetic fitter", store_digest=artifact.store_digest(request.store.root), sites_digest=artifact.sites_digest(request.store.root),
+                cohort_digest=artifact.cohort_digest(request.research_ids), offset_digest=artifact.offset_digest(request.log_variance_offset),
+                problem_digest=problem, prior_digest="synthetic prior",
+            ),
+        )
+
+    return dataclasses.replace(_bindings(recorder, client), fit=fit, save_model=artifact.save_model, load_model=artifact.load_model, predict=artifact.predict_models)
+
+
+@pytest.mark.parametrize("likelihood,cross_fit,flagged", [
+    ("gaussian_working", True, "uncertified"),
+    ("bernoulli", False, "uncertified"),
+    ("gaussian_working", False, "quarantined"),
+])
+def test_two_runs_merge_their_finished_arms_and_reach_the_report_without_fitting(workspace, likelihood, cross_fit, flagged) -> None:
+    """The expensive handoff: independent arm runs with one fit key, their mirrors merged by copying a whole arm,
+    then restored to a fresh disk. Real artifact loading and prediction take the result through effects and report,
+    including a reordered saved fold axis, a binary and a quantitative trait, and an uncertified or refused arm."""
+    from sv_pgs import artifact
+    from sv_pgs.run_mirror import DirectoryRemote, push, restore
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, "disease_likelihood": likelihood, "cross_fit": cross_fit,
+                                           "calibration_fraction": 0.25 if likelihood == "bernoulli" else 0.0})
+    first, second = _Recorder(), _Recorder()
+    run_pipeline(config, _artifact_bindings(first, client), BUDGET, through="fit", fit_arms=(ARMS[0],))
+    mirror_a = config.run_directory.with_name("mirror-a")
+    push(config.run_directory, DirectoryRemote(mirror_a))
+    other = dataclasses.replace(config, run_directory=config.run_directory.with_name("run-b"))
+    restore(other.run_directory, DirectoryRemote(mirror_a))
+    # Each job starts with the same upstream steps but keeps only its own arm's output.
+    shutil.rmtree(other.run_directory / "fit.partial")
+    run_pipeline(other, _artifact_bindings(second, client, flagged=flagged), BUDGET, through="fit", fit_arms=(ARMS[1],))
+    partial_a, partial_b = config.run_directory / "fit.partial", other.run_directory / "fit.partial"
+    assert (partial_a / workspace_pipeline.KEY_FILE).read_bytes() == (partial_b / workspace_pipeline.KEY_FILE).read_bytes()
+    assert len(first.fit_calls) == len(second.fit_calls) == 1
+    trait = config.traits[0]
+    folder = partial_b / "models" / ARMS[1] / trait
+    fitted = artifact.load_model(folder)
+    shutil.rmtree(folder)
+    artifact.save_model(folder, artifact.model_subset(fitted, tuple(reversed(fitted.model_names))))
+    mirror_b = config.run_directory.with_name("mirror-b")
+    push(other.run_directory, DirectoryRemote(mirror_b))
+    shutil.copytree(mirror_b / "fit.partial" / "models" / ARMS[1], mirror_a / "fit.partial" / "models" / ARMS[1])
+    shutil.rmtree(config.run_directory)
+    restore(config.run_directory, DirectoryRemote(mirror_a))
+    resumed = _Recorder(fits_before_failing=0)
+    summaries = run_pipeline(config, _artifact_bindings(resumed, client), BUDGET)
+    assert not resumed.fit_calls and set(summaries) == set(STEP_NAMES)
+    assert all((config.run_directory / step / COMPLETE_FILE).is_file() for step in ("fit", "score", "effects", "report", "export"))
+    disease = config.diseases[0]
+    assert summaries["score"][flagged][disease]
+    assert disease not in summaries["score"]["quarantined" if flagged == "uncertified" else "uncertified"]
+    cohort = workspace_pipeline._read_cohort(workspace_pipeline._Run(config, _artifact_bindings(resumed, client), BUDGET, {}))
+    run = workspace_pipeline._Run(config, _artifact_bindings(resumed, client), BUDGET, {})
+    with DosageStore.open(workspace_pipeline._final_store(run)) as store:
+        signed = store.read_codes(0, store.n_variants, cohort.store_columns).astype(np.float64) - 127.0
+    with np.load(config.run_directory / "score" / "predictions.npz") as scores:
+        for arm_index, arm in enumerate(ARMS):
+            for name in cohort.trait_names:
+                if name == disease and flagged == "quarantined":
+                    continue
+                model = artifact.load_model(config.run_directory / "fit" / "models" / arm / name)
+                for model_name, scoring in zip(model.model_names, model.scoring):
+                    column = cohort.model_names.index(model_name)
+                    expected = ((signed[scoring.store_rows] - scoring.signed_means[:, None]) / scoring.signed_scales[:, None]).T @ scoring.coefficients
+                    np.testing.assert_allclose(scores["genetic_mean"][arm_index, :, column], expected, rtol=1e-12, atol=1e-12)
+        for trait_index, name in enumerate(cohort.trait_names):
+            for model in cohort.trait_models(trait_index):
+                held = cohort.held_out[:, model]
+                if name == disease and flagged == "quarantined":
+                    assert np.all(np.isnan(scores["genetic_mean"][:, :, model]))
+                else:
+                    np.testing.assert_array_equal(scores["held_out_genetic"][:, held, trait_index], scores["genetic_mean"][:, held, model])
+            assert set(cohort.evaluated_folds(trait_index, config.fold_count)) == (set(range(config.fold_count)) if cross_fit else {0})
+    with (config.run_directory / "report" / "accuracy.tsv").open() as handle:
+        accuracy = list(csv.DictReader(handle, delimiter="\t"))
+    assert any(row["trait"] == trait and row["metric"] == "pgs_partial_r2" and row["value"] for row in accuracy)
+    assert (disease in {row["trait"] for row in accuracy}) == (flagged == "uncertified")
+    assert (config.run_directory / "effects" / f"{trait}.{ARMS[1]}.tsv.gz").is_file()
+    assert bool(list((config.run_directory / "effects").glob(f"{disease}.*.tsv.gz"))) == (flagged == "uncertified")
+    # Repeating the complete handoff is also a no-fit operation, including a mirror restore of the finalized run.
+    push(config.run_directory, DirectoryRemote(mirror_a))
+    shutil.rmtree(config.run_directory)
+    restore(config.run_directory, DirectoryRemote(mirror_a))
+    run_pipeline(config, _artifact_bindings(resumed, client), BUDGET)
+    assert not resumed.fit_calls
+
+
+@pytest.mark.parametrize("damage", ["missing_directory", "missing_trait", "wrong_key", "wrong_names", "wrong_covariates", "wrong_record", "truncated_file"])
+def test_a_bad_arm_handoff_stops_before_any_fitter_is_called(workspace, damage) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="fit", fit_arms=(ARMS[0],))
+    root = config.run_directory / "fit.partial" / "models" / ARMS[0]
+    folder, record = root / config.diseases[0], root / (config.diseases[0] + ".json")
+    if damage in ("missing_directory", "missing_trait"):
+        shutil.rmtree(folder)
+        if damage == "missing_trait":
+            record.unlink()
+    elif damage in ("wrong_key", "wrong_record", "truncated_file"):
+        content = json.loads(record.read_text())
+        if damage == "wrong_key":
+            content["fit_key"] = "other run"
+        elif damage == "wrong_record":
+            content["models"] = ["other_trait/fold0"]
+        else:
+            content["model_files"] = {"model.pickle": (folder / "model.pickle").stat().st_size + 1}
+        record.write_text(json.dumps(content))
+    else:
+        model = _load_model(folder)
+        if damage == "wrong_names":
+            model.model_names = tuple("other/" + name for name in model.model_names)
+        else:
+            model.covariate_names = tuple(reversed(model.covariate_names))
+        (folder / "model.pickle").write_bytes(pickle.dumps(model))
+    recorder = _Recorder(fits_before_failing=0)
+    with pytest.raises(ValueError):
+        run_pipeline(config, _bindings(recorder, client), BUDGET, through="fit")
+    assert not recorder.fit_calls and not (config.run_directory / "fit").exists()
+
+
+@pytest.mark.parametrize("all_traits", [False, True])
+def test_nonfinite_predictions_quarantine_both_arms_and_finish_the_remaining_tables(workspace, all_traits) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _bindings(_Recorder(), client)
+    calls = []
+
+    def predict(models, store, sample_indices, covariates, budget):
+        calls.append(tuple(name for model in models for name in model.model_names))
+        prediction = _predict(models, store, sample_indices, covariates, budget)
+        for index, name in enumerate(calls[-1]):
+            if all_traits or name.startswith(config.diseases[0] + "/"):
+                prediction.linear_predictor[:, index] = np.nan
+        return prediction
+
+    summary = run_pipeline(config, dataclasses.replace(bindings, predict=predict), BUDGET)
+    expected = set((*config.diseases, *config.traits) if all_traits else config.diseases)
+    assert set(summary["score"]["quarantined"]) == expected and not summary["score"]["uncertified"]
+    assert len(calls) > 1 and (config.run_directory / "report" / COMPLETE_FILE).is_file()
+    with (config.run_directory / "report" / "accuracy.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert not ({row["trait"] for row in rows} & expected)
+    with np.load(config.run_directory / "score" / "predictions.npz") as scores:
+        assert np.all(np.isnan(scores["held_out_genetic"][:, :, 0]))
+        if not all_traits:
+            assert np.any(np.isfinite(scores["held_out_genetic"][:, :, 1]))
+
+
+def test_empty_held_out_folds_keep_named_report_rows_and_do_not_enter_the_panel(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _bindings(_Recorder(), client)
+    run_pipeline(config, bindings, BUDGET, through="score")
+    run = workspace_pipeline._Run(config, bindings, BUDGET, {})
+    cohort = workspace_pipeline._read_cohort(run)
+    cohort.held_out[:] = False
+    # These are report inputs alone: no retraining, and no changes to a keyed cohort on disk.
+    from unittest.mock import patch
+    directory = config.run_directory / "empty-report"
+    directory.mkdir()
+    panel = workspace_pipeline.PanelInputs(0, tuple((name, 1.0) for name in cohort.trait_names))
+    run.config = dataclasses.replace(config, panel=panel)
+    with patch.object(workspace_pipeline, "_read_cohort", return_value=cohort):
+        summary = workspace_pipeline._report_step(run, directory)
+    assert summary["panel"]["left_out"] == list(cohort.trait_names)
+    with (directory / "accuracy.tsv").open() as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    assert rows and all(row["n"] == "0" and row["metric"] and not row["value"] for row in rows)
+    assert all(cell.count == 0 for _, _, cell in workspace_pipeline._cells(cohort, 0, config.fold_count))
+
+
+def test_prediction_workspace_excludes_loaded_models_shared_arrays_and_results() -> None:
+    values = np.zeros(128, dtype=np.float64)
+    assert workspace_pipeline._array_bytes([values, values[::2], {"again": values}]) == values.nbytes
+    cohort = SimpleNamespace(store_columns=np.arange(50), covariates=np.zeros((50, 3)))
+    model = SimpleNamespace(scoring=[SimpleNamespace(store_rows=np.arange(100), draw_count=64)])
+    budget = workspace_pipeline._prediction_budget(BUDGET, cohort, [model], {"output": values}, values)
+    assert 0 < budget.host_bytes < BUDGET.host_bytes // 2
+    with pytest.raises(MemoryError, match="no host memory"):
+        workspace_pipeline._prediction_budget(dataclasses.replace(BUDGET, host_bytes=values.nbytes), cohort, [model], {"output": values}, values)
+
+
+@pytest.mark.parametrize("damage", ["other_arm", "other_problem"])
+def test_saved_provenance_rejects_an_arm_or_training_problem_swap(workspace, damage) -> None:
+    from sv_pgs import artifact
+
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _artifact_bindings(_Recorder(), client)
+    run_pipeline(config, bindings, BUDGET, through="fit", fit_arms=(ARMS[0],))
+    root = config.run_directory / "fit.partial" / "models"
+    if damage == "other_arm":
+        shutil.copytree(root / ARMS[0], root / ARMS[1])
+    else:
+        folder = root / ARMS[0] / config.diseases[0]
+        fitted = artifact.load_model(folder)
+        shutil.rmtree(folder)
+        artifact.save_model(folder, dataclasses.replace(fitted, provenance=dataclasses.replace(fitted.provenance, problem_digest="other training rows")))
+    resumed = _Recorder(fits_before_failing=0)
+    with pytest.raises(ValueError, match="different arm offsets|different cohort or training problem"):
+        run_pipeline(config, _artifact_bindings(resumed, client), BUDGET, through="fit")
+    assert not resumed.fit_calls
+
+
+def test_legacy_records_are_checked_and_missing_verdicts_are_recovered_from_the_model(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    run_pipeline(config, _bindings(_Recorder(), client), BUDGET, through="fit", fit_arms=(ARMS[0],))
+    root = config.run_directory / "fit.partial" / "models" / ARMS[0]
+    for record in root.glob("*.json"):
+        content = json.loads(record.read_text())
+        content.pop("fit_key")
+        content.pop("acceptance")
+        record.write_text(json.dumps(content))
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through="report")
+    assert len(recorder.fit_calls) == 1
+    assert (config.run_directory / "report" / COMPLETE_FILE).is_file()
+
+
+def test_an_entirely_unscorable_fit_finishes_with_only_quarantine_rows(workspace) -> None:
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    recorder = _Recorder()
+    bindings = _bindings(recorder, client)
+
+    def fit(request):
+        model = recorder.fit(request)
+        model.refusals = tuple(f"model {index}: the fit failed: synthetic refusal" for index in range(len(model.model_names)))
+        return model
+
+    def unexpected_prediction(*args):
+        pytest.fail("no quarantined trait is passed to prediction")
+
+    summary = run_pipeline(config, dataclasses.replace(bindings, fit=fit, predict=unexpected_prediction), BUDGET)
+    assert set(summary["score"]["quarantined"]) == set((*config.diseases, *config.traits))
+    assert summary["score"]["prediction_batches"] == 0 and summary["score"]["models"] == 0
+    assert summary["effects"]["variant_tables"].startswith("0 ")
+    assert (config.run_directory / "report" / "accuracy.tsv").read_text().splitlines() == ["\t".join(workspace_pipeline.ACCURACY_COLUMNS)]
+    assert (config.run_directory / "export" / COMPLETE_FILE).is_file()
