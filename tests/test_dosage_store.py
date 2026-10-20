@@ -10,6 +10,7 @@ import time
 import numpy as np
 import pytest
 
+from benchmarks.gpu_smoke_fixtures import _write_store as _write_store  # shared with the pytest-free GPU command
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import VariantClass
 from sv_pgs.dosage_store import (
@@ -27,13 +28,9 @@ from sv_pgs.dosage_store import (
     encode_dosage_milli,
     open_column,
     shard_rows_for,
-    sites_md5,
-    statistic_column_directory,
     variant_column_directory,
     write_column,
     write_dosage_store,
-    write_manifest,
-    write_variant_ids,
 )
 from sv_pgs.genotype_buffers import FLOAT32_EXACT_ROWS, INT32_EXACT_ROWS, SIGNED_CODE_OFFSET
 
@@ -58,56 +55,6 @@ def _random_dosage_milli(rng: np.random.Generator, rows: int, samples: int) -> n
     calls = rng.choice(np.array([2, 1000, 1998, 0, 2000], dtype=np.int64), size=(rows, samples))
     diffuse = rng.integers(0, 2001, size=(rows, samples))
     return np.where(rng.random((rows, samples)) < 0.3, diffuse, calls)
-
-
-def _write_store(root: Path, milli_by_half: list[dict[str, np.ndarray]], codec: str = "raw") -> None:
-    chromosomes = list(milli_by_half[0])
-    record_counts = [milli_by_half[0][chromosome].shape[0] for chromosome in chromosomes]
-    digests = []
-    for chromosome, record_count in zip(chromosomes, record_counts):
-        positions = np.arange(1, record_count + 1, dtype=np.int64) * 100
-        lengths = np.ones(record_count, dtype=np.int32)
-        columns = {
-            "pos": (positions, {}),
-            "ref_len": (lengths, {}),
-            "alt_len": (lengths, {}),
-            "cm": (positions / 1e6, {}),
-            "variant_class": (np.zeros(record_count, dtype=np.uint8), {"legend": VARIANT_CLASS_LEGEND}),
-            "codes_per_unit": (np.full(record_count, CODES_PER_DOSAGE, dtype=np.uint8), {}),
-            "value_origin": (np.zeros(record_count, dtype=np.int16), {}),
-            "group_first": (np.arange(record_count, dtype=np.int64), {}),
-            "class": (np.zeros(record_count, dtype=np.uint8), {"legend": ["SNV", "INDEL", "SV"]}),
-            "has_pl": (np.arange(record_count) % 3 == 0, {}),
-            "panel_af": (np.full(record_count, 0.25, dtype=np.float32), {}),
-        }
-        for name, (values, attributes) in columns.items():
-            write_column(variant_column_directory(root, chromosome, name), values, attributes)
-        write_variant_ids(root, chromosome, [f"{chromosome}-{position}-allele0-1" for position in positions])
-        digests.append(sites_md5(positions, lengths, lengths))
-    write_manifest(
-        root,
-        chromosomes=chromosomes,
-        record_counts=record_counts,
-        half_sample_counts=[half[chromosomes[0]].shape[1] for half in milli_by_half],
-        chromosome_sites_md5=digests,
-    )
-    for half_index, half in enumerate(milli_by_half):
-        for chromosome, milli in half.items():
-            codes = encode_dosage_milli(milli)
-            directory = dosage_array_directory(root, half_index, chromosome)
-            layout = create_code_array(
-                directory, codes.shape[0], codes.shape[1], codec=codec, shard_rows=SHARD_ROWS, inner_rows=INNER_ROWS
-            )
-            for shard_index in range(layout.shard_count):
-                with CodeShardWriter(directory, layout, shard_index) as writer:
-                    shard_rows = codes[shard_index * SHARD_ROWS : (shard_index + 1) * SHARD_ROWS]
-                    for start in range(0, shard_rows.shape[0], 37):
-                        writer.write_rows(shard_rows[start : start + 37])
-            wide = codes.astype(np.int64)
-            write_column(statistic_column_directory(root, half_index, chromosome, "sum_code"), wide.sum(axis=1).astype(np.uint64))
-            write_column(
-                statistic_column_directory(root, half_index, chromosome, "sum_code2"), (wide * wide).sum(axis=1).astype(np.uint64)
-            )
 
 
 def _two_half_dosage() -> list[dict[str, np.ndarray]]:

@@ -1,0 +1,96 @@
+#!/bin/bash
+# Google Batch smoke job from launcher/workspace/stage.sh's source/ and env.tar.
+# Stage the revision being checked first: stage.sh archives HEAD, so uncommitted edits are NOT in that source.
+# No genotype bucket is needed. The VM copies source locally and rebuilds the locked GPU runtime offline from
+# env.tar (bin/uv, python/, uv-cache/), exactly as launcher/workspace/run_step.sh.template does, without pytest.
+#
+# PROJECT_ID=... REGION=... OPS_BUCKET=... RUN_ID=... SERVICE_ACCOUNT=... \
+# NETWORK=... SUBNETWORK=... bash benchmarks/gpu_smoke.sh submit
+#
+# GPU_COUNT defaults to 2 (a2-highgpu-2g); use GPU_COUNT=1 for a2-highgpu-1g.
+# JOB_ID, MACHINE_TYPE, GPU_TYPE and RUN_DISK_GB may be overridden. JOB_SECONDS includes VM task environment
+# preparation; the Python command itself has a separate 300-second deadline, the CUDA test files PYTEST_SECONDS
+# (default 1200). No task retries hide a failure.
+# Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging; the task's
+# exit status is the smoke command's, and FAIL lines identify failed checks (including a missing CUDA device).
+set -euo pipefail
+
+if [[ "${1:-}" == task ]]; then
+    : "${OPS:?staged source/ and env.tar directory}" "${RUN:?task-local writable directory}"
+    mkdir -p "$RUN/tools" "$RUN/tmp"
+    tar -xf "$OPS/env.tar" -C "$RUN"
+    mv "$RUN/bin/uv" "$RUN/tools/uv"
+    chmod +x "$RUN/tools/uv" "$RUN"/python/*/bin/*
+    cp -r "$OPS/source" "$RUN/source"
+    UV_OFFLINE=1 UV_CACHE_DIR="$RUN/uv-cache" UV_PYTHON_INSTALL_DIR="$RUN/python" \
+      UV_PROJECT_ENVIRONMENT="$RUN/venv" UV_LINK_MODE=copy \
+      "$RUN/tools/uv" sync --project "$RUN/source" --frozen --python 3.12 --extra gpu
+    export LD_LIBRARY_PATH="$(ls -d "$RUN"/venv/lib/python3.12/site-packages/nvidia/*/lib | paste -sd:)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export TMPDIR="$RUN/tmp" PYTHONUNBUFFERED=1
+    cd "$RUN/source"
+    # The smoke command first, then every CUDA test file (env.tar's cache holds the dev group, pytest included): the
+    # CUDA tests skip on a laptop and on CI, so this job is where they run. Either failing fails the task.
+    status=0
+    "$RUN/venv/bin/python" -m benchmarks.gpu_smoke || status=$?
+    timeout "${PYTEST_SECONDS:-1200}" "$RUN/venv/bin/python" -m pytest -q -p no:cacheprovider tests/*_cuda.py \
+      tests/test_scale_mixture_ep.py -k "cuda or device or chunk" || status=$?
+    exit "$status"
+fi
+
+case "${1:-}" in
+    spec|submit) ;;
+    *) echo "usage: $0 {spec|submit}; see this script's header for staging and variables" >&2; exit 2 ;;
+esac
+: "${PROJECT_ID:?}" "${REGION:?}" "${OPS_BUCKET:?bucket name, without gs://}" "${RUN_ID:?staged run id}"
+: "${SERVICE_ACCOUNT:?}" "${NETWORK:?}" "${SUBNETWORK:?}"
+export PROJECT_ID REGION OPS_BUCKET RUN_ID SERVICE_ACCOUNT NETWORK SUBNETWORK
+export GPU_COUNT="${GPU_COUNT:-2}"
+case "$GPU_COUNT" in 1|2) ;; *) echo 'GPU_COUNT must be 1 or 2' >&2; exit 2 ;; esac
+export MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-${GPU_COUNT}g}" GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
+export RUN_DISK_GB="${RUN_DISK_GB:-100}" JOB_SECONDS="${JOB_SECONDS:-3600}"
+JOB_ID="${JOB_ID:-svpgs-gpu-smoke-$(date +%Y%m%d%H%M%S)}"
+spec=$(mktemp)
+trap 'rm -f "$spec"' EXIT
+python3 - > "$spec" <<'PY'
+import json
+import os
+
+e = os.environ
+ops = f"/mnt/disks/ops/svpgs/{e['RUN_ID']}"
+# Task values are structured environment entries: no shell expansion of project, bucket or run names into code.
+task = {
+    "runnables": [{"script": {"text": 'bash "$OPS/source/benchmarks/gpu_smoke.sh" task'}}],
+    "environment": {"variables": {"OPS": ops, "RUN": "/mnt/disks/run"}},
+    "maxRetryCount": 0,
+    "maxRunDuration": f"{int(e['JOB_SECONDS'])}s",
+    "computeResource": {"cpuMilli": 2000, "memoryMib": 8192},
+    "volumes": [
+        {"gcs": {"remotePath": e["OPS_BUCKET"]}, "mountPath": "/mnt/disks/ops", "mountOptions": ["-o ro", "--implicit-dirs"]},
+        {"deviceName": "run", "mountPath": "/mnt/disks/run", "mountOptions": "rw,async"},
+    ],
+}
+spec = {
+    "taskGroups": [{"taskCount": 1, "taskSpec": task}],
+    "allocationPolicy": {
+        "instances": [{"installGpuDrivers": True, "policy": {
+            "machineType": e["MACHINE_TYPE"], "provisioningModel": "STANDARD",
+            "accelerators": [{"type": e["GPU_TYPE"], "count": int(e["GPU_COUNT"])}],
+            "disks": [{"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": int(e["RUN_DISK_GB"])}}],
+        }}],
+        "location": {"allowedLocations": [f"regions/{e['REGION']}"]},
+        "network": {"networkInterfaces": [{
+            "network": f"projects/{e['PROJECT_ID']}/global/networks/{e['NETWORK']}",
+            "subnetwork": f"projects/{e['PROJECT_ID']}/regions/{e['REGION']}/subnetworks/{e['SUBNETWORK']}",
+            "noExternalIpAddress": True,
+        }]},
+        "serviceAccount": {"email": e["SERVICE_ACCOUNT"]},
+    },
+    "logsPolicy": {"destination": "CLOUD_LOGGING"},
+}
+print(json.dumps(spec, indent=2))
+PY
+if [[ "$1" == spec ]]; then
+    cat "$spec"
+else
+    gcloud batch jobs submit "$JOB_ID" --project="$PROJECT_ID" --location="$REGION" --config="$spec"
+fi

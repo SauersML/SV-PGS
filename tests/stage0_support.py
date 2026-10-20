@@ -7,44 +7,9 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
+from benchmarks.gpu_smoke_fixtures import mosaic_codes as mosaic_codes  # shared with the pytest-free GPU command
 from sv_pgs.genotype_buffers import SampleLayout
 from sv_pgs.ld_partition import fixed_point_pair_weights
-
-
-def mosaic_codes(
-    rng: np.random.Generator,
-    samples: int,
-    variants: int,
-    founders: int = 10,
-    hotspot_spacing: int = 60,
-    regular_hotspots: bool = False,
-) -> NDArray[np.uint8]:
-    """Variant-major 8-bit dosage codes with block-structured LD.
-
-    Each haplotype copies one of ``founders`` founder haplotypes and switches founder
-    rarely inside LD blocks and often at hotspots, every ``hotspot_spacing`` variants
-    (exactly, or on average). Dosages get imputation-like noise; a few variants are
-    monomorphic.
-    """
-    frequency = rng.uniform(0.02, 0.5, size=variants)
-    founder_alleles = rng.random((founders, variants)) < frequency
-    switch_rate = np.full(variants, 0.004)
-    if regular_hotspots:
-        switch_rate[hotspot_spacing::hotspot_spacing] = 0.9
-    else:
-        switch_rate[rng.random(variants) < 1.0 / hotspot_spacing] = 0.6
-    haplotypes = 2 * samples
-    switches = rng.random((haplotypes, variants)) < switch_rate
-    switches[:, 0] = True
-    segment = np.cumsum(switches, axis=1) - 1
-    segment_founder = rng.integers(0, founders, size=(haplotypes, variants))
-    founder = np.take_along_axis(segment_founder, segment, axis=1)
-    alleles = founder_alleles[founder, np.arange(variants)[None, :]].astype(np.float64)
-    dosage = alleles[0::2] + alleles[1::2]
-    noisy = np.clip(dosage + rng.normal(0.0, 0.08, size=dosage.shape), 0.0, 2.0)
-    codes = np.rint(noisy * 127.0).astype(np.uint8).T.copy()
-    codes[rng.choice(variants, size=max(1, variants // 100), replace=False)] = 3
-    return codes
 
 
 def bubble_groups(rng: np.random.Generator, variants: int, maximum_run: int = 4) -> NDArray[np.int64]:
