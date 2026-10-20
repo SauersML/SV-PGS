@@ -212,6 +212,24 @@ def test_the_store_the_next_step_reads_is_downloaded_and_without_a_mount_every_s
     assert _tree(tmp_path / "copied") == _tree(run)
 
 
+def test_a_restore_downloads_a_step_s_largest_objects_first(tmp_path: Path) -> None:
+    """In name order chr1's codes go before chr10's and chr2's last; by size, chr2's (the largest here) go first."""
+    run = tmp_path / "run"
+    for chromosome, size in (("chr1", 240), ("chr10", 80), ("chr2", 400)):
+        _write(run / "store" / "store" / "dosage" / "half0" / chromosome / "c" / "0" / "0", bytes(size))
+    _write(run / "store" / COMPLETE_FILE, '{"key": "b"}')
+    push(run, DirectoryRemote(tmp_path / "mirror"))
+    requested = []
+
+    class Recording(DirectoryRemote):
+        def download_many(self, pairs: list[tuple[Path, str]]) -> None:
+            requested.extend(name for _path, name in pairs)
+            super().download_many(pairs)
+
+    restore(tmp_path / "restored", Recording(tmp_path / "mirror"))
+    assert [name.split("/")[4] for name in requested[:3]] == ["chr2", "chr1", "chr10"] and _tree(tmp_path / "restored") == _tree(run)
+
+
 def test_the_mirror_is_found_on_the_bucket_mount_that_shows_it(monkeypatch) -> None:
     monkeypatch.setenv(GCS_MOUNTS, '{"/mnt/disks/ops": "gs://ops", "/mnt/disks/cdr": "gs://cdr/v8"}')
     assert mounted("gs://ops/svpgs/run1/run") == Path("/mnt/disks/ops/svpgs/run1/run")

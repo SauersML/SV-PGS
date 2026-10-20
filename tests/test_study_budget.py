@@ -291,6 +291,26 @@ def test_submit_refuses_a_disk_size_that_is_not_a_whole_number_of_gb(tmp_path):
     assert refused.returncode != 0 and "RUN_DISK_GB" in refused.stderr and not (tmp_path / "submitted.jsonl").exists()
 
 
+@pytest.mark.parametrize("job, slot", [("store", "prepare"), ("fit", "pilot")])
+def test_a_job_s_run_disk_can_be_local_ssd_in_whole_devices(tmp_path, job, slot):
+    """pd-balanced unless RUN_DISK_TYPE names another type; local SSD comes in 375 GB devices, so its size is a multiple."""
+    launcher, environment = _fake_cloud(tmp_path)
+    environment.update(BUDGET_SLOT=slot, RUN_DISK_TYPE="local-ssd", RUN_DISK_GB="2000")
+    refused = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "multiple of 375" in refused.stderr and not (tmp_path / "submitted.jsonl").exists()
+    environment.update(RUN_DISK_TYPE="hyperdisk-extreme")
+    refused = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
+    assert refused.returncode != 0 and "RUN_DISK_TYPE" in refused.stderr and not (tmp_path / "submitted.jsonl").exists()
+    environment.update(RUN_DISK_TYPE="local-ssd", RUN_DISK_GB="1500")
+    submitted = subprocess.run(["bash", str(launcher), job], env=environment, capture_output=True, text=True)
+    assert submitted.returncode == 0, submitted.stderr
+    spec = json.loads((tmp_path / "submitted.jsonl").read_text().splitlines()[-1])
+    (disk,) = spec["allocationPolicy"]["instances"][0]["policy"]["disks"]
+    assert disk == {"deviceName": "run", "newDisk": {"type": "local-ssd", "sizeGb": 1500}}
+    run = next(volume for volume in spec["taskGroups"][0]["taskSpec"]["volumes"] if volume.get("deviceName") == "run")
+    assert run["mountPath"] == "/mnt/disks/run"
+
+
 @pytest.mark.parametrize("job, slot, through", [("store", "prepare", "direct_sv"), ("fit", "pilot", "fit")])
 def test_both_jobs_mount_the_workspace_cdr_read_only(tmp_path, job, slot, through):
     """The store job reads the GATK-SV call set there; the fit job hashes it to key the direct_sv step it skips."""

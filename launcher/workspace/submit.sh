@@ -5,7 +5,11 @@
 #   submit.sh store      # steps samples .. direct_sv, on CPUs
 #   submit.sh fit        # steps fit .. export, on GPUs
 #
-# PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity.
+# PROVISIONING_MODEL is SPOT or STANDARD for either job. Batch places the job in any zone of REGION with capacity, and has
+# no fallback from one model to the other (it uses a job's first instance policy only). A preempted task (exit 50001) is
+# retried up to MAX_RETRIES times (0 by default), and a retry resumes from what the mirror holds, so each preemption
+# redoes the job's start (environment, restore, digest) and the work since the last durable push. Spot at a fraction p of
+# the STANDARD price is the cheaper while preemptions per hour of runtime stay below (1 - p) / (hours each one redoes).
 # A store job with TASK_COUNT > 1 (THROUGH=store) is a fan-out: task i converts the run config's chromosome i on its
 # own VM (workspace-run --store-shard), and the next job, finding every chromosome in the mirror, writes the store.
 #
@@ -50,6 +54,19 @@ export TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT
 if [[ ! "${RUN_DISK_GB:?}" =~ ^[1-9][0-9]*$ ]]; then
   echo "RUN_DISK_GB is the size in GB of the new disk each job works on (the run's stores, with room to write the next)" >&2; exit 2
 fi
+# RUN_DISK_TYPE (optional, pd-balanced by default): that disk's type. pd-balanced moves 140 MiB/s plus 0.28 MiB/s per GiB,
+# 700 MiB/s at 2000 GiB (1,200 at most on 16 or more vCPUs): the AoU whole-genome restore wrote the 547 GB store to it in
+# 17 minutes and the store digest read it back in 12. local-ssd is the VM's local NVMe SSDs, 375 GiB each, RUN_DISK_GB in
+# all: a multiple of 375 that the machine type takes (2, 4 or 8 devices on a2-highgpu-2g); four or more read 2,650 MiB/s
+# and write 1,400 on a 24-vCPU A2, at a lower price per GiB than pd-balanced. Their data does not outlive the VM, as no
+# job's new disk does: a retry or the next job starts from the mirror either way.
+RUN_DISK_TYPE="${RUN_DISK_TYPE:-pd-balanced}"
+case "$RUN_DISK_TYPE" in
+  pd-balanced|pd-ssd) ;;
+  local-ssd) (( RUN_DISK_GB % 375 == 0 )) || { echo "a local-ssd RUN_DISK_GB is a multiple of 375, one local SSD each" >&2; exit 2; } ;;
+  *) echo "RUN_DISK_TYPE is pd-balanced, pd-ssd or local-ssd" >&2; exit 2 ;;
+esac
+export RUN_DISK_TYPE
 if [[ ! "$RUN_ID" =~ ^[a-z][a-z0-9-]{0,25}$ ]]; then
   echo "RUN_ID must be a lowercase study ID, at most 26 characters; keep it across restarts" >&2; exit 2
 fi
@@ -76,7 +93,7 @@ export IMPUTED_BUCKET PANEL_BUCKET
 # The slot's task script, run_step.sh in the slot's launcher directory.
 python3 "$here/budget_guard.py" render --template "$here/run_step.sh.template" --output "$stage/run_step.sh" \
   --variables RUN_ID THROUGH WORKSPACE_CDR GOOGLE_PROJECT UV_EXTRAS OPS_BUCKET CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET TASK_COUNT STORE_SHARDS FIT_ARMS AFTER_SCRIPT
-variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
+variables=(OPS_BUCKET RUN_ID MAX_RETRIES MAX_RUN_SECONDS MACHINE_TYPE PROVISIONING_MODEL PROJECT_ID RUN_DISK_GB RUN_DISK_TYPE REGION NETWORK SUBNETWORK SERVICE_ACCOUNT)
 if [ "$spec" = fit ]; then variables+=(GPU_TYPE GPU_COUNT); else variables+=(TASK_COUNT); fi
 variables+=(CDR_BUCKET IMPUTED_BUCKET PANEL_BUCKET GOOGLE_PROJECT)
 python3 "$here/budget_guard.py" render --template "$here/job_${spec}.json.template" --output "$stage/job.json" --variables "${variables[@]}"

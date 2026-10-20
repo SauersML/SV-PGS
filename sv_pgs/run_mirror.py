@@ -432,6 +432,10 @@ def restore(run_directory: Path, remote: Remote, mount: Path | None = None) -> N
             LOGGER.info("run mirror: %s/%s, which a later step's store replaces, is read from %s", step, STORE, payload)
         for directory in listed:
             (aside / directory).mkdir(parents=True, exist_ok=True)
+        # Largest first: a store's codes are one file per half and chromosome (``dosage_store.write_half_codes``), 44
+        # files and 547 GB at the AoU whole-genome workload, each downloaded as one stream; in name order a large one
+        # could start last and download alone while the other workers idle.
+        chosen.sort(key=lambda entry: -names[entry])
         remote.download_many([(aside / entry.removeprefix(f"{name}/"), entry) for entry in chosen])
         os.rename(aside, target)
         LOGGER.info("run mirror: restored %s, %d files, %.1f GB", name, len(chosen), sum(names[entry] for entry in chosen) / 1e9)

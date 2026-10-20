@@ -27,7 +27,7 @@
           "machineType": "${MACHINE_TYPE}",
           "provisioningModel": "${PROVISIONING_MODEL}",
           "accelerators": [{"type": "${GPU_TYPE}", "count": ${GPU_COUNT}}],
-          "disks": [{"deviceName": "run", "newDisk": {"type": "pd-balanced", "sizeGb": ${RUN_DISK_GB}}}]
+          "disks": [{"deviceName": "run", "newDisk": {"type": "${RUN_DISK_TYPE}", "sizeGb": ${RUN_DISK_GB}}}]
         }
       }
     ],
