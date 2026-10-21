@@ -939,6 +939,41 @@ def test_a_warm_started_posterior_solve_is_the_dense_inverse_and_takes_fewer_ite
     assert passes[1] <= passes[0], passes
 
 
+def test_an_unfinished_iterate_leaves_the_same_factor_and_reads_the_store_twice_less() -> None:
+    """``finish`` False (the mean-field route's iterate): over a cold iterate and a warm one at nearby sites, the factor
+    ``posterior_solve`` reads gives the same answers, certificates and duals, bit for bit, as the finished iterate's;
+    the only reads not made are the finish's; and the mean and its pieces, which only the finish forms, are unset
+    rather than left at an older iterate's."""
+    genotypes, bounds, covariates, training, noise, precision, shift, response, offsets, _negative = _gaussian_problem(57)
+    rng = np.random.default_rng(58)
+    right = rng.standard_normal((genotypes.shape[1], 5))
+    runs = []
+    for finish in (True, False):
+        gaussian = dual_solve.DualGaussian(
+            source=DenseDualSource(genotypes, bounds), training=training, targets=response, offsets=offsets, covariates=covariates,
+            grams=_grams(bounds, True), probe_count=2, seed=7,
+        )
+        answers = []
+        for sites in (precision, precision * (1.0 + 1e-3)):
+            gaussian.iterate(
+                site_precision=sites, site_shift=shift, noise_variance=noise, error_bound=np.full(MODEL_COUNT, np.sqrt(EPS)),
+                probe_residual_ratio=np.sqrt(EPS), indefinite_core=True, finish=finish,
+            )
+            for model in range(MODEL_COUNT):
+                solved, certificate = gaussian.posterior_solve(right, model, np.full(right.shape[1], 1e-6))
+                answers.append((solved, certificate, gaussian.last_posterior_duals.copy()))
+        runs.append((gaussian, answers, [label for label, _columns, _error in gaussian.count.records]))
+    (finished, finished_answers, finished_reads), (unfinished, unfinished_answers, unfinished_reads) = runs
+    for finished_answer, unfinished_answer in zip(finished_answers, unfinished_answers, strict=True):
+        for finished_value, unfinished_value in zip(finished_answer, unfinished_answer, strict=True):
+            np.testing.assert_array_equal(unfinished_value, finished_value)
+    assert finished_reads.count("finish") == 2 and "finish" not in unfinished_reads
+    assert [label for label in finished_reads if label != "finish"] == unfinished_reads
+    assert finished.mean is not None and len(finished.bulk_solves) == MODEL_COUNT
+    assert unfinished.mean is None and unfinished.genetic_image is None and unfinished.alpha is None
+    assert unfinished.linear_predictor is None and unfinished.bulk_solves == []
+
+
 def test_a_single_models_complement_is_the_per_column_one() -> None:
     # Every column one model's takes the thin products (W^1/2 C) F F' (W^1/2 C)' v; columns of several models take the
     # per-column factors. Both are [W^1/2] (I - H_m) [W^1/2] v with H_m the dense projector, whatever the covariates' rank.

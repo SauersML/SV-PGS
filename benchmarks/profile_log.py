@@ -17,8 +17,9 @@ It prints, with every time an offset from the log's start (its first line, or th
 earlier; never a clock time):
 1. the timeline: each phase's start, its seconds, the median and 95th percentile of the GPUs' mean utilization over the
    resource lines inside it, its CPU share, its mean disk read and write and network receive rates, and its peak driver
-   resident memory; the repeated phases (each mean-field solve, empirical Bayes round, device sweep, scoring batch and
-   streamed store read) are summarized after it instead (all of them listed with --all);
+   resident memory; the repeated phases (each mean-field solve, empirical Bayes round, device sweep, scoring batch,
+   streamed store read, the mean-field oracle's dual iterate, its response solves and products) are summarized after
+   it instead (all of them listed with --all);
 2. the repeated phases: count, total, median, 95th percentile and largest seconds, and the medians of their extras;
 3. each empirical Bayes loop: its rounds and seconds split into the oracle's solves, the curvature (the round's
    ``eb curvature:`` derivatives and responses), and the rest (the hyper steps and the trials' bookkeeping), and the
@@ -28,8 +29,8 @@ earlier; never a clock time):
    included, with the innermost quiet-stack frames seen there and how often.
 
 Only durations, rates, sizes, shares and code locations are printed, never a line's other text: the extras shown are a
-fixed list of the timing lines' own (sweeps, seconds, GB, blocks, models, rounds), none of them a count of people. The
-standard library alone, on any Python 3.8 or later (the workspace app's).
+fixed list of the timing lines' own (sweeps, seconds, GB, blocks, models, rounds, iterations, passes, solves), none of
+them a count of people. The standard library alone, on any Python 3.8 or later (the workspace app's).
 """
 from __future__ import annotations
 
@@ -55,11 +56,11 @@ CPU = re.compile(r"cpu (\d+)% iowait (\d+)%")
 MEMORY = re.compile(r"mem ([0-9.]+)/([0-9.]+) GiB")
 DISK = re.compile(r"disk r ([0-9.]+) w ([0-9.]+) MiB/s")
 NET = re.compile(r"net rx ([0-9.]+) tx ([0-9.]+) MiB/s")
-REPEATED = ("mean_field_solve", "eb_iteration", "device_sweep", "score_batch", "store_read")
+REPEATED = ("mean_field_solve", "eb_iteration", "device_sweep", "score_batch", "store_read", "dual_iterate", "response_solve", "response_products")
 """Phases a run has many of: summarized after the timeline (listed in it with --all)."""
 SHOWN_EXTRAS = (
     "sweeps", "per_sweep", "solve", "other", "load", "predict", "gb", "ld_gb", "genotype_pass", "blocks", "parts", "files", "columns",
-    "models", "rounds", "launches", "sampled", "codes", "state",
+    "models", "rounds", "launches", "sampled", "codes", "state", "iterations", "restarts", "passes", "solves", "warm",
 )
 """The timing lines' extras the report shows (with each ``gpu<i>`` busy share): durations, sizes and counts of the run's
 own work, never of people, where a read's codes came from (``codes``: the store, or Stage 0's kept codes), and a

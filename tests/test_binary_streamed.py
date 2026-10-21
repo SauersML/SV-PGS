@@ -121,6 +121,61 @@ def test_the_streamed_binary_fixed_point_is_joint_and_its_moments_are_the_dense_
     np.testing.assert_allclose(oracle.covariate_coefficients(0), alpha, rtol=1e-8, atol=1e-10)
 
 
+def test_a_binary_models_column_squares_are_read_once_per_sites_held(tmp_path: Path) -> None:
+    """``_group_squares`` holds a binary model's column squares for as long as anything holds its sites: moving the
+    metric back to sites still held reads nothing and returns the squares a read at those sites gives, bit for bit;
+    sites nobody holds drop their entry and its cache lease at the next read; an evicted lease drops its entry, which
+    the next move reads again; and the held squares do not keep the oracle alive or its leases on the ledger."""
+    import gc
+    import weakref
+    from sv_pgs.dual_solve import DualModels, column_squares
+    from sv_pgs.memory_broker import HOST, memory_scope
+
+    _store_, _covariate, _labels_, sites, statistics, prior, gaussian, _standardized, _covariates = _problem(tmp_path, 9)
+    moments = moment_starts(statistics, prior)
+    start = initial_hyperparameters(prior, moments[0].mean_variance)
+    generator = np.random.default_rng(10)
+    purpose = "a binary model's column squares at sites held"
+
+    def moved() -> BernoulliSites:
+        xi = np.where(sites.training, np.abs(generator.normal(scale=2.0, size=_SAMPLES)), 0.0)
+        return BernoulliSites(labels=sites.labels, training=sites.training, xi=xi)
+
+    def reads() -> int:
+        return sum(label == "column-squares" for label, _columns, _error in gaussian.count.records)
+
+    def held(broker) -> list:
+        return [lease for lease in broker.leases if lease.purpose == purpose]
+
+    with memory_scope(_budget()) as broker:
+        oracle = _FullDataMeanField(gaussian, statistics, prior, _DRAWS, 1 << 22, 13, [start], np.ones(1), sites=[sites])
+        entries = len(held(broker))
+        first, second = moved(), moved()
+        before = reads()
+        squares = oracle._group_squares(0, first)
+        assert reads() == before + 1
+        single = DualModels(first.weights[:, None], np.zeros((gaussian.source.variant_count, 1)), gaussian.covariates, np)
+        np.testing.assert_array_equal(squares, column_squares(gaussian.source, single, gaussian.count)[:, 0])
+        before = reads()
+        oracle._group_squares(0, second)
+        assert oracle._group_squares(0, first) is squares
+        assert reads() == before + 1 and len(held(broker)) == entries + 2
+        released = oracle._square_cache[second.key][2]
+        del second
+        oracle._group_squares(0, moved())
+        assert not released.live and len(held(broker)) == entries + 2
+        broker.evict_idle(HOST)
+        assert first.key not in oracle._square_cache and not held(broker)
+        before = reads()
+        np.testing.assert_array_equal(oracle._group_squares(0, first), squares)
+        assert reads() == before + 1 and len(held(broker)) == 1
+        reference = weakref.ref(oracle)
+        del oracle
+        gc.collect()
+        assert reference() is None
+        assert not held(broker)
+
+
 def test_the_public_binary_fit_calibrates_and_ranks(tmp_path: Path) -> None:
     store, covariate, _targets, genetic = _store(tmp_path / "store", 7)
     labels = _labels(genetic, covariate, 7)

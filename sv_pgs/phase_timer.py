@@ -12,7 +12,8 @@ written when the phase ends, so the phase began ``seconds`` before it and the ti
 are the store's restore (``run_mirror.restore``) and digest (``content_identity.tree_digest``), Stage 0
 (``genotype_statistics.compute_genotype_statistics``), the far field and the summary band (``gram_space``), the resident
 genotype codes' fill and each later streamed read (``store_block_source``), each mean-field solve with its sweeps and
-its seconds per sweep, each empirical Bayes round and the empirical Bayes as a whole (``TimedOracle``), each scoring
+its seconds per sweep, the mean-field oracle's dual iterate and each response solve with their reads (``full_data_fit``),
+each empirical Bayes round and the empirical Bayes as a whole (``TimedOracle``), each scoring
 batch (``workspace_pipeline._score_step``), and, where SWEEP_BUSY is set, each device sweep's busy share
 (``timed_sweep``). launcher/workspace/sample_resources.py writes the VM's utilization into the same log once a minute.
 

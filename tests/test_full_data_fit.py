@@ -872,6 +872,43 @@ def test_warm_starts_no_later_solve_asks_for_are_released_after_two_oracle_calls
     assert set(starts) == {second}
 
 
+def test_relative_solve_certifies_an_indefinite_response_in_few_rounds():
+    """The mean-field route's R is a linear response's, indefinite where a member's variance passes 1 / omega, so
+    r'x = x'Rx is negative for some columns. In the certificate's norm M = |R|, every |x'Ry| <= ||x||_M ||y||_M, so
+    the lower bound on ||x||_M from |r'x_hat| holds whatever its sign: each column meets ||x_hat - x||_M <= e ||x||_M
+    within a few solves, against a solver that returns its whole certified error (the signed product gave a negative
+    bound, and the request halved for each column down to float64's floor)."""
+    from types import SimpleNamespace
+    from sv_pgs.full_data_fit import _relative_solve
+
+    generator = np.random.default_rng(5)
+    basis = np.linalg.qr(generator.standard_normal((6, 6)))[0]
+    eigenvalues = np.array([-3.0, -1.5, 0.5, 1.0, 2.0, 4.0])
+    response = (basis * eigenvalues) @ basis.T
+    metric = (basis * np.abs(eigenvalues)) @ basis.T
+    right = generator.standard_normal((6, 8))
+    exact = np.linalg.solve(response, right)
+    assert np.any(np.einsum("pc,pc->c", right, exact) < 0.0) and np.any(np.einsum("pc,pc->c", right, exact) > 0.0)
+    rounds = []
+
+    def posterior_solve(values, model, bound, start):
+        # The exact answer moved by an error of M-norm exactly the bound asked for, in a random direction.
+        direction = generator.standard_normal(values.shape)
+        direction /= np.sqrt(np.einsum("pc,pq,qc->c", direction, metric, direction))
+        rounds.append(values.shape[1])
+        gaussian.last_posterior_duals = np.zeros((1, values.shape[1]))
+        return np.linalg.solve(response, values) + direction * bound, np.asarray(bound, dtype=np.float64).copy()
+
+    gaussian = SimpleNamespace(array_module=np, posterior_solve=posterior_solve)
+    relative_tolerance = 0.1
+    solved = _relative_solve(gaussian, 0, np.ones(6), lambda: None)(right, relative_tolerance)
+    error = solved - exact
+    error_norm = np.sqrt(np.einsum("pc,pq,qc->c", error, metric, error))
+    norm = np.sqrt(np.einsum("pc,pq,qc->c", exact, metric, exact))
+    assert np.all(error_norm <= relative_tolerance * norm * (1.0 + 1e-12)), (error_norm, norm)
+    assert len(rounds) <= 4, rounds
+
+
 def test_mean_field_posterior_does_not_hold_an_unused_refreshs_device_cross_products():
     """Mean-field curvature uses only Sigma R. Replacing the shared solver's refresh must release its old window
     cross-products even while an outer anchor still owns the old mean-field posterior."""

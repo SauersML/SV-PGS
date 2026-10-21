@@ -1042,6 +1042,12 @@ class DualGaussian:
         # Whether a resolved core may be symmetric indefinite (``resolved_block``): set by each ``iterate``.
         self.indefinite_core = False
 
+    @property
+    def resolved_count(self) -> int:
+        """The sites the last iterate eliminated exactly, over every model (``ResolvedSites``): with the models' mean
+        columns and the probes, the width of its solve's reads."""
+        return sum(int(np.asarray(indices).size) for indices in self._resolved.values())
+
     def _models(self, noise_variance: np.ndarray, variances: Any) -> DualModels:
         weights = self.sample_weights / self.array_module.asarray(noise_variance)[None, :]
         return DualModels(weights, variances, self.covariates, self.array_module)
@@ -1068,7 +1074,7 @@ class DualGaussian:
 
     def _iterate(
         self, *, site_precision: Any, site_shift: Any, noise_variance: np.ndarray, error_bound: Any, probe_residual_ratio: float,
-        indefinite_core: bool = False,
+        indefinite_core: bool = False, finish: bool = True,
     ) -> DualCertificate:
         """The exact mean at the sites, certified to ||mu_hat - mu||_A <= error_bound per model.
 
@@ -1078,6 +1084,14 @@ class DualGaussian:
         positive definite (the mean-field route's R = diag(1/v - omega) + Xp'Xp / sigma^2, whose tilted members'
         variances may exceed 1 / omega): the solves stay exact and certified in |A|'s norm (``ResolvedBlock``), and
         the Gaussian-only quantities (variances, draws) refuse.
+
+        ``finish`` False (the mean-field route's factor, ``full_data_fit._FullDataMeanField._iterate``) stops at the
+        solve: the factor ``posterior_solve`` reads (the bulk model, its variances, the resolved blocks and the duals the
+        next iterate starts from) is the same as with it, and ``_finish``'s two reads are not made (the mean m + D Xt'z
+        with the windows' cross-products C = Xt'Z_L, then its image X mu: a read of every mean and resolved column, as
+        wide as the resolved sites, and one of every model's mean). The mean, its image, the covariates' coefficients,
+        the linear predictor and the refresh's ``BulkSolve`` per model are then unset (None, and no bulk solves), so
+        nothing reads a mean of other sites: the mean-field route answers by its own q, never by this one's.
         """
         self.indefinite_core = bool(indefinite_core)
         array_module = self.array_module
@@ -1189,7 +1203,11 @@ class DualGaussian:
         self._duals = result.solution
         self._resolved = resolved
         self._state = state | {"models": models, "bulk_mean": bulk_mean, "bulk_variances": bulk_variances, "precision": precision}
-        self._finish(result, mean_duals, bulk_mean, bulk_variances, precision, models, state, resolved)
+        if finish:
+            self._finish(result, mean_duals, bulk_mean, bulk_variances, precision, models, state, resolved)
+        else:
+            self.mean = self.genetic_image = self.alpha = self.linear_predictor = None
+            self.bulk_solves = []
         return DualCertificate(certificate, target, iterations, restarts)
 
     def _finish(self, result: SolveResult, mean_duals: Any, bulk_mean: Any, bulk_variances: Any, precision: Any, models: DualModels, state: dict, resolved: dict) -> None:

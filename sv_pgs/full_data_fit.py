@@ -511,6 +511,15 @@ def _hold_start(starts: dict, key: tuple, duals: Any) -> None:
         starts[key] = (duals, lease)
 
 
+def _release_held_squares(cache: dict) -> None:
+    """Release the cache leases of an oracle's held column squares (``_FullDataMeanField._group_squares``): its
+    finalizer, the oracle being gone."""
+    for _sites, _values, lease in list(cache.values()):
+        if lease is not None:
+            lease.release()
+    cache.clear()
+
+
 def _collect_cycles() -> None:
     """Free the outer loop's unreachable reference cycles before the next fixed point, and log each device's ledger.
 
@@ -560,11 +569,23 @@ def _relative_solve(
     def relative_solve(right: F64Array, relative_tolerance: float) -> F64Array:
         # A column is done when its certified error b is at most e times the lower bound on ||x||_A. The first b
         # takes ||x||_A^2 ~ sum_j r_j^2 z_j, which is exact for independent effects.
+        #
+        # The norm is the certificate's own, M = L |D| L' for A = L D L' with D the bulk block and the resolved sites'
+        # Schur complement (``dual_solve.split_columns``: |core| in place of the core), which is A itself where A is
+        # positive definite. The mean-field route's R = diag(1/v - omega) + Xp'Xp / sigma^2 is a linear response's,
+        # indefinite wherever a member's variance passes 1 / omega, and there r'x = x'Rx can be negative. Every
+        # |x'Ay| <= ||x||_M ||y||_M, so with ||x_hat - x||_M <= b, |r'x_hat| <= ||x||_M^2 + ||x||_M b and ||x||_M is at
+        # least the positive root of t^2 + b t = |r'x_hat|: ``_norm_bounds`` of |r'x_hat|, the same root as before
+        # wherever r'x_hat >= 0. Read without the magnitude, a negative r'x_hat gave a negative bound, which no
+        # certificate meets, so the column's bound halved round after round, each round a whole posterior solve (its
+        # image, its exact residuals, its CG and its solution, each a read of the store), down to float64's floor: on
+        # the repository's tied mean-field fixture 7 curvature responses took 1, 14, 28, 1, 30, 29 and 28 rounds.
         values = np.asarray(right, dtype=np.float64)
         solution = np.zeros_like(values)
         live = np.flatnonzero(np.any(values != 0.0, axis=0))
         bound = relative_tolerance * np.sqrt(np.square(values[:, live]).T @ variances)
         ensure()
+        started, solves = time.perf_counter(), 0
         key = solve_key.get()
         memory = None if starts is None or key is None else (model, key, values.shape[1])
         held = None if memory is None or memory not in starts else starts[memory][0]
@@ -572,6 +593,7 @@ def _relative_solve(
         start = None if held is None else held[:, live]
         while live.size:
             solved, certified = gaussian.posterior_solve(values[:, live], model, bound, start)
+            solves += 1
             if memory is not None:
                 last = gaussian.last_posterior_duals
                 if duals is None:
@@ -580,7 +602,7 @@ def _relative_solve(
             solved, certified = np.asarray(_host(solved), dtype=np.float64), np.asarray(_host(certified), dtype=np.float64)
             if not np.all(np.isfinite(certified)):
                 raise ValueError("a posterior solve has no certificate at float64's accuracy")
-            lower, _upper = _norm_bounds(np.sum(values[:, live] * solved, axis=0), certified)
+            lower, _upper = _norm_bounds(np.abs(np.sum(values[:, live] * solved, axis=0)), certified)
             # A certificate above the bound asked for is float64's floor: no solve certifies the column better.
             done = (certified <= relative_tolerance * lower) | (certified > bound)
             solution[:, live[done]] = solved[:, done]
@@ -591,6 +613,9 @@ def _relative_solve(
             start = gaussian.last_posterior_duals[:, np.flatnonzero(~done)] if live.size else None
         if memory is not None and duals is not None:
             _hold_start(starts, memory, duals)
+        # Each posterior solve logs its CG; this line is the response's whole (with each solve's image and solution
+        # reads), after ``ensure``, whose refactoring, if any, is the dual iterate's own line.
+        timing("response_solve", time.perf_counter() - started, columns=values.shape[1], solves=solves, warm=int(held is not None))
         return solution
 
     return relative_solve
@@ -1684,7 +1709,10 @@ class _FullDataMeanField:
             raise ValueError("sites needs one entry (None for a quantitative model) per model")
         self._training_targets = np.asarray(_host(gaussian.targets), dtype=np.float64).copy()
         self._training_squares = np.asarray(_host(gaussian.unit_squares), dtype=np.float64).copy()
-        self._square_cache: dict[bytes, F64Array] = {}
+        # A binary model's column squares per sites key: (its sites, weakly, the squares, their cache lease or None outside
+        # a ledger's scope); ``_group_squares``. Their leases go with the oracle.
+        self._square_cache: dict[bytes, tuple] = {}
+        weakref.finalize(self, _release_held_squares, self._square_cache)
         if gaussian.metric_key is not None:
             # The dual solver is in another oracle's binary metric: a quantitative model's squares are the mask's, which a
             # reweight never moves, and every binary model's come from its own sites below.
@@ -1779,18 +1807,42 @@ class _FullDataMeanField:
 
     def _group_squares(self, model: int, model_sites: BernoulliSites | None) -> F64Array:
         """||xt_g||^2 per group in the model's metric: the mask's from the dual solver's construction, or a binary model's
-        at its sites by one read (``dual_solve.column_squares``), held per sites."""
+        at its sites by one read (``dual_solve.column_squares``), held per sites for as long as anything holds those
+        sites: the oracle's current and cold-start sites, and every snapshot's (``_ModelState.sites``, by reference),
+        each such entry a cache lease of the host's ledger (dropped when a mandatory lease needs its bytes).
+
+        A binary model's metric moves back to sites it has held before at every cold solve (the cold start's sites),
+        every restore of an entry state, a candidate or the best state, and every ``_ensure`` of a fixed point a later
+        trial moved: held only for the current sites, each move back read the store again for squares already formed,
+        three products of the codes each (the weighted codes, their squares and the covariates' cross-products). The
+        repository's public binary fit read them 68 times, 48 with them held."""
         if model_sites is None:
             return self._training_squares[:, model]
-        held = self._square_cache.get(model_sites.key)
-        if held is None:
-            xp = self.gaussian.array_module
-            single = DualModels(xp.asarray(model_sites.weights[:, None]), xp.zeros((self.gaussian.source.variant_count, 1)), self.gaussian.covariates, xp)
-            held = np.asarray(_host(column_squares(self.gaussian.source, single, self.gaussian.count)), dtype=np.float64)[:, 0]
-            self._square_cache = {key: value for key, value in self._square_cache.items() if any(
-                other is not None and other.key == key for other in self.sites
-            )}
-            self._square_cache[model_sites.key] = held
+        key = model_sites.key
+        entry = self._square_cache.get(key)
+        if entry is not None:
+            return entry[1]
+        xp = self.gaussian.array_module
+        single = DualModels(xp.asarray(model_sites.weights[:, None]), xp.zeros((self.gaussian.source.variant_count, 1)), self.gaussian.covariates, xp)
+        held = np.asarray(_host(column_squares(self.gaussian.source, single, self.gaussian.count)), dtype=np.float64)[:, 0]
+        # A copy of the entries: the ledger may evict one (``evict``, under its own lock) while they are read.
+        for stale, (sites, _values, lease) in list(self._square_cache.items()):
+            if sites() is None:
+                self._square_cache.pop(stale, None)
+                if lease is not None:
+                    lease.release()
+        lease = None
+        if self._broker is not None:
+            # The eviction holds the cache, not the oracle: a lease the ledger holds must not keep the oracle alive.
+            cache = self._square_cache
+
+            def evict() -> None:
+                cache.pop(key, None)
+
+            lease = self._broker.admit(HOST, int(held.nbytes), "a binary model's column squares at sites held", evict)
+            if lease is None:
+                return held
+        self._square_cache[key] = (weakref.ref(model_sites), held, lease)
         return held
 
     def _metric_arrays(self, sites: Sequence[BernoulliSites | None]) -> tuple[F64Array, F64Array, F64Array]:
@@ -2061,9 +2113,13 @@ class _FullDataMeanField:
 
     def _response_products(self, residual: F64Array, columns: F64Array, model: int, metric: tuple | None = None) -> tuple[F64Array, F64Array]:
         """(Xp'Xp c over the members, r'Xp c) for member columns c, from one image X c (one genotype pass fewer than
-        the two separately)."""
+        the two separately). Its line with the response solve's (``_relative_solve``) splits a curvature's response
+        (``scale_mixture_ep``'s ``eb curvature:`` line): the rest is the outer loop's own algebra over the variants."""
+        started = time.perf_counter()
         image = self._image(columns, model, metric)
-        return self._back(image, model, metric), residual @ image
+        products = self._back(image, model, metric), residual @ image
+        timing("response_products", time.perf_counter() - started, columns=np.shape(columns)[1])
+        return products
 
     def _reduced_posterior(self, model: int, grams: BlockGrams, group_variance: F64Array, state: "_ModelState") -> GaussianPosterior:
         """The groups' mean responses at this fixed point, warm-started across fixed points. Mean field never asks
@@ -2433,17 +2489,27 @@ class _FullDataMeanField:
 
     def _iterate(self, site_precision: F64Array, site_shift: F64Array, noise: F64Array) -> None:
         """The dual solver at q's precision and mean: sites tau = 1/v - omega and nu = m/v - h per member (identity
-        ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m."""
+        ties), whose Gaussian has precision diag(tau) + Xp'Xp / sigma^2 = R and mean m. Only its factor is read (the
+        fixed points' responses, ``posterior_solve``), so the solve stops there (``DualGaussian.iterate``'s ``finish``):
+        the dual solver's own mean, its image and its refresh's variance pieces were two more reads at every call,
+        one of them as wide as the resolved sites, that nothing of the route reads (q's mean is the oracle's)."""
         # A linear response's sites, not a Gaussian's: the members' elimination needs no sign (tied_weights).
         group_precision, group_shift = group_sites(self.ties, site_precision, site_shift, algebraic=True)
         self._sync()
-        self.gaussian.iterate(
+        started, passes = time.perf_counter(), self.gaussian.count.passes
+        certificate = self.gaussian.iterate(
             site_precision=group_precision, site_shift=group_shift, noise_variance=noise,
             error_bound=np.full(self.model_count, np.sqrt(1.0 / self.draw_count)), probe_residual_ratio=_HALF_PRECISION,
             # q's sites: a scale-mixture member's variance can exceed 1 / omega (its tau is then negative), so R is a
             # linear response's precision, symmetric and nonsingular, and not always a Gaussian's (``mean_field``'s
             # dense route solves the same system by a symmetric indefinite factorization).
-            indefinite_core=True,
+            indefinite_core=True, finish=False,
+        )
+        # The factor's own line (no other names it): its reads, and the solve's width, the models' mean columns and the
+        # resolved sites', which sets each read's cost.
+        timing(
+            "dual_iterate", time.perf_counter() - started, iterations=certificate.iterations, restarts=certificate.restarts,
+            passes=self.gaussian.count.passes - passes, columns=self.model_count + self.gaussian.resolved_count,
         )
         self.version += 1
         self._solver_version[:] = self.version
