@@ -67,7 +67,11 @@ LOOP_PHASES = ("mean_field_solve", "eb")
 """The phases each fitted group runs at least once: a mean-field solve and an empirical Bayes loop."""
 CANARY_PHASES = ("moment_starts", "annotation_design", "mode_mixture")
 """The engine's phases benchmarks/wg_canary.py times around the production functions, inside the fit like the rest."""
-ENGINE_PHASES = (*GROUP_PHASES, "resident_fill", "store_read", "mean_field_solve", "eb_iteration", "eb", "device_sweep", *CANARY_PHASES)
+CURVATURE_PHASES = ("dual_iterate", "response_solve", "response_products")
+"""An empirical Bayes curvature call's parts, inside its eb_iteration (``full_data_fit``): the mean-field oracle's dual
+iterate, the response's posterior solves and its genotype products."""
+ENGINE_PHASES = (*GROUP_PHASES, "resident_fill", "store_read", "mean_field_solve", "eb_iteration", "eb", "device_sweep", *CURVATURE_PHASES,
+                 *CANARY_PHASES)
 """The engine's phases, which belong inside the fit step; the resident fill, the streamed store reads and the device
 sweeps' busy shares are the device route's, so a CPU run has none."""
 FIT_PHASES = ("fit_open", "fit_filter")
