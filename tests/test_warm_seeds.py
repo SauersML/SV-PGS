@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 
 from sv_pgs import (
+    content_identity,
     fit_model,
     full_data_fit,
     stage2_wiring,
@@ -403,3 +404,33 @@ def test_the_fit_step_starts_each_arm_from_the_best_saved_model_its_patterns_fin
     assert warm_seeds.seeds_from_model(load_model(saved["with_sv"]), "x", _WORKING_BYTES)["trait/fold0"].offset_digest == fit_model.offset_digest(arms.offsets["with_sv"])
     # The problem the fit step ranks by is the one fit_model.fit records.
     assert workspace_pipeline._request_problem(request) == load_model(saved["with_sv"]).provenance.problem_digest
+
+
+def test_a_saved_model_read_through_the_mounted_bucket_is_a_seed(arms: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A round's warm start reads the earlier run's model through the job's gcsfuse mount of the ops bucket
+    (/mnt/disks/ops, ``content_identity.GCS_MOUNTS``), where ``content_identity.file_digest`` is the object's
+    generation. The model's checksum is of its bytes, written on the saving job's own disk and checked on the mount
+    alike, so the model is a seed and no object's metadata is asked for; a damaged copy is passed over for the next."""
+    mount = (arms.root / "ops").resolve()
+    saved = arms.root / "models" / "with_sv" / "trait"
+    good = mount / "svpgs" / "base" / "run" / "fit" / "models" / "with_sv" / "trait"
+    damaged = mount / "svpgs" / "other" / "run" / "fit" / "models" / "with_sv" / "trait"
+    for target, modified in ((good, 1_000), (damaged, 2_000)):
+        shutil.copytree(saved, target)
+        os.utime(target / "model.json", (modified, modified))
+    content = bytearray((damaged / "arrays.npz").read_bytes())
+    content[len(content) // 2] ^= 0xFF
+    (damaged / "arrays.npz").write_bytes(bytes(content))
+    asked: list[str] = []
+    blob = SimpleNamespace(generation=1, size=len(content), crc32c="AAAAAA==")
+    client = SimpleNamespace(bucket=lambda bucket, user_project=None: SimpleNamespace(get_blob=lambda name: asked.append(name) or blob))
+    monkeypatch.setattr(content_identity, "_storage_client", lambda: client)
+    monkeypatch.setenv(content_identity.GCS_MOUNTS, json.dumps({str(mount): "gs://ops-bucket"}))
+    metadata = json.loads((good / "model.json").read_text())
+    assert metadata["arrays_sha256"] == hashlib.sha256((good / "arrays.npz").read_bytes()).hexdigest()
+    assert read_seeds(good, _WORKING_BYTES) and read_seeds(damaged, _WORKING_BYTES) == {}
+    run = SimpleNamespace(config=SimpleNamespace(warm_start_models=(str(mount / "svpgs" / "*" / "run" / "fit*" / "models" / "{arm}" / "{trait}"),)), budget=_budget())
+    cohort = SimpleNamespace(trait_names=("trait",), trait_models=lambda trait: np.array([0]))
+    request = fit_model.FitRequest(**_request_arguments(arms.store, arms.covariate, arms.targets, arms.offsets["with_sv"], arms.root / "work" / "unused"))
+    (seed,) = workspace_pipeline._warm_seeds(run, cohort, arms.store, request, "with_sv")
+    assert seed is not None and seed.source == str(good) and asked == []

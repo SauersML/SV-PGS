@@ -25,7 +25,7 @@ import numpy as np
 
 from sv_pgs._typing import BoolArray, F64Array
 from sv_pgs.compute_budget import ComputeBudget
-from sv_pgs.content_identity import file_digest, tree_digest
+from sv_pgs.content_identity import tree_digest
 from sv_pgs.config import TraitType
 from sv_pgs.dosage_store import DosageStore, read_manifest
 from sv_pgs.draw_laws import law_from_arrays
@@ -325,7 +325,7 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         np.savez(handle, **arrays)
         handle.flush()
         os.fsync(handle.fileno())
-    metadata["arrays_sha256"] = file_digest(staging / _ARRAYS)
+    metadata["arrays_sha256"] = _arrays_sha256(staging / _ARRAYS)
     with open(staging / _METADATA, "w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=1, sort_keys=True)
         handle.flush()
@@ -336,6 +336,17 @@ def save_model(path: str | Path, model: FittedModel) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def _arrays_sha256(path: Path) -> str:
+    """The SHA-256 of every byte of a model's arrays.npz, the checksum ``save_model`` writes and ``load_model`` checks:
+    a content checksum, the same wherever the file is read. Not ``content_identity.file_digest``, which is a cache
+    identity: under a mounted bucket (``content_identity.GCS_MOUNTS``, /mnt/disks/ops in a job) it is the object's
+    generation, size and CRC32C, which no checksum written on the job's own disk equals. A model saved by one run and
+    read by the next through the mount (``warm_seeds.read_seeds``, the round's warm starts) failed its own checksum,
+    so every such warm start fell back to cold."""
+    with open(path, "rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _required(metadata: Mapping[str, Any], key: str, kind: type) -> Any:
@@ -364,14 +375,15 @@ def load_model(path: str | Path) -> FittedModel:
     names = _required(metadata, "arrays", list)
     if not len(model_names) == len(trait_types) == len(shifts) == len(gaussian_posteriors) == len(draw_laws):
         raise ValueError("model.json lists models, trait types, intercept shifts and draw laws of different lengths.")
+    # Legacy v3 artifacts have no checksum; new artifacts bind every saved numerical value. Checked before the archive
+    # is opened, so arrays.npz of another save, or damaged, is this ValueError rather than a zipfile error.
+    if "arrays_sha256" in metadata:
+        if metadata["arrays_sha256"] != _arrays_sha256(directory / _ARRAYS):
+            raise ValueError("arrays.npz content checksum does not match model.json")
     with np.load(directory / _ARRAYS, allow_pickle=False) as archive:
         if sorted(archive.files) != sorted(names):
             raise ValueError("arrays.npz does not hold exactly the arrays model.json lists.")
         arrays = {name: np.array(archive[name]) for name in archive.files}
-    # Legacy v3 artifacts have no checksum; new artifacts bind every saved numerical value.
-    if "arrays_sha256" in metadata:
-        if metadata["arrays_sha256"] != file_digest(directory / _ARRAYS):
-            raise ValueError("arrays.npz content checksum does not match model.json")
     scoring = tuple(
         ScoringModel(
             **{field_name: arrays[f"scoring/{index}/{field_name}"] for field_name in _SCORING_FIELDS},
