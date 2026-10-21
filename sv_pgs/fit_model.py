@@ -134,6 +134,12 @@ class FitRequest:
     # empirical-Bayes call's genetic score beside the call's ELBO and hyperparameter move. Nothing the fit computes,
     # saves or checkpoints reads them, and the problem's digest leaves them out: a fit with them is the fit without.
     evaluation: EvaluationRows | None = None
+    # The hierarchical length-by-type prior: True gives each variant class its own learned deviation from the shared
+    # length smooth (``annotation_design``'s ``by_class``); False, one length curve shared by every class.
+    length_by_class: bool = False
+    # The LD function: True adds each record's Stage 0 LD score as a learned smooth of its prior variance
+    # (``annotation_design.ld_score_annotation``); False, the prior without it.
+    ld_score_prior: bool = False
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -154,6 +160,10 @@ class FitRequest:
         set_field(self, "work_dir", Path(self.work_dir))
         if not isinstance(self.annotated_prior, bool):
             raise ValueError("annotated_prior must be True or False.")
+        if not isinstance(self.length_by_class, bool):
+            raise ValueError("length_by_class must be True or False.")
+        if not isinstance(self.ld_score_prior, bool):
+            raise ValueError("ld_score_prior must be True or False.")
         if isinstance(self.seed, bool) or not isinstance(self.seed, (int, np.integer)):
             raise ValueError("seed must be an integer.")
         if self.seed < 0:
@@ -244,7 +254,10 @@ def fit(request: FitRequest) -> FittedModel:
         covariates=request.covariates, targets=request.targets, training=request.training,
         draw_count=DRAW_COUNT, seed=request.seed,
     )
-    prior_form = f"annotated_prior={request.annotated_prior}"
+    prior_form = (
+        f"annotated_prior={request.annotated_prior}" + (" length_by_class=True" if request.length_by_class else "")
+        + (" ld_score_prior=True" if request.ld_score_prior else "")
+    )
     checkpoint_key = hashlib.sha256("\n".join((source_key, store_key, offset_key, problem_key, prior_form)).encode()).hexdigest()
     fitted = fit_models(
         store=request.store,
@@ -265,6 +278,8 @@ def fit(request: FitRequest) -> FittedModel:
             request.evaluation, covariates=np.column_stack([np.ones(request.evaluation.store_columns.shape[0]), request.evaluation.covariates]),
         ),
         model_names=request.model_names,
+        length_by_class=request.length_by_class,
+        ld_score_prior=request.ld_score_prior,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)

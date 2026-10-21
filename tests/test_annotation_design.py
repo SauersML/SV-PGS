@@ -5,8 +5,12 @@ import pytest
 from scipy.interpolate import BSpline
 from scipy.integrate import quad
 
-from sv_pgs.annotation_design import FREQUENCY, annotation_design, frequency_annotation, spline_basis
-from sv_pgs.scale_mixture_ep import _sum_to_zero_basis, _sum_to_zero_rows, class_log_density, initial_hyperparameters, scale_mixture_prior
+from sv_pgs.annotation_design import FREQUENCY, LD_SCORE, annotation_design, frequency_annotation, ld_score_annotation, smooth_shift_record, spline_basis
+from sv_pgs.scale_mixture_ep import (
+    Cavity, _sum_to_zero_basis, _sum_to_zero_rows, class_log_density, derived_lattice, embed_hyperparameters, hyper_step, initial_hyperparameters,
+    scale_mixture_prior, without_annotations,
+)
+from tests.oracles import INDEPENDENT_EFFECTS
 
 
 def _table(rng: np.random.Generator, count: int):
@@ -282,3 +286,270 @@ def test_a_length_enters_on_its_log_scale() -> None:
     np.testing.assert_allclose(from_lengths.design, from_logs.design)
     with pytest.raises(ValueError, match="must be positive"):
         annotation_design({"sv_length": np.array([0.0, 1.0, 2.0])}, {}, class_index=np.zeros(3, dtype=np.int64))
+
+
+# ------------------------------------------------------------------ hierarchical class smooths (length by type)
+
+
+_LABELS = ("snv", "deletion", "duplication", "insertion")
+
+
+def _length_table(rng: np.random.Generator, sizes=(300, 400, 400, 400), narrow: bool = False):
+    """Records by class: class 0 the SNVs, every one at length 1, the others log-uniform from 50 bp to 1 Mb; with
+    ``narrow`` the last class only above 500 kb, inside the shared smooth's last knot interval, where it resolves only
+    the cubics of that interval."""
+    classes = np.repeat(np.arange(len(sizes)), sizes).astype(np.int64)
+    lengths = np.ones(classes.shape[0])
+    for position in range(1, len(sizes)):
+        rows = classes == position
+        low = np.log(5e5) if narrow and position == len(sizes) - 1 else np.log(50.0)
+        lengths[rows] = np.exp(rng.uniform(low, np.log(1e6), int(rows.sum())))
+    return classes, lengths
+
+
+def _resolved_rank(columns: np.ndarray, classes: np.ndarray) -> int:
+    """How many directions of ``columns`` the prior resolves after class centring: its Gram's eigenvalues above the
+    prior's bound, eps p max(largest, 1)."""
+    centred = np.array(columns, dtype=np.float64, copy=True)
+    for position in np.unique(classes):
+        rows = classes == position
+        centred[rows] -= centred[rows].mean(axis=0)
+    eigenvalues = np.linalg.eigvalsh(centred.T @ centred)
+    return int(np.sum(eigenvalues > np.finfo(np.float64).eps * columns.shape[0] * max(float(eigenvalues[-1]), 1.0)))
+
+
+def _annotation_covariance(classes: np.ndarray, design) -> np.ndarray:
+    """The prior covariance of every variant's annotation shift of its log prior variance, D theta (D the prior's own
+    class-centred design), with every annotation block of the prior at unit weight."""
+    prior = _prior(classes, design)
+    start = prior.coefficient_size - prior.scale_size
+    precision = np.zeros((prior.scale_size, prior.scale_size))
+    for block in prior.smoothing_blocks:
+        if block.coordinates[0] >= start:
+            local = block.coordinates - start
+            precision[np.ix_(local, local)] += block.factor.T @ block.factor
+    return prior.scale_design @ np.linalg.solve(precision, prior.scale_design.T)
+
+
+def test_without_two_varying_classes_the_class_deviations_leave_the_design_as_it_was() -> None:
+    # The snv_indel arm's one class, a store whose length varies in one class only, and a name that is no annotation.
+    rng = np.random.default_rng(51)
+    classes, lengths = _length_table(rng, sizes=(300, 400))
+    annotations = {"sv_length": lengths, "x": rng.normal(size=classes.shape[0])}
+    plain = annotation_design(annotations, {}, class_index=classes)
+    for by_class in (("sv_length",), ("absent",)):
+        result = annotation_design(annotations, {}, class_index=classes, by_class=by_class)
+        np.testing.assert_array_equal(result.design, plain.design)
+        assert result.names == plain.names and [group.name for group in result.groups] == [group.name for group in plain.groups]
+    one_class = annotation_design({"sv_length": lengths}, {}, class_index=np.zeros(classes.shape[0], dtype=np.int64), by_class=("sv_length",))
+    assert [group.name for group in one_class.groups] == ["sv_length"]
+
+
+def test_class_deviations_are_the_shared_columns_on_sum_to_zero_class_contrasts() -> None:
+    rng = np.random.default_rng(52)
+    classes, lengths = _length_table(rng)
+    shared = annotation_design({"sv_length": lengths}, {}, class_index=classes)
+    result = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    assert [group.name for group in result.groups] == ["sv_length", "sv_length:by_class"]
+    first, deviation = result.groups
+    # the shared smooth is the one without deviations, column for column and penalty for penalty
+    np.testing.assert_array_equal(result.design[:, first.columns], shared.design)
+    np.testing.assert_array_equal(first.penalty, shared.groups[0].penalty)
+    # three classes vary (the SNVs all sit at length 1): two contrasts of every shared column, each named by the class
+    # it sets against the ones before it
+    functions = [name.split(":", 1)[1] for name in shared.names]
+    assert [result.names[column] for column in deviation.columns] == [
+        f"sv_length:by_class({label}):{function}" for function in functions for label in ("duplication", "insertion")
+    ]
+    contrasts = _sum_to_zero_rows(np.arange(3), 3)
+    level = np.maximum(classes - 1, 0)
+    for position, column in enumerate(deviation.columns):
+        function, contrast = divmod(position, 2)
+        np.testing.assert_allclose(result.design[:, column], np.where(classes > 0, shared.design[:, function] * contrasts[level, contrast], 0.0), atol=1e-15)
+    # sum_c d_c' P d_c: the function's penalty on every contrast
+    np.testing.assert_allclose(deviation.penalty, np.kron(shared.groups[0].penalty, np.eye(2)))
+    # the prior accepts it, with the deviations' own roughness weight and the ridge on their linear parts
+    names = [block.name for block in _prior(classes, result).smoothing_blocks]
+    assert any(name.endswith("(sv_length:by_class)") for name in names)
+    assert any(name.endswith("(sv_length:by_class) null space") for name in names)
+
+
+@pytest.mark.parametrize("narrow", [False, True])
+def test_class_deviations_keep_exactly_what_the_classes_resolve_beyond_the_shared_smooth(narrow: bool) -> None:
+    """Identifiability: the deviations add every direction the classes' own copies of the shared smooth resolve beyond
+    it, and nothing that is a class's constant (its class density's location) or the shared curve. A class that spans
+    part of the length range (``narrow``) leaves contrast directions no row resolves, and the group is restricted to
+    the rest, as one subspace."""
+    rng = np.random.default_rng(53)
+    classes, lengths = _length_table(rng, narrow=narrow)
+    shared = annotation_design({"sv_length": lengths}, {}, class_index=classes)
+    result = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    (deviation,) = [group for group in result.groups if group.name == "sv_length:by_class"]
+    indicators = (classes[:, None] == np.arange(len(_LABELS))[None, :]).astype(np.float64)
+    per_class = np.column_stack([shared.design * indicators[:, [position]] for position in range(len(_LABELS))])
+    assert deviation.columns.shape[0] == _resolved_rank(per_class, classes) - _resolved_rank(shared.design, classes)
+    assert any(":direction" in result.names[column] for column in deviation.columns) == narrow
+    whole = np.column_stack([indicators, result.design])
+    assert np.linalg.matrix_rank(whole) == whole.shape[1]
+    _prior(classes, result)
+
+
+@pytest.mark.parametrize("narrow", [False, True])
+def test_the_hierarchical_prior_does_not_depend_on_the_class_order(narrow: bool) -> None:
+    """Exchangeable classes: relabelling them moves the Helmert contrasts (and, where a class's support restricts the
+    group, its directions) by a rotation, which leaves the prior covariance of every variant's log-variance shift
+    unchanged: no class is a reference level."""
+    rng = np.random.default_rng(54)
+    classes, lengths = _length_table(rng, narrow=narrow)
+    first = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    relabel = np.array([2, 3, 0, 1])
+    labels = [""] * len(_LABELS)
+    for old, new in enumerate(relabel):
+        labels[new] = _LABELS[old]
+    second = annotation_design({"sv_length": lengths}, {}, class_index=relabel[classes], by_class=("sv_length",), class_labels=labels)
+    assert first.names != second.names or narrow
+    expected = _annotation_covariance(classes, first)
+    np.testing.assert_allclose(_annotation_covariance(relabel[classes], second), expected, atol=1e-9 * np.abs(expected).max())
+
+
+
+def test_a_missing_state_contrast_the_shared_smooth_carries_leaves_every_spline_contrast() -> None:
+    # Only the first class has a record with no length, so its missing-state contrast is the shared missing state
+    # itself: the one unresolved direction lies in the penalty's null space, where its roughness is roundoff, and the
+    # restriction must hold that direction, not a spline contrast, so the group keeps every resolved one.
+    classes = np.repeat(np.arange(2), 30).astype(np.int64)
+    lengths = np.tile(np.geomspace(50.0, 1e6, 30), 2)
+    lengths[0] = np.nan
+    shared = annotation_design({"sv_length": lengths}, {}, class_index=classes)
+    result = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS[:2])
+    (deviation,) = [group for group in result.groups if group.name == "sv_length:by_class"]
+    indicators = (classes[:, None] == np.arange(2)[None, :]).astype(np.float64)
+    per_class = np.column_stack([shared.design * indicators[:, [position]] for position in range(2)])
+    assert deviation.columns.shape[0] == _resolved_rank(per_class, classes) - _resolved_rank(shared.design, classes)
+    _prior(classes, result)
+
+
+def test_a_direction_at_the_bound_after_the_restriction_is_restricted_too() -> None:
+    # A class confined to the last sliver of the length range: holding its unresolved contrasts at their smoothest can
+    # leave a kept direction whose design falls to the rank bound, which the column-order screen would then drop for
+    # one class order and keep for another. The restriction runs until the screen's own test passes, so both orders
+    # keep the same prior.
+    rng = np.random.default_rng(41)
+    classes = np.repeat(np.arange(3), 100).astype(np.int64)
+    lengths = np.exp(np.r_[rng.uniform(4.0, 14.0, 200), rng.uniform(13.75, 14.0, 100)])
+    relabel = np.array([2, 0, 1])
+    first = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",))
+    second = annotation_design({"sv_length": lengths}, {}, class_index=relabel[classes], by_class=("sv_length",))
+    assert first.design.shape[1] == second.design.shape[1]
+    expected = _annotation_covariance(classes, first)
+    np.testing.assert_allclose(_annotation_covariance(relabel[classes], second), expected, atol=1e-9 * np.abs(expected).max())
+
+
+def test_a_narrow_class_keeps_its_linear_deviation_free_of_roughness() -> None:
+    """Where a class spans part of the length range, the deviations it cannot resolve are held at their smoothest: a
+    slope that differs by class (the deviations' linear parts, under their own ridge) stays a straight line on every
+    class's rows, so the roughness weight never charges a class's slope for rows it does not reach."""
+    rng = np.random.default_rng(55)
+    classes, lengths = _length_table(rng, narrow=True)
+    result = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    (deviation,) = [group for group in result.groups if group.name == "sv_length:by_class"]
+    eigenvalues, eigenvectors = np.linalg.eigh(deviation.penalty)
+    free = eigenvectors[:, eigenvalues <= np.finfo(np.float64).eps * eigenvalues.shape[0] * eigenvalues[-1]]
+    # one free direction per contrast of the three varying classes' slopes
+    assert free.shape[1] == 2
+    log_length = np.log(lengths)
+    for direction in free.T:
+        shift = result.design[:, deviation.columns] @ direction
+        for position in range(1, len(_LABELS)):
+            rows = classes == position
+            line = np.column_stack([np.ones(int(rows.sum())), log_length[rows]])
+            fitted, *_ = np.linalg.lstsq(line, shift[rows], rcond=None)
+            np.testing.assert_allclose(line @ fitted, shift[rows], atol=1e-10 * np.abs(shift).max())
+
+
+
+def test_the_nested_empirical_bayes_gives_each_class_its_length_slope_and_shrinks_a_sparse_one() -> None:
+    """Normal means (each effect's cavity its own likelihood): deletions' log prior variance rises with log length and
+    duplications' falls (+1 and -1 per standard deviation), and six records of a fourth class rise too. One shared
+    length smooth cannot carry opposite slopes; the class deviations, entered as the fit enters them (the prior without
+    annotations first on the start lattice the data derive, then every annotation group at its lambda = infinity edge,
+    ``embed_hyperparameters``), are released by the evidence, give each well-resolved class its own slope, and hold the
+    six records' class near the shared curve."""
+    rng = np.random.default_rng(56)
+    classes, lengths = _length_table(rng, sizes=(200, 500, 500, 6))
+    log_length = np.log(lengths)
+    structural = classes > 0
+    standardized = np.where(structural, (log_length - log_length[structural].mean()) / log_length[structural].std(), 0.0)
+    slopes = np.array([0.0, 1.0, -1.0, 1.0])
+    precision = rng.uniform(100.0, 800.0, classes.shape[0])
+    effects = rng.standard_normal(classes.shape[0]) * np.exp(0.5 * (np.log(0.01) + slopes[classes] * standardized))
+    cavity = Cavity(precision=precision, shift=precision * effects + np.sqrt(precision) * rng.standard_normal(classes.shape[0]))
+    offset = np.zeros(classes.shape[0])
+    nodes, floor, top = derived_lattice(cavity.precision, cavity.shift, offset, 1e-3)
+
+    def prior(design):
+        return scale_mixture_prior(
+            class_index=classes, log_variance_offset=offset, annotation_design=design.design, annotation_groups=design.groups,
+            nodes=nodes, floor=floor, top=top,
+        )
+
+    shared = annotation_design({"sv_length": lengths}, {}, class_index=classes)
+    by_class = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    base = without_annotations(prior(shared))
+    base_fit = hyper_step(base, initial_hyperparameters(base), cavity, INDEPENDENT_EFFECTS, 1 << 20, 1.0 / 128.0)
+    fits = {}
+    for name, design in (("shared", shared), ("by_class", by_class)):
+        model = prior(design)
+        fits[name] = (model, hyper_step(model, embed_hyperparameters(base, model, base_fit.hyperparameters), cavity, INDEPENDENT_EFFECTS, 1 << 20, 1.0 / 128.0))
+    model, fit = fits["by_class"]
+    assert fit.evidence > fits["shared"][1].evidence + 10.0
+    names = [block.name for block in model.smoothing_blocks]
+    assert any(np.isfinite(weight) for name, weight in zip(names, fit.hyperparameters.log_smoothing) if "(sv_length:by_class)" in name)
+    theta = np.asarray(fit.hyperparameters.coefficients)[model.coefficient_size - model.scale_size :]
+    shift = model.scale_design @ theta
+    fitted = {position: np.polyfit(standardized[classes == position], shift[classes == position], 1)[0] for position in (1, 2)}
+    assert fitted[1] > 0.5 and fitted[2] < -0.5
+    (deviation,) = [group for group in model.annotation_groups if group.name == "sv_length:by_class"]
+    bend = model.scale_design[:, deviation.columns] @ theta[deviation.columns]
+    spread = [float(np.sqrt(np.mean(np.square(bend[classes == position])))) for position in range(len(_LABELS))]
+    assert spread[0] == 0.0 and spread[3] < 0.5 * min(spread[1], spread[2])
+
+
+def test_the_fit_log_records_each_class_length_curve_by_decade() -> None:
+    rng = np.random.default_rng(57)
+    classes, lengths = _length_table(rng)
+    result = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    prior = _prior(classes, result)
+    theta = rng.normal(size=prior.scale_size)
+    record = smooth_shift_record(prior.scale_design, prior.annotation_groups, theta, "sv_length", classes, lengths, _LABELS)
+    # the SNVs' one length has no curve; each other class has the mean shift of its members in each decade of length
+    parts = dict(part.split(" [") for part in record.split("; "))
+    assert sorted(parts) == ["deletion", "duplication", "insertion"]
+    shift = prior.scale_design @ theta
+    decade = np.floor(np.log10(lengths)).astype(int)
+    for position, label in enumerate(_LABELS[1:], start=1):
+        rows = classes == position
+        expected = ", ".join(f"1e{value}: {shift[rows & (decade == value)].mean():+.3g}" for value in np.unique(decade[rows]))
+        assert parts[label] == expected + "]"
+    assert smooth_shift_record(prior.scale_design, prior.annotation_groups, theta, "absent", classes, lengths, _LABELS) == ""
+    # a member with no length is in no decade
+    unknown = lengths.copy()
+    unknown[np.flatnonzero(classes == 1)[::2]] = np.nan
+    rows = (classes == 1) & np.isfinite(unknown)
+    parts = dict(part.split(" [") for part in smooth_shift_record(prior.scale_design, prior.annotation_groups, theta, "sv_length", classes, unknown, _LABELS).split("; "))
+    assert parts["deletion"] == ", ".join(f"1e{value}: {shift[rows & (decade == value)].mean():+.3g}" for value in np.unique(decade[rows])) + "]"
+
+
+def test_the_ld_function_is_its_own_named_smooth_on_the_log_ld_score() -> None:
+    rng = np.random.default_rng(58)
+    classes = rng.choice(2, size=400).astype(np.int64)
+    scores = np.exp(rng.uniform(0.0, 5.0, 400))
+    scores[:3] = 0.0
+    (name, values), = ld_score_annotation(scores).items()
+    assert name == LD_SCORE
+    np.testing.assert_allclose(values[3:], np.log(scores[3:]))
+    result = annotation_design({LD_SCORE: values, **frequency_annotation(np.log(rng.uniform(0.02, 0.5, 400)))}, {}, class_index=classes)
+    assert [group.name for group in result.groups] == [FREQUENCY, LD_SCORE]
+    # a column with no LD at all (the covariates explain it) has no finite log: the smooth's missing state, not a value
+    assert f"{LD_SCORE}:linear" in result.names and f"{LD_SCORE}:missing" in result.names
+    np.testing.assert_array_equal(result.design[:3, result.names.index(f"{LD_SCORE}:missing")], 1.0)

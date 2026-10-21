@@ -408,6 +408,13 @@ class WorkspaceConfig:
     disease_likelihood: str = "gaussian_working"
     calibration_fraction: float = 0.0
     annotated_prior: bool = True
+    length_by_class: bool = False
+    """The hierarchical length-by-type prior (``fit_model.FitRequest.length_by_class``): each variant class's own learned
+    deviation from the shared length smooth, shrunk to it where the class's records resolve little; False (the default)
+    keeps one length curve for every class, the prior of the runs so far."""
+    ld_score_prior: bool = False
+    """The LD function (``fit_model.FitRequest.ld_score_prior``): each record's Stage 0 LD score as a learned smooth of its
+    prior variance; False (the default) leaves it out, as in the runs so far."""
     panel: PanelInputs | None = None
     cross_fit: bool = True
     """True: one model per fold, each scored on the fold it left out, and an all-rows model per trait. False: a single
@@ -443,7 +450,7 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", "fit_regions", *_FIT_FILTER_KEYS})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "length_by_class", "ld_score_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", "fit_regions", *_FIT_FILTER_KEYS})
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -453,6 +460,9 @@ class WorkspaceConfig:
             raise ValueError("disease_likelihood must be gaussian_working or bernoulli")
         if not isinstance(raw.get("annotated_prior", True), bool):
             raise ValueError("annotated_prior must be a boolean")
+        for key in ("length_by_class", "ld_score_prior"):
+            if not isinstance(raw.get(key, False), bool):
+                raise ValueError(f"{key} must be a boolean")
         if not isinstance(raw.get("cross_fit", True), bool):
             raise ValueError("cross_fit must be a boolean")
         for key in _FIT_FILTER_KEYS:
@@ -543,6 +553,8 @@ class WorkspaceConfig:
             disease_likelihood=str(raw.get("disease_likelihood", "gaussian_working")),
             calibration_fraction=float(raw.get("calibration_fraction", 0.0)),
             annotated_prior=raw.get("annotated_prior", True),
+            length_by_class=raw.get("length_by_class", False),
+            ld_score_prior=raw.get("ld_score_prior", False),
             panel=PanelInputs.from_mapping(raw.get("panel"), diseases + traits, int(raw["fold_count"])),
             cross_fit=raw.get("cross_fit", True),
             fit_minimum_minor_allele_frequency=float(raw.get("fit_minimum_minor_allele_frequency", 0.0)),
@@ -3091,7 +3103,7 @@ families, whose scores and labels are independent of the outer evaluation labels
 
 def fit_request(
     cohort: _Cohort, store: DosageStore, log_variance_offset: F64Array, budget: ComputeBudget, work_dir: Path, seed: int,
-    disease_likelihood: str = "gaussian_working", annotated_prior: bool = True,
+    disease_likelihood: str = "gaussian_working", annotated_prior: bool = True, length_by_class: bool = False, ld_score_prior: bool = False,
 ) -> FitRequest:
     """Every trait's models (each trait's folds' and its all-rows model, in the cohort's model order) as one fit, on the
     rows any of them trains on, so the models of different traits that share their training rows and covariates are
@@ -3139,6 +3151,8 @@ def fit_request(
         seed=seed,
         annotated_prior=annotated_prior,
         evaluation=evaluation,
+        length_by_class=length_by_class,
+        ld_score_prior=ld_score_prior,
     )
 
 
@@ -3297,7 +3311,7 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
                     )
                     request = fit_request(
                         cohort, store, arm_log_reliability(store.variant_table, kept, arm), run.budget, work, run.config.seed,
-                        run.config.disease_likelihood, run.config.annotated_prior,
+                        run.config.disease_likelihood, run.config.annotated_prior, run.config.length_by_class, run.config.ld_score_prior,
                     )
                     LOGGER.info("workspace pipeline: fitting %s: %d models of %d traits", arm, len(request.model_names), len(cohort.trait_names))
                     started = time.perf_counter()
@@ -4391,6 +4405,7 @@ _STEPS = (
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (
         config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
         None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)), config.fit_region,
+        config.length_by_class, config.ld_score_prior,
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
     _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(

@@ -54,7 +54,9 @@ from sv_pgs.genotype_statistics import (
     largest_block_cap, stage0_block_cap,
 )
 from sv_pgs.imputation_reliability import ColumnMeasurement, checked_log_reliability
-from sv_pgs.annotation_design import annotation_design, frequency_annotation
+from sv_pgs.annotation_design import (
+    BY_CLASS_ANNOTATIONS, LOG_SCALE_ANNOTATIONS, annotation_design, frequency_annotation, ld_score_annotation, smooth_shift_record,
+)
 from sv_pgs.progress import log
 from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior, transfer_hyperparameters
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
@@ -502,6 +504,8 @@ def _fit_group(
     trait_type: TraitType = TraitType.QUANTITATIVE,
     inference: str = "mean_field",
     annotated_prior: bool = True,
+    length_by_class: bool = False,
+    ld_score_prior: bool = False,
     evaluation: GroupEvaluation | None = None,
 ) -> list[_ModelFit]:
     """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
@@ -519,6 +523,12 @@ def _fit_group(
     A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``): after the
     separation check, Stage 0 runs on its start's equal-weight problem (every weight 1/4, response 4 kappa, noise 4), where
     the lattice and the EB start are exact, and the dual solver starts in that metric with its sites at xi = 0.
+
+    With ``length_by_class`` (the hierarchical length-by-type prior) each variant class whose lengths vary bends the
+    shared length smooth by its own learned deviation (``annotation_design``'s ``by_class``, ``BY_CLASS_ANNOTATIONS``);
+    without it every class shares one length curve, the prior of the runs so far. With ``ld_score_prior`` the level of
+    LD around each member, its Stage 0 LD score, is a learned smooth of the prior variance beside the frequency function
+    (``annotation_design.ld_score_annotation``), in either prior form; without it the prior has none, as so far.
 
     ``evaluation``, the group's evaluation rows, is the EB monitor's alone (``eb_monitor``): Stage 0's pass keeps their
     codes as it reads, and the mean-field fit logs each outer-loop call's posterior mean scored on them. Nothing of the
@@ -592,7 +602,8 @@ def _fit_group(
     # holds calibrated conditional means (a GLIMPSE2/Beagle DS, or the measurement step's rewritten D*), and its log
     # true-genotype variance, the frequency function's argument, where the reliability enters.
     offsets, log_genotype_variance = measurement.standardized_terms(member_rows, np.asarray(statistics.scales))
-    _classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
+    classes, class_index = np.unique(store.variant_table.variant_class[member_rows], return_inverse=True)
+    class_labels = [VARIANT_CLASSES[int(code)].value for code in classes]
     table = store.variant_table
     # The store's annotations per member and the frequency function; ``fit_full_data`` nests them on the prior without
     # annotations, so each enters where the evidence rises.
@@ -600,11 +611,18 @@ def _fit_group(
     # store's annotations.
     member_annotations = {name: np.asarray(values)[member_rows] for name, values in table.annotations.items()} if annotated_prior else {}
     member_annotations.update(frequency_annotation(log_genotype_variance))
+    if ld_score_prior:
+        # Each member's reduced column's LD score, which an exact tie shares (the prior is over every member).
+        member_annotations.update(ld_score_annotation(
+            np.asarray(statistics.ld.ld_scores())[np.asarray(statistics.tie_map.original_to_reduced, dtype=np.int64)]
+        ))
     annotations = annotation_design(
         member_annotations,
         table.annotation_legends,
         class_index=class_index.astype(np.int64),
         exclude=RELIABILITY_COLUMNS + IDENTIFIER_COLUMNS,
+        by_class=BY_CLASS_ANNOTATIONS if length_by_class else (),
+        class_labels=class_labels,
     )
     log(f"stage2 wiring: {annotations.design.shape[1]} annotation columns in {len(annotations.groups)} groups: {', '.join(annotations.names) or 'none'}")
     # These are the group's models: rows outside its training set have zero likelihood
@@ -712,6 +730,16 @@ def _fit_group(
                     scoring=scoring[model], noise=float(np.asarray(fit.noise_variance)[model]), hyperparameters=fit.hyperparameters[model],
                     certificate=certificate, prior_digest=digest,
                 )
+                # The learned length curves (per class where ``length_by_class`` gave the classes their own), the
+                # prior's answer to how a structural variant's effect variance grows with its length.
+                for name in LOG_SCALE_ANNOTATIONS:
+                    record = smooth_shift_record(
+                        fitted_prior.scale_design, fitted_prior.annotation_groups,
+                        np.asarray(fit.hyperparameters[model].coefficients)[fitted_prior.coefficient_size - fitted_prior.scale_size :], name,
+                        class_index, member_annotations[name], class_labels,
+                    ) if name in member_annotations else ""
+                    if record:
+                        log(f"stage2 wiring: model {int(models[genetic[columns[model]]])}: {name}'s shift of the log prior variance by decade, per class (mean zero within a class): {record}")
 
         # The EB monitor's view of these models (their positions in the group).
         watched = None if monitor is None else monitor.view([genetic[column] for column in columns])
@@ -882,6 +910,8 @@ def fit_models(
     annotated_prior: bool = True,
     evaluation: EvaluationRows | None = None,
     model_names: Sequence[str] | None = None,
+    length_by_class: bool = False,
+    ld_score_prior: bool = False,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
     names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
@@ -946,6 +976,8 @@ def fit_models(
                         trait_types[first],
                         inference,
                         annotated_prior,
+                        length_by_class,
+                        ld_score_prior,
                         group_evaluation,
                     )
             except FloatingPointError as error:

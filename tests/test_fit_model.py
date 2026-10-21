@@ -420,3 +420,21 @@ def test_the_prior_form_reaches_the_driver_and_its_checkpoints(tmp_path: Path, s
     assert annotated["checkpoint_key"] != simpler["checkpoint_key"]
     with pytest.raises(ValueError, match="annotated_prior"):
         dataclasses.replace(request, annotated_prior=1)
+
+
+def test_the_prior_switches_reach_the_driver_and_their_checkpoints(tmp_path: Path, store_root: Path, driver: _StubDriver) -> None:
+    # The hierarchical length-by-type prior and the LD function are off unless asked for; on, each is passed through to
+    # the fit, and its checkpoints never stand in for the prior without it.
+    cohort = _cohort(np.random.default_rng(1))
+    fit_model.fit(_request(store_root, cohort.arguments(), tmp_path / "shared", 11))
+    request = dataclasses.replace(_request(store_root, cohort.arguments(), tmp_path / "by_class", 11), length_by_class=True)
+    fit_model.fit(request)
+    fit_model.fit(dataclasses.replace(_request(store_root, cohort.arguments(), tmp_path / "ld", 11), ld_score_prior=True))
+    shared, by_class, ld = driver.calls
+    assert shared["length_by_class"] is False and by_class["length_by_class"] is True and ld["length_by_class"] is False
+    assert shared["ld_score_prior"] is False and by_class["ld_score_prior"] is False and ld["ld_score_prior"] is True
+    assert len({shared["checkpoint_key"], by_class["checkpoint_key"], ld["checkpoint_key"]}) == 3
+    with pytest.raises(ValueError, match="length_by_class"):
+        dataclasses.replace(request, length_by_class=1)
+    with pytest.raises(ValueError, match="ld_score_prior"):
+        dataclasses.replace(request, ld_score_prior=1)

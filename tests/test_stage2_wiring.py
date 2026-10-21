@@ -109,6 +109,66 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
     assert prediction.predictive_mean.shape == (samples, 1)
 
 
+@pytest.mark.parametrize(("length_by_class", "ld_score_prior"), [(False, False), (True, False), (False, True)])
+def test_the_prior_switches_reach_the_prior_design(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, length_by_class: bool, ld_score_prior: bool) -> None:
+    # ``length_by_class`` names the length smooth for class deviations, with the classes labelled by their store class;
+    # ``ld_score_prior`` adds each member's Stage 0 LD score, its reduced column's, as an annotation.
+    from sv_pgs import stage2_wiring
+
+    class _Designed(Exception):
+        pass
+
+    designs = []
+    statistics = []
+    computed = stage2_wiring.compute_genotype_statistics
+
+    def kept(*arguments, **keywords):
+        statistics.append(computed(*arguments, **keywords))
+        return statistics[-1]
+
+    def recorded(annotations, legends, **keywords):
+        designs.append((dict(annotations), keywords))
+        raise _Designed
+
+    monkeypatch.setattr(stage2_wiring, "compute_genotype_statistics", kept)
+    monkeypatch.setattr(stage2_wiring, "annotation_design", recorded)
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    with pytest.raises(_Designed):
+        stage2_wiring.fit_models(
+            store=store, store_columns=np.arange(store.n_samples, dtype=np.int64), covariates=np.column_stack([np.ones(store.n_samples), covariate]),
+            covariate_columns=np.ones((1, 2), dtype=bool), targets=targets[:, None], training=np.ones((store.n_samples, 1), dtype=bool),
+            trait_types=(TraitType.QUANTITATIVE,), log_variance_offset=None, budget=_budget(), work_dir=tmp_path / "work", seed=1, draw_count=4,
+            length_by_class=length_by_class, ld_score_prior=ld_score_prior,
+        )
+    ((annotations, keywords),) = designs
+    assert tuple(keywords["by_class"]) == (("sv_length",) if length_by_class else ())
+    assert keywords["class_labels"] == ["snv"]
+    assert ("log_ld_score" in annotations) == ld_score_prior
+    if ld_score_prior:
+        (fitted,) = statistics
+        scores = np.asarray(fitted.ld.ld_scores())[np.asarray(fitted.tie_map.original_to_reduced, dtype=np.int64)]
+        assert annotations["log_ld_score"].shape == (np.asarray(fitted.active_rows).shape[0],)
+        np.testing.assert_allclose(annotations["log_ld_score"], np.log(scores))
+        assert np.all(scores >= np.asarray(fitted.ld.ld_diagonal())[np.asarray(fitted.tie_map.original_to_reduced, dtype=np.int64)] ** 2)
+
+
+
+def test_the_fit_log_records_the_learned_length_curve(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # The learned length smooth's shift of the log prior variance reaches the fit log, per class and decade of length:
+    # here the store's one class, its records given lengths over five decades.
+    from sv_pgs import stage2_wiring
+
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    store.variant_table.annotations["sv_length"] = np.exp(np.random.default_rng(9).uniform(0.0, np.log(1e5), store.n_variants))
+    stage2_wiring.fit_models(
+        store=store, store_columns=np.arange(store.n_samples, dtype=np.int64), covariates=np.column_stack([np.ones(store.n_samples), covariate]),
+        covariate_columns=np.ones((1, 2), dtype=bool), targets=targets[:, None], training=np.ones((store.n_samples, 1), dtype=bool),
+        trait_types=(TraitType.QUANTITATIVE,), log_variance_offset=None, budget=_budget(), work_dir=tmp_path / "work", seed=1, draw_count=4,
+        length_by_class=True,
+    )
+    assert "sv_length's shift of the log prior variance by decade, per class (mean zero within a class): snv [1e0: " in capsys.readouterr().err
+
+
 def test_the_bench_real_adapter_fits_a_synthetic_gene_with_the_engine() -> None:
     generator = np.random.default_rng(8)
     samples, columns = 160, 120

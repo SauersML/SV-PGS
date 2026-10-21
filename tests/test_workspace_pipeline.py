@@ -1286,6 +1286,19 @@ def test_the_simpler_prior_reaches_every_fit_call(workspace):
     assert recorder.fit_calls and all(not call.annotated_prior for call in recorder.fit_calls)
 
 
+def test_the_prior_switches_reach_every_fit_call(workspace):
+    synthetic, client = workspace
+    default = WorkspaceConfig.from_mapping(synthetic.raw)
+    assert not default.length_by_class and not default.ld_score_prior
+    config = WorkspaceConfig.from_mapping({**synthetic.raw, 'length_by_class': True, 'ld_score_prior': True})
+    recorder = _Recorder()
+    run_pipeline(config, _bindings(recorder, client), BUDGET, through='fit')
+    assert recorder.fit_calls and all(call.length_by_class and call.ld_score_prior for call in recorder.fit_calls)
+    for key in ('length_by_class', 'ld_score_prior'):
+        with pytest.raises(ValueError, match=key):
+            WorkspaceConfig.from_mapping({**synthetic.raw, key: 1})
+
+
 def test_frozen_probability_calibration_uses_only_reserved_development_families(workspace):
     from sv_pgs.probability_calibration import FrozenCalibration
     synthetic, client = workspace
