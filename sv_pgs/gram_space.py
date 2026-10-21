@@ -39,6 +39,8 @@ never enters the job's resident set beyond what the ledger grants.
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 import weakref
 from dataclasses import dataclass
@@ -666,15 +668,21 @@ _BAND_FILES = {"within": "band_within.f32", "cross": "band_cross.f32"}
 
 class BandStore:
     """The summary band on disk: Stage 0's Grams re-cut into parts no wider than their region's LD extent, each part's
-    Gram and each part's Gram with the next (``build_band_store``), float32. It reads as ``LdGramStore`` does for
+    Gram and each part's Gram with the next (``summary_band``), float32. It reads as ``LdGramStore`` does for
     ``GramBand`` (``block_width``, ``has_adjacent``, ``read_gram``, ``read_adjacent``), the parts in the reduced columns'
-    order, so a ``GramBand`` over it indexes the same groups."""
+    order, so a ``GramBand`` over it indexes the same groups.
 
-    def __init__(self, directory: Path) -> None:
+    Its index lays out every part at once, and each Stage 0 block's parts are written when first needed: ``complete``
+    writes every one not yet written, and a read of a part not yet written writes its Stage 0 block's parts first, from
+    ``ld`` (Stage 0's ``LdGramStore``); without it, such a read is refused rather than served from the file's unwritten
+    zeros. The index on disk says which blocks are written, so a store opened from it again knows."""
+
+    def __init__(self, directory: Path, ld: Any = None) -> None:
         from sv_pgs.genotype_statistics import read_array
 
         self.directory = Path(directory)
         index = json.loads((self.directory / _BAND_INDEX).read_text(encoding="utf-8"))
+        self._index = index
         self.widths = np.asarray(index["widths"], dtype=np.int64)
         self.within_offsets = np.asarray(index["within_offsets"], dtype=np.int64)
         # cross_offsets[b]: the Gram of part b - 1 against part b, or -1 where none (a chromosome's first part).
@@ -682,6 +690,14 @@ class BandStore:
         self.extents = index["extents"]
         self.stored_bytes = int(index["stored_bytes"])
         self._read = read_array
+        self._ld = ld
+        # pieces[k]: one Stage 0 block's writes, each (file, offset, source, rows, columns), the source "within" (the
+        # block's Gram) or "adjacent" (its Gram with the previous block), rows and columns [start, stop) within it.
+        self._pieces = index.get("pieces", [])
+        self._unwritten = set(int(piece) for piece in index.get("unwritten", []))
+        # owner[b]: the piece that writes part b's Gram and its Gram with part b - 1.
+        self._owner = np.repeat(np.arange(len(self._pieces), dtype=np.int64), [int(piece["parts"]) for piece in self._pieces])
+        self._writing = threading.Lock()
 
     @property
     def block_count(self) -> int:
@@ -694,88 +710,156 @@ class BandStore:
         return 0 < block < self.block_count and int(self.cross_offsets[block]) >= 0
 
     def read_gram(self, block: int, out: np.ndarray | None = None) -> np.ndarray:
+        self._written(block)
         width = self.block_width(block)
         return self._read(self.directory / _BAND_FILES["within"], int(self.within_offsets[block]), (width, width), np.dtype(np.float32), out)
 
     def read_adjacent(self, block: int, out: np.ndarray | None = None) -> np.ndarray:
+        self._written(block)
         shape = (self.block_width(block - 1), self.block_width(block))
         return self._read(self.directory / _BAND_FILES["cross"], int(self.cross_offsets[block]), shape, np.dtype(np.float32), out)
 
+    @property
+    def written_bytes(self) -> int:
+        """The bytes of the parts written so far."""
+        return sum(int(piece["bytes"]) for number, piece in enumerate(self._pieces) if number not in self._unwritten) if self._pieces else self.stored_bytes
 
-def build_band_store(
-    ld: Any, sample_count: int, directory: Path, working_bytes: int, level: float, array_module: Any = np, null_scale: float = 1.0,
-) -> BandStore:
-    """Stage 0's Grams (``ld``, an ``LdGramStore``) as the summary band: each Stage 0 block's LD extent measured on its
-    own Gram (``marginal_variances.ld_extent``, the whole tail's test within the block: the lag beyond which its pairs'
+    def complete(self) -> None:
+        """Write every Stage 0 block's parts not yet written (one read of those blocks' Grams)."""
+        if not self._unwritten:
+            return
+        started = time.perf_counter()
+        pending = sorted(self._unwritten)
+        for piece in pending:
+            self._write_piece(piece)
+        written = sum(int(self._pieces[piece]["bytes"]) for piece in pending)
+        log(f"summary band: wrote the parts of {len(pending)} more Stage 0 blocks, {written / 1e9:.2f} GB, in {time.perf_counter() - started:.0f} s")
+
+    def _written(self, block: int) -> None:
+        if self._unwritten:
+            piece = int(self._owner[block])
+            if piece in self._unwritten:
+                self._write_piece(piece)
+
+    def _write_piece(self, number: int) -> None:
+        with self._writing:
+            if number not in self._unwritten:
+                return
+            if self._ld is None:
+                raise RuntimeError(f"the summary band at {self.directory} has not written Stage 0 block {self._pieces[number]['block']}'s parts, and was opened without Stage 0's Grams to write them from")
+            piece = self._pieces[number]
+            block = int(piece["block"])
+            grams = {"within": read_block(self._ld, "within", block)}
+            if any(source == "adjacent" for _file, _offset, source, _rows, _columns in piece["writes"]):
+                grams["adjacent"] = read_block(self._ld, "cross", block - 1)
+            for file, offset, source, rows, columns in piece["writes"]:
+                values = np.ascontiguousarray(grams[source][rows[0] : rows[1], columns[0] : columns[1]], dtype=np.float32)
+                with open(self.directory / _BAND_FILES[file], "r+b") as handle:
+                    handle.seek(int(offset) * np.dtype(np.float32).itemsize)
+                    handle.write(values)
+            del grams
+            self._unwritten.discard(number)
+            self._index["unwritten"] = sorted(self._unwritten)
+            _write_index(self.directory, self._index)
+
+
+def _write_index(directory: Path, index: dict) -> None:
+    """The band's index, replaced whole (a reader never sees half of one)."""
+    staged = directory / f"{_BAND_INDEX}.partial"
+    staged.write_text(json.dumps(index), encoding="utf-8")
+    os.replace(staged, directory / _BAND_INDEX)
+
+
+def summary_band(ld: Any, sample_count: int, directory: Path, level: float, null_scale: float = 1.0) -> BandStore:
+    """Stage 0's Grams (``ld``, an ``LdGramStore``) as the summary band: each Stage 0 block's LD extent read from its
+    own lag profile (``LdGramStore.lag_excess``, summed by Stage 0 from the block's Gram as
+    ``marginal_variances.ld_extent`` sums it: the whole tail's test within the block, the lag beyond which its pairs'
     excess r^2 is within its null resolution), the block cut into near-equal consecutive parts no wider than it, and
-    each part's Gram with itself and with the next part written once (across a block's end from Stage 0's adjacent
-    Gram; none across a chromosome's end). Every pair closer than its block's extent is then within one part or two
-    neighbouring ones, so the band holds the LD the data show and 2 p w float32 entries in place of Stage 0's sum of
-    squared block widths. An extent is never capped: a region whose LD reaches far (admixture's local-ancestry tracts,
-    an inversion) keeps its wide parts, and each block's extent is logged. ``null_scale`` is kappa, the unlinked pairs'
-    measured mean r^2 n (``far_field_scale``): each extent is read against kappa / n (``extent_from_profile``), without
-    which a pooled cross-ancestry cohort's extents ran to every block's edge. One read of Stage 0's Grams."""
-    from sv_pgs.marginal_variances import BlockGrams, ld_extent
+    each part's Gram with itself and with the next part (across a block's end from Stage 0's adjacent Gram; none
+    across a chromosome's end). Every pair closer than its block's extent is then within one part or two neighbouring
+    ones, so the band holds the LD the data show and 2 p w float32 entries in place of Stage 0's sum of squared block
+    widths. An extent is never capped: a region whose LD reaches far (admixture's local-ancestry tracts, an inversion)
+    keeps its wide parts, and each block's extent is logged. ``null_scale`` is kappa, the unlinked pairs' measured
+    mean r^2 n (``far_field_scale``): each extent is read against kappa / n (``extent_from_profile``), without which a
+    pooled cross-ancestry cohort's extents ran to every block's edge.
+
+    The parts are laid out here, every one's place in its file, and only the Stage 0 blocks that hold the first two
+    parts are written, which ``pass_costs`` reads to price a pass over the band; ``BandStore.complete`` writes the
+    rest once the band route is chosen. The whole genome takes the sample route (``pass_costs``), and copying the band
+    there read Stage 0's 150-169 GB of Grams and wrote 82-98 GB, 9-14 minutes of an arm [real], for a band the fit
+    then released. Written whole, the files are the ones the band was always written as, byte for byte."""
+    from sv_pgs.lag_profiles import lag_pairs
+    from sv_pgs.marginal_variances import extent_from_profile
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    itemsize = np.dtype(np.float32).itemsize
     widths: list[int] = []
     within_offsets: list[int] = []
     cross_offsets: list[int] = []
     extents: list[dict] = []
+    pieces: list[dict] = []
     positions = {"within": 0, "cross": 0}
-    handles = {name: open(directory / file_name, "wb") for name, file_name in _BAND_FILES.items()}
     started = time.perf_counter()
 
-    def write(name: str, values: np.ndarray) -> int:
+    def place(name: str, rows: tuple[int, int], columns: tuple[int, int]) -> int:
         offset = positions[name]
-        handles[name].write(np.ascontiguousarray(values, dtype=np.float32))
-        positions[name] += int(values.size)
+        positions[name] += (rows[1] - rows[0]) * (columns[1] - columns[0])
         return offset
 
-    try:
-        previous: slice | None = None
-        for block in range(ld.block_count):
-            width = int(ld.block_width(block))
-            if width == 0:
-                previous = None
-                continue
-            within = read_block(ld, "within", block)
-            single = BlockGrams(blocks=(np.arange(width, dtype=np.int64),), within=(within,), next_cross=())
-            extent = int(ld_extent(single, int(sample_count), int(working_bytes), level, array_module, null_scale)) if width > 1 else 1
-            parts = max(1, -(-width // extent))
-            cuts = np.linspace(0, width, parts + 1).round().astype(np.int64)
-            spans = [slice(int(cuts[part]), int(cuts[part + 1])) for part in range(parts)]
-            extents.append({"block": block, "width": width, "extent": extent, "parts": parts})
-            first_cross = -1
-            if previous is not None and ld.has_adjacent(block):
-                adjacent = read_block(ld, "cross", block - 1)
-                first_cross = write("cross", adjacent[previous, spans[0]])
-                del adjacent
-            for position, span in enumerate(spans):
-                widths.append(span.stop - span.start)
-                within_offsets.append(write("within", within[span, span]))
-                cross_offsets.append(first_cross if position == 0 else write("cross", within[spans[position - 1], span]))
-            previous = spans[-1]
-            del within
-    finally:
-        for handle in handles.values():
-            handle.close()
-    stored = sum(positions.values()) * np.dtype(np.float32).itemsize
-    index = {"widths": widths, "within_offsets": within_offsets, "cross_offsets": cross_offsets, "extents": extents, "stored_bytes": stored}
-    (directory / _BAND_INDEX).write_text(json.dumps(index), encoding="utf-8")
+    previous: tuple[int, int] | None = None
+    for block in range(ld.block_count):
+        width = int(ld.block_width(block))
+        if width == 0:
+            previous = None
+            continue
+        extent = int(extent_from_profile(ld.lag_excess(block), lag_pairs(width, width), int(sample_count), width, level, null_scale)) if width > 1 else 1
+        parts = max(1, -(-width // extent))
+        cuts = np.linspace(0, width, parts + 1).round().astype(np.int64)
+        spans = [(int(cuts[part]), int(cuts[part + 1])) for part in range(parts)]
+        extents.append({"block": block, "width": width, "extent": extent, "parts": parts})
+        writes: list[tuple[str, int, str, tuple[int, int], tuple[int, int]]] = []
+        first_cross = -1
+        if previous is not None and ld.has_adjacent(block):
+            first_cross = place("cross", previous, spans[0])
+            writes.append(("cross", first_cross, "adjacent", previous, spans[0]))
+        for position, span in enumerate(spans):
+            widths.append(span[1] - span[0])
+            within_offsets.append(place("within", span, span))
+            writes.append(("within", within_offsets[-1], "within", span, span))
+            if position == 0:
+                cross_offsets.append(first_cross)
+            else:
+                cross_offsets.append(place("cross", spans[position - 1], span))
+                writes.append(("cross", cross_offsets[-1], "within", spans[position - 1], span))
+        written = sum((rows[1] - rows[0]) * (columns[1] - columns[0]) for _file, _offset, _source, rows, columns in writes) * itemsize
+        pieces.append({"block": block, "parts": parts, "bytes": written, "writes": writes})
+        previous = spans[-1]
+    for name, file_name in _BAND_FILES.items():
+        with open(directory / file_name, "wb") as handle:
+            handle.truncate(positions[name] * itemsize)
+    stored = sum(positions.values()) * itemsize
+    index = {
+        "widths": widths, "within_offsets": within_offsets, "cross_offsets": cross_offsets, "extents": extents, "stored_bytes": stored,
+        "pieces": pieces, "unwritten": list(range(len(pieces))),
+    }
+    _write_index(directory, index)
+    band = BandStore(directory, ld)
+    # What pass_costs reads: part 0's Gram and part 1's Gram with it.
+    for part in range(min(2, band.block_count)):
+        band._written(part)
     values = np.array([entry["extent"] for entry in extents])
     log(
         f"summary band: {len(extents)} Stage 0 blocks re-cut into {len(widths)} parts by their LD extents against kappa {float(null_scale):.4g} / n "
         f"(median {np.median(values):.0f}, "
         f"90% {np.quantile(values, 0.9):.0f}, max {values.max()} variants; blocks at their full width: "
         f"{sum(entry['extent'] >= entry['width'] for entry in extents)}), {stored / 1e9:.2f} GB against Stage 0's {ld.stored_bytes / 1e9:.2f} GB, "
-        f"in {time.perf_counter() - started:.0f} s"
+        f"{band.written_bytes / 1e9:.2f} GB of it written for the route's pricing, in {time.perf_counter() - started:.0f} s"
     )
     for entry in extents:
         log(f"summary band: block {entry['block']}: {entry['width']} columns, LD extent {entry['extent']}, {entry['parts']} parts")
     timing("summary_band", time.perf_counter() - started, blocks=len(extents), parts=len(widths), gb=stored / GB)
-    return BandStore(directory)
+    return band
 
 
 def far_field_scale(
@@ -787,7 +871,7 @@ def far_field_scale(
     and projected on the covariates as Stage 0 projects its Grams, and their pairwise r^2 over the pairs no block reaches
     (``starts`` the blocks' first columns and ``linked[b]`` whether blocks b and b + 1 are neighbours: pairs in other
     blocks than a column's own and its linked neighbours'). Stage 0's blocks serve before the band is cut: the extent
-    test reads its excess against this kappa (``build_band_store``). On bench-sim chr22 [sim] the pooled
+    test reads its excess against this kappa (``summary_band``). On bench-sim chr22 [sim] the pooled
     cohort's pairs beyond 20 Mb sit at 1.30 / n' (0.30 / n' above chance at 150 standard errors: between-group structure
     the PCs leave), so chance alone would under-state the far field. m is the least count whose chance standard error,
     2 / m for m (m - 1) / 2 pairs of chi-square(1) r^2 n', is within the fit's resolution 1 / (2K) of the scale: 4K

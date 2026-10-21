@@ -185,13 +185,16 @@ def host_buffer_bytes(layout: SampleLayout, capacity_rows: int, block_cap: int, 
 
     Besides the buffer, its upload staging and its cross-product columns, a block of width ``w`` holds its Grams and its
     Grams with the previous block (``layout.gram_dtype``), and then either both blocks' float32 sample rows while the
-    adjacent Gram forms, or the projection's fp64 correlation and float32 projected Gram with two fp64
-    ``_HOST_PANEL x w`` temporaries per worker (the correlation is dropped before the coupling is built in panels).
+    adjacent Gram forms, or the projection's fp64 square, its float32 projected Gram and its float32 coupling to the
+    previous block with two fp64 ``_HOST_PANEL x w`` temporaries per worker: the square holds the correlation and
+    then, while the coupling is built in panels and after, the Gram and the coupling squared for the fit's sums
+    (``genotype_statistics._project_block``), so all three squares are live at once.
     The writer holds the previous block's float32 projected and adjacent Grams. Every other array is a column of width
     ``w``: ``G + 7`` fp64 arrays ``cross_columns`` wide (the block's cross-products per group; their raw, centred and
     standardized rows; the covariate loading, the projected score and its temporary; the previous block's loading and
-    the writer's copy) and at most 24 vectors (moments, scales, the tie screen's positions and signs), or a constant
-    per worker (its GEMM and cross-product panels).
+    the writer's copy) and at most 28 vectors (moments, scales, the tie screen's positions and signs, and the fit's sums:
+    the lag profile and the squared Grams' column and row sums), or a constant per worker (its GEMM and cross-product
+    panels).
     """
     rows = capacity_rows + _ROW_ALIGNMENT
     buffer = rows * (layout.width + 4 * _chunks(layout.profile_width) * _HOST_SAMPLE_CHUNK + 16)
@@ -199,9 +202,9 @@ def host_buffer_bytes(layout: SampleLayout, capacity_rows: int, block_cap: int, 
     square = block_cap * block_cap
     grams = 2 * layout.group_count * layout.gram_dtype.itemsize * square
     sample_rows = 2 * block_cap * _chunks(int(layout.group_widths.max())) * _HOST_SAMPLE_CHUNK * 4
-    projection = (8 + 4) * square + workers * 2 * _HOST_PANEL * block_cap * 8
+    projection = (8 + 4 + 4) * square + workers * 2 * _HOST_PANEL * block_cap * 8
     written = (4 + 4) * square
-    columns = block_cap * 8 * ((layout.group_count + 7) * cross_columns + 24)
+    columns = block_cap * 8 * ((layout.group_count + 7) * cross_columns + 28)
     workers_scratch = workers * (_HOST_PANEL * _HOST_PANEL * (8 + 4) + _HOST_CROSS_ROWS * _CROSS_SAMPLE_CHUNK * 8)
     return buffer + staging + grams + max(sample_rows, projection) + written + columns + workers_scratch + layout.width * cross_columns * 8
 
@@ -218,9 +221,10 @@ def cuda_buffer_bytes(layout: SampleLayout, capacity_rows: int, tile_rows: int, 
     # the Gram against the previous block has the same shape bound as the block's own
     adjacent = gram
     cross = layout.width * cross_columns * 8 + block_cap * _CROSS_SAMPLE_CHUNK * 8
-    # the projection step's own block-square arrays, live together with the Grams: the fp64 correlation matrix, the
-    # float32 projected Gram and the float32 coupling to the previous block (built in panels); plus its per-panel
-    # temporaries (two fp64 and two boolean panel x width arrays for the rank-one update and the tie screen)
+    # the projection step's own block-square arrays, live together with the Grams: the fp64 square (the correlation
+    # matrix, then the projected Gram and the coupling squared for the fit's sums), the float32 projected Gram and the
+    # float32 coupling to the previous block (built in panels); plus its per-panel temporaries (two fp64 and two
+    # boolean panel x width arrays for the rank-one update and the tie screen, or the lag profile's rows and lags)
     projection = gram_rows * gram_rows * (8 + 4 + 4) + _HOST_PANEL * gram_rows * (8 + 8 + 1 + 1)
     return resident + max(band, gram + adjacent + cross + projection)
 

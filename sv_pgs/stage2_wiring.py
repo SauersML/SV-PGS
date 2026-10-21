@@ -47,7 +47,7 @@ from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, GroupEvaluation, monitor_on
 from sv_pgs.fast_scoring import ScoringModel
-from sv_pgs.gram_space import BandStore, GramBand, build_band_store, far_field_scale, pass_costs
+from sv_pgs.gram_space import BandStore, GramBand, far_field_scale, pass_costs, summary_band
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, MixtureStart, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
@@ -575,25 +575,27 @@ def _stage0(
 
 
 def _band(
-    ld: LdGramStore, sample_count: int, share: int, level: float, array_module, kappa: float, restart: RestartStore, group: str, stage0: str,
-) -> BandStore:
-    """The summary band's restart unit (``gram_space.build_band_store``), made where there is none: keyed by the Stage 0
-    unit's build it is cut from, the samples, the test's level, kappa, the array module and the source of the band's
-    builder and of the definitions it reaches, never of the sweeps beside it in ``gram_space``. The workspace is not in
-    the key: it sets only the extent test's row chunks (``marginal_variances.ld_lag_profiles``), a summation order, and
-    it is the free device memory each job measures, so as a key part it missed the band at every restart; it is
-    recorded with the unit."""
+    ld: LdGramStore, sample_count: int, level: float, kappa: float, restart: RestartStore, group: str, stage0: str, make: bool,
+) -> BandStore | None:
+    """The summary band's restart unit (``gram_space.summary_band``, written whole), made where there is none and
+    ``make`` asks (else None): keyed by the Stage 0 unit's build it is cut from (whose lag profiles set its extents),
+    the samples, the test's level, kappa and the source of the band's builder and of the definitions it reaches, never
+    of the sweeps beside it in ``gram_space``. Only the band route makes one (``_fit_group``). The sample route prices
+    a pass over the band laid out in the group's scratch, with only what ``pass_costs`` reads written, and releases it,
+    so it neither writes nor mirrors the 82-98 GB [real] of a whole band; a restart lays it out again in seconds from
+    the Stage 0 unit."""
     named = facts({
         "stage0": stage0, "samples": sample_count, "level": repr(float(level)), "kappa": repr(float(kappa)),
-        "backend": array_module.__name__,
-        "source": definition_sources([("sv_pgs.gram_space", "build_band_store"), ("sv_pgs.gram_space", "BandStore")]),
+        "source": definition_sources([("sv_pgs.gram_space", "summary_band"), ("sv_pgs.gram_space", "BandStore")]),
     })
     key = unit_key(named)
     found = restart.unit("band", key)
     if found is None:
+        if not make:
+            return None
         restart.explain("band", group, named)
-        with restart.build("band", key, group=group, named=named, values={"share": share}) as directory:
-            build_band_store(ld, sample_count, directory, share, level, array_module, kappa)
+        with restart.build("band", key, group=group, named=named) as directory:
+            summary_band(ld, sample_count, directory, level, kappa).complete()
         found = restart.unit("band", key)
         assert found is not None
     else:
@@ -846,8 +848,13 @@ def _fit_group(
         log(f"stage2 wiring: far field: mean r^2 n' = {kappa:.4g} +- {kappa_error:.2g} over {pairs:,} pairs beyond Stage 0's neighbouring blocks (chance alone: 1)")
     if not binary and inference == "mean_field":
         # The summary band is the mean-field route's; EP runs over the samples, its windows cut at the LD extent read
-        # against the same kappa (``null_scale``).
-        band_store = _band(ld, statistics.sample_count, share, certificate_level(draw_count), source.array_module, kappa, restart, group, stage0_unit[1]["id"])
+        # against the same kappa (``null_scale``). The band route's band is read from its restart unit where an earlier
+        # run made one; otherwise it is laid out from Stage 0's lag profiles in the group's scratch with only what
+        # pass_costs reads written, and made whole, as its restart unit, only where the band route wins.
+        band_store = _band(ld, statistics.sample_count, certificate_level(draw_count), kappa, restart, group, stage0_unit[1]["id"], make=False)
+        laid_out = band_store is None
+        if band_store is None:
+            band_store = summary_band(ld, statistics.sample_count, work_dir / "band", certificate_level(draw_count), kappa)
         band = GramBand(statistics, share, store=band_store)
         band.far_scale = kappa
         sample_seconds, gram_seconds = pass_costs(band, source, source.array_module)
@@ -859,6 +866,12 @@ def _fit_group(
         if not gram_seconds < sample_seconds:
             band.release()
             band = None
+        elif laid_out:
+            band.release()
+            band_store = _band(ld, statistics.sample_count, certificate_level(draw_count), kappa, restart, group, stage0_unit[1]["id"], make=True)
+            shutil.rmtree(work_dir / "band")
+            band = GramBand(statistics, share, store=band_store)
+            band.far_scale = kappa
     # The columns of Stage 0 (positions in ``genetic``) whose fits ran on the band route, and the notes each column's
     # fit was given.
     banded: set[int] = set()

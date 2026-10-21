@@ -10,10 +10,12 @@
 # GPU_COUNT defaults to 2 (a2-highgpu-2g); use GPU_COUNT=1 for a2-highgpu-1g.
 # STEPS (default "smoke bench tests") picks the task's commands, run in the order given: smoke is
 # benchmarks/gpu_smoke.py, bench is benchmarks/sweep_bench.py (old against new seconds per mean-field sweep on one GPU),
-# tests the CUDA test files. GPU_COUNT=1 STEPS=bench measures the sweep alone on one A100.
+# stage0 is benchmarks/stage0_bench.py (old against new Stage 0 phases on one GPU), tests the CUDA test files.
+# GPU_COUNT=1 STEPS=bench measures the sweep alone on one A100, GPU_COUNT=1 STEPS=stage0 Stage 0 alone.
 # JOB_ID, MACHINE_TYPE, GPU_TYPE and RUN_DISK_GB may be overridden. JOB_SECONDS includes VM task environment
-# preparation; the smoke command itself has a separate 300-second deadline, the benchmark 600 seconds, the CUDA test
-# files PYTEST_SECONDS (default 1200). No task retries hide a failure.
+# preparation; the smoke command itself has a separate 300-second deadline, the benchmark 600 seconds, the Stage 0
+# benchmark STAGE0_BENCH_SECONDS (default 900), the CUDA test files PYTEST_SECONDS (default 1200). No task retries hide
+# a failure.
 # Use "spec" instead of "submit" to print the JSON without submitting. Logs go to Cloud Logging and to
 # svpgs/${RUN_ID}/smoke/${JOB_ID}.log in the ops bucket (mounted read-write for it); the task fails where any of its
 # commands fails, and FAIL lines identify failed checks (including a missing CUDA device).
@@ -33,12 +35,14 @@ smoke_task() {
     cd "$RUN/source"
     # The smoke command first, the mean-field sweep's benchmark (its own ten-minute deadline), then every CUDA test
     # file (env.tar's cache holds the dev group, pytest included): the CUDA tests skip on a laptop and on CI, so this
-    # job is where they run. Any of them failing fails the task.
+    # job is where they run. Any of them failing fails the task. The Stage 0 benchmark (stage0: Stage 0 and the steps up
+    # to the EB, old against new on one GPU, FAIL where a pair disagrees) runs only where STEPS names it.
     local status=0 step
     for step in ${STEPS:-smoke bench tests}; do
         case "$step" in
             smoke) "$RUN/venv/bin/python" -m benchmarks.gpu_smoke || status=$? ;;
             bench) "$RUN/venv/bin/python" -m benchmarks.sweep_bench || status=$? ;;
+            stage0) timeout "${STAGE0_BENCH_SECONDS:-900}" "$RUN/venv/bin/python" -m benchmarks.stage0_bench || status=$? ;;
             tests) timeout "${PYTEST_SECONDS:-1200}" "$RUN/venv/bin/python" -m pytest -q -p no:cacheprovider tests/*_cuda.py \
                      tests/test_scale_mixture_ep.py -k "cuda or device or chunk" || status=$? ;;
         esac
@@ -73,7 +77,7 @@ export GPU_COUNT="${GPU_COUNT:-2}"
 case "$GPU_COUNT" in 1|2) ;; *) echo 'GPU_COUNT must be 1 or 2' >&2; exit 2 ;; esac
 export STEPS="${STEPS:-smoke bench tests}"
 for step in $STEPS; do
-    case "$step" in smoke|bench|tests) ;; *) echo "STEPS takes smoke, bench and tests, not $step" >&2; exit 2 ;; esac
+    case "$step" in smoke|bench|stage0|tests) ;; *) echo "STEPS takes smoke, bench, stage0 and tests, not $step" >&2; exit 2 ;; esac
 done
 export MACHINE_TYPE="${MACHINE_TYPE:-a2-highgpu-${GPU_COUNT}g}" GPU_TYPE="${GPU_TYPE:-nvidia-tesla-a100}"
 export RUN_DISK_GB="${RUN_DISK_GB:-100}" JOB_SECONDS="${JOB_SECONDS:-3600}"

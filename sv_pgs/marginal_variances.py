@@ -60,6 +60,8 @@ from scipy.optimize import brentq
 from scipy.stats import norm
 from scipy.stats import t as student_t
 
+from sv_pgs.lag_profiles import LAG_PROFILE_ROWS, lag_excess_rows, lag_pairs, lag_profile
+
 
 @dataclass(frozen=True)
 class BulkSolve:
@@ -489,9 +491,9 @@ def ld_lag_profiles(
     """Each block's LD by lag: (excess, pairs), both (blocks, widest block), with excess[b, d] the summed r^2 over the
     block's ordered pairs d apart less their null expectation 1/n each, and pairs[b, d] = 2 (|b| - d) their count
     (lag 0 zero in both). Summed from Stage 0's own within-block Grams, one block at a time on ``array_module``, in
-    row chunks whose float64 arrays (the rows, their excess r^2, the lags and the product's temporary) fit
-    ``working_bytes``. Any region's profile is the sum of its blocks' rows, and ``extent_from_profile`` reads its
-    extent."""
+    row chunks of at most ``LAG_PROFILE_ROWS`` whose float64 arrays (the rows, their excess r^2, the lags and the
+    product's temporary) fit ``working_bytes``. Any region's profile is the sum of its blocks' rows, and
+    ``extent_from_profile`` reads its extent."""
     xp = array_module
     itemsize = np.dtype(np.float64).itemsize
     widest = max(int(members.shape[0]) for members in grams.blocks)
@@ -501,28 +503,13 @@ def ld_lag_profiles(
         width = int(members.shape[0])
         if width < 2:
             continue
-        excess = xp.zeros(widest)
         stored = np.asarray(grams.within[block])
         diagonal = xp.asarray(np.diagonal(stored), dtype=xp.float64)
-        columns = xp.arange(width)
-        chunk = max(1, int(working_bytes) // (4 * itemsize * width))
-        for first in range(0, width, chunk):
-            last = min(first + chunk, width)
-            rows = xp.arange(first, last)
-            # In place, with no masks: the chunk's float32 rows, their excess r^2 in float64, and their lags.
-            squared = xp.asarray(stored[first:last], dtype=xp.float64)
-            squared *= squared
-            squared /= diagonal[first:last, None] * diagonal[None, :]
-            squared -= 1.0 / sample_count
-            lags = xp.abs(columns[None, :] - rows[:, None])
-            excess += xp.bincount(lags.ravel(), weights=squared.ravel(), minlength=widest)[:widest]
-            del squared, lags
-        # Lag 0 is no pair: its terms are the diagonal's own r^2 = 1.
-        excess_rows[block] = _to_host(excess)
-        excess_rows[block, 0] = 0.0
-        # A block of w columns holds 2 (w - d) ordered pairs at lag d.
-        pair_rows[block] = np.maximum(2.0 * (width - np.arange(widest)), 0.0)
-        pair_rows[block, 0] = 0.0
+        chunk = min(LAG_PROFILE_ROWS, max(1, int(working_bytes) // (4 * itemsize * width)))
+        excess_rows[block, :width] = lag_profile(
+            (lag_excess_rows(stored, diagonal, first, min(first + chunk, width), sample_count, xp) for first in range(0, width, chunk)), width, xp,
+        )
+        pair_rows[block] = lag_pairs(width, widest)
     return excess_rows, pair_rows
 
 
@@ -557,7 +544,10 @@ def extent_from_profile(
     return max(1, int(np.argmax(resolved))) if resolved.any() else int(np.asarray(excess).shape[0])
 
 
-def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: float, array_module: Any = np, null_scale: float = 1.0) -> int:
+def ld_extent(
+    grams: BlockGrams, sample_count: int, working_bytes: int, level: float, array_module: Any = np, null_scale: float = 1.0,
+    profiles: tuple[NDArray[np.float64], NDArray[np.float64]] | None = None,
+) -> int:
     """The lag (in variants, along the block order) beyond which the data show no LD: the whole genome's lag profile
     (``ld_lag_profiles``) read by ``extent_from_profile``. A looser, per-variant reading of the same test (a
     variant's own tail LD score against its null resolution) cut the wiring store's 63-column blocks to 62 and failed
@@ -565,8 +555,10 @@ def ld_extent(grams: BlockGrams, sample_count: int, working_bytes: int, level: f
     nothing a window could use, so blocks need be no wider: the leave-block-out windows (the block and its two
     neighbours) then reach at least w on each side, and whatever the data do hold beyond is far field, which
     ``block_trace_certificate`` tests. ``level`` is the test's family-wise error (EP: its certificate's,
-    ``certificate_level``); ``null_scale`` the far pairs' measured mean r^2 n (``extent_from_profile``; 1 by default)."""
-    excess, pairs = ld_lag_profiles(grams, sample_count, working_bytes, array_module)
+    ``certificate_level``); ``null_scale`` the far pairs' measured mean r^2 n (``extent_from_profile``; 1 by default).
+    ``profiles`` are the blocks' lag profiles where Stage 0 kept them (``LdGramStore.lag_profiles``), in place of
+    summing them again from every stored Gram."""
+    excess, pairs = ld_lag_profiles(grams, sample_count, working_bytes, array_module) if profiles is None else profiles
     variants = sum(int(members.shape[0]) for members in grams.blocks)
     return extent_from_profile(excess.sum(axis=0), pairs.sum(axis=0), sample_count, variants, level, null_scale)
 

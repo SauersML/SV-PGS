@@ -258,10 +258,10 @@ def test_the_band_route_predicts_as_the_sample_route_on_one_chromosome(tmp_path:
 
 
 def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path: Path) -> None:
-    """``build_band_store``: Stage 0's blocks re-cut by their measured LD extents into parts no wider than it, each
-    part's Gram and each part's Gram with the next written once. The band's product is the dense Gram's restricted to
+    """``summary_band``: Stage 0's blocks re-cut by their measured LD extents into parts no wider than it, each
+    part's Gram and each part's Gram with the next written once (as the band reads them). The band's product is the dense Gram's restricted to
     pairs within one part or two neighbouring ones, and every pair closer than its block's extent is among them."""
-    from sv_pgs.gram_space import BandStore, build_band_store
+    from sv_pgs.gram_space import BandStore, summary_band
 
     store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
     training = np.arange(_TRAINING)
@@ -270,7 +270,7 @@ def test_the_summary_band_is_stage0s_gram_on_the_pairs_its_parts_reach(tmp_path:
         targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
     )
     ld = statistics.ld
-    band_store = build_band_store(ld, statistics.sample_count, tmp_path / "band", 1 << 20, 1.0 / 64)
+    band_store = summary_band(ld, statistics.sample_count, tmp_path / "band", 1.0 / 64)
     assert isinstance(band_store, BandStore) and int(band_store.widths.sum()) == int(ld.block_boundaries[-1])
     # The dense Gram Stage 0 holds: within blocks and between adjacent ones.
     count = int(ld.block_boundaries[-1])

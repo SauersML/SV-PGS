@@ -29,11 +29,13 @@ standardized columns. The 1/127 of ``DS = (s + 127) / 127`` cancels.
 from __future__ import annotations
 
 import contextvars
+import itertools
 import json
 import os
 import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
@@ -45,6 +47,7 @@ from numpy.typing import NDArray
 from sv_pgs.compute_budget import ComputeBudget, _try_import_cupy
 from sv_pgs.config import ModelConfig
 from sv_pgs.data import TieMap
+from sv_pgs.dosage_store import DEFAULT_INNER_CHUNK_ROWS
 from sv_pgs.genotype_buffers import (
     SIGNED_CODE_OFFSET,
     CudaGenotypeBuffer,
@@ -55,6 +58,7 @@ from sv_pgs.genotype_buffers import (
     host_buffer_bytes,
 )
 from sv_pgs.ld_partition import LdBlockBoundaries, OnlineBlockPartitioner, cut_allowed_from_groups
+from sv_pgs.lag_profiles import LAG_PROFILE_ROWS, lag_excess_rows, lag_pairs, lag_profile
 from sv_pgs.phase_timer import GB, timing
 from sv_pgs.progress import log
 from sv_pgs.tie_map import tie_map_from_representatives
@@ -105,6 +109,7 @@ class DosageCodeStore(Protocol):
     chromosomes: tuple[str, ...]
     chromosome_starts: NDArray[np.int64]
     variant_table: _VariantGroups
+    reader_threads: int
 
     @property
     def n_samples(self) -> int: ...
@@ -120,8 +125,26 @@ class DosageStoreTileSource:
 
     Every sample is read (the sample layout selects and groups the training columns on the
     device). Adjacent candidates with the same ``group_first`` (bubble, same-POS set,
-    duplicate group or repeat locus) are never cut apart. Each contiguous run of candidates
-    is one ``read_codes`` into its rows of the tile.
+    duplicate group or repeat locus) are never cut apart.
+
+    A tile is read as its reads (``tile_reads``): each contiguous run of candidates is one
+    ``read_codes`` into its rows of the tile, and the runs inside one inner chunk of the store
+    (``dosage_store.DEFAULT_INNER_CHUNK_ROWS`` rows, the unit a zstd store decodes whole) are one
+    read of the rows from the first to the last, whose candidate rows are then copied into the
+    tile. A tile's reads run on ``store.reader_threads`` threads at once, each ``read_codes``
+    spreading its halves over the store's own reader pool. The whole-genome store's candidates
+    are ~1 record in 127 (~1.0e6 fitted columns of 126.7M records [real]), so nearly every
+    candidate was its own run, and the runs were read one after another: each read decodes its
+    whole chunk in each half (2 of the store's reader threads busy) and waits on the disk, 4-6 ms a
+    candidate on the live round's pd-balanced disk (0.30 of the candidates in 14-21 minutes, ~1.5
+    chromosomes at once [real]), and Stage 0 was projected at 65-73 minutes an arm [real] while
+    its devices waited. Read at once, the reads keep every reader thread and the disk's queue
+    busy; a chunk holding several candidates is decoded once, not once for each (scattered at
+    random at 1 in 127, 1 - (126/127)^64 = 0.397 of the chunks hold one, 0.79 decodes a candidate
+    against 1); and a chunk-wide read's buffer (one chunk of every sample per reader thread, 77 MB
+    at 24 threads and 50,000 samples) is all the host memory added. The tile's codes are the same
+    bytes whichever way they are read: a store whose chunks are not ``DEFAULT_INNER_CHUNK_ROWS``
+    rows only shares fewer decodes.
     """
 
     def __init__(self, store: DosageCodeStore, candidate_rows: NDArray[np.int64]) -> None:
@@ -135,6 +158,12 @@ class DosageStoreTileSource:
             for index, name in enumerate(store.chromosomes)
             if np.any(chromosome_of_row == index)
         }
+        self._chromosome_starts = {name: int(store.chromosome_starts[index]) for index, name in enumerate(store.chromosomes)}
+        # The tile's reads run on this pool (each blocks on the store's own reader pool) and each reader thread keeps
+        # one chunk-wide buffer for the reads with gaps. Both go with the source.
+        self._reader_count = max(1, int(store.reader_threads))
+        self._readers = ThreadPoolExecutor(max_workers=self._reader_count, thread_name_prefix="stage0-tile-read")
+        self._buffers = threading.local()
 
     @property
     def sample_count(self) -> int:
@@ -154,9 +183,49 @@ class DosageStoreTileSource:
 
     def read_rows(self, chromosome: str, start: int, stop: int, out: NDArray[np.uint8]) -> None:
         rows = self._rows[chromosome][start:stop]
-        breaks = np.flatnonzero(np.diff(rows) > 1) + 1
-        for run_start, run_stop in zip(np.concatenate(([0], breaks)).tolist(), np.concatenate((breaks, [rows.shape[0]])).tolist()):
-            self._store.read_codes(int(rows[run_start]), int(rows[run_stop - 1]) + 1, None, out=out[run_start:run_stop])
+        reads = tile_reads(rows - self._chromosome_starts[chromosome], DEFAULT_INNER_CHUNK_ROWS)
+        following = itertools.count()
+
+        def reader() -> None:
+            # Each thread takes the next read until none is left, so a slow read holds only its own thread.
+            while (read := next(following)) < reads.shape[0] - 1:
+                first, last = int(reads[read]), int(reads[read + 1])
+                low, high = int(rows[first]), int(rows[last - 1]) + 1
+                if high - low == last - first:
+                    self._store.read_codes(low, high, None, out=out[first:last])
+                    continue
+                span = self._span(high - low, out.shape[1])
+                self._store.read_codes(low, high, None, out=span)
+                # The rows are inside the span, so "clip" never clips; it only lets take write straight into the tile.
+                np.take(span, rows[first:last] - low, axis=0, out=out[first:last], mode="clip")
+
+        # Every thread is done with the tile before a failure is raised, so none writes into it afterwards.
+        tasks = [self._readers.submit(contextvars.copy_context().run, reader) for _ in range(min(self._reader_count, reads.shape[0] - 1))]
+        wait(tasks)
+        for task in tasks:
+            task.result()
+
+    def _span(self, rows: int, samples: int) -> NDArray[np.uint8]:
+        """This reader thread's buffer for a read with gaps, ``rows`` (at most a chunk's) by ``samples``."""
+        held = getattr(self._buffers, "codes", None)
+        if held is None or held.size < rows * samples:
+            held = self._buffers.codes = np.empty(max(rows, DEFAULT_INNER_CHUNK_ROWS) * samples, dtype=np.uint8)
+        return held[: rows * samples].reshape(rows, samples)
+
+
+def tile_reads(rows: NDArray[np.int64], chunk_rows: int) -> NDArray[np.int64]:
+    """The reads of a tile's candidates, ``rows`` (ascending rows of one chromosome's arrays), as the bounds of their
+    positions: read ``k`` takes the candidates ``[reads[k], reads[k + 1])``. Each contiguous run of rows is a read, and
+    consecutive runs inside one chunk of ``chunk_rows`` rows (``row // chunk_rows``) are one, so no read with a gap
+    spans more than a chunk (``DosageStoreTileSource``)."""
+    if rows.shape[0] == 0:
+        return np.zeros(1, dtype=np.int64)
+    runs = np.concatenate(([0], np.flatnonzero(np.diff(rows) > 1) + 1, [rows.shape[0]])).astype(np.int64)
+    first_chunk = rows[runs[:-1]] // chunk_rows
+    last_chunk = rows[runs[1:] - 1] // chunk_rows
+    inside = first_chunk == last_chunk
+    joined = inside[1:] & inside[:-1] & (first_chunk[1:] == first_chunk[:-1])
+    return np.concatenate((runs[:-1][np.concatenate(([True], ~joined))], runs[-1:]))
 
 
 class GenotypeBuffer(Protocol):
@@ -557,6 +626,13 @@ _LD_ARRAYS = {
     "diagonal": ("ld_diagonal.f64", np.float64),
     "ld_score": ("ld_score.f64", np.float64),
     "adjacent": ("ld_adjacent.f32", np.float32),
+    # The fit's sums over each block's Grams, taken while Stage 0 holds them (``_project_block``), so that no later step
+    # reads the Grams for them: the block's lag profile (the LD extents of the summary band and of the EP windows) and
+    # its squared Gram's column sums and squared coupling's row and column sums (the EB start, ``moment_starts``).
+    "lag_excess": ("ld_lag_excess.f64", np.float64),
+    "square_columns": ("ld_square_columns.f64", np.float64),
+    "adjacent_square_rows": ("ld_adjacent_square_rows.f64", np.float64),
+    "adjacent_square_columns": ("ld_adjacent_square_columns.f64", np.float64),
 }
 
 
@@ -595,7 +671,9 @@ class LdGramStore:
     """The projected LD blocks of one fit on disk (memory-mapped, read by Stage 2).
 
     ``correlation_block(b) = X~_b^T X~_b / n``, with
-    the per-column diagonal and within-block LD scores computed once in Stage 0.
+    the per-column diagonal and within-block LD scores computed once in Stage 0, and the sums the fit would otherwise
+    read every Gram again for: each block's lag profile (``lag_excess``) and its squared Grams' sums (``square_columns``,
+    ``adjacent_square_rows``, ``adjacent_square_columns``, ``square_sum``, ``adjacent_square_sum``).
     """
 
     def __init__(self, directory: Path) -> None:
@@ -609,7 +687,7 @@ class LdGramStore:
         self._arrays = {
             name: np.memmap(self.directory / file_name, dtype=dtype, mode="r")
             for name, (file_name, dtype) in _LD_ARRAYS.items()
-            if (self.directory / file_name).stat().st_size
+            if (self.directory / file_name).exists() and (self.directory / file_name).stat().st_size
         }
 
     @property
@@ -679,6 +757,55 @@ class LdGramStore:
         """``R_b = X~_b^T X~_b / n`` (exactly symmetric, float32)."""
         return self.block(block_index).projected_gram * np.float32(1.0 / self.sample_count)
 
+    def lag_excess(self, block_index: int) -> NDArray[np.float64]:
+        """Block ``block_index``'s LD by lag, one entry per lag up to its width: its ordered pairs' summed r^2 less their
+        null expectation 1/n each, by how far apart they are (lag 0 zero), as ``marginal_variances.ld_lag_profiles``
+        sums it from the stored Gram, summed by Stage 0 from that Gram before it was written."""
+        return self._vector("lag_excess", block_index, self.block_width(block_index))
+
+    def lag_profiles(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Every block's lag profile, (excess, pairs), as ``marginal_variances.ld_lag_profiles`` gives them from the
+        stored Grams (blocks narrower than two columns zero), read from what Stage 0 kept: no Gram is read."""
+        widths = [self.block_width(block) for block in range(self.block_count)]
+        widest = max(widths)
+        excess = np.zeros((self.block_count, widest))
+        pairs = np.zeros((self.block_count, widest))
+        for block, width in enumerate(widths):
+            if width < 2:
+                continue
+            excess[block, :width] = self.lag_excess(block)
+            pairs[block] = lag_pairs(width, widest)
+        return excess, pairs
+
+    def square_columns(self, block_index: int) -> NDArray[np.float64]:
+        """sum_i G_ij^2 for each column j of block ``block_index``'s stored float32 Gram G, squared and summed in
+        float64 (``full_data_fit.moment_starts``)."""
+        return self._vector("square_columns", block_index, self.block_width(block_index))
+
+    def square_sum(self, block_index: int) -> float:
+        """sum_ij G_ij^2 over block ``block_index``'s stored float32 Gram, in float64."""
+        return float(self._blocks[block_index]["square_sum"])
+
+    def adjacent_square_rows(self, block_index: int) -> NDArray[np.float64]:
+        """The row sums of ``adjacent_block(block_index)`` squared in float64: one per column of the previous block."""
+        return self._vector("adjacent_square_rows", block_index, self.block_width(block_index - 1))
+
+    def adjacent_square_columns(self, block_index: int) -> NDArray[np.float64]:
+        """The column sums of ``adjacent_block(block_index)`` squared in float64: one per column of this block."""
+        return self._vector("adjacent_square_columns", block_index, self.block_width(block_index))
+
+    def adjacent_square_sum(self, block_index: int) -> float:
+        """The sum of ``adjacent_block(block_index)`` squared in float64."""
+        return float(self._blocks[block_index]["adjacent_square_sum"])
+
+    def _vector(self, name: str, block_index: int, length: int) -> NDArray[np.float64]:
+        if length == 0:
+            return np.zeros(0, dtype=np.float64)
+        if name not in self._arrays:
+            raise ValueError(f"{self.directory} has no {_LD_ARRAYS[name][0]}: its Stage 0 kept no sums for the fit; run Stage 0 again")
+        offset = int(self._blocks[block_index][f"{name}_offset"])
+        return np.array(self._arrays[name][offset : offset + length], dtype=np.float64)
+
     def _concatenated(self, name: str) -> NDArray[np.float64]:
         if name not in self._arrays:
             return np.zeros(0, dtype=np.float64)
@@ -725,21 +852,22 @@ class _LdGramWriter:
         self._thread.start()
         self.entries: dict[tuple[str, int], dict[str, Any]] = {}
 
-    def append(self, chromosome: str, start: int, arrays: dict[str, NDArray]) -> None:
-        """Queue one block (the arrays must stay unchanged until written)."""
+    def append(self, chromosome: str, start: int, arrays: dict[str, NDArray], sums: dict[str, float]) -> None:
+        """Queue one block (the arrays must stay unchanged until written) and its scalar sums, which its index entry
+        holds."""
         if self._failures:
             raise self._failures[0]
         self._in_flight.acquire()
-        self._pending.put((chromosome, start, arrays))
+        self._pending.put((chromosome, start, arrays, sums))
 
     def _write_all(self) -> None:
         while True:
             item = self._pending.get()
             if item is None:
                 return
-            chromosome, start, arrays = item
+            chromosome, start, arrays, sums = item
             try:
-                entry: dict[str, Any] = {"chromosome": chromosome}
+                entry: dict[str, Any] = {"chromosome": chromosome, **sums}
                 for name, values in arrays.items():
                     entry[f"{name}_offset"] = self._offsets[name]
                     # The array is written through its own buffer, not a byte-cast memoryview: a block with no active
@@ -872,13 +1000,21 @@ class _AdjacentState:
 
 def _project_block(
     block: BlockStatistics, projection: _Projection, buffer: GenotypeBuffer, previous: _AdjacentState | None
-) -> tuple[_BlockSummary, dict[str, NDArray], _AdjacentState]:
+) -> tuple[_BlockSummary, dict[str, NDArray], dict[str, float], _AdjacentState]:
     """Standardize, find exact ties, drop inactive and tied columns and project out the
-    covariates on the block's device; return the host summary, the projected arrays and what
-    the chromosome's next block needs for its adjacent Gram (``previous`` is this block's).
+    covariates on the block's device; return the host summary, the projected arrays, the
+    block's scalar sums and what the chromosome's next block needs for its adjacent Gram
+    (``previous`` is this block's).
 
     ``N = n S - u u^T`` is formed in fp64, where every term is an integer below 2^53 and so
     exact; the ``width^2`` work runs as row panels through ``buffer.parallel_rows``.
+
+    The fit's sums over the stored Grams (``_LD_ARRAYS``) are taken here, from the float32 Grams
+    as they are written and by the same steps as their readers' (``marginal_variances.ld_lag_profiles``,
+    ``full_data_fit.moment_starts``) on the same array module, so each is the reader's own to the bit
+    (on a device, to its reductions' rounding); they cost a few passes over a block the device
+    already holds, where each reader would read every Gram from disk again: 150-169 GB of LD
+    store a whole-genome arm writes [real], about 4 minutes a read on its 700 MiB/s disk.
     """
     xp = block.array_module
     count = int(block.group_counts[0])
@@ -894,7 +1030,11 @@ def _project_block(
     active_host = buffer.to_host(active)
     active_index = np.flatnonzero(active_host)
     inverse_root = xp.where(active, 1.0 / xp.sqrt(xp.where(active, variance_numerator, 1.0)), 0.0)
-    correlation = xp.empty((width, width), dtype=xp.float64)
+    # One fp64 square serves the block's square passes in turn: the correlation, then the projected Gram and its
+    # coupling to the previous block squared for their sums (a coupling to a wider block gets its own once this one is
+    # freed). It is the one fp64 square the memory estimates count (``cuda_buffer_bytes``, ``host_buffer_bytes``).
+    scratch = xp.empty(width * width, dtype=xp.float64)
+    correlation = scratch.reshape(width, width)
     screened: list[NDArray[np.int64]] = []
 
     def correlate(start: int, stop: int) -> None:
@@ -932,7 +1072,7 @@ def _project_block(
         gram[start:stop] = panel
 
     buffer.parallel_rows(project, kept.shape[0])
-    # the w x w fp64 correlation is the projection's largest array; nothing after this reads it
+    # nothing after this reads the correlation; its memory serves the squares below
     del correlation
     ld_score = xp.empty(kept.shape[0], dtype=xp.float64)
 
@@ -950,7 +1090,27 @@ def _project_block(
 
     buffer.parallel_rows(mirror_lower, kept.shape[0])
     buffer.parallel_rows(score_rows, kept.shape[0])
+    kept_count = int(kept.shape[0])
+    stored_diagonal = xp.diagonal(gram).astype(xp.float64)
+    # The block's lag profile from the Gram as stored, in the row chunks ``ld_lag_profiles`` takes
+    # (``lag_profiles.LAG_PROFILE_ROWS``), one after another as it sums them.
+    lag_excess = lag_profile(
+        (lag_excess_rows(gram, stored_diagonal, first, min(first + LAG_PROFILE_ROWS, kept_count), count, xp)
+         for first in range(0, kept_count, LAG_PROFILE_ROWS)), kept_count, xp,
+    )
+    # The Gram squared in float64 and summed by column and in all, as ``moment_starts`` squares it.
+    square = scratch[: kept_count * kept_count].reshape(kept_count, kept_count)
+    square[...] = gram
+    square *= square
+    square_columns = square.sum(axis=0)
+    totals = {"square_sum": float(square.sum()), "adjacent_square_sum": 0.0}
+    del square
+    # The Gram goes to the host now, where it is written from: a device then holds the square and the coupling but not
+    # the Gram beside them, so its peak stays the correlation's and the Gram's, and a full-width block's sets the pass's.
+    host_gram = buffer.to_host(gram)
+    del gram
     adjacent = xp.zeros(0, dtype=xp.float32)
+    adjacent_square_rows = adjacent_square_columns = xp.zeros(0, dtype=xp.float64)
     if block.previous_grams is not None:
         if previous is None or (previous.chromosome, previous.start) != (block.chromosome, block.previous_start):
             raise RuntimeError(f"{block.chromosome}: the block at {block.start} arrived without its predecessor's projection")
@@ -971,6 +1131,17 @@ def _project_block(
             adjacent[start:stop] = panel
 
         buffer.parallel_rows(couple, previous.kept.shape[0])
+        if adjacent.size > scratch.size:
+            del scratch
+            scratch = xp.empty(adjacent.size, dtype=xp.float64)
+        coupling_square = scratch[: adjacent.size].reshape(adjacent.shape)
+        coupling_square[...] = adjacent
+        coupling_square *= coupling_square
+        adjacent_square_rows = coupling_square.sum(axis=1)
+        adjacent_square_columns = coupling_square.sum(axis=0)
+        totals["adjacent_square_sum"] = float(coupling_square.sum())
+        del coupling_square
+    del scratch
     summary = _BlockSummary(
         active=active_host,
         means=buffer.to_host(means),
@@ -981,15 +1152,18 @@ def _project_block(
         reduced_count=int(kept.shape[0]),
     )
     arrays = {
-        "gram": gram,
         "score": projected_score,
         "cross": covariate_cross,
-        "diagonal": xp.diagonal(gram).astype(xp.float64) / count,
+        "diagonal": stored_diagonal / count,
         "ld_score": ld_score,
         "adjacent": adjacent,
+        "lag_excess": lag_excess,
+        "square_columns": square_columns,
+        "adjacent_square_rows": adjacent_square_rows,
+        "adjacent_square_columns": adjacent_square_columns,
     }
     state = _AdjacentState(chromosome=block.chromosome, start=block.start, kept=kept_device, sums=sums, inverse_root=inverse_root, loading=loading)
-    return summary, {name: buffer.to_host(values) for name, values in arrays.items()}, state
+    return summary, {"gram": host_gram, **{name: buffer.to_host(values) for name, values in arrays.items()}}, totals, state
 
 
 def _covariate_gram_pseudo_inverse(covariates: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -1097,8 +1271,8 @@ def compute_genotype_statistics(
     def sink(block: BlockStatistics, buffer: GenotypeBuffer) -> None:
         with summaries_lock:
             previous = previous_states.get(block.chromosome)
-        block_summary, arrays, state = _project_block(block, projection, buffer, previous)
-        writer.append(block.chromosome, block.start, arrays)
+        block_summary, arrays, totals, state = _project_block(block, projection, buffer, previous)
+        writer.append(block.chromosome, block.start, arrays, totals)
         with summaries_lock:
             summaries[(block.chromosome, block.start)] = (block.stop, block_summary)
             previous_states[block.chromosome] = state

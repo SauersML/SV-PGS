@@ -140,7 +140,7 @@ def _edited(monkeypatch: pytest.MonkeyPatch, module: str, old: str, new: str) ->
     monkeypatch.setattr(restart_store, "inspect", SimpleNamespace(getsource=getsource))
 
 
-_BAND = [("sv_pgs.gram_space", "build_band_store"), ("sv_pgs.gram_space", "BandStore")]
+_BAND = [("sv_pgs.gram_space", "summary_band"), ("sv_pgs.gram_space", "BandStore")]
 _CODES = [("sv_pgs.store_block_source", "StoreGenotypeBlockSource")]
 _STAGE0 = ("sv_pgs.genotype_statistics", "sv_pgs.dosage_store")
 
@@ -151,8 +151,10 @@ _STAGE0 = ("sv_pgs.genotype_statistics", "sv_pgs.dosage_store")
         # The sweeps beside the band builder in its module.
         ("sv_pgs.gram_space", "def _gram_sweep(", "def _gram_sweep_edited(", False, False, False, True),
         # The band builder itself, and a definition of another module it reaches.
-        ("sv_pgs.gram_space", "One read of Stage 0's Grams.", "One read of Stage 0's Grams, edited.", True, False, False, True),
-        ("sv_pgs.marginal_variances", "def ld_lag_profiles(", "def ld_lag_profiles( ", True, False, False, True),
+        ("sv_pgs.gram_space", "byte for byte.", "byte for byte, edited.", True, False, False, True),
+        ("sv_pgs.marginal_variances", "def extent_from_profile(", "def extent_from_profile( ", True, False, False, True),
+        # The lag profiles Stage 0 sums as it projects each block (the band's key moves with the Stage 0 build it names).
+        ("sv_pgs.lag_profiles", "def lag_excess_rows(", "def lag_excess_rows( ", False, False, True, True),
         # The engine: its mean-field oracle and its outer loop.
         ("sv_pgs.full_data_fit", "class _FullDataMeanField:", "class _FullDataMeanField:  # edited", False, False, False, True),
         ("sv_pgs.scale_mixture_ep", "def fit_hyperparameters(", "def fit_hyperparameters( ", False, False, False, True),
@@ -592,7 +594,7 @@ def test_a_group_preempted_mid_eb_resumes_on_a_fresh_disk_from_its_mirrored_rest
     capsys.readouterr()
 
     monkeypatch.setattr(full_data_fit._FullDataMeanField, "__call__", original_call)
-    for builder in ("compute_genotype_statistics", "build_band_store", "far_field_scale"):
+    for builder in ("compute_genotype_statistics", "summary_band", "far_field_scale"):
         monkeypatch.setattr(stage2_wiring, builder, lambda *args, builder=builder, **kwargs: pytest.fail(f"made {builder} again"))
     outer = full_data_fit.fit_hyperparameters
     started: list[bool] = []

@@ -73,7 +73,7 @@ from sv_pgs.dual_solve import DualGaussian, DualModels, StreamedDualSource, _Win
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.memory_broker import HOST, current_broker, device_pool
 from sv_pgs.genotype_statistics import GenotypeSufficientStatistics
-from sv_pgs.gram_space import GramBand, read_block
+from sv_pgs.gram_space import GramBand
 from sv_pgs.phase_timer import TimedOracle, timed_sweep, timing
 from sv_pgs.progress import log
 from sv_pgs.restart_store import WarmStart, load_warm_start, save_warm_start, state_key
@@ -103,7 +103,6 @@ from sv_pgs.marginal_variances import (
 from sv_pgs.scale_mixture_ep import (
     solve_key,
     Cavity,
-    _DEVICE,
     _data_value,
     class_log_density,
     device_scope,
@@ -187,7 +186,8 @@ def block_grams(
     widest = max(block.shape[0] for block in blocks)
     if level is None:
         raise ValueError("cutting the blocks to the LD extent needs its test's level")
-    extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module, null_scale)
+    # The blocks' lag profiles as Stage 0 summed them from these Grams (``LdGramStore.lag_profiles``): no Gram is read.
+    extent = ld_extent(grams, statistics.sample_count, working_bytes, level, array_module, null_scale, profiles=ld.lag_profiles())
     width = window_width(working_bytes, array_module, widest)
     log(f"leave-block-out windows: LD extent {extent} variants, memory width {width}, widest Stage 0 block {widest}")
     return refined_grams(grams, min(width, extent))
@@ -198,10 +198,12 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     start's relative prior variances. y'y after the covariates comes from the target and covariate Grams; ||X'y||^2
     from the projected scores; tr G, sum_j u_j G_jj, sum_j u_j ||G e_j||^2 and ||G||_F^2 from the projected Grams,
     within each block and with its neighbours (the LD Stage 0 keeps; farther pairs enter as zero, which only moves
-    the start). The Gram sums run on the fit's device (``scale_mixture_ep.device_scope``): each block's float32 Gram
-    goes up once and is squared there in float64, rather than on the host core by core (a 28k-column block is a 6 GB
-    float64 square, 22 of them at 40,000 samples x 518k records)."""
-    xp = _DEVICE.get()
+    the start). The Gram sums are Stage 0's (``LdGramStore.square_columns`` and its kin): each block's float32 Gram
+    squared in float64 on Stage 0's device and summed by column, by row and in all while Stage 0 held it, so no Gram
+    is read here (reading them all again took about 4 minutes of a whole-genome arm's disk at every fit: 150-169 GB of
+    LD store [real] at 700 MiB/s), and G_jj is the stored float32 diagonal, which n R_jj rounds back to exactly
+    (``GramBand``). Each sum is taken as and in the order the start took it when it read the Grams (that version is
+    ``benchmarks/stage0_bench.py``'s, and ``tests/test_stage0_sums.py`` checks the two agree)."""
     ld = statistics.ld
     # A group's prior variance is its members' sum (tie_members): u_g = sum_j u_j.
     ties = TieGroups.from_tie_map(statistics.tie_map)
@@ -216,27 +218,21 @@ def moment_starts(statistics: GenotypeSufficientStatistics, prior: ScaleMixtureP
     gram_trace = 0.0
     gram_square = 0.0
     weighted_diagonal = 0.0
+    stored_diagonal = (np.asarray(ld.ld_diagonal(), dtype=np.float64) * statistics.sample_count).astype(np.float32).astype(np.float64)
     previous_columns = None
     for block_index in range(ld.block_count):
         block = ld.block(block_index)
         columns = np.asarray(block.reduced_columns, dtype=np.int64)
-        # Read, not mapped (``gram_space.read_block``): the store is larger than the job's memory at biobank scale.
-        gram = xp.asarray(read_block(ld, "within", block_index)).astype(xp.float64)
         score_square += np.sum(np.square(np.asarray(block.projected_score, dtype=np.float64)), axis=0)
-        diagonal = _host(xp.diag(gram))
+        diagonal = stored_diagonal[columns]
         gram_trace += float(diagonal.sum())
         weighted_diagonal += float(weights[columns] @ diagonal)
-        gram *= gram
-        column_square[columns] += _host(gram.sum(axis=0))
-        gram_square += float(_host(gram.sum()))
-        del gram
+        column_square[columns] += ld.square_columns(block_index)
+        gram_square += ld.square_sum(block_index)
         if ld.has_adjacent(block_index):
-            cross_squares = xp.asarray(read_block(ld, "cross", block_index - 1)).astype(xp.float64)
-            cross_squares *= cross_squares
-            column_square[previous_columns] += _host(cross_squares.sum(axis=1))
-            column_square[columns] += _host(cross_squares.sum(axis=0))
-            gram_square += 2.0 * float(_host(cross_squares.sum()))
-            del cross_squares
+            column_square[previous_columns] += ld.adjacent_square_rows(block_index)
+            column_square[columns] += ld.adjacent_square_columns(block_index)
+            gram_square += 2.0 * ld.adjacent_square_sum(block_index)
         previous_columns = columns
     return [
         moment_start(
@@ -3103,14 +3099,13 @@ def fit_full_data(
     search from the earlier fit's components (``_mode_mixture``) on the mean-field route of quantitative models; it is
     ignored elsewhere."""
     # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
-    # moments, the moment start's Grams) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
+    # moments) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
     # fit's silent bulk (AoU chr22 disease fits: twenty-minute stretches inside hyper_step's evidence maximizations).
     device = gaussian.array_module
     # EB starts where each trait's genetic variance fits inside its phenotypic variance (lead ruling): the first mean
     # solve's iterations grow with the prior signal per sample, which a start at the lattice centre puts far past it.
-    with device_scope(device):
-        moments = moment_starts(statistics, prior)
+    moments = moment_starts(statistics, prior)
     if len(moments) != gaussian.model_count:
         raise ValueError("Stage 0's targets must be the models, in order")
     if inference not in ("ep", "mean_field"):

@@ -371,6 +371,7 @@ class _ArrayStore:
         self.chromosome_starts = np.concatenate(([0], np.cumsum(counts))).astype(np.int64)
         self._codes = np.concatenate(list(codes_by_chromosome.values()))
         self.variant_table = type("VariantTable", (), {"group_first": group_first})()
+        self.reader_threads = 3
         self.reads = 0
 
     @property
@@ -412,6 +413,82 @@ def test_the_dosage_store_source_streams_the_candidate_rows() -> None:
         store_rows = tile_source.store_rows(block.chromosome)[block.start : block.stop]
         values = signed[store_rows][:, members]
         np.testing.assert_array_equal(block.grams[0], values @ values.T)
+
+
+def test_a_tiles_reads_keep_runs_whole_and_join_only_inside_a_chunk() -> None:
+    from sv_pgs.genotype_statistics import tile_reads
+
+    # Two singletons sharing chunk 0, a run across chunks 0 and 1, a singleton in chunk 1, two runs sharing chunk 3,
+    # a run of chunk 4 alone and a singleton of chunk 5.
+    rows = np.array([1, 5, 14, 15, 16, 17, 23, 48, 49, 52, 64, 65, 66, 67, 80])
+    np.testing.assert_array_equal(tile_reads(rows, 16), [0, 2, 6, 7, 10, 14, 15])
+    np.testing.assert_array_equal(tile_reads(np.arange(40, 300), 16), [0, 260])
+    np.testing.assert_array_equal(tile_reads(np.zeros(0, dtype=np.int64), 16), [0])
+    rng = np.random.default_rng(23)
+    for _ in range(200):
+        rows = np.sort(rng.choice(2000, size=int(rng.integers(1, 400)), replace=False))
+        reads = tile_reads(rows, 16)
+        assert reads[0] == 0 and reads[-1] == rows.shape[0] and np.all(np.diff(reads) > 0)
+        inside = [rows[first] // 16 == rows[last - 1] // 16 for first, last in zip(reads[:-1], reads[1:])]
+        for read, (first, last) in enumerate(zip(reads[:-1], reads[1:])):
+            # A read is a contiguous run or lies inside one chunk, no run is split, and two reads inside one chunk
+            # would have been one.
+            assert rows[last - 1] - rows[first] == last - first - 1 or inside[read]
+            if last < rows.shape[0]:
+                assert rows[last] - rows[last - 1] > 1
+                assert not (inside[read] and inside[read + 1] and rows[first] // 16 == rows[last] // 16)
+
+
+@pytest.mark.parametrize("reader_threads", [1, 4])
+def test_the_dosage_store_source_reads_a_tile_at_once_as_the_serial_reads_did(tmp_path, reader_threads) -> None:
+    """A zstd store's scattered candidates (singletons, several in one chunk, runs across chunks and across a
+    chromosome's end) read as the tile source reads them, its reads at once, are each candidate's own codes, and every
+    ``read_codes`` it makes is a run of candidates or lies inside one of the store's chunks."""
+    from benchmarks.stage0_bench import write_store
+    from sv_pgs.dosage_store import DEFAULT_INNER_CHUNK_ROWS, DosageStore
+    from sv_pgs.genotype_statistics import DosageStoreTileSource
+
+    rng = np.random.default_rng(29)
+    counts = {"chr21": 1500, "chr22": 900}
+    codes = {name: rng.integers(0, 255, size=(count, 70), dtype=np.uint8) for name, count in counts.items()}
+    write_store(tmp_path / "store", {name: (lambda start, stop, name=name: codes[name][start:stop]) for name in counts}, counts, 70)
+    store = DosageStore.open(tmp_path / "store")
+    store.reader_threads = reader_threads
+    scattered = np.sort(rng.choice(2400, size=150, replace=False))
+    candidates = np.unique(np.concatenate([scattered, np.arange(120, 140), np.arange(1490, 1510), [0, 2399]]))
+    reads: list[tuple[int, int]] = []
+    lock = threading.Lock()
+    serial = store.read_codes
+
+    def counted(start, stop, sample_indices=None, out=None):
+        with lock:
+            reads.append((start, stop))
+        return serial(start, stop, sample_indices, out)
+
+    store.read_codes = counted
+    source = DosageStoreTileSource(store, candidates)
+    every = np.concatenate([codes["chr21"], codes["chr22"]])
+    for chromosome in source.chromosomes():
+        rows = source.store_rows(chromosome)
+        for start in range(0, rows.shape[0], 37):
+            stop = min(start + 37, rows.shape[0])
+            out = np.full((stop - start, 70), 7, dtype=np.uint8)
+            source.read_rows(chromosome, start, stop, out)
+            np.testing.assert_array_equal(out, every[rows[start:stop]])
+
+    def chromosome_of(row: int) -> int:
+        return int(np.searchsorted(store.chromosome_starts, row, side="right")) - 1
+
+    def chunk_of(row: int) -> int:
+        return (row - int(store.chromosome_starts[chromosome_of(row)])) // DEFAULT_INNER_CHUNK_ROWS
+
+    assert reads
+    for start, stop in reads:
+        assert chromosome_of(start) == chromosome_of(stop - 1)
+        held = candidates[(candidates >= start) & (candidates < stop)]
+        assert held[0] == start and held[-1] == stop - 1
+        assert held.shape[0] == stop - start or chunk_of(start) == chunk_of(stop - 1)
+    store.close()
 
 
 def test_the_tie_screen_keeps_every_exact_tie_under_fp64_rounding():
