@@ -48,7 +48,7 @@ from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
 from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, GroupEvaluation, monitor_on
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.gram_space import BandStore, GramBand, build_band_store, far_field_scale, pass_costs
-from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
+from sv_pgs.full_data_fit import FitCertificate, FullDataFit, MixtureStart, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
 from sv_pgs.marginal_variances import certificate_level
 from sv_pgs.memory_broker import memory_scope
 from sv_pgs.model_acceptance import acceptance
@@ -69,6 +69,8 @@ from sv_pgs.restart_store import (
 from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior, transfer_hyperparameters
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
 from sv_pgs.training_codes import CodeTee, TrainingCodes, code_cache_on
+from sv_pgs import warm_seeds
+from sv_pgs.warm_seeds import Seed
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -626,6 +628,7 @@ def _fit_group(
     group: str = "group",
     store_key: str | None = None,
     request_key: str | None = None,
+    seeds: Sequence[Seed | None] | None = None,
     evaluation: GroupEvaluation | None = None,
 ) -> list[_ModelFit]:
     """The group of the request's ``models`` (``model_groups``) on the sorted store columns ``training_columns``, whose
@@ -649,6 +652,14 @@ def _fit_group(
     without it every class shares one length curve, the prior of the runs so far. With ``ld_score_prior`` the level of
     LD around each member, its Stage 0 LD score, is a learned smooth of the prior variance beside the frequency function
     (``annotation_design.ld_score_annotation``), in either prior form; without it the prior has none, as so far.
+
+    ``seeds`` (one per model, in group order, None for a model without one) are earlier fits these models start from
+    (``warm_seeds``): a fit whose every model has a start begins at them, as a lattice continuation does (their
+    hyperparameters, noise, main fixed point and, where every seed holds one, mode mixture: ``full_data_fit.MixtureStart``),
+    in place of the moment start and the nested search, on the seeds' lattice where they share one that covers the
+    start lattice (``seed_lattice``), and each such model's certificate notes its seed. A quantitative mean-field fit
+    only. A seeded fit with no certified start is fitted again from the prior, as without seeds, and its certificate
+    says so: a seed moves where the fit starts, never whether it is fitted.
 
     ``evaluation``, the group's evaluation rows, is the EB monitor's alone (``eb_monitor``): Stage 0's pass keeps their
     codes as it reads, and the mean-field fit logs each outer-loop call's posterior mean scored on them. Nothing of the
@@ -778,6 +789,9 @@ def _fit_group(
     start_noise = np.full(count, 1.0 / POLYA_GAMMA_MEAN_AT_ZERO) if binary else covariate_residual_variance(store_targets, mask, covariates)
     tolerance = 0.5 / draw_count
     nodes, floor, top = _covering_lattice([stage0_lattice(statistics, target, float(start_noise[target]), offsets, tolerance) for target in range(count)])
+    seeded = seeds is not None and inference == "mean_field" and not binary
+    if seeded:
+        nodes = warm_seeds.seed_lattice([seeds[model] for model in genetic], nodes)
     prior = scale_mixture_prior(
         class_index=class_index.astype(np.int64),
         log_variance_offset=offsets,
@@ -787,6 +801,14 @@ def _fit_group(
         floor=floor,
         top=top,
     )
+    # Each genetic model's start from its seed, where it has one (``warm_seeds.warm_start``).
+    warm: list[warm_seeds.WarmStart | None] = [None] * count
+    if seeded:
+        warm = [
+            None if seeds[model] is None
+            else warm_seeds.warm_start(seeds[model], prior, member_rows, np.asarray(statistics.scales, dtype=np.float64), table.variant_class)
+            for model in genetic
+        ]
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
     source = stage2_source(store, statistics, budget, share, training_columns, CodeCache(restart, group, store_key), training_codes)
@@ -869,6 +891,21 @@ def _fit_group(
             # A binary model's metric at its start sites: W = omega(0) on the training rows, at unit noise.
             sample_weights=np.column_stack([entry.weights for entry in fit_sites]) if binary else None,
         )
+        # The models' seeds continue them where every one has a start; otherwise the fit starts from the prior.
+        starting = [warm[column] for column in columns]
+        continuation = {} if any(entry is None for entry in starting) else {
+            "starts": [entry.hyperparameters for entry in starting], "start_noise": np.array([entry.noise for entry in starting]),
+            "start_mean": np.column_stack([entry.mean for entry in starting]),
+        }
+        if continuation and all(entry.components is not None and entry.component_noises is not None for entry in starting):
+            # The seeds' mode mixtures start this fit's (``full_data_fit.MixtureStart``), a shorter one padded with its first.
+            counts = np.array([entry.components.shape[0] for entry in starting], dtype=np.int64)
+            continuation["mixture_start"] = MixtureStart(
+                means=tuple(np.column_stack([entry.components[min(index, entry.components.shape[0] - 1)] for entry in starting]) for index in range(int(counts.max()))),
+                noises=tuple(np.array([entry.component_noises[min(index, entry.components.shape[0] - 1)] for entry in starting]) for index in range(int(counts.max()))),
+                counts=counts, settled=np.array([entry.settled for entry in starting], dtype=bool),
+            )
+        seed_notes = {} if not continuation else {position: (entry.note,) for position, entry in enumerate(starting)}
         # A refusal of the joint fit names the models fitted together; its "model k" is the k-th of them.
         joint = f"joint fit of models {', '.join(str(int(models[genetic[column]])) for column in columns)}: " if len(columns) > 1 else ""
 
@@ -883,7 +920,7 @@ def _fit_group(
             )
             for model in finished:
                 certificate = _model_certificate(fit.certificate, model, joint)
-                certificate = dataclasses.replace(certificate, refusals=(*certificate.refusals, *notes))
+                certificate = dataclasses.replace(certificate, refusals=(*certificate.refusals, *notes, *seed_notes.get(model, ())))
                 if model in open_checks:
                     certificate = _with_refusal(certificate, open_checks[model])
                     log(f"stage2 wiring: model {int(models[genetic[columns[model]]])}: {open_checks[model]}")
@@ -909,20 +946,21 @@ def _fit_group(
             fit = fit_full_data(
                 gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
                 inference=inference, sites=fit_sites, null_scale=kappa, band=fit_band, monitor=watched,
-                warm_start=WarmStart(restart, group, request_key), **continuation,
+                **{"warm_start": WarmStart(restart, group, request_key), **continuation},
             )
             if fit_band is not None and np.any(fit.certificate.outer_criterion_met):
                 # The band's far-field stopping estimate can miss a slowly converging direction: a grouped fixture
                 # reported convergence but its held-out scores correlated only 0.951 with the sample-route reference.
-                # Continue from its fitted state on the samples before accepting it. An unresolved continuation is
-                # handled by the existing per-model sample-route fallback, rather than accepting the band's certificate.
+                # Continue from its fitted state on the samples before accepting it, its mode search from the band fit's
+                # components (``full_data_fit.MixtureStart``). An unresolved continuation is handled by the existing
+                # per-model sample-route fallback, rather than accepting the band's certificate.
                 log(f"stage2 wiring: continuing the band fit of {len(columns)} models on the sample route for final validation")
                 fit_band.release()
                 fit = fit_full_data(
                     gaussian=gaussian, statistics=view, prior=fit_prior, draw_count=draw_count, working_bytes=share, seed=_seed(seed, 1),
                     inference=inference, sites=fit_sites, null_scale=kappa, band=None, starts=fit.hyperparameters,
                     start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean, monitor=watched,
-                    warm_start=WarmStart(restart, group, request_key),
+                    warm_start=WarmStart(restart, group, request_key), mixture_start=fit.mixture_start(),
                 )
             return fit
 
@@ -934,7 +972,19 @@ def _fit_group(
         # models are fitted again on the lattice moved for them, and those are checked there.
         fit_prior = prior
         try:
-            fit = solve(fit_prior)
+            try:
+                fit = solve(fit_prior, **continuation)
+            except FloatingPointError as error:
+                if not continuation:
+                    raise
+                # The seeds' start has no certified fixed point: the fit from the prior, as without seeds.
+                log(f"stage2 wiring: the fit of {len(columns)} models from their seeds has no certified start ({error}); fitted again from the prior")
+                seed_notes = {
+                    position: (f"{entry.note}; from it the fit had no certified start, so it was fitted from the prior: {error}",)
+                    for position, entry in enumerate(starting)
+                }
+                # Not from the restart store's states either: the seeded fit kept its own there, under this prior's key.
+                fit = solve(fit_prior, warm_start=None)
             pending = list(range(len(columns)))
             while pending:
                 # Completed solver closures can form cycles holding large NumPy buffers. Their byte size does not
@@ -956,10 +1006,12 @@ def _fit_group(
                     moved, moved_hyperparameters = _move_lattice(moved, moved_hyperparameters, halved_lattice)
                 try:
                     # Continued from the fit on the checked lattice (its hyperparameters carried to the moved lattice, its
-                    # noise and its members' means), not from the prior: on bench-sim chr22 [sim] the refit from the prior
-                    # repeated the whole nested search, 50 minutes of the fit, to reach the state the first fit had.
+                    # noise, its members' means and its mode mixture's components), not from the prior: on bench-sim chr22
+                    # [sim] the refit from the prior repeated the whole nested search, 50 minutes of the fit, to reach the
+                    # state the first fit had.
                     refit = solve(
                         moved, starts=moved_hyperparameters, start_noise=np.asarray(fit.noise_variance, dtype=np.float64), start_mean=fit.member_mean,
+                        mixture_start=fit.mixture_start(),
                     )
                 except FloatingPointError as error:
                     # No fit on the checked lattice: these models keep the fit they have, and each certificate says the
@@ -1083,6 +1135,7 @@ def fit_models(
     identity: Mapping[str, str] | None = None,
     store_key: str | None = None,
     request_key: str | None = None,
+    seeds: Sequence[Seed | None] | None = None,
 ) -> FittedModels:
     """Every model of ``fit_model.fit``, a group at a time (``model_groups``; see the module docstring); ``inference``
     names the fixed point (``full_data_fit.fit_full_data``): the mean-field route until the EP route (structured-genome's
@@ -1098,7 +1151,8 @@ def fit_models(
     digests), so a fit whose checkpoints no longer match logs which named input changed; a group is fitted again unless
     every one of its models is, and a group's seed is the request's with its models' indices, so a rerun fits it the same
     way. A group's other units (Stage 0, the band, its codes and EB starts: ``_fit_group``) are released once its models
-    are checkpointed."""
+    are checkpointed. ``seeds`` (one per model, None for a model without one) are the earlier fits the models' empirical
+    Bayes starts from (``_fit_group``, ``warm_seeds``); the caller's ``identity`` names them (``fit_model.fit_identity``)."""
     if any(trait_type not in (TraitType.QUANTITATIVE, TraitType.BINARY) for trait_type in trait_types):
         raise ValueError(f"unknown trait types in {list(trait_types)}")
     # Stage 0 runs a buffer on every device, and Stage 2's reads are sharded over them by LD block (``stage2_source``).
@@ -1166,6 +1220,7 @@ def fit_models(
                         group_dir.name,
                         store_key,
                         request_key,
+                        None if seeds is None else [seeds[int(model)] for model in group],
                         group_evaluation,
                     )
             except FloatingPointError as error:

@@ -45,6 +45,7 @@ from sv_pgs.full_data_fit import FitCertificate
 from sv_pgs.imputation_reliability import checked_log_reliability
 from sv_pgs.restart_store import RestartStore, module_sources, unit_key
 from sv_pgs.stage2_wiring import fit_models
+from sv_pgs.warm_seeds import Seed
 
 # The scorer's K posterior draws, which also set every certificate tolerance (1/(2K) nats).
 DRAW_COUNT = 64
@@ -105,7 +106,11 @@ class FitRequest:
     the store's ``quality`` column. The fit's scratch is ``work_dir``; its restart units (``restart_store``: Stage 0
     and its LD store, the band, the codes, the EB starts and the completed models' checkpoints) are kept in
     ``restart_dir``, by default ``work_dir`` itself, which a caller places outside any directory an edit can set aside
-    (``workspace_pipeline``'s fit step: the run's restart/<arm>).
+    (``workspace_pipeline``'s fit step: the run's restart/<arm>). ``seeds`` (one per model, None for a model without one;
+    ``warm_seeds``) are earlier fits whose state a model's empirical Bayes starts from, and each seeded model's
+    certificate notes its seed; they move only where it starts, so the problem's digest leaves them out, while the fit's
+    identity names each seed's saved model (``Seed.digest``), so a completed model is never taken for the fit from
+    another start (its empirical Bayes' saved starts are resumed whatever the seed: ``fit_identity``).
 
     The fit has no measurement-object and no target-variance term: the measurement model enters as the records'
     ``log_variance_offset`` (and as the store's own recalibrated dosages), and every target is taken as measured
@@ -145,6 +150,8 @@ class FitRequest:
     # (``annotation_design.ld_score_annotation``); False, the prior without it.
     ld_score_prior: bool = False
     restart_dir: Path | None = None
+    # Per model, the earlier fit its empirical Bayes starts from (``warm_seeds``), None for a model without one.
+    seeds: tuple[Seed | None, ...] | None = None
 
     def __post_init__(self) -> None:
         """Check every field's rank, kind, values and agreement, and only then convert.
@@ -237,6 +244,11 @@ class FitRequest:
             set_field(self, "population_prevalence", prevalences)
         if self.evaluation is not None:
             set_field(self, "evaluation", self.evaluation.checked(self.store.n_samples, len(self.covariate_names), model_count))
+        if self.seeds is not None:
+            seeds = tuple(self.seeds)
+            if len(seeds) != model_count or any(seed is not None and not isinstance(seed, Seed) for seed in seeds):
+                raise ValueError("seeds needs one warm_seeds.Seed or None per model.")
+            set_field(self, "seeds", seeds)
         set_field(self, "store_columns", columns)
         set_field(self, "covariates", covariate_matrix)
         set_field(self, "targets", target_matrix)
@@ -254,9 +266,11 @@ def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
     or the launcher, keeps every completed model), the store's content (``store_key``), the records' offsets, the
     problem (the cohort's binding to the store, the models, likelihoods, covariates, targets and training rows, the
     draws and the seed: the whole request, since its groups and their seeds depend on its other models) and the prior's
-    form. The deployment prevalences are applied to the returned models after the checkpoints and are not part of it.
-    ``request`` is the identity without the source: a mean-field start (``restart_store.WarmStart``) is solved again
-    by whatever engine reads it."""
+    form, and, where any model has a seed, each seed's saved model (a checkpoint holds the fit from its start; a fit
+    without seeds keeps the identity it had). The deployment prevalences are applied to the returned models after the
+    checkpoints and are not part of it. ``request`` is the identity without the source and the seeds: a mean-field start
+    (``restart_store.WarmStart``) is solved again by whatever engine reads it, and is the newer progress on the same
+    problem whatever seed it began from, so a preempted fit resumes its own even where the retry chose another seed."""
     identity = {
         "source": module_sources("sv_pgs.fit_model"),
         "store": store_key,
@@ -273,6 +287,8 @@ def fit_identity(request: FitRequest, store_key: str) -> dict[str, str]:
             + (" ld_score_prior=True" if request.ld_score_prior else "")
         ),
     }
+    if request.seeds is not None and any(seed is not None for seed in request.seeds):
+        identity["seeds"] = ",".join("-" if seed is None else seed.digest or seed.source for seed in request.seeds)
     return identity
 
 
@@ -306,7 +322,8 @@ def fit(request: FitRequest) -> FittedModel:
         restart=RestartStore(request.restart_dir if request.restart_dir is not None else request.work_dir),
         identity=identity,
         store_key=store_key,
-        request_key=unit_key({name: value for name, value in identity.items() if name != "source"}),
+        request_key=unit_key({name: value for name, value in identity.items() if name not in ("source", "seeds")}),
+        seeds=request.seeds,
     )
     parts = certificate_parts(fitted.certificate, model_count)
     trained = request.training.any(axis=1)

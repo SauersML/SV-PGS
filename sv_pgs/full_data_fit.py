@@ -109,8 +109,10 @@ from sv_pgs.scale_mixture_ep import (
     device_scope,
     FixedPoint,
     GaussianPosterior,
+    HyperStep,
     MixtureHyperparameters,
     MomentStart,
+    OuterFit,
     ScaleMixturePrior,
     derived_lattice,
     fit_hyperparameters,
@@ -131,6 +133,15 @@ from sv_pgs.scale_mixture_ep import (
 _EPSILON = float(np.finfo(np.float64).eps)
 _HALF_PRECISION = _EPSILON ** 0.5
 _FLOAT_BYTES = np.dtype(np.float64).itemsize
+EB_PASSES = 3_000
+"""The sweeps a model's empirical Bayes may spend over the stages of one ``fit_full_data`` (the nested search's base and
+annotated stages, or a continuation's one) before it ends where it is (``_FullDataMeanField.pass_allowance``): the
+outer loop's own stopping rule has no bound on its work, and a fit that walks outside every basin walks on (chr22 T2D's
+fit of three models spent 10,252 sweeps [real], where the chr22 fits that certified spent 85-400). A model that has
+spent it is refused every new trial, so the loop ends uncertified by its own rules, and the fit returns its best-ELBO
+state with its certificate's outer criterion unmet. The round's empirical Bayes has 75 minutes on its slowest arm at
+about 1 s a sweep (lead ruling: under ~4,000 sweeps a cold fit, the mode mixture included), and the mixture's ridge
+start and at most K = 64 orders from zero take the rest at 7-16 sweeps a cold solve [real]."""
 
 
 def stage0_lattice(
@@ -364,6 +375,50 @@ class FullDataFit:
     # Per component, per model: a binary model's ``BinaryComponent`` (its covariate terms and training-row predictor
     # moments in its own metric), None for a quantitative model.
     binary_components: tuple = ()
+    # Each component's members' means (members x models, padded as ``member_components``) and, per model, whether its
+    # mode search settled with no solve or search ended at its budget (``_mode_mixture``): what a continuation of this
+    # fit starts its own search from (``mixture_start``).
+    component_means: tuple[F64Array, ...] = ()
+    component_noises: tuple[F64Array, ...] = ()
+    mixture_settled: BoolArray | None = None
+
+    def mixture_start(self) -> MixtureStart | None:
+        """This fit's mode mixture as the start of a continuation's (``MixtureStart``: the band fit's continuation on the
+        samples, a lattice check's refit), or None where it has none: the EP route, and a binary model, whose components
+        each hold their own Polya-Gamma sites, which no start carries."""
+        if not self.component_means or len(self.component_noises) != len(self.component_means) or self.mixture_settled is None:
+            return None
+        if self.certificate.mixture_components is None or any(part is not None for component in self.binary_components for part in component):
+            return None
+        return MixtureStart(
+            means=self.component_means, noises=self.component_noises, counts=np.asarray(self.certificate.mixture_components, dtype=np.int64),
+            settled=self.mixture_settled,
+        )
+
+
+@dataclass(frozen=True)
+class MixtureStart:
+    """An earlier fit's mode mixture as the start of a continuation's (``_mode_mixture``): each component's members'
+    means (``means``, members x models per component, a model's first ``counts`` of them its own) and noise variances
+    (``noises``, one per model per component: each fixed point's solve moves its own noise, so a component's mean is a
+    fixed point only at its own), and, per model, whether the earlier search settled (``settled``: one more order from
+    zero moved its average by at most the draws' resolution, and no solve or search there ended at its budget)."""
+
+    means: tuple[F64Array, ...]
+    noises: tuple[F64Array, ...]
+    counts: I64Array
+    settled: BoolArray
+
+    def __post_init__(self) -> None:
+        counts = np.asarray(self.counts)
+        if counts.ndim != 1 or np.asarray(self.settled).shape != counts.shape or counts.min(initial=1) < 1 or counts.max(initial=0) > len(self.means):
+            raise ValueError("a mixture start needs, per model, a settled flag and a count of at least one of its components")
+        if any(np.asarray(means).shape != np.asarray(self.means[0]).shape or np.asarray(means).shape[1:] != counts.shape for means in self.means):
+            raise ValueError("a mixture start's components are each members x models")
+        if len(self.noises) != len(self.means) or any(
+            np.asarray(noise).shape != counts.shape or not np.all(np.asarray(noise) > 0.0) for noise in self.noises
+        ):
+            raise ValueError("a mixture start's components each need a positive noise variance per model")
 
 
 @dataclass(frozen=True)
@@ -1512,6 +1567,9 @@ class _FullDataMeanField:
     # The fit's monitor (``eb_monitor``), shown each call that returns fixed points (``__call__``); a sibling oracle has
     # none. Nothing of the oracle reads it.
     monitor: Any = None
+    # Per model, the passes this oracle's empirical Bayes may spend (``fit_full_data``: what is left of ``EB_PASSES``
+    # after the fit's earlier stages); None, a sibling oracle's, is unbounded (``__call__``).
+    pass_allowance: I64Array | None = None
 
     """``scale_mixture_ep.FixedPoints`` on the full data by the mean-field route (``mean_field``): each model's product
     q = prod_j q_j by coordinate ascent on the ELBO, one pass over the streamed LD blocks per sweep, with the noise
@@ -1639,6 +1697,8 @@ class _FullDataMeanField:
         self.information: list = []
         # Solves that ended at their derived work budget (``SweepBudget``), per model, with their reasons in refusals.
         self.unresolved = np.zeros(model_count, dtype=np.int64)
+        # Whether a model's empirical Bayes has spent its ``pass_allowance`` (``__call__``).
+        self.allowance_spent = np.zeros(model_count, dtype=bool)
         device = self._device_pool()
         self._panel_grams = PanelGrams(self._broker, device) if device is not None else PanelGrams()
         # The cold start (a recipe: zero moments or the start means, the start's sites, and the residual they leave) and
@@ -2374,19 +2434,39 @@ class _FullDataMeanField:
         look unsolved. Both the state identity and the hyperparameters must match: another state's basin at the same
         hyperparameters is not interchangeable. A call where every model is so solves them all, as before: the outer
         loop's last call, which leaves the oracle at the returned points by solving there once more (without it the
-        returned point can sit below a best-ELBO state and its certificate is withheld)."""
+        returned point can sit below a best-ELBO state and its certificate is withheld).
+
+        A model whose passes have reached its ``pass_allowance`` (``EB_PASSES``) is refused every trial after this
+        oracle's first call (None, as a trial with no fixed point), and is solved again only at the point it holds: the
+        outer loop halves, polishes and plans once more against refusals that cost no sweep, then returns the model
+        uncertified (``scale_mixture_ep.fit_hyperparameters``), and the fit returns its best-ELBO state
+        (``restore_best``). Its first refusal is logged, counted in ``unresolved`` and marked in ``allowance_spent``
+        (``fit_full_data`` gives the certificate its reason)."""
         _collect_cycles()
-        held = [
+        at_held = [
             model for model, (point, state) in enumerate(zip(self._held, self._at))
             if point is not None and state is point[1]
             and np.array_equal(point[0].coefficients, hyperparameters[model].coefficients)
             and np.array_equal(point[0].log_smoothing, hyperparameters[model].log_smoothing)
         ]
-        if len(held) == self.model_count:
-            held = []
-        solving = [model for model in range(self.model_count) if model not in held]
+        held = at_held if len(at_held) < self.model_count else []
+        ended = [] if self.pass_allowance is None or self.refreshes == 0 else [
+            model for model in range(self.model_count)
+            if model not in at_held and int(self.model_passes[model]) >= int(self.pass_allowance[model])
+        ]
+        for model in ended:
+            if not self.allowance_spent[model]:
+                self.allowance_spent[model] = True
+                self.unresolved[model] += 1
+                log(
+                    f"mean-field oracle: model {model} has spent its empirical Bayes allowance ({int(self.model_passes[model])} sweeps in this stage, "
+                    f"{EB_PASSES} over the fit's stages) without certifying: its trials are refused from here"
+                )
+        solving = [model for model in range(self.model_count) if model not in held and model not in ended]
         if held:
             log(f"mean-field oracle: models {', '.join(str(model) for model in held)} keep their fixed points; solving {', '.join(str(model) for model in solving)}")
+        if not solving:
+            return [self._held[model][2] if model in held else None for model in range(self.model_count)]
         entry = self._solved(hyperparameters, solving)
         if entry is None:
             return [None] * self.model_count
@@ -2407,7 +2487,10 @@ class _FullDataMeanField:
                     self.checkpoint(model, hyperparameters[model], state)
         if self.monitor is not None:
             self.monitor.observe(self, hyperparameters, solving)
-        return [self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model]) for model in range(self.model_count)]
+        return [
+            None if model in ended else self._held[model][2] if model in held else self._fixed_point(model, hyperparameters[model])
+            for model in range(self.model_count)
+        ]
 
     def _solved(self, hyperparameters: Sequence[MixtureHyperparameters], solving: Sequence[int]) -> list[_ModelState] | None:
         """The models ``solving`` each at the fixed point of the higher ELBO between the solve from the carried state and,
@@ -2902,6 +2985,27 @@ def _timed_hyperparameters(
         timed.close()
 
 
+def _ended_fits(oracle: "_FullDataMeanField", tolerance: float) -> list[OuterFit]:
+    """Each model's empirical Bayes where the outer loop raised after an allowance ended it (``EB_PASSES``): a model
+    refused its trials can be left at a state where the loop has no certified step and raises
+    (``scale_mixture_ep.NoCertifiedProgress``: B + S indefinite after a walk outside every basin), which would lose
+    the fit. Instead every model returns uncertified at its highest-ELBO refreshed state's hyperparameters (the fit then
+    restores that state, ``restore_best``), its remaining gain, decrement and prediction move unmeasured (infinite) and
+    its step's stationarity unchecked; the loop's counts of steps and halvings went with it (zero here), its unresolved
+    trials are the oracle's. The caller has put the oracle back at those states."""
+    fits: list[OuterFit] = []
+    for model, hyperparameters in enumerate(oracle.best_hyperparameters):
+        step = HyperStep(
+            hyperparameters=hyperparameters, evidence=np.nan, smoothing_gradient=np.inf, stationarity_steps=np.zeros(0),
+            stationarity_errors=np.zeros(0), stationarity_gain=np.inf,
+        )
+        fits.append(OuterFit(
+            hyperparameters=hyperparameters, step=step, newton_decrement=np.inf, remaining_gain=np.inf, prediction_move=np.inf,
+            prediction_tolerance=2.0 * tolerance, iterations=0, halvings=0, unresolved=int(oracle.unresolved[model]), history=(), certified=False,
+        ))
+    return fits
+
+
 def fit_full_data(
     *, gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int, working_bytes: int, seed: int,
     inference: str = "ep",
@@ -2913,6 +3017,7 @@ def fit_full_data(
     null_scale: float = 1.0,
     monitor: Any = None,
     warm_start: WarmStart | None = None,
+    mixture_start: MixtureStart | None = None,
 ) -> FullDataFit:
     """Stage 2 from the prior (see the module docstring); ``seed`` draws the certificate's variant-side probes.
     ``starts`` (with ``start_noise`` and ``start_mean``, the members' means per model) continue an earlier fit of this
@@ -2948,7 +3053,11 @@ def fit_full_data(
     place of the moment, nested or continued start, and solves it again (its first call has no cold competitor, and no
     saved ELBO stands as a best). The outer loop's search history is not kept, so a resumed fit can take another path
     to another local optimum, and its certificate is the returned state's own; a fit that is not interrupted does the
-    same operations as without it."""
+    same operations as without it.
+
+    ``mixture_start`` (a continuation's: the earlier fit's ``FullDataFit.mixture_start``) starts the mode mixture's
+    search from the earlier fit's components (``_mode_mixture``) on the mean-field route of quantitative models; it is
+    ignored elsewhere."""
     # The empirical Bayes' per-variant passes (the data objective, its derivatives and line integrals, the tilted
     # moments, the moment start's Grams) run on the Gaussian's device (``scale_mixture_ep.device_scope``), as the small-n
     # route's do: on the host each was a numba pass over every variant on the VM's cores while its GPUs waited, the
@@ -2998,6 +3107,10 @@ def fit_full_data(
                 for model in range(gaussian.model_count)
             ]
         return key, kept[key][1]
+    # Each model's sweeps left for its empirical Bayes over this fit's stages (``EB_PASSES``), and whether a stage spent
+    # them.
+    allowance = np.full(gaussian.model_count, EB_PASSES, dtype=np.int64)
+    allowance_spent = np.zeros(gaussian.model_count, dtype=bool)
 
     def solve(
         model_prior: ScaleMixturePrior, starts: list[MixtureHyperparameters], noise: F64Array, start_mean: F64Array | None,
@@ -3025,6 +3138,7 @@ def fit_full_data(
         if key is not None:
             directory = kept[key][0]
             oracle.checkpoint = lambda model, hyperparameters, state: save_warm_start(directory / f"model{model}.npz", key, hyperparameters, state)
+        oracle.pass_allowance = allowance.copy()
         if monitor is not None:
             monitor.stage(stage)
             oracle.monitor = monitor
@@ -3032,8 +3146,20 @@ def fit_full_data(
             with device_scope(device):
                 return oracle, _timed_hyperparameters(model_prior, starts, oracle, working_bytes, 0.5 / draw_count)
         except FloatingPointError as error:
+            if oracle.allowance_spent.any() and all(state is not None for state in oracle.best_state):
+                # Ended by its allowance where the loop then had no certified step: the best-ELBO states, uncertified.
+                log(f"mean-field oracle: the outer loop raised after an allowance ended it ({error}): every model returns its best-ELBO state, uncertified")
+                oracle.refusals.append(f"the outer loop raised after an empirical Bayes allowance ended it: {error}")
+                # Put back here, not by ``restore_best``, which compares ELBOs and the state the loop left can have none.
+                for model, state in enumerate(oracle.best_state):
+                    oracle._restore_state(state, model)
+                oracle._iterate(oracle.site_precision, oracle.site_shift, oracle.noise)
+                return oracle, _ended_fits(oracle, 0.5 / draw_count)
             # The oracle's refusals say why it had no fixed point; they belong with the failure.
             raise FloatingPointError(f"{error}; mean_field refusals: {oracle.refusals}") from error
+        finally:
+            allowance[:] = np.maximum(allowance - np.asarray(getattr(oracle, "model_passes", 0), dtype=np.int64), 0)
+            allowance_spent[:] |= np.asarray(getattr(oracle, "allowance_spent", False), dtype=bool)
 
     # A model resumed on the fitted prior starts there (``solve``), as a continued fit does: the nested search is behind it.
     _key, resumed = warm_starts(prior)
@@ -3105,6 +3231,11 @@ def fit_full_data(
     if starts is None and prior.annotation_groups and mean_field is not None:
         budget_unresolved += np.asarray(base_points.unresolved, dtype=np.int64)
     refusals = list(fixed_points.refusals)
+    for model in np.flatnonzero(allowance_spent):
+        refusals.append(
+            f"model {int(model)}: its empirical Bayes spent its allowance of {EB_PASSES} sweeps without certifying, and every later trial was "
+            "refused (``full_data_fit.EB_PASSES``): the fit returns its best-ELBO state, uncertified"
+        )
     components: tuple[tuple[F64Array, F64Array], ...] = ()
     member_mean = component_weights = None
     binary_parts: tuple = ()
@@ -3115,7 +3246,9 @@ def fit_full_data(
                 f"model {int(model)}: the fit returns its best-ELBO state, not the one the outer loop ended at; the outer loop's "
                 "remaining gain, Newton decrement and prediction move describe that other state and are withheld"
             )
-        mixture = _mode_mixture(mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments)
+        mixture = _mode_mixture(
+            mean_field, gaussian, statistics, prior, draw_count, working_bytes, seed, hyperparameters, moments, None if binary.any() else mixture_start,
+        )
         member_mean, components, component_weights, binary_parts = mixture.mean, mixture.components, mixture.weights, mixture.binaries
         mean_move, noise_gains = mixture.mean_move, mixture.noise_gain
         component_count = mixture.counts
@@ -3152,6 +3285,9 @@ def fit_full_data(
         member_components=components,
         binary_components=binary_parts,
         component_weights=component_weights,
+        component_means=() if mean_field is None else mixture.component_means,
+        component_noises=() if mean_field is None else mixture.component_noises,
+        mixture_settled=None if mean_field is None else mixture.settled,
         member_shift=None if mean_field is None else mean_field.shift.copy(),
         member_omega=None if mean_field is None else mean_field.member_squares / mean_field.noise[None, :],
         cavity_precision=getattr(fixed_points, "cavity_precision", None) if mean_field is None else None,
@@ -3233,7 +3369,9 @@ class _Mixture:
     models, the weights (components x models; a model with fewer components than the most has the rest at weight zero),
     each component's ``BinaryComponent`` per binary model (None per quantitative one), each model's count of components,
     the largest mean move and noise gain over its components (each at its own fixed point), per model, and whether its
-    search ended at its budget unsettled (1) with why."""
+    search ended at its budget unsettled (1) with why; each component's members' means (members x models, padded as
+    the components) and noise variances (per model), and whether each model's search settled with nothing ended at its
+    budget (``MixtureStart``)."""
 
     mean: F64Array
     components: tuple[tuple[F64Array, F64Array], ...]
@@ -3244,11 +3382,15 @@ class _Mixture:
     noise_gain: F64Array
     unresolved: I64Array
     refusals: tuple[str, ...]
+    component_means: tuple[F64Array, ...]
+    component_noises: tuple[F64Array, ...]
+    settled: BoolArray
 
 
 def _mode_mixture(
     main: "_FullDataMeanField", gaussian: DualGaussian, statistics: GenotypeSufficientStatistics, prior: ScaleMixturePrior, draw_count: int,
     working_bytes: int, seed: int, hyperparameters: tuple[MixtureHyperparameters, ...], moments: Sequence[MomentStart] = (),
+    start: MixtureStart | None = None,
 ) -> _Mixture:
     """The mean-field fit's mixture over coordinate ascent's modes (``small_n._mode_mixture``): between near-duplicate
     columns the posterior is multimodal and the product family holds one mode, the column visited first taking the
@@ -3273,28 +3415,49 @@ def _mode_mixture(
     not, the settled ones left unsolved there. A model with fewer components than its group's most has the rest at
     weight zero.
 
+    A continuation (``start``: the band fit's on the samples, a lattice check's refit, a fit from an earlier one's saved
+    model, ``warm_seeds``) searched its modes again from
+    zero at hyperparameters that moved little (the whole genome's first solve from zero took 7-16 sweeps, a solve from a
+    nearby state 2-3 [real]): on the repository's CPU fixtures a lattice check's refit repeated its fit's mixture solve
+    for solve and pass for pass, from the ridge start to the last order. So the earlier fit's components are solved
+    first, each from its own means and noise at these hyperparameters (each solve moves its own noise, so a component is
+    a fixed point only at its own), and admitted like any mode (the earlier main fixed point is not solved again where
+    this fit's main fixed point is within the draws' resolution of it). A model whose earlier search settled
+    (``MixtureStart.settled``: one more order from zero moved its average by at most the draws' resolution), whose every
+    earlier component is again a fixed point within the draws' resolution of where it started, ||Xp d||^2 / sigma^2 <=
+    1/K, and whose main fixed point is one of them has the same modes the earlier search settled on, at weights from
+    their evidence here: its search stands, and neither the ridge start nor any order runs for it. A component need not
+    come back: a solve stops when its extrapolated ELBO gain is within the tolerance, which on a slow plateau can be far
+    from where coordinate ascent ends (on a CPU fixture the earlier ridge component, solved again at the same
+    hyperparameters and noise, moved 139 resolutions into the main mode, another order's 60). A model where one does not
+    solves no more of the earlier components and searches as without a start (the ridge start, then the orders until it
+    settles), those it solved already held, so a start that fails costs the solves up to the first component that did
+    not come back.
+
     The ridge start and the orders are solved and never factored by the dual solver (``_FullDataMeanField._solved``):
     nothing here reads a factor, neither a component's state nor the repeat and settling tests (sample-space images),
     nor a binary component (its reads of the store), and the main fixed point's own factor is put back at the end."""
     count = main.model_count
     # Per model, per component: its mean, (shift, omega), ELBO, ``BinaryComponent`` (None for a quantitative model),
-    # mean move and noise gain.
+    # mean move, noise gain and noise variance.
     means: list[list[F64Array]] = [[] for _model in range(count)]
     parts: list[list[tuple[F64Array, F64Array]]] = [[] for _model in range(count)]
     elbos: list[list[F64Array]] = [[] for _model in range(count)]
     binaries: list[list] = [[] for _model in range(count)]
     moves: list[list[float]] = [[] for _model in range(count)]
     gains: list[list[float]] = [[] for _model in range(count)]
+    noises: list[list[float]] = [[] for _model in range(count)]
+    columns = (means, parts, elbos, binaries, moves, gains, noises)
 
     def pieces(oracle: "_FullDataMeanField", model: int) -> tuple:
         return (
             oracle.mean[:, model].copy(), (oracle.shift[:, model].copy(), oracle.member_squares[:, model] / oracle.noise[model]),
             np.array(oracle.elbo[model:model + 1], dtype=np.float64), None if oracle.sites[model] is None else oracle.binary_component(model),
-            float(oracle.mean_move[model]), float(oracle.noise_gain[model]),
+            float(oracle.mean_move[model]), float(oracle.noise_gain[model]), float(oracle.noise[model]),
         )
 
     def held(oracle: "_FullDataMeanField", model: int) -> None:
-        for values, piece in zip((means, parts, elbos, binaries, moves, gains), pieces(oracle, model)):
+        for values, piece in zip(columns, pieces(oracle, model)):
             values[model].append(piece)
 
     for model in range(count):
@@ -3315,14 +3478,66 @@ def _mode_mixture(
             for index, kept in enumerate(means[model]):
                 if main._fitted_square(oracle.mean[:, model] - kept, model) / float(main.noise[model]) <= 1.0 / draw_count:
                     if float(oracle.elbo[model]) > float(elbos[model][index][0]):
-                        for values, piece in zip((means, parts, elbos, binaries, moves, gains), pieces(oracle, model)):
+                        for values, piece in zip(columns, pieces(oracle, model)):
                             values[model][index] = piece
                     break
             else:
                 held(oracle, model)
 
+    settled = np.zeros(count, dtype=bool)
+    unresolved = np.zeros(count, dtype=np.int64)
+    refusals: list[str] = []
+    if start is not None:
+        if np.asarray(start.means[0]).shape != main.mean.shape:
+            raise ValueError("a mixture start's components must be this fit's members x models")
+        # Per model: its earlier search settled and every earlier component solved so far is again a fixed point where it
+        # started; a model where one is not solves no more of them (it searches as without a start), and whether the main
+        # fixed point is among them.
+        found = np.asarray(start.settled, dtype=bool).copy()
+        main_found = np.zeros(count, dtype=bool)
+        solved_count = np.zeros(count, dtype=np.int64)
+        for index, start_means in enumerate(start.means):
+            solving = [model for model in range(count) if found[model] and index < int(start.counts[model])]
+            if index == 0:
+                # The earlier fit's main fixed point, where this fit's main one is within the draws' resolution of it, is
+                # that fixed point here already: it is not solved a second time.
+                for model in list(solving):
+                    if main._fitted_square(start_means[:, model] - main.mean[:, model], model) <= float(main.noise[model]) / draw_count:
+                        main_found[model] = True
+                        solving.remove(model)
+            if not solving:
+                continue
+            # Each component from its own means and noise, the pair at which it was a fixed point.
+            oracle = type(main)(
+                gaussian, statistics, prior, draw_count, working_bytes, seed, list(hyperparameters),
+                np.where(index < np.asarray(start.counts), np.asarray(start.noises[index], dtype=np.float64), main.noise), **main._siblings,
+                start_mean=np.asarray(start_means, dtype=np.float64).copy(), sites=list(main.sites),
+            )
+            solved = oracle._solved(list(hyperparameters), solving)
+            unresolved += oracle.unresolved
+            if solved is None:
+                found[solving] = False
+                continue
+            for model in solving:
+                resolution = float(main.noise[model]) / draw_count
+                solved_count[model] += 1
+                found[model] = main._fitted_square(oracle.mean[:, model] - start_means[:, model], model) <= resolution
+                if found[model] and not main_found[model]:
+                    main_found[model] = main._fitted_square(oracle.mean[:, model] - main.mean[:, model], model) <= resolution
+            admit(oracle, solving)
+            del oracle, solved
+        settled = found & main_found
+        for model in range(count):
+            log(
+                f"mode mixture: model {model}: {int(solved_count[model])} of the earlier fit's {int(start.counts[model])} components solved "
+                "again here: " + (
+                    "each a fixed point where it started and the main fixed point among them, so its settled search stands" if settled[model]
+                    else "searching from the ridge start and the orders as without them"
+                )
+            )
     average = [weighted(model)[0] for model in range(count)]
-    if moments:
+    searching = [model for model in range(count) if not settled[model]]
+    if moments and searching:
         # The dense end (``_ridge_mean``): with many small effects the zero-started fixed point keeps a sparse basin and
         # over-shrinks (bench-sim scenario_001 [sim]: calibration slope 2.33, r2 below the infinitesimal ridge's), and
         # the evidence weights decide between the basins.
@@ -3335,13 +3550,10 @@ def _mode_mixture(
             ),
             sites=list(main.sites),
         )
-        if ridge._solved(list(hyperparameters), list(range(count))) is not None:
-            admit(ridge, range(count))
+        if ridge._solved(list(hyperparameters), searching) is not None:
+            admit(ridge, searching)
             average = [weighted(model)[0] for model in range(count)]
         del ridge
-    settled = np.zeros(count, dtype=bool)
-    unresolved = np.zeros(count, dtype=np.int64)
-    refusals: list[str] = []
     for component in range(1, draw_count + 1):
         searching = [model for model in range(count) if not settled[model]]
         if not searching:
@@ -3390,6 +3602,9 @@ def _mode_mixture(
         noise_gain=np.array([np.max(gains[model]) for model in range(count)]),
         unresolved=unresolved,
         refusals=tuple(refusals),
+        component_means=tuple(np.column_stack([means[model][padded(model, index)] for model in range(count)]) for index in range(int(counts.max()))),
+        component_noises=tuple(np.array([noises[model][padded(model, index)] for model in range(count)]) for index in range(int(counts.max()))),
+        settled=settled & (unresolved == 0),
     )
 
 

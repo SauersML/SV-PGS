@@ -199,6 +199,187 @@ def test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples(tmp_p
     assert np.corrcoef(scores.means[held_out, 0], genetic[held_out])[0, 1] > 0.5
     assert np.all(scores.variances[held_out, 0] > 0.0)
 
+def _mean_field_fit(tmp_path: Path):
+    """``test_stage2_by_mean_field_is_certified_and_scores_the_held_out_samples``'s problem: a function fitting it by the
+    mean-field route with ``fit_full_data``'s keywords, each fit on a dual solver of its own."""
+    store, covariate, targets, _genetic = _store(tmp_path / "store", 7)
+    training = np.arange(_TRAINING)
+    statistics = compute_genotype_statistics(
+        DosageStoreTileSource(store, np.arange(store.n_variants)), training, np.column_stack([np.ones(_TRAINING), covariate[training]]),
+        targets[training, None], ModelConfig(), _budget(), _BLOCK_CAP, tmp_path / "ld",
+    )
+    member_count = statistics.active_rows.shape[0]
+    store_covariates = np.column_stack([np.ones(_SAMPLES), covariate])
+    mask = np.zeros((_SAMPLES, 1))
+    mask[training, 0] = 1.0
+    offsets = np.zeros(member_count)
+    start_noise = float(covariate_residual_variance(targets[:, None], mask, store_covariates)[0])
+    nodes, floor, top = stage0_lattice(statistics, 0, start_noise, offsets, 0.5 / _DRAWS)
+    prior = scale_mixture_prior(
+        class_index=(np.arange(member_count) % 5 == 0).astype(np.int64), log_variance_offset=offsets, annotation_design=np.zeros((member_count, 0)),
+        annotation_groups=(), nodes=nodes, floor=floor, top=top,
+    )
+    source = StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, _budget(), _WORKSPACE_BYTES))
+
+    def fit(**continuation):
+        gaussian = DualGaussian(
+            source=source, training=mask, targets=targets[:, None], offsets=np.zeros((_SAMPLES, 1)), covariates=store_covariates,
+            grams=block_grams(statistics, start_noise), probe_count=_DRAWS, seed=11,
+        )
+        return fit_full_data(
+            gaussian=gaussian, statistics=statistics, prior=prior, draw_count=_DRAWS, working_bytes=1 << 22, seed=13, inference="mean_field", **continuation,
+        )
+
+    return fit
+
+
+def test_a_fit_continued_from_its_own_fixed_point_and_mixture_is_the_same_fit_in_a_few_sweeps(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The empirical Bayes side of a warm start (a seed's or any earlier fit's state, ``stage2_wiring``): continued from
+    a converged fit's hyperparameters, noise, main fixed point (``component_means[0]``) and mode mixture
+    (``mixture_start``), the fit reaches the same fixed point and mixture, to the draws' resolution, in a handful of
+    sweeps, where the cold fit took dozens: its empirical Bayes in at most 10. Its mode mixture solves the earlier
+    components from their own means and noise; here the first (the ridge component) was stopped on a plateau and moves
+    on into the main mode (``_mode_mixture``), so the search runs again, as in the cold fit, at the cost of that one
+    solve more (``test_warm_start_eb``: a saved fit whose components come back keeps its search, with no order)."""
+    from sv_pgs import full_data_fit
+    from sv_pgs.full_data_fit import _FullDataMeanField
+
+    fit = _mean_field_fit(tmp_path)
+    sweep = _FullDataMeanField._sweep
+    # Sweeps of the empirical Bayes' oracle (the one with an allowance) and of the mode mixture's, and the mixture's
+    # searches from the ridge start or from zero.
+    sweeps = {"eb": 0, "mixture": 0}
+    searches = [0]
+
+    def counted(self, model, hyperparameters):
+        sweeps["eb" if self.pass_allowance is not None else "mixture"] += 1
+        return sweep(self, model, hyperparameters)
+
+    initialize = _FullDataMeanField.__init__
+
+    def made(self, *arguments, **keywords):
+        searches[0] += "order_seed" in keywords
+        initialize(self, *arguments, **keywords)
+
+    ridge_mean = full_data_fit._ridge_mean
+
+    def ridge(*arguments, **keywords):
+        searches[0] += 1
+        return ridge_mean(*arguments, **keywords)
+
+    monkeypatch.setattr(_FullDataMeanField, "_sweep", counted)
+    monkeypatch.setattr(_FullDataMeanField, "__init__", made)
+    monkeypatch.setattr(full_data_fit, "_ridge_mean", ridge)
+    cold = fit()
+    cold_sweeps, cold_searches = dict(sweeps), searches[0]
+    sweeps.update(eb=0, mixture=0)
+    searches[0] = 0
+    warm = fit(
+        starts=list(cold.hyperparameters), start_noise=np.asarray(cold.noise_variance, dtype=np.float64), start_mean=cold.component_means[0],
+        mixture_start=cold.mixture_start(),
+    )
+    components = int(cold.certificate.mixture_components[0])
+    print(
+        f"warm start: cold fit {cold_sweeps} sweeps ({cold_searches} searches); continued from its own fixed point and its {components} "
+        f"components' mixture {sweeps} sweeps ({searches[0]} searches), {int(warm.certificate.mixture_components[0])} modes"
+    )
+    assert sweeps["eb"] <= 10 < sum(cold_sweeps.values())
+    # One earlier component solved, then the search: the cold mixture's sweeps and that solve's.
+    assert 0 < searches[0] and sweeps["mixture"] < 2 * cold_sweeps["mixture"] and sum(sweeps.values()) < sum(cold_sweeps.values())
+    assert warm.certificate.outer_criterion_met[0] == cold.certificate.outer_criterion_met[0]
+    for hyperparameters, earlier in zip(warm.hyperparameters, cold.hyperparameters):
+        np.testing.assert_allclose(hyperparameters.coefficients, earlier.coefficients, rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(warm.noise_variance, cold.noise_variance, rtol=1e-3)
+    assert np.corrcoef(warm.member_mean[:, 0], cold.member_mean[:, 0])[0, 1] > 0.999
+
+
+def test_an_empirical_bayes_past_its_allowance_ends_at_its_best_state_uncertified(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``EB_PASSES``: a model whose empirical Bayes has spent its sweeps is refused every later trial, which costs no
+    sweep, and the outer loop ends by its own rules: the fit returns the best-ELBO state it solved, its certificate's
+    outer criterion unmet with the allowance among its refusals, and the stages' sweeps past the allowance are only
+    the re-solve at the held point."""
+    from sv_pgs import full_data_fit
+    from sv_pgs.full_data_fit import _FullDataMeanField
+
+    fit = _mean_field_fit(tmp_path)
+
+    # The empirical Bayes' oracles (an unbounded sibling is the mode mixture's), the calls each takes once spent, and
+    # the passes of those that solved.
+    oracles: list[_FullDataMeanField] = []
+    refused_calls = [0]
+    solved_after: list[int] = []
+    call = _FullDataMeanField.__call__
+
+    def counted(self, hyperparameters):
+        if self.pass_allowance is not None and not any(self is oracle for oracle in oracles):
+            oracles.append(self)
+        spent_before, passes = bool(self.allowance_spent[0]), int(self.model_passes[0])
+        points = call(self, hyperparameters)
+        if spent_before:
+            refused_calls[0] += 1
+            assert refused_calls[0] < 1_000, "the outer loop does not end against refused trials"
+            if points[0] is None:
+                # A refused trial costs no sweep.
+                assert int(self.model_passes[0]) == passes
+            else:
+                solved_after.append(int(self.model_passes[0]) - passes)
+        return points
+
+    monkeypatch.setattr(_FullDataMeanField, "__call__", counted)
+    unbounded = fit()
+    spent = sum(int(oracle.model_passes[0]) for oracle in oracles)
+    assert not any(oracle.allowance_spent[0] for oracle in oracles)
+    # An allowance the cold fit's first solve and one more trial spend.
+    oracles.clear()
+    allowance = spent // 3
+    monkeypatch.setattr(full_data_fit, "EB_PASSES", allowance)
+    ended = fit()
+    (oracle,) = oracles
+    assert oracle.allowance_spent[0] and refused_calls[0] > 0
+    certificate = ended.certificate
+    assert certificate.budget_unresolved[0] >= 1 and not certificate.outer_criterion_met[0]
+    assert any(f"spent its allowance of {allowance} sweeps" in refusal for refusal in certificate.refusals)
+    # Past its allowance the stage solved only once more, at its held point (the outer loop's last call).
+    assert len(solved_after) <= 1
+    assert int(oracle.model_passes[0]) < spent
+    # The returned state is the best ELBO the stage solved, and still the trait's: certified or not, it scores.
+    assert float(oracle.elbo[0]) >= float(oracle.best_elbo[0]) - 0.5 / _DRAWS
+    assert np.corrcoef(ended.member_mean[:, 0], unbounded.member_mean[:, 0])[0, 1] > 0.5
+
+
+def test_an_empirical_bayes_ended_by_its_allowance_returns_its_best_state_where_the_outer_loop_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Refused trials can leave the outer loop no certified step, and it raises (``scale_mixture_ep.NoCertifiedProgress``:
+    B + S indefinite at a state outside every basin, as on ``test_stage2_wiring``'s band-route fixture after 3,524
+    sweeps): the fit still returns, at the model's best-ELBO state, uncertified, with the allowance and the loop's error
+    among its refusals, where without the allowance the error would have cost the fit."""
+    import dataclasses
+
+    from sv_pgs import full_data_fit
+    from sv_pgs.scale_mixture_ep import NoCertifiedProgress
+
+    fit = _mean_field_fit(tmp_path)
+    monkeypatch.setattr(full_data_fit, "EB_PASSES", 1)
+    refused: list[list] = []
+
+    def walking(prior, starts, oracle, working_bytes, tolerance):
+        # The start's solve, one trial further (refused: the allowance is spent), then the loop's error.
+        assert all(point is not None for point in oracle(list(starts)))
+        refused.append(list(oracle([dataclasses.replace(start, coefficients=np.asarray(start.coefficients) + 0.1) for start in starts])))
+        raise NoCertifiedProgress("the Newton-B step makes no certified progress at the EP fixed point (the test's)")
+
+    monkeypatch.setattr(full_data_fit, "fit_hyperparameters", walking)
+    ended = fit()
+    assert refused == [[None]]
+    certificate = ended.certificate
+    assert not certificate.outer_criterion_met[0] and certificate.budget_unresolved[0] >= 1
+    assert any("spent its allowance of 1 sweeps" in refusal for refusal in certificate.refusals)
+    assert any(
+        "the outer loop raised after an empirical Bayes allowance ended it: the Newton-B step makes no certified progress at the EP fixed point "
+        "(the test's)" in refusal for refusal in certificate.refusals
+    )
+    assert np.all(np.isfinite(ended.member_mean)) and np.isfinite(ended.noise_variance[0])
+
+
 def test_ridge_component_is_the_gaussian_members_posterior_mean(tmp_path: Path) -> None:
     # ``_ridge_mean``: the dual solver at uniform Gaussian sites against the dense posterior mean
     # D Xp' (Xp D Xp' + sigma^2 I)^-1 yp, D = diag(v e^o), on the covariate-projected training rows.
@@ -555,6 +736,58 @@ def test_the_mode_mixture_reads_no_dual_solver_factor_of_its_orders(tmp_path: Pa
     for (shift, omega), (plain_shift, plain_omega) in zip(again.components, plain.components, strict=True):
         np.testing.assert_array_equal(shift, plain_shift)
         np.testing.assert_array_equal(omega, plain_omega)
+
+
+def test_a_continuation_s_mode_mixture_starts_from_the_earlier_fit_s_components(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A continuation's mode mixture (``MixtureStart``) solves the earlier fit's components again from their means and
+    noise (the earlier main fixed point only where this fit's main one is not it): a model whose earlier search settled,
+    whose every component is again a fixed point where it started and whose main fixed point is one of them keeps that
+    settled search, with neither the ridge start nor an order solved for it, and its mixture is the earlier one to the
+    draws' resolution; a model whose earlier search did not settle solves none of them and searches as without a start,
+    alone."""
+    from sv_pgs.full_data_fit import MixtureStart, _FullDataMeanField, _mode_mixture
+
+    oracle_of, starts, statistics, prior = _two_trait_oracle(tmp_path)
+    moments = moment_starts(statistics, prior)
+    solved = _FullDataMeanField._solved
+    # Per solve: the models solved and whether it started from zero (an order) rather than from given means.
+    solves: list[tuple[list[int], bool]] = []
+
+    def counted(self, hyperparameters, solving):
+        solves.append((list(solving), self is not mains[-1] and not np.any(self.mean)))
+        return solved(self, hyperparameters, solving)
+
+    mains: list[_FullDataMeanField] = []
+
+    def mixture(start: MixtureStart | None):
+        main = oracle_of([0, 1])
+        mains.append(main)
+        assert all(point is not None for point in main(list(starts)))
+        solves.clear()
+        return main, _mode_mixture(main, main.gaussian, statistics, prior, _DRAWS, 1 << 22, 13, tuple(starts), moments, start)
+
+    monkeypatch.setattr(_FullDataMeanField, "_solved", counted)
+    _main, plain = mixture(None)
+    assert np.all(plain.settled) and len(plain.component_means) == int(plain.counts.max())
+    # The ridge start and at least one order per model, from zero.
+    assert any(from_zero for _models, from_zero in solves)
+    earlier = MixtureStart(means=plain.component_means, noises=plain.component_noises, counts=plain.counts, settled=plain.settled)
+    main, continued = mixture(earlier)
+    assert np.all(continued.settled) and np.array_equal(continued.counts, plain.counts)
+    # Only the earlier components were solved, each from its own means, but the main fixed point, which this main one is.
+    restarted = len(plain.component_means) - 1
+    assert len(solves) == restarted and not any(from_zero for _models, from_zero in solves)
+    for model in range(2):
+        moved = main._fitted_square(continued.mean[:, model] - plain.mean[:, model], model) / float(main.noise[model])
+        assert moved <= 1.0 / _DRAWS
+    # Model 1's earlier search unsettled: it alone searches again, from the ridge start and the orders.
+    _main, searched = mixture(MixtureStart(means=plain.component_means, noises=plain.component_noises, counts=plain.counts, settled=np.array([True, False])))
+    # Model 0's earlier components (but its main fixed point), then model 1's search alone.
+    own = int(plain.counts[0]) - 1
+    assert searched.settled[0] and len(solves) > own
+    assert all(models == [0] for models, _from_zero in solves[:own]) and all(models == [1] for models, _from_zero in solves[own:])
+    assert any(from_zero for _models, from_zero in solves[own:])
+    np.testing.assert_allclose(searched.mean[:, 0], continued.mean[:, 0], rtol=1e-10, atol=1e-12)
 
 
 @pytest.mark.parametrize("cached", [False, True])
