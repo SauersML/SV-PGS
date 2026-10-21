@@ -8,10 +8,13 @@ Stage 0 on its training rows and covariate columns with every model's target as 
 models' single-variant likelihoods, the prior with one class per variant class present, the records' unit offsets and
 frequency function from the store's unit contract (``store_measurement``), the store's other sidecar columns as its
 annotation groups (``annotation_design``), the dual Gaussian with a column per model, ``fit_full_data`` by the
-mean-field fixed points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Each model keeps its own
-hyperparameters, noise, lattice check, certificate and prior digest, as when fitted alone: a group shares the store's
-reads, never a hyperparameter, so there is no cross-trait pooling of the prior. A group's models share its probes' and
-draws' seed and start lattice. The finite numerical tolerances and local empirical-Bayes maxima can also affect
+mean-field fixed points (``full_data_fit._FullDataMeanField``) and ``scoring_models``. Stage 0's pass keeps the training
+codes of every record it reads (``training_codes``): Stage 2's resident codes are filled from them, every device at once,
+before the band's costs are measured, and the far field's columns are read from them, so no step after Stage 0 reads
+the store while they are held (a restarted fit's Stage 0, far field and codes are its restart units', which read none).
+Each model keeps its own hyperparameters, noise, lattice check, certificate and prior digest, as when fitted alone: a
+group shares the store's reads, never a hyperparameter, so there is no cross-trait pooling of the prior. A group's
+models share its probes' and draws' seed and start lattice. The finite numerical tolerances and local empirical-Bayes maxima can also affect
 agreement with separate fits. A band-accelerated fit continues on the sample route before its final acceptance check.
 A binary model (0/1 targets) is a group of its own, fitted on its Polya-Gamma bound (``binary_likelihood``), on the same
 route; its reported noise variance is its whitened problem's known unit noise, which its predictive never reads.
@@ -42,7 +45,7 @@ from sv_pgs.config import ModelConfig, TraitType, VariantClass
 from sv_pgs.device_plan import ShardedDualSource
 from sv_pgs.dosage_store import VARIANT_CLASSES, DosageStore
 from sv_pgs.dual_solve import DualGaussian, StreamedDualSource
-from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, EvaluationTee, GroupEvaluation, monitor_on
+from sv_pgs.eb_monitor import MONITOR_SWITCH, EbMonitor, EvaluationCodes, EvaluationRows, GroupEvaluation, monitor_on
 from sv_pgs.fast_scoring import ScoringModel
 from sv_pgs.gram_space import BandStore, GramBand, build_band_store, far_field_scale, pass_costs
 from sv_pgs.full_data_fit import FitCertificate, FullDataFit, block_grams, covariate_residual_variance, fit_full_data, scoring_models, stage0_lattice, state_digest
@@ -65,6 +68,7 @@ from sv_pgs.restart_store import (
 )
 from sv_pgs.scale_mixture_ep import Cavity, MixtureHyperparameters, ScaleMixturePrior, extended_lattice, halved_lattice, lattice_check, scale_mixture_prior, transfer_hyperparameters
 from sv_pgs.store_block_source import StoreGenotypeBlockSource
+from sv_pgs.training_codes import CodeTee, TrainingCodes, code_cache_on
 
 _EPSILON = float(np.finfo(np.float64).eps)
 
@@ -490,15 +494,30 @@ def _quarantine_codes(fit: _ModelFit) -> list[str]:
 
 def stage2_source(
     store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int, training_columns: I64Array,
-    code_cache: CodeCache | None = None,
+    code_cache: CodeCache | None = None, codes: TrainingCodes | None = None,
 ) -> StreamedDualSource | ShardedDualSource:
     """Stage 2's reads of the store on a model's training samples: sharded by LD block over every CUDA device of the
     budget where it has several (``device_plan.ShardedDualSource``: each block's products on its own device, a read's
     images summed on the first), else streamed on the one device or the host; on a device each block's codes are kept
-    as a restart unit where ``code_cache`` names the store (``StoreGenotypeBlockSource._iter_prepared``)."""
+    as a restart unit where ``code_cache`` names the store (``StoreGenotypeBlockSource._iter_prepared``). A read takes
+    its blocks from their restart units where every block has one, else from ``codes``, the training codes Stage 0's
+    pass kept (``training_codes``), while they are held, else from the store."""
     if budget.device_kind == "cuda" and len(budget.device_ids) > 1:
-        return ShardedDualSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache)
-    return StreamedDualSource(StoreGenotypeBlockSource.from_statistics(store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache))
+        return ShardedDualSource.from_statistics(
+            store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache, codes=codes,
+        )
+    return StreamedDualSource(StoreGenotypeBlockSource.from_statistics(
+        store, statistics, budget, workspace_bytes, sample_indices=training_columns, code_cache=code_cache, codes=codes,
+    ))
+
+
+def _fill_resident(source: StreamedDualSource | ShardedDualSource) -> None:
+    """The read that fills the devices' resident genotype codes, made before the fit's first pass and on every device at
+    once where Stage 2 is sharded (``ShardedDualSource.fill``; ``StoreGenotypeBlockSource.fill``). Nothing is read on
+    the host, which holds none."""
+    started = time.perf_counter()
+    if source.fill() if isinstance(source, ShardedDualSource) else source.source.fill():
+        log(f"stage2 wiring: the resident genotype codes are held on every device, filled in {time.perf_counter() - started:.0f} s")
 
 
 def _stage0(
@@ -687,25 +706,34 @@ def _fit_group(
     count = len(genetic)
     store_targets = targets[:, genetic]
     model_sites = [sites[model] for model in genetic]
-    # The EB monitor's codes of the evaluation rows, kept from Stage 0's own tiles (``eb_monitor.EvaluationTee``) where
-    # this job makes Stage 0 (``_stage0`` asks for its tiles at the cap it cuts them at).
+    # Stage 2's codes and the EB monitor's codes of the evaluation rows, kept from Stage 0's own tiles (``training_codes``)
+    # where this job makes Stage 0 (``_stage0`` asks for its tiles at the cap it cuts them at): the resident codes and the
+    # far field then read nothing from the store. Stage 2's are admitted first, so the ledger evicts the monitor's first.
+    training_codes = None
     evaluation_codes = None
 
     def tiles(block_cap: int) -> DosageStoreTileSource:
-        nonlocal evaluation_codes
+        nonlocal training_codes, evaluation_codes
+        if code_cache_on():
+            try:
+                training_codes = TrainingCodes(candidates, training_columns)
+            except MemoryError as error:
+                log(f"training codes: not kept: {error}")
         if evaluation is not None and evaluation.store_columns.size:
             try:
                 evaluation_codes = EvaluationCodes(candidates, evaluation.store_columns, block_cap)
             except MemoryError as error:
                 log(f"eb monitor: off: {error}")
-        return DosageStoreTileSource(store, candidates) if evaluation_codes is None else EvaluationTee(store, candidates, evaluation_codes)
+        keepers = [codes for codes in (training_codes, evaluation_codes) if codes is not None]
+        return CodeTee(store, candidates, keepers) if keepers else DosageStoreTileSource(store, candidates)
 
     stage0_unit = _stage0(store, candidates, training_columns, covariates, store_targets, config, budget, work_dir, restart, group, store_key, tiles)
     statistics = load_statistics(stage0_unit[0])
     block_cap = statistics.boundaries.block_cap
     if np.asarray(statistics.active_rows).shape[0] == 0:
-        if evaluation_codes is not None:
-            evaluation_codes.release()
+        for codes in (training_codes, evaluation_codes):
+            if codes is not None:
+                codes.release()
         return without_genetic_column("every candidate record is monomorphic on these training rows")
     kept_rows = np.asarray(statistics.active_rows, dtype=np.int64)[np.asarray(statistics.tie_map.kept_indices, dtype=np.int64)]
     # The prior is over every active row: tie members keep their own class and offset (tie_members; review-mathbugs T1).
@@ -761,7 +789,10 @@ def _fit_group(
     )
     # The block source's read workspace and the fit's dense per-block jobs are live together: each gets half.
     share = budget.working_bytes // 2
-    source = stage2_source(store, statistics, budget, share, training_columns, CodeCache(restart, group, store_key))
+    source = stage2_source(store, statistics, budget, share, training_columns, CodeCache(restart, group, store_key), training_codes)
+    # The devices' resident codes filled now, from their restart units or Stage 0's kept codes where there are: the
+    # fit's first pass, the band's pass costs among them, is then a device pass.
+    _fill_resident(source)
     # Timing may select a band accelerator, never a different likelihood. Every route
     # retains DualGaussian and recomputes the omitted fields from the full sample operator.
     band = None
@@ -782,6 +813,7 @@ def _fit_group(
             restart.explain("farfield", group, far_named)
             measured = far_field_scale(
                 store, training_columns, covariates, statistics, stage0_starts, stage0_linked, draw_count, _seed(seed, _FAR_FIELD_KEY),
+                codes=training_codes,
             )
             with restart.build("farfield", unit_key(far_named), group=group, named=far_named) as directory:
                 (directory / "scale.json").write_text(json.dumps(list(measured)), encoding="utf-8")
@@ -999,6 +1031,10 @@ def _fit_group(
         band.release()
     if monitor is not None:
         monitor.close()
+    if training_codes is not None:
+        # Held to here: a device's resident set that a later peak evicts is filled again from its restart units or
+        # from them, not from the store.
+        training_codes.release()
     log(f"stage2 wiring: {kept_rows.shape[0]:,} reduced columns in {statistics.ld.block_count} blocks (cap {block_cap}), {training_columns.shape[0]:,} training samples, {count} models fitted together")
     return [result for result in results if result is not None]
 

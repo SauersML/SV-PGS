@@ -14,6 +14,14 @@ One Stage 2 read visits every LD block once. Three stages of it overlap:
 
 Each block's rows are ascending store rows (its reduced columns' representatives), read as the
 one contiguous span from its first to its last row.
+
+Where Stage 0's pass kept its training codes (``training_codes.TrainingCodes``: every record Stage 2
+reads, as the signed codes these slots hold), a read takes its blocks from them instead of the
+store: on the host a copy into the slot, on a device a copy into a host slot laid out as the
+device's (aligned rows, padded samples, the padding zero) and its upload on the copy stream. The
+slots then hold the same bytes either way, so the tiles and every product are the same. On a
+device a block's restart unit (``_iter_prepared``), where every block has one, comes first: a
+restarted fit's Stage 0 is its unit's, which reads no tile, so it keeps no codes.
 """
 
 from __future__ import annotations
@@ -96,6 +104,8 @@ class StoreGenotypeBlockSource:
     ``sample_indices`` optionally restricts all products to those store samples;
     means and scales still come from the caller's training statistics. GPU rowdict
     staging decodes full rows before gathering selected samples into compact tiles.
+    ``codes``, the training codes Stage 0's pass kept (``training_codes.TrainingCodes``), serve
+    every read while they hold every block's rows on this source's samples (the module docstring).
     """
 
     def __init__(
@@ -109,6 +119,7 @@ class StoreGenotypeBlockSource:
         workspace_bytes: int,
         sample_indices: NDArray[np.int64] | None = None,
         code_cache: CodeCache | None = None,
+        codes: Any = None,
     ) -> None:
         self._store = store
         self._sample_indices = None
@@ -131,6 +142,14 @@ class StoreGenotypeBlockSource:
         if np.shape(means) != (int(self._offsets[-1]),) or np.shape(scales) != (int(self._offsets[-1]),):
             raise ValueError("means and scales need one entry per block row")
         self._spans = [(int(rows[0]), int(rows[-1]) + 1) for rows in self._block_rows]
+        # Stage 0's kept codes where they are this source's samples' (their columns in this source's order); each block's
+        # rows' positions among them are found at the first read that asks (``_kept``).
+        sample_columns = np.arange(store.n_samples, dtype=np.int64) if self._sample_indices is None else self._sample_indices
+        self._codes = codes if codes is not None and codes.serves(sample_columns) else None
+        self._code_positions: list[NDArray[np.int64]] | None = None
+        # Where the read in progress takes its codes from (the timing line's ``codes``): the store, Stage 0's kept codes
+        # or the blocks' restart units.
+        self._origin = "store"
         self._budget = budget
         self._workspace_bytes = int(workspace_bytes)
         self._samples = int(store.n_samples if self._sample_indices is None else self._sample_indices.size)
@@ -236,6 +255,37 @@ class StoreGenotypeBlockSource:
             return True
         return self._cupy is not None and self._broker is not None and self._broker.remaining(self._pool) >= self.resident_codes_bytes
 
+    @property
+    def resident_complete(self) -> bool:
+        """Whether every block's codes are held on the device: every read from here on is a device pass."""
+        return self._resident_complete and self._resident is not None
+
+    def fill(self) -> bool:
+        """The read that fills the resident codes, made now where the device would hold them (``holds_codes``) and does
+        not yet hold them whole, so that the fit's first pass is a device pass and the fill can run on every device at
+        once (``device_plan.ShardedDualSource.fill``); whether they are held whole after it. Nothing is read on the host,
+        which holds no resident set, nor where the ledger would not admit one (the fit's reads then stream as they
+        would have)."""
+        if self._cupy is not None and not self.resident_complete and self.holds_codes():
+            for _block in self.iter_tiles():
+                pass
+        return self.resident_complete
+
+    def _kept(self) -> list[NDArray[np.int64]] | None:
+        """Each block's rows' positions among the codes Stage 0's pass kept, where those still hold every block's rows;
+        None where they do not (a read then streams the store). Codes that never held every row are dropped at once."""
+        codes = self._codes
+        if codes is None or codes.off is not None:
+            return None
+        if self._code_positions is None:
+            positions = [codes.positions(rows) for rows in self._block_rows]
+            if any(entry is None for entry in positions):
+                self._codes = None
+                log("training codes: Stage 0's pass did not keep every block's records; Stage 2 reads the store")
+                return None
+            self._code_positions = positions
+        return self._code_positions
+
     def _keep(self, block_index: int, slot: int) -> None:
         """Copy block ``block_index``'s signed codes into the resident set (on the first read), or drop the set if the
         device cannot hold it after all."""
@@ -264,12 +314,14 @@ class StoreGenotypeBlockSource:
     @classmethod
     def from_statistics(
         cls, store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int,
-        sample_indices: NDArray[np.int64] | None = None, code_cache: CodeCache | None = None,
+        sample_indices: NDArray[np.int64] | None = None, code_cache: CodeCache | None = None, codes: Any = None,
     ) -> StoreGenotypeBlockSource:
         """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
         group's representative, whose store row, mean and scale Stage 0 recorded."""
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
-        return cls(store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices, code_cache)
+        return cls(
+            store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices, code_cache, codes,
+        )
 
     @property
     def sample_count(self) -> int:
@@ -307,18 +359,103 @@ class StoreGenotypeBlockSource:
         started = time.perf_counter()
         yield from self._iter_streamed(0)
         if self._cupy is not None:
-            # A device read of the store: the one that fills the resident set, or one that streams (``_admit_resident``),
-            # its wall time the reader's work on its tiles included.
-            timing("resident_fill" if self._resident is not None else "store_read", time.perf_counter() - started, gb=self.resident_codes_bytes / GB, pool=self._pool)
+            # A device read of the store (or of Stage 0's kept codes, or of the blocks' restart units: ``codes``): the one
+            # that fills the resident set, or one that streams (``_admit_resident``), its wall time the reader's work on
+            # its tiles included.
+            timing(
+                "resident_fill" if self._resident is not None else "store_read", time.perf_counter() - started, gb=self.resident_codes_bytes / GB,
+                pool=self._pool, codes=self._origin,
+            )
         # only a read that reached every block leaves a complete resident set
         self._resident_complete = self._cupy is not None and self._resident is not None
 
     def _iter_streamed(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
-        """The blocks from ``first_block`` on, read from the store (or from their prepared codes, ``_iter_prepared``)."""
-        if self._cupy is not None:
-            if self._code_cache is not None:
-                yield from self._iter_prepared(first_block)
+        """The blocks from ``first_block`` on: on a device from their restart units where every one has one
+        (``_iter_prepared``), else, as on the host, from the codes Stage 0's pass kept while they hold them, else from
+        the store (``_iter_read``)."""
+        if self._cupy is not None and self._code_cache is not None:
+            yield from self._iter_prepared(first_block)
+            return
+        yield from self._iter_read(first_block)
+
+    def _iter_read(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The blocks from ``first_block`` on from the codes Stage 0's pass kept while they hold them, else from the
+        store."""
+        positions = self._kept()
+        self._origin = "store" if positions is None else "stage0"
+        if positions is None:
+            yield from self._iter_store(first_block)
+        elif self._cupy is not None:
+            yield from self._iter_kept_device_tiles(first_block, positions)
+        else:
+            yield from self._iter_kept_tiles(first_block, positions)
+
+    def _iter_kept_tiles(self, first_block: int, positions: list[NDArray[np.int64]]) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The host's blocks from ``first_block`` on, each block's kept codes copied into the slot the store's codes fill
+        (``_iter_store``): the same signed codes in the same places, so the same tile. Where the codes are evicted
+        between two blocks, the blocks left are read from the store."""
+        for block_index in range(first_block, len(self._block_rows)):
+            slot = block_index % 2
+            rows = int(self._block_rows[block_index].shape[0])
+            if not self._codes.copy_rows(positions[block_index], self._signed[slot][:rows, : self._samples]):
+                yield from self._iter_store(block_index)
                 return
+            yield block_index, self._tile(block_index, slot)
+
+    def _iter_kept_device_tiles(self, first_block: int, positions: list[NDArray[np.int64]]) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The device's blocks from ``first_block`` on from the kept codes: each block's rows copied into a host slot laid
+        out as the device's slot (its rows aligned and its samples padded, the padding zero, as the gather kernel leaves
+        it) and uploaded on the copy stream while the block before computes, then kept and tiled as a store read's
+        block is. The two host slots are a mandatory lease of the host ledger for the read's life. Where the codes are
+        evicted between two blocks, the blocks left are read from the store."""
+        cupy = self._cupy
+        compute = cupy.cuda.get_current_stream()
+        copied = [cupy.cuda.Event() for _ in range(2)]
+        computed = [cupy.cuda.Event() for _ in range(2)]
+        for event in computed:
+            event.record(compute)
+        shape = tuple(int(extent) for extent in self._signed[0].shape)
+        broker = current_broker()
+        lease = None if broker is None else broker.reserve(HOST, 2 * shape[0] * shape[1], "the kept codes' upload slots")
+        try:
+            staged = [np.zeros(shape, dtype=np.int8) for _ in range(2)]
+
+            def upload(position: int) -> bool:
+                slot = position % 2
+                rows = int(self._block_rows[position].shape[0])
+                padded_rows = _aligned(rows)
+                if not self._codes.copy_rows(positions[position], staged[slot][:rows, : self._samples]):
+                    return False
+                # A wider block before may have left rows here; the padded samples are never written.
+                staged[slot][rows:padded_rows] = 0
+                # The device slot is free once the block that last used it has been computed.
+                self._copy_stream.wait_event(computed[slot])
+                self._signed[slot][:padded_rows].set(staged[slot][:padded_rows], stream=self._copy_stream)
+                copied[slot].record(self._copy_stream)
+                return True
+
+            count = len(self._block_rows)
+            if not upload(first_block):
+                yield from self._iter_store(first_block)
+                return
+            for block_index in range(first_block, count):
+                slot = block_index % 2
+                copied[slot].synchronize()
+                following = block_index + 1 < count and upload(block_index + 1)
+                compute.wait_event(copied[slot])
+                self._keep(block_index, slot)
+                yield block_index, self._tile(block_index, slot)
+                computed[slot].record(compute)
+                if block_index + 1 < count and not following:
+                    yield from self._iter_store(block_index + 1)
+                    return
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _iter_store(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
+        """The blocks from ``first_block`` on, read from the store."""
+        if self._cupy is not None:
             yield from (self._iter_decoded_tiles(first_block) if self._decoder is not None else self._iter_device_tiles(first_block))
             return
         spans = self._store.iter_codes(self._spans[first_block:], self._sample_indices, self._budget)
@@ -338,7 +475,8 @@ class StoreGenotypeBlockSource:
         device on All of Us whole-genome arms [real]) on the local disk, not from a read of the whole store (547 GB,
         about 20 minutes [real]). The device placement, the means and the scales are not the codes' bytes: a unit serves
         either device, and every tile takes its standardization from this fit's Stage 0. A block's host copy lives for
-        that block alone, charged to the ledger. A partly prepared set is read from the store, which completes it."""
+        that block alone, charged to the ledger. A partly prepared set is read from the codes Stage 0's pass kept, where
+        they are held, else from the store (``_iter_read``), which completes it."""
         cache = self._code_cache
         if self._code_keys is None:
             source = definition_sources([("sv_pgs.store_block_source", "StoreGenotypeBlockSource")])
@@ -349,6 +487,7 @@ class StoreGenotypeBlockSource:
                 self._code_keys.append((unit_key(named), named))
         units = [cache.store.unit("codes", key) for key, _named in self._code_keys[first_block:]]
         if all(unit is not None for unit in units):
+            self._origin = "units"
             log(f"resident genotype codes: blocks {first_block} to {len(self._block_rows) - 1} read from their prepared codes on {self._pool}")
             for block_index, (path, _record) in zip(range(first_block, len(self._block_rows)), units):
                 slot = block_index % 2
@@ -363,8 +502,7 @@ class StoreGenotypeBlockSource:
                 self._keep(block_index, slot)
                 yield block_index, self._tile(block_index, slot)
             return
-        streamed = self._iter_decoded_tiles(first_block) if self._decoder is not None else self._iter_device_tiles(first_block)
-        for (block_index, tile), unit in zip(streamed, units):
+        for (block_index, tile), unit in zip(self._iter_read(first_block), units):
             if unit is None:
                 key, named = self._code_keys[block_index]
                 rows = _aligned(int(self._block_rows[block_index].shape[0]))

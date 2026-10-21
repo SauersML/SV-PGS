@@ -54,7 +54,7 @@ def _whole_genome_run() -> list[str]:
         _line(1745, "timing: tree_digest 720.0 s files=500 gb=547 root=run/store"),
         _line(4445, "timing: stage0 2700.0 s blocks=55 ld_gb=150 genotype_pass=2400 samples=48123"),
         _line(5345, "timing: summary_band 900.0 s blocks=55 parts=98 gb=90"),
-        _line(6545, "timing: resident_fill 1200.0 s gb=12 pool=device:0"),
+        _line(6545, "timing: resident_fill 1200.0 s gb=12 pool=device:0 codes=stage0"),
         _line(7145, "timing: mean_field_solve 600.0 s model=0 outcome=converged sweeps=12 per_sweep=50"),
         _line(7265, "timing: mean_field_solve 120.0 s model=1 outcome=converged sweeps=3 per_sweep=40"),
         _line(7365, "timing: mean_field_solve 100.0 s model=2 outcome=converged sweeps=2 per_sweep=50"),
@@ -88,6 +88,8 @@ def test_the_timeline_puts_each_phase_at_its_start_with_its_resources() -> None:
     assert stage0[1:5] == ["+0:29:05", "2700.0", "80", "80"] and stage0[9] == "20.0"
     assert stage0[10:] == ["blocks=55", "ld_gb=150", "genotype_pass=2400"]
     assert _row(report, "resident_fill")[1:4] == ["+1:29:05", "1200.0", "30"] and _row(report, "resident_fill")[6] == "900.0"
+    # where the fill's codes came from: Stage 0's kept codes
+    assert _row(report, "resident_fill")[10:] == ["gb=12", "codes=stage0"]
     assert _row(report, "eb")[1:5] == ["+1:49:05", "1455.0", "95", "95"]
     # the repeated phases are summarized, not listed
     assert not any(line.startswith("mean_field_solve ") and "+" in line for line in report.splitlines())

@@ -780,6 +780,7 @@ def build_band_store(
 
 def far_field_scale(
     store: Any, training_columns: I64Array, covariates: F64Array, statistics: Any, starts: I64Array, linked: np.ndarray, draw_count: int, seed: int,
+    codes: Any = None,
 ) -> tuple[float, float, int]:
     """kappa, the mean r^2 n' of the pairs beyond the band (chance alone: 1), with its standard error and the pairs it
     is taken over, measured on the store: m reduced columns drawn at random, read on the training samples, standardized
@@ -790,7 +791,8 @@ def far_field_scale(
     cohort's pairs beyond 20 Mb sit at 1.30 / n' (0.30 / n' above chance at 150 standard errors: between-group structure
     the PCs leave), so chance alone would under-state the far field. m is the least count whose chance standard error,
     2 / m for m (m - 1) / 2 pairs of chi-square(1) r^2 n', is within the fit's resolution 1 / (2K) of the scale: 4K
-    columns, one read of each, never a pass over the store."""
+    columns, one read of each, never a pass over the store; none at all where ``codes``, the training codes Stage 0's pass
+    kept (``training_codes.TrainingCodes``), hold them, which give the store's own codes."""
     started = time.perf_counter()
     generator = np.random.default_rng(seed)
     starts = np.asarray(starts, dtype=np.int64)
@@ -802,8 +804,12 @@ def far_field_scale(
     rows = np.asarray(statistics.active_rows, dtype=np.int64)[kept[chosen]]
     columns = np.asarray(training_columns, dtype=np.int64)
     values = np.empty((columns.shape[0], count))
-    for index, row in enumerate(rows.tolist()):
-        values[:, index] = np.asarray(store.read_codes(row, row + 1, columns), dtype=np.float64)[0]
+    kept = codes.unsigned(rows) if codes is not None and codes.serves(columns) else None
+    if kept is not None:
+        values[:] = kept.T
+    else:
+        for index, row in enumerate(rows.tolist()):
+            values[:, index] = np.asarray(store.read_codes(row, row + 1, columns), dtype=np.float64)[0]
     design = np.asarray(covariates, dtype=np.float64)
     left, singular, _ = np.linalg.svd(design, full_matrices=False)
     basis = left[:, singular > max(design.shape) * np.finfo(np.float64).eps * singular[0]]

@@ -10,7 +10,8 @@ scoring spreads its blocks over the devices (``fast_scoring``). This module shar
   Its ``blocks()`` keeps every existing read correct on several devices: each block's products run
   on the block's device, with the home device's operands moved there and the results moved back.
   Its ``map_reduce`` runs a read's blocks on all devices at once, each into its own sample-side
-  image, and sums the images in device order, so the result is deterministic.
+  image, and sums the images in device order, so the result is deterministic. Its ``fill`` makes
+  the read that fills each device's resident codes on all devices at once.
 * :func:`log_device_plan` records the decision. An exposed device that CUDA cannot use is an error when the budget
   is detected (``compute_budget.check_visible_devices``).
 
@@ -142,6 +143,8 @@ class ShardTileSource(Protocol):
 
     def holds_codes(self) -> bool: ...
 
+    def fill(self) -> bool: ...
+
 
 def moved(cupy: Any, values: Any, device_id: int) -> Any:
     """``values`` (a cupy array on any device, or a numpy array) as a contiguous array on ``device_id``,
@@ -266,13 +269,15 @@ class ShardedDualSource:
     @classmethod
     def from_statistics(
         cls, store: Any, statistics: Any, budget: ComputeBudget, workspace_bytes: int, sample_indices: NDArray[np.int64] | None = None,
-        code_cache: Any = None,
+        code_cache: Any = None, codes: Any = None,
     ) -> ShardedDualSource:
         """One Stage 0 pass's reduced LD blocks over every device of ``budget``, each device streaming
         its own blocks from ``store``, on the store samples ``sample_indices`` only (a model's training
-        samples; ``store_block_source.StoreGenotypeBlockSource``'s). The devices read at once, so each
-        shard's read-ahead plans against an equal share of the host memory. ``code_cache`` (``restart_store.CodeCache``)
-        keeps each block's codes as its own unit, whichever device reads it."""
+        samples; ``store_block_source.StoreGenotypeBlockSource``'s), or from ``codes``, the training codes
+        Stage 0's pass kept (``training_codes.TrainingCodes``), which every shard reads its own rows of.
+        The devices read at once, so each shard's read-ahead plans against an equal share of the host
+        memory. ``code_cache`` (``restart_store.CodeCache``) keeps each block's codes as its own unit,
+        whichever device reads it."""
         from sv_pgs.compute_budget import _try_import_cupy
         from sv_pgs.store_block_source import StoreGenotypeBlockSource, reduced_block_layout
 
@@ -309,6 +314,7 @@ class ShardedDualSource:
                     workspace_bytes,
                     sample_indices,
                     code_cache,
+                    codes,
                 ))
         bounds = [(int(indices[0]), int(indices[-1]) + 1) for indices in block_indices]
         return cls(shards, plan, bounds, shards[0].sample_count, cupy)
@@ -317,6 +323,36 @@ class ShardedDualSource:
         """Whether every shard's codes are held on its device, or would be at its next read
         (``store_block_source.StoreGenotypeBlockSource.holds_codes``)."""
         return all(shard.holds_codes() for shard in self._shards)
+
+    def fill(self) -> bool:
+        """Every shard's resident codes filled now, all devices at once, each shard's read on its own
+        thread in its device's context (``StoreGenotypeBlockSource.fill``: nothing is read where the
+        ledger would not hold a shard's set); whether every shard holds its set whole after it. Through
+        ``native_blocks`` the first read visits the blocks in variant order on one thread, a device at a
+        time, so each device's fill waited on the other's."""
+        failures: list[BaseException] = []
+        held = [False] * len(self._shards)
+
+        def device_worker(position: int) -> None:
+            try:
+                with _cupy_device_context(self._cupy, self.plan.device_ids[position]):
+                    held[position] = bool(self._shards[position].fill())
+                    _synchronize(self._cupy)
+            except BaseException as error:
+                failures.append(error)
+
+        # As in ``map_reduce``: each worker runs in a copy of this thread's context, the fit's memory scope with it.
+        workers = [
+            threading.Thread(target=contextvars.copy_context().run, args=(device_worker, position), name=f"stage2-fill-{device_id}")
+            for position, device_id in enumerate(self.plan.device_ids)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        if failures:
+            raise failures[0]
+        return all(held)
 
     def blocks(self) -> Iterator[tuple[int, int, Any]]:
         """Every block in variant order, as a tile that takes and returns home-device arrays."""

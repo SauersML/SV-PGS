@@ -14,10 +14,10 @@ trait's covariates (the report's ``pgs_partial_r2``) and, for a disease, its AUC
 the call's ELBO and step norm. No row, count or case count is logged.
 
 Its genotypes cost no read of the store. Stage 0's pass reads every sample of every candidate record
-(``genotype_statistics.DosageStoreTileSource``), and ``EvaluationTee`` keeps each tile's evaluation columns as the pass
-goes (``EvaluationCodes``: candidates x evaluation rows, int8 on the host, charged to the ledger; where the ledger
-cannot admit them the fit runs without a monitor). A fit whose Stage 0 did not read every member's record has no
-codes: the monitor says so and scores nothing.
+(``genotype_statistics.DosageStoreTileSource``), and ``training_codes.CodeTee`` hands each tile to ``EvaluationCodes``,
+which keeps its evaluation columns as the pass goes (candidates x evaluation rows, int8 on the host, charged to the
+ledger; where the ledger cannot admit them the fit runs without a monitor). A fit whose Stage 0 did not read every
+member's record has no codes: the monitor says so and scores nothing.
 
 A score is one pass over those codes with the members' weights m_j / s_j (the posterior mean over each member's
 training scale, Stage 0's), a Stage 0 block cap of records at a time in float32, every model of the call at once. Its
@@ -41,7 +41,6 @@ import numpy as np
 from sv_pgs._typing import BoolArray, F64Array, I64Array, U8Array
 from sv_pgs.binary_likelihood import auc
 from sv_pgs.genotype_buffers import SIGNED_CODE_OFFSET
-from sv_pgs.genotype_statistics import DosageCodeStore, DosageStoreTileSource
 from sv_pgs.memory_broker import HOST, current_broker
 from sv_pgs.progress import log
 
@@ -122,7 +121,7 @@ class GroupEvaluation:
 
 class EvaluationCodes:
     """The evaluation rows' signed codes of Stage 0's candidate records [candidates, evaluation rows], int8 on the host,
-    kept from Stage 0's own tiles (``EvaluationTee``) with which candidates a tile has filled, and a float32 buffer of a
+    kept from Stage 0's own tiles (``training_codes.CodeTee``) with which candidates a tile has filled, and a float32 buffer of a
     Stage 0 block cap of them, the scores' working rows. Both are a cache of the ledger (``memory_broker``): admitted
     only from what the host has left, and evicted (the monitor then off) whenever a lease of the fit needs the room, so
     no allocation of the fit fails for them. They do take room from the fit's own host caches: one admitted later finds
@@ -197,19 +196,6 @@ class EvaluationCodes:
         self._drop(self.off)
         if self._lease is not None:
             self._lease.release()
-
-
-class EvaluationTee(DosageStoreTileSource):
-    """Stage 0's tile source (``DosageStoreTileSource``) that keeps the evaluation columns of every tile it reads
-    (``EvaluationCodes``); the tiles themselves are unchanged."""
-
-    def __init__(self, store: DosageCodeStore, candidate_rows: I64Array, codes: EvaluationCodes) -> None:
-        super().__init__(store, candidate_rows)
-        self._codes = codes
-
-    def read_rows(self, chromosome: str, start: int, stop: int, out: U8Array) -> None:
-        super().read_rows(chromosome, start, stop, out)
-        self._codes.capture(self.store_rows(chromosome)[start:stop], out[: stop - start])
 
 
 def _residualized(values: F64Array, covariates: F64Array) -> F64Array:

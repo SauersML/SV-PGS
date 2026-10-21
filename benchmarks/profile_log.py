@@ -59,10 +59,10 @@ REPEATED = ("mean_field_solve", "eb_iteration", "device_sweep", "score_batch", "
 """Phases a run has many of: summarized after the timeline (listed in it with --all)."""
 SHOWN_EXTRAS = (
     "sweeps", "per_sweep", "solve", "other", "load", "predict", "gb", "ld_gb", "genotype_pass", "blocks", "parts", "files", "columns",
-    "models", "rounds", "launches", "sampled",
+    "models", "rounds", "launches", "sampled", "codes",
 )
 """The timing lines' extras the report shows (with each ``gpu<i>`` busy share): durations, sizes and counts of the run's
-own work, never of people."""
+own work, never of people, and where a read's codes came from (``codes``: the store, or Stage 0's kept codes)."""
 FRAMES_SHOWN = 4
 
 
