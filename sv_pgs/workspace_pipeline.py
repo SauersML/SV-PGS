@@ -4449,12 +4449,12 @@ LOCUS_VARIANCE_COLUMNS = (
     "window_share",
 )
 """``locus_variance.tsv`` (with the config's ``locus_panel``): per trait, arm, panel window bearing on the trait and
-variant class in it (then ``all`` its classes), the all-rows model's genetic variance there, the summed posterior
-E[beta^2 | data] on standardized genotypes (each record's beta^2 times its genotype variance, LD between records aside),
-its share of the model's whole genome's and of the window's. A record, structural or not, enters only with at least
-MINIMUM_REPORTED_PARTICIPANTS expected carriers of its minor allele among the model's training rows (``locus_variance``);
-the others are counted in ``rare_left_out`` and in no value, so no value rests on fewer carriers. The counts are of
-records, never of participants."""
+variant class in it (``locus_classes``: SNVs, short indels and each structural class; then ``all`` of them), the all-rows
+model's genetic variance there, the summed posterior E[beta^2 | data] on standardized genotypes (each record's beta^2
+times its genotype variance, LD between records aside), its share of the model's whole genome's and of the window's. A
+record, structural or not, enters only with at least MINIMUM_REPORTED_PARTICIPANTS expected carriers of its minor allele
+among the model's training rows (``locus_variance``); the others are counted in ``rare_left_out`` and in no value, so no
+value rests on fewer carriers. The counts are of records, never of participants."""
 
 
 def read_locus_panel(path: str | Path) -> list[dict[str, Any]]:
@@ -4465,6 +4465,18 @@ def read_locus_panel(path: str | Path) -> list[dict[str, Any]]:
         if not {"name", "kind", "chromosome", "start", "end", "traits"} <= set(locus) or not int(locus["start"]) <= int(locus["end"]):
             raise ValueError(f"{path}: a locus needs its name, kind, chromosome, start <= end and traits: {locus.get('name')!r}.")
     return loci
+
+
+SHORT_INDEL_CLASS = "short_indel"
+"""The locus table's class of every record but an SNV shorter than a structural variant (SHORT_RECORDS)."""
+
+
+def locus_classes(classes: NDArray, bins: NDArray) -> NDArray:
+    """Each record's class as the locus table splits a window: SNVs, short indels (SHORT_INDEL_CLASS) and each structural
+    class, whose records are COMMUNITY_SV_MINIMUM_LENGTH and longer (``length_bins``), so no short deletion is counted
+    as a structural one."""
+    short = (bins == SHORT_RECORDS) & (classes != PRIOR_REFERENCE_CLASS)
+    return np.where(short, SHORT_INDEL_CLASS, classes)
 
 
 def locus_variance(
@@ -4615,7 +4627,7 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                                 trained = int(cohort.training[:, cohort.all_rows_model(trait)].sum())
                                 tables["locus_variance.tsv"] = locus_variance(
                                     trait_name, arm, loci, np.asarray(table.chromosome)[rows].astype(np.int64), np.asarray(table.position)[rows].astype(np.int64),
-                                    classes[rows], (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit),
+                                    locus_classes(classes[rows], bins[rows]), (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit),
                                     trained * np.minimum(frequency, 1.0 - frequency),
                                 )
                             _write_json(temporary / "summary.json", {"tables": tables, "prior": prior is not None})
@@ -5581,6 +5593,10 @@ def check_exportable(path: Path) -> None:
             text = row.get(column) or ""
             if shown_value and text and (not text.isdigit() or int(text) == 0):
                 raise ValueError(f"{path}: a suppressed cell shows a value.")
+        # A disease's controls are its rows less its cases, shown wherever both are.
+        counts = (row.get("n") or "", row.get("cases") or "")
+        if {"n", "cases"} <= set(rule.sizes) and all(text.isdigit() for text in counts) and (int(counts[1]) > int(counts[0]) or leaves(int(counts[0]) - int(counts[1]))):
+            raise ValueError(f"{path}: a row's cases leave a control count below {MINIMUM_REPORTED_PARTICIPANTS}, or exceed its rows.")
         for total, members in rule.partitions:
             if (row.get(total) or "").isdigit():
                 shown = sum(int(row[member]) for member in members if (row.get(member) or "").isdigit())
@@ -5681,7 +5697,7 @@ _STEPS = (
         (
             _effects_step, _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
             _shown, PriorMoments, prior_moments, jackknife_ratio, effect_summaries, suppressed_levels, _hidden_counts, _hidden_records, _number,
-            read_locus_panel, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
+            read_locus_panel, locus_classes, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
             importlib.import_module("sv_pgs.postfit_checkpoint"),
         ),
         _effects_step,

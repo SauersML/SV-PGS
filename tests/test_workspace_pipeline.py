@@ -1926,6 +1926,18 @@ def test_a_run_of_regions_fits_each_window_on_the_shared_steps_mirrors_each_once
     assert [line["variants"] for line in lines] == [region.shape[0] for region in short for _trait in traits]
     with np.load(scores_path) as saved:
         assert saved["regions"].tolist() == list(windows) and saved["held_out_score"].shape[0] == len(windows)
+    # The saved scores make the same baselines with no fit, and another cohort's are refused.
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", lambda *arguments: pytest.fail("refitted"))
+    rebuilt = tmp_path / "rebuilt"
+    assert aou_ldpred2.main(["--config", str(config_path), "--from-scores", str(scores_path), "--baselines", str(rebuilt)]) == 0
+    for name, region in config.region_runs():
+        made_path = rebuilt / workspace_pipeline.REGIONS_DIRECTORY / name / "ldpred2_auto.npz"
+        with np.load(region.baselines() / "ldpred2_auto.npz") as fitted, np.load(made_path) as made:
+            assert fitted.files == made.files and all(np.array_equal(fitted[key], made[key]) for key in fitted.files)
+    with np.load(scores_path) as saved:
+        np.savez(tmp_path / "other.npz", **{**{key: saved[key] for key in saved.files}, "trait_names": saved["trait_names"][::-1]})
+    with pytest.raises(ValueError, match="another run's"):
+        aou_ldpred2.main(["--config", str(config_path), "--from-scores", str(tmp_path / "other.npz"), "--baselines", str(rebuilt)])
     compared = tmp_path / "compare.tsv"
     assert aou_compare.main(["--config", str(config_path), "--scores", str(scores_path), "--out", str(compared)]) == 0
     with compared.open() as handle:
@@ -2525,6 +2537,13 @@ def test_a_validation_split_tests_another_fold_and_reuses_every_step_before_the_
     assert {step: _completed_at(run, step) for step in reused} == before and recorder.fit_calls
 
 
+def test_the_locus_table_counts_short_indels_apart_from_the_structural_classes() -> None:
+    classes = np.array(["snv", "deletion", "deletion", "insertion", "duplication"], dtype=object)
+    lengths = np.array([1.0, 3.0, 400.0, 20.0, 5000.0])
+    split = workspace_pipeline.locus_classes(classes, workspace_pipeline.length_bins(lengths))
+    assert split.tolist() == ["snv", "short_indel", "deletion", "short_indel", "duplication"]
+
+
 def test_locus_variance_sums_a_window_s_records_by_class_and_leaves_out_those_with_few_carriers(tmp_path: Path) -> None:
     panel = tmp_path / "panel.json"
     panel.write_text(json.dumps({"loci": [
@@ -2610,6 +2629,13 @@ def test_export_refuses_a_table_without_a_rule_and_counts_the_shown_ones_would_g
     table.write_text(header + "\n".join(cases) + "\n")
     with pytest.raises(ValueError, match="all cell less"):
         check_exportable(table)
+    # A row's cases leave 1 to 20 controls, or exceed its rows.
+    for count, cases_shown in ((100, 81), (100, 99), (100, 101)):
+        table.write_text(header + f"af\twith_sv\tall\tall\t{count}\t{cases_shown}\tauc\t0.7\n")
+        with pytest.raises(ValueError, match="control count"):
+            check_exportable(table)
+    table.write_text(header + "af\twith_sv\tall\tall\t100\t100\tauc\t\n")
+    check_exportable(table)
     # A value beside a suppressed count, or beside a count of 0.
     for count in ("suppressed", "0"):
         table.write_text(header + f"ldl\twith_sv\tancestry\tafr\t{count}\t\tr2\t0.1\n")

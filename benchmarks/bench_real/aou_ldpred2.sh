@@ -10,6 +10,8 @@
 # by region.
 # Each fold's fit is kept in $OPS/ldpred2-units as it ends (participant-level held-out scores among them: they stay in
 # the workspace bucket too), so a task preempted here and started again fits only the folds it had not finished.
+# Where an earlier job left $OPS/ldpred2_held_out.npz, the baselines need no R and no fit: aou_ldpred2 --config
+# "$OPS/run_config.json" --from-scores "$OPS/ldpred2_held_out.npz" --baselines "$OPS/baselines" writes them from it.
 set -euo pipefail
 rm -rf "$RUN/renv" && mkdir -p "$RUN/renv"
 tar -xzf "$OPS/../reference/renv.tar.gz" -C "$RUN/renv"

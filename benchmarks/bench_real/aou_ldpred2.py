@@ -19,7 +19,9 @@ partial r^2 and the variant count. Each held-out person's score, by its own mode
 directory (``WorkspaceConfig.baselines``, or ``--baselines``) with the digest of each fitted model's training rows
 (``workspace_pipeline.write_baseline_scores``), where the report compares it with both arms and stacks it with them on
 the same people, resamples and covariates (``partial_r2_tables``). Both are participant-level data, which stay in the
-workspace beside the run's mirror, and which no step stages for export.
+workspace beside the run's mirror, and which no step stages for export. With ``--from-scores`` an earlier run's
+``--scores`` file is written to the baseline directory with no fit (``from_scores``): the report's comparisons with
+LDpred2 need no new LDpred2 job where one already left its scores.
 
 A run that fits regions (``WorkspaceConfig.fit_regions``) has LDpred2 fitted on each region's snv_indel records in
 turn, on the run's one cohort and store, and each line names its region ("region" first); a run without them writes
@@ -229,26 +231,53 @@ def held_out_scores(path: str | pathlib.Path, cohort, regions: Sequence[str], sc
         )
 
 
+def from_scores(path: str | pathlib.Path, cohort, regions: Sequence[tuple[str, object]]) -> np.ndarray:
+    """An earlier run's held-out scores (``held_out_scores``), [regions, cohort rows, traits], refused unless they were
+    written for these regions, cohort rows and traits in this order."""
+    with np.load(path, allow_pickle=False) as saved:
+        if (
+            saved["regions"].tolist() != [name for name, _region in regions] or saved["research_ids"].tolist() != list(cohort.research_ids)
+            or saved["trait_names"].tolist() != list(cohort.trait_names)
+        ):
+            raise ValueError(f"{path} holds another run's regions, cohort rows or traits.")
+        return np.asarray(saved["held_out_score"], dtype=np.float64)
+
+
+def write_baselines(regions: Sequence[tuple[str, object]], cohort, scores: np.ndarray) -> None:
+    """Each region's held-out scores as the report reads a baseline (``write_baseline_scores``): ldpred2_auto.npz in its
+    baseline directory."""
+    for index, (_name, region) in enumerate(regions):
+        path = region.baselines() / "ldpred2_auto.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_baseline_scores(path, cohort, {name: scores[index, :, trait] for trait, name in enumerate(cohort.trait_names)})
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, help="The run config the driver ran (its run directory holds the finished steps).")
-    parser.add_argument("--out", required=True, help="The aggregate table to write (one JSON line per trait).")
-    parser.add_argument("--scores", required=True, help="The held-out people's scores to write (held_out_scores): kept in the workspace.")
+    parser.add_argument("--out", help="The aggregate table to write (one JSON line per trait).")
+    parser.add_argument("--scores", help="The held-out people's scores to write (held_out_scores): kept in the workspace.")
+    parser.add_argument("--from-scores", type=pathlib.Path, help="An earlier run's --scores file, written to the baselines with no fit (from_scores).")
     parser.add_argument(
         "--baselines", type=pathlib.Path,
         help="The baseline directory the report reads (default the run config's, WorkspaceConfig.baselines): ldpred2_auto.npz there, a region's under regions/<name>.",
     )
     parser.add_argument("--units", help="Where each fold's fit is kept as it ends, and found again after a restart (FoldUnits): kept in the workspace.")
     args = parser.parse_args(argv)
+    if args.from_scores is None and (args.out is None or args.scores is None):
+        parser.error("--out and --scores are required unless --from-scores names the scores to write.")
     config = WorkspaceConfig.read(args.config)
     run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
     units = None if args.units is None else FoldUnits(pathlib.Path(args.units), run_identity(run))
     cohort = _fit_cohort(run)
-    measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
-    lines = []
     if args.baselines is not None:
         config = dataclasses.replace(config, baseline_directory=args.baselines)
     regions = config.region_runs() or (("", config),)
+    if args.from_scores is not None:
+        write_baselines(regions, cohort, from_scores(args.from_scores, cohort, regions))
+        return 0
+    measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
+    lines = []
     scores = np.full((len(regions), len(cohort.research_ids), len(cohort.trait_names)), np.nan)
     variants = np.zeros(len(regions), dtype=np.int64)
     with DosageStore.open(_final_store(run)) as store:
@@ -266,10 +295,7 @@ def main(argv: list[str] | None = None) -> int:
                 lines.append(json.dumps({"region": name, **line} if name else line))
                 print(lines[-1], flush=True)
     held_out_scores(args.scores, cohort, [name for name, _region in regions], scores, variants)
-    for index, (_name, region) in enumerate(regions):
-        path = region.baselines() / "ldpred2_auto.npz"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_baseline_scores(path, cohort, {name: scores[index, :, trait] for trait, name in enumerate(cohort.trait_names)})
+    write_baselines(regions, cohort, scores)
     pathlib.Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
 
