@@ -71,12 +71,15 @@ def _panel_run(tmp_path, monkeypatch, weights, primary_fold=1):
         ancestry=["group"] * n, half=["imputed"] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)),
     )
     scores = SimpleNamespace(
-        held_out_linear_predictor=scores_by_arm, held_out_genetic=scores_by_arm, held_out_calibrated_logits=scores_by_arm - 1.0,
+        held_out_linear_predictor=scores_by_arm, held_out_genetic=scores_by_arm, held_out_calibrated_logits=scores_by_arm - 1.0, held_out_structural=None,
     )
     monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
     panel = pipeline.PanelInputs.from_mapping({"primary_fold": primary_fold, "weights": weights}, cohort.trait_names, 3)
-    run = SimpleNamespace(summary=lambda step: {"quarantined": {}}, config=SimpleNamespace(fold_count=3, calibration_fraction=0.1, panel=panel))
+    run = SimpleNamespace(
+        summary=lambda step: {"quarantined": {}}, budget=SimpleNamespace(host_bytes=1 << 28),
+        config=SimpleNamespace(fold_count=3, calibration_fraction=0.1, panel=panel, seed=7, test_fold=None, baselines=lambda: tmp_path / "run" / "baselines"),
+    )
     summary = pipeline._report_step(run, tmp_path)
     with (tmp_path / "panel.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))

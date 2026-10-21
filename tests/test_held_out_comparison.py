@@ -11,9 +11,13 @@ from sklearn.metrics import roc_auc_score
 
 from sv_pgs._typing import NDArray
 from sv_pgs.held_out_comparison import (
+    cluster_bootstrap_counts,
+    cross_fitted_stack,
     logistic_recalibration_coefficients,
+    meta_analysis,
     paired_delta_auc,
     paired_delta_r2,
+    weighted_partial_r2,
 )
 from sv_pgs.probability_calibration import FrozenCalibration, paired_frozen_gain, proper_scores
 
@@ -201,3 +205,141 @@ def test_gates_accept_calibrated_nulls_and_reject_inflated_ones():
     rng = np.random.default_rng(9)
     assert size_gate(rng.standard_normal(2000))
     assert not size_gate(rng.standard_normal(2000) + 0.5)
+
+
+def _residual_r2(target: NDArray, score: NDArray, covariates: NDArray) -> float:
+    """The partial r^2 by residualizing both on the covariates with least squares, row by row."""
+    residuals = [values - covariates @ np.linalg.lstsq(covariates, values, rcond=None)[0] for values in (target, score)]
+    return float(np.corrcoef(*residuals)[0, 1] ** 2)
+
+
+def test_a_weighted_partial_r2_is_the_partial_r2_of_the_rows_repeated_by_their_weights():
+    rng = np.random.default_rng(3)
+    rows = 300
+    # The intercept, an age-like column, its square (thousands) and two principal components (hundredths): scales far
+    # apart, as the trait covariates are.
+    age = rng.uniform(20.0, 80.0, rows)
+    covariates = np.column_stack([np.ones(rows), age, age**2, rng.normal(0.0, 0.01, (rows, 2))])
+    target = 0.02 * age + rng.normal(size=rows)
+    scores = np.vstack([target * 0.3 + covariates[:, 3] * 40.0 + rng.normal(size=rows), rng.normal(size=rows)])
+    unit = weighted_partial_r2(np.ones((1, rows)), covariates, target, scores)[0]
+    np.testing.assert_allclose(unit, [_residual_r2(target, score, covariates) for score in scores], rtol=1e-9)
+    weights = rng.integers(0, 4, size=(3, rows)).astype(np.float64)
+    resampled = weighted_partial_r2(weights, covariates, target, scores)
+    for weight, values in zip(weights, resampled):
+        copies = np.repeat(np.arange(rows), weight.astype(np.int64))
+        np.testing.assert_allclose(values, [_residual_r2(target[copies], score[copies], covariates[copies]) for score in scores], rtol=1e-8)
+
+
+def test_a_weighted_partial_r2_projects_on_the_covariates_a_resample_keeps():
+    rng = np.random.default_rng(4)
+    rows = 200
+    # A duplicated column, and an indicator of five rows that a resample drops whole.
+    indicator = np.zeros(rows)
+    indicator[:5] = 1.0
+    shared = rng.normal(size=rows)
+    covariates = np.column_stack([np.ones(rows), shared, shared, indicator])
+    target, score = rng.normal(size=rows) + indicator * 3.0, rng.normal(size=rows)
+    weights = np.ones((1, rows))
+    weights[0, :5] = 0.0
+    kept = np.arange(5, rows)
+    expected = _residual_r2(target[kept], score[kept], covariates[kept])
+    assert weighted_partial_r2(weights, covariates, target, score[None, :])[0, 0] == pytest.approx(expected, rel=1e-9)
+    # A resample without rows has no partial r^2.
+    assert np.isnan(weighted_partial_r2(np.zeros((1, rows)), covariates, target, score[None, :])[0, 0])
+
+
+def test_cluster_bootstrap_counts_draw_each_stratum_s_clusters_as_many_times_as_it_holds():
+    strata = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2, 2])
+    counts = cluster_bootstrap_counts(strata, 500, np.random.default_rng(5))
+    assert counts.shape == (500, strata.shape[0]) and np.all(counts >= 0) and np.all(counts == np.round(counts))
+    for stratum in range(3):
+        np.testing.assert_array_equal(counts[:, strata == stratum].sum(axis=1), np.sum(strata == stratum))
+    # Each cluster is drawn once per resample on average, and the same seed draws the same resamples.
+    np.testing.assert_allclose(counts.mean(axis=0), 1.0, atol=0.15)
+    np.testing.assert_array_equal(counts, cluster_bootstrap_counts(strata, 500, np.random.default_rng(5)))
+
+
+def test_meta_analysis_is_inverse_variance_and_dersimonian_laird_on_independent_estimates():
+    estimates = np.array([0.010, 0.002, 0.006, -0.001])
+    variances = np.array([4e-6, 1e-6, 9e-6, 2e-6])
+    result = meta_analysis(estimates, np.diag(variances))
+    weights = 1.0 / variances
+    fixed = float(weights @ estimates / weights.sum())
+    assert result.fixed.estimate == pytest.approx(fixed, rel=1e-12)
+    assert result.fixed.standard_error == pytest.approx(weights.sum() ** -0.5, rel=1e-12)
+    q = float(weights @ (estimates - fixed) ** 2)
+    tau = max(0.0, (q - 3) / (weights.sum() - (weights**2).sum() / weights.sum()))
+    assert result.heterogeneity_q == pytest.approx(q, rel=1e-10) and result.tau_squared == pytest.approx(tau, rel=1e-10)
+    assert result.heterogeneity_p == pytest.approx(stats.chi2.sf(q, 3), rel=1e-10) and result.i_squared == pytest.approx((q - 3) / q, rel=1e-10)
+    random_weights = 1.0 / (variances + tau)
+    assert result.random.estimate == pytest.approx(float(random_weights @ estimates / random_weights.sum()), rel=1e-10)
+    assert result.random.standard_error == pytest.approx(random_weights.sum() ** -0.5, rel=1e-10)
+    assert result.positive == 3
+
+
+def test_correlated_estimates_count_less_than_independent_ones_in_the_meta_analysis():
+    estimates = np.array([0.004, 0.006])
+    independent = meta_analysis(estimates, np.diag([1e-6, 1e-6]))
+    correlated = meta_analysis(estimates, np.array([[1e-6, 0.8e-6], [0.8e-6, 1e-6]]))
+    assert correlated.fixed.estimate == pytest.approx(independent.fixed.estimate)
+    # Var of the mean of two estimates with correlation rho is (1 + rho) / 2 of one's.
+    assert correlated.fixed.standard_error == pytest.approx(np.sqrt(1.8e-6 / 2.0), rel=1e-10)
+    assert independent.fixed.standard_error == pytest.approx(np.sqrt(1e-6 / 2.0), rel=1e-10)
+    # Two estimates that move together exactly are one.
+    identical = meta_analysis(np.array([0.004, 0.004]), np.full((2, 2), 1e-6))
+    assert identical.fixed.standard_error == pytest.approx(1e-3, rel=1e-9)
+
+
+def test_correlated_heterogeneity_is_the_moment_equation_under_the_traits_covariance():
+    estimates = np.array([0.012, 0.001, 0.007])
+    covariance = np.array([[4e-6, 1e-6, 0.5e-6], [1e-6, 2e-6, 0.8e-6], [0.5e-6, 0.8e-6, 3e-6]])
+    result = meta_analysis(estimates, covariance)
+    precision = np.linalg.inv(covariance)
+    ones = np.ones(3)
+    information = ones @ precision @ ones
+    residual = precision - np.outer(precision @ ones, precision @ ones) / information
+    q = estimates @ residual @ estimates
+    tau = max(0.0, (q - 2) / np.trace(residual))
+    assert tau > 0.0 and result.tau_squared == pytest.approx(tau, rel=1e-10) and result.heterogeneity_q == pytest.approx(q, rel=1e-10)
+    widened = np.linalg.inv(covariance + tau * np.eye(3))
+    assert result.random.estimate == pytest.approx(ones @ widened @ estimates / (ones @ widened @ ones), rel=1e-10)
+    assert result.random.standard_error == pytest.approx((ones @ widened @ ones) ** -0.5, rel=1e-10)
+    assert result.random.standard_error > result.fixed.standard_error
+
+
+def test_a_meta_analysis_without_information_about_the_mean_is_undefined():
+    # Two estimates that move exactly against each other say nothing about their mean, and a non-finite input nothing at all.
+    opposed = meta_analysis(np.array([0.01, 0.02]), np.array([[1e-6, -1e-6], [-1e-6, 1e-6]]))
+    missing = meta_analysis(np.array([0.01, np.nan]), np.diag([1e-6, 1e-6]))
+    for result in (opposed, missing):
+        assert np.isnan(result.fixed.estimate) and np.isnan(result.random.estimate) and np.isnan(result.heterogeneity_q)
+    assert opposed.positive == 2 and missing.positive == 1
+
+
+def test_cross_fitted_stacking_weights_never_learn_from_the_family_they_score():
+    generator = np.random.default_rng(11)
+    rows = 400
+    families = np.repeat(np.arange(rows // 2), 2)
+    covariates = np.column_stack([np.ones(rows), generator.normal(size=rows)])
+    components = generator.normal(size=(2, rows))
+    target = 0.3 * components[0] + 0.1 * components[1] + 0.2 * covariates[:, 1] + generator.normal(size=rows)
+    stacked = cross_fitted_stack(target, covariates, components, families, 5, np.random.default_rng(3))
+    # The same seed deals the same parts: each part's score is the components weighted by the fit on the other parts.
+    order = np.random.default_rng(3).permutation(np.unique(families))
+    part = {family: index % 5 for index, family in enumerate(order.tolist())}
+    parts = np.array([part[family] for family in families.tolist()])
+    for split in range(5):
+        fitted = parts != split
+        design = np.column_stack([covariates[fitted], components[:, fitted].T])
+        weights = np.linalg.lstsq(design, target[fitted], rcond=None)[0][2:]
+        np.testing.assert_allclose(stacked[parts == split], weights @ components[:, parts == split], rtol=1e-10)
+    # A family's own outcome never moves its own score.
+    changed = target.copy()
+    changed[families == 7] += 50.0
+    restacked = cross_fitted_stack(changed, covariates, components, families, 5, np.random.default_rng(3))
+    np.testing.assert_allclose(restacked[families == 7], stacked[families == 7], rtol=1e-10)
+    assert not np.allclose(restacked[parts != parts[14]], stacked[parts != parts[14]])
+    # A row with no outcome is neither fitted nor scored.
+    changed[0] = np.nan
+    assert np.isnan(cross_fitted_stack(changed, covariates, components, families, 5, np.random.default_rng(3))[0])

@@ -109,7 +109,12 @@ def test_the_binary_ldpred2_row_uses_the_workspace_case_suppression(tmp_path: Pa
     cohort.targets[-20:] = 1.0
     monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", lambda *args: pytest.fail("suppressed cell"))
     result, rows, _scores = aou_ldpred2.ldpred2_trait(store, np.arange(30), cohort, 0)
-    assert result["held_out_rows"] == 100 and result["pgs_partial_r2"] is None and rows.shape == (0,)
+    assert result["held_out_rows"] == 100 and result["cases"] == "suppressed" and result["pgs_partial_r2"] is None and rows.shape == (0,)
+    # 40 cases and 60 controls are both shown.
+    cohort.targets[-40:] = 1.0
+    monkeypatch.setattr(aou_ldpred2.ldpred2_auto_allvar, "posterior_effects", lambda train, rows: (np.zeros(rows.shape[0]), np.ones(rows.shape[0])))
+    result, rows, _scores = aou_ldpred2.ldpred2_trait(store, np.arange(30), cohort, 0)
+    assert result["cases"] == "40" and result["pgs_partial_r2"] is not None and sorted(rows.tolist()) == np.flatnonzero(cohort.held_out[:, 0]).tolist()
 
 
 def test_cross_fit_baseline_uses_each_held_out_models_training_rows_and_fold_weights(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -277,6 +277,149 @@ def panel_z(per_trait_z: NDArray, weights: NDArray, correlation: NDArray) -> flo
     return float(weights @ per_trait_z) / math.sqrt(spread)
 
 
+def cluster_bootstrap_counts(cluster_strata: NDArray, resamples: int, generator: np.random.Generator) -> NDArray:
+    """[resamples, clusters]: how often each cluster (family, coded 0..C-1, ``cluster_strata`` its stratum) is drawn
+    when every stratum's clusters are drawn with replacement, as many as the stratum holds.
+
+    A family is the resampling unit, as in every clustered variance here, and a fold is a stratum, so each resample
+    keeps every fold's family count and a fold's own model still scores only its own fold. Drawn for the whole cohort
+    at once, one resample weights every trait's held-out people together, so the traits' statistics are resampled
+    jointly and their covariance across traits is read from the same resamples."""
+    strata = np.asarray(cluster_strata)
+    counts = np.zeros((resamples, strata.shape[0]))
+    for stratum in np.unique(strata):
+        members = np.flatnonzero(strata == stratum)
+        draws = generator.integers(0, members.shape[0], size=(resamples, members.shape[0]))
+        # One bincount over every resample: resample r's draws offset by r times the stratum's size.
+        offsets = draws + members.shape[0] * np.arange(resamples)[:, None]
+        counts[:, members] = np.bincount(offsets.ravel(), minlength=resamples * members.shape[0]).reshape(resamples, members.shape[0])
+    return counts
+
+
+def column_basis(columns: NDArray) -> NDArray:
+    """An orthonormal basis of the span of ``columns`` (rows x columns), its rank read at numpy's matrix_rank
+    tolerance (the largest singular value times max(rows, columns) times eps)."""
+    left, singular, _right = np.linalg.svd(np.asarray(columns, dtype=np.float64), full_matrices=False)
+    rank = int(np.sum(singular > singular.max(initial=0.0) * max(left.shape[0], singular.shape[0]) * np.finfo(np.float64).eps))
+    return left[:, :rank]
+
+
+def weighted_partial_r2(weights: NDArray, covariates: NDArray, target: NDArray, scores: NDArray) -> NDArray:
+    """[resamples, scores]: each score's partial r^2 with the target given the covariates (whose span holds the
+    intercept), with every row of resample r weighted by ``weights[r]`` (a row drawn w times is w copies of it).
+
+    The squared partial correlation is read from the weighted Gram of [Q, target, scores], Q an orthonormal basis of
+    the covariates on the unweighted rows (``column_basis``): with A = Q'WQ, B = Q'W[target, scores] and D their own
+    block, S = D - B'A^+B is the residual cross-product of target and scores after the weighted projection on the
+    covariates, so the partial r^2 of score m is S_0m^2 / (S_00 S_mm), the squared correlation of the two residuals
+    (``workspace_pipeline._partial_r2`` at unit weights). One matrix product forms every resample's Gram. Q rather than
+    the raw covariates keeps A near the identity times the weight total whatever the covariates' scales (age squared
+    beside principal components), so S keeps its precision where a score is mostly explained by the covariates; a
+    resample that drops every row a basis direction rests on leaves A singular there, and the pseudo-inverse projects
+    on the rest. A residual without variance has no partial r^2 (NaN)."""
+    basis = column_basis(covariates)
+    data = np.column_stack([basis, np.asarray(target, dtype=np.float64), np.atleast_2d(np.asarray(scores, dtype=np.float64)).T])
+    size, width = data.shape[1], basis.shape[1]
+    gram = (np.atleast_2d(np.asarray(weights, dtype=np.float64)) @ (data[:, :, None] * data[:, None, :]).reshape(data.shape[0], size * size)).reshape(-1, size, size)
+    cross = gram[:, :width, width:]
+    residual = gram[:, width:, width:] - np.swapaxes(cross, 1, 2) @ np.linalg.pinv(gram[:, :width, :width], hermitian=True) @ cross
+    target_variance = residual[:, 0, 0]
+    score_variance = np.diagonal(residual, axis1=1, axis2=2)[:, 1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        result = residual[:, 0, 1:] ** 2 / (target_variance[:, None] * score_variance)
+    result[~((target_variance[:, None] > 0.0) & (score_variance > 0.0))] = np.nan
+    return result
+
+
+@dataclass(frozen=True)
+class MetaAnalysis:
+    """A meta-analysis of per-trait estimates of one quantity: the fixed effect, the random effects, heterogeneity, and
+    how many estimates are positive (``meta_analysis``)."""
+
+    fixed: PairedComparison
+    random: PairedComparison
+    heterogeneity_q: float
+    heterogeneity_p: float
+    i_squared: float
+    tau_squared: float
+    positive: int
+
+
+def meta_analysis(estimates: NDArray, covariance: NDArray) -> MetaAnalysis:
+    """The common effect of per-trait ``estimates`` with sampling ``covariance`` (traits x traits; diagonal where the
+    traits' estimates are taken as independent).
+
+    Fixed effect: the generalized least-squares mean 1'S^-1 e / 1'S^-1 1, standard error (1'S^-1 1)^-1/2, so traits
+    resampled on the same people (``cluster_bootstrap_counts``) count with their correlation; S^-1 is the pseudo-inverse,
+    so two traits whose estimates move together exactly count once. Heterogeneity: Cochran's Q = e'Pe on k - 1 degrees
+    of freedom, P = S^-1 - S^-1 1 1'S^-1 / 1'S^-1 1 the residual precision about the fixed effect, and
+    I^2 = (Q - (k - 1)) / Q floored at 0 (Higgins and Thompson 2002). Random effects: tau^2 by the moment estimator
+    (Q - (k - 1)) / tr(P) floored at 0, DerSimonian and Laird's (1986) where S is diagonal and the same moment equation
+    with the traits' correlation where it is not, then the generalized least-squares mean under S + tau^2 I. Where S
+    carries no information about the mean (1'S^-1 1 not positive and finite, as for two traits whose estimates move
+    exactly against each other) or holds a non-finite value, nothing is estimated (NaN). ``positive`` counts the
+    positive estimates, descriptive only: correlated traits' signs are not independent trials."""
+    estimates = np.asarray(estimates, dtype=np.float64)
+    covariance = np.atleast_2d(np.asarray(covariance, dtype=np.float64))
+    count = estimates.shape[0]
+    ones = np.ones(count)
+    undefined = comparison_from_estimate(math.nan, math.nan)
+    positive = int(np.sum(estimates > 0.0))
+    if not (np.all(np.isfinite(covariance)) and np.all(np.isfinite(estimates))):
+        return MetaAnalysis(undefined, undefined, math.nan, math.nan, math.nan, math.nan, positive)
+
+    def generalized_mean(matrix: NDArray) -> tuple[PairedComparison, NDArray, float]:
+        precision = np.linalg.pinv(matrix, hermitian=True)
+        inverse_ones = precision @ ones
+        information = float(ones @ inverse_ones)
+        if not (math.isfinite(information) and information > 0.0):
+            return undefined, precision, information
+        return comparison_from_estimate(float(inverse_ones @ estimates) / information, math.sqrt(1.0 / information)), precision, information
+
+    fixed, precision, information = generalized_mean(covariance)
+    if not math.isfinite(fixed.estimate):
+        return MetaAnalysis(undefined, undefined, math.nan, math.nan, math.nan, math.nan, positive)
+    inverse_ones = precision @ ones
+    residual_precision = precision - np.outer(inverse_ones, inverse_ones) / information
+    q = float(estimates @ residual_precision @ estimates)
+    degrees = count - 1
+    spread = float(np.trace(residual_precision))
+    tau_squared = max(0.0, (q - degrees) / spread) if spread > 0.0 else 0.0
+    return MetaAnalysis(
+        fixed=fixed,
+        random=generalized_mean(covariance + tau_squared * np.eye(count))[0],
+        heterogeneity_q=q,
+        heterogeneity_p=float(stats.chi2.sf(q, degrees)) if degrees > 0 else math.nan,
+        i_squared=max(0.0, (q - degrees) / q) if q > 0.0 else 0.0,
+        tau_squared=tau_squared,
+        positive=positive,
+    )
+
+
+def cross_fitted_stack(target: NDArray, covariates: NDArray, components: NDArray, groups: NDArray, splits: int, generator: np.random.Generator) -> NDArray:
+    """One score from several (``components``, [components, rows]), each row's own from weights it did not train: the
+    rows' ``groups`` (families) are dealt into ``splits`` parts at random, and part j's rows take the component
+    coefficients of the least-squares fit of ``target`` on [covariates, components] over the other parts' rows. The
+    stacked score of a row is its components weighted so; the covariates' coefficients are left out, as a genetic score
+    is read given them. A family stays in one part, so no row's weights learned from its relatives. Rows with a
+    non-finite target or component are neither fitted nor scored (NaN)."""
+    components = np.atleast_2d(np.asarray(components, dtype=np.float64))
+    usable = np.isfinite(target) & np.all(np.isfinite(components), axis=0) & np.all(np.isfinite(covariates), axis=1)
+    stacked = np.full(target.shape[0], np.nan)
+    families = np.unique(np.asarray(groups)[usable])
+    part_of = dict(zip(generator.permutation(families).tolist(), (np.arange(families.shape[0]) % splits).tolist()))
+    parts = np.array([part_of.get(int(group), -1) for group in np.asarray(groups).tolist()])
+    for part in range(min(splits, families.shape[0])):
+        scored = usable & (parts == part)
+        fitted = usable & (parts != part)
+        if not scored.any() or not fitted.any():
+            continue
+        design = np.column_stack([covariates[fitted], components[:, fitted].T])
+        coefficients = np.linalg.lstsq(design, target[fitted], rcond=None)[0][covariates.shape[1] :]
+        stacked[scored] = coefficients @ components[:, scored]
+    return stacked
+
+
 def hommel_adjusted(p_values: NDArray) -> NDArray:
     """Hommel family-wise adjusted p-values (valid under positive dependence)."""
     p_values = np.asarray(p_values, dtype=np.float64)

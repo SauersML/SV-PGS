@@ -14,7 +14,8 @@ The template is read from outside the repository and nothing of it is committed:
 of Us results) must not enter this public repository. Its header, University of Minnesota wordmark and section bars are
 kept; every text box, figure and caption is replaced, all in Arial at one size and in black outside the header and
 bars. The author line and affiliations come from authors.local beside this file, untracked, so no personal name is
-committed. The figures come from figures.py.
+committed. The figures come from figures.py, and the All of Us ones from aou_results.py (``--out`` this figures
+directory) once a run's tables are exported.
 
 Placeholders: a figure the simulation or All of Us runs will supply is a dashed "placeholder" panel (figures.py); a
 number they will supply is a bracketed bold run in the text, e.g. "[x%]". The simulation's numbers and the verbs that
@@ -492,6 +493,10 @@ def build() -> None:
         figures["architectures"] = "fig_sim_architectures.png"
     if (FIGURES / "fig_sim_window.png").is_file():
         figures["window"] = "fig_sim_window.png"
+    # the All of Us figures, once aou_results.py has drawn them from a run's exported tables into this directory
+    for key, name in (("hypertension", "fig_aou_effects.png"), ("diseases", "fig_aou_diseases.png")):
+        if (FIGURES / name).is_file():
+            figures[key] = name
     ids = {}
     for index, (key, name) in enumerate(figures.items()):
         target = f"svpgs_{name}"
@@ -632,10 +637,12 @@ def build() -> None:
     xml = column.bar(xml, 119)
     xml = column.text(xml, 128, HYPERTENSION)
     xml = column.figure(xml, 121, "hypertension")
-    xml = column.caption(xml, 124, "SV effects on hypertension")
+    xml = column.caption(xml, 124, "SV effects on hypertension" if figures["hypertension"].startswith("ph_")
+                         else "SV effect variance relative to SNVs on hypertension, by SV class and length")
     xml = column.text(xml, 129, DISEASES)
     xml = column.figure(xml, 122, "diseases")
-    xml = column.caption(xml, 125, "Test AUC by disease")
+    xml = column.caption(xml, 125, "Test AUC by disease" if figures["diseases"].startswith("ph_")
+                         else "Held-out partial r² by disease, and the gain from adding SVs (95% CI)")
     xml = column.bar(xml, 95)
     xml = column.text(xml, 109, DISCUSSION)
     xml = column.bar(xml, 96)

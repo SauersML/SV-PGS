@@ -26,11 +26,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from sv_pgs import all_of_us, held_out_comparison
 from sv_pgs.all_of_us import DISEASE_DEFINITIONS, MEASUREMENT_EXCLUSION_REASONS, build_all_of_us_measurement_sql
 from sv_pgs.cohort import pipeline_half_levels
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.config import TraitType, VariantClass
 from sv_pgs.dosage_store import VARIANT_CLASS_LEGEND, VARIANT_CLASSES, DosageStore, HalfSamples, VariantTable, encode_dosage_milli
+from sv_pgs.draw_laws import ProductMixtureDraws
 from sv_pgs.fast_scoring import (
     ScoringModel,
     ScoringPlan,
@@ -1391,6 +1393,37 @@ def test_a_single_split_fits_one_model_per_trait_and_reports_its_test_fold_alone
         rows = list(csv.DictReader(handle, delimiter="\t"))
     assert {row["level"] for row in rows if row["cell"] == "fold"} == {"0"}
     assert all(row["value"] != "nan" for row in rows if row["cell"] == "all" and row["value"])
+    # A baseline's held-out scores placed in the run make the report again with the baseline beside both arms, on the
+    # same people and covariates; nothing upstream is redone, and every table the report lists passes the export check.
+    loaded = workspace_pipeline._read_cohort(workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {}))
+    genetic = np.load(run / "score" / "predictions.npz")["held_out_genetic"]
+    noise = np.random.default_rng(3).normal(size=genetic.shape[1])
+    (run / workspace_pipeline.BASELINE_DIRECTORY).mkdir()
+    workspace_pipeline.write_baseline_scores(
+        run / workspace_pipeline.BASELINE_DIRECTORY / "ldpred2_auto.npz", loaded,
+        {name: genetic[0, :, trait] + noise for trait, name in enumerate(loaded.trait_names)},
+    )
+    scored = _completed_at(run, "score")
+    recorder = _Recorder()
+    summaries = run_pipeline(config, _bindings(recorder, client), BUDGET)
+    assert not recorder.fit_calls and _completed_at(run, "score") == scored and summaries["report"]["baselines"] == ["ldpred2_auto"]
+    assert summaries["report"]["baselines_refused"] == {} and summaries["report"]["baselines_incomplete"] == []
+    partial = pd.read_csv(run / "report" / "partial_r2.tsv", sep="\t", dtype=str, keep_default_na=False)
+    stacks = {"ldpred2_auto+with_sv", "ldpred2_auto+structural"}
+    assert set(partial["method"]) == {*ARMS, "ldpred2_auto", *stacks} and set(partial["cell"]) == {"all", "ancestry"}
+    paired = pd.read_csv(run / "report" / "paired_differences.tsv", sep="\t", dtype=str, keep_default_na=False)
+    assert set(zip(paired["candidate"], paired["baseline"])) == {
+        ("with_sv", "snv_indel"), ("with_sv", "ldpred2_auto"), ("snv_indel", "ldpred2_auto"), *((stack, "ldpred2_auto") for stack in stacks),
+    }
+    # The stacks' weights are cross-fitted within the test fold: each stack is finite wherever the baseline is read.
+    shown = partial[(partial["cell"] == "all") & (partial["partial_r2"] != "")]
+    assert set(shown.groupby("trait")["method"].apply(frozenset)) <= {frozenset({*ARMS, "ldpred2_auto", *stacks})}
+    assert summaries["report"]["files"] == [
+        "accuracy.tsv", "comparison.tsv", "quarantined.tsv", "uncertified.tsv", "partial_r2.tsv", "paired_differences.tsv", "meta_analysis.tsv",
+        "trait_covariance.tsv", "heterogeneity.tsv",
+    ]
+    for name in summaries["report"]["files"]:
+        check_exportable(run / "report" / name)
     # The cross-fitting default keeps its cohort key, so its runs are not redone.
     assert WorkspaceConfig.from_mapping(synthetic.raw).cross_fit and WorkspaceConfig.from_mapping(synthetic.raw).model_folds() == (0, 1, 2)
 
@@ -2090,3 +2123,499 @@ def test_an_entirely_unscorable_fit_finishes_with_only_quarantine_rows(workspace
     assert summary["effects"]["variant_tables"].startswith("0 ")
     assert (config.run_directory / "report" / "accuracy.tsv").read_text().splitlines() == ["\t".join(workspace_pipeline.ACCURACY_COLUMNS)]
     assert (config.run_directory / "export" / COMPLETE_FILE).is_file()
+
+
+def test_a_validation_split_tests_another_fold_and_reuses_every_step_before_the_fit(workspace) -> None:
+    """test_fold: each trait's model trains on neither the reserved fold 0 nor the test fold and is scored on the test
+    fold; the steps before the fit keep their keys, so the final split reuses them and refits."""
+    synthetic, client = workspace
+    raw = {**synthetic.raw, "cross_fit": False, "panel": None, "fold_count": 3}
+    for change, message in (({"test_fold": 0}, "test_fold must be a fold"), ({"test_fold": 3}, "test_fold must be a fold"),
+                            ({"fold_count": 2, "test_fold": 1}, "fold_count >= 3"), ({"cross_fit": True, "test_fold": 1}, "cross_fit false"),
+                            ({"test_fold": True}, "cross_fit false"), ({"locus_panel": ""}, "locus_panel must be a path")):
+        with pytest.raises(ValueError, match=message):
+            WorkspaceConfig.from_mapping({**raw, **change})
+    panel = synthetic.raw["run_directory"] + "_panel.json"
+    names = [*synthetic.raw["diseases"], *synthetic.raw["traits"]]
+    chromosome = workspace_pipeline.chromosome_number(synthetic.raw["chromosomes"][0])
+    Path(panel).write_text(json.dumps({"loci": [{"name": "whole", "kind": "control", "chromosome": chromosome, "start": 0, "end": 10**9, "traits": names}]}))
+    config = WorkspaceConfig.from_mapping({**raw, "test_fold": 1, "locus_panel": panel})
+    summaries = run_pipeline(config, _bindings(_Recorder(), client), BUDGET)
+    run = config.run_directory
+    # The cohort step's masks are the final split's; every step after the ones before the fit reads the validation split.
+    stored = np.load(run / "cohort" / "cohort.npz")
+    np.testing.assert_array_equal(stored["held_out"], np.isfinite(stored["targets"]) & (stored["folds"] == 0)[:, None])
+    cohort = workspace_pipeline._read_cohort(workspace_pipeline._Run(config, _bindings(_Recorder(), client), BUDGET, {}))
+    assert not np.any(cohort.training & np.isin(cohort.folds, (0, 1))[:, None]) and np.any(cohort.training)
+    np.testing.assert_array_equal(cohort.held_out, np.isfinite(cohort.targets)[:, cohort.model_traits] & (cohort.folds == 1)[:, None])
+    assert cohort.model_names == tuple(f"{cohort.trait_names[trait]}/fold1" for trait in cohort.model_traits.tolist())
+    with (run / "report" / "accuracy.tsv").open() as handle:
+        assert {row["level"] for row in csv.DictReader(handle, delimiter="\t") if row["cell"] == "fold"} == {"1"}
+    # The panel's window, per trait and arm, in the effects step's tables.
+    locus = pd.read_csv(run / "effects" / "locus_variance.tsv", sep="\t", dtype=str, keep_default_na=False)
+    whole = locus[locus["variant_class"] == "all"]
+    assert set(zip(whole["trait"], whole["arm"])) == {(name, arm) for name in names for arm in ARMS} - {
+        (name, arm) for name in summaries["score"]["quarantined"] for arm in ARMS
+    }
+    check_exportable(run / "effects" / "locus_variance.tsv")
+    # The final split reuses every step before the fit and refits.
+    reused = [step for step in workspace_pipeline.GENOTYPE_STEPS if (run / step / "_COMPLETE.json").is_file()]
+    assert {"store", "cohort", "measurement"} <= set(reused)
+    before = {step: _completed_at(run, step) for step in reused}
+    recorder = _Recorder()
+    run_pipeline(dataclasses.replace(config, test_fold=None), _bindings(recorder, client), BUDGET)
+    assert {step: _completed_at(run, step) for step in reused} == before and recorder.fit_calls
+
+
+def test_locus_variance_sums_a_window_s_records_by_class_and_leaves_out_those_with_few_carriers(tmp_path: Path) -> None:
+    panel = tmp_path / "panel.json"
+    panel.write_text(json.dumps({"loci": [
+        {"name": "apoe", "kind": "sv_candidate", "chromosome": 19, "start": 100, "end": 200, "traits": ["ldl_cholesterol"]},
+        {"name": "other", "kind": "snv_control", "chromosome": 1, "start": 0, "end": 10, "traits": ["asthma"]},
+    ]}))
+    loci = workspace_pipeline.read_locus_panel(panel)
+    chromosomes, positions = np.array([19, 19, 19, 19, 19, 1]), np.array([100, 150, 160, 200, 201, 5])
+    classes = np.array(["snv", "snv", "deletion", "deletion", "snv", "snv"], dtype=object)
+    second = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    carriers = np.array([500.0, 10.0, 300.0, 20.5, 500.0, 500.0])
+
+    def rows() -> dict[str, dict]:
+        lines = workspace_pipeline.locus_variance("ldl_cholesterol", "with_sv", loci, chromosomes, positions, classes, second, carriers)
+        return {line[7]: dict(zip(workspace_pipeline.LOCUS_VARIANCE_COLUMNS, line)) for line in lines}
+
+    found = rows()
+    assert list(found) == ["deletion", "snv", "all"] and {row["locus"] for row in found.values()} == {"apoe"}
+    # The SNV with 10 expected carriers and the deletion with 20.5 are counted as left out, and in no value.
+    assert (found["snv"]["variants"], found["snv"]["rare_left_out"], found["snv"]["genetic_variance"]) == (1, 1, "1")
+    assert (found["deletion"]["variants"], found["deletion"]["rare_left_out"], found["deletion"]["genetic_variance"]) == (1, 1, "3")
+    assert found["all"]["genetic_variance"] == "4" and float(found["all"]["genome_share"]) == pytest.approx(4.0 / 21.0, rel=1e-5)
+    assert float(found["deletion"]["window_share"]) == pytest.approx(0.75, rel=1e-5)
+    with (tmp_path / "locus_variance.tsv").open("w", newline="") as handle:
+        csv.writer(handle, delimiter="\t").writerows([workspace_pipeline.LOCUS_VARIANCE_COLUMNS, *(tuple(row.values()) for row in found.values())])
+    check_exportable(tmp_path / "locus_variance.tsv")
+    # A class of rare records alone shows no value.
+    carriers[2] = 5.0
+    assert rows()["deletion"]["genetic_variance"] == rows()["deletion"]["window_share"] == "" and rows()["deletion"]["rare_left_out"] == 2
+    panel.write_text(json.dumps({"loci": [{"name": "bad", "kind": "control", "chromosome": 1, "start": 10, "end": 5, "traits": []}]}))
+    with pytest.raises(ValueError, match="start <= end"):
+        workspace_pipeline.read_locus_panel(panel)
+
+
+def test_a_grouping_hides_the_levels_the_all_cell_would_give_back() -> None:
+    # A level of 15 is hidden, and the next smallest with it, so the total less the shown levels is 0 or at least 21.
+    assert workspace_pipeline.suppressed_levels({"eur": (1000,), "amr": (15,), "afr": (385,)}) == {"amr", "afr"}
+    assert workspace_pipeline.suppressed_levels({"eur": (1000,), "amr": (0,), "afr": (385,)}) == set()
+    # A disease's cases are a partition of their own: 10 cases hide a level of 100 people.
+    assert workspace_pipeline.suppressed_levels({"eur": (500, 200, 300), "afr": (100, 10, 90), "sas": (400, 150, 250)}) == {"afr", "sas"}
+    # One count at a time, the rule is all_of_us.reportable_partition's.
+    parts = {"a": 12, "b": 30, "c": 25, "d": 400, "e": 0}
+    expected = {name for name, text in all_of_us.reportable_partition("467", parts).items() if text == "suppressed"}
+    assert workspace_pipeline.suppressed_levels({name: (count,) for name, count in parts.items()}) == expected == {"a", "c"}
+    observed = np.ones(1000, dtype=bool)
+    ancestry = np.array(["eur"] * 600 + ["afr"] * 385 + ["amr"] * 15)
+    cells = workspace_pipeline.held_out_cells(observed, np.zeros(1000, dtype=np.int64), (0,), {"ancestry": ancestry})
+    assert [(cell, level, held.count) for cell, level, held in cells] == [("all", "all", 1000), ("fold", "0", 1000), ("ancestry", "afr", 385), ("ancestry", "amr", 15), ("ancestry", "eur", 600)]
+    targets = np.zeros(1000)
+    assert workspace_pipeline._partition_hidden(cells, targets, False) == {("ancestry", "amr"): "rows", ("ancestry", "afr"): "rows"}
+    # Without the small level, a disease's 5 cases among the afr group hide its cases and the other group's with them.
+    ancestry[-15:] = "eur"
+    targets[600:605], targets[:300] = 1.0, 1.0
+    cells = workspace_pipeline.held_out_cells(observed, np.zeros(1000, dtype=np.int64), (0,), {"ancestry": ancestry})
+    assert workspace_pipeline._partition_hidden(cells, targets, True) == {("ancestry", "afr"): "cases", ("ancestry", "eur"): "cases"}
+    assert workspace_pipeline._partition_hidden(cells, targets, False) == {}
+    assert workspace_pipeline._hidden_counts(385, True, "cases") == ("385", "suppressed") and workspace_pipeline._hidden_counts(385, True) == ("suppressed", "suppressed")
+
+
+def test_export_refuses_a_table_without_a_rule_and_counts_the_shown_ones_would_give_back(tmp_path: Path) -> None:
+    unknown = tmp_path / "per_person.tsv"
+    unknown.write_text("trait\tvalue\nldl\t0.1\n")
+    with pytest.raises(ValueError, match="no export rule"):
+        check_exportable(unknown)
+    table = tmp_path / "accuracy.tsv"
+    header = "trait\tarm\tcell\tlevel\tn\tcases\tmetric\tvalue\n"
+    rows = ["ldl\twith_sv\tall\tall\t1000\t\tr2\t0.1", "ldl\twith_sv\tancestry\teur\t600\t\tr2\t0.1", "ldl\twith_sv\tancestry\tafr\t385\t\tr2\t0.1"]
+    # The all cell less the shown levels is the hidden level's 15 people.
+    table.write_text(header + "\n".join([*rows, "ldl\twith_sv\tancestry\tamr\t1-20 (suppressed)\t\tr2\t"]) + "\n")
+    with pytest.raises(ValueError, match="all cell less the ancestry levels"):
+        check_exportable(table)
+    hidden = ["ldl\twith_sv\tancestry\tafr\tsuppressed\t\tr2\t", "ldl\twith_sv\tancestry\tamr\t1-20 (suppressed)\t\tr2\t"]
+    table.write_text(header + "\n".join([*rows[:2], *hidden]) + "\n")
+    check_exportable(table)
+    # The arms are read apart: the snv_indel rows do not count against with_sv's.
+    table.write_text(header + "\n".join([*rows[:2], *hidden, *(row.replace("with_sv", "snv_indel") for row in (rows[0], rows[1], *hidden))]) + "\n")
+    check_exportable(table)
+    # A disease's cases: 300 in all, 290 shown in the levels, leave 10.
+    cases = [
+        "af\twith_sv\tall\tall\t1000\t300\tauc\t0.7", "af\twith_sv\tancestry\teur\t600\t200\tauc\t0.7",
+        "af\twith_sv\tancestry\tafr\t400\t90\tauc\t0.7",
+    ]
+    table.write_text(header + "\n".join(cases) + "\n")
+    with pytest.raises(ValueError, match="all cell less"):
+        check_exportable(table)
+    # A value beside a suppressed count, or beside a count of 0.
+    for count in ("suppressed", "0"):
+        table.write_text(header + f"ldl\twith_sv\tancestry\tafr\t{count}\t\tr2\t0.1\n")
+        with pytest.raises(ValueError, match="suppressed cell shows a value"):
+            check_exportable(table)
+    # A record count's shown parts leave a rest of 1 to 20 (the bin's records with a mean of exactly 0).
+    effects = tmp_path / "effects_by_class.tsv"
+    columns = "\t".join(workspace_pipeline.EFFECT_SUMMARY_COLUMNS)
+    effects.write_text(f"{columns}\nldl\twith_sv\tdeletion\t50-499\t100\t50\t35\t50\t35\t0.1\t0.1\t0.1\n")
+    with pytest.raises(ValueError, match="parts of variants"):
+        check_exportable(effects)
+    effects.write_text(f"{columns}\nldl\twith_sv\tdeletion\t50-499\t100\tsuppressed\tsuppressed\t50\t35\t0.1\t0.1\t0.1\n")
+    check_exportable(effects)
+
+
+def test_the_jackknife_ratio_deletes_each_contiguous_block_in_turn() -> None:
+    generator = np.random.default_rng(12)
+    values = generator.gamma(2.0, size=103)
+    member, reference = generator.random(103) < 0.3, generator.random(103) < 0.5
+    estimate, standard_error, blocks = workspace_pipeline.jackknife_ratio(values, member, reference, 10)
+    assert blocks == 10 and estimate == pytest.approx(values[member].mean() / values[reference].mean(), rel=1e-12)
+    edges = np.linspace(0, 103, 11).astype(np.int64)
+    deleted = []
+    for block in range(10):
+        kept = np.ones(103, dtype=bool)
+        kept[edges[block] : edges[block + 1]] = False
+        deleted.append(values[member & kept].mean() / values[reference & kept].mean())
+    assert standard_error == pytest.approx(np.sqrt(9 / 10 * np.sum((np.array(deleted) - np.mean(deleted)) ** 2)), rel=1e-10)
+    # More blocks than rows: a block a row.
+    assert workspace_pipeline.jackknife_ratio(values[:5], np.ones(5, dtype=bool), np.ones(5, dtype=bool), 10)[2] == 5
+    # A set within one block empties when it is deleted: no error is given.
+    alone = np.zeros(103, dtype=bool)
+    alone[:3] = True
+    assert np.isnan(workspace_pipeline.jackknife_ratio(values, alone, reference, 10)[1])
+
+
+def _mixture_law(classes: np.ndarray, log_scale: np.ndarray, log_density: np.ndarray, grid: np.ndarray) -> ProductMixtureDraws:
+    members = classes.shape[0]
+    return ProductMixtureDraws(
+        class_index=classes, log_scale=log_scale, log_density=log_density, log_variance_grid=grid, shift=np.zeros((1, members)),
+        omega=np.zeros((1, members)), weights=np.ones(1), key=(1, 2), draw_count=4,
+    )
+
+
+def test_the_prior_moments_are_those_of_the_fitted_scale_mixture() -> None:
+    generator = np.random.default_rng(13)
+    grid = np.linspace(-12.0, -4.0, 6)
+    log_density = np.log(generator.dirichlet(np.ones(6), size=2))
+    classes = np.array([0, 0, 1, 1, 1])
+    log_scale = generator.normal(0.0, 0.5, 5)
+    unit = generator.uniform(0.5, 2.0, 5)
+    moments = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=_mixture_law(classes, log_scale, log_density, grid)), unit)
+    density = np.exp(log_density[classes])
+    np.testing.assert_allclose(moments.variance, np.exp(log_scale) * (density * np.exp(grid)).sum(axis=1), rtol=1e-12)
+    # beta ~ sum_k pi_k N(0, u e^t_k): E|beta| per unit, against draws of the mixture.
+    member = 3
+    nodes = generator.choice(6, size=400_000, p=density[member])
+    draws = generator.normal(size=nodes.shape[0]) * np.sqrt(np.exp(log_scale[member] + grid[nodes]))
+    assert moments.absolute_effect[member] == pytest.approx(np.abs(draws).mean() * unit[member], rel=0.01)
+    assert moments.variance[member] == pytest.approx(np.mean(draws**2), rel=0.05)
+    # Dense draws hold no prior.
+    assert workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=np.zeros((5, 4))), unit) is None
+
+
+def test_effect_summaries_give_the_prior_by_class_and_length_and_hide_what_would_count_few_records(tmp_path: Path) -> None:
+    generator = np.random.default_rng(14)
+    # 300 SNVs; 60 short deletions, 50 of 50-499 bp and 8 of 500-4999 bp; 30 insertions; 10 duplications.
+    names = ["snv"] * 300 + ["deletion"] * 118 + ["insertion"] * 30 + ["duplication"] * 10
+    lengths = np.r_[np.ones(300), np.full(60, 5.0), generator.uniform(60.0, 400.0, 50), generator.uniform(600.0, 3000.0, 8),
+                    generator.uniform(60.0, 300.0, 30), np.full(10, 2000.0)]
+    classes = np.array(names, dtype=object)
+    bins = workspace_pipeline.length_bins(lengths)
+    count = classes.shape[0]
+    mean = np.abs(generator.normal(0.0, 0.01, count))
+    mean[:10] *= -1.0
+    effects = workspace_pipeline.VariantEffects(np.arange(count, dtype=np.int64), mean, np.full(count, 0.01), np.full(count, 0.6), np.full(count, 0.4))
+    unit = generator.uniform(0.5, 2.0, count)
+    # The prior grows with log length, and deletions start above SNVs.
+    legend = ["snv", "deletion", "insertion", "duplication"]
+    class_index = np.array([legend.index(name) for name in names])
+    grid = np.linspace(-12.0, -4.0, 6)
+    law = _mixture_law(class_index, 0.3 * np.log(lengths) + 0.5 * (class_index == 1), np.log(generator.dirichlet(np.ones(6), size=4)), grid)
+    prior = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=law), unit)
+    lines = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, prior)
+
+    by_class = {(line[2], line[3]): line for line in lines["effects_by_class.tsv"]}
+    # The 8 long deletions are hidden, and the next smallest of the deletions' bins with them; the duplications are
+    # hidden, and with them the insertions, the next smallest part of every structural record.
+    assert by_class["deletion", "500-4999"][4:6] == ("1-20 (suppressed)", "") and by_class["deletion", "50-499"][4:6] == ("suppressed", "")
+    assert by_class["deletion", "<50"][4] == 60 and by_class["insertion", "50-499"][4] == "suppressed"
+    assert by_class["duplication", "500-4999"][4] == "1-20 (suppressed)"
+    # 10 negative means hide the negative count, and the positive one with it.
+    assert by_class["snv", "<50"][4:7] == (300, "suppressed", "suppressed")
+    correlation = {(line[2], line[4]): line for line in lines["effect_length_correlation.tsv"]}
+    assert correlation["deletion", "absolute_mean"][3] == 58 and correlation["deletion", "absolute_mean"][5]
+    assert correlation["insertion", "absolute_mean"][3:6:2] == ("suppressed", "")
+    assert correlation["all_structural", "absolute_mean"][3] == 98
+
+    second = (mean**2 + 0.01**2) / unit**2
+    # A structural class's row is its structural records (the short deletions are in its <50 bin alone).
+    snv, deletion = classes == "snv", (classes == "deletion") & (lengths >= 50.0)
+    enrichment = {line[2]: line for line in lines["prior_enrichment.tsv"]}
+    columns = workspace_pipeline.PRIOR_ENRICHMENT_COLUMNS
+    row = dict(zip(columns, enrichment["deletion"]))
+    assert row["variants"] == 58 and float(enrichment["snv"][columns.index("prior_enrichment")]) == 1.0
+    assert float(row["prior_enrichment"]) == pytest.approx(prior.variance[deletion].mean() / prior.variance[snv].mean(), rel=1e-5)
+    assert float(row["prior_share"]) == pytest.approx(prior.variance[deletion].sum() / prior.variance.sum(), rel=1e-5)
+    assert float(row["posterior_enrichment"]) == pytest.approx(second[deletion].mean() / second[snv].mean(), rel=1e-5)
+    assert float(row["posterior_enrichment_standard_error"]) > 0.0 and row["jackknife_blocks"] == workspace_pipeline.JACKKNIFE_BLOCKS
+    assert float(row["posterior_enrichment_ci_low"]) < float(row["posterior_enrichment"]) < float(row["posterior_enrichment_ci_high"])
+    # The heritability enrichment: the class's share of the posterior genetic variance over its share of the records.
+    assert float(row["posterior_share"]) == pytest.approx(second[deletion].sum() / second.sum(), rel=1e-5)
+    assert float(row["variant_share"]) == pytest.approx(58 / count, rel=1e-5)
+    assert float(row["heritability_enrichment"]) == pytest.approx(second[deletion].mean() / second.mean(), rel=1e-5)
+    assert float(row["posterior_share_ci_low"]) < float(row["posterior_share"]) < float(row["posterior_share_ci_high"])
+    assert float(row["heritability_enrichment_ci_low"]) < float(row["heritability_enrichment"]) < float(row["heritability_enrichment_ci_high"])
+    assert enrichment["insertion"][3] == "suppressed" and enrichment["duplication"][3] == "1-20 (suppressed)"
+    assert enrichment["insertion"][4:] == ("",) * (len(columns) - 4) and enrichment["all_structural"][3] == 98
+    by_length = {(line[2], line[3]): dict(zip(workspace_pipeline.PRIOR_BY_LENGTH_COLUMNS, line)) for line in lines["prior_by_length.tsv"]}
+    short = (classes == "deletion") & (lengths < 50.0)
+    assert float(by_length["deletion", "<50"]["prior_variance"]) == pytest.approx(prior.variance[short].mean(), rel=1e-5)
+    assert float(by_length["deletion", "<50"]["prior_expected_absolute_effect"]) == pytest.approx(prior.absolute_effect[short].mean(), rel=1e-5)
+    assert by_length["deletion", "50-499"]["variants"] == "suppressed" and by_length["deletion", "50-499"]["prior_variance"] == ""
+
+    # Every table passes the export check; without a prior there are no prior lines.
+    headers = {
+        "effects_by_class.tsv": workspace_pipeline.EFFECT_SUMMARY_COLUMNS, "effect_length_correlation.tsv": workspace_pipeline.LENGTH_CORRELATION_COLUMNS,
+        "prior_by_length.tsv": workspace_pipeline.PRIOR_BY_LENGTH_COLUMNS, "prior_enrichment.tsv": columns,
+    }
+    for name, table in lines.items():
+        with (tmp_path / name).open("w", newline="") as handle:
+            csv.writer(handle, delimiter="\t").writerows([headers[name], *table])
+        check_exportable(tmp_path / name)
+    without = workspace_pipeline.effect_summaries("ldl", "with_sv", classes, bins, lengths, effects, unit, None)
+    assert without["prior_by_length.tsv"] == without["prior_enrichment.tsv"] == [] and without["effects_by_class.tsv"] == lines["effects_by_class.tsv"]
+
+
+def _held_out_traits(generator: np.random.Generator, rows: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    """Families (pairs among the first 400 rows, then singletons) in two folds by family, ancestry labels with 15 amr
+    people in fold 0, and a quantitative trait whose with_sv score adds a part the snv_indel score misses."""
+    families = np.unique(np.r_[np.arange(400) // 2, 200 + np.arange(rows - 400)], return_inverse=True)[1].astype(np.int64)
+    folds = families % 2
+    ancestry = np.where(np.arange(rows) % 3 == 0, "afr", "eur").astype(object)
+    ancestry[np.flatnonzero(folds == 0)[:15]] = "amr"
+    age, female = generator.uniform(30.0, 80.0, rows), generator.integers(0, 2, rows).astype(np.float64)
+    pcs = generator.normal(size=(rows, 3))
+    covariates = np.column_stack([np.ones(rows), age, age**2, age * female, female, pcs])
+    small, structural = generator.normal(size=rows), generator.normal(size=rows)
+    target = 0.01 * age + 0.5 * female + pcs[:, 0] + small + 0.5 * structural + 2.0 * generator.normal(size=rows)
+    snv_indel = small + 0.5 * pcs[:, 0] + generator.normal(size=rows)
+    scores = {"snv_indel": snv_indel, "with_sv": snv_indel + 0.5 * structural, "ldpred2_auto": small + 1.5 * generator.normal(size=rows)}
+    return families, folds, ancestry.astype(str), {"target": target, "covariates": covariates, "scores": scores, "structural": 0.5 * structural}
+
+
+def test_the_partial_r2_tables_resample_every_method_and_trait_on_the_same_families(tmp_path: Path) -> None:
+    generator = np.random.default_rng(15)
+    rows = 3000
+    families, folds, ancestry, data = _held_out_traits(generator, rows)
+    evaluated = folds == 0
+
+    def trait(name: str, trait_folds: tuple[int, ...]) -> workspace_pipeline.HeldOutTrait:
+        held = np.isin(folds, trait_folds)
+        targets = np.where(held, data["target"], np.nan)
+        scores = {method: np.where(held, score, np.nan) for method, score in data["scores"].items()}
+        scores |= workspace_pipeline.stacked_scores(targets, data["covariates"], scores, np.where(held, data["structural"], np.nan), families, folds, trait_folds, 7)
+        return workspace_pipeline.HeldOutTrait(name, False, data["target"], data["covariates"], scores, trait_folds)
+
+    # "ldl_again" is ldl on the same people: a meta-analysis that knows they were resampled together counts it once.
+    traits = [trait("ldl", (0,)), trait("ldl_again", (0,)), trait("crossfit", (0, 1))]
+    tables, incomplete = workspace_pipeline.partial_r2_tables(traits, families, folds, list(ancestry), 7, 400, 1 << 26)
+    partial, paired, meta = tables["partial_r2.tsv"], tables["paired_differences.tsv"], tables["meta_analysis.tsv"]
+    assert incomplete == []
+    assert partial[0] == workspace_pipeline.PARTIAL_R2_COLUMNS and paired[0] == workspace_pipeline.PAIRED_DIFFERENCE_COLUMNS
+    partial_rows = {(line[0], line[1], line[2], line[3]): dict(zip(partial[0], line)) for line in partial[1:]}
+    paired_rows = {(line[0], line[1], line[2], line[3], line[4]): dict(zip(paired[0], line)) for line in paired[1:]}
+    held = np.flatnonzero(evaluated)
+    for method, score in data["scores"].items():
+        row = partial_rows["ldl", method, "all", "all"]
+        point = workspace_pipeline._partial_r2(data["target"][held], score[held], data["covariates"][held])
+        assert row["n"] == str(held.shape[0]) and float(row["partial_r2"]) == pytest.approx(point, rel=1e-5)
+        # The bootstrap error of a squared correlation is about its delta-method 2 r (1 - r^2) / sqrt(n).
+        assert float(row["standard_error"]) == pytest.approx(2.0 * np.sqrt(point) * (1.0 - point) / np.sqrt(held.shape[0]), rel=0.3)
+        assert float(row["ci_low"]) < point < float(row["ci_high"]) and row["inference"] == "conditional_on_fitted_models"
+    gain = paired_rows["ldl", "with_sv", "snv_indel", "all", "all"]
+    assert float(gain["estimate"]) > 0.0 and float(gain["ci_low"]) > 0.0 and float(gain["p_value"]) < 0.01 and float(gain["p_bootstrap"]) < 0.01
+    estimate = float(partial_rows["ldl", "with_sv", "all", "all"]["partial_r2"]) - float(partial_rows["ldl", "snv_indel", "all", "all"]["partial_r2"])
+    assert float(gain["estimate"]) == pytest.approx(estimate, rel=1e-4, abs=1e-6)
+    stacks = ("ldpred2_auto+with_sv", "ldpred2_auto+structural")
+    assert {(candidate, baseline) for _trait, candidate, baseline, _cell, _level in paired_rows} == {
+        ("with_sv", "snv_indel"), ("with_sv", "ldpred2_auto"), ("snv_indel", "ldpred2_auto"), *((stack, "ldpred2_auto") for stack in stacks),
+    }
+    # LDpred2-auto gains from SV-PGS stacked onto it on the same people, and from the structural part alone.
+    for stack in stacks:
+        stacked = paired_rows["ldl", stack, "ldpred2_auto", "all", "all"]
+        assert float(stacked["estimate"]) > 0.0 and float(stacked["ci_low"]) > 0.0 and float(stacked["p_value"]) < 0.01
+    # The 15 amr people of the test fold are hidden, and with them the next smallest ancestry group.
+    assert partial_rows["ldl", "with_sv", "ancestry", "amr"]["n"] == "1-20 (suppressed)" and partial_rows["ldl", "with_sv", "ancestry", "amr"]["partial_r2"] == ""
+    assert partial_rows["ldl", "with_sv", "ancestry", "afr"]["n"] == "suppressed" and partial_rows["ldl", "with_sv", "ancestry", "eur"]["partial_r2"]
+    # Across folds: each fold's own partial r^2 weighted by its rows, and no z or p.
+    cross = partial_rows["crossfit", "with_sv", "all", "all"]
+    fold_values = [
+        (np.sum(folds == fold), workspace_pipeline._partial_r2(data["target"][folds == fold], data["scores"]["with_sv"][folds == fold], data["covariates"][folds == fold]))
+        for fold in (0, 1)
+    ]
+    assert float(cross["partial_r2"]) == pytest.approx(sum(count * value for count, value in fold_values) / rows, rel=1e-5)
+    assert cross["inference"] == "descriptive_cross_fit" and paired_rows["crossfit", "with_sv", "snv_indel", "all", "all"]["p_value"] == ""
+    # The meta-analysis reads the two copies' covariance from the shared resamples: its error is one copy's, not 1/sqrt(2) of it.
+    meta_rows = {tuple(line[:5]): dict(zip(meta[0], line)) for line in meta[1:]}
+    fixed = meta_rows["with_sv", "snv_indel", "all", "all", "fixed"]
+    assert fixed["traits"] == "ldl;ldl_again" and fixed["covariance"] == "joint_bootstrap" and fixed["positive_traits"] == 2
+    assert float(fixed["estimate"]) == pytest.approx(float(gain["estimate"]), rel=1e-5)
+    assert float(fixed["standard_error"]) == pytest.approx(float(gain["standard_error"]), rel=1e-4)
+    assert ("with_sv", "snv_indel", "ancestry", "eur", "fixed") in meta_rows and ("with_sv", "snv_indel", "ancestry", "afr", "fixed") not in meta_rows
+    # Its covariance is exported: the copies' covariance is each one's variance.
+    covariance = {tuple(line[:6]): float(line[6]) for line in tables["trait_covariance.tsv"][1:]}
+    assert covariance["with_sv", "snv_indel", "all", "all", "ldl", "ldl_again"] == pytest.approx(float(gain["standard_error"]) ** 2, rel=1e-4)
+    # One ancestry group shown: no test of a difference between groups.
+    assert tables["heterogeneity.tsv"] == [workspace_pipeline.HETEROGENEITY_COLUMNS]
+    # The same seed draws the same resamples.
+    assert workspace_pipeline.partial_r2_tables(traits[:1], families, folds, list(ancestry), 7, 400, 1 << 26)[0]["partial_r2.tsv"] == [
+        line for line in partial if line[0] in ("trait", "ldl")
+    ]
+    for name, lines in tables.items():
+        with (tmp_path / name).open("w", newline="") as handle:
+            csv.writer(handle, delimiter="\t").writerows(lines)
+        check_exportable(tmp_path / name)
+    # Without the amr people, the afr and eur groups are both shown, and their SV gains are tested for a difference,
+    # for the trait and for the traits combined.
+    grouped = np.where(ancestry == "amr", "eur", ancestry)
+    tables, _incomplete = workspace_pipeline.partial_r2_tables(traits[:2], families, folds, list(grouped), 7, 400, 1 << 26)
+    heterogeneity = {(line[0], line[1], line[2], line[3]): dict(zip(workspace_pipeline.HETEROGENEITY_COLUMNS, line)) for line in tables["heterogeneity.tsv"][1:]}
+    row = heterogeneity["ldl", "with_sv", "snv_indel", "ancestry"]
+    assert row["levels"] == "afr;eur" and row["degrees"] == 1 and 0.0 <= float(row["p_value"]) <= 1.0
+    assert ("combined", "with_sv", "snv_indel", "ancestry") in heterogeneity
+    # A baseline without a score on a held-out row the cells read is left out of that trait, never compared on fewer
+    # people, and so is any stack on it; an arm without one is an error.
+    partial_scores = dict(traits[0].scores)
+    partial_scores["ldpred2_auto"] = np.where(np.arange(rows) == held[0], np.nan, partial_scores["ldpred2_auto"])
+    lines = workspace_pipeline.partial_r2_tables([dataclasses.replace(traits[0], scores=partial_scores)], families, folds, list(ancestry), 7, 20, 1 << 26)
+    assert lines[1] == ["ldl: ldpred2_auto"] and {line[1] for line in lines[0]["partial_r2.tsv"][1:]} == {*ARMS, *stacks}
+    assert {(line[1], line[2]) for line in lines[0]["paired_differences.tsv"][1:]} == {("with_sv", "snv_indel")}
+    partial_scores["with_sv"] = partial_scores["ldpred2_auto"]
+    with pytest.raises(ValueError, match="with_sv genetic score is missing"):
+        workspace_pipeline.partial_r2_tables([dataclasses.replace(traits[0], scores=partial_scores)], families, folds, list(ancestry), 7, 20, 1 << 26)
+
+
+def test_method_pairs_and_the_stacks_scored_from_weights_fitted_on_other_families() -> None:
+    assert workspace_pipeline.method_pairs(["snv_indel", "with_sv", "ldpred2_auto", "ldpred2_auto+with_sv", "prs_cs+structural"]) == [
+        ("with_sv", "snv_indel"), ("with_sv", "ldpred2_auto"), ("snv_indel", "ldpred2_auto"), ("ldpred2_auto+with_sv", "ldpred2_auto"),
+    ]
+    generator = np.random.default_rng(21)
+    rows = 600
+    families, folds = np.arange(rows) // 2, (np.arange(rows) // 2) % 3
+    covariates = np.column_stack([np.ones(rows), generator.normal(size=rows)])
+    structural = generator.normal(size=rows)
+    targets = np.where(folds == 1, generator.normal(size=rows) + structural, np.nan)
+    scores = {"snv_indel": generator.normal(size=rows), "with_sv": structural + generator.normal(size=rows), "ldpred2_auto": generator.normal(size=rows)}
+    stacks = workspace_pipeline.stacked_scores(targets, covariates, scores, structural, families, folds, (1,), 7)
+    assert sorted(stacks) == ["ldpred2_auto+structural", "ldpred2_auto+with_sv"]
+    held = folds == 1
+    for name, part in (("ldpred2_auto+with_sv", scores["with_sv"]), ("ldpred2_auto+structural", structural)):
+        assert np.all(np.isnan(stacks[name][~held])) and np.all(np.isfinite(stacks[name][held]))
+        # Exactly the fold's cross-fitted stack (the fold's own seed), on its held-out rows alone.
+        expected = held_out_comparison.cross_fitted_stack(
+            targets[held], covariates[held], np.vstack([scores["ldpred2_auto"][held], part[held]]), families[held],
+            workspace_pipeline.STACKING_SPLITS, np.random.default_rng([7, 1]),
+        )
+        np.testing.assert_allclose(stacks[name][held], expected, rtol=1e-12)
+    # Without a structural part, only the whole score is stacked.
+    assert sorted(workspace_pipeline.stacked_scores(targets, covariates, scores, None, families, folds, (1,), 7)) == ["ldpred2_auto+with_sv"]
+
+
+def _baseline_cohort(rows: int = 60) -> workspace_pipeline._Cohort:
+    """Two traits (the second observed on the first 40 rows) cross-fitted over two folds: each trait's fold models, then
+    its all-rows model."""
+    folds = np.arange(rows, dtype=np.int64) % 2
+    targets = np.column_stack([np.arange(rows, dtype=np.float64), np.where(np.arange(rows) < 40, 1.0, np.nan)])
+    model_traits, model_folds = np.repeat(np.arange(2), 3), np.tile(np.arange(3), 2)
+    observed = np.isfinite(targets)[:, model_traits]
+    return workspace_pipeline._Cohort(
+        research_ids=tuple(str(1000 + row) for row in range(rows)), store_columns=np.arange(rows, dtype=np.int64), covariates=np.ones((rows, 1)),
+        covariate_names=("intercept",), covariate_columns=np.ones((2, 1), dtype=bool), targets=targets, folds=folds,
+        families=np.arange(rows, dtype=np.int64), training=observed & (folds[:, None] != model_folds[None, :]),
+        held_out=observed & (folds[:, None] == model_folds[None, :]), model_traits=model_traits, model_folds=model_folds,
+        model_names=tuple(f"{trait}/{fold}" for trait in ("t0", "t1") for fold in ("fold0", "fold1", "all")), trait_names=("t0", "t1"),
+        trait_types=(TraitType.QUANTITATIVE,) * 2, ancestry=("eur",) * rows, half=("A",) * rows,
+    )
+
+
+def test_a_baseline_s_held_out_scores_are_read_only_on_the_report_s_people_and_split(tmp_path: Path) -> None:
+    cohort = _baseline_cohort()
+    run = SimpleNamespace(config=SimpleNamespace(baselines=lambda: tmp_path / workspace_pipeline.BASELINE_DIRECTORY, fold_count=2))
+    assert workspace_pipeline._baseline_scores(run, cohort) == ({}, {})
+    (tmp_path / workspace_pipeline.BASELINE_DIRECTORY).mkdir()
+    path = tmp_path / workspace_pipeline.BASELINE_DIRECTORY / "ldpred2_auto.npz"
+    scores = np.linspace(-1.0, 1.0, 60)
+    workspace_pipeline.write_baseline_scores(path, cohort, {"t0": scores, "t1": np.full(60, np.nan)})
+    found, refused = workspace_pipeline._baseline_scores(run, cohort)
+    assert list(found) == ["ldpred2_auto"] and refused == {}
+    np.testing.assert_array_equal(found["ldpred2_auto"][:, 0], scores)
+    assert np.all(np.isnan(found["ldpred2_auto"][:, 1]))
+    # Whole models: a method that fitted t1's fold 0 model alone scores that fold's held-out people alone.
+    fold_zero = np.where((np.arange(60) < 40) & (cohort.folds == 0), 0.5, np.nan)
+    workspace_pipeline.write_baseline_scores(path, cohort, {"t1": fold_zero})
+    found, refused = workspace_pipeline._baseline_scores(run, cohort)
+    np.testing.assert_array_equal(found["ldpred2_auto"][:, 1], fold_zero)
+    # Scores that are not whole models' held-out rows are not written.
+    with pytest.raises(ValueError, match="whole models"):
+        workspace_pipeline.write_baseline_scores(path, cohort, {"t1": np.where(np.arange(60) < 41, 0.5, np.nan)})
+    # A cohort whose models trained on other rows or other people, or whose held-out people sit in other folds, leaves
+    # the baseline out and says why.
+    workspace_pipeline.write_baseline_scores(path, cohort, {"t0": scores})
+    training = cohort.training.copy()
+    training[0, 1] = False
+    found, refused = workspace_pipeline._baseline_scores(run, dataclasses.replace(cohort, training=training))
+    assert found == {} and "not this report's fold models trained on their rows" in refused["ldpred2_auto"]
+    found, refused = workspace_pipeline._baseline_scores(run, dataclasses.replace(cohort, research_ids=tuple(str(2000 + row) for row in range(60))))
+    assert found == {} and "not this report's fold models trained on their rows" in refused["ldpred2_auto"]
+    folds = cohort.folds.copy()
+    folds[0] = 1
+    found, refused = workspace_pipeline._baseline_scores(run, dataclasses.replace(cohort, folds=folds))
+    assert found == {} and "not on those models' held-out people in their folds" in refused["ldpred2_auto"]
+
+
+def _summaries(names: list[str], lengths: np.ndarray) -> dict[str, list[tuple]]:
+    """effect_summaries over records of ``names`` and ``lengths``, every effect alike, under a prior that grows with length."""
+    classes = np.array(names, dtype=object)
+    legend = sorted(set(names))
+    count = lengths.shape[0]
+    effects = workspace_pipeline.VariantEffects(np.arange(count, dtype=np.int64), np.full(count, 0.01), np.full(count, 0.01), np.full(count, 0.5), np.full(count, 0.5))
+    law = _mixture_law(np.array([legend.index(name) for name in names]), 0.3 * np.log(lengths), np.log(np.full((len(legend), 3), 1.0 / 3.0)), np.linspace(-10.0, -6.0, 3))
+    unit = np.ones(count)
+    prior = workspace_pipeline.prior_moments(SimpleNamespace(posterior_draws=law), unit)
+    return workspace_pipeline.effect_summaries("ldl", "with_sv", classes, workspace_pipeline.length_bins(lengths), lengths, effects, unit, prior)
+
+
+def test_effect_summary_counts_are_one_tree_whose_shown_parts_never_isolate_one_to_twenty_records() -> None:
+    # A class's structural part is its bins: of 108 structural deletions, the 8 long ones are hidden with the next
+    # smallest bin, while the short records (SNVs, short deletions) are a partition of their own, all shown.
+    lines = _summaries(["snv"] * 100 + ["deletion"] * 138, np.r_[np.ones(100), np.full(30, 10.0), np.full(100, 200.0), np.full(8, 2000.0)])
+    shown = {(line[2], line[3]): line[4] for line in lines["effects_by_class.tsv"]}
+    assert shown == {("snv", "<50"): 100, ("deletion", "<50"): 30, ("deletion", "50-499"): "suppressed", ("deletion", "500-4999"): "1-20 (suppressed)"}
+    enrichment = {line[2]: dict(zip(workspace_pipeline.PRIOR_ENRICHMENT_COLUMNS, line)) for line in lines["prior_enrichment.tsv"]}
+    assert enrichment["deletion"]["variants"] == enrichment["all_structural"]["variants"] == 108 and enrichment["deletion"]["prior_enrichment"] != ""
+    assert enrichment["deletion"]["variant_share"] == f"{108 / 238:.6g}"
+
+    # 8 short deletions beside 300 SNVs: the short partition hides both, so the SNVs' count and every value relative to
+    # them is hidden, while the 100 structural deletions and their share of the genetic variance are shown.
+    lines = _summaries(["snv"] * 300 + ["deletion"] * 108, np.r_[np.ones(300), np.full(8, 5.0), np.full(100, 200.0)])
+    shown = {(line[2], line[3]): line[4] for line in lines["effects_by_class.tsv"]}
+    assert shown == {("snv", "<50"): "suppressed", ("deletion", "<50"): "1-20 (suppressed)", ("deletion", "50-499"): 100}
+    enrichment = {line[2]: dict(zip(workspace_pipeline.PRIOR_ENRICHMENT_COLUMNS, line)) for line in lines["prior_enrichment.tsv"]}
+    assert enrichment["snv"]["variants"] == "suppressed" and enrichment["snv"]["prior_variance"] == ""
+    deletion = enrichment["deletion"]
+    assert deletion["variants"] == 100 and deletion["prior_enrichment"] == deletion["posterior_enrichment"] == ""
+    assert float(deletion["posterior_share"]) > 0.0 and float(deletion["heritability_enrichment"]) > 0.0
+    by_length = {(line[2], line[3]): dict(zip(workspace_pipeline.PRIOR_BY_LENGTH_COLUMNS, line)) for line in lines["prior_by_length.tsv"]}
+    assert by_length["snv", "<50"]["variants"] == "suppressed" and by_length["snv", "<50"]["prior_variance"] == ""
+    assert by_length["deletion", "50-499"]["prior_variance"] != "" and by_length["deletion", "50-499"]["prior_enrichment"] == ""
+
+    # 10 SNVs: hidden alone (no other short record), so every short record is 1 to 20 and nothing relative to every
+    # fitted record (shares of records, heritability enrichment, every structural record together) is shown.
+    lines = _summaries(["snv"] * 10 + ["deletion"] * 100 + ["insertion"] * 40, np.r_[np.ones(10), np.full(100, 200.0), np.full(40, 300.0)])
+    enrichment = {line[2]: dict(zip(workspace_pipeline.PRIOR_ENRICHMENT_COLUMNS, line)) for line in lines["prior_enrichment.tsv"]}
+    assert enrichment["snv"]["variants"] == "1-20 (suppressed)" and enrichment["all_structural"]["variants"] == "suppressed"
+    assert enrichment["deletion"]["variants"] == 100 and enrichment["deletion"]["variant_share"] == enrichment["deletion"]["heritability_enrichment"] == ""
+    assert enrichment["deletion"]["prior_enrichment"] == "" and float(enrichment["deletion"]["posterior_share"]) > 0.0

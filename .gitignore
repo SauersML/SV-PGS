@@ -10,3 +10,7 @@ probe_*.txt
 sv_pgs.egg-info/
 swarm_findings/
 verify_fix.txt
+# All of Us results drawn for the poster (aou_results.py): aggregate, but kept out of the public repository until the
+# results are released
+docs/poster/ashg2026/figures/fig_aou_*
+docs/poster/ashg2026/figures/aou_*.tsv

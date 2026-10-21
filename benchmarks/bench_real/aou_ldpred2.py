@@ -13,10 +13,13 @@ CHROMOSOME_SPACING_CM, so no window reaches another chromosome and the genome is
 
 The held-out genetic score is the posterior mean effects on the centred held-out dosages, read as the report reads the
 fit's (``_partial_r2``: the squared correlation with the target after both are residualized on the trait's covariates).
-Only aggregates leave the VM: per trait, the held-out row count (never 1 to 20), the partial r^2 and the variant count.
-Each held-out person's score, by its own model, goes to ``--scores`` by cohort row (``held_out_scores``), so the arms
-and LDpred2 are compared on the same people (aou_compare.py): participant-level data, which stays in the workspace
-beside the run's mirror, and which no step stages for export.
+Only aggregates leave the VM: per trait, the held-out row count (never 1 to 20), a disease's cases (``_cases_text``), the
+partial r^2 and the variant count. Each held-out person's score, by its own model, goes to ``--scores`` by cohort row
+(``held_out_scores``), so the arms and LDpred2 are compared on the same people (aou_compare.py), and to the run's baseline
+directory (``WorkspaceConfig.baselines``, or ``--baselines``) with the digest of each fitted model's training rows
+(``workspace_pipeline.write_baseline_scores``), where the report compares it with both arms and stacks it with them on
+the same people, resamples and covariates (``partial_r2_tables``). Both are participant-level data, which stay in the
+workspace beside the run's mirror, and which no step stages for export.
 
 A run that fits regions (``WorkspaceConfig.fit_regions``) has LDpred2 fitted on each region's snv_indel records in
 turn, on the run's one cohort and store, and each line names its region ("region" first); a run without them writes
@@ -25,6 +28,7 @@ the lines it always did.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import pathlib
@@ -38,7 +42,8 @@ from sv_pgs.config import TraitType
 from sv_pgs.compute_budget import detect_compute_budget
 from sv_pgs.dosage_store import DosageStore
 from sv_pgs.workspace_pipeline import (
-    WorkspaceConfig, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort, _Run, _shown, arm_log_reliability, fit_filtered, workspace_bindings,
+    WorkspaceConfig, _cases_text, _final_measurement_model, _final_store, _fold_weighted, _partial_r2, _read_cohort, _Run, _shown, arm_log_reliability,
+    fit_filtered, workspace_bindings, write_baseline_scores,
 )
 
 CHROMOSOME_SPACING_CM = 1e4
@@ -102,8 +107,8 @@ def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -
 
     The all-rows model has no held-out rows and never enters a comparison. Across folds the report averages the
     per-fold correlations with row-count weights, so the baseline does too; pooling differently scaled fold scores
-    would answer another question. Empty and suppressed cells do not launch a fit, and a disease's case and control
-    counts obey the same display rule even though this JSON row does not itself print those counts.
+    would answer another question. Empty and suppressed cells do not launch a fit, and a disease's case count is shown
+    only where neither it nor the controls it implies is 1 to 20 (``_cases_text``).
     """
     models = cohort.trait_models(trait) if hasattr(cohort, "trait_models") else (cohort.all_rows_model(trait),)
     evaluated = [(model, np.flatnonzero(cohort.held_out[:, model] & np.isfinite(cohort.targets[:, trait]))) for model in models]
@@ -132,12 +137,15 @@ def ldpred2_trait(store: DosageStore, records: np.ndarray, cohort, trait: int) -
             held_rows.append(cohort_rows(cohort, held))
             held_scores.append(score)
     value = _fold_weighted(values)
-    return {
+    line: dict[str, object] = {
         "trait": cohort.trait_names[trait],
         "held_out_rows": count if count == 0 or count >= SMALLEST_SHOWN_COUNT else f"<{SMALLEST_SHOWN_COUNT}",
         "variants": int(records.shape[0]),
         "pgs_partial_r2": value if np.isfinite(value) else None,
-    }, np.concatenate(held_rows), np.concatenate(held_scores)
+    }
+    if binary:
+        line["cases"] = _cases_text(count, cases)
+    return line, np.concatenate(held_rows), np.concatenate(held_scores)
 
 
 def held_out_scores(path: str | pathlib.Path, cohort, regions: Sequence[str], scores: np.ndarray, variants: np.ndarray) -> None:
@@ -157,12 +165,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True, help="The run config the driver ran (its run directory holds the finished steps).")
     parser.add_argument("--out", required=True, help="The aggregate table to write (one JSON line per trait).")
     parser.add_argument("--scores", required=True, help="The held-out people's scores to write (held_out_scores): kept in the workspace.")
+    parser.add_argument(
+        "--baselines", type=pathlib.Path,
+        help="The baseline directory the report reads (default the run config's, WorkspaceConfig.baselines): ldpred2_auto.npz there, a region's under regions/<name>.",
+    )
     args = parser.parse_args(argv)
     config = WorkspaceConfig.read(args.config)
     run = _Run(config, workspace_bindings(), detect_compute_budget(), {})
     cohort = _read_cohort(run)
     measurement = run.bindings.load_measurement_model(_final_measurement_model(run))
     lines = []
+    if args.baselines is not None:
+        config = dataclasses.replace(config, baseline_directory=args.baselines)
     regions = config.region_runs() or (("", config),)
     scores = np.full((len(regions), len(cohort.research_ids), len(cohort.trait_names)), np.nan)
     variants = np.zeros(len(regions), dtype=np.int64)
@@ -181,6 +195,10 @@ def main(argv: list[str] | None = None) -> int:
                 lines.append(json.dumps({"region": name, **line} if name else line))
                 print(lines[-1], flush=True)
     held_out_scores(args.scores, cohort, [name for name, _region in regions], scores, variants)
+    for index, (_name, region) in enumerate(regions):
+        path = region.baselines() / "ldpred2_auto.npz"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_baseline_scores(path, cohort, {name: scores[index, :, trait] for trait, name in enumerate(cohort.trait_names)})
     pathlib.Path(args.out).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0
 

@@ -27,6 +27,12 @@ def _no_quarantine(step: str) -> dict:
     return {"quarantined": {}}
 
 
+def _report_run(tmp_path, fold_count: int) -> SimpleNamespace:
+    """The run as the report step reads it: no trait quarantined, no baseline in its run directory."""
+    config = SimpleNamespace(fold_count=fold_count, calibration_fraction=.1, panel=None, seed=7, test_fold=None, baselines=lambda: tmp_path / "run" / "baselines")
+    return SimpleNamespace(summary=_no_quarantine, config=config, budget=SimpleNamespace(host_bytes=1 << 28))
+
+
 def test_constant_binary_score_fits_prevalence_and_compares_without_crashing():
     labels = np.array([0., 0., 0., 1.])
     score = np.full(4, 7.)
@@ -113,10 +119,10 @@ def test_report_keeps_degenerate_scores_and_labels_cross_fit_inference(tmp_path,
         ancestry=["group"] * n, half=["imputed"] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)),
     )
     both = np.stack([score, score])[:, :, None]
-    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=both)
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_predictive_mean=expit(both), held_out_calibrated_logits=both, held_out_structural=None)
     monkeypatch.setattr(pipeline, "_read_cohort", lambda run: cohort)
     monkeypatch.setattr(pipeline, "_read_scores", lambda run: scores)
-    summary = pipeline._report_step(SimpleNamespace(summary=_no_quarantine, config=SimpleNamespace(fold_count=fold_count, calibration_fraction=.1, panel=None)), tmp_path)
+    summary = pipeline._report_step(_report_run(tmp_path, fold_count), tmp_path)
     with (tmp_path / "comparison.tsv").open() as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     assert len(rows) == 8
@@ -141,10 +147,10 @@ def test_frozen_probabilities_include_single_class_folds_without_refitting_calib
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
         ancestry=['group'] * n, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]
-    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy(), held_out_structural=None)
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
     monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
-    pipeline._report_step(SimpleNamespace(summary=_no_quarantine, config=SimpleNamespace(fold_count=3, calibration_fraction=.1, panel=None)), tmp_path)
+    pipeline._report_step(_report_run(tmp_path, 3), tmp_path)
     with (tmp_path / 'accuracy.tsv').open() as handle:
         rows = [row for row in csv.DictReader(handle, delimiter='\t') if row['cell'] == 'all' and row['arm'] == 'with_sv']
     metrics = {row['metric']: row for row in rows}
@@ -182,10 +188,10 @@ def test_a_cells_rows_show_no_small_count_by_their_difference_and_stay_exportabl
         covariates=np.ones((n, 1)), covariate_columns=np.ones((1, 1), bool), folds=fold, families=np.arange(n),
         ancestry=ancestry, half=['imputed'] * n, evaluated_folds=lambda trait, fold_count: tuple(range(fold_count)))
     both = np.stack([linear, linear])[:, :, None]
-    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy())
+    scores = SimpleNamespace(held_out_linear_predictor=both, held_out_genetic=both, held_out_calibrated_logits=both.copy(), held_out_structural=None)
     monkeypatch.setattr(pipeline, '_read_cohort', lambda run: cohort)
     monkeypatch.setattr(pipeline, '_read_scores', lambda run: scores)
-    pipeline._report_step(SimpleNamespace(summary=_no_quarantine, config=SimpleNamespace(fold_count=3, calibration_fraction=.1, panel=None)), tmp_path)
+    pipeline._report_step(_report_run(tmp_path, 3), tmp_path)
     for name in ('accuracy.tsv', 'comparison.tsv'):
         pipeline.check_exportable(tmp_path / name)
         with (tmp_path / name).open() as handle:

@@ -43,9 +43,11 @@ Steps:
 7. ``score``: every model of both arms scored for the whole cohort from one read of the store.
    Each person's held-out prediction is the one from their own fold's model.
 8. ``effects``: each trait's all-rows model's per-record effects (kept in the workspace) and
-   their summaries by variant class and length.
+   their summaries by variant class and length, the learned prior's among them.
 9. ``report``: held-out accuracy of both arms and their paired comparison per trait, in cells by
-   fold, ancestry and half, with any count of 1 to 20 suppressed.
+   fold, ancestry and half, with any count of 1 to 20 suppressed (and any the shown ones would give
+   back); each arm's held-out partial r^2 beside a baseline method's on the same people, with
+   bootstrap intervals, paired differences and their meta-analysis across traits.
 10. ``export``: stages in ``<run>/export`` the report and effects summaries the user named in the
     config, and nothing else.
 
@@ -82,7 +84,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 from cyvcf2 import VCF
 import numpy as np
 import pandas as pd
-from scipy import stats
+from scipy import special, stats
 
 from sv_pgs import (
     all_of_us,
@@ -123,7 +125,7 @@ from sv_pgs.cohort import (
     read_predicted_ancestry,
     resolve_cohort_rows,
 )
-from sv_pgs.artifact import CERTIFICATE_STATUS, model_part, model_subset
+from sv_pgs.artifact import CERTIFICATE_STATUS, cohort_digest, model_part, model_subset
 from sv_pgs.copy_number import allele_count_decode
 from sv_pgs.compute_budget import ComputeBudget
 from sv_pgs.draw_laws import tile_rows
@@ -442,6 +444,24 @@ class WorkspaceConfig:
     are distinct and REGION_NAME's; windows may overlap, each fitted alone. None fits the run's own models; a run sets
     fit_region or fit_regions, never both. A window's fit is minutes on a small machine, so one job fits a panel of
     loci on one store."""
+    test_fold: int | None = None
+    """A single split's validation fold for method iteration, or None for the final split. The final split tests on its
+    reserved fold (the panel's primary fold, else fold 0: ``model_folds``) and trains on the rest; with ``test_fold`` the
+    model trains on every fold but these two and is scored on ``test_fold``, so the reserved fold is neither trained on
+    nor seen while priors, annotations and fit settings are chosen, and stays untouched for the final numbers. Only the
+    steps that read labels see it (``_split_cohort``): the cohort step's masks are the final split's, and the store,
+    phenotypes, cohort, measurement and direct-SV steps keep their keys (measurement and direct SV read only the
+    genotypes of the final split's fit rows), while the fit's key names the fold, so the fit and every step after it are
+    the validation run's own."""
+    baseline_directory: Path | None = None
+    """Where the report reads other methods' held-out scores (``baselines``), or None for the run directory's
+    BASELINE_DIRECTORY. The run mirror carries completed steps, not other files of the run directory, so a baseline
+    written after a job's driver (benchmarks/bench_real/aou_ldpred2.sh) is kept in the workspace bucket's mount and
+    named here for the next job's report."""
+    locus_panel: str | None = None
+    """A curated panel of genome windows (benchmarks/bench_real/locus_panel.json's format: its ``loci``, each with a
+    ``name``, ``kind``, store ``chromosome``, first and last position and the ``traits`` it bears on), whose genetic
+    variance the effects step reports per trait, arm and class (``locus_variance``), or None for none."""
 
     @classmethod
     def read(cls, path: str | Path) -> WorkspaceConfig:
@@ -450,7 +470,10 @@ class WorkspaceConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> WorkspaceConfig:
         missing = sorted(set(CONFIG_KEYS) - set(raw))
-        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {"genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "length_by_class", "ld_score_prior", "panel", "cross_fit", "fit_variant_sites", "fit_region", "fit_regions", *_FIT_FILTER_KEYS})
+        unknown = sorted(set(raw) - set(CONFIG_KEYS) - {
+            "genome_build", "disease_likelihood", "calibration_fraction", "annotated_prior", "length_by_class", "ld_score_prior", "panel", "cross_fit",
+            "fit_variant_sites", "fit_region", "fit_regions", "test_fold", "locus_panel", "baseline_directory", *_FIT_FILTER_KEYS,
+        })
         if missing or unknown:
             hints = "".join(f" {KEY_HINTS[key]}" for key in missing if key in KEY_HINTS)
             raise ValueError(f"the run config lacks {missing} and has unknown keys {unknown}; every key is required." + hints)
@@ -471,6 +494,17 @@ class WorkspaceConfig:
                 raise ValueError(f"{key} must be a number in [0, 1)")
         if raw.get("fit_variant_sites") is not None and (not isinstance(raw["fit_variant_sites"], str) or not raw["fit_variant_sites"]):
             raise ValueError("fit_variant_sites must be a site list's path or null")
+        for key in ("locus_panel", "baseline_directory"):
+            if raw.get(key) is not None and (not isinstance(raw[key], str) or not raw[key]):
+                raise ValueError(f"{key} must be a path or null")
+        test_fold = raw.get("test_fold")
+        if test_fold is not None:
+            reserved = 0 if raw.get("panel") is None else raw["panel"].get("primary_fold")
+            if raw.get("cross_fit", True) or isinstance(test_fold, bool) or not isinstance(test_fold, (int, np.integer)):
+                raise ValueError("test_fold is an integer fold of a single split (cross_fit false), or null.")
+            # Some fold besides the reserved and the test fold trains.
+            if not 0 <= test_fold < raw["fold_count"] or test_fold == reserved or raw["fold_count"] <= len({reserved, test_fold}):
+                raise ValueError(f"test_fold must be a fold in [0, fold_count) other than the reserved test fold {reserved}, with fold_count >= 3 so some fold trains.")
         for key, minimum in (("fold_count", 2), ("seed", 0)):
             value = raw[key]
             if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value < minimum:
@@ -562,19 +596,27 @@ class WorkspaceConfig:
             fit_variant_sites=raw.get("fit_variant_sites"),
             fit_region=region,
             fit_regions=regions,
+            test_fold=None if test_fold is None else int(test_fold),
+            locus_panel=raw.get("locus_panel"),
+            baseline_directory=None if raw.get("baseline_directory") is None else Path(raw["baseline_directory"]),
         )
 
     def region_runs(self) -> tuple[tuple[str, WorkspaceConfig], ...]:
         """Each of ``fit_regions`` by name, as the run its steps from the fit on make: in REGIONS_DIRECTORY/<name> of the
-        run directory (and of the marker directory), with the region's window as its fit_region. None without
-        fit_regions."""
+        run directory (and of the marker and baseline directories), with the region's window as its fit_region. None
+        without fit_regions."""
         return tuple(
             (name, dataclasses.replace(
                 self, run_directory=self.run_directory / REGIONS_DIRECTORY / name, fit_region=window, fit_regions=None,
                 marker_directory=None if self.marker_directory is None else self.marker_directory / REGIONS_DIRECTORY / name,
+                baseline_directory=None if self.baseline_directory is None else self.baseline_directory / REGIONS_DIRECTORY / name,
             ))
             for name, window in self.fit_regions or ()
         )
+
+    def baselines(self) -> Path:
+        """The directory of other methods' held-out scores (``baseline_directory``)."""
+        return self.run_directory / BASELINE_DIRECTORY if self.baseline_directory is None else self.baseline_directory
 
     def model_folds(self) -> tuple[int, ...]:
         """Each trait's models by the fold they leave out, in model order: every fold then fold_count (the all-rows
@@ -774,6 +816,8 @@ class _Run:
     """The chromosomes this run's store step converts, or None for every one (``run_pipeline``'s ``store_shard``)."""
     fit_arms: tuple[str, ...] | None = None
     """The arms this run's fit step fits, or None for every one (``run_pipeline``'s ``fit_arms``)."""
+    step: str | None = None
+    """The step running now (``_run_step``), which decides the cohort it reads (``_read_cohort``); None outside one."""
 
     def output(self, step: str) -> Path:
         return self.config.run_directory / step
@@ -827,6 +871,7 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     partial.mkdir(parents=True, exist_ok=True)
     (partial / KEY_FILE).write_text(key, encoding="utf-8")
     _mark(run.config, step.name, "started")
+    run.step = step.name
     try:
         if step.name == "fit":
             _check_fit_records(run, partial, key)
@@ -841,6 +886,8 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     except BaseException as error:
         _mark(run.config, step.name, f"failed-{type(error).__name__}")
         raise
+    finally:
+        run.step = None
     _write_json(partial / COMPLETE_FILE, {"key": key, "summary": summary, "finished": _utc()})
     os.rename(partial, final)
     run.keys[step.name] = key
@@ -1241,7 +1288,38 @@ class _Cohort:
         return tuple(sorted(int(fold) for fold in self.model_folds[self.model_traits == trait] if fold < fold_count))
 
 
+GENOTYPE_STEPS = ("samples", "store", "phenotypes", "cohort", "measurement", "direct_sv")
+"""The steps before the fit, which read the cohort step's own masks (``_read_cohort``): measurement and direct SV read
+only its fit rows' genotypes, never a label, so a validation split (``WorkspaceConfig.test_fold``) reuses them."""
+
+
+def _split_cohort(cohort: _Cohort, config: WorkspaceConfig) -> _Cohort:
+    """The cohort as a validation split reads it (``WorkspaceConfig.test_fold``): each trait's one model trains on its
+    observed rows outside the test fold and the reserved fold, less its disease's calibration families drawn as the cohort
+    step draws them (``development_calibration``), and holds out its observed rows in the test fold, named for that fold.
+    The final split's cohort is returned as it is."""
+    if config.test_fold is None:
+        return cohort
+    reserved = config.model_folds()[0]
+    model_folds = np.full_like(cohort.model_folds, config.test_fold)
+    observed = np.isfinite(cohort.targets)[:, cohort.model_traits]
+    training = observed & (cohort.folds[:, None] != config.test_fold) & (cohort.folds[:, None] != reserved)
+    held_out = observed & (cohort.folds[:, None] == config.test_fold)
+    calibration = development_calibration(training, cohort.model_traits, model_folds, len(config.diseases), cohort.families, config.calibration_fraction, config.seed)
+    return dataclasses.replace(
+        cohort, training=training & ~calibration, held_out=held_out, calibration=calibration, model_folds=model_folds,
+        model_names=tuple(f"{cohort.trait_names[trait]}/fold{config.test_fold}" for trait in cohort.model_traits.tolist()),
+    )
+
+
 def _read_cohort(run: _Run) -> _Cohort:
+    """The cohort step's cohort, as the running step reads it: a validation split's (``_split_cohort``) in every step
+    after GENOTYPE_STEPS and outside the driver (a baseline method reading a finished run)."""
+    cohort = _read_cohort_step(run)
+    return cohort if run.step in GENOTYPE_STEPS else _split_cohort(cohort, run.config)
+
+
+def _read_cohort_step(run: _Run) -> _Cohort:
     directory = run.output("cohort")
     arrays = np.load(directory / "cohort.npz")
     record = json.loads((directory / "cohort.json").read_text(encoding="utf-8"))
@@ -3375,9 +3453,11 @@ def _fit_step(run: _Run, directory: Path) -> dict[str, Any]:
 @dataclass(frozen=True, slots=True)
 class _Scores:
     """The score step's arrays: [arms, cohort rows, models] over every model, each person's own-fold held-out
-    values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait), and
+    values [arms, cohort rows, traits] (NaN where the person has no held-out prediction of the trait),
     ``structural_genetic`` [cohort rows, traits], the genetic score of the structural part (STRUCTURAL_PART) of each
-    trait's all-rows ``with_sv`` model."""
+    trait's all-rows ``with_sv`` model, and ``held_out_structural`` [cohort rows, traits], each person's own-fold
+    ``with_sv`` model's structural part, as ``held_out_genetic`` is its whole score (the report's stacked baselines: the
+    all-rows model trained on everyone, so its part is never a held-out score)."""
 
     predictive_mean: F64Array
     linear_predictor: F64Array
@@ -3387,6 +3467,7 @@ class _Scores:
     held_out_genetic: F64Array
     structural_genetic: F64Array
     held_out_calibrated_logits: F64Array | None = None
+    held_out_structural: F64Array | None = None
 
 
 def score_batches(model_bytes: Sequence[int], host_bytes: int) -> list[range]:
@@ -3436,7 +3517,7 @@ def _array_bytes(value: Any) -> int:
     return size(value)
 
 
-def _prediction_budget(budget: ComputeBudget, cohort: _Cohort, models: Sequence[Any], columns: Mapping[str, Any], structural: F64Array) -> ComputeBudget:
+def _prediction_budget(budget: ComputeBudget, cohort: _Cohort, models: Sequence[Any], columns: Mapping[str, Any], structural: Any) -> ComputeBudget:
     """The scorer's workspace after the loaded arrays and its caller's unmetered temporaries are accounted for.
 
     The saved-file batching limit alone leaves the scorer entitled to the full host again. Its plan can hold a
@@ -3501,6 +3582,8 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
     shape = (len(ARMS), cohort.store_columns.shape[0], len(cohort.model_names))
     columns = {name: np.full((shape[1], shape[0] * shape[2]), np.nan) for name in ("predictive_mean", "predictive_variance", "linear_predictor", "genetic_mean")}
     structural_genetic = np.full((shape[1], trait_count), np.nan)
+    # [cohort rows, models]: the structural part of each with_sv model that holds someone out.
+    model_structural = np.full((shape[1], shape[2]), np.nan)
     batches = score_batches([sum(path.stat().st_size for path in folder.iterdir()) for folder in directories], run.budget.host_bytes)
     restored_batches = 0
     with DosageStore.open(_final_store(run)) as store:
@@ -3509,8 +3592,9 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             batch_models = [scored[position] for position in batch]
             targets = [arm_index * shape[2] + int(index) for arm_index, trait in batch_models for index in cohort.trait_models(trait)]
             part_traits = [trait for arm_index, trait in batch_models if ARMS[arm_index] == "with_sv"]
+            part_models = [int(index) for trait in part_traits for index in cohort.trait_models(trait) if cohort.held_out[:, index].any()]
             checkpoint = BatchCheckpoint(directory, step_key, {
-                "models": batch_models, "targets": targets, "parts": part_traits, "shape": shape,
+                "models": batch_models, "targets": targets, "parts": part_traits, "model_parts": part_models, "shape": shape,
             }, ("predictions.npz",))
             saved = checkpoint.read()
             if saved is not None:
@@ -3518,6 +3602,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     for name in columns:
                         columns[name][:, targets] = arrays[name]
                     structural_genetic[:, part_traits] = arrays["structural_genetic"]
+                    model_structural[:, part_models] = arrays["model_structural"]
                 restored_batches += 1
                 continue
             started = time.perf_counter()
@@ -3529,22 +3614,28 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                 expected = tuple(cohort.model_names[index] for index in cohort.trait_models(trait))
                 if tuple(model.model_names) != expected:
                     raise ValueError(f"the {ARMS[arm_index]} model of {cohort.trait_names[trait]} holds {model.model_names}, not its trait's models {expected}.")
-            # The structural part of each trait's all-rows with_sv model, by trait, scored in the same read as the
-            # models themselves, after them.
+            # The structural part of each trait's all-rows with_sv model, by trait, and of each of its models that
+            # holds someone out, by model, scored in the same read as the models themselves, after them.
             parts = {}
             for position, model in zip(batch, fitted):
                 arm_index, trait = scored[position]
                 if ARMS[arm_index] == "with_sv":
                     all_rows_name = cohort.model_names[cohort.all_rows_model(trait)]
                     parts[trait] = model_part(model, all_rows_name, structural, f"{all_rows_name}/{STRUCTURAL_PART}")
-            models = [*fitted, *parts.values()]
+            held_parts = {}
+            for position, model in zip(batch, fitted):
+                arm_index, trait = scored[position]
+                for index in (part_models if ARMS[arm_index] == "with_sv" else []):
+                    if cohort.model_traits[index] == trait:
+                        held_parts[index] = model_part(model, cohort.model_names[index], structural, f"{cohort.model_names[index]}/{STRUCTURAL_PART}")
+            models = [*fitted, *parts.values(), *held_parts.values()]
             try:
-                budget = _prediction_budget(run.budget, cohort, models, columns, structural_genetic)
+                budget = _prediction_budget(run.budget, cohort, models, columns, (structural_genetic, model_structural))
             except MemoryError:
                 if len(batch) == 1:
                     raise
                 batches.extend(range(position, position + 1) for position in batch)
-                del fitted, parts, models, model
+                del fitted, parts, held_parts, models, model
                 continue
             try:
                 loaded = time.perf_counter()
@@ -3569,18 +3660,20 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     uncertified.pop(cohort.trait_names[trait], None)
                 # A previous successful iteration must not keep a model or prediction alive into the retry.
                 prediction, values_to_check = None, ()
-                del fitted, parts, models, model
+                del fitted, parts, held_parts, models, model
                 continue
             for name, values in (
                 ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
                 ("linear_predictor", prediction.linear_predictor), ("genetic_mean", prediction.genetic.means),
             ):
                 columns[name][:, targets] = np.asarray(values, dtype=np.float64)[:, : len(targets)]
-            structural_genetic[:, list(parts)] = np.asarray(prediction.genetic.means, dtype=np.float64)[:, len(targets) :]
-            del fitted, parts, prediction, models, model, values, values_to_check
+            means = np.asarray(prediction.genetic.means, dtype=np.float64)
+            structural_genetic[:, list(parts)] = means[:, len(targets) : len(targets) + len(parts)]
+            model_structural[:, list(held_parts)] = means[:, len(targets) + len(parts) :]
+            del fitted, parts, held_parts, prediction, models, model, values, values_to_check, means
             with checkpoint.write() as temporary:
                 np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
-                         structural_genetic=structural_genetic[:, part_traits])
+                         structural_genetic=structural_genetic[:, part_traits], model_structural=model_structural[:, part_models])
             # The batch's models loaded (and checked), then read from the store in one prediction, then committed.
             timing("score_batch", time.perf_counter() - started, models=len(batch), load=loaded - started, predict=predicted - loaded)
     # Comparisons need the same trait in both arms. If one arm failed during prediction, erase the other arm's
@@ -3592,6 +3685,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                 for values in columns.values():
                     values[:, targets] = np.nan
             structural_genetic[:, trait] = np.nan
+            model_structural[:, cohort.trait_models(trait)] = np.nan
     LOGGER.info("workspace pipeline: submitted %d models in %d prediction batches, reused %d batches",
                 sum(len(cohort.trait_models(trait)) for _arm, trait in scored), len(batches) - restored_batches, restored_batches)
 
@@ -3637,6 +3731,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
         held_out_linear_predictor=held_out(linear_predictor),
         held_out_genetic=held_out(genetic_mean),
         structural_genetic=structural_genetic,
+        held_out_structural=held_out(model_structural[None])[0],
         calibrated_logits=calibrated_logits,
         held_out_calibrated_logits=held_out(calibrated_logits),
     )
@@ -3652,7 +3747,8 @@ def _read_scores(run: _Run) -> _Scores:
         raise ValueError("the score step's arms are not this driver's.")
     if tuple(str(name) for name in arrays["model_names"]) != _read_cohort(run).model_names:
         raise ValueError("the score step's model names or order differ from the cohort's.")
-    return _Scores(**{field.name: arrays[field.name] for field in dataclasses.fields(_Scores)})
+    # A field with a default is absent from an older score step's arrays.
+    return _Scores(**{field.name: arrays[field.name] for field in dataclasses.fields(_Scores) if field.name in arrays.files or field.default is dataclasses.MISSING})
 
 
 # ---------------------------------------------------------------------------
@@ -3740,6 +3836,265 @@ row. Every value is an aggregate over the n rows; a trait observed on 1 to 20 ro
 LENGTH_CORRELATION_COLUMNS = ("trait", "arm", "variant_class", "variants", "quantity", "spearman_rho", "interpretation")
 """Per (trait, arm, structural class, and every structural record together), Spearman's rho between log length and
 the absolute fitted mean and uncertainty separately. Descriptive only: LD and prior features invalidate an independent-record significance claim."""
+PRIOR_REFERENCE_CLASS = VariantClass.SNV.value
+"""The class every prior and posterior enrichment is relative to: SNVs, the class every arm fits."""
+PRIOR_BY_LENGTH_COLUMNS = (
+    "trait", "arm", "variant_class", "length_bin", "variants", "prior_variance", "prior_variance_geometric", "prior_expected_absolute_effect",
+    "prior_enrichment", "posterior_second_moment", "posterior_enrichment",
+)
+"""``prior_by_length.tsv``: the learned prior by (trait, arm, class, length bin), read from the fitted model
+(``prior_moments``), as means over the bin's fitted records: the prior variance of a record's effect on its standardized
+genotype (its expected share of the trait's variance before the data, LD aside), its geometric mean, the prior's
+expected |effect| per unit (one allele, or one copy), the prior variance relative to the SNVs' mean
+(PRIOR_REFERENCE_CLASS), and the posterior second moment E[beta^2 | data] of the standardized effect and its enrichment
+on the same reference. Each mean is over the bin's records with every other annotation (frequency, gene context) as the
+genome has it, so a bin is the prior an SV of that class and length gets in this fit, not a length effect alone."""
+PRIOR_ENRICHMENT_COLUMNS = (
+    "trait", "arm", "variant_class", "variants", "prior_variance", "prior_enrichment", "prior_share", "posterior_second_moment",
+    "posterior_enrichment", "posterior_enrichment_standard_error", "posterior_enrichment_ci_low", "posterior_enrichment_ci_high",
+    "posterior_share", "posterior_share_ci_low", "posterior_share_ci_high", "variant_share", "heritability_enrichment",
+    "heritability_enrichment_ci_low", "heritability_enrichment_ci_high", "jackknife_blocks",
+)
+"""``prior_enrichment.tsv``: per (trait, arm, class, and every structural record together), the mean prior variance of
+the standardized effect and its enrichment over SNVs, the class's share of the summed prior variance, the same three of
+the posterior second moment, and the posterior enrichment's delete-one-block jackknife standard error and normal
+interval (``jackknife_ratio``); then the class's share of the posterior genetic variance (its records' summed
+E[beta^2 | data] on standardized genotypes over every fitted record's, each record's own variance with LD between
+records aside) with its jackknife interval, its share of the fitted records, and their ratio, the heritability
+enrichment of LD score regression's partitioning (Finucane et al. 2015, Nat Genet 47:1228) read from the posterior,
+with its jackknife interval. A structural class's row is its structural records (COMMUNITY_SV_MINIMUM_LENGTH and
+longer), as every structural record together is; its shorter records are in the length table's SHORT_RECORDS bin. The
+prior's enrichment has no interval: the empirical Bayes keeps point hyperparameters, so the fit holds no uncertainty
+about them."""
+JACKKNIFE_BLOCKS = 200
+"""The posterior enrichment's jackknife blocks: contiguous runs of the fitted records in store (genome) order, as LD
+score regression's 200-block jackknife (Bulik-Sullivan et al. 2015, Nat Genet 47:291), each long against LD."""
+
+
+@dataclass(frozen=True, slots=True)
+class PriorMoments:
+    """The learned prior at each fitted record of one model (``prior_moments``): the prior variance of its effect on its
+    standardized genotype, and its prior expected |effect| per unit."""
+
+    variance: F64Array
+    absolute_effect: F64Array
+
+
+def prior_moments(scoring: Any, unit: F64Array) -> PriorMoments | None:
+    """The prior at each of ``scoring``'s records (a ``fast_scoring.ScoringModel``; ``unit`` each record's units per
+    standardized genotype, codes_per_unit / sigma), from the fitted hyperparameters its draw law carries: the mean-field
+    law holds each member's log u_j = o_j + d_j' theta (its unit offset and every annotation smooth at the fitted
+    coefficients) and its class's lattice masses log pi_ck on the nodes t_k (``draw_laws.ProductMixtureDraws``), so the
+    prior beta_j ~ sum_k pi_ck N(0, u_j e^t_k) has variance u_j sum_k pi_ck e^t_k and expected |beta_j|
+    sqrt(2 / pi) sqrt(u_j) sum_k pi_ck e^(t_k / 2), per unit times ``unit``. None for a law that does not hold the prior
+    (dense draws, the full-data and small-n routes)."""
+    law = scoring.posterior_draws
+    if not hasattr(law, "log_density"):
+        return None
+    grid = np.asarray(law.log_variance_grid, dtype=np.float64)
+    density = np.asarray(law.log_density, dtype=np.float64)
+    classes = np.asarray(law.class_index, dtype=np.int64)
+    log_scale = np.asarray(law.log_scale, dtype=np.float64)
+    return PriorMoments(
+        variance=np.exp(log_scale + special.logsumexp(density + grid, axis=1)[classes]),
+        absolute_effect=np.sqrt(2.0 / np.pi) * np.exp(0.5 * log_scale + special.logsumexp(density + 0.5 * grid, axis=1)[classes]) * unit,
+    )
+
+
+def jackknife_ratio(values: F64Array, member: BoolArray, reference: BoolArray, blocks: int, means: bool = True) -> tuple[float, float, int]:
+    """The mean of ``values`` over ``member`` relative to their mean over ``reference`` (with ``means`` false, their sum
+    relative to their sum), its delete-one-block jackknife standard error over ``blocks`` contiguous runs of the rows
+    (fewer where there are fewer rows), and the block count. The error is NaN where deleting a block leaves either set
+    empty."""
+    count = values.shape[0]
+    blocks = min(blocks, count)
+    block = np.repeat(np.arange(blocks), np.diff(np.linspace(0, count, blocks + 1).astype(np.int64)))
+
+    def sums(mask: BoolArray) -> tuple[F64Array, F64Array]:
+        return np.bincount(block[mask], weights=values[mask], minlength=blocks), np.bincount(block[mask], minlength=blocks).astype(np.float64)
+
+    member_sum, member_count = sums(member)
+    reference_sum, reference_count = sums(reference)
+    if not means:
+        member_count, reference_count = np.ones(blocks), np.ones(blocks)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        estimate = (member_sum.sum() / member_count.sum()) / (reference_sum.sum() / reference_count.sum())
+        deleted = ((member_sum.sum() - member_sum) / (member_count.sum() - member_count)) / (
+            (reference_sum.sum() - reference_sum) / (reference_count.sum() - reference_count)
+        )
+    if blocks < 2 or not np.all(np.isfinite(deleted)):
+        return float(estimate), float("nan"), blocks
+    return float(estimate), float(np.sqrt((blocks - 1) / blocks * np.sum((deleted - deleted.mean()) ** 2))), blocks
+
+
+def _hidden_records(count: int) -> str:
+    """A hidden summary's record count, as a hidden cell's (``_hidden_counts``)."""
+    return _hidden_counts(count, False)[0]
+
+
+def effect_summaries(
+    trait: str, arm: str, classes: NDArray, bins: NDArray, lengths: F64Array, effects: VariantEffects, unit: F64Array, prior: PriorMoments | None,
+) -> dict[str, list[tuple[Any, ...]]]:
+    """One model's summary lines by table name (EFFECT_SUMMARY_COLUMNS, LENGTH_CORRELATION_COLUMNS,
+    PRIOR_BY_LENGTH_COLUMNS, PRIOR_ENRICHMENT_COLUMNS), from its fitted records' ``classes``, length ``bins`` and
+    ``lengths``, their ``effects`` and ``unit``s, and the learned ``prior`` at them (no prior lines where it is None).
+
+    Record counts are held to the participant rule, and every count a table shows is a sum of the parts of one tree, so
+    no difference of shown counts isolates 1 to 20 records: every fitted record is in one part, a class's structural
+    records (COMMUNITY_SV_MINIMUM_LENGTH and longer, the structural classes') or a class's shorter ones; every structural
+    record together is the structural parts, and a structural part is its length bins. In each partition (the structural
+    parts, the shorter parts, a structural part's bins) the parts of 1 to 20 records are hidden with the smallest others
+    until the hidden ones hold 0 or more than 20 (``suppressed_levels``); a hidden structural part hides its bins. So no
+    mean over 1 to 20 records follows from the shown means and counts. Where every structural record together, or every
+    shorter one, is 1 to 20 records, nothing relative to every fitted record is shown (the heritability enrichment and the
+    variant share would give back their count), and where the SNVs' part is hidden nothing is shown relative to them. A
+    bin's positive and negative counts are parts of its records with the zero means beside them, suppressed the same
+    way."""
+    structural = lengths >= COMMUNITY_SV_MINIMUM_LENGTH
+    structural_classes = sorted(set(classes[structural].tolist()))
+    short_counts = Counter(classes[~structural].tolist())
+    structural_counts = Counter(classes[structural].tolist())
+    hidden_structural = suppressed_levels({name: (members,) for name, members in structural_counts.items()})
+    hidden_short = suppressed_levels({name: (members,) for name, members in short_counts.items()})
+    cells = Counter(zip(classes.tolist(), bins.tolist()))
+    hidden_bins: set[tuple[str, str]] = {(name, SHORT_RECORDS) for name in hidden_short}
+    for name in structural_classes:
+        sizes = {level: (members,) for (owner, level), members in cells.items() if owner == name and level != SHORT_RECORDS}
+        hidden_bins |= {(name, level) for level in (sizes if name in hidden_structural else suppressed_levels(sizes))}
+    # The class rows: a structural class's structural part, any other class's whole (shorter) part.
+    hidden_classes = hidden_structural | {name for name in hidden_short if name not in structural_counts}
+    totals_shown = all(not 0 < int(total) < MINIMUM_REPORTED_PARTICIPANTS for total in (structural.sum(), (~structural).sum()))
+    lines: dict[str, list[tuple[Any, ...]]] = {"effects_by_class.tsv": [], "effect_length_correlation.tsv": [], "prior_by_length.tsv": [], "prior_enrichment.tsv": []}
+    root_mean_square = np.sqrt(effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation)
+    pairs = sorted(set(zip(classes.tolist(), bins.tolist())))
+    summary_blanks = ("",) * (len(EFFECT_SUMMARY_COLUMNS) - EFFECT_SUMMARY_COLUMNS.index("positive_mean"))
+    for name, level in pairs:
+        member = (classes == name) & (bins == level)
+        members = int(member.sum())
+        if (name, level) in hidden_bins:
+            lines["effects_by_class.tsv"].append((trait, arm, name, level, _hidden_records(members), *summary_blanks))
+            continue
+        mean = effects.mean[member]
+        positive, negative = int(np.sum(mean > 0.0)), int(np.sum(mean < 0.0))
+        signs = suppressed_levels({"positive": (positive,), "negative": (negative,), "zero": (members - positive - negative,)})
+        absolute = np.abs(mean)
+        lines["effects_by_class.tsv"].append((
+            trait, arm, name, level, members, "suppressed" if "positive" in signs else positive, "suppressed" if "negative" in signs else negative,
+            f"{effects.probability_positive[member].sum():.6g}", f"{effects.probability_negative[member].sum():.6g}", f"{absolute.mean():.6g}",
+            f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(root_mean_square[member] ** 2)):.6g}",
+        ))
+    for name in [*structural_classes, "all_structural"]:
+        member = structural & ((classes == name) | (name == "all_structural"))
+        if np.unique(lengths[member]).shape[0] < 2:
+            continue
+        hidden = name in hidden_classes if name != "all_structural" else int(member.sum()) < MINIMUM_REPORTED_PARTICIPANTS
+        for quantity, values in (("absolute_mean", np.abs(effects.mean)), ("posterior_sd", effects.standard_deviation)):
+            if hidden:
+                lines["effect_length_correlation.tsv"].append((trait, arm, name, _hidden_records(int(member.sum())), quantity, "", "descriptive_prior_and_LD_dependent"))
+                continue
+            selected = values[member]
+            rho = stats.spearmanr(np.log(lengths[member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
+            lines["effect_length_correlation.tsv"].append((trait, arm, name, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
+    if prior is None:
+        return lines
+    reference = classes == PRIOR_REFERENCE_CLASS
+    second = (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit)
+    # A hidden reference shows nothing relative to it: its mean would follow from a shown mean and its enrichment.
+    reference_shown = bool(reference.any()) and PRIOR_REFERENCE_CLASS not in hidden_short
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prior_reference = float(prior.variance[reference].mean()) if reference_shown else float("nan")
+        posterior_reference = float(second[reference].mean()) if reference_shown else float("nan")
+    length_blanks = ("",) * (len(PRIOR_BY_LENGTH_COLUMNS) - PRIOR_BY_LENGTH_COLUMNS.index("prior_variance"))
+    for name, level in pairs:
+        member = (classes == name) & (bins == level)
+        if (name, level) in hidden_bins:
+            lines["prior_by_length.tsv"].append((trait, arm, name, level, _hidden_records(int(member.sum())), *length_blanks))
+            continue
+        variance = prior.variance[member]
+        lines["prior_by_length.tsv"].append((
+            trait, arm, name, level, int(member.sum()), _number(variance.mean()), _number(np.exp(np.mean(np.log(variance)))),
+            _number(prior.absolute_effect[member].mean()), _number(variance.mean() / prior_reference), _number(second[member].mean()),
+            _number(second[member].mean() / posterior_reference),
+        ))
+    quantile = stats.norm.ppf((1.0 + CONFIDENCE_LEVEL) / 2.0)
+    every = np.ones(classes.shape[0], dtype=bool)
+
+    def interval(estimate: float, standard_error: float) -> tuple[str, str]:
+        return _number(estimate - quantile * standard_error), _number(estimate + quantile * standard_error)
+
+    class_blanks = ("",) * (len(PRIOR_ENRICHMENT_COLUMNS) - PRIOR_ENRICHMENT_COLUMNS.index("prior_variance"))
+    for name in [*sorted(set(classes.tolist())), *(["all_structural"] if structural.any() else [])]:
+        if name == "all_structural":
+            member, hidden = structural, not totals_shown or int(structural.sum()) < MINIMUM_REPORTED_PARTICIPANTS
+        else:
+            member, hidden = (classes == name) & (structural if name in structural_counts else ~structural), name in hidden_classes
+        members = int(member.sum())
+        if hidden:
+            lines["prior_enrichment.tsv"].append((trait, arm, name, _hidden_records(members), *class_blanks))
+            continue
+        enrichment, standard_error, blocks = jackknife_ratio(second, member, reference, JACKKNIFE_BLOCKS) if reference_shown else (np.nan, np.nan, 0)
+        share, share_error, _blocks = jackknife_ratio(second, member, every, JACKKNIFE_BLOCKS, means=False)
+        heritability, heritability_error, blocks = jackknife_ratio(second, member, every, JACKKNIFE_BLOCKS) if totals_shown else (np.nan, np.nan, blocks)
+        lines["prior_enrichment.tsv"].append((
+            trait, arm, name, members, _number(prior.variance[member].mean()), _number(prior.variance[member].mean() / prior_reference),
+            _number(prior.variance[member].sum() / prior.variance.sum()), _number(second[member].mean()), _number(enrichment),
+            _number(standard_error), *interval(enrichment, standard_error), _number(share), *interval(share, share_error),
+            _number(members / classes.shape[0]) if totals_shown else "", _number(heritability), *interval(heritability, heritability_error), blocks,
+        ))
+    return lines
+
+
+LOCUS_VARIANCE_COLUMNS = (
+    "trait", "arm", "locus", "kind", "chromosome", "start", "end", "variant_class", "variants", "rare_left_out", "genetic_variance", "genome_share",
+    "window_share",
+)
+"""``locus_variance.tsv`` (with the config's ``locus_panel``): per trait, arm, panel window bearing on the trait and
+variant class in it (then ``all`` its classes), the all-rows model's genetic variance there, the summed posterior
+E[beta^2 | data] on standardized genotypes (each record's beta^2 times its genotype variance, LD between records aside),
+its share of the model's whole genome's and of the window's. A record, structural or not, enters only with at least
+MINIMUM_REPORTED_PARTICIPANTS expected carriers of its minor allele among the model's training rows (``locus_variance``);
+the others are counted in ``rare_left_out`` and in no value, so no value rests on fewer carriers. The counts are of
+records, never of participants."""
+
+
+def read_locus_panel(path: str | Path) -> list[dict[str, Any]]:
+    """The panel's windows (``WorkspaceConfig.locus_panel``), each with its name, kind, store chromosome, first and last
+    position (both included) and traits."""
+    loci = json.loads(Path(path).read_text(encoding="utf-8"))["loci"]
+    for locus in loci:
+        if not {"name", "kind", "chromosome", "start", "end", "traits"} <= set(locus) or not int(locus["start"]) <= int(locus["end"]):
+            raise ValueError(f"{path}: a locus needs its name, kind, chromosome, start <= end and traits: {locus.get('name')!r}.")
+    return loci
+
+
+def locus_variance(
+    trait: str, arm: str, loci: Sequence[Mapping[str, Any]], chromosomes: I64Array, positions: I64Array, classes: NDArray, second: F64Array,
+    carriers: F64Array,
+) -> list[tuple[Any, ...]]:
+    """One model's ``locus_variance.tsv`` lines over its fitted records (their store ``chromosomes``, ``positions``,
+    ``classes``, posterior second moments on standardized genotypes ``second``, and expected minor-allele ``carriers``)
+    at the panel windows that list ``trait``: a record is in a window when its first base is. Carriers are read as the
+    training rows times the minor allele frequency, the fewest the minor allele copies allow (every copy in a
+    homozygote), so a record kept here has at least MINIMUM_REPORTED_PARTICIPANTS of them in expectation."""
+    total = float(second.sum())
+    rare = carriers < MINIMUM_REPORTED_PARTICIPANTS
+    lines: list[tuple[Any, ...]] = []
+    for locus in loci:
+        if trait not in locus["traits"]:
+            continue
+        window = (chromosomes == int(locus["chromosome"])) & (positions >= int(locus["start"])) & (positions <= int(locus["end"]))
+        kept = window & ~rare
+        window_total = float(second[kept].sum())
+        head = (trait, arm, locus["name"], locus["kind"], int(locus["chromosome"]), int(locus["start"]), int(locus["end"]))
+        for name in [*sorted(set(classes[window].tolist())), "all"]:
+            member = window if name == "all" else window & (classes == name)
+            variance = float(second[member & kept].sum())
+            shown = bool((member & kept).any())
+            lines.append((
+                *head, name, int((member & kept).sum()), int((member & rare).sum()), _number(variance) if shown else "",
+                _number(variance / total) if shown and total > 0.0 else "", _number(variance / window_total) if shown and window_total > 0.0 else "",
+            ))
+    return lines
 
 
 def genetic_variance_decomposition(total: F64Array, structural: F64Array) -> dict[str, float]:
@@ -3769,9 +4124,11 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
     """Each trait's all-rows model, in both arms: every fitted record's effect (``effects/<trait>.<arm>.tsv.gz``, kept in
     the workspace: it carries each record's mean dosage, from which a rare record's carrier count follows), two
     summaries by variant class and length that carry no participant count (``effects_by_class.tsv``,
-    ``effect_length_correlation.tsv``), and the structural records' share of the ``with_sv`` score's variance over each
-    trait's observed rows, from the score step's scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS). A trait the
-    score step left out as unscorable (``_fit_verdicts``) has no effects here.
+    ``effect_length_correlation.tsv``), the learned prior by class and length and its enrichment over SNVs beside the
+    posterior's (``prior_by_length.tsv``, ``prior_enrichment.tsv``: ``prior_moments``, ``effect_summaries``), and the
+    structural records' share of the ``with_sv`` score's variance over each trait's observed rows, from the score step's
+    scores (``genetic_variance.tsv``, GENETIC_VARIANCE_COLUMNS). Only summaries the export check passes are listed as
+    exportable. A trait the score step left out as unscorable (``_fit_verdicts``) has no effects here.
 
     A batch is one (arm, trait)'s all-rows model: its compressed per-record table and its already formatted summary
     rows are committed together. A restart reuses only whole, matching batches, in the original arm/trait order;
@@ -3794,8 +4151,14 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
         variance_lines.extend(
             (trait_name, reportable_count(count), quantity, f"{value:.6g}" if _shown(count, None) else "") for quantity, value in decomposition.items()
         )
-    summary_lines: list[tuple[Any, ...]] = [EFFECT_SUMMARY_COLUMNS]
-    correlation_lines: list[tuple[Any, ...]] = [LENGTH_CORRELATION_COLUMNS]
+    summaries: dict[str, list[tuple[Any, ...]]] = {
+        "effects_by_class.tsv": [EFFECT_SUMMARY_COLUMNS], "effect_length_correlation.tsv": [LENGTH_CORRELATION_COLUMNS],
+        "prior_by_length.tsv": [PRIOR_BY_LENGTH_COLUMNS], "prior_enrichment.tsv": [PRIOR_ENRICHMENT_COLUMNS],
+    }
+    loci = [] if run.config.locus_panel is None else read_locus_panel(run.config.locus_panel)
+    if run.config.locus_panel is not None:
+        summaries["locus_variance.tsv"] = [LOCUS_VARIANCE_COLUMNS]
+    priors = 0
     if reported:
         with DosageStore.open(_final_store(run)) as store:
             table = store.variant_table
@@ -3814,15 +4177,12 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                     checkpoint = BatchCheckpoint(directory, step_key, {"arm": arm, "trait": trait_name}, (table_name, "summary.json"))
                     saved = checkpoint.read()
                     if saved is None:
-                        batch_summary: list[tuple[Any, ...]] = []
-                        batch_correlation: list[tuple[Any, ...]] = []
                         with checkpoint.write() as temporary:
                             fitted = _checked_trait_model(run, cohort, arm, trait, _fitted_model_directory(run, arm, trait_name))
                             require_scorable(fitted)
                             scoring = fitted.scoring[list(fitted.model_names).index(cohort.model_names[cohort.all_rows_model(trait)])]
                             effects = variant_effects(scoring, codes_per_unit, working_bytes)
                             rows = effects.store_rows
-                            root_mean_square = np.sqrt(effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation)
                             pd.DataFrame(
                                 {
                                     "chromosome": np.asarray(table.chromosome)[rows].astype(np.int64),
@@ -3847,43 +4207,37 @@ def _effects_step(run: _Run, directory: Path) -> dict[str, Any]:
                                 # gzip's fastest level: a genome's records are tens of millions of rows per table.
                                 compression={"method": "gzip", "compresslevel": 1},
                             )
-                            frame = pd.DataFrame(
-                                {
-                                    "variant_class": classes[rows], "length_bin": bins[rows], "mean": effects.mean,
-                                    "probability_positive": effects.probability_positive, "probability_negative": effects.probability_negative,
-                                    "root_mean_square": root_mean_square,
-                                }
-                            )
-                            for (variant_class, length_bin), group in frame.groupby(["variant_class", "length_bin"], sort=True):
-                                absolute = np.abs(group["mean"].to_numpy())
-                                batch_summary.append((
-                                    trait_name, arm, variant_class, length_bin, len(group), int((group["mean"] > 0.0).sum()), int((group["mean"] < 0.0).sum()),
-                                    f"{group['probability_positive'].sum():.6g}", f"{group['probability_negative'].sum():.6g}",
-                                    f"{absolute.mean():.6g}", f"{np.median(absolute):.6g}", f"{np.sqrt(np.mean(group['root_mean_square'].to_numpy() ** 2)):.6g}",
-                                ))
-                            structural = lengths[rows] >= COMMUNITY_SV_MINIMUM_LENGTH
-                            for variant_class in [*sorted(set(classes[rows][structural])), "all_structural"]:
-                                member = structural & ((classes[rows] == variant_class) | (variant_class == "all_structural"))
-                                if np.unique(lengths[rows][member]).shape[0] < 2:
-                                    continue
-                                for quantity, values in (("absolute_mean", np.abs(effects.mean)), ("posterior_sd", effects.standard_deviation)):
-                                    selected = values[member]
-                                    rho = stats.spearmanr(np.log(lengths[rows][member]), selected).statistic if np.ptp(selected) > 0 else float("nan")
-                                    batch_correlation.append((trait_name, arm, variant_class, int(member.sum()), quantity, f"{rho:.6g}", "descriptive_prior_and_LD_dependent"))
-                            _write_json(temporary / "summary.json", {"summary": batch_summary, "correlation": batch_correlation})
+                            unit = codes_per_unit[rows] / np.asarray(scoring.signed_scales, dtype=np.float64)
+                            prior = prior_moments(scoring, unit)
+                            tables = effect_summaries(trait_name, arm, classes[rows], bins[rows], lengths[rows], effects, unit, prior)
+                            if loci:
+                                frequency = np.asarray(table.sum_code, dtype=np.float64)[rows] / (2.0 * CODES_PER_DOSAGE * store.n_samples)
+                                trained = int(cohort.training[:, cohort.all_rows_model(trait)].sum())
+                                tables["locus_variance.tsv"] = locus_variance(
+                                    trait_name, arm, loci, np.asarray(table.chromosome)[rows].astype(np.int64), np.asarray(table.position)[rows].astype(np.int64),
+                                    classes[rows], (effects.mean * effects.mean + effects.standard_deviation * effects.standard_deviation) / (unit * unit),
+                                    trained * np.minimum(frequency, 1.0 - frequency),
+                                )
+                            _write_json(temporary / "summary.json", {"tables": tables, "prior": prior is not None})
                         saved = checkpoint.path
                     record = json.loads((saved / "summary.json").read_text(encoding="utf-8"))
-                    summary_lines.extend(record["summary"])
-                    correlation_lines.extend(record["correlation"])
+                    for name, lines in record["tables"].items():
+                        summaries[name].extend(lines)
+                    priors += bool(record["prior"])
                     output = directory / table_name
                     output.unlink(missing_ok=True)
                     os.link(saved / table_name, output)
-    for name, lines in (("effects_by_class.tsv", summary_lines), ("effect_length_correlation.tsv", correlation_lines), ("genetic_variance.tsv", variance_lines)):
+    summaries["genetic_variance.tsv"] = variance_lines
+    for name, lines in summaries.items():
         with (directory / name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
-    exportable = ["effects_by_class.tsv", "effect_length_correlation.tsv", "genetic_variance.tsv"]
+    exportable, refused = _checked_exportable(directory, list(summaries))
     _write_json(directory / EXPORTABLE_FILE, exportable)
-    return {"files": exportable, "variant_tables": f"{len(ARMS) * len(reported)} per-record effect tables, kept in the workspace"}
+    return {
+        "files": exportable, "not_exportable": refused,
+        "variant_tables": f"{len(ARMS) * len(reported)} per-record effect tables, kept in the workspace",
+        "prior": f"the learned prior read from {priors} of {len(ARMS) * len(reported)} models' draw laws (mean-field models hold it; others have none)",
+    }
 
 
 ACCURACY_COLUMNS = ("trait", "arm", "cell", "level", "n", "cases", "metric", "value")
@@ -3918,22 +4272,58 @@ class _HeldOutCell:
         return int(sum(rows.shape[0] for rows in self.folds))
 
 
-def _cells(cohort: _Cohort, trait: int, fold_count: int) -> list[tuple[str, str, _HeldOutCell]]:
-    """Every report cell of a trait: all its held-out rows, each evaluated fold, each ancestry group and each half."""
-    observed = np.isfinite(cohort.targets[:, trait]) & cohort.held_out[:, cohort.trait_models(trait)].any(axis=1)
-    ancestry, half = np.array(cohort.ancestry), np.array(cohort.half)
-    folds = cohort.evaluated_folds(trait, fold_count)
+def held_out_cells(observed: BoolArray, folds: I64Array, evaluated: Sequence[int], groupings: Mapping[str, Sequence[str]]) -> list[tuple[str, str, _HeldOutCell]]:
+    """The report cells of one trait's held-out rows (``observed`` rows in the ``evaluated`` folds): all of them, each
+    evaluated fold, then each level of every grouping in ``groupings`` (a label per row, by the grouping's name)."""
 
     def cell(member: BoolArray) -> _HeldOutCell:
-        return _HeldOutCell(tuple(np.flatnonzero(observed & member & (cohort.folds == fold)) for fold in folds))
+        return _HeldOutCell(tuple(np.flatnonzero(observed & member & (folds == fold)) for fold in evaluated))
 
-    everyone = np.ones(cohort.folds.shape[0], dtype=bool)
-    return (
-        [("all", "all", cell(everyone))]
-        + [("fold", str(fold), cell(cohort.folds == fold)) for fold in folds]
-        + [("ancestry", label, cell(ancestry == label)) for label in sorted(set(cohort.ancestry))]
-        + [("half", label, cell(half == label)) for label in sorted(set(cohort.half))]
+    cells = [("all", "all", cell(np.ones(folds.shape[0], dtype=bool)))] + [("fold", str(fold), cell(folds == fold)) for fold in evaluated]
+    for grouping, labels in groupings.items():
+        labelled = np.asarray(labels)
+        cells += [(grouping, label, cell(labelled == label)) for label in sorted(set(labelled.tolist()))]
+    return cells
+
+
+def _held_out_rows(cohort: _Cohort, trait: int) -> BoolArray:
+    """A trait's rows that one of its models holds out and that observe it: the people its held-out metrics are read on."""
+    return np.isfinite(cohort.targets[:, trait]) & cohort.held_out[:, cohort.trait_models(trait)].any(axis=1)
+
+
+def _cells(cohort: _Cohort, trait: int, fold_count: int) -> list[tuple[str, str, _HeldOutCell]]:
+    """Every report cell of a trait: all its held-out rows, each evaluated fold, each ancestry group and each half."""
+    return held_out_cells(
+        _held_out_rows(cohort, trait), cohort.folds, cohort.evaluated_folds(trait, fold_count), {"ancestry": cohort.ancestry, "half": cohort.half}
     )
+
+
+def suppressed_levels(parts: Mapping[str, Sequence[int]]) -> set[str]:
+    """The levels of a partition that are not shown beside its total, each level given by its counts (rows; a disease's
+    cases and controls beside them): every level with a count of 1 to 20, then the smallest of the others until each
+    count's suppressed total is 0 or at least MINIMUM_REPORTED_PARTICIPANTS. ``all_of_us.reportable_partition``'s rule
+    over several counts at once, so the total less the shown levels gives no count of 1 to 20 in any of them."""
+    suppressed = {level for level, counts in parts.items() if any(0 < count < MINIMUM_REPORTED_PARTICIPANTS for count in counts)}
+    others = sorted((counts[0], level) for level, counts in parts.items() if level not in suppressed and counts[0])
+    width = len(next(iter(parts.values()), ()))
+
+    def leaking() -> bool:
+        return any(0 < sum(parts[level][index] for level in suppressed) < MINIMUM_REPORTED_PARTICIPANTS for index in range(width))
+
+    while others and leaking():
+        suppressed.add(others.pop(0)[1])
+    return suppressed
+
+
+def _hidden_counts(count: int, binary: bool, hidden: str = "rows") -> tuple[str, str]:
+    """The counts a hidden cell (``_partition_hidden``) shows: its rows where only its cases are hidden (``hidden``
+    "cases"), or where they are 1 to 20 and reportable_count writes them as suppressed itself; none of its own else."""
+    return (reportable_count(count) if hidden == "cases" or count < MINIMUM_REPORTED_PARTICIPANTS else "suppressed", "suppressed" if binary else "")
+
+
+def _number(value: float) -> str:
+    """A table's number as the report writes it, or nothing where it is not finite."""
+    return f"{value:.6g}" if np.isfinite(value) else ""
 
 
 def _fold_weighted(values: Sequence[tuple[int, float]]) -> float:
@@ -4111,6 +4501,385 @@ def _primary_influence(
     raise ValueError(f"no primary influence for {metric!r}")
 
 
+BOOTSTRAP_RESAMPLES = 2000
+"""The resamples behind every held-out partial r^2 interval and paired difference (``partial_r2_tables``): Efron and
+Tibshirani's 1,000 to 2,000 for a percentile interval (An Introduction to the Bootstrap, 1993, section 19.3)."""
+CONFIDENCE_LEVEL = 0.95
+"""The two-sided level of every interval the partial r^2 tables and the prior summaries give."""
+BASELINE_DIRECTORY = "baselines"
+"""``<run>/baselines/<method>.npz``, or the config's ``baseline_directory``: another method's held-out genetic scores on
+this run's cohort (``write_baseline_scores``; benchmarks/bench_real/aou_ldpred2.py writes LDpred2-auto's as
+``ldpred2_auto.npz``), which the report compares with both arms on the same held-out people and the same covariates
+(``partial_r2_tables``). One score per held-out person, so it stays in the workspace as the score step's predictions do,
+and no table lists it for export."""
+STACKING_SPLITS = 5
+"""The parts a held-out fold's families are dealt into for a stacked score (``stacked_scores``): each part's weights are
+fitted on the other four, so every weight trains on 80% of the fold's held-out people and never on the person it
+scores, as five-fold cross-validation is usually run."""
+STACKED_PARTS = ("with_sv", "structural")
+"""What a stacked score adds to a baseline: the ``with_sv`` arm's whole held-out score, or only its structural part
+(``_Scores.held_out_structural``). A stacked method is named ``<baseline>+<part>``."""
+PARTIAL_R2_COLUMNS = ("trait", "method", "cell", "level", "n", "cases", "partial_r2", "standard_error", "ci_low", "ci_high", "resamples", "inference")
+"""``partial_r2.tsv``: per trait, method (each arm, then each baseline, then each stacked score: ``stacked_scores``) and
+cell (all held-out rows, each ancestry group), the held-out partial r^2 of the method's genetic score (``_partial_r2``:
+the squared correlation with the outcome after both are residualized on the trait's covariates, PC1-16, age, age^2,
+age x female and sex among them; a disease's 0/1 outcome is read the same way), with its family-clustered bootstrap
+standard error and percentile interval."""
+PAIRED_DIFFERENCE_COLUMNS = (
+    "trait", "candidate", "baseline", "cell", "level", "n", "cases", "estimate", "standard_error", "ci_low", "ci_high", "z", "p_value",
+    "p_bootstrap", "relative_estimate", "relative_ci_low", "relative_ci_high", "resamples", "inference",
+)
+"""``paired_differences.tsv``: per trait, pair of methods and cell, the candidate's partial r^2 less the baseline's on the
+same held-out people, from the same resamples: its bootstrap standard error and percentile interval, z = estimate / SE
+with its two-sided normal p, the bootstrap's own two-sided p (twice the smaller share of resampled differences on either
+side of 0, each counted with the estimate itself), and the difference relative to the baseline's partial r^2."""
+META_ANALYSIS_COLUMNS = (
+    "candidate", "baseline", "cell", "level", "model", "traits", "estimate", "standard_error", "ci_low", "ci_high", "z", "p_value",
+    "heterogeneity_q", "heterogeneity_p", "i_squared", "tau_squared", "positive_traits", "covariance",
+)
+"""``meta_analysis.tsv``: per pair of methods and cell (all held-out rows, each ancestry group), the traits' held-out
+partial r^2 differences combined (``held_out_comparison.meta_analysis``), fixed and random effects, over the traits
+whose single test fold gives each a p-value there, with the traits' covariance from the joint resamples (``covariance``
+says which), and how many of the traits' differences are positive (descriptive)."""
+TRAIT_COVARIANCE_COLUMNS = ("candidate", "baseline", "cell", "level", "trait", "other_trait", "covariance")
+"""``trait_covariance.tsv``: the joint-resample covariance of every two traits' paired differences behind each
+meta-analysis, so meta-analyses across runs (docs/poster/ashg2026/aou_results.py) keep each run's own correlations."""
+HETEROGENEITY_COLUMNS = ("trait", "candidate", "baseline", "cell", "levels", "estimates", "q", "degrees", "p_value")
+"""``heterogeneity.tsv``: per trait, and for the traits combined (trait ``combined``: each level's fixed effect over the
+traits), whether a pair's paired difference differs between a grouping's levels (each ancestry group): Cochran's Q of
+the levels' differences about their common value under their joint-resample covariance, on levels - 1 degrees of
+freedom. The levels are those whose difference is shown with a p-value; ``estimates`` lists their differences."""
+
+
+@dataclass(frozen=True, slots=True)
+class HeldOutTrait:
+    """One trait's held-out genetic scores on a cohort's rows, as ``partial_r2_tables`` reads them: its outcome (NaN off
+    its held-out rows), its own covariates (the intercept among them), each method's genetic score (finite on the
+    trait's held-out rows) and the folds its held-out rows come from."""
+
+    name: str
+    binary: bool
+    targets: F64Array
+    covariates: F64Array
+    scores: Mapping[str, F64Array]
+    folds: tuple[int, ...]
+
+
+def method_pairs(methods: Sequence[str]) -> list[tuple[str, str]]:
+    """The (candidate, baseline) pairs the tables compare: with_sv against snv_indel, each arm against each baseline
+    method, and each stacked score against the baseline it adds to (``stacked_scores``) where that baseline is compared."""
+    pairs = [("with_sv", "snv_indel")]
+    for method in methods:
+        if method in ARMS:
+            continue
+        if "+" in method:
+            pairs.extend((method, baseline) for baseline in [method.split("+")[0]] if baseline in methods)
+        else:
+            pairs.extend((arm, method) for arm in reversed(ARMS))
+    return pairs
+
+
+def stacked_scores(
+    targets: F64Array, covariates: F64Array, scores: Mapping[str, F64Array], structural: F64Array | None, families: I64Array, folds: I64Array,
+    evaluated: Sequence[int], seed: int,
+) -> dict[str, F64Array]:
+    """For every baseline method among ``scores`` (one not in ARMS), each STACKED_PARTS score added to it: per evaluated
+    fold, the least-squares weights of the baseline and the part given the covariates, cross-fitted over the fold's
+    held-out families (``held_out_comparison.cross_fitted_stack``, STACKING_SPLITS parts), so a person's stacked score
+    comes from weights fitted on other families of their fold and never on them; NaN off the held-out rows
+    (``targets`` is NaN there). Every stack of a fold deals its families the same way (seeded by ``seed`` and the fold), so
+    two stacked scores differ by what they add alone. ``structural`` (the with_sv arm's held-out structural part) None
+    leaves the structural stack out. A stack is what the best SNV score gains from the SV-PGS score on the same people:
+    the gain of ``<baseline>+structural`` over the baseline is the structural records' alone."""
+    parts = {"with_sv": scores["with_sv"], "structural": structural}
+    stacked: dict[str, F64Array] = {}
+    for baseline, values in scores.items():
+        if baseline in ARMS:
+            continue
+        for part in STACKED_PARTS:
+            if parts[part] is None:
+                continue
+            result = np.full(targets.shape[0], np.nan)
+            for fold in evaluated:
+                rows = np.flatnonzero((folds == fold) & np.isfinite(targets))
+                result[rows] = held_out_comparison.cross_fitted_stack(
+                    targets[rows], covariates[rows], np.vstack([values[rows], parts[part][rows]]), families[rows], STACKING_SPLITS,
+                    np.random.default_rng([seed, int(fold)]),
+                )
+            stacked[f"{baseline}+{part}"] = result
+    return stacked
+
+
+def partial_r2_tables(
+    traits: Sequence[HeldOutTrait], families: I64Array, folds: I64Array, ancestry: Sequence[str], seed: int, resamples: int, working_bytes: int,
+) -> tuple[dict[str, list[tuple[Any, ...]]], list[str]]:
+    """The lines of ``partial_r2.tsv``, ``paired_differences.tsv``, ``meta_analysis.tsv``, ``trait_covariance.tsv`` and
+    ``heterogeneity.tsv`` by file name for ``traits`` on one cohort's rows (``families``, ``folds`` and ``ancestry`` per
+    row), and the baselines left out of a trait because they did not score every held-out row its cells read ("trait:
+    method"; an arm's missing score is an error).
+
+    Each trait's cells are the report's (``held_out_cells``: all held-out rows, each ancestry group), shown as the
+    accuracy table shows them (``_partition_hidden``, ``_shown``), each method's partial r^2 read on each evaluated fold's
+    rows with that fold's covariates and weighted by the fold's rows, as accuracy.tsv's pgs_partial_r2. Its uncertainty is
+    a cluster bootstrap of the held-out people (``held_out_comparison.cluster_bootstrap_counts``: each fold's families
+    drawn with replacement within it), every method scored on the same resample, so a paired difference is resampled whole
+    and holds the methods' correlation; the fitted models are fixed, so, as comparison.tsv's, the inference is
+    conditional on them and across several folds descriptive (no z or p). Every trait is resampled from the same
+    ``seed``, so resample r weights the same families in every trait, and the meta-analysis reads the traits'
+    covariance from them (traits observed on overlapping people, or genetically correlated, are not independent), as the
+    test of a difference between ancestry groups reads the groups'. A cell's counts are those of the folds its partial
+    r^2 is read on, as accuracy.tsv's pgs_partial_r2 row shows them, so the two tables never differ by a dropped fold."""
+    # The resampled clusters: a fold's members of one family (the kinship folds keep a family in one fold, so these are
+    # the families), each in its fold's stratum.
+    span = int(families.max(initial=0)) + 1
+    keys, clusters = np.unique(np.asarray(folds, dtype=np.int64) * span + families, return_inverse=True)
+    cluster_folds = keys // span
+    lower, upper = (1.0 - CONFIDENCE_LEVEL) / 2.0, (1.0 + CONFIDENCE_LEVEL) / 2.0
+    chunk = max(1, min(resamples, working_bytes // (np.dtype(np.float64).itemsize * (cluster_folds.shape[0] + 2 * families.shape[0]))))
+    partial_lines: list[tuple[Any, ...]] = [PARTIAL_R2_COLUMNS]
+    paired_lines: list[tuple[Any, ...]] = [PAIRED_DIFFERENCE_COLUMNS]
+    # An unshown cell's values, every column after its counts.
+    partial_blanks = ("",) * (len(PARTIAL_R2_COLUMNS) - PARTIAL_R2_COLUMNS.index("partial_r2"))
+    paired_blanks = ("",) * (len(PAIRED_DIFFERENCE_COLUMNS) - PAIRED_DIFFERENCE_COLUMNS.index("estimate"))
+    # Each tested difference's resamples, by (candidate, baseline, cell, level) across traits and by (trait, candidate,
+    # baseline, cell) across a grouping's levels.
+    joint: dict[tuple[str, str, str, str], list[tuple[str, float, F64Array]]] = {}
+    across_levels: dict[tuple[str, str, str, str], list[tuple[str, float, F64Array]]] = {}
+    incomplete: list[str] = []
+    for trait in traits:
+        observed = np.isfinite(trait.targets)
+        cells = [entry for entry in held_out_cells(observed, folds, trait.folds, {"ancestry": ancestry}) if entry[0] != "fold"]
+        hidden = _partition_hidden(cells, trait.targets, trait.binary)
+        # Per cell: its counts as shown, and the folds its partial r^2 is read on (none where it is not shown).
+        read: list[tuple[str, str, tuple[str, str], Sequence[I64Array]]] = []
+        for cell, level, held in cells:
+            cases = int(sum(int(trait.targets[rows].sum()) for rows in held.folds)) if trait.binary else None
+            if (cell, level) in hidden:
+                read.append((cell, level, _hidden_counts(held.count, trait.binary, hidden[(cell, level)]), []))
+                continue
+            selected = _scored_folds(held, trait.targets, trait.binary) if _shown(held.count, cases) else []
+            used, used_cases = _evaluated_counts(selected, trait.targets, trait.binary)
+            shown = bool(selected) and _shown(used, used_cases)
+            counts = (reportable_count(used), _cases_text(used, used_cases)) if shown else (reportable_count(held.count), _cases_text(held.count, cases))
+            read.append((cell, level, counts, selected if shown else []))
+        methods = []
+        for method, values in trait.scores.items():
+            if all(np.all(np.isfinite(values[rows])) for _cell, _level, _counts, selected in read for rows in selected):
+                methods.append(method)
+            elif method in ARMS:
+                raise ValueError(f"{trait.name}: the {method} genetic score is missing on held-out rows the report reads.")
+            else:
+                incomplete.append(f"{trait.name}: {method}")
+        pairs = method_pairs(methods)
+        stacked = np.vstack([np.asarray(trait.scores[method], dtype=np.float64) for method in methods])
+
+        def fold_weighted(weights: Callable[[I64Array], F64Array], selected: Sequence[I64Array]) -> F64Array:
+            # [resamples, methods]: each fold's partial r^2 under the resamples' weights, weighted by the fold's
+            # resampled rows.
+            total, mass = 0.0, 0.0
+            for rows in selected:
+                fold_weights = weights(rows)
+                total = total + fold_weights.sum(axis=1)[:, None] * held_out_comparison.weighted_partial_r2(
+                    fold_weights, trait.covariates[rows], trait.targets[rows], stacked[:, rows]
+                )
+                mass = mass + fold_weights.sum(axis=1)[:, None]
+            # A resample that draws none of a small cell's families has no partial r^2 there (NaN).
+            with np.errstate(divide="ignore", invalid="ignore"):
+                return np.asarray(total / mass)
+
+        points = {(cell, level): fold_weighted(lambda rows: np.ones((1, rows.shape[0])), selected)[0] for cell, level, _counts, selected in read if selected}
+        replicates = {key: np.empty((resamples, len(methods))) for key in points}
+        generator = np.random.default_rng(seed)
+        for start in range(0, resamples, chunk):
+            counts = held_out_comparison.cluster_bootstrap_counts(cluster_folds, min(chunk, resamples - start), generator)
+            for cell, level, _counts, selected in read:
+                if selected:
+                    replicates[cell, level][start : start + counts.shape[0]] = fold_weighted(lambda rows: counts[:, clusters[rows]], selected)
+        for cell, level, shown_counts, selected in read:
+            single = len(selected) == 1
+            inference = "conditional_on_fitted_models" if single else "descriptive_cross_fit"
+            if not selected:
+                partial_lines.extend((trait.name, method, cell, level, *shown_counts, *partial_blanks) for method in methods)
+                paired_lines.extend((trait.name, candidate, baseline, cell, level, *shown_counts, *paired_blanks) for candidate, baseline in pairs)
+                continue
+            point, resampled = points[cell, level], replicates[cell, level]
+            for index, method in enumerate(methods):
+                finite = resampled[np.isfinite(resampled[:, index]), index]
+                low, high = np.quantile(finite, [lower, upper]) if finite.shape[0] else (np.nan, np.nan)
+                partial_lines.append((
+                    trait.name, method, cell, level, *shown_counts, _number(point[index]),
+                    _number(float(np.std(finite, ddof=1)) if finite.shape[0] > 1 else float("nan")), _number(low), _number(high), resamples, inference,
+                ))
+            for candidate, baseline in pairs:
+                first, second = methods.index(candidate), methods.index(baseline)
+                estimate = float(point[first] - point[second])
+                differences = resampled[:, first] - resampled[:, second]
+                finite = differences[np.isfinite(differences)]
+                standard_error = float(np.std(finite, ddof=1)) if finite.shape[0] > 1 else float("nan")
+                comparison = held_out_comparison.comparison_from_estimate(estimate, standard_error)
+                low, high = np.quantile(finite, [lower, upper]) if finite.shape[0] else (np.nan, np.nan)
+                bootstrap_p = min(1.0, 2.0 * min(np.sum(finite <= 0.0) + 1, np.sum(finite >= 0.0) + 1) / (finite.shape[0] + 1)) if finite.shape[0] else np.nan
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    relative = differences / resampled[:, second]
+                relative = relative[np.isfinite(relative)]
+                relative_low, relative_high = np.quantile(relative, [lower, upper]) if relative.shape[0] else (np.nan, np.nan)
+                tested = single and np.isfinite(comparison.z_score)
+                paired_lines.append((
+                    trait.name, candidate, baseline, cell, level, *shown_counts, _number(estimate), _number(standard_error), _number(low), _number(high),
+                    _number(comparison.z_score) if tested else "", _number(2.0 * stats.norm.sf(abs(comparison.z_score))) if tested else "",
+                    _number(bootstrap_p) if single else "", _number(estimate / point[second]) if np.isfinite(point[second]) and point[second] else "", _number(relative_low),
+                    _number(relative_high), resamples, inference,
+                ))
+                if tested and standard_error > 0.0:
+                    joint.setdefault((candidate, baseline, cell, level), []).append((trait.name, estimate, differences))
+                    if cell != "all":
+                        across_levels.setdefault((trait.name, candidate, baseline, cell), []).append((level, estimate, differences))
+    meta_lines: list[tuple[Any, ...]] = [META_ANALYSIS_COLUMNS]
+    covariance_lines: list[tuple[Any, ...]] = [TRAIT_COVARIANCE_COLUMNS]
+    heterogeneity_lines: list[tuple[Any, ...]] = [HETEROGENEITY_COLUMNS]
+    quantile = stats.norm.ppf(upper)
+
+    def jointly(entries: list[tuple[str, float, F64Array]]) -> tuple[F64Array, F64Array] | None:
+        # The entries' estimates and covariance over the resamples every one of them has, or None with fewer than two.
+        resampled = np.vstack([differences for _name, _estimate, differences in entries])
+        complete = resampled[:, np.all(np.isfinite(resampled), axis=0)]
+        if complete.shape[1] < 2:
+            return None
+        return np.array([estimate for _name, estimate, _differences in entries]), np.atleast_2d(np.cov(complete))
+
+    def heterogeneity(trait_name: str, candidate: str, baseline: str, cell: str, entries: list[tuple[str, float, F64Array]]) -> None:
+        found = jointly(entries) if len(entries) > 1 else None
+        if found is None:
+            return
+        result = held_out_comparison.meta_analysis(*found)
+        heterogeneity_lines.append((
+            trait_name, candidate, baseline, cell, ";".join(name for name, _estimate, _differences in entries), ";".join(_number(value) for value in found[0]),
+            _number(result.heterogeneity_q), len(entries) - 1, _number(result.heterogeneity_p),
+        ))
+
+    # Each level's fixed effect over the traits, resampled with the same weights, by (candidate, baseline, cell).
+    combined_levels: dict[tuple[str, str, str], list[tuple[str, float, F64Array]]] = {}
+    for (candidate, baseline, cell, level), entries in joint.items():
+        found = jointly(entries) if len(entries) > 1 else None
+        if found is None:
+            continue
+        estimates, covariance = found
+        result = held_out_comparison.meta_analysis(estimates, covariance)
+        names = [name for name, _estimate, _differences in entries]
+        for model, combined in (("fixed", result.fixed), ("random", result.random)):
+            meta_lines.append((
+                candidate, baseline, cell, level, model, ";".join(names), _number(combined.estimate), _number(combined.standard_error),
+                _number(combined.estimate - quantile * combined.standard_error), _number(combined.estimate + quantile * combined.standard_error),
+                _number(combined.z_score), _number(2.0 * stats.norm.sf(abs(combined.z_score))), _number(result.heterogeneity_q),
+                _number(result.heterogeneity_p), _number(result.i_squared), _number(result.tau_squared) if model == "random" else "",
+                result.positive, "joint_bootstrap",
+            ))
+        covariance_lines.extend(
+            (candidate, baseline, cell, level, names[first], names[second], _number(covariance[first, second]))
+            for first in range(len(names)) for second in range(first, len(names))
+        )
+        if cell != "all" and np.isfinite(result.fixed.estimate):
+            precision = np.linalg.pinv(covariance, hermitian=True)
+            weights = precision.sum(axis=1) / precision.sum()
+            resampled = np.vstack([differences for _name, _estimate, differences in entries])
+            combined_levels.setdefault((candidate, baseline, cell), []).append((level, result.fixed.estimate, weights @ resampled))
+    for (trait_name, candidate, baseline, cell), entries in across_levels.items():
+        heterogeneity(trait_name, candidate, baseline, cell, entries)
+    for (candidate, baseline, cell), entries in combined_levels.items():
+        heterogeneity("combined", candidate, baseline, cell, entries)
+    tables = {
+        "partial_r2.tsv": partial_lines, "paired_differences.tsv": paired_lines, "meta_analysis.tsv": meta_lines,
+        "trait_covariance.tsv": covariance_lines, "heterogeneity.tsv": heterogeneity_lines,
+    }
+    return tables, incomplete
+
+
+def _training_digest(cohort: _Cohort, model: int) -> str:
+    """The digest of one model's training research IDs (``artifact.cohort_digest``)."""
+    return cohort_digest([cohort.research_ids[row] for row in np.flatnonzero(cohort.training[:, model])])
+
+
+def _held_out_models(cohort: _Cohort, trait: int) -> list[int]:
+    """A trait's models that hold someone out: its fold models, never the all-rows model (which holds no one out)."""
+    return [int(model) for model in cohort.trait_models(trait) if cohort.held_out[:, model].any()]
+
+
+def write_baseline_scores(path: Path, cohort: _Cohort, scores: Mapping[str, F64Array]) -> None:
+    """A method's held-out genetic scores, ``scores[trait name]`` one value per cohort row, finite on exactly the held-out
+    rows of the trait's models it fitted (``_held_out_models``, whole models), as the report reads them
+    (BASELINE_DIRECTORY): per trait the scored research IDs, their scores and folds, and per fitted model its name and the
+    digest of its training research IDs, from which the report knows the method trained on those models' rows and scored
+    their held-out people. A trait with no finite score is not written."""
+    arrays: dict[str, np.ndarray] = {}
+    names = []
+    for name, values in scores.items():
+        trait = cohort.trait_names.index(name)
+        values = np.asarray(values, dtype=np.float64)
+        rows = np.flatnonzero(np.isfinite(values))
+        if not rows.shape[0]:
+            continue
+        models = [model for model in _held_out_models(cohort, trait) if np.all(np.isfinite(values[cohort.held_out[:, model]]))]
+        if not np.array_equal(rows, np.flatnonzero(cohort.held_out[:, models].any(axis=1))):
+            raise ValueError(f"{name}: the scores are not the held-out rows of whole models.")
+        names.append(name)
+        arrays |= {
+            f"{name}/research_ids": np.array([cohort.research_ids[row] for row in rows], dtype=str), f"{name}/scores": values[rows],
+            f"{name}/folds": cohort.folds[rows], f"{name}/models": np.array([cohort.model_names[model] for model in models], dtype=str),
+            f"{name}/training": np.array([_training_digest(cohort, model) for model in models], dtype=str),
+        }
+    with Path(path).open("wb") as handle:
+        np.savez(handle, traits=np.array(names, dtype=str), **arrays)
+
+
+def _baseline_scores(run: _Run, cohort: _Cohort) -> tuple[dict[str, F64Array], dict[str, str]]:
+    """Each baseline method's held-out genetic scores (BASELINE_DIRECTORY) [cohort rows, traits], NaN off the rows it
+    scored, and why each other baseline file was left out. A file is read only if, for every trait of this cohort it
+    scored, its models are this cohort's models of that trait that hold someone out, each trained on exactly that model's
+    training rows (by digest), and its scored people are exactly those models' held-out people, each in their own fold: a
+    comparison is on the same people and the same split, or it is not made."""
+    directory = run.config.baselines()
+    found: dict[str, F64Array] = {}
+    refused: dict[str, str] = {}
+    paths = sorted(directory.glob("*.npz")) if directory.is_dir() else []
+    position = {research_id: row for row, research_id in enumerate(cohort.research_ids)} if paths else {}
+    for path in paths:
+        values = np.full(cohort.targets.shape, np.nan)
+        try:
+            with np.load(path) as arrays:
+                for name in [str(name) for name in arrays["traits"]]:
+                    if name not in cohort.trait_names:
+                        continue
+                    trait = cohort.trait_names.index(name)
+                    held_out = {cohort.model_names[model]: model for model in _held_out_models(cohort, trait)}
+                    trained = dict(zip((str(model) for model in arrays[f"{name}/models"]), (str(digest) for digest in arrays[f"{name}/training"])))
+                    if not trained or any(model not in held_out or digest != _training_digest(cohort, held_out[model]) for model, digest in trained.items()):
+                        raise ValueError(f"its {name} models are not this report's fold models trained on their rows")
+                    rows = np.array([position.get(str(research_id), -1) for research_id in arrays[f"{name}/research_ids"]], dtype=np.int64)
+                    expected = np.flatnonzero(cohort.held_out[:, [held_out[model] for model in trained]].any(axis=1))
+                    if np.any(rows < 0) or not np.array_equal(np.sort(rows), expected) or not np.array_equal(arrays[f"{name}/folds"], cohort.folds[rows]):
+                        raise ValueError(f"its {name} scores are not on those models' held-out people in their folds")
+                    values[rows, trait] = arrays[f"{name}/scores"]
+        except (KeyError, ValueError) as error:
+            refused[path.stem] = f"{path.name}: {error}; it was made on another cohort or split, and is not compared."
+            LOGGER.warning("workspace pipeline: baseline %s", refused[path.stem])
+            continue
+        found[path.stem] = values
+    return found, refused
+
+
+def _report_inputs(config: WorkspaceConfig) -> dict[str, Any]:
+    """What the report reads beyond its upstream steps: the pre-registered panel, its bootstrap's resamples and level,
+    and each baseline file's digest (BASELINE_DIRECTORY), so a baseline placed in the run after its report makes the
+    report again."""
+    directory = config.baselines()
+    return {
+        "panel": None if config.panel is None else [config.panel.primary_fold, [list(weight) for weight in config.panel.weights]],
+        "bootstrap": [BOOTSTRAP_RESAMPLES, CONFIDENCE_LEVEL],
+        "stacking": [STACKING_SPLITS, list(STACKED_PARTS)],
+        "baselines": {path.stem: _file_digest(path) for path in sorted(directory.glob("*.npz"))} if directory.is_dir() else {},
+    }
+
+
 QUARANTINE_COLUMNS = ("trait", "quarantined_fits")
 """``quarantined.tsv``: each trait left out of every table as unscorable, with its arms and their models' codes."""
 UNCERTIFIED_COLUMNS = ("trait", "uncertified_fits")
@@ -4197,6 +4966,15 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
     included; the others on the folds ``_scored_folds`` keeps. Across multiple folds the estimate and conditional
     standard error are descriptive: shared-training covariance is not estimated, so no combined z or p-value is emitted.
 
+    Every trait, a disease's included, is also read on the LDpred2 baseline's scale (``partial_r2_tables``): each arm's,
+    each baseline method's (``WorkspaceConfig.baselines``) and each baseline's stacked with the with_sv score or its
+    structural part alone (``stacked_scores``) held-out partial r^2 with a family-clustered bootstrap interval
+    (``partial_r2.tsv``), each pair's paired difference on the same resamples (``paired_differences.tsv``), the traits'
+    differences combined per cell with their covariance (``meta_analysis.tsv``, ``trait_covariance.tsv``), and the test of
+    a difference between ancestry groups (``heterogeneity.tsv``). A grouping's levels whose counts the all cell would give
+    back are hidden with the small ones (``_partition_hidden``), and only tables the export check passes are listed as
+    exportable.
+
     A trait the score step left out as unscorable (``_fit_verdicts``) is in no table but ``quarantined.tsv``
     (QUARANTINE_COLUMNS). An uncertified trait is in every table, and ``uncertified.tsv`` (UNCERTIFIED_COLUMNS) names it
     with its arms and their models' fatal codes.
@@ -4237,8 +5015,7 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
             shown = _shown(count, cases)
             if (cell, level) in hidden:
                 # Hidden with its family's other small levels, so that no count of 1 to 20 follows from "all" less them.
-                rows_text = counts[0] if hidden[(cell, level)] == "cases" or count < MINIMUM_REPORTED_PARTICIPANTS else "suppressed"
-                counts, shown = (rows_text, "suppressed" if binary else ""), False
+                counts, shown = _hidden_counts(count, binary, hidden[(cell, level)]), False
             scored = _scored_folds(held, targets, binary) if shown else []
             proper = _proper_folds([rows for rows in held.folds if rows.shape[0]], scored, targets, binary) if shown else []
 
@@ -4284,47 +5061,167 @@ def _report_step(run: _Run, directory: Path) -> dict[str, Any]:
                     name, cell, level, *metric_counts, metric, f"{combined.estimate:.6g}", f"{combined.standard_error:.6g}",
                     z_text, p_text, inference,
                 ))
+    baselines, refused_baselines = _baseline_scores(run, cohort)
+    held_out = []
+    for trait, name in enumerate(cohort.trait_names):
+        if name in quarantined:
+            continue
+        targets = np.where(_held_out_rows(cohort, trait), cohort.targets[:, trait], np.nan)
+        covariates = cohort.covariates[:, cohort.covariate_columns[trait]]
+        evaluated_folds = cohort.evaluated_folds(trait, fold_count)
+        methods = {arm: scores.held_out_genetic[arm_index, :, trait] for arm_index, arm in enumerate(ARMS)}
+        methods |= {baseline: values[:, trait] for baseline, values in baselines.items() if np.isfinite(values[:, trait]).any()}
+        structural = None if scores.held_out_structural is None else scores.held_out_structural[:, trait]
+        methods |= stacked_scores(targets, covariates, methods, structural, cohort.families, cohort.folds, evaluated_folds, run.config.seed)
+        held_out.append(HeldOutTrait(name, cohort.trait_types[trait] == TraitType.BINARY, targets, covariates, methods, evaluated_folds))
+    held_out_tables, incomplete = partial_r2_tables(
+        held_out, cohort.families, cohort.folds, cohort.ancestry, run.config.seed, BOOTSTRAP_RESAMPLES, run.budget.host_bytes // 2
+    )
     tables = [
         ("accuracy.tsv", accuracy), ("comparison.tsv", comparison),
         ("quarantined.tsv", [QUARANTINE_COLUMNS, *((name, "; ".join(arms)) for name, arms in quarantined.items())]),
         ("uncertified.tsv", [UNCERTIFIED_COLUMNS, *((name, "; ".join(arms)) for name, arms in uncertified.items())]),
+        *held_out_tables.items(),
     ]
     panel_summary: dict[str, Any] | str = "no pre-registered panel in the run config"
-    if run.config.panel is not None:
+    if run.config.panel is not None and run.config.test_fold is not None:
+        panel_summary = "a validation split (test_fold) tests no pre-registered panel: its primary fold is reserved"
+    elif run.config.panel is not None:
         panel_lines, panel_summary = _panel_rows(run, cohort, scores, quarantined)
         tables.append(("panel.tsv", panel_lines))
     for file_name, lines in tables:
         with (directory / file_name).open("w", newline="", encoding="utf-8") as handle:
             csv.writer(handle, delimiter="\t").writerows(lines)
-    exportable = [file_name for file_name, _lines in tables]
+    exportable, refused = _checked_exportable(directory, [file_name for file_name, _lines in tables])
     _write_json(directory / EXPORTABLE_FILE, exportable)
     return {
         "files": exportable,
+        "not_exportable": refused,
         "quarantined": sorted(quarantined),
         "uncertified": sorted(uncertified),
         "panel": panel_summary,
+        "baselines": sorted(baselines),
+        "baselines_refused": refused_baselines,
+        "baselines_incomplete": incomplete,
         "comparison_inference": (
             "Standard errors are conditional on fitted models. Multi-fold comparisons are descriptive: "
             "shared-training covariance is not estimated, so combined z and p-values are omitted."
         ),
+        "partial_r2_inference": (
+            f"{BOOTSTRAP_RESAMPLES} family-clustered bootstrap resamples of the held-out people within each fold, every method "
+            "and trait on the same resamples; conditional on the fitted models and on each stacked score's weights, which are "
+            f"cross-fitted over {STACKING_SPLITS} parts of each fold's held-out families and never fitted on the person scored."
+        ),
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class ExportRule:
+    """The columns the export check reads in one table (``check_exportable``): ``sizes``, the counts whose suppression
+    hides the row's ``values``; and ``partitions``, each a shown count with the counts of its parts, shown or suppressed
+    on their own (a part's suppression hides no value), whose unshown rest must not be a count of 1 to 20."""
+
+    sizes: tuple[str, ...] = ()
+    values: tuple[str, ...] = ()
+    partitions: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+def export_rules() -> dict[str, ExportRule]:
+    """Every table a step may list as exportable, by file name, with its rule: participant counts (n, and a disease's
+    cases) in the report's tables; record counts in the effects summaries, held to the same rule though no participant is
+    counted there, so no summary describes 1 to 20 records. A table no rule names is never exportable."""
+    participants = PARTICIPANT_COUNT_COLUMNS
+    return {
+        "accuracy.tsv": ExportRule(participants, ("value",)),
+        "comparison.tsv": ExportRule(participants, ("estimate", "standard_error", "z", "p_value")),
+        "quarantined.tsv": ExportRule(),
+        "uncertified.tsv": ExportRule(),
+        "panel.tsv": ExportRule(participants, ("estimate", "standard_error", "z", "p_one_sided", "p_hommel")),
+        "partial_r2.tsv": ExportRule(participants, PARTIAL_R2_COLUMNS[PARTIAL_R2_COLUMNS.index("partial_r2") :]),
+        "paired_differences.tsv": ExportRule(participants, PAIRED_DIFFERENCE_COLUMNS[PAIRED_DIFFERENCE_COLUMNS.index("estimate") :]),
+        "meta_analysis.tsv": ExportRule(),
+        "trait_covariance.tsv": ExportRule(),
+        "heterogeneity.tsv": ExportRule(),
+        "effects_by_class.tsv": ExportRule(
+            ("variants",), EFFECT_SUMMARY_COLUMNS[EFFECT_SUMMARY_COLUMNS.index("expected_positive") :], (("variants", ("positive_mean", "negative_mean")),)
+        ),
+        "effect_length_correlation.tsv": ExportRule(("variants",), ("spearman_rho",)),
+        "genetic_variance.tsv": ExportRule(("n",), ("value",)),
+        "prior_by_length.tsv": ExportRule(("variants",), PRIOR_BY_LENGTH_COLUMNS[PRIOR_BY_LENGTH_COLUMNS.index("prior_variance") :]),
+        "prior_enrichment.tsv": ExportRule(("variants",), PRIOR_ENRICHMENT_COLUMNS[PRIOR_ENRICHMENT_COLUMNS.index("prior_variance") :]),
+        # Its record counts are not participants', and every record in a value has 21 or more expected carriers.
+        "locus_variance.tsv": ExportRule(),
+        # benchmarks/bench_real/aou_compare.py's comparison of the arms and LDpred2 on the same held-out people.
+        "compare.tsv": ExportRule(participants, ("estimate", "standard_error", "ci_lower", "ci_upper")),
     }
 
 
 def check_exportable(path: Path) -> None:
-    """Refuse a report table that shows a participant count of 1 to 20, or a value for a cell below
-    MINIMUM_REPORTED_PARTICIPANTS (any column of PARTICIPANT_COUNT_COLUMNS the table has)."""
-    for row in _read_table(path):
-        shown_value = any(row.get(column) for column in ("value", "estimate"))
-        for column in PARTICIPANT_COUNT_COLUMNS:
-            count = row.get(column)
-            if count is None or count == "":
-                continue
-            if not count.isdigit():
-                if shown_value:
-                    raise ValueError(f"{path}: a suppressed cell shows a value.")
-                continue
-            if 0 < int(count) < MINIMUM_REPORTED_PARTICIPANTS or (shown_value and int(count) < MINIMUM_REPORTED_PARTICIPANTS):
+    """Refuse a table no export rule names (``export_rules``), or one whose rule's counts show a count of 1 to 20, a
+    value beside a suppressed count or beside a count of 0, a partition whose shown parts leave a rest of 1 to 20, or,
+    in a table of cells, an all cell whose count (rows, a disease's cases or its controls) less one grouping's shown
+    levels' is 1 to 20. Rows are compared within the rows that agree on every column but the cell, the counts and the
+    values (one trait's one arm and metric, say), as a reader would set them side by side."""
+    rule = export_rules().get(Path(path).name)
+    if rule is None:
+        raise ValueError(f"{path}: no export rule names this table, so nothing says which of its columns count.")
+    rows = _read_table(path)
+    parts = [part for _total, members in rule.partitions for part in members]
+
+    def leaves(rest: int) -> bool:
+        return 0 < rest < MINIMUM_REPORTED_PARTICIPANTS
+
+    for row in rows:
+        for column in (*rule.sizes, *parts):
+            text = row.get(column) or ""
+            if text.isdigit() and leaves(int(text)):
                 raise ValueError(f"{path}: a count below {MINIMUM_REPORTED_PARTICIPANTS} is shown.")
+        shown_value = any(row.get(column) for column in rule.values)
+        for column in rule.sizes:
+            text = row.get(column) or ""
+            if shown_value and text and (not text.isdigit() or int(text) == 0):
+                raise ValueError(f"{path}: a suppressed cell shows a value.")
+        for total, members in rule.partitions:
+            if (row.get(total) or "").isdigit():
+                shown = sum(int(row[member]) for member in members if (row.get(member) or "").isdigit())
+                if leaves(int(row[total]) - shown):
+                    raise ValueError(f"{path}: the parts of {total} it shows leave a count below {MINIMUM_REPORTED_PARTICIPANTS}.")
+    if not rows or not {"cell", "level", "n"} <= set(rows[0]):
+        return
+    key_columns = [column for column in rows[0] if column not in {"cell", "level", *rule.sizes, *parts, *rule.values}]
+    groups: dict[tuple[str, ...], list[dict[str, str]]] = {}
+    for row in rows:
+        groups.setdefault(tuple(row[column] for column in key_columns), []).append(row)
+
+    def counted(row: dict[str, str]) -> tuple[int | None, int | None, int | None]:
+        # (rows, cases, controls) as the row shows them; None where it does not.
+        count = int(row["n"]) if row["n"].isdigit() else None
+        cases = int(row["cases"]) if (row.get("cases") or "").isdigit() else None
+        return count, cases, None if count is None or cases is None else count - cases
+
+    for members in groups.values():
+        for whole in (row for row in members if row["cell"] == "all"):
+            for grouping in {row["cell"] for row in members} - {"all"}:
+                levels = [counted(row) for row in members if row["cell"] == grouping]
+                for index, total in enumerate(counted(whole)):
+                    if total is not None and leaves(total - sum(level[index] or 0 for level in levels)):
+                        raise ValueError(f"{path}: the all cell less the {grouping} levels it shows leaves a count below {MINIMUM_REPORTED_PARTICIPANTS}.")
+
+
+def _checked_exportable(directory: Path, names: Sequence[str]) -> tuple[list[str], dict[str, str]]:
+    """The tables of ``names`` in ``directory`` that the export check passes (``check_exportable``), and why it refuses
+    each of the others: a refused table stays in the step's directory and is never listed for export."""
+    passed: list[str] = []
+    refused: dict[str, str] = {}
+    for name in names:
+        try:
+            check_exportable(directory / name)
+        except ValueError as error:
+            LOGGER.warning("workspace pipeline: %s is not exportable: %s", name, error)
+            refused[name] = str(error)
+        else:
+            passed.append(name)
+    return passed, refused
 
 
 EXPORT_SOURCES = ("report", "effects")
@@ -4402,28 +5299,42 @@ _STEPS = (
         _direct_sv_step,
     ),
     # The fit runs fit_model and everything it imports (the engine, the store reader, the scorer the artifact holds).
+    # A validation split (test_fold) names its fold in the fit's key; the final split's key is as it was.
     _Step("fit", ("cohort", "measurement", "direct_sv"), lambda config: (
         config.seed, config.disease_likelihood, config.annotated_prior, config.fit_minimum_minor_allele_frequency, config.fit_minimum_r2,
         None if config.fit_variant_sites is None else _file_digest(Path(config.fit_variant_sites)), config.fit_region,
         config.length_by_class, config.ld_score_prior,
+        *(() if config.test_fold is None else (("test_fold", config.test_fold),)),
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _split_cohort, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(
-        "effects", ("cohort", "fit", "score"), lambda config: None,
-        (_effects_step, _read_scores, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition, _shown, importlib.import_module("sv_pgs.postfit_checkpoint")), _effects_step,
+        "effects", ("cohort", "fit", "score"), lambda config: {
+            "jackknife_blocks": JACKKNIFE_BLOCKS, "confidence": CONFIDENCE_LEVEL,
+            "locus_panel": None if config.locus_panel is None else _file_digest(Path(config.locus_panel)),
+        },
+        (
+            _effects_step, _read_scores, _split_cohort, _checked_trait_model, _final_store, variant_effects, length_bins, genetic_variance_decomposition,
+            _shown, PriorMoments, prior_moments, jackknife_ratio, effect_summaries, suppressed_levels, _hidden_counts, _hidden_records, _number,
+            read_locus_panel, locus_variance, _checked_exportable, check_exportable, ExportRule, export_rules,
+            importlib.import_module("sv_pgs.postfit_checkpoint"),
+        ),
+        _effects_step,
     ),
     _Step(
         "report",
         ("cohort", "score"),
-        lambda config: None if config.panel is None else [config.panel.primary_fold, [list(weight) for weight in config.panel.weights]],
+        _report_inputs,
         (
-            _report_step, _read_scores, _Cohort.evaluated_folds, _proper_folds, _evaluated_counts, _residualized, _cells, _partition_hidden, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text,
-            _primary_influence, _panel_rows,
+            _report_step, _read_scores, _split_cohort, _Cohort.evaluated_folds, _proper_folds, _evaluated_counts, _residualized, held_out_cells, _held_out_rows,
+            _cells, _partition_hidden, _scored_folds, _held_out_metric, _paired, _fold_combined, _fold_weighted, _partial_r2, _shown, _cases_text, _primary_influence,
+            _panel_rows, _hidden_counts, _number, HeldOutTrait, method_pairs, stacked_scores,
+            partial_r2_tables, _training_digest,
+            _held_out_models, _baseline_scores, _checked_exportable, check_exportable, ExportRule, export_rules,
             held_out_comparison, probability_calibration,
         ),
         _report_step,
     ),
-    _Step("export", ("report", "effects"), lambda config: config.export, (_export_step, check_exportable), _export_step),
+    _Step("export", ("report", "effects"), lambda config: config.export, (_export_step, check_exportable, ExportRule, export_rules), _export_step),
 )
 
 
