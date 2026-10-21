@@ -2,7 +2,7 @@
 chr22 cohort, Beagle-imputed arm). Nothing here is from All of Us.
 
 Every value is read from the replicate results copied from MSI (simulation.py's LOCAL tree: grid, grid-truth, window,
-window-truth), and from simulation_summary.json for the analytic expected AUC and the imputation accuracy bins.
+window-truth), and from simulation_summary.json for the AUC at full h² and the imputation accuracy bins.
 
     uv run --with matplotlib python docs/poster/ashg2026/sim_gallery.py [output directory]
 
@@ -224,13 +224,9 @@ def accuracy_figure(grids, summary):
     fig, (ax, gap) = plt.subplots(1, 2, figsize=(200 * MM, 86 * MM), gridspec_kw={"width_ratios": [1.25, 1.0]})
     fig.subplots_adjust(left=0.095, right=0.985, top=0.90, bottom=0.17, wspace=0.62)
     log_size_axis(ax)
-    expected = summary["points"]["null"]["expected_auc"]
     ceiling = summary["points"]["null"]["true_value_auc"]
-    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.5)), linewidth=1.6, zorder=4)
-    ax.text(SIZES[0] / 1.3 * 1.04, ceiling + 0.002, "True genetic value", color=GREY, fontsize=11, va="bottom")
-    ax.plot(SIZES, [expected[str(size)] for size in SIZES], color=GREY, linestyle=(0, (4, 2)), linewidth=1.6, zorder=4)
-    ax.text(SIZES[-1] * 1.12, expected[str(SIZES[-1])] - 0.001, "Expected\n(theory)", color=GREY, fontsize=11,
-            va="top", ha="left", linespacing=1.0)
+    ax.hlines(ceiling, SIZES[0] / 1.3, SIZES[-1] * 1.06, color=GREY, linestyle=(0, (1, 1.5)), linewidth=1.6, zorder=4)
+    ax.text(SIZES[-1] * 1.12, ceiling, "h²", color=GREY, fontsize=12.5, va="center", ha="left")
     counts = {}
     for key, method, color in (("with_sv_auc", "SV-PGS", BLUE), ("ldpred2_auc", "LDpred2-auto", VERMILLION)):
         pooled = [interval([row[key] for point, _, _ in SV_SHARES for row in grouped.get((point, size), [])])
@@ -274,8 +270,8 @@ def accuracy_figure(grids, summary):
         "on HapMap3-density SNVs of the same training people. a, Test AUC, mean and Student-t 95% interval over the "
         "replicates of all three settings pooled ("
         + ", ".join(f"{n}" for n in counts["SV-PGS"])
-        + " replicates at 5k, 10k, 20k and 40k). Dashed: the AUC expected of a score estimated from that many people "
-        "(Daetwyler et al. 2008; Wray et al. 2010); dotted: the AUC of the true genetic value. b, The paired "
+        + " replicates at 5k, 10k, 20k and 40k). Dotted: the AUC of a score that captures all of h² "
+        "(Wray et al. 2010), the most any method can reach. b, The paired "
         "difference in AUC between the methods on the same held-out people for each setting separately, mean and "
         "Student-t 95% interval over its replicates; the three overlap at every size, which is why a pools them. "
         f"bench-sim v7 cohort from 1000 Genomes haplotypes, Beagle-imputed SVs; fitted on MSI."
