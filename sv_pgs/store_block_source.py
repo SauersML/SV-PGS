@@ -9,11 +9,12 @@ One Stage 2 read visits every LD block once. Three stages of it overlap:
    block's rows go to the device, and ``DosageStore.read_codes_to_device`` checks and decodes
    just those rows there, on the copy stream, into a compact [block rows, n] buffer; the host
    only reads bytes;
-3. the device: one kernel picks the block's rows out of its span and writes them as signed codes
+3. the device: one kernel writes the block's rows, on this source's samples, as signed codes
    ``s = code - 127`` into an aligned buffer, which a ``CodeBlockTile`` wraps without copying.
 
-Each block's rows are ascending store rows (its reduced columns' representatives), read as the
-one contiguous span from its first to its last row.
+Each block's rows are ascending store rows (its reduced columns' representatives). The host reads
+the one contiguous span from a block's first to its last row; a device reads only the block's
+rows, so they are staged compactly.
 
 Where Stage 0's pass kept its training codes (``training_codes.TrainingCodes``: every record Stage 2
 reads, as the signed codes these slots hold), a read takes its blocks from them instead of the
@@ -180,26 +181,20 @@ class StoreGenotypeBlockSource:
             self._input_samples = int(store.n_samples) if self._decoder is not None else self._samples
             self._sample_columns = (cupy.asarray(self._sample_indices) if self._decoder is not None and self._sample_indices is not None
                                     else cupy.arange(self._samples, dtype=cupy.int64))
-            # A block's rows are staged compactly, so the gather is the identity: a rowdict read lands them so, and other
-            # codecs read only them (``_iter_device_tiles``). Staged whole, a span is every record between the block's
-            # first and last: chr22's HapMap3 block of 14,542 sites spanned 861k records, 37 GB of an A100's 42.
+            # A block's rows are staged compactly, so the gather is the identity on rows: a rowdict read lands them so,
+            # and other codecs read only them (``_iter_device_tiles``).
             self._spans_on_device = [cupy.empty((widest_block, self._input_samples), dtype=cupy.uint8) for _ in range(2)]
             self._rows_in_span = [cupy.arange(rows.shape[0], dtype=cupy.int64) for rows in self._block_rows]
             self.resident_bytes += sum(int(slot.nbytes) for slot in self._spans_on_device) + sum(int(rows.nbytes) for rows in self._rows_in_span) + int(self._sample_columns.nbytes)
             self._gather = cupy.RawKernel(_GATHER_SOURCE.replace("SIGNED_CODE_OFFSET", str(SIGNED_CODE_OFFSET)), "gather_signed_codes")
             self._copy_stream = cupy.cuda.Stream(non_blocking=True)
-        # Every block's signed codes held on the device after the first read, as a cache of the shared ledger
-        # (``memory_broker``): each later read (every mean-field sweep, every dual-solver pass) then builds its tiles from
-        # device memory. Streamed, 43% of a 518k x 40k bench-sim Stage 2 was the store's reads [sim, scenario_000, py-spy
-        # on the A40]. The cache is admitted only from what the device's pool has left once everything the fit holds is
-        # counted, and never from a free-memory snapshot; a later allocation that needs its bytes evicts it
-        # (``_drop_resident``), and the read in progress then streams the blocks it has not reached, so the eviction
-        # frees every block but the one a tile still references. An evicted set is asked for again at the next read,
-        # from what the ledger then has left: the peak that evicted it can be a step's own (the moment starts square
-        # each Stage 0 block in float64 on the device, 10 GB at a 29k-column block), and a set never readmitted
-        # streamed every later read from the store (an All of Us whole-genome fit [real]: three reads of 6-10 minutes
-        # each after its moment starts, where the resident reads are seconds). A readmission costs nothing beyond the
-        # read that refills it, which streams the store either way.
+        # Every block's signed codes held on the device after the first read, a cache of the shared ledger
+        # (``memory_broker``), so each later read (every mean-field sweep, every dual-solver pass) builds its tiles from
+        # device memory instead of the store. It is admitted from what the ledger has left, never from a free-memory
+        # snapshot, and a later allocation that needs its bytes evicts it (``_drop_resident``): the read in progress
+        # streams the blocks it has not reached, and the next read asks for it again, since the peak that evicted it can
+        # be one step's own and a set never readmitted streams every later read (6-10 minutes each on an All of Us
+        # whole-genome fit, where a resident read takes seconds).
         self._resident: list[Any] | None = None
         self._resident_complete = False
         self._evictions = 0
@@ -247,10 +242,9 @@ class StoreGenotypeBlockSource:
         """Whether this source's codes are held on its device, or would be at its next read (within what the ledger has
         left): its reads after the one that fills them are then device passes, not reads of the store.
 
-        What is left is counted as the admission counts it, the pool's free blocks returned first (``remaining``), not
-        as ``admits`` reads the pool as it stands: there, on the All of Us whole-genome fits, the device the route
-        choice's first read had not reached yet answered no while CuPy's pool held freed blocks, admitted the set at
-        its own first read a minute later, and half the fits took the band route."""
+        What is left is counted as the admission counts it, the pool's free blocks returned first (``remaining``), not as
+        the pool stands: a device whose CuPy pool still held freed blocks answered no, then admitted the set at its first
+        read, and the fit took the band route."""
         if self._resident is not None:
             return True
         return self._cupy is not None and self._broker is not None and self._broker.remaining(self._pool) >= self.resident_codes_bytes
@@ -316,8 +310,7 @@ class StoreGenotypeBlockSource:
         cls, store: DosageStore, statistics: GenotypeSufficientStatistics, budget: ComputeBudget, workspace_bytes: int,
         sample_indices: NDArray[np.int64] | None = None, code_cache: CodeCache | None = None, codes: Any = None,
     ) -> StoreGenotypeBlockSource:
-        """The reduced model's LD blocks of one Stage 0 pass: each reduced column is its tie
-        group's representative, whose store row, mean and scale Stage 0 recorded."""
+        """The reduced model's LD blocks of one Stage 0 pass (``reduced_block_layout``)."""
         block_rows, block_indices, means, scales = reduced_block_layout(statistics)
         return cls(
             store, block_rows, block_indices, np.concatenate(means), np.concatenate(scales), budget, workspace_bytes, sample_indices, code_cache, codes,
@@ -336,12 +329,7 @@ class StoreGenotypeBlockSource:
         return self._block_variant_indices
 
     def _tile(self, block_index: int, slot: int) -> CodeBlockTile:
-        rows = int(self._block_rows[block_index].shape[0])
-        offset = slice(int(self._offsets[block_index]), int(self._offsets[block_index + 1]))
-        return CodeBlockTile.from_aligned(
-            self._signed[slot][: _aligned(rows)], rows, self._samples, self._means[offset], self._scales[offset],
-            self._scale_spreads[block_index], self.array_module, self._workspace_bytes,
-        )
+        return self._resident_tile(block_index, self._signed[slot][: _aligned(int(self._block_rows[block_index].shape[0]))])
 
     def iter_tiles(self) -> Iterator[tuple[int, CodeBlockTile]]:
         """Yield (block_index, tile) in block order; a tile is valid until the next is requested."""
@@ -470,13 +458,12 @@ class StoreGenotypeBlockSource:
     def _iter_prepared(self, first_block: int) -> Iterator[tuple[int, CodeBlockTile]]:
         """The blocks from ``first_block`` on from their prepared codes where every one of them is a whole restart unit
         (``restart_store``: ``codes``, one per block, keyed by the store, the block's rows, the samples and the source of
-        this class with every definition it reaches, the store's reads among them, never the engine's), else from the store, each block missing its unit then kept as one. A
-        restarted fit's resident set then fills from the compact signed codes (``resident_codes_bytes``, 8-15 GB a
-        device on All of Us whole-genome arms [real]) on the local disk, not from a read of the whole store (547 GB,
-        about 20 minutes [real]). The device placement, the means and the scales are not the codes' bytes: a unit serves
-        either device, and every tile takes its standardization from this fit's Stage 0. A block's host copy lives for
-        that block alone, charged to the ledger. A partly prepared set is read from the codes Stage 0's pass kept, where
-        they are held, else from the store (``_iter_read``), which completes it."""
+        this class with every definition it reaches, never the engine's), else as ``_iter_read`` reads them (Stage 0's
+        kept codes, else the store), each block missing its unit then saved as one. A restarted fit's resident set then
+        fills from the compact signed codes (``resident_codes_bytes``, 8-15 GB a device on All of Us whole-genome arms)
+        on the local disk, not from a read of the whole store (547 GB, about 20 minutes). A unit holds no device
+        placement, means or scales, so it serves either device and every tile takes its standardization from this fit's
+        Stage 0. A block's host copy lives for that block alone, charged to the ledger."""
         cache = self._code_cache
         if self._code_keys is None:
             source = definition_sources([("sv_pgs.store_block_source", "StoreGenotypeBlockSource")])
@@ -520,9 +507,8 @@ class StoreGenotypeBlockSource:
         computed = [cupy.cuda.Event() for _ in range(2)]
         for event in computed:
             event.record(compute)
-        # Only the blocks' own rows are read, each maximal run of consecutive store rows as one range: a block's span is
-        # every record between its first and last, and read whole (chr22's HapMap3 block of 14,542 sites spanned 861k
-        # records) its pinned read-ahead slots outgrew what the host could pin.
+        # Only the blocks' own rows are read, each maximal run of consecutive store rows as one range: read whole, a span
+        # (chr22's HapMap3 block of 14,542 sites spanned 861k records) outgrew what the host could pin.
         runs = [consecutive_runs(rows) for rows in self._block_rows[first_block:]]
         pieces = self._store.iter_codes([run for block in runs for run in block], self._sample_indices, self._budget)
         # Each slot's block, assembled on the host from its runs; a slot is refilled only after its last copy has run.

@@ -44,9 +44,10 @@ def structural_variant_class_from_token(token: str) -> VariantClass:
 
     CNV is copy-number variation, not a duplication; INV has its own class; a
     mobile-element insertion (an ME token) is its own class, apart from other
-    insertions. A breakend (BND) keeps the legacy inversion/breakend/complex
-    class; the GATK-SV store source drops breakends before typing. Length never
-    splits a class: it enters the prior as a continuous annotation.
+    insertions. A breakend (BND) takes the inversion/breakend/complex class
+    (``INVERSION_BND_COMPLEX``); the GATK-SV store source drops breakends before
+    typing. Length never splits a class: it enters the prior as a continuous
+    annotation.
     """
     if "DEL" in token:
         return VariantClass.DELETION

@@ -462,10 +462,10 @@ _FAILURE_TEXT = (
     "holds a row frame that does not fit its depth", "names an exception sample outside the row",
 )
 FAILURE_BITS = {name: 1 << index for index, name in enumerate(_FAILURE_NAMES)}
+"""The device checks' failure bits, as ``read_rows_to_device`` reports them."""
 CHUNK_FAILURES = {FAILURE_BITS[name]: text for name, text in zip(_FAILURE_NAMES, _FAILURE_TEXT)}
 CHUNK_LEVEL_FAILURES = FAILURE_BITS["FAILED_CRC"] | FAILURE_BITS["FAILED_TABLE"]
 """Failures that name a chunk (``first_bad``); the others name a row."""
-"""The device checks' failure bits, as ``read_rows_to_device`` reports them."""
 
 
 class GpuRowDecoder:

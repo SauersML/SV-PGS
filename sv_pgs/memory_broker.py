@@ -2,10 +2,10 @@
 substantial allocation charged before it is made, and every cache admitted only from what the rest leaves.
 
 ``compute_budget`` measures what the machine allows (``ComputeBudget``: host bytes after MemAvailable, the memory
-cgroups, the runner's allotment and the address-space limit; each device's free bytes once its libraries exist). Every
-consumer used to plan its own buffers against that whole number, so two consumers that were each within the budget
-could together exceed it, and a cache sized from a free-memory snapshot (the resident genotype codes, the panel Grams)
-could take what a later mandatory buffer needed. The broker keeps one account per pool instead.
+cgroups, the runner's allotment and the address-space limit; each device's free bytes once its libraries exist). The
+broker keeps one account per pool: two consumers that each plan against the whole number can together exceed it, and a
+cache sized from a free-memory snapshot (the resident genotype codes, the panel Grams) can take what a later mandatory
+buffer needs.
 
 Host pools (``host``, ``pinned``) are ledgers of leases:
 
@@ -24,9 +24,9 @@ Device pools are metered (``_DeviceMeter``): their held bytes are every byte the
 the scope began, CuPy's reserved bytes (its live arrays, the free blocks its pool keeps, and the fragments of a
 partly used block, which it cannot return) plus what the device gave outside the pool (library workspaces, lazily
 loaded modules), measured from the device's free bytes against the scope's start. The pool's live bytes alone
-(``used_bytes``) were the meter before: they leave out the fragments and the outside bytes, so the ledger admitted
-allocations the device then refused (bench-sim v7 chr22 001 on a 40 GB A100 [bench]: 1.2 GB refused with 40.9 GB
-reserved, every cache already dropped). The pool's free blocks are held until returned: a decision the held bytes
+(``used_bytes``) leave out the fragments and the outside bytes, so a ledger metering them admits allocations the device
+then refuses (on a 40 GB A100, 1.2 GB refused with 40.9 GB reserved, every cache already dropped). The pool's free
+blocks are held until returned: a decision the held bytes
 refuse first returns them (``settles``, the pool's ``free_all_blocks``), then evicts caches. Inside a CUDA scope every
 CuPy allocation goes through the ledger's allocator (``_LedgerAllocator``), which makes room for it (returning the
 free blocks, then evicting idle device caches, newest first) or raises ``MemoryError`` before the allocation is made.
@@ -74,8 +74,8 @@ Host allocator. glibc's malloc returns every freed block above its mmap threshol
 64-bit) to the kernel, and trims the heap's free top above its trim threshold. A fit forms and frees temporaries far
 above that cap many times over (the curvature correction's response blocks are variants x columns x 8 bytes), so each
 one is unmapped on free and faulted in again, zeroed, on its next allocation: with transparent huge pages that is a
-huge-page zero fault and, in regions numpy madvises, a direct compaction per block (bench-sim chr22 013 on an A100
-node: the main thread at ~90% system time, curvature calls of 33-300 s). For the scope of a fit the allocator keeps
+huge-page zero fault and, in regions numpy madvises, a direct compaction per block (on an A100 node, the main thread
+at ~90% system time and curvature calls of 33-300 s). For the scope of a fit the allocator keeps
 what the fit frees instead (``_retain_freed_host_memory``): the mmap threshold should be at least the largest
 temporary, which exceeds glibc's cap, and the one setting that serves every temporary from the heap is M_MMAP_MAX = 0;
 the trim threshold should be the host budget, the memory the fit is entitled to keep, and since the ledger bounds the
@@ -157,8 +157,7 @@ class MemoryBroker:
     meters: dict[str, Callable[[], int]] = field(default_factory=dict)
     # A metered pool's O(1) bound on its meter (a device's reserved bytes and its outside bytes as last measured):
     # where the bound already decides a question (a request fits, or no new peak), the meter, which asks the device, is
-    # not read. Reading the pool's live bytes on every device allocation was 92% of a genome fit's stage 2 (bench-sim
-    # 013 [sim], py-spy).
+    # not read; read on every device allocation, it was 92% of a genome fit's Stage 2.
     bounds: dict[str, Callable[[], int]] = field(default_factory=dict)
     # A metered pool's return of what it holds unused (a device pool's free blocks): the first answer to a request its
     # held bytes refuse, before any cache is evicted.
@@ -246,10 +245,8 @@ class MemoryBroker:
         for pool in charged:
             bound = self.bounds.get(pool)
             if bound is not None:
-                # A pool with an O(1) bound records the bound's peak. Reading the meter whenever the bound was above the
-                # recorded peak (nearly always, when the meter was the pool's live bytes) was 74% of a genome fit's
-                # mean-field sweeps (bench-sim chr22 004 [sim], py-spy: used <- held <- _note_peaks on every device
-                # allocation).
+                # A pool with an O(1) bound records the bound's peak: reading the meter here on every device allocation
+                # was 74% of a genome fit's mean-field sweeps.
                 self.peaks[pool] = max(self.peaks[pool], int(bound()) + pending)
                 continue
             self.peaks[pool] = max(self.peaks[pool], self.held(pool) + (pending if pool in self.meters else 0))

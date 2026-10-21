@@ -1,6 +1,6 @@
 """Quantized dosage store: uint8 ALT-dosage codes in variant-major Zarr v3 shards.
 
-Layout ("svpgs-store v1", target-format REPORT §2 with addenda A1/A2)::
+Layout ("svpgs-store v1")::
 
     MANIFEST.json                        format, chromosomes, records per chromosome, samples per
                                          half, md5 of each chromosome's (pos, ref_len, alt_len)
@@ -15,9 +15,9 @@ whose only non-zero dosages are that small is stored monomorphic (counted by
 written.  Dosages count the ALT allele.  Every record's value is ``code / codes_per_unit +
 value_origin`` (two variant columns): an ALT-count record has 127 and 0, a copy-number record
 (``VariantClass.COPY_NUMBER``) floor(254 / its maximum copy number) and minus its modal copy
-number, so its value is CN - modal CN and every integer copy number is exact (``copy_number``).  The Stage 0 kernels (``genotype_buffers``) work on
-``s = code - 127`` in [-127, 127]; standardization is affine in s, so (DS - mean_DS) / sd_DS =
-(s - mean_s) / sd_s exactly.
+number, so its value is CN - modal CN and every integer copy number is exact (``copy_number``).
+The Stage 0 kernels (``genotype_buffers``) work on ``s = code - 127`` in [-127, 127];
+standardization is affine in s, so (DS - mean_DS) / sd_DS = (s - mean_s) / sd_s exactly.
 
 Three inner-chunk codec chains exist, and each array's ``zarr.json`` says which one it uses:
 
@@ -32,7 +32,7 @@ Three inner-chunk codec chains exist, and each array's ``zarr.json`` says which 
   range inside a shard is a zero-copy view of the page cache.  Any range can also be read with
   ``preadv`` straight into a caller buffer, such as pinned host memory for GPU staging.
 
-The shard index is crc32c-checked in both chains.  Variant metadata is columnar; no Python
+The shard index is crc32c-checked in every chain.  Variant metadata is columnar; no Python
 object is built per variant.
 """
 

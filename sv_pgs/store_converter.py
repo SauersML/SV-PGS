@@ -1,17 +1,16 @@
 """Per-record transforms and sidecar fields of the popped-BCF -> dosage-store converter.
 
-The converter turns every popped
-record of the imputed panel into one store row. This module holds its exact per-record
-pieces; each is a pure function of sites-only inputs or of one record block:
+The converter turns every popped record of the imputed panel into one store row. This module
+holds its exact per-record pieces; each is a pure function of sites-only inputs or of one record
+block:
 
 - ``core_spans``: the reference bases a record changes, on 0-based half-open coordinates
   (a pure insertion spans the two bases around its insertion point).
-- ``value_matched_background`` (A4.10): the imputation's error-rate background is removed
+- ``value_matched_background``: the imputation's error-rate background is removed
   where the dosage equals a background value the site's paths predict, and nowhere else.
 - ``linear_recalibration``: the stored column D* = mu_g + kappa (DS - mu_g), per ancestry group
   g, with the stratum's truth-calibrated kappa, so that Cov(G, D*) = Var(D*).
-- ``tr_loci`` (A4.6/A4.7): each record's tandem-repeat locus, the connected components of
-  repeat intervals that records bridge.
+- ``tr_loci``: each record's tandem-repeat locus, the repeat interval that contains its core.
 - ``unbreakable_group_first``: the store's ``group_first``, merging bubbles, same-POS sets and
   TR loci into contiguous row spans a Stage 0 block may never cut.
 - ``decode_batch`` / ``decode_plain_batch`` / ``decode_called_batch`` / ``no_call_fill`` /
@@ -23,7 +22,7 @@ pieces; each is a pure function of sites-only inputs or of one record block:
 - ``write_store_manifest``: the MANIFEST with each half's measurement and the gate results.
 
 Everything here is AoU panel-derived site structure or genotype-derived data once applied
-to the panel, so its outputs are workspace-only (A4.9).
+to the panel, so its outputs are workspace-only.
 """
 
 from __future__ import annotations
@@ -118,7 +117,7 @@ def core_spans(positions: NDArray, refs: Sequence[str], alts: Sequence[str]) -> 
 
 @dataclass(frozen=True, slots=True)
 class BackgroundCorrection:
-    """A block's corrected dosages and the floor-QC counts of the correction (A4.10)."""
+    """A block's corrected dosages and the floor-QC counts of the correction."""
 
     dosage_milli: NDArray
     zeroed: I64Array
@@ -214,7 +213,7 @@ def linear_recalibration(dosage_milli: NDArray, sample_groups: NDArray, scales: 
 
 @dataclass(frozen=True, slots=True)
 class TrLoci:
-    """One chromosome's tandem-repeat loci (A4.7) and each record's locus.
+    """One chromosome's tandem-repeat loci and each record's locus.
 
     ``record_locus[r]`` indexes the loci table (in coordinate order), ``NO_LOCUS`` for a record
     whose core no repeat interval contains. A locus is one repeat interval (``tr_loci``);
@@ -243,10 +242,9 @@ def tr_loci(
     is one locus. A record belongs to the locus whose interval contains its core: a change inside
     the repeat and its slop. A record whose core reaches past an interval (a deletion of a repeat
     and its flank, or one spanning several repeats) changes more than a repeat's length and belongs
-    to none, so no record bridges loci. Merging the intervals a record bridged chained the loci: on
-    the public 1kGP/HGSVC panel sites of chr22 (bench-real's), with every record of a locus in one
-    unsplittable group, the largest group held 34,180 records over 1.35 Mb, past any LD block cap;
-    with containment and only the TR-class records grouped, 2,897 over 119 kb.
+    to none, so no record bridges loci: on chr22's public 1kGP/HGSVC panel sites, loci merged
+    through bridging records made an unsplittable group of 34,180 records over 1.35 Mb, past any LD
+    block cap, where containment's largest is 2,897 over 119 kb.
     """
     interval_starts = np.asarray(interval_starts, dtype=np.int64)
     interval_ends = np.asarray(interval_ends, dtype=np.int64)
@@ -798,10 +796,9 @@ def no_call_fill(group_sums: I64Array, group_counts: I64Array) -> NDArray:
 
 
 def _side_by_side(batch_codes: Sequence[U8Array], start: int, stop: int, pool: ThreadPoolExecutor) -> U8Array:
-    """Rows [start, stop) of every batch side by side, each batch's rows copied on a thread of ``pool``. A memory-mapped
-    batch's copy faults its pages in from disk: copied one batch at a time, the disk had one read in flight (chr1 of the
-    All of Us store read at 125 MiB/s and took 80 minutes), and numpy's copy releases the GIL, so the batches' reads
-    overlap."""
+    """Rows [start, stop) of every batch side by side, each batch's rows copied on a thread of ``pool``: a memory-mapped
+    batch's copy faults its pages in from disk and numpy's copy releases the GIL, so the batches' reads overlap (one
+    batch at a time, chr1 of the All of Us store read at 125 MiB/s and took 80 minutes)."""
     edges = np.concatenate([[0], np.cumsum([codes.shape[1] for codes in batch_codes])]).astype(np.int64)
     block = np.empty((stop - start, int(edges[-1])), dtype=np.uint8)
 
@@ -852,9 +849,8 @@ def assemble_half(
 
     ``sample_groups`` covers the half's samples in that order. A no-call (MISSING_CODE) takes
     ``no_call_milli[record, group]`` (``no_call_fill`` of the chromosome's measurement totals).
-    ``scales`` is the per-record, per-group kappa of the D* recalibration where
-    design-reliability supplies one, or None before it exists (the stored codes are then the
-    background-corrected DS, and the MANIFEST says so). Writes the half's per-record ``no_calls``
+    ``scales`` is the per-record, per-group kappa of the D* recalibration, or None (the stored
+    codes are then the background-corrected DS, and the MANIFEST says so). Writes the half's per-record ``no_calls``
     statistic beside its code sums and returns the sums; each step's working set fits
     ``budget``'s host memory.
     """
