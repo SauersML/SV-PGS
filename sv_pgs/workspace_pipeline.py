@@ -1031,6 +1031,15 @@ def _accepted(run: _Run, step: _Step, record: dict[str, Any]) -> bool:
     return True
 
 
+def _fit_records_state(directory: Path) -> list[tuple[str, int, int]]:
+    """Every file under the fit partial's models/ by path, size and modification time: what ``_check_fit_records``
+    reads, so an unchanged state is one it has already checked."""
+    root = directory / "models"
+    if not root.is_dir():
+        return []
+    return sorted((path.relative_to(root).as_posix(), status.st_size, status.st_mtime_ns) for path in root.rglob("*") if path.is_file() for status in [path.stat()])
+
+
 def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     from sv_pgs.phase_timer import timing
 
@@ -1073,8 +1082,11 @@ def _run_step(run: _Run, step: _Step) -> dict[str, Any]:
     try:
         if step.name == "fit":
             _check_fit_records(run, partial, key)
+            checked = _fit_records_state(partial)
         summary = step.body(run, partial)
-        if step.name == "fit":
+        # A body that saved or recorded nothing (a merge, whose arms were all handed over) leaves the models just
+        # checked: checking them again loaded every model and read the store's variant table a second time.
+        if step.name == "fit" and _fit_records_state(partial) != checked:
             _check_fit_records(run, partial, key)
     except StepPart:
         if step.name == "fit":
@@ -3819,6 +3831,87 @@ def _prediction_budget(budget: ComputeBudget, cohort: _Cohort, models: Sequence[
     return dataclasses.replace(budget, host_bytes=remaining // 2)
 
 
+class GatheredRows:
+    """The store records ``rows`` (ascending store rows) as a store of their own, its row i the store's row rows[i]:
+    what ``predict_models`` reads for models whose rows are renumbered to match (``gathered_models``).
+
+    The scorer reads each run of consecutive store rows its models use as a block of its own (``fast_scoring.ScoringPlan.
+    read_ranges``), and forms each block's weights, draw-law tiles and device products once per block. The All of Us fit
+    keeps 1.06M of the store's 126.7M records [real], few of them adjacent, so the score step read some million blocks of
+    a row or two, each with a draw-law tile per model, a read of its own and its own kernel launches: the merge job's
+    scoring took tens of minutes to over an hour. Renumbered, the used rows are one run, which the scorer reads in its
+    widest blocks. This reader fills each block from the store one inner chunk at a time (``spans``), as many chunks read
+    at once as keep the store's reader threads busy (``DosageStore.iter_codes``), and copies the used rows out of them.
+
+    The scores are the store rows' scores: the same codes, weights and draws (a draw's number depends on its row, never
+    on the tile it is drawn in, ``draw_laws``), summed over other blocks, so they agree to rounding. ``root`` is the
+    store's, so ``predict_models`` checks the models' variant layout against the store itself."""
+
+    def __init__(self, store: DosageStore, rows: I64Array) -> None:
+        self.store = store
+        self.rows = np.asarray(rows, dtype=np.int64)
+        self.root = store.root
+        self.n_samples = store.n_samples
+        # Each read is the used rows of one inner chunk, so every chunk holding a used row is decoded once and no other
+        # is. Reads of one chunk each keep the store's ring deep: it reads as many at once as fill its reader threads
+        # (``DosageStore._ring_depth``), where one wide read among them would leave it two in flight.
+        self.inner_rows = min(array.layout.inner_rows for arrays in store._arrays for array in arrays)
+
+    def spans(self, rows: I64Array) -> tuple[I64Array, I64Array, I64Array]:
+        """The store reads that cover ``rows`` (ascending store rows): (starts, stops, each read's first position in
+        ``rows``), one read for the rows of each inner chunk (a chromosome's rows from its first in chunks of
+        ``inner_rows``, as its code arrays are written), from the chunk's first used row to its last."""
+        starts = self.store.chromosome_starts
+        chromosome = np.searchsorted(starts, rows, side="right") - 1
+        local = rows - starts[chromosome]
+        new = np.ones(rows.shape[0], dtype=bool)
+        new[1:] = (np.diff(chromosome) != 0) | (np.diff(local // self.inner_rows) != 0)
+        firsts = np.flatnonzero(new)
+        lasts = np.append(firsts[1:], rows.shape[0]) - 1
+        return rows[firsts], rows[lasts] + 1, firsts
+
+    def iter_codes(self, row_ranges: Sequence[tuple[int, int]], sample_indices: NDArray | None, budget: ComputeBudget) -> Iterator[tuple[int, int, U8Array]]:
+        """Yield (start, stop, codes[stop - start, all samples]) for each range of gathered rows, in order, as
+        ``DosageStore.iter_codes`` does for store rows. A yielded block stays valid until the next is asked for: one
+        block buffer, which the scorer's host plan covers (a source that reads through its own buffers is charged
+        ``fast_scoring``'s read-ahead rows, more than this one block)."""
+        if sample_indices is not None:
+            raise ValueError("gathered rows are read on the store's whole sample axis.")
+        ranges = [(int(start), int(stop)) for start, stop in row_ranges]
+        if not ranges:
+            return
+        block = np.empty((max(stop - start for start, stop in ranges), self.n_samples), dtype=np.uint8)
+        for start, stop in ranges:
+            wanted = self.rows[start:stop]
+            out = block[: stop - start]
+            starts, stops, firsts = self.spans(wanted)
+            # One read-ahead ring per block: its reads are listed a block at a time, not a million at once.
+            codes = self.store.iter_codes(list(zip(starts.tolist(), stops.tolist())), None, budget)
+            try:
+                for (read_start, _read_stop, read), first, last in zip(codes, firsts.tolist(), [*firsts[1:].tolist(), stop - start]):
+                    # The positions lie inside the read by construction, so "clip" never clips; it only lets take write
+                    # straight into the block without buffering.
+                    np.take(read, wanted[first:last] - read_start, axis=0, out=out[first:last], mode="clip")
+            finally:
+                codes.close()
+            yield start, stop, out
+
+
+def gathered_models(models: Sequence[Any], store: DosageStore) -> tuple[list[Any], GatheredRows]:
+    """``models`` with every scoring model's store rows renumbered to their places among the rows any of them uses,
+    and those rows as a store (``GatheredRows``). Only the row numbers change: each scoring model keeps its means,
+    scales, coefficients and draw law, whose draws are numbered by the model's own rows."""
+    used = [scoring.store_rows for model in models for scoring in model.scoring]
+    rows = np.unique(np.concatenate(used)) if used else np.zeros(0, dtype=np.int64)
+    gathered = [
+        dataclasses.replace(model, scoring=tuple(
+            dataclasses.replace(scoring, store_rows=np.searchsorted(rows, scoring.store_rows).astype(np.int64)) for scoring in model.scoring
+        ))
+        for model in models
+    ]
+    return gathered, GatheredRows(store, rows)
+
+
 def _fit_verdicts(run: _Run, cohort: _Cohort, unscorable: bool) -> dict[str, list[str]]:
     """From the acceptance each fit record holds (written when the fit ended): with ``unscorable``, the traits that
     cannot be scored (``model_acceptance.unscorable_codes``: non-finite parameters, or a fit that failed and returned its
@@ -3913,17 +4006,37 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     if cohort.model_traits[index] == trait:
                         held_parts[index] = model_part(model, cohort.model_names[index], structural, f"{cohort.model_names[index]}/{STRUCTURAL_PART}")
             models = [*fitted, *parts.values(), *held_parts.values()]
+            # Scored on their used rows gathered into one run (``GatheredRows``); the renumbered models share every
+            # array with ``models`` but their row numbers, which the budget counts with the gathered rows themselves.
+            gathered, reader = gathered_models(models, store)
             try:
-                budget = _prediction_budget(run.budget, cohort, models, columns, (structural_genetic, model_structural))
+                budget = _prediction_budget(run.budget, cohort, gathered, columns, (structural_genetic, model_structural, models, reader.rows))
             except MemoryError:
                 if len(batch) == 1:
                     raise
                 batches.extend(range(position, position + 1) for position in batch)
-                del fitted, parts, held_parts, models, model
+                del fitted, parts, held_parts, models, model, gathered, reader
                 continue
             try:
                 loaded = time.perf_counter()
-                prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
+                failure = None
+                try:
+                    prediction = run.bindings.predict(gathered, reader, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
+                except MemoryError:
+                    raise
+                except Exception as error:
+                    # A non-finite prediction is the models' own, whichever rows they are read on (quarantined below).
+                    if isinstance(error, ValueError) and str(error).startswith("Non-finite predictions"):
+                        raise
+                    failure = f"{type(error).__name__}: {error}"
+                if failure is not None:
+                    # Any other failure of the gathered read must not cost a merge job its attempt: the batch is scored as
+                    # it was before GatheredRows, from the store's own rows with its own budget, once the failed read's
+                    # frames (its buffers and device arrays) are gone with the exception.
+                    LOGGER.warning("workspace pipeline: scoring on gathered rows failed (%s); scoring the batch from the store's rows", failure)
+                    gathered = reader = None
+                    budget = _prediction_budget(run.budget, cohort, models, columns, (structural_genetic, model_structural))
+                    prediction = run.bindings.predict(models, store, cohort.store_columns, cohort.covariates[:, 1:], budget, checkpoint=batch_reads(checkpoint))
                 # Production prediction checks these too; bindings must obey the same contract. A failed fused read
                 # is retried one trait at a time so one overflow cannot hide the other traits' valid predictions.
                 values_to_check = (prediction.predictive_mean, prediction.predictive_variance, prediction.linear_predictor, prediction.genetic.means)
@@ -3944,7 +4057,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
                     uncertified.pop(cohort.trait_names[trait], None)
                 # A previous successful iteration must not keep a model or prediction alive into the retry.
                 prediction, values_to_check = None, ()
-                del fitted, parts, held_parts, models, model
+                del fitted, parts, held_parts, models, model, gathered, reader
                 continue
             for name, values in (
                 ("predictive_mean", prediction.predictive_mean), ("predictive_variance", prediction.predictive_variance),
@@ -3954,7 +4067,7 @@ def _score_step(run: _Run, directory: Path) -> dict[str, Any]:
             means = np.asarray(prediction.genetic.means, dtype=np.float64)
             structural_genetic[:, list(parts)] = means[:, len(targets) : len(targets) + len(parts)]
             model_structural[:, list(held_parts)] = means[:, len(targets) + len(parts) :]
-            del fitted, parts, held_parts, prediction, models, model, values, values_to_check, means
+            del fitted, parts, held_parts, prediction, models, model, values, values_to_check, means, gathered, reader
             with checkpoint.write() as temporary:
                 np.savez(temporary / "predictions.npz", **{name: values[:, targets] for name, values in columns.items()},
                          structural_genetic=structural_genetic[:, part_traits], model_structural=model_structural[:, part_models])
@@ -5559,7 +5672,7 @@ _STEPS = (
         *(() if config.test_fold is None else (("test_fold", config.test_fold),)),
         *(() if not config.warm_start_models else (("warm_start_models", config.warm_start_models),)),
     ), (_fit_step, fit_filtered, listed_sites, region_records, _final_store, _final_measurement_model, structural_records, arm_log_reliability, fit_request, model_subset, *module_closure(fit_model)), _fit_step),
-    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _split_cohort, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
+    _Step("score", ("cohort", "fit"), lambda config: None, (_score_step, _split_cohort, _fit_verdicts, _checked_trait_model, _prediction_budget, _array_bytes, _final_store, score_batches, structural_records, model_part, GatheredRows, gathered_models, importlib.import_module("sv_pgs.postfit_checkpoint")), _score_step),
     _Step(
         "effects", ("cohort", "fit", "score"), lambda config: {
             "jackknife_blocks": JACKKNIFE_BLOCKS, "confidence": CONFIDENCE_LEVEL,

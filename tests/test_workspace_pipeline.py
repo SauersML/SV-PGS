@@ -16,6 +16,7 @@ import gzip
 import hashlib
 import inspect
 import json
+import logging
 import pickle
 import re
 import shutil
@@ -1990,7 +1991,9 @@ def test_postfit_resumes_after_a_mirrored_batch_and_keeps_every_output(workspace
 
     def interrupted(*args, **kwargs):
         calls.append(True)
-        if len(calls) == 2:
+        # Every call from the second on fails: the score step retries a failed read of gathered rows on the store's
+        # own rows, which must fail too for the batch to be lost.
+        if len(calls) >= 2:
             raise RuntimeError("preempted batch")
         return original(*args, **kwargs)
 
@@ -2321,6 +2324,103 @@ def test_prediction_workspace_excludes_loaded_models_shared_arrays_and_results()
     assert 0 < budget.host_bytes < BUDGET.host_bytes // 2
     with pytest.raises(MemoryError, match="no host memory"):
         workspace_pipeline._prediction_budget(dataclasses.replace(BUDGET, host_bytes=values.nbytes), cohort, [model], {"output": values}, values)
+
+
+def test_models_score_on_their_gathered_rows_as_on_the_store_rows(tmp_path: Path) -> None:
+    """The score step reads the rows its models use gathered into one run (``GatheredRows``): every model's mean and
+    draw scores equal those read from the store rows themselves to rounding, over rows sharing an inner chunk, rows
+    alone in theirs, a chromosome's first and last rows and both chromosomes; each read is one inner chunk holding a
+    used row, and the scorer reads the gathered rows in one block, not one per run of adjacent store rows."""
+    from sv_pgs.dosage_store import write_dosage_store
+
+    rng = np.random.default_rng(20261020)
+    counts, sample_count, inner_rows = (150, 90), 29, 8
+    variant_count = sum(counts)
+    codes = rng.integers(0, 255, (variant_count, sample_count)).astype(np.uint8)
+    wide = codes.astype(np.uint64)
+    ids = b"".join(f"v{row}".encode() for row in range(variant_count))
+    table = VariantTable(
+        chromosome=np.repeat(np.array([21, 22], dtype=np.int8), counts), position=np.arange(variant_count, dtype=np.int64) * 7 + 3,
+        genetic_position_cm=np.linspace(0.0, 3.0, variant_count), ref_length=np.ones(variant_count, dtype=np.int32),
+        alt_length=np.ones(variant_count, dtype=np.int32), variant_class=np.zeros(variant_count, dtype=np.uint8),
+        codes_per_unit=np.full(variant_count, 127, dtype=np.uint8), value_origin=np.zeros(variant_count, dtype=np.int64),
+        group_first=np.arange(variant_count, dtype=np.int64), sum_code=wide.sum(axis=1), sum_code2=(wide * wide).sum(axis=1),
+        annotations={}, annotation_legends={}, id_bytes=np.frombuffer(ids, dtype=np.uint8),
+        id_offsets=np.concatenate([[0], np.cumsum([len(f"v{row}") for row in range(variant_count)])]).astype(np.int64),
+    )
+    write_dosage_store(tmp_path / "store", sample_count, table, [codes[start : start + 17] for start in range(0, variant_count, 17)],
+                       codec="zstd", shard_rows=32, inner_rows=inner_rows)
+    chosen = (
+        np.array([0, 1, 2, 9, 30, 31, 32, 33, 64, 100, 149, 150, 151, 160, 199, 238, 239], dtype=np.int64),
+        np.array([2, 3, 40, 41, 42, 43, 44, 45, 46, 47, 48, 149, 150, 239], dtype=np.int64),
+    )
+    scorings = []
+    for model, rows in enumerate(chosen):
+        signed = codes[rows].astype(np.float64) - 127.0
+        draws = rng.normal(0.0, 1e-2, (rows.size, 3))
+        alpha = np.array([0.5, 0.0])
+        scorings.append(ScoringModel(rows, signed.mean(axis=1), signed.std(axis=1) + 1.0, rng.normal(0.0, 0.1, rows.size), draws, alpha,
+                                     TraitType.QUANTITATIVE, 0.0, np.repeat(alpha[:, None], 3, axis=1), np.zeros((2, 2)), True))
+    models = [_Fitted((f"m{model}",), ("age",), (scoring,), np.ones(1), {"outer_criterion_met": np.ones(1, dtype=bool)}) for model, scoring in enumerate(scorings)]
+    samples = np.array([0, 3, 4, 10, 17, 28], dtype=np.int64)
+    with DosageStore.open(tmp_path / "store") as store:
+        direct = score_genetic(_StoreBlocks(store, BUDGET), ScoringPlan.from_models(scorings), BUDGET, samples)
+        gathered, reader = workspace_pipeline.gathered_models(models, store)
+        assert reader.root == store.root and reader.n_samples == store.n_samples
+        assert np.array_equal(reader.rows, np.union1d(*chosen))
+        starts, stops, firsts = reader.spans(reader.rows)
+        chromosome = np.searchsorted(store.chromosome_starts, reader.rows, side="right") - 1
+        chunks = np.unique(chromosome * variant_count + (reader.rows - store.chromosome_starts[chromosome]) // inner_rows)
+        assert starts.shape == stops.shape == chunks.shape and np.all(stops > starts) and np.array_equal(reader.rows[firsts], starts)
+        plan = ScoringPlan.from_models([scoring for model in gathered for scoring in model.scoring])
+        assert plan.row_runs == ((0, reader.rows.size, 0),)
+        assert all(np.array_equal(reader.rows[scoring.store_rows], rows) for (scoring,), rows in zip((model.scoring for model in gathered), chosen))
+        read = score_genetic(_StoreBlocks(reader, BUDGET), plan, BUDGET, samples)
+    np.testing.assert_allclose(read.means, direct.means, rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(read.variances, direct.variances, rtol=1e-12, atol=1e-15)
+    for gathered_draws, direct_draws in zip(read.draws, direct.draws):
+        np.testing.assert_allclose(gathered_draws, direct_draws, rtol=1e-12, atol=1e-12)
+
+
+def test_a_failed_gathered_read_scores_the_batch_from_the_store_rows_as_before(workspace, monkeypatch, caplog) -> None:
+    """A gathered read that fails (here every ``GatheredRows`` read raises) is logged once per batch with its exception's
+    type, and the batch is scored from the store's own rows as before ``GatheredRows``: the saved scores equal, bit for
+    bit, those of a run whose score step reads the store rows directly."""
+    synthetic, client = workspace
+    config = WorkspaceConfig.from_mapping(synthetic.raw)
+    bindings = _bindings(_Recorder(), client)
+    run_pipeline(config, bindings, BUDGET, through="fit")
+    direct = dataclasses.replace(config, run_directory=config.run_directory.with_name("run-direct"))
+    shutil.copytree(config.run_directory, direct.run_directory, symlinks=True)
+
+    class StoreRows:
+        """The route before GatheredRows behind its interface: the models keep their store rows, read from the store."""
+
+        def __init__(self, store: DosageStore) -> None:
+            self.store, self.rows, self.root, self.n_samples = store, np.zeros(0, dtype=np.int64), store.root, store.n_samples
+
+        def iter_codes(self, row_ranges, sample_indices, budget):
+            yield from self.store.iter_codes(row_ranges, sample_indices, budget)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(workspace_pipeline, "gathered_models", lambda models, store: (list(models), StoreRows(store)))
+        run_pipeline(direct, bindings, BUDGET, through="score")
+    failures = []
+
+    def failing(self, row_ranges, sample_indices, budget):
+        failures.append(len(row_ranges))
+        raise RuntimeError("synthetic read failure")
+        yield
+
+    monkeypatch.setattr(workspace_pipeline.GatheredRows, "iter_codes", failing)
+    with caplog.at_level(logging.WARNING, logger="sv_pgs.workspace_pipeline"):
+        run_pipeline(config, bindings, BUDGET, through="score")
+    logged = [record for record in caplog.records if "scoring on gathered rows failed (RuntimeError: synthetic read failure)" in record.getMessage()]
+    assert failures and len(logged) == len(failures)
+    with np.load(config.run_directory / "score" / "predictions.npz") as fallback, np.load(direct.run_directory / "score" / "predictions.npz") as expected:
+        assert sorted(fallback.files) == sorted(expected.files)
+        for name in expected.files:
+            assert np.array_equal(fallback[name], expected[name], equal_nan=expected[name].dtype.kind == "f"), name
 
 
 @pytest.mark.parametrize("damage", ["other_arm", "other_problem"])
