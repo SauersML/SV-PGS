@@ -3190,10 +3190,15 @@ def _line_log_integrals(
                 pieces_high.append(cuts[1:])
                 pieces_sign.append(np.full(cuts.shape[0] - 1, signs[index]))
             intervals[column] = (np.concatenate(pieces_low), np.concatenate(pieces_high), np.concatenate(pieces_sign))
-            if 2 * intervals[column][0].shape[0] * nodes.shape[0] * prior.variant_count * np.dtype(np.float64).itemsize > working_bytes:
-                # The next round's pass (its normalizers, one per variant and step) would not fit the working budget:
-                # the integrand is not resolved to the share within what the budget can evaluate, and subdivision
-                # alone would grow the open intervals without end.
+            if 2 * intervals[column][0].shape[0] * nodes.shape[0] * prior.density_size * np.dtype(np.float64).itemsize > working_bytes:
+                # The next round's pass would not fit the working budget: ``_lines`` holds every step's class log
+                # densities at once (C x K each, the raw and the normalized), its variants in pieces that fit the
+                # budget, so the integrand is not resolved to the share within what the budget can evaluate, and
+                # subdivision alone would grow the open intervals without end. Charged per variant and step (the
+                # normalizers a pass held whole before ``_lines`` took its rows in pieces), the bound refused every
+                # integral that needed a second interval at 1,206 variants and 1 MiB, and so every correction a
+                # released annotation group needed on draw 2 of the class-length simulation, and it allowed a
+                # whole-genome direction (~1e6 variants) about two intervals per GB of the budget.
                 raise FloatingPointError("the exact integral along a direction did not converge within the working budget")
             still_open.append(column)
         open_ = still_open
@@ -4796,6 +4801,38 @@ def _path_gain(prior: ScaleMixturePrior, start: _State, end: _State, move: F64Ar
     return gain, abs(end_correction) + start.error + end.error
 
 
+def _rises(gain: float, resolution: float, end: _State, tolerance: float) -> bool:
+    """Whether a move whose realized gain is ``gain`` with ``resolution`` (``_path_gain``: both states' errors) raises
+    V(rho) by more than ``tolerance`` at its lower bound.
+
+    A state's error is two-sided, and its share x's own decrement delta is not: V(rho_end) is the evidence at the
+    maximizer of E - P at rho_end, where E - P is at least its value at x_end, so x_end short of that maximizer
+    leaves V(rho_end) above W_end by about delta_end (theory-ep (b)), never below. Only the rest of the end's error
+    (the determinant's and the corrections' first-order move with x, and the rounding) can put V(rho_end) below
+    W_end; the start's whole error bounds how far V(rho_start) lies above W_start. So the lower bound of V's rise is
+    the gain less its resolution plus the end's decrement. A joint trial ends at the x the model placed, short of
+    its maximum at the trial's own fixed point by a decrement that is most of the trial state's error (up to 0.5 nats
+    on the repository's mean-field fixtures): charged as a fall, it refused rises the trial had resolved (3 of the 80
+    refused joint trials there), and x was then polished and the step planned and solved again."""
+    return gain - resolution + end.decrement > tolerance
+
+
+def _halved_reach(slope: float, predicted: float, fraction: float) -> float:
+    """The largest gain the halvings of a refused joint step (half of ``fraction`` and shorter: the next is tried at
+    half, each shorter one only after it) reach under the quadratic q(f) = s f + c f^2 along the segment through the
+    state's slope s and the model's gain ``predicted`` for the whole step (c = predicted - s): q at half the fraction,
+    or the quadratic's peak where it falls before that, and never below zero. With s twice x's decrement delta (a
+    Newton step in x alone) and a prediction delta + g (x's polish and the step's own gain g), the half step reaches
+    3 delta / 4 + g / 4, so from an unpolished state, whose error is at least delta, no halving clears that error
+    unless g exceeds delta."""
+    curvature = predicted - slope
+    half = 0.5 * fraction
+    reach = max(0.0, slope * half + curvature * half * half)
+    if curvature < 0.0 and 0.0 < slope / (2.0 * -curvature) < half:
+        reach = max(reach, slope * slope / (4.0 * -curvature))
+    return reach
+
+
 @dataclass(frozen=True)
 class _OuterTrial:
     """A pending outer trial: the joint step to ``hyperparameters`` at ``fraction`` of its segment (``newton`` None;
@@ -4842,13 +4879,15 @@ def fit_hyperparameters(
     - ``hyper_step`` maximizes the model over the weights, to rho-hat and the model's own maximizer x there; the model
       predicts V to gain pi_k = V_k(rho-hat) - W_k, with W_k V's formula at the state itself (``_outer_state``).
     - The joint trial (rho-hat, x) is solved for its fixed point and its own B, and V's realized gain along the step
-      measured (``_path_gain``). It is accepted when that gain less its resolution exceeds ``tolerance``: V(rho) then
+      measured (``_path_gain``). It is accepted when that gain less its resolution, with the trial's own decrement
+      credited (``_rises``: x short of its maximum leaves V above W, never below), exceeds ``tolerance``: V(rho) then
       rises by more than the fit's resolution at every accepted joint step, so there are at most
       (V* - V(rho_0)) / tolerance of them. A refused joint trial is halved along its segment at rho-hat (where that
       keeps the edges) while each halving raises the realized gain. From a state where V's formula has no certified
       value (x_k outside every basin of its integrand at rho_k, as at an arbitrary start) the joint trial enters one:
       it is accepted where the trial's own state is certified, uncounted, and every accepted joint step lands in a
-      certified state, so only an inner step can leave one.
+      certified state, so only an inner step can leave one (and one from a state whose error is mostly x's
+      decrement is refused where it would).
     - Otherwise x takes inner steps at rho_k. An inner step ascends L_rho, not V (a function of the weights alone),
       so it is accepted on any certified rise: the natural monotonicity test where B + S is positive definite
       (Deuflhard, Newton Methods for Nonlinear Problems, 2004, Section 3.1.4: at the trial's fixed point
@@ -4897,12 +4936,12 @@ def fit_hyperparameters(
     # A release (the step frees an edge weight) is taken as its weights' move first, at x_k and its fixed point
     # (the fixed point does not depend on the weights), and x then follows by inner steps at the freed weights; the
     # joint step stands where x's certified V at the freed weights, once polished, is above the state's it left by
-    # more than the tolerance and both errors. ``anchors`` holds that state (and the step's predicted gain) until
+    # more than the tolerance and both errors (``_rises``). ``anchors`` holds that state (and the step's predicted gain) until
     # then, and ``refused_releases`` the blocks a model was returned from, which its next hyper steps hold at their
     # edge (``hyper_step``'s ``held_edges``): the interior there was measured at its own fixed point and lost.
     anchors: list[tuple[MixtureHyperparameters, FixedPoint, CurvatureCorrection, _State, float] | None] = [None] * count
     # The hyperparameters each model's last plan was made from (``plan``: a plan made twice from one state ends the fit).
-    planned_at: list[tuple[F64Array, F64Array] | None] = [None] * count
+    planned_at: list[tuple[F64Array, F64Array, bool] | None] = [None] * count
     refused_releases: list[set[frozenset[int]]] = [set() for _model in range(count)]
     # The blocks a model's hyper step moved to their edge and the joint trial refused at its own fixed point: its
     # next hyper steps keep them finite (``hyper_step``'s ``held_finite``).
@@ -4969,9 +5008,22 @@ def fit_hyperparameters(
             return max(gain, 0.0)
         return slope * slope / (4.0 * -curvature)
 
+    def unmeasured_reach(model: int, segment: F64Array, fraction: float, predicted: float) -> float:
+        """``_halved_reach`` at the state's slope along the segment (``segment_reach``'s): where a refused joint trial
+        from an unpolished state has no measured gain (no fixed point, or no certified value at its end), the largest
+        gain its halvings can reach under the model's own quadratic, through that slope and the gain the model
+        predicted for the whole step. ``segment_reach`` reads an unmeasured gain as unbounded, so every such trial
+        halved; from an unpolished state a halving is refused unless its gain clears the state's error, x's decrement
+        there, of which a half step recovers only part. On LDL's whole-genome fit [real, aou-wl1 snv_indel] the whole
+        step from a state of error 3.75 (its decrement) predicted 4.964 and had no certified value; its half step
+        realized 3.684 and was refused on that error, 31 of the fit's minutes in one fixed point and its curvature,
+        after which x polished as it does here at once."""
+        newton = _newton_b(prior, hyperparameters[model].log_smoothing, hyperparameters[model].coefficients, points[model], corrections[model], working_bytes)
+        return _halved_reach(float(newton.gradient @ (newton.allowed.T @ segment)), predicted, fraction)
+
     def settle_release(model: int) -> None:
         """x polished at the freed weights: the release stands where its certified V is above the state's it left by
-        more than the tolerance and both errors (its realized gain measured against the step's prediction);
+        more than the tolerance and both errors (``_rises``; its realized gain measured against the step's prediction);
         otherwise the model returns to that state and this release is not planned again."""
         anchor = anchors[model]
         assert anchor is not None
@@ -4988,7 +5040,7 @@ def fit_hyperparameters(
             resolution = polished_state.error + anchor_state.error
         remainders[model] = abs(realized - predicted) if np.isfinite(realized) else np.inf
         anchors[model] = None
-        if polished_state is not None and realized - resolution > tolerance:
+        if polished_state is not None and _rises(realized, resolution, polished_state, tolerance):
             states[model] = replace(polished_state, polished=True)
             return
         refused_releases[model].add(frozenset(
@@ -5124,10 +5176,17 @@ def fit_hyperparameters(
                 states[model] = replace(states[model], polished=False)
                 return reopened
         previous = planned_at[model]
-        planned_at[model] = (hyperparameters[model].coefficients.copy(), np.array(hyperparameters[model].log_smoothing, dtype=np.float64, copy=True))
+        # With whether x was polished there: a polish before the trial (below) that finds x already at its maximum
+        # takes no step and marks the state polished, and the state is planned again with no trial between. That plan
+        # is a new one (a polished state's hyper step may free the edges an unpolished one holds, and no trial from it
+        # has been refused), not the repeated plan the guard below stops.
+        planned_at[model] = (
+            hyperparameters[model].coefficients.copy(), np.array(hyperparameters[model].log_smoothing, dtype=np.float64, copy=True), state.polished,
+        )
         if (
             remaining > tolerance and previous is not None
             and np.array_equal(previous[0], planned_at[model][0]) and np.array_equal(previous[1], planned_at[model][1])
+            and previous[2] == planned_at[model][2]
         ):
             # The plan is made from the very state its predecessor was made from: the trial it led to was refused
             # and nothing moved, its pieces cannot be tightened further (``decide``: a piece that cannot reach its
@@ -5156,15 +5215,20 @@ def fit_hyperparameters(
             f"(state error {state.error:.3g}, step error {step.evidence_error:.3g}, {weights}), "
             f"{iterations[model]} accepted steps, {halvings[model]} halvings so far"
         )
-        if (
-            remaining > tolerance and not state.polished and np.isfinite(remainders[model])
-            and predicted + remainders[model] <= state.error + tolerance
-        ):
+        bounded = np.isfinite(remainders[model]) and predicted + remainders[model] <= state.error + tolerance
+        if remaining > tolerance and not state.polished and (bounded or (predicted <= state.error and not state.at_resolution)):
             # The joint trial cannot be accepted from here: its realized gain is at most the prediction plus the model's
-            # measured remainder, and acceptance needs it above both states' errors and the tolerance, of which this
-            # state's error alone takes it all. x is polished first, which lowers that error, and the state is planned
-            # again from there (on bench-sim chr22 001 [sim] a trial predicted 2.25 realized 2.28 and was refused on its
-            # start's error, 4.28, its two fixed points spent).
+            # measured remainder, and acceptance needs it above the state's error and the tolerance (``_rises``), of
+            # which this state's error alone takes it all. x is polished first, which lowers that error, and the state is
+            # planned again from there (on bench-sim chr22 001 [sim] a trial predicted 2.25 realized 2.28 and was
+            # refused on its start's error, 4.28, its two fixed points spent). Where the model's prediction alone is
+            # within the state's error, x polishes first too, whatever the remainder: the trial is accepted then only
+            # where the model under-predicts the step by more than the tolerance, and a refused trial from an
+            # unpolished state polishes x anyway, after a fixed point at the trial and any halvings. An unmeasured
+            # remainder (the first plans of a fit) or one measured at an early, longer step could not tell such a
+            # trial from one that rises; on the repository's empirical-Bayes test problems (at their own tolerances and
+            # at 1/128) 51 of 60 such trials were refused, against 6 of 64 from unpolished states whose prediction
+            # cleared the state's error. A state whose polish already ended below x's resolution is not asked again.
             log(f"eb outer: model {model} polishes before its trial: predicted {predicted:.4g} + remainder {remainders[model]:.3g} within the state's error {state.error:.3g}")
             return inner(model, step, remaining, True)
         entry = _OuterTrial(step.hyperparameters, step, remaining, remaining <= tolerance, predicted=predicted, weights_tolerance=planned)
@@ -5310,8 +5374,9 @@ def fit_hyperparameters(
                         gain, resolution = _path_gain(prior, state, trial_state, trial.coefficients - hyperparameters[model].coefficients)
                         if entry.fraction == 1.0:
                             remainders[model] = abs(gain - entry.predicted)
-                        report("accepted" if gain - resolution > tolerance else "refused", trial_state, resolution)
-                        if gain - resolution > tolerance:
+                        rises = _rises(gain, resolution, trial_state, tolerance)
+                        report("accepted" if rises else "refused", trial_state, resolution)
+                        if rises:
                             # A new state: its polish starts from its own Cauchy radius (as at an entered trial).
                             hyperparameters[model], points[model], corrections[model], states[model] = trial, trial_point, trial_correction, trial_state
                             displaced[model], pending[model], radii[model] = False, None, None
@@ -5394,8 +5459,12 @@ def fit_hyperparameters(
                 elif same_edges and longer and (np.isneginf(gain) or gain > entry.realized) and (
                     # A polished state whose whole step has no certified end halves toward the fraction-certified
                     # close above (the trial's error falls with the fraction); elsewhere the halving searches a gain,
-                    # and ends where the segment's quadratic model reaches none.
-                    (state.polished and whole_uncertifiable[model]) or segment_reach(model, segment, entry.fraction, gain) - state.error > tolerance
+                    # and ends where the segment's quadratic model reaches none (an unmeasured gain from an unpolished
+                    # state: where the model's own reaches none, ``unmeasured_reach``).
+                    (state.polished and whole_uncertifiable[model]) or (
+                        segment_reach(model, segment, entry.fraction, gain) if state.polished or np.isfinite(gain)
+                        else unmeasured_reach(model, segment, entry.fraction, entry.predicted)
+                    ) - state.error > tolerance
                 ):
                     halved = MixtureHyperparameters(coefficients=hyperparameters[model].coefficients + fraction * segment, log_smoothing=target.log_smoothing)
                     pending[model] = replace(entry, hyperparameters=halved, certifying=False, fraction=fraction, realized=max(gain, entry.realized))
@@ -5466,8 +5535,24 @@ def fit_hyperparameters(
                 # than Newton's thousand units lowers, so the loop halved to x's resolution and read a maximum where
                 # the state's own error was 9.6 nats.
                 accepted = 0.5 * float((newton.gradient + gradient) @ proposal) > 0.0
+            left = False
             if accepted:
                 trial_correction, trial_state = solve_state(trial, trial_point)
+                # A step from a certified state to one outside every basin (no certified V at the trial) is refused
+                # and shortened as a descent is, where x's own decrement is most of that state's error: the polish is
+                # then what lowers the error, the trapezoid sees an ascent of E, but V at the trial has no value to
+                # rise by, and the walk out there is blind. On the repository's grouped Gram fixture a polish from a
+                # state of error 1.36 (all of it x's decrement) took two such steps (101 and 217 units) and came back
+                # to a certified state of error 15.1 five fixed points later, sixteen in all to its maximum; shortened,
+                # its third step reached 0.056 and its fourth 0.0007. On LDL's whole-genome fit [real, aou-wl1
+                # snv_indel] a polish's first step (5.87 units from a state of error 3.75, all of it the decrement)
+                # left every basin, about 7.5 minutes a fixed point. Where the decrement is a sliver of the error no
+                # step of x moves the certificate, and the refusals only halve: a release's polish on dbg_eb7 with six
+                # sparse records (decrement 0.002 of 7.94 nats) halved a 155-unit step eighteen times to a basin 6e-4
+                # wide, 47 fixed points in the stage where 9 do without the refusal.
+                left = trial_state is None and states[model] is not None and states[model].decrement > 0.5 * states[model].error
+                accepted = not left
+            if accepted:
                 previous_state = states[model]
                 if previous_state is None and trial_state is None and last_steps[model] is not None:
                     current = points[model]
@@ -5513,7 +5598,7 @@ def fit_hyperparameters(
             inner_gains[model] = []
             log(
                 f"eb outer: model {model} inner step refused: length {length:.3g} (radius {entry.radius:.3g}), decrement {newton.decrement:.3g}, "
-                f"{'unresolved trial' if trial_point is None else 'below resolution' if not resolved else 'no ascent'}"
+                f"{'unresolved trial' if trial_point is None else 'below resolution' if not resolved else 'no certified value' if left else 'no ascent'}"
             )
             if not resolved:
                 if entry.polishes and anchors[model] is not None:

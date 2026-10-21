@@ -7,10 +7,10 @@ from scipy.integrate import quad
 
 from sv_pgs.annotation_design import FREQUENCY, LD_SCORE, annotation_design, frequency_annotation, ld_score_annotation, smooth_shift_record, spline_basis
 from sv_pgs.scale_mixture_ep import (
-    Cavity, _sum_to_zero_basis, _sum_to_zero_rows, class_log_density, derived_lattice, embed_hyperparameters, hyper_step, initial_hyperparameters,
-    scale_mixture_prior, without_annotations,
+    Cavity, FixedPoint, _sum_to_zero_basis, _sum_to_zero_rows, class_log_density, derived_lattice, embed_hyperparameters, fit_hyperparameters,
+    hyper_step, initial_hyperparameters, scale_mixture_prior, tilted_moments, without_annotations,
 )
-from tests.oracles import INDEPENDENT_EFFECTS
+from tests.oracles import INDEPENDENT_EFFECTS, diagonal_posterior
 
 
 def _table(rng: np.random.Generator, count: int):
@@ -513,6 +513,82 @@ def test_the_nested_empirical_bayes_gives_each_class_its_length_slope_and_shrink
     bend = model.scale_design[:, deviation.columns] @ theta[deviation.columns]
     spread = [float(np.sqrt(np.mean(np.square(bend[classes == position])))) for position in range(len(_LABELS))]
     assert spread[0] == 0.0 and spread[3] < 0.5 * min(spread[1], spread[2])
+
+
+def _draw_two():
+    """Draw 2 of the class-length process above (its effects drawn before the cavities' precisions): the length
+    classes, their lengths, each effect's cavity (its own likelihood), and the prior with the class deviations on the
+    lattice the data derive."""
+    rng = np.random.default_rng(56)
+    classes, lengths = _length_table(rng, sizes=(200, 500, 500, 6))
+    log_length = np.log(lengths)
+    structural = classes > 0
+    standardized = np.where(structural, (log_length - log_length[structural].mean()) / log_length[structural].std(), 0.0)
+    slopes = np.array([0.0, 1.0, -1.0, 1.0])
+    effects = rng.standard_normal(classes.shape[0]) * np.exp(0.5 * (np.log(0.01) + slopes[classes] * standardized))
+    precision = rng.uniform(100.0, 800.0, classes.shape[0])
+    cavity = Cavity(precision=precision, shift=precision * effects + np.sqrt(precision) * rng.standard_normal(classes.shape[0]))
+    offset = np.zeros(classes.shape[0])
+    nodes, floor, top = derived_lattice(cavity.precision, cavity.shift, offset, 1e-3)
+    design = annotation_design({"sv_length": lengths}, {}, class_index=classes, by_class=("sv_length",), class_labels=_LABELS)
+    prior = scale_mixture_prior(
+        class_index=classes, log_variance_offset=offset, annotation_design=design.design, annotation_groups=design.groups,
+        nodes=nodes, floor=floor, top=top,
+    )
+    return prior, cavity
+
+
+def _released_deviation(prior, hyperparameters) -> bool:
+    names = [block.name for block in prior.smoothing_blocks]
+    return any(np.isfinite(weight) for name, weight in zip(names, hyperparameters.log_smoothing) if "(sv_length:by_class)" in name)
+
+
+@pytest.mark.slow
+def test_draw_two_releases_the_class_deviations_within_a_one_mebibyte_budget() -> None:
+    """The release of the class deviations on draw 2 is worth 135 nats (V 3284.1 against the base's 3148.8). The
+    exact line integrals of its corrections need up to four open intervals a direction; charged as normalizers per
+    variant and step (2 x 29 x 1,206 x 8 bytes an interval), 1 MiB refused every integral past its first round, so no
+    deviation weight had a certified value and the search kept them all at their edge (V 3148.65). ``_lines`` holds
+    only each step's class log densities whole, its variants in pieces of the budget."""
+    prior, cavity = _draw_two()
+    base = without_annotations(prior)
+    base_fit = hyper_step(base, initial_hyperparameters(base), cavity, INDEPENDENT_EFFECTS, 1 << 20, 1.0 / 128.0)
+    fit = hyper_step(prior, embed_hyperparameters(base, prior, base_fit.hyperparameters), cavity, INDEPENDENT_EFFECTS, 1 << 20, 1.0 / 128.0)
+    assert _released_deviation(prior, fit.hyperparameters)
+    assert fit.evidence > base_fit.evidence + 100.0
+
+
+@pytest.mark.slow
+def test_the_nested_outer_loop_takes_the_release_its_polished_state_plans() -> None:
+    """The fit's own route on draw 2 (``fit_hyperparameters``: the prior without annotations from its start, then the
+    annotated prior from that fit with every group at its lambda = infinity edge), with the exact normal-means fixed
+    point. Each stage's first plan predicts no gain from an unpolished state whose error clears it, so x polishes
+    first, is found at its maximum, and the state is marked polished; a polished state's hyper step frees the edges
+    an unpolished one holds, so its plan is a release. Read as the same plan made twice from one state, it ended both
+    stages uncertified with every deviation at its edge, V's lower bound at the returned state 3145.44 in each; the
+    plans from the polished states release a block in each stage and the annotated fit returns with the deviations'
+    null space freed, V's lower bound 3276.26 there (W 3286.63 less its error 10.38, still uncertified)."""
+    prior, cavity = _draw_two()
+    base = without_annotations(prior)
+
+    def fixed_points(model_prior):
+        def solve(hyperparameters):
+            points = []
+            for model in hyperparameters:
+                moments = tilted_moments(model_prior, model, cavity, 1 << 28)
+                points.append(FixedPoint(
+                    cavity=cavity, posterior=diagonal_posterior(moments.variance), mean=moments.mean,
+                    precision_norm=lambda direction, variance=moments.variance: float(np.sum(np.square(direction) / variance)),
+                    effective_effects=float(np.sum(cavity.precision * moments.variance)),
+                ))
+            return points
+        return solve
+
+    (base_fit,) = fit_hyperparameters(base, [initial_hyperparameters(base)], fixed_points(base), 1 << 28, 1.0 / 128.0)
+    start = embed_hyperparameters(base, prior, base_fit.hyperparameters)
+    (fit,) = fit_hyperparameters(prior, [start], fixed_points(prior), 1 << 28, 1.0 / 128.0)
+    assert base_fit.iterations >= 2 and fit.iterations >= 1
+    assert _released_deviation(prior, fit.hyperparameters)
 
 
 def test_the_fit_log_records_each_class_length_curve_by_decade() -> None:

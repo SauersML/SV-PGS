@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import gc
+import re
 import weakref
 from pathlib import Path
 from types import SimpleNamespace
@@ -80,6 +81,13 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
         return original_gaussian(**arguments)
 
     monkeypatch.setattr(stage2_wiring, "DualGaussian", training_only_gaussian)
+    # The outer loop's log and each joint trial's start state (``scale_mixture_ep._path_gain``), in order.
+    from sv_pgs import scale_mixture_ep
+
+    events: list = []
+    path_gain, engine_log = scale_mixture_ep._path_gain, scale_mixture_ep.log
+    monkeypatch.setattr(scale_mixture_ep, "_path_gain", lambda prior, start, end, move: (events.append(start), path_gain(prior, start, end, move))[1])
+    monkeypatch.setattr(scale_mixture_ep, "log", lambda message: (events.append(message), engine_log(message))[1])
     model = fit_model.fit(
         fit_model.FitRequest(
             store=store,
@@ -99,6 +107,25 @@ def test_fit_runs_the_engine_and_the_saved_model_scores_the_store(tmp_path: Path
         )
     )
     assert model.certificate["remaining_gain"][0] <= 0.5 / fit_model.DRAW_COUNT
+    # A plan that does not certify from a state whose x is not polished takes its joint trial only where the model
+    # predicts more than the state's error; otherwise x polishes first (``fit_hyperparameters``' plan). Here the
+    # second plan predicted 0.007 nats against the state's error 0.011 on the samples route (0.024 against 0.025 on the
+    # Gram route): its trial was refused, and the inner step that followed was that trial's own move in x.
+    planned: dict[str, tuple[float, float]] = {}
+    start = None
+    trials = 0
+    for event in events:
+        if not isinstance(event, str):
+            start = event
+            continue
+        if (found := re.search(r"model (\d+) plan \d+: predicted gain (\S+), remaining (\S+) ", event)) is not None:
+            planned[found.group(1)] = (float(found.group(2)), float(found.group(3)))
+        elif (found := re.search(r"model (\d+) joint trial at fraction 1 of", event)) is not None and start is not None:
+            predicted, remaining = planned[found.group(1)]
+            trials += 1
+            assert start.polished or start.at_resolution or remaining <= 0.5 / fit_model.DRAW_COUNT or predicted > start.error * (1.0 - 1e-3), event
+            start = None
+    assert trials
     assert model.certificate["far_field"][0] == 0.0
     assert model.certificate["far_field_scale"][0] == 0.0
     assert model.certificate["budget_unresolved"][0] == 0
@@ -435,9 +462,28 @@ def test_a_group_fits_each_model_as_it_would_be_fitted_alone(tmp_path: Path, mon
     from sv_pgs import stage2_wiring
     from tests.test_full_data_fit import _StoreCodes
 
+    from sv_pgs import scale_mixture_ep
+
     store, covariate, model_targets, training, held_out = _three_traits(tmp_path / "store")
     monkeypatch.setattr(stage2_wiring, "pass_costs", (lambda band, source, xp: (0.0, np.inf)) if route == "samples" else (lambda band, source, xp: (np.inf, 0.0)))
+    lines: list[str] = []
+    engine_log = scale_mixture_ep.log
+    monkeypatch.setattr(scale_mixture_ep, "log", lambda message: (lines.append(message), engine_log(message))[1])
     together = _fitted_group(store, covariate, model_targets, training, tmp_path / "together", 5)
+    # An inner step from a certified state never stands outside every basin (``fit_hyperparameters``: it is refused
+    # and shortened). On the Gram route a polish from a state of error 1.36 took 101 and then 217 units there and came
+    # back to a certified state of error 15.1 five fixed points later.
+    errors: dict[str, float] = {}
+    for line in lines:
+        found = re.search(r"model (\d+) (plan \d+|inner step accepted|joint trial)", line)
+        error = re.search(r"state error ([^\s,()]+)", line)
+        if found is None or error is None:
+            continue
+        model, kind, value = found.group(1), found.group(2), float(error.group(1))
+        if kind == "inner step accepted":
+            assert not (np.isfinite(errors.get(model, np.inf)) and value == np.inf), line
+        if kind != "joint trial" or line.endswith(": accepted"):
+            errors[model] = value
     monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (0.0, np.inf))
     for model in range(6):
         alone = _fitted_group(store, covariate, model_targets[:, [model]], training[:, [model]], tmp_path / f"alone{model}", 5)
@@ -535,15 +581,31 @@ def test_a_quarantined_band_fit_whose_sample_refit_has_no_start_stands_alone(tmp
 
 
 def test_a_band_route_fit_the_gate_would_quarantine_is_fitted_again_on_the_sample_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Model 4 alone on the band route, seed 5: its fit ends uncertified (its outer loop returns from outside every
-    basin; ``model_acceptance`` would quarantine it, and its coefficients correlate 0.33 with the sample route's), so it
-    is fitted again alone on the sample route, which the gate accepts, and its refusals say why."""
+    """Model 4 alone on the band route, seed 5, its fit ended uncertified: its polish stepped 346 and then 693 units out
+    of every basin and the outer loop returned from there (``model_acceptance`` would quarantine it, and its
+    coefficients correlated 0.33 with the sample route's). An inner step from a certified state is now refused where
+    it would leave every basin (``scale_mixture_ep.fit_hyperparameters``), and that fit certifies, its coefficients
+    correlating 0.99999995 with the sample route's; so the band route's fit is made to end as it did, and the gate's
+    refit is tested on it: fitted again alone on the sample route, which the gate accepts, its refusals saying why."""
     from sv_pgs import stage2_wiring
     from sv_pgs.fit_model import certificate_parts
     from sv_pgs.model_acceptance import acceptance
 
     store, covariate, model_targets, training, _held_out = _three_traits(tmp_path / "store")
     monkeypatch.setattr(stage2_wiring, "pass_costs", lambda band, source, xp: (np.inf, 0.0))
+    engine = stage2_wiring.fit_full_data
+
+    def walked_off(**arguments):
+        fit = engine(**arguments)
+        if arguments["band"] is None:
+            return fit
+        # From outside every basin: the outer criterion unmet and the remaining gain unmeasured.
+        unmeasured = np.full(np.shape(fit.certificate.remaining_gain), np.inf)
+        return dataclasses.replace(fit, certificate=dataclasses.replace(
+            fit.certificate, outer_criterion_met=np.zeros(unmeasured.shape, dtype=bool), remaining_gain=unmeasured, prediction_move=unmeasured,
+        ))
+
+    monkeypatch.setattr(stage2_wiring, "fit_full_data", walked_off)
     fitted = _fitted_group(store, covariate, model_targets[:, [4]], training[:, [4]], tmp_path / "work", 5)
     (reason,) = [reason for reason in fitted.certificate.refusals if "quarantined" in reason]
     assert reason.startswith("model 0: the band route's fit would be quarantined (outer_criterion_met") and reason.endswith("fitted again alone on the sample route")

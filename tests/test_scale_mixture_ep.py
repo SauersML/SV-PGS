@@ -885,7 +885,7 @@ def test_a_line_integral_whose_settled_errors_outgrow_a_falling_total_raises_the
 
     monkeypatch.setattr(engine, "_lines", lambda *arguments: lambda steps: {column: log_integrand(step) for column, step in steps.items()})
     with pytest.raises(FloatingPointError, match="settled against an earlier total"):
-        engine._line_log_integrals(SimpleNamespace(variant_count=1), None, None, np.zeros((1, 1)), 0.0, None, _WORKING_BYTES, 1e-3)
+        engine._line_log_integrals(SimpleNamespace(density_size=1), None, None, np.zeros((1, 1)), 0.0, None, _WORKING_BYTES, 1e-3)
 
 
 def test_a_non_finite_curvature_is_not_resolvably_positive_definite():
@@ -1433,6 +1433,49 @@ def test_a_search_started_at_its_certified_optimum_certifies_again():
     assert abs(again.step.evidence - fit.step.evidence) <= 2.0 * _EVIDENCE_TOLERANCE
     # Its first plan certifies: no joint trial had to measure the zero step's remainder (and be refused for its zero gain).
     assert again.halvings == 0 and len(again.history) == 1, (again.halvings, again.history)
+
+
+def test_a_joint_trial_rises_on_vs_lower_bound_with_only_its_end_decrement_credited():
+    """``_rises``: x short of its maximum leaves V above W, never below, so the end state's decrement is credited
+    against the resolution (both states' errors), and the start's is not (V(rho_start) can lie above W_start by its
+    whole error). A trial that realized 0.285 nats from a start whose error is 0.2 to an end whose error is 0.09, 0.085
+    of it the end's decrement, was refused as a fall of 0.005 below the errors; V's lower bound rose by 0.08."""
+    from sv_pgs.scale_mixture_ep import _rises, _State
+
+    def state(error, decrement):
+        return _State(value=0.0, rest=0.0, gradient=np.zeros(1), fixed_curvature=np.zeros((1, 1)), correction=None, error=error, decrement=decrement)
+
+    gain = 0.285
+    for start_decrement in (0.0, 0.2):
+        start = state(0.2, start_decrement)
+        assert _rises(gain, start.error + 0.09, state(0.09, 0.085), _EVIDENCE_TOLERANCE)
+        # Error that is not x's decrement (the determinant's and the corrections' move with x, rounding) is a fall.
+        assert not _rises(gain, start.error + 0.09, state(0.09, 0.0), _EVIDENCE_TOLERANCE)
+    # The credit never exceeds the end's own error: a gain the start's error alone takes stays refused.
+    assert not _rises(0.15, 0.2 + 0.09, state(0.09, 0.085), _EVIDENCE_TOLERANCE)
+
+
+def test_a_refused_unmeasured_trial_halves_only_where_its_quadratic_clears_the_state_error():
+    """``_halved_reach``: the halvings of a refused joint step reach at most the quadratic through the state's slope
+    and the whole step's predicted gain, at half the fraction or at the quadratic's peak before it. On LDL's
+    whole-genome fit [real, aou-wl1 snv_indel] the whole step from a state of error 3.75 predicted 4.964 and had no
+    certified end, and its half step realized 3.684, refused on that error after one more fixed point and its
+    curvature. With the slope of x's own Newton step (twice its decrement), or of the whole prediction's straight
+    line, the quadratic reaches under the state's error at half the step, so no halving is tried; a slope well above
+    the prediction (most of the step's gain in its first half) still halves."""
+    from sv_pgs.scale_mixture_ep import _halved_reach
+
+    error, predicted = 3.75, 4.964
+    for slope in (2.0 * error, 2.0 * predicted):
+        reach = _halved_reach(slope, predicted, 1.0)
+        assert reach == pytest.approx(0.5 * slope + 0.25 * (predicted - slope))
+        assert reach < error + _EVIDENCE_TOLERANCE
+    assert _halved_reach(20.0, predicted, 1.0) > error + _EVIDENCE_TOLERANCE
+    # The peak where it falls before half the fraction: s^2 / (4 |c|) at f = s / (2 |c|) = 0.25.
+    assert _halved_reach(20.0, -20.0, 1.0) == pytest.approx(2.5)
+    # Each halving's own fraction, and never below zero.
+    assert _halved_reach(2.0 * error, predicted, 0.5) == pytest.approx(0.25 * 2.0 * error + 0.0625 * (predicted - 2.0 * error))
+    assert _halved_reach(-1.0, -2.0, 1.0) == 0.0
 
 
 def test_the_trust_region_step_takes_the_hard_case_exactly():
