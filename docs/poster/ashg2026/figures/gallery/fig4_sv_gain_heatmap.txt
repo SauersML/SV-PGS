@@ -1,0 +1,1 @@
+Figure 4 | Gain from adding SVs by architecture and training size. Mean paired ΔAUC (× 1,000) between SV-PGS fitted with and without SVs on one chromosome 22 window, with SVs measured by their true genotypes (a) or imputed (b). Grey cells had fewer than two replicates. Rows are ordered by the mean true-genotype gain.

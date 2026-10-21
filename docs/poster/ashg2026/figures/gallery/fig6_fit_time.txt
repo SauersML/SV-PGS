@@ -1,0 +1,1 @@
+Figure 6 | Fit time. Wall time of one fit on chromosome 22 per method and training size, pooled over every architecture: median (points) and interquartile range (bars). MSI Slurm jobs, one fit per job; SV-PGS fits every variant by empirical Bayes, LDpred2-auto HapMap3-density SNVs.
