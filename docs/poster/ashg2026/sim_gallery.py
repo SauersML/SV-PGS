@@ -6,7 +6,7 @@ window-truth), and from simulation_summary.json for the analytic expected AUC an
 
     uv run --with matplotlib python docs/poster/ashg2026/sim_gallery.py [output directory]
 
-Figures are sized in millimetres for print (single column 89 mm, double 183 mm) with 6-7 pt type. Each is written as a
+Figures are sized in millimetres for print (single column 89 mm, double 183 mm) with 7.5-8 pt type. Each is written as a
 vector PDF and a 600 dpi PNG; gallery.pdf holds every figure on its own page above its legend.
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib import font_manager
 from matplotlib.backends.backend_pdf import PdfPages
-from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm, to_rgb
+from matplotlib.colors import LinearSegmentedColormap, to_rgb
 from matplotlib.lines import Line2D
 from scipy import stats
 
@@ -55,12 +55,12 @@ def _font() -> str:
 
 plt.rcParams.update({
     "font.family": _font(),
-    "font.size": 7,
-    "axes.labelsize": 7,
-    "axes.titlesize": 7,
-    "xtick.labelsize": 6.5,
-    "ytick.labelsize": 6.5,
-    "legend.fontsize": 6.5,
+    "font.size": 7.5,
+    "axes.labelsize": 8,
+    "axes.titlesize": 8,
+    "xtick.labelsize": 7.5,
+    "ytick.labelsize": 7.5,
+    "legend.fontsize": 7.5,
     "axes.linewidth": 0.6,
     "axes.edgecolor": INK,
     "axes.labelcolor": INK,
@@ -92,24 +92,37 @@ plt.rcParams.update({
 })
 
 LABELS = {
-    "null": "No causal SVs",
-    "sv_5pct": "5% of causal variants SVs",
-    "sv_5pct_fold3": "5% SVs, 3× effect",
-    "sv_20pct": "20% of causal variants SVs",
-    "sv_20pct_fold3": "20% SVs, 3× effect",
-    "length_positive": "Effect grows with SV length",
-    "deletion_positive": "Deletions 3× variance",
-    "multi_feature_positive": "Length, type and annotation",
+    "null": "0% (no causal SVs)",
+    "sv_5pct": "5%",
+    "sv_20pct": "20%",
+    "sv_5pct_fold3": "5% causal SVs, 3× SV effect",
+    "sv_20pct_fold3": "20% causal SVs, 3× SV effect",
     "sv_heavy_tail": "Heavy-tailed SV effects",
     "sv_two_point": "Two-point SV effects",
+    "length_positive": "Larger effects for longer SVs",
+    "deletion_positive": "Deletion effects 3× insertions'",
+    "multi_feature_positive": "Length, type and annotation",
+    "tagged_sv": "Only well-imputed SVs",
+    "tagged_sv_fold3": "Only well-imputed SVs, 3× effect",
+    "common_sv": "Only common SVs",
     "sparse_sv": "50 causal variants",
     "polygenic_sv": "2,000 causal variants",
-    "rare_disease": "Prevalence 1%",
     "low_heritability": "h² = 0.01",
-    "tagged_sv": "Only well-tagged SVs causal",
-    "tagged_sv_fold3": "Well-tagged SVs, 3× effect",
-    "common_sv": "Only common SVs causal",
+    "rare_disease": "Prevalence 1%",
 }
+GROUPS = (
+    ("Causal variants that are SVs", ("null", "sv_5pct", "sv_20pct")),
+    ("SV effect size and shape", ("sv_5pct_fold3", "sv_20pct_fold3", "sv_heavy_tail", "sv_two_point")),
+    ("SV effect by SV feature", ("length_positive", "deletion_positive", "multi_feature_positive")),
+    ("Which SVs are causal", ("tagged_sv", "tagged_sv_fold3", "common_sv")),
+    ("Trait", ("sparse_sv", "polygenic_sv", "low_heritability", "rare_disease")),
+)
+ARCHITECTURES = (
+    "Unless named, an architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and 20% causal SVs; "
+    "'3× SV effect' triples the SV effect SD, 'well-imputed' draws causal SVs only from those Beagle imputes with "
+    "r² ≥ 0.8 and 'common' only from SVs of frequency ≥ 5%."
+)
+POINT_UNIT = "Differences are in AUC × 100 (one unit is 0.01 AUC)."
 
 
 def shade(color: str, amount: float) -> tuple:
@@ -120,6 +133,13 @@ def shade(color: str, amount: float) -> tuple:
 
 def thousands(count: int) -> str:
     return f"{count // 1000}k"
+
+
+def signed(value: float, digits: int = 1) -> str:
+    """``value`` with a sign and a true minus, and no sign on a value that rounds to zero."""
+    if round(value, digits) == 0:
+        return f"{0:.{digits}f}"
+    return f"{value:+.{digits}f}".replace("-", "−")
 
 
 def interval(values) -> tuple[float, float, float, int]:
@@ -136,7 +156,7 @@ def interval(values) -> tuple[float, float, float, int]:
 
 
 def letter(ax, text: str, x: float = -0.16, y: float = 1.04) -> None:
-    ax.text(x, y, text, transform=ax.transAxes, ha="left", va="bottom", fontsize=8, fontweight="bold")
+    ax.text(x, y, text, transform=ax.transAxes, ha="left", va="bottom", fontsize=9, fontweight="bold")
 
 
 def load_results() -> dict[str, list[dict]]:
@@ -155,62 +175,110 @@ def cells(rows: list[dict]) -> dict[tuple[str, int], list[dict]]:
     return grouped
 
 
+def finite(rows: list[dict], key: str) -> list[float]:
+    return [100 * row[key] for row in rows if row.get(key) is not None and math.isfinite(row[key])]
+
+
+def layout(present) -> list[tuple[str, str]]:
+    """Rows top to bottom: each group's heading, then its architectures that ``present`` keeps."""
+    rows = []
+    for heading, points in GROUPS:
+        kept = [point for point in points if present(point)]
+        if kept:
+            rows.append(("heading", heading))
+            rows.extend(("point", point) for point in kept)
+    return rows
+
+
+def row_labels(ax, rows, start: float) -> None:
+    """Group headings in bold and architectures indented under them, left-aligned at axes x ``start``."""
+    place = matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for y, (kind, value) in enumerate(rows):
+        if kind == "heading":
+            ax.text(start, y, value, transform=place, ha="left", va="center", fontweight="bold")
+        else:
+            ax.text(start + 0.04, y, LABELS[value], transform=place, ha="left", va="center")
+    ax.set_yticks([])
+    ax.spines["left"].set_visible(False)
+    ax.set_ylim(len(rows) - 0.5, -0.7)
+
+
 # ------------------------------------------------------------------ Figure 1
 
 
-SV_SHARES = (("null", "0%", 0.62, "o"), ("sv_5pct", "5%", 0.32, "s"), ("sv_20pct", "20%", 0.0, "^"))
+SV_SHARES = (("null", "0%", INK), ("sv_5pct", "5%", "#767676"), ("sv_20pct", "20%", "#AAAAAA"))
+
+
+def log_size_axis(ax) -> None:
+    """Training size on a true log2 axis, ticked at the grid's sizes only."""
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(SIZES, [thousands(size) for size in SIZES])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.set_xlim(SIZES[0] / 1.3, SIZES[-1] * 1.3)
 
 
 def accuracy_figure(grids, summary):
-    """Test AUC against training size for SV-PGS and LDpred2-auto, at three shares of causal SVs."""
+    """(a) Test AUC against training size per method, pooled over 0%, 5% and 20% causal SVs; (b) the paired gap between
+    the methods for each share of causal SVs, which shows the pooling hides nothing."""
     grouped = cells(grids["grid"])
-    fig, ax = plt.subplots(figsize=(110 * MM, 78 * MM))
-    fig.subplots_adjust(left=0.13, right=0.80, top=0.95, bottom=0.15)
-    xs = np.log2(np.array(SIZES) / SIZES[0])
+    fig, (ax, gap) = plt.subplots(1, 2, figsize=(170 * MM, 68 * MM), gridspec_kw={"width_ratios": [1.25, 1.0]})
+    fig.subplots_adjust(left=0.075, right=0.985, top=0.93, bottom=0.17, wspace=0.62)
+    log_size_axis(ax)
     expected = summary["points"]["null"]["expected_auc"]
-    ax.plot(xs, [expected[str(size)] for size in SIZES], color=GREY, linestyle=(0, (3, 2)), linewidth=0.8)
-    ax.text(xs[-1] + 0.12, expected[str(SIZES[-1])], "Expected AUC,\nall h² captured", color=GREY, fontsize=6.5,
-            va="center", ha="left", linespacing=1.1)
-    methods = (("with_sv_auc", "SV-PGS", BLUE), ("ldpred2_auc", "LDpred2-auto", VERMILLION))
-    ends = {}
-    for key, method, color in methods:
-        for index, (point, share, lightness, marker) in enumerate(SV_SHARES):
-            tone = shade(color, lightness)
-            dodge = (index - 1) * 0.07
-            present, means, lows, highs = [], [], [], []
-            for step, size in enumerate(SIZES):
-                mean, low, high, n = interval([row[key] for row in grouped.get((point, size), [])])
-                if n < 2:
-                    continue
-                present.append(xs[step] + dodge), means.append(mean), lows.append(low), highs.append(high)
-            ax.plot(present, means, color=tone, linewidth=1.0, zorder=3)
-            ax.vlines(present, lows, highs, color=tone, linewidth=0.8, zorder=3)
-            ax.scatter(present, means, s=14, marker=marker, color=tone, edgecolor="white", linewidth=0.4, zorder=4)
-            ends.setdefault(method, []).append(means[-1])
-    for key, method, color in methods:
-        ax.text(xs[-1] + 0.12, float(np.mean(ends[method])), method, color=color, fontsize=7, fontweight="bold",
-                va="center", ha="left")
-    ax.set_xticks(xs, [thousands(size) for size in SIZES])
-    ax.set_xlim(xs[0] - 0.25, xs[-1] + 0.25)
-    ax.set_ylim(0.50, 0.68)
-    ax.set_yticks(np.arange(0.50, 0.681, 0.04))
-    ax.yaxis.set_minor_locator(matplotlib.ticker.MultipleLocator(0.01))
+    ceiling = summary["points"]["null"]["true_value_auc"]
+    ax.axhline(ceiling, color=GREY, linestyle=(0, (1, 1.5)), linewidth=0.8, zorder=4)
+    ax.text(SIZES[0] / 1.3 * 1.04, ceiling + 0.002, "True genetic value", color=GREY, fontsize=7, va="bottom")
+    ax.plot(SIZES, [expected[str(size)] for size in SIZES], color=GREY, linestyle=(0, (4, 2)), linewidth=0.8, zorder=4)
+    ax.text(SIZES[-1] * 1.12, expected[str(SIZES[-1])] - 0.001, "Expected\n(theory)", color=GREY, fontsize=7,
+            va="top", ha="left", linespacing=1.0)
+    counts = {}
+    for key, method, color in (("with_sv_auc", "SV-PGS", BLUE), ("ldpred2_auc", "LDpred2-auto", VERMILLION)):
+        pooled = [interval([100 * row[key] for point, _, _ in SV_SHARES for row in grouped.get((point, size), [])])
+                  for size in SIZES]
+        mean, low, high = (np.array([cell[i] for cell in pooled]) / 100 for i in range(3))
+        counts[method] = [cell[3] for cell in pooled]
+        ax.fill_between(SIZES, low, high, color=color, alpha=0.18, linewidth=0, zorder=1)
+        ax.plot(SIZES, mean, color=color, linewidth=1.5, zorder=3, marker="o", markersize=3.4,
+                markeredgecolor="white", markeredgewidth=0.5)
+        ax.text(SIZES[-1] * 1.12, mean[-1], method, color=color, fontsize=8, fontweight="bold", va="center",
+                ha="left")
+    ax.set_ylim(0.52, 0.68)
+    ax.set_yticks(np.arange(0.52, 0.681, 0.04))
     ax.set_xlabel("Training sample size")
     ax.set_ylabel("Test AUC")
-    handles = [Line2D([0], [0], marker=marker, color=shade(GREY, lightness * 0.8), markeredgecolor="white",
-                      markeredgewidth=0.4, markersize=4.2, linewidth=1.0, label=share)
-               for _, share, lightness, marker in SV_SHARES]
-    ax.legend(handles=handles, title="Causal variants that are SVs", title_fontsize=6.5, loc="upper left", ncol=3,
-              columnspacing=1.0, handletextpad=0.3, alignment="left")
+    letter(ax, "a", x=-0.2)
+
+    log_size_axis(gap)
+    gap.axhline(0, color=INK, linewidth=0.6, zorder=1)
+    for index, (point, share, color) in enumerate(SV_SHARES):
+        nudge = 2 ** (0.09 * (index - 1))
+        stats_by_size = [interval(finite(grouped.get((point, size), []), "delta_auc_vs_ldpred2")) for size in SIZES]
+        xs = [size * nudge for size in SIZES]
+        means = [cell[0] for cell in stats_by_size]
+        gap.vlines(xs, [cell[1] for cell in stats_by_size], [cell[2] for cell in stats_by_size], color=color,
+                   linewidth=0.9, zorder=2)
+        gap.plot(xs, means, color=color, linewidth=0.9, marker="o", markersize=3.4, markeredgecolor="white",
+                 markeredgewidth=0.5, zorder=3, label=share)
+    gap.set_ylim(-0.5, 7.5)
+    gap.set_yticks(range(0, 8, 2))
+    gap.set_xlabel("Training sample size")
+    gap.set_ylabel("AUC × 100, SV-PGS − LDpred2-auto")
+    gap.legend(title="Causal variants that are SVs", loc="upper left", ncol=3, handlelength=1.2, columnspacing=1.0,
+               handletextpad=0.4, title_fontsize=7, fontsize=7, alignment="left", borderaxespad=0.1)
+    letter(gap, "b", x=-0.27)
     caption = (
-        "Figure 1 | SV-PGS gains accuracy faster than LDpred2-auto as the training sample grows, whatever the share "
-        "of causal SVs. Test AUC in 10,000 held-out people for a simulated binary trait on chromosome 22 (liability "
-        "h² = 0.1, prevalence 10%, 200 causal variants) in which 0%, 5% or 20% of the causal variants are SVs with the "
-        "same per-variant effect distribution as small variants. SV-PGS fits every SNV, indel and imputed SV; "
-        "LDpred2-auto fits HapMap3-density SNVs of the same training people. Points are means over simulation "
-        "replicates (5-15 per point) with Student-t 95% intervals, offset horizontally for legibility; the dashed line "
-        "is the expected AUC of a score capturing all of h² (Daetwyler et al. 2008; Wray et al. 2010). bench-sim v7 "
-        "cohort from 1000 Genomes haplotypes, Beagle-imputed SVs; fitted on MSI."
+        "Figure 1 | SV-PGS gains accuracy faster than LDpred2-auto as the training sample grows, by the same margin "
+        "whether 0%, 5% or 20% of the causal variants are SVs. A simulated binary trait on chromosome 22 (liability "
+        "h² = 0.1, prevalence 10%, 200 causal variants, SV effects drawn like small-variant effects), scored in the "
+        "same 10,000 held-out people by SV-PGS fitted on every SNV, indel and imputed SV and by LDpred2-auto fitted "
+        "on HapMap3-density SNVs of the same training people. a, Test AUC, mean and Student-t 95% interval over the "
+        "replicates of all three settings pooled ("
+        + ", ".join(f"{n}" for n in counts["SV-PGS"])
+        + " replicates at 5k, 10k, 20k and 40k). Dashed: the AUC expected of a score estimated from that many people "
+        "(Daetwyler et al. 2008; Wray et al. 2010); dotted: the AUC of the true genetic value. b, The paired "
+        "difference in AUC between the methods on the same held-out people for each setting separately, mean and "
+        "Student-t 95% interval over its replicates; the three overlap at every size, which is why a pools them. "
+        f"{POINT_UNIT} bench-sim v7 cohort from 1000 Genomes haplotypes, Beagle-imputed SVs; fitted on MSI."
     )
     return fig, caption
 
@@ -219,50 +287,39 @@ def accuracy_figure(grids, summary):
 
 
 def ldpred2_figure(grids):
+    size = SIZES[-1]
     grouped = cells(grids["grid"])
-    rows = []
-    for point in LABELS:
-        for size in sorted(SIZES, reverse=True):
-            values = [value for value in (row["delta_auc_vs_ldpred2"] for row in grouped.get((point, size), []))
-                      if math.isfinite(value)]
-            if len(values) >= 3:
-                rows.append((point, size, values, *interval(values)))
-                break
-    rows.sort(key=lambda row: row[3])
-    fig, ax = plt.subplots(figsize=(120 * MM, 92 * MM))
-    fig.subplots_adjust(left=0.33, right=0.86, top=0.97, bottom=0.12)
+    values = {point: finite(grouped.get((point, size), []), "delta_auc_vs_ldpred2") for point in LABELS}
+    rows = layout(lambda point: len(values[point]) >= 3)
+    missing = [LABELS[point] for point in LABELS if len(values[point]) < 3]
+    fig, ax = plt.subplots(figsize=(120 * MM, 104 * MM))
+    fig.subplots_adjust(left=0.43, right=0.93, top=0.95, bottom=0.11)
     ax.axvline(0, color=INK, linewidth=0.6, zorder=1)
-    rng = np.random.default_rng(1)
-    for y, (point, size, values, mean, low, high, n) in enumerate(rows):
-        ax.scatter(values, y + rng.uniform(-0.18, 0.18, len(values)), s=5, color=shade(BLUE, 0.55), linewidths=0,
-                   zorder=2)
-        ax.hlines(y, low, high, color=BLUE, linewidth=1.0, zorder=3)
-        ax.scatter([mean], [y], s=16, color=BLUE, edgecolor="white", linewidth=0.4, zorder=4)
-        wins = sum(value > 0 for value in values)
-        ax.text(1.02, y, f"{wins}/{n}", transform=ax.get_yaxis_transform(), ha="left", va="center", fontsize=6.5)
-        ax.text(1.12, y, thousands(size), transform=ax.get_yaxis_transform(), ha="left", va="center", fontsize=6.5,
-                color=GREY)
-    top = len(rows) - 0.4
-    ax.text(1.02, top, "Wins", transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6.5,
-            fontweight="bold")
-    ax.text(1.12, top, "N", transform=ax.get_yaxis_transform(), ha="left", va="bottom", fontsize=6.5,
-            color=GREY, style="italic")
-    ax.set_yticks(range(len(rows)), [LABELS[row[0]] for row in rows])
-    ax.tick_params(axis="y", length=0)
-    ax.spines["left"].set_visible(False)
-    ax.set_ylim(-0.6, len(rows) - 0.4)
-    ax.xaxis.set_minor_locator(matplotlib.ticker.MultipleLocator(0.01))
-    ax.set_xlabel("ΔAUC, SV-PGS − LDpred2-auto")
-    wins = sum(sum(value > 0 for value in row[2]) for row in rows)
-    total = sum(len(row[2]) for row in rows)
+    wins = total = 0
+    for y, (kind, point) in enumerate(rows):
+        if kind != "point":
+            continue
+        mean, low, high, n = interval(values[point])
+        ax.scatter(values[point], [y] * n, s=7, color=LIGHT, linewidths=0, zorder=2)
+        ax.hlines(y, low, high, color=BLUE, linewidth=1.1, zorder=3)
+        ax.scatter([mean], [y], s=20, color=BLUE, edgecolor="white", linewidth=0.5, zorder=4)
+        ax.text(1.02, y, f"{n}", transform=matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData),
+                ha="left", va="center", color=GREY)
+        wins += sum(value > 0 for value in values[point])
+        total += n
+    ax.text(1.02, -1.0, "n", transform=matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData),
+            ha="left", va="center", color=GREY, fontstyle="italic")
+    row_labels(ax, rows, -0.78)
+    ax.set_xlim(-1.5, 12)
+    ax.set_xticks(range(0, 13, 4))
+    ax.set_xlabel("AUC × 100, SV-PGS − LDpred2-auto")
     caption = (
         f"Figure 2 | SV-PGS is more accurate than LDpred2-auto across simulated genetic architectures. Paired "
-        f"difference in test AUC (same 10,000 held-out people) between SV-PGS with SVs and LDpred2-auto, per "
-        f"replicate (small dots), with the mean and its Student-t 95% interval, at the largest training size with at "
-        f"least three replicates (N, right). Wins: replicates in which SV-PGS had the higher AUC ({wins} of {total} "
-        f"overall). Unless named, each architecture has liability h² = 0.1, prevalence 10%, 200 causal variants and "
-        f"20% causal SVs; '3× effect' triples the SV effect variance, 'well-tagged' draws causal SVs only from those "
-        f"imputed with r² ≥ 0.8, 'common' only from SVs of frequency ≥ 5%."
+        f"difference in test AUC on the same 10,000 held-out people between SV-PGS (every SNV, indel and imputed SV) "
+        f"and LDpred2-auto (HapMap3-density SNVs), both trained on the same {size:,} people: replicates (grey), mean "
+        f"and Student-t 95% interval (blue); n replicates at right. SV-PGS had the higher AUC in {wins} of {total} "
+        f"replicates. {ARCHITECTURES} {POINT_UNIT} Not yet replicated three times at {size:,}: "
+        f"{', '.join(missing).lower()}."
     )
     return fig, caption
 
@@ -273,42 +330,45 @@ def ldpred2_figure(grids):
 def sv_gain_figure(grids):
     imputed, true = defaultdict(list), defaultdict(list)
     for row in grids["window"]:
-        imputed[row["point"]].append(row["delta_auc"])
+        imputed[row["point"]].extend(finite([row], "delta_auc"))
     for row in grids["window-truth"]:
-        true[row["point"]].append(row["delta_auc"])
-    points = [point for point in LABELS if len(true[point]) >= 3 and len(imputed[point]) >= 3]
-    summary = {point: (interval(imputed[point]), interval(true[point])) for point in points}
-    points.sort(key=lambda point: summary[point][1][0])
-    fig, ax = plt.subplots(figsize=(120 * MM, 96 * MM))
-    fig.subplots_adjust(left=0.33, right=0.97, top=0.90, bottom=0.11)
+        true[row["point"]].extend(finite([row], "delta_auc"))
+    rows = layout(lambda point: len(true[point]) >= 3 and len(imputed[point]) >= 3)
+    fig, ax = plt.subplots(figsize=(130 * MM, 112 * MM))
+    fig.subplots_adjust(left=0.40, right=0.90, top=0.91, bottom=0.10)
     ax.axvline(0, color=INK, linewidth=0.6, zorder=1)
-    for y, point in enumerate(points):
-        (mi, li, hi, ni), (mt, lt, ht, nt) = summary[point]
-        ax.hlines(y + 0.16, lt, ht, color=BLUE, linewidth=1.0, zorder=3)
-        ax.scatter([mt], [y + 0.16], s=16, color=BLUE, edgecolor="white", linewidth=0.4, zorder=4)
-        ax.hlines(y - 0.16, li, hi, color=SKY, linewidth=1.0, zorder=3)
-        ax.scatter([mi], [y - 0.16], s=14, facecolor="white", edgecolor=SKY, linewidth=0.9, zorder=4)
-    ax.set_yticks(range(len(points)), [LABELS[point] for point in points])
-    ax.tick_params(axis="y", length=0)
-    ax.spines["left"].set_visible(False)
-    ax.set_ylim(-0.6, len(points) - 0.4)
-    ax.xaxis.set_minor_locator(matplotlib.ticker.MultipleLocator(0.005))
-    ax.set_xlabel("ΔAUC from adding SVs, SV-PGS with − without SVs")
+    place = matplotlib.transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    clear = shown = 0
+    for y, (kind, point) in enumerate(rows):
+        if kind != "point":
+            continue
+        for column, offset, values, color, face in ((1.02, -0.17, true[point], BLUE, BLUE),
+                                                    (1.09, 0.17, imputed[point], SKY, "white")):
+            mean, low, high, n = interval(values)
+            ax.hlines(y + offset, low, high, color=color, linewidth=1.1, zorder=3)
+            ax.scatter([mean], [y + offset], s=18, facecolor=face, edgecolor=color if face == "white" else "white",
+                       linewidth=0.9 if face == "white" else 0.5, zorder=4)
+            ax.text(column, y, f"{n}", transform=place, ha="left", va="center", color=color)
+        shown += 1
+        clear += interval(true[point])[1] > 0
+    ax.text(1.055, -1.0, "n", transform=place, ha="center", va="center", color=GREY, fontstyle="italic")
+    row_labels(ax, rows, -0.75)
+    ax.set_xlabel("AUC × 100, SV-PGS with SVs − SV-PGS without SVs")
     handles = [
-        Line2D([0], [0], marker="o", color=BLUE, markeredgecolor="white", markeredgewidth=0.4, markersize=4.2,
-               linewidth=1.0, label="True SV genotypes"),
-        Line2D([0], [0], marker="o", color=SKY, markerfacecolor="white", markeredgewidth=0.9, markersize=3.8,
-               linewidth=1.0, label="Imputed SV genotypes"),
+        Line2D([0], [0], marker="o", color=BLUE, markeredgecolor="white", markeredgewidth=0.5, markersize=4.6,
+               linewidth=1.1, label="True SV genotypes"),
+        Line2D([0], [0], marker="o", color=SKY, markerfacecolor="white", markeredgewidth=0.9, markersize=4.2,
+               linewidth=1.1, label="Imputed SV genotypes"),
     ]
-    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.0), ncol=2, columnspacing=1.4)
-    significant = [LABELS[point] for point in points if summary[point][1][1] > 0]
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.01), ncol=2, columnspacing=1.6)
     caption = (
         "Figure 3 | SVs add accuracy when they are measured well; imputation removes most of the gain. Paired "
-        "difference in test AUC between SV-PGS fitted with and without SVs, when every SV is measured by its true "
-        "genotype (dark) or imputed by Beagle from SNV haplotypes (light), on one 3 Mb chromosome 22 window "
-        "(60,000 records). Means with Student-t 95% intervals over replicates, training sizes 5,000-40,000 pooled. "
-        f"The true-genotype interval excludes zero for {len(significant)} of {len(points)} architectures. Same "
-        "simulated people, truth and fits; only the SV genotypes differ."
+        "difference in test AUC on the same held-out people between SV-PGS fitted with and without SVs, when every SV "
+        "is measured by its true genotype (dark) or imputed by Beagle from SNV haplotypes (light), on one 3 Mb "
+        "chromosome 22 window (60,000 records). Means with Student-t 95% intervals over replicates, training sizes "
+        f"5,000-40,000 pooled; n replicates at right (true, imputed). The true-genotype interval lies above zero for {clear} of "
+        f"{shown} architectures. Same simulated people, truth and fits; only the SV genotypes differ. "
+        f"{ARCHITECTURES} {POINT_UNIT}"
     )
     return fig, caption
 
@@ -317,62 +377,61 @@ def sv_gain_figure(grids):
 
 
 def heatmap_figure(grids):
-    true_cells = cells(grids["window-truth"])
-
-    def order_key(point):
-        means = [np.mean([r["delta_auc"] for r in true_cells[(point, size)]]) for size in SIZES
-                 if len(true_cells.get((point, size), [])) >= 2]
-        return -np.mean(means) if means else 0.0
-
-    order = sorted(LABELS, key=order_key)
-    cmap = LinearSegmentedColormap.from_list("gain", [shade(VERMILLION, 0.0), shade(VERMILLION, 0.85), "#FFFFFF",
-                                                      shade(BLUE, 0.80), BLUE, "#003A5C"])
-    norm = TwoSlopeNorm(vmin=-0.008, vcenter=0.0, vmax=0.024)
-    fig, axes = plt.subplots(1, 2, figsize=(140 * MM, 100 * MM), sharey=True)
-    fig.subplots_adjust(left=0.25, right=0.88, top=0.80, bottom=0.03, wspace=0.06)
-    for panel, (ax, grid, title) in enumerate(((axes[0], "window-truth", "True SV genotypes"),
-                                               (axes[1], "window", "Imputed SV genotypes"))):
+    sizes = SIZES[:-1]
+    panels = (("window-truth", "True SV genotypes"), ("window", "Imputed SV genotypes"))
+    summaries = {}
+    for grid, _ in panels:
         grouped = cells(grids[grid])
-        matrix = np.full((len(order), len(SIZES)), np.nan)
-        for i, point in enumerate(order):
-            for j, size in enumerate(SIZES):
-                values = [row["delta_auc"] for row in grouped.get((point, size), []) if math.isfinite(row["delta_auc"])]
-                if len(values) >= 2:
-                    matrix[i, j] = float(np.mean(values))
-        image = ax.imshow(np.ma.masked_invalid(matrix), cmap=cmap, norm=norm, aspect="auto")
-        ax.set_facecolor("#F2F2F2")
-        for i in range(len(order)):
-            for j in range(len(SIZES)):
-                if math.isnan(matrix[i, j]):
+        summaries[grid] = {(point, size): interval(finite(grouped.get((point, size), []), "delta_auc"))
+                           for point in LABELS for size in sizes}
+    rows = layout(lambda point: True)
+    clear_values = [abs(mean) for table in summaries.values() for mean, low, high, n in table.values()
+                    if n >= 2 and (low > 0 or high < 0)]
+    limit = max(0.5, math.ceil(10 * max(clear_values, default=0.5)) / 10)
+    norm = matplotlib.colors.Normalize(-limit, limit)
+    cmap = LinearSegmentedColormap.from_list("gain", [VERMILLION, "#FFFFFF", BLUE])
+    fig, axes = plt.subplots(1, 2, figsize=(142 * MM, 118 * MM), sharey=True)
+    fig.subplots_adjust(left=0.375, right=0.99, top=0.90, bottom=0.02, wspace=0.05)
+    for panel, (ax, (grid, title)) in enumerate(zip(axes, panels)):
+        colours = np.ones((len(rows), len(sizes), 3))
+        for i, (kind, point) in enumerate(rows):
+            if kind != "point":
+                continue
+            for j, size in enumerate(sizes):
+                mean, low, high, n = summaries[grid][(point, size)]
+                if n < 2:
+                    colours[i, j] = to_rgb("#F2F2F2")
+                    ax.text(j, i, "–", ha="center", va="center", fontsize=7, color=GREY)
                     continue
-                value = matrix[i, j] * 1000
-                text = "0" if abs(value) < 0.05 else f"{value:+.1f}".replace("-", "−")
-                ax.text(j, i, text, ha="center", va="center", fontsize=5.5,
-                        color="white" if abs(matrix[i, j]) > 0.012 else INK)
-        ax.set_xticks(range(len(SIZES)), [thousands(size) for size in SIZES])
+                clear = low > 0 or high < 0
+                rgb = np.array(cmap(norm(mean))[:3])
+                # an interval that covers zero is drawn pale, so colour carries only what the replicates support
+                colours[i, j] = rgb if clear else rgb + (1 - rgb) * 0.75
+                dark = colours[i, j] @ np.array([0.299, 0.587, 0.114]) < 0.55
+                ax.text(j, i, signed(mean, 2), ha="center", va="center", fontsize=7,
+                        color="white" if dark else (INK if clear else GREY),
+                        fontweight="bold" if clear else "normal")
+        ax.imshow(colours, aspect="auto", interpolation="nearest")
+        ax.set_xticks(range(len(sizes)), [f"n = {thousands(size)}" for size in sizes])
         ax.xaxis.tick_top()
-        ax.xaxis.set_label_position("top")
-        ax.set_xlabel("Training sample size", labelpad=4)
         ax.tick_params(axis="both", length=0)
-        ax.set_xticks(np.arange(-0.5, len(SIZES)), minor=True)
-        ax.set_yticks(np.arange(-0.5, len(order)), minor=True)
-        ax.grid(which="minor", color="white", linewidth=1.0)
+        ax.set_xticks(np.arange(-0.5, len(sizes)), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(rows)), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.2)
         ax.tick_params(which="minor", length=0)
         for spine in ax.spines.values():
             spine.set_visible(False)
-        ax.text(0.5, 1.115, title, transform=ax.transAxes, ha="center", va="bottom", fontsize=7, fontweight="bold")
-        letter(ax, "ab"[panel], x=-0.02 if panel else -0.62, y=1.115)
-    axes[0].set_yticks(range(len(order)), [LABELS[point] for point in order])
-    bar = fig.add_axes([0.905, 0.30, 0.012, 0.40])
-    colorbar = fig.colorbar(image, cax=bar)
-    colorbar.outline.set_linewidth(0.4)
-    colorbar.set_ticks([-0.008, 0, 0.008, 0.016, 0.024], labels=["−8", "0", "8", "16", "24"])
-    colorbar.ax.tick_params(labelsize=6, length=2, width=0.4)
-    colorbar.set_label("ΔAUC × 10³", fontsize=6.5)
+        ax.set_title(title, fontweight="bold", pad=16)
+        letter(ax, "ab"[panel], x=-0.04 if panel else -1.02, y=1.065)
+    row_labels(axes[0], rows, -1.02)
+    axes[0].set_ylim(len(rows) - 0.5, -0.5)
     caption = (
-        "Figure 4 | Gain from adding SVs by architecture and training size. Mean paired ΔAUC (× 1,000) between "
-        "SV-PGS fitted with and without SVs on one chromosome 22 window, with SVs measured by their true genotypes "
-        "(a) or imputed (b). Grey cells had fewer than two replicates. Rows are ordered by the mean true-genotype gain."
+        "Figure 4 | The gain from adding SVs by architecture and training size. Mean paired difference in test AUC on "
+        "the same held-out people between SV-PGS fitted with and without SVs on one chromosome 22 window, with SVs "
+        "measured by their true genotypes (a) or imputed (b). Bold on full colour: the Student-t 95% interval over "
+        f"replicates excludes zero; grey on pale colour: it does not. Colour saturates at ±{limit:.1f}. Dashes: fewer "
+        f"than two replicates. 40,000-person window fits are not yet replicated and are left out. {ARCHITECTURES} "
+        f"{POINT_UNIT}"
     )
     return fig, caption
 
@@ -443,7 +502,7 @@ def compute_figure(grids):
     grouped = cells(grids["grid"])
     fig, ax = plt.subplots(figsize=(89 * MM, 68 * MM))
     fig.subplots_adjust(left=0.17, right=0.72, top=0.95, bottom=0.17)
-    methods = (("with_sv", "SV-PGS, with SVs", BLUE, 0.08, 0.80), ("snv_indel", "SV-PGS, no SVs", SKY, -0.0, 1.25),
+    methods = (("with_sv", "SV-PGS with SVs", BLUE, 0.08, 0.80), ("snv_indel", "SV-PGS without SVs", SKY, -0.0, 1.25),
                ("ldpred2_auto", "LDpred2-auto", VERMILLION, -0.08, 1.0))
     xs = np.log2(np.array(SIZES) / SIZES[0])
     for key, label, color, offset, nudge in methods:

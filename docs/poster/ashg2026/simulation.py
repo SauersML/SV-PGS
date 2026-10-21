@@ -189,6 +189,8 @@ def summarize(results: list[dict], attempts: list[dict], expected: bool = True) 
         points[point] = {"setting": setting(point), "sizes": by_size}
         if expected:
             points[point]["expected_auc"] = {str(count): expected_auc(point, count) for count in TRAIN_COUNTS}
+            # the AUC of the true genetic value itself, which no training size can pass
+            points[point]["true_value_auc"] = auc_of(setting(point)["h2"], setting(point)["prevalence"])
     return points
 
 
